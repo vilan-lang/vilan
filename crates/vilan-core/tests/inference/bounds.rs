@@ -13958,3 +13958,131 @@ fn b476_the_option_join_flatten_is_accepted_and_typed() {
     );
 }
 
+// --- B482 (RULED door (a)): an injected closure called inside `clear` of its ---
+// --- own context gets the CLEARED state — reactive-layers.md §7.3's static    ---
+// --- `untrack`. Strict reads in its literal are refused; `get_safe` is `None`. -
+
+/// The callee shape: `notify` calls its callback under `current.clear(..)`;
+/// `twice` calls it once plainly and once cleared.
+const B482_CALLEES: &str = r#"
+fun notify(callback: (|i32| void) context current) {
+    current.clear(|| callback(1));
+}
+
+fun twice(callback: (|i32| void) context current) {
+    callback(1);
+    current.clear(|| callback(2));
+}
+"#;
+
+fn b482_program(main_body: &str) -> String {
+    format!("{B458_HEAD}{B482_CALLEES}\nfun main() {{\n{main_body}\n}}\nmain();\n")
+}
+
+/// The call compiles (it was "an injected closure is called here, but this
+/// code can be reached without an enclosing `run`"), and a safe read in the
+/// literal sees `None` — though the literal was written under `run(7, ..)`.
+#[test]
+fn b482_a_callback_called_inside_clear_reads_the_context_as_absent() {
+    assert_compiles_and_runs(
+        &b482_program(
+            r#"current.run(7, || {
+                notify(|n| print(i"{n} {describe()}"));
+                notify(|n| print(i"{n} {current.get_safe().is_none()}"));
+            });"#,
+        ),
+        "1 none\n1 true\n",
+    );
+}
+
+/// One literal reached by a plain call AND a cleared one: `Some` from the
+/// first, `None` from the second.
+#[test]
+fn b482_the_same_literal_sees_the_value_outside_clear_and_none_inside() {
+    assert_compiles_and_runs(
+        &b482_program(
+            r#"current.run(7, || {
+                twice(|n| print(i"{n} {describe()}"));
+            });"#,
+        ),
+        "1 some 7\n2 none\n",
+    );
+}
+
+/// A STRICT read in a literal that lands at a cleared position is refused at
+/// compile time, at the read, naming the position and the steer.
+#[test]
+fn b482_a_strict_read_in_a_cleared_callback_is_refused() {
+    let source = b482_program(
+        r#"current.run(7, || {
+            notify(|n| print(n + current.get()));
+        });"#,
+    );
+    assert_fails_with(
+        &source,
+        "this closure is called with `current` CLEARED: it lands at the parameter `callback` of \
+         `notify`, which is called under `current.clear(..)`",
+    );
+    assert_fails_without(&source, "an injected closure is called here");
+}
+
+/// The same refusal reached through a FORWARD: `relay` hands its callback to
+/// `notify`, so a literal at `relay` can be called cleared too.
+#[test]
+fn b482_a_forwarded_callback_is_cleared_through_the_forward() {
+    let relay = r#"
+fun relay(callback: (|i32| void) context current) {
+    notify(callback);
+}
+"#;
+    let refused = format!(
+        "{B458_HEAD}{B482_CALLEES}{relay}\nfun main() {{\n{}\n}}\nmain();\n",
+        r#"current.run(7, || { relay(|n| print(n + current.get())); });"#
+    );
+    assert_fails_with(&refused, "this closure is called with `current` CLEARED");
+    let accepted = format!(
+        "{B458_HEAD}{B482_CALLEES}{relay}\nfun main() {{\n{}\n}}\nmain();\n",
+        r#"current.run(7, || { relay(|n| print(i"{n} {describe()}")); });"#
+    );
+    assert_compiles_and_runs(&accepted, "1 none\n");
+}
+
+/// A callback position NOT called under `clear` is untouched: its literal
+/// still reads the context strictly.
+#[test]
+fn b482_an_uncleared_callback_position_still_reads_strictly() {
+    let plain = r#"
+fun plain(callback: (|i32| void) context current) {
+    callback(1);
+}
+"#;
+    assert_compiles_and_runs(
+        &format!(
+            "{B458_HEAD}{plain}\nfun main() {{\n{}\n}}\nmain();\n",
+            r#"current.run(7, || { plain(|n| print(n + current.get())); });"#
+        ),
+        "8\n",
+    );
+}
+
+/// A SEPARATE position written with the same closure type as a cleared one is
+/// its own position: each annotation is its own closure type, so `plain`'s
+/// literal is not reached by `notify`'s `clear` and still reads strictly.
+#[test]
+fn b482_a_same_typed_separate_position_is_not_cleared() {
+    let plain = r#"
+fun plain(callback: (|i32| void) context current) {
+    callback(1);
+}
+"#;
+    assert_compiles_and_runs(
+        &format!(
+            "{B458_HEAD}{B482_CALLEES}{plain}\nfun main() {{\n{}\n}}\nmain();\n",
+            r#"current.run(7, || {
+                plain(|n| print(n + current.get()));
+                notify(|n| print(i"{n} {describe()}"));
+            });"#
+        ),
+        "8\n1 none\n",
+    );
+}

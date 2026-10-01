@@ -60271,6 +60271,16 @@ pub struct Program<'src> {
     /// keyed on `parameters` sees plumbing dressed as source. Membership is the
     /// bool: absent means bare.
     pub context_optional_hidden_parameters: HashSet<Id>,
+    /// B482: the closure TYPES whose `context` clause entry arrives CLEARED
+    /// somewhere — a callback position some callee calls under
+    /// `context.clear(..)` — as `(closure type, context)`. Every literal that
+    /// lands at such a position takes that context's hidden parameter as an
+    /// `Option` (`context_optional_hidden_parameters`), and so does every call
+    /// through it: `None` under the `clear`, `Some` elsewhere. Keyed by the
+    /// TYPE because a backend writes the type down where no literal is in
+    /// sight (the Rust backend's `Rc<dyn Fn(..)>`); the pass unites every
+    /// position a value can travel between, so one type has one answer.
+    pub cleared_clause_contexts: HashSet<(TypeId, Id)>,
     /// E124: the module-level bindings `context::thread_contexts` recognized as
     /// ambient contexts — `let app_context = Context<AppContext>::new();`.
     ///
@@ -70052,6 +70062,7 @@ fn analyze_over_world<'src>(
         context_erased_subjects: HashMap::default(),
         context_hidden_parameters: HashMap::default(),
         context_optional_hidden_parameters: HashSet::default(),
+        cleared_clause_contexts: HashSet::default(),
         context_bindings: Vec::new(),
         bool_enum_id: analyzer.bool_enum_id,
         module_id_by_name: analyzer.module_id_by_name,

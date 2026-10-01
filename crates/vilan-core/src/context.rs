@@ -273,6 +273,9 @@ struct Plan {
     runs: Vec<RunSite>,
     /// B458: `clear` calls to lower to `body()`, as `(call, body entity)`.
     clears: Vec<(Id, Id)>,
+    /// B482: the closure types whose clause entry for a context arrives
+    /// cleared, as `(type, context)` — `Program::cleared_clause_contexts`.
+    cleared_types: Vec<(TypeId, Id)>,
     /// `Context::new()` calls to lower to an opaque value.
     news: Vec<Id>,
     /// Spawn registration (async-polymorphism.md Part B): each `async` spawn
@@ -500,6 +503,157 @@ fn adoptable_closure(program: &Program, source: Id) -> Option<Id> {
     match program.entity_map.get(&initial) {
         Some(Expr::Closure(closure_id)) => Some(*closure_id),
         _ => None,
+    }
+}
+
+/// B482: a place a `context`-typed closure VALUE can sit — a parameter or a
+/// binding, a struct field, a function's return. A literal LANDS at one, a
+/// value is FORWARDED from one to another, and a call is made THROUGH one;
+/// whether a call through a carrier runs under `clear` of its context is what
+/// decides how every literal that can reach the carrier receives that context.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Carrier {
+    Value(Id),
+    Field(Id, usize),
+    Return(Id),
+}
+
+/// A node of the carrier union (B482): a carrier, or a closure TYPE. A
+/// carrier is united with every type it is written at, so two positions of one
+/// type answer alike — a backend renders the type, not the position.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum CarrierKey {
+    Carrier(Carrier),
+    Type(TypeId),
+}
+
+/// The carrier an injected VALUE is read out of (B482): a reference to a
+/// clause-typed parameter or binding, a read of a clause-typed field, or a
+/// direct call whose callee's declared return carries a clause. `None` for
+/// anything else — a literal, a named function, a value with no clause.
+fn carrier_of_value(
+    program: &Program,
+    value_contexts: &HashMap<Id, Vec<Id>>,
+    entity: Id,
+) -> Option<Carrier> {
+    match program.entity_map.get(&entity)? {
+        Expr::Local(target) if value_contexts.contains_key(target) => Some(Carrier::Value(*target)),
+        expr @ Expr::Field(_, struct_id, index) if field_read_clause(program, expr).is_some() => {
+            Some(Carrier::Field(*struct_id, *index))
+        }
+        Expr::Call(call_id) if call_return_clause(program, entity).is_some() => {
+            call_target(program, *call_id).map(Carrier::Return)
+        }
+        _ => None,
+    }
+}
+
+/// The closure type a carrier is DECLARED at, where it has one of its own (a
+/// field's is read per instance, at the landing that knows the instance).
+fn carrier_declared_type(program: &Program, carrier: Carrier) -> Option<TypeId> {
+    match carrier {
+        Carrier::Value(id) => program
+            .parameters
+            .get(&id)
+            .map(|parameter| parameter.type_id)
+            .or_else(|| program.variables.get(&id).map(|variable| variable.type_id)),
+        Carrier::Field(struct_id, index) => field_type_at(program, struct_id, index, None),
+        Carrier::Return(function) => program.functions.get(&function)?.return_type_id,
+    }
+}
+
+/// How a B482 refusal names the position a cleared literal landed at: the
+/// parameter and its function, the field and its struct, the binding, or the
+/// function whose return it is.
+fn cleared_position_label(program: &Program, carrier: Carrier) -> String {
+    match carrier {
+        Carrier::Value(id) => {
+            if let Some(parameter) = program.parameters.get(&id) {
+                let function = program
+                    .functions
+                    .get(&parameter.function_id)
+                    .map(|function| function.name)
+                    .unwrap_or("its function");
+                format!("the parameter `{}` of `{function}`", parameter.name)
+            } else {
+                let name = program
+                    .variables
+                    .get(&id)
+                    .map(|variable| variable.name)
+                    .unwrap_or("a binding");
+                format!("the binding `{name}`")
+            }
+        }
+        Carrier::Field(struct_id, index) => {
+            let declaration = program.structs.get(&struct_id);
+            let struct_name = declaration
+                .map(|declaration| declaration.name)
+                .unwrap_or("a struct");
+            let field_name = declaration
+                .and_then(|declaration| declaration.fields.get(index))
+                .map(|field| field.name)
+                .unwrap_or("a field");
+            format!("the field `{field_name}` of `{struct_name}`")
+        }
+        Carrier::Return(function) => {
+            let name = program
+                .functions
+                .get(&function)
+                .map(|function| function.name)
+                .unwrap_or("a function");
+            format!("the return of `{name}`")
+        }
+    }
+}
+
+/// A union-find over [`CarrierKey`]s — the classes of positions a value can
+/// travel between (B482).
+#[derive(Default)]
+struct CarrierClasses {
+    parent: HashMap<CarrierKey, CarrierKey>,
+    /// Every key ever united, roots included (a root has no `parent` entry).
+    members: HashSet<CarrierKey>,
+}
+
+impl CarrierClasses {
+    fn root(&mut self, key: CarrierKey) -> CarrierKey {
+        let mut current = key;
+        while let Some(&next) = self.parent.get(&current) {
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        // Path compression: point every node on the walk at the root.
+        let mut walk = key;
+        while walk != current {
+            let next = self.parent.get(&walk).copied().unwrap_or(current);
+            self.parent.insert(walk, current);
+            walk = next;
+        }
+        current
+    }
+
+    /// [`Self::root`] without compressing — for a reader holding the classes
+    /// shared.
+    fn find(&self, key: CarrierKey) -> CarrierKey {
+        let mut current = key;
+        while let Some(&next) = self.parent.get(&current) {
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        current
+    }
+
+    fn unite(&mut self, left: CarrierKey, right: CarrierKey) {
+        self.members.insert(left);
+        self.members.insert(right);
+        let (left, right) = (self.root(left), self.root(right));
+        if left != right {
+            self.parent.insert(left, right);
+        }
     }
 }
 
@@ -1358,6 +1512,12 @@ fn analyze(
     // construction, which is the ownership divergence A85 measured.
     let mut deferred: HashMap<Id, HashSet<Id>> = HashMap::default(); // ctx -> closures
     let mut injected_calls: HashMap<Id, Vec<(Node, Id)>> = HashMap::default(); // ctx -> (caller, call)
+    // B482: the positions a value travels between, united; where each literal
+    // landed; and the position each call through an injected value reads it
+    // out of.
+    let mut carrier_classes = CarrierClasses::default();
+    let mut literal_landings: Vec<(Id, Carrier)> = Vec::new();
+    let mut injected_call_carriers: HashMap<Id, Carrier> = HashMap::default();
     // The working clause map: declared clauses (parameters AND `let`
     // annotations) plus ADOPTED ones — an unannotated closure-literal binding
     // passed into a clause position adopts that clause (`let add = || ..;`
@@ -1441,6 +1601,11 @@ fn analyze(
         // also earn the value-flow restriction's refusal for appearing
         // somewhere the threading cannot follow — it is the same appearance.
         let mut refused_landings: HashSet<Id> = HashSet::default();
+        // B482: every LANDING the four rules below see, as `(value, the
+        // position, the position's type)` — read once adoption has settled, to
+        // unite the positions a value travels between and to say where each
+        // literal landed.
+        let mut landing_sites: Vec<(Id, Carrier, Option<TypeId>)> = Vec::new();
         for (&entity, expr) in &program.entity_map {
             if let Some(clause) = field_read_clause(program, expr) {
                 injected_values.insert(entity, clause);
@@ -1468,6 +1633,7 @@ fn analyze(
             let Some(initial) = variable.initial else {
                 continue;
             };
+            landing_sites.push((initial, Carrier::Value(binding_id), Some(variable.type_id)));
             match program.entity_map.get(&initial) {
                 Some(Expr::Closure(closure_id)) => {
                     for &context in &clause {
@@ -1539,12 +1705,14 @@ fn analyze(
         // `entity_map` iteration is not ordered; the refusals below are.
         field_stores.sort_by_key(|(entity, _, index, _)| (entity.0, *index));
         for (entity, struct_id, index, value) in field_stores {
-            let Some(clause) = field_type_at(program, struct_id, index, Some(entity))
+            let field_type = field_type_at(program, struct_id, index, Some(entity));
+            let Some(clause) = field_type
                 .and_then(|type_id| clause_of_type(program, type_id))
                 .map(<[Id]>::to_vec)
             else {
                 continue;
             };
+            landing_sites.push((value, Carrier::Field(struct_id, index), field_type));
             match program.entity_map.get(&value) {
                 Some(Expr::Closure(closure_id)) => {
                     for &context in &clause {
@@ -1600,15 +1768,17 @@ fn analyze(
         // closure: the literal it returns is born under the clause, and the
         // caller supplies the context at each call through the value.
         for &(function_id, value) in &program.return_sites {
-            let Some(clause) = program
+            let return_type = program
                 .functions
                 .get(&function_id)
-                .and_then(|function| function.return_type_id)
+                .and_then(|function| function.return_type_id);
+            let Some(clause) = return_type
                 .and_then(|type_id| clause_of_type(program, type_id))
                 .map(<[Id]>::to_vec)
             else {
                 continue;
             };
+            landing_sites.push((value, Carrier::Return(function_id), return_type));
             match program.entity_map.get(&value) {
                 Some(Expr::Closure(closure_id)) => {
                     for &context in &clause {
@@ -1674,6 +1844,14 @@ fn analyze(
                 let Some(clause) = value_contexts.get(parameter).cloned() else {
                     continue;
                 };
+                landing_sites.push((
+                    *argument,
+                    Carrier::Value(*parameter),
+                    program
+                        .parameters
+                        .get(parameter)
+                        .map(|declared| declared.type_id),
+                ));
                 match program.entity_map.get(argument) {
                     Some(Expr::Closure(closure_id)) => {
                         for &context in &clause {
@@ -1755,7 +1933,46 @@ fn analyze(
                             .or_default()
                             .push((*node, call.call_id));
                     }
+                    if let Some(carrier) =
+                        carrier_of_value(program, &value_contexts, function_call.subject_id)
+                    {
+                        injected_call_carriers.insert(call.call_id, carrier);
+                    }
                 }
+            }
+        }
+
+        // --- B482: the carrier classes. A literal lands at a position, a
+        // value is forwarded from one to another, and a position is written at
+        // a closure type; all three join one class, so a literal answers to
+        // every call any position of its class makes — and a backend that
+        // writes the TYPE down agrees with every literal that reaches it. ---
+        for &(value, destination, destination_type) in &landing_sites {
+            let destination_key = CarrierKey::Carrier(destination);
+            if let Some(type_id) = destination_type {
+                carrier_classes.unite(destination_key, CarrierKey::Type(type_id));
+            }
+            match program.entity_map.get(&value) {
+                Some(Expr::Closure(closure_id)) => {
+                    literal_landings.push((*closure_id, destination));
+                }
+                _ => {
+                    if let Some(source) = carrier_of_value(program, &value_contexts, value) {
+                        carrier_classes.unite(CarrierKey::Carrier(source), destination_key);
+                        // An ADOPTING binding (B333) holds the literal it was
+                        // initialised with: the literal lands at the binding.
+                        if let Carrier::Value(binding) = source
+                            && let Some(closure_id) = adoptable_closure(program, binding)
+                        {
+                            literal_landings.push((closure_id, source));
+                        }
+                    }
+                }
+            }
+        }
+        for &carrier in injected_call_carriers.values() {
+            if let Some(type_id) = carrier_declared_type(program, carrier) {
+                carrier_classes.unite(CarrierKey::Carrier(carrier), CarrierKey::Type(type_id));
             }
         }
 
@@ -1954,6 +2171,67 @@ fn analyze(
                 // given. The premise failed; the walk stops here.
                 || unresolved_argument_closures.contains(&id)
         };
+        // --- B482 (RULED door (a)): a call through an injected closure
+        // written inside `clear` of its own context hands the callee the
+        // CLEARED state — the static `untrack` of reactive-layers.md §7.3. Such
+        // a call demands nothing of its caller (there is nothing to supply),
+        // and every literal that can reach the position it calls through takes
+        // the context as an `Option`: `None` there, `Some` from every other
+        // call. A strict read in such a literal is refused below. ---
+        //
+        // Whether a node runs under `clear` of THIS context: it is a `clear`
+        // body, or a closure that captures (directly or through closures that
+        // capture in turn) from one — never past a node that holds a value of
+        // its own.
+        let under_clear = |node: Id| -> bool {
+            let mut current = node;
+            loop {
+                if cleared_here(current).is_some() {
+                    return true;
+                }
+                if program.functions.contains_key(&current)
+                    || run_closures.get(&current) == Some(&context)
+                    || deferred
+                        .get(&context)
+                        .is_some_and(|closures| closures.contains(&current))
+                {
+                    return false;
+                }
+                match graph.closure_parent_of(current) {
+                    Some(parent) => current = parent,
+                    None => return false,
+                }
+            }
+        };
+        let cleared_calls: HashSet<Id> = injected_calls
+            .get(&context)
+            .into_iter()
+            .flatten()
+            .filter(|(owner, _)| under_clear(owner.id()))
+            .map(|(_, call_id)| *call_id)
+            .collect();
+        let cleared_roots: HashSet<CarrierKey> = cleared_calls
+            .iter()
+            .filter_map(|call_id| injected_call_carriers.get(call_id))
+            .map(|carrier| carrier_classes.find(CarrierKey::Carrier(*carrier)))
+            .collect();
+        let carrier_cleared = |carrier: Carrier| -> bool {
+            !cleared_roots.is_empty()
+                && cleared_roots.contains(&carrier_classes.find(CarrierKey::Carrier(carrier)))
+        };
+        // The literals of this context that can reach a cleared position, each
+        // with where it landed.
+        let cleared_literals: HashMap<Id, Carrier> = literal_landings
+            .iter()
+            .filter(|(literal, _)| {
+                deferred
+                    .get(&context)
+                    .is_some_and(|closures| closures.contains(literal))
+            })
+            .filter(|(_, carrier)| carrier_cleared(*carrier))
+            .map(|(literal, carrier)| (*literal, *carrier))
+            .collect();
+
         // Backward reachability: a caller of a needs-context node needs it too
         // — through direct edges, through dispatch (B14), and — for CAPTURING
         // closures only — through the enclosing scope (the closure reads its
@@ -2004,7 +2282,12 @@ fn analyze(
                 strict_worklist.push(get.owner.id());
             }
         }
-        for (owner, _call) in injected_calls.get(&context).into_iter().flatten() {
+        for (owner, call_id) in injected_calls.get(&context).into_iter().flatten() {
+            // B482: a call under `clear` hands on the cleared state, and
+            // demands no value of its caller.
+            if cleared_calls.contains(call_id) {
+                continue;
+            }
             if strict.insert(owner.id()) {
                 strict_worklist.push(owner.id());
             }
@@ -2486,7 +2769,7 @@ fn analyze(
         // Calling an injected closure IS a read: its deferred argument comes
         // from the caller, so an unbound caller has nothing to supply.
         for (owner, call_id) in injected_calls.get(&context).into_iter().flatten() {
-            if bound.contains(&owner.id()) {
+            if bound.contains(&owner.id()) || cleared_calls.contains(call_id) {
                 continue;
             }
             let message = format!(
@@ -2522,6 +2805,99 @@ fn analyze(
                         )),
                     ));
                 }
+            }
+        }
+
+        // --- B482: a strict read inside a literal that can reach a CLEARED
+        // position. The literal is called under `clear` there and holds no
+        // value, so it reads its context only through `get_safe` (`None` at
+        // that call). The refusal anchors at what the AUTHOR wrote inside the
+        // literal — the read, or the call that leads to one — and falls back
+        // to the literal itself. ---
+        let mut cleared_offenders: Vec<(&Id, &Carrier)> = cleared_literals
+            .iter()
+            .filter(|(literal, _)| strict.contains(literal))
+            .collect();
+        cleared_offenders.sort_by_key(|(literal, _)| literal.0);
+        for (&literal, &carrier) in cleared_offenders {
+            // The literal's own frame: itself, and every closure that captures
+            // from it without a value of its own in between.
+            let in_frame = |node: Id| -> bool {
+                let mut current = node;
+                loop {
+                    if current == literal {
+                        return true;
+                    }
+                    if program.functions.contains_key(&current) || own_param_closure(current) {
+                        return false;
+                    }
+                    match graph.closure_parent_of(current) {
+                        Some(parent) => current = parent,
+                        None => return false,
+                    }
+                }
+            };
+            let mut anchors: Vec<Id> = Vec::new();
+            for get in gets
+                .iter()
+                .filter(|get| get.context == context && !get.safe && in_frame(get.owner.id()))
+            {
+                anchors.push(get.call_id);
+            }
+            for node in graph.nodes().iter().filter(|node| in_frame(node.id())) {
+                for call in graph.calls_of(node.id()) {
+                    if let CallTarget::Function(callee) = call.target
+                        && strict.contains(&callee)
+                    {
+                        anchors.push(call.call_id);
+                    }
+                }
+            }
+            for (caller, call_id, candidates) in &dispatch_sites {
+                if in_frame(*caller) && candidates.iter().any(|id| strict.contains(id)) {
+                    anchors.push(*call_id);
+                }
+            }
+            for (owner, call_id) in injected_calls.get(&context).into_iter().flatten() {
+                if in_frame(owner.id()) && !cleared_calls.contains(call_id) {
+                    anchors.push(*call_id);
+                }
+            }
+            anchors.retain(|anchor| !library_spanned(*anchor));
+            anchors.sort_by_key(|anchor| anchor.0);
+            anchors.dedup();
+            if anchors.is_empty()
+                && let Some((&entity, _)) = program
+                    .entity_map
+                    .iter()
+                    .find(|(_, expr)| matches!(expr, Expr::Closure(id) if *id == literal))
+            {
+                anchors.push(entity);
+            }
+            let position = cleared_position_label(program, carrier);
+            let name = context_name(program, context);
+            let directly = cleared_calls
+                .iter()
+                .filter_map(|call_id| injected_call_carriers.get(call_id))
+                .any(|cleared| *cleared == carrier);
+            let how = match directly {
+                true => format!("which is called under `{name}.clear(..)`"),
+                false => format!(
+                    "which shares its closure with a position called under `{name}.clear(..)` \
+                     (a value forwarded there, or a position of the same closure type)"
+                ),
+            };
+            for anchor in anchors {
+                errors.push(anchored(
+                    program,
+                    anchor,
+                    format!(
+                        "context `{name}` is read here, but this closure is called with `{name}` \
+                         CLEARED: it lands at {position}, {how}, where there is no value to read \
+                         — read it with `{name}.get_safe()` (which answers `None` there), or \
+                         read it before handing the closure on"
+                    ),
+                ));
             }
         }
 
@@ -2674,9 +3050,12 @@ fn analyze(
         // A parameter holds the BARE value when its provider is strict or a
         // `run` closure (which `run` hands the bare value); otherwise it
         // holds `Option<T>`.
+        // B482: a literal that can reach a cleared position holds the
+        // `Option`, whatever its provider would otherwise say.
         let holds_bare = |node: Id| -> bool {
             provider_of
                 .get(&node)
+                .filter(|provider| !cleared_literals.contains_key(provider))
                 .map(|provider| strict.contains(provider) || run_closure_ids.contains(provider))
                 .unwrap_or(false)
         };
@@ -2789,9 +3168,40 @@ fn analyze(
         }
         // Calls through injected closures: the caller's value rides as the
         // deferred trailing argument (the bare channel).
+        //
+        // B482: a call through a CLEARED position hands an `Option` — `None`
+        // under the `clear`, the caller's bare value `Some`-wrapped elsewhere
+        // (or its own `Option` as it is, inside a cleared literal).
         for (owner, call_id) in injected_calls.get(&context).into_iter().flatten() {
-            plan.thread_calls
-                .push((*call_id, context, ThreadForm::Param { owner: *owner }));
+            let through_cleared = injected_call_carriers
+                .get(call_id)
+                .is_some_and(|carrier| carrier_cleared(*carrier));
+            let form = if cleared_calls.contains(call_id) {
+                ThreadForm::NoneLiteral
+            } else if through_cleared && holds_bare(owner.id()) {
+                ThreadForm::WrapSome { owner: *owner }
+            } else {
+                ThreadForm::Param { owner: *owner }
+            };
+            plan.thread_calls.push((*call_id, context, form));
+        }
+        if !cleared_roots.is_empty() {
+            let mut cleared_types: Vec<TypeId> = carrier_classes
+                .members
+                .iter()
+                .copied()
+                .filter_map(|key| match key {
+                    CarrierKey::Type(type_id)
+                        if cleared_roots.contains(&carrier_classes.find(key)) =>
+                    {
+                        Some(type_id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            cleared_types.sort_by_key(|type_id| type_id.0);
+            plan.cleared_types
+                .extend(cleared_types.into_iter().map(|type_id| (type_id, context)));
         }
         // Top-level calls to safe functions: the entry point with no value —
         // a literal `None` rides along. (Top-level calls to STRICT functions
@@ -2935,6 +3345,10 @@ fn analyze(
 
 /// Applies a validated plan, mutating the IR in place.
 fn apply(program: &mut Program, plan: Plan) {
+    // B482: the cleared clause positions, for a backend that writes the type.
+    program
+        .cleared_clause_contexts
+        .extend(plan.cleared_types.iter().copied());
     let mut next_id = program.next_entity_id;
     let mut fresh = || {
         let id = Id(next_id);

@@ -2456,6 +2456,60 @@ const B480_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B482: an injected callback called inside `clear` of its own context gets
+/// the CLEARED state — `get_safe` is `None` there and the bare value's `Some`
+/// from a plain call through the same position — and natively the position's
+/// closure type carries the context as an `Option` (`cleared_clause_contexts`),
+/// which every literal landing there agrees with, beside a `run` body and a
+/// plain injected position that stay bare.
+#[test]
+fn a_callback_called_inside_clear_reads_the_context_as_absent_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b482.vl"), B482_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b482.vl"),
+        Verdict::Identical,
+        "a cleared callback must read the context as absent on both backends"
+    );
+}
+
+const B482_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::option::Option::{ Some, None };\n",
+    "\n",
+    "let current: Context<i32> = Context::new();\n",
+    "\n",
+    "fun describe(): str {\n",
+    "\tmatch current.get_safe() {\n",
+    "\t\tSome(let value) => i\"some {value}\",\n",
+    "\t\tNone => \"none\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun notify(callback: (|i32| void) context current) {\n",
+    "\tcurrent.clear(|| callback(1));\n",
+    "}\n",
+    "\n",
+    "fun twice(callback: (|i32| void) context current) {\n",
+    "\tcallback(1);\n",
+    "\tcurrent.clear(|| callback(2));\n",
+    "}\n",
+    "\n",
+    "fun plain(callback: (|i32, i32| void) context current) {\n",
+    "\tcallback(3, 4);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tcurrent.run(7, || {\n",
+    "\t\tnotify(|n: i32| print(i\"{n} {describe()}\"));\n",
+    "\t\ttwice(|n: i32| print(i\"{n} {describe()}\"));\n",
+    "\t\tplain(|n: i32, m: i32| print(n + m + current.get()));\n",
+    "\t});\n",
+    "}\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is
