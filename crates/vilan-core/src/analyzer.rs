@@ -19433,6 +19433,10 @@ impl<'src> Analyzer<'src> {
                 // A79's keyed handle: the ELEMENT is the second argument.
                 // Its KEY is `resolved_handle_return_key`'s answer (B319).
                 ("KeyedCell", [_key, element]) => Some(*element),
+                // A138: a map's PER-KEY handle crosses as a plain mirror of
+                // `Option<V>`; `V` is what has to be Wire, and the key stays on
+                // the server.
+                ("MapEntry" | "MemoEntry", [_key, value]) => Some(*value),
                 _ => None,
             },
             Type::Enum(id, arguments) => match (
@@ -19442,8 +19446,12 @@ impl<'src> Analyzer<'src> {
                 // R4/B326: the written twin declines to descend into a KEYED
                 // handle here, and the two have to agree — a form one reads as
                 // a handle and the other does not is the one outcome this pair
-                // exists to rule out.
-                ("Option", [inner]) if self.resolved_handle_return_key(*inner).is_none() => {
+                // exists to rule out. Nor into a per-key handle (A138), which
+                // already answers `None` for an absent key.
+                ("Option", [inner])
+                    if self.resolved_handle_return_key(*inner).is_none()
+                        && !self.resolved_is_entry_handle(*inner) =>
+                {
                     self.resolved_handle_return_element(*inner)
                 }
                 _ => None,
@@ -19455,6 +19463,18 @@ impl<'src> Analyzer<'src> {
     /// [`handle_return_key`]'s descent, read off a RESOLVED type (B319) — the
     /// element descent's twin, one argument to the left, and `None` for a
     /// handle that is not keyed.
+    /// Whether a RESOLVED return is a map's per-key handle (A138) —
+    /// [`is_entry_handle_spelling`]'s twin.
+    fn resolved_is_entry_handle(&self, type_id: TypeId) -> bool {
+        match type_id.get_type(self) {
+            Type::Struct(id, _) => matches!(
+                self.structs.get(&id).map(|struct_| struct_.name),
+                Some("MapEntry" | "MemoEntry")
+            ),
+            _ => false,
+        }
+    }
+
     fn resolved_handle_return_key(&self, type_id: TypeId) -> Option<TypeId> {
         match type_id.get_type(self) {
             Type::Struct(id, arguments) => match (
@@ -62439,6 +62459,15 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
                 _ => None,
             }
         }
+        // A138: `MapEntry<K, V>` (`MapCell::at(key)`) and its sealed twin
+        // `MemoEntry<K, V>` cross as a plain mirror of `Option<V>`; the value
+        // is what has to be Wire, and the key stays on the server.
+        Node::AccessorWithGenerics(_, arguments) if is_entry_handle_spelling(node) => {
+            match arguments.0.as_slice() {
+                [_key, value] => Some(&value.0),
+                _ => None,
+            }
+        }
         Node::AccessorWithGenerics(name, arguments) if *name == "Option" => {
             match arguments.0.as_slice() {
                 // R4/B326: `Option<KeyedCell<K, T>>` is NOT a handle return,
@@ -62450,12 +62479,27 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
                 // generator had already declined to shape a mirror for.
                 // Supporting the form — a per-KEY `Absent` beside A92's
                 // per-source one — is a design item, not this rule's business.
-                [inner] if handle_return_key(&inner.0).is_none() => handle_return_element(&inner.0),
+                [inner]
+                    if handle_return_key(&inner.0).is_none()
+                        && !is_entry_handle_spelling(&inner.0) =>
+                {
+                    handle_return_element(&inner.0)
+                }
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+/// Whether a written return is a map's PER-KEY handle (A138): `MapEntry<K, V>`
+/// or `MemoEntry<K, V>` — `std::rpc`'s `handle_element` reads the same names.
+fn is_entry_handle_spelling(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::AccessorWithGenerics(name, arguments)
+            if (*name == "MapEntry" || *name == "MemoEntry") && arguments.0.len() == 2
+    )
 }
 
 /// The KEY of a keyed handle return, as WRITTEN (B319) —

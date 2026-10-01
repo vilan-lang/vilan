@@ -39,6 +39,7 @@ import pkg::reactive::{
 	Subscriber,
 	Subscription,
 	also_releasing,
+	fresh_id,
 	observe,
 };
 import pkg::shared::Shared;
@@ -62,13 +63,32 @@ struct KeySlot {
 /// like the cells that hold it: a copy is the same table.
 export struct KeySlots {
 	table: Shared<NativeMap<KeySlot>>,
+	/// Each ASKED key's identity (`MapEntry::identity`), minted on first ask and
+	/// kept: an identity must not change while anything holds it, and a slot comes
+	/// and goes with its subscriptions. One number per key ever asked about.
+	identities: Shared<NativeMap<i32>>,
 }
 
 export impl KeySlots {
 	/// An empty table: nothing watched.
 	fun new(): KeySlots {
 		let table: NativeMap<KeySlot> = NativeMap::new();
-		KeySlots { table = Shared::new(table) }
+		let identities: NativeMap<i32> = NativeMap::new();
+		KeySlots { table = Shared::new(table), identities = Shared::new(identities) }
+	}
+
+	/// `hash`'s identity: one number for every handle to this key of this table,
+	/// and a different one for every other — what a tracked read keeps one edge by,
+	/// and what a connection dedups an exported per-key handle by (A92).
+	fun identity(self, hash: Hash): i32 {
+		match self.identities.read().get(hash) {
+			Some(let held) => held,
+			None => {
+				let minted = fresh_id();
+				self.identities.write().insert(hash, minted);
+				minted
+			},
+		}
 	}
 
 	/// Attach `subscriber` to `hash`'s slot — made here if nobody watched the key —
@@ -586,6 +606,13 @@ export impl MapEntry<type K: Hashable, type V> {
 export impl MapEntry<type K: Hashable, type V> with Source<Option<V>> {
 	fun get(self): Option<V> {
 		self.map.items.read().get(self.key)
+	}
+
+	/// One identity per key of this map (`KeySlots::identity`): a tracked read of
+	/// `at(key)` keeps one edge across runs, and a connection exporting it twice
+	/// answers the channel it already minted.
+	fun identity(self): Option<i32> {
+		Some(self.map.slots.identity(self.key.hash()))
 	}
 
 	/// The key's slot, counted (Q4).

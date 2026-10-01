@@ -1635,7 +1635,9 @@ fun main() {
 `at(key)` is a `Source<Option<V>>` — `derive`, `effect`, `switch`, a tracked
 `.track()`, a UI binding all take it — and a `Signal<Option<V>>` whose
 `set(Some(v))` is `insert(key, v)` and `set(None)` is `remove(key)`. It is data,
-not a subscription: two consumers of one `at(key)` need no seal. Its
+not a subscription: two consumers of one `at(key)` need no seal, and an `[rpc]`
+method may answer it — it crosses as a `RemoteSource<Option<V>>` mirror that the
+key's writes alone update. Its
 subscriptions land on the key's SLOT, a notification-only cell made by the first
 subscription and dropped with the last (`watched()` counts them), so the table is
 the size of what is watched and a write to a key nobody watches costs one hash

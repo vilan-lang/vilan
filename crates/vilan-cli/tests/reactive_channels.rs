@@ -4751,6 +4751,101 @@ fn a145_a_memo_cell_is_an_rpc_handle_return_over_a_socket() {
     );
 }
 
+// --- A138: a map's per-key handle crosses as a mirror -------------------------
+
+/// A138: an `[rpc]` method answering `MapCell::at(key)` — a `MapEntry<K, V>` —
+/// replies with a plain channel, `RemoteSource<Option<V>>` at the client (the
+/// mirror a `MemoCell<Option<V>>` reply makes, so the contract does not move),
+/// and the forward rides the key's SLOT: a post to key 1 sends nothing to the
+/// mirror of key 2.
+const A138_MAP_ENTRY_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::hash_map::HashMap;
+import std::process::exit;
+import std::reactive::{ MapCell, MapEntry, Source };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::RemoteSource;
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(InboxClient)]
+struct Inbox {
+	messages: MapCell<i32, str>,
+}
+
+impl Inbox {
+	[rpc]
+	fun post(self, id: i32, text: str): i32 {
+		self.messages.insert(id, text);
+		id
+	}
+
+	[rpc]
+	fun message(self, id: i32): MapEntry<i32, str> {
+		self.messages.at(id)
+	}
+}
+
+fun main() {
+	let inbox = Inbox { messages = MapCell::of([(1, "hello")].to_map()) };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(inbox.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 300 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+async fun run(port: i32) {
+	match InboxClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let first: RemoteSource<Option<str>> = client.message(1);
+			let second: RemoteSource<Option<str>> = client.message(2);
+			let second_updates = Shared::new(0);
+			let _a = first.sub(|value| {});
+			let _b = second.sub(|value| second_updates.write() += 1);
+			until(|| first.get().is_some() && second.get().is_some());
+			print(i"seed: first={first.get().unwrap_or(None).unwrap_or("-")} second={second.get().unwrap_or(None).unwrap_or("-")}");
+			let seeded = second_updates.read();
+			print(i"post:{client.post(1, "edited").unwrap_or(0 - 1)}");
+			until(|| first.get() == Some(Some("edited")));
+			print(i"post:{client.post(2, "new").unwrap_or(0 - 1)}");
+			until(|| second.get() == Some(Some("new")));
+			print(i"after: first={first.get().unwrap_or(None).unwrap_or("-")} second={second.get().unwrap_or(None).unwrap_or("-")} second_updates={second_updates.read() - seeded}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a138_a_map_entry_is_an_rpc_handle_return_over_a_socket() {
+    let stdout = run_program("a138_map_entry_socket", A138_MAP_ENTRY_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "seed: first=hello second=-",
+            "post:1",
+            "post:2",
+            "after: first=edited second=new second_updates=1"
+        ],
+        "a MapEntry handle must cross as a per-key mirror; got:\n{stdout}"
+    );
+}
+
 // --- A135: a handler runs under its CONNECTION's owner ----------------------
 
 /// A135 IN PROCESS: kolt's shape — a handle method whose body is

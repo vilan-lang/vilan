@@ -78,9 +78,10 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "map_cell.vl",
-        3,
+        4,
         "E (A138 S1): a `MapCell`'s own map, a `KeySlots` table, and each \
-         watched key's subscription count. Each is minted by the cell (or the \
+         watched key's subscription count; +1 at A138's wire reply, the table of \
+         each asked key's identity (`MapEntry::identity`). Each is minted by the cell (or the \
          first subscription on a key) and read and written through every copy \
          of the handle and by the slot's release, which a disposal elsewhere \
          runs: the E class, as `ListCell`'s list is",
@@ -281,7 +282,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 191,
+        total, 192,
         "the total number of `Shared` construction sites in std changed"
     );
 

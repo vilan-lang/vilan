@@ -2741,6 +2741,10 @@ export impl MemoEntry<type K: Hashable, type V> with Source<Option<V>> {
 		self.entry.get()
 	}
 
+	fun identity(self): Option<i32> {
+		self.entry.identity()
+	}
+
 	[must_use]
 	fun on_settle(self, subscriber: Subscriber): Subscription {
 		self.entry.on_settle(subscriber)
