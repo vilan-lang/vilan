@@ -1414,40 +1414,43 @@ struct R11Instance {
     site: R11Site,
 }
 
-/// Candidate ids (bindings, place expressions, `is` tests) indexed by their
-/// declaration span, so an R11 instantiation reads the ones lexically inside
-/// its callee rather than every one in the program (M94).
+/// Candidate ids indexed by their source span, so a question about one
+/// region reads the candidates lexically inside it rather than every one in
+/// the program: R11's bindings, place expressions and `is` tests, sliced per
+/// instantiated callee (M94), and B457's calls, sliced per function and per
+/// loop (M96).
 ///
-/// An id the index cannot place — no source, or no span — is returned for
-/// EVERY callee, and a callee it cannot place gets every candidate: both
-/// widen the slice back toward the whole-program set the readers were always
-/// correct over, so a missing span can cost time but never an answer.
+/// A slice comes back in the order the candidates were handed in, which is
+/// what lets a reader that used to filter a whole map keep that map's
+/// iteration order — B457's write summaries memoize as they go, so the order
+/// a function's calls are asked in is part of the answer.
 struct LexicalCandidates {
-    /// Per source, `(start, end, id)` sorted by `start`.
-    by_source: HashMap<SourceId, Vec<(usize, usize, Id)>>,
+    /// Per source, `(start, end, position, id)` sorted by `start`, where
+    /// `position` is the id's place in the order it was handed in.
+    by_source: HashMap<SourceId, Vec<(usize, usize, usize, Id)>>,
     unplaced: Vec<Id>,
     all: Vec<Id>,
 }
 
 impl LexicalCandidates {
     fn build(analyzer: &Analyzer<'_>, ids: impl Iterator<Item = Id>) -> Self {
-        let mut by_source: HashMap<SourceId, Vec<(usize, usize, Id)>> = HashMap::default();
+        let mut by_source: HashMap<SourceId, Vec<(usize, usize, usize, Id)>> = HashMap::default();
         let mut unplaced = Vec::new();
         let mut all = Vec::new();
-        for id in ids {
+        for (position, id) in ids.enumerate() {
             all.push(id);
             match (analyzer.source_of_id(id), analyzer.span_map.get(&id)) {
                 (Some(source), Some(span)) => {
                     by_source
                         .entry(source)
                         .or_default()
-                        .push((span.start, span.end, id));
+                        .push((span.start, span.end, position, id));
                 }
                 _ => unplaced.push(id),
             }
         }
         for entries in by_source.values_mut() {
-            entries.sort_unstable_by_key(|(start, end, id)| (*start, *end, id.0));
+            entries.sort_unstable_by_key(|(start, _, position, _)| (*start, *position));
         }
         LexicalCandidates {
             by_source,
@@ -1456,7 +1459,28 @@ impl LexicalCandidates {
         }
     }
 
-    /// The candidates inside `callee`'s declaration span, plus the unplaced.
+    /// The PLACED candidates whose span lies inside `start..end` of `source`,
+    /// in the order they were handed in.
+    fn inside(&self, source: SourceId, start: usize, end: usize) -> Vec<Id> {
+        let Some(entries) = self.by_source.get(&source) else {
+            return Vec::new();
+        };
+        let first = entries.partition_point(|(entry_start, ..)| *entry_start < start);
+        let mut inside: Vec<(usize, Id)> = entries[first..]
+            .iter()
+            .take_while(|(entry_start, ..)| *entry_start <= end)
+            .filter(|(_, entry_end, ..)| *entry_end <= end)
+            .map(|(_, _, position, id)| (*position, *id))
+            .collect();
+        inside.sort_unstable_by_key(|(position, _)| *position);
+        inside.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// R11's slice (M94): the candidates inside `callee`'s declaration span,
+    /// plus every candidate the index could not place — and every candidate
+    /// at all when the callee itself cannot be placed. Both widen the slice
+    /// back toward the whole-program set R11's readers were always correct
+    /// over, so a missing span costs time, never an answer.
     fn within(&self, analyzer: &Analyzer<'_>, callee: Id) -> Vec<Id> {
         let (Some(source), Some(span)) = (
             analyzer.source_of_id(callee),
@@ -1464,18 +1488,9 @@ impl LexicalCandidates {
         ) else {
             return self.all.clone();
         };
-        let mut inside = self.unplaced.clone();
-        if let Some(entries) = self.by_source.get(&source) {
-            let first = entries.partition_point(|(start, _, _)| *start < span.start);
-            inside.extend(
-                entries[first..]
-                    .iter()
-                    .take_while(|(start, _, _)| *start <= span.end)
-                    .filter(|(_, end, _)| *end <= span.end)
-                    .map(|(_, _, id)| *id),
-            );
-        }
-        inside
+        let mut within = self.unplaced.clone();
+        within.extend(self.inside(source, span.start, span.end));
+        within
     }
 }
 
@@ -28619,6 +28634,16 @@ impl<'src> Analyzer<'src> {
                 }
             }
         };
+        // M96: B457's call-through test asks, per loop and per function, which
+        // calls lie inside a span. Indexed once here, where the expression map
+        // is iterated and not changed, in that iteration's order.
+        let calls = LexicalCandidates::build(
+            self,
+            self.expr_id_to_expr_map
+                .iter()
+                .filter(|(_, expr)| matches!(expr, Expr::Call(_)))
+                .map(|(id, _)| *id),
+        );
         for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
             // M19 T1b: a reused module's decisions are restored below. Every
             // position this loop `consider`s is a sub-expression of the entry it
@@ -28677,7 +28702,7 @@ impl<'src> Analyzer<'src> {
                 Expr::ForEach(iterable_id, _, _) => {
                     if let Some(cell) = self.shared_cells.reads.get(iterable_id).copied()
                         && (self.spans_an_in_place_write(*expr_id, cell)
-                            || self.spans_a_call_reaching_a_write(*expr_id, cell))
+                            || self.spans_a_call_reaching_a_write(*expr_id, cell, &calls))
                     {
                         consider(self, *iterable_id, None);
                     }
@@ -28759,6 +28784,7 @@ impl<'src> Analyzer<'src> {
                                     self.function_reaches_an_in_place_write(
                                         callee_id,
                                         cell,
+                                        &calls,
                                         &mut HashMap::default(),
                                     )
                                 });
@@ -29799,29 +29825,25 @@ impl<'src> Analyzer<'src> {
     /// B457 (RULED 2026-09-29, R-e door (a)): whether a CALL inside
     /// `expr_id`'s source span can reach an in-place write of `cell` — the
     /// call-through half of B400's loop test. Spans, for the same reason.
-    fn spans_a_call_reaching_a_write(&self, expr_id: Id, cell: CellSlot) -> bool {
+    /// `calls` is every call in the program indexed by span (M96).
+    fn spans_a_call_reaching_a_write(
+        &self,
+        expr_id: Id,
+        cell: CellSlot,
+        calls: &LexicalCandidates,
+    ) -> bool {
         let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
         else {
             return true;
         };
-        let (start, end) = (span.start, span.end);
-        let calls: Vec<Id> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter(|(other_id, other)| {
-                matches!(other, Expr::Call(_))
-                    && **other_id != expr_id
-                    && self.source_of_id(**other_id) == Some(source)
-                    && self.span_map.get(other_id).is_some_and(|other_span| {
-                        other_span.start >= start && other_span.end <= end
-                    })
-            })
-            .map(|(other_id, _)| *other_id)
-            .collect();
         let mut summaries: HashMap<Id, bool> = HashMap::default();
         calls
+            .inside(source, span.start, span.end)
             .into_iter()
-            .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, &mut summaries))
+            .filter(|call_id| *call_id != expr_id)
+            .any(|call_id| {
+                self.call_reaches_an_in_place_write(call_id, cell, calls, &mut summaries)
+            })
     }
 
     /// B457: whether one call can reach an in-place write of `cell` — the
@@ -29837,6 +29859,7 @@ impl<'src> Analyzer<'src> {
         &self,
         call_id: Id,
         cell: CellSlot,
+        calls: &LexicalCandidates,
         summaries: &mut HashMap<Id, bool>,
     ) -> bool {
         if self.shared_cells.reads.contains_key(&call_id)
@@ -29874,9 +29897,9 @@ impl<'src> Analyzer<'src> {
                         .is_some_and(|function| function.has_body)
                 })
                 .collect();
-            return candidates
-                .into_iter()
-                .any(|member| self.function_reaches_an_in_place_write(member, cell, summaries));
+            return candidates.into_iter().any(|member| {
+                self.function_reaches_an_in_place_write(member, cell, calls, summaries)
+            });
         }
         match self.expr_id_to_expr_map.get(&function_call.subject_id) {
             Some(Expr::Local(callee)) => {
@@ -29893,7 +29916,8 @@ impl<'src> Analyzer<'src> {
                     .get(callee)
                     .is_some_and(|function| function.has_body)
                 {
-                    return self.function_reaches_an_in_place_write(*callee, cell, summaries);
+                    return self
+                        .function_reaches_an_in_place_write(*callee, cell, calls, summaries);
                 }
                 self.shared_cells.mutated.contains(&cell)
             }
@@ -29902,11 +29926,15 @@ impl<'src> Analyzer<'src> {
     }
 
     /// B457: a function's write summary for `cell` — an in-place write inside
-    /// its span, or a call inside it that reaches one.
+    /// its span, or a call inside it that reaches one. The calls come from
+    /// `calls`' span index (M96): filtering the whole expression map per
+    /// function asked made the summary O(functions × expressions) — 48
+    /// summaries, ~95M instructions each, on kolt's client.
     fn function_reaches_an_in_place_write(
         &self,
         function_id: Id,
         cell: CellSlot,
+        calls: &LexicalCandidates,
         summaries: &mut HashMap<Id, bool>,
     ) -> bool {
         if let Some(answer) = summaries.get(&function_id) {
@@ -29922,22 +29950,10 @@ impl<'src> Analyzer<'src> {
             ) else {
                 return true;
             };
-            let (start, end) = (span.start, span.end);
-            let calls: Vec<Id> = self
-                .expr_id_to_expr_map
-                .iter()
-                .filter(|(other_id, other)| {
-                    matches!(other, Expr::Call(_))
-                        && self.source_of_id(**other_id) == Some(source)
-                        && self.span_map.get(other_id).is_some_and(|other_span| {
-                            other_span.start >= start && other_span.end <= end
-                        })
-                })
-                .map(|(other_id, _)| *other_id)
-                .collect();
             calls
+                .inside(source, span.start, span.end)
                 .into_iter()
-                .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, summaries))
+                .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, calls, summaries))
         };
         summaries.insert(function_id, answer);
         answer
