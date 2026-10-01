@@ -96,9 +96,10 @@ This is what `switch` does for a *structural* dependency — follow whichever
 source the current value selects — written as ordinary control flow.
 
 Keeping an edge rather than re-attaching it needs the source to say which state
-it is. `Source::identity()` answers that: a `SignalCell` and a sealed `.memo()`
-name their cell, so a body that reads the same cell on every run holds one edge
-on it for its whole life. A source that answers `None` (the default for a type
+it is. `Source::identity()` answers that: a `SignalCell`, a sealed `.memo()`, a
+`ListCell`, a `KeyedCell` and a remote mirror (`RemoteSource`, `KeyedSource`)
+name their cell, so a body that reads the same one on every run holds one edge
+on it for its whole life — for a mirror, one lease. A source that answers `None` (the default for a type
 you write yourself) still works — each run attaches a fresh edge and releases
 the previous one.
 

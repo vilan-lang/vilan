@@ -635,3 +635,103 @@ fn m93_a_body_that_never_tracks_allocates_no_tracker() {
         "quiet=0 value=22\neffect 10 100\neffect 10 200\neffect 11 200\ntracking=3 after=0 summed=211\n",
     );
 }
+
+#[test]
+fn a146_a_tracked_list_keyed_or_mirror_read_keeps_one_edge_across_runs() {
+    // A146: `ListCell`, `KeyedCell`, `RemoteSource` and `KeyedSource` name their
+    // identity (their value cell's), so a body that tracks one on every run keeps
+    // ONE edge on it — for a mirror, one lease, no re-attach per run. The
+    // instrument wraps each source, counting the edges a tracked read attaches
+    // and answering the wrapped source's identity. Red before A146 (the default
+    // `None`): every wrapper reads `attaches=7`, one per run.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, derive };
+        import std::delta::ListCell;
+        import std::rpc::{ KeyedCell, Keyed, KeyedSource, ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::json::json_codec;
+        import std::shared::Shared;
+
+        // Counts the edges a tracked read attaches to the wrapped source, and answers the
+        // wrapped source's identity.
+        struct Counted<S> {
+            inner: S,
+            attaches: Shared<i32>,
+        }
+
+        impl Counted<type S: Source<type T>> with Source<T> {
+            fun get(self): T {
+                self.inner.get()
+            }
+
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.attaches.write() = self.attaches.read() + 1;
+                self.inner.on_settle(subscriber)
+            }
+
+            fun identity(self): Option<i32> {
+                self.inner.identity()
+            }
+        }
+
+        fun counted<S>(inner: S): Counted<S> {
+            Counted { inner, attaches = Shared::new(0) }
+        }
+
+        [derive(Wire)]
+        struct Row {
+            id: str,
+            n: i32,
+        }
+
+        impl Row with Keyed<str> {
+            fun key(self): str {
+                self.id
+            }
+        }
+
+        fun main() {
+            let list = counted(ListCell::of([1, 2]));
+            let keyed: Counted<KeyedCell<str, Row>> = counted(KeyedCell::new([Row { id = "a", n = 1 }]));
+            let status = Signal::new(7);
+            let (client_end, server_end) = duplex_pair();
+            let server = ReactiveServer::new(server_end, json_codec());
+            let channel = server.expose(status);
+            let rows: KeyedCell<str, Row> = KeyedCell::new([Row { id = "b", n = 2 }]);
+            let keyed_channel = server.expose_keyed_cell(rows);
+            let client = ReactiveClient::new(client_end, json_codec());
+            let remote: RemoteSource<i32> = client.source(channel);
+            let mirror = counted(remote);
+            let remote_rows: KeyedSource<str, Row> = client.attached_keyed_source(keyed_channel);
+            let keyed_mirror = counted(remote_rows);
+            let trigger: SignalCell<i32> = Signal::new(0);
+            let sealed = derive(|| {
+                let value = match mirror.track() {
+                    Some(let n) => n,
+                    None => 0,
+                };
+                let remote_count = match keyed_mirror.track() {
+                    Some(let found) => found.len(),
+                    None => 0usize,
+                };
+                i"{trigger.track()} {list.track().len()} {keyed.track().len()} {value} {remote_count}"
+            }).memo();
+            mut step = 1;
+            for step <= 5 {
+                trigger.set(step);
+                step += 1;
+            }
+            print(i"list attaches={list.attaches.read()}");
+            print(i"keyed cell attaches={keyed.attaches.read()}");
+            print(i"mirror attaches={mirror.attaches.read()}");
+            print(i"keyed mirror attaches={keyed_mirror.attaches.read()}");
+            print(sealed.get());
+        }
+
+        main();
+        "#,
+        "list attaches=1\nkeyed cell attaches=1\nmirror attaches=1\nkeyed mirror attaches=1\n5 2 1 7 1\n",
+    );
+}

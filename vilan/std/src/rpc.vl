@@ -4407,6 +4407,13 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 		self.cache.get()
 	}
 
+	/// The mirror's cache cell's identity (A146): every handle to this mirror —
+	/// a copy, a rebound one after a reconnect — names the same cell, so a tracked
+	/// read keeps one edge (and one lease) across runs instead of re-attaching.
+	fun identity(self): Option<i32> {
+		self.cache.identity()
+	}
+
 	/// The trait's attach, counted like every other observing path: put the
 	/// subscriber on the cache, and hold the channel open until the handle is
 	/// disposed.
@@ -5157,6 +5164,11 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
 		self.elements.get()
 	}
 
+	/// The elements cell's identity (A146), so a tracked read keeps one edge.
+	fun identity(self): Option<i32> {
+		self.elements.identity()
+	}
+
 	[must_use]
 	fun on_settle(self, subscriber: Subscriber): Subscription {
 		self.elements.on_settle(subscriber)
@@ -5370,6 +5382,12 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with S
 	/// no lease, no frame.
 	fun get(self): Option<List<T>> {
 		self.cache.get()
+	}
+
+	/// The mirror's cache cell's identity (A146), as `RemoteSource`'s: a tracked
+	/// read keeps one edge and one lease across runs.
+	fun identity(self): Option<i32> {
+		self.cache.identity()
 	}
 
 	/// The trait's attach, counted like every other observing path — ORDER forced

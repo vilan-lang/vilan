@@ -952,6 +952,12 @@ export impl ListCell<type T> with Source<List<T>> {
 		self.items.read()
 	}
 
+	/// The items cell's identity (A146): every handle to this list names the same
+	/// cell, so a tracked read keeps one edge across runs.
+	fun identity(self): Option<i32> {
+		Some(self.items.identity())
+	}
+
 	/// The observer is handed the list as it stands when the notification is
 	/// delivered, which is what a `SignalCell`'s observer is handed too.
 	///

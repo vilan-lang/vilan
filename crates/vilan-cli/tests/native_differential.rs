@@ -2592,6 +2592,98 @@ const J7_PROBE: &str = concat!(
     "}\n",
 );
 
+/// A146: `ListCell` and `KeyedCell` name their identity, so a body that tracks
+/// one on every run keeps ONE edge on it (`attaches=1`) on both backends. (The
+/// mirror half of the pin, `RemoteSource` and `KeyedSource` over `duplex_pair`,
+/// is JS-only: `inference::tracking`'s A146 pin — the native backend refuses
+/// that program by name, at an unresolved type in the rpc layer.)
+#[test]
+fn a_tracked_list_or_keyed_cell_keeps_one_edge_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_a146.vl"), A146_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_a146.vl"),
+        Verdict::Identical,
+        "a tracked list or keyed cell must keep one edge the same way on both backends"
+    );
+    let output = vilan(&staged)
+        .args(["run", "native_probe_a146.vl"])
+        .output()
+        .expect("run the probe");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "list attaches=1\nkeyed cell attaches=1\n5 2 1\n",
+        "one edge per source across six runs (red before A146: `attaches=6`)"
+    );
+}
+
+const A146_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, derive };\n",
+    "import std::delta::ListCell;\n",
+    "import std::rpc::{ KeyedCell, Keyed };\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "// Counts the edges a tracked read attaches to the wrapped source, and answers the\n",
+    "// wrapped source's identity.\n",
+    "struct Counted<S> {\n",
+    "\tinner: S,\n",
+    "\tattaches: Shared<i32>,\n",
+    "}\n",
+    "\n",
+    "impl Counted<type S: Source<type T>> with Source<T> {\n",
+    "\tfun get(self): T {\n",
+    "\t\tself.inner.get()\n",
+    "\t}\n",
+    "\n",
+    "\tfun on_settle(self, subscriber: Subscriber): Subscription {\n",
+    "\t\tself.attaches.write() = self.attaches.read() + 1;\n",
+    "\t\tself.inner.on_settle(subscriber)\n",
+    "\t}\n",
+    "\n",
+    "\tfun identity(self): Option<i32> {\n",
+    "\t\tself.inner.identity()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun counted<S>(inner: S): Counted<S> {\n",
+    "\tCounted { inner, attaches = Shared::new(0) }\n",
+    "}\n",
+    "\n",
+    "[derive(Wire)]\n",
+    "struct Row {\n",
+    "\tid: str,\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Row with Keyed<str> {\n",
+    "\tfun key(self): str {\n",
+    "\t\tself.id\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet list = counted(ListCell::of([1, 2]));\n",
+    "\tlet keyed: Counted<KeyedCell<str, Row>> = counted(KeyedCell::new([Row { id = \"a\", n = 1 }]));\n",
+    "\tlet trigger: SignalCell<i32> = Signal::new(0);\n",
+    "\tlet sealed = derive(|| {\n",
+    "\t\ti\"{trigger.track()} {list.track().len()} {keyed.track().len()}\"\n",
+    "\t}).memo();\n",
+    "\tmut step = 1;\n",
+    "\tfor step <= 5 {\n",
+    "\t\ttrigger.set(step);\n",
+    "\t\tstep += 1;\n",
+    "\t}\n",
+    "\tprint(i\"list attaches={list.attaches.read()}\");\n",
+    "\tprint(i\"keyed cell attaches={keyed.attaches.read()}\");\n",
+    "\tprint(sealed.get());\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is

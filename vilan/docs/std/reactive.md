@@ -656,7 +656,8 @@ The guide's [tracked reads](../guide/tracked-reads.md) chapter is the tour.
   its reads with the edges it holds, in order: an edge to a source read again is
   kept, a new read attaches one, an edge nothing read is detached. A source keeps
   its edge across runs when it can say what state it is — `Source::identity()`,
-  answered by `SignalCell` and `MemoCell` (their cell); `None`, the default,
+  answered by `SignalCell`, `MemoCell`, `ListCell`, `KeyedCell`, `RemoteSource`
+  and `KeyedSource` (their value cell); `None`, the default,
   re-attaches each run and releases the old edge. A source that names its identity
   and is read twice in one run is one edge.
 - **Glitch-free.** An edge wakes through a DERIVATION relay (the turn's first
