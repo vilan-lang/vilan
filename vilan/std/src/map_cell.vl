@@ -342,6 +342,44 @@ fun wake_for<K: Hashable, V>(slots: KeySlots, ops: List<MapOp<K, V>>) {
 	}
 }
 
+/// Apply `ops` — what a map pipe's drain said — to `cell` as ONE batch: each op
+/// mutates the map and is recorded as the cell's own (a `Put`'s "what was there"
+/// and a `Delete`'s "what left" re-read from the map, so the log stays exact
+/// whatever the producer claimed), the keys they name wake once each, and the cell
+/// publishes once. What `.memo()` over a map pipe applies on every wake.
+export [internal("a map pipe's seal applying a drain (A138 S2)")]
+fun apply_map_ops<K: Hashable, V>(cell: MapCell<K, V>, ops: List<MapOp<K, V>>) {
+	mut recorded: List<MapOp<K, V>> = [];
+	for op in ops {
+		match op {
+			MapOp::Put(let key, let _claimed, let now) => {
+				let previous = cell.items.read().get(key);
+				cell.items.write().insert(key, now);
+				recorded.push(MapOp::Put(key, previous, now));
+			},
+			MapOp::Delete(let key, let _claimed) => match cell.items.read().get(key) {
+				Some(let gone) => {
+					cell.items.write().remove(key);
+					recorded.push(MapOp::Delete(key, gone));
+				},
+				None => {},
+			},
+			MapOp::Reset(let map) => {
+				cell.items.write() = map;
+				recorded.push(MapOp::Reset(map));
+			},
+		}
+	}
+	if recorded.len() == 0 {
+		ret;
+	}
+	for op in recorded {
+		cell.log.record(op);
+	}
+	wake_for(cell.slots, recorded);
+	publish_map(cell);
+}
+
 export impl MapCell<type K: Hashable, type V: PartialEq> {
 	/// The COMPAT DOOR: take a whole map and record what CHANGED — a `Delete` per
 	/// key that left, a `Put` per key that arrived or whose value differs — instead

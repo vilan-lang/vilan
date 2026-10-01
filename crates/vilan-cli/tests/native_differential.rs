@@ -1362,7 +1362,7 @@ fn a142_collection_pipes_build_the_same_on_both_backends() {
     }
 }
 
-/// A138 S1: `MapCell` on both backends — its seeded random walk
+/// A138 S1 and S2: `MapCell` and the map operators on both backends — their seeded random walks
 /// (`inference/maps.rs` runs the same program on JS), checked against a plain
 /// `HashMap` after every write: the map and its order, a mirror replayed from the
 /// drained `MapOp`s, every watched key's handle and how often it woke.
@@ -1385,6 +1385,17 @@ fn a138_map_and_set_cells_build_the_same_on_both_backends_or_are_refused_by_name
         compare(&staged, "native_probe_map_walk.vl"),
         Verdict::Identical,
         "a MapCell must build and answer the same on both backends"
+    );
+    // A138 S2: the map operators' walk (`inference/maps.rs` runs it on JS).
+    std::fs::write(
+        staged.join("native_probe_map_operator_walk.vl"),
+        include_str!("native/map_operator_walk.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_map_operator_walk.vl"),
+        Verdict::Identical,
+        "the map operators must build and answer the same on both backends"
     );
     std::fs::write(
         staged.join("native_probe_set_walk.vl"),

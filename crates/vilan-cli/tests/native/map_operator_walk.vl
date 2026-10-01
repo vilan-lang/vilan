@@ -1,0 +1,148 @@
+// A138 S2: the map operators under a seeded random walk of every write a
+// `MapCell` has, interleaved with flips of the flows the closures answer,
+// checked after EVERY step against a recomputation from the map itself.
+import std::hash_map::HashMap;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ MapCell, Signal, SignalCell, Source, comp };
+
+mut seed = 7;
+
+fun next(bound: i32): i32 {
+	seed = (seed * 75 + 74) % 65537;
+	seed % bound
+}
+
+fun flag_for(flags: List<SignalCell<bool>>, value: i32): SignalCell<bool> {
+	flags[(value % 4).as_usize()]
+}
+
+fun main() {
+	let flags: List<SignalCell<bool>> = [
+		Signal::new(false),
+		Signal::new(true),
+		Signal::new(false),
+		Signal::new(true),
+	];
+	let cell: MapCell<i32, i32> = MapCell::of([(1, 10), (2, 21), (3, 30)].to_map());
+	let (outs, scope) = comp(|| {
+		let values = cell.values().memo();
+		let entries = cell.entries().memo();
+		let tens = cell.map_values(|v| v * 10).memo();
+		let signed = cell
+			.map_values(|v| flag_for(flags, v).derive(|on| if on { v } else { 0 - v }))
+			.memo();
+		let odd = cell.filter(|key, value| value % 2 == 1).memo();
+		let followed = cell
+			.filter(|key, value| flag_for(flags, value).derive(|on| on || value % 3 == 0))
+			.memo();
+		let counted = cell.count().memo();
+		let summed = cell.sum_by(|v| v).memo();
+		let odd_values = cell.filter(|key, value| value % 2 == 1).values().memo();
+		let followed_count = cell.filter(|key, value| flag_for(flags, value)).count().memo();
+		(values, entries, tens, signed, odd, followed, counted, summed, odd_values, followed_count)
+	});
+	let (values, entries, tens, signed, odd, followed, counted, summed, odd_values, followed_count) = outs;
+	mut failures = 0;
+	mut step = 0;
+	for step < 600 {
+		let choice = next(9);
+		let key = next(10);
+		let value = next(50);
+		if choice <= 2 {
+			cell.insert(key, value);
+		} else if choice == 3 {
+			cell.remove(key);
+		} else if choice == 4 {
+			cell.update(key, |&mut held| held += 1);
+		} else if choice == 5 {
+			let flag = flags[next(4).as_usize()];
+			flag.set(!flag.get());
+		} else if choice == 6 {
+			let other = next(10);
+			cell.edit(|&mut map| {
+				map.insert(key, value);
+				map.remove(other);
+			});
+		} else if choice == 7 && next(3) == 0 {
+			mut target: HashMap<i32, i32> = HashMap::new();
+			let current: HashMap<i32, i32> = Source::get(cell);
+			for entry in current.entries() {
+				if entry.0 != key {
+					target.insert(entry.0, entry.1 + 1);
+				}
+			}
+			cell.reconcile_to(target);
+		} else if choice == 8 && next(8) == 0 {
+			cell.set([(4, 40), (5, 51)].to_map());
+		}
+		let map: HashMap<i32, i32> = Source::get(cell);
+		mut want_tens: HashMap<i32, i32> = HashMap::new();
+		mut want_signed: HashMap<i32, i32> = HashMap::new();
+		mut want_odd: HashMap<i32, i32> = HashMap::new();
+		mut want_followed: HashMap<i32, i32> = HashMap::new();
+		mut want_odd_values: List<i32> = [];
+		mut flagged: usize = 0;
+		mut sum = 0;
+		for entry in map.entries() {
+			let v = entry.1;
+			want_tens.insert(entry.0, v * 10);
+			want_signed.insert(entry.0, if flag_for(flags, v).get() { v } else { 0 - v });
+			if v % 2 == 1 {
+				want_odd.insert(entry.0, v);
+			}
+			if flag_for(flags, v).get() || v % 3 == 0 {
+				want_followed.insert(entry.0, v);
+			}
+			if flag_for(flags, v).get() {
+				flagged += 1;
+			}
+			sum += v;
+		}
+		let got_tens: HashMap<i32, i32> = Source::get(tens);
+		let got_signed: HashMap<i32, i32> = Source::get(signed);
+		let got_odd: HashMap<i32, i32> = Source::get(odd);
+		let got_followed: HashMap<i32, i32> = Source::get(followed);
+		for entry in got_odd.entries() {
+			want_odd_values.push(entry.1);
+		}
+		if values.get() != map.values() {
+			failures += 1;
+		}
+		mut entry_keys: List<i32> = [];
+		mut entry_values: List<i32> = [];
+		for pair in entries.get() {
+			entry_keys.push(pair.0);
+			entry_values.push(pair.1);
+		}
+		if entry_keys != map.keys() || entry_values != map.values() {
+			failures += 1;
+		}
+		if got_tens != want_tens {
+			failures += 1;
+		}
+		if got_signed != want_signed {
+			failures += 1;
+		}
+		if got_odd != want_odd {
+			failures += 1;
+		}
+		if got_followed != want_followed {
+			failures += 1;
+		}
+		if counted.get() != map.len() {
+			failures += 1;
+		}
+		if summed.get() != sum {
+			failures += 1;
+		}
+		if odd_values.get() != want_odd_values {
+			failures += 1;
+		}
+		if followed_count.get() != flagged {
+			failures += 1;
+		}
+		step += 1;
+	}
+	print(i"failures {failures}");
+	scope.dispose();
+}

@@ -8,10 +8,11 @@
 // no "what was there"), and its per-member read is `contains(x): bool`, not
 // `at(x): Option<void>`.
 import pkg::delta::{ DeltaCursor, DeltaLog, DeltaSource, SetOp };
-import pkg::hash::Hashable;
+import pkg::hash::{ Hash, Hashable };
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
 import pkg::map_cell::KeySlots;
+import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
 import pkg::shared::Shared;
@@ -157,6 +158,64 @@ export impl SetCell<type T: Hashable> {
 			}
 		}
 		publish_set(self);
+	}
+}
+
+/// Apply `ops` — a set pipe's drain — to `cell` as ONE batch: an op that changes
+/// nothing (an `Add` of a held member, a `Remove` of an absent one) is dropped, the
+/// members the rest name wake once each, and the cell publishes once. What
+/// `.memo()` over a set pipe applies on every wake.
+export [internal("a set pipe's seal applying a drain (A138 S2)")]
+fun apply_set_ops<T: Hashable>(cell: SetCell<T>, ops: List<SetOp<T>>) {
+	mut recorded: List<SetOp<T>> = [];
+	mut reset = false;
+	for op in ops {
+		match op {
+			SetOp::Add(let value) => {
+				if !cell.items.read().contains(value) {
+					cell.items.write().insert(value);
+					recorded.push(SetOp::Add(value));
+				}
+			},
+			SetOp::Remove(let value) => {
+				if cell.items.read().contains(value) {
+					cell.items.write().remove(value);
+					recorded.push(SetOp::Remove(value));
+				}
+			},
+			SetOp::Reset(let set) => {
+				cell.items.write() = set;
+				recorded.push(SetOp::Reset(set));
+				reset = true;
+			},
+		}
+	}
+	if recorded.len() == 0 {
+		ret;
+	}
+	for op in recorded {
+		cell.log.record(op);
+	}
+	if reset {
+		cell.slots.wake_all();
+	} else {
+		mut named: NativeMap<bool> = NativeMap::new();
+		for op in recorded {
+			match op {
+				SetOp::Add(let value) => wake_once(cell.slots, &mut named, value.hash()),
+				SetOp::Remove(let value) => wake_once(cell.slots, &mut named, value.hash()),
+				SetOp::Reset(let _set) => {},
+			}
+		}
+	}
+	publish_set(cell);
+}
+
+/// Wake `hash`'s slot unless `named` says this batch already did.
+fun wake_once(slots: KeySlots, named: &mut NativeMap<bool>, hash: Hash) {
+	if !named.contains_key(hash) {
+		named.insert(hash, true);
+		slots.wake(hash);
 	}
 }
 

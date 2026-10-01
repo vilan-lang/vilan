@@ -19,6 +19,10 @@ use crate::support::*;
 /// The map walk, shared with `native_differential` (which runs it natively).
 const MAP_WALK: &str = include_str!("../../../vilan-cli/tests/native/map_walk.vl");
 
+/// The map operators' walk, shared with `native_differential` too.
+const MAP_OPERATOR_WALK: &str =
+    include_str!("../../../vilan-cli/tests/native/map_operator_walk.vl");
+
 /// The set walk — JS only: the native backend refuses `SetOp`'s variants today
 /// (`native_differential` pins the refusal by name).
 const SET_WALK: &str = include_str!("../../../vilan-cli/tests/native/set_walk.vl");
@@ -422,4 +426,191 @@ fn a138_s1_the_set_cell_agrees_with_a_hash_set_under_a_random_walk() {
         &format!("{SET_WALK}\nmain();\n"),
         "failures 0\nwatched 4\nwatched 0\n[ 70, 57, 62, 64 ]\n",
     );
+}
+
+// --- S2: the operators (§5) ----------------------------------------------------
+
+/// The positional face and the key set, as the ops a consumer is told. `values()`
+/// is a one-element `Splice` at a new key's RANK, a `SetAt` there for an
+/// overwrite, a one-element `Splice` out for a removal — a removed and re-inserted
+/// key goes to the end, as the map puts it — and a `Reset` for a `set`. `keys()`
+/// is an `Add` for a new key, nothing for an overwrite, a `Remove` for a removal,
+/// so a sealed key set's `contains(x)` wakes when `x` arrives or leaves and never
+/// for a write to `x`'s value. Red with a stale rank (an appended key's Fenwick
+/// node built without the slots below it). (`keys()` answering an overwrite with an
+/// `Add` would NOT redden it: the seal drops an `Add` of a held member, so a sealed
+/// key set is right either way; the stage's own op is what `key_ops` states.)
+#[test]
+fn a138_s2_values_ranks_its_ops_and_keys_changes_only_on_arrival_and_removal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{
+            DeltaSource,
+            MapCell,
+            SeqOp,
+            SetOp,
+            Signal,
+            SignalCell,
+            Source,
+            comp,
+            on_cleanup,
+        };
+
+        fun nums(xs: List<i32>): str {
+            mut out = "[";
+            for x in xs {
+                out = out + i" {x}";
+            }
+            out + " ]"
+        }
+
+        fun seq(ops: List<SeqOp<i32>>): str {
+            mut out = "";
+            for op in ops {
+                match op {
+                    SeqOp::Splice(let at, let removed, let inserted) => out = out + i"splice({at},{nums(removed)},{nums(inserted)}) ",
+                    SeqOp::SetAt(let at, let was, let now) => out = out + i"set({at},{was},{now}) ",
+                    SeqOp::Reset(let items) => out = out + i"reset({nums(items)}) ",
+                    SeqOp::Move(let from, let count, let to) => out = out + i"move({from},{count},{to}) ",
+                }
+            }
+            out
+        }
+
+        fun set_ops(ops: List<SetOp<str>>): str {
+            mut out = "";
+            for op in ops {
+                match op {
+                    SetOp::Add(let value) => out = out + i"add({value}) ",
+                    SetOp::Remove(let value) => out = out + i"remove({value}) ",
+                    SetOp::Reset(let set) => out = out + i"reset({set.len()}) ",
+                }
+            }
+            out
+        }
+
+        fun main() {
+            let cell: MapCell<str, i32> = MapCell::of([("a", 1), ("b", 2), ("c", 3)].to_map());
+            let ((values, keys), scope) = comp(|| (cell.values().memo(), cell.keys().memo()));
+            let vcursor = values.cursor();
+            let kcursor = keys.cursor();
+            cell.insert("b", 20);
+            cell.insert("d", 4);
+            cell.remove("a");
+            cell.insert("a", 5);
+            cell.remove("zz");
+            print(seq(values.since(vcursor)));
+            print(set_ops(keys.since(kcursor)));
+            print(values.get());
+            mut d_wakes = 0;
+            let watch = keys.contains("d").on_change(|held| d_wakes += 1);
+            cell.insert("d", 40);
+            cell.insert("e", 1);
+            cell.remove("d");
+            print(d_wakes);
+            cell.set([("q", 1)].to_map());
+            print(seq(values.since(vcursor)));
+            print(set_ops(keys.since(kcursor)));
+            watch.dispose();
+            scope.dispose();
+        }
+
+        main();
+        "#,
+        "set(1,2,20) splice(3,[ ],[ 4 ]) splice(0,[ 1 ],[ ]) splice(3,[ ],[ 5 ]) \nadd(d) remove(a) add(a) \n[ 20, 3, 4, 5 ]\n1\nset(2,4,40) splice(4,[ ],[ 1 ]) splice(2,[ 40 ],[ ]) reset([ 1 ]) \nadd(e) remove(d) reset(1) \n",
+    );
+}
+
+/// The keyed operators' cost model and owners (§5, §6.4): `map_values` runs its
+/// closure once per `Put` and never for a `Delete`, and each key's run is
+/// released when the key re-runs or leaves and the rest with the consumer; a
+/// `filter` whose predicate answers a flow FOLLOWS it per key — a flip is a
+/// `Delete` or a `Put` downstream, a key that stays kept is a `Put` only when its
+/// input was replaced; a sealed map pipe's `at(key)` wakes for that key alone; and
+/// `count`, `sum_by` and `.sample()` read once. Red with the re-run not releasing
+/// the last run (`released` short), or a predicate flow not followed.
+#[test]
+fn a138_s2_keyed_operators_run_per_put_follow_flows_and_release_per_key() {
+    assert_compiles_and_runs(
+        r#"
+        import std::hash_map::HashMap;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ DeltaSource, MapCell, MapOp, Signal, SignalCell, Source, comp, on_cleanup };
+
+        fun opt(value: Option<i32>): str {
+            match value {
+                Some(let held) => i"Some({held})",
+                None => "None",
+            }
+        }
+
+        fun describe(ops: List<MapOp<str, i32>>): str {
+            mut out = "";
+            for op in ops {
+                match op {
+                    MapOp::Put(let key, let was, let now) => out = out + i"put({key},{opt(was)},{now}) ",
+                    MapOp::Delete(let key, let gone) => out = out + i"delete({key},{gone}) ",
+                    MapOp::Reset(let map) => out = out + i"reset({map.len()}) ",
+                }
+            }
+            out
+        }
+
+        fun main() {
+            let cell: MapCell<str, i32> = MapCell::of([("a", 1), ("b", 2)].to_map());
+            let online: SignalCell<bool> = Signal::new(true);
+            mut runs = 0;
+            mut released = 0;
+            let ((scaled, shown), scope) = comp(|| (cell
+                .map_values(|v| {
+                    runs += 1;
+                    on_cleanup(|| released += 1);
+                    v * 10
+                })
+                .memo(), cell.filter(|key, v| online.derive(|on| on || v > 1)).memo()));
+            let scursor = scaled.cursor();
+            let fcursor = shown.cursor();
+            print(i"runs={runs} released={released}");
+            cell.insert("c", 3);
+            cell.insert("a", 5);
+            cell.remove("b");
+            print(i"runs={runs} released={released}");
+            print(describe(scaled.since(scursor)));
+            online.set(false);
+            print(describe(shown.since(fcursor)));
+            cell.insert("a", 0);
+            cell.insert("a", 7);
+            online.set(true);
+            print(describe(shown.since(fcursor)));
+            mut a_wakes = 0;
+            let watch = scaled.at("a").on_change(|value| a_wakes += 1);
+            cell.insert("c", 30);
+            cell.insert("a", 6);
+            print(i"a_wakes={a_wakes} {opt(scaled.at("a").get())} {opt(scaled.get("c"))}");
+            watch.dispose();
+            let counted = cell.count().sample();
+            let summed = cell.sum_by(|v| v * 2).sample();
+            let pairs = cell.map_values(|v| v + 1).sample();
+            print(i"{counted} {summed} {pairs.len()}");
+            scope.dispose();
+            print(i"runs={runs} released={released}");
+        }
+
+        main();
+        "#,
+        "runs=2 released=0\nruns=4 released=2\nput(c,None,30) put(a,Some(10),50) delete(b,20) \nput(c,None,3) put(a,Some(1),5) delete(b,2) \ndelete(a,5) put(a,None,7) \na_wakes=1 Some(60) Some(300)\n2 72 2\nruns=8 released=8\n",
+    );
+}
+
+/// The operators' walk: every write a `MapCell` has, interleaved with flips of the
+/// flows the closures answer, checked after every step against a recomputation
+/// from the map — `values`/`entries` (the rank index, through enough churn to
+/// compact it), `map_values` plain and following, `filter` plain and following,
+/// `count`, `sum_by`, and two chains (`filter(..).values()`, `filter(..).count()`).
+#[test]
+fn a138_s2_the_map_operators_agree_with_a_recomputation_under_a_random_walk() {
+    assert_compiles_and_runs(&format!("{MAP_OPERATOR_WALK}\nmain();\n"), "failures 0\n");
 }

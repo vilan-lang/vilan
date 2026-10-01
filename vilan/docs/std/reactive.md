@@ -61,6 +61,8 @@ import std::reactive::{
 | `coll`, `coll_by`, `Coll`, `CollBy`, `SameElement` | methods/structs/trait | a flow of whole lists into a collection pipe: the positional diff (prefix/suffix trim) and the keyed one (`ReconcilePlan`, emits `Move`) |
 | `MapCell<K, V>`, `MapEntry<K, V>`, `MapSignal`, `MapSource`, `TrackedMap` | structs/traits | a `HashMap` cell whose writes ARE its `MapOp`s; `at(key)`, a handle that depends on ONE key |
 | `SetCell<T>`, `SetEntry<T>`, `SetSignal`, `SetSource` | structs/traits | the same for a `HashSet`; `contains(x)`, a `Source<bool>` for one member |
+| `MapFlow`, `MapPipe`, `MapMemo`, `MemoEntry`, `SetFlow`, `SetPipe`, `SetMemo` | traits/structs | the Map and Set shapes' pipes: anything a map (set) pipeline starts from; a move-only map (set) pipe (`memo`/`memo_global`/`sample`); what it seals into |
+| `keys`, `values`, `entries`, `map_values`, `filter`, `count`, `sum_by` | methods | the map operators — a set pipe, collection pipes in insertion order (a Fenwick rank), map pipes, scalar pipes; each costs what the op names |
 | `KeySlots` | struct | the per-key slot table both stand on: a slot per WATCHED key, counted per subscription |
 
 ## Signal and SignalCell
@@ -1701,6 +1703,78 @@ Both are `DeltaSource`s (`MapSource`, `SetSource`), with `cursor`/`since`/`reade
 as `ListCell` has them: a cursor that fell behind the log is told the whole
 collection as one `Reset`. `SetCell` builds on the JS backend only for now: the
 native backend refuses `SetOp`'s variants by name.
+
+## Map pipes — operators for maps and sets
+
+```vilan,fragment
+[resource] trait MapFlow<K: Hashable, V> { fun open(own self): MapInstance<K, V>; }   // MapSource, every map pipe
+[resource] trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
+	fun memo(own self): MapMemo<K, V>          // seal: a read-only MapSource with get(key)/at(key)
+	fun memo_global(own self): MapMemo<K, V>
+	fun sample(own self): HashMap<K, V>
+}
+impl type F: MapFlow<type K, type V> {
+	fun keys(own self): MapKeys<F, K, V>                       // a SetPipe<K>
+	fun values(own self): MapValues<F, K, V>                   // a CollPipe<V>, in insertion order
+	fun entries(own self): MapEntries<F, K, V>                 // a CollPipe<(K, V)>
+	fun map_values<R>(own self, transform: |V| R): MapMapValues<F, K, V, R>   // R: IntoElement<U>
+	fun filter<R>(own self, keep: |K, V| R): MapFilter<F, K, V, R>           // R: IntoFlow<bool>
+	fun count(own self): MapCount<F, K, V>                     // a Pipe<usize>
+	fun sum_by<N: Add + Sub + Default>(own self, measure: |V| N): MapSum<F, K, V, N>   // a Pipe<N>
+}
+// SetFlow<T>, SetPipe<T> (memo → SetMemo<T>, with contains(x)), the Set shape's twins
+```
+
+A map OPERATOR is a collection pipe for the Map shape: it is consumed once —
+sealed with `.memo()`, handed to a consumer, or read once with `.sample()` — and
+what travels between its stages is the `MapOp`, which names KEYS. So every
+operator costs what the op names: `map_values` runs its closure once per `Put` and
+never for a `Delete`, `filter` once per `Put`, `keys()` turns a new key's `Put`
+into an `Add` and ignores an overwrite, and `count`/`sum_by` add what arrived and
+subtract what left.
+
+```vilan
+import std::hash_map::HashMap;
+import std::reactive::{ MapCell, comp };
+
+fun main() {
+	let stock: MapCell<str, i32> = MapCell::of([("pens", 3), ("ink", 0)].to_map());
+	let ((names, low, total), scope) = comp(|| (
+		stock.keys().memo(),                                  // a SetMemo
+		stock.filter(|item, count| count < 2).values().memo(),   // a ListMemo
+		stock.sum_by(|count| count).memo()
+	));
+	stock.insert("pens", 1);       // one Put: the filter runs once
+	stock.insert("pads", 9);       // the key set gains one Add
+	print(names.get().len());      // 3
+	print(low.get());              // [ 0, 1 ]: "pens" joined the filter after "ink"
+	print(total.get());            // 10
+	scope.dispose();
+}
+```
+
+**The positional face is where order lives.** `values()` and `entries()` are
+collection pipes in the map's insertion order — what `each_by` and a `ListMemo`
+consume. A new key is a one-element `Splice` at its RANK, the number of live keys
+before it, which a Fenwick tree over the keys' slots answers in O(log n); an
+overwrite is a `SetAt` there, a removal a one-element `Splice` out; a removed and
+re-inserted key goes to the end, as the map puts it. Every other operator is
+order-free — and a map PIPE's order is the order its keys arrived in it: a key
+that flips into a `filter` joins its output at the end.
+
+**Following and owners**, as for the collection operators: a `filter` predicate
+that answers a flow is FOLLOWED per key (a flip is a `Put` or a `Delete`
+downstream), a `map_values` closure that answers a pipe has it started per key
+and its value carried, and each key's run gets an owner of its own — released
+when the key's value is replaced or the key leaves. `sum_by`'s measure answers a
+plain number for now.
+
+A sealed map pipe is a `MapMemo`: a read-only granular map source with `get(key)`,
+`len`, `peek`, and `at(key)` — a read-only per-key handle on the sealed map's
+slots, so a key's reader wakes only when the pipe changed that key.
+
+`keys()` builds on the JS backend only for now (it emits `SetOp`s, which the
+native backend refuses by name); every other map operator builds natively.
 
 ## reconcile: keyed list diffing
 

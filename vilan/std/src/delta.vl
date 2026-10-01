@@ -31,11 +31,14 @@
 // turn produce ONE notification and the consumer drains every op at the settle, so
 // the log is as long as one turn's writes.
 import pkg::compare::PartialEq;
-import pkg::hash::Hashable;
+import pkg::default::Default;
+import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
+import pkg::map_cell::{ MapCell, MapEntry, MapSource, apply_map_ops };
 import pkg::native_map::NativeMap;
+import pkg::operators::{ Add, Sub };
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	Flow,
@@ -62,6 +65,7 @@ import pkg::reactive::{
 	tracking,
 	wake,
 };
+import pkg::set_cell::{ SetCell, SetEntry, SetSource, apply_set_ops };
 import pkg::shared::Shared;
 import pkg::task::ambient_nursery;
 
@@ -2532,4 +2536,1136 @@ export impl type P: CollPipe<type T> with RowFeed<T> {
 	fun open_rows(own self): CollInstance<T> {
 		self.open()
 	}
+}
+
+// === Map and set pipes (A138 S2, `proposal/reactive-maps-sets.md` §5) ========
+//
+// §6's collection pipes, for the Map and Set shapes. A map OPERATOR returns a
+// move-only map pipe — or, where its output is another shape, a set pipe
+// (`keys`), a collection pipe (`values`, `entries`) or a scalar pipe (`count`,
+// `sum_by`) — and what travels between stages is the shape's op: `MapOp`, which
+// names KEYS, not positions. So every operator but the positional face is
+// order-free, and costs what the op names: a `Put` of one key is one call of a
+// closure, a `Delete` none.
+//
+// **The positional face (§6.2).** `values()` and `entries()` are where an order is
+// seen: the map's insertion order, which `each_by` and a sealed `ListMemo` need as
+// positions. A new key's rank is the number of live keys before it, which a
+// Fenwick tree over the keys' slots answers in O(log n) (`RankFace`, below): a new
+// key is appended, a removed key's slot goes dead, an overwrite keeps its slot.
+//
+// **Following and owners.** `map_values` and `filter` take their closure's result
+// through `IntoElement`/`IntoFlow` exactly as the collection operators do (R9,
+// R31, R35): a closure answering a plain value subscribes to nothing, one answering
+// a flow has it started for the KEY and followed, and each key's run has an owner
+// of its own — split off only when the run registered something — released when the
+// key leaves or its value is replaced (§6.4). They reuse the collection operators'
+// per-element machinery (`ElementCore`'s runs, holds and relays), keyed by the
+// map's key instead of by position.
+
+/// A STARTED map flow — `CollInstance`'s twin for the Map shape: the consumer reads
+/// `snapshot` once as its seed, attaches its ONE subscriber, and on every wake-up
+/// `drain`s the ops since the last drain.
+export struct MapInstance<K: Hashable, V> {
+	snapshot: || HashMap<K, V>,
+	attach: |Subscriber| Subscription,
+	drain: || List<MapOp<K, V>>,
+	release: || void,
+}
+
+/// Anything a map pipeline starts from: every `MapSource` (through the blanket
+/// below) and every map pipe stage. It carries the map operators; the sealing
+/// operations are `MapPipe`'s. `[resource]`, as `CollFlow` is.
+export [resource] trait MapFlow<K: Hashable, V> {
+	/// Start this map flow for its one consumer — the node author's member.
+	[must_use]
+	fun open(own self): MapInstance<K, V>;
+}
+
+/// Every granular map source starts as a map flow: a cursor into its log, minted
+/// before the seed is read, drained through its `reader` (A132), retired at the
+/// release.
+export impl type S: MapSource<type K, type V> with MapFlow<K, V> {
+	fun open(own self): MapInstance<K, V> {
+		let cursor = self.cursor();
+		let read = self.reader();
+		MapInstance<K, V> {
+			// QUALIFIED, and that is a workaround: through this SUBTRAIT bound a
+			// bare `self.get()` is emitted as the implementor's INHERENT `get(key)`
+			// — `MapCell`'s per-key read, called with no key — where the analyzer
+			// typed it as `Source::get` (maps-45's finding, B473's family).
+			snapshot = || {
+				let whole: HashMap<K, V> = Source::get(self);
+				whole
+			},
+			attach = |subscriber: Subscriber| self.on_settle(subscriber),
+			drain = || read(cursor),
+			release = || self.drop_cursor(cursor),
+		}
+	}
+}
+
+/// A map TRANSFORMATION: a `MapFlow` with no `get`, consumed once — sealed with
+/// `.memo()` into a `MapMemo` (a granular map source again, with `at(key)`), or
+/// read once with `.sample()`. Sharing is sealing, as for every pipe.
+export [resource] trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
+	/// Seal into a READ-ONLY granular map source: the pipe's one consumer, each
+	/// drain applied to one `MapCell` as one batch, so the sealed map's own log
+	/// says what the pipe said and its per-key slots wake for the keys the pipe
+	/// named. Owner-tied, like every seal; a module binding says `.memo_global()`.
+	fun memo(own self): MapMemo<K, V> {
+		MapMemo<K, V> { cell = seal_map(self.open(), true) }
+	}
+
+	/// `.memo()` for a map that lives as long as the PROGRAM (A130).
+	fun memo_global(own self): MapMemo<K, V> {
+		MapMemo<K, V> { cell = seal_map(self.open(), false) }
+	}
+
+	/// A one-off read: start the pipe, take the map, release it — including what
+	/// its per-key runs built.
+	fun sample(own self): HashMap<K, V> {
+		let instance = self.open();
+		let value = (instance.snapshot)();
+		(instance.release)();
+		value
+	}
+}
+
+/// The seal both map `memo`s share — `seal_collection`'s shape.
+fun seal_map<K: Hashable, V>(instance: MapInstance<K, V>, owned: bool): MapCell<K, V> {
+	let sealed: MapCell<K, V> = MapCell::of((instance.snapshot)());
+	let drain = instance.drain;
+	if owned {
+		let refreshed = (instance.attach)(subscriber_of(|| apply_map_ops(sealed, drain()), true));
+		also_releasing(refreshed, instance.release);
+		let _owned = register_with_owner(refreshed);
+	} else {
+		// NAMED for the no-cycle gate, as `seal_collection`'s program-lifetime
+		// refresh is.
+		let cell_global_refresh = || apply_map_ops(sealed, drain());
+		let _for_the_program = (instance.attach)(subscriber_of(cell_global_refresh, true));
+	}
+	sealed
+}
+
+/// What `.memo()` seals a map pipe into: a read-only granular map source over one
+/// `MapCell`. A pipeline starts from it again, and `at(key)` reads one key of it.
+export [hint(MapSource<K, V>)]
+struct MapMemo<K: Hashable, V> {
+	cell: MapCell<K, V>,
+}
+
+export impl MapMemo<type K: Hashable, type V> {
+	/// What `key` holds.
+	fun get(self, key: K): Option<V> {
+		self.cell.get(key)
+	}
+
+	/// Whether `key` is held.
+	fun contains_key(self, key: K): bool {
+		self.cell.contains_key(key)
+	}
+
+	/// How many keys are held.
+	fun len(self): usize {
+		self.cell.len()
+	}
+
+	/// Nothing held.
+	fun is_empty(self): bool {
+		self.cell.is_empty()
+	}
+
+	/// Read the map in place, as `MapCell::peek` does.
+	fun peek<U>(self, read: sync |&HashMap<K, V>| U): U {
+		self.cell.peek(read)
+	}
+
+	/// The per-key handle, READ-ONLY: a `Source<Option<V>>` on the key's slot, as
+	/// `MapCell::at` is, with no `set` — a derivation is written by its upstream
+	/// only.
+	fun at(self, key: K): MemoEntry<K, V> {
+		MemoEntry<K, V> { entry = self.cell.at(key) }
+	}
+
+	/// How many keys have a live slot.
+	fun watched(self): usize {
+		self.cell.watched()
+	}
+}
+
+export impl MapMemo<type K: Hashable, type V> with Source<HashMap<K, V>> {
+	fun get(self): HashMap<K, V> {
+		Source::get(self.cell)
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |HashMap<K, V>| void, immediately: bool): Subscription {
+		self.cell.attach_observer(observer, immediately)
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.cell.on_settle(subscriber)
+	}
+}
+
+export impl MapMemo<type K: Hashable, type V> with DeltaSource<HashMap<K, V>, MapOp<K, V>> {
+	fun cursor(self): DeltaCursor {
+		self.cell.cursor()
+	}
+
+	fun drop_cursor(self, cursor: DeltaCursor) {
+		self.cell.drop_cursor(cursor);
+	}
+
+	fun since(self, cursor: DeltaCursor): List<MapOp<K, V>> {
+		self.cell.since(cursor)
+	}
+
+	fun reader(self): |DeltaCursor| List<MapOp<K, V>> {
+		self.cell.reader()
+	}
+}
+
+export impl MapMemo<type K: Hashable, type V> with MapSource<K, V> {}
+
+/// `MapMemo::at(key)`'s answer: `MapEntry`'s read face.
+export struct MemoEntry<K: Hashable, V> {
+	entry: MapEntry<K, V>,
+}
+
+export impl MemoEntry<type K: Hashable, type V> with Source<Option<V>> {
+	fun get(self): Option<V> {
+		self.entry.get()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.entry.on_settle(subscriber)
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |Option<V>| void, immediately: bool): Subscription {
+		self.entry.attach_observer(observer, immediately)
+	}
+}
+
+// --- The Set shape's pipe faces -----------------------------------------------
+
+/// A STARTED set flow — `MapInstance`'s twin for the Set shape.
+export struct SetInstance<T: Hashable> {
+	snapshot: || HashSet<T>,
+	attach: |Subscriber| Subscription,
+	drain: || List<SetOp<T>>,
+	release: || void,
+}
+
+/// Anything a set pipeline starts from: every `SetSource` and every set pipe stage.
+export [resource] trait SetFlow<T: Hashable> {
+	/// Start this set flow for its one consumer.
+	[must_use]
+	fun open(own self): SetInstance<T>;
+}
+
+/// Every granular set source starts as a set flow.
+export impl type S: SetSource<type T> with SetFlow<T> {
+	fun open(own self): SetInstance<T> {
+		let cursor = self.cursor();
+		let read = self.reader();
+		SetInstance<T> {
+			snapshot = || self.get(),
+			attach = |subscriber: Subscriber| self.on_settle(subscriber),
+			drain = || read(cursor),
+			release = || self.drop_cursor(cursor),
+		}
+	}
+}
+
+/// A set TRANSFORMATION — what `keys()` returns — sealed with `.memo()` into a
+/// `SetMemo` (with `contains(x)`), or read once with `.sample()`.
+export [resource] trait SetPipe<T: Hashable> with SetFlow<T> {
+	/// Seal into a read-only granular set source (owner-tied).
+	fun memo(own self): SetMemo<T> {
+		SetMemo<T> { cell = seal_set(self.open(), true) }
+	}
+
+	/// `.memo()` for a set that lives as long as the PROGRAM (A130).
+	fun memo_global(own self): SetMemo<T> {
+		SetMemo<T> { cell = seal_set(self.open(), false) }
+	}
+
+	/// A one-off read.
+	fun sample(own self): HashSet<T> {
+		let instance = self.open();
+		let value = (instance.snapshot)();
+		(instance.release)();
+		value
+	}
+}
+
+/// The seal both set `memo`s share.
+fun seal_set<T: Hashable>(instance: SetInstance<T>, owned: bool): SetCell<T> {
+	let sealed: SetCell<T> = SetCell::of((instance.snapshot)());
+	let drain = instance.drain;
+	if owned {
+		let refreshed = (instance.attach)(subscriber_of(|| apply_set_ops(sealed, drain()), true));
+		also_releasing(refreshed, instance.release);
+		let _owned = register_with_owner(refreshed);
+	} else {
+		let cell_global_refresh = || apply_set_ops(sealed, drain());
+		let _for_the_program = (instance.attach)(subscriber_of(cell_global_refresh, true));
+	}
+	sealed
+}
+
+/// What `.memo()` seals a set pipe into: a read-only granular set source over one
+/// `SetCell`, whose `contains(x)` wakes for `x` alone.
+export [hint(SetSource<T>)]
+struct SetMemo<T: Hashable> {
+	cell: SetCell<T>,
+}
+
+export impl SetMemo<type T: Hashable> {
+	/// How many members are held.
+	fun len(self): usize {
+		self.cell.len()
+	}
+
+	/// Nothing held.
+	fun is_empty(self): bool {
+		self.cell.is_empty()
+	}
+
+	/// Read the set in place.
+	fun peek<U>(self, read: sync |&HashSet<T>| U): U {
+		self.cell.peek(read)
+	}
+
+	/// The per-member handle — a `Source<bool>`, read-only already.
+	fun contains(self, value: T): SetEntry<T> {
+		self.cell.contains(value)
+	}
+}
+
+export impl SetMemo<type T: Hashable> with Source<HashSet<T>> {
+	fun get(self): HashSet<T> {
+		self.cell.get()
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |HashSet<T>| void, immediately: bool): Subscription {
+		self.cell.attach_observer(observer, immediately)
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.cell.on_settle(subscriber)
+	}
+}
+
+export impl SetMemo<type T: Hashable> with DeltaSource<HashSet<T>, SetOp<T>> {
+	fun cursor(self): DeltaCursor {
+		self.cell.cursor()
+	}
+
+	fun drop_cursor(self, cursor: DeltaCursor) {
+		self.cell.drop_cursor(cursor);
+	}
+
+	fun since(self, cursor: DeltaCursor): List<SetOp<T>> {
+		self.cell.since(cursor)
+	}
+
+	fun reader(self): |DeltaCursor| List<SetOp<T>> {
+		self.cell.reader()
+	}
+}
+
+export impl SetMemo<type T: Hashable> with SetSource<T> {}
+
+// --- The rank index: the positional face's order (§6.2) ----------------------
+
+/// The insertion order of a map's keys as POSITIONS: one slot per key that ever
+/// arrived (a removed key's slot goes dead), a Fenwick tree over the live slots,
+/// and the slot each live key holds. A key's rank — its position in `values()` —
+/// is the number of live slots before its own: O(log n). An arrival appends a slot
+/// (O(log n), the tree grows by one node); a removal kills one (O(log n)); an
+/// overwrite moves nothing. Dead slots are compacted away once they outnumber the
+/// live ones, so the walk and the memory stay proportional to the live count.
+///
+/// One-based internally, as `KeptIndex` is: `tree[i]` covers the `lowbit(i)` slots
+/// ending at `i`.
+struct RankFace {
+	/// The key hash each slot was made for, live or dead, in arrival order.
+	slots: Shared<List<Hash>>,
+	alive: Shared<List<bool>>,
+	/// A LIVE key's slot.
+	slot_of: Shared<NativeMap<usize>>,
+	tree: Shared<List<i32>>,
+	live: Shared<usize>,
+}
+
+/// A face over `keys`, in order, all live.
+fun rank_face(keys: List<Hash>): RankFace {
+	let slots: List<Hash> = [];
+	let alive: List<bool> = [];
+	let slot_of: NativeMap<usize> = NativeMap::new();
+	let tree: List<i32> = [0];
+	let face = RankFace {
+		slots = Shared::new(slots),
+		alive = Shared::new(alive),
+		slot_of = Shared::new(slot_of),
+		tree = Shared::new(tree),
+		live = Shared::new(0),
+	};
+	face_rebuild(face, keys);
+	face
+}
+
+/// Replace the face with `keys`, all live, in O(n).
+fun face_rebuild(face: RankFace, keys: List<Hash>) {
+	mut slots: List<Hash> = [];
+	mut alive: List<bool> = [];
+	mut slot_of: NativeMap<usize> = NativeMap::new();
+	mut tree: List<i32> = [0];
+	mut at: usize = 0;
+	for key in keys {
+		slots.push(key);
+		alive.push(true);
+		slot_of.insert(key, at);
+		tree.push(1);
+		at += 1;
+	}
+	// O(n) build: each node adds itself into its parent.
+	let size = at.as_i32();
+	mut node = 1;
+	for node <= size {
+		let parent = node + (node & (0 - node));
+		if parent <= size {
+			tree[parent.as_usize()] = tree[parent.as_usize()] + tree[node.as_usize()];
+		}
+		node += 1;
+	}
+	face.slots.write() = slots;
+	face.alive.write() = alive;
+	face.slot_of.write() = slot_of;
+	face.tree.write() = tree;
+	face.live.write() = at;
+}
+
+/// The number of live slots before `slot` (zero-based).
+fun face_live_before(face: RankFace, slot: usize): usize {
+	mut total = 0;
+	mut at = slot.as_i32();
+	for at > 0 {
+		total += face.tree.read()[at.as_usize()];
+		at = at - (at & (0 - at));
+	}
+	total.as_usize()
+}
+
+/// The rank of a live key, or `None` when it holds no live slot.
+fun face_rank(face: RankFace, key: Hash): Option<usize> {
+	match face.slot_of.read().get(key) {
+		Some(let slot) => Some(face_live_before(face, slot)),
+		None => None,
+	}
+}
+
+/// A key arrives at the END: one slot appended, and its rank — the live count
+/// before it — answered.
+fun face_append(face: RankFace, key: Hash): usize {
+	let slot = face.slots.read().len();
+	let rank = face.live.read();
+	// The new node `i` covers `(i - lowbit(i), i]`: itself, plus the slots below it
+	// in that range — the prefix up to `i - 1` less the prefix up to
+	// `i - lowbit(i)`.
+	let node = (slot + 1).as_i32();
+	let covered_from = (node - (node & (0 - node))).as_usize();
+	let below = face_live_before(face, slot) - face_live_before(face, covered_from);
+	face.slots.write().push(key);
+	face.alive.write().push(true);
+	face.tree.write().push((below + 1).as_i32());
+	face.slot_of.write().insert(key, slot);
+	face.live.write() = rank + 1;
+	rank
+}
+
+/// A live key leaves: its slot goes dead, and its rank before it left is answered.
+/// Dead slots are compacted once they outnumber the live ones.
+fun face_remove(face: RankFace, key: Hash): Option<usize> {
+	match face.slot_of.read().get(key) {
+		Some(let slot) => {
+			let rank = face_live_before(face, slot);
+			face.slot_of.write().remove(key);
+			face.alive.write()[slot] = false;
+			let size = face.tree.read().len().as_i32() - 1;
+			mut at = slot.as_i32() + 1;
+			for at <= size {
+				face.tree.write()[at.as_usize()] = face.tree.read()[at.as_usize()] - 1;
+				at = at + (at & (0 - at));
+			}
+			let live = face.live.read() - 1;
+			face.live.write() = live;
+			let dead = face.slots.read().len() - live;
+			if dead > live && dead > 32 {
+				mut kept: List<Hash> = [];
+				mut index = 0;
+				for held in face.slots.read() {
+					if face.alive.read()[index] {
+						kept.push(held);
+					}
+					index += 1;
+				}
+				face_rebuild(face, kept);
+			}
+			Some(rank)
+		},
+		None => None,
+	}
+}
+
+/// The positional face's derivative: each map op as the one `SeqOp` it is at its
+/// key's rank. `out` makes the element (`values()`'s value, `entries()`'s pair).
+fun ranked_ops<K: Hashable, V, U>(
+	face: RankFace,
+	ops: List<MapOp<K, V>>,
+	out: |K, V| U,
+): List<SeqOp<U>> {
+	mut produced: List<SeqOp<U>> = [];
+	for op in ops {
+		match op {
+			MapOp::Put(let key, let was, let now) => {
+				match (face_rank(face, key.hash()), was) {
+					(Some(let rank), Some(let before)) => produced.push(SeqOp::SetAt(rank, out(key, before), out(key, now))),
+					// A producer that said "new" of a key the face holds: an
+					// in-place change whose old element is not known — the new one
+					// stands in for it.
+					(Some(let rank), None) => produced.push(SeqOp::SetAt(rank, out(key, now), out(key, now))),
+					(None, _) => {
+						let rank = face_append(face, key.hash());
+						produced.push(SeqOp::Splice(rank, [], [out(key, now)]));
+					},
+				}
+			},
+			MapOp::Delete(let key, let gone) => match face_remove(face, key.hash()) {
+				Some(let rank) => produced.push(SeqOp::Splice(rank, [out(key, gone)], [])),
+				None => {},
+			},
+			MapOp::Reset(let map) => {
+				mut hashes: List<Hash> = [];
+				mut elements: List<U> = [];
+				for entry in map.entries() {
+					hashes.push(entry.0.hash());
+					elements.push(out(entry.0, entry.1));
+				}
+				face_rebuild(face, hashes);
+				produced.push(SeqOp::Reset(elements));
+			},
+		}
+	}
+	produced
+}
+
+/// The hashes of `map`'s keys, in its order.
+fun hashes_of<K: Hashable, V>(map: HashMap<K, V>): List<Hash> {
+	mut hashes: List<Hash> = [];
+	for key in map.keys() {
+		hashes.push(key.hash());
+	}
+	hashes
+}
+
+// --- The keyed per-element core (§6.4, keyed) -----------------------------------
+
+/// One key's row in a keyed stage: the key, its input value, what the closure
+/// answered for it, and the slot id its run's holds are filed under.
+struct KeyRow<K, V, U> {
+	key: K,
+	input: V,
+	value: U,
+	id: i32,
+}
+
+/// A keyed stage's state: the collection operators' `ElementCore` for the RUNS —
+/// its closure, scratch owner, holds, dirty slots and consumer — with the rows kept
+/// by key rather than by position (the core's own positional lists stay empty). The
+/// rows are a `NativeMap` keyed by the key's hash, which iterates in the upstream
+/// map's order: an overwrite keeps its row's place, a removal drops it, an arrival
+/// appends.
+struct KeyedCore<K: Hashable, V, U> {
+	core: ElementCore<(K, V), U>,
+	rows: Shared<NativeMap<KeyRow<K, V, U>>>,
+	/// A run's slot id → its key's hash, for the followed flows that wake.
+	key_of_slot: Shared<NativeMap<Hash>>,
+}
+
+/// One key change the keyed core resolved.
+enum KeyEvent<K, V, U> {
+	/// A key arrived: its input and what the closure answered.
+	Arrived(K, V, U),
+	/// A key's (input, answer) changed: `true` when the INPUT was replaced (the key
+	/// re-ran), `false` when only the flow it answered moved.
+	Changed(K, (V, U), (V, U), bool),
+	/// A key left, with what it held.
+	Left(K, V, U),
+	/// The map became these rows.
+	Reset(List<KeyRow<K, V, U>>),
+}
+
+fun keyed_core<K: Hashable, V, U>(
+	stage: Owner,
+	run: |(K, V)| (ElementRun<U>, Option<Owner>),
+): KeyedCore<K, V, U> {
+	let rows: NativeMap<KeyRow<K, V, U>> = NativeMap::new();
+	let key_of_slot: NativeMap<Hash> = NativeMap::new();
+	KeyedCore<K, V, U> {
+		core = element_core(stage, run),
+		rows = Shared::new(rows),
+		key_of_slot = Shared::new(key_of_slot),
+	}
+}
+
+/// Run the closure for `key`'s `input` and file the row.
+fun keyed_admit<K: Hashable, V, U>(keyed: KeyedCore<K, V, U>, key: K, input: V): KeyRow<K, V, U> {
+	let (id, value) = admit(keyed.core, (key, input));
+	let row = KeyRow<K, V, U> { key, input, value, id };
+	let hash = key.hash();
+	keyed.rows.write().insert(hash, row);
+	keyed.key_of_slot.write().insert(id.hash(), hash);
+	row
+}
+
+/// Release what `row`'s run built.
+fun keyed_retire<K: Hashable, V, U>(keyed: KeyedCore<K, V, U>, row: KeyRow<K, V, U>) {
+	keyed.key_of_slot.write().remove(row.id.hash());
+	retire(keyed.core, row.id);
+}
+
+/// Seed the rows from `map`, in its order.
+fun keyed_seed<K: Hashable, V, U>(keyed: KeyedCore<K, V, U>, map: HashMap<K, V>) {
+	for entry in map.entries() {
+		let _row = keyed_admit(keyed, entry.0, entry.1);
+	}
+}
+
+/// Every row, in order.
+fun keyed_rows<K: Hashable, V, U>(keyed: KeyedCore<K, V, U>): List<KeyRow<K, V, U>> {
+	keyed.rows.read().values()
+}
+
+/// Apply the upstream's ops, then the followed flows that moved, and answer the key
+/// events they made, in order.
+fun keyed_resolve<K: Hashable, V, U>(
+	keyed: KeyedCore<K, V, U>,
+	ops: List<MapOp<K, V>>,
+): List<KeyEvent<K, V, U>> {
+	mut events: List<KeyEvent<K, V, U>> = [];
+	for op in ops {
+		match op {
+			MapOp::Put(let key, let _was, let input) => {
+				match keyed.rows.read().get(key.hash()) {
+					Some(let row) => {
+						// The key RE-RUNS: its last run is released first, and the
+						// new run is a slot of its own.
+						keyed_retire(keyed, row);
+						let fresh = keyed_admit(keyed, key, input);
+						events.push(KeyEvent::Changed(key, (row.input, row.value), (fresh.input, fresh.value), true));
+					},
+					None => {
+						let fresh = keyed_admit(keyed, key, input);
+						events.push(KeyEvent::Arrived(key, fresh.input, fresh.value));
+					},
+				}
+			},
+			MapOp::Delete(let key, let _gone) => {
+				let hash = key.hash();
+				match keyed.rows.read().get(hash) {
+					Some(let row) => {
+						keyed_retire(keyed, row);
+						keyed.rows.write().remove(hash);
+						events.push(KeyEvent::Left(key, row.input, row.value));
+					},
+					None => {},
+				}
+			},
+			MapOp::Reset(let map) => {
+				for row in keyed_rows(keyed) {
+					keyed_retire(keyed, row);
+				}
+				let emptied: NativeMap<KeyRow<K, V, U>> = NativeMap::new();
+				keyed.rows.write() = emptied;
+				keyed_seed(keyed, map);
+				events.push(KeyEvent::Reset(keyed_rows(keyed)));
+			},
+		}
+	}
+	// The followed flows that moved: each slot re-read once however often it woke,
+	// and a slot the ops above retired skipped — its key left or re-ran.
+	let woke = keyed.core.dirty.read();
+	if woke.len() > 0 {
+		keyed.core.dirty.write() = [];
+		mut seen: NativeMap<bool> = NativeMap::new();
+		for id in woke {
+			if seen.contains_key(id.hash()) {
+				jump continue;
+			}
+			seen.insert(id.hash(), true);
+			match keyed.key_of_slot.read().get(id.hash()) {
+				Some(let hash) => match keyed.rows.read().get(hash) {
+					Some(let row) => match keyed.core.holds.read().get(id.hash()) {
+						Some(let hold) => {
+							if hold.follows {
+								let now = (hold.pull)();
+								keyed.rows
+									.write()
+									.insert(hash, KeyRow<K, V, U> {
+										key = row.key,
+										input = row.input,
+										value = now,
+										id = row.id,
+									});
+								events.push(KeyEvent::Changed(row.key, (row.input, row.value), (row.input, now), false));
+							}
+						},
+						None => {},
+					},
+					None => {},
+				},
+				None => {},
+			}
+		}
+	}
+	events
+}
+
+/// The upstream's attach, with the consumer's subscriber remembered for the
+/// followed flows to wake.
+fun keyed_attach<K: Hashable, V, U>(
+	keyed: KeyedCore<K, V, U>,
+	attach: |Subscriber| Subscription,
+): |Subscriber| Subscription {
+	let consumer = keyed.core.consumer;
+	|subscriber: Subscriber| {
+		consumer.write() = Some(subscriber);
+		attach(subscriber)
+	}
+}
+
+/// A release that takes every key's run down, then the stage's owner, then the
+/// upstream.
+fun keyed_release<K: Hashable, V, U>(keyed: KeyedCore<K, V, U>, release: || void): || void {
+	|| {
+		for row in keyed_rows(keyed) {
+			keyed_retire(keyed, row);
+		}
+		keyed.core.stage.dispose();
+		release();
+	}
+}
+
+// --- The map operators (§5) ---------------------------------------------------
+
+/// The operators every map flow has — a blanket over `MapFlow`, so a `MapCell`, a
+/// `MapMemo` and a map pipe all have them.
+export impl type F: MapFlow<type K, type V> {
+	/// The keys, as a SET pipe: a new key's `Put` is an `Add`, an overwrite is
+	/// nothing, a `Delete` is a `Remove` — O(1) per op, no state. kolt's
+	/// `channels.keys()`: it changes only when a key arrives or leaves.
+	fun keys(own self): MapKeys<F, K, V> {
+		MapKeys<F, K, V> { up = self }
+	}
+
+	/// The values in the map's (insertion) order, as a COLLECTION pipe: a new key
+	/// is a one-element `Splice` at its rank, an overwrite a `SetAt` there, a
+	/// `Delete` a one-element `Splice` out — O(log n) per op through the rank index
+	/// (§6.2). What `each_by` and a `ListMemo` consume.
+	fun values(own self): MapValues<F, K, V> {
+		MapValues<F, K, V> { up = self }
+	}
+
+	/// The `(key, value)` pairs in the map's order, as `values()` is.
+	fun entries(own self): MapEntries<F, K, V> {
+		MapEntries<F, K, V> { up = self }
+	}
+
+	/// Each value through `transform`, keyed as before: one call per `Put`, none
+	/// per `Delete`. A returned PIPE is started per key and its value carried, a
+	/// returned `Source` is the value itself (`IntoElement`, R35) — `map`'s rule.
+	fun map_values<R>(
+		own self,
+		transform: (sync |V| R) context (owner_scope, ambient_nursery),
+	): MapMapValues<F, K, V, R> {
+		MapMapValues<F, K, V, R> { up = self, transform }
+	}
+
+	/// The entries `keep` answers `true` for, following a flow it answers (R9): one
+	/// call per `Put`, and a key that flips in or out is a `Put` or a `Delete`
+	/// downstream.
+	fun filter<R>(
+		own self,
+		keep: (sync |K, V| R) context (owner_scope, ambient_nursery),
+	): MapFilter<F, K, V, R> {
+		MapFilter<F, K, V, R> { up = self, keep }
+	}
+
+	/// How many keys the map holds — a scalar pipe over a counter: a new key adds
+	/// one, a `Delete` takes one, O(1) per op.
+	fun count(own self): MapCount<F, K, V> {
+		MapCount<F, K, V> { up = self }
+	}
+
+	/// The sum of `measure` over the values — a scalar pipe over an accumulator:
+	/// what arrived is added and what left subtracted (the op's "what was there" is
+	/// exactly for this), O(1) per op.
+	///
+	/// `measure` answers a plain number, and is not followed if it answers a flow:
+	/// `N` cannot be inferred through a result trait's argument (B484), so the
+	/// result is the number itself until that lands — then `R: IntoFlow<N>`, as
+	/// `filter`'s.
+	fun sum_by<N: Add + Sub + Default>(
+		own self,
+		measure: (sync |V| N) context (owner_scope, ambient_nursery),
+	): MapSum<F, K, V, N> {
+		MapSum<F, K, V, N> { up = self, measure }
+	}
+}
+
+/// `keys()` as a stage.
+export [resource] struct MapKeys<F, K, V> {
+	up: F,
+}
+
+export impl MapKeys<type F: MapFlow<type K, type V>, K, V> with SetFlow<K> {
+	fun open(own self): SetInstance<K> {
+		let upstream = self.up.open();
+		let seed = (upstream.snapshot)().keys().to_set();
+		let drain = upstream.drain;
+		SetInstance<K> {
+			snapshot = || seed,
+			attach = upstream.attach,
+			drain = || key_ops(drain()),
+			release = upstream.release,
+		}
+	}
+}
+
+export impl MapKeys<type F: MapFlow<type K, type V>, K, V> with SetPipe<K> {}
+
+/// `keys()`'s derivative.
+fun key_ops<K: Hashable, V>(ops: List<MapOp<K, V>>): List<SetOp<K>> {
+	mut produced: List<SetOp<K>> = [];
+	for op in ops {
+		match op {
+			MapOp::Put(let key, let was, let _now) => {
+				if was.is_none() {
+					produced.push(SetOp::Add(key));
+				}
+			},
+			MapOp::Delete(let key, let _gone) => produced.push(SetOp::Remove(key)),
+			MapOp::Reset(let map) => produced.push(SetOp::Reset(map.keys().to_set())),
+		}
+	}
+	produced
+}
+
+/// `values()` as a stage.
+export [hint(CollPipe<V>)]
+[resource] struct MapValues<F, K, V> {
+	up: F,
+}
+
+export impl MapValues<type F: MapFlow<type K, type V>, K, V> with CollFlow<V> {
+	fun open(own self): CollInstance<V> {
+		let upstream = self.up.open();
+		let seed = (upstream.snapshot)();
+		let face = rank_face(hashes_of(seed));
+		let elements = seed.values();
+		let drain = upstream.drain;
+		CollInstance<V> {
+			snapshot = || elements,
+			attach = upstream.attach,
+			drain = || ranked_ops(face, drain(), |key: K, value: V| value),
+			release = upstream.release,
+		}
+	}
+}
+
+export impl MapValues<type F: MapFlow<type K, type V>, K, V> with CollPipe<V> {}
+
+/// `entries()` as a stage.
+export [hint(CollPipe<(K, V)>)]
+[resource] struct MapEntries<F, K, V> {
+	up: F,
+}
+
+export impl MapEntries<type F: MapFlow<type K, type V>, K, V> with CollFlow<(K, V)> {
+	fun open(own self): CollInstance<(K, V)> {
+		let upstream = self.up.open();
+		let seed = (upstream.snapshot)();
+		let face = rank_face(hashes_of(seed));
+		let elements = seed.entries();
+		let drain = upstream.drain;
+		CollInstance<(K, V)> {
+			snapshot = || elements,
+			attach = upstream.attach,
+			drain = || ranked_ops(face, drain(), |key: K, value: V| (key, value)),
+			release = upstream.release,
+		}
+	}
+}
+
+export impl MapEntries<type F: MapFlow<type K, type V>, K, V> with CollPipe<(K, V)> {}
+
+/// `map_values` as a stage.
+export [resource] struct MapMapValues<F, K, V, R> {
+	up: F,
+	transform: (|V| R) context (owner_scope, ambient_nursery),
+}
+
+export impl MapMapValues<type F: MapFlow<type K, type V>, K, V, type R: IntoElement<type U>> with MapFlow<
+	K,
+	U,
+> {
+	fun open(own self): MapInstance<K, U> {
+		let transform = self.transform;
+		let upstream = self.up.open();
+		let stage = Owner::new();
+		let keyed: KeyedCore<K, V, U> = keyed_core(stage, |entry: (K, V)| {
+			let (answer, owner) = run_element(stage, || transform(entry.1));
+			(answer.start_element_value(), owner)
+		});
+		keyed_seed(keyed, (upstream.snapshot)());
+		let drain = upstream.drain;
+		MapInstance<K, U> {
+			snapshot = || {
+				mut out: HashMap<K, U> = HashMap::new();
+				for row in keyed_rows(keyed) {
+					out.insert(row.key, row.value);
+				}
+				out
+			},
+			attach = keyed_attach(keyed, upstream.attach),
+			drain = || mapped_map_ops(keyed_resolve(keyed, drain())),
+			release = keyed_release(keyed, upstream.release),
+		}
+	}
+}
+
+export impl MapMapValues<type F: MapFlow<type K, type V>, K, V, type R: IntoElement<type U>> with MapPipe<
+	K,
+	U,
+> {}
+
+/// `map_values`'s derivative: every key event, its answers.
+fun mapped_map_ops<K: Hashable, V, U>(events: List<KeyEvent<K, V, U>>): List<MapOp<K, U>> {
+	mut produced: List<MapOp<K, U>> = [];
+	for event in events {
+		match event {
+			KeyEvent::Arrived(let key, let _input, let value) => produced.push(MapOp::Put(key, None, value)),
+			KeyEvent::Changed(let key, let before, let after, let _rerun) => {
+				produced.push(MapOp::Put(key, Some(before.1), after.1));
+			},
+			KeyEvent::Left(let key, let _input, let value) => produced.push(MapOp::Delete(key, value)),
+			KeyEvent::Reset(let rows) => {
+				mut map: HashMap<K, U> = HashMap::new();
+				for row in rows {
+					map.insert(row.key, row.value);
+				}
+				produced.push(MapOp::Reset(map));
+			},
+		}
+	}
+	produced
+}
+
+/// `filter` as a stage.
+export [resource] struct MapFilter<F, K, V, R> {
+	up: F,
+	keep: (|K, V| R) context (owner_scope, ambient_nursery),
+}
+
+export impl MapFilter<type F: MapFlow<type K, type V>, K, V, type R: IntoFlow<bool>> with MapFlow<
+	K,
+	V,
+> {
+	fun open(own self): MapInstance<K, V> {
+		let keep = self.keep;
+		let upstream = self.up.open();
+		let stage = Owner::new();
+		let keyed: KeyedCore<K, V, bool> = keyed_core(stage, |entry: (K, V)| {
+			let (answer, owner) = run_element(stage, || keep(entry.0, entry.1));
+			(answer.start_element(), owner)
+		});
+		keyed_seed(keyed, (upstream.snapshot)());
+		let drain = upstream.drain;
+		MapInstance<K, V> {
+			snapshot = || kept_map(keyed_rows(keyed)),
+			attach = keyed_attach(keyed, upstream.attach),
+			drain = || filtered_map_ops(keyed_resolve(keyed, drain())),
+			release = keyed_release(keyed, upstream.release),
+		}
+	}
+}
+
+export impl MapFilter<type F: MapFlow<type K, type V>, K, V, type R: IntoFlow<bool>> with MapPipe<
+	K,
+	V,
+> {}
+
+/// The kept rows, as a map in their order.
+fun kept_map<K: Hashable, V>(rows: List<KeyRow<K, V, bool>>): HashMap<K, V> {
+	mut out: HashMap<K, V> = HashMap::new();
+	for row in rows {
+		if row.value {
+			out.insert(row.key, row.input);
+		}
+	}
+	out
+}
+
+/// `filter`'s derivative over the kept flags: a key that arrives kept is a `Put`,
+/// one that flips in is a `Put` and out a `Delete`, one that stays kept is a `Put`
+/// when its INPUT was replaced (a predicate flow re-notifying `true` moved
+/// nothing).
+fun filtered_map_ops<K: Hashable, V>(events: List<KeyEvent<K, V, bool>>): List<MapOp<K, V>> {
+	mut produced: List<MapOp<K, V>> = [];
+	for event in events {
+		match event {
+			KeyEvent::Arrived(let key, let input, let kept) => {
+				if kept {
+					produced.push(MapOp::Put(key, None, input));
+				}
+			},
+			KeyEvent::Changed(let key, let before, let after, let rerun) => {
+				if before.1 && after.1 {
+					if rerun {
+						produced.push(MapOp::Put(key, Some(before.0), after.0));
+					}
+				} else if before.1 {
+					produced.push(MapOp::Delete(key, before.0));
+				} else if after.1 {
+					produced.push(MapOp::Put(key, None, after.0));
+				}
+			},
+			KeyEvent::Left(let key, let input, let kept) => {
+				if kept {
+					produced.push(MapOp::Delete(key, input));
+				}
+			},
+			KeyEvent::Reset(let rows) => produced.push(MapOp::Reset(kept_map(rows))),
+		}
+	}
+	produced
+}
+
+/// `count()` as a stage: a SCALAR pipe over a counter.
+export [hint(Pipe<usize>)]
+[resource] struct MapCount<F, K, V> {
+	up: F,
+}
+
+export impl MapCount<type F: MapFlow<type K, type V>, K, V> with Flow<usize> {
+	[must_use]
+	fun on_change(own self, observer: |usize| void): Subscription {
+		observe_flow(self, observer, false)
+	}
+
+	[must_use]
+	fun sub(own self, observer: |usize| void): Subscription {
+		observe_flow(self, observer, true)
+	}
+
+	fun start(own self): Instance<usize> {
+		let upstream = self.up.open();
+		let held: Shared<usize> = Shared::new((upstream.snapshot)().len());
+		let drain = upstream.drain;
+		Instance<usize> {
+			pull = || {
+				for op in drain() {
+					match op {
+						MapOp::Put(let _key, let was, let _now) => {
+							if was.is_none() {
+								held.write() = held.read() + 1;
+							}
+						},
+						MapOp::Delete(let _key, let _gone) => held.write() = held.read() - 1,
+						MapOp::Reset(let map) => held.write() = map.len(),
+					}
+				}
+				held.read()
+			},
+			attach = upstream.attach,
+			release = upstream.release,
+		}
+	}
+}
+
+export impl MapCount<type F: MapFlow<type K, type V>, K, V> with Pipe<usize> {}
+
+/// `sum_by` as a stage: a SCALAR pipe over an accumulator, the keyed core
+/// underneath so each key's measure runs once per `Put` under an owner of its own.
+export [resource] struct MapSum<F, K, V, N> {
+	up: F,
+	measure: (|V| N) context (owner_scope, ambient_nursery),
+}
+
+export impl MapSum<type F: MapFlow<type K, type V>, K, V, type N: Add + Sub + Default> with Flow<
+	N,
+> {
+	[must_use]
+	fun on_change(own self, observer: |N| void): Subscription {
+		observe_flow(self, observer, false)
+	}
+
+	[must_use]
+	fun sub(own self, observer: |N| void): Subscription {
+		observe_flow(self, observer, true)
+	}
+
+	fun start(own self): Instance<N> {
+		let measure = self.measure;
+		let upstream = self.up.open();
+		let stage = Owner::new();
+		let keyed: KeyedCore<K, V, N> = keyed_core(stage, |entry: (K, V)| {
+			let (answer, owner) = run_element(stage, || measure(entry.1));
+			(ElementRun<N>::Constant(answer), owner)
+		});
+		keyed_seed(keyed, (upstream.snapshot)());
+		let zero = N::default();
+		let total: Shared<N> = Shared::new(total_of(zero, keyed_rows(keyed)));
+		let drain = upstream.drain;
+		Instance<N> {
+			pull = || {
+				for event in keyed_resolve(keyed, drain()) {
+					match event {
+						KeyEvent::Arrived(let _key, let _input, let value) => total.write() = total.read() + value,
+						KeyEvent::Changed(let _key, let before, let after, let _rerun) => {
+							total.write() = total.read() - before.1 + after.1;
+						},
+						KeyEvent::Left(let _key, let _input, let value) => total.write() = total.read() - value,
+						KeyEvent::Reset(let rows) => total.write() = total_of(zero, rows),
+					}
+				}
+				total.read()
+			},
+			attach = keyed_attach(keyed, upstream.attach),
+			release = keyed_release(keyed, upstream.release),
+		}
+	}
+}
+
+export impl MapSum<type F: MapFlow<type K, type V>, K, V, type N: Add + Sub + Default> with Pipe<
+	N,
+> {}
+
+/// The sum of the rows' answers, from `zero`.
+fun total_of<K, V, N: Add>(zero: N, rows: List<KeyRow<K, V, N>>): N {
+	mut total = zero;
+	for row in rows {
+		total = total + row.value;
+	}
+	total
 }
