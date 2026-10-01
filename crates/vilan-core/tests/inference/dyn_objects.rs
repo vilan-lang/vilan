@@ -563,7 +563,6 @@ fun main() {
 /// `Option` join only), and the inner object is a `Flow` through the blanket
 /// over every `Source`; the result is a pipe, sealed to be read twice.
 #[test]
-#[ignore = "A142: reactive-44 find: a dyn Source's table has no slot for Flow::start, so a pipe over an object fails at run time (start is not a function)"]
 fn a_std_blanket_flattens_through_the_object() {
     assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };
@@ -739,7 +738,6 @@ fun main() {
 /// renamed `map` to `Flow::derive`, reached through the same blanket; the node
 /// is a pipe, read once with `.sample()`.)
 #[test]
-#[ignore = "A142: reactive-44 find: a dyn Source's table has no slot for Flow::start, so a pipe over an object fails at run time (start is not a function)"]
 fn a124_map_through_a_dyn_source_is_the_blanket_node() {
     assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };
@@ -761,7 +759,6 @@ fun main() {
 /// has one consumer, so each of the three builds its own `derive` over the
 /// object (`.cell()`, `.on_change`, `.sample()`).
 #[test]
-#[ignore = "A142: reactive-44 find: a dyn Source's table has no slot for Flow::start, so a pipe over an object fails at run time (start is not a function)"]
 fn a124_the_blanket_node_spelling_reaches_through_a_dyn_source() {
     assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };

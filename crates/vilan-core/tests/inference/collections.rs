@@ -240,12 +240,12 @@ fn a142_s4_filter_map_and_any_over_transients() {
     );
 }
 
-/// A `dyn` element — the paper's own spelling, `CollSource<dyn TransientSource<..>>`
-/// — is held by B475: a `dyn Source`'s table has no slot for `Flow::start`, so
-/// starting one per element fails at run time ("start is not a function"). The
-/// concrete-element pins above are the shape until B475 lands.
+/// A `dyn` element — the paper's own spelling, `CollSource<dyn TransientSource<..>>`.
+/// Each element is STARTED through its object's table, so the table carries
+/// `Flow::start`, a supertrait member reached through the stage's `Flow` bound
+/// (B475: it had no slot, and starting one per element threw "start is not a
+/// function").
 #[test]
-#[ignore = "B475: a dyn Source's table has no slot for Flow::start (reactive-44's find 3)"]
 fn a142_s4_filter_map_over_source_objects() {
     assert_compiles_and_runs(
         r#"

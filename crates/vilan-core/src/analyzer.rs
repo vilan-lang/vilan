@@ -31920,11 +31920,26 @@ impl<'src> Analyzer<'src> {
                 GenericDispatch::OnType(..) => None,
             })
             .collect();
+        // B475: an object also satisfies a bound on any of its trait's
+        // SUPERTRAITS — a `dyn Source<T>` meets `S: Flow<T>`, which is how a
+        // pipe stage over a source object starts it — so its table takes the
+        // member when the bound's trait is reached FROM the object's trait,
+        // not only when the object's trait is reached from the bound's.
+        let object_closures: Vec<(Id, Vec<Id>)> = self
+            .dyn_object_traits
+            .iter()
+            .map(|object_trait| (*object_trait, self.trait_with_supertraits(*object_trait)))
+            .collect();
         for (constraint_id, member) in dispatches {
             for (trait_id, _) in self.generic_bound_traits(constraint_id) {
                 for reachable in self.trait_with_supertraits(trait_id) {
                     if self.dyn_object_traits.contains(&reachable) {
                         self.dyn_dispatched_members.insert((reachable, member));
+                    }
+                }
+                for (object_trait, closure) in &object_closures {
+                    if closure.contains(&trait_id) {
+                        self.dyn_dispatched_members.insert((*object_trait, member));
                     }
                 }
             }

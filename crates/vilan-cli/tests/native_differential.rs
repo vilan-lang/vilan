@@ -2325,6 +2325,40 @@ const TRACKING_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B475: a pipe over a `dyn Source<T>` STARTS the object through a `Flow`
+/// bound, so the object's table carries `Flow::start` (a supertrait member) —
+/// a `derive` sealed with `.cell()`, one consumed by `on_change`, one read with
+/// `.sample()`, and the total join `switch(|inner| inner)` over a cell of
+/// objects. JS threw "start is not a function"; both backends agree now.
+#[test]
+fn a_pipe_over_a_source_object_starts_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b475.vl"), B475_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b475.vl"),
+        Verdict::Identical,
+        "a pipe over a source object must start it the same way on both backends"
+    );
+}
+
+const B475_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ SignalCell, Source };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet cell = SignalCell::new(1);\n",
+    "\tlet object: dyn Source<i32> = cell;\n",
+    "\tlet cached = object.derive(|n: i32| n + 1).cell();\n",
+    "\tlet watch = object.derive(|n: i32| n * 10).on_change(|n: i32| print(i\"saw {n}\"));\n",
+    "\tlet outer = SignalCell::new(object);\n",
+    "\tlet flat = outer.switch(|inner: dyn Source<i32>| inner).memo();\n",
+    "\tcell.set(5);\n",
+    "\tprint(i\"{object.derive(|n: i32| n + 1).sample()} {cached.get()} {flat.get()}\");\n",
+    "\twatch.dispose();\n",
+    "}\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is
