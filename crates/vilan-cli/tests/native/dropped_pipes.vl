@@ -1,0 +1,32 @@
+// F60 (R-d door (a)): a pipe dropped unconsumed builds natively and runs as
+// on JS — a `derive`, a `distinct_by`, a chain, the free `derive`, a
+// pipe dropped inside a generic body at two instantiations, a `switch`, a
+// `flatten` over `Option`s of sources, and the collection pipes.
+import std::io::print;
+import std::reactive::{ Flow, Signal, SignalCell, Source, derive };
+import std::delta::ListCell;
+import std::option::Option::{ self, None, Some };
+
+fun dropped_in_a_generic<T>(source: SignalCell<T>) {
+	source.derive(|value| Some(value));
+}
+
+fun main() {
+	let count = Signal::new(1);
+	count.derive(|value| value * 2);
+	count.distinct_by(|value| value);
+	count.derive(|value| value * 2).derive(|value| i"{value}");
+	derive(|| count.track() + 1);
+	dropped_in_a_generic(count);
+	dropped_in_a_generic(Signal::new("s"));
+	let first = Signal::new(1);
+	let outer = Signal::new(first);
+	outer.switch(|inner| inner);
+	let maybe: SignalCell<Option<SignalCell<i32>>> = Signal::new(Some(first));
+	maybe.flatten();
+	let items: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+	items.coll();
+	items.coll().map(|x| x * 2);
+	let cells = ListCell::of([1, 2]);
+	print(i"{count.get()} {cells.get().len()}");
+}

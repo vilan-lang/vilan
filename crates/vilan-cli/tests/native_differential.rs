@@ -7185,3 +7185,29 @@ fn a_literal_pattern_takes_its_subjects_width_on_both_backends() {
         "a literal pattern over a `usize`/`u8`/`u53` subject must build and match the same"
     );
 }
+
+/// F60, R-d door (a)'s native half: a pipe that is never consumed — built as a
+/// statement and dropped — builds natively and the program runs as it does on
+/// JS. The pipe nodes' `[must_use]` (reactive-45) makes the drop a WARNING on
+/// both backends; this pin holds the build.
+///
+/// The item's repro, `outer.flatten();` over a `SignalCell<SignalCell<i32>>`,
+/// is not a dropped-pipe defect: KEPT (`let kept = outer.flatten();`) it is
+/// refused natively the same way, because the `flatten` it selects is the
+/// blanket over `Flow<Option<I: Source<U>>>`, whose bound that receiver does
+/// not meet, so `I` and `U` bind to nothing. B476/B477 refuse that selection in
+/// the analyzer. Every well-typed dropped pipe already built; this keeps it so.
+#[test]
+fn a_dropped_pipe_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_dropped_pipes.vl"),
+        include_str!("native/dropped_pipes.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_dropped_pipes.vl"),
+        Verdict::Identical,
+        "a pipe built and dropped must build and run the same on both backends"
+    );
+}
