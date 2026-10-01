@@ -5947,7 +5947,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 guards.push(format!("&*{name} == {literal}"));
                 Ok(name)
             }
-            ExprPattern::Literal(id) => self.expression(*id, 0),
+            // A literal pattern is written at the SUBJECT's type, never at the
+            // expectation around the `match`: `std::base64`'s `match rest { 2
+            // => 1, .. }` over a `usize` remainder emitted `(2i32)`, the arms'
+            // width, and rustc refused every leg (E0308; `crypto.vl`, F57).
+            ExprPattern::Literal(id) => {
+                let saved = std::mem::replace(&mut self.expected_type, subject_type);
+                let rendered = self.expression(*id, 0);
+                self.expected_type = saved;
+                rendered
+            }
             ExprPattern::Variant(enum_id, index, payload) => {
                 // A BACKED variant is its literal, which is the same pattern a
                 // `match` over a raw number or a raw `str` already takes.
@@ -7167,7 +7176,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ("NodeServer", "on_upgrade") => format!(
                 "({}).on_upgrade(&{}, {})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 1, depth)?,
                 self.value_argument(argument_ids, 2, depth)?
             ),
             ("NodeServer", "close") => format!(
@@ -7212,51 +7221,51 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ("NodeResponse", "set_header_raw") => format!(
                 "({}).set_header(&{}, &{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?,
-                self.value_argument(argument_ids, 2, depth)?
+                self.place_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 2, depth)?
             ),
             ("NodeResponse", "end") => format!(
                 "({}).end(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             ("NodeResponse", "end_bytes") => format!(
                 "({}).end_bytes(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             ("NodeResponse", "write") => format!(
                 "({}).write(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             ("NodeResponse", "on_event") => format!(
                 "({}).on_event(&{}, {})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 1, depth)?,
                 self.value_argument(argument_ids, 2, depth)?
             ),
             // --- NodeSocket ---
             ("NodeSocket", "write_text") => format!(
                 "({}).write_text(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             ("NodeSocket", "write_bytes") => format!(
                 "({}).write_bytes(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             ("NodeSocket", "on_bytes") => format!(
                 "({}).on_bytes(&{}, {})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 1, depth)?,
                 self.value_argument(argument_ids, 2, depth)?
             ),
             ("NodeSocket", "on_signal") => format!(
                 "({}).on_signal(&{}, {})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 1, depth)?,
                 self.value_argument(argument_ids, 2, depth)?
             ),
             ("NodeSocket", "set_timeout") => format!(
@@ -7288,7 +7297,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ("Bytes", "copy_into") => format!(
                 "({}).copy_into(&{}, {})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 1, depth)?,
                 self.value_argument(argument_ids, 2, depth)?
             ),
             ("Bytes", "len") => {
@@ -7313,12 +7322,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ("TextDecoder", "decode") => format!(
                 "({}).decode(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             ("TextEncoder", "encode") => format!(
                 "({}).encode(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             // --- RawStat (`std::fs`'s `fs.Stats`) ---
             ("RawStat", "size") => {
@@ -7336,12 +7345,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ("NodeHash", "update") => format!(
                 "({}).update(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             ("NodeHash", "digest") => format!(
                 "({}).digest(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             ("NodeSocket", "destroyed") => format!(
                 "({}).destroyed()",
@@ -7815,11 +7824,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 symbol: "pbkdf2Sync",
             } => format!(
                 "vilan_rt_crypto::pbkdf2_sync(&{}, &{}, ({}) as i64, ({}) as i64, &{})",
-                self.value_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 0, depth)?,
+                self.place_argument(argument_ids, 1, depth)?,
                 self.value_argument(argument_ids, 2, depth)?,
                 self.value_argument(argument_ids, 3, depth)?,
-                self.value_argument(argument_ids, 4, depth)?
+                self.place_argument(argument_ids, 4, depth)?
             ),
             // `buffer.toString(encoding)` on the `Buffer` `pbkdf2Sync`
             // answered. A plain `Uint8Array`'s `toString` is a different
@@ -7836,7 +7845,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 format!(
                     "({}).to_string_encoded(&{})",
                     self.place_argument(argument_ids, 0, depth)?,
-                    self.value_argument(argument_ids, 1, depth)?
+                    self.place_argument(argument_ids, 1, depth)?
                 )
             }
             _ => return Ok(None),
@@ -7940,7 +7949,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             (Some("node:crypto"), "createHash", "create_hash") => Ok(Some(format!(
                 "vilan_rt::crypto::create_hash(&{})",
-                self.value_argument(argument_ids, 0, depth)?
+                self.place_argument(argument_ids, 0, depth)?
             ))),
             (Some("node:fs/promises"), "readFile", "read_bytes") => one(self, "fs::read_bytes"),
             (Some("node:fs/promises"), "readFile", "read_file_encoded") => {
@@ -8184,7 +8193,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ("JSON.parse", "parse_json_value") => {
                 format!(
                     "vilan_rt::json::parse(&{})",
-                    self.value_argument(argument_ids, 0, depth)?
+                    self.place_argument(argument_ids, 0, depth)?
                 )
             }
             // `JSON.stringify(value)` under whatever name declared it:
@@ -8202,7 +8211,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ("Object.hasOwn", "has_json_field") => format!(
                 "({}).has_field(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
+                self.place_argument(argument_ids, 1, depth)?
             ),
             ("String", "coerce_str") => format!(
                 "({}).coerce_str()",
@@ -9418,10 +9427,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // "A".code_at(0)` handed the `let`'s `u32` down to the index, which is
         // an `i32`, and rustc refused `(0u32)`. The literal's own record is
         // the binding's parameter type, which is what it falls back to here.
+        //
+        // F57: the runtime function takes the argument BY VALUE, so the
+        // position consumes it and rule 1's copy is owed at a place read that
+        // is not its binding's last use — `pbkdf2_sha512(password, salt, ..)`
+        // twice over one `salt` moved it into the first call and rustc refused
+        // the second (E0382). A host member that takes a reference (`&{}` in
+        // its rendering) reads its argument with [`Self::place_argument`]
+        // instead, and owes nothing.
         match argument_ids.get(index) {
             Some(argument) => {
                 let argument = *argument;
-                self.expecting_nothing(|emitter| emitter.value_of(argument, depth))
+                self.consumed_value_of_expecting(argument, None, depth)
             }
             None => Ok("()".to_string()),
         }

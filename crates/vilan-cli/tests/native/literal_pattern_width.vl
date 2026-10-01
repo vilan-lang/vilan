@@ -1,0 +1,35 @@
+// F57: a literal pattern is written at its SUBJECT's width — `std::base64`'s
+// `match rest { 2 => 1, .. }` over a `usize` emitted `(2i32)` (the arms'
+// width), and rustc refused every leg; a `u8` and a `u53` subject beside it.
+import std::io::print;
+
+fun tail(length: usize): i32 {
+	let rest = length % 4;
+	match rest {
+		2 => 1,
+		3 => 2,
+		_ => 0,
+	}
+}
+
+fun width(code: u8): str {
+	match code {
+		0 => "nul",
+		255 => "max",
+		_ => "other",
+	}
+}
+
+fun main() {
+	let lengths: List<usize> = [6, 7, 8];
+	for length in lengths {
+		print(tail(length));
+	}
+	print(width(255u8));
+	let big: u53 = 5;
+	let shown: str = match big {
+		5 => "five",
+		_ => "?",
+	};
+	print(shown);
+}

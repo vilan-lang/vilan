@@ -224,6 +224,29 @@ const ASYNC_SUITE: &[&str] = &[
     "time.vl",
 ];
 
+/// F57: the corpus programs that reach a platform module and that the
+/// backend BUILDS — the ones the platform-free sweep leaves out by
+/// construction, so no gate saw them. `crypto.vl` was rustc E0382 at the
+/// Order 44 seal (a host binding's by-value argument moved its `salt`) behind
+/// an E0308 (a `match` literal pattern written at the arms' width over a
+/// `usize`), and nothing ran it. [`every_platform_bound_program_is_identical_or_named`]
+/// requires these four and classifies the rest.
+const PLATFORM_BOUND_REQUIRED: &[&str] = &[
+    "crypto.vl",
+    "db.vl",
+    "asset_bundle.vl",
+    "element-syntax.vl",
+];
+
+/// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
+/// agree on for a reason that is not the program's, named with the reason.
+const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[(
+    "estate.vl",
+    "the JS `vilan run` prints its build's asset report (`Bundled  robots.txt`, ...) on \
+     STDOUT ahead of the program's output, and the native run reports nothing; the \
+     program's own three lines are identical",
+)];
+
 /// Modules whose presence in an `import` means the program reaches a platform
 /// surface S1a has none of. Written as a support list so Order 38 widens the
 /// corpus by deleting rows rather than by rewriting the walk.
@@ -291,6 +314,30 @@ pub fn platform_free_programs() -> Vec<String> {
                 .iter()
                 .any(|(excluded, _)| *excluded == name);
             if !reaches_a_platform && !outside {
+                programs.push(name);
+            }
+        }
+    }
+    programs.sort();
+    programs
+}
+
+/// Every corpus program that reaches a platform module and is not one of
+/// [`ASYNC_SUITE`]'s (which has its own gate), in a stable order — the
+/// complement of [`platform_free_programs`] over the same walk.
+fn platform_bound_programs() -> Vec<String> {
+    let free = platform_free_programs();
+    let mut programs = Vec::new();
+    let entries = std::fs::read_dir(corpus_dir()).expect("read the corpus directory");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "vl") {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let outside = OUTSIDE_THE_DIFFERENTIAL
+                .iter()
+                .chain(PLATFORM_BOUND_OUTSIDE)
+                .any(|(excluded, _)| *excluded == name);
+            if !free.contains(&name) && !ASYNC_SUITE.contains(&name.as_str()) && !outside {
                 programs.push(name);
             }
         }
@@ -7068,4 +7115,73 @@ fn a_field_read_or_written_through_a_shared_view_is_identical_on_both_backends()
             "{name}: a field through a `Shared` view must read and write the same on both backends"
         );
     }
+}
+
+/// F57: every platform-bound corpus program the backend ACCEPTS prints what
+/// node prints, the ones it refuses say which construct stopped them, and the
+/// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is
+/// printed, as the corpus sweep's is: its refusals are the work list.
+#[test]
+fn every_platform_bound_program_is_identical_or_named() {
+    let staged = stage();
+    let programs = platform_bound_programs();
+    let mut identical_programs: Vec<String> = Vec::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut broken = Vec::new();
+    for program in &programs {
+        match compare(&staged, program) {
+            Verdict::Identical => identical_programs.push(program.clone()),
+            Verdict::Refused(reason) => refused.push((program.clone(), reason)),
+            Verdict::Broken(detail) => broken.push(format!("{program}: {detail}")),
+        }
+    }
+    eprintln!(
+        "platform-bound differential: {} enumerated, {} identical, {} refused by name, {} broken",
+        programs.len(),
+        identical_programs.len(),
+        refused.len(),
+        broken.len()
+    );
+    for (program, reason) in &refused {
+        eprintln!("  refused  {program}: {reason}");
+    }
+    for program in &identical_programs {
+        eprintln!("  identical  {program}");
+    }
+    assert!(
+        broken.is_empty(),
+        "platform-bound programs the native backend ACCEPTED and then got wrong:\n{}",
+        broken.join("\n")
+    );
+    for required in PLATFORM_BOUND_REQUIRED {
+        assert!(
+            identical_programs.iter().any(|program| program == required),
+            "{required} builds natively and prints node's bytes; it must stay that way"
+        );
+    }
+    for (program, _) in PLATFORM_BOUND_OUTSIDE {
+        assert!(
+            corpus_dir().join(program).is_file(),
+            "{program} is named outside the platform-bound differential but is not a corpus program"
+        );
+    }
+}
+
+/// F57's second defect: a `match` literal pattern takes the SUBJECT's width,
+/// never the expectation around the `match` (the arms' type). It stood behind
+/// `crypto.vl`'s E0382 in `std::base64::decode_url`, so the platform-bound pin
+/// reaches it only through a platform; this probe holds it platform-free.
+#[test]
+fn a_literal_pattern_takes_its_subjects_width_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_literal_pattern_width.vl"),
+        include_str!("native/literal_pattern_width.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_literal_pattern_width.vl"),
+        Verdict::Identical,
+        "a literal pattern over a `usize`/`u8`/`u53` subject must build and match the same"
+    );
 }
