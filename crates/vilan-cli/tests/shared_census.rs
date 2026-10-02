@@ -165,11 +165,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
     (
         "store.vl",
         4,
-        "E: a store's cells, all minted by the store and reached through every copy \
-         of a handle (A142 S7, `proposal/store.md`) — the root's value (`Store::new`), \
-         each node of its slot tree, a slot's subscription count (read by the \
-         subscription's release, Q12), and the payload `assume()` falls back to \
-         (held by the `Store<P>` it hands back)",
+        "E + R: a store's cells, all minted by the store and reached through every \
+         copy of a handle (A142 S7, `proposal/store.md`) — the root's value \
+         (`Store::new`), each node of its slot tree, a slot's subscription count \
+         (read by the subscription's release, Q12) — and the identity draw (R): a \
+         path's identity is minted once, from the one counter `Shared::identity` \
+         stamps from, by a cell made for its stamp (A146)",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
     (

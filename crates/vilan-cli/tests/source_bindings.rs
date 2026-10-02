@@ -331,7 +331,9 @@ fun main() {
 	let presence = Store::new(Presence::Online(Device { name = "laptop", since = 1 }));
 	let _root = mount_root("app", || view("main").child(when_live(presence.online(), |device| {
 		print("built");
-		view("p").bind_text(device.name())
+		// The handles bind through the `Flow` arms alone (B476): a text binding
+		// and an attribute value.
+		view("p").attr("title", device.name()).bind_text(device.name())
 	})));
 	dump("mounted");
 	let _renamed = presence.online().name().patch("phone");
@@ -363,9 +365,12 @@ fun main() {
         position("offline"),
         position("online"),
     );
-    assert!(lines[mounted].contains("<p>laptop</p>"), "mount:\n{stdout}");
     assert!(
-        lines[patched].contains("<p>phone</p>"),
+        lines[mounted].contains(r#"<p title="laptop">laptop</p>"#),
+        "mount:\n{stdout}"
+    );
+    assert!(
+        lines[patched].contains(r#"<p title="phone">phone</p>"#),
         "a payload write must reach the body's binding:\n{stdout}"
     );
     assert_eq!(
@@ -378,7 +383,7 @@ fun main() {
         "the variant ending must take the body down:\n{stdout}"
     );
     assert!(
-        lines[online].contains("<p>tablet</p>"),
+        lines[online].contains(r#"<p title="tablet">tablet</p>"#),
         "rebuilt:\n{stdout}"
     );
     assert_eq!(

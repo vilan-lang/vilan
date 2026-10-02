@@ -69,7 +69,9 @@ handle's path — a read of `city` copies the city, never the whole user — and
 A handle is data: copying it allocates nothing, and it has no owner. It is a
 `Source<T>`, so every pipe, effect and binding takes one (`city.derive(..)`,
 `<p>{city}</p>`), and a `Signal<T>`, so anything that writes a signal writes it
-(`set_with`, `optimistic`, `bind_value`).
+(`set_with`, `optimistic`, `bind_value`). Every handle to one path of one store
+has one `identity()`, so a body that `track()`s a handle on every run keeps one
+edge on it.
 
 ## What a write wakes
 

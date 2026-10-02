@@ -854,3 +854,89 @@ fn a142_s7_when_live_compiles_on_both_ui_layers() {
         "<aside><p>laptop</p></aside>\n<aside></aside>\n",
     );
 }
+
+// ── A146: a store handle names its state ────────────────────────────────────
+
+#[test]
+fn a142_s7_every_handle_to_one_path_of_one_store_shares_an_identity() {
+    // A146 on the store: one number per path of one store — a projection made
+    // twice, a copy, a flag asked twice and the `Store` `assume()` hands back
+    // beside its `StoreSome` agree; another path, another flag and the same path
+    // of another store differ.
+    assert_compiles_and_runs(
+        &variant_program(
+            r#"
+            let user = Store::new(alice());
+            let other = Store::new(alice());
+            let city = user.address().city();
+            let copy = city;
+            print(user.address().city().identity() == copy.identity());
+            print(city.identity() == user.address().zip().identity());
+            print(city.identity() == other.address().city().identity());
+            print(user.identity() == user.identity());
+            print(user.nick().is_some().identity() == user.nick().is_some().identity());
+            let presence = Store::new(online("laptop", 1));
+            print(presence.online().identity() == presence.online().assume().identity());
+            print(presence.is_online().identity() == presence.is_away().identity());
+            "#,
+        ),
+        "true\nfalse\nfalse\ntrue\ntrue\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn a142_s7_a_tracked_read_of_a_store_handle_attaches_once_across_runs() {
+    // A146's point: a body that `track()`s the same handle on every run keeps ONE
+    // edge on it. The instrument wraps the handle and counts its attaches; with
+    // `identity()` delegated to the handle's, five re-runs attach once. Red with
+    // the handle's identity answering `None`: one attach per run and one more for the write (`attaches=7`).
+    assert_compiles_and_runs(
+        &program(
+            r#"
+            let user = Store::new(alice());
+            let watched = Watched { inner = user.address().city(), attaches = Shared::new(0) };
+            let trigger: SignalCell<i32> = Signal::new(0);
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                derive(|| i"{trigger.track()} {watched.track()}").effect(|line| print(line));
+            });
+            mut step = 1;
+            for step <= 5 {
+                trigger.set(step);
+                step += 1;
+            }
+            user.address().city().set("Bergen");
+            print(i"attaches={watched.attaches.read()}");
+            owner.dispose();
+            "#,
+        )
+        .replace(
+            "fun main() {",
+            r#"import std::reactive::{ Subscriber, Subscription };
+
+struct Watched {
+    inner: Store<str>,
+    attaches: Shared<i32>,
+}
+
+impl Watched with Source<str> {
+    fun get(self): str {
+        self.inner.get()
+    }
+
+    [must_use]
+    fun on_settle(self, subscriber: Subscriber): Subscription {
+        self.attaches.write() = self.attaches.read() + 1;
+        self.inner.on_settle(subscriber)
+    }
+
+    fun identity(self): Option<i32> {
+        self.inner.identity()
+    }
+}
+
+fun main() {"#,
+        ),
+        "0 Oslo\n1 Oslo\n2 Oslo\n3 Oslo\n4 Oslo\n5 Oslo\n5 Bergen\nattaches=1\n",
+    );
+}

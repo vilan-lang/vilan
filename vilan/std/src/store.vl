@@ -50,7 +50,9 @@
 // while it is. It is not a `Signal`: `set(None)` would have no meaning there.
 // Switching the variant is a write to the enum's own handle.
 import pkg::compare::PartialEq;
+import pkg::hash::Hashable;
 import pkg::io::panic;
+import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	Signal,
@@ -60,6 +62,7 @@ import pkg::reactive::{
 	Subscription,
 	also_releasing,
 	batch,
+	observe,
 };
 import pkg::shared::Shared;
 
@@ -81,14 +84,49 @@ export struct StoreSlot {
 /// struct's children are its fields, by declaration index; an enum's child `1 + i`
 /// is the payload of variant `i`, and its child 0 the discriminant, whose own child
 /// `1 + i` is variant `i`'s flag.
+///
+/// The ROOT's node also keeps the store's identities (`ids`): one number per path
+/// ever asked about, minted on the first ask and kept — an identity must not change
+/// while anything holds it, and a node comes and goes with its subscriptions, so
+/// the table hangs off the one node that never goes. Every other node's is `None`.
 export struct StoreNode {
 	me: Option<StoreSlot>,
 	kids: List<Option<Shared<StoreNode>>>,
+	ids: Option<NativeMap<i32>>,
 }
 
 fun empty_node(): Shared<StoreNode> {
 	mut kids: List<Option<Shared<StoreNode>>> = [];
-	Shared::new(StoreNode { me = None, kids })
+	Shared::new(StoreNode { me = None, kids, ids = None })
+}
+
+/// The identity of the path `path` under `root` (A146): one number for every handle
+/// to it — a projection made twice, a copy, the `Store` that `assume()` hands back
+/// beside its `StoreSome` — and a different one for every other path and every
+/// other store. A tracked read of a handle keeps one edge across runs by it.
+fun identity_at(root: Shared<StoreNode>, path: List<usize>): i32 {
+	let key = path.hash();
+	match root.read().ids {
+		Some(let ids) => match ids.get(key) {
+			Some(let held) => {
+				ret held;
+			},
+			None => {},
+		},
+		None => {},
+	}
+	// Drawn from the ONE identity space `Shared::identity` stamps from, which a
+	// `SignalCell`'s identity is: a tracker compares identities across sources,
+	// and `fresh_id`'s counter (subscriber ids) overlaps that one — a store path
+	// minted there collided with a cell's in one tracked body and never attached.
+	let minted = Shared::new(0).identity();
+	mut ids: NativeMap<i32> = match root.read().ids {
+		Some(let held) => held,
+		None => NativeMap::new(),
+	};
+	ids.insert(key, minted);
+	root.write().ids = Some(ids);
+	minted
 }
 
 /// The child of `node` at `index`, if anything ever watched below it — the diff's
@@ -253,24 +291,27 @@ fun deliver(woken: List<StoreSlot>) {
 	}
 }
 
-/// Attach `subscriber` to the slot at `path` — made here, with the nodes on the way
-/// down, if nothing watches the path yet — and count it. The handle's release takes
-/// the count down and, with the last subscription, drops the slot and every node
-/// left empty (Q12).
-fun watch_at(root: Shared<StoreNode>, path: List<usize>, subscriber: Subscriber): Subscription {
+/// The slot at `path` — made here, with the nodes on the way down, if nothing
+/// watches the path yet.
+fun slot_at(root: Shared<StoreNode>, path: List<usize>): StoreSlot {
 	mut node = root;
 	for index in path {
 		node = kid_made(node, index);
 	}
-	let slot = match node.read().me {
+	match node.read().me {
 		Some(let held) => held,
 		None => {
 			let made = StoreSlot { signal = SignalCell::new(0), watchers = Shared::new(0) };
 			node.write().me = Some(made);
 			made
 		},
-	};
-	let handle = slot.signal.on_settle(subscriber);
+	}
+}
+
+/// Count one subscription onto `slot`, and chain its release onto `handle`: the
+/// count goes down when the handle is disposed and, with the last subscription,
+/// the slot goes, and every node left empty (Q12).
+fun counted(root: Shared<StoreNode>, path: List<usize>, slot: StoreSlot, handle: Subscription) {
 	slot.watchers.write() = slot.watchers.read() + 1;
 	let watchers = slot.watchers;
 	also_releasing(handle, || {
@@ -280,6 +321,25 @@ fun watch_at(root: Shared<StoreNode>, path: List<usize>, subscriber: Subscriber)
 			prune(root, path);
 		}
 	});
+}
+
+/// Attach `subscriber` to the slot at `path`, counted.
+fun watch_at(root: Shared<StoreNode>, path: List<usize>, subscriber: Subscriber): Subscription {
+	let slot = slot_at(root, path);
+	let handle = slot.signal.on_settle(subscriber);
+	counted(root, path, slot, handle);
+	handle
+}
+
+/// Attach an OBSERVER to the slot at `path`, counted. The subscriber is minted
+/// where every observer's is (`observe`), so a derivation mark reaches it, and the
+/// closure the slot keeps holds only the handle's READ — never the slot tree, which
+/// holds the slot: a handle captured there would be a loop through every node on
+/// the path (A132's, one level down; `MapEntry::attach_observer` is the model).
+fun observe_at(root: Shared<StoreNode>, path: List<usize>, observer: || void): Subscription {
+	let slot = slot_at(root, path);
+	let handle = observe(slot.signal, |_wake| observer());
+	counted(root, path, slot, handle);
 	handle
 }
 
@@ -667,8 +727,10 @@ export impl StoreSome<type P> {
 	/// body down — it reads the payload as it was when this was called, and a write
 	/// then lands nowhere. Refuses a variant that is not live now.
 	fun assume(self): Store<P> {
-		let held: Shared<Option<P>> = Shared::new(self.get());
-		if held.read().is_none() {
+		// A capture, not a cell: nothing writes it, and a closure captures the
+		// BINDING (spec §6.9).
+		let snapshot = self.get();
+		if snapshot.is_none() {
 			panic("`StoreSome::assume` on a variant that is not live");
 		}
 		let lend = self.lend;
@@ -682,7 +744,7 @@ export impl StoreSome<type P> {
 					f(&payload);
 				});
 				if !reached {
-					match held.read() {
+					match snapshot {
 						Some(let last) => f(&last),
 						None => {},
 					}
@@ -747,14 +809,12 @@ export impl Store<type T> with Source<T> {
 	/// The value at this path, copied out of the root in place: a leaf read copies
 	/// the leaf, however large the root.
 	fun get(self): T {
-		mut out: Option<T> = None;
-		(self.lend)(|held: &T| {
-			out = Some(*held);
-		});
-		match out {
-			Some(let value) => value,
-			None => panic("a `Store` read reached no value"),
-		}
+		lent_value(self.lend)
+	}
+
+	/// One number for every handle to this path of this store (A146).
+	fun identity(self): Option<i32> {
+		Some(identity_at(self.root, self.path))
 	}
 
 	/// Attach to this path's slot, made (with its nodes) on the first subscription
@@ -763,6 +823,39 @@ export impl Store<type T> with Source<T> {
 	fun on_settle(self, subscriber: Subscriber): Subscription {
 		watch_at(self.root, self.path, subscriber)
 	}
+
+	/// The observer reads through the handle's in-place lend, which is all the
+	/// slot's closure keeps (`observe_at`).
+	[must_use]
+	fun attach_observer(self, observer: |T| void, immediately: bool): Subscription {
+		let lend = self.lend;
+		let handle = observe_at(self.root, self.path, || observer(lent_value(lend)));
+		if immediately {
+			observer(lent_value(lend));
+		}
+		handle
+	}
+}
+
+/// The value a `Store`'s lend reaches, copied out — only the value at the path.
+fun lent_value<T>(lend: |(|&T| void)| void): T {
+	mut out: Option<T> = None;
+	lend(|held: &T| {
+		out = Some(*held);
+	});
+	match out {
+		Some(let value) => value,
+		None => panic("a `Store` read reached no value"),
+	}
+}
+
+/// The payload a `StoreSome`'s lend reaches while its variants are live.
+fun lent_option<P>(lend: |(|&P| void)| void): Option<P> {
+	mut out: Option<P> = None;
+	lend(|held: &P| {
+		out = Some(*held);
+	});
+	out
 }
 
 export impl Store<type T: Storable> with Signal<T> {
@@ -784,16 +877,27 @@ export impl StoreSome<type P> with Source<Option<P>> {
 	/// The payload at this path while every variant on the way is live, else
 	/// `None`.
 	fun get(self): Option<P> {
-		mut out: Option<P> = None;
-		(self.lend)(|held: &P| {
-			out = Some(*held);
-		});
-		out
+		lent_option(self.lend)
+	}
+
+	/// One number for every handle to this path of this store (A146).
+	fun identity(self): Option<i32> {
+		Some(identity_at(self.root, self.path))
 	}
 
 	[must_use]
 	fun on_settle(self, subscriber: Subscriber): Subscription {
 		watch_at(self.root, self.path, subscriber)
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |Option<P>| void, immediately: bool): Subscription {
+		let lend = self.lend;
+		let handle = observe_at(self.root, self.path, || observer(lent_option(lend)));
+		if immediately {
+			observer(lent_option(lend));
+		}
+		handle
 	}
 }
 
@@ -817,9 +921,24 @@ export impl StoreFlag with Source<bool> {
 		(self.read)()
 	}
 
+	/// One number for every handle to this flag of this store (A146).
+	fun identity(self): Option<i32> {
+		Some(identity_at(self.root, self.path))
+	}
+
 	[must_use]
 	fun on_settle(self, subscriber: Subscriber): Subscription {
 		watch_at(self.root, self.path, subscriber)
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |bool| void, immediately: bool): Subscription {
+		let read = self.read;
+		let handle = observe_at(self.root, self.path, || observer(read()));
+		if immediately {
+			observer(read());
+		}
+		handle
 	}
 }
 
