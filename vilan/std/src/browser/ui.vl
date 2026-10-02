@@ -66,8 +66,8 @@ import pkg::reactive::{
 	reconcile,
 	run_with_owner,
 	subscriber_of,
-	turn,
 	tracking,
+	turn,
 	turn_scope,
 };
 import pkg::shared::Shared;
@@ -198,8 +198,8 @@ export impl View {
 	/// below, and each dispatch runs the clause-typed handler inside a fresh turn —
 	/// an event's signal writes settle as one wave. (`AtSuspension` behaves as
 	/// `AtEnd` until the async hook lands.) Handlers die with the DOM node — no
-	/// registration needed. A handler is a CALLBACK (A142 §7.3, B482): it runs under
-	/// `tracking.clear(..)`, so a `track()` in it is refused at compile time.
+	/// registration needed. A handler is a CALLBACK (A142 §7.3, B482): it runs
+	/// under `tracking.clear(..)`, so a `track()` in it is refused at compile time.
 	fun on(self, event: str, handler: (|| void) context (turn_scope, tracking)): View {
 		self.element.on(event, || turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler())));
 		self
@@ -209,11 +209,8 @@ export impl View {
 	/// modifier keys, key names. The same turn discipline: each dispatch settles as
 	/// one wave.
 	fun on_event(self, event: str, handler: (|Event| void) context (turn_scope, tracking)): View {
-		self.element
-			.on_event(
-				event,
-				|dispatched| turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler(dispatched))),
-			);
+		self.element.on_event(event, |dispatched| turn(FlushPolicy::AtSuspension, || tracking
+			.clear(|| handler(dispatched))));
 		self
 	}
 
