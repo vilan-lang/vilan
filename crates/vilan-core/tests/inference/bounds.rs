@@ -8073,6 +8073,108 @@ fn a_bounded_dispatch_reached_from_many_callers_selects_once_per_type() {
     );
 }
 
+/// M97: the selections dispatch refinement asks are answered ONCE per program.
+///
+/// Both shipped consumers — the context pass and the const pass's const-only
+/// check — refine their dispatch sites through `refined_edges`, and each asked
+/// `impl_members_for_bound` the same questions afresh: on kolt's client ~5.9G
+/// instructions apiece, ~10% of a `check` each. The answers are now memoized
+/// on the `Program`, so a refinement of a program whose passes have already
+/// run evaluates its per-site selections exactly as before (the per-site count
+/// is unchanged — that memo is E106's, and its pin is the one above) and
+/// COMPUTES none of them. Only a counter can see it; the edges do not move.
+#[test]
+fn a_refinement_after_the_passes_computes_no_selection_the_passes_already_made() {
+    use vilan_core::call_graph::{CallGraph, CallTarget, IndirectReason};
+    use vilan_core::dispatch_refine::{
+        self, DispatchSite, RefinedCaller, candidates_of, member_name_at,
+    };
+
+    let source = r#"
+        trait Show3 { fun show3(self): str; }
+        struct Badge { size: i32 }
+        impl Badge with Show3 { fun show3(self): str { "badge" } }
+
+        fun tell<V: Show3>(value: V) { print(value.show3()); }
+
+        fun main() {
+            tell(Badge { size = 1 });
+            tell(Badge { size = 2 });
+        }
+        main();
+        "#;
+    let (evaluated, computed, edges_first, edges_second) = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let graph = CallGraph::build(&program);
+            let mut sites: Vec<DispatchSite> = Vec::new();
+            for node in graph.nodes() {
+                for call in graph.calls_of(node.id()) {
+                    if !matches!(
+                        call.target,
+                        CallTarget::Indirect(
+                            IndirectReason::TraitDispatch | IndirectReason::GenericMember
+                        )
+                    ) {
+                        continue;
+                    }
+                    let Some(name) = member_name_at(&program, call.call_id) else {
+                        continue;
+                    };
+                    sites.push(DispatchSite {
+                        owner: RefinedCaller::Node(node.id()),
+                        call: call.call_id,
+                        candidates: candidates_of(
+                            &program,
+                            program.admitting_file(call.call_id),
+                            name,
+                        ),
+                    });
+                }
+            }
+            let edges_first = dispatch_refine::refined_edges(&program, &graph, &sites).len();
+            dispatch_refine::reset_selection_count();
+            dispatch_refine::reset_bound_selections_computed();
+            let edges_second = dispatch_refine::refined_edges(&program, &graph, &sites).len();
+            (
+                dispatch_refine::selection_count(),
+                dispatch_refine::bound_selections_computed(),
+                edges_first,
+                edges_second,
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+
+    assert!(
+        evaluated > 0,
+        "the program must make the refinement select (`value.show3()` inside \
+         `tell`), or the count below proves nothing"
+    );
+    assert_eq!(edges_first, edges_second, "the memo must change no edge");
+    assert_eq!(
+        computed, 0,
+        "{evaluated} selections were asked a second time and {computed} were \
+         COMPUTED again: dispatch refinement must answer a question the program \
+         has already answered from its memo (M97)"
+    );
+}
+
 /// Analyzes `source` on a large-stack worker and reports how many BOUND
 /// EVALUATIONS `check_generic_bound_satisfaction` performed — the M19 memo's
 /// instrument. The counter is zeroed on the worker thread, so a concurrently

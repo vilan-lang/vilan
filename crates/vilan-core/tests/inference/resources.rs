@@ -8886,3 +8886,146 @@ fn b469_a_trait_default_destructures_when_the_inheriting_resource_has_no_drop() 
         "cannot move a resource field out of a live aggregate",
     );
 }
+
+// --- M94: R11 classifies the instantiated callee's body, not the program ----
+//
+// Since A142 R39 made `Flow` and `Pipe` `[resource]` traits, every std reactive
+// generic called with a pipe is an R11 instantiation — merely importing
+// `std::reactive` makes thirteen of them. Each one used to re-classify EVERY
+// binding and place expression in the program, minting a fresh type slot per
+// place as it went: O(instantiations × program), 1.45M scratch slots and
+// ~570 ms on kolt's client, and every slot was then classified again by
+// `compute_resource_types` (M95). The diagnostics cannot tell the difference
+// — the wider set was never read — so only a count can pin it: the type slots
+// one analysis leaves behind.
+
+/// Analyzes `source` cold on a large-stack worker and reports how many type
+/// slots the finished program holds. Cold because a base-cache hit serves a
+/// cloned world whose slot count is the storing analysis's, not this one's.
+fn type_slots_after_one_analysis(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            vilan_core::analyzer::base_cache_clear();
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            program
+                .expect("analysis should produce a program")
+                .type_id_to_type_map
+                .len()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// A program of `functions` filler functions, each reading three place
+/// expressions (`pair`, `pair.0`, `pair.1`), behind `header`.
+fn filler_program(header: &str, functions: usize) -> String {
+    let mut source = format!("{header}\nimport std::io::print;\n");
+    for index in 0..functions {
+        source.push_str(&format!(
+            "fun filler_{index}(pair: (i32, i32)): i32 {{ pair.0 + pair.1 }}\n"
+        ));
+    }
+    source.push_str("fun main() { print(filler_0((1, 2))); }\n");
+    source
+}
+
+#[test]
+fn r11_instantiations_do_not_mint_a_type_slot_per_place_in_the_program() {
+    const SMALL: usize = 10;
+    const LARGE: usize = 60;
+    // The same filler grows the program by the same slots with or without the
+    // reactive module — unless each of `std::reactive`'s instantiations pays
+    // for every place the filler adds, which is the regression.
+    let plain_growth = type_slots_after_one_analysis(&filler_program("", LARGE))
+        - type_slots_after_one_analysis(&filler_program("", SMALL));
+    let reactive_growth =
+        type_slots_after_one_analysis(&filler_program("import std::reactive;", LARGE))
+            - type_slots_after_one_analysis(&filler_program("import std::reactive;", SMALL));
+    // A program that declares a resource runs the CONCRETE move scan once,
+    // and it reads one slot per place: linear, and allowed. One slot per place
+    // per INSTANTIATION is the regression — thirteen here, before M94.
+    let added_places = 3 * (LARGE - SMALL);
+    let extra_per_place =
+        (reactive_growth.saturating_sub(plain_growth)) as f64 / added_places as f64;
+    assert!(
+        extra_per_place < 3.0,
+        "adding {added_places} place expressions grew a program that imports \
+         `std::reactive` by {reactive_growth} type slots against {plain_growth} \
+         without it ({extra_per_place:.1} extra per place): R11 is classifying \
+         (and minting for) places outside the instantiated callee (M94)"
+    );
+}
+
+// --- M95: resource classification mints no slot a substitution cannot change ---
+//
+// `compute_resource_types` classifies every type slot, and classifying an
+// instantiation (`Holder<i32>`) substitutes the declaration's members through
+// its arguments. Each substitution minted a fresh slot, even where it changed
+// nothing — the member mentioned no generic, or was a generic bound to a
+// concrete slot — and slots are not interned, so the classification memo
+// missed on every copy: 274k fresh slots over kolt's client's 343k roots.
+// The member's own (or its bound's) slot classifies identically. Only a count
+// can see the difference.
+
+#[test]
+fn classifying_an_instantiation_mints_no_slot_its_substitution_cannot_change() {
+    const SMALL: usize = 10;
+    const LARGE: usize = 60;
+    let program = |declaration: &str, literal: &str, functions: usize| {
+        let mut source = format!("import std::io::print;\n{declaration}\n");
+        for index in 0..functions {
+            source.push_str(&format!(
+                "fun filler_{index}(): i32 {{ let held = {literal}; held.a + held.b + held.c }}\n"
+            ));
+        }
+        source.push_str("fun main() { print(filler_0()); }\n");
+        source
+    };
+    let generic = |functions| {
+        program(
+            "struct Holder<T> { a: T, b: T, c: T }",
+            "Holder { a = 1, b = 2, c = 3 }",
+            functions,
+        )
+    };
+    let plain = |functions| {
+        program(
+            "struct Plain { a: i32, b: i32, c: i32 }",
+            "Plain { a = 1, b = 2, c = 3 }",
+            functions,
+        )
+    };
+    let plain_growth =
+        type_slots_after_one_analysis(&plain(LARGE)) - type_slots_after_one_analysis(&plain(SMALL));
+    let generic_growth = type_slots_after_one_analysis(&generic(LARGE))
+        - type_slots_after_one_analysis(&generic(SMALL));
+    // The generic program's own analysis mints four more slots per function
+    // than the plain one (the instantiation and its substituted reads); the
+    // classification's copies added six more — two `Holder<i32>` roots per
+    // function, three members each — reading 10.0 with them planted back.
+    let added = LARGE - SMALL;
+    let extra_per_function = generic_growth.saturating_sub(plain_growth) as f64 / added as f64;
+    assert!(
+        extra_per_function < 7.0,
+        "adding {added} functions that each build a `Holder<i32>` grew the program by \
+         {generic_growth} type slots against {plain_growth} for the same functions over a \
+         non-generic struct ({extra_per_function:.1} extra per function): classification is \
+         minting a slot per member it substitutes without changing (M95)"
+    );
+}

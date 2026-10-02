@@ -602,6 +602,76 @@ fn phase_timing_env_var_prints_the_phase_split() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M98: `VILAN_PHASE_TIMING=passes` adds the checks phase's per-pass split —
+/// one `[vilan pass]` line per pass that cost a millisecond, its own prefix so
+/// the positional `[vilan phase]` readers never see it — and every value of
+/// the switch prints the `emission-walk … program-drop …` row, the two costs
+/// after the post-passes that no phase line used to name.
+#[test]
+fn phase_timing_passes_prints_the_per_pass_split_and_the_emission_row() {
+    let dir = temp_package(
+        "phasepasses",
+        "import std::reactive;\nimport std::io::print;\nfun main() { print(7); }\n",
+    );
+    let run = |value: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .current_dir(&dir)
+            .args(["check", "."])
+            .env("VILAN_PHASE_TIMING", value)
+            .output()
+            .expect("run vilan");
+        assert!(
+            output.status.success(),
+            "the fixture must check cleanly; stderr was: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    let split = run("passes");
+    let pass_lines: Vec<&str> = split
+        .lines()
+        .filter(|line| line.starts_with("[vilan pass]"))
+        .collect();
+    // A host with no per-thread CPU clock (Windows: the phase lines read
+    // `/?cpu`) has nothing to split by, so the split prints no line there —
+    // the row below is what every host must print.
+    let host_has_a_thread_cpu_clock = !split.contains("/?cpu");
+    assert!(
+        !pass_lines.is_empty() || !host_has_a_thread_cpu_clock,
+        "VILAN_PHASE_TIMING=passes printed no per-pass line; stderr was: {split}"
+    );
+    for line in &pass_lines {
+        let figure = line
+            .split_whitespace()
+            .find(|word| word.ends_with("cpu"))
+            .unwrap_or_else(|| panic!("`{line}` carries no `<ms>cpu` figure"));
+        let milliseconds: f64 = figure
+            .trim_end_matches("cpu")
+            .parse()
+            .unwrap_or_else(|_| panic!("`{line}`'s cpu figure must be a number"));
+        assert!(
+            milliseconds >= 1.0,
+            "`{line}` is under the one-millisecond floor the split prints at"
+        );
+    }
+    assert!(
+        split.contains("[vilan phase] emission-walk ") && split.contains(" program-drop "),
+        "the emission row is missing; stderr was: {split}"
+    );
+
+    let plain = run("1");
+    assert!(
+        !plain.contains("[vilan pass]"),
+        "the per-pass split must be off under VILAN_PHASE_TIMING=1; stderr was: {plain}"
+    );
+    assert!(
+        plain.contains("[vilan phase] emission-walk "),
+        "the emission row rides every value of the switch; stderr was: {plain}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The post-pass half of the split, per pass (backlog M5,
 /// `perf-baseline.md` §6): the aggregate `post-passes` wall could not say
 /// which pass moved, and it printed only on the `analyze_source` path — a CLI
