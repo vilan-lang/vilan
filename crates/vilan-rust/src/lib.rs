@@ -2312,6 +2312,38 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
+    /// Whether a DECLARED type mentions one of a declaration's own
+    /// `parameters` anywhere — read off the declaration, never through the
+    /// substitution in force.
+    fn mentions_a_parameter(&self, type_id: TypeId, parameters: &[TypeId]) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return true;
+        };
+        if parameters.contains(&type_id) {
+            return true;
+        }
+        match self.program.type_id_to_type_map.get(&type_id) {
+            Some(Type::Generic(constraint_id)) => parameters.contains(constraint_id),
+            Some(
+                Type::Struct(_, arguments)
+                | Type::Enum(_, arguments)
+                | Type::Tuple(arguments)
+                | Type::Trait(_, arguments)
+                | Type::Dyn(_, arguments),
+            ) => arguments
+                .iter()
+                .any(|argument| self.mentions_a_parameter(*argument, parameters)),
+            Some(Type::Array(element, _)) => self.mentions_a_parameter(*element, parameters),
+            Some(Type::Closure(closure_parameters, returned, _)) => {
+                closure_parameters
+                    .iter()
+                    .any(|parameter| self.mentions_a_parameter(*parameter, parameters))
+                    || self.mentions_a_parameter(*returned, parameters)
+            }
+            _ => false,
+        }
+    }
+
     /// A nominal type instantiated at `any` is REFUSED, even though `any`
     /// itself now renders (F18 slice 2).
     ///
@@ -6643,15 +6675,54 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .get(*index)
                 .ok_or_else(|| unsupported("a struct field past the declaration", span))?;
             let name = sanitize(field.name);
-            // The field's declared type under THIS instantiation, so a field
-            // holding a generic enum can ground it.
+            // The field's declared type under THIS instantiation, so a value
+            // closed only by its position — a bare variant, a generic call left
+            // open — closes from it.
+            //
+            // F73: the WHOLE declared type, not its head. Resolving the head
+            // and restoring the substitution handed `cell = SignalCell::new(None)`
+            // the expectation `SignalCell<Option<V>>` with `V` the struct's own
+            // parameter, unbound once the instance's bindings were gone, and the
+            // call closed `T` with it — refused as "an unbound generic type
+            // parameter (parameter 2 of struct `Pair`)". A type id cannot be
+            // minted here, so the instance's bindings stay in force while the
+            // value is rendered, which is how the struct's own field types are
+            // rendered ([`Self::ensure_struct`]). Inside the struct's OWN impl,
+            // whose binders are the declaration's parameters, a literal of
+            // another instantiation (`Pair<V, K>` in `impl Pair<type K, type
+            // V>`) would rebind them under the value's own types. There the
+            // bindings are not installed: a field that IS a parameter expects
+            // its argument, and one that only mentions a parameter expects
+            // nothing — its parameters read under the bindings in force would
+            // name the wrong instantiation (`held: Maybe<V>` expecting the
+            // method's `V` where the literal's `V` is its `K`).
+            let rebinds = entries.iter().any(|(parameter, argument)| {
+                self.current_substitution
+                    .get(parameter)
+                    .is_some_and(|bound| self.type_key(*bound) != self.type_key(*argument))
+            });
             let saved = self.enter_substitution(entries.clone());
-            let expecting = self.concrete(field.type_id);
-            self.current_substitution = saved;
+            let expecting = if !rebinds {
+                Some(field.type_id)
+            } else if let Some(Type::Generic(parameter)) =
+                self.program.type_id_to_type_map.get(&field.type_id)
+                && let Some((_, argument)) = entries.iter().find(|(bound, _)| bound == parameter)
+            {
+                self.current_substitution = saved.clone();
+                Some(*argument)
+            } else {
+                self.current_substitution = saved.clone();
+                (!self.mentions_a_parameter(
+                    field.type_id,
+                    &declaration.generic_parameter_constraint_ids,
+                ))
+                .then_some(field.type_id)
+            };
             // A field declared `async |T| U` takes a future-answering closure.
             self.expects_async_value = self.program.async_fields.contains(&(struct_id, *index));
-            let rendered = self.consumed_value_of_expecting(*value, Some(expecting), depth);
+            let rendered = self.consumed_value_of_expecting(*value, expecting, depth);
             self.expects_async_value = false;
+            self.current_substitution = saved;
             parts.push(format!("{name}: {}", rendered?));
         }
         Ok(format!("{} {{ {} }}", instance.name, parts.join(", ")))

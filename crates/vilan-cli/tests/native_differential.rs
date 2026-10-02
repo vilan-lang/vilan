@@ -8742,3 +8742,81 @@ fn a_default_over_a_source_written_in_its_providers_binder_is_identical_on_both_
         "a Flow default over a source written in its provider's binder must build and run the same"
     );
 }
+
+/// F73: `set(None)` on a two-parameter struct's `Signal<Option<V>>` impl, and
+/// the struct literal that builds it, are identical on both backends.
+///
+/// The item's own refusal ("an unbound generic type parameter (parameter 2 of
+/// struct `Pair`)" at the `impl .. with Signal<Option<V>>` header) reproduces
+/// on 0.42.0 and not on this order's base, where an earlier merge had closed
+/// it; the probe pins it. Reproducing it found the literal beside it: a struct
+/// literal's field expectation was its declared type's HEAD, resolved under the
+/// instance and then dropped, so `cell = SignalCell::new(None)` met
+/// `SignalCell<Option<V>>` with the struct's own `V` unbound. The instance's
+/// bindings stay in force while a field's value is rendered now — in `main`
+/// under an annotation, in the struct's own static at two instantiations, and
+/// for a generic struct literal nested in another's field.
+///
+/// Inside the struct's OWN impl a literal of ANOTHER instantiation
+/// (`Pair<V, K>` in `impl Pair<type K, type V>`) cannot take that rule — the
+/// impl's binders are the declaration's parameters, and installing the
+/// literal's bindings would retype the value's own reads — so a field that
+/// only mentions a parameter expects nothing there, and a value that needed
+/// the expectation is refused by name rather than built at the wrong
+/// instantiation (rustc E0308 before).
+#[test]
+fn a_struct_literals_fields_close_their_values_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_struct_literal_field_positions.vl"),
+        include_str!("native/struct_literal_field_positions.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_struct_literal_field_positions.vl"),
+        Verdict::Identical,
+        "a struct literal's field must close its value from the instance on both backends"
+    );
+    std::fs::write(
+        staged.join("native_probe_swapped_literal.vl"),
+        SWAPPED_LITERAL_PROBE,
+    )
+    .expect("write the probe program");
+    match compare(&staged, "native_probe_swapped_literal.vl") {
+        Verdict::Identical => {}
+        Verdict::Refused(reason) => assert!(
+            reason.contains("instantiated at `any`"),
+            "the swapped literal's refusal moved to another construct: {reason}"
+        ),
+        Verdict::Broken(detail) => {
+            panic!("a swapped literal in its own impl was built wrong: {detail}")
+        }
+    }
+}
+
+const SWAPPED_LITERAL_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "enum Maybe<T> {\n",
+    "\tNothing,\n",
+    "\tJust(T),\n",
+    "}\n",
+    "\n",
+    "struct Pair<K, V> {\n",
+    "\tkey: K,\n",
+    "\theld: Maybe<V>,\n",
+    "}\n",
+    "\n",
+    "impl Pair<type K, type V> {\n",
+    "\tfun swap(self, value: V): Pair<V, K> {\n",
+    "\t\tPair { key = value, held = Maybe::Nothing }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet pair: Pair<str, i32> = Pair { key = \"k\", held = Maybe::Just(1) };\n",
+    "\tlet swapped = pair.swap(9);\n",
+    "\tprint(swapped.key);\n",
+    "\tprint(swapped.held is Maybe::Nothing);\n",
+    "}\n",
+);

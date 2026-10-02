@@ -284,6 +284,14 @@ written down.
 <!-- family: fix -->
 **Native builds observe a generic source whose `Source` argument is written in its own binder: `impl W<type P> with Source<Option<P>>` then `w.effect(|n| ..)` was refused by name as "an unbound generic type parameter (parameter 1 of struct `W`)", and builds and prints node's bytes now — `effect`, `effect_on_change` and the rest of `Flow`'s defaults, over one- and two-parameter sources and a `List` argument.** A default reached through the `Flow` blanket binds the blanket's `T` from the receiver's `Source` impl, and that answer is written in the PROVIDER's binder (`Option<P>`); the provider's binders were bound where a member is dispatched (F58) and not where a default is specialized, so `P` stayed open. It blocked observing std's `StoreSome<P>` natively. The JS backend is unchanged. Pin: `a_default_over_a_source_written_in_its_providers_binder_is_identical_on_both_backends`. Tracker F75.
 
+---
+
+<!-- family: fix -->
+---
+
+<!-- family: fix -->
+**Native builds a struct literal whose field value is closed only by the field: `Pair { cell = SignalCell::new(None), key = "k" }` under `Pair<str, i32>`, and the same literal inside a generic function or the struct's own static, was refused by name ("an unresolved type", or an unbound parameter of the struct), and builds and prints node's bytes now.** A field's expectation was the HEAD of its declared type, resolved under the literal's instance and then dropped, so `SignalCell<Option<V>>` reached `SignalCell::new(None)` with the struct's own `V` open. The instance's bindings stay in force while the field's value is rendered — the way the struct's own field types are rendered. Inside the struct's OWN impl, whose binders are the declaration's parameters, a literal of another instantiation (`Pair<V, K>` in `impl Pair<type K, type V>`) keeps them out, and a field that only mentions a parameter expects nothing there: such a value is refused by name rather than built at the wrong instantiation. The item's own repro, `set(None)` on a two-parameter struct's `Signal<Option<V>>` impl, was refused on 0.42.0 and builds at this order's base; it is pinned with the literal. The JS backend is unchanged. Pin: `a_struct_literals_fields_close_their_values_on_both_backends`. Tracker F73.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->
