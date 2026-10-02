@@ -14,7 +14,7 @@ use vilan_core::fx::{FxHashMap as HashMap, FxHashSet};
 use vilan_core::id::Id;
 use vilan_core::leak_tally::{LeakSite, Leaked};
 use vilan_core::lexing::{AT_IS_NOT_A_TOKEN, tokenize};
-use vilan_core::node::{Convention, CssDeclaration, CssItem, Node};
+use vilan_core::node::{CssDeclaration, CssItem, Node};
 use vilan_core::parsing::{A_CSS_DECLARATION_IS_A_CALL, IMPORTANT_HAS_NO_PLACE};
 use vilan_core::{
     Error, LeakedEntryAst, Manifest, OwnedModules, Platform as BuildPlatform, Program, Span,
@@ -630,33 +630,43 @@ pub struct Symbol {
     pub children: Vec<Symbol>,
 }
 
-/// A parameter's signature fragment for hover, with its declared calling
-/// convention: `own x: T`, `x: &T`, `x: &mut T`, or the plain `x: T`. The `&` /
-/// `&mut` live on the convention (rule 3), not in `type_label`, so they are
-/// prepended here; `self` renders in its convention-specific self form.
+/// The second block under a `name: Type` line (E237, ruled): the definition
+/// of the type `type_id` names — a struct's fields or an enum's variants under
+/// the instantiation's arguments, a trait-typed or `dyn` value's required
+/// members — fenced, with the blank line that makes it its own paragraph.
+/// Empty where the type has no definition to show (a primitive, an opaque
+/// external, a closure).
+fn definition_paragraph(program: &Program, type_id: vilan_core::type_::TypeId) -> String {
+    match program.type_definitions.of(type_id) {
+        Some(block) => format!("\n\n```vilan\n{block}\n```"),
+        None => String::new(),
+    }
+}
+
+/// `self` hovered as the binding it is (E239): the block that introduces it
+/// (E238's header — which is where a blanket's or a trait's bound is written),
+/// then `self: <subject>` in the receiver's convention, then the subject's
+/// definition (E237).
 ///
-/// A spread parameter renders its `...` (variadic-generics.md §S): unlike
-/// `mut`, it IS part of the signature — it is exactly what a reader of the
-/// hover needs in order to know whether to write the arguments out flat or as
-/// one tuple. It never combines with a convention.
-fn parameter_signature(parameter: &Parameter, type_label: &str) -> String {
-    if parameter.name == "self" {
-        return match parameter.convention {
-            Convention::Bare => "self".to_string(),
-            Convention::Own => "own self".to_string(),
-            Convention::Ref => "&self".to_string(),
-            Convention::RefMut => "&mut self".to_string(),
-        };
-    }
-    if parameter.spread {
-        return format!("...{}: {type_label}", parameter.name);
-    }
-    match parameter.convention {
-        Convention::Bare => format!("{}: {type_label}", parameter.name),
-        Convention::Own => format!("own {}: {type_label}", parameter.name),
-        Convention::Ref => format!("{}: &{type_label}", parameter.name),
-        Convention::RefMut => format!("{}: &mut {type_label}", parameter.name),
-    }
+/// Inside a trait the subject is `Self`, the type the trait's member is
+/// written against, and its definition is the trait's required members — the
+/// bound is what `self` promises there. In a blanket the subject is the
+/// binder (`self: S`), whose bound the header line spells.
+fn self_hover(program: &Program, parameter: &Parameter, type_label: &str) -> String {
+    let in_a_trait = program
+        .member_owners
+        .get(&parameter.function_id)
+        .is_some_and(|owner| program.traits.contains_key(owner));
+    let subject = if in_a_trait { "Self" } else { type_label };
+    let line = format!("{}: {subject}", parameter.signature_label(""));
+    let fenced = match program.member_header(parameter.function_id) {
+        Some(header) => format!("{header}\n{line}"),
+        None => line,
+    };
+    format!(
+        "```vilan\n{fenced}\n```{}",
+        definition_paragraph(program, parameter.type_id)
+    )
 }
 
 /// Clamp a rendered hover preview to its display budget, cutting at a char
@@ -3585,6 +3595,13 @@ impl Document {
             Some(resolved) => format!("{}\n\n{}", asyncify(declaration), asyncify(resolved)),
             None => asyncify(declaration),
         };
+        // E238 (ruled door (b)): a member's block — `impl Memo<type K:
+        // Hashable, type V>`, `trait Flow<T>` — on its own line above the
+        // `fun` line, inside the same fence: two lines of real syntax.
+        let declaration = match program.member_header(declaration_id) {
+            Some(header) => format!("{header}\n{declaration}"),
+            None => declaration,
+        };
         let mut out = String::new();
         // E213: hover LEADS with the reason. The declaration is reachable —
         // that is what visibility already answered — and what the reader needs
@@ -3741,6 +3758,7 @@ impl Document {
                 signature.push_str(&format!(" = {value}"));
             }
             let mut out = format!("```vilan\n{signature}\n```");
+            out.push_str(&definition_paragraph(program, variable.type_id));
             // E227 (Q5): the abbreviation beneath the full type, when the inlay
             // hint shows one — outside the fence, because the fence is vilan
             // and `~` is not. The reader who wonders what the hint means
@@ -3765,9 +3783,13 @@ impl Document {
         }
         if let Some(parameter) = program.parameters.get(&binding) {
             let type_label = program.expr_types.get(&binding)?;
+            if parameter.name == "self" {
+                return Some(self_hover(program, parameter, type_label));
+            }
             return Some(format!(
-                "```vilan\n{}\n```",
-                parameter_signature(parameter, type_label)
+                "```vilan\n{}\n```{}",
+                parameter.signature_label(type_label),
+                definition_paragraph(program, parameter.type_id)
             ));
         }
         None
@@ -3789,6 +3811,9 @@ impl Document {
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
         let mut out = format!("```vilan\n{name}: {type_label}\n```");
+        if let Some(type_id) = program.expr_type_ids.get(&id) {
+            out.push_str(&definition_paragraph(program, *type_id));
+        }
         // E204: a FIELD's own `///`, where the read resolves to one. A field
         // carries no entity id, so `doc_comment_of` has nothing to look up —
         // `Expr::Field`'s (struct, index) key is what names the declaration,
@@ -3852,6 +3877,7 @@ impl Document {
             out.push_str("\n\n");
         }
         out.push_str(&format!("```vilan\n{}: {type_label}\n```", field.name));
+        out.push_str(&definition_paragraph(program, field.type_id));
         if let Some(docs) = self.struct_field_docs(program, struct_id, index) {
             out.push_str("\n\n");
             out.push_str(&docs);
@@ -11039,7 +11065,10 @@ pub(crate) mod tests {
     fn e149_hovering_an_equality_operator_answers_with_its_eq() {
         assert_eq!(
             operator_hover_at(OPERATOR_IMPLS, "if a == b", 5),
-            Some("```vilan\nfun eq(self, other: Point): bool\n```".to_string()),
+            Some(
+                "```vilan\nimpl Point with PartialEq\nfun eq(self, other: Point): bool\n```"
+                    .to_string()
+            ),
         );
     }
 
@@ -11047,7 +11076,10 @@ pub(crate) mod tests {
     fn e149_hovering_a_plus_answers_with_its_add() {
         assert_eq!(
             operator_hover_at(OPERATOR_IMPLS, "a + b", 2),
-            Some("```vilan\nfun add(self, other: Point): Point\n```".to_string()),
+            Some(
+                "```vilan\nimpl Point with Add\nfun add(self, other: Point): Point\n```"
+                    .to_string()
+            ),
         );
     }
 
@@ -11059,7 +11091,10 @@ pub(crate) mod tests {
         let source = "import std::compare::PartialEq;\nimport std::io::print;\n\n[derive(PartialEq)]\nstruct Tag {\n\tn: i32,\n}\n\nfun main() {\n\tlet a = Tag { n = 1 };\n\tlet b = Tag { n = 2 };\n\tif a == b {\n\t\tprint(1);\n\t}\n}\n";
         assert_eq!(
             operator_hover_at(source, "if a == b", 5),
-            Some("```vilan\nfun eq(self, other: Tag): bool\n```".to_string()),
+            Some(
+                "```vilan\nimpl Tag with PartialEq\nfun eq(self, other: Tag): bool\n```"
+                    .to_string()
+            ),
         );
     }
 
@@ -14167,7 +14202,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `add` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun add(self, b: Self): Self\n```"),
+            hover.contains("```vilan\ntrait Add<B = Self>\nfun add(self, b: Self): Self\n```"),
             "{hover}"
         );
     }
@@ -14181,7 +14216,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `sub` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun sub(self, b: Self): Self\n```"),
+            hover.contains("```vilan\ntrait Sub<B = Self>\nfun sub(self, b: Self): Self\n```"),
             "{hover}"
         );
     }
@@ -14195,7 +14230,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `plus` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun plus(self, b: Self): Self\n```"),
+            hover.contains("```vilan\ntrait Adder<B = Self>\nfun plus(self, b: Self): Self\n```"),
             "{hover}"
         );
     }
@@ -14210,7 +14245,9 @@ pub(crate) mod tests {
         )
         .expect("hover on `alike` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun alike(self, other: Self): bool\n```"),
+            hover.contains(
+                "```vilan\ntrait Same<B = Self>\nfun alike(self, other: Self): bool\n```"
+            ),
             "{hover}"
         );
     }
@@ -14225,7 +14262,9 @@ pub(crate) mod tests {
         )
         .expect("hover on `label` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun label(self, times: i32, other: Self): str\n```"),
+            hover.contains(
+                "```vilan\ntrait Labelled<B = Self>\nfun label(self, times: i32, other: Self): str\n```"
+            ),
             "{hover}"
         );
     }
@@ -14239,7 +14278,8 @@ pub(crate) mod tests {
         )
         .expect("hover on the impl's `eq` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun eq(self, other: Tag): bool\n```"),
+            hover
+                .contains("```vilan\nimpl Tag with PartialEq\nfun eq(self, other: Tag): bool\n```"),
             "{hover}"
         );
     }
@@ -14266,7 +14306,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `eq` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun eq(self, b: Self): bool\n```"),
+            hover.contains("```vilan\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -14278,7 +14318,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `eq` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun eq(self, b: Self): bool\n```"),
+            hover.contains("```vilan\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -14290,7 +14330,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `lt` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun lt(self, b: Self): bool\n```"),
+            hover.contains("```vilan\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -14302,7 +14342,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `lt` should produce a label");
         assert!(
-            hover.contains("```vilan\nfun lt(self, b: Self): bool\n```"),
+            hover.contains("```vilan\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -22979,6 +23019,379 @@ fun main() {
             "`util` is a module of its own, not a name in the entry"
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// Order 45's hover arc, as ONE change (E235 + E237 + E238 + E239, ruled
+/// 2026-10-01): a member's hover names the block it is declared in, every
+/// parameter prints its convention, `self` hovers as a binding, and a value's
+/// hover carries its type's definition. One pin per shape the rulings list.
+#[cfg(test)]
+mod hover_arc {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// The fixture every shape is hovered in — `¦` marks nothing here; each
+    /// pin names the text its caret sits in, and the offset inside it.
+    const FIXTURE: &str = "import std::io::print;\nimport std::memo::Memo;\nimport std::reactive::{ SignalCell, Source };\n\n\
+struct UserId {\n\tvalue: i32,\n}\n\n\
+struct User {\n\tid: UserId,\n\tname: str,\n\ttags: List<str>,\n}\n\n\
+enum Shape {\n\tCircle(f64),\n\tRect(f64, f64),\n\tEmpty,\n}\n\n\
+struct Pair<A, B> {\n\tleft: A,\n\tright: B,\n}\n\n\
+struct Wide {\n\ta: i32,\n\tb: i32,\n\tc: i32,\n\td: i32,\n\te: i32,\n\tf: i32,\n\tg: i32,\n\th: i32,\n\ti: i32,\n\tj: i32,\n\tk: i32,\n\tl: i32,\n\tm: i32,\n}\n\n\
+trait Greeter {\n\tfun greet(self): str;\n\tfun twice(self): str {\n\t\tself.greet() + self.greet()\n\t}\n}\n\n\
+impl User with Greeter {\n\tfun greet(self): str {\n\t\tself.name\n\t}\n}\n\n\
+impl User {\n\tfun take(own self): str {\n\t\tself.name\n\t}\n\tfun peek(&self): i32 {\n\t\tself.id.value\n\t}\n\tfun rename(&mut self, own name: str) {\n\t\tself.name = name;\n\t}\n}\n\n\
+trait Read<T> {\n\tfun read(self): T;\n}\n\n\
+impl Pair<type A, type B> with Read<A> {\n\tfun read(self): A {\n\t\tself.left\n\t}\n}\n\n\
+trait Named {\n\tfun label(self): str;\n}\n\n\
+impl type S: Greeter with Named {\n\tfun label(self): str {\n\t\tself.greet()\n\t}\n}\n\n\
+fun describe(greeter: Greeter): str {\n\tgreeter.greet()\n}\n\n\
+fun total(xs: &List<i32>, out: &mut List<i32>, own extra: List<i32>): usize {\n\txs.len() + extra.len()\n}\n\n\
+fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags = [] };\n\tuser.rename(\"b\");\n\tprint(user.peek());\n\tprint(user.label());\n\tprint(user.twice());\n\tprint(describe(user));\n\tprint(user.id.value);\n\tlet pair = Pair { left = 1, right = \"x\" };\n\tprint(pair.read());\n\tlet shape = Shape::Circle(1.0);\n\tlet wide = Wide { a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 8, i = 9, j = 10, k = 11, l = 12, m = 13 };\n\tlet memo: Memo<str, i32> = Memo::new();\n\tprint(memo.get_or_insert(\"a\", || 1));\n\tlet opt = Some(3);\n\tlet cell = SignalCell::new(3);\n\tlet source: dyn Source<i32> = cell;\n\tmut out: List<i32> = [];\n\tout.push(1);\n\tlet count = 3;\n\tprint(total(&out, &mut out, [count]));\n\tprint(user.take());\n}\n\nmain();\n";
+
+    fn analyzed() -> Document {
+        let document = Document::analyze(FIXTURE, &std_root(), Path::new("test.vl"));
+        let errors: Vec<String> = document
+            .published_diagnostics()
+            .into_iter()
+            .filter(|diagnostic| !diagnostic.warning)
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(errors.is_empty(), "the fixture compiles: {errors:?}");
+        document
+    }
+
+    /// The hover at `at` bytes into the `nth` occurrence (0-based) of
+    /// `needle` in [`FIXTURE`].
+    fn hover(document: &Document, needle: &str, nth: usize, at: usize) -> String {
+        let start = FIXTURE
+            .match_indices(needle)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("{needle:?} #{nth} is in the fixture"))
+            .0;
+        document
+            .hover(start + at)
+            .unwrap_or_else(|| panic!("a hover at {needle:?} #{nth} +{at}"))
+    }
+
+    fn fence(lines: &str) -> String {
+        format!("```vilan\n{lines}\n```")
+    }
+
+    // --- E238: a member names its block, on its own line --------------------
+
+    #[test]
+    fn e238_an_inherent_methods_hover_leads_with_its_impl_head_and_its_bounds() {
+        let document = analyzed();
+        let hover = hover(&document, "memo.get_or_insert", 0, 7);
+        assert!(
+            hover.starts_with(&fence(
+                "impl Memo<type K: Hashable, type V>\nfun get_or_insert(self, key: K, make: || V): V\n\nfun get_or_insert(self, key: str, make: || i32): i32"
+            )),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e238_a_trait_impls_method_names_the_impl_and_its_with_clause() {
+        let document = analyzed();
+        let pair_read = hover(&document, "pair.read()", 0, 6);
+        assert!(
+            pair_read.starts_with(
+                "```vilan\nimpl Pair<type A, type B> with Read<A>\nfun read(self): A\n"
+            ),
+            "{pair_read}"
+        );
+        let user_greet = hover(&document, "fun greet(self): str {", 0, 5);
+        assert!(
+            user_greet.starts_with(&fence("impl User with Greeter\nfun greet(self): str")),
+            "{user_greet}"
+        );
+    }
+
+    #[test]
+    fn e238_a_blankets_method_names_the_blanket_with_its_binder_and_bound() {
+        let document = analyzed();
+        let hover = hover(&document, "user.label()", 0, 6);
+        assert!(
+            hover.starts_with(&fence(
+                "impl type S: Greeter with Named\nfun label(self): str"
+            )),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e238_a_trait_default_and_a_requirement_name_the_trait() {
+        let document = analyzed();
+        let default = hover(&document, "user.twice()", 0, 6);
+        assert!(
+            default.starts_with(&fence("trait Greeter\nfun twice(self): str")),
+            "{default}"
+        );
+        let requirement = hover(&document, "greeter.greet()", 0, 9);
+        assert!(
+            requirement.starts_with(&fence("trait Greeter\nfun greet(self): str")),
+            "{requirement}"
+        );
+        // A std trait member through a bound: the trait's parameters as declared.
+        let generic = hover(&document, "fun read(self): T;", 0, 5);
+        assert!(
+            generic.starts_with(&fence("trait Read<T>\nfun read(self): T")),
+            "{generic}"
+        );
+    }
+
+    #[test]
+    fn e238_a_free_function_has_no_header() {
+        let document = analyzed();
+        let free = hover(&document, "print(describe(user))", 0, 7);
+        assert!(
+            free.starts_with("```vilan\nfun describe(greeter: Greeter): str\n"),
+            "{free}"
+        );
+    }
+
+    #[test]
+    fn e238_completions_detail_carries_the_same_header() {
+        let text = FIXTURE.replacen("print(user.peek());", "print(user.pe());", 1);
+        let offset = text.find("user.pe()").expect("the edited call") + "user.pe".len();
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        let completions = document.completion(offset);
+        let peek = completions
+            .iter()
+            .find(|completion| completion.label == "peek")
+            .expect("`peek` is offered after `user.`");
+        assert_eq!(
+            peek.detail.as_deref(),
+            Some("impl User\nfun peek(&self): i32"),
+        );
+    }
+
+    // --- E235: every parameter prints its convention ------------------------
+
+    #[test]
+    fn e235_the_receivers_convention_is_printed() {
+        let document = analyzed();
+        assert!(
+            hover(&document, "user.take()", 0, 6)
+                .starts_with(&fence("impl User\nfun take(own self): str"))
+        );
+        assert!(
+            hover(&document, "user.peek()", 0, 6)
+                .starts_with(&fence("impl User\nfun peek(&self): i32"))
+        );
+        assert!(
+            hover(&document, "user.rename(", 0, 6)
+                .starts_with(&fence("impl User\nfun rename(&mut self, own name: str)"))
+        );
+    }
+
+    #[test]
+    fn e235_every_parameters_convention_is_printed() {
+        let document = analyzed();
+        let free = hover(&document, "print(total(", 0, 7);
+        assert!(
+            free.starts_with(&fence(
+                "fun total(xs: &List<i32>, out: &mut List<i32>, own extra: List<i32>): usize"
+            )),
+            "{free}"
+        );
+        // An external's too: `List::push` takes `&mut self` and keeps its item.
+        let push = hover(&document, "out.push(1)", 0, 5);
+        assert!(
+            push.contains("external fun push(&mut self, own item: T): void"),
+            "{push}"
+        );
+    }
+
+    #[test]
+    fn e235_the_conformance_steer_declares_the_convention_the_trait_requires() {
+        // The steer's suggested declaration must CONFORM when copied — the
+        // check compares conventions, so a dropped `own` was a declaration
+        // the same check then refused.
+        let source = "trait Consume {\n\tfun eat(own self): i32;\n}\n\nstruct Meal {\n\tsize: i32,\n}\n\nimpl Meal with Consume {}\n\nfun main() {}\n\nmain();\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let messages: Vec<String> = document
+            .published_diagnostics()
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("declare `fun eat(own self): i32`")),
+            "{messages:?}"
+        );
+    }
+
+    // --- E239: `self` hovers as a binding -----------------------------------
+
+    #[test]
+    fn e239_self_in_an_inherent_impl_is_the_subject_in_its_convention() {
+        let document = analyzed();
+        let owned = hover(&document, "fun take(own self)", 0, 13);
+        assert!(
+            owned.starts_with(&fence("impl User\nown self: User")),
+            "{owned}"
+        );
+        let borrowed = hover(&document, "fun rename(&mut self", 0, 16);
+        assert!(
+            borrowed.starts_with(&fence("impl User\n&mut self: User")),
+            "{borrowed}"
+        );
+        // A use of it answers the same as the declaration.
+        let use_site = hover(&document, "self.id.value", 0, 1);
+        assert!(
+            use_site.starts_with(&fence("impl User\n&self: User")),
+            "{use_site}"
+        );
+    }
+
+    #[test]
+    fn e239_self_in_a_trait_impl_is_the_impls_subject() {
+        let document = analyzed();
+        let hover = hover(&document, "fun greet(self): str {", 0, 11);
+        assert!(
+            hover.starts_with(&fence("impl User with Greeter\nself: User")),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e239_self_in_a_trait_default_is_self_bounded_by_the_trait() {
+        let document = analyzed();
+        let hover = hover(&document, "self.greet() + self.greet()", 0, 1);
+        assert_eq!(
+            hover,
+            format!(
+                "{}\n\n{}",
+                fence("trait Greeter\nself: Self"),
+                fence("trait Greeter {\n\tfun greet(self): str;\n}")
+            )
+        );
+    }
+
+    #[test]
+    fn e239_self_in_a_blanket_is_the_binder_and_its_bound() {
+        let document = analyzed();
+        let hover = hover(&document, "self.greet()\n\t}\n}\n\nfun describe", 0, 1);
+        assert_eq!(
+            hover,
+            format!(
+                "{}\n\n{}",
+                fence("impl type S: Greeter with Named\nself: S"),
+                fence("trait Greeter {\n\tfun greet(self): str;\n}")
+            )
+        );
+    }
+
+    // --- E237: the type's definition under `name: Type` ---------------------
+
+    #[test]
+    fn e237_a_struct_typed_variable_shows_its_fields_one_level_deep() {
+        let document = analyzed();
+        // `id: UserId` stays a name: one level deep.
+        assert_eq!(
+            hover(&document, "mut user = ", 0, 4),
+            format!(
+                "{}\n\n{}",
+                fence("mut user: User"),
+                fence("struct User {\n\tid: UserId,\n\tname: str,\n\ttags: List<str>,\n}")
+            )
+        );
+    }
+
+    #[test]
+    fn e237_a_field_read_and_a_field_declaration_show_the_fields_type() {
+        let document = analyzed();
+        let block = fence("struct UserId {\n\tvalue: i32,\n}");
+        let read = hover(&document, "print(user.id.value)", 0, 11);
+        assert_eq!(read, format!("{}\n\n{block}", fence("id: UserId")));
+        let declared = hover(&document, "\tid: UserId,", 0, 1);
+        assert_eq!(declared, format!("{}\n\n{block}", fence("id: UserId")));
+    }
+
+    #[test]
+    fn e237_a_generic_types_definition_is_shown_at_its_instantiation() {
+        let document = analyzed();
+        assert_eq!(
+            hover(&document, "let pair = ", 0, 4),
+            format!(
+                "{}\n\n{}",
+                fence("let pair: Pair<i32, str>"),
+                fence("struct Pair<i32, str> {\n\tleft: i32,\n\tright: str,\n}")
+            )
+        );
+        // A std type follows the same rule, its fields substituted.
+        let memo = hover(&document, "let memo: ", 0, 4);
+        assert!(
+            memo.contains(&fence(
+                "struct Memo<str, i32> {\n\tentries: Shared<HashMap<str, i32>>,\n}"
+            )),
+            "{memo}"
+        );
+    }
+
+    #[test]
+    fn e237_an_enum_shows_its_variants_and_a_std_enum_its_instantiation() {
+        let document = analyzed();
+        assert!(hover(&document, "let shape = ", 0, 4).ends_with(&fence(
+            "enum Shape {\n\tCircle(f64),\n\tRect(f64, f64),\n\tEmpty,\n}"
+        )));
+        assert!(
+            hover(&document, "let opt = ", 0, 4)
+                .ends_with(&fence("enum Option<i32> {\n\tSome(i32),\n\tNone,\n}"))
+        );
+    }
+
+    #[test]
+    fn e237_a_dyn_value_and_a_trait_typed_parameter_show_the_required_members() {
+        let document = analyzed();
+        let object = hover(&document, "let source: ", 0, 4);
+        assert!(
+            object.ends_with(&fence(
+                "trait Source<i32> with Flow<i32> {\n\tfun get(self): i32;\n\tfun on_settle(self, subscriber: Subscriber): Subscription;\n}"
+            )),
+            "{object}"
+        );
+        // The default `twice` is not a requirement, so it is not listed.
+        assert_eq!(
+            hover(&document, "fun describe(greeter", 0, 14),
+            format!(
+                "{}\n\n{}",
+                fence("greeter: Greeter"),
+                fence("trait Greeter {\n\tfun greet(self): str;\n}")
+            )
+        );
+    }
+
+    #[test]
+    fn e237_a_long_definition_is_capped_at_twelve_members() {
+        let document = analyzed();
+        let hover = hover(&document, "let wide = ", 0, 4);
+        let block = hover.split("\n\n").nth(1).expect("a definition block");
+        assert_eq!(
+            block,
+            fence(
+                "struct Wide {\n\ta: i32,\n\tb: i32,\n\tc: i32,\n\td: i32,\n\te: i32,\n\tf: i32,\n\tg: i32,\n\th: i32,\n\ti: i32,\n\tj: i32,\n\tk: i32,\n\tl: i32,\n\t…\n}"
+            )
+        );
+    }
+
+    #[test]
+    fn e237_a_primitive_or_an_opaque_type_has_no_definition_block() {
+        let document = analyzed();
+        assert_eq!(
+            hover(&document, "let count = ", 0, 4),
+            fence("let count: i32")
+        );
+        // `List` is an external host type: there is no shape to show.
+        assert_eq!(
+            hover(&document, "mut out: List", 0, 4),
+            fence("mut out: List<i32>")
+        );
     }
 }
 
