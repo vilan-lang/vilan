@@ -470,6 +470,9 @@ def run_scenario(server, root, scenario, runs, callgrind=False):
             server.wait_publish(document.uri, undone)
             server.settle()
     document.close()
+    for samples in rows.values():
+        for sample in samples:
+            sample["companions"] = len(companions)
     for companion in companions:
         companion.close()
     server.settle()
@@ -537,7 +540,7 @@ def print_table(cold_rows, rows, header):
             f"| {max(s['memory']['VmHWM'] for s in samples) / 1024:.0f} |"
         )
     for name, samples in rows.items():
-        if any(s["files_republished"] > 1 for s in samples):
+        if any(s.get("companions") for s in samples):
             print(
                 f"| {name}: every open file | {median([s['all_published_cpu_ms'] for s in samples]):.0f} "
                 f"| | {median([s['all_published_ms'] for s in samples]):.0f} "
