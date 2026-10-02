@@ -30,7 +30,7 @@ bytes-aliasing	3	8
 delta-law	22	61
 reactive-on-change	35	80
 reactive-flatten	39	89
-list-cell	70	189
+list-cell	68	189
 reactive-selector	13	33
 f64-print-boundary	0	0
 non-bmp-string-length	0	0

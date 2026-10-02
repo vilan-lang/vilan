@@ -5,7 +5,7 @@
 // inverse `parse`/`href` pair over `segments`, and derives its typed route signal
 // itself:
 //
-//     let route = current_path().derive(|path| parse(path));
+//     let route = current_path().derive(parse);
 //     view("main").child(swap(route, |current| match current { .. }));
 //
 // Nested layouts are nested functions, guards are `if`s, and `link` takes a route
@@ -74,7 +74,7 @@ fun ensure_wired() {
 }
 
 /// The current `location.pathname`, live across `navigate` and back/forward. Derive
-/// the app's typed route from it: `current_path().derive(|path| parse(path))`.
+/// the app's typed route from it: `current_path().derive(parse)`.
 export fun current_path(): SignalCell<str> {
 	ensure_wired();
 	path_signal

@@ -424,7 +424,7 @@ destructors here, so a handle you forget about keeps firing. Hold it and
 which does that for you — and `effect` is the one to reach for.
 
 **A cached derivation made outside every boundary lives as long as its
-source, on purpose.** `current_path().derive(|path| parse(path))` at the top of
+source, on purpose.** `current_path().derive(parse)` at the top of
 `main` is a pipe and costs nothing until something consumes it; a `.memo()` of it there is
 meant to last as long as the program. Refusing that would be the stricter rule
 and would break the idiom, so vilan does not — except in a module binding's
@@ -499,8 +499,9 @@ fun main() {
 ```
 
 Because a body's owner and nursery are INJECTED into it (a `context` clause), a
-body must be a closure literal (or a local closure): `count.derive(|n| label(n))`,
-not `count.derive(label)`.
+body is a closure literal, a local closure, or a named function or variant that
+reads none of them: `count.derive(label)` and `count.derive(Some)` work as
+`count.derive(|n| label(n))` does.
 
 Creating reactive state *outside* any owner is a compile error. That
 sounds strict, but it's the property that makes leaks impossible by

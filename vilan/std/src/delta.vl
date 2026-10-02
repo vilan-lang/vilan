@@ -1097,12 +1097,12 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	// notification, so a handler holding the source was a loop no count could
 	// collect.
 	let read = source.reader();
-	// `on_change`, through the blanket `Flow` over `Source` (F58 built that hop
-	// natively). Not `attach_observer` directly: through this SUBTRAIT bound a
-	// supertrait default's override is not dispatched (both backends), and
-	// `Source`'s default captures the source, the loop A132 took out; the blanket's
-	// own `Source` bound reaches the cell's override.
-	let _owned = register_with_owner(source.on_change(|_published| {
+	// The source's own attach, through this SUBTRAIT bound: since B473 a
+	// supertrait default's override IS dispatched through it, so the cell's
+	// `attach_observer` (which captures only its items, A132) is reached without
+	// the `Flow` blanket's hop — and without the callback position's clear, which
+	// this closure (std's own, tracking nothing) does not need.
+	let _owned = register_with_owner(source.attach_observer(|_published| {
 		for op in read(cursor) {
 			match op {
 				// The derivative of `map g`: what arrived, mapped. Nothing else is
@@ -1119,7 +1119,7 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 				SeqOp::Move(let from, let count, let to) => out.move_range(from, count, to),
 			}
 		}
-	}));
+	}, false));
 	defer_to_owner(|| source.drop_cursor(cursor));
 	out
 }

@@ -232,10 +232,8 @@ export impl Transient<type T, type E> with TransientSource<T, E> {
 /// `.transient()` over a flow of tasks that answer `Result<T, E>` (R36): an
 /// `Err(e)` is lifted into `Failed(e, stale)`.
 ///
-/// Declared BEFORE the bare-task impl below, and the order is load-bearing: a
-/// `Task<Result<T, E>>` also matches `Task<T>`, and between two blankets that both
-/// apply, the compiler takes the first declared (tracker B477). This one is the
-/// more specific.
+/// A `Task<Result<T, E>>` also matches the bare-task impl below; this one is the
+/// more specific, and specificity — not declaration order — picks it (B477).
 ///
 /// A task that PANICS has no `E` to become, so its panic is raised again — from the
 /// task that settles the seal, reported with its origin like any unobserved failure

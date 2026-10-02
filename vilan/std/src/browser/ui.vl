@@ -869,18 +869,6 @@ export impl type S: Flow<str> with Slot {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<str> with Slot {
-	fun place(own self, parent: View) {
-		place_text_flow(self, parent);
-	}
-}
-
 fun place_text_flow<F: Flow<str>>(own flow: F, parent: View) {
 	let node = create_text_node("");
 	parent.element.append_text(node);
@@ -937,18 +925,6 @@ export impl type S: Flow<View> with Slot {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<View> with Slot {
-	fun place(own self, parent: View) {
-		place_view_flow(self, parent);
-	}
-}
-
 fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
 	let region = Region::open(parent);
 	let live: Shared<Option<View>> = Shared::new(None);
@@ -979,18 +955,6 @@ fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
 /// with the same ownership story as the single-view arm above — and, with it,
 /// the same `Region`, so the whole run keeps the hole's position (A71).
 export impl type S: Flow<List<View>> with Slot {
-	fun place(own self, parent: View) {
-		place_views_flow(self, parent);
-	}
-}
-
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<List<View>> with Slot {
 	fun place(own self, parent: View) {
 		place_views_flow(self, parent);
 	}
@@ -2167,18 +2131,6 @@ export impl type S: Flow<str> with AttrValue {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<str> with AttrValue {
-	fun apply(own self, parent: View, name: str) {
-		apply_text_flow(self, parent, name);
-	}
-}
-
 fun apply_text_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2209,18 +2161,6 @@ export impl Option<str> with AttrValue {
 /// that reads PRESENCE (`[data-dragging] *`), where there is no string that turns
 /// the attribute off.
 export impl type S: Flow<Option<str>> with AttrValue {
-	fun apply(own self, parent: View, name: str) {
-		apply_optional_flow(self, parent, name);
-	}
-}
-
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<Option<str>> with AttrValue {
 	fun apply(own self, parent: View, name: str) {
 		apply_optional_flow(self, parent, name);
 	}
@@ -2262,18 +2202,6 @@ export impl type S: Flow<str> with AttrBinding {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<str> with AttrBinding {
-	fun bind_attribute(own self, parent: View, name: str) {
-		bind_text_attribute_flow(self, parent, name);
-	}
-}
-
 fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2284,18 +2212,6 @@ fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str)
 /// Present exactly while the source says `Some`, and gone while it says `None` —
 /// the shape kolt hand-wrote as `bind_attr_proper` (A105).
 export impl type S: Flow<Option<str>> with AttrBinding {
-	fun bind_attribute(own self, parent: View, name: str) {
-		bind_optional_attribute_flow(self, parent, name);
-	}
-}
-
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<Option<str>> with AttrBinding {
 	fun bind_attribute(own self, parent: View, name: str) {
 		bind_optional_attribute_flow(self, parent, name);
 	}
