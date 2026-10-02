@@ -64,7 +64,7 @@ import pkg::reactive::{
 	batch,
 	observe,
 };
-import pkg::shared::Shared;
+import pkg::shared::{ Shared, fresh_identity };
 
 // === Slots and nodes (§2.2, §3.3) ============================================
 
@@ -115,11 +115,7 @@ fun identity_at(root: Shared<StoreNode>, path: List<usize>): i32 {
 		},
 		None => {},
 	}
-	// Drawn from the ONE identity space `Shared::identity` stamps from, which a
-	// `SignalCell`'s identity is: a tracker compares identities across sources,
-	// and `fresh_id`'s counter (subscriber ids) overlaps that one — a store path
-	// minted there collided with a cell's in one tracked body and never attached.
-	let minted = Shared::new(0).identity();
+	let minted = fresh_identity();
 	mut ids: NativeMap<i32> = match root.read().ids {
 		Some(let held) => held,
 		None => NativeMap::new(),

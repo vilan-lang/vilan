@@ -66,7 +66,7 @@ import pkg::reactive::{
 	turn,
 };
 import pkg::result::Result::{ self, Err, Ok };
-import pkg::shared::Shared;
+import pkg::shared::{ Shared, fresh_identity };
 import pkg::task::Task;
 import pkg::time::{ Duration, sleep_for };
 import pkg::transient::{ TransientSource, TransientState };
@@ -2499,7 +2499,7 @@ export impl ReactiveServer {
 	fun expose_entry_dynamic<K: Hashable, V: Wire>(self, entry: MapEntry<K, V>): i32 {
 		let identity = match entry.identity() {
 			Some(let held) => held,
-			None => fresh_id(),
+			None => fresh_identity(),
 		};
 		match self.dynamic_channel_for(identity, false) {
 			Some(let held) => held,

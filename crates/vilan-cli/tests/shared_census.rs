@@ -163,14 +163,19 @@ const CENSUS: &[(&str, usize, &str)] = &[
          a `KeySlots`, counted in `map_cell.vl`)",
     ),
     (
+        "shared.vl",
+        1,
+        "R: `fresh_identity`'s draw (A147) — a cell made only for the stamp \
+         `Shared::identity` gives it, which is how every `identity()` in std \
+         draws from ONE space; it is dropped at once",
+    ),
+    (
         "store.vl",
-        4,
-        "E + R: a store's cells, all minted by the store and reached through every \
+        3,
+        "E: a store's cells, all minted by the store and reached through every \
          copy of a handle (A142 S7, `proposal/store.md`) — the root's value \
-         (`Store::new`), each node of its slot tree, a slot's subscription count \
-         (read by the subscription's release, Q12) — and the identity draw (R): a \
-         path's identity is minted once, from the one counter `Shared::identity` \
-         stamps from, by a cell made for its stamp (A146)",
+         (`Store::new`), each node of its slot tree, and a slot's subscription \
+         count (read by the subscription's release, Q12)",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
     (
