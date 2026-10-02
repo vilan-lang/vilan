@@ -40,7 +40,7 @@ import pkg::reactive::{
 	Derive,
 	Disposable,
 	FlushPolicy,
-	MapEntry,
+	HashMapEntry,
 	MemoCell,
 	MemoEntry,
 	Owner,
@@ -1919,14 +1919,14 @@ fun reply_source_memo_option<T: Wire>(
 	reply_source_option(request, cell)
 }
 
-/// `reply_source` for a map's PER-KEY handle (A138): `MapEntry<K, V>` in — what
-/// `MapCell::at(key)` answers — the channel id of a plain dynamic exposure on the
-/// wire, `RemoteSource<Option<V>>` at the client: the same mirror a
+/// `reply_source` for a map's PER-KEY handle (A138): `HashMapEntry<K, V>` in — what
+/// `HashMapCell::at(key)` answers — the channel id of a plain dynamic exposure on
+/// the wire, `RemoteSource<Option<V>>` at the client: the same mirror a
 /// `MemoCell<Option<V>>` reply produces, so the contract does not move when a
 /// service trades a sealed per-key view for the cell's own handle.
 fun reply_source_entry<K: Hashable, V: Wire>(
 	request: RpcRequest,
-	entry: MapEntry<K, V>,
+	entry: HashMapEntry<K, V>,
 ): RpcOutcome {
 	match session_of(request.connection) {
 		Some(let session) => reply(session.expose_entry_dynamic(entry)),
@@ -1934,7 +1934,8 @@ fun reply_source_entry<K: Hashable, V: Wire>(
 	}
 }
 
-/// `reply_source_entry` for a SEALED map pipe's per-key handle, `MapMemo::at(key)`.
+/// `reply_source_entry` for a SEALED map pipe's per-key handle,
+/// `HashMapMemo::at(key)`.
 fun reply_source_memo_entry<K: Hashable, V: Wire>(
 	request: RpcRequest,
 	entry: MemoEntry<K, V>,
@@ -2491,12 +2492,12 @@ export impl ReactiveServer {
 		}
 	}
 
-	/// `expose_dynamic` for a map's PER-KEY handle, `MapCell::at(key)` (A138): the
-	/// same plain channel, `RemoteSource<Option<V>>` at the client, carrying the
-	/// key's value and woken by that key's writes alone — the cell's per-key slot
-	/// is what the forward subscribes to. Deduped by the entry's identity, one per
-	/// key of the map, as a cell's is by its own.
-	fun expose_entry_dynamic<K: Hashable, V: Wire>(self, entry: MapEntry<K, V>): i32 {
+	/// `expose_dynamic` for a map's PER-KEY handle, `HashMapCell::at(key)` (A138):
+	/// the same plain channel, `RemoteSource<Option<V>>` at the client, carrying
+	/// the key's value and woken by that key's writes alone — the cell's per-key
+	/// slot is what the forward subscribes to. Deduped by the entry's identity, one
+	/// per key of the map, as a cell's is by its own.
+	fun expose_entry_dynamic<K: Hashable, V: Wire>(self, entry: HashMapEntry<K, V>): i32 {
 		let identity = match entry.identity() {
 			Some(let held) => held,
 			None => fresh_identity(),
@@ -6337,11 +6338,11 @@ export macro fun handle_element(type_: TypeExpr): str {
 		};
 		ret keyed_element;
 	}
-	// A map's PER-KEY handle (A138), `MapEntry<K, V>` — what `MapCell::at(key)`
-	// answers — or its sealed twin `MemoEntry<K, V>`, is a `Source<Option<V>>`: a
-	// plain handle whose element is `Option<V>`, the mirror a `MemoCell<Option<V>>`
-	// reply produces.
-	if type_.name == "MapEntry" || type_.name == "MemoEntry" {
+	// A map's PER-KEY handle (A138), `HashMapEntry<K, V>` — what
+	// `HashMapCell::at(key)` answers — or its sealed twin `MemoEntry<K, V>`, is a
+	// `Source<Option<V>>`: a plain handle whose element is `Option<V>`, the mirror
+	// a `MemoCell<Option<V>>` reply produces.
+	if type_.name == "HashMapEntry" || type_.name == "MemoEntry" {
 		if type_.arguments.len() != 2 {
 			ret "";
 		}
@@ -6582,11 +6583,11 @@ export macro fun service(item: Item): Source {
 					// per-KEY absence means, and nothing has asked for either. Read
 					// as a handle it would mint a PLAIN mirror over a keyed
 					// channel, which is the one outcome worth ruling out here.
-					// Nor is `Option<MapEntry<K, V>>` (A138): a per-key handle
+					// Nor is `Option<HashMapEntry<K, V>>` (A138): a per-key handle
 					// already answers `None` for an absent key, so there is no
 					// second absence to carry.
 					if handle_key(inner) == ""
-						&& inner.name != "MapEntry"
+						&& inner.name != "HashMapEntry"
 						&& inner.name != "MemoEntry" {
 						let inner_element = handle_element(inner);
 						if inner_element != "" {
@@ -6804,7 +6805,7 @@ export macro fun service(item: Item): Source {
 		};
 		// A handle written as the read-only seal (A145) exports the cell behind it.
 		let memo = handle_is_memo(method.return_type);
-		let replier = if kind == "plain" && method.return_type.name == "MapEntry" {
+		let replier = if kind == "plain" && method.return_type.name == "HashMapEntry" {
 			"rpc::reply_source_entry(__request, "
 		} else if kind == "plain" && method.return_type.name == "MemoEntry" {
 			"rpc::reply_source_memo_entry(__request, "

@@ -1,4 +1,4 @@
-// `MapCell<K, V>` — a `HashMap` whose WRITES ARE ITS DELTAS, and the per-key
+// `HashMapCell<K, V>` — a `HashMap` whose WRITES ARE ITS DELTAS, and the per-key
 // handle that makes a map worth a cell of its own (tracker A138,
 // `proposal/reactive-maps-sets.md` §3–§4).
 //
@@ -58,12 +58,12 @@ export struct KeySlot {
 /// per WATCHED key, keyed by the key's canonical `Hash` (the identity `HashMap`
 /// keys by), allocated by the first subscription and dropped with the last (Q4).
 ///
-/// It is the one per-key implementation in std (Q5): `MapCell`'s `at(key)`,
-/// `SetCell`'s `contains(x)`, and a store's keyed node all stand on it. A handle,
+/// It is the one per-key implementation in std (Q5): `HashMapCell`'s `at(key)`,
+/// `HashSetCell`'s `contains(x)`, and a store's keyed node all stand on it. A handle,
 /// like the cells that hold it: a copy is the same table.
 export struct KeySlots {
 	table: Shared<NativeMap<KeySlot>>,
-	/// Each ASKED key's identity (`MapEntry::identity`), minted on first ask and
+	/// Each ASKED key's identity (`HashMapEntry::identity`), minted on first ask and
 	/// kept: an identity must not change while anything holds it, and a slot comes
 	/// and goes with its subscriptions. One number per key ever asked about.
 	identities: Shared<NativeMap<i32>>,
@@ -169,7 +169,7 @@ fun release_slot_on(slots: KeySlots, hash: Hash, slot: KeySlot, handle: Subscrip
 // === The faces (§3.4) ========================================================
 
 /// A granular MAP source (§3.4): a `Source<HashMap<K, V>>` whose writes are its
-/// `MapOp`s, so a map pipeline starts from it without diffing. `MapCell` is one,
+/// `MapOp`s, so a map pipeline starts from it without diffing. `HashMapCell` is one,
 /// and so is what `.memo()` seals a map pipe into.
 ///
 /// It names no reads of its own. A map's per-key read is `get(key)`, and vilan has
@@ -179,8 +179,9 @@ fun release_slot_on(slots: KeySlots, hash: Hash, slot: KeySlot, handle: Subscrip
 /// `entries`, ...) are every map flow's.
 export trait MapSource<K: Hashable, V> with DeltaSource<HashMap<K, V>, MapOp<K, V>> {}
 
-/// The map's WRITES (§3.2), each one op and one notification. `MapCell` implements
-/// it; `reconcile_to` (it needs `V: PartialEq`) and `edit` are the cell's own.
+/// The map's WRITES (§3.2), each one op and one notification. `HashMapCell`
+/// implements it; `reconcile_to` (it needs `V: PartialEq`) and `edit` are the
+/// cell's own.
 export trait MapSignal<K: Hashable, V> with Signal<HashMap<K, V>> {
 	/// `key` holds `value` now: `Put(key, what was there, value)`.
 	fun insert(self, key: K, value: V);
@@ -207,7 +208,7 @@ export trait MapSignal<K: Hashable, V> with Signal<HashMap<K, V>> {
 /// notification every whole-map observer rides, and the per-key slots `at(key)`
 /// subscribes to.
 ///
-///     let messages: MapCell<u53, Message> = MapCell::new();
+///     let messages: HashMapCell<u53, Message> = HashMapCell::new();
 ///     let one = messages.at(7);        // depends on key 7 only
 ///     messages.insert(7, hello);       // `one` wakes; a reader of key 8 does not
 ///
@@ -222,7 +223,7 @@ export trait MapSignal<K: Hashable, V> with Signal<HashMap<K, V>> {
 /// already explains the map it sees. A per-key observer and a whole-map observer
 /// are two notifications: in a turn they settle together; outside one the key's
 /// runs first.
-export struct MapCell<K: Hashable, V> {
+export struct HashMapCell<K: Hashable, V> {
 	/// The map. Mutated in place by every write, before anything is told.
 	items: Shared<HashMap<K, V>>,
 	/// The whole-map notification, carrying the log's sequence as of the last
@@ -234,8 +235,11 @@ export struct MapCell<K: Hashable, V> {
 }
 
 /// The one constructor body.
-fun map_cell<K: Hashable, V>(own map: HashMap<K, V>, log: DeltaLog<MapOp<K, V>>): MapCell<K, V> {
-	MapCell {
+fun hash_map_cell<K: Hashable, V>(
+	own map: HashMap<K, V>,
+	log: DeltaLog<MapOp<K, V>>,
+): HashMapCell<K, V> {
+	HashMapCell {
 		items = Shared::new(map),
 		published = SignalCell::new(0),
 		log,
@@ -244,27 +248,27 @@ fun map_cell<K: Hashable, V>(own map: HashMap<K, V>, log: DeltaLog<MapOp<K, V>>)
 }
 
 /// Fire a write's one whole-map notification, LAST.
-fun publish_map<K: Hashable, V>(cell: MapCell<K, V>) {
+fun publish_map<K: Hashable, V>(cell: HashMapCell<K, V>) {
 	cell.published.set(cell.log.at());
 }
 
-export impl MapCell<type K: Hashable, type V> {
+export impl HashMapCell<type K: Hashable, type V> {
 	/// An empty cell.
-	fun new(): MapCell<K, V> {
+	fun new(): HashMapCell<K, V> {
 		let empty: HashMap<K, V> = HashMap::new();
-		map_cell(empty, DeltaLog<MapOp<K, V>>::new())
+		hash_map_cell(empty, DeltaLog<MapOp<K, V>>::new())
 	}
 
 	/// A cell holding `map`. Nothing is recorded: a cursor minted after this reads
 	/// the map as its own starting point.
-	fun of(own map: HashMap<K, V>): MapCell<K, V> {
-		map_cell(map, DeltaLog<MapOp<K, V>>::new())
+	fun of(own map: HashMap<K, V>): HashMapCell<K, V> {
+		hash_map_cell(map, DeltaLog<MapOp<K, V>>::new())
 	}
 
 	/// A cell whose log has a ceiling other than `delta_log_limit` — what a test
 	/// that wants to reach the lag path without writing a thousand ops asks for.
-	fun with_limit(own map: HashMap<K, V>, limit: usize): MapCell<K, V> {
-		map_cell(map, DeltaLog<MapOp<K, V>>::with_limit(limit))
+	fun with_limit(own map: HashMap<K, V>, limit: usize): HashMapCell<K, V> {
+		hash_map_cell(map, DeltaLog<MapOp<K, V>>::with_limit(limit))
 	}
 
 	/// What `key` holds now — a copy of the one value, read in place.
@@ -294,7 +298,7 @@ export impl MapCell<type K: Hashable, type V> {
 		let weak = self.items.downgrade();
 		match weak.get() {
 			Some(let map) => read(map),
-			None => panic("MapCell::peek: the cell's own map is gone while the cell holds it"),
+			None => panic("HashMapCell::peek: the cell's own map is gone while the cell holds it"),
 		}
 	}
 
@@ -304,14 +308,14 @@ export impl MapCell<type K: Hashable, type V> {
 	///
 	/// A handle, not a subscription: it costs nothing until something subscribes,
 	/// and the key's slot lives exactly as long as its subscriptions do (Q4).
-	fun at(self, key: K): MapEntry<K, V> {
-		MapEntry<K, V> { map = self, key }
+	fun at(self, key: K): HashMapEntry<K, V> {
+		HashMapEntry<K, V> { map = self, key }
 	}
 
 	/// The BATCH door: hand `body` a recorder over a copy of the map, then record
 	/// one op per mutation it made, wake the keys they name, and publish ONCE.
-	fun edit(self, body: sync |&mut TrackedMap<K, V>| void) {
-		mut recorder = TrackedMap<K, V> { map = self.items.read(), ops = [] };
+	fun edit(self, body: sync |&mut TrackedHashMap<K, V>| void) {
+		mut recorder = TrackedHashMap<K, V> { map = self.items.read(), ops = [] };
 		body(&mut recorder);
 		let produced = recorder.map;
 		let recorded = recorder.ops;
@@ -368,7 +372,7 @@ fun wake_for<K: Hashable, V>(slots: KeySlots, ops: List<MapOp<K, V>>) {
 /// whatever the producer claimed), the keys they name wake once each, and the cell
 /// publishes once. What `.memo()` over a map pipe applies on every wake.
 export [internal("a map pipe's seal applying a drain (A138 S2)")]
-fun apply_map_ops<K: Hashable, V>(cell: MapCell<K, V>, ops: List<MapOp<K, V>>) {
+fun apply_map_ops<K: Hashable, V>(cell: HashMapCell<K, V>, ops: List<MapOp<K, V>>) {
 	mut recorded: List<MapOp<K, V>> = [];
 	for op in ops {
 		match op {
@@ -400,7 +404,7 @@ fun apply_map_ops<K: Hashable, V>(cell: MapCell<K, V>, ops: List<MapOp<K, V>>) {
 	publish_map(cell);
 }
 
-export impl MapCell<type K: Hashable, type V: PartialEq> {
+export impl HashMapCell<type K: Hashable, type V: PartialEq> {
 	/// The COMPAT DOOR: take a whole map and record what CHANGED — a `Delete` per
 	/// key that left, a `Put` per key that arrived or whose value differs — instead
 	/// of the `Reset` `set` records. Only the changed keys' slots wake (Q6), and an
@@ -446,7 +450,7 @@ export impl MapCell<type K: Hashable, type V: PartialEq> {
 	}
 }
 
-export impl MapCell<type K: Hashable, type V> with MapSignal<K, V> {
+export impl HashMapCell<type K: Hashable, type V> with MapSignal<K, V> {
 	fun insert(self, key: K, value: V) {
 		let previous = self.items.read().get(key);
 		self.items.write().insert(key, value);
@@ -503,7 +507,7 @@ export impl MapCell<type K: Hashable, type V> with MapSignal<K, V> {
 	}
 }
 
-export impl MapCell<type K: Hashable, type V> with Source<HashMap<K, V>> {
+export impl HashMapCell<type K: Hashable, type V> with Source<HashMap<K, V>> {
 	/// The whole map, as a value — a copy. `peek` is the read that does not copy,
 	/// and `get(key)` the per-key one.
 	fun get(self): HashMap<K, V> {
@@ -530,7 +534,7 @@ export impl MapCell<type K: Hashable, type V> with Source<HashMap<K, V>> {
 	}
 }
 
-export impl MapCell<type K: Hashable, type V> with Signal<HashMap<K, V>> {
+export impl HashMapCell<type K: Hashable, type V> with Signal<HashMap<K, V>> {
 	/// The wholesale write: the map BECAME this one, recorded as one `Reset`, which
 	/// wakes every watched key (Q6). It never compares (R7); `reconcile_to` does.
 	fun set(self, value: HashMap<K, V>) {
@@ -548,7 +552,7 @@ export impl MapCell<type K: Hashable, type V> with Signal<HashMap<K, V>> {
 	}
 }
 
-export impl MapCell<type K: Hashable, type V> with DeltaSource<HashMap<K, V>, MapOp<K, V>> {
+export impl HashMapCell<type K: Hashable, type V> with DeltaSource<HashMap<K, V>, MapOp<K, V>> {
 	fun cursor(self): DeltaCursor {
 		self.log.cursor()
 	}
@@ -558,22 +562,22 @@ export impl MapCell<type K: Hashable, type V> with DeltaSource<HashMap<K, V>, Ma
 	}
 
 	fun since(self, cursor: DeltaCursor): List<MapOp<K, V>> {
-		map_cell_since(self.log, self.items, cursor)
+		hash_map_cell_since(self.log, self.items, cursor)
 	}
 
 	/// The log and the map, and not `published` (A132).
 	fun reader(self): |DeltaCursor| List<MapOp<K, V>> {
 		let log = self.log;
 		let items = self.items;
-		|cursor| map_cell_since(log, items, cursor)
+		|cursor| hash_map_cell_since(log, items, cursor)
 	}
 }
 
-export impl MapCell<type K: Hashable, type V> with MapSource<K, V> {}
+export impl HashMapCell<type K: Hashable, type V> with MapSource<K, V> {}
 
-/// `MapCell::since`'s body over the two parts it reads: a cursor that lost history
-/// is told the map, as a `Reset`.
-fun map_cell_since<K: Hashable, V>(
+/// `HashMapCell::since`'s body over the two parts it reads: a cursor that lost
+/// history is told the map, as a `Reset`.
+fun hash_map_cell_since<K: Hashable, V>(
 	log: DeltaLog<MapOp<K, V>>,
 	items: Shared<HashMap<K, V>>,
 	cursor: DeltaCursor,
@@ -590,26 +594,26 @@ fun map_cell_since<K: Hashable, V>(
 
 // === The per-key handle (§4, Q5) =============================================
 
-/// `MapCell::at(key)`'s answer: the map plus a key. A `Source<Option<V>>` whose
+/// `HashMapCell::at(key)`'s answer: the map plus a key. A `Source<Option<V>>` whose
 /// subscriptions land on the key's slot, so it wakes for a write to THIS key, a
 /// `Reset`, and nothing else; and a `Signal<Option<V>>` that writes the key.
 ///
 /// Data, like the cell: copy it, store it, hand it to any number of consumers —
 /// `messages.at(id).derive(render)` starts a pipe from it, and two consumers of one
 /// `at(key)` need no seal (it has state to read, R29).
-export struct MapEntry<K: Hashable, V> {
-	map: MapCell<K, V>,
+export struct HashMapEntry<K: Hashable, V> {
+	map: HashMapCell<K, V>,
 	key: K,
 }
 
-export impl MapEntry<type K: Hashable, type V> {
+export impl HashMapEntry<type K: Hashable, type V> {
 	/// The key this handle reads.
 	fun key(self): K {
 		self.key
 	}
 }
 
-export impl MapEntry<type K: Hashable, type V> with Source<Option<V>> {
+export impl HashMapEntry<type K: Hashable, type V> with Source<Option<V>> {
 	fun get(self): Option<V> {
 		self.map.items.read().get(self.key)
 	}
@@ -642,7 +646,7 @@ export impl MapEntry<type K: Hashable, type V> with Source<Option<V>> {
 	}
 }
 
-export impl MapEntry<type K: Hashable, type V> with Signal<Option<V>> {
+export impl HashMapEntry<type K: Hashable, type V> with Signal<Option<V>> {
 	/// `Some(v)` is `insert(key, v)`; `None` is `remove(key)`.
 	fun set(self, value: Option<V>) {
 		match value {
@@ -659,15 +663,15 @@ export impl MapEntry<type K: Hashable, type V> with Signal<Option<V>> {
 
 // === The batch recorder ======================================================
 
-/// A plain map plus the ops that produced it — what `MapCell::edit` hands a body.
-/// Not reactive: a body may make a dozen mutations at no notification cost, and the
-/// cell publishes once when it returns.
-export struct TrackedMap<K: Hashable, V> {
+/// A plain map plus the ops that produced it — what `HashMapCell::edit` hands a
+/// body. Not reactive: a body may make a dozen mutations at no notification cost,
+/// and the cell publishes once when it returns.
+export struct TrackedHashMap<K: Hashable, V> {
 	map: HashMap<K, V>,
 	ops: List<MapOp<K, V>>,
 }
 
-export impl TrackedMap<type K: Hashable, type V> {
+export impl TrackedHashMap<type K: Hashable, type V> {
 	/// What `key` holds.
 	fun get(self, key: K): Option<V> {
 		self.map.get(key)

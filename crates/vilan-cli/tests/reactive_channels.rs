@@ -4753,7 +4753,7 @@ fn a145_a_memo_cell_is_an_rpc_handle_return_over_a_socket() {
 
 // --- A138: a map's per-key handle crosses as a mirror -------------------------
 
-/// A138: an `[rpc]` method answering `MapCell::at(key)` — a `MapEntry<K, V>` —
+/// A138: an `[rpc]` method answering `HashMapCell::at(key)` — a `HashMapEntry<K, V>` —
 /// replies with a plain channel, `RemoteSource<Option<V>>` at the client (the
 /// mirror a `MemoCell<Option<V>>` reply makes, so the contract does not move),
 /// and the forward rides the key's SLOT: a post to key 1 sends nothing to the
@@ -4763,7 +4763,7 @@ import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::hash_map::HashMap;
 import std::process::exit;
-import std::reactive::{ MapCell, MapEntry, Source };
+import std::reactive::{ HashMapCell, HashMapEntry, Source };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
 import std::rpc_server::Service;
@@ -4772,7 +4772,7 @@ import std::time::sleep;
 
 [service(InboxClient)]
 struct Inbox {
-	messages: MapCell<i32, str>,
+	messages: HashMapCell<i32, str>,
 }
 
 impl Inbox {
@@ -4783,13 +4783,13 @@ impl Inbox {
 	}
 
 	[rpc]
-	fun message(self, id: i32): MapEntry<i32, str> {
+	fun message(self, id: i32): HashMapEntry<i32, str> {
 		self.messages.at(id)
 	}
 }
 
 fun main() {
-	let inbox = Inbox { messages = MapCell::of([(1, "hello")].to_map()) };
+	let inbox = Inbox { messages = HashMapCell::of([(1, "hello")].to_map()) };
 	Server::builder()
 		.port(0)
 		.with_service(Service::new(inbox.dispatcher().into_protocol(json_codec())))
@@ -4842,7 +4842,7 @@ fn a138_a_map_entry_is_an_rpc_handle_return_over_a_socket() {
             "post:2",
             "after: first=edited second=new second_updates=1"
         ],
-        "a MapEntry handle must cross as a per-key mirror; got:\n{stdout}"
+        "a HashMapEntry handle must cross as a per-key mirror; got:\n{stdout}"
     );
 }
 

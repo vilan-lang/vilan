@@ -1,29 +1,29 @@
-// `SetCell<T>` — a `HashSet` whose WRITES ARE ITS DELTAS, and the per-member handle
-// (tracker A138, `proposal/reactive-maps-sets.md` §3.3–§4).
+// `HashSetCell<T>` — a `HashSet` whose WRITES ARE ITS DELTAS, and the per-member
+// handle (tracker A138, `proposal/reactive-maps-sets.md` §3.3–§4).
 //
-// The Set shape's cell, beside `MapCell` and over the same body (Q3): the set, the
-// `SetOp` log, one whole-set notification, and the per-key slots (`KeySlots`) that
-// `contains(x)` subscribes to. It is its own type rather than `MapCell<T, void>`
-// for the two reasons the paper gives: its op vocabulary is smaller (`Add` carries
-// no "what was there"), and its per-member read is `contains(x): bool`, not
-// `at(x): Option<void>`.
+// The Set shape's cell, beside `HashMapCell` and over the same body (Q3): the set,
+// the `SetOp` log, one whole-set notification, and the per-key slots (`KeySlots`)
+// that `contains(x)` subscribes to. It is its own type rather than
+// `HashMapCell<T, void>` for the two reasons the paper gives: its op vocabulary is
+// smaller (`Add` carries no "what was there"), and its per-member read is
+// `contains(x): bool`, not `at(x): Option<void>`.
 import pkg::delta::{ DeltaCursor, DeltaLog, DeltaSource, SetOp };
 import pkg::hash::{ Hash, Hashable };
+import pkg::hash_map_cell::KeySlots;
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
-import pkg::map_cell::KeySlots;
 import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
 import pkg::shared::Shared;
 
 /// A granular SET source (§3.4): a `Source<HashSet<T>>` whose writes are its
-/// `SetOp`s. `SetCell` is one, and so is what `.memo()` seals a set pipe into
-/// (`SetMemo`). Its per-member read, `contains(x)`, is each implementor's own.
+/// `SetOp`s. `HashSetCell` is one, and so is what `.memo()` seals a set pipe into
+/// (`HashSetMemo`). Its per-member read, `contains(x)`, is each implementor's own.
 export trait SetSource<T: Hashable> with DeltaSource<HashSet<T>, SetOp<T>> {}
 
-/// The set's WRITES (§3.3), each one op and one notification. `SetCell` implements
-/// it; `reconcile_to` is the cell's own.
+/// The set's WRITES (§3.3), each one op and one notification. `HashSetCell`
+/// implements it; `reconcile_to` is the cell's own.
 export trait SetSignal<T: Hashable> with Signal<HashSet<T>> {
 	/// `value` joins: `Add(value)`, and `true`, when it was not held; a held member
 	/// records nothing and answers `false`.
@@ -40,13 +40,13 @@ export trait SetSignal<T: Hashable> with Signal<HashSet<T>> {
 /// A `HashSet<T>` whose WRITES ARE ITS DELTAS — the set, the `SetOp` log, one
 /// whole-set notification, and the per-member slots `contains(x)` subscribes to.
 ///
-///     let online: SetCell<UserId> = SetCell::new();
+///     let online: HashSetCell<UserId> = HashSetCell::new();
 ///     let dot = online.contains(friend);   // a Source<bool> for one member
 ///     online.insert(stranger);             // `dot` does not wake
 ///
-/// Handle receivers, like `MapCell`'s. A write records its op, mutates the set,
+/// Handle receivers, like `HashMapCell`'s. A write records its op, mutates the set,
 /// wakes the member's slot and then fires the whole-set notification.
-export struct SetCell<T: Hashable> {
+export struct HashSetCell<T: Hashable> {
 	items: Shared<HashSet<T>>,
 	published: SignalCell<i32>,
 	log: DeltaLog<SetOp<T>>,
@@ -54,8 +54,8 @@ export struct SetCell<T: Hashable> {
 }
 
 /// The one constructor body.
-fun set_cell<T: Hashable>(own set: HashSet<T>, log: DeltaLog<SetOp<T>>): SetCell<T> {
-	SetCell {
+fun hash_set_cell<T: Hashable>(own set: HashSet<T>, log: DeltaLog<SetOp<T>>): HashSetCell<T> {
+	HashSetCell {
 		items = Shared::new(set),
 		published = SignalCell::new(0),
 		log,
@@ -64,25 +64,25 @@ fun set_cell<T: Hashable>(own set: HashSet<T>, log: DeltaLog<SetOp<T>>): SetCell
 }
 
 /// Fire a write's one whole-set notification, LAST.
-fun publish_set<T: Hashable>(cell: SetCell<T>) {
+fun publish_set<T: Hashable>(cell: HashSetCell<T>) {
 	cell.published.set(cell.log.at());
 }
 
-export impl SetCell<type T: Hashable> {
+export impl HashSetCell<type T: Hashable> {
 	/// An empty cell.
-	fun new(): SetCell<T> {
+	fun new(): HashSetCell<T> {
 		let empty: HashSet<T> = HashSet::new();
-		set_cell(empty, DeltaLog<SetOp<T>>::new())
+		hash_set_cell(empty, DeltaLog<SetOp<T>>::new())
 	}
 
 	/// A cell holding `set`. Nothing is recorded.
-	fun of(own set: HashSet<T>): SetCell<T> {
-		set_cell(set, DeltaLog<SetOp<T>>::new())
+	fun of(own set: HashSet<T>): HashSetCell<T> {
+		hash_set_cell(set, DeltaLog<SetOp<T>>::new())
 	}
 
 	/// A cell whose log has a ceiling other than `delta_log_limit`.
-	fun with_limit(own set: HashSet<T>, limit: usize): SetCell<T> {
-		set_cell(set, DeltaLog<SetOp<T>>::with_limit(limit))
+	fun with_limit(own set: HashSet<T>, limit: usize): HashSetCell<T> {
+		hash_set_cell(set, DeltaLog<SetOp<T>>::with_limit(limit))
 	}
 
 	/// How many members are held.
@@ -100,15 +100,15 @@ export impl SetCell<type T: Hashable> {
 		let weak = self.items.downgrade();
 		match weak.get() {
 			Some(let set) => read(set),
-			None => panic("SetCell::peek: the cell's own set is gone while the cell holds it"),
+			None => panic("HashSetCell::peek: the cell's own set is gone while the cell holds it"),
 		}
 	}
 
 	/// THE PER-MEMBER HANDLE (§4): a `Source<bool>`, `true` exactly while `value`
 	/// is held, that wakes for a write of `value`, a `Reset`, and nothing else. Its
 	/// slot lives as long as its subscriptions (Q4).
-	fun contains(self, value: T): SetEntry<T> {
-		SetEntry<T> { set = self, value }
+	fun contains(self, value: T): HashSetEntry<T> {
+		HashSetEntry<T> { set = self, value }
 	}
 
 	/// How many ops the log is holding.
@@ -166,7 +166,7 @@ export impl SetCell<type T: Hashable> {
 /// members the rest name wake once each, and the cell publishes once. What
 /// `.memo()` over a set pipe applies on every wake.
 export [internal("a set pipe's seal applying a drain (A138 S2)")]
-fun apply_set_ops<T: Hashable>(cell: SetCell<T>, ops: List<SetOp<T>>) {
+fun apply_set_ops<T: Hashable>(cell: HashSetCell<T>, ops: List<SetOp<T>>) {
 	mut recorded: List<SetOp<T>> = [];
 	mut reset = false;
 	for op in ops {
@@ -219,7 +219,7 @@ fun wake_once(slots: KeySlots, named: &mut NativeMap<bool>, hash: Hash) {
 	}
 }
 
-export impl SetCell<type T: Hashable> with SetSignal<T> {
+export impl HashSetCell<type T: Hashable> with SetSignal<T> {
 	fun insert(self, value: T): bool {
 		if self.items.read().contains(value) {
 			ret false;
@@ -251,13 +251,13 @@ export impl SetCell<type T: Hashable> with SetSignal<T> {
 	}
 }
 
-export impl SetCell<type T: Hashable> with Source<HashSet<T>> {
+export impl HashSetCell<type T: Hashable> with Source<HashSet<T>> {
 	/// The whole set, as a value — a copy. `peek` reads it in place.
 	fun get(self): HashSet<T> {
 		self.items.read()
 	}
 
-	/// The set cell's identity (A146), as `MapCell`'s.
+	/// The set cell's identity (A146), as `HashMapCell`'s.
 	fun identity(self): Option<i32> {
 		Some(self.items.identity())
 	}
@@ -274,7 +274,7 @@ export impl SetCell<type T: Hashable> with Source<HashSet<T>> {
 	}
 }
 
-export impl SetCell<type T: Hashable> with Signal<HashSet<T>> {
+export impl HashSetCell<type T: Hashable> with Signal<HashSet<T>> {
 	/// The wholesale write, as one `Reset`, which wakes every watched member (Q6).
 	fun set(self, value: HashSet<T>) {
 		self.items.write() = value;
@@ -291,7 +291,7 @@ export impl SetCell<type T: Hashable> with Signal<HashSet<T>> {
 	}
 }
 
-export impl SetCell<type T: Hashable> with DeltaSource<HashSet<T>, SetOp<T>> {
+export impl HashSetCell<type T: Hashable> with DeltaSource<HashSet<T>, SetOp<T>> {
 	fun cursor(self): DeltaCursor {
 		self.log.cursor()
 	}
@@ -301,20 +301,20 @@ export impl SetCell<type T: Hashable> with DeltaSource<HashSet<T>, SetOp<T>> {
 	}
 
 	fun since(self, cursor: DeltaCursor): List<SetOp<T>> {
-		set_cell_since(self.log, self.items, cursor)
+		hash_set_cell_since(self.log, self.items, cursor)
 	}
 
 	/// The log and the set, and not `published` (A132).
 	fun reader(self): |DeltaCursor| List<SetOp<T>> {
 		let log = self.log;
 		let items = self.items;
-		|cursor| set_cell_since(log, items, cursor)
+		|cursor| hash_set_cell_since(log, items, cursor)
 	}
 }
 
-export impl SetCell<type T: Hashable> with SetSource<T> {}
+export impl HashSetCell<type T: Hashable> with SetSource<T> {}
 
-fun set_cell_since<T: Hashable>(
+fun hash_set_cell_since<T: Hashable>(
 	log: DeltaLog<SetOp<T>>,
 	items: Shared<HashSet<T>>,
 	cursor: DeltaCursor,
@@ -329,14 +329,14 @@ fun set_cell_since<T: Hashable>(
 	}
 }
 
-/// `SetCell::contains(value)`'s answer: the set plus a member. A `Source<bool>` on
-/// the member's slot.
-export struct SetEntry<T: Hashable> {
-	set: SetCell<T>,
+/// `HashSetCell::contains(value)`'s answer: the set plus a member. A `Source<bool>`
+/// on the member's slot.
+export struct HashSetEntry<T: Hashable> {
+	set: HashSetCell<T>,
 	value: T,
 }
 
-export impl SetEntry<type T: Hashable> with Source<bool> {
+export impl HashSetEntry<type T: Hashable> with Source<bool> {
 	fun get(self): bool {
 		self.set.items.read().contains(self.value)
 	}

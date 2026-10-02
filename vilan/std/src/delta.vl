@@ -34,9 +34,10 @@ import pkg::compare::PartialEq;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
+import pkg::hash_map_cell::{ HashMapCell, HashMapEntry, MapSource, apply_map_ops };
 import pkg::hash_set::HashSet;
+import pkg::hash_set_cell::{ HashSetCell, HashSetEntry, SetSource, apply_set_ops };
 import pkg::io::panic;
-import pkg::map_cell::{ MapCell, MapEntry, MapSource, apply_map_ops };
 import pkg::native_map::NativeMap;
 import pkg::operators::{ Add, Sub };
 import pkg::option::Option::{ self, None, Some };
@@ -65,7 +66,6 @@ import pkg::reactive::{
 	tracking,
 	wake,
 };
-import pkg::set_cell::{ SetCell, SetEntry, SetSource, apply_set_ops };
 import pkg::shared::Shared;
 import pkg::task::ambient_nursery;
 
@@ -133,8 +133,8 @@ export enum SeqOp<T> {
 /// A map's change. `Put`'s `Option<V>` is the difference between an insert and an
 /// overwrite, which a group fold over the values needs.
 ///
-/// Recorded, not slated: nothing asks for a reactive map cell yet. It is written
-/// here so the log's shape is chosen against more than one collection.
+/// `HashMapCell`'s log records it; it is written here, beside `SeqOp`, so the log's
+/// shape is chosen against more than one collection.
 ///
 /// `K: Hashable` is the `Reset` arm's bound, not the op's: `HashMap<K, V>` demands it,
 /// and an op that carries the whole collection carries its bounds with it.
@@ -2599,20 +2599,20 @@ export impl type S: MapSource<type K, type V> with MapFlow<K, V> {
 }
 
 /// A map TRANSFORMATION: a `MapFlow` with no `get`, consumed once — sealed with
-/// `.memo()` into a `MapMemo` (a granular map source again, with `at(key)`), or
+/// `.memo()` into a `HashMapMemo` (a granular map source again, with `at(key)`), or
 /// read once with `.sample()`. Sharing is sealing, as for every pipe.
 export [resource] trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
 	/// Seal into a READ-ONLY granular map source: the pipe's one consumer, each
-	/// drain applied to one `MapCell` as one batch, so the sealed map's own log
+	/// drain applied to one `HashMapCell` as one batch, so the sealed map's own log
 	/// says what the pipe said and its per-key slots wake for the keys the pipe
 	/// named. Owner-tied, like every seal; a module binding says `.memo_global()`.
-	fun memo(own self): MapMemo<K, V> {
-		MapMemo<K, V> { cell = seal_map(self.open(), true) }
+	fun memo(own self): HashMapMemo<K, V> {
+		HashMapMemo<K, V> { cell = seal_map(self.open(), true) }
 	}
 
 	/// `.memo()` for a map that lives as long as the PROGRAM (A130).
-	fun memo_global(own self): MapMemo<K, V> {
-		MapMemo<K, V> { cell = seal_map(self.open(), false) }
+	fun memo_global(own self): HashMapMemo<K, V> {
+		HashMapMemo<K, V> { cell = seal_map(self.open(), false) }
 	}
 
 	/// A one-off read: start the pipe, take the map, release it — including what
@@ -2626,8 +2626,8 @@ export [resource] trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
 }
 
 /// The seal both map `memo`s share — `seal_collection`'s shape.
-fun seal_map<K: Hashable, V>(instance: MapInstance<K, V>, owned: bool): MapCell<K, V> {
-	let sealed: MapCell<K, V> = MapCell::of((instance.snapshot)());
+fun seal_map<K: Hashable, V>(instance: MapInstance<K, V>, owned: bool): HashMapCell<K, V> {
+	let sealed: HashMapCell<K, V> = HashMapCell::of((instance.snapshot)());
 	let drain = instance.drain;
 	if owned {
 		let refreshed = (instance.attach)(subscriber_of(|| apply_map_ops(sealed, drain()), true));
@@ -2643,13 +2643,14 @@ fun seal_map<K: Hashable, V>(instance: MapInstance<K, V>, owned: bool): MapCell<
 }
 
 /// What `.memo()` seals a map pipe into: a read-only granular map source over one
-/// `MapCell`. A pipeline starts from it again, and `at(key)` reads one key of it.
+/// `HashMapCell`. A pipeline starts from it again, and `at(key)` reads one key of
+/// it.
 export [hint(MapSource<K, V>)]
-struct MapMemo<K: Hashable, V> {
-	cell: MapCell<K, V>,
+struct HashMapMemo<K: Hashable, V> {
+	cell: HashMapCell<K, V>,
 }
 
-export impl MapMemo<type K: Hashable, type V> {
+export impl HashMapMemo<type K: Hashable, type V> {
 	/// What `key` holds.
 	fun get(self, key: K): Option<V> {
 		self.cell.get(key)
@@ -2670,14 +2671,14 @@ export impl MapMemo<type K: Hashable, type V> {
 		self.cell.is_empty()
 	}
 
-	/// Read the map in place, as `MapCell::peek` does.
+	/// Read the map in place, as `HashMapCell::peek` does.
 	fun peek<U>(self, read: sync |&HashMap<K, V>| U): U {
 		self.cell.peek(read)
 	}
 
 	/// The per-key handle, READ-ONLY: a `Source<Option<V>>` on the key's slot, as
-	/// `MapCell::at` is, with no `set` — a derivation is written by its upstream
-	/// only.
+	/// `HashMapCell::at` is, with no `set` — a derivation is written by its
+	/// upstream only.
 	fun at(self, key: K): MemoEntry<K, V> {
 		MemoEntry<K, V> { entry = self.cell.at(key) }
 	}
@@ -2688,7 +2689,7 @@ export impl MapMemo<type K: Hashable, type V> {
 	}
 }
 
-export impl MapMemo<type K: Hashable, type V> with Source<HashMap<K, V>> {
+export impl HashMapMemo<type K: Hashable, type V> with Source<HashMap<K, V>> {
 	fun get(self): HashMap<K, V> {
 		Source::get(self.cell)
 	}
@@ -2708,7 +2709,7 @@ export impl MapMemo<type K: Hashable, type V> with Source<HashMap<K, V>> {
 	}
 }
 
-export impl MapMemo<type K: Hashable, type V> with DeltaSource<HashMap<K, V>, MapOp<K, V>> {
+export impl HashMapMemo<type K: Hashable, type V> with DeltaSource<HashMap<K, V>, MapOp<K, V>> {
 	fun cursor(self): DeltaCursor {
 		self.cell.cursor()
 	}
@@ -2726,11 +2727,11 @@ export impl MapMemo<type K: Hashable, type V> with DeltaSource<HashMap<K, V>, Ma
 	}
 }
 
-export impl MapMemo<type K: Hashable, type V> with MapSource<K, V> {}
+export impl HashMapMemo<type K: Hashable, type V> with MapSource<K, V> {}
 
-/// `MapMemo::at(key)`'s answer: `MapEntry`'s read face.
+/// `HashMapMemo::at(key)`'s answer: `HashMapEntry`'s read face.
 export struct MemoEntry<K: Hashable, V> {
-	entry: MapEntry<K, V>,
+	entry: HashMapEntry<K, V>,
 }
 
 export impl MemoEntry<type K: Hashable, type V> with Source<Option<V>> {
@@ -2785,16 +2786,16 @@ export impl type S: SetSource<type T> with SetFlow<T> {
 }
 
 /// A set TRANSFORMATION — what `keys()` returns — sealed with `.memo()` into a
-/// `SetMemo` (with `contains(x)`), or read once with `.sample()`.
+/// `HashSetMemo` (with `contains(x)`), or read once with `.sample()`.
 export [resource] trait SetPipe<T: Hashable> with SetFlow<T> {
 	/// Seal into a read-only granular set source (owner-tied).
-	fun memo(own self): SetMemo<T> {
-		SetMemo<T> { cell = seal_set(self.open(), true) }
+	fun memo(own self): HashSetMemo<T> {
+		HashSetMemo<T> { cell = seal_set(self.open(), true) }
 	}
 
 	/// `.memo()` for a set that lives as long as the PROGRAM (A130).
-	fun memo_global(own self): SetMemo<T> {
-		SetMemo<T> { cell = seal_set(self.open(), false) }
+	fun memo_global(own self): HashSetMemo<T> {
+		HashSetMemo<T> { cell = seal_set(self.open(), false) }
 	}
 
 	/// A one-off read.
@@ -2807,8 +2808,8 @@ export [resource] trait SetPipe<T: Hashable> with SetFlow<T> {
 }
 
 /// The seal both set `memo`s share.
-fun seal_set<T: Hashable>(instance: SetInstance<T>, owned: bool): SetCell<T> {
-	let sealed: SetCell<T> = SetCell::of((instance.snapshot)());
+fun seal_set<T: Hashable>(instance: SetInstance<T>, owned: bool): HashSetCell<T> {
+	let sealed: HashSetCell<T> = HashSetCell::of((instance.snapshot)());
 	let drain = instance.drain;
 	if owned {
 		let refreshed = (instance.attach)(subscriber_of(|| apply_set_ops(sealed, drain()), true));
@@ -2822,13 +2823,13 @@ fun seal_set<T: Hashable>(instance: SetInstance<T>, owned: bool): SetCell<T> {
 }
 
 /// What `.memo()` seals a set pipe into: a read-only granular set source over one
-/// `SetCell`, whose `contains(x)` wakes for `x` alone.
+/// `HashSetCell`, whose `contains(x)` wakes for `x` alone.
 export [hint(SetSource<T>)]
-struct SetMemo<T: Hashable> {
-	cell: SetCell<T>,
+struct HashSetMemo<T: Hashable> {
+	cell: HashSetCell<T>,
 }
 
-export impl SetMemo<type T: Hashable> {
+export impl HashSetMemo<type T: Hashable> {
 	/// How many members are held.
 	fun len(self): usize {
 		self.cell.len()
@@ -2845,12 +2846,12 @@ export impl SetMemo<type T: Hashable> {
 	}
 
 	/// The per-member handle — a `Source<bool>`, read-only already.
-	fun contains(self, value: T): SetEntry<T> {
+	fun contains(self, value: T): HashSetEntry<T> {
 		self.cell.contains(value)
 	}
 }
 
-export impl SetMemo<type T: Hashable> with Source<HashSet<T>> {
+export impl HashSetMemo<type T: Hashable> with Source<HashSet<T>> {
 	fun get(self): HashSet<T> {
 		self.cell.get()
 	}
@@ -2870,7 +2871,7 @@ export impl SetMemo<type T: Hashable> with Source<HashSet<T>> {
 	}
 }
 
-export impl SetMemo<type T: Hashable> with DeltaSource<HashSet<T>, SetOp<T>> {
+export impl HashSetMemo<type T: Hashable> with DeltaSource<HashSet<T>, SetOp<T>> {
 	fun cursor(self): DeltaCursor {
 		self.cell.cursor()
 	}
@@ -2888,7 +2889,7 @@ export impl SetMemo<type T: Hashable> with DeltaSource<HashSet<T>, SetOp<T>> {
 	}
 }
 
-export impl SetMemo<type T: Hashable> with SetSource<T> {}
+export impl HashSetMemo<type T: Hashable> with SetSource<T> {}
 
 // --- The rank index: the positional face's order (§6.2) ----------------------
 
@@ -3273,8 +3274,8 @@ fun keyed_release<K: Hashable, V, U>(keyed: KeyedCore<K, V, U>, release: || void
 
 // --- The map operators (§5) ---------------------------------------------------
 
-/// The operators every map flow has — a blanket over `MapFlow`, so a `MapCell`, a
-/// `MapMemo` and a map pipe all have them.
+/// The operators every map flow has — a blanket over `MapFlow`, so a `HashMapCell`,
+/// a `HashMapMemo` and a map pipe all have them.
 export impl type F: MapFlow<type K, type V> {
 	/// The keys, as a SET pipe: a new key's `Put` is an `Add`, an overwrite is
 	/// nothing, a `Delete` is a `Remove` — O(1) per op, no state. kolt's

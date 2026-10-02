@@ -1,5 +1,5 @@
 //! Reactive maps and sets (`proposal/reactive-maps-sets.md`, tracker A138):
-//! `MapCell<K, V>` and `SetCell<T>`, whose writes ARE their deltas (`MapOp`,
+//! `HashMapCell<K, V>` and `HashSetCell<T>`, whose writes ARE their deltas (`MapOp`,
 //! `SetOp`), and the per-key handles — `at(key)`, `contains(x)` — whose
 //! subscriptions land on one key's slot.
 //!
@@ -31,7 +31,7 @@ const SET_WALK: &str = include_str!("../../../vilan-cli/tests/native/set_walk.vl
 const DESCRIBE_MAP_OPS: &str = r#"
 import std::hash_map::HashMap;
 import std::option::Option::{ self, None, Some };
-import std::reactive::{ DeltaSource, MapCell, MapOp, Signal, Source, comp };
+import std::reactive::{ DeltaSource, HashMapCell, MapOp, Signal, Source, comp };
 
 fun opt(value: Option<i32>): str {
     match value {
@@ -67,7 +67,7 @@ fn a138_s1_every_write_records_its_op() {
             "{DESCRIBE_MAP_OPS}{}",
             r#"
             fun main() {
-                let cell: MapCell<str, i32> = MapCell::new();
+                let cell: HashMapCell<str, i32> = HashMapCell::new();
                 mut notified = 0;
                 let watch = cell.on_change(|map| notified += 1);
                 let cursor = cell.cursor();
@@ -117,7 +117,7 @@ fn a138_s1_a_lagging_cursor_is_told_the_map() {
             "{DESCRIBE_MAP_OPS}{}",
             r#"
             fun main() {
-                let cell: MapCell<str, i32> = MapCell::with_limit([("a", 1)].to_map(), 2);
+                let cell: HashMapCell<str, i32> = HashMapCell::with_limit([("a", 1)].to_map(), 2);
                 let cursor = cell.cursor();
                 print(describe(cell.since(cursor)));
                 cell.insert("b", 2);
@@ -149,7 +149,7 @@ fn a138_s1_at_depends_on_its_key_only() {
             "{DESCRIBE_MAP_OPS}{}",
             r#"
             fun main() {
-                let cell: MapCell<str, i32> = MapCell::of([("a", 1), ("b", 2)].to_map());
+                let cell: HashMapCell<str, i32> = HashMapCell::of([("a", 1), ("b", 2)].to_map());
                 mut runs = 0;
                 mut b_calls = 0;
                 let (doubled, scope) = comp(|| cell.at("a").derive(|value| {
@@ -191,7 +191,7 @@ fn a138_s1_a_key_slot_is_counted_and_goes_with_its_last_subscription() {
             "{DESCRIBE_MAP_OPS}{}",
             r#"
             fun main() {
-                let cell: MapCell<str, i32> = MapCell::new();
+                let cell: HashMapCell<str, i32> = HashMapCell::new();
                 print(cell.watched());
                 mut first = 0;
                 mut second = 0;
@@ -235,7 +235,7 @@ fn a138_s1_reset_wakes_every_live_slot_and_reconcile_only_what_changed() {
             "{DESCRIBE_MAP_OPS}{}",
             r#"
             fun main() {
-                let cell: MapCell<str, i32> = MapCell::of([("a", 1), ("b", 2), ("c", 3)].to_map());
+                let cell: HashMapCell<str, i32> = HashMapCell::of([("a", 1), ("b", 2), ("c", 3)].to_map());
                 mut a = 0;
                 mut b = 0;
                 mut c = 0;
@@ -279,7 +279,7 @@ fn a138_s1_a_map_entry_writes_its_key() {
             "{DESCRIBE_MAP_OPS}{}",
             r#"
             fun main() {
-                let cell: MapCell<str, i32> = MapCell::new();
+                let cell: HashMapCell<str, i32> = HashMapCell::new();
                 let entry = cell.at("k");
                 mut seen: List<str> = [];
                 let watch = entry.sub(|value| seen.push(opt(value)));
@@ -318,7 +318,7 @@ fn a138_s1_at_feeds_an_effect_a_tracked_read_and_a_switch() {
             }
 
             fun main() {
-                let cell: MapCell<str, i32> = MapCell::of([("a", 1), ("b", 2)].to_map());
+                let cell: HashMapCell<str, i32> = HashMapCell::of([("a", 1), ("b", 2)].to_map());
                 let picked: SignalCell<str> = Signal::new("a");
                 mut effects: List<str> = [];
                 let (outs, scope) = comp(|| {
@@ -373,7 +373,7 @@ fn a138_s1_a_set_cell_answers_records_and_wakes_per_member() {
     assert_compiles_and_runs(
         r#"
         import std::hash_set::HashSet;
-        import std::reactive::{ DeltaSource, SetCell, SetOp, Source };
+        import std::reactive::{ DeltaSource, HashSetCell, SetOp, Source };
 
         fun describe(ops: List<SetOp<str>>): str {
             mut out = "";
@@ -388,7 +388,7 @@ fn a138_s1_a_set_cell_answers_records_and_wakes_per_member() {
         }
 
         fun main() {
-            let online: SetCell<str> = SetCell::of(["a", "b"].to_set());
+            let online: HashSetCell<str> = HashSetCell::of(["a", "b"].to_set());
             mut a_seen: List<bool> = [];
             mut c_calls = 0;
             let watch_a = online.contains("a").sub(|held| a_seen.push(held));
@@ -449,7 +449,7 @@ fn a138_s2_values_ranks_its_ops_and_keys_changes_only_on_arrival_and_removal() {
         import std::option::Option::{ self, None, Some };
         import std::reactive::{
             DeltaSource,
-            MapCell,
+            HashMapCell,
             SeqOp,
             SetOp,
             Signal,
@@ -493,7 +493,7 @@ fn a138_s2_values_ranks_its_ops_and_keys_changes_only_on_arrival_and_removal() {
         }
 
         fun main() {
-            let cell: MapCell<str, i32> = MapCell::of([("a", 1), ("b", 2), ("c", 3)].to_map());
+            let cell: HashMapCell<str, i32> = HashMapCell::of([("a", 1), ("b", 2), ("c", 3)].to_map());
             let ((values, keys), scope) = comp(|| (cell.values().memo(), cell.keys().memo()));
             let vcursor = values.cursor();
             let kcursor = keys.cursor();
@@ -538,7 +538,7 @@ fn a138_s2_keyed_operators_run_per_put_follow_flows_and_release_per_key() {
         r#"
         import std::hash_map::HashMap;
         import std::option::Option::{ self, None, Some };
-        import std::reactive::{ DeltaSource, MapCell, MapOp, Signal, SignalCell, Source, comp, on_cleanup };
+        import std::reactive::{ DeltaSource, HashMapCell, MapOp, Signal, SignalCell, Source, comp, on_cleanup };
 
         fun opt(value: Option<i32>): str {
             match value {
@@ -560,7 +560,7 @@ fn a138_s2_keyed_operators_run_per_put_follow_flows_and_release_per_key() {
         }
 
         fun main() {
-            let cell: MapCell<str, i32> = MapCell::of([("a", 1), ("b", 2)].to_map());
+            let cell: HashMapCell<str, i32> = HashMapCell::of([("a", 1), ("b", 2)].to_map());
             let online: SignalCell<bool> = Signal::new(true);
             mut runs = 0;
             mut released = 0;
@@ -605,7 +605,7 @@ fn a138_s2_keyed_operators_run_per_put_follow_flows_and_release_per_key() {
     );
 }
 
-/// The operators' walk: every write a `MapCell` has, interleaved with flips of the
+/// The operators' walk: every write a `HashMapCell` has, interleaved with flips of the
 /// flows the closures answer, checked after every step against a recomputation
 /// from the map — `values`/`entries` (the rank index, through enough churn to
 /// compact it), `map_values` plain and following, `filter` plain and following,
@@ -617,7 +617,7 @@ fn a138_s2_the_map_operators_agree_with_a_recomputation_under_a_random_walk() {
 }
 
 /// A146's identity for the new sources: every handle to one cell (a copy of a
-/// `MapCell`, a `SetCell`, the memo a pipe sealed into) names it with one number,
+/// `HashMapCell`, a `HashSetCell`, the memo a pipe sealed into) names it with one number,
 /// and every per-key handle names its KEY — two `at("a")`s agree, `at("b")`
 /// differs, and the same key of another map differs — so a tracked read keeps one
 /// edge across runs and a connection dedups an exported handle.
@@ -626,18 +626,18 @@ fn a138_every_handle_to_one_cell_or_one_key_shares_an_identity() {
     assert_compiles_and_runs(
         r#"
         import std::hash_map::HashMap;
-        import std::reactive::{ MapCell, SetCell, Source, comp };
+        import std::reactive::{ HashMapCell, HashSetCell, Source, comp };
 
         fun main() {
-            let cell: MapCell<str, i32> = MapCell::new();
+            let cell: HashMapCell<str, i32> = HashMapCell::new();
             let copy = cell;
-            let other: MapCell<str, i32> = MapCell::new();
+            let other: HashMapCell<str, i32> = HashMapCell::new();
             print(cell.identity() == copy.identity());
             print(cell.identity() == other.identity());
             print(cell.at("a").identity() == copy.at("a").identity());
             print(cell.at("a").identity() == cell.at("b").identity());
             print(cell.at("a").identity() == other.at("a").identity());
-            let set: SetCell<i32> = SetCell::new();
+            let set: HashSetCell<i32> = HashSetCell::new();
             print(set.contains(1).identity() == set.contains(1).identity());
             print(set.contains(1).identity() == set.contains(2).identity());
             let (memo, scope) = comp(|| cell.map_values(|value| value + 1).memo());
@@ -654,7 +654,7 @@ fn a138_every_handle_to_one_cell_or_one_key_shares_an_identity() {
 
 /// A147: a per-key handle's identity and a cell's are drawn from ONE space. A
 /// tracker keeps one edge per identity across every source a body reads, so a
-/// `MapEntry` (or `SetCell::contains`) numbered from `fresh_id` — the SUBSCRIBER
+/// `HashMapEntry` (or `HashSetCell::contains`) numbered from `fresh_id` — the SUBSCRIBER
 /// counter — could equal a `SignalCell`'s (`Shared::identity`'s counter) and be
 /// deduped against it: the body never heard the key. Every cell here is paired
 /// with every key in a tracked body, the numbers having been minted where the old
@@ -665,7 +665,7 @@ fn a138_every_handle_to_one_cell_or_one_key_shares_an_identity() {
 fn a147_a_key_handle_and_a_cell_never_share_an_identity() {
     assert_compiles_and_runs(
         r#"
-        import std::reactive::{ MapCell, SetCell, Signal, SignalCell, Source, derive };
+        import std::reactive::{ HashMapCell, HashSetCell, Signal, SignalCell, Source, derive };
 
         fun main() {
             mut cells: List<SignalCell<i32>> = [];
@@ -676,8 +676,8 @@ fn a147_a_key_handle_and_a_cell_never_share_an_identity() {
                 cells.push(cell);
                 i += 1;
             }
-            let map: MapCell<i32, i32> = MapCell::new();
-            let set: SetCell<i32> = SetCell::new();
+            let map: HashMapCell<i32, i32> = HashMapCell::new();
+            let set: HashSetCell<i32> = HashSetCell::new();
             mut key = 0;
             for key < 6 {
                 map.insert(key, 0);

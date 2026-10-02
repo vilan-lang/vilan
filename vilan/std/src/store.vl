@@ -331,7 +331,7 @@ fun watch_at(root: Shared<StoreNode>, path: List<usize>, subscriber: Subscriber)
 /// where every observer's is (`observe`), so a derivation mark reaches it, and the
 /// closure the slot keeps holds only the handle's READ — never the slot tree, which
 /// holds the slot: a handle captured there would be a loop through every node on
-/// the path (A132's, one level down; `MapEntry::attach_observer` is the model).
+/// the path (A132's, one level down; `HashMapEntry::attach_observer` is the model).
 fun observe_at(root: Shared<StoreNode>, path: List<usize>, observer: || void): Subscription {
 	let slot = slot_at(root, path);
 	let handle = observe(slot.signal, |_wake| observer());

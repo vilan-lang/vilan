@@ -9,7 +9,7 @@ import std::option::Option::{ self, None, Some };
 import std::reactive::{
 
 	DeltaSource,
-	MapCell,
+	HashMapCell,
 	SeqOp,
 	SetOp,
 	Signal,
@@ -53,7 +53,7 @@ fun set_ops(ops: List<SetOp<str>>): str {
 }
 
 fun main() {
-	let cell: MapCell<str, i32> = MapCell::of([("a", 1), ("b", 2), ("c", 3)].to_map());
+	let cell: HashMapCell<str, i32> = HashMapCell::of([("a", 1), ("b", 2), ("c", 3)].to_map());
 	let ((values, keys), scope) = comp(|| (cell.values().memo(), cell.keys().memo()));
 	let vcursor = values.cursor();
 	let kcursor = keys.cursor();

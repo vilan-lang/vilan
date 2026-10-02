@@ -1,11 +1,11 @@
-// A138 S1: a `SetCell` under a seeded random walk — insert, remove (held and
+// A138 S1: a `HashSetCell` under a seeded random walk — insert, remove (held and
 // absent), reconcile_to, set, clear — checked after every step against a plain
 // `HashSet`: the cell's set and its order, a mirror rebuilt from the drained
 // ops, the answers `insert`/`remove` gave, and how often each watched member's
 // `contains` handle woke.
 import std::hash_set::HashSet;
 import std::option::Option::{ self, None, Some };
-import std::reactive::{ DeltaSource, SetCell, SetOp, Source, Subscription };
+import std::reactive::{ DeltaSource, HashSetCell, SetOp, Source, Subscription };
 import std::shared::Shared;
 
 mut seed = 99;
@@ -28,7 +28,7 @@ fun replay(mirror: &mut HashSet<i32>, ops: List<SetOp<i32>>) {
 }
 
 fun main() {
-	let cell: SetCell<i32> = SetCell::new();
+	let cell: HashSetCell<i32> = HashSetCell::new();
 	mut oracle: HashSet<i32> = HashSet::new();
 	mut mirror: HashSet<i32> = HashSet::new();
 	let cursor = cell.cursor();
