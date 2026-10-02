@@ -1,0 +1,29 @@
+// F81: `*if c { &a } else { &b }` — the spelled copy of a view a branch
+// chooses — builds natively. It was emitted as a deref of the branches' copies
+// (rustc E0614 / E0599).
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+fun main() {
+	let a = [1, 2];
+	let b = [3];
+	let c = a.len() > 1;
+	mut picked = *if c { &a } else { &b };
+	picked.push(9);
+	print(i"{picked.len()} {a.len()} {b.len()}");
+	let p = Point { x = 1, y = 2 };
+	let q = Point { x = 3, y = 4 };
+	mut chosen = *match Some(2) {
+		Some(let k) => if k > 1 { &q } else { &p },
+		None => &p,
+	};
+	chosen.x += 10;
+	print(i"{chosen.x} {q.x} {p.x}");
+	let nested = *if c { if a.len() > 5 { &b } else { &a } } else { &b };
+	print(nested.len());
+}

@@ -2013,12 +2013,38 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// own generic parameters bound to the arguments `type_id` implements the
     /// trait at, plus the providing impl's binders bound from the concrete
     /// receiver. The JS emitter's `trait_parameter_substitution` (B58).
+    ///
+    /// F75: plus the binders of the impl that PROVIDES a blanket's bound, as
+    /// [`Self::dispatch_to_member`] adds them for a member (F58). A default
+    /// reached through `impl type S: Source<type T> with Flow<T>` at `S =
+    /// W<str>` binds `T` from `impl W<type P> with Source<Option<P>>` — as
+    /// `Option<P>`, in the provider's binder — and without `P = str` beside it
+    /// `w.effect(..)` was refused as an unbound parameter of `W`. The JS
+    /// emitter needs no concrete type, so its half stays as it is.
     fn trait_parameter_substitution(
         &self,
         default_id: Id,
         type_id: TypeId,
     ) -> HashMap<TypeId, TypeId> {
-        mono::trait_parameter_substitution(self.program, None, default_id, type_id)
+        let mut substitution =
+            mono::trait_parameter_substitution(self.program, None, default_id, type_id);
+        let declaring_trait = self
+            .program
+            .traits
+            .iter()
+            .find(|(_, trait_)| trait_.declarations.values().any(|id| *id == default_id))
+            .map(|(trait_id, _)| *trait_id);
+        if let Some(trait_id) = declaring_trait
+            && let Some(implementation) =
+                impl_select::select_implementation(self.program, None, type_id, trait_id)
+        {
+            impl_select::bind_provider_binders(
+                self.program,
+                implementation.subject,
+                &mut substitution,
+            );
+        }
+        substitution
     }
 
     /// Composes `entries` onto the substitution in force and installs the
@@ -2281,6 +2307,38 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let (parameters, returns) = (parameters.clone(), *returns);
                 parameters.iter().any(|inner| self.mentions_any(*inner))
                     || self.mentions_any(returns)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a DECLARED type mentions one of a declaration's own
+    /// `parameters` anywhere — read off the declaration, never through the
+    /// substitution in force.
+    fn mentions_a_parameter(&self, type_id: TypeId, parameters: &[TypeId]) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return true;
+        };
+        if parameters.contains(&type_id) {
+            return true;
+        }
+        match self.program.type_id_to_type_map.get(&type_id) {
+            Some(Type::Generic(constraint_id)) => parameters.contains(constraint_id),
+            Some(
+                Type::Struct(_, arguments)
+                | Type::Enum(_, arguments)
+                | Type::Tuple(arguments)
+                | Type::Trait(_, arguments)
+                | Type::Dyn(_, arguments),
+            ) => arguments
+                .iter()
+                .any(|argument| self.mentions_a_parameter(*argument, parameters)),
+            Some(Type::Array(element, _)) => self.mentions_a_parameter(*element, parameters),
+            Some(Type::Closure(closure_parameters, returned, _)) => {
+                closure_parameters
+                    .iter()
+                    .any(|parameter| self.mentions_a_parameter(*parameter, parameters))
+                    || self.mentions_a_parameter(*returned, parameters)
             }
             _ => false,
         }
@@ -3655,15 +3713,35 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `dyn Fn(..)` signature is written from (F44), so it is rendered once, by
     /// the same rules the declaration uses, and the two cannot disagree.
     fn parameter_parts(&mut self, id: Id, span: Span) -> Result<(String, String), Error> {
+        self.parameter_parts_at(id, None, span)
+    }
+
+    /// [`Self::parameter_parts`], with the parameter's type taken from
+    /// `positioned` where the analyzer recorded none — a closure literal's
+    /// parameter that only its POSITION types (F74).
+    fn parameter_parts_at(
+        &mut self,
+        id: Id,
+        positioned: Option<TypeId>,
+        span: Span,
+    ) -> Result<(String, String), Error> {
         if self.program.context_hidden_parameters.contains_key(&id) {
             return self.context_parameter_parts(id, span);
         }
-        let parameter = self
+        let mut parameter = self
             .program
             .parameters
             .get(&id)
             .cloned()
             .ok_or_else(|| unsupported("an unresolved parameter", span))?;
+        if let Some(positioned) = positioned
+            && matches!(
+                self.resolve(parameter.type_id),
+                None | Some(Type::Unresolved | Type::Unknown)
+            )
+        {
+            parameter.type_id = positioned;
+        }
         if parameter.spread {
             return Err(unsupported("a spread parameter", span));
         }
@@ -3916,9 +3994,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Local(_) if self.program.variant_coercions.contains_key(&id) => {
                 self.variant_closure(id, span)?
             }
-            // J6: a `None` or a variant the context pass synthesized as an
-            // argument names the VARIANT, not a place — `Expr::Local` of the
-            // variant's own declaration id.
+            // A bare variant — `None`, `Maybe::Nothing`, or one the context
+            // pass synthesized as an argument (J6) — names the VARIANT, not a
+            // place: `Expr::Local` of the variant's own declaration id. It is a
+            // constructor with no payload, and takes its enum's arguments by
+            // the constructor's rule (F76): the type recorded at THIS site,
+            // else the position's. It passed none, so a generic user enum's
+            // bare variant was refused as unbound under its own annotation.
             Expr::Local(binding)
                 if matches!(
                     self.program.entity_map.get(&binding),
@@ -3930,7 +4012,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 else {
                     unreachable!("the guard just matched an enum variant");
                 };
-                self.variant_path(enum_id, index, &[], span)?
+                let arguments = self.variant_arguments(id, enum_id, index, &[]);
+                self.variant_path(enum_id, index, &arguments, span)?
             }
             // F35: a named FUNCTION in a value position — `map_each(source,
             // counted)` hands `counted` itself where a closure could stand.
@@ -4087,6 +4170,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     format!("&{}", self.expression(operand, depth)?)
                 }
             }
+            // F81: `*if c { &a } else { &b }` — the spelled copy of a view a
+            // branch chooses. The branches' tails are value positions here, so
+            // each leaf is already its copy, and the `*` has nothing to cross.
+            Expr::Dereference(operand) if self.is_conditional(operand) => {
+                self.expression(operand, depth)?
+            }
             Expr::Dereference(operand) => format!("(*{})", self.expression(operand, depth)?),
             Expr::Call(call_id) => self.call(id, call_id, depth, span)?,
             Expr::Async(spawned) => self.async_spawn(id, spawned, depth, span)?,
@@ -4115,8 +4204,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let value = self.copy_a_consumed_place_read(subject, value);
                 format!("let {bound} = {value}")
             }
+            // The variant's declaration itself: the constructor's rule, as
+            // for the bare variant above.
             Expr::EnumVariant(enum_id, index) => {
-                let arguments = self.enum_arguments_at(id, enum_id);
+                let arguments = self.variant_arguments(id, enum_id, index, &[]);
                 self.variant_path(enum_id, index, &arguments, span)?
             }
             Expr::TryAssert(receiver) => self.try_assert(id, receiver, depth, span)?,
@@ -4437,6 +4528,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         if let Some(parameter) = self.program.parameters.get(&binding) {
             return self.receiving_form(parameter) == Receiving::RefMut;
+        }
+        // F80: a `for e in &mut xs` element is an `iter_mut` item — a `&mut T`
+        // loan, handed on by reborrow (`&mut *e`), never `&mut e`.
+        if self.program.for_each_views.get(&binding) == Some(&true) {
+            return true;
         }
         self.program
             .variables
@@ -5173,7 +5269,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let name = self.binding_name(binding);
         let mutable = if variable.mutable { "mut " } else { "" };
         // An annotation is WRITTEN ONLY where the initializer cannot type the
-        // binding — an empty collection literal, and nothing else.
+        // binding — an empty collection literal, and a `Shared` cell built
+        // around one (F74: `let leases: Shared<List<KeyLease>> =
+        // Shared::new([])` read `lease.key` off a `Vec<_>` rustc had not
+        // settled yet, E0282) — and nothing else.
         //
         // The temptation is to annotate everything, and it is wrong: a binding's
         // `type_id` is its POINTEE's whenever the binding is a view (the type
@@ -5183,8 +5282,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // inference has the right answer at every one of those sites, and every
         // numeric literal this emitter writes carries its own suffix — so the
         // annotation buys nothing except the chance to be wrong.
+        // A bare empty literal is annotated whatever the binding's type, as it
+        // always was; a cell around one only when that type is closed, so a
+        // binding Rust could settle from its uses is never refused for it.
         let initializer_needs_a_type = variable.initial.is_some_and(|initial| {
             matches!(self.program.entity_map.get(&initial), Some(Expr::List(items)) if items.is_empty())
+                || (self.cannot_type_itself(initial) && self.is_grounded(variable.type_id))
         });
         let annotation = if initializer_needs_a_type {
             let rendered = self.rust_type(variable.type_id, self.span_of(binding))?;
@@ -5260,6 +5363,34 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
+    /// Whether an initializer leaves its own type to its READERS natively: an
+    /// empty list literal, or `Shared::new` around one — the cell is typed by
+    /// the list, and the list by nothing. Rust settles such a binding from its
+    /// first use, and a use that reads a member through it (`lease.key`) comes
+    /// before anything has (E0282), so the binding's type is written.
+    fn cannot_type_itself(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::List(items)) => items.is_empty(),
+            Some(Expr::Call(call_id)) => {
+                let Some(call) = self.program.function_calls.get(call_id) else {
+                    return false;
+                };
+                let Some(Expr::Local(subject)) = self.program.entity_map.get(&call.subject_id)
+                else {
+                    return false;
+                };
+                matches!(
+                    self.program.intrinsics.get(subject),
+                    Some(Intrinsic::SharedNew)
+                ) && call
+                    .argument_ids
+                    .first()
+                    .is_some_and(|value| self.cannot_type_itself(*value))
+            }
+            _ => false,
+        }
+    }
+
     /// Whether `id` builds an `Option` or a `Result` variant directly — `None`,
     /// `Some(x)`, `Ok(x)`, `Err(e)` — whose Rust path names no instance (F55).
     fn builds_a_host_variant(&self, id: Id) -> bool {
@@ -5285,6 +5416,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .enums
             .get(enum_id)
             .is_some_and(|declaration| matches!(declaration.name, "Option" | "Result"))
+    }
+
+    /// Whether an expression CHOOSES its value among branches — an `if`, a
+    /// `match` — whose tails this emitter renders as value positions.
+    fn is_conditional(&self, id: Id) -> bool {
+        matches!(
+            self.program.entity_map.get(&id),
+            Some(Expr::If(_) | Expr::Match(..))
+        )
     }
 
     /// Whether a type is one of the numeric scalar primitives — the set
@@ -6101,7 +6241,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) -> Result<String, Error> {
         match pattern {
             ExprPattern::Wildcard => Ok("_".to_string()),
-            ExprPattern::Binding(id) => Ok(self.binding_name(*id)),
+            // F79: a `mut` binder — `Some(mut p)`, `mut (c, d) = ..` — is a
+            // `mut` Rust binder, or a `&mut p` of it is refused (E0596).
+            ExprPattern::Binding(id) => Ok(
+                if self
+                    .program
+                    .variables
+                    .get(id)
+                    .is_some_and(|variable| variable.mutable)
+                {
+                    format!("mut {}", self.binding_name(*id))
+                } else {
+                    self.binding_name(*id)
+                },
+            ),
             // A `str` LITERAL pattern (F20). A vilan `str` is an `Rc<str>` and
             // its literal emits `vilan_rt::str_new("..")`, which is a function
             // CALL and no pattern at all — `parse-bool.vl` matches `"true"` /
@@ -6327,7 +6480,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// The arguments a VARIANT CONSTRUCTOR instantiates its enum at.
     ///
-    /// Two sources, in order, because neither is total. The type recorded at the
+    /// Three sources, in order, because none is total. The type recorded at the
     /// call site is the general answer, but for a generic enum it can be
     /// OPEN — `Tree::Leaf(7)` records `Tree<any>`, its parameter still a hole
     /// the surrounding `let`'s annotation closes later (this is B357's shape
@@ -6336,9 +6489,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// bound against the variant's declared payload types by the same walk that
     /// binds an impl subject.
     ///
-    /// A NULLARY variant of a generic enum has neither — nothing to read the
-    /// parameter off — and the refusal names it rather than instantiating a
-    /// second Rust enum over a hole.
+    /// Between the two, the POSITION the constructor is emitted into, when it
+    /// expects the same enum with its arguments closed — the only source a
+    /// NULLARY variant has (`let n: Maybe<i32> = Maybe::Nothing`, F76), whose
+    /// recorded type stays open, and which used to read the recorded type
+    /// alone and was refused under its annotation. A variant with none of the
+    /// three names
+    /// the unbound parameter rather than instantiating a second Rust enum over
+    /// a hole.
     fn variant_arguments(
         &mut self,
         expr_id: Id,
@@ -6463,9 +6621,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// Whether a type argument is CLOSED — something a Rust type can be minted
     /// from. `any`, an unresolved hole and a still-abstract generic are not.
+    ///
+    /// Nor is a bare TRAIT (F72). A declaration's own parameter can arrive as
+    /// its constraint id, whose `Type` is the parameter's BOUND — `any` for
+    /// `enum Tree<T>`, but `Hashable` itself for `enum Op<T: Hashable>` — so a
+    /// constructor whose site recorded the open `Op<T>` read as closed, and
+    /// the enum was minted over "a trait object" instead of falling back to the
+    /// position or the payload. No value is ever typed as a bare trait once
+    /// [`Self::concrete`] has rewritten a default body's `Self`; an object is
+    /// `Dyn`, which stays grounded.
     fn is_grounded(&self, type_id: TypeId) -> bool {
         match self.resolve(type_id) {
-            Some(Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_)) | None => false,
+            Some(
+                Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_) | Type::Trait(_, _),
+            )
+            | None => false,
             Some(
                 Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
             ) => arguments
@@ -6593,15 +6763,54 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .get(*index)
                 .ok_or_else(|| unsupported("a struct field past the declaration", span))?;
             let name = sanitize(field.name);
-            // The field's declared type under THIS instantiation, so a field
-            // holding a generic enum can ground it.
+            // The field's declared type under THIS instantiation, so a value
+            // closed only by its position — a bare variant, a generic call left
+            // open — closes from it.
+            //
+            // F73: the WHOLE declared type, not its head. Resolving the head
+            // and restoring the substitution handed `cell = SignalCell::new(None)`
+            // the expectation `SignalCell<Option<V>>` with `V` the struct's own
+            // parameter, unbound once the instance's bindings were gone, and the
+            // call closed `T` with it — refused as "an unbound generic type
+            // parameter (parameter 2 of struct `Pair`)". A type id cannot be
+            // minted here, so the instance's bindings stay in force while the
+            // value is rendered, which is how the struct's own field types are
+            // rendered ([`Self::ensure_struct`]). Inside the struct's OWN impl,
+            // whose binders are the declaration's parameters, a literal of
+            // another instantiation (`Pair<V, K>` in `impl Pair<type K, type
+            // V>`) would rebind them under the value's own types. There the
+            // bindings are not installed: a field that IS a parameter expects
+            // its argument, and one that only mentions a parameter expects
+            // nothing — its parameters read under the bindings in force would
+            // name the wrong instantiation (`held: Maybe<V>` expecting the
+            // method's `V` where the literal's `V` is its `K`).
+            let rebinds = entries.iter().any(|(parameter, argument)| {
+                self.current_substitution
+                    .get(parameter)
+                    .is_some_and(|bound| self.type_key(*bound) != self.type_key(*argument))
+            });
             let saved = self.enter_substitution(entries.clone());
-            let expecting = self.concrete(field.type_id);
-            self.current_substitution = saved;
+            let expecting = if !rebinds {
+                Some(field.type_id)
+            } else if let Some(Type::Generic(parameter)) =
+                self.program.type_id_to_type_map.get(&field.type_id)
+                && let Some((_, argument)) = entries.iter().find(|(bound, _)| bound == parameter)
+            {
+                self.current_substitution = saved.clone();
+                Some(*argument)
+            } else {
+                self.current_substitution = saved.clone();
+                (!self.mentions_a_parameter(
+                    field.type_id,
+                    &declaration.generic_parameter_constraint_ids,
+                ))
+                .then_some(field.type_id)
+            };
             // A field declared `async |T| U` takes a future-answering closure.
             self.expects_async_value = self.program.async_fields.contains(&(struct_id, *index));
-            let rendered = self.consumed_value_of_expecting(*value, Some(expecting), depth);
+            let rendered = self.consumed_value_of_expecting(*value, expecting, depth);
             self.expects_async_value = false;
+            self.current_substitution = saved;
             parts.push(format!("{name}: {}", rendered?));
         }
         Ok(format!("{} {{ {} }}", instance.name, parts.join(", ")))
@@ -6801,10 +7010,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             self.census_walk(&[closure.return_], depth);
             return rendered;
         }
+        // F74: a parameter the analyzer left untyped — `Shared::new(|_key| {})`
+        // under `Shared<|Hash| void>`, where nothing in the literal constrains
+        // `_key` and the annotation reaches the call's `T` only — takes the
+        // position's: the closure type the literal is rendered into.
+        let positioned: Vec<TypeId> = match self
+            .expected_type
+            .and_then(|type_id| self.resolve(type_id))
+        {
+            Some(Type::Closure(expected, _, _)) if expected.len() == closure.parameters.len() => {
+                expected.clone()
+            }
+            _ => Vec::new(),
+        };
         let mut parameters = Vec::new();
         let mut signature = Vec::new();
-        for parameter_id in &closure.parameters {
-            let (binder, rendered) = self.parameter_parts(*parameter_id, span)?;
+        for (index, parameter_id) in closure.parameters.iter().enumerate() {
+            let (binder, rendered) =
+                self.parameter_parts_at(*parameter_id, positioned.get(index).copied(), span)?;
             parameters.push(format!("{binder}: {rendered}"));
             signature.push(rendered);
         }
@@ -8714,8 +8937,39 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if function_call.argument_ids.is_empty() {
                 return Ok(path);
             }
-            let arguments = self.value_arguments(&function_call.argument_ids, depth)?;
-            return Ok(format!("{path}({})", arguments.join(", ")));
+            // Each payload is a POSITION, so a constructor nested in it closes
+            // from it the way it would under a `let`'s annotation (F76):
+            // `Some(Maybe::Nothing)` under `Option<Maybe<i32>>`. The payload
+            // types are read off the position's own expectation, never off the
+            // arguments the site recorded — inside a generic instance those
+            // can name the wrong parameter (F66), and an expectation is
+            // something a literal or a struct obeys. Only a CLOSED payload type
+            // is handed down: an open one says nothing, and an `any` one would
+            // wrap the value.
+            let payload_types = match self.expected_type.and_then(|type_id| self.resolve(type_id)) {
+                Some(Type::Enum(expected, expected_arguments))
+                    if *expected == enum_id
+                        && expected_arguments
+                            .iter()
+                            .all(|argument| self.is_grounded(*argument)) =>
+                {
+                    let expected_arguments = expected_arguments.clone();
+                    self.variant_payload_types(enum_id, index, &expected_arguments)
+                }
+                _ => Vec::new(),
+            };
+            let mut rendered = Vec::new();
+            for (slot, argument) in function_call.argument_ids.iter().enumerate() {
+                let expecting = payload_types
+                    .get(slot)
+                    .copied()
+                    .filter(|payload_type| self.is_grounded(*payload_type));
+                rendered.push(match expecting {
+                    Some(_) => self.consumed_value_of_expecting(*argument, expecting, depth)?,
+                    None => self.consumed_value_of(*argument, depth)?,
+                });
+            }
+            return Ok(format!("{path}({})", rendered.join(", ")));
         }
 
         // A124 R3: `o.member(..)` where `o` is a trait OBJECT — a slot call.
@@ -9483,8 +9737,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // 1's copy, never a move out of the reference (rustc E0507). It is
             // never a last use either: what dies here is the view, not the
             // place it names.
-            Some(Expr::Dereference(_)) => {
-                if self.is_natively_copy(id) {
+            Some(Expr::Dereference(operand)) => {
+                // F81: over a conditional the leaves are the copies already.
+                if self.is_natively_copy(id) || self.is_conditional(*operand) {
                     return rendered;
                 }
                 self.copies_taken += 1;
@@ -10425,10 +10680,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 slot,
             },
         );
-        // REPLACED rather than composed, exactly as the JS emitter does it: a
-        // default body has no generic parameters of its own, and the trait's
-        // arguments for THIS type are the whole binding it runs under.
-        let mut substitution = self.trait_parameter_substitution(default_id, type_id);
+        // The trait's arguments for THIS type, and the default's own, are the
+        // binding the body runs under — COMPOSED onto the caller's, as
+        // [`Self::ensure_function`] composes, never in place of it (F71). The
+        // receiver is resolved at its head alone, so a receiver built in a
+        // generic body — `s.derive(..).switch(..)` inside `fun switch_to<.., S:
+        // Source<T>, ..>`, a `Switch<Derive<S, ..>, ..>` — reaches the body
+        // still written in the CALLER's binders, and the trait's bindings are
+        // read off it in those terms. Replaced, the caller's `S` was gone and
+        // `.cell()` was refused as "an unbound generic type parameter
+        // (parameter 3 of `switch_to`)". Reachable is not keyed: the instance
+        // is keyed by the receiver resolved under the caller (above), and the
+        // default's own entries win over any caller entry they share.
+        let mut substitution = self.current_substitution.clone();
+        substitution.extend(self.trait_parameter_substitution(default_id, type_id));
         substitution.extend(own);
         let saved_self = self.current_self_type.replace(type_id);
         let self_traits = self.self_traits_of(default_id);

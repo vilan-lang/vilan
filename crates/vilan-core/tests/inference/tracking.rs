@@ -645,7 +645,9 @@ fn a146_a_tracked_list_keyed_or_mirror_read_keeps_one_edge_across_runs() {
     // ONE edge on it — for a mirror, one lease, no re-attach per run. The
     // instrument wraps each source, counting the edges a tracked read attaches
     // and answering the wrapped source's identity. Red before A146 (the default
-    // `None`): every wrapper reads `attaches=7`, one per run.
+    // `None`): every wrapper reads `attaches=7`, one per run. The same program
+    // runs natively in `native_differential`'s
+    // `an_in_process_mirror_program_is_identical_on_both_backends` (F74).
     assert_compiles_and_runs(
         r#"
         import std::io::print;

@@ -1,0 +1,41 @@
+// F80: a `for e in &mut xs` element is a `&mut` loan natively, handed on by
+// reborrow. `f(e)` to a `|&mut T|` closure was emitted `f(&mut e)` (rustc
+// E0596), in a generic body and a concrete one.
+import std::io::print;
+
+struct Counter {
+	hits: i32,
+}
+
+fun bump(counter: &mut Counter) {
+	counter.hits += 1;
+}
+
+fun each<T>(xs: &mut List<T>, f: |&mut T| void) {
+	for e in &mut xs {
+		f(e);
+	}
+}
+
+fun each_counter(counters: &mut List<Counter>, f: |&mut Counter| void) {
+	for counter in &mut counters {
+		f(counter);
+		bump(&mut counter);
+		counter.hits += 100;
+	}
+}
+
+fun main() {
+	mut xs = [1, 2, 3];
+	each(&mut xs, |&mut n| n += 10);
+	print(xs);
+	mut names = ["a", "b"];
+	each(&mut names, |&mut name| name = *name + "!");
+	print(names);
+	mut counters = [Counter { hits = 0 }, Counter { hits = 5 }];
+	each_counter(&mut counters, |&mut counter| counter.hits += 1);
+	each(&mut counters, |&mut counter| bump(&mut counter));
+	for counter in counters {
+		print(counter.hits);
+	}
+}

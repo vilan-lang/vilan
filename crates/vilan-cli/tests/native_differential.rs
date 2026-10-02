@@ -1626,53 +1626,51 @@ fn a142_collection_pipes_build_the_same_on_both_backends() {
     }
 }
 
-/// A138 S1 and S2: `MapCell` and the map operators on both backends — their seeded random walks
-/// (`inference/maps.rs` runs the same program on JS), checked against a plain
-/// `HashMap` after every write: the map and its order, a mirror replayed from the
-/// drained `MapOp`s, every watched key's handle and how often it woke.
-///
-/// `SetCell` is REFUSED natively, by name, and this pin holds the refusal to a
-/// name rather than letting it become a wrong answer: the native backend types a
-/// variant constructor of a ONE-parameter enum whose parameter is bounded
-/// (`SetOp<T: Hashable>`'s `Add(value)`) as a bare trait object (`MapOp<K: Hashable,
-/// V>` has two parameters and builds). When that lands, the set's walk is expected
-/// to be identical, and this pin says so.
+/// A138 S1 and S2: `MapCell`, `SetCell` and the map operators on both backends —
+/// their seeded random walks (`inference/maps.rs` runs the same programs on JS),
+/// checked against a plain `HashMap`/`HashSet` after every write: the collection
+/// and its order, a mirror replayed from the drained ops, every watched key's
+/// handle and how often it woke — plus `keys()`, a set pipe, and a `MapEntry`'s
+/// `set(Some(v))`/`set(None)` writes. `SetCell`, `SetOp` and `keys()` were
+/// refused natively until F72 (a variant of the one-parameter, BOUNDED
+/// `SetOp<T: Hashable>` was typed as a bare trait object).
 #[test]
-fn a138_map_and_set_cells_build_the_same_on_both_backends_or_are_refused_by_name() {
+fn a138_map_and_set_cells_build_the_same_on_both_backends() {
     let staged = stage();
-    std::fs::write(
-        staged.join("native_probe_map_walk.vl"),
-        include_str!("native/map_walk.vl"),
-    )
-    .expect("write the probe program");
-    assert_eq!(
-        compare(&staged, "native_probe_map_walk.vl"),
-        Verdict::Identical,
-        "a MapCell must build and answer the same on both backends"
-    );
-    // A138 S2: the map operators' walk (`inference/maps.rs` runs it on JS).
-    std::fs::write(
-        staged.join("native_probe_map_operator_walk.vl"),
-        include_str!("native/map_operator_walk.vl"),
-    )
-    .expect("write the probe program");
-    assert_eq!(
-        compare(&staged, "native_probe_map_operator_walk.vl"),
-        Verdict::Identical,
-        "the map operators must build and answer the same on both backends"
-    );
-    std::fs::write(
-        staged.join("native_probe_set_walk.vl"),
-        include_str!("native/set_walk.vl"),
-    )
-    .expect("write the probe program");
-    match compare(&staged, "native_probe_set_walk.vl") {
-        Verdict::Identical => {}
-        Verdict::Refused(reason) => assert!(
-            reason.contains("a trait object"),
-            "the set's native refusal moved to another construct: {reason}"
+    for (name, program, what) in [
+        (
+            "native_probe_map_walk.vl",
+            include_str!("native/map_walk.vl"),
+            "a MapCell",
         ),
-        Verdict::Broken(detail) => panic!("a SetCell was accepted natively and wrong: {detail}"),
+        // A138 S2: the map operators' walk.
+        (
+            "native_probe_map_operator_walk.vl",
+            include_str!("native/map_operator_walk.vl"),
+            "the map operators",
+        ),
+        (
+            "native_probe_set_walk.vl",
+            include_str!("native/set_walk.vl"),
+            "a SetCell",
+        ),
+        (
+            "native_probe_map_keys_pipe.vl",
+            include_str!("native/map_keys_pipe.vl"),
+            "`keys()` and `values()`",
+        ),
+        (
+            "native_probe_map_entry_writes.vl",
+            include_str!("native/map_entry_writes.vl"),
+            "a MapEntry's writes",
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{what} must build and answer the same on both backends"
+        );
     }
 }
 
@@ -2980,9 +2978,9 @@ const J7_PROBE: &str = concat!(
 
 /// A146: `ListCell` and `KeyedCell` name their identity, so a body that tracks
 /// one on every run keeps ONE edge on it (`attaches=1`) on both backends. (The
-/// mirror half of the pin, `RemoteSource` and `KeyedSource` over `duplex_pair`,
-/// is JS-only: `inference::tracking`'s A146 pin — the native backend refuses
-/// that program by name, at an unresolved type in the rpc layer.)
+/// mirror half, `RemoteSource` and `KeyedSource` over `duplex_pair`, is
+/// `inference::tracking`'s A146 program, natively in
+/// `an_in_process_mirror_program_is_identical_on_both_backends` since F74.)
 #[test]
 fn a_tracked_list_or_keyed_cell_keeps_one_edge_on_both_backends() {
     let staged = stage();
@@ -8655,5 +8653,303 @@ fn the_spelled_copy_of_a_view_expression_is_identical_on_both_backends() {
         compare(&staged, "native_probe_b496.vl"),
         Verdict::Identical,
         "the spelled copy of a view expression must copy on both backends"
+    );
+}
+
+/// F72: a variant constructor of an enum whose parameter is BOUNDED builds
+/// natively — `enum Op<T: Hashable> { Add(T), Drop(T) }` then
+/// `let op: Op<i32> = Op::Add(3)`, which was refused as "a value of type `a
+/// trait object`". The constructor's site records the enum OPEN, its argument
+/// the parameter's constraint id, and that id's type is the parameter's bound:
+/// `any` for an unbounded `T` (read as open, so the emitter fell back to the
+/// position or the payload) but `Hashable` itself for a bounded one, which the
+/// emitter took for a closed argument and minted the enum over. That is why a
+/// second, unbounded parameter (`MapOp<K: Hashable, V>`) built: one open
+/// argument sent the whole list to the fallback. The probe covers an annotated
+/// binding, the payload alone, an argument position, `Option` and list
+/// nesting, a generic function at two instances, a generic impl, two bounds
+/// on one parameter, and two bounded parameters. It blocked `SetCell`,
+/// `SetOp` and `MapCell::keys()`.
+#[test]
+fn a_variant_of_an_enum_with_a_bounded_parameter_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_bounded_variant_constructors.vl"),
+        include_str!("native/bounded_variant_constructors.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_bounded_variant_constructors.vl"),
+        Verdict::Identical,
+        "a variant of an enum whose parameter is bounded must build and print the same"
+    );
+}
+
+/// F76: a bare variant of a generic USER enum — `let n: Maybe<i32> =
+/// Maybe::Nothing` — builds natively; it was refused as "an unbound generic
+/// type parameter (parameter 1 of enum `Maybe`)" under its own annotation. A
+/// bare variant is an `Expr::Local` of the variant's declaration, and its arm
+/// minted the enum at NO arguments, never asking the position — where a
+/// constructor with a payload reads the site's record, then the position, then
+/// the payload (`variant_arguments`), and a bare one has only the first two.
+/// It takes that rule now, and a constructor's payload is a position of its
+/// own (`Some(Maybe::Nothing)` under `Option<Maybe<i32>>`). `None` built all
+/// along because `Option` is Rust's enum, whose path names no instance. The
+/// probe covers an annotated binding, an argument, a generic function's
+/// return at two instances, `ret` and a tail, a mixed list literal, an
+/// assignment, a nested payload, both arms of an `if`, a field written
+/// through a generic impl, and a two-parameter enum with a bound.
+#[test]
+fn a_bare_variant_of_a_generic_enum_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_bare_generic_variants.vl"),
+        include_str!("native/bare_generic_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_bare_generic_variants.vl"),
+        Verdict::Identical,
+        "a bare variant of a generic enum must close from its position and print the same"
+    );
+}
+
+/// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
+/// source whose `Source` argument is written in the source impl's own binder
+/// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds
+/// natively; it was refused as "an unbound generic type parameter (parameter
+/// 1 of struct `W`)". The default's substitution binds the blanket's `T` from
+/// the receiver's `Source` impl, as `Option<P>` in that PROVIDER's binder, and
+/// nothing bound `P`: F58 had added the provider's binders where a MEMBER is
+/// dispatched (`on_change`, `start`), not where a default is specialized
+/// (`effect`, `effect_on_change`). The probe covers both, a two-parameter
+/// source whose argument is in its second parameter, a list argument, and the
+/// pipes (`derive(..).memo()`, `sample()`). It blocked observing std's
+/// `StoreSome<P>` natively.
+#[test]
+fn a_default_over_a_source_written_in_its_providers_binder_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_provider_binder_defaults.vl"),
+        include_str!("native/provider_binder_defaults.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_provider_binder_defaults.vl"),
+        Verdict::Identical,
+        "a Flow default over a source written in its provider's binder must build and run the same"
+    );
+}
+
+/// F73: `set(None)` on a two-parameter struct's `Signal<Option<V>>` impl, and
+/// the struct literal that builds it, are identical on both backends.
+///
+/// The item's own refusal ("an unbound generic type parameter (parameter 2 of
+/// struct `Pair`)" at the `impl .. with Signal<Option<V>>` header) reproduces
+/// on 0.42.0 and not on this order's base, where an earlier merge had closed
+/// it; the probe pins it. Reproducing it found the literal beside it: a struct
+/// literal's field expectation was its declared type's HEAD, resolved under the
+/// instance and then dropped, so `cell = SignalCell::new(None)` met
+/// `SignalCell<Option<V>>` with the struct's own `V` unbound. The instance's
+/// bindings stay in force while a field's value is rendered now — in `main`
+/// under an annotation, in the struct's own static at two instantiations, and
+/// for a generic struct literal nested in another's field.
+///
+/// Inside the struct's OWN impl a literal of ANOTHER instantiation
+/// (`Pair<V, K>` in `impl Pair<type K, type V>`) cannot take that rule — the
+/// impl's binders are the declaration's parameters, and installing the
+/// literal's bindings would retype the value's own reads — so a field that
+/// only mentions a parameter expects nothing there, and a value that needed
+/// the expectation is refused by name rather than built at the wrong
+/// instantiation (rustc E0308 before).
+#[test]
+fn a_struct_literals_fields_close_their_values_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_struct_literal_field_positions.vl"),
+        include_str!("native/struct_literal_field_positions.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_struct_literal_field_positions.vl"),
+        Verdict::Identical,
+        "a struct literal's field must close its value from the instance on both backends"
+    );
+    std::fs::write(
+        staged.join("native_probe_swapped_literal.vl"),
+        SWAPPED_LITERAL_PROBE,
+    )
+    .expect("write the probe program");
+    match compare(&staged, "native_probe_swapped_literal.vl") {
+        Verdict::Identical => {}
+        Verdict::Refused(reason) => assert!(
+            reason.contains("instantiated at `any`"),
+            "the swapped literal's refusal moved to another construct: {reason}"
+        ),
+        Verdict::Broken(detail) => {
+            panic!("a swapped literal in its own impl was built wrong: {detail}")
+        }
+    }
+}
+
+const SWAPPED_LITERAL_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "enum Maybe<T> {\n",
+    "\tNothing,\n",
+    "\tJust(T),\n",
+    "}\n",
+    "\n",
+    "struct Pair<K, V> {\n",
+    "\tkey: K,\n",
+    "\theld: Maybe<V>,\n",
+    "}\n",
+    "\n",
+    "impl Pair<type K, type V> {\n",
+    "\tfun swap(self, value: V): Pair<V, K> {\n",
+    "\t\tPair { key = value, held = Maybe::Nothing }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet pair: Pair<str, i32> = Pair { key = \"k\", held = Maybe::Just(1) };\n",
+    "\tlet swapped = pair.swap(9);\n",
+    "\tprint(swapped.key);\n",
+    "\tprint(swapped.held is Maybe::Nothing);\n",
+    "}\n",
+);
+
+/// F71: a pipe built and SEALED inside a generic body — `source.derive(|v|
+/// f(v)).switch(|inner| inner).cell()` in `fun switch_to<T, U, S: Source<T>,
+/// I: Source<U>>` — builds natively; it was refused as "an unbound generic
+/// type parameter (parameter 3 of `switch_to`)". The sealing call is a trait
+/// DEFAULT whose receiver is written in the generic body's binders
+/// (`Switch<Derive<S, ..>, ..>`), and a default body ran under the trait's
+/// bindings ALONE — the caller's `S` replaced away — where a function instance
+/// composes onto its caller's. The probe covers the item's repro, B479's
+/// unannotated selector (`inference::traits`' pin is its JS half), `memo()`
+/// and `sample()` as the seal, the blanket-method spelling, and an `Option`
+/// source.
+#[test]
+fn a_pipe_sealed_in_a_generic_body_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_pipe_defaults.vl"),
+        include_str!("native/generic_pipe_defaults.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_pipe_defaults.vl"),
+        Verdict::Identical,
+        "a pipe sealed in a generic body must build and run the same on both backends"
+    );
+}
+
+/// F74: an in-process `duplex_pair` program — A146's inference pin, a server
+/// and a client mirroring a cell and a keyed cell, each source wrapped in a
+/// generic `Counted<S>` — builds natively and prints node's bytes; it was
+/// refused as "an unresolved type". The wrapper was not the cause: the program
+/// reaches `std::rpc`'s `keyed_mirror_of`, and two of its bindings were typed
+/// only by their written annotations. `Shared::new(|_key| {})` under
+/// `Shared<|Hash| void>` — the analyzer leaves a closure parameter nothing
+/// constrains untyped, so the literal takes its parameter types from the
+/// closure type it is rendered into; and `Shared::new([])` under
+/// `Shared<List<KeyLease>>`, whose first use reads `lease.key` off a `Vec<_>`
+/// rustc had not settled (E0282) — a cell around an empty literal has its
+/// binding's type written, as an empty literal always had. The second program
+/// holds both shapes outside std.
+#[test]
+fn an_in_process_mirror_program_is_identical_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        (
+            "native_probe_in_process_mirrors.vl",
+            include_str!("native/in_process_mirrors.vl"),
+        ),
+        (
+            "native_probe_position_typed_bindings.vl",
+            include_str!("native/position_typed_bindings.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{name}: must build and print the same on both backends"
+        );
+    }
+    // A146's mirror half, natively: one edge per source across the runs.
+    let output = vilan(&staged)
+        .args([
+            "run",
+            "--backend",
+            "rust",
+            "native_probe_in_process_mirrors.vl",
+        ])
+        .output()
+        .expect("run the probe natively");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "list attaches=1\nkeyed cell attaches=1\nmirror attaches=1\nkeyed mirror attaches=1\n5 2 1 7 1\n",
+        "one edge per source, mirrors included, natively (A146)"
+    );
+}
+
+/// F79: a `mut` pattern binder — `Some(mut p)` in a `match`, `mut (c, d) =
+/// (3, 4)`, an `is` capture, a generic body's `match` — is emitted `mut`, so a
+/// `&mut` of it builds (rustc E0596 before), and the matched place a program
+/// reads again keeps its value.
+#[test]
+fn a_mut_pattern_binder_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_mut_pattern_binders.vl"),
+        include_str!("native/mut_pattern_binders.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_mut_pattern_binders.vl"),
+        Verdict::Identical,
+        "a `mut` pattern binder must be mutable natively and print the same"
+    );
+}
+
+/// F80: a `for e in &mut xs` element is a `&mut` loan natively (an `iter_mut`
+/// item), so handing it on — `f(e)` to a `|&mut T|` closure in a generic body
+/// or a concrete one, `bump(&mut counter)`, a field write through it — is a
+/// reborrow (`&mut *e`). It was emitted `&mut e`, which rustc refused (E0596).
+#[test]
+fn a_for_mut_element_handed_on_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_for_mut_element_loans.vl"),
+        include_str!("native/for_mut_element_loans.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_for_mut_element_loans.vl"),
+        Verdict::Identical,
+        "a `for` element over `&mut xs` must be handed on by reborrow and print the same"
+    );
+}
+
+/// F81: `*if c { &a } else { &b }` — the spelled copy B496's refusal steers to
+/// — builds natively over a list and a struct, through a `match`, and nested;
+/// it was emitted as a deref of the branches' COPIES (rustc E0599/E0614). A
+/// branch tail is a value position here, so each leaf is its copy already and
+/// the `*` is dropped. (A SCALAR or `str` chosen this way prints the place pair
+/// on JS — reported — so the probe holds aggregates.)
+#[test]
+fn a_deref_of_a_conditional_view_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_deref_of_a_conditional_view.vl"),
+        include_str!("native/deref_of_a_conditional_view.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_deref_of_a_conditional_view.vl"),
+        Verdict::Identical,
+        "`*` over a conditional view must copy the chosen value on both backends"
     );
 }

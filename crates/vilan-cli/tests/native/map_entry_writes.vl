@@ -1,0 +1,43 @@
+// A138 S1's `MapEntry` writes natively: `at(key)` is a `Signal<Option<V>>`,
+// `set(Some(v))` inserts the key and `set(None)` removes it (F73's shape). The
+// program is `inference::maps`' `a138_s1_a_map_entry_writes_its_key`.
+import std::io::print;
+import std::hash_map::HashMap;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ DeltaSource, MapCell, MapOp, Signal, Source, comp };
+
+fun opt(value: Option<i32>): str {
+	match value {
+		Some(let held) => i"Some({held})",
+		None => "None",
+	}
+}
+
+fun describe(ops: List<MapOp<str, i32>>): str {
+	mut out = "";
+	for op in ops {
+		match op {
+			MapOp::Put(let key, let was, let now) => out = out + i"put({key},{opt(was)},{now}) ",
+			MapOp::Delete(let key, let gone) => out = out + i"delete({key},{gone}) ",
+			MapOp::Reset(let map) => out = out + i"reset({map.len()}) ",
+		}
+	}
+	out
+}
+
+fun main() {
+	let cell: MapCell<str, i32> = MapCell::new();
+	let entry = cell.at("k");
+	mut seen: List<str> = [];
+	let watch = entry.sub(|value| seen.push(opt(value)));
+	let cursor = cell.cursor();
+	entry.set(Some(1));
+	entry.set(Some(2));
+	entry.set(None);
+	entry.set(None);
+	entry.notify();
+	print(seen);
+	print(describe(cell.since(cursor)));
+	print(entry.key());
+	watch.dispose();
+}

@@ -1,0 +1,92 @@
+// F74: an in-process `duplex_pair` program — a `ReactiveServer` exposing a
+// cell and a keyed cell, a `ReactiveClient` mirroring both, each source wrapped
+// in a generic `Counted<S>` — builds natively. It is A146's inference pin
+// program (`inference::tracking`), which reactive-45 pinned on JS only because
+// the native backend refused it ("an unresolved type"). The wrapper was not
+// the cause: the program reaches `std::rpc`'s `keyed_mirror_of`, whose
+// `Shared::new(|_key| {})` left the closure's parameter untyped and whose
+// `Shared::new([])` gave rustc a `Vec<_>` read before it was settled.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, derive };
+import std::delta::ListCell;
+import std::rpc::{ KeyedCell, Keyed, KeyedSource, ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+import std::json::json_codec;
+import std::shared::Shared;
+
+// Counts the edges a tracked read attaches to the wrapped source, and answers the
+// wrapped source's identity.
+struct Counted<S> {
+    inner: S,
+    attaches: Shared<i32>,
+}
+
+impl Counted<type S: Source<type T>> with Source<T> {
+    fun get(self): T {
+        self.inner.get()
+    }
+
+    fun on_settle(self, subscriber: Subscriber): Subscription {
+        self.attaches.write() = self.attaches.read() + 1;
+        self.inner.on_settle(subscriber)
+    }
+
+    fun identity(self): Option<i32> {
+        self.inner.identity()
+    }
+}
+
+fun counted<S>(inner: S): Counted<S> {
+    Counted { inner, attaches = Shared::new(0) }
+}
+
+[derive(Wire)]
+struct Row {
+    id: str,
+    n: i32,
+}
+
+impl Row with Keyed<str> {
+    fun key(self): str {
+        self.id
+    }
+}
+
+fun main() {
+    let list = counted(ListCell::of([1, 2]));
+    let keyed: Counted<KeyedCell<str, Row>> = counted(KeyedCell::new([Row { id = "a", n = 1 }]));
+    let status = Signal::new(7);
+    let (client_end, server_end) = duplex_pair();
+    let server = ReactiveServer::new(server_end, json_codec());
+    let channel = server.expose(status);
+    let rows: KeyedCell<str, Row> = KeyedCell::new([Row { id = "b", n = 2 }]);
+    let keyed_channel = server.expose_keyed_cell(rows);
+    let client = ReactiveClient::new(client_end, json_codec());
+    let remote: RemoteSource<i32> = client.source(channel);
+    let mirror = counted(remote);
+    let remote_rows: KeyedSource<str, Row> = client.attached_keyed_source(keyed_channel);
+    let keyed_mirror = counted(remote_rows);
+    let trigger: SignalCell<i32> = Signal::new(0);
+    let sealed = derive(|| {
+        let value = match mirror.track() {
+            Some(let n) => n,
+            None => 0,
+        };
+        let remote_count = match keyed_mirror.track() {
+            Some(let found) => found.len(),
+            None => 0usize,
+        };
+        i"{trigger.track()} {list.track().len()} {keyed.track().len()} {value} {remote_count}"
+    }).memo();
+    mut step = 1;
+    for step <= 5 {
+        trigger.set(step);
+        step += 1;
+    }
+    print(i"list attaches={list.attaches.read()}");
+    print(i"keyed cell attaches={keyed.attaches.read()}");
+    print(i"mirror attaches={mirror.attaches.read()}");
+    print(i"keyed mirror attaches={keyed_mirror.attaches.read()}");
+    print(sealed.get());
+}
+
