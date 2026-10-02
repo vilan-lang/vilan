@@ -159,30 +159,30 @@ function $M(self, b) {
 	}
 	return $O;
 }
-function $S(self, b) {
+function $P(self, b) {
+	const $Q = self;
+	let $R = null;
+	if ($Q[0] === 0) {
+		const x = $Q[1];
+		$R = [ 0, __clone(x) ];
+	} else {
+		$R = b;
+	}
+	return $R;
+}
+function $S(self) {
 	const $T = self;
 	let $U = null;
-	if ($T[0] === 0) {
-		const x = $T[1];
-		$U = [ 0, __clone(x) ];
+	if ($T[0] === 0 && $T[1][0] === 0) {
+		const x = $T[1][1];
+		$U = [ 0, [ 0, __clone(x) ] ];
+	} else if ($T[0] === 0 && $T[1][0] === 1) {
+		$U = [ 1 ];
 	} else {
-		$U = b;
+		const e = $T[1];
+		$U = [ 0, [ 1, __clone(e) ] ];
 	}
 	return $U;
-}
-function $V(self) {
-	const $W = self;
-	let $X = null;
-	if ($W[0] === 0 && $W[1][0] === 0) {
-		const x = $W[1][1];
-		$X = [ 0, [ 0, __clone(x) ] ];
-	} else if ($W[0] === 0 && $W[1][0] === 1) {
-		$X = [ 1 ];
-	} else {
-		const e = $W[1];
-		$X = [ 0, [ 1, __clone(e) ] ];
-	}
-	return $X;
 }
 const ok = [ 0, 10 ];
 const err = [ 1, "boom" ];
@@ -211,6 +211,6 @@ console.log($B($y(ok)));
 console.log($G($D(err), "none"));
 console.log($J(err));
 console.log($d($M(ok, [ 0, 5 ]), 0));
-console.log($d($S(err, [ 0, 3 ]), 0));
+console.log($d($P(err, [ 0, 3 ]), 0));
 const ro = [ 0, [ 0, 42 ] ];
-console.log($B($V(ro)));
+console.log($B($S(ro)));

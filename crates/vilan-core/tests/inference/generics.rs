@@ -9176,3 +9176,179 @@ fn b434_filter_map_over_an_into_flow_bound_takes_the_parameter_itself() {
         "2\n20\n",
     );
 }
+
+// --- B484: a binder named only in another binder's bound binds from the ---
+// --- instantiation that MATCHES the bound, when a type provides several.  ---
+
+/// `R: IntoFlow<Option<U>>` with `R` a FLOW: a flow is `IntoFlow<itself>`
+/// (the plain blanket) and `IntoFlow<its element>` (the flow blanket), and
+/// only the second is an `Option`, so `U` is the element's payload — `str`
+/// here, proven by the annotation the last call contradicts. A plain `Option`
+/// answer bound `U` before; a source or a pipe answer left it uninferred.
+#[test]
+fn b484_a_binder_in_a_trait_argument_binds_through_a_flow() {
+    let shape = concat!(
+        "import std::io::print;\n",
+        "import std::option::Option::{ self, None, Some };\n",
+        "import std::reactive::{ IntoFlow, Signal, SignalCell, Source };\n",
+        "struct Picked<U> { found: List<U> }\n",
+        "fun pick<T, U, R: IntoFlow<Option<U>>>(xs: List<T>, select: |T| R): Picked<U> {\n",
+        "\tPicked<U> { found = [] }\n",
+        "}\n",
+    );
+    assert_compiles_and_runs(
+        &format!(
+            "{shape}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet a: SignalCell<Option<str>> = Signal::new(Some(\"a\"));\n",
+                "\tlet sources = [a];\n",
+                "\tlet plain: Picked<str> = pick(sources, |source| source.get());\n",
+                "\tlet flowing = pick(sources, |source| source);\n",
+                "\tlet piped = pick(sources, |source| source.derive(|v| v));\n",
+                "\tlet typed: List<str> = flowing.found;\n",
+                "\tprint(plain.found.len() + typed.len() + piped.found.len());\n",
+                "}\n",
+            )
+        ),
+        "0\n",
+    );
+    assert_fails_with(
+        &format!(
+            "{shape}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet a: SignalCell<Option<str>> = Signal::new(Some(\"a\"));\n",
+                "\tlet wrong: Picked<i32> = pick([a], |source| source);\n",
+                "\tprint(wrong.found.len());\n",
+                "}\n",
+            )
+        ),
+        "'SignalCell<Option<str>>' does not implement trait 'IntoFlow<Option<i32>>'",
+    );
+}
+
+// --- B468 (R-e, RULED door (a)): a DEFAULTED struct or enum parameter left ---
+// --- out of a written application takes its default there.                ---
+
+const B468_ORDERED: &str = concat!(
+    "import std::io::print;\n",
+    "struct Insertion {}\n",
+    "struct Sorted {}\n",
+    "struct Ordered<K, V, O = Insertion> { keys: List<K>, values: List<V>, order: O }\n",
+    "fun count(ordered: Ordered<str, i32, Insertion>): usize { ordered.keys.len() }\n",
+);
+
+/// The signature's `Ordered<str, i32>` and the literal's `Ordered<str, i32,
+/// Insertion>` are ONE type, in both directions: a short annotation handed to
+/// the full parameter, and a full literal returned through a short return.
+#[test]
+fn b468_an_omitted_defaulted_argument_takes_its_default() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B468_ORDERED}{}",
+            concat!(
+                "fun make(): Ordered<str, i32> {\n",
+                "\tOrdered<str, i32, Insertion> { keys = [\"a\", \"b\"], values = [1, 2], order = Insertion {} }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tlet short: Ordered<str, i32> = Ordered { keys = [\"c\"], values = [3], order = Insertion {} };\n",
+                "\tprint(count(make()) + count(short));\n",
+                "}\n",
+            )
+        ),
+        "3\n",
+    );
+}
+
+/// The default is a TYPE, not a hole: a value at another argument there is
+/// refused where the short annotation meets it.
+#[test]
+fn b468_the_default_is_checked_not_inferred() {
+    assert_fails_with(
+        &format!(
+            "{B468_ORDERED}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet wrong: Ordered<str, i32> = Ordered { keys = [], values = [], order = Sorted {} };\n",
+                "\tprint(wrong.keys.len());\n",
+                "}\n",
+            )
+        ),
+        "Sorted",
+    );
+}
+
+/// A default written in an EARLIER parameter reads it at that parameter's
+/// argument, and an enum's default applies the same way.
+#[test]
+fn b468_a_default_naming_an_earlier_parameter_and_an_enum_default() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "struct Keyed<K, I = List<K>> { items: I }\n",
+            "enum Either<L, R = str> { Left(L), Right(R) }\n",
+            "fun size(keyed: Keyed<i32, List<i32>>): usize { keyed.items.len() }\n",
+            "fun main() {\n",
+            "\tlet keyed: Keyed<i32> = Keyed { items = [1, 2, 3] };\n",
+            "\tprint(size(keyed));\n",
+            "\tlet either: Either<i32> = Either::Right(\"r\");\n",
+            "\tmatch either {\n",
+            "\t\tEither::Left(let n) => print(n),\n",
+            "\t\tEither::Right(let text) => print(text),\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "3\nr\n",
+    );
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "struct Keyed<K, I = List<K>> { items: I }\n",
+            "fun main() {\n",
+            "\tlet keyed: Keyed<i32> = Keyed { items = [\"a\"] };\n",
+            "\tprint(keyed.items.len());\n",
+            "}\n",
+        ),
+        "List<i32>",
+    );
+}
+
+// --- B454: an argument typed in the callee's own terms binds nothing back ---
+
+/// `ok.and(Ok(5))` — `and<U>(self, b: Result<U, E>)`, whose `E` is `Result`'s
+/// own parameter (an impl subject inherits the declaration's ids). `Ok(5)`
+/// typed against `Result<U, E>` came back `Result<i32, E>`, and reconciling it
+/// bound `E` back to ITSELF over the receiver's `str`, so the call answered
+/// `Result<i32, E>` (natively refused by name). The result is the receiver's
+/// error type now — proven by reading the error out as a `str`.
+#[test]
+fn b454_an_argument_constructor_takes_the_receivers_error_type() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::{ io::print, result::Result::{ self, Err, Ok } };\n",
+            "fun main() {\n",
+            "\tlet ok: Result<i32, str> = Ok(10);\n",
+            "\tlet err: Result<i32, str> = Err(\"boom\");\n",
+            "\tlet both = ok.and(Ok(5));\n",
+            "\tlet typed: Result<i32, str> = both;\n",
+            "\tprint(typed.unwrap_or(0));\n",
+            "\tlet failed = err.and(Ok(\"text\"));\n",
+            "\tlet reason: str = failed.err().unwrap_or(\"none\");\n",
+            "\tprint(reason);\n",
+            "}\n",
+        ),
+        "5\nboom\n",
+    );
+    assert_fails_with(
+        concat!(
+            "import std::{ io::print, result::Result::{ self, Err, Ok } };\n",
+            "fun main() {\n",
+            "\tlet ok: Result<i32, str> = Ok(10);\n",
+            "\tlet wrong: Result<i32, bool> = ok.and(Ok(5));\n",
+            "\tprint(wrong.unwrap_or(0));\n",
+            "}\n",
+        ),
+        "Result<i32, str>",
+    );
+}

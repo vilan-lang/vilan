@@ -610,9 +610,12 @@ consumer's release). A registration that arrives after its run was released —
 an `await` that resumed late — is released on the spot.
 
 The body's owner and nursery are INJECTED (the `context` clause), which is what
-makes them the RUN's rather than the boundary's; the price is that a body is a
-closure literal or a local closure — a named function is refused at the call
-(`count.derive(|n| label(n))`, not `count.derive(label)`). `scoped_effect` and
+makes them the RUN's rather than the boundary's. A body is a closure literal, a
+local closure, or a named function or variant that reads none of the injected
+contexts — `count.derive(label)` and `count.derive(Some)` hand the call its
+body as directly as `count.derive(|n| label(n))` does; a function that reads
+one (a `.track()` inside it) is refused as a value and written as a literal
+at the call. `scoped_effect` and
 `scoped_effect_on_change` are `effect`'s and `effect_on_change`'s names before
 the two merged, kept one release as deprecated aliases.
 

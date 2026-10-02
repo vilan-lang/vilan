@@ -672,6 +672,17 @@ pub enum ExprPattern {
     Literal(Id),
 }
 
+/// How one binder's bound arguments rank against another's
+/// (`Analyzer::bound_arguments_order`, B477).
+enum ArgumentOrder {
+    /// Every argument is an instance of the other's pattern, one strictly.
+    Narrower,
+    /// Each matches the other, or the two share no trait to compare.
+    Same,
+    /// Some argument is not an instance of the other's pattern.
+    Unranked,
+}
+
 /// Whether a pattern matches every value of its type — the grammar's
 /// "irrefutable subset" (spec §3.10: the `let`/parameter binder forms). A tuple
 /// destructure qualifies only when every element does, so `(let a, let b)` is a
@@ -4265,6 +4276,9 @@ pub struct Analyzer<'src> {
     // For-each loops whose iterable is a custom iterator: the resolved `next`
     // method id, so codegen emits a `next()`/`Some`-matching loop instead.
     for_each_next: HashMap<Id, Id>,
+    // B481: a for-each loop whose `next` is an INHERITED default → the index of
+    // the implementation that provides it, for the post-build admission pass.
+    for_each_next_providers: HashMap<Id, usize>,
     // For-each loops → the type the iterable INFERRED to, by loop id. The
     // transformer's native lowerings are chosen by that type, and it cannot
     // recover it on its own: an iterable written as a parameter (`self` above
@@ -4329,6 +4343,11 @@ pub struct Analyzer<'src> {
     // cache, then reused.
     std_module_files: Vec<(String, PathBuf)>,
     std_export_index: Option<HashMap<String, String>>,
+    /// B472: std's DEPRECATED alias re-exports (`export [deprecated(..)] import
+    /// pkg::hash_map::HashMap as Map;`), alias → (the name it stands for, that
+    /// name's module). Built in the same lazy pass as the export index; an
+    /// alias that is NOT deprecated joins the export index itself.
+    std_deprecated_alias_index: Option<HashMap<String, (String, String)>>,
     /// The names `std::web` makes ambient, read lazily off disk on the first
     /// failed resolution (`prelude.md` §11.4). A package on the base prelude
     /// reaching for `Signal`, `view`, `View`, `style` or `ui` is the one new
@@ -5594,6 +5613,63 @@ fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>
     );
 }
 
+/// One `export import … as Alias;` a module publishes (B472).
+struct AliasReexport<'src> {
+    alias: &'src str,
+    target: &'src str,
+    /// The target's module, `::`-joined below the package root
+    /// (`pkg::hash_map::HashMap` → `hash_map`).
+    target_module: String,
+    deprecated: bool,
+}
+
+/// Every top-level `export import … as Alias;` of a module (B472): the import
+/// steer's index holds DECLARED names, and an alias re-export declares none.
+fn collect_alias_reexports<'src>(items: &NodeList<'src>, out: &mut Vec<AliasReexport<'src>>) {
+    fn walk<'src>(
+        branch: &ImportBranch<'src>,
+        path: &mut Vec<&'src str>,
+        deprecated: bool,
+        out: &mut Vec<AliasReexport<'src>>,
+    ) {
+        match branch {
+            ImportBranch::Path(name, _, tail) => match tail {
+                ImportTail::Leaf => {}
+                ImportTail::Alias(alias, _) => out.push(AliasReexport {
+                    alias,
+                    target: name,
+                    target_module: path.iter().skip(1).copied().collect::<Vec<_>>().join("::"),
+                    deprecated,
+                }),
+                ImportTail::Continue(next) => {
+                    path.push(name);
+                    walk(next, path, deprecated, out);
+                    path.pop();
+                }
+            },
+            ImportBranch::Set(branches) => {
+                for branch in branches {
+                    walk(branch, path, deprecated, out);
+                }
+            }
+            ImportBranch::Reach(_, inner) => walk(inner, path, deprecated, out),
+            ImportBranch::Selector(_) => {}
+        }
+    }
+    for item in items {
+        let Node::Export(_, inner, labels) = &item.0 else {
+            continue;
+        };
+        let Node::Import(branch, _) = &inner.0 else {
+            continue;
+        };
+        let deprecated = labels
+            .as_ref()
+            .is_some_and(|labels| labels.deprecated.is_some());
+        walk(branch, &mut Vec::new(), deprecated, out);
+    }
+}
+
 /// Strips a top-level item's wrappers (`export`, a derive, a service, a macro
 /// attribute) down to the item itself.
 fn unwrap_item<'a, 'src>(item: &'a Spanned<Node<'src>>) -> &'a Node<'src> {
@@ -6510,6 +6586,7 @@ impl<'src> Analyzer<'src> {
             untyped_comprehension_binders: HashSet::default(),
             prepped_for_each: Vec::new(),
             for_each_next: HashMap::default(),
+            for_each_next_providers: HashMap::default(),
             for_each_iterable_types: HashMap::default(),
             for_each_views: HashMap::default(),
             closure_type_parameter_views: HashMap::default(),
@@ -6520,6 +6597,7 @@ impl<'src> Analyzer<'src> {
             prepped_conditions: Vec::new(),
             std_module_files: Vec::new(),
             std_export_index: None,
+            std_deprecated_alias_index: None,
             web_prelude_index: None,
             entry_prelude_path: None,
             prelude_repair: PreludeRepair::default(),
@@ -7060,7 +7138,18 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            let binding_context: SubstitutionContext = bindings.iter().copied().collect();
+            let mut binding_context: SubstitutionContext = bindings.iter().copied().collect();
+            // B476: a binder written only INSIDE another binder's bound — the
+            // `T` of `impl type S: Src<type T> with Fl<T>` — is bound from what
+            // the value provides at that bound, so the arguments the impl
+            // provides below (`Fl<T>`) are read at the value's own `T`. Left
+            // open, `T` read as indeterminate and every instantiation of `Fl`
+            // passed: a `Cell<i32>` met `: Fl<str>` through the blanket.
+            if self.bound_argument_grounding_depth < 4 {
+                self.bound_argument_grounding_depth += 1;
+                self.bind_subject_bound_binders(subject_id, value_type, &mut binding_context);
+                self.bound_argument_grounding_depth -= 1;
+            }
             for (binder_constraint_id, argument_type_id) in bindings {
                 let binder_traits = self.generic_bound_traits(binder_constraint_id);
                 if binder_traits.is_empty() {
@@ -7519,7 +7608,9 @@ impl<'src> Analyzer<'src> {
                     } else {
                         format!(
                             "'{type_label}' does not implement trait '{trait_label}', \
-                             required by a generic bound of this call"
+                             required by a generic bound of this call{}",
+                            self.total_join_steer(call_id, *required_trait_id)
+                                .unwrap_or_default()
                         )
                     };
                     errors.push((
@@ -7879,6 +7970,31 @@ impl<'src> Analyzer<'src> {
                 a_source == b_source && a_span == b_span && a_msg == b_msg
             },
         );
+        // B476: the SAME sentence at a site that ENCLOSES another site saying
+        // it is the inner one's cascade, not a second finding — a refused
+        // `outer.flatten()` hands its wrong stage on, and every call chained
+        // onto it fails the very bound the inner call did, about the very same
+        // type (`outer.flatten().on_change(..)` said it twice). The innermost
+        // site is where the author wrote the mistake, so it alone stays. The
+        // inner sentence may carry a steer the outer one does not (it is the
+        // call the steer is about), so it repeats the outer when it STARTS
+        // with it.
+        let enclosed_repeats: Vec<bool> = errors
+            .iter()
+            .map(|(source, _, span, msg, _)| {
+                errors
+                    .iter()
+                    .any(|(other_source, _, other_span, other_msg, _)| {
+                        other_source == source
+                            && other_msg.starts_with(msg.as_str())
+                            && other_span != span
+                            && other_span.start >= span.start
+                            && other_span.end <= span.end
+                    })
+            })
+            .collect();
+        let mut repeats = enclosed_repeats.into_iter();
+        errors.retain(|_| !repeats.next().unwrap_or(false));
         // Note WHERE the failing bound is declared (`T: Feed` in the
         // callee's signature — cross-file when the callee is std's): the
         // generic's registration entity carries the declaration's name span.
@@ -19680,7 +19796,6 @@ impl<'src> Analyzer<'src> {
         else {
             return true;
         };
-        let bindings: Vec<(TypeId, TypeId)> = bindings.into_iter().collect();
         // A bound's arguments are written in the impl's own binders
         // (`impl KeyedSource<type K, type T: Keyed<K>>`), so they are read
         // through what THIS receiver binds those to — `Keyed<str>` on a
@@ -19688,7 +19803,24 @@ impl<'src> Analyzer<'src> {
         // `Keyed<str>` and the impl answered "does not hold" for its own
         // receiver (B395, where an inherited default is carried by an impl
         // whose bounds hold and the false no handed it to a blanket).
-        let context: SubstitutionContext = bindings.iter().copied().collect();
+        let mut context: SubstitutionContext = bindings.into_iter().collect();
+        // B476: a binder written only INSIDE a bound — the `I` of `impl type F:
+        // Fl<Option<type I: Src<type U>>>` — is bound from what the receiver
+        // provides at that bound, and then its OWN bounds are checked like the
+        // subject's: a `Cell<Cell<i32>>` binds nothing at `Fl<Option<I>>` (its
+        // `Fl` argument is no `Option`), so that arm does not hold, and a
+        // `Cell<Option<i32>>` binds `I = i32`, which is no `Src`. Left open, the
+        // inner binder read as a hole and the arm held for every flow.
+        if self.bound_argument_grounding_depth < 4 {
+            self.bound_argument_grounding_depth += 1;
+            self.bind_subject_bound_binders(impl_subject, subject_type, &mut context);
+            self.bound_argument_grounding_depth -= 1;
+        }
+        let mut bindings: Vec<(TypeId, TypeId)> = context
+            .iter()
+            .map(|(binder, bound)| (*binder, *bound))
+            .collect();
+        bindings.sort_by_key(|(binder, _)| binder.0);
         for (constraint_id, bound_id) in bindings {
             let bound = bound_id.get_type(self);
             // A122: a binder's TUPLE bound holds for a tuple of an admitted
@@ -19776,8 +19908,12 @@ impl<'src> Analyzer<'src> {
                 .then(|| (implementation.subject, provided.clone()))
             })
             .collect();
+        // No provider at all is DECIDED, not undecided (B476): a nominal
+        // receiver nothing implements the trait for does not meet the bound at
+        // any arguments — `Option<Cell<i32>>` at a binder `I: Src<U>` — and only
+        // an object, whose table is its implementation, still can.
         if providers.is_empty() {
-            return true;
+            return self.type_implements_trait(subject_type, trait_id);
         }
         let mut decided = false;
         for (provider_subject, written) in providers {
@@ -19902,18 +20038,39 @@ impl<'src> Analyzer<'src> {
             return effective;
         }
         let impl_subject_type = impl_subject.get_type(self);
-        let bindings: SubstitutionContext = self
+        let mut bindings: SubstitutionContext = self
             .reconcile_declaration(&impl_subject_type, subject_type, &impl_subject_type)
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
-        effective
-            .into_iter()
-            .map(|argument_id| {
-                let argument = argument_id.get_type(self);
-                let resolved = self.substitute_type(&argument, &bindings);
-                resolved.get_type_id(self)
-            })
-            .collect()
+        let substitute = |analyzer: &mut Self, bindings: &SubstitutionContext| -> Vec<TypeId> {
+            effective
+                .iter()
+                .map(|argument_id| {
+                    let argument = argument_id.get_type(analyzer);
+                    let resolved = analyzer.substitute_type(&argument, bindings);
+                    resolved.get_type_id(analyzer)
+                })
+                .collect()
+        };
+        let resolved = substitute(self, &bindings);
+        // B476: a BLANKET writes its home's arguments in a binder its subject
+        // does not carry — `impl type S: Src<type T> with Fl<T>` provides
+        // `Fl<T>`, `T` living in `S`'s bound — so the substitution above leaves
+        // `T` abstract, and an abstract argument agreed with every bound: a
+        // `Cell<i32>` met `S: Fl<str>` and `S: Fl<i32>` alike, and two arms
+        // over `Fl<X>` collided on every receiver. The receiver's own impl of
+        // the bound's trait decides `T` (B379's grounding, for the home).
+        if self.bound_argument_grounding_depth < 4
+            && resolved
+                .iter()
+                .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
+        {
+            self.bound_argument_grounding_depth += 1;
+            self.bind_subject_bound_binders(impl_subject, subject_type, &mut bindings);
+            self.bound_argument_grounding_depth -= 1;
+            return substitute(self, &bindings);
+        }
+        resolved
     }
 
     /// The precedence rule of `proposal/method-resolution.md` §3, for a
@@ -19950,11 +20107,30 @@ impl<'src> Analyzer<'src> {
                 Type::Generic(_)
             )
         };
+        // B477: between BLANKETS the specificity order decides, not the order
+        // they were declared in — a bound narrower at its arguments
+        // (`Pipe<Task<Result<T, E>>>` over `Pipe<Task<T>>`) wins either way
+        // round. Two that do not rank keep the first declared, and the
+        // post-build pass reports that pair at the call (B330's residue).
+        let inherent_blankets: Vec<&ImplMemberCandidate> = candidates
+            .iter()
+            .filter(inherent)
+            .filter(|candidate| blanket(candidate))
+            .collect();
+        let most_specific_blanket = inherent_blankets
+            .iter()
+            .copied()
+            .find(|candidate| {
+                !inherent_blankets
+                    .iter()
+                    .any(|other| self.impl_outranks(other, candidate))
+            })
+            .or_else(|| inherent_blankets.first().copied());
         if let Some(winner) = candidates
             .iter()
             .filter(inherent)
             .find(|candidate| !blanket(candidate))
-            .or_else(|| candidates.iter().find(inherent))
+            .or(most_specific_blanket)
         {
             return ImplMemberResolution::Found(winner.member_id, winner.impl_subject);
         }
@@ -20129,6 +20305,13 @@ impl<'src> Analyzer<'src> {
     /// aligned binder, with at least one position strictly larger; two binders
     /// bounded by unrelated traits are neither, which is the residue R3 reports
     /// rather than ranks.
+    ///
+    /// B477: one trait bounding both binders at different ARGUMENTS ranks by
+    /// those arguments' shapes, as subjects do — `type P: Pipe<Task<Result<T,
+    /// E>>>` ≻ `type P: Pipe<Task<T>>`, because the second's argument pattern
+    /// matches the first's and not the other way round. Without it the pair
+    /// ranked neither way, and an inherent member was taken from whichever
+    /// block was declared first.
     fn subject_bounds_are_stronger(&self, stronger: TypeId, weaker: TypeId) -> bool {
         let mut stronger_binders = Vec::new();
         let mut weaker_binders = Vec::new();
@@ -20153,8 +20336,47 @@ impl<'src> Analyzer<'src> {
             {
                 strictly = true;
             }
+            match self.bound_arguments_order(*stronger_id, *weaker_id) {
+                ArgumentOrder::Narrower => strictly = true,
+                ArgumentOrder::Same => {}
+                ArgumentOrder::Unranked => return false,
+            }
         }
         strictly
+    }
+
+    /// How a binder's bound ARGUMENTS compare with another's, trait by trait
+    /// where both binders name the same trait directly (B477): `Narrower` when
+    /// every argument of `left`'s is matched by `right`'s pattern and one is
+    /// not matched back, `Same` when each matches the other (or no trait is
+    /// shared), `Unranked` when some argument of `left`'s is not an instance of
+    /// `right`'s. Binders inside the arguments (`Option<type I>`) are holes.
+    fn bound_arguments_order(&self, left: TypeId, right: TypeId) -> ArgumentOrder {
+        let right_bounds = self.generic_bound_traits(right);
+        let mut narrower = false;
+        for (trait_id, left_arguments) in self.generic_bound_traits(left) {
+            let Some((_, right_arguments)) = right_bounds
+                .iter()
+                .find(|(right_trait, _)| *right_trait == trait_id)
+            else {
+                continue;
+            };
+            if left_arguments.len() != right_arguments.len() {
+                continue;
+            }
+            for (left_argument, right_argument) in left_arguments.iter().zip(right_arguments) {
+                if !self.impl_subject_matches(*right_argument, *left_argument) {
+                    return ArgumentOrder::Unranked;
+                }
+                if !self.impl_subject_matches(*left_argument, *right_argument) {
+                    narrower = true;
+                }
+            }
+        }
+        match narrower {
+            true => ArgumentOrder::Narrower,
+            false => ArgumentOrder::Same,
+        }
     }
 
     /// A binder's declared bounds CLOSED over the supertrait graph — the set
@@ -31365,6 +31587,37 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// B476's steer: std's `flatten` is the `Option` join over a flow of
+    /// `Option<source>` (A142 §3.2), and a flow of plain sources — the total
+    /// join A4's `flatten` used to be — meets its `Flow<Option<..>>` bound no
+    /// more. The refusal names the spelling the total join took. Keyed on
+    /// std's own `flatten` failing std's `Flow`: a user's `flatten` is
+    /// answered by the ordinary sentence.
+    fn total_join_steer(&self, call_id: Id, required_trait_id: Id) -> Option<String> {
+        let from_std = |id: Id| {
+            self.source_of_id(id)
+                .is_some_and(|source| self.std_sources.contains(&source))
+        };
+        let trait_ = self.traits.get(&required_trait_id)?;
+        if trait_.name != "Flow" || !from_std(required_trait_id) {
+            return None;
+        }
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(member_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let function = self.functions.get(member_id)?;
+        if function.name != "flatten" || !from_std(*member_id) {
+            return None;
+        }
+        Some(
+            "; `flatten` joins a flow of `Option<source>` (a `None` reads `None`), and a flow \
+             of plain sources is followed with `.switch(|inner| inner)`"
+                .to_string(),
+        )
+    }
+
     /// A142 §3.3's steer: a receiver that implements the PIPE trait, asked for
     /// a member only the SOURCE trait declares (`get`, and the other reads).
     /// A pipe is a description consumed once; reading it means sealing it, or
@@ -31920,11 +32173,26 @@ impl<'src> Analyzer<'src> {
                 GenericDispatch::OnType(..) => None,
             })
             .collect();
+        // B475: an object also satisfies a bound on any of its trait's
+        // SUPERTRAITS — a `dyn Source<T>` meets `S: Flow<T>`, which is how a
+        // pipe stage over a source object starts it — so its table takes the
+        // member when the bound's trait is reached FROM the object's trait,
+        // not only when the object's trait is reached from the bound's.
+        let object_closures: Vec<(Id, Vec<Id>)> = self
+            .dyn_object_traits
+            .iter()
+            .map(|object_trait| (*object_trait, self.trait_with_supertraits(*object_trait)))
+            .collect();
         for (constraint_id, member) in dispatches {
             for (trait_id, _) in self.generic_bound_traits(constraint_id) {
                 for reachable in self.trait_with_supertraits(trait_id) {
                     if self.dyn_object_traits.contains(&reachable) {
                         self.dyn_dispatched_members.insert((reachable, member));
+                    }
+                }
+                for (object_trait, closure) in &object_closures {
+                    if closure.contains(&trait_id) {
+                        self.dyn_dispatched_members.insert((*object_trait, member));
                     }
                 }
             }
@@ -32135,6 +32403,61 @@ impl<'src> Analyzer<'src> {
             current = self.scopes.get(&id).and_then(|scope| scope.parent_id);
         }
         false
+    }
+
+    /// R-e (B468, RULED door (a)): a written application of a struct or an
+    /// enum that leaves a DEFAULTED parameter out takes the default there —
+    /// `Ordered<str, i32>` IS `Ordered<str, i32, Insertion>` for `struct
+    /// Ordered<K, V, O = Insertion>`, where it was a different, shorter type
+    /// that met the full spelling nowhere. The declaration's own parameter list
+    /// holds a defaulted parameter's DEFAULT type (B188), and a default written
+    /// in terms of an EARLIER parameter (`O = Key<K>`) reads
+    /// it at the argument written for that parameter. Anything but an
+    /// under-supply the defaults cover is returned as written — the arity
+    /// check refuses it.
+    fn with_defaulted_arguments(
+        &mut self,
+        declaration_id: Id,
+        written: Vec<TypeId>,
+    ) -> Vec<TypeId> {
+        let Some(declared) = self.declared_generic_parameters.get(&declaration_id) else {
+            return written;
+        };
+        // The declaration's own list: a REFERENCE's type carries none.
+        let carried: Vec<TypeId> = self
+            .structs
+            .get(&declaration_id)
+            .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            .or_else(|| {
+                self.enums
+                    .get(&declaration_id)
+                    .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            })
+            .unwrap_or_default();
+        if written.len() >= declared.len()
+            || declared.len() != carried.len()
+            || !declared[written.len()..]
+                .iter()
+                .all(|parameter| parameter.has_default)
+        {
+            return written;
+        }
+        // An undefaulted parameter's entry IS its constraint id — the key a
+        // mention of it (`Type::Generic`) substitutes through.
+        let substitution: SubstitutionContext = carried
+            .iter()
+            .zip(declared.iter())
+            .zip(written.iter())
+            .filter(|((_, parameter), _)| !parameter.has_default)
+            .map(|((constraint_id, _), argument)| (*constraint_id, *argument))
+            .collect();
+        let mut arguments = written;
+        for default_id in &carried[arguments.len()..] {
+            let default = default_id.get_type(self);
+            let grounded = self.substitute_type(&default, &substitution);
+            arguments.push(grounded.get_type_id(self));
+        }
+        arguments
     }
 
     /// The refusal a WRITTEN type application earns when the arguments it
@@ -37862,11 +38185,23 @@ impl<'src> Analyzer<'src> {
     ) {
         if let Some(existing) = substitution.get(&constraint_id).copied()
             && existing != type_id
-            && self.binding_is_weaker(type_id, existing)
+            && (self.binding_is_weaker(type_id, existing)
+                || self.binds_to_itself(constraint_id, type_id))
         {
             return;
         }
         substitution.insert(constraint_id, type_id);
+    }
+
+    /// B454: a binding of a generic to ITSELF says nothing — and it is what a
+    /// reconcile reports when an argument was typed in the callee's own
+    /// terms. `ok.and(Ok(5))` with `and<U>(self, b: Result<U, E>)`: the
+    /// impl's `E` IS `Result`'s own parameter (an impl subject inherits the
+    /// declaration's ids, B77), so `Ok(5)` typed against `Result<U, E>` comes
+    /// back `Result<i32, E>`, and reconciling it handed `E` back to itself —
+    /// over the receiver's `str`, which the call's result then lost.
+    fn binds_to_itself(&self, constraint_id: TypeId, type_id: TypeId) -> bool {
+        matches!(type_id.borrow_type(self), Type::Generic(bound) if *bound == constraint_id)
     }
 
     /// Whether `candidate` says strictly LESS about a generic than `held` does
@@ -41456,6 +41791,9 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         let mut first_match: Option<Vec<TypeId>> = None;
+        // The generics the receiver itself carries (B479, below).
+        let mut receiver_generics = Vec::new();
+        self.collect_generics(concrete, 0, &mut receiver_generics);
         for (subject_id, arguments) in candidates {
             let subject = subject_id.get_type(self);
             // B390: a refused subject provides nothing (`impl_subject_admits`).
@@ -41518,10 +41856,19 @@ impl<'src> Analyzer<'src> {
                 // out concrete answered the question; one that did not is kept
                 // only as the fallback, which is exactly what this returned
                 // before there was anything to prefer.
-                if !resolved
-                    .iter()
-                    .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
-                {
+                //
+                // B479: a generic the RECEIVER itself carries is an answer, not
+                // a hole — inside a generic body, `Derive<S, A, J>` provides
+                // `Flow<J>`, `J` the caller's own parameter. Read as a hole, that
+                // answer lost to the Source blanket's ungrounded `T` (registered
+                // first), and a selector's parameter in the body was typed as
+                // that bare `T`.
+                if !resolved.iter().any(|argument| {
+                    matches!(
+                        argument.get_type(self),
+                        Type::Generic(binder) if !receiver_generics.contains(&binder)
+                    )
+                }) {
                     answered.push((subject_id, resolved));
                     if first_only {
                         break;
@@ -41643,11 +41990,19 @@ impl<'src> Analyzer<'src> {
                 // B286: the argument may itself be a PARAMETER carrying the
                 // bound, and a parameter has no impl to read. Its own declared
                 // bound is the answer, and the only one there is.
+                // B484: a type may provide the bound's trait at SEVERAL
+                // instantiations — a flow is `IntoFlow<itself>` through the
+                // plain blanket and `IntoFlow<its element>` through the flow
+                // one — so the provider is chosen by the bound's own pattern
+                // (`IntoFlow<Option<U>>` keeps the instantiation that IS an
+                // `Option`), as an impl's bound binders are (B408). The first
+                // provider answered `IntoFlow<SignalCell<..>>`, which no
+                // `Option<U>` reconciles with, and `U` went uninferred.
                 let provided = match concrete {
                     Type::Generic(caller_constraint_id) => {
                         self.abstract_trait_arguments(caller_constraint_id, trait_id)
                     }
-                    _ => self.trait_args_for(&concrete, trait_id),
+                    _ => self.trait_args_for_pattern(&concrete, trait_id, &trait_arguments),
                 };
                 let Some(impl_arguments) = provided else {
                     continue;
@@ -41905,7 +42260,16 @@ impl<'src> Analyzer<'src> {
             .return_inference_stack
             .pop()
             .is_some_and(|(_, exact)| exact);
-        if exact && !matches!(inference.type_, Type::Unresolved) {
+        // F65: and only an answer in the function's OWN terms is the
+        // function's. One inferred under a caller's substitution is that
+        // caller's instantiation (`SignalCell<str>` for `cell("s")`), and the
+        // record is keyed by the function alone: the read above never serves
+        // it across callers, but the Program's consumers read the record as
+        // THE return type — the Rust backend's `return_type_of`, per instance —
+        // and every instance of a generic function returned the LAST caller's
+        // type (rustc E0308).
+        if exact && substitution_context.is_empty() && !matches!(inference.type_, Type::Unresolved)
+        {
             let type_id = inference.type_.clone().get_type_id(self);
             self.inferred_return_types.insert(function_id, type_id);
         }
@@ -49620,6 +49984,7 @@ impl<'src> Analyzer<'src> {
         let mut ambiguous_names: HashSet<String> = HashSet::default();
         let mut method_index: HashMap<(String, String), (String, String)> = HashMap::default();
         let mut ambiguous_methods: HashSet<(String, String)> = HashSet::default();
+        let mut deprecated_aliases: HashMap<String, (String, String)> = HashMap::default();
         let files = self.std_module_files.clone();
         for (module_name, path) in &files {
             let Some(loaded) = load_package_module(path) else {
@@ -49636,6 +50001,29 @@ impl<'src> Analyzer<'src> {
                     None => {
                         export_index.insert(declared.to_string(), module_name.clone());
                     }
+                }
+            }
+            // B472: an ALIAS re-export publishes a name no declaration
+            // carries. A plain one steers like a declaration; a deprecated one
+            // steers to the name it stands for.
+            let mut aliases = Vec::new();
+            collect_alias_reexports(&loaded.ast.0, &mut aliases);
+            for alias in aliases {
+                match alias.deprecated {
+                    true => {
+                        deprecated_aliases
+                            .entry(alias.alias.to_string())
+                            .or_insert((alias.target.to_string(), alias.target_module));
+                    }
+                    false => match export_index.get(alias.alias) {
+                        Some(existing) if existing == module_name => {}
+                        Some(_) => {
+                            ambiguous_names.insert(alias.alias.to_string());
+                        }
+                        None => {
+                            export_index.insert(alias.alias.to_string(), module_name.clone());
+                        }
+                    },
                 }
             }
             let declared: HashSet<&str> = names.into_iter().collect();
@@ -49663,6 +50051,7 @@ impl<'src> Analyzer<'src> {
             method_index.remove(&key);
         }
         self.std_export_index = Some(export_index);
+        self.std_deprecated_alias_index = Some(deprecated_aliases);
         self.std_trait_method_index = Some(method_index);
     }
 
@@ -49746,9 +50135,21 @@ impl<'src> Analyzer<'src> {
                 "; import it first (`import {root}::{module}::{name};`)"
             ));
         }
-        let module = self.std_export_index.as_ref()?.get(name)?;
+        if let Some(module) = self
+            .std_export_index
+            .as_ref()
+            .and_then(|index| index.get(name))
+        {
+            return Some(format!(
+                "; import it first (`import std::{module}::{name};`)"
+            ));
+        }
+        // B472: a deprecated alias steers to the name it stands for — the
+        // import the deprecation itself would ask for.
+        let (target, module) = self.std_deprecated_alias_index.as_ref()?.get(name)?;
         Some(format!(
-            "; import it first (`import std::{module}::{name};`)"
+            "; did you mean `{target}` (`import std::{module}::{target};`)? `{name}` is its \
+             deprecated alias"
         ))
     }
 
@@ -54090,8 +54491,12 @@ impl<'src> Analyzer<'src> {
                     // keeps whatever the reference resolved to.
                     let no_written_arguments = argument_type_ids.is_empty();
                     let subject_type = match (subject_type, argument_type_ids.is_empty()) {
-                        (Type::Enum(id, _), false) => Type::Enum(id, argument_type_ids),
-                        (Type::Struct(id, _), false) => Type::Struct(id, argument_type_ids),
+                        (Type::Enum(id, _), false) => {
+                            Type::Enum(id, self.with_defaulted_arguments(id, argument_type_ids))
+                        }
+                        (Type::Struct(id, _), false) => {
+                            Type::Struct(id, self.with_defaulted_arguments(id, argument_type_ids))
+                        }
                         // A parameterized trait bound/template (`Into<bool>`,
                         // `Readable<U>`) keeps its arguments for impl selection.
                         (Type::Trait(id, _), false) => Type::Trait(id, argument_type_ids),
@@ -56216,6 +56621,16 @@ impl<'src> Analyzer<'src> {
                             continue;
                         }
                         self.for_each_next.insert(for_each_id, next_id);
+                        // B481: the block that provides the default, for the
+                        // admission pass — the loop's `next` is no call.
+                        if let Some(index) =
+                            self.implementations.iter().position(|implementation| {
+                                implementation.subject == impl_subject_id
+                                    && implementation.trait_ids.contains(&trait_id)
+                            })
+                        {
+                            self.for_each_next_providers.insert(for_each_id, index);
+                        }
                         let receiver_type_id = iterable_type.clone().get_type_id(self);
                         self.generic_dispatch.insert(
                             for_each_id,
@@ -59720,6 +60135,11 @@ pub struct Program<'src> {
     pub traits: IndexMap<Id, Trait<'src>>,
     pub generic_dispatch: HashMap<Id, GenericDispatch<'src>>,
     pub for_each_next: HashMap<Id, Id>,
+    /// B481: a for-each loop whose `next` is an INHERITED default → the index
+    /// (into `implementations`) of the block that provides it — what the
+    /// post-build admission pass checks against the loop's file, as it checks
+    /// a call's.
+    pub for_each_next_providers: HashMap<Id, usize>,
     /// Per `for x in iterable` loop: the type the ITERABLE inferred to. The
     /// native lowerings are chosen by it (`HashSet` walks its backing map's values,
     /// everything else is a plain `for...of`), and emission cannot recover it —
@@ -60050,6 +60470,16 @@ pub struct Program<'src> {
     /// keyed on `parameters` sees plumbing dressed as source. Membership is the
     /// bool: absent means bare.
     pub context_optional_hidden_parameters: HashSet<Id>,
+    /// B482: the closure TYPES whose `context` clause entry arrives CLEARED
+    /// somewhere — a callback position some callee calls under
+    /// `context.clear(..)` — as `(closure type, context)`. Every literal that
+    /// lands at such a position takes that context's hidden parameter as an
+    /// `Option` (`context_optional_hidden_parameters`), and so does every call
+    /// through it: `None` under the `clear`, `Some` elsewhere. Keyed by the
+    /// TYPE because a backend writes the type down where no literal is in
+    /// sight (the Rust backend's `Rc<dyn Fn(..)>`); the pass unites every
+    /// position a value can travel between, so one type has one answer.
+    pub cleared_clause_contexts: HashSet<(TypeId, Id)>,
     /// E124: the module-level bindings `context::thread_contexts` recognized as
     /// ambient contexts — `let app_context = Context<AppContext>::new();`.
     ///
@@ -69759,6 +70189,7 @@ fn analyze_over_world<'src>(
         traits: analyzer.traits,
         generic_dispatch: analyzer.generic_dispatch,
         for_each_next: analyzer.for_each_next,
+        for_each_next_providers: analyzer.for_each_next_providers,
         for_each_iterable_types: analyzer.for_each_iterable_types,
         for_each_views: analyzer.for_each_views,
         closure_type_parameter_views: analyzer.closure_type_parameter_views,
@@ -69831,6 +70262,7 @@ fn analyze_over_world<'src>(
         context_erased_subjects: HashMap::default(),
         context_hidden_parameters: HashMap::default(),
         context_optional_hidden_parameters: HashSet::default(),
+        cleared_clause_contexts: HashSet::default(),
         context_bindings: Vec::new(),
         bool_enum_id: analyzer.bool_enum_id,
         module_id_by_name: analyzer.module_id_by_name,
@@ -70760,7 +71192,42 @@ pub fn check_call_site_admission(program: &mut Program) {
         }
     }
     let mut violations: Vec<(Error, SourceId)> = Vec::new();
-    for (call_id, function_call) in &program.function_calls {
+    // The SITES that resolved a member through an implementation: every wired
+    // call, and (B481) every `for` loop over a custom iterator — whose `next`
+    // is the lookup's answer exactly as a call's is, but is no call, so the
+    // pass never saw a loop driving a `next` through a block its file
+    // declined. `(anchor, member, receiver expression, the inherited
+    // default's recorded provider)`.
+    let mut sites: Vec<(Id, Id, Option<Id>, Option<(Id, usize, String)>)> = program
+        .function_calls
+        .iter()
+        .filter_map(|(call_id, function_call)| {
+            let Some(Expr::Local(member_id)) = program.entity_map.get(&function_call.subject_id)
+            else {
+                return None;
+            };
+            Some((
+                *call_id,
+                *member_id,
+                function_call.argument_ids.first().copied(),
+                declined.get(call_id).cloned(),
+            ))
+        })
+        .collect();
+    for (&loop_id, &next_id) in &program.for_each_next {
+        let provided = program
+            .for_each_next_providers
+            .get(&loop_id)
+            .map(|index| (next_id, *index, "next".to_string()));
+        // Anchored at the ITERABLE — the `box` of `for item in box`, the
+        // receiver the loop calls `next` on — rather than the whole loop.
+        let anchor = match program.entity_map.get(&loop_id) {
+            Some(Expr::ForEach(iterable, ..)) => *iterable,
+            _ => loop_id,
+        };
+        sites.push((anchor, next_id, None, provided));
+    }
+    for (call_id, member_id, receiver_expression, provided) in &sites {
         // B391: the file a call is ADMITTED under — for generated code, the
         // module whose attribute generated it (B354's rule, `admitting_file`).
         // `source_of` answers the `DERIVED_SOURCE` sentinel there, which
@@ -70773,17 +71240,17 @@ pub fn check_call_site_admission(program: &mut Program) {
         };
         // A method call's callee is a fresh local bound to the member the
         // lookup found (`wire_method_call`), which is the one place a call
-        // records WHICH implementation answered it.
-        let Some(Expr::Local(member_id)) = program.entity_map.get(&function_call.subject_id) else {
-            continue;
-        };
+        // records WHICH implementation answered it; a loop's is its recorded
+        // `next`.
+        //
         // B401: an inherited DEFAULT is declared by its trait, not by the
         // block that provides it — so its block is the one the lookup recorded
         // when the file had declined it, and a call it did not record was
-        // admitted.
+        // admitted. A loop records its provider whatever the file admits, and
+        // the admission below decides.
         let (index, inherited_name) = match declaring.get(member_id).copied() {
             Some(index) => (index, None),
-            None => match declined.get(call_id) {
+            None => match provided {
                 Some((declined_member, index, name)) if declined_member == member_id => {
                     (*index, Some(name.as_str()))
                 }
@@ -70798,10 +71265,8 @@ pub fn check_call_site_admission(program: &mut Program) {
         if let Some(residue) = residues
             .iter()
             .find(|residue| residue.first == *member_id || residue.second == *member_id)
-            && let Some(receiver) = function_call
-                .argument_ids
-                .first()
-                .and_then(|receiver| receiver_type_id(program, *receiver))
+            && let Some(receiver) =
+                receiver_expression.and_then(|receiver| receiver_type_id(program, receiver))
             && crate::impl_select::is_resolvable(
                 program.type_id_to_type_map.get(&receiver).unwrap_or(&Type::Unknown),
             )

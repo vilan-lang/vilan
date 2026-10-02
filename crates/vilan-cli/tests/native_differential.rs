@@ -2325,6 +2325,191 @@ const TRACKING_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B475: a pipe over a `dyn Source<T>` STARTS the object through a `Flow`
+/// bound, so the object's table carries `Flow::start` (a supertrait member) —
+/// a `derive` sealed with `.cell()`, one consumed by `on_change`, one read with
+/// `.sample()`, and the total join `switch(|inner| inner)` over a cell of
+/// objects. JS threw "start is not a function"; both backends agree now.
+#[test]
+fn a_pipe_over_a_source_object_starts_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b475.vl"), B475_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b475.vl"),
+        Verdict::Identical,
+        "a pipe over a source object must start it the same way on both backends"
+    );
+}
+
+const B475_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ SignalCell, Source };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet cell = SignalCell::new(1);\n",
+    "\tlet object: dyn Source<i32> = cell;\n",
+    "\tlet cached = object.derive(|n: i32| n + 1).cell();\n",
+    "\tlet watch = object.derive(|n: i32| n * 10).on_change(|n: i32| print(i\"saw {n}\"));\n",
+    "\tlet outer = SignalCell::new(object);\n",
+    "\tlet flat = outer.switch(|inner: dyn Source<i32>| inner).memo();\n",
+    "\tcell.set(5);\n",
+    "\tprint(i\"{object.derive(|n: i32| n + 1).sample()} {cached.get()} {flat.get()}\");\n",
+    "\twatch.dispose();\n",
+    "}\n",
+);
+
+/// B478: a named function and a variant at a `context`-typed closure position
+/// — `count.derive(Some)`, `count.derive(double)`, `count.effect(show)`. JS
+/// ignores the hidden context arguments the caller appends; natively the value
+/// is adapted to the position's arity (the function item alone was refused by
+/// rustc, E0593).
+#[test]
+fn a_named_function_at_a_context_typed_position_runs_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b478.vl"), B478_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b478.vl"),
+        Verdict::Identical,
+        "a named function or a variant must stand for a context-typed body on both backends"
+    );
+}
+
+const B478_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Owner, SignalCell, Source, run_with_owner };\n",
+    "\n",
+    "fun show(value: i32) {\n",
+    "\tprint(i\"show {value}\");\n",
+    "}\n",
+    "\n",
+    "fun double(value: i32): i32 {\n",
+    "\tvalue * 2\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = SignalCell::new(4);\n",
+    "\tlet wrapped = count.derive(Some).memo();\n",
+    "\tlet doubled = count.derive(double).memo();\n",
+    "\tlet owner = Owner::new();\n",
+    "\trun_with_owner(owner, || {\n",
+    "\t\tcount.effect(show);\n",
+    "\t});\n",
+    "\tcount.set(5);\n",
+    "\tprint(wrapped.get().unwrap() + doubled.get());\n",
+    "\towner.dispose();\n",
+    "}\n",
+);
+
+/// B480 + B484: a binder bound through a trait ARGUMENT, reached through an
+/// object — `switch`'s `U` from a `dyn Flow<i32>` selector with nothing
+/// written, and a collection pipe over a list of `dyn Source<Option<str>>`
+/// whose `filter_map(|source| source)` binds `R: IntoFlow<Option<U>>`'s `U`
+/// from the object's own trait argument. Natively the second reached the
+/// emitter with `U` unbound and was refused by name.
+#[test]
+fn a_binder_through_an_objects_trait_argument_is_bound_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b480.vl"), B480_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b480.vl"),
+        Verdict::Identical,
+        "a binder through an object's trait argument must bind on both backends"
+    );
+}
+
+const B480_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Flow, ListCell, Signal, SignalCell, Source, comp };\n",
+    "\n",
+    "fun arm(on: bool, count: SignalCell<i32>): dyn Flow<i32> {\n",
+    "\tif on {\n",
+    "\t\tcount.derive(|value| value * 100)\n",
+    "\t} else {\n",
+    "\t\tcount\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet flag = Signal::new(true);\n",
+    "\tlet count = Signal::new(1);\n",
+    "\tlet picked = flag.switch(|on| arm(on, count)).memo();\n",
+    "\tprint(picked.get());\n",
+    "\tflag.set(false);\n",
+    "\tcount.set(3);\n",
+    "\tprint(picked.get());\n",
+    "\tlet a: SignalCell<Option<str>> = Signal::new(Some(\"a\"));\n",
+    "\tlet b: SignalCell<Option<str>> = Signal::new(None);\n",
+    "\tlet first: dyn Source<Option<str>> = a;\n",
+    "\tlet second: dyn Source<Option<str>> = b;\n",
+    "\tlet sources: ListCell<dyn Source<Option<str>>> = ListCell::of([first, second]);\n",
+    "\tlet (loaded, scope) = comp(|| sources.filter_map(|source| source).memo());\n",
+    "\tprint(loaded.get().len());\n",
+    "\tb.set(Some(\"b\"));\n",
+    "\tlet names = loaded.get();\n",
+    "\tprint(names[0] + names[1]);\n",
+    "\tscope.dispose();\n",
+    "}\n",
+);
+
+/// B482: an injected callback called inside `clear` of its own context gets
+/// the CLEARED state — `get_safe` is `None` there and the bare value's `Some`
+/// from a plain call through the same position — and natively the position's
+/// closure type carries the context as an `Option` (`cleared_clause_contexts`),
+/// which every literal landing there agrees with, beside a `run` body and a
+/// plain injected position that stay bare.
+#[test]
+fn a_callback_called_inside_clear_reads_the_context_as_absent_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b482.vl"), B482_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b482.vl"),
+        Verdict::Identical,
+        "a cleared callback must read the context as absent on both backends"
+    );
+}
+
+const B482_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::option::Option::{ Some, None };\n",
+    "\n",
+    "let current: Context<i32> = Context::new();\n",
+    "\n",
+    "fun describe(): str {\n",
+    "\tmatch current.get_safe() {\n",
+    "\t\tSome(let value) => i\"some {value}\",\n",
+    "\t\tNone => \"none\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun notify(callback: (|i32| void) context current) {\n",
+    "\tcurrent.clear(|| callback(1));\n",
+    "}\n",
+    "\n",
+    "fun twice(callback: (|i32| void) context current) {\n",
+    "\tcallback(1);\n",
+    "\tcurrent.clear(|| callback(2));\n",
+    "}\n",
+    "\n",
+    "fun plain(callback: (|i32, i32| void) context current) {\n",
+    "\tcallback(3, 4);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tcurrent.run(7, || {\n",
+    "\t\tnotify(|n: i32| print(i\"{n} {describe()}\"));\n",
+    "\t\ttwice(|n: i32| print(i\"{n} {describe()}\"));\n",
+    "\t\tplain(|n: i32, m: i32| print(n + m + current.get()));\n",
+    "\t});\n",
+    "}\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is
@@ -5063,23 +5248,22 @@ const AND_THEN_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F38's boundary, moved by B424: `result-combinators.vl` stopped at
-/// `or_else<F>` over an `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose
-/// `F` nothing in the program constrained. The ruling (R-h, door (b)) gives
-/// that `F` the input's error type, and `err.or(Ok(3))`'s likewise, so both
-/// emit now. The program stops one wall further on: `ok.and(Ok(5))`'s
-/// ARGUMENT, a constructor whose own error parameter the analyzer leaves
-/// open although its landing position (`Result<U, E>` at the receiver's
-/// `E`) fixes it — refused by name, not broken.
+/// F38's boundary, moved by B424 and closed by B454: `result-combinators.vl`
+/// stopped at `or_else<F>` over an `Ok`-only closure (`err.or_else(|e|
+/// Ok(7))`), whose `F` nothing in the program constrained — the ruling (R-h,
+/// door (b)) gives that `F` the input's error type, and `err.or(Ok(3))`'s
+/// likewise — and then at `ok.and(Ok(5))`, whose result lost the receiver's
+/// `E`: the argument, typed in `Result`'s own terms, reconciled `E` back to
+/// itself over the receiver's `str` (a self-binding is no evidence now). The
+/// whole program builds natively and prints node's bytes.
 #[test]
-fn an_unconstrained_generic_parameter_is_refused_by_name() {
+fn result_combinators_is_identical_on_both_backends() {
     let staged = stage();
-    match compare(&staged, "result-combinators.vl") {
-        Verdict::Refused(reason) => {
-            assert!(reason.contains("parameter 2 of enum `Result`"), "{reason}")
-        }
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
+    assert_eq!(
+        compare(&staged, "result-combinators.vl"),
+        Verdict::Identical,
+        "every combinator of `result-combinators.vl` must build natively and agree"
+    );
 }
 
 /// **F37**: a PARTIAL move where the source's order asks for one, and the
@@ -7668,9 +7852,9 @@ fn a_churned_hash_map_walks_in_insertion_order_on_both_backends() {
     );
 }
 
-/// F65 (OPEN, native-45 STOPPED it — the defect is the analyzer's record): a
-/// generic function whose return is inferred, called at two instantiations,
-/// emits ONE instantiation's return type for every instance. `wrap<T>(x: T):
+/// F65 (native-45 STOPPED it as the analyzer's; solver-b-45 fixed the record):
+/// a generic function whose return is inferred, called at two instantiations,
+/// emitted ONE instantiation's return type for every instance. `wrap<T>(x: T):
 /// Source<T> { SignalCell::new(x) }` at `i32` and `str` emits both instances
 /// returning the `str` cell, and the `i32` caller's reads meet the wrong
 /// struct (rustc E0308). The same holds with no return written at all, so it
@@ -7678,8 +7862,9 @@ fn a_churned_hash_map_walks_in_insertion_order_on_both_backends() {
 /// return as the LAST call site's `SignalCell<str>` rather than
 /// `SignalCell<T>`, and both call expressions share that one type id — so
 /// nothing per call carries the instance's return for the emitter to read.
+/// The record is written only under an empty substitution now — in the
+/// function's own terms — so each instance substitutes its own.
 #[test]
-#[ignore = "F65: the analyzer records a generic function's inferred return at one call site's instantiation"]
 fn a_generic_inferred_return_is_per_instance_on_both_backends() {
     let staged = stage();
     std::fs::write(

@@ -251,8 +251,8 @@ row	flagship	key
 216	-	`run` must be called on a named context with a closure literal body
 217	-	`run` must be called on a named context with a closure literal body, or a closure value whose type is `context`-annotated with exactly this context
 218	-	this parameter's `context` clause names a value that is not a context
-219	-	a `context`-typed {position} takes a closure literal, or a value with the same `context` clause
-220	-	a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)
+219	-	a `context`-typed {position} takes a closure literal, a named function or variant, or a value with the same `context` clause
+220	-	a `context`-typed parameter takes a closure literal, a named function or variant, a value with the same `context` clause, or a local closure binding (which adopts the clause)
 221	flagship	an injected (`context`-typed) closure can only be called, forwarded to a position with the same `context` clause, or passed to `run`
 222	flagship	context `{}` is read here, but this code can be reached without an enclosing `run`
 223	-	an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`
@@ -626,3 +626,4 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 601	-	`[hint({shown})]` must name a trait application — the trait a `{host_name}` is shown as in an inlay hint, written in its own parameters (`[hint(Source<T>)]`) — and `{shown}` is not a trait
 602	-	`[hint({shown})]`: no impl of `{shown}` for `{host}` — a hint may only name a trait application the type implements, or the abbreviation would promise what the value lacks
 603	-	`[hint(..)]` names the trait a struct or an enum is shown as in an inlay hint, and {kind} is not a type — write it on the struct or enum whose values the hint is about
+604	-	context `{name}` is read here, but this closure is called with `{name}` CLEARED: it lands at {position}, {how}, where there is no value to read — read it with `{name}.get_safe()` (which answers `None` there), or read it before handing the closure on

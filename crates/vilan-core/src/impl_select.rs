@@ -435,8 +435,56 @@ fn bounds_are_stronger(program: &Program, stronger: TypeId, weaker: TypeId) -> b
         {
             strictly = true;
         }
+        // B477, the analyzer's `bound_arguments_order` read here: one trait at
+        // narrower ARGUMENTS is the stronger bound (`Pipe<Task<Result<T, E>>>`
+        // over `Pipe<Task<T>>`), and arguments that are not an instance of the
+        // other's pattern rank neither way.
+        match bound_arguments_narrower(program, *stronger_id, *weaker_id) {
+            Some(true) => strictly = true,
+            Some(false) => {}
+            None => return false,
+        }
     }
     strictly
+}
+
+/// Whether `left`'s bound arguments are NARROWER than `right`'s, trait by trait
+/// where both name the same one: `Some(true)` when every argument is an
+/// instance of `right`'s pattern and one strictly, `Some(false)` when they
+/// match each other (or share no trait), `None` when one is not an instance.
+fn bound_arguments_narrower(program: &Program, left: TypeId, right: TypeId) -> Option<bool> {
+    let trait_application = |type_id: &TypeId| match program.type_id_to_type_map.get(type_id) {
+        Some(Type::Trait(trait_id, arguments)) => Some((*trait_id, arguments.clone())),
+        _ => None,
+    };
+    let right_bounds: Vec<(Id, Vec<TypeId>)> = bound_type_ids(program, right)
+        .iter()
+        .filter_map(trait_application)
+        .collect();
+    let mut narrower = false;
+    for (trait_id, left_arguments) in bound_type_ids(program, left)
+        .iter()
+        .filter_map(trait_application)
+    {
+        let Some((_, right_arguments)) = right_bounds
+            .iter()
+            .find(|(right_trait, _)| *right_trait == trait_id)
+        else {
+            continue;
+        };
+        if left_arguments.len() != right_arguments.len() {
+            continue;
+        }
+        for (left_argument, right_argument) in left_arguments.iter().zip(right_arguments) {
+            if !subject_shape_matches(program, *right_argument, *left_argument) {
+                return None;
+            }
+            if !subject_shape_matches(program, *left_argument, *right_argument) {
+                narrower = true;
+            }
+        }
+    }
+    Some(narrower)
 }
 
 /// A binder's declared bounds CLOSED over the supertrait graph — the emission
@@ -872,6 +920,19 @@ fn provided_trait_argument_sets(
     trait_id: Id,
 ) -> Vec<(TypeId, Vec<TypeId>)> {
     let mut providers = Vec::new();
+    // B475's native half: a trait OBJECT provides its trait and that trait's
+    // supertraits at the arguments it carries, threaded down the chain — no
+    // impl subject names it, so without this a blanket over `S: Source<type T>`
+    // bound `S` to a `dyn Source<Option<str>>` and left `T` a hole, and the
+    // collection pipe over a list of source objects reached the native emitter
+    // with its element unbound.
+    if let Some(Type::Dyn(object_trait_id, object_arguments)) =
+        program.type_id_to_type_map.get(&concrete)
+        && let Some(arguments) =
+            object_trait_arguments(program, *object_trait_id, object_arguments, trait_id)
+    {
+        providers.push((concrete, arguments));
+    }
     for implementation in &program.implementations {
         // B419: through the supertrait chain — a one-block subtrait impl
         // provides the supertrait too.
@@ -901,6 +962,52 @@ fn provided_trait_argument_sets(
         ));
     }
     providers
+}
+
+/// The arguments an object over `object_trait_id` (at `object_arguments`)
+/// provides for `trait_id` — the object's own trait, or a supertrait reached
+/// down the chain with each trait's parameters substituted by the arguments
+/// the clause above passed it. Grounded one step deep like [`ground_id`]: a
+/// clause argument that IS a parameter becomes its argument, a constructed one
+/// stays as written (a hole to every agreement check).
+fn object_trait_arguments(
+    program: &Program,
+    object_trait_id: Id,
+    object_arguments: &[TypeId],
+    trait_id: Id,
+) -> Option<Vec<TypeId>> {
+    let mut stack: Vec<(Id, Vec<TypeId>)> = vec![(object_trait_id, object_arguments.to_vec())];
+    let mut seen: Vec<Id> = Vec::new();
+    while let Some((current, arguments)) = stack.pop() {
+        if current == trait_id {
+            return Some(arguments);
+        }
+        if seen.contains(&current) {
+            continue;
+        }
+        seen.push(current);
+        let Some(trait_) = program.traits.get(&current) else {
+            continue;
+        };
+        let bindings: HashMap<TypeId, TypeId> = trait_
+            .generic_parameter_constraint_ids
+            .iter()
+            .copied()
+            .zip(arguments.iter().copied())
+            .collect();
+        for supertrait in &trait_.supertraits {
+            if let Some(Type::Trait(super_id, super_arguments)) =
+                program.type_id_to_type_map.get(supertrait)
+            {
+                let grounded = super_arguments
+                    .iter()
+                    .map(|argument| ground_id(program, *argument, &bindings))
+                    .collect();
+                stack.push((*super_id, grounded));
+            }
+        }
+    }
+    None
 }
 
 /// [`ground`] at the id level, one step deep: a written argument that IS a

@@ -8190,14 +8190,18 @@ fn a_pipe_asked_for_a_member_no_source_declares_keeps_its_ordinary_message() {
     assert_fails_without(&source, "a pipe has no");
 }
 
-/// reactive-44's find (REPORT-reactive-44): the total join written as a pipe in
-/// a generic body, with the selector's parameter UNannotated. `.derive(f)` is a
-/// `Derive<S, T, I>` over the caller's abstract `I`, and `.switch(|inner| inner)`
-/// types `inner` as an unsubstituted `T` — "cannot infer 'U'" and "generic
-/// parameter 'T' is missing the bound ': Flow<U>'". The same body at concrete
-/// types, or with `|inner: I|`, compiles (the three B371 pins above).
+/// reactive-44's find (REPORT-reactive-44), B479: the total join written as a
+/// pipe in a generic body, with the selector's parameter UNannotated.
+/// `.derive(..)` is a `Derive<S, T, I>` over the caller's abstract `I`, which
+/// provides `Flow<I>` — and `.switch(|inner| inner)` typed `inner` as the
+/// Source blanket's bare `T` ("cannot infer 'U'", "generic parameter 'T' is
+/// missing the bound ': Flow<U>'"), because an answer written in the CALLER's
+/// own parameter read as a hole and the blanket's ungrounded one, declared
+/// first, won. The same body at concrete types, or with `|inner: I|`, always
+/// compiled (the three B371 pins above). The transform is a literal over `f`:
+/// a closure PARAMETER carries no clause, and `derive`'s body takes one
+/// (A142 S2's migration).
 #[test]
-#[ignore = "A142: reactive-44 find: a pipe stage's closure parameter in a generic body is typed as the trait's unsubstituted T"]
 fn a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter() {
     assert_compiles_and_runs(
         r#"
@@ -8205,7 +8209,7 @@ fn a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter() {
         import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
 
         fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
-            source.derive(f).switch(|inner| inner).cell()
+            source.derive(|value| f(value)).switch(|inner| inner).cell()
         }
 
         fun main() {
@@ -8733,5 +8737,43 @@ fn a_second_emission_of_one_program_computes_no_impl_selection() {
         second, 0,
         "the second emission computed {second} impl selections (the first computed \
          {first}): every one was already answered for this program (M98)"
+    );
+}
+
+/// B479 without std: a stage type's own impl provides `Fl<U>` in the caller's
+/// parameter (`Der<S, T, I>` → `Fl<I>`), and a blanket over every `Src`
+/// provides `Fl` too — written first, its `T` grounded by nothing a `Der` has.
+/// The selector's parameter is typed from the stage's answer, the caller's `I`,
+/// not from the blanket's bare `T`.
+#[test]
+fn b479_a_stage_selector_in_a_generic_body_takes_the_receivers_own_answer() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Fl<T> { fun pull(self): T; }\n",
+            "trait Src<T> with Fl<T> { fun get(self): T; }\n",
+            "impl type S: Src<type T> with Fl<T> { fun pull(self): T { self.get() } }\n",
+            "struct Cell<T> { v: T }\n",
+            "impl Cell<type T> with Src<T> { fun get(self): T { self.v } }\n",
+            "struct Der<S, T, U> { up: S, f: |T| U }\n",
+            "impl Der<type S: Fl<type T>, T, type U> with Fl<U> {\n",
+            "\tfun pull(self): U { (self.f)(self.up.pull()) }\n",
+            "}\n",
+            "struct Sw<S, T, I, U> { up: S, sel: |T| I }\n",
+            "impl Sw<type S: Fl<type T>, T, type I: Fl<type U>, U> with Fl<U> {\n",
+            "\tfun pull(self): U { (self.sel)(self.up.pull()).pull() }\n",
+            "}\n",
+            "impl type F: Fl<type T> {\n",
+            "\tfun der<U>(self, f: |T| U): Der<F, T, U> { Der<F, T, U> { up = self, f } }\n",
+            "\tfun sw<U, I: Fl<U>>(self, sel: |T| I): Sw<F, T, I, U> { Sw<F, T, I, U> { up = self, sel } }\n",
+            "}\n",
+            "fun switch_to<T, U, S: Src<T>, I: Src<U>>(source: S, f: |T| I): U {\n",
+            "\tsource.der(f).sw(|inner| inner).pull()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(switch_to(Cell { v = 1 }, |m| Cell { v = m * 2 }));\n",
+            "}\n",
+        ),
+        "2\n",
     );
 }
