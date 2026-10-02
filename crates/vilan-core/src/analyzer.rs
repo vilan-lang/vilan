@@ -60,6 +60,26 @@ thread_local! {
     /// M19 memo's instrument, and the only thing that can see it working. See
     /// [`generic_bound_checks`].
     static GENERIC_BOUND_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many impl SUBJECT COMPARISONS the inherited-member scans of method
+    /// lookup (`inherited_default_candidates`, `inheriting_impls_of_declared_homes`)
+    /// have made on this thread since [`reset_inherited_subject_tests`] (M103).
+    /// See [`inherited_subject_tests`].
+    static INHERITED_SUBJECT_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of impl subject comparisons method lookup's inherited-member
+/// scans have made on this thread since the last
+/// [`reset_inherited_subject_tests`]. The scans compare a receiver against an
+/// impl only when one of the impl's traits can provide the member being looked
+/// up (M103), so an impl that cannot answer the lookup costs no type walk —
+/// which changes no candidate, so only this count can see it.
+pub fn inherited_subject_tests() -> usize {
+    INHERITED_SUBJECT_TESTS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`inherited_subject_tests`].
+pub fn reset_inherited_subject_tests() {
+    INHERITED_SUBJECT_TESTS.with(|count| count.set(0));
 }
 
 /// The number of bound evaluations this thread's
@@ -19736,7 +19756,20 @@ impl<'src> Analyzer<'src> {
         self.implementations
             .iter()
             .filter(|implementation| !implementation.declarations.contains_key(member_name))
+            // M103: the home test before the subject comparison — a recursive
+            // type walk per impl, and the expensive half. An impl of none of
+            // the homes is dropped by the `find` below whatever its subject,
+            // so asking the comparison about it first only cost the walk:
+            // every impl in the program per method lookup, which grew with
+            // each pipe node std declared.
             .filter(|implementation| {
+                implementation
+                    .trait_ids
+                    .iter()
+                    .any(|trait_id| homes.contains(trait_id))
+            })
+            .filter(|implementation| {
+                INHERITED_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
                 self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
@@ -22929,17 +22962,34 @@ impl<'src> Analyzer<'src> {
         // B401: parallel to `reached` — the providing block's index, and
         // whether the calling file admits the member from it.
         let mut providers: Vec<(usize, bool)> = Vec::new();
-        for (index, implementation) in
-            self.implementations
-                .iter()
-                .enumerate()
-                .filter(|(_, implementation)| {
-                    self.impl_subject_admits(
-                        subject_type,
-                        implementation.subject.borrow_type(self),
-                        &HashMap::default(),
-                    )
+        // Per trait, whether it has a method of this name — asked once per
+        // trait rather than once per impl that provides it.
+        let mut trait_has_member: HashMap<Id, bool> = HashMap::default();
+        for (index, implementation) in self
+            .implementations
+            .iter()
+            .enumerate()
+            // M103: the trait test before the subject comparison, for
+            // `inheriting_impls_of_declared_homes`' reason — an impl none
+            // of whose traits has a method of this name reaches nothing in
+            // the loop below, so the comparison's type walk was spent on
+            // every other impl in the program per lookup.
+            .filter(|(_, implementation)| {
+                implementation.trait_ids.iter().any(|trait_id| {
+                    *trait_has_member.entry(*trait_id).or_insert_with(|| {
+                        self.method_member_in_trait(*trait_id, member_name)
+                            .is_some()
+                    })
                 })
+            })
+            .filter(|(_, implementation)| {
+                INHERITED_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
+                self.impl_subject_admits(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+            })
         {
             for trait_id in &implementation.trait_ids {
                 let Some(member_id) = self.method_member_in_trait(*trait_id, member_name) else {

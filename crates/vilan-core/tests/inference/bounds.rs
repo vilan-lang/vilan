@@ -8336,6 +8336,92 @@ fn an_inherited_defaults_candidates_are_computed_once_per_member() {
     );
 }
 
+/// M103: method lookup compares a receiver only against the impls that can
+/// provide the member it looks up.
+///
+/// The inherited-member scans of method resolution (a trait default the
+/// receiver inherits, and the default-taking impls ranked beside a declaring
+/// one) compared the receiver against EVERY impl in the program — a recursive
+/// type walk each — and only then asked whether the impl's traits had the
+/// member. With std's pipe nodes that was most of `compare_type_rigid`'s 3.9G
+/// instructions in a kolt `check`. The trait test now comes first, so impls
+/// that cannot answer the lookup cost nothing: twenty more of them, of a trait
+/// with no such member, leave the comparison count exactly where it was.
+#[test]
+fn method_lookup_compares_only_the_impls_that_can_provide_the_member() {
+    fn subject_tests(unrelated: usize) -> (usize, bool) {
+        let mut source = String::from(
+            r#"
+            trait Chime5 { fun ring5(self): str; fun chime5(self): str { self.ring5() } }
+            trait Unrelated5 { fun unrelated5(self): i32; }
+            struct Bell5 { size: i32 }
+            impl Bell5 with Chime5 { fun ring5(self): str { "ding" } }
+            "#,
+        );
+        for index in 0..unrelated {
+            source.push_str(&format!(
+                "struct Filler{index} {{ size: i32 }}\n\
+                 impl Filler{index} with Unrelated5 {{ fun unrelated5(self): i32 {{ {index} }} }}\n"
+            ));
+        }
+        source.push_str(
+            "fun main() {\n    let bell = Bell5 { size = 1 };\n    print(bell.chime5());\n}\nmain();\n",
+        );
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                // The program borrows its source for `'static`.
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                vilan_core::analyzer::reset_inherited_subject_tests();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                assert!(program.is_some(), "analysis should produce a program");
+                (
+                    vilan_core::analyzer::inherited_subject_tests(),
+                    vilan_core::analyzer::served_from_base_cache(),
+                )
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    // The base cache serves std's resolved world to every analysis after the
+    // first in this process, and std's own lookups are made while resolving
+    // it: both measured analyses must be served from it, so each counts the
+    // same thing — its entry's lookups. A concurrent test can evict the world
+    // under plain `cargo test` (one process), so a miss is measured again.
+    let served = |unrelated: usize| {
+        (0..4)
+            .map(|_| subject_tests(unrelated))
+            .find(|(_, served)| *served)
+            .map(|(count, _)| count)
+            .expect("the base cache serves a repeated analysis of the same world")
+    };
+    let without = served(0);
+    let with_twenty = served(20);
+    assert!(
+        without > 0,
+        "`bell.chime5()` must reach the inherited-default scan, or the count proves nothing"
+    );
+    assert_eq!(
+        with_twenty, without,
+        "twenty impls of a trait with no `chime5` took the lookup's subject \
+         comparisons from {without} to {with_twenty}: an impl that cannot provide the \
+         member must not be compared against the receiver (M103)"
+    );
+}
+
 /// Analyzes `source` on a large-stack worker and reports how many BOUND
 /// EVALUATIONS `check_generic_bound_satisfaction` performed — the M19 memo's
 /// instrument. The counter is zeroed on the worker thread, so a concurrently

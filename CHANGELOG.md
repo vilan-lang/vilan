@@ -353,6 +353,11 @@ written down.
 <!-- family: performance -->
 **An inherited default's dispatch candidates are computed once per member: `vilan check` on kolt drops from 21.5G instructions to 19.5G (v0.42.1: 25.3G).** M103's second half. `async_infer` asks, at every `OnType` dispatch site — a `self` call inside a trait default, an inherited default on a concrete receiver — which impl members a `Self` that declares the member can reach (`trait_subject_candidates`): a scan of every implementation with a `subject_applies` bound proof per blanket implementor, 1.9G instructions of a kolt `check` once maps-45's blankets landed. That set depends on the member name alone and on the program's traits, impls and type slots, which are settled before the post-passes run, so it is memoized per member on the `Program`; the `is_self_method` filter, which reads parameters, still runs per call. No output moves. Pin: `inference::bounds`' `an_inherited_defaults_candidates_are_computed_once_per_member` (six `bell.chime()` sites compute what one site computes, 77 sets; red at 102 with the memo bypassed). Tracker M103.
 
+---
+
+<!-- family: performance -->
+**Method lookup compares a receiver only against the impls that can provide the member: `vilan check` on kolt drops from 19.5G instructions to 17.1G (v0.42.1: 25.3G).** M103's third half. Two inherited-member scans of method resolution — `inherited_default_candidates` (a trait default the receiver inherits) and `inheriting_impls_of_declared_homes` (the default-taking impls ranked beside a declaring one, §13.2 row 17) — ran `impl_subject_admits`, a recursive type comparison, over every impl in the program and asked about the impl's traits afterwards; with std's pipe nodes that was most of `compare_type_rigid`'s 3.9G. The trait test (a trait of the impl has a method of that name; a trait among the declared homes) now comes first, asked once per trait per lookup — the same candidates in the same order, since an impl that fails it was dropped by the loop either way. No output moves. Pin: `inference::bounds`' `method_lookup_compares_only_the_impls_that_can_provide_the_member` (twenty impls of an unrelated trait leave the lookup's subject comparisons where they were; red at 21,580 → 23,340 with the trait test after the comparison). Tracker M103.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->
