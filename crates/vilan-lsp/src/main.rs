@@ -3535,9 +3535,11 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        self.fenced("did_change", (), || {
+        // E242: the diagnostics this edit carried along, republished at once —
+        // no analysis — so a squiggle stays on its code until the next one.
+        let followed = self.fenced("did_change", None, || {
             if params.content_changes.is_empty() {
-                return;
+                return None;
             }
             let uri = params.text_document.uri;
             if is_manifest(&uri) {
@@ -3563,7 +3565,7 @@ impl LanguageServer for Backend {
                 // the package's union is withdrawn like any other change in it.
                 self.withdraw_package_grays_for(&uri);
                 self.manifests.insert(uri, ManifestDocument::new(text));
-                return;
+                return None;
             }
             // M63: typing in a file is the strongest focus signal there is.
             // Before the edit, so the analysis this change schedules lands on a
@@ -3575,12 +3577,29 @@ impl LanguageServer for Backend {
             // debounced re-analysis still sees the just-typed character.
             // A document the protocol never opened has no base to splice
             // into; ranged events for it are dropped by the same guard.
+            let mut follows_diagnostics = false;
             let text = {
-                let Some(mut document) = self.documents.get_mut(&uri) else {
-                    return;
-                };
+                let mut document = self.documents.get_mut(&uri)?;
+                let mut publish_state = self
+                    .publish_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for change in &params.content_changes {
+                    let before = Arc::clone(&document.line_index);
                     document.apply_change(change.range, &change.text);
+                    // E242: each published diagnostic on this file follows the
+                    // edit — a whole-text replacement has no image to follow.
+                    if let Some(range) = change.range {
+                        let start = before.offset(range.start);
+                        let end = before.offset(range.end).max(start);
+                        let edit = document::EditDelta {
+                            start,
+                            old_len: end - start,
+                            new_len: change.text.len(),
+                        };
+                        follows_diagnostics |=
+                            publish_state.follow_edit(&uri, &before, edit, &document.line_index);
+                    }
                 }
                 document.text.clone()
             };
@@ -3598,8 +3617,24 @@ impl LanguageServer for Backend {
             // debounce, before any analysis — the withdrawal is the half of the
             // staleness rule that must not wait for anything.
             self.withdraw_package_grays_for(&uri);
-            self.on_change(uri, text);
-        })
+            self.on_change(uri.clone(), text);
+            follows_diagnostics.then_some(uri)
+        });
+        if let Some(uri) = followed {
+            // Planned UNDER the publish gate, from the state as it is then: an
+            // analysis that landed meanwhile already replaced the groups, and
+            // repainting those is right, where sending a list planned before
+            // the gate could arrive after the fresh one and undo it.
+            let _sending = self.publish_gate.lock().await;
+            let (target, diagnostics) = self
+                .publish_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .republish(&uri);
+            self.client
+                .publish_diagnostics(target, diagnostics, None)
+                .await;
+        }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
