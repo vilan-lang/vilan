@@ -62432,8 +62432,8 @@ fn handle_return_key<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
 /// The djb2 string hash, as a raw `u32` — the HMR fingerprint of a binding's
 /// canonical structural type rendering (`hmr.md` §4).
 ///
-/// It is the same hash `std/src/rpc.vl`'s `service_hash` computes over a
-/// service contract surface; the Rust `service_contract_hash` that used to
+/// It is the same hash `contract_hash.rs` computes over a service contract
+/// surface (A144); the Rust `service_contract_hash` that used to
 /// share this function went with the fallback generator (N70).
 fn djb2_hash(text: &str) -> u32 {
     let mut hash: u32 = 5381;

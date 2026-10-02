@@ -11,6 +11,7 @@ pub mod chunks;
 pub mod closest_name;
 pub mod const_eval;
 pub mod context;
+pub mod contract_hash;
 pub mod css;
 pub mod css_properties;
 pub mod dead_items;
@@ -1126,6 +1127,9 @@ pub fn post_analysis_passes(
     for (error, source) in evaluated.errors {
         program.push_diagnostic(error, source);
     }
+    // A144: every `[service]` contract hash, over the RESOLVED surface types,
+    // answered in place beside the const results it is serialized with.
+    contract_hash::resolve_contract_hashes(program);
     // The last pass to want it by reference is done, so the graph moves onto
     // the program: the cycle check below, chunk planning, emission and the
     // LSP's requirement hover all read it through `Program::call_graph`.

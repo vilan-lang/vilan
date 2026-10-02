@@ -35,7 +35,9 @@ that runs on every read.
 `connect` accepts a relative url (`"/"`) in the browser; it dials the same
 host over WebSocket, waits for the server's announcement, and verifies the
 **contract hash**: a drifted server fails the connect with
-`RpcError::Contract`.
+`RpcError::Contract`. The hash covers the surface's RESOLVED types, so a
+respelling is not a drift: `Map<str, i32>` (the deprecated alias), `HashMap<str,
+i32>` and a renaming import of it hash alike.
 
 ## Mirrors: `RemoteSource<T>`
 
