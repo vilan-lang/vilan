@@ -23,8 +23,11 @@ position and an ordinary name everywhere else (`with`, `own`, `lazy`, `as`,
 …); the rest are reserved. It is the list for a tool that highlights or
 escapes Vilan outside this toolchain to read instead of keeping its own
 copy, which drifts: the playground's editor on this site reads it, and
-`vilan bindgen` escapes exactly the reserved words (a TypeScript member
-named `css` binds as `css_`, one named `lazy` as `lazy`).
+`vilan bindgen` escapes exactly the reserved words, and only where a
+reserved word cannot stand: a free function, a parameter or a type named
+`css` binds as `css_`, one named `lazy` as `lazy`. A MEMBER may be any word,
+so a TypeScript method or property named `type` or `css` binds as written
+(`event.type()`); only a member named `self` keeps its `_`.
 
 ## `vilan init [name]`
 

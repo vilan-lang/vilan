@@ -1274,20 +1274,61 @@ fn member_names_become_snake_case_matching_the_hand_written_std_dialect() {
     );
 }
 
+/// E234 (ruled 2026-09-29): since B414 S4 a MEMBER may be named by any word,
+/// a reserved one included, so a TS member called `type` or `match` binds
+/// under the host's own name — `event.type()`, not `event.type_()` — and the
+/// generated module compiles and is callable. A reserved word still names no
+/// parameter or free function, so those positions keep their `_`.
 #[test]
-fn a_vilan_keyword_member_name_is_escaped() {
-    // A TS member called `type` or `match` would not parse as a vilan function
-    // name; the extern keeps the exact JS spelling either way.
-    let output = bind("interface A { type: string; match(): void; }");
+fn e234_a_vilan_keyword_member_name_binds_as_written() {
+    let output = bind(
+        "export declare class A { type: string; match(): void; static if(type: string): A; toDataURL(type?: string, quality?: number): string; }\n\
+         export declare function match(type: string): void;\n",
+    );
     assert!(output.contains("[extern(get, \"type\")]"), "{output}");
+    assert!(output.contains("external fun type(self): str;"), "{output}");
     assert!(
-        output.contains("external fun type_(self): str;"),
+        output.contains("external fun match(self): void;"),
         "{output}"
     );
+    // A static member is a member too; its PARAMETER is a binding.
     assert!(
-        output.contains("external fun match_(self): void;"),
+        output.contains("external fun if(type_: str): A;"),
         "{output}"
     );
+    // An optional arity's name is a MEMBER built from its parameters' names:
+    // the parameter keeps its `_`, the member name does not double it.
+    assert!(
+        output.contains(
+            "external fun to_data_url_with_type_and_quality(self, type_: str, quality: f64): str;"
+        ),
+        "{output}"
+    );
+    // The free function and its parameter are bindings: still escaped.
+    assert!(
+        output.contains("external fun match_(type_: str): void;"),
+        "{output}"
+    );
+    let errors = compile(&format!(
+        "{output}\nfun read(a: A): str {{\n\ta.match();\n\tA::if(\"x\").type()\n}}\n\nfun main() {{}}\n"
+    ));
+    assert!(
+        errors.is_empty(),
+        "the bindings compile and are callable: {errors:?}\n{output}"
+    );
+}
+
+/// E234's one exception: `self` is the receiver's name, which a member cannot
+/// take, so a member named `self` keeps its `_`.
+#[test]
+fn e234_a_member_named_self_is_still_escaped() {
+    let output = bind("interface A { self: string; }");
+    assert!(
+        output.contains("external fun self_(self): str;"),
+        "{output}"
+    );
+    let errors = compile(&format!("{output}\nfun main() {{}}\n"));
+    assert!(errors.is_empty(), "{errors:?}\n{output}");
 }
 
 #[test]
@@ -1666,7 +1707,7 @@ fn a_string_literal_variant_that_starts_with_a_digit_stays_a_valid_identifier() 
     let output = bind("type Ctx = \"2d\" | \"webgl\";\ninterface C { use(c: Ctx): void; }");
     assert!(output.contains("\t_2d = \"2d\","), "{output}");
     assert!(
-        output.contains("external fun use_(self, c: Ctx): void;"),
+        output.contains("external fun use(self, c: Ctx): void;"),
         "{output}"
     );
     assert!(
@@ -1725,6 +1766,8 @@ fn e225_members_named_css_dyn_or_lazy_bind_to_escaped_names_that_compile() {
          export declare function css(): void;\n",
     );
     assert!(source.contains("css_"), "`css_` is emitted:\n{source}");
+    // E234: the MEMBER `css` binds as written; only the free function escapes.
+    assert!(source.contains("external fun css(self): str;"), "{source}");
     for contextual in ["fun dyn(", "fun lazy("] {
         assert!(
             source.contains(contextual),

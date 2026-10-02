@@ -263,6 +263,23 @@ fn escape_reserved(name: &str) -> String {
     name.to_string()
 }
 
+/// A MEMBER's name — a method, a getter, a static, a constructor inside the
+/// type's `impl` — which since B414 S4 may be ANY word, a reserved one
+/// included: `fun type(self)` declares it and `event.type()` calls it, because
+/// a member position is entered after a token (`fun` in an `impl` body, `.`,
+/// `::`) that no keyword reading can begin at (contextual-keywords.md S4).
+/// E234, ruled: so a member binds under the host's own name, and only `self`
+/// — the receiver's name, which a member cannot take — is still suffixed.
+/// [`RESERVED_NAMES`]' type names guard against SHADOWING a type, which a
+/// member cannot do. A binding, a parameter, a free function and a type are
+/// still [`escape_reserved`]'s: a reserved word names none of them.
+fn member_name(name: &str) -> String {
+    if name == "self" {
+        return format!("{name}_");
+    }
+    name.to_string()
+}
+
 /// `getElementById` → `get_element_by_id`, matching the hand-written std
 /// dialect (`dom.vl`). A `_` is inserted before an uppercase letter that either
 /// follows a lowercase letter or digit, or begins a word inside an acronym run
@@ -1154,7 +1171,7 @@ impl<'options> Emitter<'options> {
                 // after the symbol it actually constructs with.
                 format!("new_{}", to_snake_case(&global.global))
             };
-            let name = unique_name(&escape_reserved(&base), names);
+            let name = unique_name(&member_name(&base), names);
             let first = &global.constructors[0];
             let overloads: Vec<Signature> = global.constructors[1..].to_vec();
             // Used AS WRITTEN, unlike a class's `constructor(…)` — which
@@ -1508,7 +1525,7 @@ impl<'options> Emitter<'options> {
         let base = to_snake_case(&property.name);
         let mut bound = false;
         if property.readable {
-            let name = unique_name(&escape_reserved(&base), names);
+            let name = unique_name(&member_name(&base), names);
             if property.is_static {
                 let _ = writeln!(out, "\t[extern(\"{owner}.{}\")]", property.name);
                 let _ = writeln!(out, "\t[platform(\"{}\")]", self.options.platform);
@@ -1521,7 +1538,7 @@ impl<'options> Emitter<'options> {
             bound = true;
         }
         if property.writable && !property.is_static {
-            let name = unique_name(&escape_reserved(&format!("set_{base}")), names);
+            let name = unique_name(&member_name(&format!("set_{base}")), names);
             let _ = writeln!(out, "\t[extern(set, \"{}\")]", property.name);
             let _ = writeln!(out, "\t[platform(\"{}\")]", self.options.platform);
             let _ = writeln!(
@@ -1552,7 +1569,7 @@ impl<'options> Emitter<'options> {
             format!("[extern(method, \"{}\")]", signature.name)
         };
         let receiver = (!method.is_static).then_some("self");
-        let name = unique_name(&escape_reserved(&to_snake_case(&signature.name)), names);
+        let name = unique_name(&member_name(&to_snake_case(&signature.name)), names);
         let text = self.emit_function(owner, &name, signature, &binding, receiver, overloads);
         Rendered::bound(indent(&text))
     }
@@ -1655,7 +1672,7 @@ impl<'options> Emitter<'options> {
             ));
             let suffix: Vec<String> = parameters[required..]
                 .iter()
-                .map(|parameter| parameter.name.clone())
+                .map(|parameter| parameter.word.clone())
                 .collect();
             let full_name = format!("{name}_with_{}", suffix.join("_and_"));
             if optional_count > 1 {
@@ -1740,7 +1757,8 @@ impl<'options> Emitter<'options> {
         todos: &mut Vec<String>,
         notes: &mut Vec<String>,
     ) -> RenderedParameter {
-        let name = escape_reserved(&to_snake_case(&parameter.name));
+        let word = to_snake_case(&parameter.name);
+        let name = escape_reserved(&word);
         let Some(declared) = &parameter.declared_type else {
             self.coverage.note_todo("untyped parameter");
             todos.push(format!(
@@ -1749,6 +1767,7 @@ impl<'options> Emitter<'options> {
             ));
             return RenderedParameter {
                 name,
+                word,
                 text: "any".to_string(),
                 optional: parameter.optional,
             };
@@ -1771,6 +1790,7 @@ impl<'options> Emitter<'options> {
         notes.extend(mapped.notes.iter().cloned());
         RenderedParameter {
             name,
+            word,
             text: mapped.text,
             optional: parameter.optional,
         }
@@ -2276,6 +2296,11 @@ impl Rendered {
 
 struct RenderedParameter {
     name: String,
+    /// The snake-cased host name WITHOUT the reserved-word escape — what a
+    /// MEMBER name built from parameter names (an optional arity's
+    /// `to_data_url_with_type_and_quality`) spells, since a member is any
+    /// word (E234) and the `_` belongs to the binding position alone.
+    word: String,
     text: String,
     optional: bool,
 }
