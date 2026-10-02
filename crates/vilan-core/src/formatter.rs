@@ -117,12 +117,51 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_on_heads(sort_element_heads(
         sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
             canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
-                collapse_field_shorthands(lead_export_past_attribute_runs(drop_trailing_commas(
-                    tokens,
-                ))),
+                collapse_field_shorthands(lead_export_past_attribute_runs(
+                    drop_redundant_view_prefixes(drop_trailing_commas(tokens)),
+                )),
             )),
         ))),
     ))))
+}
+
+/// Drops a parameter's view prefix that its type already states — `&x: &i32`
+/// is `x: &i32`, `&mut x: &mut T` is `x: &mut T` — so the safety net accepts
+/// the printer writing the convention once, in the type (B507: a closure
+/// parameter `|&x: &i32|` declined the whole file). A prefix the type does
+/// not repeat (`&x: &mut T`, where the prefix wins) is left for the printer
+/// to keep, and both streams then carry it.
+///
+/// Recognized by SHAPE, at a parameter's head — right after a `(`, a `,` or
+/// a closure's `|` — where `&` can only be a convention: `& NAME : & T` with
+/// `T` not `mut`, and `& mut NAME : & mut`. An expression never puts `NAME :`
+/// after a `&`. Runs over both streams.
+fn drop_redundant_view_prefixes(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let at_parameter_head =
+            matches!(result.last(), Some(Token::Ctrl('(' | ',') | Token::Op("|")));
+        if at_parameter_head && tokens[index] == Token::Op("&") {
+            let (prefix, mutable) = if tokens.get(index + 1) == Some(&Token::Mut) {
+                (2, true)
+            } else {
+                (1, false)
+            };
+            let name = index + prefix;
+            let redundant = matches!(tokens.get(name), Some(Token::Ident(_)))
+                && tokens.get(name + 1) == Some(&Token::Op(":"))
+                && tokens.get(name + 2) == Some(&Token::Op("&"))
+                && (tokens.get(name + 3) == Some(&Token::Mut)) == mutable;
+            if redundant {
+                index = name;
+                continue;
+            }
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
 }
 
 /// Moves a declaration's `export (in PATH)?` marker AHEAD of an attribute run
@@ -5733,14 +5772,20 @@ impl<'src> Printer<'src> {
             if parameter.mutable {
                 self.out.push_str("mut ");
             }
-            let type_is_reference = matches!(
-                parameter_type.as_deref().map(|spanned| &spanned.0),
-                Some(Node::Reference(..))
-            );
+            // A view prefix the TYPE already says is dropped (`&x: &i32` is
+            // `x: &i32`, the convention inferred from the type, §6.3) — and
+            // the net folds the same drop ([`drop_redundant_view_prefixes`]).
+            // One the type does NOT say is kept: the prefix wins over the
+            // type, so dropping `&` from `&x: &mut i32` would change the
+            // convention (B507).
+            let type_view = match parameter_type.as_deref().map(|spanned| &spanned.0) {
+                Some(Node::Reference(mutable, _)) => Some(*mutable),
+                _ => None,
+            };
             match parameter.convention {
                 Convention::Own => self.out.push_str("own "),
-                Convention::Ref if !type_is_reference => self.out.push('&'),
-                Convention::RefMut if !type_is_reference => self.out.push_str("&mut "),
+                Convention::Ref if type_view != Some(false) => self.out.push('&'),
+                Convention::RefMut if type_view != Some(true) => self.out.push_str("&mut "),
                 _ => {}
             }
             // `...items` — the spread marker binds to the binder, after any
@@ -8662,6 +8707,25 @@ mod reformats {
         ] {
             assert_formats(written, expected);
         }
+    }
+
+    // B507: a parameter's view prefix the type repeats reprints in the type
+    // alone, in a closure and in a function; one the type contradicts (the
+    // prefix wins, §6.3) is kept, so the convention survives the reprint.
+    #[test]
+    fn b507_a_view_prefix_the_type_repeats_reprints_in_the_type() {
+        assert_formats(
+            "fun f(&x: &i32, &mut y: &mut i32): i32 {\n\t*x\n}\n\nfun main() {\n\tlet g = |&a: &i32, b: i32| *a + b;\n\tlet h = |&mut c: &mut i32| *c;\n}\n",
+            "fun f(x: &i32, y: &mut i32): i32 {\n\t*x\n}\n\nfun main() {\n\tlet g = |a: &i32, b: i32| *a + b;\n\tlet h = |c: &mut i32| *c;\n}\n",
+        );
+        // The prefix the type does not say stays: dropping it would change
+        // the convention.
+        let kept = "fun f(&x: &mut i32, &mut y: &i32) {}\n";
+        // Through `reprint`, so a decline (which hands the input back) reds.
+        let reprinted = super::reprint(kept).unwrap_or_else(|declined| {
+            panic!("the formatter declined: {}", declined.sentence())
+        });
+        assert_eq!(reprinted, kept);
     }
 
     // E146 rule 3, in full: both written orders in, ONE order out, for a
