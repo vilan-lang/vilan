@@ -517,8 +517,8 @@ export fun rpc_protocols(credential: str): List<str> {
 // runtime helper (a `typeof` check, safe in any build); `hmr_register_teardown`
 // is a shim global, only ever reached behind the `hmr_active()` guard — inert
 // (and never referenced at runtime) without a dev shim.
-export [extern("__hmr_active")]
-external fun hmr_active(): bool;
+[extern("__hmr_active")]
+export external fun hmr_active(): bool;
 
 [extern("__hmr_register_teardown", retains)]
 external fun hmr_register_teardown(cleanup: || void): void;
@@ -581,8 +581,8 @@ external fun dial_promise(executor: |(|bool| void)| void): Promise<bool>;
 /// Railway's `isReady`, typed (proposal/transport-robustness.md §2.1). `Closed` is
 /// terminal: the retry budget ran out (or the server's contract drifted); the app
 /// decides what a fresh start looks like.
-export [derive(PartialEq, Debug)]
-enum ConnectionState {
+[derive(PartialEq, Debug)]
+export enum ConnectionState {
 	Connected,
 	Reconnecting,
 	Closed,
@@ -950,8 +950,8 @@ fun reject_announcement_prefix(): str {
 /// `WebSocket` exposes strictly less. So the discrimination cannot be read off the
 /// failure; it has to be SENT, and the server sends it as one frame on an upgraded
 /// socket it then closes.
-export [derive(PartialEq, Debug)]
-enum DialFailure {
+[derive(PartialEq, Debug)]
+export enum DialFailure {
 	/// The socket never opened, or opened and said nothing: an unreachable server,
 	/// a network error, a non-101 the host will not describe. RETRYABLE — waiting
 	/// is exactly what might fix it.
@@ -1372,8 +1372,8 @@ export enum RpcOutcome {
 /// `RpcError::to_json()` is a shipped surface — `vilan/benchmarks`' rpc legs print
 /// a failed call with it, and a `Result<T, RpcError>` is the value every generated
 /// stub answers — so the derive says so.
-export [derive(Wire, Json, Debug, PartialEq)]
-enum RpcError {
+[derive(Wire, Json, Debug, PartialEq)]
+export enum RpcError {
 	Transport(str),
 	Decode(str),
 	Remote(str),
@@ -4230,8 +4230,8 @@ export impl ReactiveClient with Disposable {
 /// channel. Still derived from what the mirror was TOLD, so an UNWATCHED mirror
 /// reads `Waiting` forever, correctly: nothing opened its channel, and nothing has
 /// been asked on its behalf.
-export [derive(PartialEq, Debug)]
-enum Status {
+[derive(PartialEq, Debug)]
+export enum Status {
 	/// Nothing has arrived yet. This is what an unwatched mirror reads, for as long
 	/// as it stays unwatched — `status` reports, it does not ask.
 	Waiting,
@@ -4367,8 +4367,8 @@ export impl MirrorTable<type M> {
 	}
 }
 
-export [hint(Source<Option<T>>)]
-struct RemoteSource<T> {
+[hint(Source<Option<T>>)]
+export struct RemoteSource<T> {
 	// Cells, not plain fields: a reconnect rebind points the mirror at the fresh
 	// connection's channel (the id cell is SHARED with the `ReactiveClient` route,
 	// so routing moves in the same write).
@@ -6246,8 +6246,8 @@ export macro fun is_contract_slot(rendered: str): bool {
 /// slot's type. After analysis each call is replaced in place by djb2 over the
 /// template with every slot filled by its parameter's RESOLVED type, rendered as 8
 /// hex digits — so an alias and its target hash alike. The call never runs.
-export [internal("the [service] expansion's contract hash (A144); the compiler answers it in place")]
-fun resolved_contract_hash<S>(template: str, slots: S): str {
+[internal("the [service] expansion's contract hash (A144); the compiler answers it in place")]
+export fun resolved_contract_hash<S>(template: str, slots: S): str {
 	panic("the compiler answers `resolved_contract_hash` in place (A144)")
 }
 

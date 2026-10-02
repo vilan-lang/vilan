@@ -185,8 +185,8 @@ export impl Handshake {
 /// answered with before it is destroyed — no socket, no session, no
 /// `ReactiveServer`, which is the whole point of gating BEFORE the upgrade rather
 /// than inside a method.
-export [derive(PartialEq, Debug)]
-enum Reject {
+[derive(PartialEq, Debug)]
+export enum Reject {
 	/// 401 — no credential, or one that did not verify.
 	Unauthorized,
 	/// 403 — a good credential for someone who may not have this.

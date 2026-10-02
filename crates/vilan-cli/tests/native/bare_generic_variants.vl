@@ -94,7 +94,7 @@ fun main() {
 	print(show(chosen));
 	// A struct field, written through a generic impl.
 	let held: Maybe<str> = Maybe::Just("h");
-	mut holder: Slot<str> = Slot { held = held };
+	mut holder: Slot<str> = Slot { held };
 	print(holder.is_empty());
 	holder.clear();
 	print(holder.is_empty());

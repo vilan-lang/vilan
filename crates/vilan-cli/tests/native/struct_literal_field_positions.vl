@@ -63,7 +63,12 @@ struct Outer<T> {
 
 fun outer_of<T>(scale: T): Outer<T> {
 	Outer {
-		inner = Pair { cell = SignalCell::new(None), key = "inner", held = Maybe::Nothing, history = [] },
+		inner = Pair {
+			cell = SignalCell::new(None),
+			key = "inner",
+			held = Maybe::Nothing,
+			history = [],
+		},
 		scale,
 	}
 }

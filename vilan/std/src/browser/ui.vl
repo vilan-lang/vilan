@@ -2231,8 +2231,8 @@ fun bind_optional_attribute_flow<F: Flow<Option<str>>>(own flow: F, parent: View
 /// IT an `Option<Element>` signature is a wider API question (A24, fullstack-dx.md
 /// §9.5) deliberately NOT taken here — this is a private guard at the mount seam
 /// alone.
-export [extern("__is_null")]
-external fun is_null(value: Element): bool;
+[extern("__is_null")]
+export external fun is_null(value: Element): bool;
 
 /// The lookup `mount`/`mount_root` share: fails loud, naming the id, instead
 /// of leaving `element.clear()` below to throw "Cannot read properties of

@@ -218,8 +218,8 @@ fun mint_subscriber(notify: || void): Subscriber {
 /// A relay is always a DERIVATION: it decides whether (and which) downstream to
 /// wake, and that has to happen in the wave's first phase, where a derivation it
 /// wakes still joins the fixpoint and an effect it wakes still runs after it.
-export [internal("a node author's relay mint (A124 R2): a stage that keeps a registration of its own")]
-fun subscriber_of(notify: || void, derived: bool): Subscriber {
+[internal("a node author's relay mint (A124 R2): a stage that keeps a registration of its own")]
+export fun subscriber_of(notify: || void, derived: bool): Subscriber {
 	Subscriber { id = fresh_id(), notify, live = Shared::new(true), derived }
 }
 
@@ -249,8 +249,8 @@ export enum FlushPolicy {
 // (recorded follow-on); the enum states intent and keeps the API stable.
 
 /// The host's microtask queue — the continuation-settling primitive.
-export [extern("queueMicrotask", retains)]
-external fun queue_microtask(callback: || void);
+[extern("queueMicrotask", retains)]
+export external fun queue_microtask(callback: || void);
 
 /// The runtime's `try`/`finally` (tracker B292). vilan has no exception
 /// syntax, so the catch seam is glue — `__with_finally` in `transformer.rs`,
@@ -268,8 +268,8 @@ external fun with_finally(body: || void, after: || void);
 /// returned; `Some(text)` carrying the host's own diagnosis when it threw. It costs
 /// one `Option` per call, so it belongs where the loop is a disposal group and not
 /// where it is a notification wave.
-export [extern("__guarded")]
-external fun guarded(body: || void): Option<str>;
+[extern("__guarded")]
+export external fun guarded(body: || void): Option<str>;
 
 export struct Turn {
 	// The EFFECT queue, kept ASCENDING BY SUBSCRIBER ID (A110 door 2): the ids are
@@ -622,8 +622,8 @@ fun reissued(subscriber: Subscriber): Subscriber {
 /// default a hidden context parameter that `SignalCell`'s override does not take,
 /// and one table signature cannot carry a parameter only some implementations
 /// declare: every `dyn Source` would stop building natively.
-export [internal("a node author's relay wake (A124 R2)")]
-fun wake(subscriber: Subscriber) {
+[internal("a node author's relay wake (A124 R2)")]
+export fun wake(subscriber: Subscriber) {
 	defer_subscriber(None, subscriber);
 }
 
@@ -833,8 +833,8 @@ export impl Subscription with Disposable {
 /// IS the answer — or from inside the release of the handle an owner's teardown
 /// disposed, whose `dispose` PUBLISHED its ambient turn for exactly that extent
 /// (`releasing_turns`), which is where this reads it.
-export [internal("a node's release of a registration it made for itself (A124 S2b)")]
-fun detach(handle: Subscription) {
+[internal("a node's release of a registration it made for itself (A124 S2b)")]
+export fun detach(handle: Subscription) {
 	// Inside a release, the turn that release published (B283's own answer,
 	// which is `dispose`'s ambient one); else the draining turn, else none.
 	let turn = match releasing_turns.read().last() {
@@ -1003,8 +1003,8 @@ let no_cleanups: Shared<List<|| void>> = Shared::new([]);
 let owner_lists_allocated_count: Shared<i32> = Shared::new(0);
 
 /// `owner_lists_allocated_count`, read. A pin's instrument, not an application's.
-export [internal("an instrument for the lazy-owner pin (A142 §4.1); it counts, it decides nothing")]
-fun owner_lists_allocated(): i32 {
+[internal("an instrument for the lazy-owner pin (A142 §4.1); it counts, it decides nothing")]
+export fun owner_lists_allocated(): i32 {
 	owner_lists_allocated_count.read()
 }
 
@@ -1013,8 +1013,8 @@ fun owner_lists_allocated(): i32 {
 let run_nurseries_allocated_count: Shared<i32> = Shared::new(0);
 
 /// `run_nurseries_allocated_count`, read. A pin's instrument, not an application's.
-export [internal("an instrument for the lazy-nursery pin (M92); it counts, it decides nothing")]
-fun run_nurseries_allocated(): i32 {
+[internal("an instrument for the lazy-nursery pin (M92); it counts, it decides nothing")]
+export fun run_nurseries_allocated(): i32 {
 	run_nurseries_allocated_count.read()
 }
 
@@ -1330,8 +1330,8 @@ fun release_runs(runs: Owner) {
 /// starts is registered with the STAGE's nursery (the host registers it at the
 /// `async` expression, where no element owner exists yet), so it is cancelled with
 /// the stage's instance rather than with the element.
-export [internal("a collection stage's per-element run (A142 §6.4)")]
-fun run_element<T>(
+[internal("a collection stage's per-element run (A142 §6.4)")]
+export fun run_element<T>(
 	stage: Owner,
 	body: (|| T) context (owner_scope, ambient_nursery),
 ): (T, Option<Owner>) {
@@ -1469,8 +1469,8 @@ export struct TrackedEdge {
 let trackers_allocated_count: Shared<i32> = Shared::new(0);
 
 /// `trackers_allocated_count`, read. A pin's instrument, not an application's.
-export [internal("an instrument for the lazy-tracker pin (M93); it counts, it decides nothing")]
-fun trackers_allocated(): i32 {
+[internal("an instrument for the lazy-tracker pin (M93); it counts, it decides nothing")]
+export fun trackers_allocated(): i32 {
 	trackers_allocated_count.read()
 }
 
@@ -1824,8 +1824,8 @@ export fun derive<T>(
 }
 
 /// The free `derive` as a stage: its body, and nothing upstream.
-export [hint(Pipe<T>)]
-[resource] struct TrackedDerive<T> {
+[hint(Pipe<T>)]
+[resource] export struct TrackedDerive<T> {
 	body: (|| T) context (owner_scope, tracking, ambient_nursery),
 }
 
@@ -2015,7 +2015,7 @@ export struct Instance<T> {
 /// Declared `[resource]` (R39): a pipe stage erases into `dyn Flow<T>`, and that
 /// object is move-only. The attribute is this trait's alone, so `dyn Source<T>`
 /// stays copyable though `Source` extends `Flow`.
-export [resource] trait Flow<T> {
+[resource] export trait Flow<T> {
 	/// Start this flow for its one consumer: the node author's member, where every
 	/// member below is the consumer's. A stage starts its upstream, keeps whatever
 	/// state its instance needs, and hands back how to read it, attach to it and
@@ -2198,8 +2198,12 @@ export impl type S: Source<type T> with Flow<T> {
 /// start the flow, attach one pulling subscriber, and chain the instance's release
 /// onto the handle. The subscriber is MINTED, so it spends the derivation mark
 /// (`as_derivation`) like every observer does.
-export [internal("a stage author's `on_change`/`sub`, written once")]
-fun observe_flow<T, F: Flow<T>>(own flow: F, observer: |T| void, immediately: bool): Subscription {
+[internal("a stage author's `on_change`/`sub`, written once")]
+export fun observe_flow<T, F: Flow<T>>(
+	own flow: F,
+	observer: |T| void,
+	immediately: bool,
+): Subscription {
 	let instance = flow.start();
 	let pull = instance.pull;
 	if !immediately {
@@ -2227,7 +2231,7 @@ fun observe_flow<T, F: Flow<T>>(own flow: F, observer: |T| void, immediately: bo
 ///     let total = cart.derive(|c| c.sum()).memo();   // one instance, one run per change
 ///     text(total);                                    // a source is data: pass it anywhere
 ///     badge(total.derive(|t| t > 100));               // each consumer builds its own pipe
-export [resource] trait Pipe<T> with Flow<T> {
+[resource] export trait Pipe<T> with Flow<T> {
 	/// Seal into a READ-ONLY source backed by one cell (A142 R11/R20): the pipe's
 	/// one consumer, run once per change, with the value cached for every reader.
 	/// Nothing downstream can `set` a derivation.
@@ -2301,8 +2305,8 @@ export [resource] trait Pipe<T> with Flow<T> {
 /// be a source as well as a pipe. The server renderer's read, which hears no change
 /// after its one pass; an application reads a source with `get` and a pipe with
 /// `.sample()`.
-export [internal("the server renderer's one read of a flow — read a source with `get`, a pipe with `.sample()`")]
-fun read_once<T, F: Flow<T>>(own flow: F): T {
+[internal("the server renderer's one read of a flow — read a source with `get`, a pipe with `.sample()`")]
+export fun read_once<T, F: Flow<T>>(own flow: F): T {
 	let instance = flow.start();
 	let value = (instance.pull)();
 	(instance.release)();
@@ -2312,8 +2316,8 @@ fun read_once<T, F: Flow<T>>(own flow: F): T {
 /// `release` chained onto `handle`'s own release, so disposing the handle releases
 /// the instance behind it too — the consumer's half of `Instance`. Chained rather
 /// than wrapped for `also_retiring`'s reason: no second handle, no context read.
-export [internal("a consumer's release chained onto its handle")]
-fun also_releasing(handle: Subscription, release: || void) {
+[internal("a consumer's release chained onto its handle")]
+export fun also_releasing(handle: Subscription, release: || void) {
 	let previous = handle.release.read();
 	handle.release.write() = Some(|| {
 		release();
@@ -2584,8 +2588,8 @@ export impl SignalCell<type T> {
 ///
 /// One cell underneath, so a memo read by N consumers ran its chain once per change,
 /// whatever N is.
-export [hint(Source<T>)]
-struct MemoCell<T> {
+[hint(Source<T>)]
+export struct MemoCell<T> {
 	cell: SignalCell<T>,
 }
 
@@ -2821,8 +2825,8 @@ fun detach_held(handle: Shared<Option<Subscription>>) {
 /// every type it mentions, so the upstream's `T` is a parameter of the struct. The
 /// transform is held plain (`|T| U`, not `sync |T| U`): `sync` is accepted on a
 /// parameter and not on a field, so it is checked where the stage is built.
-export [hint(Pipe<U>)]
-[resource] struct Derive<S, T, U> {
+[hint(Pipe<U>)]
+[resource] export struct Derive<S, T, U> {
 	up: S,
 	transform: (|T| U) context (owner_scope, tracking, ambient_nursery),
 }
@@ -2883,8 +2887,8 @@ export impl Derive<type S: Flow<type T>, T, type U> with Pipe<U> {}
 /// (`type I: Flow<U>, type U`) rather than read out of `I`'s bound (A124 S2b: read
 /// out of the bound, an inherited default's observer parameter is the trait's
 /// unsubstituted `T`).
-export [hint(Pipe<U>)]
-[resource] struct Switch<S, T, I, U> {
+[hint(Pipe<U>)]
+[resource] export struct Switch<S, T, I, U> {
 	up: S,
 	select: (|T| I) context (owner_scope, tracking, ambient_nursery),
 }
@@ -2948,8 +2952,8 @@ export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Pipe<U
 /// `switch_some` as a stage (A142 R8): `Switch` over a flow of `Option<T>`, where
 /// `None` DETACHES — nothing is followed and the stage reads `None` — and `Some(x)`
 /// follows the flow `select` builds for `x`, wrapped.
-export [hint(Pipe<Option<U>>)]
-[resource] struct SwitchSome<S, T, I, U> {
+[hint(Pipe<Option<U>>)]
+[resource] export struct SwitchSome<S, T, I, U> {
 	up: S,
 	select: (|T| I) context (owner_scope, tracking, ambient_nursery),
 }
@@ -3044,8 +3048,8 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 /// `None`; `Some(value)` follows the `Flow<Option<U>>` that `select` builds for it,
 /// and the two absences collapse into one. The instance is `SwitchSome`'s, without
 /// the wrapping.
-export [hint(Pipe<Option<U>>)]
-[resource] struct AndThen<S, T, I, U> {
+[hint(Pipe<Option<U>>)]
+[resource] export struct AndThen<S, T, I, U> {
 	up: S,
 	select: (|T| I) context (owner_scope, tracking, ambient_nursery),
 }
@@ -3140,8 +3144,8 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 /// the stage follows `source`, as `Some`; while it is false it reads `None` and is
 /// detached. It takes a `Source` rather than a pipe because it starts the followed
 /// flow afresh each time the flag TURNS true, and a pipe starts once.
-export [hint(Pipe<Option<T>>)]
-[resource] struct ThenSome<F, S, T> {
+[hint(Pipe<Option<T>>)]
+[resource] export struct ThenSome<F, S, T> {
 	up: F,
 	source: S,
 }
@@ -3197,8 +3201,8 @@ export impl ThenSome<type F: Flow<bool>, type S: Source<T>, type T> with Pipe<Op
 /// current values. Its attach forwards the SAME subscriber to every input, so a
 /// diamond standing on one root puts one consumer's record on it once per arm — and
 /// a turn calls it once. The handle disposes every arm.
-export [hint(Pipe<T>)]
-[resource] struct Combine<T: (2..)> {
+[hint(Pipe<T>)]
+[resource] export struct Combine<T: (2..)> {
 	sources: (U in T: dyn Source<U>),
 }
 
@@ -3238,8 +3242,8 @@ export impl Combine<type T> with Pipe<T> {}
 /// The last value is the INSTANCE's state: the relay reads the upstream once per
 /// change, keeps what it read, and the consumer's pull reads what was kept — so the
 /// chain above runs once per change, not once per read.
-export [hint(Pipe<T>)]
-[resource] struct Distinct<S, T> {
+[hint(Pipe<T>)]
+[resource] export struct Distinct<S, T> {
 	up: S,
 }
 
@@ -3280,8 +3284,8 @@ export impl Distinct<type S: Flow<T>, type T: PartialEq> with Pipe<T> {}
 
 /// `.distinct_by(key)` as a stage (A142 R7): `Distinct`, comparing `key` of the
 /// value rather than the value, and passing the whole value on.
-export [hint(Pipe<T>)]
-[resource] struct DistinctBy<S, T, K> {
+[hint(Pipe<T>)]
+[resource] export struct DistinctBy<S, T, K> {
 	up: S,
 	key: |T| K,
 }
@@ -3714,8 +3718,8 @@ export fun reconcile<T, K: PartialEq + Hashable>(
 // per edit. Both are off unless asked for.
 
 /// The sync status a UI can bind ("saved" / "unsaved" / the failure).
-export [derive(PartialEq, Debug)]
-enum DraftState {
+[derive(PartialEq, Debug)]
+export enum DraftState {
 	// `local` matches the last pushed/adopted value.
 	Synced,
 	// Local edits not yet confirmed (in-flight included).
@@ -3945,8 +3949,8 @@ export impl Draft<type T: PartialEq> {
 // The rollback is the recovery; the user re-issues.
 
 /// Where a write made through an `Optimistic` cell stands. Bind it.
-export [derive(PartialEq, Debug)]
-enum WriteState {
+[derive(PartialEq, Debug)]
+export enum WriteState {
 	// Nothing in flight; the cell's value is the last confirmed truth.
 	Confirmed,
 	// The newest write is on the wire.

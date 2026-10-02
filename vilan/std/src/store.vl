@@ -127,8 +127,8 @@ fun identity_at(root: Shared<StoreNode>, path: List<usize>): i32 {
 
 /// The child of `node` at `index`, if anything ever watched below it — the diff's
 /// step down, which never allocates.
-export [internal("the derive's step down the slot tree (A142 S7)")]
-fun store_kid(node: Option<Shared<StoreNode>>, index: usize): Option<Shared<StoreNode>> {
+[internal("the derive's step down the slot tree (A142 S7)")]
+export fun store_kid(node: Option<Shared<StoreNode>>, index: usize): Option<Shared<StoreNode>> {
 	match node {
 		None => None,
 		Some(let held) => match held.read().kids.get(index) {
@@ -140,8 +140,8 @@ fun store_kid(node: Option<Shared<StoreNode>>, index: usize): Option<Shared<Stor
 
 /// Whether a whole-value slot stands at `node`: a diff below it must then answer
 /// "changed" exactly, where it may otherwise skip what nobody watches.
-export [internal("the derive's question to the slot tree (A142 S7)")]
-fun store_has_me(node: Option<Shared<StoreNode>>): bool {
+[internal("the derive's question to the slot tree (A142 S7)")]
+export fun store_has_me(node: Option<Shared<StoreNode>>): bool {
 	match node {
 		None => false,
 		Some(let held) => held.read().me.is_some(),
@@ -149,8 +149,12 @@ fun store_has_me(node: Option<Shared<StoreNode>>): bool {
 }
 
 /// Collect `node`'s whole-value slot into `woken` when `changed`.
-export [internal("the derive's wake of a level it diffed (A142 S7)")]
-fun store_wake_me(node: Option<Shared<StoreNode>>, changed: bool, woken: &mut List<StoreSlot>) {
+[internal("the derive's wake of a level it diffed (A142 S7)")]
+export fun store_wake_me(
+	node: Option<Shared<StoreNode>>,
+	changed: bool,
+	woken: &mut List<StoreSlot>,
+) {
 	if changed {
 		match node {
 			None => {},
@@ -166,8 +170,8 @@ fun store_wake_me(node: Option<Shared<StoreNode>>, changed: bool, woken: &mut Li
 /// changed in a way the diff did not take apart — a variant that came or went (each
 /// slot under it went between `Some` and `None`), or a leaf compared whole whose
 /// type still projects (a `[reactive(coarse)]` field).
-export [internal("the derive's wake of a whole subtree (A142 S7)")]
-fun store_wake_all(node: Option<Shared<StoreNode>>, woken: &mut List<StoreSlot>) {
+[internal("the derive's wake of a whole subtree (A142 S7)")]
+export fun store_wake_all(node: Option<Shared<StoreNode>>, woken: &mut List<StoreSlot>) {
 	match node {
 		None => {},
 		Some(let held) => {
@@ -182,8 +186,8 @@ fun store_wake_all(node: Option<Shared<StoreNode>>, woken: &mut List<StoreSlot>)
 /// A value with no methods at all — a closure-typed field — diffed: the bare tier's
 /// answer (every covering write is a change), which a closure type cannot reach as
 /// a method.
-export [internal("the derive's diff of a closure-typed field (A142 S7)")]
-fun store_opaque(node: Option<Shared<StoreNode>>, woken: &mut List<StoreSlot>): bool {
+[internal("the derive's diff of a closure-typed field (A142 S7)")]
+export fun store_opaque(node: Option<Shared<StoreNode>>, woken: &mut List<StoreSlot>): bool {
 	store_wake_all(node, woken);
 	true
 }
@@ -194,8 +198,8 @@ fun store_opaque(node: Option<Shared<StoreNode>>, woken: &mut List<StoreSlot>): 
 /// moved wake, and a third variant's does not, since its answer did not change
 /// (Q7). Every live slot under either payload wakes too, each having gone between
 /// `Some` and `None`. Answers `true`, the diff's verdict.
-export [internal("the derive's variant switch (A142 S7)")]
-fun store_switch(
+[internal("the derive's variant switch (A142 S7)")]
+export fun store_switch(
 	node: Option<Shared<StoreNode>>,
 	from: usize,
 	to: usize,
@@ -534,8 +538,8 @@ export impl Option<type P: Storable> with Storable {
 /// It is a `Source<T>`: `get` copies out only the value at the path, never the
 /// root's, and a subscription allocates the path's slot. It is a `Signal<T>`: `set`
 /// diffs, assigns in place, and wakes what changed (the module's write rule).
-export [hint(Signal<T>)]
-struct Store<T> {
+[hint(Signal<T>)]
+export struct Store<T> {
 	[internal("the store's slot tree; reach it through the handle")] root: Shared<StoreNode>,
 	[internal("the store's path; reach it through the handle")] path: List<usize>,
 	[internal("the in-place read; reach it through `get`")] lend: |(|&T| void)| void,
@@ -546,8 +550,8 @@ struct Store<T> {
 /// `None` while the variant on its path is not live, and `patch(value)`, which
 /// writes only while it is. Projects further like a `Store`:
 /// `presence.online().name()` is a `StoreSome<str>`.
-export [hint(Source<Option<P>>)]
-struct StoreSome<P> {
+[hint(Source<Option<P>>)]
+export struct StoreSome<P> {
 	[internal("the store's slot tree; reach it through the handle")] root: Shared<StoreNode>,
 	[internal("the store's path; reach it through the handle")] path: List<usize>,
 	[internal("the in-place read; reach it through `get`")] lend: |(|&P| void)| void,
@@ -560,8 +564,8 @@ struct StoreSome<P> {
 /// comes or goes and never on a write inside a payload, nor on a switch between two
 /// OTHER variants — what a consumer that rebuilds only on the variant subscribes
 /// to.
-export [hint(Source<bool>)]
-struct StoreFlag {
+[hint(Source<bool>)]
+export struct StoreFlag {
 	[internal("the store's slot tree; reach it through the handle")] root: Shared<StoreNode>,
 	[internal("the store's path; reach it through the handle")] path: List<usize>,
 	[internal("the read; reach it through `get`")] read: || bool,
@@ -940,8 +944,8 @@ export impl StoreFlag with Source<bool> {
 
 /// How many slots and nodes `store`'s root holds now — the instrument the slot
 /// lifetime's pins read (Q12). It counts; it decides nothing.
-export [internal("an instrument for the slot-lifetime pins (A142 S7); it counts, it decides nothing")]
-fun store_census<T>(store: Store<T>): (usize, usize) {
+[internal("an instrument for the slot-lifetime pins (A142 S7); it counts, it decides nothing")]
+export fun store_census<T>(store: Store<T>): (usize, usize) {
 	count_tree(store.root)
 }
 

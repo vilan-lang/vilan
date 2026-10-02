@@ -2,12 +2,11 @@
 // `SetOp`s, a one-parameter enum over a BOUNDED parameter — refused by name as
 // "a trait object" until F72. The program is `inference::maps`'
 // `a138_s2_values_ranks_its_ops_and_keys_changes_only_on_arrival_and_removal`.
-import std::io::print;
 import std::hash_map::HashMap;
 import std::hash_set::HashSet;
+import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{
-
 	DeltaSource,
 	MapCell,
 	SeqOp,

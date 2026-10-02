@@ -1174,7 +1174,7 @@ export struct CollInstance<T> {
 /// `[resource]`, like `Flow` (R39): a stage is move-only, and its object is too. A
 /// source is data — the blanket's `own self` on a `ListCell` is a copy of the
 /// handle.
-export [resource] trait CollFlow<T> {
+[resource] export trait CollFlow<T> {
 	/// Start this collection flow for its one consumer — the node author's member.
 	[must_use]
 	fun open(own self): CollInstance<T>;
@@ -1217,7 +1217,7 @@ export impl ListCell<type T> with CollSource<T> {}
 ///     let loaded = ids.map(|id| fetch_row(id)).memo();   // one instance
 ///     let pending = loaded.any(|row| row.is_pending()).memo();
 ///     each(loaded, |row| row.id, render);                 // a source is data
-export [resource] trait CollPipe<T> with CollFlow<T> {
+[resource] export trait CollPipe<T> with CollFlow<T> {
 	/// Seal into a READ-ONLY granular source (R23): the pipe's one consumer, its
 	/// ops applied to one `ListCell` as they arrive, the collection cached for
 	/// every reader. Owner-tied like `Pipe::memo` (A28); a module binding says
@@ -1291,8 +1291,8 @@ fun apply_ops<T>(cell: ListCell<T>, ops: List<SeqOp<T>>) {
 /// What `.memo()` seals a collection pipe into: a read-only granular source over
 /// one `ListCell` (R23, R28's read-only face). It is a `CollSource`, so a pipeline
 /// starts from it again, `each` follows its ops, and it is data — pass it anywhere.
-export [hint(CollSource<T>)]
-struct ListMemo<T> {
+[hint(CollSource<T>)]
+export struct ListMemo<T> {
 	cell: ListCell<T>,
 }
 
@@ -1424,8 +1424,8 @@ struct ElementHold<V> {
 /// §6.1). A pin's instrument; it decides nothing.
 let element_holds_allocated_count: Shared<i32> = Shared::new(0);
 
-export [internal("an instrument for the per-element allocation pin (A142 §6.1); it counts, it decides nothing")]
-fun element_holds_allocated(): i32 {
+[internal("an instrument for the per-element allocation pin (A142 §6.1); it counts, it decides nothing")]
+export fun element_holds_allocated(): i32 {
 	element_holds_allocated_count.read()
 }
 
@@ -1882,7 +1882,7 @@ export impl type F: CollFlow<type S: Source<type U>> {
 }
 
 /// `map` as a stage.
-export [resource] struct CollMap<F, T, R> {
+[resource] export struct CollMap<F, T, R> {
 	up: F,
 	transform: (|T| R) context (owner_scope, ambient_nursery),
 }
@@ -1928,8 +1928,8 @@ fun mapped_ops<T, U>(events: List<ElementEvent<T, U>>): List<SeqOp<U>> {
 }
 
 /// `flatten` as a stage: `map` over the identity, every element followed.
-export [hint(CollPipe<U>)]
-[resource] struct CollFlatten<F, S, U> {
+[hint(CollPipe<U>)]
+[resource] export struct CollFlatten<F, S, U> {
 	up: F,
 }
 
@@ -1957,8 +1957,8 @@ export impl CollFlatten<type F: CollFlow<type S>, type S: Source<type U>, U> wit
 /// `filter` as a stage: the core's `bool` per element, a mirror of it the events
 /// are replayed on (their positions are each event's own), and the Fenwick index
 /// over the mirror.
-export [hint(CollPipe<T>)]
-[resource] struct CollFilter<F, T, R> {
+[hint(CollPipe<T>)]
+[resource] export struct CollFilter<F, T, R> {
 	up: F,
 	keep: (|T| R) context (owner_scope, ambient_nursery),
 }
@@ -2004,7 +2004,7 @@ export impl CollFilter<type F: CollFlow<type T>, T, type R: IntoFlow<bool>> with
 export impl CollFilter<type F: CollFlow<type T>, T, type R: IntoFlow<bool>> with CollPipe<T> {}
 
 /// `filter_map` as a stage: `filter`'s index over `is_some`, the payloads out.
-export [resource] struct CollFilterMap<F, T, R> {
+[resource] export struct CollFilterMap<F, T, R> {
 	up: F,
 	select: (|T| R) context (owner_scope, ambient_nursery),
 }
@@ -2169,8 +2169,8 @@ fun kept_ops<T, V, U>(
 /// `any`/`all`/`count` as a stage: a SCALAR pipe over a counter (§6.2) — what
 /// arrived is added, what left subtracted, a flip moves it by one — finished into
 /// the answer on every pull.
-export [hint(Pipe<U>)]
-[resource] struct CollTally<F, T, R, U> {
+[hint(Pipe<U>)]
+[resource] export struct CollTally<F, T, R, U> {
 	up: F,
 	test: (|T| R) context (owner_scope, ambient_nursery),
 	finish: |usize, usize| U,
@@ -2303,8 +2303,8 @@ export impl type F: Flow<List<type T: PartialEq>> {
 }
 
 /// `.coll()` as a stage.
-export [hint(CollPipe<T>)]
-[resource] struct Coll<F, T> {
+[hint(CollPipe<T>)]
+[resource] export struct Coll<F, T> {
 	up: F,
 }
 
@@ -2364,8 +2364,8 @@ fun span_of<T>(list: List<T>, from: usize, to: usize): List<T> {
 }
 
 /// `.coll_by(key)` as a stage.
-export [hint(CollPipe<T>)]
-[resource] struct CollBy<F, T, K> {
+[hint(CollPipe<T>)]
+[resource] export struct CollBy<F, T, K> {
 	up: F,
 	key: |T| K,
 }
@@ -2504,7 +2504,7 @@ fun place_matched<T>(
 /// source with a positional log is followed by its ops, one without by a `Reset`
 /// per change (the whole-list pass it has always had), and a pipe by the ops its
 /// stages produce.
-export [resource] trait RowFeed<T> {
+[resource] export trait RowFeed<T> {
 	/// Start this input for its one run.
 	[must_use]
 	fun open_rows(own self): CollInstance<T>;
@@ -2576,7 +2576,7 @@ export struct MapInstance<K: Hashable, V> {
 /// Anything a map pipeline starts from: every `MapSource` (through the blanket
 /// below) and every map pipe stage. It carries the map operators; the sealing
 /// operations are `MapPipe`'s. `[resource]`, as `CollFlow` is.
-export [resource] trait MapFlow<K: Hashable, V> {
+[resource] export trait MapFlow<K: Hashable, V> {
 	/// Start this map flow for its one consumer — the node author's member.
 	[must_use]
 	fun open(own self): MapInstance<K, V>;
@@ -2601,7 +2601,7 @@ export impl type S: MapSource<type K, type V> with MapFlow<K, V> {
 /// A map TRANSFORMATION: a `MapFlow` with no `get`, consumed once — sealed with
 /// `.memo()` into a `MapMemo` (a granular map source again, with `at(key)`), or
 /// read once with `.sample()`. Sharing is sealing, as for every pipe.
-export [resource] trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
+[resource] export trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
 	/// Seal into a READ-ONLY granular map source: the pipe's one consumer, each
 	/// drain applied to one `MapCell` as one batch, so the sealed map's own log
 	/// says what the pipe said and its per-key slots wake for the keys the pipe
@@ -2644,8 +2644,8 @@ fun seal_map<K: Hashable, V>(instance: MapInstance<K, V>, owned: bool): MapCell<
 
 /// What `.memo()` seals a map pipe into: a read-only granular map source over one
 /// `MapCell`. A pipeline starts from it again, and `at(key)` reads one key of it.
-export [hint(MapSource<K, V>)]
-struct MapMemo<K: Hashable, V> {
+[hint(MapSource<K, V>)]
+export struct MapMemo<K: Hashable, V> {
 	cell: MapCell<K, V>,
 }
 
@@ -2764,7 +2764,7 @@ export struct SetInstance<T: Hashable> {
 }
 
 /// Anything a set pipeline starts from: every `SetSource` and every set pipe stage.
-export [resource] trait SetFlow<T: Hashable> {
+[resource] export trait SetFlow<T: Hashable> {
 	/// Start this set flow for its one consumer.
 	[must_use]
 	fun open(own self): SetInstance<T>;
@@ -2786,7 +2786,7 @@ export impl type S: SetSource<type T> with SetFlow<T> {
 
 /// A set TRANSFORMATION — what `keys()` returns — sealed with `.memo()` into a
 /// `SetMemo` (with `contains(x)`), or read once with `.sample()`.
-export [resource] trait SetPipe<T: Hashable> with SetFlow<T> {
+[resource] export trait SetPipe<T: Hashable> with SetFlow<T> {
 	/// Seal into a read-only granular set source (owner-tied).
 	fun memo(own self): SetMemo<T> {
 		SetMemo<T> { cell = seal_set(self.open(), true) }
@@ -2823,8 +2823,8 @@ fun seal_set<T: Hashable>(instance: SetInstance<T>, owned: bool): SetCell<T> {
 
 /// What `.memo()` seals a set pipe into: a read-only granular set source over one
 /// `SetCell`, whose `contains(x)` wakes for `x` alone.
-export [hint(SetSource<T>)]
-struct SetMemo<T: Hashable> {
+[hint(SetSource<T>)]
+export struct SetMemo<T: Hashable> {
 	cell: SetCell<T>,
 }
 
@@ -3336,7 +3336,7 @@ export impl type F: MapFlow<type K, type V> {
 }
 
 /// `keys()` as a stage.
-export [resource] struct MapKeys<F, K, V> {
+[resource] export struct MapKeys<F, K, V> {
 	up: F,
 }
 
@@ -3374,8 +3374,8 @@ fun key_ops<K: Hashable, V>(ops: List<MapOp<K, V>>): List<SetOp<K>> {
 }
 
 /// `values()` as a stage.
-export [hint(CollPipe<V>)]
-[resource] struct MapValues<F, K, V> {
+[hint(CollPipe<V>)]
+[resource] export struct MapValues<F, K, V> {
 	up: F,
 }
 
@@ -3398,8 +3398,8 @@ export impl MapValues<type F: MapFlow<type K, type V>, K, V> with CollFlow<V> {
 export impl MapValues<type F: MapFlow<type K, type V>, K, V> with CollPipe<V> {}
 
 /// `entries()` as a stage.
-export [hint(CollPipe<(K, V)>)]
-[resource] struct MapEntries<F, K, V> {
+[hint(CollPipe<(K, V)>)]
+[resource] export struct MapEntries<F, K, V> {
 	up: F,
 }
 
@@ -3422,7 +3422,7 @@ export impl MapEntries<type F: MapFlow<type K, type V>, K, V> with CollFlow<(K, 
 export impl MapEntries<type F: MapFlow<type K, type V>, K, V> with CollPipe<(K, V)> {}
 
 /// `map_values` as a stage.
-export [resource] struct MapMapValues<F, K, V, R> {
+[resource] export struct MapMapValues<F, K, V, R> {
 	up: F,
 	transform: (|V| R) context (owner_scope, ambient_nursery),
 }
@@ -3484,7 +3484,7 @@ fun mapped_map_ops<K: Hashable, V, U>(events: List<KeyEvent<K, V, U>>): List<Map
 }
 
 /// `filter` as a stage.
-export [resource] struct MapFilter<F, K, V, R> {
+[resource] export struct MapFilter<F, K, V, R> {
 	up: F,
 	keep: (|K, V| R) context (owner_scope, ambient_nursery),
 }
@@ -3564,8 +3564,8 @@ fun filtered_map_ops<K: Hashable, V>(events: List<KeyEvent<K, V, bool>>): List<M
 }
 
 /// `count()` as a stage: a SCALAR pipe over a counter.
-export [hint(Pipe<usize>)]
-[resource] struct MapCount<F, K, V> {
+[hint(Pipe<usize>)]
+[resource] export struct MapCount<F, K, V> {
 	up: F,
 }
 
@@ -3615,7 +3615,7 @@ export impl MapCount<type F: MapFlow<type K, type V>, K, V> with Pipe<usize> {}
 /// (`type R: IntoFlow<type N>`): the accumulator's zero is `N::default()`, and a
 /// static call on a type bound only through such a binder is not resolved when the
 /// code is emitted (maps-45's find).
-export [resource] struct MapSum<F, K, V, R, N> {
+[resource] export struct MapSum<F, K, V, R, N> {
 	up: F,
 	measure: (|V| R) context (owner_scope, ambient_nursery),
 }
