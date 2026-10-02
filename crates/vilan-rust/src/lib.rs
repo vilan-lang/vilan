@@ -10577,10 +10577,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 slot,
             },
         );
-        // REPLACED rather than composed, exactly as the JS emitter does it: a
-        // default body has no generic parameters of its own, and the trait's
-        // arguments for THIS type are the whole binding it runs under.
-        let mut substitution = self.trait_parameter_substitution(default_id, type_id);
+        // The trait's arguments for THIS type, and the default's own, are the
+        // binding the body runs under — COMPOSED onto the caller's, as
+        // [`Self::ensure_function`] composes, never in place of it (F71). The
+        // receiver is resolved at its head alone, so a receiver built in a
+        // generic body — `s.derive(..).switch(..)` inside `fun switch_to<.., S:
+        // Source<T>, ..>`, a `Switch<Derive<S, ..>, ..>` — reaches the body
+        // still written in the CALLER's binders, and the trait's bindings are
+        // read off it in those terms. Replaced, the caller's `S` was gone and
+        // `.cell()` was refused as "an unbound generic type parameter
+        // (parameter 3 of `switch_to`)". Reachable is not keyed: the instance
+        // is keyed by the receiver resolved under the caller (above), and the
+        // default's own entries win over any caller entry they share.
+        let mut substitution = self.current_substitution.clone();
+        substitution.extend(self.trait_parameter_substitution(default_id, type_id));
         substitution.extend(own);
         let saved_self = self.current_self_type.replace(type_id);
         let self_traits = self.self_traits_of(default_id);

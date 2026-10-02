@@ -1,0 +1,65 @@
+// F71: a pipe built inside a generic body and sealed there —
+// `source.derive(|v| f(v)).switch(|inner| inner).cell()` in
+// `fun switch_to<T, U, S: Source<T>, I: Source<U>>` — builds natively. The
+// sealing `.cell()` is a trait DEFAULT, and its receiver
+// (`Switch<Derive<S, ..>, ..>`) is written in the generic body's own binders;
+// the default's body ran under the trait's bindings alone, so `S` was gone and
+// the call was refused as "an unbound generic type parameter (parameter 3 of
+// `switch_to`)".
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+
+/// The item's repro, as a free function.
+fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
+	source.derive(|value| f(value)).switch(|inner: I| inner).cell()
+}
+
+/// B479's spelling: the selector's parameter unannotated.
+fun switch_bare<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
+	source.derive(|value| f(value)).switch(|inner| inner).cell()
+}
+
+/// Sealed with `memo()` and with `sample()`, two other defaults.
+fun doubled_memo<S: Source<i32>>(source: S): i32 {
+	let sealed = source.derive(|n| n * 2).memo();
+	sealed.get()
+}
+
+fun tripled_sample<S: Source<i32>>(source: S): i32 {
+	source.derive(|n| n * 3).sample()
+}
+
+/// The blanket-method spelling.
+impl type S: Source<type T> {
+	fun switch_on<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
+		self.derive(|value| f(value)).switch(|inner: I| inner).cell()
+	}
+}
+
+/// A pipe over an `Option` source, sealed in a generic body.
+fun first_some<T, S: Source<Option<T>>>(source: S, fallback: T): SignalCell<T> {
+	source.derive(|held| held.unwrap_or(fallback)).cell()
+}
+
+fun main() {
+	let n = Signal::new(1);
+	let a = SignalCell::new(10);
+	let b = SignalCell::new(20);
+	let flag = SignalCell::new(true);
+	let maybe: SignalCell<Option<str>> = SignalCell::new(None);
+	run_with_owner(Owner::new(), || {
+		let doubled: SignalCell<i32> = switch_to(n, |m| Signal::new(m * 2));
+		let bare: SignalCell<i32> = switch_bare(n, |m| Signal::new(m + 100));
+		let picked = switch_to(flag, |on: bool| if on { a } else { b });
+		let method = n.switch_on(|m| Signal::new(i"n={m}"));
+		let named = first_some(maybe, "nobody");
+		print(i"{doubled.get()} {bare.get()} {picked.get()} {method.get()} {named.get()}");
+		n.set(5);
+		flag.set(false);
+		b.set(21);
+		maybe.set(Some("al"));
+		print(i"{doubled.get()} {bare.get()} {picked.get()} {method.get()} {named.get()}");
+	});
+	print(i"{doubled_memo(n)} {tripled_sample(n)} {doubled_memo(a)}");
+}

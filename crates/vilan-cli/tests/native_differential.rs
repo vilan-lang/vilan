@@ -8820,3 +8820,29 @@ const SWAPPED_LITERAL_PROBE: &str = concat!(
     "\tprint(swapped.held is Maybe::Nothing);\n",
     "}\n",
 );
+
+/// F71: a pipe built and SEALED inside a generic body — `source.derive(|v|
+/// f(v)).switch(|inner| inner).cell()` in `fun switch_to<T, U, S: Source<T>,
+/// I: Source<U>>` — builds natively; it was refused as "an unbound generic
+/// type parameter (parameter 3 of `switch_to`)". The sealing call is a trait
+/// DEFAULT whose receiver is written in the generic body's binders
+/// (`Switch<Derive<S, ..>, ..>`), and a default body ran under the trait's
+/// bindings ALONE — the caller's `S` replaced away — where a function instance
+/// composes onto its caller's. The probe covers the item's repro, B479's
+/// unannotated selector (`inference::traits`' pin is its JS half), `memo()`
+/// and `sample()` as the seal, the blanket-method spelling, and an `Option`
+/// source.
+#[test]
+fn a_pipe_sealed_in_a_generic_body_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_pipe_defaults.vl"),
+        include_str!("native/generic_pipe_defaults.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_pipe_defaults.vl"),
+        Verdict::Identical,
+        "a pipe sealed in a generic body must build and run the same on both backends"
+    );
+}
