@@ -3713,15 +3713,35 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `dyn Fn(..)` signature is written from (F44), so it is rendered once, by
     /// the same rules the declaration uses, and the two cannot disagree.
     fn parameter_parts(&mut self, id: Id, span: Span) -> Result<(String, String), Error> {
+        self.parameter_parts_at(id, None, span)
+    }
+
+    /// [`Self::parameter_parts`], with the parameter's type taken from
+    /// `positioned` where the analyzer recorded none — a closure literal's
+    /// parameter that only its POSITION types (F74).
+    fn parameter_parts_at(
+        &mut self,
+        id: Id,
+        positioned: Option<TypeId>,
+        span: Span,
+    ) -> Result<(String, String), Error> {
         if self.program.context_hidden_parameters.contains_key(&id) {
             return self.context_parameter_parts(id, span);
         }
-        let parameter = self
+        let mut parameter = self
             .program
             .parameters
             .get(&id)
             .cloned()
             .ok_or_else(|| unsupported("an unresolved parameter", span))?;
+        if let Some(positioned) = positioned
+            && matches!(
+                self.resolve(parameter.type_id),
+                None | Some(Type::Unresolved | Type::Unknown)
+            )
+        {
+            parameter.type_id = positioned;
+        }
         if parameter.spread {
             return Err(unsupported("a spread parameter", span));
         }
@@ -5238,7 +5258,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let name = self.binding_name(binding);
         let mutable = if variable.mutable { "mut " } else { "" };
         // An annotation is WRITTEN ONLY where the initializer cannot type the
-        // binding — an empty collection literal, and nothing else.
+        // binding — an empty collection literal, and a `Shared` cell built
+        // around one (F74: `let leases: Shared<List<KeyLease>> =
+        // Shared::new([])` read `lease.key` off a `Vec<_>` rustc had not
+        // settled yet, E0282) — and nothing else.
         //
         // The temptation is to annotate everything, and it is wrong: a binding's
         // `type_id` is its POINTEE's whenever the binding is a view (the type
@@ -5248,8 +5271,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // inference has the right answer at every one of those sites, and every
         // numeric literal this emitter writes carries its own suffix — so the
         // annotation buys nothing except the chance to be wrong.
+        // A bare empty literal is annotated whatever the binding's type, as it
+        // always was; a cell around one only when that type is closed, so a
+        // binding Rust could settle from its uses is never refused for it.
         let initializer_needs_a_type = variable.initial.is_some_and(|initial| {
             matches!(self.program.entity_map.get(&initial), Some(Expr::List(items)) if items.is_empty())
+                || (self.cannot_type_itself(initial) && self.is_grounded(variable.type_id))
         });
         let annotation = if initializer_needs_a_type {
             let rendered = self.rust_type(variable.type_id, self.span_of(binding))?;
@@ -5322,6 +5349,34 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "a binding with no initializer",
                 self.span_of(binding),
             )),
+        }
+    }
+
+    /// Whether an initializer leaves its own type to its READERS natively: an
+    /// empty list literal, or `Shared::new` around one — the cell is typed by
+    /// the list, and the list by nothing. Rust settles such a binding from its
+    /// first use, and a use that reads a member through it (`lease.key`) comes
+    /// before anything has (E0282), so the binding's type is written.
+    fn cannot_type_itself(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::List(items)) => items.is_empty(),
+            Some(Expr::Call(call_id)) => {
+                let Some(call) = self.program.function_calls.get(call_id) else {
+                    return false;
+                };
+                let Some(Expr::Local(subject)) = self.program.entity_map.get(&call.subject_id)
+                else {
+                    return false;
+                };
+                matches!(
+                    self.program.intrinsics.get(subject),
+                    Some(Intrinsic::SharedNew)
+                ) && call
+                    .argument_ids
+                    .first()
+                    .is_some_and(|value| self.cannot_type_itself(*value))
+            }
+            _ => false,
         }
     }
 
@@ -6922,10 +6977,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             self.census_walk(&[closure.return_], depth);
             return rendered;
         }
+        // F74: a parameter the analyzer left untyped — `Shared::new(|_key| {})`
+        // under `Shared<|Hash| void>`, where nothing in the literal constrains
+        // `_key` and the annotation reaches the call's `T` only — takes the
+        // position's: the closure type the literal is rendered into.
+        let positioned: Vec<TypeId> = match self
+            .expected_type
+            .and_then(|type_id| self.resolve(type_id))
+        {
+            Some(Type::Closure(expected, _, _)) if expected.len() == closure.parameters.len() => {
+                expected.clone()
+            }
+            _ => Vec::new(),
+        };
         let mut parameters = Vec::new();
         let mut signature = Vec::new();
-        for parameter_id in &closure.parameters {
-            let (binder, rendered) = self.parameter_parts(*parameter_id, span)?;
+        for (index, parameter_id) in closure.parameters.iter().enumerate() {
+            let (binder, rendered) =
+                self.parameter_parts_at(*parameter_id, positioned.get(index).copied(), span)?;
             parameters.push(format!("{binder}: {rendered}"));
             signature.push(rendered);
         }

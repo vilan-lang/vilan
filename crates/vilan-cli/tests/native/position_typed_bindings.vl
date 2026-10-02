@@ -1,0 +1,44 @@
+// F74's two shapes, outside std::rpc where they were found: a closure literal
+// whose parameter only its POSITION types, and a `Shared` cell built around an
+// empty list whose first use reads a member of an element. (A body that READS
+// such a parameter — `|key| print(i"{key}")` — is still refused natively: the
+// analyzer leaves the parameter untyped, and the body's reads carry that.)
+import std::io::print;
+import std::shared::Shared;
+
+struct Lease {
+	key: str,
+	live: bool,
+}
+
+fun keep(f: |i32| void): Shared<|i32| void> {
+	Shared::new(f)
+}
+
+fun main() {
+	// `_key` is typed by the annotation alone, through `Shared::new`'s `T`:
+	// nothing in the literal constrains it.
+	let ignored: Shared<|i32| void> = Shared::new(|_key| {});
+	let pair: Shared<|str, i32| void> = Shared::new(|_name, _count| {});
+	ignored.read()(1);
+	pair.read()("a", 2);
+	pair.write() = |name: str, count: i32| print(i"replaced {name} {count}");
+	pair.read()("b", 3);
+	let kept = keep(|_key| {});
+	kept.read()(2);
+	// The first use reads `lease.key` before anything has settled the element.
+	let leases: Shared<List<Lease>> = Shared::new([]);
+	let find = |wanted: str| {
+		mut found = false;
+		for lease in leases.read() {
+			if lease.key == wanted && lease.live {
+				found = true;
+			}
+		}
+		found
+	};
+	print(find("x"));
+	leases.write().push(Lease { key = "x", live = true });
+	print(find("x"));
+	print(find("y"));
+}

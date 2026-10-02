@@ -300,6 +300,14 @@ written down.
 <!-- family: fix -->
 **Native builds a pipe sealed inside a generic body: `fun switch_to<T, U, S: Source<T>, I: Source<U>>(s: S, f: sync |T| I): SignalCell<U> { s.derive(|v| f(v)).switch(|inner| inner).cell() }` was refused by name as "an unbound generic type parameter (parameter 3 of `switch_to`)", and builds and prints node's bytes now — as do `memo()` and `sample()` as the seal and the blanket-method spelling.** The seal is a trait default, and its receiver (`Switch<Derive<S, ..>, ..>`) is written in the generic body's own binders; a default's body ran under the trait's bindings alone, replacing the caller's, so `S` was gone. A default's bindings are composed onto the caller's now, as a function instance's always were; the instance is still keyed by the receiver resolved under the caller. B479's std pin (`a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter`) built on JS only for this. The JS backend is unchanged. Pin: `a_pipe_sealed_in_a_generic_body_is_identical_on_both_backends`. Tracker F71.
 
+---
+
+<!-- family: fix -->
+---
+
+<!-- family: fix -->
+**Native builds an in-process `duplex_pair` program that mirrors a cell and a keyed cell (`client.source(..)`, `client.attached_keyed_source(..)`), which was refused by name as "an unresolved type".** Two bindings in `std::rpc`'s `keyed_mirror_of` were typed only by their written annotations. `Shared::new(|_key| {})` under `Shared<|Hash| void>`: the analyzer leaves a closure parameter nothing constrains untyped, so a closure literal now takes such a parameter's type from the closure type it is rendered into. And `Shared::new([])` under `Shared<List<KeyLease>>`, whose first use read a field of an element before rustc had settled the `Vec<_>` (E0282): a `Shared` cell around an empty list literal has its binding's type written, as an empty literal always had (when that type is closed). A body that READS a parameter only its position types (`|key| print(i"{key}")`) is still refused natively — the analyzer's half, reported. The JS backend is unchanged. Pin: `an_in_process_mirror_program_is_identical_on_both_backends` (A146's mirror program, which reactive-45 pinned on JS only for this, and both shapes outside std). Tracker F74.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->

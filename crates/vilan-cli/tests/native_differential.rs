@@ -8846,3 +8846,38 @@ fn a_pipe_sealed_in_a_generic_body_is_identical_on_both_backends() {
         "a pipe sealed in a generic body must build and run the same on both backends"
     );
 }
+
+/// F74: an in-process `duplex_pair` program — A146's inference pin, a server
+/// and a client mirroring a cell and a keyed cell, each source wrapped in a
+/// generic `Counted<S>` — builds natively and prints node's bytes; it was
+/// refused as "an unresolved type". The wrapper was not the cause: the program
+/// reaches `std::rpc`'s `keyed_mirror_of`, and two of its bindings were typed
+/// only by their written annotations. `Shared::new(|_key| {})` under
+/// `Shared<|Hash| void>` — the analyzer leaves a closure parameter nothing
+/// constrains untyped, so the literal takes its parameter types from the
+/// closure type it is rendered into; and `Shared::new([])` under
+/// `Shared<List<KeyLease>>`, whose first use reads `lease.key` off a `Vec<_>`
+/// rustc had not settled (E0282) — a cell around an empty literal has its
+/// binding's type written, as an empty literal always had. The second program
+/// holds both shapes outside std.
+#[test]
+fn an_in_process_mirror_program_is_identical_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        (
+            "native_probe_in_process_mirrors.vl",
+            include_str!("native/in_process_mirrors.vl"),
+        ),
+        (
+            "native_probe_position_typed_bindings.vl",
+            include_str!("native/position_typed_bindings.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{name}: must build and print the same on both backends"
+        );
+    }
+}
