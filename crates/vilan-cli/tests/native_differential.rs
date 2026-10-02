@@ -8657,3 +8657,32 @@ fn the_spelled_copy_of_a_view_expression_is_identical_on_both_backends() {
         "the spelled copy of a view expression must copy on both backends"
     );
 }
+
+/// F72: a variant constructor of an enum whose parameter is BOUNDED builds
+/// natively — `enum Op<T: Hashable> { Add(T), Drop(T) }` then
+/// `let op: Op<i32> = Op::Add(3)`, which was refused as "a value of type `a
+/// trait object`". The constructor's site records the enum OPEN, its argument
+/// the parameter's constraint id, and that id's type is the parameter's bound:
+/// `any` for an unbounded `T` (read as open, so the emitter fell back to the
+/// position or the payload) but `Hashable` itself for a bounded one, which the
+/// emitter took for a closed argument and minted the enum over. That is why a
+/// second, unbounded parameter (`MapOp<K: Hashable, V>`) built: one open
+/// argument sent the whole list to the fallback. The probe covers an annotated
+/// binding, the payload alone, an argument position, `Option` and list
+/// nesting, a generic function at two instances, a generic impl, two bounds
+/// on one parameter, and two bounded parameters. It blocked `SetCell`,
+/// `SetOp` and `MapCell::keys()`.
+#[test]
+fn a_variant_of_an_enum_with_a_bounded_parameter_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_bounded_variant_constructors.vl"),
+        include_str!("native/bounded_variant_constructors.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_bounded_variant_constructors.vl"),
+        Verdict::Identical,
+        "a variant of an enum whose parameter is bounded must build and print the same"
+    );
+}

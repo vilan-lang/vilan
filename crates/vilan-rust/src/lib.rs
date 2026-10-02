@@ -6463,9 +6463,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// Whether a type argument is CLOSED — something a Rust type can be minted
     /// from. `any`, an unresolved hole and a still-abstract generic are not.
+    ///
+    /// Nor is a bare TRAIT (F72). A declaration's own parameter can arrive as
+    /// its constraint id, whose `Type` is the parameter's BOUND — `any` for
+    /// `enum Tree<T>`, but `Hashable` itself for `enum Op<T: Hashable>` — so a
+    /// constructor whose site recorded the open `Op<T>` read as closed, and
+    /// the enum was minted over "a trait object" instead of falling back to the
+    /// position or the payload. No value is ever typed as a bare trait once
+    /// [`Self::concrete`] has rewritten a default body's `Self`; an object is
+    /// `Dyn`, which stays grounded.
     fn is_grounded(&self, type_id: TypeId) -> bool {
         match self.resolve(type_id) {
-            Some(Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_)) | None => false,
+            Some(
+                Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_) | Type::Trait(_, _),
+            )
+            | None => false,
             Some(
                 Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
             ) => arguments
