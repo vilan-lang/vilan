@@ -13539,6 +13539,26 @@ fn sanitize_identifier(name: &str) -> String {
     result
 }
 
+thread_local! {
+    /// How many candidate names [`NameGenerator::unique_readable`] has tested
+    /// on this thread since [`reset_readable_name_probes`] (M107).
+    static READABLE_NAME_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of candidate names readable naming has tested on this thread
+/// since the last [`reset_readable_name_probes`]: one per name, plus one per
+/// namesake skipped. Before M107 every readable name re-tested every earlier
+/// namesake's suffix, so a base shared by `n` locals cost `n²/2` probes; the
+/// emitted names are the same either way, so only this count can see it.
+pub fn readable_name_probes() -> usize {
+    READABLE_NAME_PROBES.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`readable_name_probes`].
+pub fn reset_readable_name_probes() {
+    READABLE_NAME_PROBES.with(|count| count.set(0));
+}
+
 /// How generated identifiers are named.
 enum NameStyle {
     /// After the source (`greet`), disambiguated on collision — most debuggable.
@@ -13653,6 +13673,13 @@ struct NameGenerator {
     /// mint consults it, so a generated name is never a reserved word and never
     /// repeats.
     minted: HashSet<String>,
+    /// Per readable base, the first suffix [`NameGenerator::unique_readable`]
+    /// has not yet found taken (M107). `minted` only grows and the reserved
+    /// set is fixed, so every suffix below it is still taken, and the probe
+    /// may start here instead of at `2`: the name it lands on is the same, and
+    /// a base shared by thousands of locals (`item`, `found`, `i`) costs one
+    /// probe a name instead of one per earlier namesake.
+    next_suffix: HashMap<String, u64>,
 }
 
 impl NameGenerator {
@@ -13665,6 +13692,7 @@ impl NameGenerator {
             names: HashMap::default(),
             seed,
             minted: HashSet::default(),
+            next_suffix: HashMap::default(),
         }
     }
 
@@ -13710,12 +13738,20 @@ impl NameGenerator {
     /// it collides with neither a reserved name nor a previously assigned one.
     fn unique_readable(&mut self, source: &str) -> String {
         let base = sanitize_identifier(source);
-        let mut candidate = base.clone();
-        let mut suffix = 2;
-        while self.is_taken(&candidate) {
-            candidate = format!("{base}{suffix}");
-            suffix += 1;
+        let probe = |generator: &Self, candidate: &str| {
+            READABLE_NAME_PROBES.with(|count| count.set(count.get() + 1));
+            generator.is_taken(candidate)
+        };
+        if !probe(self, &base) {
+            return self.mint(base);
         }
+        let mut suffix = self.next_suffix.get(&base).copied().unwrap_or(2);
+        let mut candidate = format!("{base}{suffix}");
+        while probe(self, &candidate) {
+            suffix += 1;
+            candidate = format!("{base}{suffix}");
+        }
+        self.next_suffix.insert(base, suffix + 1);
         self.mint(candidate)
     }
 
@@ -14254,8 +14290,72 @@ fn bodyless_refusal_frame(requester: Option<(&str, Option<&str>)>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Formatter, HashSet, bodyless_refusal_frame, canonical_instance_body, js, unescape_string,
+        Formatter, HashMap, HashSet, NameGenerator, NameSeed, NameStyle, bodyless_refusal_frame,
+        canonical_instance_body, js, readable_name_probes, reset_readable_name_probes,
+        unescape_string,
     };
+    use crate::id::Id;
+
+    /// Readable names for `sources` (one entity each, in order), and the
+    /// candidate probes they cost.
+    fn readable_names(sources: &[&str], reserved: &[&str]) -> (Vec<String>, usize) {
+        let seed = NameSeed {
+            style: NameStyle::Readable,
+            source_names: sources
+                .iter()
+                .enumerate()
+                .map(|(index, source)| (Id(index as u32), (*source).to_string()))
+                .collect::<HashMap<Id, String>>(),
+            reserved: reserved.iter().map(|name| (*name).to_string()).collect(),
+        };
+        let mut generator = NameGenerator::new(std::rc::Rc::new(seed));
+        reset_readable_name_probes();
+        let names = (0..sources.len())
+            .map(|index| generator.name_for(Id(index as u32)))
+            .collect();
+        (names, readable_name_probes())
+    }
+
+    /// **M107** — readable naming is linear in a shared base's namesakes, and
+    /// names exactly as before: each takes the SMALLEST free suffix from `2`.
+    ///
+    /// `unique_readable` started every probe at suffix `2`, so the `n`th local
+    /// named `item` re-tested the `n - 1` names before it: quadratic in a base
+    /// that every function of a package repeats (`item`, `found`, `i`), and
+    /// the emission walk's ×4.6 per doubling on generated code. The probe now
+    /// starts at the first suffix not yet found taken — every one below it is
+    /// still taken, since minted names are never released — so a name costs
+    /// the base's probe and its own.
+    #[test]
+    fn readable_naming_is_linear_in_a_bases_namesakes_and_names_as_before() {
+        let (names, _) = readable_names(
+            &["item", "item", "item3", "item", "item", "found"],
+            &["item2_reserved_never"],
+        );
+        assert_eq!(
+            names,
+            ["item", "item2", "item3", "item4", "item5", "found"],
+            "the smallest free suffix from 2, skipping a namesake a source spelled itself"
+        );
+        let (names, _) = readable_names(&["item", "item", "item"], &["item2"]);
+        assert_eq!(
+            names,
+            ["item", "item3", "item4"],
+            "a reserved suffix is skipped"
+        );
+
+        let small: Vec<&str> = vec!["item"; 500];
+        let large: Vec<&str> = vec!["item"; 1000];
+        let (_, small_probes) = readable_names(&small, &[]);
+        let (_, large_probes) = readable_names(&large, &[]);
+        assert_eq!(
+            (small_probes, large_probes),
+            (2 * 500 - 1, 2 * 1000 - 1),
+            "one probe for the base and one for its own suffix per name: 500 \
+             namesakes cost {small_probes} probes and 1,000 cost {large_probes} — \
+             the restart at suffix 2 made it n²/2 (M107)"
+        );
+    }
 
     /// One emitted instance: `function <name>(self) { const <temp> = self;
     /// return <temp>; }` — the smallest body that BINDS a generated
