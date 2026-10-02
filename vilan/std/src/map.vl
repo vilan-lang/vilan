@@ -8,4 +8,4 @@
 // so a `Map<str, i32>` and a `HashMap<str, i32>` are one type and pass for each
 // other. Every use outside std warns with the steer; the module goes in the release
 // after the one that deprecated it.
-export [deprecated("use std::hash_map::HashMap")] import pkg::hash_map::HashMap as Map;
+[deprecated("use std::hash_map::HashMap")] export import pkg::hash_map::HashMap as Map;

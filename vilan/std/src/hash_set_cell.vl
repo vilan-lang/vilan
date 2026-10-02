@@ -165,8 +165,8 @@ export impl HashSetCell<type T: Hashable> {
 /// nothing (an `Add` of a held member, a `Remove` of an absent one) is dropped, the
 /// members the rest name wake once each, and the cell publishes once. What
 /// `.memo()` over a set pipe applies on every wake.
-export [internal("a set pipe's seal applying a drain (A138 S2)")]
-fun apply_set_ops<T: Hashable>(cell: HashSetCell<T>, ops: List<SetOp<T>>) {
+[internal("a set pipe's seal applying a drain (A138 S2)")]
+export fun apply_set_ops<T: Hashable>(cell: HashSetCell<T>, ops: List<SetOp<T>>) {
 	mut recorded: List<SetOp<T>> = [];
 	mut reset = false;
 	for op in ops {

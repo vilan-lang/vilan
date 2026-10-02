@@ -21,10 +21,8 @@ struct User {
 	name: str,
 	age: i32,
 	address: Address,
-	[reactive(coarse)]
-	billing: Address,
-	[reactive(name = "nickname")]
-	get: Option<str>,
+	[reactive(coarse)] billing: Address,
+	[reactive(name = "nickname")] get: Option<str>,
 }
 
 [derive(Storable)]
@@ -48,7 +46,11 @@ fun drained(): str {
 		out = out + name;
 	}
 	woke.write() = [];
-	if out == "" { "-" } else { out }
+	if out == "" {
+		"-"
+	} else {
+		out
+	}
 }
 
 fun census<T>(store: Store<T>): str {

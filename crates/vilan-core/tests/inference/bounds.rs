@@ -4651,7 +4651,20 @@ fn the_js_refugee_hint_names_the_idiom() {
         main();
         "#,
         "const x = 3",
-        "Vilan has no const declarations; write `let x = const ..`",
+        "`const x = …` is not a declaration: a compile-time binding is `const let x = …`, and a runtime one seeded from a build-time value is `let x = const …`",
+    );
+    // B488: both spellings the steer names compile — it named only the second
+    // until G24 gave the declaration its own.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            const let x = 3;
+            let y = const 4;
+            print(x + y);
+        }
+        "#,
+        "7\n",
     );
 }
 

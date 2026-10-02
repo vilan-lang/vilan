@@ -33996,13 +33996,14 @@ impl<'src> Analyzer<'src> {
         if let Node::Const(inner) = &node.0 {
             // A JS refugee's `const x = 3;` parses as `const (x = 3)` —
             // assignment is an expression — so the declaration shape is
-            // caught here, with the idiom.
+            // caught here, with the idiom. B488: G24 gave the declaration a
+            // spelling, `const let`, so the steer names it first.
             if matches!(&inner.0, Node::Assign(..)) {
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: node.1,
-                    msg: "Vilan has no const declarations; write `let x = const ..`".to_string(),
+                    msg: "`const x = …` is not a declaration: a compile-time binding is `const let x = …`, and a runtime one seeded from a build-time value is `let x = const …`".to_string(),
                 });
                 let id = self.new_entity_id();
                 self.expr_id_to_expr_map.insert(id, Expr::Error);

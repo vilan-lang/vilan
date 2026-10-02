@@ -1096,9 +1096,10 @@ learn: the default IS private, `export *;` marks a whole module at once,
 and `export(in mod)` / `export(in pkg)` narrow one item. `export` also
 *re-exports* something this module imported
 (`export import pkg::io::panic;`), so importers of this module see that
-name as if it were declared here. Unlike `pub`, it goes ahead of the
-attributes as well as the keyword — `export [derive(Wire)] struct Handle`
-— because it wraps the whole declaration.
+name as if it were declared here. Like `pub`, it goes after the
+attributes and ahead of the other keywords — `[derive(Wire)]` ⏎ `export
+struct Handle` — and it still wraps the whole declaration, attributes
+included.
 → [spec §4.8](../spec/names.md)
 
 **"a mutable binding is spelled `mut x = …` …"**

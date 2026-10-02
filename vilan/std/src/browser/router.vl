@@ -39,8 +39,8 @@ external fun location_path(): str;
 /// prints a pathname would then never compare equal to what the location says. Read
 /// this where the query matters — on load, and in a `popstate` handler — and keep
 /// routing on the path.
-export [extern("__router_url")]
-external fun location_url(): str;
+[extern("__router_url")]
+export external fun location_url(): str;
 
 /// Decodes percent-escapes (`decodeURIComponent`): `"hello%20world"` is
 /// `"hello world"`, `"caf%C3%A9"` is `"café"`.
@@ -49,8 +49,8 @@ external fun location_url(): str;
 /// `%`) decodes to ITSELF rather than throwing. A URL is text a stranger chose, so
 /// a decoder that can crash is a route that a link can take down — and the useful
 /// answer for a piece that is not an escape sequence is the piece.
-export [extern("__percent_decode")]
-external fun percent_decode(text: str): str;
+[extern("__percent_decode")]
+export external fun percent_decode(text: str): str;
 
 /// The path-signal singleton (the `std::reactive` module-state pattern) — created
 /// empty at load, wired to the real location on first use.

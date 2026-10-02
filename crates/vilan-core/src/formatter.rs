@@ -97,9 +97,10 @@ fn code_tokens_spanned(source: &str) -> Option<Vec<Spanned<Token<'_>>>> {
 }
 
 /// The formatter's token-level canonicalization, used to check a reprint changed
-/// nothing but trivia and the five canonical orders. Six order-insensitivities
+/// nothing but trivia and the canonical orders. Order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
-/// (dropped), the canonical ordering of a top-level import run (see the
+/// (dropped), an `export` marker written after its item's attributes (moved
+/// ahead of them, B445), the canonical ordering of a top-level import run (see the
 /// canonical-import-order section below), the canonical ordering of an ELEMENT
 /// HEAD's items (see the canonical-element-head-order section), the canonical
 /// ordering of an `on` HEAD's condition values (see the canonical-on-head-order
@@ -116,10 +117,127 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_on_heads(sort_element_heads(
         sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
             canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
-                collapse_field_shorthands(drop_trailing_commas(tokens)),
+                collapse_field_shorthands(lead_export_past_attribute_runs(
+                    drop_redundant_view_prefixes(drop_trailing_commas(tokens)),
+                )),
             )),
         ))),
     ))))
+}
+
+/// Drops a parameter's view prefix that its type already states — `&x: &i32`
+/// is `x: &i32`, `&mut x: &mut T` is `x: &mut T` — so the safety net accepts
+/// the printer writing the convention once, in the type (B507: a closure
+/// parameter `|&x: &i32|` declined the whole file). A prefix the type does
+/// not repeat (`&x: &mut T`, where the prefix wins) is left for the printer
+/// to keep, and both streams then carry it.
+///
+/// Recognized by SHAPE, at a parameter's head — right after a `(`, a `,` or
+/// a closure's `|` — where `&` can only be a convention: `& NAME : & T` with
+/// `T` not `mut`, and `& mut NAME : & mut`. An expression never puts `NAME :`
+/// after a `&`. Runs over both streams.
+fn drop_redundant_view_prefixes(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let at_parameter_head =
+            matches!(result.last(), Some(Token::Ctrl('(' | ',') | Token::Op("|")));
+        if at_parameter_head && tokens[index] == Token::Op("&") {
+            let (prefix, mutable) = if tokens.get(index + 1) == Some(&Token::Mut) {
+                (2, true)
+            } else {
+                (1, false)
+            };
+            let name = index + prefix;
+            let redundant = matches!(tokens.get(name), Some(Token::Ident(_)))
+                && tokens.get(name + 1) == Some(&Token::Op(":"))
+                && tokens.get(name + 2) == Some(&Token::Op("&"))
+                && (tokens.get(name + 3) == Some(&Token::Mut)) == mutable;
+            if redundant {
+                index = name;
+                continue;
+            }
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// Moves a declaration's `export (in PATH)?` marker AHEAD of an attribute run
+/// written before it — `[platform("browser")] export impl …` becomes `export
+/// [platform("browser")] impl …` — in BOTH streams, so the safety net reads
+/// the two sides of the marker (B445) as one spelling and accepts the printer
+/// moving it to the ruled side, after the attributes
+/// ([`Printer::print_exported_item`], B485 §6.2). The parser reads the same
+/// rotation (`Parser::lead_export_past_its_attributes`), so the tree the
+/// printer walks holds the run as the item's prefix whichever side it was on.
+///
+/// Recognized by SHAPE where a statement can begin (the stream's start, or
+/// after a `;`, `{` or `}`): a run of `[name …]` groups ending at `export`.
+/// A relocation, not a deletion, so the net still sees every attribute and
+/// the marker survive; it runs over both streams.
+fn lead_export_past_attribute_runs(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let at_statement_head = matches!(result.last(), None | Some(Token::Ctrl(';' | '{' | '}')));
+        if at_statement_head
+            && let Some((marker, past_marker)) = attribute_run_before_export(&tokens, index)
+        {
+            result.extend(tokens[marker..past_marker].iter().cloned());
+            result.extend(tokens[index..marker].iter().cloned());
+            index = past_marker;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// When a run of `[name …]` groups starting at `start` ends at an `export`
+/// marker, the marker's index and the index just past it (and past its `(in
+/// PATH)` scope); `None` otherwise, and for `export *;`, which takes no
+/// attributes.
+fn attribute_run_before_export(tokens: &[Token<'_>], start: usize) -> Option<(usize, usize)> {
+    let past_group = |open: usize| -> Option<usize> {
+        let mut depth = 0usize;
+        let mut at = open;
+        loop {
+            match tokens.get(at)? {
+                Token::Ctrl('[' | '(' | '{') => depth += 1,
+                Token::Ctrl(']' | ')' | '}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at + 1);
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+    };
+    let mut at = start;
+    while tokens.get(at) == Some(&Token::Ctrl('['))
+        && matches!(tokens.get(at + 1), Some(Token::Ident(_)))
+    {
+        at = past_group(at)?;
+    }
+    if at == start || tokens.get(at) != Some(&Token::Export) {
+        return None;
+    }
+    let marker = at;
+    let mut past_marker = marker + 1;
+    if tokens.get(past_marker) == Some(&Token::Ctrl('('))
+        && tokens.get(past_marker + 1) == Some(&Token::In)
+    {
+        past_marker = past_group(past_marker)?;
+    }
+    if tokens.get(past_marker) == Some(&Token::Op("*")) {
+        return None;
+    }
+    Some((marker, past_marker))
 }
 
 /// Moves every bare `export *;` to the FRONT of the token stream, so the safety
@@ -3472,6 +3590,23 @@ struct Printer<'src> {
     head_start: Option<usize>,
 }
 
+/// `[resource]` as it prints today: on the declaration line, in the slot the
+/// keyword it was until B413 held. B485's layout (Q10) moves it to a line of
+/// its own; until then it is the one attribute the declaration line opens
+/// with, and an `export` placed on that line goes after it.
+const RESOURCE_ON_THE_HEAD: &str = "[resource] ";
+
+/// `(in PATH)` after an `export` — printed verbatim, `::`-joined, with no
+/// space before the `(` (`export(in pkg) fun f()`). Empty when the marker
+/// carries no narrowing.
+fn export_scope_text(scope: Option<&ExportScope<'_>>) -> String {
+    let Some(scope) = scope else {
+        return String::new();
+    };
+    let path: Vec<&str> = scope.path.iter().map(|(segment, _)| *segment).collect();
+    format!("(in {})", path.join("::"))
+}
+
 impl<'src> Printer<'src> {
     /// A printer over `source` under `options`, at column zero with nothing
     /// declined and no split armed — the state every entry point starts from,
@@ -4340,31 +4475,60 @@ impl<'src> Printer<'src> {
                 self.out.push(';');
             }
             Node::Export(scope, inner, labels) => {
+                // B485 §6.2 (RULED): the re-export's label, then the marker.
+                self.print_import_labels(labels);
                 self.out.push_str("export");
                 self.print_export_scope(scope.as_deref());
                 self.out.push(' ');
-                self.print_import_labels(labels);
                 self.print_import_like(&inner.0);
             }
             _ => {}
         }
     }
 
-    /// `(in PATH)` after an `export` — printed verbatim, `::`-joined, with no
-    /// space before the `(` (`export(in pkg) fun f()`). Nothing when the marker
-    /// carries no narrowing.
-    fn print_export_scope(&mut self, scope: Option<&ExportScope<'src>>) {
-        let Some(scope) = scope else {
-            return;
-        };
-        self.out.push_str("(in ");
-        for (index, (segment, _)) in scope.path.iter().enumerate() {
-            if index > 0 {
-                self.out.push_str("::");
+    /// An exported declaration in the ONE order B485 ruled (§6.2): its
+    /// attributes, then the keywords — `export` first among them — then the
+    /// declaration word. `[platform("node")]` ⏎ `export async fun f()`, and
+    /// not `export [platform("node")]` ⏎ `async fun f()`, which split the
+    /// signature across lines. The parser reads both (B445).
+    ///
+    /// The item prints its own attribute lines, each ended by
+    /// [`Printer::end_attribute_line`], which marks where the declaration
+    /// line begins; the marker is placed THERE once the item is printed, so
+    /// every item kind — and a derive, a service or a macro attribute
+    /// wrapping one — takes it at its signature without an arm of its own.
+    /// `[resource]`, which still prints on the declaration line, is an
+    /// attribute and stays ahead of it (`[resource] export struct H`). An item
+    /// with no attribute takes the marker at its start, as it always did. The
+    /// declaration line's width rule measures from the same offset, so it
+    /// reads the line with the marker on it.
+    fn print_exported_item(
+        &mut self,
+        scope: Option<&ExportScope<'src>>,
+        exported: &Spanned<Node<'src>>,
+    ) {
+        let start = self.out.len();
+        let enclosing_head = self.head_start.take();
+        self.print_item(exported);
+        let declaration = match self.head_start {
+            Some(head) if head >= start => head,
+            _ => {
+                self.head_start = enclosing_head;
+                start
             }
-            self.out.push_str(segment);
-        }
-        self.out.push(')');
+        };
+        let declaration = if self.out[declaration..].starts_with(RESOURCE_ON_THE_HEAD) {
+            declaration + RESOURCE_ON_THE_HEAD.len()
+        } else {
+            declaration
+        };
+        let marker = format!("export{} ", export_scope_text(scope));
+        self.out.insert_str(declaration, &marker);
+    }
+
+    /// `(in PATH)` after an `export` — see [`export_scope_text`].
+    fn print_export_scope(&mut self, scope: Option<&ExportScope<'src>>) {
+        self.out.push_str(&export_scope_text(scope));
     }
 
     /// Whether `node`, printed as a statement, takes a terminating `;`. Expression
@@ -4451,7 +4615,7 @@ impl<'src> Printer<'src> {
             Node::Struct(name, generics, external, resource, body, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("[resource] ");
+                    self.out.push_str(RESOURCE_ON_THE_HEAD);
                 }
                 if *external {
                     self.out.push_str("external ");
@@ -4529,7 +4693,7 @@ impl<'src> Printer<'src> {
             Node::Enum(name, generics, resource, variants, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("[resource] ");
+                    self.out.push_str(RESOURCE_ON_THE_HEAD);
                 }
                 self.out.push_str("enum ");
                 self.out.push_str(name.0);
@@ -4624,7 +4788,7 @@ impl<'src> Printer<'src> {
             Node::Trait(name, generics, supertraits, body, labels) => {
                 self.print_item_labels(labels);
                 if labels.as_ref().is_some_and(|labels| labels.resource) {
-                    self.out.push_str("[resource] ");
+                    self.out.push_str(RESOURCE_ON_THE_HEAD);
                 }
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
@@ -4677,11 +4841,8 @@ impl<'src> Printer<'src> {
                 self.print_item(item);
             }
             Node::Export(scope, exported, labels) => {
-                self.out.push_str("export");
-                self.print_export_scope(scope.as_deref());
-                self.out.push(' ');
                 self.print_import_labels(labels);
-                self.print_item(exported);
+                self.print_exported_item(scope.as_deref(), exported);
             }
             // G24's `const fun` — a DECLARATION under a marker, printed the way
             // `export` above prints one (N89). The expression printer's own
@@ -5611,14 +5772,20 @@ impl<'src> Printer<'src> {
             if parameter.mutable {
                 self.out.push_str("mut ");
             }
-            let type_is_reference = matches!(
-                parameter_type.as_deref().map(|spanned| &spanned.0),
-                Some(Node::Reference(..))
-            );
+            // A view prefix the TYPE already says is dropped (`&x: &i32` is
+            // `x: &i32`, the convention inferred from the type, §6.3) — and
+            // the net folds the same drop ([`drop_redundant_view_prefixes`]).
+            // One the type does NOT say is kept: the prefix wins over the
+            // type, so dropping `&` from `&x: &mut i32` would change the
+            // convention (B507).
+            let type_view = match parameter_type.as_deref().map(|spanned| &spanned.0) {
+                Some(Node::Reference(mutable, _)) => Some(*mutable),
+                _ => None,
+            };
             match parameter.convention {
                 Convention::Own => self.out.push_str("own "),
-                Convention::Ref if !type_is_reference => self.out.push('&'),
-                Convention::RefMut if !type_is_reference => self.out.push_str("&mut "),
+                Convention::Ref if type_view != Some(false) => self.out.push('&'),
+                Convention::RefMut if type_view != Some(true) => self.out.push_str("&mut "),
                 _ => {}
             }
             // `...items` — the spread marker binds to the binder, after any
@@ -7181,6 +7348,35 @@ impl<'src> Printer<'src> {
         self.indent -= 1;
     }
 
+    /// Whether a member chain's last link is a CALL (`a.b()`, `a.b.c()`), so
+    /// a call written after it applies to its result without parentheses.
+    fn member_chain_ends_in_a_call(node: &Node<'src>) -> bool {
+        match node {
+            Node::MemberAccessor(_, member) => match &member.0 {
+                Node::Call(..) => true,
+                inner @ Node::MemberAccessor(..) => Self::member_chain_ends_in_a_call(inner),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// A prefix operator's operand (`-`, `!`, `&`, `*`, `await`). An `if` or a
+    /// `match` there is an ATOM to the parser — it ends at its own closing
+    /// brace — so it prints bare, as written: `*if c { &a } else { &b }`.
+    /// The operand rule would wrap it (both rank 0, the statement-like
+    /// forms), and the added parentheses are token drift the net declines
+    /// the whole file for (F81's fixture). A written group still reprints
+    /// as one; everything else keeps the operand rule.
+    fn print_prefix_operand(&mut self, operand: &Spanned<Node<'src>>, split: Split) {
+        if matches!(operand.0, Node::If(_) | Node::Match(_, _)) {
+            self.split = Split::Off;
+            self.print_expr(operand);
+        } else {
+            self.print_split_operand(operand, 10, split);
+        }
+    }
+
     fn print_split_operand(&mut self, expr: &Spanned<Node<'src>>, minimum: u8, split: Split) {
         self.split = if Self::expression_precedence(&expr.0) >= minimum {
             split
@@ -7475,10 +7671,16 @@ impl<'src> Printer<'src> {
                 // callee must be parenthesized — `(a.b)(c)` — or it reparses wrong.
                 // A `?.` lift chain likewise absorbs a following call into its
                 // continuation, so a `Lift` callee needs its own parens: `(a?.b)()`.
+                //
+                // A member chain that already ENDS in a call is the exception:
+                // `kept.read()(2)` calls the result of `kept.read()`, which is
+                // what the postfix chain reads anyway, so it prints as written
+                // rather than as `(kept.read())(2)`, which the net declined.
                 if matches!(
                     callee.0,
                     Node::MemberAccessor(_, _) | Node::Index(_, _) | Node::Lift(_, _)
-                ) {
+                ) && !Self::member_chain_ends_in_a_call(&callee.0)
+                {
                     self.out.push('(');
                     self.print_expr(callee);
                     self.out.push(')');
@@ -7563,7 +7765,7 @@ impl<'src> Printer<'src> {
             // unwrapped.
             Node::Unary(operator, operand) => {
                 self.out.push(*operator);
-                self.print_split_operand(operand, 10, split);
+                self.print_prefix_operand(operand, split);
             }
             Node::TryAssert(subject) => {
                 self.print_operand(subject, 100);
@@ -7608,11 +7810,11 @@ impl<'src> Printer<'src> {
                 if *mutable {
                     self.out.push_str("mut ");
                 }
-                self.print_split_operand(operand, 10, split);
+                self.print_prefix_operand(operand, split);
             }
             Node::Dereference(operand) => {
                 self.out.push('*');
-                self.print_split_operand(operand, 10, split);
+                self.print_prefix_operand(operand, split);
             }
             // `..e` — a tuple-value spread (variadic-generics.md §T). The operand
             // is printed WITHOUT the operand rule's parentheses: `..` takes the
@@ -7626,7 +7828,7 @@ impl<'src> Printer<'src> {
             }
             Node::Await(operand) => {
                 self.out.push_str("await ");
-                self.print_split_operand(operand, 10, split);
+                self.print_prefix_operand(operand, split);
             }
             Node::Async(operand) => {
                 self.out.push_str("async ");
@@ -8486,6 +8688,104 @@ mod reformats {
         );
     }
 
+    // B445 + B485 §6.2 (RULED): an attribute run may stand on either side of
+    // `export`, and the formatter prints the ruled order — attributes, then
+    // the keywords with `export` first, then the declaration word — so the
+    // signature is one line. Every item kind a label leads, a run of several,
+    // a scoped marker, a re-export's label, a comment above the statement, a
+    // run split across the marker, `[resource]` on the declaration line, an
+    // unattributed export (unchanged), and a rotated statement after an
+    // untouched one.
+    #[test]
+    fn b485_an_exported_declarations_attributes_print_ahead_of_export() {
+        let canonical = "[platform(\"browser\")]\nexport impl P with Show {\n\tfun show(self): str {\n\t\t\"p\"\n\t}\n}\n";
+        let body = " impl P with Show {\n\tfun show(self): str {\n\t\t\"p\"\n\t}\n}\n";
+        assert_formats(&format!("[platform(\"browser\")] export{body}"), canonical);
+        assert_formats(&format!("export [platform(\"browser\")]{body}"), canonical);
+        for (written, expected) in [
+            (
+                "export(in pkg) [deprecated(\"use g()\")] [must_use] async fun f(): i32 { 1 }\n",
+                "[deprecated(\"use g()\")]\n[must_use]\nexport(in pkg) async fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "[deprecated(\"use g()\")] [must_use] export(in pkg) async fun f(): i32 { 1 }\n",
+                "[deprecated(\"use g()\")]\n[must_use]\nexport(in pkg) async fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "export [derive(Debug)] struct S { x: i32 }\n",
+                "[derive(Debug)]\nexport struct S {\n\tx: i32,\n}\n",
+            ),
+            (
+                "// the cache\nexport [internal(\"why\")] let x = 1;\n",
+                "// the cache\n[internal(\"why\")]\nexport let x = 1;\n",
+            ),
+            (
+                "export [deprecated(\"use a::c\")] import a::b;\n",
+                "[deprecated(\"use a::c\")] export import a::b;\n",
+            ),
+            (
+                "[deprecated(\"use g()\")] export [platform(\"node\")] fun f(): i32 { 1 }\n",
+                "[deprecated(\"use g()\")]\n[platform(\"node\")]\nexport fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "export [resource] struct Handle { id: i32 }\n",
+                "[resource] export struct Handle {\n\tid: i32,\n}\n",
+            ),
+            (
+                "export [hint(Show)] [resource] external struct Handle;\n",
+                "[hint(Show)]\n[resource] export external struct Handle;\n",
+            ),
+            (
+                "export fun a() {}\n\n[must_use] export fun b(): i32 { 1 }\n",
+                "export fun a() {}\n\n[must_use]\nexport fun b(): i32 {\n\t1\n}\n",
+            ),
+        ] {
+            assert_formats(written, expected);
+        }
+    }
+
+    // Two shapes next's fixtures write and the printer could not reprint, so
+    // `vilan fmt` declined both files (`ci-local.sh vilan-fmt` red): a prefix
+    // operator over an `if`/`match` (F81's `*if c { &a } else { &b }`) and a
+    // call on a member chain that ends in a call (`kept.read()(2)`). Each
+    // prints as written; a written group and a chain that does NOT end in a
+    // call keep their parentheses.
+    #[test]
+    fn a_prefix_over_a_block_form_and_a_call_after_a_call_reprint_as_written() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tmut picked = *if c { &a } else { &b };\n",
+            "\tlet negated = -if c { 1 } else { 2 } * 3;\n",
+            "\tlet flipped = !match n {\n\t\t0 => true,\n\t\t_ => false,\n\t};\n",
+            "\tlet grouped = *(if c { &a } else { &b });\n",
+            "\tkept.read()(2);\n",
+            "\tpair.inner.read()(\"a\", 2);\n",
+            "\t(holder.callback)(3);\n",
+            "}\n",
+        );
+        let reprinted = super::reprint(source)
+            .unwrap_or_else(|declined| panic!("the formatter declined: {}", declined.sentence()));
+        assert_eq!(reprinted, source);
+    }
+
+    // B507: a parameter's view prefix the type repeats reprints in the type
+    // alone, in a closure and in a function; one the type contradicts (the
+    // prefix wins, §6.3) is kept, so the convention survives the reprint.
+    #[test]
+    fn b507_a_view_prefix_the_type_repeats_reprints_in_the_type() {
+        assert_formats(
+            "fun f(&x: &i32, &mut y: &mut i32): i32 {\n\t*x\n}\n\nfun main() {\n\tlet g = |&a: &i32, b: i32| *a + b;\n\tlet h = |&mut c: &mut i32| *c;\n}\n",
+            "fun f(x: &i32, y: &mut i32): i32 {\n\t*x\n}\n\nfun main() {\n\tlet g = |a: &i32, b: i32| *a + b;\n\tlet h = |c: &mut i32| *c;\n}\n",
+        );
+        // The prefix the type does not say stays: dropping it would change
+        // the convention.
+        let kept = "fun f(&x: &mut i32, &mut y: &i32) {}\n";
+        // Through `reprint`, so a decline (which hands the input back) reds.
+        let reprinted = super::reprint(kept)
+            .unwrap_or_else(|declined| panic!("the formatter declined: {}", declined.sentence()));
+        assert_eq!(reprinted, kept);
+    }
+
     // E146 rule 3, in full: both written orders in, ONE order out, for a
     // declaration with a return type and for one without, for a single-name
     // clause and for a list, and for a bodyless declaration (a trait
@@ -9109,9 +9409,10 @@ mod idempotency {
     #[test]
     fn a_deprecated_steer_survives_the_reprint_on_a_type_and_a_re_export() {
         // B382: a type's steer on its own line, leading the prefix; a
-        // re-export's on the statement's own line.
+        // re-export's on the statement's own line, ahead of its `export`
+        // (B485 §6.2).
         let source = concat!(
-            "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n\n",
+            "[deprecated(\"use pkg::inner::DeltaCursor\")] export import pkg::inner::DeltaCursor as KeyedCursor;\n\n",
             "[deprecated(\"use Next\")]\n",
             "[internal(\"old plumbing\")]\n",
             "struct Previous {}\n\n",
@@ -9165,8 +9466,8 @@ mod idempotency {
             "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
             "[internal(\"a binding\")]\n",
             "let cache = 3;\n\n",
-            "export [internal(\"exported\")]\n",
-            "struct Marker {}\n\n",
+            "[internal(\"exported\")]\n",
+            "export struct Marker {}\n\n",
             "[derive(Clone)]\n",
             "[internal(\"derived\")]\n",
             "struct Point {\n\tx: i32,\n}\n",
@@ -9184,8 +9485,8 @@ mod idempotency {
         // E227: the argument is a TYPE, printed as types are, between
         // `[internal]` and `[platform]` — the prefix's order.
         let source = concat!(
-            "export [hint(Source<U>)]\n",
-            "struct Map<S, T, U> {\n\tup: S,\n}\n\n",
+            "[hint(Source<U>)]\n",
+            "export struct Map<S, T, U> {\n\tup: S,\n}\n\n",
             "[internal(\"a node\")]\n",
             "[hint(Iterator<(usize, T)>)]\n",
             "[resource] struct Enumerated<I, T> {\n\tupstream: I,\n}\n\n",

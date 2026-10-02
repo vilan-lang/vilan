@@ -67,6 +67,15 @@ filter = 'binary(replay_differential)'
 priority = 100
 slow-timeout = { period = "180s", terminate-after = 5 }
 
+# The marker census (B485) analyzes a few hundred probe programs on a worker
+# pool of its own — compute, like the replay differential above, so it starts
+# first rather than holding the run open at the end, and its honest cost
+# under a loaded box (20 s alone, ~2 min at loadavg 60) is not a runaway.
+[[profile.default.overrides]]
+filter = 'binary(marker_census)'
+priority = 100
+slow-timeout = { period = "180s", terminate-after = 5 }
+
 # The wall-clock waits run ONE AT A TIME (tracker N46).
 #
 # Every member waits, on the wall clock, for work happening on ANOTHER thread or

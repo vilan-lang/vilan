@@ -56,7 +56,7 @@ row	flagship	key
 19	-	a `{kind}` parameter takes a view; pass `{kind} <place>` (th
 20	-	an array length must be a non-negative integer literal 
 21	-	the `?` lifts this condition to an `Option`/`Result`, which 
-22	-	Vilan has no const declarations; write `let x = const ..`
+22	-	`const x = …` is not a declaration: a compile-time binding is `const let x = …`
 23	-	a triple-quoted string spans lines: the opening """ must be
 24	-	a tuple position is a bare number (`.0`, `.1`); drop the suffix
 25	-	expected a method name after `.`

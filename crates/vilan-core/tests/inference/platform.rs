@@ -92,6 +92,47 @@ fn an_impl_declared_browser_requires_it_of_its_members_alone() {
     assert_fails_without(source, "`plain` requires");
 }
 
+/// B445: the attribute may stand AHEAD of `export` as well as after it — the
+/// issue's own `[platform("browser")] export impl` — and it is the impl's
+/// declaration either way: the members require the platform, the browser
+/// build is clean, and both spellings emit the same program.
+#[test]
+fn b445_an_impl_platform_written_ahead_of_export_is_the_impls() {
+    let program = |head: &str| {
+        format!(
+            "trait Show {{\n\tfun show(self): str;\n}}\n\n\
+             struct P {{}}\n\n\
+             {head} impl P with Show {{\n\tfun show(self): str {{\n\t\t\"p\"\n\t}}\n}}\n\n\
+             fun main() {{\n\tprint(P {{}}.show());\n}}\n"
+        )
+    };
+    let ahead = program("[platform(\"browser\")] export");
+    let after = program("export [platform(\"browser\")]");
+    for source in [&ahead, &after] {
+        assert_fails_with(
+            source,
+            "`show` requires the `browser` platform its `impl` declares",
+        );
+    }
+    let emitted_ahead = compile_browser(&ahead).expect("the browser build is clean");
+    let emitted_after = compile_browser(&after).expect("the browser build is clean");
+    assert_eq!(emitted_ahead, emitted_after);
+    // A function's whole prefix, with a scope, ahead of the marker.
+    let function = |head: &str| {
+        format!("{head} fun answer(): i32 {{\n\t42\n}}\n\nfun main() {{\n\tprint(answer());\n}}\n")
+    };
+    assert_eq!(
+        compile(&function(
+            "[deprecated(\"use other()\")] [must_use] export(in pkg)"
+        ))
+        .expect("the attributed, scoped export compiles"),
+        compile(&function(
+            "export(in pkg) [deprecated(\"use other()\")] [must_use]"
+        ))
+        .expect("the attributed, scoped export compiles"),
+    );
+}
+
 /// A pattern no platform answers to is reported ONCE, where it is written —
 /// not once per function the declaration covers.
 #[test]

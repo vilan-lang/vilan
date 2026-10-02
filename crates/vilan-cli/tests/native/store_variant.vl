@@ -45,7 +45,11 @@ fun drained(): str {
 		out = out + name;
 	}
 	woke.write() = [];
-	if out == "" { "-" } else { out }
+	if out == "" {
+		"-"
+	} else {
+		out
+	}
 }
 
 fun main() {

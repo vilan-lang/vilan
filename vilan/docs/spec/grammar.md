@@ -14,7 +14,9 @@ name can, so the position alone decides. `own` and `lazy` at a parameter's
 head, `lazy` before `let`/`mut`, `jump` before its target and `dyn` at a
 type's head are PREFIXES of a name, and the grammar never puts two names side
 by side, so the word is the keyword when a name follows it (for `dyn`, when
-anything but `::` follows it) and a name otherwise: `fun f(own: Owner)`,
+anything but `::` follows it; for `own` and `lazy`, also when a binder's
+other heads do — `mut`, a destructure's `(` or `[`, a spread's `...` — but
+never a single `.`) and a name otherwise: `fun f(own: Owner)`,
 `|lazy| lazy.force()`, `jump.height`, `dyn::Registry`. `then` follows a
 complete operand (§3.8), which is where no name can stand either.
 
@@ -76,10 +78,15 @@ impl-selector = "(" "impl" type ")"
                 [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
-export      = "export" [ "(" "in" path-branch ")" ]
-              [ deprecated-label ]   (* only before `import`: B382's re-export *)
+export      = { lead-attribute }   (* the item's own prefix: B485's one order *)
+              "export" [ "(" "in" path-branch ")" ]
+              [ deprecated-label ]   (* B382's re-export label, the pre-B485 side *)
               statement   (* §4.8 *)
             | "export" "*" ";" ;          (* the whole-module marker *)
+lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
+               | resource-attr | extern-attr | "[" "must_use" "]" | "[" "rpc" "]"
+               | "[" "trait_only" "]" | derive-attr | service-attr
+               | client-service-attr | macro-attr ;
 ```
 
 `import` brings names from another module into scope; `use` brings names
@@ -96,8 +103,17 @@ declaration as the module's surface (or re-exports an import);
 is the one form carrying no inner statement. The wrapper does not change
 the statement's own shape, so a wrapped `let` keeps its terminator —
 `export let registry = …;` — and a wrapped `fun` still takes none. A
-declaration carrying attributes is wrapped as a whole, with the marker
-ahead of them: `export [derive(Wire)] struct Handle { … }`. A `#` before
+declaration carrying attributes is wrapped as a whole, attributes and all.
+The ONE order (B485) is attributes, then the keywords — `export` first
+among them — then the declaration word: `[derive(Wire)]` ⏎ `export struct
+Handle { … }`, `[platform("browser")]` ⏎ `export impl …`. This release also
+reads the run on the other side of the marker (`export [derive(Wire)]
+struct Handle`, the spelling before B445), and `vilan fmt` rewrites it into
+the order; the release after refuses it. An attribute written on either
+side is read exactly as one after the marker (and its scope) always was: it
+joins the item's own prefix, whose order and admissions are the item
+production's (§3.3), and a run may be split across the marker. Only an
+attribute shape — `[` then a name — leads a marker; `export *;` takes none. The marker is written once: a second `export` on one declaration is refused (B492). A `#` before
 a path element is the **reach** marker:
 `import pkg::a::{ #hidden };` imports an item the module does not export,
 deliberately (§4.3, §4.8).
@@ -232,7 +248,7 @@ than the minor release after the warning first shipped.
 
 The same steer labels a **struct**, an **enum**, a **trait** or a module
 binding (leading its prefix, as on a function), and a **re-export**:
-`export [deprecated("use pkg::inner::DeltaCursor")] import
+`[deprecated("use pkg::inner::DeltaCursor")] export import
 pkg::inner::DeltaCursor as KeyedCursor;` deprecates the name `KeyedCursor`
 the re-export publishes, while the item stays exactly the item —
 `KeyedCursor` is still a `DeltaCursor`. A use of a deprecated type in
@@ -433,15 +449,15 @@ optionally, each element (`T: (2..)`, `T: (..: Display)`); see §5.9.
 ### Attributes and macro items
 
 ```text
-derived-item   = "[" "derive" "(" IDENT { "," IDENT } [ "," ] ")" "]"
-                 ( struct | enum ) ;
+derived-item   = derive-attr ( struct | enum ) ;
+derive-attr    = "[" "derive" "(" IDENT { "," IDENT } [ "," ] ")" "]" ;
 service-item   = { service-attr | client-service-attr }- struct ;
 service-attr   = "[" "service" [ "(" service-args ")" ] "]" ;
 service-args   = service-arg { "," service-arg } ;   (* a client name leads or is absent; each other arg at most once *)
 service-arg    = IDENT | "http" | "client" "=" IDENT ;
 client-service-attr = "[" "client_service" "]" ;
-macro-attributed-item = "[" IDENT [ "(" [ expr-span { "," expr-span } ] ")" ] "]"
-                        ( struct | enum | function ) ;
+macro-attributed-item = macro-attr ( struct | enum | function ) ;
+macro-attr       = "[" IDENT [ "(" [ expr-span { "," expr-span } ] ")" ] "]" ;
 macro-fun        = "macro" function ;
 macro-invocation = "macro" IDENT "(" [ expr-span { "," expr-span } ] ")" ;
 macro-block      = "macro" block ;

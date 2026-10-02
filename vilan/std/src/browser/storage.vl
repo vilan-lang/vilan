@@ -31,24 +31,24 @@ import pkg::dom::Window;
 import pkg::option::Option::{ self, None, Some };
 
 /// `localStorage.getItem(key)` — "" when absent.
-export [extern("__local_get")]
-external fun get(key: str): str;
+[extern("__local_get")]
+export external fun get(key: str): str;
 
-export [extern("localStorage.setItem")]
-external fun set(key: str, value: str): void;
+[extern("localStorage.setItem")]
+export external fun set(key: str, value: str): void;
 
-export [extern("localStorage.removeItem")]
-external fun remove(key: str): void;
+[extern("localStorage.removeItem")]
+export external fun remove(key: str): void;
 
 /// The tab-scoped variant (cleared when the tab closes).
-export [extern("__session_get")]
-external fun session_get(key: str): str;
+[extern("__session_get")]
+export external fun session_get(key: str): str;
 
-export [extern("sessionStorage.setItem")]
-external fun session_set(key: str, value: str): void;
+[extern("sessionStorage.setItem")]
+export external fun session_set(key: str, value: str): void;
 
-export [extern("sessionStorage.removeItem")]
-external fun session_remove(key: str): void;
+[extern("sessionStorage.removeItem")]
+export external fun session_remove(key: str): void;
 
 // --- The handle ---------------------------------------------------------------
 

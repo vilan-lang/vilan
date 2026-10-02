@@ -116,8 +116,8 @@ impl Shared<type T> {
 /// one edge and never heard the other (A147). The draw is a cell made for its stamp
 /// and dropped — the counter is the host's, reached through the one call that
 /// advances it.
-export [internal("the one identity space every `Source::identity` draws from (A147)")]
-fun fresh_identity(): i32 {
+[internal("the one identity space every `Source::identity` draws from (A147)")]
+export fun fresh_identity(): i32 {
 	Shared::new(0).identity()
 }
 

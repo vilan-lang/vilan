@@ -6,7 +6,13 @@
 import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{
-	Owner, Signal, SignalCell, Source, Subscriber, Subscription, run_with_owner,
+	Owner,
+	Signal,
+	SignalCell,
+	Source,
+	Subscriber,
+	Subscription,
+	run_with_owner,
 };
 
 struct W<P> {

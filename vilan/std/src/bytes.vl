@@ -92,13 +92,13 @@ export impl Bytes {
 
 /// A whole `ArrayBuffer` viewed as bytes (`new Uint8Array(buffer)`) — how a binary
 /// fetch response body becomes a `Bytes`.
-export [extern(new, "Uint8Array")]
-external fun bytes_of_buffer(buffer: ByteBuffer): Bytes;
+[extern(new, "Uint8Array")]
+export external fun bytes_of_buffer(buffer: ByteBuffer): Bytes;
 
 export external struct DataView;
 
-export [extern(new, "DataView")]
-external fun data_view(buffer: ByteBuffer): DataView;
+[extern(new, "DataView")]
+export external fun data_view(buffer: ByteBuffer): DataView;
 
 export impl DataView {
 	/// Read/write an IEEE-754 double at `offset`; `little_endian` selects the byte
@@ -127,8 +127,8 @@ impl TextEncoder {
 
 export external struct TextDecoder;
 
-export [extern(new, "TextDecoder")]
-external fun new_text_decoder(): TextDecoder;
+[extern(new, "TextDecoder")]
+export external fun new_text_decoder(): TextDecoder;
 
 export impl TextDecoder {
 	[extern(method)]
