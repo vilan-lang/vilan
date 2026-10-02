@@ -8267,6 +8267,75 @@ fn a_bound_selection_tests_only_the_impls_that_can_answer_it() {
     );
 }
 
+/// M103: an inherited default's dispatch candidates are computed once per
+/// member, not once per call site.
+///
+/// `async_infer` asks, at every `OnType` dispatch site (a `self` call in a
+/// default body, an inherited default on a concrete receiver), which impl
+/// members a `Self` declaring that member can reach — a scan of every impl with
+/// a `subject_applies` bound proof per blanket implementor. The answer depends
+/// on the member name alone, and on kolt's client the scan was 1.9G
+/// instructions of a `check` once maps-45's blankets landed. Memoized per
+/// member on the `Program`: six call sites of `chime` ask six times and compute
+/// exactly what one call site computes.
+#[test]
+fn an_inherited_defaults_candidates_are_computed_once_per_member() {
+    fn counts(calls: usize) -> (usize, usize) {
+        let mut source = String::from(
+            r#"
+            trait Chime { fun ring(self): str; fun chime(self): str { self.ring() } }
+            struct Bell { size: i32 }
+            impl Bell with Chime { fun ring(self): str { "ding" } }
+
+            fun main() {
+                let bell = Bell { size = 1 };
+            "#,
+        );
+        for _ in 0..calls {
+            source.push_str("    print(bell.chime());\n");
+        }
+        source.push_str("}\nmain();\n");
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                // The program borrows its source for `'static`.
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                vilan_core::async_infer::reset_trait_subject_counts();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                drop(program);
+                vilan_core::async_infer::trait_subject_counts()
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    let (asked_once, computed_once) = counts(1);
+    let (asked_six, computed_six) = counts(6);
+    assert!(
+        asked_six > asked_once,
+        "six `bell.chime()` sites must ask more often than one ({asked_six} vs \
+         {asked_once}), or the count below proves nothing"
+    );
+    assert_eq!(
+        computed_six, computed_once,
+        "{asked_six} asks computed {computed_six} reachable sets where one call site's \
+         {asked_once} asks computed {computed_once}: the set is the member's, so a \
+         second site of the same member must read it from the memo (M103)"
+    );
+}
+
 /// Analyzes `source` on a large-stack worker and reports how many BOUND
 /// EVALUATIONS `check_generic_bound_satisfaction` performed — the M19 memo's
 /// instrument. The counter is zeroed on the worker thread, so a concurrently
