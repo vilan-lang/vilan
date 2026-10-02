@@ -3484,6 +3484,82 @@ fn a145_a_memo_handle_return_whose_element_is_not_wire_is_refused_at_the_element
     }
 }
 
+/// A138: a map's PER-KEY handle — `MapCell::at(key)`'s `MapEntry<K, V>`, and a
+/// sealed map pipe's `MemoEntry<K, V>` — is a handle return, a mirror of
+/// `Option<V>` at the client, so `V` is what must be Wire and the refusal names it;
+/// over a Wire value both compile. `Option<MapEntry<..>>` is NOT a handle (a
+/// per-key handle already answers `None` for an absent key), so it meets the
+/// ordinary Wire refusal, on both the written and the resolved side.
+#[test]
+fn a138_a_map_entry_handle_return_is_judged_by_its_value() {
+    for (returned, body) in [
+        ("MapEntry<i32, Secret>", "self.secrets.at(1)"),
+        (
+            "MemoEntry<i32, Secret>",
+            "self.secrets.map_values(|secret| secret).memo().at(1)",
+        ),
+    ] {
+        let source = format!(
+            r#"
+        import std::io::print;
+        import std::reactive::{{ MapCell, MapEntry, MemoEntry }};
+        struct Secret {{ token: str }}
+        [service(StoreClient)]
+        struct Store {{
+            secrets: MapCell<i32, Secret>,
+        }}
+        impl Store {{
+            [rpc]
+            fun watch(self): {returned} {{ {body} }}
+        }}
+        fun main() {{ print("store"); }}
+        main();
+        "#
+        );
+        assert_fails_with(
+            &source,
+            "returns a signal handle whose element `Secret` is not Wire",
+        );
+    }
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ MapCell, MapEntry, MemoEntry };
+        [service(InboxClient)]
+        struct Inbox {
+            messages: MapCell<i32, str>,
+        }
+        impl Inbox {
+            [rpc]
+            fun message(self, id: i32): MapEntry<i32, str> { self.messages.at(id) }
+            [rpc]
+            fun shouted(self, id: i32): MemoEntry<i32, str> {
+                self.messages.map_values(|text| text.to_uppercase()).memo_global().at(id)
+            }
+        }
+        fun main() { print("inbox"); }
+        main();
+        "#,
+    );
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ MapCell, MapEntry };
+        [service(InboxClient)]
+        struct Inbox {
+            messages: MapCell<i32, str>,
+        }
+        impl Inbox {
+            [rpc]
+            fun message(self, id: i32): Option<MapEntry<i32, str>> { Some(self.messages.at(id)) }
+        }
+        fun main() { print("inbox"); }
+        main();
+        "#,
+        "is not Wire",
+    );
+}
+
 /// The control, and the two shapes the mapping admits: `SignalCell<T>` becomes
 /// `RemoteSource<T>` at the client and `Option<SignalCell<T>>` becomes
 /// `Option<RemoteSource<T>>`, both over a Wire element.

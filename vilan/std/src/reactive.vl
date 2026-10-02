@@ -42,18 +42,36 @@ export import pkg::delta::{
 	IntoFlow,
 	ListCell,
 	ListMemo,
+	MapCount,
+	MapEntries,
+	MapFilter,
+	MapFlow,
+	MapInstance,
+	MapKeys,
+	MapMapValues,
+	MapMemo,
 	MapOp,
+	MapPipe,
+	MapSum,
+	MapValues,
+	MemoEntry,
 	RowFeed,
 	SameElement,
 	SeqOp,
 	Sequence,
 	SequenceCell,
+	SetFlow,
+	SetInstance,
+	SetMemo,
 	SetOp,
+	SetPipe,
 	Tracked,
 	delta_log_limit,
 	element_holds_allocated,
 	map_each,
 };
+export import pkg::map_cell::{ KeySlots, MapCell, MapEntry, MapSignal, MapSource, TrackedMap };
+export import pkg::set_cell::{ SetCell, SetEntry, SetSignal, SetSource };
 
 /// A resource that can be released. An `Owner` collects `Disposable`s and releases
 /// them as a group; `Subscription`, `Owner`, and `std::ui`'s `View` are disposable.

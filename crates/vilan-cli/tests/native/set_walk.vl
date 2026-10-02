@@ -1,0 +1,122 @@
+// A138 S1: a `SetCell` under a seeded random walk — insert, remove (held and
+// absent), reconcile_to, set, clear — checked after every step against a plain
+// `HashSet`: the cell's set and its order, a mirror rebuilt from the drained
+// ops, the answers `insert`/`remove` gave, and how often each watched member's
+// `contains` handle woke.
+import std::hash_set::HashSet;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ DeltaSource, SetCell, SetOp, Source, Subscription };
+import std::shared::Shared;
+
+mut seed = 99;
+
+fun next(bound: i32): i32 {
+	seed = (seed * 75 + 74) % 65537;
+	seed % bound
+}
+
+fun replay(mirror: &mut HashSet<i32>, ops: List<SetOp<i32>>) {
+	for op in ops {
+		match op {
+			SetOp::Add(let value) => mirror.insert(value),
+			SetOp::Remove(let value) => mirror.remove(value),
+			SetOp::Reset(let set) => {
+				mirror = set;
+			},
+		}
+	}
+}
+
+fun main() {
+	let cell: SetCell<i32> = SetCell::new();
+	mut oracle: HashSet<i32> = HashSet::new();
+	mut mirror: HashSet<i32> = HashSet::new();
+	let cursor = cell.cursor();
+	let wakes: Shared<List<i32>> = Shared::new([0, 0, 0, 0]);
+	mut handles: List<Subscription> = [];
+	mut watched = 0;
+	for watched < 4 {
+		let index = watched.as_usize();
+		handles.push(cell.contains(watched).on_change(|held| {
+			wakes.write()[index] = wakes.read()[index] + 1;
+		}));
+		watched += 1;
+	}
+	mut failures = 0;
+	mut step = 0;
+	for step < 500 {
+		let choice = next(6);
+		let value = next(8);
+		let before = oracle;
+		let woke_before = wakes.read();
+		mut everything = false;
+		if choice <= 1 {
+			let answered = cell.insert(value);
+			if answered == oracle.contains(value) {
+				failures += 1;
+			}
+			oracle.insert(value);
+		} else if choice == 2 {
+			let answered = cell.remove(value);
+			if answered != oracle.contains(value) {
+				failures += 1;
+			}
+			oracle.remove(value);
+		} else if choice == 3 {
+			mut target: HashSet<i32> = HashSet::new();
+			for member in oracle.values() {
+				if member != value {
+					target.insert(member);
+				}
+			}
+			target.insert(next(8));
+			cell.reconcile_to(target);
+			for member in before.values() {
+				if !target.contains(member) {
+					oracle.remove(member);
+				}
+			}
+			for member in target.values() {
+				oracle.insert(member);
+			}
+		} else if choice == 4 && next(4) == 0 {
+			let fresh = [5, 1, 3].to_set();
+			cell.set(fresh);
+			oracle = fresh;
+			everything = true;
+		} else if choice == 5 && next(4) == 0 {
+			everything = oracle.len() > 0;
+			cell.clear();
+			oracle = HashSet::new();
+		}
+		replay(&mut mirror, cell.since(cursor));
+		let whole: HashSet<i32> = Source::get(cell);
+		if whole != oracle
+			|| mirror != oracle
+			|| whole.values() != oracle.values()
+			|| cell.len() != oracle.len() {
+			failures += 1;
+		}
+		mut index = 0;
+		for index < 4 {
+			let member = index.as_i32();
+			if cell.contains(member).get() != oracle.contains(member) {
+				failures += 1;
+			}
+			let changed = before.contains(member) != oracle.contains(member);
+			let expected = if everything || changed { 1 } else { 0 };
+			if wakes.read()[index] - woke_before[index] != expected {
+				failures += 1;
+			}
+			index += 1;
+		}
+		step += 1;
+	}
+	print(i"failures {failures}");
+	print(i"watched {cell.watched()}");
+	for handle in handles {
+		handle.dispose();
+	}
+	print(i"watched {cell.watched()}");
+	print(wakes.read());
+}

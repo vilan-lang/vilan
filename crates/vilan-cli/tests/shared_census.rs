@@ -51,7 +51,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "delta.vl",
-        24,
+        33,
         "E: the delta log's ops/version/base/cursors (twice — `new` and \
          `with_limit`) plus a cursor's own sequence. Every one of them is \
          minted by the CELL that holds the log and read by the CONSUMERS that \
@@ -69,7 +69,22 @@ const CENSUS: &[(&str, usize, &str)] = &[
          index's tree; plus `element_holds_allocated_count`, the module-level \
          counter the per-element allocation pin reads (R). +2 at A142 S5: \
          `.coll()`'s and `.coll_by()`'s last list, the one each diffs the next \
-         against (O, per instance).",
+         against (O, per instance). +9 at A138 S2, the map operators' INSTANCE \
+         state (O, per instance, as the collection stages'): the rank index's \
+         five (slots, live flags, a live key's slot, the Fenwick tree, the live \
+         count) behind `values()`/`entries()`, the keyed core's two (rows by key, \
+         a run's slot id to its key) behind `map_values`/`filter`/`sum_by`, and \
+         `count()`'s counter and `sum_by`'s accumulator.",
+    ),
+    (
+        "map_cell.vl",
+        4,
+        "E (A138 S1): a `MapCell`'s own map, a `KeySlots` table, and each \
+         watched key's subscription count; +1 at A138's wire reply, the table of \
+         each asked key's identity (`MapEntry::identity`). Each is minted by the cell (or the \
+         first subscription on a key) and read and written through every copy \
+         of the handle and by the slot's release, which a disposal elsewhere \
+         runs: the E class, as `ListCell`'s list is",
     ),
     (
         "memo.vl",
@@ -140,6 +155,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
          client's wire demand (R: one per `ReactiveClient`, every mirror's \
          `Subscribe`/`Unsubscribe` registered in it, cleared by a reconnect \
          and by `dispose`).",
+    ),
+    (
+        "set_cell.vl",
+        1,
+        "E (A138 S1): a `SetCell`'s own set, as `MapCell`'s map (its slots are \
+         a `KeySlots`, counted in `map_cell.vl`)",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
     (
@@ -261,7 +282,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 178,
+        total, 192,
         "the total number of `Shared` construction sites in std changed"
     );
 

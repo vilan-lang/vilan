@@ -33,6 +33,7 @@ mod lazy;
 mod lifetimes;
 mod liveness;
 mod macros;
+mod maps;
 mod markdown;
 mod modules;
 mod platform;

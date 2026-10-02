@@ -3289,6 +3289,8 @@ fn handle_spelling(returned: &Node) -> Option<&'static str> {
         ("SignalCell", 1) => Some("SignalCell"),
         ("MemoCell", 1) => Some("MemoCell"),
         ("KeyedCell", 2) => Some("KeyedCell"),
+        ("MapEntry", 2) => Some("MapEntry"),
+        ("MemoEntry", 2) => Some("MemoEntry"),
         _ => None,
     }
 }
