@@ -18,11 +18,23 @@ default, at a pinned commit — and prints one table row per edit:
   - the same four requests once the server is idle (CPU, summed over the
     server's live threads, so a request is measured in nanoseconds, not in
     10 ms clock ticks);
-  - peak resident memory (VmHWM) after the edit.
+  - peak resident memory (VmHWM) after the edit;
+  - user-space INSTRUCTIONS from the edit to idle (E244, perf-b-45's counter):
+    a hardware counter attached to every server thread with `inherit`, so the
+    analysis threads it spawns later are counted too. Instructions do not move
+    with the load average the way CPU time does on this host; `-` where
+    `perf_event_open` is refused (`/proc/sys/kernel/perf_event_paranoid`);
+  - the analyses an edit ran, counted from the server's `VILAN_PHASE_TIMING`
+    lines, where the server prints them.
 
 CPU time, not wall, is the figure to compare: a machine running other work
 stretches wall time and leaves CPU time alone (E121's measurement rule — and
 record the load average beside every number, which this prints).
+
+A KEYSTROKE-PLUS-PAUSE row (E244) types the leaf keystroke and then RESTS
+until the server has been quiet for three seconds: every other row resumes
+after 0.4 s of quiet, which is shorter than the dead-code clock's pause, so
+the analyses a real pause sets off never show there.
 
 The edits (`SCENARIOS` below): a keystroke in a leaf file, one in the widely
 imported `shared.vl`, one in the client model `model.vl` (whose edit
@@ -46,6 +58,9 @@ recorded at spawn and the harness kills THAT process, never by name.
 """
 
 import argparse
+import ctypes
+import ctypes.util
+import struct
 import json
 import os
 import queue
@@ -71,6 +86,17 @@ SCENARIOS = [
         "file": "src/views.vl",
         "edit": ("\tlet theme_modal = create_theme_modal();", 1),
         "text": " ",
+        "hover": ("create_theme_modal();", 3),
+        "completion": ("get_prefs().theme.derive", len("get_prefs().")),
+    },
+    {
+        # E244: the same keystroke, then a REAL pause — the dead-code clock's
+        # union analyses run, which a row resuming after 0.4 s never sees.
+        "name": "leaf keystroke + pause",
+        "file": "src/views.vl",
+        "edit": ("\tlet theme_modal = create_theme_modal();", 1),
+        "text": " ",
+        "pause": 3.0,
         "hover": ("create_theme_modal();", 3),
         "completion": ("get_prefs().theme.derive", len("get_prefs().")),
     },
@@ -161,6 +187,59 @@ def memory_kb(pid):
     return readings
 
 
+class InstructionCounter:
+    """User-space instructions retired by a process and every thread it spawns
+    after attachment (E244): one `perf_event_open` hardware counter per live
+    thread, `inherit` set, so an analysis thread spawned later by any of them
+    is counted — its count is folded into its parent's when it exits, which is
+    why the counter is read at IDLE. `available` is false where the kernel
+    refuses the counter; every reading is then `None`."""
+
+    HW_INSTRUCTIONS = 1
+
+    class _Attr(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_uint32), ("size", ctypes.c_uint32), ("config", ctypes.c_uint64),
+            ("sample_period", ctypes.c_uint64), ("sample_type", ctypes.c_uint64),
+            ("read_format", ctypes.c_uint64), ("flags", ctypes.c_uint64),
+            ("wakeup_events", ctypes.c_uint32), ("bp_type", ctypes.c_uint32),
+            ("config1", ctypes.c_uint64), ("config2", ctypes.c_uint64),
+            ("branch_sample_type", ctypes.c_uint64), ("sample_regs_user", ctypes.c_uint64),
+            ("sample_stack_user", ctypes.c_uint32), ("clockid", ctypes.c_int32),
+            ("sample_regs_intr", ctypes.c_uint64), ("aux_watermark", ctypes.c_uint32),
+            ("sample_max_stack", ctypes.c_uint16), ("reserved", ctypes.c_uint16),
+        ]
+
+    def __init__(self, pid):
+        self.fds = []
+        self.available = False
+        if not sys.platform.startswith("linux") or os.uname().machine != "x86_64":
+            return
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        try:
+            for task in os.listdir(f"/proc/{pid}/task"):
+                attr = self._Attr()
+                attr.type = 0  # PERF_TYPE_HARDWARE
+                attr.size = ctypes.sizeof(self._Attr)
+                attr.config = self.HW_INSTRUCTIONS
+                # inherit (bit 1), exclude_kernel (bit 5), exclude_hv (bit 6).
+                attr.flags = (1 << 1) | (1 << 5) | (1 << 6)
+                fd = libc.syscall(298, ctypes.byref(attr), int(task), -1, -1, 0)  # perf_event_open
+                if fd < 0:
+                    raise OSError(ctypes.get_errno(), "perf_event_open")
+                self.fds.append(fd)
+            self.available = True
+        except OSError:
+            for fd in self.fds:
+                os.close(fd)
+            self.fds = []
+
+    def read(self):
+        if not self.available:
+            return None
+        return sum(struct.unpack("q", os.read(fd, 8))[0] for fd in self.fds)
+
+
 def load_average():
     with open("/proc/loadavg") as handle:
         return " ".join(handle.read().split()[:3])
@@ -185,6 +264,7 @@ class Server:
         )
         self.pid = self.process.pid
         self.next_id = 0
+        self.instructions = InstructionCounter(-1)
         self.responses = {}
         self.response_ready = threading.Condition()
         self.publishes = []  # (time, uri, diagnostics)
@@ -235,6 +315,18 @@ class Server:
             elif message.get("method") == "window/logMessage":
                 self.log.write(f"{now:.3f} {message['params'].get('message', '')}\n")
                 self.log.flush()
+
+    def analyses_logged(self):
+        """How many analyses the server has reported on stderr so far
+        (`VILAN_PHASE_TIMING`'s `lsp-context` lines), or `None` before it
+        has printed one."""
+        self.stderr.flush()
+        try:
+            text = Path(self.stderr.name).read_text(errors="replace")
+        except OSError:
+            return None
+        count = text.count("lsp-context")
+        return count if count else None
 
     def notify(self, method, params):
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
@@ -392,13 +484,20 @@ def measure_edit(server, document, scenario, apply):
     """Apply one edit and measure it: the keystroke-path requests first, then
     diagnostics, then idle, then the settled requests."""
     cpu_before = cpu_ms(server.pid)
+    instructions_before = server.instructions.read()
+    analyses_before = server.analyses_logged()
     started = time.perf_counter()
     apply()
     keystroke = {kind: document.ask(kind, scenario) * 1000 for kind in KEYSTROKE_REQUESTS}
     first = server.wait_publish(document.uri, started)
-    settled_at = server.settle()
+    # E244: a PAUSE row rests until the server has been quiet that long, so
+    # whatever a real pause sets off (the dead-code clock's analyses) runs and
+    # is counted; every other row resumes after 0.4 s of quiet.
+    settled_at = server.settle(quiet_polls=int(scenario.get("pause", 0.4) * 10))
     last = server.last_publish(document.uri, started)
     cpu_after = cpu_ms(server.pid)
+    instructions_after = server.instructions.read()
+    analyses_after = server.analyses_logged()
     settled = {}
     for kind in KEYSTROKE_REQUESTS:
         before = live_threads_ns(server.pid)
@@ -418,6 +517,14 @@ def measure_edit(server, document, scenario, apply):
         "diagnostics_ms": (landed[0] - started) * 1000,
         "diagnostics_cpu_ms": landed[3] - cpu_before,
         "first_publish_ms": (first[0] - started) * 1000,
+        "instructions": (
+            instructions_after - instructions_before
+            if instructions_before is not None and instructions_after is not None
+            else None
+        ),
+        "analyses": (
+            analyses_after - (analyses_before or 0) if analyses_after is not None else None
+        ),
         "all_published_ms": (everything[0] - started) * 1000 if everything else None,
         "all_published_cpu_ms": everything[3] - cpu_before if everything else None,
         "files_republished": len({entry[1] for entry in caused}),
@@ -493,6 +600,7 @@ def prepare_copy(kolt, commit, scratch):
             target.mkdir(parents=True)
             with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
                 tar.extractall(target, filter="data")
+        copy_untracked_inputs(kolt, target)
         return target, sha
     target = Path(scratch) / "kolt-worktree"
     if target.exists():
@@ -501,6 +609,16 @@ def prepare_copy(kolt, commit, scratch):
         kolt, target, ignore=shutil.ignore_patterns("dist", "worktrees", "node_modules", ".git", "*.db", "target")
     )
     return target, "(working tree)"
+
+
+def copy_untracked_inputs(kolt, target):
+    """The gitignored inputs the const pass reads — kolt's generated
+    `src/search-dict/` — copied beside the archive when the checkout has them;
+    without them the copy reports const-eval errors the owner's tree does not."""
+    for relative in ("search-dict", "src/search-dict"):
+        source = kolt / relative
+        if source.is_dir() and not (target / relative).exists():
+            shutil.copytree(source, target / relative)
 
 
 def checkout_std_above(path):
@@ -516,17 +634,22 @@ def median(values):
 
 
 def print_table(cold_rows, rows, header):
+    def counted(values, scale, digits):
+        value = median(values)
+        return "-" if value != value else f"{value / scale:.{digits}f}"
+
     print(header)
     print()
     print(
-        "| edit | CPU to diagnostics ms | CPU to idle ms | wall to diagnostics ms | errors "
+        "| edit | CPU to diagnostics ms | CPU to idle ms | instructions:u to idle (G) | analyses "
+        "| wall to diagnostics ms | errors "
         "| keystroke wall ms (hover / completion / inlay / tokens) "
         "| idle CPU ms (hover / completion / inlay / tokens) | VmHWM MB |"
     )
-    print("|---|---:|---:|---:|---:|---|---|---:|")
+    print("|---|---:|---:|---:|---:|---:|---:|---|---|---:|")
     for name, cold in cold_rows.items():
         print(
-            f"| {name} | {cold['diagnostics_cpu_ms']:.0f} | {cold['cpu_ms']:.0f} | {cold['diagnostics_ms']:.0f} "
+            f"| {name} | {cold['diagnostics_cpu_ms']:.0f} | {cold['cpu_ms']:.0f} | | | {cold['diagnostics_ms']:.0f} "
             f"| | | | {cold['memory']['VmHWM'] / 1024:.0f} |"
         )
     for name, samples in rows.items():
@@ -535,6 +658,8 @@ def print_table(cold_rows, rows, header):
         print(
             f"| {name} | {median([s['diagnostics_cpu_ms'] for s in samples]):.0f} "
             f"| {median([s['cpu_ms'] for s in samples]):.0f} "
+            f"| {counted([s.get('instructions') for s in samples], 1e9, 2)} "
+            f"| {counted([s.get('analyses') for s in samples], 1, 0)} "
             f"| {median([s['diagnostics_ms'] for s in samples]):.0f} "
             f"| {samples[-1]['errors']} | {keystroke} | {settled} "
             f"| {max(s['memory']['VmHWM'] for s in samples) / 1024:.0f} |"
@@ -543,15 +668,16 @@ def print_table(cold_rows, rows, header):
         if any(s.get("companions") for s in samples):
             print(
                 f"| {name}: every open file | {median([s['all_published_cpu_ms'] for s in samples]):.0f} "
-                f"| | {median([s['all_published_ms'] for s in samples]):.0f} "
+                f"| | | | {median([s['all_published_ms'] for s in samples]):.0f} "
                 f"| {samples[-1]['files_republished']} files | | | |"
             )
     print()
     print("Medians over the runs. E121's targets: <10 ms on the keystroke path, <500 ms to errors.")
     print(
         "CPU is the whole server process (every thread) from the edit to the analysis's publish for the file, and "
-        "to idle; wall includes the debounce and the machine's load. Keystroke requests are asked before the "
-        "analysis lands; idle requests after it."
+        "to idle; instructions are user-space, every thread, edit to idle; wall includes the debounce and the "
+        "machine's load. Keystroke requests are asked before the analysis lands; idle requests after it. A pause "
+        "row rests until the server has been quiet for its pause; every other row resumes after 0.4 s."
     )
 
 
@@ -609,6 +735,9 @@ def main():
         scenarios = scenarios[:1]
         arguments.runs = 1
 
+    # The server prints one `lsp-context` line per analysis under this
+    # variable — the analysis count per edit (E244). It writes to stderr only.
+    env.setdefault("VILAN_PHASE_TIMING", "1")
     load_before = load_average()
     server = Server(command, root, env, scratch / "vilan-lsp.stderr")
     print(f"server pid {server.pid}: {' '.join(command)}", file=sys.stderr)
@@ -631,6 +760,9 @@ def main():
             },
         )
         server.notify("initialized", {})
+        # E244: attached once the server's threads exist; threads it spawns
+        # later inherit the counter.
+        server.instructions = InstructionCounter(server.pid)
         cold_rows, rows = {}, {}
         for scenario in scenarios:
             print(f"  {scenario['name']} ...", file=sys.stderr)
