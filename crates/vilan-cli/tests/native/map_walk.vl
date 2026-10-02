@@ -1,4 +1,4 @@
-// A138 S1: a `MapCell` under a seeded random walk of every write it has —
+// A138 S1: a `HashMapCell` under a seeded random walk of every write it has —
 // insert, overwrite, remove (held and absent), update, get_or_insert, edit,
 // reconcile_to, set, clear — checked after EVERY step against a plain
 // `HashMap` written the same way: the cell's map, the map a consumer rebuilds
@@ -6,7 +6,7 @@
 // and how often it woke.
 import std::hash_map::HashMap;
 import std::option::Option::{ self, None, Some };
-import std::reactive::{ DeltaSource, MapCell, MapOp, Source, Subscription };
+import std::reactive::{ DeltaSource, HashMapCell, MapOp, Source, Subscription };
 import std::shared::Shared;
 
 mut seed = 4242;
@@ -29,7 +29,7 @@ fun replay(mirror: &mut HashMap<i32, i32>, ops: List<MapOp<i32, i32>>) {
 }
 
 fun main() {
-	let cell: MapCell<i32, i32> = MapCell::new();
+	let cell: HashMapCell<i32, i32> = HashMapCell::new();
 	mut oracle: HashMap<i32, i32> = HashMap::new();
 	mut mirror: HashMap<i32, i32> = HashMap::new();
 	let cursor = cell.cursor();

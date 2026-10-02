@@ -1626,12 +1626,12 @@ fn a142_collection_pipes_build_the_same_on_both_backends() {
     }
 }
 
-/// A138 S1 and S2: `MapCell`, `SetCell` and the map operators on both backends —
+/// A138 S1 and S2: `HashMapCell`, `HashSetCell` and the map operators on both backends —
 /// their seeded random walks (`inference/maps.rs` runs the same programs on JS),
 /// checked against a plain `HashMap`/`HashSet` after every write: the collection
 /// and its order, a mirror replayed from the drained ops, every watched key's
-/// handle and how often it woke — plus `keys()`, a set pipe, and a `MapEntry`'s
-/// `set(Some(v))`/`set(None)` writes. `SetCell`, `SetOp` and `keys()` were
+/// handle and how often it woke — plus `keys()`, a set pipe, and a `HashMapEntry`'s
+/// `set(Some(v))`/`set(None)` writes. `HashSetCell`, `SetOp` and `keys()` were
 /// refused natively until F72 (a variant of the one-parameter, BOUNDED
 /// `SetOp<T: Hashable>` was typed as a bare trait object).
 #[test]
@@ -1641,7 +1641,7 @@ fn a138_map_and_set_cells_build_the_same_on_both_backends() {
         (
             "native_probe_map_walk.vl",
             include_str!("native/map_walk.vl"),
-            "a MapCell",
+            "a HashMapCell",
         ),
         // A138 S2: the map operators' walk.
         (
@@ -1652,7 +1652,7 @@ fn a138_map_and_set_cells_build_the_same_on_both_backends() {
         (
             "native_probe_set_walk.vl",
             include_str!("native/set_walk.vl"),
-            "a SetCell",
+            "a HashSetCell",
         ),
         (
             "native_probe_map_keys_pipe.vl",
@@ -1662,7 +1662,7 @@ fn a138_map_and_set_cells_build_the_same_on_both_backends() {
         (
             "native_probe_map_entry_writes.vl",
             include_str!("native/map_entry_writes.vl"),
-            "a MapEntry's writes",
+            "a HashMapEntry's writes",
         ),
     ] {
         std::fs::write(staged.join(name), program).expect("write the probe program");
@@ -8668,8 +8668,8 @@ fn the_spelled_copy_of_a_view_expression_is_identical_on_both_backends() {
 /// argument sent the whole list to the fallback. The probe covers an annotated
 /// binding, the payload alone, an argument position, `Option` and list
 /// nesting, a generic function at two instances, a generic impl, two bounds
-/// on one parameter, and two bounded parameters. It blocked `SetCell`,
-/// `SetOp` and `MapCell::keys()`.
+/// on one parameter, and two bounded parameters. It blocked `HashSetCell`,
+/// `SetOp` and `HashMapCell::keys()`.
 #[test]
 fn a_variant_of_an_enum_with_a_bounded_parameter_is_identical_on_both_backends() {
     let staged = stage();

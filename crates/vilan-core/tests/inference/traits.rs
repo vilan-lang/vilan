@@ -3484,16 +3484,16 @@ fn a145_a_memo_handle_return_whose_element_is_not_wire_is_refused_at_the_element
     }
 }
 
-/// A138: a map's PER-KEY handle — `MapCell::at(key)`'s `MapEntry<K, V>`, and a
+/// A138: a map's PER-KEY handle — `HashMapCell::at(key)`'s `HashMapEntry<K, V>`, and a
 /// sealed map pipe's `MemoEntry<K, V>` — is a handle return, a mirror of
 /// `Option<V>` at the client, so `V` is what must be Wire and the refusal names it;
-/// over a Wire value both compile. `Option<MapEntry<..>>` is NOT a handle (a
+/// over a Wire value both compile. `Option<HashMapEntry<..>>` is NOT a handle (a
 /// per-key handle already answers `None` for an absent key), so it meets the
 /// ordinary Wire refusal, on both the written and the resolved side.
 #[test]
 fn a138_a_map_entry_handle_return_is_judged_by_its_value() {
     for (returned, body) in [
-        ("MapEntry<i32, Secret>", "self.secrets.at(1)"),
+        ("HashMapEntry<i32, Secret>", "self.secrets.at(1)"),
         (
             "MemoEntry<i32, Secret>",
             "self.secrets.map_values(|secret| secret).memo().at(1)",
@@ -3502,11 +3502,11 @@ fn a138_a_map_entry_handle_return_is_judged_by_its_value() {
         let source = format!(
             r#"
         import std::io::print;
-        import std::reactive::{{ MapCell, MapEntry, MemoEntry }};
+        import std::reactive::{{ HashMapCell, HashMapEntry, MemoEntry }};
         struct Secret {{ token: str }}
         [service(StoreClient)]
         struct Store {{
-            secrets: MapCell<i32, Secret>,
+            secrets: HashMapCell<i32, Secret>,
         }}
         impl Store {{
             [rpc]
@@ -3524,14 +3524,14 @@ fn a138_a_map_entry_handle_return_is_judged_by_its_value() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::reactive::{ MapCell, MapEntry, MemoEntry };
+        import std::reactive::{ HashMapCell, HashMapEntry, MemoEntry };
         [service(InboxClient)]
         struct Inbox {
-            messages: MapCell<i32, str>,
+            messages: HashMapCell<i32, str>,
         }
         impl Inbox {
             [rpc]
-            fun message(self, id: i32): MapEntry<i32, str> { self.messages.at(id) }
+            fun message(self, id: i32): HashMapEntry<i32, str> { self.messages.at(id) }
             [rpc]
             fun shouted(self, id: i32): MemoEntry<i32, str> {
                 self.messages.map_values(|text| text.to_uppercase()).memo_global().at(id)
@@ -3544,14 +3544,14 @@ fn a138_a_map_entry_handle_return_is_judged_by_its_value() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::reactive::{ MapCell, MapEntry };
+        import std::reactive::{ HashMapCell, HashMapEntry };
         [service(InboxClient)]
         struct Inbox {
-            messages: MapCell<i32, str>,
+            messages: HashMapCell<i32, str>,
         }
         impl Inbox {
             [rpc]
-            fun message(self, id: i32): Option<MapEntry<i32, str>> { Some(self.messages.at(id)) }
+            fun message(self, id: i32): Option<HashMapEntry<i32, str>> { Some(self.messages.at(id)) }
         }
         fun main() { print("inbox"); }
         main();

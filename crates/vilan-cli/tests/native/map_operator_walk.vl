@@ -1,9 +1,9 @@
 // A138 S2: the map operators under a seeded random walk of every write a
-// `MapCell` has, interleaved with flips of the flows the closures answer,
+// `HashMapCell` has, interleaved with flips of the flows the closures answer,
 // checked after EVERY step against a recomputation from the map itself.
 import std::hash_map::HashMap;
 import std::option::Option::{ self, None, Some };
-import std::reactive::{ MapCell, Signal, SignalCell, Source, comp };
+import std::reactive::{ HashMapCell, Signal, SignalCell, Source, comp };
 
 mut seed = 7;
 
@@ -23,7 +23,7 @@ fun main() {
 		Signal::new(false),
 		Signal::new(true),
 	];
-	let cell: MapCell<i32, i32> = MapCell::of([(1, 10), (2, 21), (3, 30)].to_map());
+	let cell: HashMapCell<i32, i32> = HashMapCell::of([(1, 10), (2, 21), (3, 30)].to_map());
 	let (outs, scope) = comp(|| {
 		let values = cell.values().memo();
 		let entries = cell.entries().memo();

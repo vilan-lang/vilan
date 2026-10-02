@@ -1,10 +1,10 @@
-// A138 S1's `MapEntry` writes natively: `at(key)` is a `Signal<Option<V>>`,
+// A138 S1's `HashMapEntry` writes natively: `at(key)` is a `Signal<Option<V>>`,
 // `set(Some(v))` inserts the key and `set(None)` removes it (F73's shape). The
 // program is `inference::maps`' `a138_s1_a_map_entry_writes_its_key`.
 import std::io::print;
 import std::hash_map::HashMap;
 import std::option::Option::{ self, None, Some };
-import std::reactive::{ DeltaSource, MapCell, MapOp, Signal, Source, comp };
+import std::reactive::{ DeltaSource, HashMapCell, MapOp, Signal, Source, comp };
 
 fun opt(value: Option<i32>): str {
 	match value {
@@ -26,7 +26,7 @@ fun describe(ops: List<MapOp<str, i32>>): str {
 }
 
 fun main() {
-	let cell: MapCell<str, i32> = MapCell::new();
+	let cell: HashMapCell<str, i32> = HashMapCell::new();
 	let entry = cell.at("k");
 	mut seen: List<str> = [];
 	let watch = entry.sub(|value| seen.push(opt(value)));

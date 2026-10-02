@@ -77,14 +77,20 @@ const CENSUS: &[(&str, usize, &str)] = &[
          `count()`'s counter and `sum_by`'s accumulator.",
     ),
     (
-        "map_cell.vl",
+        "hash_map_cell.vl",
         4,
-        "E (A138 S1): a `MapCell`'s own map, a `KeySlots` table, and each \
+        "E (A138 S1): a `HashMapCell`'s own map, a `KeySlots` table, and each \
          watched key's subscription count; +1 at A138's wire reply, the table of \
-         each asked key's identity (`MapEntry::identity`). Each is minted by the cell (or the \
+         each asked key's identity (`HashMapEntry::identity`). Each is minted by the cell (or the \
          first subscription on a key) and read and written through every copy \
          of the handle and by the slot's release, which a disposal elsewhere \
          runs: the E class, as `ListCell`'s list is",
+    ),
+    (
+        "hash_set_cell.vl",
+        1,
+        "E (A138 S1): a `HashSetCell`'s own set, as `HashMapCell`'s map (its slots are \
+         a `KeySlots`, counted in `hash_map_cell.vl`)",
     ),
     (
         "memo.vl",
@@ -155,12 +161,6 @@ const CENSUS: &[(&str, usize, &str)] = &[
          client's wire demand (R: one per `ReactiveClient`, every mirror's \
          `Subscribe`/`Unsubscribe` registered in it, cleared by a reconnect \
          and by `dispose`).",
-    ),
-    (
-        "set_cell.vl",
-        1,
-        "E (A138 S1): a `SetCell`'s own set, as `MapCell`'s map (its slots are \
-         a `KeySlots`, counted in `map_cell.vl`)",
     ),
     (
         "shared.vl",

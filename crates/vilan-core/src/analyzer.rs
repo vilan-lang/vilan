@@ -19436,7 +19436,7 @@ impl<'src> Analyzer<'src> {
                 // A138: a map's PER-KEY handle crosses as a plain mirror of
                 // `Option<V>`; `V` is what has to be Wire, and the key stays on
                 // the server.
-                ("MapEntry" | "MemoEntry", [_key, value]) => Some(*value),
+                ("HashMapEntry" | "MemoEntry", [_key, value]) => Some(*value),
                 _ => None,
             },
             Type::Enum(id, arguments) => match (
@@ -19469,7 +19469,7 @@ impl<'src> Analyzer<'src> {
         match type_id.get_type(self) {
             Type::Struct(id, _) => matches!(
                 self.structs.get(&id).map(|struct_| struct_.name),
-                Some("MapEntry" | "MemoEntry")
+                Some("HashMapEntry" | "MemoEntry")
             ),
             _ => false,
         }
@@ -62725,7 +62725,7 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
                 _ => None,
             }
         }
-        // A138: `MapEntry<K, V>` (`MapCell::at(key)`) and its sealed twin
+        // A138: `HashMapEntry<K, V>` (`HashMapCell::at(key)`) and its sealed twin
         // `MemoEntry<K, V>` cross as a plain mirror of `Option<V>`; the value
         // is what has to be Wire, and the key stays on the server.
         Node::AccessorWithGenerics(_, arguments) if is_entry_handle_spelling(node) => {
@@ -62758,13 +62758,13 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
     }
 }
 
-/// Whether a written return is a map's PER-KEY handle (A138): `MapEntry<K, V>`
+/// Whether a written return is a map's PER-KEY handle (A138): `HashMapEntry<K, V>`
 /// or `MemoEntry<K, V>` — `std::rpc`'s `handle_element` reads the same names.
 fn is_entry_handle_spelling(node: &Node) -> bool {
     matches!(
         node,
         Node::AccessorWithGenerics(name, arguments)
-            if (*name == "MapEntry" || *name == "MemoEntry") && arguments.0.len() == 2
+            if (*name == "HashMapEntry" || *name == "MemoEntry") && arguments.0.len() == 2
     )
 }
 
