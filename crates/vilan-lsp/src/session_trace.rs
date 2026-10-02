@@ -165,9 +165,34 @@ pub struct AnalysisTally {
     /// M27, in whole milliseconds — see [`AnalysisCounts::index_total_ms`].
     index_total_ms: AtomicU64,
     index_max_ms: AtomicU64,
+    /// M104: the package clock's legs — analyzed, and taken from an open
+    /// entry's landed analysis instead. See [`AnalysisTally::union_legs`].
+    union_legs_analyzed: AtomicU64,
+    union_legs_reused: AtomicU64,
 }
 
 impl AnalysisTally {
+    /// M104: one package-clock leg that analyzed its entry.
+    pub fn record_union_leg_analyzed(&self) {
+        self.union_legs_analyzed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M104: one package-clock leg taken from an open entry's landed analysis.
+    pub fn record_union_leg_reused(&self) {
+        self.union_legs_reused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(analyzed, reused)` package-clock legs this session (M104). Kept out of
+    /// [`AnalysisCounts`]: the clock's analyses are not the debounced path's,
+    /// and the session page's columns are that path's. Read by the pins.
+    #[cfg(test)]
+    pub fn union_legs(&self) -> (u64, u64) {
+        (
+            self.union_legs_analyzed.load(Ordering::Relaxed),
+            self.union_legs_reused.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn record_started(&self) {
         self.started.fetch_add(1, Ordering::Relaxed);
     }
