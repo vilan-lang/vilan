@@ -8953,3 +8953,105 @@ fn a_deref_of_a_conditional_view_is_identical_on_both_backends() {
         "`*` over a conditional view must copy the chosen value on both backends"
     );
 }
+
+/// A142 S7 S1 (`proposal/store.md`): a derived struct's store builds and wakes
+/// the same on both backends — a nested struct, a whole write that wakes only the
+/// changed spine, a handle write committed along the spine, a write of the value
+/// held, `notify`, a `[reactive(coarse)]` field, a `[reactive(name = "..")]`
+/// projection, an `Option` field through its `Some` (read and patched), a generic
+/// struct, and the slot census through subscribe and dispose.
+#[test]
+fn a142_s7_a_struct_store_builds_and_wakes_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_struct.vl"),
+        include_str!("native/store_struct.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_struct.vl"),
+        Verdict::Identical,
+        "a struct store must build and wake the same on both backends"
+    );
+}
+
+/// A142 S7: OBSERVING a `StoreSome<P>` — `nick.effect(..)` — is refused by name
+/// natively. It is not the store's: any generic `W<P>` implementing
+/// `Source<Option<P>>` leaves `P` unbound when a consumer starts it through the
+/// `Flow` blanket (the minimal repro is the second program). Reading and
+/// patching one build (the struct probe above). When the backend closes the
+/// gap this reds, and `store_struct.vl` takes the observer.
+#[test]
+fn a142_s7_observing_a_store_some_is_refused_by_name_natively() {
+    let staged = stage();
+    for (name, program) in [
+        ("native_probe_store_some_observed.vl", STORE_SOME_OBSERVED),
+        (
+            "native_probe_option_source_observed.vl",
+            OPTION_SOURCE_OBSERVED,
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        match compare(&staged, name) {
+            Verdict::Refused(reason) => assert!(
+                reason.contains("unbound generic type parameter"),
+                "{name}: refused for another reason: {reason}"
+            ),
+            other => panic!(
+                "{name}: the native backend now answers ({other:?}) — move the observer into \
+                 `native/store_struct.vl` and retire this pin"
+            ),
+        }
+    }
+}
+
+const STORE_SOME_OBSERVED: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Owner, Signal, Source, run_with_owner };\n",
+    "import std::store::{ Storable, Store };\n",
+    "\n",
+    "[derive(Storable)]\n",
+    "struct Profile {\n",
+    "\tnick: Option<str>,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet profile = Store::new(Profile { nick = Some(\"al\") });\n",
+    "\tlet watching = Owner::new();\n",
+    "\trun_with_owner(watching, || {\n",
+    "\t\tprofile.nick().some().effect(|n| print(n.unwrap_or(\"-\")));\n",
+    "\t});\n",
+    "\tlet _landed = profile.nick().some().patch(\"ally\");\n",
+    "\twatching.dispose();\n",
+    "}\n",
+);
+
+const OPTION_SOURCE_OBSERVED: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Owner, Signal, SignalCell, Source, Subscriber, Subscription, run_with_owner };\n",
+    "\n",
+    "struct W<P> {\n",
+    "\tcell: SignalCell<Option<P>>,\n",
+    "}\n",
+    "\n",
+    "impl W<type P> with Source<Option<P>> {\n",
+    "\tfun get(self): Option<P> {\n",
+    "\t\tself.cell.get()\n",
+    "\t}\n",
+    "\n",
+    "\t[must_use]\n",
+    "\tfun on_settle(self, subscriber: Subscriber): Subscription {\n",
+    "\t\tself.cell.on_settle(subscriber)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet w = W { cell = SignalCell::new(Some(\"a\")) };\n",
+    "\tlet watching = Owner::new();\n",
+    "\trun_with_owner(watching, || {\n",
+    "\t\tw.effect(|n| print(n.unwrap_or(\"-\")));\n",
+    "\t});\n",
+    "\tw.cell.set(Some(\"b\"));\n",
+    "\twatching.dispose();\n",
+    "}\n",
+);

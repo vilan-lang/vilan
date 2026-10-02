@@ -162,6 +162,15 @@ const CENSUS: &[(&str, usize, &str)] = &[
         "E (A138 S1): a `SetCell`'s own set, as `MapCell`'s map (its slots are \
          a `KeySlots`, counted in `map_cell.vl`)",
     ),
+    (
+        "store.vl",
+        4,
+        "E: a store's cells, all minted by the store and reached through every copy \
+         of a handle (A142 S7, `proposal/store.md`) — the root's value (`Store::new`), \
+         each node of its slot tree, a slot's subscription count (read by the \
+         subscription's release, Q12), and the payload `assume()` falls back to \
+         (held by the `Store<P>` it hands back)",
+    ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
     (
         "transient.vl",
@@ -282,7 +291,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 192,
+        total, 196,
         "the total number of `Shared` construction sites in std changed"
     );
 

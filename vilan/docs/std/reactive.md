@@ -1,7 +1,9 @@
 # std::reactive reference
 
 Signals, effects, ownership, turns, and the higher-level cells. Concepts and
-usage patterns: the [reactive guide](../guide/reactive.md).
+usage patterns: the [reactive guide](../guide/reactive.md). The fine-grained
+version of a whole struct — a handle per field, generated from the type — is a
+[store](store.md).
 
 Import what you use:
 

@@ -5574,7 +5574,7 @@ fn b376_the_refusal_names_what_is_derivable() {
 
         fun main() {}
         "#,
-        "std derives `PartialEq`, `Default`, `Debug`, `Json`, `Wire`, `Hashable`",
+        "std derives `PartialEq`, `Default`, `Debug`, `Json`, `Wire`, `Hashable`, `Storable`",
     );
 }
 

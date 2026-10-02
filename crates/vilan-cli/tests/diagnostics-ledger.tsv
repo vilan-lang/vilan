@@ -630,3 +630,4 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 605	-	unused pipe: a pipe runs nothing until it is consumed — seal it (`.memo()`), consume it (`.effect(..)`, a binding), or `let _ = …` to discard.
 NEW	-	`[reactive(name = "..")]` names the field's PROJECTION — a method on the store handle — so it must be an identifier: letters, digits and `_`, not starting with a digit
 NEW	-	`[reactive(..)]` on a field takes `coarse` (one slot, compared whole, even when the field's type derives `Storable`) and `name = ".."` (the name its store projection is generated under), comma-separated: `[reactive(coarse)]`, `[reactive(name = "nick")]`
+NEW	-	`[derive(Storable)]` on `{name}`: the field `{field}` would project as `{method}()`, which a store handle already has (`{method}` is a handle member, and an inherent member wins over a projection) — rename the projection with `[reactive(name = "..")]` on the field
