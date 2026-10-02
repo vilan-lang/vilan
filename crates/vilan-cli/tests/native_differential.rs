@@ -8932,3 +8932,24 @@ fn a_for_mut_element_handed_on_is_identical_on_both_backends() {
         "a `for` element over `&mut xs` must be handed on by reborrow and print the same"
     );
 }
+
+/// F81: `*if c { &a } else { &b }` — the spelled copy B496's refusal steers to
+/// — builds natively over a list and a struct, through a `match`, and nested;
+/// it was emitted as a deref of the branches' COPIES (rustc E0599/E0614). A
+/// branch tail is a value position here, so each leaf is its copy already and
+/// the `*` is dropped. (A SCALAR or `str` chosen this way prints the place pair
+/// on JS — reported — so the probe holds aggregates.)
+#[test]
+fn a_deref_of_a_conditional_view_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_deref_of_a_conditional_view.vl"),
+        include_str!("native/deref_of_a_conditional_view.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_deref_of_a_conditional_view.vl"),
+        Verdict::Identical,
+        "`*` over a conditional view must copy the chosen value on both backends"
+    );
+}

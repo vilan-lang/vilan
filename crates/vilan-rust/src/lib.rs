@@ -4170,6 +4170,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     format!("&{}", self.expression(operand, depth)?)
                 }
             }
+            // F81: `*if c { &a } else { &b }` — the spelled copy of a view a
+            // branch chooses. The branches' tails are value positions here, so
+            // each leaf is already its copy, and the `*` has nothing to cross.
+            Expr::Dereference(operand) if self.is_conditional(operand) => {
+                self.expression(operand, depth)?
+            }
             Expr::Dereference(operand) => format!("(*{})", self.expression(operand, depth)?),
             Expr::Call(call_id) => self.call(id, call_id, depth, span)?,
             Expr::Async(spawned) => self.async_spawn(id, spawned, depth, span)?,
@@ -5410,6 +5416,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .enums
             .get(enum_id)
             .is_some_and(|declaration| matches!(declaration.name, "Option" | "Result"))
+    }
+
+    /// Whether an expression CHOOSES its value among branches — an `if`, a
+    /// `match` — whose tails this emitter renders as value positions.
+    fn is_conditional(&self, id: Id) -> bool {
+        matches!(
+            self.program.entity_map.get(&id),
+            Some(Expr::If(_) | Expr::Match(..))
+        )
     }
 
     /// Whether a type is one of the numeric scalar primitives — the set
@@ -9722,8 +9737,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // 1's copy, never a move out of the reference (rustc E0507). It is
             // never a last use either: what dies here is the view, not the
             // place it names.
-            Some(Expr::Dereference(_)) => {
-                if self.is_natively_copy(id) {
+            Some(Expr::Dereference(operand)) => {
+                // F81: over a conditional the leaves are the copies already.
+                if self.is_natively_copy(id) || self.is_conditional(*operand) {
                     return rendered;
                 }
                 self.copies_taken += 1;

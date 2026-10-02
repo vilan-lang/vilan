@@ -303,6 +303,11 @@ written down.
 <!-- family: fix -->
 **Native builds a `for e in &mut xs` element handed on: `fun each<T>(xs: &mut List<T>, f: |&mut T| void) { for e in &mut xs { f(e) } }` was refused by rustc (E0596), and builds and prints node's bytes now.** The element is an `iter_mut` item — already a `&mut` loan — and was handed on as `&mut e`; it is reborrowed (`&mut *e`) now, as a `&mut` parameter forwarding its loan always was. The JS backend is unchanged. Pin: `a_for_mut_element_handed_on_is_identical_on_both_backends`. Tracker F80.
 
+---
+
+<!-- family: fix -->
+**Native builds `*if c { &a } else { &b }` — the spelled copy of a view a branch chooses, over a list or a struct, through a `match` or nested — which rustc refused (E0599, E0614).** The branches' tails are value positions natively, so each leaf was already its copy, and the `*` over them dereferenced a value; it is dropped over an `if` or a `match` now. The JS backend is unchanged. Pin: `a_deref_of_a_conditional_view_is_identical_on_both_backends`. Tracker F81.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->
