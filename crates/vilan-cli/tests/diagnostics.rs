@@ -633,8 +633,12 @@ fn phase_timing_passes_prints_the_per_pass_split_and_the_emission_row() {
         .lines()
         .filter(|line| line.starts_with("[vilan pass]"))
         .collect();
+    // A host with no per-thread CPU clock (Windows: the phase lines read
+    // `/?cpu`) has nothing to split by, so the split prints no line there —
+    // the row below is what every host must print.
+    let host_has_a_thread_cpu_clock = !split.contains("/?cpu");
     assert!(
-        !pass_lines.is_empty(),
+        !pass_lines.is_empty() || !host_has_a_thread_cpu_clock,
         "VILAN_PHASE_TIMING=passes printed no per-pass line; stderr was: {split}"
     );
     for line in &pass_lines {
