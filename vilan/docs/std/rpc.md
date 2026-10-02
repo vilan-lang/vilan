@@ -59,7 +59,7 @@ impl RemoteSource<type T> {
 	fun status(self): SignalCell<Status>                      // passive: what the mirror was last told
 	fun or(self, initial: T): Derive<RemoteSource<T>, Option<T>, T>   // a pipe: `initial` until the first update
 	[must_use]
-	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
+	fun sub(self, observer: (|T| void) context tracking): Subscription  // counted, manual: present values; dispose to release
 }
 
 // A mirror is a transient source (std::transient): Status mapped arm for arm.

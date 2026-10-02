@@ -1960,6 +1960,45 @@ fn analyze(
                 carrier_classes.unite(CarrierKey::Carrier(carrier), CarrierKey::Type(type_id));
             }
         }
+        // A trait member's clause parameter and the same parameter of every
+        // member that implements it are ONE position: a literal passed through a
+        // bound (`flow.sub(|v| ..)` with `F: Flow<T>`) lands at the DECLARATION's
+        // parameter, and the call that runs it is in whichever impl the bound
+        // dispatches to. Without the union a literal at the declaration missed an
+        // impl's `clear` — read as present on JS, and rendered bare where the
+        // impl's type is an `Option` natively (reactive-45's B482 std half).
+        for trait_ in program.traits.values() {
+            for (name, &declared) in &trait_.declarations {
+                let Some(declaration) = program.functions.get(&declared) else {
+                    continue;
+                };
+                for implementation in program
+                    .implementations
+                    .iter()
+                    .filter(|implementation| implementation.trait_ids.contains(&trait_.id))
+                {
+                    let Some(implementing) = implementation
+                        .declarations
+                        .get(name)
+                        .and_then(|member| program.functions.get(member))
+                    else {
+                        continue;
+                    };
+                    for (declared_parameter, implementing_parameter) in
+                        declaration.parameters.iter().zip(&implementing.parameters)
+                    {
+                        if value_contexts.contains_key(declared_parameter)
+                            && value_contexts.contains_key(implementing_parameter)
+                        {
+                            carrier_classes.unite(
+                                CarrierKey::Carrier(Carrier::Value(*declared_parameter)),
+                                CarrierKey::Carrier(Carrier::Value(*implementing_parameter)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // --- B324: a clause written where the threading cannot follow it. ---
         // Each of the four writing positions above has a landing rule, and a

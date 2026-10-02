@@ -42,6 +42,7 @@ import pkg::reactive::{
 	owner_scope,
 	read_once,
 	run_with_owner,
+	tracking,
 	turn_scope,
 };
 import pkg::shared::Shared;
@@ -166,7 +167,7 @@ export impl View {
 	/// An event listener — ACCEPTED AND DISCARDED: a server-rendered element
 	/// carries no handler wiring. Kept in the surface so the same component code
 	/// compiles on both legs; the handler is the client's business.
-	fun on(self, event: str, handler: (|| void) context turn_scope): View {
+	fun on(self, event: str, handler: (|| void) context (turn_scope, tracking)): View {
 		self
 	}
 
@@ -177,7 +178,7 @@ export impl View {
 	/// accepted. (This is what lets a browser module like `std::router`, whose
 	/// `link` binds an `on_event`, still resolve `std::ui` when the analyzer loads
 	/// it to compute a process build's cross-platform requirements.)
-	fun on_event<E>(self, event: str, handler: (|E| void) context turn_scope): View {
+	fun on_event<E>(self, event: str, handler: (|E| void) context (turn_scope, tracking)): View {
 		self
 	}
 

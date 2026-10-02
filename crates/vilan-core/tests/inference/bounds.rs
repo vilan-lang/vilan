@@ -14068,6 +14068,45 @@ fun plain(callback: (|i32| void) context current) {
 /// A SEPARATE position written with the same closure type as a cleared one is
 /// its own position: each annotation is its own closure type, so `plain`'s
 /// literal is not reached by `notify`'s `clear` and still reads strictly.
+/// A literal passed through a TRAIT BOUND lands at the trait's declaration of
+/// the member, and the call that clears it is in the impl the bound dispatches
+/// to: the two parameters are one position (reactive-45, found with B482's std
+/// half). The literal reads the cleared state, and a strict read in it is the
+/// cleared refusal. Red before the union: `1 some 7` — the literal was handed
+/// the run's value though the impl called it cleared (and natively its hidden
+/// parameter was rendered bare where the impl's type is an `Option`).
+#[test]
+fn b482_a_literal_through_a_bound_is_cleared_by_the_impl_it_dispatches_to() {
+    let head = r#"
+trait Notifier {
+    fun notify(self, callback: (|i32| void) context current);
+}
+
+struct Plain {}
+
+impl Plain with Notifier {
+    fun notify(self, callback: (|i32| void) context current) {
+        current.clear(|| callback(1));
+    }
+}
+
+fun via<N: Notifier>(notifier: N) {
+    current.run(7, || {
+        notifier.notify(|n| print(i"{n} {describe()}"));
+    });
+}
+"#;
+    assert_compiles_and_runs(
+        &format!("{B458_HEAD}{head}\nfun main() {{\n    via(Plain {{}});\n}}\nmain();\n"),
+        "1 none\n",
+    );
+    let strict = head.replace("print(i\"{n} {describe()}\")", "print(n + current.get())");
+    assert_fails_with(
+        &format!("{B458_HEAD}{strict}\nfun main() {{\n    via(Plain {{}});\n}}\nmain();\n"),
+        "this closure is called with `current` CLEARED",
+    );
+}
+
 #[test]
 fn b482_a_same_typed_separate_position_is_not_cleared() {
     let plain = r#"

@@ -59,6 +59,7 @@ import pkg::reactive::{
 	register_with_owner,
 	run_element,
 	subscriber_of,
+	tracking,
 	wake,
 };
 import pkg::shared::Shared;
@@ -2173,13 +2174,13 @@ export [hint(Pipe<U>)]
 
 export impl CollTally<type F: CollFlow<type T>, T, type R: IntoFlow<bool>, type U> with Flow<U> {
 	[must_use]
-	fun on_change(own self, observer: |U| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|U| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |U| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|U| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<U> {

@@ -363,8 +363,10 @@ fn a142_s6_a_track_outside_every_scope_is_the_coverage_refusal() {
 
 #[test]
 fn a142_s6_a_callback_positions_track_is_refused_when_minted_outside_a_scope() {
-    // An `on_change` observer is a callback, not a body: it opens no scope, so a
-    // `track()` in one written outside every body has nothing to register with.
+    // An `on_change` observer is a callback, not a body: it opens no scope, and
+    // since B482's std half it is CALLED with `tracking` cleared, so a `track()`
+    // in it is refused as a read of a cleared context — wherever the literal is
+    // written (the coverage refusal said "reached without an enclosing `run`").
     assert_fails_with(
         r#"
         import std::reactive::{ Owner, Signal, SignalCell, Source };
@@ -380,7 +382,7 @@ fn a142_s6_a_callback_positions_track_is_refused_when_minted_outside_a_scope() {
 
         main();
         "#,
-        "can be reached without an enclosing `run`",
+        "this closure is called with `tracking` CLEARED: it lands at the parameter `observer` of `on_change`",
     );
 }
 
@@ -734,4 +736,182 @@ fn a146_a_tracked_list_keyed_or_mirror_read_keeps_one_edge_across_runs() {
         "#,
         "list attaches=1\nkeyed cell attaches=1\nmirror attaches=1\nkeyed mirror attaches=1\n5 2 1 7 1\n",
     );
+}
+
+// --- B482's std half (R-g): the base callback positions run CLEARED ----------
+//
+// `on_change`, `sub`, `effect_on_change` and the UI event handlers take their
+// callback `context tracking` and call it under `tracking.clear(..)` (A142 §7.3).
+// A callback minted INSIDE a body — where `tracking` is in scope — therefore
+// reads it as absent, and a `track()` in it is refused at compile time.
+
+#[test]
+fn b482_a_track_in_a_callback_written_inside_a_body_is_refused() {
+    // Each position, written inside an effect body (the scope a `track()` there
+    // would otherwise have seen). Red before the std half: all three compiled,
+    // and the read was a `get()` registered with nothing (the epoch guard).
+    for (position, call) in [
+        (
+            "on_change",
+            "let _held = other.on_change(|_value| { let _read = late.track(); });",
+        ),
+        (
+            "sub",
+            "let _held = other.sub(|_value| { let _read = late.track(); });",
+        ),
+        (
+            "effect_on_change",
+            "other.effect_on_change(|_value| { let _read = late.track(); });",
+        ),
+    ] {
+        let source = format!(
+            r#"
+        import std::reactive::{{ Owner, Signal, SignalCell, Source, run_with_owner }};
+
+        fun main() {{
+            let count: SignalCell<i32> = Signal::new(1);
+            let other: SignalCell<i32> = Signal::new(1);
+            let late: SignalCell<i32> = Signal::new(1);
+            let owner = Owner::new();
+            run_with_owner(owner, || {{
+                count.effect(|_value: i32| {{
+                    {call}
+                }});
+            }});
+        }}
+
+        main();
+        "#
+        );
+        let parameter = if position == "effect_on_change" {
+            "body"
+        } else {
+            "observer"
+        };
+        assert_fails_with(
+            &source,
+            &format!(
+                "this closure is called with `tracking` CLEARED: it lands at the parameter `{parameter}` of `{position}`"
+            ),
+        );
+    }
+}
+
+#[test]
+fn b482_a_callbacks_safe_read_of_tracking_is_none() {
+    // The same three positions, minted inside an effect body, read `tracking`
+    // safely: `None` in the callback, `Some` in the body that minted it. Red
+    // before the std half: the callbacks read the body's captured scope,
+    // `Some` (`true` printed as `false`).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner, tracking };
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            let other: SignalCell<i32> = Signal::new(1);
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                count.effect(|_value: i32| {
+                    print(i"body {tracking.get_safe().is_some()}");
+                    let _changed = other.on_change(|_value| print(i"on_change {tracking.get_safe().is_none()}"));
+                    let _subbed = other.sub(|_value| print(i"sub {tracking.get_safe().is_none()}"));
+                    other.effect_on_change(|_value| print(i"effect_on_change {tracking.get_safe().is_none()}"));
+                });
+            });
+            other.set(2);
+            owner.dispose();
+        }
+
+        main();
+        "#,
+        "body true\nsub true\non_change true\nsub true\neffect_on_change true\n",
+    );
+}
+
+#[test]
+fn b482_a_callback_value_typed_without_the_clause_is_refused_and_both_migrations_compile() {
+    // BREAKING (R-g): a callback VALUE whose type carries no `context tracking`
+    // cannot land at a callback position — the threading cannot clear it. The
+    // two spellings that do: wrap it in a literal, or type it with the clause.
+    let refused = r#"
+        import std::reactive::{ Owner, Signal, SignalCell, Source };
+
+        fun watch(cell: SignalCell<i32>, react: |i32| void) {
+            let owner = Owner::new();
+            owner.take(cell.on_change(react));
+        }
+
+        fun main() {
+            watch(Signal::new(1), |n| print(n));
+        }
+
+        main();
+        "#;
+    assert_fails_with(
+        refused,
+        "a `context`-typed parameter takes a closure literal, a named function or variant, a value with the same `context` clause",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, tracking };
+
+        fun wrapped(cell: SignalCell<i32>, react: |i32| void): Owner {
+            let owner = Owner::new();
+            owner.take(cell.on_change(|value| react(value)));
+            owner
+        }
+
+        fun typed(cell: SignalCell<i32>, react: (|i32| void) context tracking): Owner {
+            let owner = Owner::new();
+            owner.take(cell.on_change(react));
+            owner
+        }
+
+        fun main() {
+            let cell: SignalCell<i32> = Signal::new(1);
+            let first = wrapped(cell, |n| print(i"wrapped {n}"));
+            let second = typed(cell, |n| print(i"typed {n}"));
+            cell.set(2);
+            first.dispose();
+            second.dispose();
+        }
+
+        main();
+        "#,
+        "wrapped 2\ntyped 2\n",
+    );
+}
+
+#[test]
+fn b482_a_track_in_a_ui_event_handler_is_refused() {
+    // The UI event handlers are callback positions too (`on`, `on_event`): a
+    // handler minted inside a body runs CLEARED in the browser.
+    let source = r#"
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::ui::{ View, view };
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            let late: SignalCell<i32> = Signal::new(1);
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                count.effect(|_value: i32| {
+                    let _view: View = view("button").on("click", || {
+                        let _read = late.track();
+                    });
+                });
+            });
+        }
+
+        main();
+        "#;
+    let message = "this closure is called with `tracking` CLEARED: it lands at the parameter `handler` of `on`";
+    assert_fails_browser_with(source, message);
+    // The server's `std::ui` DISCARDS a handler (it is never called), so its
+    // clause is only the signature's: the process leg compiles, and a fullstack
+    // build is refused by its browser leg.
+    assert_compiles(source);
 }

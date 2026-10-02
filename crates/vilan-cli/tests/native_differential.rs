@@ -2684,6 +2684,42 @@ const A146_PROBE: &str = concat!(
     "main();\n",
 );
 
+/// B482's std half: `on_change`, `sub` and `effect_on_change` call their
+/// callback under `tracking.clear(..)`, so a callback minted inside an effect
+/// body reads `tracking` as absent — the same on both backends.
+#[test]
+fn a_base_callback_runs_with_tracking_cleared_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b482_std.vl"), B482_STD_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b482_std.vl"),
+        Verdict::Identical,
+        "a base callback must run with tracking cleared the same way on both backends"
+    );
+}
+
+const B482_STD_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner, tracking };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet other: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet owner = Owner::new();\n",
+    "\trun_with_owner(owner, || {\n",
+    "\t\tcount.effect(|_value: i32| {\n",
+    "\t\t\tprint(i\"body {tracking.get_safe().is_some()}\");\n",
+    "\t\t\tlet _changed = other.on_change(|value| print(i\"on_change {value} {tracking.get_safe().is_none()}\"));\n",
+    "\t\t\tlet _subbed = other.sub(|value| print(i\"sub {value} {tracking.get_safe().is_none()}\"));\n",
+    "\t\t\tother.effect_on_change(|value| print(i\"effect_on_change {value} {tracking.get_safe().is_none()}\"));\n",
+    "\t\t});\n",
+    "\t});\n",
+    "\tother.set(2);\n",
+    "\towner.dispose();\n",
+    "}\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is

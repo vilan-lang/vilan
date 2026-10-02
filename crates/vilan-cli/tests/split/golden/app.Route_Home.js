@@ -1,7 +1,7 @@
 const __vilan_chunks = globalThis.__vilan_chunks;
 const LABEL = __vilan_chunks.fn.LABEL;
 const panel = __vilan_chunks.fn.panel;
-function home_page($cI, $cJ) {
-	return panel("Home", LABEL, $cI, $cJ);
+function home_page($cK, $cL) {
+	return panel("Home", LABEL, $cK, $cL);
 }
 __vilan_chunks.fn.home_page = home_page;

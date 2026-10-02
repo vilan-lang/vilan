@@ -266,11 +266,16 @@ trait Flow<T> {
 	[must_use]
 	fun start(own self): Instance<T>                                  // the stage author's member
 	[must_use]
-	fun on_change(own self, observer: |T| void): Subscription         // no first call
+	fun observe(own self, observer: |T| void, immediately: bool): Subscription
+	                                                                  // the stage author's attach (required)
 	[must_use]
-	fun sub(own self, observer: |T| void): Subscription               // + one immediate call
-	fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
-	                                                                  // owner-registered; an owner per run
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription
+	                                                                  // no first call; a callback (cleared)
+	[must_use]
+	fun sub(own self, observer: (|T| void) context tracking): Subscription
+	                                                                  // + one immediate call; cleared
+	fun effect_on_change(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
+	                                                                  // owner-registered; an owner per run; cleared
 	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
 	                                                                  // the same, eager; the body tracks
 	fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
@@ -550,7 +555,7 @@ fun main() {
 
 ```vilan,fragment
 fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
-fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+fun effect_on_change(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
 fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
 fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, tracking, ambient_nursery)): Switch<Self, T, I, U>
 fun on_cleanup(cleanup: || void)

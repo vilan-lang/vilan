@@ -163,13 +163,19 @@ fun main() {
 
 ## Callbacks do not track
 
-`on_change`, `sub` and `effect_on_change` take **callbacks**, not bodies: they
-open no scope of their own. A `track()` in a callback written outside every body
-is refused at compile time. One written inside a body captured that body's run,
-and when the callback fires later it registers nothing — the run it belonged to
-is over. Either way a callback never becomes a hidden dependency of anything. (The second case is guarded when the callback runs; making it a compile-time
-refusal too — a callback parameter that runs its callback with the scope cleared —
-is a planned follow-up.)
+`on_change`, `sub`, `effect_on_change` and the UI event handlers (`on`,
+`on_event`) take **callbacks**, not bodies: they open no scope of their own, and
+they run their callback with `tracking` **cleared**. So a `track()` in a callback
+is refused at compile time wherever the callback is written — inside a body or
+outside every body — and `tracking.get_safe()` in one reads `None`. A callback
+never becomes a hidden dependency of anything.
+
+A callback position's parameter is typed `context tracking`, so it takes a
+closure literal, a named function, or a value whose type carries the same
+clause. A closure VALUE typed without it — `fun watch(react: |i32| void)` handing
+`react` on — is refused there; wrap it in a literal
+(`cell.on_change(|value| react(value))`) or type it
+`(|i32| void) context tracking`.
 
 `on_change` over a pipe that tracks still hears its first change: a consumer
 that does not read at once *primes* the pipe — it runs the pipe's bodies once,

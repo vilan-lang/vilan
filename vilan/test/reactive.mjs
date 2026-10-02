@@ -815,41 +815,49 @@ function $j(self, $k, $l) {
 function $g(self, $h, $i) {
 	return [ $j(self, $h, $i) ];
 }
-function $bl(signal, observer) {
+function $bm(signal, observer) {
 	const cell = signal[0];
 	return $q(signal, mint_subscriber(() => {
-		const $bm = [ 0, cell ];
-		let $bn = null;
-		if ($bm[0] === 0) {
-			const live = $bm[1];
-			$bn = observer(live.v);
+		const $bn = [ 0, cell ];
+		let $bo = null;
+		if ($bn[0] === 0) {
+			const live = $bn[1];
+			$bo = observer(live.v);
 		} else {
-			$bn = undefined;
+			$bo = undefined;
 		}
-		return $bn;
+		return $bo;
 	}));
 }
-function $bk(self, observer, immediately) {
-	const subscription = $bl(self, observer);
+function $bl(self, observer, immediately) {
+	const subscription = $bm(self, observer);
 	if (immediately) {
 		observer($o(self));
 	}
 	return subscription;
 }
-function $bj(self, observer, immediately) {
-	return $bk(self[0], observer, immediately);
+function $bk(self, observer, immediately) {
+	return $bl(self[0], observer, immediately);
 }
-function $bi(self, observer) {
-	return $bj(self, observer, true);
+function $bj(self, observer) {
+	return $bk(self, (value) => {
+		return (() => {
+			return observer(value, [ 1 ]);
+		})();
+	}, true);
 }
-function $bo(self, transform, $bp) {
-	$aO(self, transform($o(self)), $bp);
+function $bp(self, transform, $bq) {
+	$aO(self, transform($o(self)), $bq);
 }
-function $bq(self) {
+function $br(self) {
 	return $o(self[0]);
 }
-function $br(self, observer) {
-	return $bk(self, observer, true);
+function $bt(self, observer) {
+	return $bl(self, (value) => {
+		return (() => {
+			return observer(value, [ 1 ]);
+		})();
+	}, true);
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
@@ -863,15 +871,15 @@ const count = $a(0);
 const doubled = $g($f(__clone(count), (n, $c, $d, $e) => {
 	return n * 2;
 }), [ 1 ], [ 1 ]);
-$bc(owner, $bi(__clone(doubled), (n) => {
+$bc(owner, $bj(__clone(doubled), (n, $bi) => {
 	return console.log(n);
 }), [ 1 ]);
 $aO(count, 1, [ 1 ]);
-$bo(count, (n) => {
+$bp(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
-console.log($bq(doubled));
-$bc(owner, $br(__clone(count), (n) => {
+console.log($br(doubled));
+$bc(owner, $bt(__clone(count), (n, $bs) => {
 	return console.log(n);
 }), [ 1 ]);
 $aO(count, 20, [ 1 ]);

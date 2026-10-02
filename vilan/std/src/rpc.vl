@@ -60,6 +60,7 @@ import pkg::reactive::{
 	owner_scope,
 	queue_microtask,
 	register_with_owner,
+	tracking,
 	turn,
 };
 import pkg::result::Result::{ self, Err, Ok };
@@ -4445,7 +4446,9 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 		if immediately {
 			self.lease(observer)
 		} else {
-			let subscription = self.cache.on_change(observer);
+			// The cell's own attach: `observer` is the plain closure a callback
+			// position already cleared, so it goes on as it is.
+			let subscription = self.cache.attach_observer(observer, false);
 			subscription.release.write() = Some(|| self.release());
 			self.acquire();
 			subscription
@@ -4591,10 +4594,11 @@ export impl RemoteSource<type T> {
 	/// reaches this one, which is the shape every caller was written against
 	/// and the one a view wants (a `None` is not a value to render).
 	[must_use]
-	fun sub(self, observer: |T| void): Subscription {
+	fun sub(self, observer: (|T| void) context tracking): Subscription {
+		let plain = |value: T| tracking.clear(|| observer(value));
 		self.lease(|value| {
 			match value {
-				Some(let present) => observer(present),
+				Some(let present) => plain(present),
 				None => {},
 			}
 		})
@@ -4606,7 +4610,7 @@ export impl RemoteSource<type T> {
 	/// disposed. One count, one place the frames are decided.
 	fun lease(self, observer: |Option<T>| void): Subscription {
 		self.acquire();
-		let subscription = self.cache.sub(observer);
+		let subscription = self.cache.attach_observer(observer, true);
 		subscription.release.write() = Some(|| self.release());
 		subscription
 	}
@@ -5408,7 +5412,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with S
 		if immediately {
 			self.lease(observer)
 		} else {
-			let subscription = self.cache.on_change(observer);
+			let subscription = self.cache.attach_observer(observer, false);
 			subscription.release.write() = Some(|| self.release());
 			self.acquire();
 			subscription
@@ -5549,9 +5553,10 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// channel's whole-collection forward if nothing else holds it, and disposing
 	/// the subscription releases it.
 	[must_use]
-	fun sub(self, observer: |List<T>| void): Subscription {
+	fun sub(self, observer: (|List<T>| void) context tracking): Subscription {
+		let plain = |value: List<T>| tracking.clear(|| observer(value));
 		self.lease(|value| match value {
-			Some(let present) => observer(present),
+			Some(let present) => plain(present),
 			None => {},
 		})
 	}
@@ -5559,7 +5564,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// The counted primitive under every whole-collection path.
 	fun lease(self, observer: |Option<List<T>>| void): Subscription {
 		self.acquire();
-		let subscription = self.cache.sub(observer);
+		let subscription = self.cache.attach_observer(observer, true);
 		subscription.release.write() = Some(|| self.release());
 		subscription
 	}
