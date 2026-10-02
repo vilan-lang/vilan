@@ -9,11 +9,15 @@ struct Square {
 }
 
 impl Square with Shape<i32> {
-	fun area(self): i32 { self.side * self.side }
+	fun area(self): i32 {
+		self.side * self.side
+	}
 }
 
 impl Square with Shape<str> {
-	fun area(self): str { "big" }
+	fun area(self): str {
+		"big"
+	}
 }
 
 fun main() {
