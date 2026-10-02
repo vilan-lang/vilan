@@ -19,9 +19,10 @@ import std::store::{ Storable, Store, StoreSome, StoreFlag };
 | `Store<T>` | struct | a root plus a path: a `Source<T>` and a `Signal<T>`, the root and every projection alike |
 | `Store::new(value)` | constructor | a root holding `value` |
 | `StoreSome<P>` | struct | a handle *through* an `Option` (or an enum variant): a `Source<Option<P>>` plus `patch` |
-| `StoreFlag` | struct | a discriminant as a read-only `Source<bool>` (`is_some()`) |
+| `StoreFlag` | struct | a discriminant as a read-only `Source<bool>` (`is_some()`, `is_online()`) |
 | `[reactive(coarse)]` | field attribute | the field is one slot, compared whole |
 | `[reactive(name = "..")]` | field attribute | the name the field's projection is generated under |
+| `when_live(handle, body)` | `std::ui` | a variant as content: rebuilt only when the variant changes, the payload's `Store<P>` in hand |
 
 ## A store
 
@@ -171,6 +172,78 @@ changes what the payload holds. `is_some()` is a `StoreFlag`, the
 discriminant: it wakes when the option comes or goes, and never on a write
 inside it.
 
+## Enums
+
+A derived enum's store diffs its discriminant first, then the live variant's
+payload. Per variant the derive writes `is_<variant>()`, the discriminant as a
+`StoreFlag`, and per variant WITH a payload a handle through it, named after the
+variant in snake case (`Online(Device)` gives `online()`, a `StoreSome<Device>`;
+`Away(str, i32)` gives `away()`, a `StoreSome<(str, i32)>`):
+
+```vilan
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+import std::store::{ Storable, Store, StoreSome };
+
+[derive(PartialEq, Storable)]
+struct Device {
+	name: str,
+	since: i32,
+}
+
+[derive(PartialEq, Storable)]
+enum Presence {
+	Offline,
+	Online(Device),
+}
+
+fun main() {
+	let presence = Store::new(Presence::Online(Device { name = "laptop", since = 1 }));
+	let name: StoreSome<str> = presence.online().name();
+	let page = Owner::new();
+	run_with_owner(page, || {
+		presence.is_online().effect(|live| print(i"online: {live}"));
+	});
+	print(name.patch("phone"));                  // true — and `is_online` does not wake
+	presence.set(Presence::Offline);             // online: false
+	print(name.patch("ghost"));                  // false: the variant is not live
+	print(name.get().unwrap_or("-"));            // -
+	page.dispose();
+}
+```
+
+- **A same-variant write patches the payload.** `Online(d1)` to `Online(d2)`
+  with only `since` changed wakes `since` and the enum's own slot — not `name`,
+  not the discriminant. Subscriptions into the payload survive, because slots
+  hang off the type's paths, not off the value.
+- **A different variant** moves every live slot under either payload between
+  `Some` and `None`, so all of them wake, and so do the two variants' flags
+  (`is_offline()`, `is_online()`). A third variant's flag does not: its answer
+  did not change.
+- **A handle through a variant writes only while the variant is live**: `patch`
+  answers whether it landed. A write cannot choose the variant; switching it is a
+  write to the enum's own handle (`presence.set(..)`).
+
+A payload variant's handle also has `live()`, its discriminant as a `StoreFlag`,
+and `assume()`, the payload as a `Store<P>` for code that only runs while the
+variant is live.
+
+### when_live — rebuild only on the variant
+
+`when_some` hands its body a cell of the WHOLE payload, so every binding in the
+body reruns on every write to any of its fields. `when_live` follows only the
+discriminant, and hands the body the payload's own `Store<P>`:
+
+```vilan,fragment
+<aside>{when_live(presence.online(), |device| device_panel(device))}</aside>
+```
+
+The body is built under a fresh owner when the variant goes live and disposed
+when it goes away; a write inside the payload wakes only the bindings that read
+what changed. Should a derivation in the body run in the turn that ends the
+variant — a derivation settles before the effect that tears the body down — it
+reads the payload as it was when the body was built, and a write then lands
+nowhere. On the server it renders the live payload once.
+
 ## What it costs
 
 - **A derive line per type**, and a knob per coarse field.
@@ -179,6 +252,8 @@ inside it.
 - **A whole write costs one comparison per live slot.** A handle write costs
   the comparisons under the handle.
 - **Projections are methods**: `user.address().city()`.
+- **A write through a variant copies the payload out and back** — a pattern
+  cannot bind a writable view into an enum's payload.
 
 On the native backend a store builds and wakes as it does on JS, with one gap:
 observing a `StoreSome` (`nick.effect(..)`) is refused by name for now — the

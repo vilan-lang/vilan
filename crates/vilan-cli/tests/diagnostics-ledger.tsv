@@ -631,3 +631,5 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 NEW	-	`[reactive(name = "..")]` names the field's PROJECTION — a method on the store handle — so it must be an identifier: letters, digits and `_`, not starting with a digit
 NEW	-	`[reactive(..)]` on a field takes `coarse` (one slot, compared whole, even when the field's type derives `Storable`) and `name = ".."` (the name its store projection is generated under), comma-separated: `[reactive(coarse)]`, `[reactive(name = "nick")]`
 NEW	-	`[derive(Storable)]` on `{name}`: the field `{field}` would project as `{method}()`, which a store handle already has (`{method}` is a handle member, and an inherent member wins over a projection) — rename the projection with `[reactive(name = "..")]` on the field
+NEW	-	`[derive(Storable)]` on `{name}`: the variant `{variant}` would project as `{snake}()`/`{flag}()`, which a store handle already has — rename the variant
+NEW	-	`[derive(Storable)]` on `{name}`: two variants project as `{snake}()`

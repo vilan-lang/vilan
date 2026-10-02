@@ -463,6 +463,8 @@ std/store.md h2 a-store
 std/store.md h2 what-a-write-wakes
 std/store.md h2 derivestorable
 std/store.md h2 through-an-option
+std/store.md h2 enums
+std/store.md h3 when_live--rebuild-only-on-the-variant
 std/store.md h2 what-it-costs
 std/strings.md h1 strings-reference
 std/strings.md h2 str

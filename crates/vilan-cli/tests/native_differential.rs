@@ -8975,6 +8975,26 @@ fn a142_s7_a_struct_store_builds_and_wakes_the_same_on_both_backends() {
     );
 }
 
+/// A142 S7 S2: a derived enum's store builds and wakes the same on both
+/// backends — a same-variant write patching the payload, a switch away and back,
+/// a `patch` through a dead and a live variant, a multi-payload variant read and
+/// patched as a tuple, `assume()` read past the variant's end, and a generic
+/// enum with a scalar payload.
+#[test]
+fn a142_s7_an_enum_store_builds_and_wakes_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_variant.vl"),
+        include_str!("native/store_variant.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_variant.vl"),
+        Verdict::Identical,
+        "an enum store must build and wake the same on both backends"
+    );
+}
+
 /// A142 S7: OBSERVING a `StoreSome<P>` — `nick.effect(..)` — is refused by name
 /// natively. It is not the store's: any generic `W<P>` implementing
 /// `Source<Option<P>>` leaves `P` unbound when a consumer starts it through the

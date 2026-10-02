@@ -71,6 +71,7 @@ import pkg::reactive::{
 	turn_scope,
 };
 import pkg::shared::Shared;
+import pkg::store::{ Store, StoreFlag, StoreSome };
 import pkg::style::Style;
 
 /// A binding's subscription: `observer` now and on every change, released with
@@ -2397,6 +2398,29 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 			},
 		}
 	});
+}
+
+// === `when_live`: a store's variant as content (A142 S7) ====================
+//
+// `when_some` hands its body a `SignalCell<T>` of the WHOLE payload, so every
+// binding in the body is a projection of that cell and reruns on every write to
+// any of the payload's fields. A store already knows the payload's shape: this
+// rebuilds ONLY on the variant (it follows the discriminant slot,
+// `proposal/store.md` §2.6) and hands the body the payload's own `Store<P>`, whose
+// field handles wake one by one. KEEP IN STEP with the process twin's copy
+// (process/ui.vl).
+
+/// A store's variant as CONTENT at THIS position, with the payload's `Store<P>` in
+/// hand: built under a fresh owner when the variant goes live, and disposed when it
+/// goes away. A write inside the payload wakes only the bindings that read what
+/// changed; it never rebuilds the body.
+///
+///     <aside>{when_live(presence.online(), |device| device_panel(device))}</aside>
+export fun when_live<P, C: Slot>(
+	handle: StoreSome<P>,
+	render: (sync |Store<P>| C) context owner_scope,
+): Conditional<StoreFlag, C> {
+	when(handle.live(), || render(handle.assume()))
 }
 
 // === A121: focus scopes (proposal/focus-scope.md) ============================

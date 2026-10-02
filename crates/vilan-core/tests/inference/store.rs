@@ -585,3 +585,271 @@ fn a142_s7_a_handle_reads_one_leaf_without_copying_the_root() {
         "chars=4000 slots=0 nodes=1\n",
     );
 }
+
+// ── S2: enums ───────────────────────────────────────────────────────────────
+
+/// The paper's `Presence` (Appendix A) beside `TYPES`' leaves: an enum whose
+/// payload is a derived struct, so a handle reaches through the variant.
+const VARIANTS: &str = r#"
+[derive(PartialEq, Storable)]
+struct Device {
+    name: str,
+    since: Counted,
+}
+
+[derive(PartialEq, Storable)]
+enum Presence {
+    Offline,
+    Online(Device),
+    Away(str, i32),
+}
+
+fun online(name: str, since: i32): Presence {
+    Presence::Online(Device { name, since = Counted { value = since } })
+}
+"#;
+
+fn variant_program(body: &str) -> String {
+    format!("{TYPES}\n{VARIANTS}\nfun main() {{\n{body}\n}}\n\nmain();\n")
+}
+
+#[test]
+fn a142_s7_a_same_variant_write_patches_the_payload_and_rebuilds_nothing() {
+    // §2.6: `Online(d1)` to `Online(d2)` with only `since` changed wakes `since`
+    // and the enum's own slot — not `name`, not the discriminant — so a consumer
+    // gated on the discriminant builds once across a hundred such writes. Red
+    // when a same-variant write is treated as a variant switch
+    // (`tag=100 name=100`).
+    assert_compiles_and_runs(
+        &variant_program(
+            r#"
+            let presence = Store::new(online("laptop", 0));
+            let tags = Shared::new(0);
+            let names = Shared::new(0);
+            let sinces = Shared::new(0);
+            let watching = Owner::new();
+            run_with_owner(watching, || {
+                presence.is_online().effect_on_change(|_t| tags.write() += 1);
+                presence.online().name().effect_on_change(|_n| names.write() += 1);
+                presence.online().since().effect_on_change(|_s| sinces.write() += 1);
+                presence.effect_on_change(|_p| mark("presence"));
+            });
+            mut i = 1;
+            for i <= 100 {
+                presence.set(online("laptop", i));
+                i += 1;
+            }
+            woke.write() = [];
+            print(i"100 same-variant writes: tag={tags.read()} name={names.read()} since={sinces.read()} {drained()}");
+            watching.dispose();
+            "#,
+        ),
+        "100 same-variant writes: tag=0 name=0 since=100 [-] compares=100\n",
+    );
+}
+
+#[test]
+fn a142_s7_a_variant_switch_wakes_the_discriminant_and_every_live_payload_slot() {
+    // §2.6: a different variant moves every live slot under the payload between
+    // `Some` and `None`, so all of them wake, and so do the two variants' flags —
+    // `is_away()` stays asleep through `Online` <-> `Offline`, since its answer
+    // does not move (Q7). A
+    // `patch` through the dead variant lands nothing, wakes nothing, answers
+    // `false` and leaves the variant as it was; switching back wakes the same
+    // five; a `patch` through the live one wakes its leaf and the spine.
+    assert_compiles_and_runs(
+        &variant_program(
+            r#"
+            let presence = Store::new(online("laptop", 1));
+            let name = presence.online().name();
+            let watching = Owner::new();
+            run_with_owner(watching, || {
+                presence.is_online().effect_on_change(|t| mark(i"tag={t}"));
+                name.effect_on_change(|n| mark(i"name={n.unwrap_or("-")}"));
+                presence.online().since().effect_on_change(|s| mark(i"since={s.is_some()}"));
+                presence.is_away().effect_on_change(|a| mark(i"away={a}"));
+                presence.effect_on_change(|_p| mark("presence"));
+            });
+            presence.set(Presence::Offline);
+            print(i"to Offline: {drained()}");
+            print(i"patch through the dead variant: landed={name.patch("ghost")} {drained()} online={presence.is_online().get()}");
+            presence.set(online("phone", 5));
+            print(i"back Online: {drained()}");
+            print(i"patch through the live variant: landed={name.patch("tablet")} {drained()}");
+            presence.set(Presence::Away("lunch", 30));
+            print(i"to Away: {drained()} away={presence.away().get().unwrap_or(("-", 0)).0}");
+            watching.dispose();
+            "#,
+        ),
+        "to Offline: [tag=false name=- since=false presence] compares=0\n\
+         patch through the dead variant: landed=false [-] compares=0 online=false\n\
+         back Online: [tag=true name=phone since=true presence] compares=0\n\
+         patch through the live variant: landed=true [name=tablet presence] compares=0\n\
+         to Away: [tag=false name=- since=false away=true presence] compares=0 away=lunch\n",
+    );
+}
+
+#[test]
+fn a142_s7_a_handle_into_a_payload_is_a_source_of_an_option_with_patch() {
+    // Q6: a through-variant handle reads `None` while the variant is not live
+    // and `Some` while it is; `live()` is its variant's discriminant; it projects
+    // further (`online().name()`), and a multi-payload variant's handle reads the
+    // payload as a tuple.
+    assert_compiles_and_runs(
+        &variant_program(
+            r#"
+            let presence = Store::new(Presence::Offline);
+            let device = presence.online();
+            print(i"offline: device={device.get().is_some()} live={device.live().get()} name={device.name().get().unwrap_or("-")}");
+            presence.set(online("laptop", 7));
+            let now: Device = device.get().unwrap();
+            print(i"online: name={now.name} since={device.since().get().unwrap().value} live={device.live().get()}");
+            presence.set(Presence::Away("lunch", 30));
+            let (why, minutes) = presence.away().get().unwrap();
+            print(i"away: {why} {minutes} online={presence.is_online().get()} offline={presence.is_offline().get()}");
+            let _patched = presence.away().patch(("meeting", 60));
+            let (why_now, minutes_now) = presence.away().get().unwrap();
+            print(i"patched: {why_now} {minutes_now}");
+            "#,
+        ),
+        "offline: device=false live=false name=-\n\
+         online: name=laptop since=7 live=true\n\
+         away: lunch 30 online=false offline=false\n\
+         patched: meeting 60\n",
+    );
+}
+
+#[test]
+fn a142_s7_a_payload_store_assumed_reads_the_last_payload_once_the_variant_ends() {
+    // `assume()` — what `when_live` hands its body — is a `Store<P>` through the
+    // variant: it reads and writes the live payload, and should a reader run in
+    // the turn that ends the variant it reads the payload as it was when assumed,
+    // while a write then lands nowhere. Assuming a dead variant is refused.
+    assert_compiles_and_runs(
+        &variant_program(
+            r#"
+            let presence = Store::new(online("laptop", 1));
+            let device: Store<Device> = presence.online().assume();
+            device.name().set("phone");
+            let held: Presence = presence.get();
+            let now = match held {
+                Presence::Online(let d) => d.name,
+                _ => "-",
+            };
+            print(i"live: {device.name().get()} root={now}");
+            presence.set(Presence::Offline);
+            device.name().set("ghost");
+            print(i"ended: {device.name().get()} online={presence.is_online().get()}");
+            "#,
+        ),
+        "live: phone root=phone\nended: laptop online=false\n",
+    );
+}
+
+#[test]
+fn a142_s7_an_enum_derive_refuses_a_variant_named_like_a_handle_member() {
+    // Q9 for variants: `Set(i32)` would project as `set()` (a payload variant's
+    // through-handle) and `Some(i32)` as `some()`; both refused. A bare variant
+    // projects only `is_..()`, so a bare `Get` is fine.
+    for variant in ["Set(i32)", "Some(i32)", "Patch(str)"] {
+        assert_fails_with(
+            &format!(
+                r#"
+                import std::store::Storable;
+
+                [derive(Storable)]
+                enum Clash {{
+                    Plain,
+                    {variant},
+                }}
+
+                fun main() {{}}
+                "#
+            ),
+            "which a store handle already has",
+        );
+    }
+    assert_compiles(
+        r#"
+        import std::store::Storable;
+
+        [derive(Storable)]
+        enum Fine {
+            Get,
+            Done(i32),
+        }
+
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn a142_s7_a_generic_enum_derives_with_a_scalar_payload() {
+    // B194's binder rule through the enum derive, with a scalar `T` — the payload
+    // is lent through a local, so the JS emit's scalar view is a real one.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, Source };
+        import std::store::{ Storable, Store };
+
+        [derive(Storable)]
+        enum Maybe<T> {
+            Nothing,
+            Just(T),
+        }
+
+        fun main() {
+            let maybe = Store::new(Maybe::Just(1));
+            print(maybe.just().get().unwrap_or(0));
+            print(maybe.just().patch(2));
+            print(maybe.just().get().unwrap_or(0));
+            maybe.set(Maybe::Nothing);
+            print(maybe.just().patch(3));
+            print(maybe.is_nothing().get());
+        }
+
+        main();
+        "#,
+        "1\ntrue\n2\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn a142_s7_when_live_compiles_on_both_ui_layers() {
+    // S2's UI helper: `when_live(handle, |payload| body)` is a `when` over the
+    // handle's discriminant whose body is handed the payload's `Store<P>`. It is
+    // declared on both twins, so one component compiles for the browser and for
+    // the server, where it renders the live payload once.
+    let component = r#"
+        import std::io::print;
+        import std::reactive::Source;
+        import std::store::{ Storable, Store };
+        import std::ui::{ View, view, when_live };
+
+        [derive(PartialEq, Storable)]
+        struct Device {
+            name: str,
+        }
+
+        [derive(PartialEq, Storable)]
+        enum Presence {
+            Offline,
+            Online(Device),
+        }
+
+        fun panel(presence: Store<Presence>): View {
+            view("aside").child(when_live(presence.online(), |device| view("p").bind_text(device.name())))
+        }
+    "#;
+    assert_compiles_browser(&format!("{component}\nfun main() {{}}\n"));
+    assert_compiles_and_runs(
+        &format!(
+            "{component}\nimport std::ui::render;\n\nfun main() {{\n    \
+             print(render(panel(Store::new(Presence::Online(Device {{ name = \"laptop\" }})))));\n    \
+             print(render(panel(Store::new(Presence::Offline))));\n}}\n\nmain();\n"
+        ),
+        "<aside><p>laptop</p></aside>\n<aside></aside>\n",
+    );
+}
