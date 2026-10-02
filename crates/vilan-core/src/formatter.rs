@@ -4466,7 +4466,9 @@ impl<'src> Printer<'src> {
                         self.out.push_str(" {");
                         self.indent += 1;
                         let mut prev_end = fields.1.into_range().start + 1;
-                        for ((field_name, field_type, exposed, internal), span) in &fields.0 {
+                        for ((field_name, field_type, exposed, internal, reactivity), span) in
+                            &fields.0
+                        {
                             let range = span.into_range();
                             let after_comments = self.flush_comments_before(range.start, prev_end);
                             if self.has_blank_between(after_comments, range.start) {
@@ -4483,6 +4485,11 @@ impl<'src> Printer<'src> {
                                 self.out.push_str(reason);
                                 self.out.push_str("\")] ");
                             }
+                            // A142 S7's store knobs, on whichever side of
+                            // `[expose]` the author wrote them.
+                            if reactivity.is_written() && !reactivity.after_expose {
+                                self.print_reactivity(*reactivity);
+                            }
                             match exposed {
                                 Exposure::None => {}
                                 Exposure::Whole => self.out.push_str("[expose] "),
@@ -4498,6 +4505,9 @@ impl<'src> Printer<'src> {
                                     self.out.push_str(key);
                                     self.out.push_str(")] ");
                                 }
+                            }
+                            if reactivity.is_written() && reactivity.after_expose {
+                                self.print_reactivity(*reactivity);
                             }
                             self.out.push_str(field_name.0);
                             if let Some(field_type) = field_type {
@@ -5287,6 +5297,24 @@ impl<'src> Printer<'src> {
     /// above it — the shape `print_func` gives a function's. PRINTED, never
     /// skipped: an attribute with no printer arm makes the token net decline
     /// every file carrying one.
+    /// A field's `[reactive(..)]` (A142 S7), arguments in their one order —
+    /// `coarse` first — and a trailing space before what follows on the line.
+    fn print_reactivity(&mut self, reactivity: crate::node::Reactivity<'src>) {
+        self.out.push_str("[reactive(");
+        if reactivity.coarse {
+            self.out.push_str("coarse");
+        }
+        if let Some(name) = reactivity.name {
+            if reactivity.coarse {
+                self.out.push_str(", ");
+            }
+            self.out.push_str("name = \"");
+            self.out.push_str(name);
+            self.out.push('"');
+        }
+        self.out.push_str(")] ");
+    }
+
     fn print_item_labels(&mut self, labels: &ItemLabels<'src>) {
         let Some(labels) = labels else {
             return;
@@ -9006,6 +9034,21 @@ mod idempotency {
             "and a function's leads the ordered prefix:\n{formatted}"
         );
         assert_fixed_point("internal", source);
+    }
+
+    /// A142 S7's `[reactive(..)]` is PRINTED, on the field's line and on the
+    /// side of `[expose]` it was written — or the token net would decline every
+    /// file holding a store type.
+    #[test]
+    fn a_reactive_attribute_survives_the_reprint() {
+        let source = "struct S {\n\t[reactive(coarse)] a: i32,\n\t[reactive(name = \"verb\")] get: str,\n\
+                      \t[reactive(coarse, name = \"all\")] [expose] b: C,\n\tc: i32,\n}\n";
+        let formatted = format(source);
+        assert_eq!(formatted, source, "the reprint is the source");
+        assert_fixed_point("reactive", source);
+        // The other order around `[expose]` reprints as written.
+        let swapped = "struct S {\n\t[expose] [reactive(coarse)] b: C,\n}\n";
+        assert_eq!(format(swapped), swapped);
     }
 
     /// E219: the ITEM's repro. An attribute line has a width of its own and

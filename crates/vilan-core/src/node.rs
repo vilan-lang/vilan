@@ -1375,7 +1375,7 @@ impl<'src> Node<'src> {
             }
             Node::Struct(_, generic_parameters, _, _resource, fields, _) => {
                 visit_generic_parameters(generic_parameters.as_deref(), visit);
-                for (_, type_, _, _) in fields
+                for (_, type_, _, _, _) in fields
                     .iter()
                     .flat_map(|fields| &fields.0)
                     .map(|field| &field.0)
@@ -1625,12 +1625,44 @@ impl<'src> Exposure<'src> {
 // visibility cannot serve at all: vilan has no per-field visibility, so a
 // field that is public on purpose and dangerous on purpose (`Region.anchor`)
 // had no way to say so.
+//
+// The fifth slot is the field's `[reactive(..)]` knobs (A142 S7), which only
+// `[derive(Storable)]` reads.
 pub type StructField<'src> = (
     Spanned<&'src str>,
     Option<Spanned<Node<'src>>>,
     Exposure<'src>,
     Option<&'src str>,
+    Reactivity<'src>,
 );
+
+/// A struct field's `[reactive(..)]` attribute (tracker A142 S7,
+/// `proposal/store.md` Q4 and Q9): the knobs `[derive(Storable)]` reads off
+/// the field through `macro_std::meta::Field`, and nothing else does. The
+/// default is no attribute at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Reactivity<'src> {
+    /// `coarse` (Q4): the field is ONE slot, diffed whole with `==`, even when
+    /// its type derives `Storable` — an `Address` that is always edited as a
+    /// whole.
+    pub coarse: bool,
+    /// `name = "nick"` (Q9): the name the field's projection is generated
+    /// under, the literal's contents — the way out when the field's own name
+    /// is a store handle's member (`get`, `set`, `derive`, ...). `None` keeps
+    /// the field's name.
+    pub name: Option<&'src str>,
+    /// Whether it was written AFTER the field's `[expose]` — both orders parse,
+    /// and the formatter reprints the one the author wrote (a reorder would be
+    /// a token-stream change, which it declines).
+    pub after_expose: bool,
+}
+
+impl Reactivity<'_> {
+    /// Whether the field carries the attribute at all.
+    pub fn is_written(self) -> bool {
+        self.coarse || self.name.is_some()
+    }
+}
 
 // One field of a struct LITERAL: its name, and the value assigned to it —
 // `None` for the shorthand form, where the name is also the value's binding.

@@ -628,3 +628,5 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 603	-	`[hint(..)]` names the trait a struct or an enum is shown as in an inlay hint, and {kind} is not a type — write it on the struct or enum whose values the hint is about
 604	-	context `{name}` is read here, but this closure is called with `{name}` CLEARED: it lands at {position}, {how}, where there is no value to read — read it with `{name}.get_safe()` (which answers `None` there), or read it before handing the closure on
 605	-	unused pipe: a pipe runs nothing until it is consumed — seal it (`.memo()`), consume it (`.effect(..)`, a binding), or `let _ = …` to discard.
+NEW	-	`[reactive(name = "..")]` names the field's PROJECTION — a method on the store handle — so it must be an identifier: letters, digits and `_`, not starting with a digit
+NEW	-	`[reactive(..)]` on a field takes `coarse` (one slot, compared whole, even when the field's type derives `Storable`) and `name = ".."` (the name its store projection is generated under), comma-separated: `[reactive(coarse)]`, `[reactive(name = "nick")]`

@@ -51,12 +51,20 @@ export impl TypeExpr {
 // associated types, so a collection that does not name its key in its own type
 // (a `List<T>`) has nowhere else to get one; this is the one attribute argument
 // in the language that is a type rather than a word.
+//
+// `reactive_coarse` and `reactive_name` are the field's `[reactive(..)]` knobs
+// (tracker A142 S7, `proposal/store.md` Q4 and Q9), read by
+// `[derive(Storable)]`: `[reactive(coarse)]` makes the field one slot compared
+// whole, and `[reactive(name = "nick")]` renames its store projection (`""`
+// when the field keeps its own name).
 export struct Field {
 	name: str,
 	type_: TypeExpr,
 	exposed: bool,
 	keyed: bool,
 	key: str,
+	reactive_coarse: bool,
+	reactive_name: str,
 }
 
 // One declared generic parameter of a struct or enum: its name, its written

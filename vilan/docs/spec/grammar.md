@@ -294,7 +294,10 @@ struct = [ deprecated-label ] [ internal-label ] { hint-label } [ platform-attr 
          (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
 field  = [ internal-label ]
-         [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] MEMBER [ ":" type ] ;
+         ( [ reactive-attr ] [ expose-attr ] | expose-attr reactive-attr ) MEMBER [ ":" type ] ;
+expose-attr    = "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ;
+reactive-attr  = "[" "reactive" "(" reactive-arg { "," reactive-arg } ")" "]" ;   (* A142 S7 *)
+reactive-arg   = "coarse" | "name" "=" STRING ;
 internal-label = "[" "internal" "(" STRING ")" "]" ;
 deprecated-label = "[" "deprecated" "(" STRING ")" "]" ;
 resource-attr    = "[" "resource" "]" ;   (* B413 *)
@@ -448,8 +451,13 @@ A macro attribute's arguments are captured as **source spans**: the
 macro receives their text, not their values (§10). The built-in
 attribute names (`derive`, `service`, `client_service`, `extern`,
 `must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
-`deprecated`, `internal`) are not available as user macro-attribute
-names.
+`deprecated`, `internal`, `resource`, `hint`, `reactive`) are not
+available as user macro-attribute names.
+
+`[reactive(..)]` is a field's store knobs, read by `[derive(Storable)]`
+(`std::store`) and by nothing else: `coarse` makes the field one slot,
+compared whole, and `name = "x"` generates its projection as `x()`. The
+`name` must be an identifier. It may stand on either side of `[expose]`.
 
 `[service(..)]` and `[client_service]` may be written in either order
 on one struct; a struct carrying both is peer-to-peer and expands
