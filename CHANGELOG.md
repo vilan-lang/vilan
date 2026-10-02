@@ -343,6 +343,11 @@ written down.
 <!-- family: fix -->
 **Native builds `*if c { &a } else { &b }` — the spelled copy of a view a branch chooses, over a list or a struct, through a `match` or nested — which rustc refused (E0599, E0614).** The branches' tails are value positions natively, so each leaf was already its copy, and the `*` over them dereferenced a value; it is dropped over an `if` or a `match` now. The JS backend is unchanged. Pin: `a_deref_of_a_conditional_view_is_identical_on_both_backends`. Tracker F81.
 
+---
+
+<!-- family: performance -->
+**A bound selection tests only the impls that can answer it: `vilan check` on kolt costs 21.5G instructions where next's 29.1G (v0.42.1: 25.3G), and a leaf keystroke's post-passes in the language server drop from ~700 to ~400 ms of CPU.** M103, the regression maps-45 brought: its map and set operators are blanket impls (`impl type S: MapSource<K, V> with MapFlow<K, V>`, `impl type F: MapFlow<K, V> { .. }`, …), and `dispatch_refine::impl_members_for_bound` ran `subject_applies` — a recursive bound proof per blanket — over EVERY implementation in the program before keeping the matches that declare the member or inherit it from a trait, so each blanket std added made every selection dearer (7.0G of the 29.1G). An impl that declares no member of that name, provides no trait declaring it and names none of the bound's traits cannot move the answer (the narrowing to the bound's traits reads only impls that name one), so the selection no longer tests it: the same list, in the same order. Bisected over next's merges since v0.42.1 on `vilan check` under callgrind (24.3–25.4G at every merge through solver-c-45; 29.1G at maps-45). No output moves. Pin: `inference::bounds`' `a_bound_selection_tests_only_the_impls_that_can_answer_it` (with std loaded, 290 impls: ONE subject test for a member one impl declares; red at 290 with the filter removed). Tracker M103.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->

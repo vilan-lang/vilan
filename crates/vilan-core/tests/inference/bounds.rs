@@ -8175,6 +8175,98 @@ fn a_refinement_after_the_passes_computes_no_selection_the_passes_already_made()
     );
 }
 
+/// M103: a bound selection tests only the impls that can change its answer.
+///
+/// `impl_members_for_bound` used to run `subject_applies` — a recursive bound
+/// proof for every blanket impl — over EVERY implementation in the program,
+/// and keep only the matches that declare the member or inherit it from a
+/// trait. Every blanket std added made every selection dearer: maps-45's map
+/// and set operators took a kolt `check` from 24.3G instructions to 29.1G,
+/// 7.0G of it inside this selection. An impl that declares no `member`,
+/// provides no trait declaring it and names none of the bound's traits cannot
+/// move the answer, so it is no longer tested. Here std is loaded (hundreds of
+/// impls, dozens of blankets) and ONE impl in the program mentions `show4` —
+/// so one subject test, and the answer is that impl's member.
+#[test]
+fn a_bound_selection_tests_only_the_impls_that_can_answer_it() {
+    use vilan_core::dispatch_refine;
+    use vilan_core::type_::Type;
+
+    let source = r#"
+        trait Show4 { fun show4(self): str; }
+        struct Plaque { size: i32 }
+        impl Plaque with Show4 { fun show4(self): str { "plaque" } }
+
+        fun tell<V: Show4>(value: V) { print(value.show4()); }
+
+        fun main() {
+            tell(Plaque { size = 1 });
+        }
+        main();
+        "#;
+    let (selected, expected, tests, implementations) = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let plaque = program
+                .structs
+                .values()
+                .find(|struct_| struct_.name == "Plaque")
+                .expect("the program declares `Plaque`")
+                .id;
+            let subject = program
+                .type_id_to_type_map
+                .iter()
+                .find(|(_, type_)| matches!(type_, Type::Struct(id, arguments) if *id == plaque && arguments.is_empty()))
+                .map(|(type_id, _)| *type_id)
+                .expect("`Plaque` has a type slot");
+            let expected: Vec<_> = program
+                .implementations
+                .iter()
+                .filter_map(|implementation| implementation.declarations.get("show4").copied())
+                .collect();
+            dispatch_refine::reset_bound_selection_subject_tests();
+            // A member nothing has asked about under this key yet: the
+            // empty-traits reading, so the memo cannot answer it.
+            let selected =
+                dispatch_refine::impl_members_for_bound(&program, None, subject, "show4", &[]);
+            (
+                selected,
+                expected,
+                dispatch_refine::bound_selection_subject_tests(),
+                program.implementations.len(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+
+    assert_eq!(expected.len(), 1, "one impl declares `show4`");
+    assert_eq!(selected, expected, "the selection is `Plaque`'s own member");
+    assert!(
+        implementations > 50,
+        "std must be loaded for the count to mean anything ({implementations} impls)"
+    );
+    assert_eq!(
+        tests, 1,
+        "{tests} of the program's {implementations} impls were subject-tested for a \
+         member exactly one of them can provide (M103)"
+    );
+}
+
 /// Analyzes `source` on a large-stack worker and reports how many BOUND
 /// EVALUATIONS `check_generic_bound_satisfaction` performed — the M19 memo's
 /// instrument. The counter is zeroed on the worker thread, so a concurrently
