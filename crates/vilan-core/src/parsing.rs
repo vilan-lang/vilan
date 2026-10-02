@@ -459,6 +459,14 @@ const EXPORT_TAKES_AN_ITEM: &str = "`export` takes an ITEM — a `fun`, `struct`
      the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an \
      expression is none of those, and publishes nothing, checks nothing and emits nothing";
 
+/// B492: a second `export` on one declaration. The marker is a statement
+/// WRAPPER (§3.2), so `export export fun f()` parsed as an export of an
+/// export and was accepted silently, meaning exactly what one marker means.
+/// Refused where it stands, and read past, so the declaration still parses
+/// and the reader gets the one sentence.
+const EXPORT_IS_WRITTEN_ONCE: &str = "`export` is written once: the declaration is already marked, \
+     and a second `export` adds nothing — delete it";
+
 /// The rule a MALFORMED import path breaks (B320). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
 /// sanctioned spelling).
@@ -2858,8 +2866,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// S2 did.
     fn parse_statement(&mut self) -> Option<Spanned<Node<'src>>> {
         // Item nesting is its own recursive grammar and reaches no expression
-        // rule (B142): `fun a() { fun a() { .. } }`, `mod`, `impl`, `trait` and
-        // chained `export` all close their cycle back through here.
+        // rule (B142): `fun a() { fun a() { .. } }`, `mod`, `impl` and `trait`
+        // all close their cycle back through here. A chained `export` did
+        // until B492: a repeated marker is refused and read past, so it no
+        // longer nests.
         //
         // The stand-in CONSUMES a token, which the other funnels' does not, and
         // that is what keeps the refusal linear here: `parse_program` and
@@ -2884,7 +2894,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // host of F27 R1's platform). Taken here, once, so every statement
         // nested inside this one reads false.
         let file_head = std::mem::take(&mut self.file_head);
-        self.lead_export_past_its_attributes();
+        let _ = self.lead_export_past_its_attributes();
         if let Some(item) = self.attempt(Self::parse_module_self) {
             if !file_head {
                 self.errors.push(ParseError {
@@ -3005,14 +3015,14 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// front of `export`, so a rotation is never undone: a later alternative
     /// at this position reads the same rotated stream, and finds no run to
     /// rotate again.
-    fn lead_export_past_its_attributes(&mut self) {
+    fn lead_export_past_its_attributes(&mut self) -> bool {
         let start = self.position;
         let mut at = start;
         while self.tokens.get(at).map(|(token, _)| token) == Some(&Token::Ctrl('['))
             && matches!(self.tokens.get(at + 1), Some((Token::Ident(_), _)))
         {
             let Some(after) = self.past_balanced_group(at) else {
-                return;
+                return false;
             };
             at = after;
         }
@@ -3020,22 +3030,34 @@ impl<'a, 'src> Parser<'a, 'src> {
         if marker == start
             || self.tokens.get(marker).map(|(token, _)| token) != Some(&Token::Export)
         {
-            return;
+            return false;
         }
+        // The marker's scope travels with it — and so does a REPEATED marker,
+        // with or without a scope of its own (B492): `[..] export export fun`
+        // reaches `parse_export` as `export export [..] fun` and takes the
+        // repeat's refusal there, rather than nesting one export in another.
         let mut past_marker = marker + 1;
-        if self.tokens.get(past_marker).map(|(token, _)| token) == Some(&Token::Ctrl('('))
-            && self.tokens.get(past_marker + 1).map(|(token, _)| token) == Some(&Token::In)
-        {
-            let Some(after) = self.past_balanced_group(past_marker) else {
-                return;
-            };
-            past_marker = after;
+        loop {
+            let at = self.tokens.get(past_marker).map(|(token, _)| token);
+            if at == Some(&Token::Export) {
+                past_marker += 1;
+            } else if at == Some(&Token::Ctrl('('))
+                && self.tokens.get(past_marker + 1).map(|(token, _)| token) == Some(&Token::In)
+            {
+                let Some(after) = self.past_balanced_group(past_marker) else {
+                    return false;
+                };
+                past_marker = after;
+            } else {
+                break;
+            }
         }
         if matches!(self.tokens.get(past_marker), Some((Token::Op("*"), _))) {
-            return;
+            return false;
         }
         self.tokens[start..past_marker].rotate_left(marker - start);
         self.assignment_reachable[start..past_marker].rotate_left(marker - start);
+        true
     }
 
     /// The index just past the bracket group opening at `open` (a `[`, `(` or
@@ -3131,7 +3153,7 @@ impl<'a, 'src> Parser<'a, 'src> {
          which parsing refuses; match the outer shape and destructure the rest inside the arm";
 
     /// [`Parser::NESTING_REFUSAL`] for the item/statement grammar — nested `fun`,
-    /// `mod`, `impl`, `trait` and chained `export`.
+    /// `mod`, `impl` and `trait` (a chained `export` no longer nests, B492).
     const ITEM_NESTING_REFUSAL: &'static str = "this declaration nests more than 500 levels \
          deep, which parsing refuses; lift the inner declarations out to the top level";
 
@@ -3171,7 +3193,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// placed anywhere in the expression grammar could see them: types
     /// ([`Parser::parse_type`], the sole caller of `parse_type_atom`),
     /// binders/patterns, items ([`Parser::parse_statement`] — nested `fun`,
-    /// `mod`, `impl`, `trait`, and `export` chaining), import paths, and nested
+    /// `mod`, `impl` and `trait`; `export` chaining too until B492), import paths, and nested
     /// elements. These are not theoretical: `fun a() { fun a() { .. } }` at 5000
     /// levels overflowed a 64 MiB worker with no diagnostic at all, which is
     /// precisely the outcome B142 exists to prevent. Each of those funnels calls
@@ -7629,7 +7651,30 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.bump();
             return Some((Node::ExportAll, self.span_from(start)));
         }
-        let scope = self.parse_export_scope();
+        // B492: one marker per declaration — a repeated one is refused and
+        // read past, so the tree is the one export it means. Either marker
+        // may carry the scope (`export export(in pkg)`, `export(in pkg)
+        // export`); the first one written is the declaration's.
+        //
+        // A repeat is a marker, a scope, or an attribute run that ends at
+        // another `export` (`export [m] export fun`): the run is the item's,
+        // so it is rotated behind the repeat exactly as at a statement's head,
+        // and the repeat refused. So no `export` nests in another, and a
+        // marker chain is not a nesting door at all.
+        let mut scope = None;
+        loop {
+            self.refuse_repeated_export_markers();
+            if scope.is_none() {
+                scope = self.parse_export_scope();
+                if scope.is_some() {
+                    continue;
+                }
+            }
+            if self.lead_export_past_its_attributes() {
+                continue;
+            }
+            break;
+        }
         // B382: `export [deprecated("use …")] import …;` — the steer is the
         // RE-EXPORT's, so the export carries it. Read only ahead of `import`:
         // before a declaration the same attribute is the declaration's own
@@ -7664,6 +7709,23 @@ impl<'a, 'src> Parser<'a, 'src> {
         let span = self.span_from(start);
         let span = Span::from(span.start.min(inner.1.start)..span.end);
         Some((Node::Export(scope, Box::new(inner), labels), span))
+    }
+
+    /// B492's refusal: a run of `export` markers at the cursor is reported
+    /// ONCE, spanning the run, and read past.
+    fn refuse_repeated_export_markers(&mut self) {
+        let start = self.position;
+        while self.peek_is(&Token::Export) {
+            self.bump();
+        }
+        if self.position > start {
+            self.errors.push(ParseError {
+                span: self.span_from(start),
+                reason: ParseErrorReason::Rule(EXPORT_IS_WRITTEN_ONCE),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
     }
 
     /// `(in PATH)` after `export` — B318 §2.2's narrowing, `None` when the
@@ -10392,6 +10454,73 @@ mod tests {
             message.starts_with("a spread parameter receives a tuple"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn b492_a_repeated_export_is_refused_and_read_past() {
+        // (source, the text each refusal spans): one refusal per RUN of
+        // repeated markers, wherever the repeat stands.
+        for (source, refused) in [
+            ("export export fun f() {}", vec!["export"]),
+            ("export export export let x = 1;", vec!["export export"]),
+            (
+                "[platform(\"node\")] export export fun f() {}",
+                vec!["export"],
+            ),
+            ("export(in pkg) export struct S {}", vec!["export"]),
+            ("export export(in pkg) struct S {}", vec!["export"]),
+            (
+                "[must_use] export(in pkg) export fun f(): i32 { 1 }",
+                vec!["export"],
+            ),
+            // Separated by an attribute run: the run is the item's.
+            (
+                "export [must_use] export fun f(): i32 { 1 }",
+                vec!["export"],
+            ),
+            (
+                "[deprecated(\"x\")] export [must_use] export fun f(): i32 { 1 }",
+                vec!["export"],
+            ),
+            (
+                "export [must_use] export [platform(\"node\")] export fun f() {}",
+                vec!["export", "export"],
+            ),
+        ] {
+            let (tree, errors) = parse(source);
+            let rendered: Vec<String> = errors.iter().map(render).collect();
+            let spans: Vec<&str> = errors
+                .iter()
+                .map(|error| &source[error.span.start..error.span.end])
+                .collect();
+            assert_eq!(spans, refused, "{source}: {rendered:?}");
+            for message in &rendered {
+                assert_eq!(message, EXPORT_IS_WRITTEN_ONCE, "{source}");
+            }
+            // One export, of the declaration: not an export of an export.
+            let (statements, _) = tree.expect("a tree");
+            match &statements[0].0 {
+                Node::Export(_, inner, _) => {
+                    assert!(!matches!(inner.0, Node::Export(..)), "{source}: {inner:?}")
+                }
+                other => panic!("{source}: expected an Export, got {other:?}"),
+            }
+        }
+        // The attributes on either side of a repeat are the item's prefix.
+        let (tree, _) = parse("[deprecated(\"x\")] export [must_use] export fun f(): i32 { 1 }");
+        match &tree.expect("a tree").0[0].0 {
+            Node::Export(_, inner, _) => match &inner.0 {
+                Node::Func(function) => {
+                    assert_eq!(function.deprecated, Some("x"));
+                    assert!(function.must_use);
+                }
+                other => panic!("expected a Func, got {other:?}"),
+            },
+            other => panic!("expected an Export, got {other:?}"),
+        }
+        // The first marker is not refused, and `export *;` is untouched.
+        program("export fun f() {}");
+        program("export *;");
     }
 
     #[test]

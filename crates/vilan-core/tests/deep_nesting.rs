@@ -732,10 +732,6 @@ fn nesting_doors(levels: usize) -> Vec<(&'static str, String)> {
             "nested `mod`",
             format!("{}\n{}\n", "mod a {".repeat(n), "}".repeat(n)),
         ),
-        (
-            "`export` chain",
-            format!("{}fun f() {{\n\tvoid\n}}\n", "export ".repeat(n)),
-        ),
         // Import paths and elements.
         ("import path", format!("use {}a;\n", "a::".repeat(n))),
         (
@@ -751,6 +747,23 @@ fn nesting_doors(levels: usize) -> Vec<(&'static str, String)> {
             ),
         ),
     ]
+}
+
+/// B492 closed the `export` chain as a nesting door: a repeated marker is
+/// refused and read past rather than parsed as an export of an export, so
+/// 5000 markers are one refusal and no nesting at all — not the item bound's
+/// refusal, and not 4999 of anything. (It was a door of its own, at this
+/// depth, until then.)
+#[test]
+fn an_export_chain_is_one_refusal_and_no_nesting() {
+    let source = format!("{}fun f() {{\n\tvoid\n}}\n", "export ".repeat(5000));
+    let (produced, messages) = parse_on_64_mib(source);
+    assert!(produced, "the chain still produces a tree");
+    assert_eq!(messages.len(), 1, "{messages:#?}");
+    assert!(
+        messages[0].starts_with("`export` is written once"),
+        "{messages:#?}"
+    );
 }
 
 #[test]

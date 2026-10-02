@@ -108,8 +108,8 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | `async` | ✓ | · | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `const` | ✓ | · | ✓ | · | · | · | · | · | · | · | · | ✓ | · | ✓ | · | · | · | s1 |
-| `export` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | s1 |
-| `external` | a2 | · | a2 | ✓ | · | ✓ | · | · | · | · | · | · | · | · | · | · | · | s1 |
+| `export` | ✓ | s2 | s2 | ✓ | s2 | s2 | ✓ | ✓ | ✓ | s2 | s2 | ✓ | s2 | s2 | ✓ | ✓ | s2 | s1 |
+| `external` | a3 | · | a3 | ✓ | · | ✓ | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `macro` | ✓ | · | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `mut` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `as` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
@@ -127,21 +127,21 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 | `void` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `with` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `[derive(Debug)]` | · | · | · | ✓ | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | s1 |
-| `[service]` | · | · | · | a3 | a3 | a3 | · | · | · | · | · | · | · | · | · | · | · | s1 |
-| `[client_service]` | · | · | · | a3 | a3 | a3 | · | · | · | · | · | · | · | · | · | · | · | s1 |
+| `[service]` | · | · | · | a4 | a4 | a4 | · | · | · | · | · | · | · | · | · | · | · | s1 |
+| `[client_service]` | · | · | · | a4 | a4 | a4 | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `[extern("f")]` | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `[must_use]` | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `[rpc]` | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `[trait_only]` | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
-| `[doc(hidden)]` | s4 | s4 | s4 | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
+| `[doc(hidden)]` | s5 | s5 | s5 | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
 | `[expose]` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
-| `[platform("browser")]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | · | · | · | a5 |
-| `[deprecated("use g")]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | a6 | a6 | a6 | ✓ | ✓ | ✓ | · | s7 | ✓ | s1 |
-| `[internal("why")]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | a6 | a6 | a6 | ✓ | ✓ | ✓ | · | · | · | s1 |
-| `[resource]` | s8 | s8 | s8 | ✓ | ✓ | ✓ | ✓ | ✓ | s8 | s8 | s8 | s8 | s8 | s8 | s8 | s8 | s8 | s8 |
-| `[hint(Show)]` | · | · | · | a9 | a9 | a9 | a9 | a10 | a11 | a11 | a11 | a12 | a12 | a12 | · | · | · | s1 |
+| `[platform("browser")]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | · | · | · | a6 |
+| `[deprecated("use g")]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | a7 | a7 | a7 | ✓ | ✓ | ✓ | · | s8 | ✓ | s1 |
+| `[internal("why")]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | a7 | a7 | a7 | ✓ | ✓ | ✓ | · | · | · | s1 |
+| `[resource]` | s9 | s9 | s9 | ✓ | ✓ | ✓ | ✓ | ✓ | s9 | s9 | s9 | s9 | s9 | s9 | s9 | s9 | s9 | s9 |
+| `[hint(Show)]` | · | · | · | a10 | a10 | a10 | a10 | a11 | a12 | a12 | a12 | a13 | a13 | a13 | · | · | · | s1 |
 | `[reactive(coarse)]` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s1 |
-| `[user_macro]` | a13 | a13 | a13 | a13 | a13 | a13 | a13 | · | · | · | · | · | · | · | · | · | · | s1 |
+| `[user_macro]` | a14 | a14 | a14 | a14 | a14 | a14 | a14 | · | · | · | · | · | · | · | · | · | · | s1 |
 
 ### 2.2 Member heads
 
@@ -155,18 +155,18 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 |---|:-:|:-:|:-:|:-:|:-:|
 | `async` | ✓ | ✓ | ✓ | · | · |
 | `const` | ✓ | · | · | · | · |
-| `export` | a14 | · | · | · | · |
-| `external` | a15 | a16 | a16 | · | · |
-| `macro` | a17 | · | · | · | · |
+| `export` | a15 | · | · | · | · |
+| `external` | a16 | a17 | a17 | · | · |
+| `macro` | a18 | · | · | · | · |
 | `mut` | · | · | · | · | · |
 | `as` | · | · | · | · | · |
 | `borrows` | · | · | · | · | · |
 | `context` | · | · | · | · | · |
-| `dyn` | · | · | · | s18 | s18 |
+| `dyn` | · | · | · | s19 | s19 |
 | `jump` | · | · | · | · | · |
-| `lazy` | · | · | · | s19 | s19 |
+| `lazy` | · | · | · | s20 | s20 |
 | `only` | · | · | · | · | · |
-| `own` | · | · | · | s20 | s20 |
+| `own` | · | · | · | s21 | s21 |
 | `self` | · | · | · | · | · |
 | `Self` | · | · | · | · | · |
 | `sync` | · | · | · | · | · |
@@ -180,12 +180,12 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 | `[must_use]` | ✓ | ✓ | ✓ | · | · |
 | `[rpc]` | ✓ | ✓ | ✓ | · | · |
 | `[trait_only]` | ✓ | ✓ | ✓ | · | · |
-| `[doc(hidden)]` | s4 | s4 | s4 | · | · |
-| `[expose]` | · | · | · | a21 | · |
+| `[doc(hidden)]` | s5 | s5 | s5 | · | · |
+| `[expose]` | · | · | · | a22 | · |
 | `[platform("browser")]` | ✓ | ✓ | ✓ | · | · |
 | `[deprecated("use g")]` | ✓ | ✓ | ✓ | · | · |
 | `[internal("why")]` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `[resource]` | s8 | · | · | s8 | s8 |
+| `[resource]` | s9 | · | · | s9 | s9 |
 | `[hint(Show)]` | · | · | · | · | · |
 | `[reactive(coarse)]` | · | · | · | ✓ | · |
 | `[user_macro]` | ✓ | · | · | · | · |
@@ -205,20 +205,20 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 
 | marker | B1 | B2 | B3 | B4 | B5 | B6 | B7 | B8 | B9 | B10 |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| `async` | · | · | · | · | a22 | · | ✓ | · | a23 | ✓ |
-| `const` | · | · | · | ✓ | a24 | · | · | a25 | ✓ | ✓ |
-| `export` | · | · | · | a14 | s26 | · | · | s26 | · | s26 |
+| `async` | · | · | · | · | a23 | · | ✓ | · | a24 | ✓ |
+| `const` | · | · | · | ✓ | a25 | · | · | a26 | ✓ | ✓ |
+| `export` | · | · | · | a15 | s27 | · | · | s27 | · | s27 |
 | `external` | · | · | · | · | · | · | · | · | · | · |
-| `macro` | · | · | · | · | · | · | · | · | a27 | a27 |
+| `macro` | · | · | · | · | · | · | · | · | a28 | a28 |
 | `mut` | ✓ | ✓ | ✓ | · | ✓ | · | · | · | · | · |
 | `as` | · | · | · | · | · | · | · | · | · | · |
 | `borrows` | · | · | · | · | · | · | · | · | · | · |
 | `context` | · | · | · | · | · | · | · | · | · | · |
-| `dyn` | s18 | s18 | s18 | · | s18 | ✓ | · | · | s18 | s18 |
+| `dyn` | s19 | s19 | s19 | · | s19 | ✓ | · | · | s19 | s19 |
 | `jump` | · | · | · | · | · | · | · | · | · | · |
-| `lazy` | ✓ | ✓ | s28 | a29 | s30 | s19 | · | · | · | · |
+| `lazy` | ✓ | ✓ | s29 | a30 | s31 | s20 | · | · | · | · |
 | `only` | · | · | · | · | · | · | · | · | · | · |
-| `own` | ✓ | ✓ | ✓ | · | s20 | s20 | · | · | s20 | s20 |
+| `own` | ✓ | ✓ | ✓ | · | s21 | s21 | · | · | s21 | s21 |
 | `self` | · | · | · | · | · | · | · | · | · | · |
 | `Self` | · | · | · | · | · | · | · | · | · | · |
 | `sync` | · | · | · | · | · | · | ✓ | · | · | · |
@@ -234,11 +234,11 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 | `[trait_only]` | · | · | · | · | · | · | · | · | · | · |
 | `[doc(hidden)]` | · | · | · | · | · | · | · | · | · | · |
 | `[expose]` | · | · | · | · | · | · | · | · | · | · |
-| `[platform("browser")]` | · | · | · | a31 | · | · | · | · | · | · |
-| `[deprecated("use g")]` | · | · | · | a31 | · | · | · | · | · | · |
-| `[internal("why")]` | · | · | · | a31 | · | · | · | · | · | · |
-| `[resource]` | · | · | · | s8 | s8 | · | · | · | s8 | s8 |
-| `[hint(Show)]` | · | · | · | a12 | · | · | · | · | · | · |
+| `[platform("browser")]` | · | · | · | a32 | · | · | · | · | · | · |
+| `[deprecated("use g")]` | · | · | · | a32 | · | · | · | · | · | · |
+| `[internal("why")]` | · | · | · | a32 | · | · | · | · | · | · |
+| `[resource]` | · | · | · | s9 | s9 | · | · | · | s9 | s9 |
+| `[hint(Show)]` | · | · | · | a13 | · | · | · | · | · | · |
 | `[reactive(coarse)]` | · | · | · | · | · | · | · | · | · | · |
 | `[user_macro]` | · | · | · | · | · | · | · | · | · | · |
 
@@ -248,7 +248,7 @@ The positions whose cell is `✓` or `aN` (the parser takes the marker there).
 
 - `async`: I1, I3, M1, M2, M3, B5, B7, B9, B10
 - `const`: I1, I3, I12, I14, M1, B4, B5, B8, B9, B10
-- `export`: I1, I2, I3, I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14, I15, I16, I17, M1, B4
+- `export`: I1, I4, I7, I8, I9, I12, I15, I16, M1, B4
 - `external`: I1, I3, I4, I6, M1, M2, M3
 - `macro`: I1, I3, M1, B9, B10
 - `mut`: B1, B2, B3, B5
@@ -298,11 +298,10 @@ Taken alone: `async`, `const`, `export`, `external`, `macro`, `[extern("f")]`, `
 
 ### I3 — between `export` and `fun`
 
-Taken alone: `async`, `const`, `export`, `external`, `macro`, `[extern("f")]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform("browser")]`, `[deprecated("use g")]`, `[internal("why")]`, `[user_macro]`.
+Taken alone: `async`, `const`, `external`, `macro`, `[extern("f")]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform("browser")]`, `[deprecated("use g")]`, `[internal("why")]`, `[user_macro]`.
 
-- The order every one-order pair agrees with: `export` < `const` < `macro` < `[user_macro]` < `[deprecated("use g")]` < `[internal("why")]` < `[extern("f")]` < `[must_use]` < `[rpc]` < `[trait_only]` < `[platform("browser")]` < `async` < `external`
-- One order only: `export` < `async`; `async` < `external`; `macro` < `async`; `[extern("f")]` < `async`; `[must_use]` < `async`; `[rpc]` < `async`; `[trait_only]` < `async`; `[platform("browser")]` < `async`; `[deprecated("use g")]` < `async`; `[internal("why")]` < `async`; `[user_macro]` < `async`; `export` < `const`; `export` < `external`; `export` < `macro`; `macro` < `external`; `[extern("f")]` < `external`; `[must_use]` < `external`; `[rpc]` < `external`; `[trait_only]` < `external`; `[platform("browser")]` < `external`; `[deprecated("use g")]` < `external`; `[internal("why")]` < `external`; `[user_macro]` < `external`; `macro` < `[extern("f")]`; `macro` < `[must_use]`; `macro` < `[rpc]`; `macro` < `[trait_only]`; `macro` < `[platform("browser")]`; `macro` < `[deprecated("use g")]`; `macro` < `[internal("why")]`; `[extern("f")]` < `[must_use]`; `[extern("f")]` < `[rpc]`; `[extern("f")]` < `[trait_only]`; `[extern("f")]` < `[platform("browser")]`; `[deprecated("use g")]` < `[extern("f")]`; `[internal("why")]` < `[extern("f")]`; `[user_macro]` < `[extern("f")]`; `[must_use]` < `[rpc]`; `[must_use]` < `[trait_only]`; `[must_use]` < `[platform("browser")]`; `[deprecated("use g")]` < `[must_use]`; `[internal("why")]` < `[must_use]`; `[user_macro]` < `[must_use]`; `[rpc]` < `[trait_only]`; `[rpc]` < `[platform("browser")]`; `[deprecated("use g")]` < `[rpc]`; `[internal("why")]` < `[rpc]`; `[user_macro]` < `[rpc]`; `[trait_only]` < `[platform("browser")]`; `[deprecated("use g")]` < `[trait_only]`; `[internal("why")]` < `[trait_only]`; `[user_macro]` < `[trait_only]`; `[deprecated("use g")]` < `[platform("browser")]`; `[internal("why")]` < `[platform("browser")]`; `[user_macro]` < `[platform("browser")]`; `[deprecated("use g")]` < `[internal("why")]`; `[user_macro]` < `[deprecated("use g")]`; `[user_macro]` < `[internal("why")]`
-- Either order: `export` <> `[extern("f")]`; `export` <> `[must_use]`; `export` <> `[rpc]`; `export` <> `[trait_only]`; `export` <> `[platform("browser")]`; `export` <> `[deprecated("use g")]`; `export` <> `[internal("why")]`; `export` <> `[user_macro]`
+- The order every one-order pair agrees with: `const` < `macro` < `[user_macro]` < `[deprecated("use g")]` < `[internal("why")]` < `[extern("f")]` < `[must_use]` < `[rpc]` < `[trait_only]` < `[platform("browser")]` < `async` < `external`
+- One order only: `async` < `external`; `macro` < `async`; `[extern("f")]` < `async`; `[must_use]` < `async`; `[rpc]` < `async`; `[trait_only]` < `async`; `[platform("browser")]` < `async`; `[deprecated("use g")]` < `async`; `[internal("why")]` < `async`; `[user_macro]` < `async`; `macro` < `external`; `[extern("f")]` < `external`; `[must_use]` < `external`; `[rpc]` < `external`; `[trait_only]` < `external`; `[platform("browser")]` < `external`; `[deprecated("use g")]` < `external`; `[internal("why")]` < `external`; `[user_macro]` < `external`; `macro` < `[extern("f")]`; `macro` < `[must_use]`; `macro` < `[rpc]`; `macro` < `[trait_only]`; `macro` < `[platform("browser")]`; `macro` < `[deprecated("use g")]`; `macro` < `[internal("why")]`; `[extern("f")]` < `[must_use]`; `[extern("f")]` < `[rpc]`; `[extern("f")]` < `[trait_only]`; `[extern("f")]` < `[platform("browser")]`; `[deprecated("use g")]` < `[extern("f")]`; `[internal("why")]` < `[extern("f")]`; `[user_macro]` < `[extern("f")]`; `[must_use]` < `[rpc]`; `[must_use]` < `[trait_only]`; `[must_use]` < `[platform("browser")]`; `[deprecated("use g")]` < `[must_use]`; `[internal("why")]` < `[must_use]`; `[user_macro]` < `[must_use]`; `[rpc]` < `[trait_only]`; `[rpc]` < `[platform("browser")]`; `[deprecated("use g")]` < `[rpc]`; `[internal("why")]` < `[rpc]`; `[user_macro]` < `[rpc]`; `[trait_only]` < `[platform("browser")]`; `[deprecated("use g")]` < `[trait_only]`; `[internal("why")]` < `[trait_only]`; `[user_macro]` < `[trait_only]`; `[deprecated("use g")]` < `[platform("browser")]`; `[internal("why")]` < `[platform("browser")]`; `[user_macro]` < `[platform("browser")]`; `[deprecated("use g")]` < `[internal("why")]`; `[user_macro]` < `[deprecated("use g")]`; `[user_macro]` < `[internal("why")]`
 - Do not stack: `async` × `const`; `const` × `external`; `const` × `macro`; `const` × `[extern("f")]`; `const` × `[must_use]`; `const` × `[rpc]`; `const` × `[trait_only]`; `const` × `[platform("browser")]`; `const` × `[deprecated("use g")]`; `const` × `[internal("why")]`; `const` × `[user_macro]`; `macro` × `[user_macro]`
 
 ### I4 — before `struct`
@@ -387,31 +386,31 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 | `async` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `await` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `const` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `css` | s32 | s32 | · | · | ✓ | ✓ | ✓ | · |
+| `css` | s33 | s33 | · | · | ✓ | ✓ | ✓ | · |
 | `else` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `enum` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `export` | · | · | · | s26 | ✓ | ✓ | ✓ | s26 |
+| `export` | · | · | · | s27 | ✓ | ✓ | ✓ | s27 |
 | `external` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `false` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `for` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `fun` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `if` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `impl` | · | · | s33 | · | ✓ | ✓ | ✓ | · |
-| `import` | s34 | s34 | s34 | · | ✓ | ✓ | ✓ | · |
+| `impl` | · | · | s34 | · | ✓ | ✓ | ✓ | · |
+| `import` | s35 | s35 | s35 | · | ✓ | ✓ | ✓ | · |
 | `in` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `is` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `let` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `macro` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `match` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `mod` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `mut` | s35 | · | · | · | ✓ | ✓ | ✓ | · |
+| `mut` | s36 | · | · | · | ✓ | ✓ | ✓ | · |
 | `null` | · | · | · | ✓ | ✓ | ✓ | ✓ | · |
 | `ret` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `struct` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `trait` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `type` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `true` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `use` | s34 | s34 | s34 | · | ✓ | ✓ | ✓ | · |
+| `use` | s35 | s35 | s35 | · | ✓ | ✓ | ✓ | · |
 | `as` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `borrows` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `context` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -420,11 +419,11 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 | `lazy` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `only` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `own` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `self` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | s36 |
+| `self` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | s37 |
 | `Self` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `sync` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `then` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `void` | s37 | s37 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `void` | s38 | s38 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `with` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `derive` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `service` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -445,39 +444,40 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 ## Notes
 
 - **s1** `mod self;` carries the attributes of the whole file, so it is the file's first statement: move it above the first import. To fence one function instead, write `[platform(..)]` on the function
-- **a2** `external fun f` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
-- **a3** `[service]` on `S` has an empty contract surface: it declares no `[rpc]` method, no `[expose]`d field and no `client = ..` handler, so the client it generates can call nothing and every call answers `unknown method` at r…
-- **s4** `[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already reachable and absent from completion, which is the whole of what this marker meant — delete it, and write `export` on the names…
-- **a5** `main` requires the `browser` platform its file declares and cannot run on `node:24`
-- **a6** `[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about
-- **s7** `[deprecated(..)]` on an `import` deprecates the name a RE-EXPORT publishes, and this import is not exported, so it publishes nothing — write `export` before the attribute, or delete it
-- **s8** `[resource]` marks a type as a resource: it may label only a `struct`, an `enum` or a `trait` declaration
-- **a9** cannot find type 'Show'
-- **a10** `[hint(..)]` names the trait a struct or an enum is shown as in an inlay hint, and a trait is not a type — write it on the struct or enum whose values the hint is about
-- **a11** `[hint(..)]` names the trait a struct or an enum is shown as in an inlay hint, and an `impl` block is not a type — write it on the struct or enum whose values the hint is about
-- **a12** `[hint(..)]` names the trait a struct or an enum is shown as in an inlay hint, and a module binding is not a type — write it on the struct or enum whose values the hint is about
-- **a13** no macro named `user_macro` is in scope
-- **a14** `export` is a module-level item and cannot appear inside a body
-- **a15** `external fun m` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
-- **a16** `external fun t` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
-- **a17** a `macro fun` must be a top-level item
-- **s18** `dyn` marks a trait object in TYPE position — `let shape: dyn Shape = circle;` — and has no reading in an expression: a value becomes a trait object where it meets that type
-- **s19** `lazy` is written where the deferral is DECLARED — `lazy let name: T = …;` at module level, or `lazy name: T` on a parameter — and a call passes the argument plainly
-- **s20** `own` is a PARAMETER convention — `fun take(own list: List<T>)` — and has no reading here: a `let` already owns its value, and a type is written without it
-- **a21** field `x` of struct `S` is `[expose]`d, but its type `i32` does not implement `std::Source`: only observable state can be exposed, because the client mirrors it by subscribing. Write a `SignalCell<T>` with a Wire `T`, or…
-- **a22** cannot find 'x' in this scope
-- **a23** Expected i32, but got Promise<i32> instead.
-- **a24** Vilan has no const declarations; write `let x = const ..`
-- **a25** const evaluation failed: a `const` result must be plain data; this evaluates to a closure. A compile-time CLOSURE is spelled as a declaration: write `const let g = ..;` — a `const let` admits a closure over plain data (`…
-- **s26** `export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for the whole module and a `(in PATH)` sco…
-- **a27** no macro named `g` is in scope
-- **s28** a closure cannot take a `lazy` parameter: a closure TYPE (`sync \|A\| B`) has no lazy form, so the thunking would be invisible to every position the closure is annotated, stored or passed in. Take a closure parameter (`\|ma…
-- **a29** `x` is a `lazy` binding inside a body: `lazy` defers a MODULE-LEVEL binding, whose lifetime is the process's. A local would need a runtime was-it-initialized flag to know whether to destroy it at the end of its scope — d…
-- **s30** a lazy binding is `lazy let name: T = <initializer>;` — `lazy` defers a BINDING's initializer to its first use, and a parameter's argument to the callee's first read
-- **a31** `x` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
-- **s32** `css` is a keyword: it begins a `css { … }` block. The style values that used to spell it were renamed out of its way — `Length::css(…)` is now `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.t…
-- **s33** the unit type is spelled `void`: `()` is the empty tuple, which no expression can produce
-- **s34** an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
-- **s35** a mutable binding is spelled `mut x = …`: `let` and `mut` are the two binding forms, not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and writing both is neither
-- **s36** `self` is reserved for the file's own module — `mod self;`, with no body, as the file's first statement — so a nested module cannot take the name: give it another
-- **s37** `void` is the unit value's own spelling, so a binding cannot take it: every later `void` still reads as the unit, not as this binding — name it something else
+- **s2** `export` is written once: the declaration is already marked, and a second `export` adds nothing — delete it
+- **a3** `external fun f` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
+- **a4** `[service]` on `S` has an empty contract surface: it declares no `[rpc]` method, no `[expose]`d field and no `client = ..` handler, so the client it generates can call nothing and every call answers `unknown method` at r…
+- **s5** `[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already reachable and absent from completion, which is the whole of what this marker meant — delete it, and write `export` on the names…
+- **a6** `main` requires the `browser` platform its file declares and cannot run on `node:24`
+- **a7** `[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about
+- **s8** `[deprecated(..)]` on an `import` deprecates the name a RE-EXPORT publishes, and this import is not exported, so it publishes nothing — write `export` before the attribute, or delete it
+- **s9** `[resource]` marks a type as a resource: it may label only a `struct`, an `enum` or a `trait` declaration
+- **a10** cannot find type 'Show'
+- **a11** `[hint(..)]` names the trait a struct or an enum is shown as in an inlay hint, and a trait is not a type — write it on the struct or enum whose values the hint is about
+- **a12** `[hint(..)]` names the trait a struct or an enum is shown as in an inlay hint, and an `impl` block is not a type — write it on the struct or enum whose values the hint is about
+- **a13** `[hint(..)]` names the trait a struct or an enum is shown as in an inlay hint, and a module binding is not a type — write it on the struct or enum whose values the hint is about
+- **a14** no macro named `user_macro` is in scope
+- **a15** `export` is a module-level item and cannot appear inside a body
+- **a16** `external fun m` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
+- **a17** `external fun t` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
+- **a18** a `macro fun` must be a top-level item
+- **s19** `dyn` marks a trait object in TYPE position — `let shape: dyn Shape = circle;` — and has no reading in an expression: a value becomes a trait object where it meets that type
+- **s20** `lazy` is written where the deferral is DECLARED — `lazy let name: T = …;` at module level, or `lazy name: T` on a parameter — and a call passes the argument plainly
+- **s21** `own` is a PARAMETER convention — `fun take(own list: List<T>)` — and has no reading here: a `let` already owns its value, and a type is written without it
+- **a22** field `x` of struct `S` is `[expose]`d, but its type `i32` does not implement `std::Source`: only observable state can be exposed, because the client mirrors it by subscribing. Write a `SignalCell<T>` with a Wire `T`, or…
+- **a23** cannot find 'x' in this scope
+- **a24** Expected i32, but got Promise<i32> instead.
+- **a25** `const x = …` is not a declaration: a compile-time binding is `const let x = …`, and a runtime one seeded from a build-time value is `let x = const …`
+- **a26** const evaluation failed: a `const` result must be plain data; this evaluates to a closure. A compile-time CLOSURE is spelled as a declaration: write `const let g = ..;` — a `const let` admits a closure over plain data (`…
+- **s27** `export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for the whole module and a `(in PATH)` sco…
+- **a28** no macro named `g` is in scope
+- **s29** a closure cannot take a `lazy` parameter: a closure TYPE (`sync \|A\| B`) has no lazy form, so the thunking would be invisible to every position the closure is annotated, stored or passed in. Take a closure parameter (`\|ma…
+- **a30** `x` is a `lazy` binding inside a body: `lazy` defers a MODULE-LEVEL binding, whose lifetime is the process's. A local would need a runtime was-it-initialized flag to know whether to destroy it at the end of its scope — d…
+- **s31** a lazy binding is `lazy let name: T = <initializer>;` — `lazy` defers a BINDING's initializer to its first use, and a parameter's argument to the callee's first read
+- **a32** `x` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+- **s33** `css` is a keyword: it begins a `css { … }` block. The style values that used to spell it were renamed out of its way — `Length::css(…)` is now `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.t…
+- **s34** the unit type is spelled `void`: `()` is the empty tuple, which no expression can produce
+- **s35** an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
+- **s36** a mutable binding is spelled `mut x = …`: `let` and `mut` are the two binding forms, not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and writing both is neither
+- **s37** `self` is reserved for the file's own module — `mod self;`, with no body, as the file's first statement — so a nested module cannot take the name: give it another
+- **s38** `void` is the unit value's own spelling, so a binding cannot take it: every later `void` still reads as the unit, not as this binding — name it something else

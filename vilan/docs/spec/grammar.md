@@ -113,7 +113,7 @@ the order; the release after refuses it. An attribute written on either
 side is read exactly as one after the marker (and its scope) always was: it
 joins the item's own prefix, whose order and admissions are the item
 production's (§3.3), and a run may be split across the marker. Only an
-attribute shape — `[` then a name — leads a marker; `export *;` takes none. A `#` before
+attribute shape — `[` then a name — leads a marker; `export *;` takes none. The marker is written once: a second `export` on one declaration is refused (B492). A `#` before
 a path element is the **reach** marker:
 `import pkg::a::{ #hidden };` imports an item the module does not export,
 deliberately (§4.3, §4.8).
