@@ -2417,6 +2417,36 @@ fn r9_consuming_a_module_global_inside_a_closure_via_let_is_rejected() {
     );
 }
 
+/// B519: a module-level `let` a MACRO writes is a module-level binding like a
+/// written one, so §5's loan-only rule holds it too. It is declared in the
+/// expansion's own scope (a child of the module's), which the module-level
+/// classification did not count — consuming it was accepted.
+#[test]
+fn r9_consuming_a_macro_generated_module_global_is_rejected() {
+    assert_fails_with(
+        r#"
+        [resource] struct Res { handle: i32 }
+
+        macro fun holder(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source };
+
+            source("let res: Res = Res { handle = 1 };\n")
+        }
+
+        [holder]
+        struct Seed {
+            unused: i32,
+        }
+
+        fun main() {
+            let mine = res;
+        }
+        "#,
+        "module-level resource",
+    );
+}
+
 #[test]
 fn r9_dropping_a_module_global_inside_a_closure_is_rejected() {
     // `drop(res)` inside a closure is an own-move of a process-lifetime binding —
