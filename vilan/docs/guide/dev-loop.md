@@ -530,7 +530,7 @@ fun missing_page(): View {
 
 fun main() {
 	let _root = mount_root("app", || {
-		let route = current_path().derive(|path| parse(path));
+		let route = current_path().derive(parse);
 		view("main")
 			// Visible only while a route chunk is in flight; the page behind
 			// it is the one you were already on.

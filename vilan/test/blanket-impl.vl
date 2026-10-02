@@ -21,7 +21,7 @@ impl type T with MaybeSignal<T> {
 // wherever both match.
 impl SignalCell<type T> with MaybeSignal<T> {
 	fun bind(self, react: |T| void) {
-		let _watching = self.sub(react);
+		let _watching = self.sub(|value| react(value));
 	}
 }
 

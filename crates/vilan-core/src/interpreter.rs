@@ -1699,6 +1699,8 @@ impl<'a> Interpreter<'a> {
                 nursery.insert(Rc::from("cancel"), cancel);
                 Ok(Value::Object(Rc::new(RefCell::new(nursery))))
             }
+            // M92's question of that nursery: it never holds a task here.
+            "__nursery_has_spawned" => Ok(Value::Bool(false)),
             // The reactive core's two exception seams (tracker B292), mirroring
             // `helper_source`'s JS. Only a vilan `panic` is a THROW here
             // (`FailureKind::Thrown`); fuel, depth, an unsupported capability

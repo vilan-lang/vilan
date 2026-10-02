@@ -1353,6 +1353,106 @@ fn a130_a_cell_in_a_module_bindings_initializer_is_refused_at_the_method() {
 }
 
 #[test]
+fn rk_a_transient_in_a_module_bindings_initializer_is_refused_with_its_own_twin() {
+    // R-k: `.transient()` registers with the ambient owner exactly as `.cell()`
+    // does, so in a module binding's initializer it is refused the same way —
+    // naming its own seal and steering to `.transient_global()`. Both arms: a flow
+    // of `Result` tasks and a flow of bare tasks. Red before R-k: the program
+    // compiled, and the seal's registration stayed on `id` for the program.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::result::Result::{ self, Ok, Err };
+        import std::transient::Transient;
+
+        let id: SignalCell<i32> = Signal::new(1);
+        let fetched: Transient<i32, str> = id.derive(|x| async Ok(x * 10)).transient();
+        let bare: Transient<i32, str> = id.derive(|x| async { x * 100 }).transient();
+
+        fun main() {
+            print(fetched.get().is_some());
+        }
+        "#;
+    // Occurrence 0 is the import's `std::transient`; 1 and 2 are the two seals.
+    for occurrence in [1, 2] {
+        assert_fails_spanning_nth(
+            source,
+            "transient",
+            occurrence,
+            "`.transient()` in the initializer of the module binding",
+        );
+    }
+    assert_fails_with(source, "the module binding `fetched`");
+    assert_fails_with(source, "the module binding `bare`");
+    assert_fails_with(
+        source,
+        "or write `.transient_global()`, which says that lifetime",
+    );
+}
+
+#[test]
+fn rk_transient_global_at_module_level_compiles_and_follows_its_source() {
+    // The program-lifetime spelling: both arms compile in a module binding's
+    // initializer and follow their source to the latest task's answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::result::Result::{ self, Ok, Err };
+        import std::time::sleep;
+        import std::transient::Transient;
+
+        let id: SignalCell<i32> = Signal::new(1);
+        let fetched: Transient<i32, str> = id.derive(|x| async Ok(x * 10)).transient_global();
+        let bare: Transient<i32, str> = id.derive(|x| async { x * 100 }).transient_global();
+
+        fun main() {
+            sleep(10);
+            print(i"{fetched.get().unwrap_or(0)} {bare.get().unwrap_or(0)}");
+            id.set(2);
+            sleep(10);
+            print(i"{fetched.get().unwrap_or(0)} {bare.get().unwrap_or(0)}");
+        }
+
+        main();
+        "#,
+        "10 100\n20 200\n",
+    );
+}
+
+#[test]
+fn rk_transient_global_ignores_an_ambient_owner_where_transient_is_released_with_it() {
+    // The lifetime is in the name: made under an owner that is then disposed,
+    // `.transient_global()` keeps following its source; `.transient()` made the
+    // same way stops at the disposal and keeps its last answer. Red when the
+    // global twin registers with the owner: `global=10`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::result::Result::{ self, Ok, Err };
+        import std::time::sleep;
+        import std::transient::Transient;
+
+        fun main() {
+            let id: SignalCell<i32> = Signal::new(1);
+            let owner = Owner::new();
+            let scoped: Transient<i32, str> = run_with_owner(owner, || id.derive(|x| async Ok(x * 10)).transient());
+            let global: Transient<i32, str> = run_with_owner(owner, || id.derive(|x| async Ok(x * 10)).transient_global());
+            sleep(10);
+            owner.dispose();
+            id.set(2);
+            sleep(10);
+            print(i"scoped={scoped.get().unwrap_or(0)} global={global.get().unwrap_or(0)}");
+        }
+
+        main();
+        "#,
+        "scoped=10 global=20\n",
+    );
+}
+
+#[test]
 fn a142_a130_a_memo_in_a_module_bindings_initializer_is_refused_with_its_own_twin() {
     // `.memo()` is owner-tied exactly as `.cell()` is, and it is refused the same
     // way — naming its own seal and steering to its own `_global` twin. Red when
@@ -1926,6 +2026,16 @@ fn a135_a_handle_method_whose_tail_is_cell_warns_with_the_memo_steer() {
         found.iter().all(|(_, spanned)| spanned == "cell"),
         "every warning spans the `.cell` name: {found:#?}"
     );
+    let steered = warning_diagnostics(&A135_SERVICE.replace(
+        "{BODY}",
+        "[rpc]\n        fun count(self): SignalCell<usize> {\n            self.names.derive(|names| names.len()).cell()\n        }",
+    ));
+    assert!(
+        steered
+            .iter()
+            .any(|(message, _)| message.contains("a `Memo` whose maker writes `.cell_global()`")),
+        "a `.cell()` tail is steered to `.cell_global()`: {steered:#?}"
+    );
 }
 
 /// A135 (c), the controls: a handle returning a cell that OUTLIVES the call (a
@@ -2103,6 +2213,14 @@ fn a145_a_memo_handle_method_whose_tail_is_memo_warns() {
         .filter(|(message, _)| message.contains("returns a signal handle it builds with"))
         .map(|(message, range)| {
             assert_eq!(&source[range], "memo", "{message}");
+            // The warning names the seal the body wrote, and its program-lifetime
+            // twin (A135's tail, transient-44's find): red when it was hard-coded
+            // to `.cell()` / `.cell_global()`.
+            assert!(
+                message.contains("builds with `.memo()` on every call")
+                    && message.contains("a `Memo` whose maker writes `.memo_global()`"),
+                "{message}"
+            );
             message.split('`').nth(1).unwrap_or_default().to_string()
         })
         .collect();
@@ -2198,16 +2316,22 @@ fn a136_a_maker_that_builds_what_outlives_the_caller_does_not_warn() {
 
 #[test]
 fn a142_s2_a_body_that_registers_nothing_allocates_no_owner() {
-    // `owner_lists_allocated` counts every cleanup list an owner ever made. Ten
-    // changes through a sealed two-stage chain and a plain effect allocate NONE
-    // (`quiet=0`); the same ten through an effect whose body registers one
-    // cleanup per run allocate one list per run (`busy=10`). Red when the run's
-    // owner allocates its list up front: `quiet=30` (a list per run per body).
+    // `owner_lists_allocated` counts every cleanup list an owner ever made, and
+    // `run_nurseries_allocated` every nursery a pipe run made (M92). Ten changes
+    // through a sealed two-stage chain and a plain effect allocate NEITHER
+    // (`quiet=0 nurseries=0`); the same ten through an effect whose body
+    // registers one cleanup per run allocate one list per run (`busy=10`) and
+    // still no nursery; ten through an effect whose body starts a task allocate
+    // one nursery per run (`spawning=10`): a nursery a task registered with is
+    // cancelled with its run. Red when the run's owner allocates its list up
+    // front: `quiet=30`; red when every run makes a nursery (before M92):
+    // `nurseries=30` and `busy_nurseries=10`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::reactive::{
-            Owner, Signal, SignalCell, Source, on_cleanup, owner_lists_allocated, run_with_owner,
+            Owner, Signal, SignalCell, Source, on_cleanup, owner_lists_allocated, run_nurseries_allocated,
+            run_with_owner,
         };
 
         fun main() {
@@ -2220,30 +2344,46 @@ fn a142_s2_a_body_that_registers_nothing_allocates_no_owner() {
                 root.derive(|value| value + 1).derive(|value| value * 2).memo()
             });
             let before = owner_lists_allocated();
+            let before_nurseries = run_nurseries_allocated();
             mut step = 1;
             for step <= 10 {
                 root.set(step);
                 step += 1;
             }
-            print(i"quiet={owner_lists_allocated() - before} value={sealed.get()}");
+            print(i"quiet={owner_lists_allocated() - before} nurseries={run_nurseries_allocated() - before_nurseries} value={sealed.get()}");
             let noisy = Owner::new();
             run_with_owner(noisy, || {
                 root.effect(|_value: i32| on_cleanup(|| {}));
             });
             let before_busy = owner_lists_allocated();
+            let before_busy_nurseries = run_nurseries_allocated();
             step = 1;
             for step <= 10 {
                 root.set(step);
                 step += 1;
             }
-            print(i"busy={owner_lists_allocated() - before_busy}");
+            print(i"busy={owner_lists_allocated() - before_busy} busy_nurseries={run_nurseries_allocated() - before_busy_nurseries}");
             noisy.dispose();
+            let spawning = Owner::new();
+            run_with_owner(spawning, || {
+                root.effect(|value: i32| {
+                    let _task = async value;
+                });
+            });
+            let before_spawning = run_nurseries_allocated();
+            step = 1;
+            for step <= 10 {
+                root.set(step);
+                step += 1;
+            }
+            print(i"spawning={run_nurseries_allocated() - before_spawning}");
+            spawning.dispose();
             boundary.dispose();
         }
 
         main();
         "#,
-        "quiet=0 value=22\nbusy=10\n",
+        "quiet=0 nurseries=0 value=22\nbusy=10 busy_nurseries=0\nspawning=10\n",
     );
 }
 
@@ -2415,13 +2555,13 @@ fn a142_s2_a_derive_bodys_superseded_task_is_cancelled() {
 }
 
 #[test]
-#[ignore = "A142: reactive-44 find — a spawn inside a user-written `context ambient_nursery` closure is not registered with the injected nursery, so a cancelled run's task is reported as an unhandled task error"]
 fn a142_s2_a_cancelled_runs_task_is_owned_and_reports_nothing() {
-    // The ownership half of the pin above: the run's task is REGISTERED with the
-    // run's nursery, so its cancellation is absorbed like every owned task's.
-    // Today the spawn is not connected to the injected nursery: the task is
-    // cancelled through the ambient signal (its sleep aborts) but it is unowned,
-    // so its AbortError is reported on stderr.
+    // The ownership half of the pin above (J7): the run's task is REGISTERED with
+    // the run's nursery, so its cancellation is absorbed like every owned task's.
+    // Red when a spawn in a literal born under `context ambient_nursery` is not
+    // connected to the nursery its caller injects (the program calls no
+    // `nursery`): the task is cancelled through the ambient signal (its sleep
+    // aborts) but it is unowned, so its AbortError is reported on stderr.
     let (stdout, stderr) = compile_and_run_capturing_stderr(
         r#"
         import std::io::print;
@@ -2457,6 +2597,139 @@ fn a142_s2_a_cancelled_runs_task_is_owned_and_reports_nothing() {
 }
 
 #[test]
+fn j7_a_spawn_in_a_user_written_ambient_nursery_closure_is_owned_by_the_injected_nursery() {
+    // J7 (native-44's divergence): a function whose body parameter is typed
+    // `context ambient_nursery` establishes a detached nursery for it and cancels
+    // the nursery after. The task the literal spawned belongs to that nursery, so
+    // it is cancelled (neither `survived` prints) and its cancellation is
+    // absorbed. Red before J7 — the program calls no `nursery`, so the spawn was
+    // never connected: two "unhandled task error … AbortError" lines on stderr.
+    // Both shapes: the clause alone, and beside `owner_scope` (a pipe body's).
+    let (stdout, stderr) = compile_and_run_capturing_stderr(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, owner_scope };
+        import std::task::{ ambient_nursery, detached_nursery };
+        import std::time::sleep;
+
+        fun single(body: (|| void) context ambient_nursery) {
+            let held = detached_nursery();
+            ambient_nursery.run(held, body);
+            held.cancel();
+        }
+
+        fun double(body: (|| void) context (owner_scope, ambient_nursery)) {
+            let held = detached_nursery();
+            owner_scope.run(Owner::new(), || ambient_nursery.run(held, || body()));
+            held.cancel();
+        }
+
+        fun main() {
+            single(|| {
+                let _task = async {
+                    sleep(20);
+                    print("single survived");
+                };
+            });
+            double(|| {
+                let _task = async {
+                    sleep(20);
+                    print("double survived");
+                };
+            });
+            sleep(60);
+            print("done");
+        }
+
+        main();
+        "#,
+    )
+    .expect("compiles and runs");
+    assert_eq!(stdout, "done\n");
+    assert!(
+        stderr.trim().is_empty(),
+        "a cancelled owned task reports nothing: {stderr}"
+    );
+}
+
+#[test]
+fn j7_a_spawn_in_a_function_an_effect_body_calls_is_owned_by_the_run() {
+    // The dynamic extent, not the literal: a spawn inside a helper the body CALLS
+    // registers with the run's nursery too (the helper is threaded the nursery
+    // like any function a `nursery` body calls), so a superseded run's task is
+    // cancelled AND absorbed. Red when only a spawn written in the literal itself
+    // registers: `fetched 1` stays cancelled through the signal but its
+    // AbortError reaches stderr.
+    let (stdout, stderr) = compile_and_run_capturing_stderr(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::time::sleep;
+
+        fun fetch_later(value: i32) {
+            let _pending = async {
+                sleep(30);
+                print(i"fetched {value}");
+            };
+        }
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            run_with_owner(boundary, || {
+                id.effect(|value: i32| fetch_later(value));
+            });
+            id.set(2);
+            sleep(120);
+            boundary.dispose();
+            print("done");
+        }
+
+        main();
+        "#,
+    )
+    .expect("compiles and runs");
+    assert_eq!(stdout, "fetched 2\ndone\n");
+    assert!(
+        stderr.trim().is_empty(),
+        "a cancelled owned task reports nothing: {stderr}"
+    );
+}
+
+#[test]
+fn j7_a_spawn_with_no_nursery_establishing_site_stays_free_floating() {
+    // The engagement is still gated: a program that only loads `std::task` and
+    // spawns (no `nursery`, no `enter`, no literal at a `context ambient_nursery`
+    // position) keeps the unstructured behaviour — its failing task, never
+    // awaited, reports on stderr with its origin.
+    let (stdout, stderr) = compile_and_run_capturing_stderr(
+        r#"
+        import std::io::{ panic, print };
+        import std::task::Task;
+        import std::time::sleep;
+
+        fun fail(): i32 {
+            panic("boom")
+        }
+
+        fun main() {
+            let _task: Task<i32> = async fail();
+            sleep(20);
+            print("done");
+        }
+
+        main();
+        "#,
+    )
+    .expect("compiles and runs");
+    assert_eq!(stdout, "done\n");
+    assert!(
+        stderr.contains("unhandled task error") && stderr.contains("boom"),
+        "a free task's failure reports: {stderr}"
+    );
+}
+
+#[test]
 fn a142_s2_scoped_effect_is_a_deprecated_alias_of_effect() {
     // R2 merged the pair: `scoped_effect` still compiles, warns, and behaves as
     // `effect` does.
@@ -2484,5 +2757,112 @@ fn a142_s2_scoped_effect_is_a_deprecated_alias_of_effect() {
             .iter()
             .any(|(message, _)| message.contains("scoped_effect")),
         "scoped_effect warns as deprecated"
+    );
+}
+
+// --- F60 (R-d door (a)): a pipe dropped unconsumed WARNS ----------------------
+//
+// A pipe node runs nothing until a consumer starts it, so a pipe built as a bare
+// statement is a mistake the type can name: every pipe node type (anything std's
+// `Pipe`/`CollPipe` is implemented for, and a `dyn Pipe`) is must-use. It warns —
+// a dropped value is not an error anywhere else in the language — and still
+// builds on both backends (`native_differential`'s dropped-pipes probe).
+
+const F60_UNUSED_PIPE: &str = "unused pipe: a pipe runs nothing until it is consumed";
+
+#[test]
+fn f60_a_dropped_pipe_warns_whichever_function_built_it() {
+    // One warning per dropped pipe statement: a `derive`, a `distinct_by`, a
+    // chain, the free `derive`, a `switch`, an `Option` `flatten`, the
+    // collection pipes (`coll`, `coll().map`), a transient's `latest()` (a
+    // `dyn Pipe`), and an application's own function that answers a pipe. Red
+    // before F60: none of them said anything.
+    let found = warnings(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Derive, Signal, SignalCell, Source, derive };
+        import std::transient::{ Transient, TransientSource };
+
+        fun doubled(source: SignalCell<i32>): Derive<SignalCell<i32>, i32, i32> {
+            source.derive(|value| value * 2)
+        }
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            count.derive(|value| value * 2);
+            count.distinct_by(|value| value);
+            count.derive(|value| value * 2).derive(|value| i"{value}");
+            derive(|| count.track() + 1);
+            let first: SignalCell<i32> = Signal::new(1);
+            let outer: SignalCell<SignalCell<i32>> = Signal::new(first);
+            outer.switch(|inner| inner);
+            let maybe: SignalCell<Option<SignalCell<i32>>> = Signal::new(Some(first));
+            maybe.flatten();
+            let items: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+            items.coll();
+            items.coll().map(|x| x * 2);
+            let fetched: Transient<i32, str> = count.derive(|x| async x).transient_global();
+            fetched.latest();
+            doubled(count);
+        }
+
+        main();
+        "#,
+    );
+    let dropped = found
+        .iter()
+        .filter(|message| message.starts_with(F60_UNUSED_PIPE))
+        .count();
+    assert_eq!(dropped, 10, "{found:#?}");
+}
+
+#[test]
+fn f60_a_consumed_sealed_or_discarded_pipe_does_not_warn() {
+    // The controls: a sealed pipe (`.memo()` answers a cell, not a pipe), one
+    // consumed by an `effect`, one bound with `let _`, one returned, a source
+    // (`Signal::new`), and an application's OWN trait named `Pipe` — none warns.
+    let found = warnings(
+        r#"
+        import std::reactive::{ Derive, Owner, Signal, SignalCell, Source, run_with_owner };
+
+        trait Pipe {
+            fun go(self): i32;
+        }
+
+        struct Mine {}
+
+        impl Mine with Pipe {
+            fun go(self): i32 { 1 }
+        }
+
+        fun make(): Mine {
+            Mine {}
+        }
+
+        fun doubled(source: SignalCell<i32>): Derive<SignalCell<i32>, i32, i32> {
+            source.derive(|value| value * 2)
+        }
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                count.derive(|value| value + 1).memo();
+                count.derive(|value| value + 1).effect(|value: i32| print(value));
+            });
+            let _ = count.derive(|value| value * 2);
+            Signal::new(3);
+            make();
+            let _kept = doubled(count);
+        }
+
+        main();
+        "#,
+    );
+    assert!(
+        !found
+            .iter()
+            .any(|message| message.starts_with(F60_UNUSED_PIPE)),
+        "{found:#?}"
     );
 }

@@ -256,7 +256,7 @@ const B474_PROBE: &str = concat!(
     "import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };\n",
     "\n",
     "fun through_the_trait<T, S: Source<T>>(source: S, observe: |T| void) {\n",
-    "\tlet live = source.sub(observe);\n",
+    "\tlet live = source.sub(|value| observe(value));\n",
     "\tlive.dispose();\n",
     "}\n",
     "\n",
@@ -2507,6 +2507,216 @@ const B482_PROBE: &str = concat!(
     "\t\ttwice(|n: i32| print(i\"{n} {describe()}\"));\n",
     "\t\tplain(|n: i32, m: i32| print(n + m + current.get()));\n",
     "\t});\n",
+    "}\n",
+);
+
+/// J7 + M92: a spawn in a literal born under `context ambient_nursery` — a
+/// user-written clause, and a pipe body's — is OWNED by the nursery its caller
+/// injects: cancelled with it, and its cancellation absorbed (native-44 found JS
+/// reporting two "unhandled task error … AbortError" lines here and native none).
+/// A run that starts no task hands its nursery on (`nurseries=0`). Stdout the
+/// same on both backends, and stderr empty on both.
+#[test]
+fn an_injected_nurserys_spawn_is_owned_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_j7.vl"), J7_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_j7.vl"),
+        Verdict::Identical,
+        "an injected nursery's spawn must be owned the same way on both backends"
+    );
+    for backend in [None, Some("rust")] {
+        let mut command = vilan(&staged);
+        command.arg("run");
+        if let Some(backend) = backend {
+            command.args(["--backend", backend]);
+        }
+        let output = command
+            .arg("native_probe_j7.vl")
+            .output()
+            .expect("run the probe");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "nurseries=0 value=12\nfetched 3\ndone\n",
+            "backend {backend:?}"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "a cancelled owned task reports nothing (backend {backend:?}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+const J7_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Owner, Signal, SignalCell, Source, run_nurseries_allocated, run_with_owner };\n",
+    "import std::task::{ ambient_nursery, detached_nursery };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "fun single(body: (|| void) context ambient_nursery) {\n",
+    "\tlet held = detached_nursery();\n",
+    "\tambient_nursery.run(held, body);\n",
+    "\theld.cancel();\n",
+    "}\n",
+    "\n",
+    "fun fetch_later(value: i32) {\n",
+    "\tlet _pending = async {\n",
+    "\t\tsleep(30);\n",
+    "\t\tprint(i\"fetched {value}\");\n",
+    "\t};\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tsingle(|| {\n",
+    "\t\tlet _task = async {\n",
+    "\t\t\tsleep(20);\n",
+    "\t\t\tprint(\"single survived\");\n",
+    "\t\t};\n",
+    "\t});\n",
+    "\tlet id: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet boundary = Owner::new();\n",
+    "\tlet sealed = run_with_owner(boundary, || id.derive(|value: i32| value * 4).memo());\n",
+    "\tlet before = run_nurseries_allocated();\n",
+    "\tid.set(2);\n",
+    "\tid.set(3);\n",
+    "\tprint(i\"nurseries={run_nurseries_allocated() - before} value={sealed.get()}\");\n",
+    "\trun_with_owner(boundary, || {\n",
+    "\t\tid.effect(|value: i32| fetch_later(value));\n",
+    "\t});\n",
+    "\tid.set(4);\n",
+    "\tid.set(3);\n",
+    "\tsleep(120);\n",
+    "\tboundary.dispose();\n",
+    "\tprint(\"done\");\n",
+    "}\n",
+);
+
+/// A146: `ListCell` and `KeyedCell` name their identity, so a body that tracks
+/// one on every run keeps ONE edge on it (`attaches=1`) on both backends. (The
+/// mirror half of the pin, `RemoteSource` and `KeyedSource` over `duplex_pair`,
+/// is JS-only: `inference::tracking`'s A146 pin — the native backend refuses
+/// that program by name, at an unresolved type in the rpc layer.)
+#[test]
+fn a_tracked_list_or_keyed_cell_keeps_one_edge_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_a146.vl"), A146_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_a146.vl"),
+        Verdict::Identical,
+        "a tracked list or keyed cell must keep one edge the same way on both backends"
+    );
+    let output = vilan(&staged)
+        .args(["run", "native_probe_a146.vl"])
+        .output()
+        .expect("run the probe");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "list attaches=1\nkeyed cell attaches=1\n5 2 1\n",
+        "one edge per source across six runs (red before A146: `attaches=6`)"
+    );
+}
+
+const A146_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, derive };\n",
+    "import std::delta::ListCell;\n",
+    "import std::rpc::{ KeyedCell, Keyed };\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "// Counts the edges a tracked read attaches to the wrapped source, and answers the\n",
+    "// wrapped source's identity.\n",
+    "struct Counted<S> {\n",
+    "\tinner: S,\n",
+    "\tattaches: Shared<i32>,\n",
+    "}\n",
+    "\n",
+    "impl Counted<type S: Source<type T>> with Source<T> {\n",
+    "\tfun get(self): T {\n",
+    "\t\tself.inner.get()\n",
+    "\t}\n",
+    "\n",
+    "\tfun on_settle(self, subscriber: Subscriber): Subscription {\n",
+    "\t\tself.attaches.write() = self.attaches.read() + 1;\n",
+    "\t\tself.inner.on_settle(subscriber)\n",
+    "\t}\n",
+    "\n",
+    "\tfun identity(self): Option<i32> {\n",
+    "\t\tself.inner.identity()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun counted<S>(inner: S): Counted<S> {\n",
+    "\tCounted { inner, attaches = Shared::new(0) }\n",
+    "}\n",
+    "\n",
+    "[derive(Wire)]\n",
+    "struct Row {\n",
+    "\tid: str,\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Row with Keyed<str> {\n",
+    "\tfun key(self): str {\n",
+    "\t\tself.id\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet list = counted(ListCell::of([1, 2]));\n",
+    "\tlet keyed: Counted<KeyedCell<str, Row>> = counted(KeyedCell::new([Row { id = \"a\", n = 1 }]));\n",
+    "\tlet trigger: SignalCell<i32> = Signal::new(0);\n",
+    "\tlet sealed = derive(|| {\n",
+    "\t\ti\"{trigger.track()} {list.track().len()} {keyed.track().len()}\"\n",
+    "\t}).memo();\n",
+    "\tmut step = 1;\n",
+    "\tfor step <= 5 {\n",
+    "\t\ttrigger.set(step);\n",
+    "\t\tstep += 1;\n",
+    "\t}\n",
+    "\tprint(i\"list attaches={list.attaches.read()}\");\n",
+    "\tprint(i\"keyed cell attaches={keyed.attaches.read()}\");\n",
+    "\tprint(sealed.get());\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);
+
+/// B482's std half: `on_change`, `sub` and `effect_on_change` call their
+/// callback under `tracking.clear(..)`, so a callback minted inside an effect
+/// body reads `tracking` as absent — the same on both backends.
+#[test]
+fn a_base_callback_runs_with_tracking_cleared_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b482_std.vl"), B482_STD_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b482_std.vl"),
+        Verdict::Identical,
+        "a base callback must run with tracking cleared the same way on both backends"
+    );
+}
+
+const B482_STD_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner, tracking };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet other: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet owner = Owner::new();\n",
+    "\trun_with_owner(owner, || {\n",
+    "\t\tcount.effect(|_value: i32| {\n",
+    "\t\t\tprint(i\"body {tracking.get_safe().is_some()}\");\n",
+    "\t\t\tlet _changed = other.on_change(|value| print(i\"on_change {value} {tracking.get_safe().is_none()}\"));\n",
+    "\t\t\tlet _subbed = other.sub(|value| print(i\"sub {value} {tracking.get_safe().is_none()}\"));\n",
+    "\t\t\tother.effect_on_change(|value| print(i\"effect_on_change {value} {tracking.get_safe().is_none()}\"));\n",
+    "\t\t});\n",
+    "\t});\n",
+    "\tother.set(2);\n",
+    "\towner.dispose();\n",
     "}\n",
 );
 

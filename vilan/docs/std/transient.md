@@ -16,6 +16,7 @@ import std::transient::{ TransientState, TransientSource, Transient, TaskSource 
 | `TransientState<T, E>` | enum | `Pending`, `Ready(T)`, `Refreshing(T)`, `Failed(E, Option<T>)`, `Absent` |
 | `TransientSource<T, E>` | trait | a `Source<Option<T>>` that also says where it stands: `state()`, `latest()`, `is_pending()` |
 | `.transient()` | method on a pipe of tasks | seal a flow of tasks: the latest task wins |
+| `.transient_global()` | method on a pipe of tasks | `.transient()` for the program's lifetime (a module binding's spelling) |
 | `Transient<T, E>` | struct | what `.transient()` returns |
 | `TaskSource<T, E>` | struct | one task as a transient: `TaskSource::new(task)`, `TaskSource::of(task)` |
 
@@ -86,7 +87,10 @@ raised again, reported like any unobserved failure, and the transient stays
 where the change left it.)
 
 Like `.memo()`, the seal is owner-tied: made inside a boundary, it is released
-with the boundary.
+with the boundary. In a module binding's initializer, which has no owner,
+`.transient()` is refused; `.transient_global()` is the same seal for the life of
+the program — it registers with no owner, even inside a boundary, and nothing
+releases it (the `.cell_global()` rule).
 
 ## TaskSource: one task
 

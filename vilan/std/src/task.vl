@@ -64,7 +64,19 @@ export impl Nursery {
 	/// std's IO wrappers already do (`ambient_signal`).
 	[extern(method, "signal_of")]
 	external fun signal(self): CancelSignal;
+
+	/// Whether any task has registered with this nursery, ever — a finished one
+	/// included. A pipe stage asks it to keep one nursery across runs that start no
+	/// task (M92): a nursery nothing registered with has nothing to cancel, so the
+	/// next run can take it as it is.
+	[internal("a pipe stage's nursery reuse (M92); an application cancels a nursery it owns")]
+	fun has_spawned(self): bool {
+		__nursery_has_spawned(self)
+	}
 }
+
+[extern("__nursery_has_spawned")]
+external fun __nursery_has_spawned(nursery: Nursery): bool;
 
 /// The ambient nursery's cancel signal, if any — read this to bridge an abortable
 /// host API that std doesn't wrap.

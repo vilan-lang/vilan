@@ -59,6 +59,7 @@ import pkg::reactive::{
 	register_with_owner,
 	run_element,
 	subscriber_of,
+	tracking,
 	wake,
 };
 import pkg::shared::Shared;
@@ -952,6 +953,12 @@ export impl ListCell<type T> with Source<List<T>> {
 		self.items.read()
 	}
 
+	/// The items cell's identity (A146): every handle to this list names the same
+	/// cell, so a tracked read keeps one edge across runs.
+	fun identity(self): Option<i32> {
+		Some(self.items.identity())
+	}
+
 	/// The observer is handed the list as it stands when the notification is
 	/// delivered, which is what a `SignalCell`'s observer is handed too.
 	///
@@ -1090,12 +1097,12 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	// notification, so a handler holding the source was a loop no count could
 	// collect.
 	let read = source.reader();
-	// `on_change`, through the blanket `Flow` over `Source` (F58 built that hop
-	// natively). Not `attach_observer` directly: through this SUBTRAIT bound a
-	// supertrait default's override is not dispatched (both backends), and
-	// `Source`'s default captures the source, the loop A132 took out; the blanket's
-	// own `Source` bound reaches the cell's override.
-	let _owned = register_with_owner(source.on_change(|_published| {
+	// The source's own attach, through this SUBTRAIT bound: since B473 a supertrait
+	// default's override IS dispatched through it, so the cell's `attach_observer`
+	// (which captures only its items, A132) is reached without the `Flow` blanket's
+	// hop — and without the callback position's clear, which this closure (std's
+	// own, tracking nothing) does not need.
+	let _owned = register_with_owner(source.attach_observer(|_published| {
 		for op in read(cursor) {
 			match op {
 				// The derivative of `map g`: what arrived, mapped. Nothing else is
@@ -1112,7 +1119,7 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 				SeqOp::Move(let from, let count, let to) => out.move_range(from, count, to),
 			}
 		}
-	}));
+	}, false));
 	defer_to_owner(|| source.drop_cursor(cursor));
 	out
 }
@@ -1398,8 +1405,8 @@ export impl type P: Pipe<type T> with IntoElement<T> {
 /// the owner its run's registrations were split into. A plain element that
 /// registered nothing has no record; one that registered something and answered a
 /// plain value has a record that follows nothing (`follows` false, a `pull` that
-/// answers the value, a `release` that does nothing). Closures are held bare rather
-/// than as `Option`s, which the native backend does not hold.
+/// answers the value, a `release` that does nothing): its closures are held bare,
+/// as no-ops where there is nothing to call, rather than as `Option`s.
 struct ElementHold<V> {
 	follows: bool,
 	pull: || V,
@@ -2167,13 +2174,13 @@ export [hint(Pipe<U>)]
 
 export impl CollTally<type F: CollFlow<type T>, T, type R: IntoFlow<bool>, type U> with Flow<U> {
 	[must_use]
-	fun on_change(own self, observer: |U| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|U| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |U| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|U| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<U> {

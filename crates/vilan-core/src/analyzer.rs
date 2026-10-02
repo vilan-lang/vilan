@@ -28968,21 +28968,78 @@ impl<'src> Analyzer<'src> {
                 statements.extend(block_statements.iter().copied());
             }
         }
+        let pipe_traits = self.std_pipe_traits();
         for statement_id in statements {
             let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&statement_id) else {
                 continue;
             };
-            if self.call_is_must_use(*call_id) {
-                self.warnings.push(Error { trace: Vec::new(), note: None,
-                    span: **self.span_map.get(&statement_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: "unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.".to_string(),
-                });
-                // This sweep runs over the whole program, outside any per-file
-                // walk, so the warning's file comes from its anchor statement —
-                // the span belongs to that file, and that is where it renders.
-                let source = self.source_of_id(statement_id).unwrap_or(SourceId(0));
-                self.warning_sources.push(source);
-            }
+            let message = if self.call_is_must_use(*call_id) {
+                "unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.".to_string()
+            } else if self.discarded_pipe(statement_id, &pipe_traits) {
+                // F60 (R-d door (a)): a pipe NODE is must-use by its type, so a
+                // dropped one warns whichever function built it — a std
+                // combinator or an application's own. It runs nothing: a pipe
+                // starts only when it is consumed.
+                "unused pipe: a pipe runs nothing until it is consumed — seal it (`.memo()`), consume it (`.effect(..)`, a binding), or `let _ = …` to discard.".to_string()
+            } else {
+                continue;
+            };
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&statement_id).unwrap_or(&&EMPTY_SPAN),
+                msg: message,
+            });
+            // This sweep runs over the whole program, outside any per-file
+            // walk, so the warning's file comes from its anchor statement —
+            // the span belongs to that file, and that is where it renders.
+            let source = self.source_of_id(statement_id).unwrap_or(SourceId(0));
+            self.warning_sources.push(source);
+        }
+    }
+
+    /// std's pipe traits (F60): `std::reactive`'s `Pipe` and `std::delta`'s
+    /// `CollPipe`, by declaration — std declares each name once, and an
+    /// application's own trait of the same name is not std's.
+    fn std_pipe_traits(&self) -> Vec<Id> {
+        self.traits
+            .values()
+            .filter(|declared| matches!(declared.name, "Pipe" | "CollPipe"))
+            .filter(|declared| {
+                self.source_of_id(declared.id)
+                    .is_some_and(|source| self.std_sources.contains(&source))
+            })
+            .map(|declared| declared.id)
+            .collect()
+    }
+
+    /// Whether a discarded statement's value is a PIPE (F60): a struct some
+    /// implementation makes a `Pipe`/`CollPipe`, or a `dyn Pipe` object.
+    fn discarded_pipe(&self, statement_id: Id, pipe_traits: &[Id]) -> bool {
+        if pipe_traits.is_empty() {
+            return false;
+        }
+        // The interned type when the call has one, else the callee's declared
+        // return — a pipe's node TYPE is what decides, not its arguments.
+        let Some(type_id) = self
+            .resolved_type_id_of(statement_id)
+            .or_else(|| self.call_declared_return_type_id(statement_id))
+        else {
+            return false;
+        };
+        match type_id.get_type(self) {
+            Type::Dyn(trait_id, _) => pipe_traits.contains(&trait_id),
+            Type::Struct(struct_id, _) => self.implementations.iter().any(|implementation| {
+                implementation
+                    .trait_ids
+                    .iter()
+                    .any(|trait_id| pipe_traits.contains(trait_id))
+                    && matches!(
+                        implementation.subject.get_type(self),
+                        Type::Struct(subject, _) if subject == struct_id
+                    )
+            }),
+            _ => false,
         }
     }
 
@@ -62432,8 +62489,8 @@ fn handle_return_key<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
 /// The djb2 string hash, as a raw `u32` — the HMR fingerprint of a binding's
 /// canonical structural type rendering (`hmr.md` §4).
 ///
-/// It is the same hash `std/src/rpc.vl`'s `service_hash` computes over a
-/// service contract surface; the Rust `service_contract_hash` that used to
+/// It is the same hash `contract_hash.rs` computes over a service contract
+/// surface (A144); the Rust `service_contract_hash` that used to
 /// share this function went with the fallback generator (N70).
 fn djb2_hash(text: &str) -> u32 {
     let mut hash: u32 = 5381;

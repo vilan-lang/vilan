@@ -969,9 +969,8 @@ export struct Owner {
 /// false) and no nursery; each is its own only once something needs it.
 export struct OwnerCell {
 	epoch: i32,
-	// Its own cell once `listed`, so a registration pushes in place. Not an
-	// `Option`: the native backend holds a closure list in a `Shared` but not an
-	// `Option` of one.
+	// Its own cell once `listed`, so a registration pushes in place; until then the
+	// shared `no_cleanups`, which nothing pushes to.
 	cleanups: Shared<List<|| void>>,
 	listed: bool,
 	nursery: Option<Nursery>,
@@ -989,6 +988,16 @@ let owner_lists_allocated_count: Shared<i32> = Shared::new(0);
 export [internal("an instrument for the lazy-owner pin (A142 §4.1); it counts, it decides nothing")]
 fun owner_lists_allocated(): i32 {
 	owner_lists_allocated_count.read()
+}
+
+/// How many nurseries pipe runs have allocated since the program started — the
+/// instrument behind "a run that starts no task allocates no nursery" (M92).
+let run_nurseries_allocated_count: Shared<i32> = Shared::new(0);
+
+/// `run_nurseries_allocated_count`, read. A pin's instrument, not an application's.
+export [internal("an instrument for the lazy-nursery pin (M92); it counts, it decides nothing")]
+fun run_nurseries_allocated(): i32 {
+	run_nurseries_allocated_count.read()
 }
 
 export impl Owner {
@@ -1031,41 +1040,41 @@ export impl Owner {
 		if self.is_disposed() {
 			cleanup();
 		} else {
-			let held = self.cell.read();
-			if held.listed {
-				held.cleanups.write().push(cleanup);
+			if self.cell.read().listed {
+				self.cell.read().cleanups.write().push(cleanup);
 			} else {
 				owner_lists_allocated_count.write() = owner_lists_allocated_count.read() + 1;
-				self.cell.write() = OwnerCell {
-					epoch = held.epoch,
-					cleanups = Shared::new([cleanup]),
-					listed = true,
-					nursery = held.nursery,
-				};
+				self.cell.write().cleanups = Shared::new([cleanup]);
+				self.cell.write().listed = true;
 			}
 		}
 	}
 
 	/// The owner of this cell's NEXT run: the live epoch is released (its cleanups
-	/// run, its nursery is cancelled) and the epoch after it opened, with a fresh
-	/// nursery for its tasks when `with_nursery` — a pipe stage's per-run owner
-	/// (A142 §4). Reached from any epoch of the cell: a stage keeps the cell and
-	/// renews through whichever epoch it last handed out.
+	/// run, its nursery is cancelled) and the epoch after it opened, with a nursery
+	/// for its tasks — a pipe stage's per-run owner (A142 §4). Reached from any
+	/// epoch of the cell: a stage keeps the cell and renews through whichever epoch
+	/// it last handed out.
+	///
+	/// **A run that starts no task allocates no nursery (M92).** A nursery no task
+	/// has registered with has nothing to cancel, so it is CARRIED into the next
+	/// epoch instead of cancelled and replaced: a stage makes a nursery at its
+	/// first run and again only after a run that spawned. (A task spawned later
+	/// through a closure the carried run minted joins the live run's nursery and is
+	/// cancelled with it — one run late, never leaked; the stage's last release
+	/// cancels it whatever it holds.)
 	[internal("a pipe stage's per-run owner (A142 §4); an application disposes an owner and makes a new one")]
-	fun renew(self, with_nursery: bool): Owner {
-		let live = Owner { cell = self.cell, epoch = self.cell.read().epoch };
-		live.dispose();
-		let next = self.cell.read().epoch;
-		if with_nursery {
-			let held = self.cell.read();
-			self.cell.write() = OwnerCell {
-				epoch = held.epoch,
-				cleanups = held.cleanups,
-				listed = held.listed,
-				nursery = Some(detached_nursery()),
-			};
+	fun renew(self): Owner {
+		let carried: Option<Nursery> = match self.cell.read().nursery {
+			Some(let nursery) => if nursery.has_spawned() { None } else { Some(nursery) },
+			None => None,
+		};
+		Owner { cell = self.cell, epoch = self.cell.read().epoch }.advance(carried);
+		if self.cell.read().nursery.is_none() {
+			run_nurseries_allocated_count.write() = run_nurseries_allocated_count.read() + 1;
+			self.cell.write().nursery = Some(detached_nursery());
 		}
-		Owner { cell = self.cell, epoch = next }
+		Owner { cell = self.cell, epoch = self.cell.read().epoch }
 	}
 
 	/// The live epoch's nursery, made at the first ask — a collection stage's one
@@ -1077,13 +1086,7 @@ export impl Owner {
 			Some(let held) => held,
 			None => {
 				let made = detached_nursery();
-				let held = self.cell.read();
-				self.cell.write() = OwnerCell {
-					epoch = held.epoch,
-					cleanups = held.cleanups,
-					listed = held.listed,
-					nursery = Some(made),
-				};
+				self.cell.write().nursery = Some(made);
 				made
 			},
 		}
@@ -1096,23 +1099,14 @@ export impl Owner {
 	/// own run registered.
 	[internal("a collection stage's per-element owner (A142 §6.4)")]
 	fun split_registrations(self): Option<Owner> {
-		let held = self.cell.read();
-		if !held.listed || self.is_disposed() {
+		if !self.cell.read().listed || self.is_disposed() {
 			ret None;
 		}
-		self.cell.write() = OwnerCell {
-			epoch = held.epoch,
-			cleanups = no_cleanups,
-			listed = false,
-			nursery = held.nursery,
-		};
+		let cleanups = self.cell.read().cleanups;
+		self.cell.write().cleanups = no_cleanups;
+		self.cell.write().listed = false;
 		Some(Owner {
-			cell = Shared::new(OwnerCell {
-				epoch = 0,
-				cleanups = held.cleanups,
-				listed = true,
-				nursery = None,
-			}),
+			cell = Shared::new(OwnerCell { epoch = 0, cleanups, listed = true, nursery = None }),
 			epoch = 0,
 		})
 	}
@@ -1135,18 +1129,32 @@ export impl Owner with Disposable {
 	/// instead of landing on the emptied list — and so does a late registration
 	/// made through this epoch's handle after a newer epoch opened.
 	fun dispose(self) {
+		self.advance(None);
+	}
+}
+
+impl Owner {
+	/// Release this epoch — `dispose`, carrying `carried` (the epoch's own nursery,
+	/// which no task registered with) into the next epoch uncancelled: `renew`'s
+	/// M92 reuse. Nothing when this epoch is already over.
+	fun advance(self, carried: Option<Nursery>) {
 		if !self.is_disposed() {
 			let held = self.cell.read();
 			self.cell.write() = OwnerCell {
 				epoch = self.epoch + 1,
 				cleanups = no_cleanups,
 				listed = false,
-				nursery = None,
+				nursery = carried,
 			};
 			// Tasks first: a cancelled task's in-flight IO rejects at once, and a
-			// cleanup below that inspects what the run left sees it settled.
+			// cleanup below that inspects what the run left sees it settled. A
+			// carried nursery holds no task, and stays live for the next epoch.
 			match held.nursery {
-				Some(let nursery) => nursery.cancel(),
+				Some(let nursery) => {
+					if carried.is_none() {
+						nursery.cancel();
+					}
+				},
 				None => {},
 			}
 			// Every cleanup runs, even past a throwing one (tracker B292).
@@ -1272,11 +1280,13 @@ export fun on_cleanup(cleanup: || void) {
 ///
 /// Nothing here allocates an owner: the run's owner is the next epoch of the one
 /// cell the stage already holds, and its cleanup list is allocated at the run's
-/// first registration (`Owner::defer`). The nursery IS allocated per run — the
-/// host's spawn machinery registers a task with the ambient nursery at the `async`
-/// expression, so one has to exist before the body runs.
+/// first registration (`Owner::defer`). A nursery has to exist before the body runs
+/// — the spawn machinery registers a task with the ambient nursery at the `async`
+/// expression (J7: the body is born under `ambient_nursery`, so the task is OWNED,
+/// and its cancellation is absorbed) — but a run that started no task hands its
+/// nursery on to the next run (M92, `Owner::renew`).
 fun run_body<T>(runs: Owner, body: (|| T) context (owner_scope, ambient_nursery)): T {
-	let run = runs.renew(true);
+	let run = runs.renew();
 	match run.nursery() {
 		Some(let nursery) => owner_scope.run(run, || ambient_nursery.run(nursery, || body())),
 		None => panic("a renewed run carries its nursery"),
@@ -1380,26 +1390,20 @@ export struct TrackScope {
 	epoch: i32,
 }
 
-/// A stage's tracked dependencies, across its runs: where its runs stand, what the
-/// run in progress has read, what the last run read, the edges attached to them,
-/// and the subscriber a change of any of them wakes. One per stage instance; a
-/// copy is a handle to the same cells.
+/// A stage's tracked dependencies, across its runs: ONE cell per stage instance,
+/// holding where its runs stand, the subscriber a change wakes, and — from the
+/// stage's first tracked read on — the lists of what it read. A copy is a handle to
+/// the same cell.
+///
+/// **A body that never tracks allocates no lists (M93).** Most bodies read their
+/// input and nothing else; their stage holds this one cell and never more. The
+/// first `track()` any run admits makes the lists' cell (`trackers_allocated`
+/// counts it), and they live as long as the stage instance.
 export struct Tracker {
 	runs: Shared<TrackRuns>,
-	/// The reads of the run in progress, in order, one per source.
-	reading: Shared<List<Dependency>>,
-	/// The last run's reads, while nothing is attached to follow them — what an
-	/// attach wires. Emptied at the attach: from then on `edges` holds them.
-	read: Shared<List<Dependency>>,
-	/// One edge per dependency of the last run, while attached.
-	edges: Shared<List<TrackedEdge>>,
-	/// What a change of a dependency wakes: the stage's consumer, a selector's
-	/// re-selection, an effect's re-run. `None` until attached.
-	target: Shared<Option<Subscriber>>,
 }
 
-/// Where a tracker's runs stand. Written whole, by the transitions below (a field
-/// write through a cell's view is not one the native backend emits).
+/// Where a tracker's runs stand, written field by field through the cell.
 export struct TrackRuns {
 	/// The last run's epoch; `open` while that run is in progress.
 	epoch: i32,
@@ -1411,6 +1415,22 @@ export struct TrackRuns {
 	/// meanwhile is `missed`, answered once the edges stand.
 	connecting: bool,
 	missed: bool,
+	/// What a change of a dependency wakes: the stage's consumer, a selector's
+	/// re-selection, an effect's re-run. `None` until attached.
+	target: Option<Subscriber>,
+	/// The dependency lists, made at the stage's first tracked read (M93).
+	lists: Option<Shared<TrackLists>>,
+}
+
+/// A tracking stage's dependency lists, in ONE cell of their own.
+export struct TrackLists {
+	/// The reads of the run in progress, in order, one per source.
+	reading: List<Dependency>,
+	/// The last run's reads, while nothing is attached to follow them — what an
+	/// attach wires. Emptied at the attach: from then on `edges` holds them.
+	read: List<Dependency>,
+	/// One edge per dependency of the last run, while attached.
+	edges: List<TrackedEdge>,
 }
 
 /// One tracked read: the source's identity when it can name one, and how to attach
@@ -1426,7 +1446,18 @@ export struct TrackedEdge {
 	handle: Subscription,
 }
 
-/// A fresh tracker: no runs, no reads, nothing attached.
+/// How many trackers have made their dependency lists since the program started —
+/// the instrument behind "a body that never tracks allocates no tracker" (M93).
+let trackers_allocated_count: Shared<i32> = Shared::new(0);
+
+/// `trackers_allocated_count`, read. A pin's instrument, not an application's.
+export [internal("an instrument for the lazy-tracker pin (M93); it counts, it decides nothing")]
+fun trackers_allocated(): i32 {
+	trackers_allocated_count.read()
+}
+
+/// A fresh tracker: no runs, nothing attached, and no lists until something is
+/// tracked.
 fun new_tracker(): Tracker {
 	Tracker {
 		runs = Shared::new(TrackRuns {
@@ -1435,67 +1466,22 @@ fun new_tracker(): Tracker {
 			dirty = false,
 			connecting = false,
 			missed = false,
+			target = None,
+			lists = None,
 		}),
-		reading = Shared::new([]),
-		read = Shared::new([]),
-		edges = Shared::new([]),
-		target = Shared::new(None),
 	}
 }
 
-/// The next run begins: a fresh epoch, open, nothing changed since.
-fun opened(held: TrackRuns): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch + 1,
-		open = true,
-		dirty = false,
-		connecting = held.connecting,
-		missed = held.missed,
-	}
-}
-
-/// The run in progress ended.
-fun closed(held: TrackRuns): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch,
-		open = false,
-		dirty = held.dirty,
-		connecting = held.connecting,
-		missed = held.missed,
-	}
-}
-
-/// A dependency changed: the stage is dirty, and the wake is `missed` while edges
-/// are being attached.
-fun dirtied(held: TrackRuns): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch,
-		open = held.open,
-		dirty = true,
-		connecting = held.connecting,
-		missed = held.missed || held.connecting,
-	}
-}
-
-/// Edges start (`true`) or finish (`false`) going up.
-fun connecting(held: TrackRuns, now: bool): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch,
-		open = held.open,
-		dirty = held.dirty,
-		connecting = now,
-		missed = held.missed,
-	}
-}
-
-/// A missed wake answered.
-fun answered(held: TrackRuns): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch,
-		open = held.open,
-		dirty = held.dirty,
-		connecting = held.connecting,
-		missed = false,
+/// The tracker's lists, made now if this is the stage's first tracked read.
+fun lists_of(tracker: Tracker): Shared<TrackLists> {
+	match tracker.runs.read().lists {
+		Some(let lists) => lists,
+		None => {
+			trackers_allocated_count.write() = trackers_allocated_count.read() + 1;
+			let made = Shared::new(TrackLists { reading = [], read = [], edges = [] });
+			tracker.runs.write().lists = Some(made);
+			made
+		},
 	}
 }
 
@@ -1517,12 +1503,12 @@ fun run_tracked<T>(
 	mut value = run_once(runs, tracker, || body());
 	mut rounds = 0;
 	for tracker.runs.read().missed && rounds < 100 {
-		tracker.runs.write() = answered(tracker.runs.read());
+		tracker.runs.write().missed = false;
 		value = run_once(runs, tracker, || body());
 		rounds += 1;
 	}
 	if tracker.runs.read().missed {
-		tracker.runs.write() = answered(tracker.runs.read());
+		tracker.runs.write().missed = false;
 	}
 	value
 }
@@ -1546,11 +1532,17 @@ fun has_run(tracker: Tracker): bool {
 
 /// Begin the next run: a fresh epoch, no reads yet, nothing changed since.
 fun open_run(tracker: Tracker): TrackScope {
-	let next = opened(tracker.runs.read());
-	let epoch = next.epoch;
-	tracker.runs.write() = next;
-	if !tracker.reading.write().is_empty() {
-		tracker.reading.write() = [];
+	let epoch = tracker.runs.read().epoch + 1;
+	tracker.runs.write().epoch = epoch;
+	tracker.runs.write().open = true;
+	tracker.runs.write().dirty = false;
+	match tracker.runs.read().lists {
+		Some(let lists) => {
+			if !lists.write().reading.is_empty() {
+				lists.write().reading = [];
+			}
+		},
+		None => {},
 	}
 	TrackScope { tracker, epoch }
 }
@@ -1558,17 +1550,24 @@ fun open_run(tracker: Tracker): TrackScope {
 /// End the run in progress: its reads become the dependencies — wired against the
 /// edges when attached, kept for the attach when not.
 fun close_run(tracker: Tracker) {
-	tracker.runs.write() = closed(tracker.runs.read());
-	match tracker.target.read() {
-		Some(let target) => reconnect(tracker, target),
+	tracker.runs.write().open = false;
+	// A stage that has never tracked has no reads and no edges: nothing to wire.
+	let lists = match tracker.runs.read().lists {
+		Some(let lists) => lists,
 		None => {
-			if !tracker.reading.write().is_empty() || !tracker.read.write().is_empty() {
-				tracker.read.write() = tracker.reading.read();
+			ret;
+		},
+	};
+	match tracker.runs.read().target {
+		Some(let target) => reconnect(tracker, lists, target),
+		None => {
+			if !lists.write().reading.is_empty() || !lists.write().read.is_empty() {
+				lists.write().read = lists.read().reading;
 			}
 		},
 	}
-	if !tracker.reading.write().is_empty() {
-		tracker.reading.write() = [];
+	if !lists.write().reading.is_empty() {
+		lists.write().reading = [];
 	}
 }
 
@@ -1580,18 +1579,18 @@ fun close_run(tracker: Tracker) {
 ///
 /// Both lists are read out of their cells first: an attach may notify inside the
 /// call, and what that reaches may reach this tracker.
-fun reconnect(tracker: Tracker, target: Subscriber) {
-	if tracker.reading.write().is_empty() && tracker.edges.write().is_empty() {
+fun reconnect(tracker: Tracker, lists: Shared<TrackLists>, target: Subscriber) {
+	if lists.write().reading.is_empty() && lists.write().edges.is_empty() {
 		ret;
 	}
-	let held = tracker.edges.read();
-	let reading = tracker.reading.read();
+	let held = lists.read().edges;
+	let reading = lists.read().reading;
 	mut kept: List<bool> = [];
 	for _edge in held {
 		kept.push(false);
 	}
 	mut next: List<TrackedEdge> = [];
-	tracker.runs.write() = connecting(tracker.runs.read(), true);
+	tracker.runs.write().connecting = true;
 	mut position: usize = 0;
 	for dependency in reading {
 		match reusable(held, kept, dependency.identity, position) {
@@ -1608,7 +1607,7 @@ fun reconnect(tracker: Tracker, target: Subscriber) {
 		}
 		position += 1;
 	}
-	tracker.edges.write() = next;
+	lists.write().edges = next;
 	mut index: usize = 0;
 	for edge in held {
 		if !kept[index] {
@@ -1618,7 +1617,7 @@ fun reconnect(tracker: Tracker, target: Subscriber) {
 	}
 	// A relay that fired while the edges went up is `missed`, and `run_tracked`
 	// answers it by running again — not by a wake (see there).
-	tracker.runs.write() = connecting(tracker.runs.read(), false);
+	tracker.runs.write().connecting = false;
 }
 
 /// The held edge a read of `identity` at `position` reuses, if any: the one at its
@@ -1664,9 +1663,11 @@ fun same_identity(identity: Option<i32>, wanted: i32): bool {
 /// they stand.
 fun relay_for(tracker: Tracker, target: Subscriber): Subscriber {
 	subscriber_of(|| {
-		let held = tracker.runs.read();
-		tracker.runs.write() = dirtied(held);
-		if !held.connecting {
+		let connecting = tracker.runs.read().connecting;
+		tracker.runs.write().dirty = true;
+		if connecting {
+			tracker.runs.write().missed = true;
+		} else {
 			wake(target);
 		}
 	}, true)
@@ -1677,11 +1678,17 @@ fun relay_for(tracker: Tracker, target: Subscriber): Subscriber {
 /// while they are wired wakes the target once they stand — no run is in progress
 /// here to answer it by running again.
 fun attach_tracker(tracker: Tracker, target: Subscriber) {
-	tracker.target.write() = Some(target);
-	if !tracker.read.write().is_empty() {
-		let read = tracker.read.read();
-		tracker.read.write() = [];
-		tracker.runs.write() = connecting(tracker.runs.read(), true);
+	tracker.runs.write().target = Some(target);
+	let lists = match tracker.runs.read().lists {
+		Some(let lists) => lists,
+		None => {
+			ret;
+		},
+	};
+	if !lists.write().read.is_empty() {
+		let read = lists.read().read;
+		lists.write().read = [];
+		tracker.runs.write().connecting = true;
 		mut edges: List<TrackedEdge> = [];
 		for dependency in read {
 			edges.push(TrackedEdge {
@@ -1689,10 +1696,10 @@ fun attach_tracker(tracker: Tracker, target: Subscriber) {
 				handle = (dependency.attach)(relay_for(tracker, target)),
 			});
 		}
-		tracker.edges.write() = edges;
-		tracker.runs.write() = connecting(tracker.runs.read(), false);
+		lists.write().edges = edges;
+		tracker.runs.write().connecting = false;
 		if tracker.runs.read().missed {
-			tracker.runs.write() = answered(tracker.runs.read());
+			tracker.runs.write().missed = false;
 			wake(target);
 		}
 	}
@@ -1702,21 +1709,27 @@ fun attach_tracker(tracker: Tracker, target: Subscriber) {
 /// `switch_some` whose outer went `None` ran no selector, so it depends on nothing
 /// its last selection read.
 fun forget_reads(tracker: Tracker) {
-	if !tracker.edges.write().is_empty() {
-		let edges = tracker.edges.read();
-		tracker.edges.write() = [];
+	let lists = match tracker.runs.read().lists {
+		Some(let lists) => lists,
+		None => {
+			ret;
+		},
+	};
+	if !lists.write().edges.is_empty() {
+		let edges = lists.read().edges;
+		lists.write().edges = [];
 		for edge in edges {
 			detach(edge.handle);
 		}
 	}
-	if !tracker.read.write().is_empty() {
-		tracker.read.write() = [];
+	if !lists.write().read.is_empty() {
+		lists.write().read = [];
 	}
 }
 
 /// Stop following: every edge detached, nothing to wake. Idempotent.
 fun detach_tracker(tracker: Tracker) {
-	tracker.target.write() = None;
+	tracker.runs.write().target = None;
 	forget_reads(tracker);
 }
 
@@ -1725,16 +1738,21 @@ fun detach_tracker(tracker: Tracker) {
 /// not read this source already.
 fun admits(scope: TrackScope, identity: Option<i32>): bool {
 	let tracker = scope.tracker;
-	let runs = tracker.runs.read();
-	if !runs.open || runs.epoch != scope.epoch {
+	if !tracker.runs.read().open || tracker.runs.read().epoch != scope.epoch {
 		ret false;
 	}
+	let lists = match tracker.runs.read().lists {
+		Some(let lists) => lists,
+		None => {
+			ret true;
+		},
+	};
 	match identity {
 		Some(let wanted) => {
-			let count = tracker.reading.write().len();
+			let count = lists.write().reading.len();
 			mut index: usize = 0;
 			for index < count {
-				if same_identity(tracker.reading.write()[index].identity, wanted) {
+				if same_identity(lists.write().reading[index].identity, wanted) {
 					ret false;
 				}
 				index += 1;
@@ -1763,8 +1781,8 @@ export impl type S: Source<type T> {
 		let scope = tracking.get();
 		let identity = self.identity();
 		if admits(scope, identity) {
-			scope.tracker.reading
-				.write()
+			lists_of(scope.tracker)
+				.write().reading
 				.push(Dependency {
 					identity,
 					attach = |subscriber: Subscriber| self.on_settle(subscriber),
@@ -1795,13 +1813,13 @@ export [hint(Pipe<T>)]
 
 export impl TrackedDerive<type T> with Flow<T> {
 	[must_use]
-	fun on_change(own self, observer: |T| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |T| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<T> {
@@ -1996,25 +2014,36 @@ export [resource] trait Flow<T> {
 	/// immediate call IS the initial paint), which is why `sub`/`effect` exist
 	/// beside it.
 	///
+	/// A CALLBACK, not a body (A142 §7.3, B482): every impl runs `observer` under
+	/// `tracking.clear(..)`, so a `track()` in it is refused at compile time and a
+	/// `tracking.get_safe()` reads `None` — it runs after whatever body minted it.
+	///
 	/// REQUIRED rather than a default, like `sub`, so that each impl answers it
 	/// itself: a stage with `observe_flow`, and every source through the blanket
 	/// below with its own `attach_observer` (a mirror's lease, a cell's direct
-	/// attach) — which a default overridden in the blanket would not reach through
-	/// a generic bound.
+	/// attach).
 	[must_use]
-	fun on_change(own self, observer: |T| void): Subscription;
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription;
 
 	/// Subscribe: `observer` fires ONCE NOW with the current value, then once per
 	/// change. The eager form. You hold the `Subscription`; `effect` is the
-	/// owner-tied spelling.
+	/// owner-tied spelling. A callback, cleared as `on_change`'s is.
 	[must_use]
-	fun sub(own self, observer: |T| void): Subscription;
+	fun sub(own self, observer: (|T| void) context tracking): Subscription;
 
 	/// `effect` WITHOUT the immediate first call: `body` runs on every CHANGE from
 	/// here on, each run under an owner of its own (`effect`'s contract otherwise).
-	fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery)) {
+	///
+	/// A CALLBACK, not a tracking body (A142 §7.3, B482): it runs under
+	/// `tracking.clear(..)`, so a `track()` in it is refused at compile time and a
+	/// `tracking.get_safe()` reads `None`. Its dependency is its input.
+	fun effect_on_change(
+		own self,
+		body: (|T| void) context (owner_scope, tracking, ambient_nursery),
+	) {
 		let runs = Owner::new();
-		let subscription = self.on_change(|value: T| run_body(runs, || body(value)));
+		let subscription = self.on_change(|value: T| run_body(runs, || tracking
+			.clear(|| body(value))));
 		also_releasing(subscription, || release_runs(runs));
 		get_owner().take(subscription);
 	}
@@ -2041,28 +2070,30 @@ export [resource] trait Flow<T> {
 	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery)) {
 		let runs = Owner::new();
 		let tracker = new_tracker();
-		let latest: Shared<Option<T>> = Shared::new(None);
+		// The value the input delivered last, which a tracked re-run runs with: a
+		// binding the two closures capture (spec §6.9), not a cell (M93).
+		mut latest: Option<T> = None;
 		// `sub`'s immediate call happens INSIDE `sub`, before the re-run record
 		// exists: until the first run (`has_run`) a delivery only records the
 		// value, and the first run follows below — so the re-run's id is below
 		// everything a run creates, and a tracked re-run releases the run's
 		// children before they would run (parent before child).
 		let subscription = self.sub(|value: T| {
-			latest.write() = Some(value);
+			latest = Some(value);
 			if has_run(tracker) {
 				run_tracked(runs, tracker, || body(value));
 			}
 		});
 		let rerun = subscriber_of(|| {
 			if tracker.runs.read().dirty {
-				match latest.read() {
+				match latest {
 					Some(let value) => run_tracked(runs, tracker, || body(value)),
 					None => {},
 				}
 			}
 		}, false);
 		attach_tracker(tracker, rerun);
-		match latest.read() {
+		match latest {
 			Some(let value) => run_tracked(runs, tracker, || body(value)),
 			None => {},
 		}
@@ -2135,13 +2166,13 @@ export impl type S: Source<type T> with Flow<T> {
 	}
 
 	[must_use]
-	fun on_change(own self, observer: |T| void): Subscription {
-		self.attach_observer(observer, false)
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
+		self.attach_observer(|value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |T| void): Subscription {
-		self.attach_observer(observer, true)
+	fun sub(own self, observer: (|T| void) context tracking): Subscription {
+		self.attach_observer(|value| tracking.clear(|| observer(value)), true)
 	}
 }
 
@@ -2299,7 +2330,7 @@ export trait Signal<T> with Source<T> {
 	/// The canonical cell, concretely — deliberately not `Self`: a bare
 	/// `Signal::new(1)` has no receiver and no bound in scope to resolve a `Self`
 	/// against.
-	fun new(value: T): SignalCell<T> {
+	fun new(own value: T): SignalCell<T> {
 		SignalCell::new(value)
 	}
 
@@ -2451,7 +2482,10 @@ export impl SignalCell<type T> with Signal<T> {
 	/// Declared, not inherited: `Type::func` reads the type's OWN members, so the
 	/// trait's default body is reachable at `Signal::new` and this one is reachable
 	/// at `SignalCell::new`. They are the same cell either way.
-	fun new(value: T): SignalCell<T> {
+	///
+	/// The cell STORES `value`, so it takes it `own` (R-c): a caller's last use
+	/// moves it in, any other use hands over a copy — never the caller's own value.
+	fun new(own value: T): SignalCell<T> {
 		mut subscribers: List<Subscriber> = [];
 		SignalCell { value = Shared::new(value), subscribers = Shared::new(subscribers) }
 	}
@@ -2777,13 +2811,13 @@ export [hint(Pipe<U>)]
 
 export impl Derive<type S: Flow<type T>, T, type U> with Flow<U> {
 	[must_use]
-	fun on_change(own self, observer: |U| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|U| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |U| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|U| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<U> {
@@ -2839,13 +2873,13 @@ export [hint(Pipe<U>)]
 
 export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U> {
 	[must_use]
-	fun on_change(own self, observer: |U| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|U| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |U| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|U| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<U> {
@@ -2906,13 +2940,13 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 	Option<U>,
 > {
 	[must_use]
-	fun on_change(own self, observer: |Option<U>| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|Option<U>| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |Option<U>| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|Option<U>| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<Option<U>> {
@@ -3002,13 +3036,13 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 	Option<U>,
 > {
 	[must_use]
-	fun on_change(own self, observer: |Option<U>| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|Option<U>| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |Option<U>| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|Option<U>| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<Option<U>> {
@@ -3096,13 +3130,13 @@ export [hint(Pipe<Option<T>>)]
 
 export impl ThenSome<type F: Flow<bool>, type S: Source<T>, type T> with Flow<Option<T>> {
 	[must_use]
-	fun on_change(own self, observer: |Option<T>| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|Option<T>| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |Option<T>| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|Option<T>| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<Option<T>> {
@@ -3152,13 +3186,13 @@ export [hint(Pipe<T>)]
 
 export impl Combine<type T> with Flow<T> {
 	[must_use]
-	fun on_change(own self, observer: |T| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |T| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<T> {
@@ -3193,13 +3227,13 @@ export [hint(Pipe<T>)]
 
 export impl Distinct<type S: Flow<T>, type T: PartialEq> with Flow<T> {
 	[must_use]
-	fun on_change(own self, observer: |T| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |T| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<T> {
@@ -3236,13 +3270,13 @@ export [hint(Pipe<T>)]
 
 export impl DistinctBy<type S: Flow<T>, type T, type K: PartialEq> with Flow<T> {
 	[must_use]
-	fun on_change(own self, observer: |T| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |T| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<T> {
@@ -3475,7 +3509,9 @@ export impl type S: Source<type T> {
 		};
 		start(self.get());
 		as_derivation();
-		let _owned = register_with_owner(self.on_change(start));
+		// The source's own attach: `start` is this function's closure, not a
+		// caller's callback, so it needs no clearing (B482).
+		let _owned = register_with_owner(self.attach_observer(start, false));
 		loaded
 	}
 }

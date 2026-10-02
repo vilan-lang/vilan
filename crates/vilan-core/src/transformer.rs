@@ -1145,6 +1145,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
+        "__nursery_has_spawned",
         "__nursery_run",
         "__sleep",
         "__timer",
@@ -2144,6 +2145,15 @@ fn helper_source(name: &str) -> &'static str {
         // (an owner's `cancel`/`drop`) never reach here and stay silent. Reuses
         // the base `__Nursery` (co-emitted) untouched — so a plain `nursery`
         // program stays byte-identical.
+        // Whether any task ever registered with a nursery (M92): a pipe stage
+        // carries a nursery no task registered with into its next run instead
+        // of cancelling and replacing it. Reads `__Nursery`'s child list, so
+        // only a nursery a `__nursery_new*` made ever reaches it.
+        "__nursery_has_spawned" => {
+            "function __nursery_has_spawned(n) {\n\
+             \treturn n.children.length > 0;\n\
+             }"
+        }
         "__nursery_new_detached" => {
             "function __nursery_new_detached() {\n\
              \tconst n = __nursery_new(undefined);\n\
@@ -13295,6 +13305,7 @@ const RESERVED_NAMES: &[&str] = &[
     "__Task",
     "__nursery_new",
     "__nursery_new_detached",
+    "__nursery_has_spawned",
     "__nursery_run",
     "__nursery_of",
     "__nursery_is_cancel",

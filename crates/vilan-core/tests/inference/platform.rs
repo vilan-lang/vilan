@@ -10027,7 +10027,12 @@ fn b249_a_trait_parameter_takes_the_impls_argument() {
     // separate find — copied verbatim it is refused for its receiver), and this
     // pin must not be the one that fixes that spelling in place.
     assert_fails_with(source, "missing 'on_change'; declare `fun on_change(");
-    assert_fails_with(source, ", observer: |i32| void): Subscription`");
+    // B482's std half typed the observer with its clause: `(|T| void) context
+    // tracking`, substituted the same way.
+    assert_fails_with(
+        source,
+        ", observer: (|i32| void) context tracking): Subscription`",
+    );
     assert_fails_without(source, "|T| void");
 }
 

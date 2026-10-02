@@ -3070,7 +3070,7 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
 /// struct's own text alone would go stale when a method changes.
 /// What `[service]` found to put on the wire, for the one check `run_service`
 /// makes on it (B375). The three counts are the three kinds of contract-surface
-/// entry `service_hash` folds, and `is_empty` is exactly "this service hashes
+/// entry the contract hash folds (`contract_hash.rs`), and `is_empty` is exactly "this service hashes
 /// to the empty-set hash".
 pub(crate) struct ServiceSurface {
     /// The annotated struct's name, for the refusal's sentence.

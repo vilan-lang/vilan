@@ -429,7 +429,7 @@ impl type T with MaybeSignal<T> {              // every type, statically
 	fun bind(self, react: |T| void) { react(self); }
 }
 impl SignalCell<type T> with MaybeSignal<T> {      // signals, reactively
-	fun bind(self, react: |T| void) { let _watching = self.sub(react); }
+	fun bind(self, react: |T| void) { let _watching = self.sub(|value| react(value)); }
 }
 
 fun badge<V: MaybeSignal<str>>(label: V) { … }  // takes both, no ceremony

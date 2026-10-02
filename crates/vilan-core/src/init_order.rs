@@ -145,7 +145,8 @@ pub fn check_cycles(program: &mut Program) {
 /// chain above it, and the chain holds the upstream: a loop nothing will ever
 /// release, behind a name that promised a scope. `.cell_global()` is the same
 /// node with that lifetime in its name, and the no-cycle gate excludes it by
-/// that name.
+/// that name. `.memo()` and `.transient()` (R-k) are owner-tied the same way, and
+/// refused the same way, steered to `.memo_global()` and `.transient_global()`.
 ///
 /// STATIC-ONLY, by ruling (A130, R-e at Order 42's GO): the check reads the
 /// calls the initializer ITSELF makes, which is the call graph's
@@ -233,29 +234,31 @@ fn seal_called(
         .map(|(_, name)| *name)
 }
 
-/// The owner-tied seals `std::reactive` declares, if `reactive.vl` loaded: the
-/// functions named `cell` and `memo` (A142 R20: `Pipe`'s two faces) whose
-/// declarations sit in std's `reactive.vl`, each with its name. A user's own `cell`
-/// or `memo` (an inherent method, a free function) is a different declaration in a
-/// different file and is never matched.
+/// The owner-tied seals std declares: the functions named `cell` and `memo` whose
+/// declarations sit in std's `reactive.vl` (A142 R20: `Pipe`'s two faces), and the
+/// `transient` arms in std's `transient.vl` (R-k: a `Transient` registers with the
+/// ambient owner exactly as `.cell()` does), each with its name. A user's own
+/// `cell`, `memo` or `transient` (an inherent method, a free function) is a
+/// different declaration in a different file and is never matched.
 fn std_reactive_seals(program: &Program) -> Vec<(Id, &'static str)> {
     program
         .functions
         .values()
         .filter_map(|function| {
-            let name = match function.name {
-                "cell" => "cell",
-                "memo" => "memo",
+            let (name, file) = match function.name {
+                "cell" => ("cell", "reactive.vl"),
+                "memo" => ("memo", "reactive.vl"),
+                "transient" => ("transient", "transient.vl"),
                 _ => return None,
             };
             let source = program.source_of(function.id)?;
-            let in_std_reactive = program.std_sources.contains(&source)
+            let in_std_file = program.std_sources.contains(&source)
                 && program
                     .sources
                     .get(source.0 as usize)
                     .and_then(|path| path.file_name())
-                    .is_some_and(|file| file == "reactive.vl");
-            in_std_reactive.then_some((function.id, name))
+                    .is_some_and(|found| found == file);
+            in_std_file.then_some((function.id, name))
         })
         .collect()
 }

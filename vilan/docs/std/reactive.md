@@ -69,7 +69,7 @@ in-place `update` — names `SignalCell`.
 
 ```vilan,fragment
 trait Signal<T> with Source<T> {
-	fun new(value: T): SignalCell<T>             // default body: the canonical cell
+	fun new(own value: T): SignalCell<T>         // default body: the canonical cell
 	fun set(self, value: T)                      // required
 	fun notify(self)                             // required
 	fun set_with(self, transform: sync |T| T)    // default: set(transform(get()))
@@ -83,7 +83,7 @@ it hands back is a `SignalCell<T>`.
 
 ```vilan,fragment
 impl SignalCell<type T> with Signal<T> {
-	fun new(value: T): SignalCell<T>
+	fun new(own value: T): SignalCell<T>
 	fun set(self, value: T)                 // write + notify
 	fun notify(self)                        // publish without changing
 	// from the trait default:
@@ -266,11 +266,16 @@ trait Flow<T> {
 	[must_use]
 	fun start(own self): Instance<T>                                  // the stage author's member
 	[must_use]
-	fun on_change(own self, observer: |T| void): Subscription         // no first call
+	fun observe(own self, observer: |T| void, immediately: bool): Subscription
+	                                                                  // the stage author's attach (required)
 	[must_use]
-	fun sub(own self, observer: |T| void): Subscription               // + one immediate call
-	fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
-	                                                                  // owner-registered; an owner per run
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription
+	                                                                  // no first call; a callback (cleared)
+	[must_use]
+	fun sub(own self, observer: (|T| void) context tracking): Subscription
+	                                                                  // + one immediate call; cleared
+	fun effect_on_change(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
+	                                                                  // owner-registered; an owner per run; cleared
 	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
 	                                                                  // the same, eager; the body tracks
 	fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
@@ -297,7 +302,9 @@ Two kinds of reactive value (A142's pipe model):
   `and_then`, `then_some`, `flatten`, `distinct`, `distinct_by`, `combine` —
   a description with no `get`. It is consumed exactly once: sealed with
   `.memo()`, `.cell()`, the `_global` twins or `.sample()`, or handed to a
-  consumer (an `effect`, a UI binding).
+  consumer (an `effect`, a UI binding). A pipe built as a bare statement runs nothing,
+  and the compiler WARNS about it (`unused pipe`) — whichever function built it,
+  std's or your own; `let _ = …` says the drop is meant.
 
 **`Flow`** is what both are: every `Source` through a blanket, and every pipe
 stage directly. The consumers and the combinators live there, and every one of
@@ -550,7 +557,7 @@ fun main() {
 
 ```vilan,fragment
 fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
-fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+fun effect_on_change(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
 fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
 fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, tracking, ambient_nursery)): Switch<Self, T, I, U>
 fun on_cleanup(cleanup: || void)
@@ -564,16 +571,19 @@ an `owner.take`, a mirror's lease — is released before the next run, and the
 last run's when the consumer is released (the enclosing boundary, for an
 `effect` or a `.memo()`; the call itself, for `.sample()`). A task the body
 starts runs in the run's nursery and is **cancelled** when the run is released,
-so a superseded fetch stops rather than landing late. A pipe has exactly one
+so a superseded fetch stops rather than landing late. The task is OWNED by that
+nursery — spawned in the body or in anything the body calls — so its
+cancellation is absorbed, never reported as an unhandled task error. A pipe has exactly one
 consumer, so every body runs once per change inside one instance, and "a run"
 always means "one run per change".
 
 The owner is allocated LAZILY: a stage keeps one owner cell for the life of its
 instance, each run is the next epoch of it, and the cleanup list is made at the
 run's first registration — a body that registers nothing costs a read and a
-write, and allocates no owner. (A run's nursery is created per run: the host's
-spawn machinery registers a task at the `async` expression, so one has to
-exist before the body runs.) The bindings in `std::ui` do not pay even that:
+write, and allocates no owner. A run's nursery has to exist before the body
+runs (the spawn machinery registers a task at the `async` expression), but a
+run that started no task hands its nursery on to the next run: a stage makes a
+nursery at its first run, and again only after a run that spawned. The bindings in `std::ui` do not pay even that:
 their bodies write the DOM and register nothing, so they attach plainly.
 
 ```vilan
@@ -653,7 +663,8 @@ The guide's [tracked reads](../guide/tracked-reads.md) chapter is the tour.
   its reads with the edges it holds, in order: an edge to a source read again is
   kept, a new read attaches one, an edge nothing read is detached. A source keeps
   its edge across runs when it can say what state it is — `Source::identity()`,
-  answered by `SignalCell` and `MemoCell` (their cell); `None`, the default,
+  answered by `SignalCell`, `MemoCell`, `ListCell`, `KeyedCell`, `RemoteSource`
+  and `KeyedSource` (their value cell); `None`, the default,
   re-attaches each run and releases the old edge. A source that names its identity
   and is read twice in one run is one edge.
 - **Glitch-free.** An edge wakes through a DERIVATION relay (the turn's first
@@ -691,8 +702,9 @@ fun main() {
 }
 ```
 
-`TrackScope`, `Tracker`, `Dependency` and `TrackedEdge` are the layer's own
-records (a run's scope, a stage's dependencies across runs, one read, one edge);
+`TrackScope`, `Tracker`, `TrackRuns`, `TrackLists`, `Dependency` and `TrackedEdge`
+are the layer's own records (a run's scope, a stage's dependencies across runs —
+its lists made at the stage's first `track()` — one read, one edge);
 an application never builds them.
 
 ## selector — per-key selection

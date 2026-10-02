@@ -7131,6 +7131,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 module: None,
                 symbol: "__nursery_new_detached",
             } => "vilan_rt::executor::nursery_new_detached()".to_string(),
+            // M92: whether a pipe run's nursery ever took a task.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__nursery_has_spawned",
+            } => format!(
+                "vilan_rt::executor::nursery_has_spawned(&({}))",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
             // The join takes the body as a FUTURE where the JS helper takes a
             // closure it invokes: `await body()` there is `body.await` here, and
             // a `Pin<Box<dyn Future>>` is what lets the join hold it across the

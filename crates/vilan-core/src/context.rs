@@ -1117,13 +1117,14 @@ fn analyze(
 
     // --- Spawn registration (async-polymorphism.md Part B): every `async`
     // spawn is a SAFE read of the `std::task` ambient nursery, so a spawn in
-    // a nursery's dynamic extent registers its task. Engaged only when some
-    // call to a nursery-establishing construct exists — `nursery`, or
-    // `OwnedNursery.enter` (destruction.md §9) — so a program that merely loads
-    // `std::task` (say, for `settle_all`) compiles untouched. The spawn's owner
-    // is the node containing the spawn expression (the spawn closure's parent);
-    // a module-level spawn has none and stays free-floating.
-    let nursery_engaged = [program.nursery_fn_id, program.owned_nursery_enter_fn_id]
+    // a nursery's dynamic extent registers its task. Engaged only when the
+    // program has a nursery-establishing site — so a program that merely loads
+    // `std::task` (say, for `settle_all`) compiles untouched. A call to
+    // `nursery` or to `OwnedNursery.enter` (destruction.md §9) is one, known
+    // here; the other — a closure literal born under an `ambient_nursery`
+    // clause — is known once the clause positions are walked, and the sites
+    // are collected there (below, before the per-context loop).
+    let nursery_called = [program.nursery_fn_id, program.owned_nursery_enter_fn_id]
         .into_iter()
         .flatten()
         .any(|establishing_fn| {
@@ -1132,24 +1133,8 @@ fn analyze(
                 .values()
                 .any(|call| local_target(program, call.subject_id) == Some(establishing_fn))
         });
-    let nursery_context: Option<Id> = program.nursery_ambient_id.filter(|_| nursery_engaged);
-    let mut spawn_sites: Vec<(Id, Node)> = Vec::new();
-    if let Some(context) = nursery_context {
+    if let Some(context) = program.nursery_ambient_id.filter(|_| nursery_called) {
         contexts.insert(context);
-        for (&entity_id, expr) in &program.entity_map {
-            let Expr::Async(closure_id) = expr else {
-                continue;
-            };
-            let Some(parent) = graph.closure_parent_of(*closure_id) else {
-                continue;
-            };
-            let Some(&owner) = graph.nodes().iter().find(|node| node.id() == parent) else {
-                continue;
-            };
-            spawn_sites.push((entity_id, owner));
-        }
-        // Deterministic plan order (entity_map iteration is not).
-        spawn_sites.sort_by_key(|(entity_id, _)| entity_id.0);
     }
 
     if contexts.is_empty()
@@ -1975,6 +1960,45 @@ fn analyze(
                 carrier_classes.unite(CarrierKey::Carrier(carrier), CarrierKey::Type(type_id));
             }
         }
+        // A trait member's clause parameter and the same parameter of every
+        // member that implements it are ONE position: a literal passed through a
+        // bound (`flow.sub(|v| ..)` with `F: Flow<T>`) lands at the DECLARATION's
+        // parameter, and the call that runs it is in whichever impl the bound
+        // dispatches to. Without the union a literal at the declaration missed an
+        // impl's `clear` — read as present on JS, and rendered bare where the
+        // impl's type is an `Option` natively (reactive-45's B482 std half).
+        for trait_ in program.traits.values() {
+            for (name, &declared) in &trait_.declarations {
+                let Some(declaration) = program.functions.get(&declared) else {
+                    continue;
+                };
+                for implementation in program
+                    .implementations
+                    .iter()
+                    .filter(|implementation| implementation.trait_ids.contains(&trait_.id))
+                {
+                    let Some(implementing) = implementation
+                        .declarations
+                        .get(name)
+                        .and_then(|member| program.functions.get(member))
+                    else {
+                        continue;
+                    };
+                    for (declared_parameter, implementing_parameter) in
+                        declaration.parameters.iter().zip(&implementing.parameters)
+                    {
+                        if value_contexts.contains_key(declared_parameter)
+                            && value_contexts.contains_key(implementing_parameter)
+                        {
+                            carrier_classes.unite(
+                                CarrierKey::Carrier(Carrier::Value(*declared_parameter)),
+                                CarrierKey::Carrier(Carrier::Value(*implementing_parameter)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // --- B324: a clause written where the threading cannot follow it. ---
         // Each of the four writing positions above has a landing rule, and a
@@ -2068,6 +2092,42 @@ fn analyze(
             errors.push(anchored(program, entity, "an injected (`context`-typed) closure can only be called, forwarded to a position with the same `context` clause, or passed to `run`"
                     .to_string()));
         }
+    }
+    // Spawn registration, continued. J7: a closure literal written at a
+    // `context ambient_nursery` position — `nursery`'s and `enter`'s body, and
+    // every pipe body (`effect`, `derive`, a selector: A142 §4.1) — is born
+    // under the nursery its CALLER establishes, so a spawn in it (or in what it
+    // calls) must register with that nursery exactly as a spawn under
+    // `nursery(..)`'s body does. Before J7 only the two calls engaged, and a
+    // run's task was cancelled through the ambient signal but unowned: its
+    // AbortError reported as an unhandled task error. The literal is the
+    // general form (the two calls' bodies are such literals); the calls stay
+    // for a body forwarded as a value. The spawn's owner is the node
+    // containing the spawn expression (the spawn closure's parent); a
+    // module-level spawn has none and stays free-floating.
+    let nursery_context: Option<Id> = program.nursery_ambient_id.filter(|context| {
+        nursery_called
+            || deferred
+                .get(context)
+                .is_some_and(|literals| !literals.is_empty())
+    });
+    let mut spawn_sites: Vec<(Id, Node)> = Vec::new();
+    if let Some(context) = nursery_context {
+        contexts.insert(context);
+        for (&entity_id, expr) in &program.entity_map {
+            let Expr::Async(closure_id) = expr else {
+                continue;
+            };
+            let Some(parent) = graph.closure_parent_of(*closure_id) else {
+                continue;
+            };
+            let Some(&owner) = graph.nodes().iter().find(|node| node.id() == parent) else {
+                continue;
+            };
+            spawn_sites.push((entity_id, owner));
+        }
+        // Deterministic plan order (entity_map iteration is not).
+        spawn_sites.sort_by_key(|(entity_id, _)| entity_id.0);
     }
     plan.contexts = {
         let mut sorted: Vec<Id> = contexts.iter().copied().collect();

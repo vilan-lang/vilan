@@ -3116,6 +3116,78 @@ fn i9_the_deprecated_map_spelling_is_still_a_keyed_expose_map() {
     );
 }
 
+/// A144 (R-f): the contract hash reads the RESOLVED type, so every spelling of
+/// one wire contract hashes alike — the deprecated `Map<..>`, `HashMap<..>`, a
+/// renaming import of it, on an `[rpc]` signature and on a WHOLE-value
+/// `[expose]` (whose element the hash names). Red before A144 (the hash read
+/// the types as written): the three `[rpc]` services printed `7edcd9bc`,
+/// `966c1d7c` and `1956457c`, and the two whole exposures differed. The value
+/// itself is djb2 over the canonical surface,
+/// `counts(HashMap<str, i32>)->HashMap<str, i32>;` — the spelling a plainly
+/// written service already had, so its hash did not move.
+#[test]
+fn a144_an_alias_and_its_target_hash_alike() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_map::HashMap as Table;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        [service(NewClient)]
+        struct NewSpelling {
+            unused: i32,
+        }
+        impl NewSpelling {
+            [rpc]
+            fun counts(self, names: HashMap<str, i32>): HashMap<str, i32> { names }
+        }
+        [service(OldClient)]
+        struct OldSpelling {
+            unused: i32,
+        }
+        impl OldSpelling {
+            [rpc]
+            fun counts(self, names: Map<str, i32>): Map<str, i32> { names }
+        }
+        [service(RenamedClient)]
+        struct RenamedSpelling {
+            unused: i32,
+        }
+        impl RenamedSpelling {
+            [rpc]
+            fun counts(self, names: Table<str, i32>): Table<str, i32> { names }
+        }
+        [service(WholeNewClient)]
+        struct WholeNew {
+            [expose] counts: SignalCell<HashMap<str, i32>>,
+        }
+        impl WholeNew {
+            [rpc]
+            fun size(self): usize { self.counts.get().len() }
+        }
+        [service(WholeOldClient)]
+        struct WholeOld {
+            [expose] counts: SignalCell<Map<str, i32>>,
+        }
+        impl WholeOld {
+            [rpc]
+            fun size(self): usize { self.counts.get().len() }
+        }
+        fun main() {
+            print(NewSpelling { unused = 0 }.contract_hash());
+            print(OldSpelling { unused = 0 }.contract_hash());
+            print(RenamedSpelling { unused = 0 }.contract_hash());
+            let whole_new = WholeNew { counts = Signal::new(HashMap::new()) }.contract_hash();
+            let whole_old = WholeOld { counts = Signal::new(Map::new()) }.contract_hash();
+            print(whole_new == whole_old);
+        }
+        main();
+        "#,
+        "7edcd9bc\n7edcd9bc\n7edcd9bc\ntrue\n",
+    );
+}
+
 /// A56 / R6: the field names its key TWICE — once in the attribute, once in the
 /// `Map` element — and the two disagree.
 ///
