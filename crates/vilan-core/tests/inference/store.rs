@@ -786,8 +786,9 @@ fn a142_s7_an_enum_derive_refuses_a_variant_named_like_a_handle_member() {
 
 #[test]
 fn a142_s7_a_generic_enum_derives_with_a_scalar_payload() {
-    // B194's binder rule through the enum derive, with a scalar `T` — the payload
-    // is lent through a local, so the JS emit's scalar view is a real one.
+    // B194's binder rule through the enum derive, with a scalar `T`: the payload
+    // binder is lent in place (`f(&p0)`, B504) and written through a `mut` binder
+    // (`Just(mut p0)`, F79).
     assert_compiles_and_runs(
         r#"
         import std::io::print;

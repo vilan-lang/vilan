@@ -2,9 +2,8 @@
 // scenarios (`proposal/store.md` §2.6, Appendix A): a same-variant write that
 // patches the payload, a switch away and back, a `patch` through a dead and a
 // live variant, a multi-payload variant read as a tuple, a generic enum with a
-// scalar payload, and a payload `Store` assumed past the variant's end. (Observing
-// a `StoreSome` is refused natively — `a142_s7_observing_a_store_some_is_refused_
-// by_name_natively` — so the observers here are the enum's and its flags'.)
+// scalar payload, a payload `Store` assumed past the variant's end, and an
+// observer through the variant.
 import std::compare::PartialEq;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
@@ -56,6 +55,7 @@ fun main() {
 	run_with_owner(watching, || {
 		presence.is_online().effect_on_change(|t| mark(i"tag={t}"));
 		presence.is_away().effect_on_change(|a| mark(i"away={a}"));
+		name.effect_on_change(|n| mark(i"name={n.unwrap_or("-")}"));
 		presence.effect_on_change(|_p| mark("presence"));
 	});
 	presence.set(Presence::Online(Device { name = "laptop", since = 2 }));
@@ -77,7 +77,6 @@ fun main() {
 	watching.dispose();
 	let maybe = Store::new(Maybe::Just(1));
 	print(i"maybe: {maybe.just().get().unwrap_or(0)} {maybe.just().patch(2)} {maybe.just().get().unwrap_or(0)}");
-	// (`Maybe::Nothing` itself is not written here: a bare variant of a generic
-	// user enum is refused natively wherever it stands, store or no store.)
-	print(i"nothing: {maybe.is_nothing().get()} just={maybe.is_just().get()}");
+	maybe.set(Maybe::Nothing);
+	print(i"nothing: {maybe.just().patch(3)} {maybe.is_nothing().get()} just={maybe.is_just().get()}");
 }

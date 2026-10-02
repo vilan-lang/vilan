@@ -1,7 +1,7 @@
 // A142 S7 S1 on both backends: a derived struct's store — the paper's scenarios
 // (`proposal/store.md` Appendix A) for a nested struct, a whole write, the spine
 // commit, a write of the value held, `notify`, a coarse field, a renamed
-// projection, an `Option` field through its `Some`, a generic struct, and the slot
+// projection, an `Option` field through its `Some` (observed, read and patched), a generic struct, and the slot
 // census through subscribe and dispose.
 import std::compare::PartialEq;
 import std::io::print;
@@ -80,6 +80,7 @@ fun main() {
 		user.billing().effect_on_change(|_b| mark("billing"));
 		user.billing().zip().effect_on_change(|_z| mark("billing.zip"));
 		user.nickname().is_some().effect_on_change(|s| mark(i"nickname.is_some={s}"));
+		user.nickname().some().effect_on_change(|n| mark(i"nick={n.unwrap_or("-")}"));
 		user.effect_on_change(|_u| mark("user"));
 	});
 	print(i"subscribed: {census(user)}");

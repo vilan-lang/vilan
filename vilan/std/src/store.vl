@@ -682,10 +682,7 @@ export impl StoreSome<type P> {
 				});
 				if !reached {
 					match held.read() {
-						Some(let last) => {
-							let lent = last;
-							f(&lent);
-						},
+						Some(let last) => f(&last),
 						None => {},
 					}
 				}
@@ -701,19 +698,12 @@ export impl Store<Option<type P>> {
 	fun some(self): StoreSome<P> {
 		self.variant(1, |held: &Option<P>, f: |&P| void| {
 			match held {
-				// Rebound before the view is taken: a view of a pattern
-				// binder is a pair over an unboxed value on the JS emit,
-				// which reads the wrong slot for a scalar (B-find, filed).
-				Some(let payload) => {
-					let lent = payload;
-					f(&lent);
-				},
+				Some(let payload) => f(&payload),
 				None => {},
 			}
 		}, |held: &mut Option<P>, f: |&mut P| void| {
 			match held.take() {
-				Some(let taken) => {
-					mut payload = taken;
+				Some(mut payload) => {
 					f(&mut payload);
 					held = Some(payload);
 				},
@@ -733,19 +723,12 @@ export impl StoreSome<Option<type P>> {
 	fun some(self): StoreSome<P> {
 		self.variant(1, |held: &Option<P>, f: |&P| void| {
 			match held {
-				// Rebound before the view is taken: a view of a pattern
-				// binder is a pair over an unboxed value on the JS emit,
-				// which reads the wrong slot for a scalar (B-find, filed).
-				Some(let payload) => {
-					let lent = payload;
-					f(&lent);
-				},
+				Some(let payload) => f(&payload),
 				None => {},
 			}
 		}, |held: &mut Option<P>, f: |&mut P| void| {
 			match held.take() {
-				Some(let taken) => {
-					mut payload = taken;
+				Some(mut payload) => {
 					f(&mut payload);
 					held = Some(payload);
 				},
@@ -983,36 +966,8 @@ macro fun store_bare_binders(generics: List<GenericParameter>): str {
 	"<" + join(parts, ", ") + ">"
 }
 
-/// Whether a written type mentions one of `generics`, at any depth (`T`,
-/// `List<T>`); an opaque type text (a closure, a tuple) is read as mentioning
-/// them all.
-macro fun store_mentions(type_: TypeExpr, generics: List<GenericParameter>): bool {
-	let written = type_.render();
-	if written.contains("|") || written.contains("(") {
-		ret generics.len() > 0;
-	}
-	for parameter in generics {
-		if type_.name == parameter.name {
-			ret true;
-		}
-	}
-	for argument in type_.arguments {
-		if store_mentions(argument, generics) {
-			ret true;
-		}
-	}
-	false
-}
-
 /// One field projection on a handle type (`Store` or `StoreSome`): the in-place
 /// read and write of `held.{field}`, one step below the handle's own.
-///
-/// A field whose type is a GENERIC parameter of the subject is lent through a local
-/// instead (`let lent = held.field; f(&lent)`, written back after a write): the JS
-/// emit decides whether `&held.field` is a scalar's `(base, key)` pair from the
-/// field's declared type, and a parameter that resolves to a scalar at the
-/// instantiation is handed over bare (filed with this slice). The local costs a
-/// copy of that one field per step, and only for such a field.
 macro fun store_projection(
 	handle: str,
 	subject: str,
@@ -1020,16 +975,11 @@ macro fun store_projection(
 	field: str,
 	index: usize,
 	type_: TypeExpr,
-	through_local: bool,
 ): str {
 	let operand = store_operand(type_);
 	let written = type_.render();
-	mut read = i"|held: &{subject}, f: |&{operand}| void| f(&held.{field})";
-	mut write = i"|held: &mut {subject}, f: |&mut {operand}| void| f(&mut held.{field})";
-	if through_local {
-		read = i"|held: &{subject}, f: |&{operand}| void| \{\n\tlet lent = held.{field};\n\tf(&lent);\n" + "}";
-		write = i"|held: &mut {subject}, f: |&mut {operand}| void| \{\n\tmut lent = held.{field};\n\tf(&mut lent);\n\theld.{field} = lent;\n" + "}";
-	}
+	let read = i"|held: &{subject}, f: |&{operand}| void| f(&held.{field})";
+	let write = i"|held: &mut {subject}, f: |&mut {operand}| void| f(&mut held.{field})";
 	i"fun {method}(self): {handle}<{written}> \{\n\tself.project({index}, {read}, {write})\n" + "}"
 }
 
@@ -1064,9 +1014,8 @@ export macro fun store_struct_impls(target: StructItem): str {
 			let step = if field.reactive_coarse { "store_leaf_diff" } else { "store_diff" };
 			diff = diff.line(i"changed = self.{field.name}.{step}(other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
 		}
-		let through_local = store_mentions(field.type_, target.generics);
-		store_impl = store_impl.member(store_projection("Store", subject, method, field.name, index, field.type_, through_local));
-		some_impl = some_impl.member(store_projection("StoreSome", subject, method, field.name, index, field.type_, through_local));
+		store_impl = store_impl.member(store_projection("Store", subject, method, field.name, index, field.type_));
+		some_impl = some_impl.member(store_projection("StoreSome", subject, method, field.name, index, field.type_));
 		index = index + 1;
 	}
 	diff = diff.line("store_wake_me(node, changed, woken);").expr("changed");
@@ -1214,8 +1163,14 @@ export macro fun store_enum_impls(target: EnumItem): str {
 					position = position + 1;
 				}
 			}
-			let read = i"|held: &{subject}, f: |&{operand}| void| \{\n\tmatch held \{\n\t\t{bound} => \{\n\t\t\tlet lent = {built};\n\t\t\tf(&lent);\n\t\t" + "},\n\t\t_ => {},\n\t}\n}";
-			let write = i"|held: &mut {subject}, f: |&mut {operand}| void| \{\n\tmatch held \{\n\t\t{bound} => \{\n\t\t\tmut payload = {built};\n\t\t\tf(&mut payload);\n\t\t\theld = {name}::{variant.name}({join(unpacked, ", ")});\n\t\t" + "},\n\t\t_ => {},\n\t}\n}";
+			let read = i"|held: &{subject}, f: |&{operand}| void| \{\n\tmatch held \{\n\t\t{bound} => f(&{built}),\n\t\t_ => \{" + "},\n\t}\n}";
+			// One payload binds `mut` and is written back; several are gathered
+			// into the tuple the handle lends, then spread back.
+			let write = if arity == 1 {
+				i"|held: &mut {subject}, f: |&mut {operand}| void| \{\n\tmatch held \{\n\t\t{name}::{variant.name}(mut p0) => \{\n\t\t\tf(&mut p0);\n\t\t\theld = {name}::{variant.name}(p0);\n\t\t" + "},\n\t\t_ => {},\n\t}\n}"
+			} else {
+				i"|held: &mut {subject}, f: |&mut {operand}| void| \{\n\tmatch held \{\n\t\t{bound} => \{\n\t\t\tmut payload = {built};\n\t\t\tf(&mut payload);\n\t\t\theld = {name}::{variant.name}({join(unpacked, ", ")});\n\t\t" + "},\n\t\t_ => {},\n\t}\n}"
+			};
 			let through = i"fun {snake}(self): StoreSome<{payload}> \{\n\tself.variant({child}, {read}, {write})\n" + "}";
 			store_impl = store_impl.member(through);
 			some_impl = some_impl.member(through);

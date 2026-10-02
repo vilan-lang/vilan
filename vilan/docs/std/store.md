@@ -255,7 +255,4 @@ nowhere. On the server it renders the live payload once.
 - **A write through a variant copies the payload out and back** — a pattern
   cannot bind a writable view into an enum's payload.
 
-On the native backend a store builds and wakes as it does on JS, with one gap:
-observing a `StoreSome` (`nick.effect(..)`) is refused by name for now — the
-native backend cannot yet start a pipe over a generic type implementing
-`Source<Option<P>>`. Reading and patching through one build.
+On the native backend a store builds, wakes and is observed as it does on JS.
