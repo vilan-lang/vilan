@@ -580,6 +580,37 @@ const B505_PROBE: &str = concat!(
     "\tprint(flag);\n",
     "}\n",
 );
+const B496_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct P {\n",
+    "\tx: i32,\n",
+    "}\n",
+    "\n",
+    "struct Holder {\n",
+    "\tp: P,\n",
+    "}\n",
+    "\n",
+    "fun inner(holder: &Holder): &P borrows holder {\n",
+    "\t&holder.p\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut a = P { x = 1 };\n",
+    "\tmut out = P { x = 0 };\n",
+    "\tout = *&a;\n",
+    "\tout.x = 99;\n",
+    "\tprint(a.x);\n",
+    "\tlet holder = Holder { p = P { x = 2 } };\n",
+    "\tout = *inner(&holder);\n",
+    "\tout.x = 98;\n",
+    "\tprint(holder.p.x);\n",
+    "\tmut n = 1;\n",
+    "\tlet m = 5;\n",
+    "\tn = *&m;\n",
+    "\tprint(n + 1);\n",
+    "}\n",
+);
 
 /// The programs the default suite runs — small, fast, and between them they
 /// cover every value shape S1a claims: scalars, `str`, `bool`, a struct with an
@@ -8487,5 +8518,20 @@ fn a_scalar_receiver_and_a_cell_less_view_are_identical_on_both_backends() {
         compare(&staged, "native_probe_b505.vl"),
         Verdict::Identical,
         "a scalar receiver at a view self must be a view on both backends"
+    );
+}
+
+/// B496: the spelled copy of a view expression assigned into a value place
+/// (`out = *&a`, `out = *inner(&holder)`, `n = *&m`) copies on both backends
+/// (the unspelled assignment is refused; JS aliased it).
+#[test]
+fn the_spelled_copy_of_a_view_expression_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b496.vl"), B496_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b496.vl"),
+        Verdict::Identical,
+        "the spelled copy of a view expression must copy on both backends"
     );
 }

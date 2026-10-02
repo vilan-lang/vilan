@@ -11628,3 +11628,105 @@ fn b505_a_view_of_a_scalar_without_a_cell_is_a_fresh_cell() {
         "11\n9\ntrue\ntrue\n12\n12\n13\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B496: a view expression assigned into a value place takes `*`.
+// ---------------------------------------------------------------------------
+
+/// B496: `out = &a`, `out = inner(&holder)` (a `borrows` call) and `out = if
+/// c { &a } else { &b }` store a VIEW into a value place, which on JS aliased
+/// the caller's aggregate (`out.x = 99` wrote `a`) or stored a scalar's
+/// `(base, key)` pair. B465 refused a view BINDING there; a view expression
+/// is the same read, refused with the same sentence at the leaf.
+#[test]
+fn b496_a_view_expression_assigned_to_a_value_place_is_refused() {
+    for (setup, assignment) in [
+        ("mut a = P { x = 1 };", "out = &a;"),
+        (
+            "let holder = H { p = P { x = 2 } };",
+            "out = inner(&holder);",
+        ),
+        (
+            "let a = P { x = 1 }; let b = P { x = 2 }; let flag = true;",
+            "out = if flag { &a } else { &b };",
+        ),
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct P {{ x: i32 }}
+                struct H {{ p: P }}
+
+                fun inner(holder: &H): &P borrows holder {{
+                    &holder.p
+                }}
+
+                fun main() {{
+                    {setup}
+                    mut out = P {{ x = 0 }};
+                    {assignment}
+                    out.x = 99;
+                }}
+                "#
+            ),
+            "a view can't be read as a value here; write `*` to copy the value out",
+        );
+    }
+    assert_fails_with(
+        r#"
+        fun main() {
+            mut n = 1;
+            let m = 5;
+            n = &m;
+        }
+        "#,
+        "a view can't be read as a value here; write `*` to copy the value out",
+    );
+}
+
+/// B496: the spelled copy COPIES — `*&a`, `*inner(&holder)` and `*if c { &a }
+/// else { &b }` take rule 1's copy like `*v` (B466); the last two recorded no
+/// type to copy at, so the `*` the refusal steers to aliased as well.
+#[test]
+fn b496_the_spelled_copy_of_a_view_expression_is_a_copy() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct P {
+            x: i32,
+        }
+
+        struct H {
+            p: P,
+        }
+
+        fun inner(holder: &H): &P borrows holder {
+            &holder.p
+        }
+
+        fun main() {
+            mut a = P { x = 1 };
+            mut out = P { x = 0 };
+            out = *&a;
+            out.x = 99;
+            print(a.x);
+            let holder = H { p = P { x = 2 } };
+            out = *inner(&holder);
+            out.x = 98;
+            print(holder.p.x);
+            let flag = true;
+            let b = P { x = 3 };
+            out = *if flag { &a } else { &b };
+            out.x = 97;
+            print(a.x);
+            print(out.x);
+            mut n = 1;
+            let m = 5;
+            n = *&m;
+            print(n + 1);
+        }
+        "#,
+        "1\n2\n1\n97\n6\n",
+    );
+}

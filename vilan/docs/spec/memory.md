@@ -247,7 +247,9 @@ deliberately second-class; a view may not outlive the thing it views:
 Mutating through a view writes the viewed place; reading its value
 requires an explicit `*`. A view in **value position** (passed where a
 value is expected, used as an operator's operand, or bound or ASSIGNED to a
-value type — `out = v` as much as `let out: T = v`) is a compile error, never
+value type — `out = v` as much as `let out: T = v`, and a view EXPRESSION
+alike: `out = &a`, `out = inner(&holder)` of a `borrows` function, or a
+branch of a value `if` handing either back) is a compile error, never
 a silent coercion to the pointee (so the `(base, key)` representation of a
 scalar view can't leak); write `*v` to copy the value out. A closure's view
 parameter is a view by the same rule, whether the literal spells it

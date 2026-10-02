@@ -28461,11 +28461,37 @@ impl<'src> Analyzer<'src> {
                 // `out = c` aliased it where `out = *c` copies (rule 1). A
                 // compound write's synthesized re-read is excluded inside
                 // `is_scalar_view_read`, and it is a binary operand anyway.
+                //
+                // B496: a view EXPRESSION is the same read — `out = &a`, a
+                // `borrows` call (`out = inner(&holder)`), or either as a leaf
+                // of a value `if`/`match`/block (`out = if c { &a } else { &b
+                // }`). Each stored the caller's aggregate itself on JS (a
+                // later `out.x = 99` wrote `a`), or a scalar's `(base, key)`
+                // pair; rule 3 keeps a view expression out of the copies, so
+                // `*` is the spelling that copies. Reported at the leaf.
                 Expr::Assignment(_, value) => {
                     if self.is_scalar_view_read(*value, &view_bindings)
                         || self.is_view_binding_read(*value, &view_bindings)
                     {
                         leaks.push(*value);
+                        continue;
+                    }
+                    let mut leaves = Vec::new();
+                    self.collect_tail_leaves(*value, &mut leaves);
+                    for leaf in leaves {
+                        let is_view_expression = match self.expr_id_to_expr_map.get(&leaf) {
+                            Some(Expr::Reference(..)) => true,
+                            Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
+                            Some(Expr::Local(_)) => {
+                                leaf != *value
+                                    && (self.is_scalar_view_read(leaf, &view_bindings)
+                                        || self.is_view_binding_read(leaf, &view_bindings))
+                            }
+                            _ => false,
+                        };
+                        if is_view_expression {
+                            leaks.push(leaf);
+                        }
                     }
                 }
                 // A call argument whose parameter is NOT a view (`&[mut] T`) wants
@@ -29661,9 +29687,32 @@ impl<'src> Analyzer<'src> {
             .or_else(|| match self.expr_id_to_expr_map.get(&value_id) {
                 // A view's type is its pointee's (references are transparent in
                 // the type system), so the operand answers for `*v`.
-                Some(Expr::Dereference(operand)) => self.place_value_type_id(*operand),
+                Some(Expr::Dereference(operand)) => self.view_pointee_type_id(*operand),
                 _ => None,
             })
+    }
+
+    /// The type a VIEW expression points at, for `*view`'s copy (B466, B496):
+    /// a view binding's own type, a `&place`'s place, a `borrows` call's
+    /// declared return, and a value `if`/`match`/block's first leaf that
+    /// answers. The three expression forms record no type of their own, so
+    /// `*inner(&holder)` and `*if c { &a } else { &b }` — the spellings the
+    /// assignment refusal steers to — had no type to copy at and aliased.
+    fn view_pointee_type_id(&self, view_id: Id) -> Option<TypeId> {
+        self.place_value_type_id(view_id).or_else(|| {
+            match self.expr_id_to_expr_map.get(&view_id)? {
+                Expr::Reference(place, _) => self.place_value_type_id(*place),
+                Expr::Call(call_id) => self.call_declared_return_type_id(*call_id),
+                Expr::If(_) | Expr::Match(..) | Expr::Block(_) => {
+                    let mut leaves = Vec::new();
+                    self.collect_tail_leaves(view_id, &mut leaves);
+                    leaves
+                        .into_iter()
+                        .find_map(|leaf| self.view_pointee_type_id(leaf))
+                }
+                _ => None,
+            }
+        })
     }
 
     /// B418: the expressions a CHOOSING value can hand back — the tail of a
