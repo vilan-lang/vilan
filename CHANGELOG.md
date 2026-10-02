@@ -298,6 +298,11 @@ written down.
 <!-- family: fix -->
 **Native builds a `&mut` of a `mut` PATTERN binder: `match Some(1) { Some(mut p) => bump(&mut p), .. }`, `mut (c, d) = (3, 4); bump(&mut c)` and an `is` capture were refused by rustc (E0596), and build and print node's bytes now.** A pattern binder was emitted without its `mut`. The JS backend is unchanged. Pin: `a_mut_pattern_binder_is_identical_on_both_backends`. Tracker F79.
 
+---
+
+<!-- family: fix -->
+**Native builds a `for e in &mut xs` element handed on: `fun each<T>(xs: &mut List<T>, f: |&mut T| void) { for e in &mut xs { f(e) } }` was refused by rustc (E0596), and builds and prints node's bytes now.** The element is an `iter_mut` item — already a `&mut` loan — and was handed on as `&mut e`; it is reborrowed (`&mut *e`) now, as a `&mut` parameter forwarding its loan always was. The JS backend is unchanged. Pin: `a_for_mut_element_handed_on_is_identical_on_both_backends`. Tracker F80.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->

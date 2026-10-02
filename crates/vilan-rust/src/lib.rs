@@ -4523,6 +4523,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(parameter) = self.program.parameters.get(&binding) {
             return self.receiving_form(parameter) == Receiving::RefMut;
         }
+        // F80: a `for e in &mut xs` element is an `iter_mut` item — a `&mut T`
+        // loan, handed on by reborrow (`&mut *e`), never `&mut e`.
+        if self.program.for_each_views.get(&binding) == Some(&true) {
+            return true;
+        }
         self.program
             .variables
             .get(&binding)

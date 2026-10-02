@@ -8913,3 +8913,22 @@ fn a_mut_pattern_binder_is_identical_on_both_backends() {
         "a `mut` pattern binder must be mutable natively and print the same"
     );
 }
+
+/// F80: a `for e in &mut xs` element is a `&mut` loan natively (an `iter_mut`
+/// item), so handing it on — `f(e)` to a `|&mut T|` closure in a generic body
+/// or a concrete one, `bump(&mut counter)`, a field write through it — is a
+/// reborrow (`&mut *e`). It was emitted `&mut e`, which rustc refused (E0596).
+#[test]
+fn a_for_mut_element_handed_on_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_for_mut_element_loans.vl"),
+        include_str!("native/for_mut_element_loans.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_for_mut_element_loans.vl"),
+        Verdict::Identical,
+        "a `for` element over `&mut xs` must be handed on by reborrow and print the same"
+    );
+}
