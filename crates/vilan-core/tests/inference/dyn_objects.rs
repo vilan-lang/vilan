@@ -1738,3 +1738,117 @@ fn a142_a_source_object_stays_copyable_though_flow_is_a_resource_trait() {
 ",
     );
 }
+
+/// B436: `print` of a trait OBJECT prints the value it erased — `[ 5 ]`, the
+/// `Square` — not the backend's `[ value, table ]` pair (`[ [ 5 ], {} ]`). The
+/// pair is how the JS backend carries an object; at the host boundary (an
+/// `any` parameter) the value crosses. Nested in a list the pair is still the
+/// list's element, and prints as one — the native twin reproduces both.
+#[test]
+fn b436_printing_a_trait_object_prints_its_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Shape {
+            fun area(self): i32;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape {
+            fun area(self): i32 { self.side * self.side }
+        }
+
+        fun main() {
+            let shape: dyn Shape = Square { side = 5 };
+            print(shape);
+            print(shape.area());
+        }
+
+        main();
+        "#,
+        "[ 5 ]\n25\n",
+    );
+}
+
+/// B437: an object's TABLE is keyed by the trait APPLICATION, not the trait
+/// alone. `impl Square with Shape<i32>` and `with Shape<str>` are two tables
+/// over one type; keyed by the trait, `dyn Shape<str>` was handed the `i32`
+/// table built first and its `area` answered `16` (native answered `big`).
+#[test]
+fn b437_two_applications_of_one_trait_over_one_type_take_their_own_tables() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Shape<T> {
+            fun area(self): T;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape<i32> {
+            fun area(self): i32 { self.side * self.side }
+        }
+
+        impl Square with Shape<str> {
+            fun area(self): str { "big" }
+        }
+
+        fun main() {
+            let counted: dyn Shape<i32> = Square { side = 2 };
+            let named: dyn Shape<str> = Square { side = 4 };
+            print(counted.area());
+            print(named.area());
+        }
+
+        main();
+        "#,
+        "4\nbig\n",
+    );
+}
+
+/// B437's other half, the control: two positions of ONE application — two
+/// annotations, two type ids, a compound argument — share one table and one
+/// instance of a generic over the object, because both keys spell the type
+/// structurally (`type_key`'s `Dyn` arm, beside the table key's arguments).
+#[test]
+fn b437_two_positions_of_one_application_share_one_table_and_one_instance() {
+    let source = r#"
+        import std::io::print;
+
+        trait Shape<T> {
+            fun area(self): T;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape<List<i32>> {
+            fun area(self): List<i32> { [self.side * self.side] }
+        }
+
+        fun measure<S: Shape<List<i32>>>(shape: S): List<i32> {
+            shape.area()
+        }
+
+        fun main() {
+            let first: dyn Shape<List<i32>> = Square { side = 2 };
+            let second: dyn Shape<List<i32>> = Square { side = 3 };
+            print(measure(first));
+            print(measure(second));
+        }
+
+        main();
+        "#;
+    let js = compile(source).expect("compiles");
+    assert_eq!(js.matches("Object.create(").count(), 1, "one table:\n{js}");
+    assert_eq!(js.matches("(shape) {").count(), 1, "one instance:\n{js}");
+    assert_compiles_and_runs(source, "[ 4 ]\n[ 9 ]\n");
+}

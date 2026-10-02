@@ -16,9 +16,11 @@ use crate::type_::{SubstitutionContext, Type, TypeId};
 use crate::util::{join_with, plural};
 
 mod hint_labels;
+mod hover_labels;
 mod liveness;
 
 pub use hint_labels::HintLabel;
+pub use hover_labels::{DEFINITION_MEMBER_CAP, PatternLabel, ReferenceHover, TypeDefinitions};
 pub use liveness::DropExtent;
 
 /// Distinguishes the recursive type operations that resolve generics through a
@@ -2108,7 +2110,8 @@ fn backing_placement_error(
 // A match pattern as walked, with variant names not yet resolved.
 #[derive(Debug, Clone)]
 enum WalkPattern<'src> {
-    Wildcard,
+    // `_`, with where it is written (E241's hover).
+    Wildcard(Span, SourceId),
     Binding(Id),
     // A variant path (`["Some"]`, `["Signal", "Quit"]`) and optional payload.
     Variant(
@@ -2457,6 +2460,11 @@ enum SignatureSide<'a> {
     /// parameter is the matching clause argument, falling back to the subject
     /// when the clause supplied none. The conformance steer reads this side.
     Impl(TypeId, &'a [TypeId]),
+    /// The trait APPLIED to arguments with no subject in hand — a bound's
+    /// `Read<U>` or a `dyn`'s object, as hover lists its required members
+    /// (E237, E240): `Self` reads `Self`, as on the declaration side, and the
+    /// trait's own parameters take the arguments, as on the impl side.
+    Applied(&'a [TypeId]),
 }
 
 /// A supertrait member reached from a sub-trait's default body (B205/B216):
@@ -3675,6 +3683,10 @@ pub struct Analyzer<'src> {
     // The span of the member identifier in a field access or method call (`.x`),
     // keyed by the access expr id — the precise use-site span for rename/nav.
     member_name_spans: HashMap<Id, Span>,
+    /// E241: every variant pattern the ENTRY file matches, as resolved — read
+    /// E241: every variant pattern and `_` the ENTRY file matches, as
+    /// resolved — read by the label build into [`Program::pattern_labels`].
+    pattern_sites: Vec<hover_labels::PatternSite>,
     /// Method calls the fixpoint never selected, as `(call entity, receiver
     /// entity, member name)` — filled once, after the fixpoint. See
     /// [`Program::unresolved_method_calls`] for why anyone wants them.
@@ -6518,6 +6530,7 @@ impl<'src> Analyzer<'src> {
             expr_id_to_scope_id_map: HashMap::default(),
             expr_id_to_type_id_map: HashMap::default(),
             member_name_spans: HashMap::default(),
+            pattern_sites: Vec::new(),
             unresolved_method_calls: Vec::new(),
             arity_invalid_calls: Vec::new(),
             written_call_arguments: Vec::new(),
@@ -21556,7 +21569,9 @@ impl<'src> Analyzer<'src> {
     /// Source<T>`) already reads right, and rendering it through a substitution
     /// would be the same string by a longer road.
     fn trait_argument_substitution(&self, subject: &SignatureSubject<'_>) -> SubstitutionContext {
-        let SignatureSide::Impl(_, trait_arguments) = subject.rendered_for else {
+        let (SignatureSide::Impl(_, trait_arguments) | SignatureSide::Applied(trait_arguments)) =
+            subject.rendered_for
+        else {
             return SubstitutionContext::default();
         };
         let Some(trait_) = self.traits.get(&subject.declaring_trait_id) else {
@@ -21607,7 +21622,9 @@ impl<'src> Analyzer<'src> {
             _ => return None,
         }
         let (impl_subject, trait_arguments) = match subject.rendered_for {
-            SignatureSide::Declaration => return Some("Self".to_string()),
+            SignatureSide::Declaration | SignatureSide::Applied(_) => {
+                return Some("Self".to_string());
+            }
             SignatureSide::Impl(impl_subject, trait_arguments) => (impl_subject, trait_arguments),
         };
         let written = self
@@ -21925,34 +21942,26 @@ impl<'src> Analyzer<'src> {
             let Some(parameter) = self.parameters.get(parameter_id) else {
                 continue;
             };
-            if parameter.name == "self" {
-                parameters.push("self".to_string());
+            // The receiver's and every parameter's convention, `lazy` and a
+            // spread's `...` — the contract a caller (and an implementor)
+            // writes against — through the one rendering
+            // (`Parameter::signature_label`, E235). `mut` is not part of it.
+            //
+            // A `context` clause is part of the signature's contract, and
+            // `declaration_type_label_for` has already rendered it: since B309
+            // the clause is a property of the closure TYPE (`Type::Closure`'s
+            // third slot), so it prints wherever that type does. E9's original
+            // per-parameter append lived here and printed it a SECOND time,
+            // bare, after the parenthesized one — `body: (|| void) context
+            // owner_scope context owner_scope` (E207). Nothing is appended
+            // now; the entity-keyed `parameter_contexts` index answers the
+            // context pass alone.
+            let type_label = if parameter.name == "self" {
+                String::new()
             } else {
-                // A spread parameter's `...` is part of the signature
-                // (variadic-generics.md §S) — it is what tells a reader whether
-                // to write the arguments out flat or as one tuple. `mut`,
-                // which is not, stays unrendered. `lazy` renders for the same
-                // reason `...` does (lazy.md §5, "hover renders `lazy` in
-                // signatures like the other effect surface"): it tells a reader
-                // whether their argument runs here or inside the callee.
-                let label = format!(
-                    "{}{}{}: {}",
-                    if parameter.lazy { "lazy " } else { "" },
-                    if parameter.spread { "..." } else { "" },
-                    parameter.name,
-                    self.signature_type_label(parameter.type_id, subject, substitution)
-                );
-                // A `context` clause is part of the signature's contract, and
-                // `declaration_type_label_for` has already rendered it: since
-                // B309 the clause is a property of the closure TYPE
-                // (`Type::Closure`'s third slot), so it prints wherever that
-                // type does. E9's original per-parameter append lived here and
-                // printed it a SECOND time, bare, after the parenthesized
-                // one — `body: (|| void) context owner_scope context
-                // owner_scope` (E207). Nothing is appended now; the entity-keyed
-                // `parameter_contexts` index answers the context pass alone.
-                parameters.push(label);
-            }
+                self.signature_type_label(parameter.type_id, subject, substitution)
+            };
+            parameters.push(parameter.signature_label(&type_label));
         }
         let generics =
             self.generic_list_label_under(&function.generic_parameter_constraint_ids, substitution);
@@ -37034,7 +37043,7 @@ impl<'src> Analyzer<'src> {
         visible_from: usize,
     ) -> WalkPattern<'src> {
         match pattern {
-            Pattern::Wildcard => WalkPattern::Wildcard,
+            Pattern::Wildcard => WalkPattern::Wildcard(*span, self.current_source_id),
             Pattern::Binding(name, mutable, name_span) => {
                 let name = *name;
                 let capture_id = self.new_entity_id();
@@ -37240,7 +37249,13 @@ impl<'src> Analyzer<'src> {
         crate::stack_guard::ensure_sufficient_stack("the pattern walk");
         let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::PATTERN);
         match pattern {
-            WalkPattern::Wildcard => Some(ExprPattern::Wildcard),
+            WalkPattern::Wildcard(span, source_id) => {
+                // E241: `_` hovers as what it matches whole.
+                if *source_id == SourceId(0) {
+                    self.record_pattern_wildcard(*span, expected_type_id);
+                }
+                Some(ExprPattern::Wildcard)
+            }
             WalkPattern::Binding(capture_id) => {
                 let capture_id = *capture_id;
                 self.variables.get_mut(&capture_id).unwrap().type_id = expected_type_id;
@@ -37418,6 +37433,18 @@ impl<'src> Analyzer<'src> {
                         ),
                     });
                     return None;
+                }
+                // E241: the hover answer for the variant's name — the variant
+                // of the matched value's type, its payload as substituted.
+                if source_id == SourceId(0) {
+                    self.record_pattern_variant(
+                        span,
+                        path,
+                        enum_id,
+                        variant_index,
+                        expected_type_id,
+                        &data_type_ids,
+                    );
                 }
                 let mut resolved_payload = Vec::new();
                 for (sub_pattern, data_type_id) in payload_patterns.iter().zip(data_type_ids) {
@@ -61157,6 +61184,26 @@ pub struct Program<'src> {
     /// Full declaration labels for hover (E9): function signatures,
     /// struct/enum blocks — keyed by declaration id, fenced by the LSP.
     pub declaration_labels: HashMap<Id, String>,
+    /// E238: the block each MEMBER is declared in — function id to the
+    /// `impl` block's id or the trait's — for every impl and trait in the
+    /// world. Read with [`Program::member_headers`].
+    pub member_owners: HashMap<Id, Id>,
+    /// E238: each block's header line, keyed by the owner id
+    /// [`Program::member_owners`] answers: `impl Memo<type K: Hashable, type
+    /// V>`, `impl MemoCell<type T> with Source<T>`, `impl type S: Source<type
+    /// T>`, `trait Flow<T>`.
+    pub member_headers: HashMap<Id, String>,
+    /// E237: the definition block of each entry-file binding's, parameter's,
+    /// member read's and field's type, keyed by that type id.
+    pub type_definitions: TypeDefinitions,
+    /// E241: an entry-file variant PATTERN's name span and its hover label —
+    /// the variant of the matched value's type with its payload substituted
+    /// (`Option<i32>::Some(i32)`) — and the enum and variant it names.
+    pub pattern_labels: Vec<PatternLabel>,
+    /// E240: the entry's type-position names that are a type parameter
+    /// (`type I: Read<U>` and the declaration introducing it) or a trait (its
+    /// required members), by span.
+    pub reference_hovers: Vec<ReferenceHover>,
     /// E206: the signature a GENERIC call site reached, rendered under the
     /// bindings the solver chose there — `fun get_or(self, key: UserId, make:
     /// || SignalCell<Option<User>>): SignalCell<Option<User>>` where the
@@ -61562,6 +61609,13 @@ impl<'src> Program<'src> {
             return None;
         }
         self.note_source_of(id)
+    }
+
+    /// E238: the header line of the block `function_id` is declared in — an
+    /// `impl` head or a `trait` head — or `None` for a free function.
+    pub fn member_header(&self, function_id: Id) -> Option<&str> {
+        let owner = self.member_owners.get(&function_id)?;
+        self.member_headers.get(owner).map(String::as_str)
     }
 
     pub fn source_of(&self, id: Id) -> Option<SourceId> {
@@ -70373,15 +70427,14 @@ fn analyze_over_world<'src>(
         let mut parameters: Vec<String> = Vec::new();
         for parameter_id in &external.parameters {
             if let Some(parameter) = analyzer.parameters.get(parameter_id) {
-                if parameter.name == "self" {
-                    parameters.push("self".to_string());
+                // E235: an external's receiver and parameters carry their
+                // conventions too (`List::push` is `&mut self, own item`).
+                let type_label = if parameter.name == "self" {
+                    String::new()
                 } else {
-                    parameters.push(format!(
-                        "{}: {}",
-                        parameter.name,
-                        analyzer.declaration_type_label(parameter.type_id)
-                    ));
-                }
+                    analyzer.declaration_type_label(parameter.type_id)
+                };
+                parameters.push(parameter.signature_label(&type_label));
             }
         }
         let return_label = format!(
@@ -70410,6 +70463,14 @@ fn analyze_over_world<'src>(
             analyzer.pretty_print_type(&Type::Trait(trait_id, Vec::new()), &empty_substitution);
         expr_types.insert(trait_id, label);
     }
+    // E238: the block each member is declared in, and each block's header.
+    let (member_owners, member_headers) = analyzer.member_headers();
+    // E237: the definition under an entry binding's, member's or field's type.
+    let type_definitions = analyzer.type_definitions(&expr_type_ids);
+    // E241: a variant pattern's label, rendered once its types have settled.
+    let pattern_labels = analyzer.pattern_labels();
+    // E240: type parameters and traits named in type position.
+    let reference_hovers = analyzer.reference_hovers();
 
     // E145: which identifiers spell an `as` alias rather than its target.
     analyzer.collect_import_alias_spans();
@@ -70818,6 +70879,11 @@ fn analyze_over_world<'src>(
         expr_types,
         hint_labels,
         declaration_labels,
+        member_owners,
+        member_headers,
+        type_definitions,
+        pattern_labels,
+        reference_hovers,
         call_signature_labels,
         expr_type_ids,
         inferred_return_types: std::mem::take(&mut analyzer.inferred_return_types),
