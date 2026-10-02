@@ -53,6 +53,41 @@ impl TypeDefinitions {
     }
 }
 
+/// One PATTERN position the entry matches (E241), as `resolve_pattern` saw
+/// it: where its name is, what it is, and the matched value's type.
+#[derive(Debug, Clone)]
+pub(super) struct PatternSite {
+    name_span: Span,
+    kind: PatternSiteKind,
+    /// The matched value's type — for a variant, only when it IS the enum.
+    matched: Option<TypeId>,
+}
+
+#[derive(Debug, Clone)]
+enum PatternSiteKind {
+    /// A variant: the enum, the variant, its payload under the arguments.
+    Variant {
+        enum_id: Id,
+        variant_index: usize,
+        payload: Vec<TypeId>,
+    },
+    /// `_`: matches the value whole and binds nothing.
+    Wildcard,
+}
+
+/// A pattern position's hover (E241): where its name is, what it renders
+/// as — `Option<i32>::Some(i32)`, `_: Option<i32>` — and, for a variant, the
+/// enum and variant it names, so the editor can read the variant's `///`.
+#[derive(Debug, Clone)]
+pub struct PatternLabel {
+    pub name_span: Span,
+    pub label: String,
+    pub variant: Option<(Id, usize)>,
+    /// Whether the label names the matched value's own type (with its
+    /// arguments) rather than the bare enum.
+    pub matched: bool,
+}
+
 impl Parameter<'_> {
     /// One parameter as a signature writes it (E235): the receiver in its
     /// convention's own form (`self`, `own self`, `&self`, `&mut self`), any
@@ -323,6 +358,121 @@ impl<'src> Analyzer<'src> {
             // that the plain label would not already name.
             _ => self.declaration_type_label(type_id),
         }
+    }
+
+    /// E241: bank one variant pattern for its hover. `span` is the whole
+    /// path's (`Option::None`); the label belongs to the LAST segment, the
+    /// variant's own name, which is what a caret on `None` is on.
+    pub(super) fn record_pattern_variant(
+        &mut self,
+        span: Span,
+        path: &[&'src str],
+        enum_id: Id,
+        variant_index: usize,
+        matched: TypeId,
+        payload: &[TypeId],
+    ) {
+        let start = span.into_range().start
+            + path[..path.len().saturating_sub(1)]
+                .iter()
+                .map(|segment| segment.len() + "::".len())
+                .sum::<usize>();
+        let length = path.last().map_or(0, |segment| segment.len());
+        let matched = matches!(
+            matched.borrow_type(self),
+            Type::Enum(matched_enum, _) if *matched_enum == enum_id
+        )
+        .then_some(matched);
+        self.pattern_sites.push(PatternSite {
+            name_span: (start..start + length).into(),
+            kind: PatternSiteKind::Variant {
+                enum_id,
+                variant_index,
+                payload: payload.to_vec(),
+            },
+            matched,
+        });
+    }
+
+    /// E241: bank a `_` for its hover — the type it matches whole.
+    pub(super) fn record_pattern_wildcard(&mut self, span: Span, matched: TypeId) {
+        self.pattern_sites.push(PatternSite {
+            name_span: span,
+            kind: PatternSiteKind::Wildcard,
+            matched: Some(matched),
+        });
+    }
+
+    /// E241: the banked pattern positions rendered — a variant as the matched
+    /// value's type (`Option<i32>`, the bare enum where nothing more is
+    /// known), the variant and its payload as this match binds it; a `_` as
+    /// `_: T`.
+    pub(super) fn pattern_labels(&self) -> Vec<PatternLabel> {
+        let empty = SubstitutionContext::default();
+        let mut labels: Vec<PatternLabel> = Vec::new();
+        for site in &self.pattern_sites {
+            // A pattern may resolve more than once (a re-walk once its
+            // scrutinee's type is known): the answer that knows the matched
+            // type wins, and otherwise the latest.
+            let earlier = labels
+                .iter()
+                .position(|label| label.name_span == site.name_span);
+            if let Some(earlier) = earlier {
+                if site.matched.is_none() && labels[earlier].matched {
+                    continue;
+                }
+                labels.remove(earlier);
+            }
+            let matched_label = site
+                .matched
+                .map(|matched| self.pretty_print_type(matched.borrow_type(self), &empty));
+            let (label, variant) = match &site.kind {
+                PatternSiteKind::Wildcard => {
+                    let Some(matched_label) = matched_label else {
+                        continue;
+                    };
+                    // An unresolved scrutinee has nothing to say.
+                    if matches!(
+                        site.matched.map(|matched| matched.borrow_type(self)),
+                        Some(Type::Unknown | Type::Unresolved)
+                    ) {
+                        continue;
+                    }
+                    (format!("_: {matched_label}"), None)
+                }
+                PatternSiteKind::Variant {
+                    enum_id,
+                    variant_index,
+                    payload,
+                } => {
+                    let Some(enum_) = self.enums.get(enum_id) else {
+                        continue;
+                    };
+                    let Some(variant) = enum_.variants.get(*variant_index) else {
+                        continue;
+                    };
+                    let head = matched_label.unwrap_or_else(|| enum_.name.to_string());
+                    let mut label = format!("{head}::{}", variant.name);
+                    if !payload.is_empty() {
+                        let payload: Vec<String> = payload
+                            .iter()
+                            .map(|type_id| {
+                                self.pretty_print_type(type_id.borrow_type(self), &empty)
+                            })
+                            .collect();
+                        label.push_str(&format!("({})", payload.join(", ")));
+                    }
+                    (label, Some((*enum_id, *variant_index)))
+                }
+            };
+            labels.push(PatternLabel {
+                name_span: site.name_span,
+                label,
+                variant,
+                matched: site.matched.is_some(),
+            });
+        }
+        labels
     }
 
     /// E237: the definition blocks for the entry's typed positions — every

@@ -3266,6 +3266,11 @@ impl Document {
         if let Some(rendered) = self.namespace_hover(program, offset) {
             return Some(rendered);
         }
+        // A variant PATTERN in a `match` leg or an `is`: the variant of the
+        // matched value's type (E241), not the bare enum's name.
+        if let Some(rendered) = self.pattern_hover(program, offset) {
+            return Some(rendered);
+        }
         // A field's own DECLARATION, or the field name in a struct
         // initializer (E204): `x: i32` and `x`'s `///`. Asked before the type
         // reference below, which would otherwise answer both positions with the
@@ -3406,6 +3411,39 @@ impl Document {
         if let Some(requirement) = self.platform_requirements.get(&target) {
             out.push_str("\n\n");
             out.push_str(requirement);
+        }
+        Some(out)
+    }
+
+    /// The hover for a PATTERN position (E241): a variant's name as
+    /// `Option<i32>::None` / `Option<i32>::Some(i32)` — the variant of the
+    /// type the leg matches, its payload as this match binds it — fenced, with
+    /// the variant's `///`; a `_` as `_: Option<i32>`, what it matches whole.
+    ///
+    /// The type-reference row the same name carries answered before, with the
+    /// bare enum (`Option`, unfenced): the enum's name for a caret on the
+    /// variant, and without the arguments the match is over.
+    fn pattern_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let site = program.pattern_labels.iter().find(|site| {
+            let range = site.name_span.into_range();
+            range.start <= offset && offset < range.end
+        })?;
+        let mut out = format!("```vilan\n{}\n```", site.label);
+        let variant_entity = site.variant.and_then(|(enum_id, variant_index)| {
+            let enumeration = program.enums.get(&enum_id)?;
+            let name = enumeration.variants.get(variant_index)?.name;
+            program
+                .scopes
+                .get(&enumeration.variants_scope_id)?
+                .name_to_id_map
+                .get(name)
+                .copied()
+        });
+        if let Some(docs) =
+            variant_entity.and_then(|entity| self.analysis(program).doc_comment_of(entity))
+        {
+            out.push_str("\n\n");
+            out.push_str(&docs);
         }
         Some(out)
     }
@@ -23392,6 +23430,86 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
             hover(&document, "mut out: List", 0, 4),
             fence("mut out: List<i32>")
         );
+    }
+}
+
+/// E241: a variant PATTERN hovers as the variant of the matched value's type,
+/// its payload substituted, with the variant's `///` — where it answered the
+/// bare enum's name, unfenced (`Option` for a caret on `None`).
+#[cfg(test)]
+mod hover_patterns {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    const FIXTURE: &str = "import std::io::print;\n\n\
+enum Shape {\n\tCircle(f64),\n\tRect(f64, f64),\n\tEmpty,\n}\n\n\
+/// A pair of things.\nenum Pair<A, B> {\n\t/// Both present.\n\tBoth(A, B),\n\tNeither,\n}\n\n\
+fun main() {\n\tlet x: Option<i32> = Some(3);\n\tmatch x {\n\t\tNone => print(\"none\"),\n\t\t_ => print(\"some\"),\n\t}\n\tmatch x {\n\t\tSome(let v) => print(v),\n\t\tOption::None => print(\"none\"),\n\t}\n\tlet shape = Shape::Rect(1.0, 2.0);\n\tmatch shape {\n\t\tShape::Rect(let w, let h) => print(w + h),\n\t\tShape::Empty => print(\"empty\"),\n\t\t_ => print(\"x\"),\n\t}\n\tlet pair: Pair<str, i32> = Pair::Both(\"a\", 1);\n\tmatch pair {\n\t\tPair::Both(let a, let b) => print(a),\n\t\tPair::Neither => print(\"n\"),\n\t}\n\tlet n = 3;\n\tmatch n {\n\t\t3 => print(\"three\"),\n\t\t_ => print(\"other\"),\n\t}\n\tif x is Some(let y) {\n\t\tprint(y);\n\t}\n}\n\nmain();\n";
+
+    fn hover(needle: &str, at: usize) -> Option<String> {
+        let document = Document::analyze(FIXTURE, &std_root(), Path::new("test.vl"));
+        let errors: Vec<String> = document
+            .published_diagnostics()
+            .into_iter()
+            .filter(|diagnostic| !diagnostic.warning)
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(errors.is_empty(), "the fixture compiles: {errors:?}");
+        let start = FIXTURE.find(needle).unwrap_or_else(|| panic!("{needle:?}"));
+        document.hover(start + at)
+    }
+
+    fn fence(line: &str) -> Option<String> {
+        Some(format!("```vilan\n{line}\n```"))
+    }
+
+    #[test]
+    fn e241_a_bare_variant_hovers_as_the_matched_types_variant() {
+        assert_eq!(
+            hover("None => print(\"none\"),\n\t\t_", 1),
+            fence("Option<i32>::None")
+        );
+    }
+
+    #[test]
+    fn e241_a_payload_variant_hovers_with_its_payload_substituted() {
+        assert_eq!(hover("Some(let v)", 1), fence("Option<i32>::Some(i32)"));
+        // The binding inside it hovers as a binding, as it did.
+        assert_eq!(hover("Some(let v)", 9), fence("let v: i32"));
+        // The same in an `is` test.
+        assert_eq!(hover("is Some(let y)", 4), fence("Option<i32>::Some(i32)"));
+    }
+
+    #[test]
+    fn e241_a_qualified_variant_hovers_on_its_variant_and_its_enum_on_the_enum() {
+        assert_eq!(hover("Option::None", 9), fence("Option<i32>::None"));
+        // The enum segment keeps its own answer: the enum.
+        let enumeration = hover("Option::None", 2).expect("the enum segment hovers");
+        assert!(enumeration.contains("enum Option<T>"), "{enumeration}");
+    }
+
+    #[test]
+    fn e241_a_user_enums_variants_hover_with_their_payload_and_doc() {
+        assert_eq!(
+            hover("Shape::Rect(let w", 8),
+            fence("Shape::Rect(f64, f64)")
+        );
+        assert_eq!(hover("Shape::Empty =>", 8), fence("Shape::Empty"));
+        assert_eq!(
+            hover("Pair::Both(let a", 7),
+            Some("```vilan\nPair<str, i32>::Both(str, i32)\n```\n\nBoth present.".to_string())
+        );
+        assert_eq!(hover("Pair::Neither", 7), fence("Pair<str, i32>::Neither"));
+    }
+
+    #[test]
+    fn e241_a_wildcard_hovers_as_what_it_matches_and_a_literal_as_nothing() {
+        // `_` answered the enclosing match's type (`void`), which was wrong:
+        // it answers what it matches whole.
+        assert_eq!(hover("_ => print(\"some\")", 0), fence("_: Option<i32>"));
+        assert_eq!(hover("_ => print(\"x\")", 0), fence("_: Shape"));
+        // A literal is its own value and names nothing.
+        assert_eq!(hover("3 => print(\"three\")", 0), None);
     }
 }
 

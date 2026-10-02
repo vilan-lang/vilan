@@ -20,7 +20,7 @@ mod hover_labels;
 mod liveness;
 
 pub use hint_labels::HintLabel;
-pub use hover_labels::{DEFINITION_MEMBER_CAP, TypeDefinitions};
+pub use hover_labels::{DEFINITION_MEMBER_CAP, PatternLabel, TypeDefinitions};
 pub use liveness::DropExtent;
 
 /// Distinguishes the recursive type operations that resolve generics through a
@@ -2110,7 +2110,8 @@ fn backing_placement_error(
 // A match pattern as walked, with variant names not yet resolved.
 #[derive(Debug, Clone)]
 enum WalkPattern<'src> {
-    Wildcard,
+    // `_`, with where it is written (E241's hover).
+    Wildcard(Span, SourceId),
     Binding(Id),
     // A variant path (`["Some"]`, `["Signal", "Quit"]`) and optional payload.
     Variant(
@@ -3677,6 +3678,10 @@ pub struct Analyzer<'src> {
     // The span of the member identifier in a field access or method call (`.x`),
     // keyed by the access expr id — the precise use-site span for rename/nav.
     member_name_spans: HashMap<Id, Span>,
+    /// E241: every variant pattern the ENTRY file matches, as resolved — read
+    /// E241: every variant pattern and `_` the ENTRY file matches, as
+    /// resolved — read by the label build into [`Program::pattern_labels`].
+    pattern_sites: Vec<hover_labels::PatternSite>,
     /// Method calls the fixpoint never selected, as `(call entity, receiver
     /// entity, member name)` — filled once, after the fixpoint. See
     /// [`Program::unresolved_method_calls`] for why anyone wants them.
@@ -6520,6 +6525,7 @@ impl<'src> Analyzer<'src> {
             expr_id_to_scope_id_map: HashMap::default(),
             expr_id_to_type_id_map: HashMap::default(),
             member_name_spans: HashMap::default(),
+            pattern_sites: Vec::new(),
             unresolved_method_calls: Vec::new(),
             arity_invalid_calls: Vec::new(),
             written_call_arguments: Vec::new(),
@@ -37028,7 +37034,7 @@ impl<'src> Analyzer<'src> {
         visible_from: usize,
     ) -> WalkPattern<'src> {
         match pattern {
-            Pattern::Wildcard => WalkPattern::Wildcard,
+            Pattern::Wildcard => WalkPattern::Wildcard(*span, self.current_source_id),
             Pattern::Binding(name, mutable, name_span) => {
                 let name = *name;
                 let capture_id = self.new_entity_id();
@@ -37234,7 +37240,13 @@ impl<'src> Analyzer<'src> {
         crate::stack_guard::ensure_sufficient_stack("the pattern walk");
         let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::PATTERN);
         match pattern {
-            WalkPattern::Wildcard => Some(ExprPattern::Wildcard),
+            WalkPattern::Wildcard(span, source_id) => {
+                // E241: `_` hovers as what it matches whole.
+                if *source_id == SourceId(0) {
+                    self.record_pattern_wildcard(*span, expected_type_id);
+                }
+                Some(ExprPattern::Wildcard)
+            }
             WalkPattern::Binding(capture_id) => {
                 let capture_id = *capture_id;
                 self.variables.get_mut(&capture_id).unwrap().type_id = expected_type_id;
@@ -37412,6 +37424,18 @@ impl<'src> Analyzer<'src> {
                         ),
                     });
                     return None;
+                }
+                // E241: the hover answer for the variant's name — the variant
+                // of the matched value's type, its payload as substituted.
+                if source_id == SourceId(0) {
+                    self.record_pattern_variant(
+                        span,
+                        path,
+                        enum_id,
+                        variant_index,
+                        expected_type_id,
+                        &data_type_ids,
+                    );
                 }
                 let mut resolved_payload = Vec::new();
                 for (sub_pattern, data_type_id) in payload_patterns.iter().zip(data_type_ids) {
@@ -61163,6 +61187,10 @@ pub struct Program<'src> {
     /// E237: the definition block of each entry-file binding's, parameter's,
     /// member read's and field's type, keyed by that type id.
     pub type_definitions: TypeDefinitions,
+    /// E241: an entry-file variant PATTERN's name span and its hover label —
+    /// the variant of the matched value's type with its payload substituted
+    /// (`Option<i32>::Some(i32)`) — and the enum and variant it names.
+    pub pattern_labels: Vec<PatternLabel>,
     /// E206: the signature a GENERIC call site reached, rendered under the
     /// bindings the solver chose there — `fun get_or(self, key: UserId, make:
     /// || SignalCell<Option<User>>): SignalCell<Option<User>>` where the
@@ -70426,6 +70454,8 @@ fn analyze_over_world<'src>(
     let (member_owners, member_headers) = analyzer.member_headers();
     // E237: the definition under an entry binding's, member's or field's type.
     let type_definitions = analyzer.type_definitions(&expr_type_ids);
+    // E241: a variant pattern's label, rendered once its types have settled.
+    let pattern_labels = analyzer.pattern_labels();
 
     // E145: which identifiers spell an `as` alias rather than its target.
     analyzer.collect_import_alias_spans();
@@ -70837,6 +70867,7 @@ fn analyze_over_world<'src>(
         member_owners,
         member_headers,
         type_definitions,
+        pattern_labels,
         call_signature_labels,
         expr_type_ids,
         inferred_return_types: std::mem::take(&mut analyzer.inferred_return_types),
