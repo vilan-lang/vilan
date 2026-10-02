@@ -26011,22 +26011,50 @@ impl<'src> Analyzer<'src> {
     /// separately — the roots whose type is a *generic* parameter, whose
     /// scalar-ness (and so whether they are boxed) can only be decided at
     /// monomorphization, by the transformer, against the concrete type.
-    fn compute_boxed_locals(&self) -> (HashSet<Id>, HashSet<Id>) {
+    ///
+    /// A view is taken by a written `&[mut] place` and, just as much, by a
+    /// method call's receiver at a `&self`/`&mut self` (`receiver_views`): a
+    /// `mut x` whose `x.bump()` writes through `&mut self` needs the cell as
+    /// much as `bump(&mut x)` does (B505).
+    ///
+    /// A `mut` parameter is boxed at body entry; an immutable one is not — the
+    /// emitter gives a `&` of it a fresh one-slot cell holding its value,
+    /// which no write can make disagree with the binding (B505).
+    fn compute_boxed_locals(&self, receiver_views: &HashSet<Id>) -> (HashSet<Id>, HashSet<Id>) {
         let mut boxed = HashSet::default();
         let mut generic_referenced_roots = HashSet::default();
-        for expr in self.expr_id_to_expr_map.values() {
-            if let Expr::Reference(operand, _) = expr
-                && let Some(root) = self.place_root(*operand)
-            {
+        let viewed_places = self
+            .expr_id_to_expr_map
+            .values()
+            .filter_map(|expr| match expr {
+                Expr::Reference(operand, _) => Some(*operand),
+                _ => None,
+            })
+            .chain(receiver_views.iter().copied());
+        for operand in viewed_places {
+            if let Some(root) = self.place_root(operand) {
                 // A `mut` parameter is a mutable scalar cell like any
                 // `mut` local (H9): viewed, it re-boxes at body entry so
-                // the `(base, key)` view writes through a real cell.
+                // the `(base, key)` view writes through a real cell. One
+                // typed by a generic is decided per instance, as a local is.
                 if let Some(parameter) = self.parameters.get(&root) {
-                    if parameter.mutable
-                        && self.is_scalar_view_pointee(&parameter.type_id.get_type(self))
-                    {
-                        boxed.insert(root);
+                    if parameter.mutable {
+                        match parameter.type_id.get_type(self) {
+                            Type::Generic(_) => {
+                                generic_referenced_roots.insert(root);
+                            }
+                            type_ if self.is_scalar_view_pointee(&type_) => {
+                                boxed.insert(root);
+                            }
+                            _ => {}
+                        }
                     }
+                    continue;
+                }
+                // A view BINDING (`let v = &x`, `for e in &mut xs`, a wrapped
+                // view's capture) holds a view, not a value: a view of it is
+                // that view again, never a cell around the pair.
+                if self.view_binding_mutability(root).is_some() {
                     continue;
                 }
                 match self
@@ -26053,11 +26081,187 @@ impl<'src> Analyzer<'src> {
         (boxed, generic_referenced_roots)
     }
 
+    /// The `&place` expressions whose representation the ANALYZER fixes,
+    /// which the JS emitter must not re-decide per instance (B506): a view
+    /// handed back through a RETURN: a return leaf, or the payload of a
+    /// wrapped-view constructor at one (`Some(&self.slots[i].value)`).
+    ///
+    /// The caller reads a `borrows` call's result, or a wrapped view's
+    /// capture, by the callee's DECLARED pointee
+    /// (`function_returns_scalar_view`, `wrapped_view_captures`), never by an
+    /// instance's. So the protocol is the generic body's verdict — a `&T`
+    /// comes back as the element's own value for every `T` — and both sides
+    /// read it. Every OTHER view (an argument, a receiver, a binding's
+    /// initializer, an inline transient's payload) is consumed by code of the
+    /// same instance, and is a `(base, key)` pair exactly when its pointee is
+    /// a scalar there.
+    fn compute_fixed_view_refs(&self) -> HashSet<Id> {
+        let mut refs = HashSet::default();
+        let add_leaves = |value_id: Id, refs: &mut HashSet<Id>| {
+            let mut leaves = Vec::new();
+            self.collect_tail_leaves(value_id, &mut leaves);
+            for leaf in leaves {
+                match self.expr_id_to_expr_map.get(&leaf) {
+                    Some(Expr::Reference(..)) => {
+                        refs.insert(leaf);
+                    }
+                    Some(Expr::Call(call_id)) if self.call_is_variant_constructor(*call_id) => {
+                        let Some(function_call) = self.function_calls.get(call_id) else {
+                            continue;
+                        };
+                        for argument_id in &function_call.argument_ids {
+                            if matches!(
+                                self.expr_id_to_expr_map.get(argument_id),
+                                Some(Expr::Reference(..))
+                            ) {
+                                refs.insert(*argument_id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        for (_, value_id) in &self.return_sites {
+            add_leaves(*value_id, &mut refs);
+        }
+        for function in self.functions.values() {
+            if function.has_body {
+                add_leaves(function.body.1, &mut refs);
+            }
+        }
+        refs
+    }
+
+    /// The captures of INLINE transients (`match Some(&x) { Some(let v) => .. }`,
+    /// the conditional form too), each with the payloads its subject's leaves
+    /// carry — a `&place` or a forwarded view binding. The capture holds
+    /// whatever its payload is, at each instance: a pair exactly when the
+    /// payload is one. The analyzer's shape (`wrapped_view_captures`) is the
+    /// generic body's; a payload of a `T` that is a scalar at an instance is a
+    /// pair there (B506), so the emitter asks the payload. A call RETURNING a
+    /// wrapped view is not here: its capture reads the callee's protocol.
+    fn compute_transient_view_payloads(&self) -> HashMap<Id, Vec<Id>> {
+        let mut captures: HashMap<Id, Vec<Id>> = HashMap::default();
+        for expr in self.expr_id_to_expr_map.values() {
+            let Expr::Match(subject_id, legs) = expr else {
+                continue;
+            };
+            if matches!(
+                self.expr_id_to_expr_map.get(subject_id),
+                Some(Expr::Call(call_id)) if self.call_returns_wrapped_view(*call_id).is_some()
+            ) || self
+                .inline_subject_wrapped_view_shape(*subject_id)
+                .is_none()
+            {
+                continue;
+            }
+            let mut leaves = Vec::new();
+            self.collect_tail_leaves(*subject_id, &mut leaves);
+            let payloads: Vec<Id> = leaves
+                .into_iter()
+                .filter_map(|leaf| match self.expr_id_to_expr_map.get(&leaf) {
+                    Some(Expr::Call(call_id))
+                        if self.inline_wrapped_view_shape(*call_id).is_some() =>
+                    {
+                        self.function_calls
+                            .get(call_id)
+                            .and_then(|function_call| function_call.argument_ids.first().copied())
+                    }
+                    _ => None,
+                })
+                .collect();
+            for leg in legs {
+                if let ExprPattern::Variant(_, _, sub_patterns) = &leg.pattern
+                    && let [ExprPattern::Binding(capture_id)] = sub_patterns.as_slice()
+                {
+                    captures.insert(*capture_id, payloads.clone());
+                }
+            }
+        }
+        captures
+    }
+
+    /// B505: the method-call receivers a `&self`/`&mut self` borrows
+    /// IMPLICITLY — `x.peek()`, `1.same(&1)`, `counter.count.bump()`. The
+    /// receiver is the one argument the call site may hand a view parameter
+    /// without writing `&` (`check_view_arguments` exempts it), so the IR
+    /// carries the place itself, where every other view argument is an
+    /// `Expr::Reference`. A receiver that already IS a view (a view binding,
+    /// a `&`/`&mut` parameter, a `borrows` call) passes as it stands.
+    ///
+    /// The JS emitter lowers each of these as the written `&receiver` would
+    /// be when its type is a scalar (decided per instance), and
+    /// `compute_boxed_locals` boxes the root a `&mut self` writes through.
+    /// Natively the same seam synthesizes the `&`/`&mut` (`call_arguments`).
+    fn compute_receiver_views(&self) -> HashSet<Id> {
+        let mut receivers = HashSet::default();
+        for function_call in self.function_calls.values() {
+            let Some(Expr::Local(callee_id)) =
+                self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            let Some(receiver_parameter) = self
+                .functions
+                .get(callee_id)
+                .and_then(|function| function.parameters.first())
+                .and_then(|parameter_id| self.parameters.get(parameter_id))
+            else {
+                continue;
+            };
+            if receiver_parameter.name != "self"
+                || !matches!(
+                    receiver_parameter.convention,
+                    Convention::Ref | Convention::RefMut
+                )
+            {
+                continue;
+            }
+            if let Some(receiver) = function_call.argument_ids.first()
+                && !self.assignment_target_is_view(*receiver)
+            {
+                receivers.insert(*receiver);
+            }
+        }
+        receivers
+    }
+
     /// Whether a place is a scalar primitive — the case that needs a `(base, key)`
     /// view, since a JS number/string isn't addressable on its own.
+    ///
+    /// B505: an RVALUE viewed (`&11`, `&(a + 8)`, `&!done`) often has no
+    /// recorded type — inference computes an arithmetic expression's type
+    /// from its operands and keeps no row for it, and a literal no context
+    /// settled keeps its default unrecorded — so the expression's own shape
+    /// answers: a literal, a comparison and a logical operator are scalars,
+    /// arithmetic over two scalars is one, and a unary operator is what its
+    /// operand is. The JS emitter's `value_resolves_to_scalar` mirrors it per
+    /// instance.
     fn place_is_scalar(&self, expr_id: Id) -> bool {
-        self.place_value_type(expr_id)
-            .is_some_and(|type_| self.is_scalar_view_pointee(&type_))
+        match self.place_value_type(expr_id) {
+            Some(type_) => self.is_scalar_view_pointee(&type_),
+            None => match self.expr_id_to_expr_map.get(&expr_id) {
+                Some(Expr::Number(..) | Expr::String(_) | Expr::MultilineString(_)) => true,
+                Some(Expr::Binary(
+                    BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::Gt
+                    | BinaryOp::LtEq
+                    | BinaryOp::GtEq
+                    | BinaryOp::And
+                    | BinaryOp::Or,
+                    _,
+                    _,
+                )) => true,
+                Some(Expr::Binary(_, lhs, rhs)) => {
+                    self.place_is_scalar(*lhs) && self.place_is_scalar(*rhs)
+                }
+                Some(Expr::Unary(_, operand)) => self.place_is_scalar(*operand),
+                _ => false,
+            },
+        }
     }
 
     /// Whether a function returns a scalar `(base, key)` view: it has a `borrows`
@@ -28257,11 +28461,37 @@ impl<'src> Analyzer<'src> {
                 // `out = c` aliased it where `out = *c` copies (rule 1). A
                 // compound write's synthesized re-read is excluded inside
                 // `is_scalar_view_read`, and it is a binary operand anyway.
+                //
+                // B496: a view EXPRESSION is the same read — `out = &a`, a
+                // `borrows` call (`out = inner(&holder)`), or either as a leaf
+                // of a value `if`/`match`/block (`out = if c { &a } else { &b
+                // }`). Each stored the caller's aggregate itself on JS (a
+                // later `out.x = 99` wrote `a`), or a scalar's `(base, key)`
+                // pair; rule 3 keeps a view expression out of the copies, so
+                // `*` is the spelling that copies. Reported at the leaf.
                 Expr::Assignment(_, value) => {
                     if self.is_scalar_view_read(*value, &view_bindings)
                         || self.is_view_binding_read(*value, &view_bindings)
                     {
                         leaks.push(*value);
+                        continue;
+                    }
+                    let mut leaves = Vec::new();
+                    self.collect_tail_leaves(*value, &mut leaves);
+                    for leaf in leaves {
+                        let is_view_expression = match self.expr_id_to_expr_map.get(&leaf) {
+                            Some(Expr::Reference(..)) => true,
+                            Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
+                            Some(Expr::Local(_)) => {
+                                leaf != *value
+                                    && (self.is_scalar_view_read(leaf, &view_bindings)
+                                        || self.is_view_binding_read(leaf, &view_bindings))
+                            }
+                            _ => false,
+                        };
+                        if is_view_expression {
+                            leaks.push(leaf);
+                        }
                     }
                 }
                 // A call argument whose parameter is NOT a view (`&[mut] T`) wants
@@ -29457,9 +29687,32 @@ impl<'src> Analyzer<'src> {
             .or_else(|| match self.expr_id_to_expr_map.get(&value_id) {
                 // A view's type is its pointee's (references are transparent in
                 // the type system), so the operand answers for `*v`.
-                Some(Expr::Dereference(operand)) => self.place_value_type_id(*operand),
+                Some(Expr::Dereference(operand)) => self.view_pointee_type_id(*operand),
                 _ => None,
             })
+    }
+
+    /// The type a VIEW expression points at, for `*view`'s copy (B466, B496):
+    /// a view binding's own type, a `&place`'s place, a `borrows` call's
+    /// declared return, and a value `if`/`match`/block's first leaf that
+    /// answers. The three expression forms record no type of their own, so
+    /// `*inner(&holder)` and `*if c { &a } else { &b }` — the spellings the
+    /// assignment refusal steers to — had no type to copy at and aliased.
+    fn view_pointee_type_id(&self, view_id: Id) -> Option<TypeId> {
+        self.place_value_type_id(view_id).or_else(|| {
+            match self.expr_id_to_expr_map.get(&view_id)? {
+                Expr::Reference(place, _) => self.place_value_type_id(*place),
+                Expr::Call(call_id) => self.call_declared_return_type_id(*call_id),
+                Expr::If(_) | Expr::Match(..) | Expr::Block(_) => {
+                    let mut leaves = Vec::new();
+                    self.collect_tail_leaves(view_id, &mut leaves);
+                    leaves
+                        .into_iter()
+                        .find_map(|leaf| self.view_pointee_type_id(leaf))
+                }
+                _ => None,
+            }
+        })
     }
 
     /// B418: the expressions a CHOOSING value can hand back — the tail of a
@@ -61055,6 +61308,19 @@ pub struct Program<'src> {
     // monomorphization, so the transformer resolves the concrete type and treats a
     // scalar pointee like `boxed_locals` / `scalar_view_refs`.
     pub generic_referenced_roots: HashSet<Id>,
+    // B505: method-call receivers a `&self`/`&mut self` borrows implicitly
+    // (`x.peek()`): the place itself stands where a view is passed, so the JS
+    // emitter lowers a scalar one as the written `&x` would be.
+    pub receiver_views: HashSet<Id>,
+    // B506: the `&place` exprs whose `(base, key)`-or-not representation is
+    // the analyzer's verdict, never re-decided per instance — a view handed
+    // back through a return: a leaf, or a wrapped view's payload
+    // (`compute_fixed_view_refs`).
+    pub fixed_view_refs: HashSet<Id>,
+    // B506: an inline transient's capture → the payloads its subject carries
+    // (`compute_transient_view_payloads`); the capture is a pair at an
+    // instance exactly when its payload is.
+    pub transient_view_payloads: HashMap<Id, Vec<Id>>,
     // View bindings/params holding a scalar `(base, key)` view; `*v` lowers to
     // `v[0][v[1]]` (covers both a boxed local and a scalar field).
     pub primitive_views: HashSet<Id>,
@@ -69649,7 +69915,10 @@ fn analyze_over_world<'src>(
     let (return_clone_sites, return_view_reads) = analyzer.compute_return_clone_sites();
     crate::phase_pass_mark("analyzer.compute_return_clone_sites()");
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
-    let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
+    let receiver_views = analyzer.compute_receiver_views();
+    let fixed_view_refs = analyzer.compute_fixed_view_refs();
+    let transient_view_payloads = analyzer.compute_transient_view_payloads();
+    let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals(&receiver_views);
     let primitive_views = analyzer.compute_primitive_views();
     let scalar_view_refs = analyzer.compute_scalar_view_refs();
     let scalar_view_calls = analyzer.compute_scalar_view_calls();
@@ -70425,6 +70694,9 @@ fn analyze_over_world<'src>(
         drop_call_edges: std::mem::take(&mut analyzer.drop_call_edges),
         boxed_locals,
         generic_referenced_roots,
+        receiver_views,
+        fixed_view_refs,
+        transient_view_payloads,
         primitive_views,
         scalar_view_refs,
         scalar_view_calls,

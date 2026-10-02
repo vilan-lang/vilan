@@ -11199,3 +11199,534 @@ fn b464_a_closure_view_parameter_called_with_a_view_writes_through() {
         "a `&mut` parameter takes a view; pass `&mut <place>` (there is no implicit borrow).",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B504: a binder a view is taken of is a cell wherever it is declared.
+// ---------------------------------------------------------------------------
+
+/// B504: `&binder` of a PATTERN binder — a `match` leg's capture, a
+/// destructuring `let`'s, a `for` element, an `is` capture — is a view into
+/// the binder's one-slot cell, as `&x` of a `let x` always was. The analyzer
+/// boxed every viewed scalar local, but only a `let` and a `mut` parameter
+/// were DECLARED as the cell: a capture was declared bare, so `&payload`
+/// paired the value itself (`'ally'[0]` read `a`, a number read `undefined`)
+/// and a later read of the binder took its first character.
+#[test]
+fn b504_a_pattern_binder_a_view_is_taken_of_is_a_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun show(v: &i32) {
+            print(*v);
+        }
+
+        fun show_str(v: &str) {
+            print(*v);
+        }
+
+        fun lend_match(held: Option<str>, f: |&str| void) {
+            match held {
+                Some(let payload) => {
+                    f(&payload);
+                    print(payload);
+                },
+                None => {},
+            }
+        }
+
+        fun lend_generic<T>(held: Option<T>, f: |&T| void) {
+            match held {
+                Some(let payload) => f(&payload),
+                None => {},
+            }
+        }
+
+        fun main() {
+            lend_match(Some("ally"), |&v: &str| print(*v));
+            lend_generic(Some("ally"), |&v: &str| print(*v));
+            lend_generic(Some(7), |&v: &i32| print(*v));
+            let (a, b) = (4, "five");
+            show(&a);
+            show_str(&b);
+            print(a + 1);
+            for i in [6, 7] {
+                show(&i);
+                print(i * 10);
+            }
+            if Some(9) is Some(let nine) {
+                show(&nine);
+                print(nine);
+            }
+            match Some(10) {
+                Some(let q) => {
+                    let w = &q;
+                    print(*w + q);
+                },
+                None => {},
+            }
+        }
+        "#,
+        "ally\nally\nally\n7\n4\nfive\n5\n6\n60\n7\n70\n9\n9\n20\n",
+    );
+}
+
+/// B504: a `mut` pattern binder written through `&mut` keeps the write — a
+/// `match` capture, a destructured `mut (..)`, an `is` capture — and a view
+/// taken in a GUARD names the capture's cell, which the leg declares before
+/// the guard reads it.
+#[test]
+fn b504_a_mut_pattern_binder_writes_through_its_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun bump(v: &mut i32) {
+            v = *v + 1;
+        }
+
+        fun peek(v: &i32): i32 {
+            *v
+        }
+
+        fun main() {
+            match Some(1) {
+                Some(mut p) => {
+                    bump(&mut p);
+                    print(p);
+                },
+                None => {},
+            }
+            mut (c, d) = (3, 4);
+            bump(&mut c);
+            print(c + d);
+            if Some(40) is Some(mut m) {
+                bump(&mut m);
+                print(m);
+            }
+            match Some(5) {
+                Some(let n) if peek(&n) > 4 => print(n * 2),
+                _ => print("no"),
+            }
+        }
+        "#,
+        "2\n8\n41\n10\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B506: a view of a generic place is a pair exactly where its type is a
+// scalar at the instance.
+// ---------------------------------------------------------------------------
+
+/// B506: `&pair.left` with `left: T`, `&x` with `x: T` a parameter, a view
+/// binding of either, an inline transient's capture, a `mut x: T` parameter's
+/// `&mut x`, a `for e in &mut xs` element over `List<T>`, `&mut pair.left`
+/// written through, and a re-borrow `&x` of a `x: &T` are `(base, key)`
+/// pairs at an instance where `T` is a scalar, and the value's own reference
+/// where it is an aggregate. The analyzer decided them on the generic body,
+/// where `T` is abstract, and only a generic `let` ROOT was re-decided per
+/// instance: the field and the parameter passed the VALUE to a callee reading
+/// a pair (`TypeError`), and a view binding's `*v` read the pair as the value.
+#[test]
+fn b506_a_view_of_a_generic_place_is_decided_per_instance() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Pair<T> {
+            left: T,
+        }
+
+        fun lend<T>(pair: &Pair<T>, f: |&T| void) {
+            f(&pair.left);
+        }
+
+        fun lend_through_bindings<T>(pair: &Pair<T>, f: |&T| void) {
+            let v = &pair.left;
+            f(v);
+            let w = v;
+            f(w);
+        }
+
+        fun lend_parameter<T>(x: T, f: |&T| void) {
+            f(&x);
+        }
+
+        fun read_back<T>(x: T): T {
+            let v = &x;
+            *v
+        }
+
+        fun lend_transient<T>(x: T, f: |&T| void) {
+            match Some(&x) {
+                Some(let v) => f(v),
+                None => {},
+            }
+        }
+
+        fun bump_generic<T>(mut x: T, f: |&mut T| void): T {
+            f(&mut x);
+            x
+        }
+
+        fun each_mut<T>(xs: &mut List<T>, f: |&mut T| void) {
+            for e in &mut xs {
+                f(e);
+            }
+        }
+
+        fun reset_all<T>(xs: &mut List<T>, value: T) {
+            for e in &mut xs {
+                e = value;
+            }
+        }
+
+        fun write_left<T>(pair: &mut Pair<T>, f: |&mut T| void) {
+            f(&mut pair.left);
+        }
+
+        fun relend<T>(x: &T, f: |&T| void) {
+            f(&x);
+        }
+
+        fun relend_closure<T>(x: T, f: |&T| void) {
+            let through = |held: &T| f(&held);
+            through(&x);
+        }
+
+        fun main() {
+            lend(&Pair { left = 1 }, |v: &i32| print(*v));
+            lend(&Pair { left = "ab" }, |v: &str| print(*v));
+            lend(&Pair { left = [2, 3] }, |v: &List<i32>| print(v.len()));
+            lend_through_bindings(&Pair { left = 4 }, |v: &i32| print(*v));
+            lend_parameter(5, |v: &i32| print(*v));
+            lend_parameter(true, |v: &bool| print(*v));
+            print(read_back(6));
+            print(read_back("seven"));
+            lend_transient(8, |v: &i32| print(*v));
+            print(bump_generic(9, |v: &mut i32| { v = *v + 1; }));
+            mut xs = [10, 20];
+            each_mut(&mut xs, |v: &mut i32| { v = *v * 2; });
+            print(xs[0] + xs[1]);
+            reset_all(&mut xs, 3);
+            print(xs[0] + xs[1]);
+            mut pair = Pair { left = 1 };
+            write_left(&mut pair, |v: &mut i32| { v = *v + 41; });
+            print(pair.left);
+            mut words = Pair { left = "a" };
+            write_left(&mut words, |v: &mut str| { v = *v + "b"; });
+            print(words.left);
+            relend(&pair.left, |v: &i32| print(*v));
+            relend_closure(5, |v: &i32| print(*v));
+        }
+        "#,
+        "1\nab\n2\n4\n4\n5\ntrue\n6\nseven\n8\n10\n60\n6\n42\nab\n42\n5\n",
+    );
+}
+
+/// B506's boundary: a view handed back through a RETURN keeps the generic
+/// body's verdict, because the caller reads it by the callee's declared
+/// pointee — a `borrows` return of `&T`, a wrapped `Option<&T>`, and
+/// `Arena::get` at `Arena<i32>` hand the element's value back as before.
+#[test]
+fn b506_a_returned_generic_view_keeps_the_declared_protocol() {
+    assert_compiles_and_runs(
+        r#"
+        import std::arena::Arena;
+        import std::io::print;
+
+        struct Pair<T> {
+            left: T,
+        }
+
+        fun first<T>(xs: &List<T>): &T borrows xs {
+            &xs[0]
+        }
+
+        fun left_of<T>(pair: &Pair<T>): &T borrows pair {
+            &pair.left
+        }
+
+        fun maybe_left<T>(pair: &Pair<T>): Option<&T> borrows pair {
+            Some(&pair.left)
+        }
+
+        fun main() {
+            let xs = [1, 2];
+            print(*first(&xs));
+            let v = first(&xs);
+            print(*v);
+            let pair = Pair { left = 3 };
+            print(*left_of(&pair));
+            match maybe_left(&pair) {
+                Some(let l) => print(*l),
+                None => {},
+            }
+            mut arena: Arena<i32> = Arena::new();
+            let handle = arena.insert(4);
+            match arena.get(handle) {
+                Some(let value) => print(*value),
+                None => {},
+            }
+        }
+        "#,
+        "1\n1\n3\n3\n4\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B505: a receiver a `&self` borrows, and a view of a place with no cell.
+// ---------------------------------------------------------------------------
+
+/// B505: a SCALAR receiver at a `&self`/`&mut self` is the view the written
+/// `&receiver` would be — a local, a `mut` local written through `&mut self`,
+/// a literal, an rvalue, a field, a list element, a tuple position, a `bool`,
+/// a generic `T` at a scalar instance, a receiver that is itself a view. The
+/// IR carries the receiver as the place (the one implicit borrow), and the JS
+/// emitter passed it bare: `self[0][self[1]]` threw, or read `undefined`, and
+/// a `&mut self` write no-oped.
+#[test]
+fn b505_a_scalar_receiver_at_a_ref_self_is_a_view() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Same {
+            fun same(&self, other: &Self): bool;
+        }
+
+        impl type T: PartialEq with Same {
+            fun same(&self, other: &T): bool {
+                *self == *other
+            }
+        }
+
+        trait Bump {
+            fun bump(&mut self);
+            fun peek(&self): i32;
+        }
+
+        impl i32 with Bump {
+            fun bump(&mut self) {
+                self = *self + 1;
+            }
+            fun peek(&self): i32 {
+                *self
+            }
+        }
+
+        trait Flip {
+            fun flip(&mut self);
+        }
+
+        impl bool with Flip {
+            fun flip(&mut self) {
+                self = !*self;
+            }
+        }
+
+        struct Counter {
+            count: i32,
+        }
+
+        fun generic<T: Same>(a: T, b: T): bool {
+            a.same(&b)
+        }
+
+        fun bump_twice<T: Bump>(mut x: T): T {
+            x.bump();
+            x.bump();
+            x
+        }
+
+        fun peek_view(v: &i32): i32 {
+            v.peek()
+        }
+
+        fun bump_view(v: &mut i32) {
+            v.bump();
+        }
+
+        fun main() {
+            print(1.same(&1));
+            print(generic("x", "x"));
+            print(generic(1, 2));
+            let a = 1;
+            let b = 1;
+            print(a.same(&b));
+            mut x = 1;
+            x.bump();
+            print(x);
+            print(x.peek());
+            print(7.peek());
+            print((3 + 4).peek());
+            mut counter = Counter { count = 1 };
+            counter.count.bump();
+            print(counter.count);
+            mut xs = [10, 20];
+            xs[0].bump();
+            print(xs[0]);
+            mut pair = (5, "p");
+            pair.0.bump();
+            print(pair.0);
+            print(bump_twice(7));
+            print(peek_view(&xs[1]));
+            bump_view(&mut xs[1]);
+            print(xs[1]);
+            mut flag = false;
+            flag.flip();
+            print(flag);
+            match Some(3) {
+                Some(let n) if n.peek() > 2 => print(n.peek()),
+                _ => print("no"),
+            }
+        }
+        "#,
+        "true\ntrue\nfalse\ntrue\n2\n2\n7\n7\n2\n11\n6\n9\n20\n21\ntrue\n3\n",
+    );
+}
+
+/// B505: a view of a scalar that has no cell — an rvalue (`&11`,
+/// `&(a + 8)`, `&!done`), an immutable parameter, a closure's parameter — is
+/// a fresh one-slot cell holding the value; nothing can write the binding
+/// while the view lives, so the two never disagree. It was a pair of the
+/// VALUE and `0` (`[x, 0]`, reading `undefined`), and an rvalue whose type
+/// inference left unrecorded was passed bare.
+#[test]
+fn b505_a_view_of_a_scalar_without_a_cell_is_a_fresh_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun show(v: &i32) {
+            print(*v);
+        }
+
+        fun show_flag(v: &bool) {
+            print(*v);
+        }
+
+        fun param(x: i32) {
+            show(&x);
+            print(x);
+        }
+
+        fun main() {
+            show(&11);
+            let a = 1;
+            show(&(a + 8));
+            let done = false;
+            show_flag(&!done);
+            show_flag(&(a > 0));
+            param(12);
+            let apply = |n: i32| show(&n);
+            apply(13);
+        }
+        "#,
+        "11\n9\ntrue\ntrue\n12\n12\n13\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B496: a view expression assigned into a value place takes `*`.
+// ---------------------------------------------------------------------------
+
+/// B496: `out = &a`, `out = inner(&holder)` (a `borrows` call) and `out = if
+/// c { &a } else { &b }` store a VIEW into a value place, which on JS aliased
+/// the caller's aggregate (`out.x = 99` wrote `a`) or stored a scalar's
+/// `(base, key)` pair. B465 refused a view BINDING there; a view expression
+/// is the same read, refused with the same sentence at the leaf.
+#[test]
+fn b496_a_view_expression_assigned_to_a_value_place_is_refused() {
+    for (setup, assignment) in [
+        ("mut a = P { x = 1 };", "out = &a;"),
+        (
+            "let holder = H { p = P { x = 2 } };",
+            "out = inner(&holder);",
+        ),
+        (
+            "let a = P { x = 1 }; let b = P { x = 2 }; let flag = true;",
+            "out = if flag { &a } else { &b };",
+        ),
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct P {{ x: i32 }}
+                struct H {{ p: P }}
+
+                fun inner(holder: &H): &P borrows holder {{
+                    &holder.p
+                }}
+
+                fun main() {{
+                    {setup}
+                    mut out = P {{ x = 0 }};
+                    {assignment}
+                    out.x = 99;
+                }}
+                "#
+            ),
+            "a view can't be read as a value here; write `*` to copy the value out",
+        );
+    }
+    assert_fails_with(
+        r#"
+        fun main() {
+            mut n = 1;
+            let m = 5;
+            n = &m;
+        }
+        "#,
+        "a view can't be read as a value here; write `*` to copy the value out",
+    );
+}
+
+/// B496: the spelled copy COPIES — `*&a`, `*inner(&holder)` and `*if c { &a }
+/// else { &b }` take rule 1's copy like `*v` (B466); the last two recorded no
+/// type to copy at, so the `*` the refusal steers to aliased as well.
+#[test]
+fn b496_the_spelled_copy_of_a_view_expression_is_a_copy() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct P {
+            x: i32,
+        }
+
+        struct H {
+            p: P,
+        }
+
+        fun inner(holder: &H): &P borrows holder {
+            &holder.p
+        }
+
+        fun main() {
+            mut a = P { x = 1 };
+            mut out = P { x = 0 };
+            out = *&a;
+            out.x = 99;
+            print(a.x);
+            let holder = H { p = P { x = 2 } };
+            out = *inner(&holder);
+            out.x = 98;
+            print(holder.p.x);
+            let flag = true;
+            let b = P { x = 3 };
+            out = *if flag { &a } else { &b };
+            out.x = 97;
+            print(a.x);
+            print(out.x);
+            mut n = 1;
+            let m = 5;
+            n = *&m;
+            print(n + 1);
+        }
+        "#,
+        "1\n2\n1\n97\n6\n",
+    );
+}

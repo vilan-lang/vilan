@@ -347,6 +347,270 @@ const B464_PROBE: &str = concat!(
     "\t});\n",
     "}\n",
 );
+const B504_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun show(v: &i32) {\n",
+    "\tprint(*v);\n",
+    "}\n",
+    "\n",
+    "fun show_str(v: &str) {\n",
+    "\tprint(*v);\n",
+    "}\n",
+    "\n",
+    "fun lend_match(held: Option<str>, f: |&str| void) {\n",
+    "\tmatch held {\n",
+    "\t\tSome(let payload) => {\n",
+    "\t\t\tf(&payload);\n",
+    "\t\t\tprint(payload);\n",
+    "\t\t},\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun lend_generic<T>(held: Option<T>, f: |&T| void) {\n",
+    "\tmatch held {\n",
+    "\t\tSome(let payload) => f(&payload),\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlend_match(Some(\"ally\"), |&v: &str| print(*v));\n",
+    "\tlend_generic(Some(\"ally\"), |&v: &str| print(*v));\n",
+    "\tlend_generic(Some(7), |&v: &i32| print(*v));\n",
+    "\tlet (a, b) = (4, \"five\");\n",
+    "\tshow(&a);\n",
+    "\tshow_str(&b);\n",
+    "\tprint(a + 1);\n",
+    "\tfor i in [6, 7] {\n",
+    "\t\tshow(&i);\n",
+    "\t\tprint(i * 10);\n",
+    "\t}\n",
+    "\tif Some(9) is Some(let nine) {\n",
+    "\t\tshow(&nine);\n",
+    "\t\tprint(nine);\n",
+    "\t}\n",
+    "\tmatch Some(10) {\n",
+    "\t\tSome(let q) => {\n",
+    "\t\t\tlet w = &q;\n",
+    "\t\t\tprint(*w + q);\n",
+    "\t\t},\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+);
+const B506_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Pair<T> {\n",
+    "\tleft: T,\n",
+    "}\n",
+    "\n",
+    "fun first<T>(xs: &List<T>): &T borrows xs {\n",
+    "\t&xs[0]\n",
+    "}\n",
+    "\n",
+    "fun left_of<T>(pair: &Pair<T>): &T borrows pair {\n",
+    "\t&pair.left\n",
+    "}\n",
+    "\n",
+    "fun lend<T>(pair: &Pair<T>, f: |&T| void) {\n",
+    "\tf(&pair.left);\n",
+    "}\n",
+    "\n",
+    "fun lend_through_binding<T>(pair: &Pair<T>, f: |&T| void) {\n",
+    "\tlet v = &pair.left;\n",
+    "\tf(v);\n",
+    "}\n",
+    "\n",
+    "fun lend_parameter<T>(x: T, f: |&T| void) {\n",
+    "\tf(&x);\n",
+    "}\n",
+    "\n",
+    "fun read_back<T>(x: T): T {\n",
+    "\tlet v = &x;\n",
+    "\t*v\n",
+    "}\n",
+    "\n",
+    "fun lend_transient<T>(x: T, f: |&T| void) {\n",
+    "\tmatch Some(&x) {\n",
+    "\t\tSome(let v) => f(v),\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun bump_generic<T>(mut x: T, f: |&mut T| void): T {\n",
+    "\tf(&mut x);\n",
+    "\tx\n",
+    "}\n",
+    "\n",
+    "fun write_left<T>(pair: &mut Pair<T>, f: |&mut T| void) {\n",
+    "\tf(&mut pair.left);\n",
+    "}\n",
+    "\n",
+    "fun relend<T>(x: &T, f: |&T| void) {\n",
+    "\tf(&x);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlend(&Pair { left = 1 }, |v: &i32| print(*v));\n",
+    "\tlend(&Pair { left = \"ab\" }, |v: &str| print(*v));\n",
+    "\tlend(&Pair { left = [2, 3] }, |v: &List<i32>| print(v.len()));\n",
+    "\tlend_through_binding(&Pair { left = 4 }, |v: &i32| print(*v));\n",
+    "\tlend_parameter(5, |v: &i32| print(*v));\n",
+    "\tlend_parameter(true, |v: &bool| print(*v));\n",
+    "\tprint(read_back(6));\n",
+    "\tprint(read_back(\"seven\"));\n",
+    "\tlend_transient(8, |v: &i32| print(*v));\n",
+    "\tprint(bump_generic(9, |v: &mut i32| { v = *v + 1; }));\n",
+    "\tprint(*first(&[11, 12]));\n",
+    "\tprint(*left_of(&Pair { left = 13 }));\n",
+    "\tmut pair = Pair { left = 1 };\n",
+    "\twrite_left(&mut pair, |v: &mut i32| { v = *v + 41; });\n",
+    "\tprint(pair.left);\n",
+    "\tmut words = Pair { left = \"a\" };\n",
+    "\twrite_left(&mut words, |v: &mut str| { v = *v + \"b\"; });\n",
+    "\tprint(words.left);\n",
+    "\trelend(&pair.left, |v: &i32| print(*v));\n",
+    "}\n",
+);
+const B505_PROBE: &str = concat!(
+    "import std::compare::PartialEq;\n",
+    "import std::io::print;\n",
+    "\n",
+    "trait Same {\n",
+    "\tfun same(&self, other: &Self): bool;\n",
+    "}\n",
+    "\n",
+    "impl type T: PartialEq with Same {\n",
+    "\tfun same(&self, other: &T): bool {\n",
+    "\t\t*self == *other\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Bump {\n",
+    "\tfun bump(&mut self);\n",
+    "\tfun peek(&self): i32;\n",
+    "}\n",
+    "\n",
+    "impl i32 with Bump {\n",
+    "\tfun bump(&mut self) {\n",
+    "\t\tself = *self + 1;\n",
+    "\t}\n",
+    "\tfun peek(&self): i32 {\n",
+    "\t\t*self\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Flip {\n",
+    "\tfun flip(&mut self);\n",
+    "}\n",
+    "\n",
+    "impl bool with Flip {\n",
+    "\tfun flip(&mut self) {\n",
+    "\t\tself = !*self;\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Counter {\n",
+    "\tcount: i32,\n",
+    "}\n",
+    "\n",
+    "fun show(v: &i32) {\n",
+    "\tprint(*v);\n",
+    "}\n",
+    "\n",
+    "fun generic<T: Same>(a: T, b: T): bool {\n",
+    "\ta.same(&b)\n",
+    "}\n",
+    "\n",
+    "fun bump_twice<T: Bump>(mut x: T): T {\n",
+    "\tx.bump();\n",
+    "\tx.bump();\n",
+    "\tx\n",
+    "}\n",
+    "\n",
+    "fun peek_view(v: &i32): i32 {\n",
+    "\tv.peek()\n",
+    "}\n",
+    "\n",
+    "fun bump_view(v: &mut i32) {\n",
+    "\tv.bump();\n",
+    "}\n",
+    "\n",
+    "fun param(x: i32) {\n",
+    "\tshow(&x);\n",
+    "\tprint(x.peek());\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(1.same(&1));\n",
+    "\tprint(generic(\"x\", \"x\"));\n",
+    "\tprint(generic(1, 2));\n",
+    "\tlet a = 1;\n",
+    "\tlet b = 1;\n",
+    "\tprint(a.same(&b));\n",
+    "\tmut x = 1;\n",
+    "\tx.bump();\n",
+    "\tprint(x);\n",
+    "\tprint(x.peek());\n",
+    "\tprint(7.peek());\n",
+    "\tprint((3 + 4).peek());\n",
+    "\tshow(&11);\n",
+    "\tshow(&(a + 8));\n",
+    "\tparam(12);\n",
+    "\tlet apply = |n: i32| show(&n);\n",
+    "\tapply(13);\n",
+    "\tmut counter = Counter { count = 1 };\n",
+    "\tcounter.count.bump();\n",
+    "\tprint(counter.count);\n",
+    "\tmut xs = [10, 20];\n",
+    "\txs[0].bump();\n",
+    "\tprint(xs[0]);\n",
+    "\tmut pair = (5, \"p\");\n",
+    "\tpair.0.bump();\n",
+    "\tprint(pair.0);\n",
+    "\tprint(bump_twice(7));\n",
+    "\tprint(peek_view(&xs[1]));\n",
+    "\tbump_view(&mut xs[1]);\n",
+    "\tprint(xs[1]);\n",
+    "\tmut flag = false;\n",
+    "\tflag.flip();\n",
+    "\tprint(flag);\n",
+    "}\n",
+);
+const B496_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct P {\n",
+    "\tx: i32,\n",
+    "}\n",
+    "\n",
+    "struct Holder {\n",
+    "\tp: P,\n",
+    "}\n",
+    "\n",
+    "fun inner(holder: &Holder): &P borrows holder {\n",
+    "\t&holder.p\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut a = P { x = 1 };\n",
+    "\tmut out = P { x = 0 };\n",
+    "\tout = *&a;\n",
+    "\tout.x = 99;\n",
+    "\tprint(a.x);\n",
+    "\tlet holder = Holder { p = P { x = 2 } };\n",
+    "\tout = *inner(&holder);\n",
+    "\tout.x = 98;\n",
+    "\tprint(holder.p.x);\n",
+    "\tmut n = 1;\n",
+    "\tlet m = 5;\n",
+    "\tn = *&m;\n",
+    "\tprint(n + 1);\n",
+    "}\n",
+);
 
 /// The programs the default suite runs — small, fast, and between them they
 /// cover every value shape S1a claims: scalars, `str`, `bool`, a struct with an
@@ -8205,5 +8469,69 @@ fn a_closure_view_parameter_takes_a_view_on_both_backends() {
         compare(&staged, "native_probe_b464.vl"),
         Verdict::Identical,
         "a closure's view parameter must write through on both backends"
+    );
+}
+
+/// B504: a view of a pattern binder — a `match` capture (concrete and
+/// generic), a destructured `let`'s, a `for` element, an `is` capture — reads
+/// the binder on both backends (`inference::borrows`' `b504_*` pins are the
+/// JS half; JS read the value's first character, or `undefined`).
+#[test]
+fn a_view_of_a_pattern_binder_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b504.vl"), B504_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b504.vl"),
+        Verdict::Identical,
+        "a view of a pattern binder must read the binder on both backends"
+    );
+}
+
+/// B506: a view of a generic place — a field typed `T`, a parameter typed
+/// `T`, a view binding of one, an inline transient's capture, a `mut x: T`
+/// parameter's `&mut x`, `&mut pair.left` written through, a re-borrow — is
+/// the same on both backends at a scalar and an aggregate instance, and a
+/// view RETURNED keeps its protocol (`*first(..)`, `*left_of(..)`).
+#[test]
+fn a_view_of_a_generic_place_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b506.vl"), B506_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b506.vl"),
+        Verdict::Identical,
+        "a view of a generic place must be decided per instance on both backends"
+    );
+}
+
+/// B505: a scalar receiver at a `&self`/`&mut self` — a local, a literal, an
+/// rvalue, a field, an element, a tuple position, a `bool`, a generic — and a
+/// view of a scalar with no cell (`&11`, `&(a + 8)`, an immutable or closure
+/// parameter) are identical on both backends; JS passed the value bare.
+#[test]
+fn a_scalar_receiver_and_a_cell_less_view_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b505.vl"), B505_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b505.vl"),
+        Verdict::Identical,
+        "a scalar receiver at a view self must be a view on both backends"
+    );
+}
+
+/// B496: the spelled copy of a view expression assigned into a value place
+/// (`out = *&a`, `out = *inner(&holder)`, `n = *&m`) copies on both backends
+/// (the unspelled assignment is refused; JS aliased it).
+#[test]
+fn the_spelled_copy_of_a_view_expression_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b496.vl"), B496_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b496.vl"),
+        Verdict::Identical,
+        "the spelled copy of a view expression must copy on both backends"
     );
 }

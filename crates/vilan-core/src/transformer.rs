@@ -3852,7 +3852,15 @@ impl<'src> Transformer<'src> {
             .iter()
             .filter_map(|parameter_id| {
                 let name = self.ng.name_for(*parameter_id);
-                if self.program.parameter_entry_clones.contains(parameter_id) {
+                // A boxed parameter is a scalar at this instance (a generic
+                // `mut x: T` can be both recorded and boxed), and a scalar's
+                // copy is itself: the cell is what it owes.
+                if self.local_is_boxed(*parameter_id) {
+                    Some(js::Node::Assignment(
+                        Box::new(js::Node::Local(name.clone())),
+                        Box::new(js::Node::Array(vec![js::Node::Local(name)])),
+                    ))
+                } else if self.program.parameter_entry_clones.contains(parameter_id) {
                     self.used_helpers.insert("__clone");
                     Some(js::Node::Assignment(
                         Box::new(js::Node::Local(name.clone())),
@@ -3860,11 +3868,6 @@ impl<'src> Transformer<'src> {
                             Box::new(js::Node::Local("__clone".to_string())),
                             vec![js::Node::Local(name)],
                         )),
-                    ))
-                } else if self.program.boxed_locals.contains(parameter_id) {
-                    Some(js::Node::Assignment(
-                        Box::new(js::Node::Local(name.clone())),
-                        Box::new(js::Node::Array(vec![js::Node::Local(name)])),
                     ))
                 } else {
                     None
@@ -4299,7 +4302,7 @@ impl<'src> Transformer<'src> {
     /// parameter, or `&place` of a scalar place directly.
     fn derefs_scalar_view(&self, operand: Id) -> bool {
         match self.program.entity_map.get(&operand) {
-            Some(Expr::Reference(..)) => self.program.scalar_view_refs.contains(&operand),
+            Some(Expr::Reference(place, _)) => self.emits_scalar_view_ref(operand, *place),
             _ => self.emits_scalar_view_pair(operand),
         }
     }
@@ -4313,10 +4316,7 @@ impl<'src> Transformer<'src> {
     /// hand), so asking "is this already a pair" must say no about it.
     fn emits_scalar_view_pair(&self, id: Id) -> bool {
         match self.program.entity_map.get(&id) {
-            Some(Expr::Local(binding)) => {
-                self.program.primitive_views.contains(binding)
-                    || self.generic_ref_param_is_scalar(*binding)
-            }
+            Some(Expr::Local(binding)) => self.binding_holds_a_scalar_view_pair(*binding),
             // `*obj.slot()` — a `borrows` call returning a scalar view. A
             // scalar `Shared::write()` is one too: it lowers to the `(base,
             // key)` pair, and the analyzer cannot classify it (the pointee is
@@ -4326,6 +4326,36 @@ impl<'src> Transformer<'src> {
             }
             _ => false,
         }
+    }
+
+    /// Whether a binding holds a scalar `(base, key)` view at THIS instance.
+    /// `primitive_views` is the analyzer's answer on the generic body, so it
+    /// lists the concrete ones; a view whose pointee is a generic `T` is a
+    /// pair exactly where `T` is a scalar, and is decided here by what made
+    /// it (B505/B506):
+    ///
+    /// - a `&`/`&mut` parameter, by its pointee type;
+    /// - a `let v = &..` binding (or a copy of one), by its initializer;
+    /// - an inline transient's capture, by its payload;
+    /// - a `for e in &mut xs` element, by the element type — the loop builds
+    ///   `[xs, i]` or `xs[i]` by this same question.
+    fn binding_holds_a_scalar_view_pair(&self, binding: Id) -> bool {
+        self.program.primitive_views.contains(&binding)
+            || self.generic_ref_param_is_scalar(binding)
+            || self.view_binding_holds_a_scalar_pair(binding)
+            || self
+                .program
+                .transient_view_payloads
+                .get(&binding)
+                .is_some_and(|payloads| {
+                    payloads
+                        .iter()
+                        .any(|payload| self.derefs_scalar_view(*payload))
+                })
+            || (self.program.for_each_views.contains_key(&binding)
+                && self
+                    .binding_type_id(binding)
+                    .is_some_and(|type_id| self.resolves_to_scalar_view_pointee(type_id)))
     }
 
     /// B444: per argument position of the callee `subject_id` names, whether
@@ -4435,6 +4465,30 @@ impl<'src> Transformer<'src> {
             })
     }
 
+    /// B505/B506: a view BINDING made in a generic body — `let v = &x` with
+    /// `x: T`, `let v = &pair.left`, or a copy `let w = v` of one — holds the
+    /// pair its initializer made at THIS instance. `compute_primitive_views`
+    /// decided it on the generic body, where the pointee is abstract, so it
+    /// could not list it; `*v` then read the pair itself as the value.
+    fn view_binding_holds_a_scalar_pair(&self, binding: Id) -> bool {
+        let Some(initial) = self
+            .program
+            .variables
+            .get(&binding)
+            .and_then(|variable| variable.initial)
+        else {
+            return false;
+        };
+        match self.program.entity_map.get(&initial) {
+            Some(Expr::Reference(operand, _)) => {
+                self.emits_scalar_view_ref(initial, *operand)
+                    && !self.program.return_view_reads.contains(&initial)
+            }
+            Some(Expr::Local(_)) => self.emits_scalar_view_pair(initial),
+            _ => false,
+        }
+    }
+
     /// Whether `type_id`, resolved under the active monomorphization substitution,
     /// is a scalar the **view** machinery lowers to a `(base, key)` pair — a scalar
     /// primitive (`SCALAR_PRIMITIVE_NAMES`), or `bool` (a numeric enum, so it is
@@ -4529,37 +4583,175 @@ impl<'src> Transformer<'src> {
         self.program.boxed_locals.contains(&id)
             || (self.program.generic_referenced_roots.contains(&id)
                 && self
-                    .program
-                    .variables
+                    .binding_type_id(id)
+                    .is_some_and(|type_id| self.resolves_to_scalar_view_pointee(type_id)))
+    }
+
+    /// A local's or a parameter's declared type — a `mut` parameter typed by a
+    /// generic is a `generic_referenced_roots` entry as a local is (B505).
+    fn binding_type_id(&self, id: Id) -> Option<TypeId> {
+        self.program
+            .variables
+            .get(&id)
+            .map(|variable| variable.type_id)
+            .or_else(|| {
+                self.program
+                    .parameters
                     .get(&id)
-                    .is_some_and(|variable| self.resolves_to_scalar_view_pointee(variable.type_id)))
+                    .map(|parameter| parameter.type_id)
+            })
+    }
+
+    /// A binder's declared value: the one-slot cell `[value]` when the binder
+    /// is boxed at this instance, the value otherwise. EVERY declaration of a
+    /// local goes through here — a `let`, a `match`/`let` pattern's capture,
+    /// an `is` capture, a `for` element — because `compute_boxed_locals`
+    /// boxes a root by what is done to it (a view taken), not by how it was
+    /// declared, and every read and write of a boxed local goes through
+    /// `[0]`. B504: a pattern capture was declared bare, so `&payload` made a
+    /// pair over the VALUE and a read of `payload` answered its first
+    /// character.
+    fn declare_cell_if_boxed(&self, binder: Id, value: js::Node<'src>) -> js::Node<'src> {
+        if self.local_is_boxed(binder) {
+            js::Node::Array(vec![value])
+        } else {
+            value
+        }
     }
 
     /// Whether `&[mut] operand` (the reference expr `ref_id`) lowers to a scalar
     /// `(base, key)` pair: a concrete scalar place (`scalar_view_refs`), or a
-    /// reference whose place root is a generic local resolving here to a scalar.
+    /// place whose type is generic and resolves, at this instance, to a scalar.
+    ///
+    /// B506: the place's OWN type decides, not its root's. `&pair.left` with
+    /// `left: T` and `pair: &Pair<T>` roots in a parameter typed `Pair<T>`,
+    /// which no instance makes a scalar, while the field it names is `i32` at
+    /// `lend(&Pair { left = 1 }, ..)` — the value was passed where the callee
+    /// read a pair. B505: the same for a parameter typed `T` itself (`f(&x)`),
+    /// which no root rule reached, since only locals were recorded.
+    ///
+    /// A view handed back through a return (a leaf, a wrapped view's payload —
+    /// `fixed_view_refs`) keeps the analyzer's verdict: the caller reading it
+    /// decides by the callee's declared pointee, never by an instance.
     fn emits_scalar_view_ref(&self, ref_id: Id, operand: Id) -> bool {
         self.program.scalar_view_refs.contains(&ref_id)
-            || self.place_root_local(operand).is_some_and(|root| {
-                self.program.generic_referenced_roots.contains(&root)
-                    && self.program.variables.get(&root).is_some_and(|variable| {
-                        self.resolves_to_scalar_view_pointee(variable.type_id)
-                    })
-            })
+            || (!self.program.fixed_view_refs.contains(&ref_id)
+                && self.value_resolves_to_scalar(operand))
     }
 
-    /// The local a place expression bottoms out in (mirrors the analyzer's
-    /// `place_root`) — for deciding a generic place's view representation.
-    fn place_root_local(&self, expr_id: Id) -> Option<Id> {
-        match self.program.entity_map.get(&expr_id)? {
-            Expr::Local(binding) => Some(*binding),
-            Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
-                self.place_root_local(*subject)
-            }
-            Expr::Index(subject, _) => self.place_root_local(*subject),
-            Expr::Dereference(operand) => self.place_root_local(*operand),
-            _ => None,
+    /// Whether a viewed expression's type, resolved under the active
+    /// monomorphization, is a scalar the view machinery pairs — the
+    /// per-instance half of `scalar_view_refs`, whose analyzer verdict an
+    /// abstract `T` cannot reach. An expression with no recorded type answers
+    /// by its shape, as the analyzer's `place_is_scalar` does (B505).
+    fn value_resolves_to_scalar(&self, expr_id: Id) -> bool {
+        if let Some(type_id) = self.expr_type_id(expr_id) {
+            return self.resolves_to_scalar_view_pointee(type_id);
         }
+        match self.program.entity_map.get(&expr_id) {
+            Some(Expr::Number(..) | Expr::String(_) | Expr::MultilineString(_)) => true,
+            Some(Expr::Binary(
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::LtEq
+                | BinaryOp::GtEq
+                | BinaryOp::And
+                | BinaryOp::Or,
+                _,
+                _,
+            )) => true,
+            Some(Expr::Binary(_, lhs, rhs)) => {
+                self.value_resolves_to_scalar(*lhs) && self.value_resolves_to_scalar(*rhs)
+            }
+            Some(Expr::Unary(_, operand)) => self.value_resolves_to_scalar(*operand),
+            _ => false,
+        }
+    }
+
+    /// The `(base, key)` pair a view of the scalar place `operand` lowers to —
+    /// the written `&[mut] operand`, or a receiver a `&self`/`&mut self`
+    /// borrows implicitly (B505). WHO HOLDS THE CELL decides the base:
+    ///
+    /// - a field, a tuple position or a list element is a slot of its
+    ///   container, which is the base;
+    /// - a BOXED local (a `let`, a pattern binder, a `mut` parameter — every
+    ///   root `compute_boxed_locals` chose, declared as a one-slot cell
+    ///   wherever it is declared) is its own cell at slot 0;
+    /// - a binding that already IS a scalar view is that view (a re-borrow);
+    /// - anything else — an immutable parameter, an rvalue (`&1`, `&(a + 8)`,
+    ///   `7.peek()`) — has no cell, so the view gets a fresh one holding the
+    ///   value. Nothing can write the binding while the view lives (a `&mut`
+    ///   of one needs a `mut` binder, which is boxed), so the two never
+    ///   disagree. This arm made a pair of the VALUE and `0` before (B504,
+    ///   B505): a read through it answered the value's first character, or
+    ///   `undefined` for a number, and a write threw.
+    fn scalar_view_of_place(
+        &mut self,
+        operand: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let zero = || js::Node::Number("0".to_string(), None);
+        let (base, key) = match self.program.entity_map.get(&operand) {
+            Some(Expr::Field(subject, _, field_index)) => (
+                self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
+                js::Node::Number(field_index.to_string(), None),
+            ),
+            // B453: `&mut pair.1` — a tuple POSITION is a slot of the tuple's
+            // flat array, exactly as a struct field is a slot of its, so the
+            // view is the tuple plus the position's flat offset. A scalar view
+            // is width 1 by construction.
+            Some(Expr::TupleIndex(subject, offset, width)) => {
+                let (offset, _) = self.tuple_index_slot(operand, (*offset, *width));
+                (
+                    self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
+                    js::Node::Number(offset.to_string(), None),
+                )
+            }
+            // `&mut list[i]` — the checked mint (`__at_view`): the scalar
+            // `(base, key)` pair exists only for an in-bounds element, so a
+            // view of an absent element panics at the `&mut`, not at first use
+            // through it.
+            Some(Expr::Index(subject, index)) => {
+                let base = self.walk_entity(*subject, block).unwrap_or(js::Node::Void);
+                let key = self.walk_entity(*index, block).unwrap_or(js::Node::Void);
+                self.used_helpers.insert("__at_view");
+                return js::Node::Call(
+                    Box::new(js::Node::Local("__at_view".to_string())),
+                    vec![base, key],
+                );
+            }
+            // A boxed scalar local: the cell itself (slot 0 holds the value),
+            // not the `[0]` read `walk_entity` would produce.
+            //
+            // An aliased capture (an `is` test's, a guarded leg's) is a cell
+            // once `materialize_captures` declares it, which it does before
+            // the guard is walked; naming the cell is a READ of the capture
+            // for the guard's placement of that declaration (`is_binding_reads`).
+            Some(Expr::Local(root)) if self.local_is_boxed(*root) => {
+                if self.is_bindings.contains_key(root)
+                    && let Some(reads) = self.is_binding_reads.as_mut()
+                {
+                    reads.insert(*root);
+                }
+                (js::Node::Local(self.ng.name_for(*root)), zero())
+            }
+            // A view of a view is the view: `&v` of a `v: &i32`, `&*v`.
+            Some(Expr::Local(_)) if self.emits_scalar_view_pair(operand) => {
+                return self.walk_entity(operand, block).unwrap_or(js::Node::Void);
+            }
+            Some(Expr::Dereference(inner)) if self.emits_scalar_view_pair(*inner) => {
+                return self.walk_entity(*inner, block).unwrap_or(js::Node::Void);
+            }
+            _ => (
+                js::Node::Array(vec![
+                    self.walk_entity(operand, block).unwrap_or(js::Node::Void),
+                ]),
+                zero(),
+            ),
+        };
+        js::Node::Array(vec![base, key])
     }
 
     /// Whether this intrinsic call is a `Shared::write()` whose pointee resolves
@@ -5250,6 +5442,14 @@ impl<'src> Transformer<'src> {
                             // the callee a second memo of the same thunk.
                             if let Some(cell) = this.lazy_argument(arg) {
                                 return Some(cell);
+                            }
+                            // B505: a receiver a `&self`/`&mut self` borrows
+                            // implicitly is the view the written `&receiver`
+                            // would be — a pair, when it is a scalar here.
+                            if this.program.receiver_views.contains(&arg)
+                                && this.value_resolves_to_scalar(arg)
+                            {
+                                return Some(this.scalar_view_of_place(arg, block));
                             }
                             // An argument to an `own` parameter is copied (marked in
                             // `clone_sites`), like a binding copy.
@@ -6204,50 +6404,7 @@ impl<'src> Transformer<'src> {
                 if self.emits_scalar_view_ref(id, *operand)
                     && !self.program.return_view_reads.contains(&id)
                 {
-                    let (base, key) = match self.program.entity_map.get(operand) {
-                        Some(Expr::Field(subject, _, field_index)) => (
-                            self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
-                            js::Node::Number(field_index.to_string(), None),
-                        ),
-                        // B453: `&mut pair.1` — a tuple POSITION is a slot of the
-                        // tuple's flat array, exactly as a struct field is a slot
-                        // of its, so the view is the tuple plus the position's
-                        // flat offset. It fell to the arm below, which made a pair
-                        // of the slot's VALUE and `0`: a write through it threw
-                        // (`Cannot create property '0' on number`) and a read gave
-                        // `undefined`. A scalar view is width 1 by construction.
-                        Some(Expr::TupleIndex(subject, offset, width)) => {
-                            let (offset, _) = self.tuple_index_slot(*operand, (*offset, *width));
-                            (
-                                self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
-                                js::Node::Number(offset.to_string(), None),
-                            )
-                        }
-                        // `&mut list[i]` — the checked mint (`__at_view`): the
-                        // scalar `(base, key)` pair exists only for an in-bounds
-                        // element, so a view of an absent element panics at the
-                        // `&mut`, not at first use through it.
-                        Some(Expr::Index(subject, index)) => {
-                            let base = self.walk_entity(*subject, block).unwrap_or(js::Node::Void);
-                            let key = self.walk_entity(*index, block).unwrap_or(js::Node::Void);
-                            self.used_helpers.insert("__at_view");
-                            return Some(js::Node::Call(
-                                Box::new(js::Node::Local("__at_view".to_string())),
-                                vec![base, key],
-                            ));
-                        }
-                        // A boxed scalar local: the cell itself (slot 0 holds the
-                        // value), not the `[0]` read `walk_entity` would produce.
-                        Some(Expr::Local(root)) => (
-                            js::Node::Local(self.ng.name_for(*root)),
-                            js::Node::Number("0".to_string(), None),
-                        ),
-                        _ => (
-                            self.walk_entity(*operand, block).unwrap_or(js::Node::Void),
-                            js::Node::Number("0".to_string(), None),
-                        ),
-                    };
-                    return Some(js::Node::Array(vec![base, key]));
+                    return Some(self.scalar_view_of_place(*operand, block));
                 }
                 return self.walk_entity(*operand, block);
             }
@@ -6432,11 +6589,7 @@ impl<'src> Transformer<'src> {
                         })
                         .unwrap_or(js::Node::Void);
                     // A boxed scalar local is declared as a one-slot cell.
-                    if self.local_is_boxed(*id) {
-                        js::Node::Array(vec![value])
-                    } else {
-                        value
-                    }
+                    self.declare_cell_if_boxed(*id, value)
                 };
                 let js_variable = js::Variable {
                     name,
@@ -6812,12 +6965,13 @@ impl<'src> Transformer<'src> {
                         )),
                     ];
                     if let Some(item_id) = item_id {
+                        let element = js::Node::PropertyIndex(
+                            Box::new(js::Node::Local(next_value_name)),
+                            Box::new(js::Node::Number("1".to_string(), None)),
+                        );
                         loop_body.push(js::Node::ConstVariable(js::Variable {
                             name: self.ng.name_for(*item_id),
-                            value: Box::new(js::Node::PropertyIndex(
-                                Box::new(js::Node::Local(next_value_name)),
-                                Box::new(js::Node::Number("1".to_string(), None)),
-                            )),
+                            value: Box::new(self.declare_cell_if_boxed(*item_id, element)),
                         }));
                     }
                     loop_body.extend(self.walk_loop_body_nodes(&body.0, body.1));
@@ -6838,7 +6992,7 @@ impl<'src> Transformer<'src> {
                         value: Box::new(t_iterable),
                     }));
                     let index_name = self.ng.next_name();
-                    let element = if self.program.primitive_views.contains(&item_id) {
+                    let element = if self.binding_holds_a_scalar_view_pair(item_id) {
                         js::Node::Array(vec![
                             js::Node::Local(list_name.clone()),
                             js::Node::Local(index_name.clone()),
@@ -6866,10 +7020,22 @@ impl<'src> Transformer<'src> {
                 }
 
                 // Otherwise a native `for...of` (a `List` is a JS array).
-                let binding = item_id
-                    .map(|item_id| self.ng.name_for(item_id))
-                    .unwrap_or_else(|| "_".to_string());
-                let t_body = self.walk_loop_body_nodes(&body.0, body.1);
+                // An element a view is taken of is a cell (B504): the loop
+                // binds a fresh name and the body opens by declaring the cell.
+                let boxed_item = item_id.filter(|item_id| self.local_is_boxed(*item_id));
+                let binding = match (item_id, boxed_item) {
+                    (_, Some(_)) => self.ng.next_name(),
+                    (Some(item_id), None) => self.ng.name_for(*item_id),
+                    (None, None) => "_".to_string(),
+                };
+                let mut t_body = Vec::new();
+                if let Some(item_id) = boxed_item {
+                    t_body.push(js::Node::ConstVariable(js::Variable {
+                        name: self.ng.name_for(item_id),
+                        value: Box::new(js::Node::Array(vec![js::Node::Local(binding.clone())])),
+                    }));
+                }
+                t_body.extend(self.walk_loop_body_nodes(&body.0, body.1));
                 block.push(js::Node::ForOf(binding, Box::new(t_iterable), t_body));
                 js::Node::Void
             }
@@ -7081,7 +7247,8 @@ impl<'src> Transformer<'src> {
                                 .any(|capture| {
                                     guard_reads.contains(&capture)
                                         && (self.capture_copies(capture)
-                                            || self.capture_materializes(capture))
+                                            || self.capture_materializes(capture)
+                                            || self.local_is_boxed(capture))
                                 });
                             if guard_prelude.is_empty() && !reads_a_declaration {
                                 // A plain guard stays an expression in the chain's
@@ -8003,7 +8170,11 @@ impl<'src> Transformer<'src> {
     fn materialize_captures(&mut self, pattern: &ExprPattern, out: &mut Vec<js::Node<'src>>) {
         for capture_id in Self::pattern_capture_ids(pattern) {
             let copies = self.capture_copies(capture_id);
-            if !copies && !self.capture_materializes(capture_id) {
+            // B504: a capture a view is taken of is a CELL, declared like every
+            // boxed binder — an alias into the subject has no slot of its own
+            // for `&capture` to name.
+            let boxed = self.local_is_boxed(capture_id);
+            if !copies && !boxed && !self.capture_materializes(capture_id) {
                 continue;
             }
             let Some(accessor) = self.is_bindings.get(&capture_id).cloned() else {
@@ -8021,7 +8192,7 @@ impl<'src> Transformer<'src> {
             let name = self.ng.name_for(capture_id);
             let variable = js::Variable {
                 name: name.clone(),
-                value: Box::new(read),
+                value: Box::new(self.declare_cell_if_boxed(capture_id, read)),
             };
             let mutable = self
                 .program
@@ -8034,7 +8205,16 @@ impl<'src> Transformer<'src> {
             } else {
                 js::Node::ConstVariable(variable)
             });
-            self.is_bindings.insert(capture_id, js::Node::Local(name));
+            // A boxed capture's every read and write goes through its slot.
+            let accessor = if boxed {
+                js::Node::PropertyIndex(
+                    Box::new(js::Node::Local(name)),
+                    Box::new(js::Node::Number("0".to_string(), None)),
+                )
+            } else {
+                js::Node::Local(name)
+            };
+            self.is_bindings.insert(capture_id, accessor);
         }
     }
 
@@ -9532,7 +9712,7 @@ impl<'src> Transformer<'src> {
                 };
                 let variable = js::Variable {
                     name,
-                    value: Box::new(subject),
+                    value: Box::new(self.declare_cell_if_boxed(*capture_id, subject)),
                 };
                 // B150: a capture an explicit `drop(c)` empties is rebound once.
                 bindings.push(if mutable || self.slot_is_emptied_early(*capture_id) {
