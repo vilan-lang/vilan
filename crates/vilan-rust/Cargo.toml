@@ -6,7 +6,7 @@
 # emitted source rather than against each other's internals.
 [package]
 name = "vilan-rust"
-version = "0.42.0"
+version = "0.42.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
