@@ -6260,7 +6260,7 @@ fn b158_the_maybe_signal_probe_dispatches_through_a_blanket_and_a_signal_impl() 
 
         impl SignalCell<type T> with MaybeSignal<T> {
             fun bind(self, react: |T| void) {
-                let _watching = self.sub(react);
+                let _watching = self.sub(|value| react(value));
             }
         }
 
@@ -6363,7 +6363,7 @@ fn b158_a_nested_bound_reaches_the_blanket_for_a_value_the_signal_impl_also_matc
         }
 
         impl SignalCell<type T> with MaybeSignal<T> {
-            fun bind(self, react: |T| void) { let _watching = self.sub(react); }
+            fun bind(self, react: |T| void) { let _watching = self.sub(|value| react(value)); }
         }
 
         fun badge<V: MaybeSignal<str>>(label: V) {
@@ -7301,7 +7301,7 @@ fn b165_the_static_blanket_and_a_source_bounded_blanket_coexist() {
         }
 
         impl type S: Source<type T> with Maybe<T> {
-            fun show(self, react: |T| void) { let _watching = self.sub(react); }
+            fun show(self, react: |T| void) { let _watching = self.sub(|value| react(value)); }
         }
 
         fun badge<V: Maybe<str>>(label: V) { label.show(|text| print(i"[{text}]")); }

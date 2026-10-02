@@ -256,7 +256,7 @@ const B474_PROBE: &str = concat!(
     "import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };\n",
     "\n",
     "fun through_the_trait<T, S: Source<T>>(source: S, observe: |T| void) {\n",
-    "\tlet live = source.sub(observe);\n",
+    "\tlet live = source.sub(|value| observe(value));\n",
     "\tlive.dispose();\n",
     "}\n",
     "\n",

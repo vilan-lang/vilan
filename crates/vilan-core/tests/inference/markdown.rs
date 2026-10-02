@@ -5690,7 +5690,7 @@ fn a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none() {
         // The trait's `sub`, reached through a generic receiver: it makes the
         // immediate call with whatever the mirror holds, `None` included.
         fun through_the_trait<T, S: Source<T>>(source: S, observe: |T| void) {
-            let live = source.sub(observe);
+            let live = source.sub(|value| observe(value));
             live.dispose();
         }
 
