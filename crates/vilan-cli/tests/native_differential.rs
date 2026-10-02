@@ -8994,3 +8994,22 @@ fn a142_s7_an_enum_store_builds_and_wakes_the_same_on_both_backends() {
         "an enum store must build and wake the same on both backends"
     );
 }
+
+/// B436 + B437: a trait object prints as its value, alone, and as the pair a
+/// list holds; two applications of one trait over one type dispatch through
+/// their own tables — identical on both backends (the JS leg printed the pair
+/// and answered `Shape<str>`'s `area` from the `i32` table).
+#[test]
+fn a_trait_objects_print_and_its_tables_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_dyn_print_and_tables.vl"),
+        include_str!("native/dyn_print_and_tables.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_dyn_print_and_tables.vl"),
+        Verdict::Identical,
+        "an object prints its value and dispatches through its own application's table"
+    );
+}

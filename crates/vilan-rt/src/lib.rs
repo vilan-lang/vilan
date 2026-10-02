@@ -827,12 +827,18 @@ impl<T: ?Sized> PartialEq for Dyn<T> {
     }
 }
 
-/// On the JS backend the pair is `[ value, table ]` and the table carries its
-/// slots on its PROTOTYPE, so node prints it as `{}` and `JSON.stringify` as
-/// `{}` — both reproducible here, with the value rendered through the object's
-/// `Js` supertrait.
+/// B436: an object printed ITSELF prints as the value it erased — the JS
+/// backend hands the host the value, not its `[ value, table ]` pair, at an
+/// `any` parameter (`print`). NESTED in a container the JS backend still holds
+/// the pair, and the table carries its slots on its PROTOTYPE, so node prints
+/// it `[ value, {} ]`; that is reproduced here, the value rendered through the
+/// object's `Js` supertrait.
 impl<T: ?Sized + Js> Js for Dyn<T> {
     fn js(&self) -> String {
+        self.object.js()
+    }
+
+    fn js_nested(&self) -> String {
         js_tuple(&[self.object.js_nested(), "{}".to_string()])
     }
 }

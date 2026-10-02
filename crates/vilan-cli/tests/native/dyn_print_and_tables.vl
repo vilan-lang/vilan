@@ -1,0 +1,29 @@
+import std::io::print;
+
+trait Shape<T> {
+	fun area(self): T;
+}
+
+struct Square {
+	side: i32,
+}
+
+impl Square with Shape<i32> {
+	fun area(self): i32 { self.side * self.side }
+}
+
+impl Square with Shape<str> {
+	fun area(self): str { "big" }
+}
+
+fun main() {
+	let counted: dyn Shape<i32> = Square { side = 5 };
+	let named: dyn Shape<str> = Square { side = 4 };
+	let shapes: List<dyn Shape<i32>> = [counted];
+	print(counted);
+	print(shapes);
+	print(counted.area());
+	print(named.area());
+}
+
+main();

@@ -5661,6 +5661,8 @@ impl<'src> Transformer<'src> {
                             .get(&target_id)
                             .and_then(|external| external.extern_binding.clone())
                         {
+                            let args =
+                                self.host_arguments(target_id, &function_call.argument_ids, args);
                             let call = self.emit_extern(target_id, binding, args);
                             return Some(self.maybe_await(target_id, call));
                         }
@@ -8829,6 +8831,55 @@ impl<'src> Transformer<'src> {
     /// Lowers an `[extern]`-bound call to its host (JS) form. The first argument
     /// is the receiver for method/property bindings; a `Function` binding with a
     /// module records the import to emit.
+    /// B436: a trait OBJECT handed to the host at an `any` parameter crosses
+    /// as the value it erased, not as the `[value, table]` pair — the pair is
+    /// this backend's representation, and `print(object)` printed it
+    /// (`[ [ 5 ], {} ]`). Native renders the object's value the same way
+    /// (`vilan-rt`'s `Js for Dyn`), so both print `[ 5 ]`.
+    fn host_arguments(
+        &self,
+        target_id: Id,
+        argument_ids: &[Id],
+        mut args: Vec<js::Node<'src>>,
+    ) -> Vec<js::Node<'src>> {
+        let Some(external) = self.program.external_functions.get(&target_id) else {
+            return args;
+        };
+        for (index, (parameter_id, argument_id)) in
+            external.parameters.iter().zip(argument_ids).enumerate()
+        {
+            let takes_any = self
+                .program
+                .parameters
+                .get(parameter_id)
+                .is_some_and(|parameter| {
+                    matches!(
+                        self.program.type_id_to_type_map.get(&parameter.type_id),
+                        Some(Type::Any)
+                    )
+                });
+            let is_object = self.expr_type_id(*argument_id).is_some_and(|type_id| {
+                matches!(
+                    self.program
+                        .type_id_to_type_map
+                        .get(&self.resolve_type_id(type_id)),
+                    Some(Type::Dyn(..))
+                )
+            });
+            if takes_any
+                && is_object
+                && let Some(argument) = args.get_mut(index)
+            {
+                let pair = std::mem::replace(argument, js::Node::Void);
+                *argument = js::Node::PropertyIndex(
+                    Box::new(pair),
+                    Box::new(js::Node::Number("0".to_string(), None)),
+                );
+            }
+        }
+        args
+    }
+
     fn emit_extern(
         &mut self,
         target_id: Id,
@@ -10510,7 +10561,14 @@ impl<'src> Transformer<'src> {
     /// identical.
     fn emit_vtable(&mut self, type_id: TypeId, trait_id: Id, trait_arguments: &[TypeId]) -> String {
         let type_id = self.resolve_type_id(type_id);
-        let key = (trait_id, self.type_key(type_id));
+        // B437: the TRAIT APPLICATION is part of the key. `impl Square with
+        // Shape<i32>` and `with Shape<str>` are two tables over one type, and
+        // keying by the trait alone handed `dyn Shape<str>` the first one built
+        // — its `area` answered `16` where native answered `"big"`.
+        let mut type_key = self.type_key(type_id);
+        type_key.push('@');
+        self.write_type_key_arguments(trait_arguments, &mut type_key);
+        let key = (trait_id, type_key);
         if let Some(name) = self.vtables.get(&key) {
             return name.clone();
         }
@@ -12071,6 +12129,14 @@ impl<'src> Transformer<'src> {
             }
             Type::Trait(id, arguments) => {
                 let _ = write!(out, "T{}", id.0);
+                self.write_type_key_arguments(arguments, out);
+            }
+            // B437: an object's key is its trait APPLICATION, spelled
+            // structurally like every nominal above — the `Debug` fallthrough
+            // carried its arguments as raw ids, so two `dyn Read<i32>`
+            // positions minted from different ids keyed apart.
+            Type::Dyn(id, arguments) => {
+                let _ = write!(out, "D{}", id.0);
                 self.write_type_key_arguments(arguments, out);
             }
             Type::Tuple(elements) => {
