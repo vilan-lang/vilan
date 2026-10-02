@@ -65,6 +65,38 @@ thread_local! {
     /// have made on this thread since [`reset_inherited_subject_tests`] (M103).
     /// See [`inherited_subject_tests`].
     static INHERITED_SUBJECT_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many impl PAIRS `check_duplicate_trait_impls` has compared on this
+    /// thread since [`reset_duplicate_impl_comparisons`] (M107). See
+    /// [`duplicate_impl_comparisons`].
+    static DUPLICATE_IMPL_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of impl pairs the duplicate-impl check has compared on this
+/// thread since the last [`reset_duplicate_impl_comparisons`]. Each impl is
+/// compared only with the earlier impls of its own trait and subject head
+/// (M107), so impls of one trait over distinct types are never paired — which
+/// changes no report, so only this count can see it.
+pub fn duplicate_impl_comparisons() -> usize {
+    DUPLICATE_IMPL_COMPARISONS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`duplicate_impl_comparisons`].
+pub fn reset_duplicate_impl_comparisons() {
+    DUPLICATE_IMPL_COMPARISONS.with(|count| count.set(0));
+}
+
+/// [`Analyzer::impl_subject_bucket`]'s classes (M107).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ImplSubjectBucket {
+    Struct(Id),
+    Enum(Id),
+    Trait(Id),
+    Generic,
+    Tuple(usize),
+    Array,
+    Closure(usize),
+    Mapped,
+    Other,
 }
 
 /// The number of impl subject comparisons method lookup's inherited-member
@@ -9623,13 +9655,28 @@ impl<'src> Analyzer<'src> {
             )
         });
         let mut duplicates: Vec<(&'src str, TraitImplSite, TraitImplSite)> = Vec::new();
+        // M107: each site is compared only with the earlier sites of its own
+        // trait and subject SHAPE ([`impl_subject_bucket`]), in the order they
+        // were seen. A repeat has both — the trait is the key's first half and
+        // `same_impl_type` holds only for one shape, one head — so the first
+        // earlier repeat in the bucket is the first in the whole list, and the
+        // report is the one the pairwise scan made. That scan compared every
+        // impl of a trait with every earlier one, cloning both subjects for the
+        // shape walk: quadratic in the impls of one trait, which a package of
+        // `derive`s has thousands of (×6.1 per doubling of generated code).
+        let mut earlier_by_bucket: HashMap<(Id, ImplSubjectBucket), Vec<usize>> =
+            HashMap::default();
         for (position, site) in sites.iter().enumerate() {
+            let key = (site.trait_id, self.impl_subject_bucket(site.subject));
+            let earlier = earlier_by_bucket.entry(key).or_default();
             // Each later impl is reported against the FIRST one it repeats, so
             // three copies produce two errors, each naming the original.
-            let Some(first) = sites[..position]
-                .iter()
-                .find(|earlier| self.same_trait_instantiation(earlier, site))
-            else {
+            let first = earlier.iter().map(|index| &sites[*index]).find(|earlier| {
+                DUPLICATE_IMPL_COMPARISONS.with(|count| count.set(count.get() + 1));
+                self.same_trait_instantiation(earlier, site)
+            });
+            earlier.push(position);
+            let Some(first) = first else {
                 continue;
             };
             let Some(trait_) = self.traits.get(&site.trait_id) else {
@@ -9679,6 +9726,27 @@ impl<'src> Analyzer<'src> {
                 },
                 second.impl_id,
             );
+        }
+    }
+
+    /// The shape class of an impl subject that [`Self::same_impl_type`] can
+    /// only ever equate within (M107): its kind, and its nominal head where it
+    /// has one. Coarser than sameness on purpose — the bucket only has to
+    /// contain every repeat, and the shape walk still decides.
+    fn impl_subject_bucket(&self, subject: TypeId) -> ImplSubjectBucket {
+        match subject.borrow_type(self) {
+            Type::Struct(id, _) => ImplSubjectBucket::Struct(*id),
+            Type::Enum(id, _) => ImplSubjectBucket::Enum(*id),
+            Type::Trait(id, _) => ImplSubjectBucket::Trait(*id),
+            Type::Generic(_) => ImplSubjectBucket::Generic,
+            Type::Tuple(items) => ImplSubjectBucket::Tuple(items.len()),
+            Type::Array(..) => ImplSubjectBucket::Array,
+            Type::Closure(parameters, ..) => ImplSubjectBucket::Closure(parameters.len()),
+            Type::Mapped(..) => ImplSubjectBucket::Mapped,
+            // `Void`, `Any`, `Never`, `Function`, `Module`, and a position that
+            // never resolved: equal only as the same slot or the same value,
+            // which one shared bucket keeps together.
+            _ => ImplSubjectBucket::Other,
         }
     }
 

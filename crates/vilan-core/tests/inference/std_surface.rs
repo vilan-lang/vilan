@@ -5217,6 +5217,73 @@ fn b98_the_platform_twins_are_not_a_duplicate_on_either_leg() {
     assert_compiles(source);
 }
 
+/// M107: the duplicate-impl check compares an impl only with the earlier impls
+/// of its own trait and subject head, so impls of one trait over distinct
+/// types are never paired — the check is linear in them, where the pairwise
+/// scan was quadratic (×6.1 per doubling of a generated package of `derive`s).
+/// Measured by the comparison counter at two sizes in one process: 120 more
+/// impls of `Tag` over 120 more structs add no comparison at all. The reports
+/// are the pairwise scan's (the B98 pins above are the proof).
+#[test]
+fn m107_impls_of_one_trait_over_distinct_types_are_never_compared() {
+    fn comparisons(impls: usize) -> (usize, bool) {
+        let mut source = String::from("trait Tag { fun tag(self): i32; }\n");
+        for index in 0..impls {
+            source.push_str(&format!(
+                "struct Tagged{index} {{ size: i32 }}\n\
+                 impl Tagged{index} with Tag {{ fun tag(self): i32 {{ {index} }} }}\n"
+            ));
+        }
+        source.push_str("fun main() { print(Tagged0 { size = 1 }.tag()); }\nmain();\n");
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                // The program borrows its source for `'static`.
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                vilan_core::analyzer::reset_duplicate_impl_comparisons();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                assert!(program.is_some(), "analysis should produce a program");
+                (
+                    vilan_core::analyzer::duplicate_impl_comparisons(),
+                    vilan_core::analyzer::served_from_base_cache(),
+                )
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    // Both measured analyses are served std's world from the base cache, so
+    // each counts the same std share; a miss (a concurrent test evicting the
+    // world under plain `cargo test`) is measured again.
+    let served = |impls: usize| {
+        (0..4)
+            .map(|_| comparisons(impls))
+            .find(|(_, served)| *served)
+            .map(|(count, _)| count)
+            .expect("the base cache serves a repeated analysis of the same world")
+    };
+    let small = served(120);
+    let large = served(240);
+    assert_eq!(
+        large, small,
+        "120 more impls of `Tag` over 120 more types took the duplicate-impl \
+         check from {small} comparisons to {large}: an impl must be compared only with \
+         the earlier impls of its own trait and subject head (M107)"
+    );
+}
+
 // --- B4 §2.2: a bare trait annotation must not launder a resource -----------
 //
 // `proposal/trait-objects.md` §2.2 (probes P8/P9): the resource analysis
