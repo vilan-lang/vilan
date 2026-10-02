@@ -4642,10 +4642,32 @@ impl<'src> Transformer<'src> {
     /// Whether a viewed expression's type, resolved under the active
     /// monomorphization, is a scalar the view machinery pairs — the
     /// per-instance half of `scalar_view_refs`, whose analyzer verdict an
-    /// abstract `T` cannot reach.
+    /// abstract `T` cannot reach. An expression with no recorded type answers
+    /// by its shape, as the analyzer's `place_is_scalar` does (B505).
     fn value_resolves_to_scalar(&self, expr_id: Id) -> bool {
-        self.expr_type_id(expr_id)
-            .is_some_and(|type_id| self.resolves_to_scalar_view_pointee(type_id))
+        if let Some(type_id) = self.expr_type_id(expr_id) {
+            return self.resolves_to_scalar_view_pointee(type_id);
+        }
+        match self.program.entity_map.get(&expr_id) {
+            Some(Expr::Number(..) | Expr::String(_) | Expr::MultilineString(_)) => true,
+            Some(Expr::Binary(
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::LtEq
+                | BinaryOp::GtEq
+                | BinaryOp::And
+                | BinaryOp::Or,
+                _,
+                _,
+            )) => true,
+            Some(Expr::Binary(_, lhs, rhs)) => {
+                self.value_resolves_to_scalar(*lhs) && self.value_resolves_to_scalar(*rhs)
+            }
+            Some(Expr::Unary(_, operand)) => self.value_resolves_to_scalar(*operand),
+            _ => false,
+        }
     }
 
     /// The `(base, key)` pair a view of the scalar place `operand` lowers to —
@@ -5420,6 +5442,14 @@ impl<'src> Transformer<'src> {
                             // the callee a second memo of the same thunk.
                             if let Some(cell) = this.lazy_argument(arg) {
                                 return Some(cell);
+                            }
+                            // B505: a receiver a `&self`/`&mut self` borrows
+                            // implicitly is the view the written `&receiver`
+                            // would be — a pair, when it is a scalar here.
+                            if this.program.receiver_views.contains(&arg)
+                                && this.value_resolves_to_scalar(arg)
+                            {
+                                return Some(this.scalar_view_of_place(arg, block));
                             }
                             // An argument to an `own` parameter is copied (marked in
                             // `clone_sites`), like a binding copy.

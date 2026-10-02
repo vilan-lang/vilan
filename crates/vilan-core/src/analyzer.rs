@@ -26012,10 +26012,15 @@ impl<'src> Analyzer<'src> {
     /// scalar-ness (and so whether they are boxed) can only be decided at
     /// monomorphization, by the transformer, against the concrete type.
     ///
+    /// A view is taken by a written `&[mut] place` and, just as much, by a
+    /// method call's receiver at a `&self`/`&mut self` (`receiver_views`): a
+    /// `mut x` whose `x.bump()` writes through `&mut self` needs the cell as
+    /// much as `bump(&mut x)` does (B505).
+    ///
     /// A `mut` parameter is boxed at body entry; an immutable one is not — the
     /// emitter gives a `&` of it a fresh one-slot cell holding its value,
-    /// which no write can make disagree with the binding (B506).
-    fn compute_boxed_locals(&self) -> (HashSet<Id>, HashSet<Id>) {
+    /// which no write can make disagree with the binding (B505).
+    fn compute_boxed_locals(&self, receiver_views: &HashSet<Id>) -> (HashSet<Id>, HashSet<Id>) {
         let mut boxed = HashSet::default();
         let mut generic_referenced_roots = HashSet::default();
         let viewed_places = self
@@ -26024,7 +26029,8 @@ impl<'src> Analyzer<'src> {
             .filter_map(|expr| match expr {
                 Expr::Reference(operand, _) => Some(*operand),
                 _ => None,
-            });
+            })
+            .chain(receiver_views.iter().copied());
         for operand in viewed_places {
             if let Some(root) = self.place_root(operand) {
                 // A `mut` parameter is a mutable scalar cell like any
@@ -26176,11 +26182,86 @@ impl<'src> Analyzer<'src> {
         captures
     }
 
+    /// B505: the method-call receivers a `&self`/`&mut self` borrows
+    /// IMPLICITLY — `x.peek()`, `1.same(&1)`, `counter.count.bump()`. The
+    /// receiver is the one argument the call site may hand a view parameter
+    /// without writing `&` (`check_view_arguments` exempts it), so the IR
+    /// carries the place itself, where every other view argument is an
+    /// `Expr::Reference`. A receiver that already IS a view (a view binding,
+    /// a `&`/`&mut` parameter, a `borrows` call) passes as it stands.
+    ///
+    /// The JS emitter lowers each of these as the written `&receiver` would
+    /// be when its type is a scalar (decided per instance), and
+    /// `compute_boxed_locals` boxes the root a `&mut self` writes through.
+    /// Natively the same seam synthesizes the `&`/`&mut` (`call_arguments`).
+    fn compute_receiver_views(&self) -> HashSet<Id> {
+        let mut receivers = HashSet::default();
+        for function_call in self.function_calls.values() {
+            let Some(Expr::Local(callee_id)) =
+                self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            let Some(receiver_parameter) = self
+                .functions
+                .get(callee_id)
+                .and_then(|function| function.parameters.first())
+                .and_then(|parameter_id| self.parameters.get(parameter_id))
+            else {
+                continue;
+            };
+            if receiver_parameter.name != "self"
+                || !matches!(
+                    receiver_parameter.convention,
+                    Convention::Ref | Convention::RefMut
+                )
+            {
+                continue;
+            }
+            if let Some(receiver) = function_call.argument_ids.first()
+                && !self.assignment_target_is_view(*receiver)
+            {
+                receivers.insert(*receiver);
+            }
+        }
+        receivers
+    }
+
     /// Whether a place is a scalar primitive — the case that needs a `(base, key)`
     /// view, since a JS number/string isn't addressable on its own.
+    ///
+    /// B505: an RVALUE viewed (`&11`, `&(a + 8)`, `&!done`) often has no
+    /// recorded type — inference computes an arithmetic expression's type
+    /// from its operands and keeps no row for it, and a literal no context
+    /// settled keeps its default unrecorded — so the expression's own shape
+    /// answers: a literal, a comparison and a logical operator are scalars,
+    /// arithmetic over two scalars is one, and a unary operator is what its
+    /// operand is. The JS emitter's `value_resolves_to_scalar` mirrors it per
+    /// instance.
     fn place_is_scalar(&self, expr_id: Id) -> bool {
-        self.place_value_type(expr_id)
-            .is_some_and(|type_| self.is_scalar_view_pointee(&type_))
+        match self.place_value_type(expr_id) {
+            Some(type_) => self.is_scalar_view_pointee(&type_),
+            None => match self.expr_id_to_expr_map.get(&expr_id) {
+                Some(Expr::Number(..) | Expr::String(_) | Expr::MultilineString(_)) => true,
+                Some(Expr::Binary(
+                    BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::Gt
+                    | BinaryOp::LtEq
+                    | BinaryOp::GtEq
+                    | BinaryOp::And
+                    | BinaryOp::Or,
+                    _,
+                    _,
+                )) => true,
+                Some(Expr::Binary(_, lhs, rhs)) => {
+                    self.place_is_scalar(*lhs) && self.place_is_scalar(*rhs)
+                }
+                Some(Expr::Unary(_, operand)) => self.place_is_scalar(*operand),
+                _ => false,
+            },
+        }
     }
 
     /// Whether a function returns a scalar `(base, key)` view: it has a `borrows`
@@ -61178,6 +61259,10 @@ pub struct Program<'src> {
     // monomorphization, so the transformer resolves the concrete type and treats a
     // scalar pointee like `boxed_locals` / `scalar_view_refs`.
     pub generic_referenced_roots: HashSet<Id>,
+    // B505: method-call receivers a `&self`/`&mut self` borrows implicitly
+    // (`x.peek()`): the place itself stands where a view is passed, so the JS
+    // emitter lowers a scalar one as the written `&x` would be.
+    pub receiver_views: HashSet<Id>,
     // B506: the `&place` exprs whose `(base, key)`-or-not representation is
     // the analyzer's verdict, never re-decided per instance — a view handed
     // back through a return: a leaf, or a wrapped view's payload
@@ -69781,9 +69866,10 @@ fn analyze_over_world<'src>(
     let (return_clone_sites, return_view_reads) = analyzer.compute_return_clone_sites();
     crate::phase_pass_mark("analyzer.compute_return_clone_sites()");
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
+    let receiver_views = analyzer.compute_receiver_views();
     let fixed_view_refs = analyzer.compute_fixed_view_refs();
     let transient_view_payloads = analyzer.compute_transient_view_payloads();
-    let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
+    let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals(&receiver_views);
     let primitive_views = analyzer.compute_primitive_views();
     let scalar_view_refs = analyzer.compute_scalar_view_refs();
     let scalar_view_calls = analyzer.compute_scalar_view_calls();
@@ -70559,6 +70645,7 @@ fn analyze_over_world<'src>(
         drop_call_edges: std::mem::take(&mut analyzer.drop_call_edges),
         boxed_locals,
         generic_referenced_roots,
+        receiver_views,
         fixed_view_refs,
         transient_view_payloads,
         primitive_views,

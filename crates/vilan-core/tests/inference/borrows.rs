@@ -11474,3 +11474,157 @@ fn b506_a_returned_generic_view_keeps_the_declared_protocol() {
         "1\n1\n3\n3\n4\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B505: a receiver a `&self` borrows, and a view of a place with no cell.
+// ---------------------------------------------------------------------------
+
+/// B505: a SCALAR receiver at a `&self`/`&mut self` is the view the written
+/// `&receiver` would be — a local, a `mut` local written through `&mut self`,
+/// a literal, an rvalue, a field, a list element, a tuple position, a `bool`,
+/// a generic `T` at a scalar instance, a receiver that is itself a view. The
+/// IR carries the receiver as the place (the one implicit borrow), and the JS
+/// emitter passed it bare: `self[0][self[1]]` threw, or read `undefined`, and
+/// a `&mut self` write no-oped.
+#[test]
+fn b505_a_scalar_receiver_at_a_ref_self_is_a_view() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Same {
+            fun same(&self, other: &Self): bool;
+        }
+
+        impl type T: PartialEq with Same {
+            fun same(&self, other: &T): bool {
+                *self == *other
+            }
+        }
+
+        trait Bump {
+            fun bump(&mut self);
+            fun peek(&self): i32;
+        }
+
+        impl i32 with Bump {
+            fun bump(&mut self) {
+                self = *self + 1;
+            }
+            fun peek(&self): i32 {
+                *self
+            }
+        }
+
+        trait Flip {
+            fun flip(&mut self);
+        }
+
+        impl bool with Flip {
+            fun flip(&mut self) {
+                self = !*self;
+            }
+        }
+
+        struct Counter {
+            count: i32,
+        }
+
+        fun generic<T: Same>(a: T, b: T): bool {
+            a.same(&b)
+        }
+
+        fun bump_twice<T: Bump>(mut x: T): T {
+            x.bump();
+            x.bump();
+            x
+        }
+
+        fun peek_view(v: &i32): i32 {
+            v.peek()
+        }
+
+        fun bump_view(v: &mut i32) {
+            v.bump();
+        }
+
+        fun main() {
+            print(1.same(&1));
+            print(generic("x", "x"));
+            print(generic(1, 2));
+            let a = 1;
+            let b = 1;
+            print(a.same(&b));
+            mut x = 1;
+            x.bump();
+            print(x);
+            print(x.peek());
+            print(7.peek());
+            print((3 + 4).peek());
+            mut counter = Counter { count = 1 };
+            counter.count.bump();
+            print(counter.count);
+            mut xs = [10, 20];
+            xs[0].bump();
+            print(xs[0]);
+            mut pair = (5, "p");
+            pair.0.bump();
+            print(pair.0);
+            print(bump_twice(7));
+            print(peek_view(&xs[1]));
+            bump_view(&mut xs[1]);
+            print(xs[1]);
+            mut flag = false;
+            flag.flip();
+            print(flag);
+            match Some(3) {
+                Some(let n) if n.peek() > 2 => print(n.peek()),
+                _ => print("no"),
+            }
+        }
+        "#,
+        "true\ntrue\nfalse\ntrue\n2\n2\n7\n7\n2\n11\n6\n9\n20\n21\ntrue\n3\n",
+    );
+}
+
+/// B505: a view of a scalar that has no cell — an rvalue (`&11`,
+/// `&(a + 8)`, `&!done`), an immutable parameter, a closure's parameter — is
+/// a fresh one-slot cell holding the value; nothing can write the binding
+/// while the view lives, so the two never disagree. It was a pair of the
+/// VALUE and `0` (`[x, 0]`, reading `undefined`), and an rvalue whose type
+/// inference left unrecorded was passed bare.
+#[test]
+fn b505_a_view_of_a_scalar_without_a_cell_is_a_fresh_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun show(v: &i32) {
+            print(*v);
+        }
+
+        fun show_flag(v: &bool) {
+            print(*v);
+        }
+
+        fun param(x: i32) {
+            show(&x);
+            print(x);
+        }
+
+        fun main() {
+            show(&11);
+            let a = 1;
+            show(&(a + 8));
+            let done = false;
+            show_flag(&!done);
+            show_flag(&(a > 0));
+            param(12);
+            let apply = |n: i32| show(&n);
+            apply(13);
+        }
+        "#,
+        "11\n9\ntrue\ntrue\n12\n12\n13\n",
+    );
+}
