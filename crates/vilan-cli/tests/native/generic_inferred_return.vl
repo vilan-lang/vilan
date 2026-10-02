@@ -2,11 +2,15 @@
 // the return (B460's checked return) or no return written at all — called at
 // two instantiations, each caller holding its own instantiation's cell.
 import std::io::print;
-import std::reactive::{ Source, SignalCell };
+import std::reactive::{ SignalCell, Source };
 
-fun wrap<T>(x: T): Source<T> { SignalCell::new(x) }
+fun wrap<T>(x: T): Source<T> {
+	SignalCell::new(x)
+}
 
-fun cell<T>(x: T) { SignalCell::new(x) }
+fun cell<T>(x: T) {
+	SignalCell::new(x)
+}
 
 fun main() {
 	let a = wrap(1);

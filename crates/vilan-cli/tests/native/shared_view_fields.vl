@@ -4,8 +4,8 @@
 // later write. Natively each read is a scoped borrow, so the read-modify-write
 // line finds no live borrow at its left side.
 import std::io::print;
-import std::shared::Shared;
 import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
 
 struct Inner {
 	depth: i32,

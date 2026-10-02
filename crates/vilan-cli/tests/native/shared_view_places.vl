@@ -4,8 +4,8 @@
 // a field, a subscript write, and a mutating call (`pop`) inside an
 // expression that reads the same cell after it.
 import std::io::print;
-import std::shared::Shared;
 import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
 
 struct Inner {
 	depth: i32,

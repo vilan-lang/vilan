@@ -2,10 +2,10 @@
 // on JS — a `derive`, a `distinct_by`, a chain, the free `derive`, a
 // pipe dropped inside a generic body at two instantiations, a `switch`, a
 // `flatten` over `Option`s of sources, and the collection pipes.
-import std::io::print;
-import std::reactive::{ Flow, Signal, SignalCell, Source, derive };
 import std::delta::ListCell;
+import std::io::print;
 import std::option::Option::{ self, None, Some };
+import std::reactive::{ Flow, Signal, SignalCell, Source, derive };
 
 fun dropped_in_a_generic<T>(source: SignalCell<T>) {
 	source.derive(|value| Some(value));

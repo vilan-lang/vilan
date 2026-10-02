@@ -5,8 +5,8 @@
 // shape) — and the `match` leg's own copy: a leg handing back a place copies
 // it, as a block's tail does.
 import std::io::print;
-import std::shared::Shared;
 import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
 
 struct Plain {
 	make: Option<str>,
@@ -47,7 +47,6 @@ fun legs() {
 	print(g.direct());
 }
 
-
 struct Hold<V> {
 	follows: bool,
 	pull: Option<|| V>,
@@ -65,7 +64,9 @@ fun core<V>(): Core<V> {
 
 fun hold<V>(core: Core<V>, value: V) {
 	core.holds.write().push(Hold<V> { follows = true, pull = Some(|| value), release = None });
-	core.holds.write().push(Hold<V> { follows = false, pull = None, release = Some(|| print("released")) });
+	core.holds
+		.write()
+		.push(Hold<V> { follows = false, pull = None, release = Some(|| print("released")) });
 }
 
 fun pulled<V>(core: Core<V>, fallback: V): List<V> {
@@ -91,7 +92,6 @@ fun cells() {
 	hold(words, "w");
 	print(pulled(words, "-"));
 }
-
 
 struct Lazy<V> {
 	make: Option<|| V>,
