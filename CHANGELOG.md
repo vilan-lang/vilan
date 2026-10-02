@@ -271,14 +271,8 @@ written down.
 ---
 
 <!-- family: fix -->
----
-
-<!-- family: fix -->
 **Native builds a bare variant of a generic user enum: `let n: Maybe<i32> = Maybe::Nothing;` was refused by name as "an unbound generic type parameter (parameter 1 of enum `Maybe`)" under its own annotation, and builds and prints node's bytes now — as do `show(Maybe::Nothing)`, a generic function's `Maybe::Nothing` return, a list literal, an assignment and `Some(Maybe::Nothing)`.** A bare variant minted its enum at no arguments and never asked the position it was written into. It takes the constructor's rule now — the type recorded at the site, else the position's — and a constructor's payload is a position of its own, read off the position's closed type rather than the site's record (which can name the wrong parameter inside a generic instance). `None` had built all along: `Option` is Rust's own enum, whose path names no instance. The JS backend is unchanged. The native copy census moves by scalar payloads alone (a natively `Copy` payload is not a counted copy; one `.clone()` of a `usize` drops). Pin: `a_bare_variant_of_a_generic_enum_is_identical_on_both_backends`. Tracker F76.
 
----
-
-<!-- family: fix -->
 ---
 
 <!-- family: fix -->
@@ -287,22 +281,13 @@ written down.
 ---
 
 <!-- family: fix -->
----
-
-<!-- family: fix -->
 **Native builds a struct literal whose field value is closed only by the field: `Pair { cell = SignalCell::new(None), key = "k" }` under `Pair<str, i32>`, and the same literal inside a generic function or the struct's own static, was refused by name ("an unresolved type", or an unbound parameter of the struct), and builds and prints node's bytes now.** A field's expectation was the HEAD of its declared type, resolved under the literal's instance and then dropped, so `SignalCell<Option<V>>` reached `SignalCell::new(None)` with the struct's own `V` open. The instance's bindings stay in force while the field's value is rendered — the way the struct's own field types are rendered. Inside the struct's OWN impl, whose binders are the declaration's parameters, a literal of another instantiation (`Pair<V, K>` in `impl Pair<type K, type V>`) keeps them out, and a field that only mentions a parameter expects nothing there: such a value is refused by name rather than built at the wrong instantiation. The item's own repro, `set(None)` on a two-parameter struct's `Signal<Option<V>>` impl, was refused on 0.42.0 and builds at this order's base; it is pinned with the literal. The JS backend is unchanged. Pin: `a_struct_literals_fields_close_their_values_on_both_backends`. Tracker F73.
 
 ---
 
 <!-- family: fix -->
----
-
-<!-- family: fix -->
 **Native builds a pipe sealed inside a generic body: `fun switch_to<T, U, S: Source<T>, I: Source<U>>(s: S, f: sync |T| I): SignalCell<U> { s.derive(|v| f(v)).switch(|inner| inner).cell() }` was refused by name as "an unbound generic type parameter (parameter 3 of `switch_to`)", and builds and prints node's bytes now — as do `memo()` and `sample()` as the seal and the blanket-method spelling.** The seal is a trait default, and its receiver (`Switch<Derive<S, ..>, ..>`) is written in the generic body's own binders; a default's body ran under the trait's bindings alone, replacing the caller's, so `S` was gone. A default's bindings are composed onto the caller's now, as a function instance's always were; the instance is still keyed by the receiver resolved under the caller. B479's std pin (`a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter`) built on JS only for this. The JS backend is unchanged. Pin: `a_pipe_sealed_in_a_generic_body_is_identical_on_both_backends`. Tracker F71.
 
----
-
-<!-- family: fix -->
 ---
 
 <!-- family: fix -->
