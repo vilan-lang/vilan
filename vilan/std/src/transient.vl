@@ -245,8 +245,8 @@ export impl type P: Pipe<Task<Result<type T, type E>>> {
 		seal_results(self, false)
 	}
 
-	/// `.transient()` for a transient that lives as long as the PROGRAM (R-k, A130's
-	/// twin of `.cell_global()`): it registers with NO owner, even inside a
+	/// `.transient()` for a transient that lives as long as the PROGRAM (R-k,
+	/// A130's twin of `.cell_global()`): it registers with NO owner, even inside a
 	/// boundary, and nothing releases it. The spelling for a module binding's
 	/// initializer, where `.transient()` is refused — a module has no owner.
 	fun transient_global(own self): Transient<T, E> {
@@ -271,15 +271,15 @@ export impl type P: Pipe<Task<type T>> {
 /// The `Result` arm's seal: owner-tied (`hold`), or for the program when `global`.
 fun seal_results<T, E, P: Pipe<Task<Result<T, E>>>>(own pipe: P, global: bool): Transient<T, E> {
 	let seal: Transient<T, E> = Transient::pending();
-	// A DERIVATION: it publishes a state, so a turn settles it before any
-	// effect reads it — the `Refreshing` a change moves it to is already there.
+	// A DERIVATION: it publishes a state, so a turn settles it before any effect
+	// reads it — the `Refreshing` a change moves it to is already there.
 	as_derivation();
 	let subscription = pipe.sub(|task: Task<Result<T, E>>| {
 		let mine = seal.claim();
 		let _settling = async {
 			let outcome: Result<Result<T, E>, str> = guarded_async(|| await task);
-			// A superseded task — cancelled, or merely slower — is dropped
-			// before its outcome is looked at: its abort is not a failure.
+			// A superseded task — cancelled, or merely slower — is dropped before
+			// its outcome is looked at: its abort is not a failure.
 			if seal.current(mine) {
 				match outcome {
 					Ok(let answered) => seal.settle(mine, answered),

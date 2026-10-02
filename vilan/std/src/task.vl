@@ -66,9 +66,9 @@ export impl Nursery {
 	external fun signal(self): CancelSignal;
 
 	/// Whether any task has registered with this nursery, ever — a finished one
-	/// included. A pipe stage asks it to keep one nursery across runs that start
-	/// no task (M92): a nursery nothing registered with has nothing to cancel, so
-	/// the next run can take it as it is.
+	/// included. A pipe stage asks it to keep one nursery across runs that start no
+	/// task (M92): a nursery nothing registered with has nothing to cancel, so the
+	/// next run can take it as it is.
 	[internal("a pipe stage's nursery reuse (M92); an application cancels a nursery it owns")]
 	fun has_spawned(self): bool {
 		__nursery_has_spawned(self)

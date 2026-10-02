@@ -4407,8 +4407,8 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 		self.cache.get()
 	}
 
-	/// The mirror's cache cell's identity (A146): every handle to this mirror —
-	/// a copy, a rebound one after a reconnect — names the same cell, so a tracked
+	/// The mirror's cache cell's identity (A146): every handle to this mirror — a
+	/// copy, a rebound one after a reconnect — names the same cell, so a tracked
 	/// read keeps one edge (and one lease) across runs instead of re-attaching.
 	fun identity(self): Option<i32> {
 		self.cache.identity()
@@ -6175,8 +6175,8 @@ export macro fun with_contract_slot(slots: List<str>, rendered: str): List<str> 
 	grown
 }
 
-/// Whether a written type takes a slot of the template: every type but `void`
-/// (a closure parameter cannot be one) and `_` (no type was readable).
+/// Whether a written type takes a slot of the template: every type but `void` (a
+/// closure parameter cannot be one) and `_` (no type was readable).
 export macro fun is_contract_slot(rendered: str): bool {
 	rendered != "void" && rendered != "_"
 }
@@ -6185,8 +6185,8 @@ export macro fun is_contract_slot(rendered: str): bool {
 /// expansion writes this call wherever the hash is needed, with the surface as a
 /// template (`$N$` slots) and a closure whose Nth parameter is typed with the Nth
 /// slot's type. After analysis each call is replaced in place by djb2 over the
-/// template with every slot filled by its parameter's RESOLVED type, rendered as
-/// 8 hex digits — so an alias and its target hash alike. The call never runs.
+/// template with every slot filled by its parameter's RESOLVED type, rendered as 8
+/// hex digits — so an alias and its target hash alike. The call never runs.
 export [internal("the [service] expansion's contract hash (A144); the compiler answers it in place")]
 fun resolved_contract_hash<S>(template: str, slots: S): str {
 	panic("the compiler answers `resolved_contract_hash` in place (A144)")
@@ -6605,7 +6605,11 @@ export macro fun service(item: Item): Source {
 		} else {
 			(rendered_return, "")
 		};
-		surface = surface + ")->" + contract_slot(contract_slots.len(), return_type) + return_mark + ";";
+		surface = surface
+			+ ")->"
+			+ contract_slot(contract_slots.len(), return_type)
+			+ return_mark
+			+ ";";
 		contract_slots = with_contract_slot(contract_slots, return_type);
 		surface_index = surface_index + 1;
 	}
@@ -6623,10 +6627,20 @@ export macro fun service(item: Item): Source {
 		// only for a service that uses the form — a plain `[expose]` service hashes
 		// byte-identically to what it hashed before A39.
 		if key == "" {
-			surface = surface + "expose:" + field_name + ":" + contract_slot(contract_slots.len(), element) + ";";
+			surface = surface
+				+ "expose:"
+				+ field_name
+				+ ":"
+				+ contract_slot(contract_slots.len(), element)
+				+ ";";
 			contract_slots = with_contract_slot(contract_slots, element);
 		} else {
-			surface = surface + "keyed:" + field_name + ":" + contract_slot(contract_slots.len(), key) + ":";
+			surface = surface
+				+ "keyed:"
+				+ field_name
+				+ ":"
+				+ contract_slot(contract_slots.len(), key)
+				+ ":";
 			contract_slots = with_contract_slot(contract_slots, key);
 			surface = surface + contract_slot(contract_slots.len(), element) + ";";
 			contract_slots = with_contract_slot(contract_slots, element);
@@ -6658,7 +6672,10 @@ export macro fun service(item: Item): Source {
 			surface = surface + contract_slot(contract_slots.len(), parameter.type_.render());
 			contract_slots = with_contract_slot(contract_slots, parameter.type_.render());
 		}
-		surface = surface + ")->" + contract_slot(contract_slots.len(), handler_method.return_type.render()) + ";";
+		surface = surface
+			+ ")->"
+			+ contract_slot(contract_slots.len(), handler_method.return_type.render())
+			+ ";";
 		contract_slots = with_contract_slot(contract_slots, handler_method.return_type.render());
 	}
 	// The expression every site that needs the hash writes: the compiler answers
@@ -6670,7 +6687,11 @@ export macro fun service(item: Item): Source {
 		slot_parameters.push(i"_slot{slot_index}: {slot_type}");
 		slot_index = slot_index + 1;
 	}
-	let hash = "rpc::resolved_contract_hash(" + quote(surface) + ", |" + join(slot_parameters, ", ") + "| {})";
+	let hash = "rpc::resolved_contract_hash("
+		+ quote(surface)
+		+ ", |"
+		+ join(slot_parameters, ", ")
+		+ "| {})";
 
 	// --- The dispatcher: one route per [rpc] method, every handler capturing
 	// the ONE `self` binding this function declares.

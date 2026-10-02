@@ -969,8 +969,8 @@ export struct Owner {
 /// false) and no nursery; each is its own only once something needs it.
 export struct OwnerCell {
 	epoch: i32,
-	// Its own cell once `listed`, so a registration pushes in place; until then
-	// the shared `no_cleanups`, which nothing pushes to.
+	// Its own cell once `listed`, so a registration pushes in place; until then the
+	// shared `no_cleanups`, which nothing pushes to.
 	cleanups: Shared<List<|| void>>,
 	listed: bool,
 	nursery: Option<Nursery>,
@@ -1106,12 +1106,7 @@ export impl Owner {
 		self.cell.write().cleanups = no_cleanups;
 		self.cell.write().listed = false;
 		Some(Owner {
-			cell = Shared::new(OwnerCell {
-				epoch = 0,
-				cleanups,
-				listed = true,
-				nursery = None,
-			}),
+			cell = Shared::new(OwnerCell { epoch = 0, cleanups, listed = true, nursery = None }),
 			epoch = 0,
 		})
 	}
@@ -1285,11 +1280,11 @@ export fun on_cleanup(cleanup: || void) {
 ///
 /// Nothing here allocates an owner: the run's owner is the next epoch of the one
 /// cell the stage already holds, and its cleanup list is allocated at the run's
-/// first registration (`Owner::defer`). A nursery has to exist before the body
-/// runs — the spawn machinery registers a task with the ambient nursery at the
-/// `async` expression (J7: the body is born under `ambient_nursery`, so the task
-/// is OWNED, and its cancellation is absorbed) — but a run that started no task
-/// hands its nursery on to the next run (M92, `Owner::renew`).
+/// first registration (`Owner::defer`). A nursery has to exist before the body runs
+/// — the spawn machinery registers a task with the ambient nursery at the `async`
+/// expression (J7: the body is born under `ambient_nursery`, so the task is OWNED,
+/// and its cancellation is absorbed) — but a run that started no task hands its
+/// nursery on to the next run (M92, `Owner::renew`).
 fun run_body<T>(runs: Owner, body: (|| T) context (owner_scope, ambient_nursery)): T {
 	let run = runs.renew();
 	match run.nursery() {
@@ -1787,8 +1782,7 @@ export impl type S: Source<type T> {
 		let identity = self.identity();
 		if admits(scope, identity) {
 			lists_of(scope.tracker)
-				.write()
-				.reading
+				.write().reading
 				.push(Dependency {
 					identity,
 					attach = |subscriber: Subscriber| self.on_settle(subscriber),
