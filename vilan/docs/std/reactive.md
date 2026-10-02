@@ -1722,7 +1722,7 @@ impl type F: MapFlow<type K, type V> {
 	fun map_values<R>(own self, transform: |V| R): MapMapValues<F, K, V, R>   // R: IntoElement<U>
 	fun filter<R>(own self, keep: |K, V| R): MapFilter<F, K, V, R>           // R: IntoFlow<bool>
 	fun count(own self): MapCount<F, K, V>                     // a Pipe<usize>
-	fun sum_by<N: Add + Sub + Default>(own self, measure: |V| N): MapSum<F, K, V, N>   // a Pipe<N>
+	fun sum_by<N: Add + Sub + Default, R: IntoFlow<N>>(own self, measure: |V| R): MapSum<F, K, V, R, N>   // a Pipe<N>
 }
 // SetFlow<T>, SetPipe<T> (memo → SetMemo<T>, with contains(x)), the Set shape's twins
 ```
@@ -1768,8 +1768,8 @@ that flips into a `filter` joins its output at the end.
 that answers a flow is FOLLOWED per key (a flip is a `Put` or a `Delete`
 downstream), a `map_values` closure that answers a pipe has it started per key
 and its value carried, and each key's run gets an owner of its own — released
-when the key's value is replaced or the key leaves. `sum_by`'s measure answers a
-plain number for now.
+when the key's value is replaced or the key leaves. A `sum_by` measure that answers
+a flow is followed the same way: the sum moves by the difference.
 
 A sealed map pipe is a `MapMemo`: a read-only granular map source with `get(key)`,
 `len`, `peek`, and `at(key)` — a read-only per-key handle on the sealed map's

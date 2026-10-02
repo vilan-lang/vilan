@@ -257,6 +257,11 @@ export impl SetCell<type T: Hashable> with Source<HashSet<T>> {
 		self.items.read()
 	}
 
+	/// The set cell's identity (A146), as `MapCell`'s.
+	fun identity(self): Option<i32> {
+		Some(self.items.identity())
+	}
+
 	[must_use]
 	fun attach_observer(self, observer: |HashSet<T>| void, immediately: bool): Subscription {
 		let items = self.items;
@@ -334,6 +339,12 @@ export struct SetEntry<T: Hashable> {
 export impl SetEntry<type T: Hashable> with Source<bool> {
 	fun get(self): bool {
 		self.set.items.read().contains(self.value)
+	}
+
+	/// One identity per member of this set (`KeySlots::identity`), as a map entry's
+	/// is per key.
+	fun identity(self): Option<i32> {
+		Some(self.set.slots.identity(self.value.hash()))
 	}
 
 	[must_use]

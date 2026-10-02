@@ -39,9 +39,12 @@ fun main() {
 		let summed = cell.sum_by(|v| v).memo();
 		let odd_values = cell.filter(|key, value| value % 2 == 1).values().memo();
 		let followed_count = cell.filter(|key, value| flag_for(flags, value)).count().memo();
-		(values, entries, tens, signed, odd, followed, counted, summed, odd_values, followed_count)
+		let followed_sum = cell
+			.sum_by(|v| flag_for(flags, v).derive(|on| if on { v } else { 0 }))
+			.memo();
+		(values, entries, tens, signed, odd, followed, counted, summed, odd_values, followed_count, followed_sum)
 	});
-	let (values, entries, tens, signed, odd, followed, counted, summed, odd_values, followed_count) = outs;
+	let (values, entries, tens, signed, odd, followed, counted, summed, odd_values, followed_count, followed_sum) = outs;
 	mut failures = 0;
 	mut step = 0;
 	for step < 600 {
@@ -83,6 +86,7 @@ fun main() {
 		mut want_odd_values: List<i32> = [];
 		mut flagged: usize = 0;
 		mut sum = 0;
+		mut flagged_sum = 0;
 		for entry in map.entries() {
 			let v = entry.1;
 			want_tens.insert(entry.0, v * 10);
@@ -97,6 +101,9 @@ fun main() {
 				flagged += 1;
 			}
 			sum += v;
+			if flag_for(flags, v).get() {
+				flagged_sum += v;
+			}
 		}
 		let got_tens: HashMap<i32, i32> = Source::get(tens);
 		let got_signed: HashMap<i32, i32> = Source::get(signed);
@@ -136,6 +143,9 @@ fun main() {
 			failures += 1;
 		}
 		if odd_values.get() != want_odd_values {
+			failures += 1;
+		}
+		if followed_sum.get() != flagged_sum {
 			failures += 1;
 		}
 		if followed_count.get() != flagged {

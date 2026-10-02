@@ -511,6 +511,12 @@ export impl MapCell<type K: Hashable, type V> with Source<HashMap<K, V>> {
 		self.items.read()
 	}
 
+	/// The map cell's identity (A146): every handle to this map names the same
+	/// cell, so a tracked read keeps one edge across runs.
+	fun identity(self): Option<i32> {
+		Some(self.items.identity())
+	}
+
 	/// The observer is handed the map as it stands when the notification is
 	/// delivered. It captures the ITEMS cell and not the handle (A132).
 	[must_use]

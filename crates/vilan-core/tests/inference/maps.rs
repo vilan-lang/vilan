@@ -609,8 +609,45 @@ fn a138_s2_keyed_operators_run_per_put_follow_flows_and_release_per_key() {
 /// flows the closures answer, checked after every step against a recomputation
 /// from the map — `values`/`entries` (the rank index, through enough churn to
 /// compact it), `map_values` plain and following, `filter` plain and following,
-/// `count`, `sum_by`, and two chains (`filter(..).values()`, `filter(..).count()`).
+/// `count`, `sum_by` plain and following, and two chains (`filter(..).values()`,
+/// `filter(..).count()`).
 #[test]
 fn a138_s2_the_map_operators_agree_with_a_recomputation_under_a_random_walk() {
     assert_compiles_and_runs(&format!("{MAP_OPERATOR_WALK}\nmain();\n"), "failures 0\n");
+}
+
+/// A146's identity for the new sources: every handle to one cell (a copy of a
+/// `MapCell`, a `SetCell`, the memo a pipe sealed into) names it with one number,
+/// and every per-key handle names its KEY — two `at("a")`s agree, `at("b")`
+/// differs, and the same key of another map differs — so a tracked read keeps one
+/// edge across runs and a connection dedups an exported handle.
+#[test]
+fn a138_every_handle_to_one_cell_or_one_key_shares_an_identity() {
+    assert_compiles_and_runs(
+        r#"
+        import std::hash_map::HashMap;
+        import std::reactive::{ MapCell, SetCell, Source, comp };
+
+        fun main() {
+            let cell: MapCell<str, i32> = MapCell::new();
+            let copy = cell;
+            let other: MapCell<str, i32> = MapCell::new();
+            print(cell.identity() == copy.identity());
+            print(cell.identity() == other.identity());
+            print(cell.at("a").identity() == copy.at("a").identity());
+            print(cell.at("a").identity() == cell.at("b").identity());
+            print(cell.at("a").identity() == other.at("a").identity());
+            let set: SetCell<i32> = SetCell::new();
+            print(set.contains(1).identity() == set.contains(1).identity());
+            print(set.contains(1).identity() == set.contains(2).identity());
+            let (memo, scope) = comp(|| cell.map_values(|value| value + 1).memo());
+            print(memo.identity() == memo.identity());
+            print(memo.at("a").identity() == memo.at("a").identity());
+            print(memo.identity() == cell.identity());
+            scope.dispose();
+        }
+        main();
+        "#,
+        "true\nfalse\ntrue\nfalse\nfalse\ntrue\nfalse\ntrue\ntrue\nfalse\n",
+    );
 }

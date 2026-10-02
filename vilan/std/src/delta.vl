@@ -2590,14 +2590,7 @@ export impl type S: MapSource<type K, type V> with MapFlow<K, V> {
 		let cursor = self.cursor();
 		let read = self.reader();
 		MapInstance<K, V> {
-			// QUALIFIED, and that is a workaround: through this SUBTRAIT bound a
-			// bare `self.get()` is emitted as the implementor's INHERENT `get(key)`
-			// — `MapCell`'s per-key read, called with no key — where the analyzer
-			// typed it as `Source::get` (maps-45's finding, B473's family).
-			snapshot = || {
-				let whole: HashMap<K, V> = Source::get(self);
-				whole
-			},
+			snapshot = || self.get(),
 			attach = |subscriber: Subscriber| self.on_settle(subscriber),
 			drain = || read(cursor),
 			release = || self.drop_cursor(cursor),
@@ -2698,6 +2691,10 @@ export impl MapMemo<type K: Hashable, type V> {
 export impl MapMemo<type K: Hashable, type V> with Source<HashMap<K, V>> {
 	fun get(self): HashMap<K, V> {
 		Source::get(self.cell)
+	}
+
+	fun identity(self): Option<i32> {
+		self.cell.identity()
 	}
 
 	[must_use]
@@ -2856,6 +2853,10 @@ export impl SetMemo<type T: Hashable> {
 export impl SetMemo<type T: Hashable> with Source<HashSet<T>> {
 	fun get(self): HashSet<T> {
 		self.cell.get()
+	}
+
+	fun identity(self): Option<i32> {
+		self.cell.identity()
 	}
 
 	[must_use]
@@ -3323,17 +3324,14 @@ export impl type F: MapFlow<type K, type V> {
 
 	/// The sum of `measure` over the values — a scalar pipe over an accumulator:
 	/// what arrived is added and what left subtracted (the op's "what was there" is
-	/// exactly for this), O(1) per op.
-	///
-	/// `measure` answers a plain number, and is not followed if it answers a flow:
-	/// `N` cannot be inferred through a result trait's argument (B484), so the
-	/// result is the number itself until that lands — then `R: IntoFlow<N>`, as
-	/// `filter`'s.
-	fun sum_by<N: Add + Sub + Default>(
+	/// exactly for this), O(1) per op. `measure` may answer a flow, followed per
+	/// key (`IntoFlow`, R9): a key whose flow moves changes the sum by the
+	/// difference.
+	fun sum_by<N: Add + Sub + Default, R: IntoFlow<N>>(
 		own self,
-		measure: (sync |V| N) context (owner_scope, ambient_nursery),
-	): MapSum<F, K, V, N> {
-		MapSum<F, K, V, N> { up = self, measure }
+		measure: (sync |V| R) context (owner_scope, ambient_nursery),
+	): MapSum<F, K, V, R, N> {
+		MapSum<F, K, V, R, N> { up = self, measure }
 	}
 }
 
@@ -3573,13 +3571,13 @@ export [hint(Pipe<usize>)]
 
 export impl MapCount<type F: MapFlow<type K, type V>, K, V> with Flow<usize> {
 	[must_use]
-	fun on_change(own self, observer: |usize| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|usize| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |usize| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|usize| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<usize> {
@@ -3610,23 +3608,29 @@ export impl MapCount<type F: MapFlow<type K, type V>, K, V> with Flow<usize> {
 export impl MapCount<type F: MapFlow<type K, type V>, K, V> with Pipe<usize> {}
 
 /// `sum_by` as a stage: a SCALAR pipe over an accumulator, the keyed core
-/// underneath so each key's measure runs once per `Put` under an owner of its own.
-export [resource] struct MapSum<F, K, V, N> {
+/// underneath so each key's measure runs once per `Put` under an owner of its own
+/// and a flow it answers is followed.
+///
+/// `N` is the stage's own parameter rather than a binder inside `R`'s bound
+/// (`type R: IntoFlow<type N>`): the accumulator's zero is `N::default()`, and a
+/// static call on a type bound only through such a binder is not resolved when the
+/// code is emitted (maps-45's find).
+export [resource] struct MapSum<F, K, V, R, N> {
 	up: F,
-	measure: (|V| N) context (owner_scope, ambient_nursery),
+	measure: (|V| R) context (owner_scope, ambient_nursery),
 }
 
-export impl MapSum<type F: MapFlow<type K, type V>, K, V, type N: Add + Sub + Default> with Flow<
+export impl MapSum<type F: MapFlow<type K, type V>, K, V, type R: IntoFlow<N>, type N: Add + Sub + Default> with Flow<
 	N,
 > {
 	[must_use]
-	fun on_change(own self, observer: |N| void): Subscription {
-		observe_flow(self, observer, false)
+	fun on_change(own self, observer: (|N| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
 
 	[must_use]
-	fun sub(own self, observer: |N| void): Subscription {
-		observe_flow(self, observer, true)
+	fun sub(own self, observer: (|N| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
 
 	fun start(own self): Instance<N> {
@@ -3635,7 +3639,7 @@ export impl MapSum<type F: MapFlow<type K, type V>, K, V, type N: Add + Sub + De
 		let stage = Owner::new();
 		let keyed: KeyedCore<K, V, N> = keyed_core(stage, |entry: (K, V)| {
 			let (answer, owner) = run_element(stage, || measure(entry.1));
-			(ElementRun<N>::Constant(answer), owner)
+			(answer.start_element(), owner)
 		});
 		keyed_seed(keyed, (upstream.snapshot)());
 		let zero = N::default();
@@ -3661,7 +3665,7 @@ export impl MapSum<type F: MapFlow<type K, type V>, K, V, type N: Add + Sub + De
 	}
 }
 
-export impl MapSum<type F: MapFlow<type K, type V>, K, V, type N: Add + Sub + Default> with Pipe<
+export impl MapSum<type F: MapFlow<type K, type V>, K, V, type R: IntoFlow<N>, type N: Add + Sub + Default> with Pipe<
 	N,
 > {}
 
