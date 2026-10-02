@@ -1626,53 +1626,51 @@ fn a142_collection_pipes_build_the_same_on_both_backends() {
     }
 }
 
-/// A138 S1 and S2: `MapCell` and the map operators on both backends — their seeded random walks
-/// (`inference/maps.rs` runs the same program on JS), checked against a plain
-/// `HashMap` after every write: the map and its order, a mirror replayed from the
-/// drained `MapOp`s, every watched key's handle and how often it woke.
-///
-/// `SetCell` is REFUSED natively, by name, and this pin holds the refusal to a
-/// name rather than letting it become a wrong answer: the native backend types a
-/// variant constructor of a ONE-parameter enum whose parameter is bounded
-/// (`SetOp<T: Hashable>`'s `Add(value)`) as a bare trait object (`MapOp<K: Hashable,
-/// V>` has two parameters and builds). When that lands, the set's walk is expected
-/// to be identical, and this pin says so.
+/// A138 S1 and S2: `MapCell`, `SetCell` and the map operators on both backends —
+/// their seeded random walks (`inference/maps.rs` runs the same programs on JS),
+/// checked against a plain `HashMap`/`HashSet` after every write: the collection
+/// and its order, a mirror replayed from the drained ops, every watched key's
+/// handle and how often it woke — plus `keys()`, a set pipe, and a `MapEntry`'s
+/// `set(Some(v))`/`set(None)` writes. `SetCell`, `SetOp` and `keys()` were
+/// refused natively until F72 (a variant of the one-parameter, BOUNDED
+/// `SetOp<T: Hashable>` was typed as a bare trait object).
 #[test]
-fn a138_map_and_set_cells_build_the_same_on_both_backends_or_are_refused_by_name() {
+fn a138_map_and_set_cells_build_the_same_on_both_backends() {
     let staged = stage();
-    std::fs::write(
-        staged.join("native_probe_map_walk.vl"),
-        include_str!("native/map_walk.vl"),
-    )
-    .expect("write the probe program");
-    assert_eq!(
-        compare(&staged, "native_probe_map_walk.vl"),
-        Verdict::Identical,
-        "a MapCell must build and answer the same on both backends"
-    );
-    // A138 S2: the map operators' walk (`inference/maps.rs` runs it on JS).
-    std::fs::write(
-        staged.join("native_probe_map_operator_walk.vl"),
-        include_str!("native/map_operator_walk.vl"),
-    )
-    .expect("write the probe program");
-    assert_eq!(
-        compare(&staged, "native_probe_map_operator_walk.vl"),
-        Verdict::Identical,
-        "the map operators must build and answer the same on both backends"
-    );
-    std::fs::write(
-        staged.join("native_probe_set_walk.vl"),
-        include_str!("native/set_walk.vl"),
-    )
-    .expect("write the probe program");
-    match compare(&staged, "native_probe_set_walk.vl") {
-        Verdict::Identical => {}
-        Verdict::Refused(reason) => assert!(
-            reason.contains("a trait object"),
-            "the set's native refusal moved to another construct: {reason}"
+    for (name, program, what) in [
+        (
+            "native_probe_map_walk.vl",
+            include_str!("native/map_walk.vl"),
+            "a MapCell",
         ),
-        Verdict::Broken(detail) => panic!("a SetCell was accepted natively and wrong: {detail}"),
+        // A138 S2: the map operators' walk.
+        (
+            "native_probe_map_operator_walk.vl",
+            include_str!("native/map_operator_walk.vl"),
+            "the map operators",
+        ),
+        (
+            "native_probe_set_walk.vl",
+            include_str!("native/set_walk.vl"),
+            "a SetCell",
+        ),
+        (
+            "native_probe_map_keys_pipe.vl",
+            include_str!("native/map_keys_pipe.vl"),
+            "`keys()` and `values()`",
+        ),
+        (
+            "native_probe_map_entry_writes.vl",
+            include_str!("native/map_entry_writes.vl"),
+            "a MapEntry's writes",
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{what} must build and answer the same on both backends"
+        );
     }
 }
 
@@ -2980,9 +2978,9 @@ const J7_PROBE: &str = concat!(
 
 /// A146: `ListCell` and `KeyedCell` name their identity, so a body that tracks
 /// one on every run keeps ONE edge on it (`attaches=1`) on both backends. (The
-/// mirror half of the pin, `RemoteSource` and `KeyedSource` over `duplex_pair`,
-/// is JS-only: `inference::tracking`'s A146 pin — the native backend refuses
-/// that program by name, at an unresolved type in the rpc layer.)
+/// mirror half, `RemoteSource` and `KeyedSource` over `duplex_pair`, is
+/// `inference::tracking`'s A146 program, natively in
+/// `an_in_process_mirror_program_is_identical_on_both_backends` since F74.)
 #[test]
 fn a_tracked_list_or_keyed_cell_keeps_one_edge_on_both_backends() {
     let staged = stage();
@@ -8880,4 +8878,19 @@ fn an_in_process_mirror_program_is_identical_on_both_backends() {
             "{name}: must build and print the same on both backends"
         );
     }
+    // A146's mirror half, natively: one edge per source across the runs.
+    let output = vilan(&staged)
+        .args([
+            "run",
+            "--backend",
+            "rust",
+            "native_probe_in_process_mirrors.vl",
+        ])
+        .output()
+        .expect("run the probe natively");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "list attaches=1\nkeyed cell attaches=1\nmirror attaches=1\nkeyed mirror attaches=1\n5 2 1 7 1\n",
+        "one edge per source, mirrors included, natively (A146)"
+    );
 }

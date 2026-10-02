@@ -1703,8 +1703,7 @@ fun main() {
 
 Both are `DeltaSource`s (`MapSource`, `SetSource`), with `cursor`/`since`/`reader`
 as `ListCell` has them: a cursor that fell behind the log is told the whole
-collection as one `Reset`. `SetCell` builds on the JS backend only for now: the
-native backend refuses `SetOp`'s variants by name.
+collection as one `Reset`.
 
 ## Map pipes — operators for maps and sets
 
@@ -1774,9 +1773,6 @@ a flow is followed the same way: the sum moves by the difference.
 A sealed map pipe is a `MapMemo`: a read-only granular map source with `get(key)`,
 `len`, `peek`, and `at(key)` — a read-only per-key handle on the sealed map's
 slots, so a key's reader wakes only when the pipe changed that key.
-
-`keys()` builds on the JS backend only for now (it emits `SetOp`s, which the
-native backend refuses by name); every other map operator builds natively.
 
 ## reconcile: keyed list diffing
 
