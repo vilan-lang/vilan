@@ -93,6 +93,18 @@ SCENARIOS = [
         "completion": ("get_client().get_safe()!.create_channel", len("get_client().")),
     },
     {
+        # The same edit with the files that import the model OPEN beside it,
+        # as the owner's editor has them: an edit re-analyses its open
+        # dependents too, and that is the cost the single-document row hides.
+        "name": "model.vl keystroke, importers open",
+        "file": "src/model.vl",
+        "also_open": ["src/client.vl", "src/channel.vl", "src/views.vl"],
+        "edit": ("\t\tget_client().get_safe()!.create_channel(name)", 2),
+        "text": " ",
+        "hover": ("create_channel(name)", 3),
+        "completion": ("get_client().get_safe()!.create_channel", len("get_client().")),
+    },
+    {
         "name": "css keystroke",
         "file": "src/styles.vl",
         "edit": ("\twidth(size(4));", 1),
@@ -393,6 +405,11 @@ def measure_edit(server, document, scenario, apply):
         wall = document.ask(kind, scenario)
         settled[kind] = ((live_threads_ns(server.pid) - before) / 1e6, wall * 1000)
     errors = sum(1 for diagnostic in last[2] if diagnostic.get("severity", 1) == 1) if last else 0
+    # Every publish the edit caused, to any file — the open dependents'
+    # re-analyses among them.
+    with server.publish_ready:
+        caused = [entry for entry in server.publishes if started < entry[0] <= settled_at]
+    everything = max(caused, key=lambda entry: entry[0]) if caused else None
     # The ANALYSIS's publish is the last one before idle: since E242 the
     # server republishes the followed diagnostics at once, before any
     # analysis, and that repaint is the first publish an edit gets.
@@ -401,6 +418,9 @@ def measure_edit(server, document, scenario, apply):
         "diagnostics_ms": (landed[0] - started) * 1000,
         "diagnostics_cpu_ms": landed[3] - cpu_before,
         "first_publish_ms": (first[0] - started) * 1000,
+        "all_published_ms": (everything[0] - started) * 1000 if everything else None,
+        "all_published_cpu_ms": everything[3] - cpu_before if everything else None,
+        "files_republished": len({entry[1] for entry in caused}),
         "cpu_ms": cpu_after - cpu_before,
         "settle_ms": (settled_at - started) * 1000,
         "errors": errors,
@@ -411,6 +431,12 @@ def measure_edit(server, document, scenario, apply):
 
 
 def run_scenario(server, root, scenario, runs, callgrind=False):
+    companions = [Document(server, root / relative) for relative in scenario.get("also_open", [])]
+    for companion in companions:
+        opened = time.perf_counter()
+        companion.open()
+        server.wait_publish(companion.uri, opened)
+        server.settle()
     document = Document(server, root / scenario["file"])
     opened = time.perf_counter()
     cpu_before = cpu_ms(server.pid)
@@ -444,6 +470,8 @@ def run_scenario(server, root, scenario, runs, callgrind=False):
             server.wait_publish(document.uri, undone)
             server.settle()
     document.close()
+    for companion in companions:
+        companion.close()
     server.settle()
     return cold, rows
 
@@ -508,6 +536,13 @@ def print_table(cold_rows, rows, header):
             f"| {samples[-1]['errors']} | {keystroke} | {settled} "
             f"| {max(s['memory']['VmHWM'] for s in samples) / 1024:.0f} |"
         )
+    for name, samples in rows.items():
+        if any(s["files_republished"] > 1 for s in samples):
+            print(
+                f"| {name}: every open file | {median([s['all_published_cpu_ms'] for s in samples]):.0f} "
+                f"| | {median([s['all_published_ms'] for s in samples]):.0f} "
+                f"| {samples[-1]['files_republished']} files | | | |"
+            )
     print()
     print("Medians over the runs. E121's targets: <10 ms on the keystroke path, <500 ms to errors.")
     print(
@@ -599,7 +634,9 @@ def main():
             cold, scenario_rows = run_scenario(
                 server, root, scenario, arguments.runs, callgrind=bool(arguments.callgrind)
             )
-            cold_rows[f"open {scenario['file']}"] = cold
+            companions = len(scenario.get("also_open", []))
+            suffix = f" (beside {companions} open importers)" if companions else ""
+            cold_rows[f"open {scenario['file']}{suffix}"] = cold
             rows.update(scenario_rows)
         if arguments.callgrind:
             subprocess.run(["callgrind_control", "-d", str(server.pid)], capture_output=True)
