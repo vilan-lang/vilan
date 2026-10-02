@@ -193,6 +193,13 @@ export impl Transient<type T, type E> {
 		});
 		let _owned = register_with_owner(subscription);
 	}
+
+	/// `hold` for a seal that lives as long as the PROGRAM (`.transient_global()`):
+	/// the subscription registers with no owner and nothing releases it, so nothing
+	/// retires the seal either.
+	fun hold_for_the_program(self, subscription: Subscription) {
+		let _for_the_program = subscription;
+	}
 }
 
 export impl Transient<type T, type E> with Source<Option<T>> {
@@ -235,26 +242,15 @@ export impl Transient<type T, type E> with TransientSource<T, E> {
 /// — and the transient stays where the claim left it.
 export impl type P: Pipe<Task<Result<type T, type E>>> {
 	fun transient(own self): Transient<T, E> {
-		let seal: Transient<T, E> = Transient::pending();
-		// A DERIVATION: it publishes a state, so a turn settles it before any
-		// effect reads it — the `Refreshing` a change moves it to is already there.
-		as_derivation();
-		let subscription = self.sub(|task: Task<Result<T, E>>| {
-			let mine = seal.claim();
-			let _settling = async {
-				let outcome: Result<Result<T, E>, str> = guarded_async(|| await task);
-				// A superseded task — cancelled, or merely slower — is dropped
-				// before its outcome is looked at: its abort is not a failure.
-				if seal.current(mine) {
-					match outcome {
-						Ok(let answered) => seal.settle(mine, answered),
-						Err(let message) => panic(message),
-					}
-				}
-			};
-		});
-		seal.hold(subscription);
-		seal
+		seal_results(self, false)
+	}
+
+	/// `.transient()` for a transient that lives as long as the PROGRAM (R-k, A130's
+	/// twin of `.cell_global()`): it registers with NO owner, even inside a
+	/// boundary, and nothing releases it. The spelling for a module binding's
+	/// initializer, where `.transient()` is refused — a module has no owner.
+	fun transient_global(own self): Transient<T, E> {
+		seal_results(self, true)
 	}
 }
 
@@ -262,18 +258,61 @@ export impl type P: Pipe<Task<Result<type T, type E>>> {
 /// `Failed(message, stale)`, so `E` is `str`.
 export impl type P: Pipe<Task<type T>> {
 	fun transient(own self): Transient<T, str> {
-		let seal: Transient<T, str> = Transient::pending();
-		as_derivation();
-		let subscription = self.sub(|task: Task<T>| {
-			let mine = seal.claim();
-			let _settling = async {
-				let outcome: Result<T, str> = guarded_async(|| await task);
-				seal.settle(mine, outcome);
-			};
-		});
-		seal.hold(subscription);
-		seal
+		seal_tasks(self, false)
 	}
+
+	/// `.transient()` for the PROGRAM's lifetime (R-k): `transient_global` over a
+	/// flow of bare tasks.
+	fun transient_global(own self): Transient<T, str> {
+		seal_tasks(self, true)
+	}
+}
+
+/// The `Result` arm's seal: owner-tied (`hold`), or for the program when `global`.
+fun seal_results<T, E, P: Pipe<Task<Result<T, E>>>>(own pipe: P, global: bool): Transient<T, E> {
+	let seal: Transient<T, E> = Transient::pending();
+	// A DERIVATION: it publishes a state, so a turn settles it before any
+	// effect reads it — the `Refreshing` a change moves it to is already there.
+	as_derivation();
+	let subscription = pipe.sub(|task: Task<Result<T, E>>| {
+		let mine = seal.claim();
+		let _settling = async {
+			let outcome: Result<Result<T, E>, str> = guarded_async(|| await task);
+			// A superseded task — cancelled, or merely slower — is dropped
+			// before its outcome is looked at: its abort is not a failure.
+			if seal.current(mine) {
+				match outcome {
+					Ok(let answered) => seal.settle(mine, answered),
+					Err(let message) => panic(message),
+				}
+			}
+		};
+	});
+	if global {
+		seal.hold_for_the_program(subscription);
+	} else {
+		seal.hold(subscription);
+	}
+	seal
+}
+
+/// The bare-task arm's seal, `seal_results`' twin.
+fun seal_tasks<T, P: Pipe<Task<T>>>(own pipe: P, global: bool): Transient<T, str> {
+	let seal: Transient<T, str> = Transient::pending();
+	as_derivation();
+	let subscription = pipe.sub(|task: Task<T>| {
+		let mine = seal.claim();
+		let _settling = async {
+			let outcome: Result<T, str> = guarded_async(|| await task);
+			seal.settle(mine, outcome);
+		};
+	});
+	if global {
+		seal.hold_for_the_program(subscription);
+	} else {
+		seal.hold(subscription);
+	}
+	seal
 }
 
 // === One task: `TaskSource` (R24) =============================================

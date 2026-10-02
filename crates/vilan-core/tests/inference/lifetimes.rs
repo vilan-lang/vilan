@@ -1353,6 +1353,106 @@ fn a130_a_cell_in_a_module_bindings_initializer_is_refused_at_the_method() {
 }
 
 #[test]
+fn rk_a_transient_in_a_module_bindings_initializer_is_refused_with_its_own_twin() {
+    // R-k: `.transient()` registers with the ambient owner exactly as `.cell()`
+    // does, so in a module binding's initializer it is refused the same way —
+    // naming its own seal and steering to `.transient_global()`. Both arms: a flow
+    // of `Result` tasks and a flow of bare tasks. Red before R-k: the program
+    // compiled, and the seal's registration stayed on `id` for the program.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::result::Result::{ self, Ok, Err };
+        import std::transient::Transient;
+
+        let id: SignalCell<i32> = Signal::new(1);
+        let fetched: Transient<i32, str> = id.derive(|x| async Ok(x * 10)).transient();
+        let bare: Transient<i32, str> = id.derive(|x| async { x * 100 }).transient();
+
+        fun main() {
+            print(fetched.get().is_some());
+        }
+        "#;
+    // Occurrence 0 is the import's `std::transient`; 1 and 2 are the two seals.
+    for occurrence in [1, 2] {
+        assert_fails_spanning_nth(
+            source,
+            "transient",
+            occurrence,
+            "`.transient()` in the initializer of the module binding",
+        );
+    }
+    assert_fails_with(source, "the module binding `fetched`");
+    assert_fails_with(source, "the module binding `bare`");
+    assert_fails_with(
+        source,
+        "or write `.transient_global()`, which says that lifetime",
+    );
+}
+
+#[test]
+fn rk_transient_global_at_module_level_compiles_and_follows_its_source() {
+    // The program-lifetime spelling: both arms compile in a module binding's
+    // initializer and follow their source to the latest task's answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::result::Result::{ self, Ok, Err };
+        import std::time::sleep;
+        import std::transient::Transient;
+
+        let id: SignalCell<i32> = Signal::new(1);
+        let fetched: Transient<i32, str> = id.derive(|x| async Ok(x * 10)).transient_global();
+        let bare: Transient<i32, str> = id.derive(|x| async { x * 100 }).transient_global();
+
+        fun main() {
+            sleep(10);
+            print(i"{fetched.get().unwrap_or(0)} {bare.get().unwrap_or(0)}");
+            id.set(2);
+            sleep(10);
+            print(i"{fetched.get().unwrap_or(0)} {bare.get().unwrap_or(0)}");
+        }
+
+        main();
+        "#,
+        "10 100\n20 200\n",
+    );
+}
+
+#[test]
+fn rk_transient_global_ignores_an_ambient_owner_where_transient_is_released_with_it() {
+    // The lifetime is in the name: made under an owner that is then disposed,
+    // `.transient_global()` keeps following its source; `.transient()` made the
+    // same way stops at the disposal and keeps its last answer. Red when the
+    // global twin registers with the owner: `global=10`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::result::Result::{ self, Ok, Err };
+        import std::time::sleep;
+        import std::transient::Transient;
+
+        fun main() {
+            let id: SignalCell<i32> = Signal::new(1);
+            let owner = Owner::new();
+            let scoped: Transient<i32, str> = run_with_owner(owner, || id.derive(|x| async Ok(x * 10)).transient());
+            let global: Transient<i32, str> = run_with_owner(owner, || id.derive(|x| async Ok(x * 10)).transient_global());
+            sleep(10);
+            owner.dispose();
+            id.set(2);
+            sleep(10);
+            print(i"scoped={scoped.get().unwrap_or(0)} global={global.get().unwrap_or(0)}");
+        }
+
+        main();
+        "#,
+        "scoped=10 global=20\n",
+    );
+}
+
+#[test]
 fn a142_a130_a_memo_in_a_module_bindings_initializer_is_refused_with_its_own_twin() {
     // `.memo()` is owner-tied exactly as `.cell()` is, and it is refused the same
     // way — naming its own seal and steering to its own `_global` twin. Red when
