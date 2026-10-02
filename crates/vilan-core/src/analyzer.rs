@@ -60,6 +60,58 @@ thread_local! {
     /// M19 memo's instrument, and the only thing that can see it working. See
     /// [`generic_bound_checks`].
     static GENERIC_BOUND_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many impl SUBJECT COMPARISONS the inherited-member scans of method
+    /// lookup (`inherited_default_candidates`, `inheriting_impls_of_declared_homes`)
+    /// have made on this thread since [`reset_inherited_subject_tests`] (M103).
+    /// See [`inherited_subject_tests`].
+    static INHERITED_SUBJECT_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many impl PAIRS `check_duplicate_trait_impls` has compared on this
+    /// thread since [`reset_duplicate_impl_comparisons`] (M107). See
+    /// [`duplicate_impl_comparisons`].
+    static DUPLICATE_IMPL_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of impl pairs the duplicate-impl check has compared on this
+/// thread since the last [`reset_duplicate_impl_comparisons`]. Each impl is
+/// compared only with the earlier impls of its own trait and subject head
+/// (M107), so impls of one trait over distinct types are never paired — which
+/// changes no report, so only this count can see it.
+pub fn duplicate_impl_comparisons() -> usize {
+    DUPLICATE_IMPL_COMPARISONS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`duplicate_impl_comparisons`].
+pub fn reset_duplicate_impl_comparisons() {
+    DUPLICATE_IMPL_COMPARISONS.with(|count| count.set(0));
+}
+
+/// [`Analyzer::impl_subject_bucket`]'s classes (M107).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ImplSubjectBucket {
+    Struct(Id),
+    Enum(Id),
+    Trait(Id),
+    Generic,
+    Tuple(usize),
+    Array,
+    Closure(usize),
+    Mapped,
+    Other,
+}
+
+/// The number of impl subject comparisons method lookup's inherited-member
+/// scans have made on this thread since the last
+/// [`reset_inherited_subject_tests`]. The scans compare a receiver against an
+/// impl only when one of the impl's traits can provide the member being looked
+/// up (M103), so an impl that cannot answer the lookup costs no type walk —
+/// which changes no candidate, so only this count can see it.
+pub fn inherited_subject_tests() -> usize {
+    INHERITED_SUBJECT_TESTS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`inherited_subject_tests`].
+pub fn reset_inherited_subject_tests() {
+    INHERITED_SUBJECT_TESTS.with(|count| count.set(0));
 }
 
 /// The number of bound evaluations this thread's
@@ -9603,13 +9655,28 @@ impl<'src> Analyzer<'src> {
             )
         });
         let mut duplicates: Vec<(&'src str, TraitImplSite, TraitImplSite)> = Vec::new();
+        // M107: each site is compared only with the earlier sites of its own
+        // trait and subject SHAPE ([`impl_subject_bucket`]), in the order they
+        // were seen. A repeat has both — the trait is the key's first half and
+        // `same_impl_type` holds only for one shape, one head — so the first
+        // earlier repeat in the bucket is the first in the whole list, and the
+        // report is the one the pairwise scan made. That scan compared every
+        // impl of a trait with every earlier one, cloning both subjects for the
+        // shape walk: quadratic in the impls of one trait, which a package of
+        // `derive`s has thousands of (×6.1 per doubling of generated code).
+        let mut earlier_by_bucket: HashMap<(Id, ImplSubjectBucket), Vec<usize>> =
+            HashMap::default();
         for (position, site) in sites.iter().enumerate() {
+            let key = (site.trait_id, self.impl_subject_bucket(site.subject));
+            let earlier = earlier_by_bucket.entry(key).or_default();
             // Each later impl is reported against the FIRST one it repeats, so
             // three copies produce two errors, each naming the original.
-            let Some(first) = sites[..position]
-                .iter()
-                .find(|earlier| self.same_trait_instantiation(earlier, site))
-            else {
+            let first = earlier.iter().map(|index| &sites[*index]).find(|earlier| {
+                DUPLICATE_IMPL_COMPARISONS.with(|count| count.set(count.get() + 1));
+                self.same_trait_instantiation(earlier, site)
+            });
+            earlier.push(position);
+            let Some(first) = first else {
                 continue;
             };
             let Some(trait_) = self.traits.get(&site.trait_id) else {
@@ -9659,6 +9726,27 @@ impl<'src> Analyzer<'src> {
                 },
                 second.impl_id,
             );
+        }
+    }
+
+    /// The shape class of an impl subject that [`Self::same_impl_type`] can
+    /// only ever equate within (M107): its kind, and its nominal head where it
+    /// has one. Coarser than sameness on purpose — the bucket only has to
+    /// contain every repeat, and the shape walk still decides.
+    fn impl_subject_bucket(&self, subject: TypeId) -> ImplSubjectBucket {
+        match subject.borrow_type(self) {
+            Type::Struct(id, _) => ImplSubjectBucket::Struct(*id),
+            Type::Enum(id, _) => ImplSubjectBucket::Enum(*id),
+            Type::Trait(id, _) => ImplSubjectBucket::Trait(*id),
+            Type::Generic(_) => ImplSubjectBucket::Generic,
+            Type::Tuple(items) => ImplSubjectBucket::Tuple(items.len()),
+            Type::Array(..) => ImplSubjectBucket::Array,
+            Type::Closure(parameters, ..) => ImplSubjectBucket::Closure(parameters.len()),
+            Type::Mapped(..) => ImplSubjectBucket::Mapped,
+            // `Void`, `Any`, `Never`, `Function`, `Module`, and a position that
+            // never resolved: equal only as the same slot or the same value,
+            // which one shared bucket keeps together.
+            _ => ImplSubjectBucket::Other,
         }
     }
 
@@ -19736,7 +19824,20 @@ impl<'src> Analyzer<'src> {
         self.implementations
             .iter()
             .filter(|implementation| !implementation.declarations.contains_key(member_name))
+            // M103: the home test before the subject comparison — a recursive
+            // type walk per impl, and the expensive half. An impl of none of
+            // the homes is dropped by the `find` below whatever its subject,
+            // so asking the comparison about it first only cost the walk:
+            // every impl in the program per method lookup, which grew with
+            // each pipe node std declared.
             .filter(|implementation| {
+                implementation
+                    .trait_ids
+                    .iter()
+                    .any(|trait_id| homes.contains(trait_id))
+            })
+            .filter(|implementation| {
+                INHERITED_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
                 self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
@@ -22929,17 +23030,34 @@ impl<'src> Analyzer<'src> {
         // B401: parallel to `reached` — the providing block's index, and
         // whether the calling file admits the member from it.
         let mut providers: Vec<(usize, bool)> = Vec::new();
-        for (index, implementation) in
-            self.implementations
-                .iter()
-                .enumerate()
-                .filter(|(_, implementation)| {
-                    self.impl_subject_admits(
-                        subject_type,
-                        implementation.subject.borrow_type(self),
-                        &HashMap::default(),
-                    )
+        // Per trait, whether it has a method of this name — asked once per
+        // trait rather than once per impl that provides it.
+        let mut trait_has_member: HashMap<Id, bool> = HashMap::default();
+        for (index, implementation) in self
+            .implementations
+            .iter()
+            .enumerate()
+            // M103: the trait test before the subject comparison, for
+            // `inheriting_impls_of_declared_homes`' reason — an impl none
+            // of whose traits has a method of this name reaches nothing in
+            // the loop below, so the comparison's type walk was spent on
+            // every other impl in the program per lookup.
+            .filter(|(_, implementation)| {
+                implementation.trait_ids.iter().any(|trait_id| {
+                    *trait_has_member.entry(*trait_id).or_insert_with(|| {
+                        self.method_member_in_trait(*trait_id, member_name)
+                            .is_some()
+                    })
                 })
+            })
+            .filter(|(_, implementation)| {
+                INHERITED_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
+                self.impl_subject_admits(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+            })
         {
             for trait_id in &implementation.trait_ids {
                 let Some(member_id) = self.method_member_in_trait(*trait_id, member_name) else {
@@ -61366,6 +61484,11 @@ pub struct Program<'src> {
     /// [`crate::impl_select::applying_implementations`]' answers, as indices
     /// into `implementations` (M98). Derived data, like the graph.
     applying_memo: std::sync::Mutex<HashMap<crate::impl_select::ApplyingKey, Vec<usize>>>,
+    /// The receiver-reachable candidates of a `self`/inherited-default
+    /// dispatch, per member name (M103) — `async_infer`'s
+    /// `trait_subject_candidates` before its receiver filter. Derived data,
+    /// like the graph.
+    trait_subject_memo: std::sync::Mutex<HashMap<String, Option<Vec<Id>>>>,
 }
 
 /// One module-level binding's HMR transfer descriptor (`hmr.md` §4).
@@ -61803,6 +61926,16 @@ impl<'src> Program<'src> {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<crate::impl_select::ApplyingKey, Vec<usize>>> {
         self.applying_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `async_infer`'s per-member subject-reachability memo (M103), read
+    /// through a poisoned lock for [`Self::bound_selection_memo`]'s reason.
+    pub(crate) fn trait_subject_memo(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, Option<Vec<Id>>>> {
+        self.trait_subject_memo
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -70748,6 +70881,7 @@ fn analyze_over_world<'src>(
         call_graph_memo: std::sync::OnceLock::new(),
         bound_selection_memo: std::sync::Mutex::default(),
         applying_memo: std::sync::Mutex::default(),
+        trait_subject_memo: std::sync::Mutex::default(),
     })
 }
 

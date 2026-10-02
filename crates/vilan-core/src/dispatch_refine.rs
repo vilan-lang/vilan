@@ -123,6 +123,28 @@ thread_local! {
     /// pass and the const pass sharing one answer, which no output can.
     static BOUND_SELECTIONS_COMPUTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// How many impl SUBJECT TESTS (`subject_applies`, a bound proof per
+    /// blanket impl) [`impl_members_for_bound`]'s selections have run on this
+    /// thread since [`reset_bound_selection_subject_tests`] (M103). The
+    /// selection asks only the impls that can contribute to its answer, so
+    /// an impl that neither declares the member, nor provides a trait that
+    /// does, nor names one of the bound's traits is never tested — and this
+    /// is the count that shows it, since the answer is the same either way.
+    static BOUND_SELECTION_SUBJECT_TESTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The number of impl subject tests [`impl_members_for_bound`]'s selections
+/// have run on this thread since the last
+/// [`reset_bound_selection_subject_tests`]. See
+/// [`BOUND_SELECTION_SUBJECT_TESTS`].
+pub fn bound_selection_subject_tests() -> usize {
+    BOUND_SELECTION_SUBJECT_TESTS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`bound_selection_subject_tests`].
+pub fn reset_bound_selection_subject_tests() {
+    BOUND_SELECTION_SUBJECT_TESTS.with(|count| count.set(0));
 }
 
 /// The number of selections [`impl_members_for_bound`] computed rather than
@@ -373,7 +395,29 @@ fn impl_members_for_bound_uncached(
         .filter(|implementation| {
             scope.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
         })
+        // M103: the impls this selection can READ, before the subject test
+        // that costs a recursive bound proof per blanket impl. A matching impl
+        // contributes to the answer in exactly two ways: a member it declares
+        // under `member`'s name, or one its traits declare (the inherited
+        // defaults below) — and, through `traits`, it decides whether the
+        // narrowing below finds anything. An impl that does none of the three
+        // changes nothing whether it matches or not, so it is never asked. The
+        // answer is the same list in the same order; what moves is the count
+        // of `subject_applies` calls, which grew with every blanket impl std
+        // added (maps-45's map and set operators took a kolt `check` from
+        // 24.3G instructions to 29.1G, 7.0G of it here).
         .filter(|implementation| {
+            implementation.declarations.contains_key(member)
+                || implementation.trait_ids.iter().any(|trait_id| {
+                    traits.contains(trait_id)
+                        || program
+                            .traits
+                            .get(trait_id)
+                            .is_some_and(|trait_| trait_.declarations.contains_key(member))
+                })
+        })
+        .filter(|implementation| {
+            BOUND_SELECTION_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
             program
                 .type_id_to_type_map
                 .get(&implementation.subject)

@@ -8175,6 +8175,253 @@ fn a_refinement_after_the_passes_computes_no_selection_the_passes_already_made()
     );
 }
 
+/// M103: a bound selection tests only the impls that can change its answer.
+///
+/// `impl_members_for_bound` used to run `subject_applies` — a recursive bound
+/// proof for every blanket impl — over EVERY implementation in the program,
+/// and keep only the matches that declare the member or inherit it from a
+/// trait. Every blanket std added made every selection dearer: maps-45's map
+/// and set operators took a kolt `check` from 24.3G instructions to 29.1G,
+/// 7.0G of it inside this selection. An impl that declares no `member`,
+/// provides no trait declaring it and names none of the bound's traits cannot
+/// move the answer, so it is no longer tested. Here std is loaded (hundreds of
+/// impls, dozens of blankets) and ONE impl in the program mentions `show4` —
+/// so one subject test, and the answer is that impl's member.
+#[test]
+fn a_bound_selection_tests_only_the_impls_that_can_answer_it() {
+    use vilan_core::dispatch_refine;
+    use vilan_core::type_::Type;
+
+    let source = r#"
+        trait Show4 { fun show4(self): str; }
+        struct Plaque { size: i32 }
+        impl Plaque with Show4 { fun show4(self): str { "plaque" } }
+
+        fun tell<V: Show4>(value: V) { print(value.show4()); }
+
+        fun main() {
+            tell(Plaque { size = 1 });
+        }
+        main();
+        "#;
+    let (selected, expected, tests, implementations) = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let plaque = program
+                .structs
+                .values()
+                .find(|struct_| struct_.name == "Plaque")
+                .expect("the program declares `Plaque`")
+                .id;
+            let subject = program
+                .type_id_to_type_map
+                .iter()
+                .find(|(_, type_)| matches!(type_, Type::Struct(id, arguments) if *id == plaque && arguments.is_empty()))
+                .map(|(type_id, _)| *type_id)
+                .expect("`Plaque` has a type slot");
+            let expected: Vec<_> = program
+                .implementations
+                .iter()
+                .filter_map(|implementation| implementation.declarations.get("show4").copied())
+                .collect();
+            dispatch_refine::reset_bound_selection_subject_tests();
+            // A member nothing has asked about under this key yet: the
+            // empty-traits reading, so the memo cannot answer it.
+            let selected =
+                dispatch_refine::impl_members_for_bound(&program, None, subject, "show4", &[]);
+            (
+                selected,
+                expected,
+                dispatch_refine::bound_selection_subject_tests(),
+                program.implementations.len(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+
+    assert_eq!(expected.len(), 1, "one impl declares `show4`");
+    assert_eq!(selected, expected, "the selection is `Plaque`'s own member");
+    assert!(
+        implementations > 50,
+        "std must be loaded for the count to mean anything ({implementations} impls)"
+    );
+    assert_eq!(
+        tests, 1,
+        "{tests} of the program's {implementations} impls were subject-tested for a \
+         member exactly one of them can provide (M103)"
+    );
+}
+
+/// M103: an inherited default's dispatch candidates are computed once per
+/// member, not once per call site.
+///
+/// `async_infer` asks, at every `OnType` dispatch site (a `self` call in a
+/// default body, an inherited default on a concrete receiver), which impl
+/// members a `Self` declaring that member can reach — a scan of every impl with
+/// a `subject_applies` bound proof per blanket implementor. The answer depends
+/// on the member name alone, and on kolt's client the scan was 1.9G
+/// instructions of a `check` once maps-45's blankets landed. Memoized per
+/// member on the `Program`: six call sites of `chime` ask six times and compute
+/// exactly what one call site computes.
+#[test]
+fn an_inherited_defaults_candidates_are_computed_once_per_member() {
+    fn counts(calls: usize) -> (usize, usize) {
+        let mut source = String::from(
+            r#"
+            trait Chime { fun ring(self): str; fun chime(self): str { self.ring() } }
+            struct Bell { size: i32 }
+            impl Bell with Chime { fun ring(self): str { "ding" } }
+
+            fun main() {
+                let bell = Bell { size = 1 };
+            "#,
+        );
+        for _ in 0..calls {
+            source.push_str("    print(bell.chime());\n");
+        }
+        source.push_str("}\nmain();\n");
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                // The program borrows its source for `'static`.
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                vilan_core::async_infer::reset_trait_subject_counts();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                drop(program);
+                vilan_core::async_infer::trait_subject_counts()
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    let (asked_once, computed_once) = counts(1);
+    let (asked_six, computed_six) = counts(6);
+    assert!(
+        asked_six > asked_once,
+        "six `bell.chime()` sites must ask more often than one ({asked_six} vs \
+         {asked_once}), or the count below proves nothing"
+    );
+    assert_eq!(
+        computed_six, computed_once,
+        "{asked_six} asks computed {computed_six} reachable sets where one call site's \
+         {asked_once} asks computed {computed_once}: the set is the member's, so a \
+         second site of the same member must read it from the memo (M103)"
+    );
+}
+
+/// M103: method lookup compares a receiver only against the impls that can
+/// provide the member it looks up.
+///
+/// The inherited-member scans of method resolution (a trait default the
+/// receiver inherits, and the default-taking impls ranked beside a declaring
+/// one) compared the receiver against EVERY impl in the program — a recursive
+/// type walk each — and only then asked whether the impl's traits had the
+/// member. With std's pipe nodes that was most of `compare_type_rigid`'s 3.9G
+/// instructions in a kolt `check`. The trait test now comes first, so impls
+/// that cannot answer the lookup cost nothing: twenty more of them, of a trait
+/// with no such member, leave the comparison count exactly where it was.
+#[test]
+fn method_lookup_compares_only_the_impls_that_can_provide_the_member() {
+    fn subject_tests(unrelated: usize) -> (usize, bool) {
+        let mut source = String::from(
+            r#"
+            trait Chime5 { fun ring5(self): str; fun chime5(self): str { self.ring5() } }
+            trait Unrelated5 { fun unrelated5(self): i32; }
+            struct Bell5 { size: i32 }
+            impl Bell5 with Chime5 { fun ring5(self): str { "ding" } }
+            "#,
+        );
+        for index in 0..unrelated {
+            source.push_str(&format!(
+                "struct Filler{index} {{ size: i32 }}\n\
+                 impl Filler{index} with Unrelated5 {{ fun unrelated5(self): i32 {{ {index} }} }}\n"
+            ));
+        }
+        source.push_str(
+            "fun main() {\n    let bell = Bell5 { size = 1 };\n    print(bell.chime5());\n}\nmain();\n",
+        );
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                // The program borrows its source for `'static`.
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                vilan_core::analyzer::reset_inherited_subject_tests();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                assert!(program.is_some(), "analysis should produce a program");
+                (
+                    vilan_core::analyzer::inherited_subject_tests(),
+                    vilan_core::analyzer::served_from_base_cache(),
+                )
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    // The base cache serves std's resolved world to every analysis after the
+    // first in this process, and std's own lookups are made while resolving
+    // it: both measured analyses must be served from it, so each counts the
+    // same thing — its entry's lookups. A concurrent test can evict the world
+    // under plain `cargo test` (one process), so a miss is measured again.
+    let served = |unrelated: usize| {
+        (0..4)
+            .map(|_| subject_tests(unrelated))
+            .find(|(_, served)| *served)
+            .map(|(count, _)| count)
+            .expect("the base cache serves a repeated analysis of the same world")
+    };
+    let without = served(0);
+    let with_twenty = served(20);
+    assert!(
+        without > 0,
+        "`bell.chime5()` must reach the inherited-default scan, or the count proves nothing"
+    );
+    assert_eq!(
+        with_twenty, without,
+        "twenty impls of a trait with no `chime5` took the lookup's subject \
+         comparisons from {without} to {with_twenty}: an impl that cannot provide the \
+         member must not be compared against the receiver (M103)"
+    );
+}
+
 /// Analyzes `source` on a large-stack worker and reports how many BOUND
 /// EVALUATIONS `check_generic_bound_satisfaction` performed — the M19 memo's
 /// instrument. The counter is zeroed on the worker thread, so a concurrently

@@ -86,6 +86,7 @@ impl PackageReach {
 /// serially inside one `spawn_blocking` — kolt's three cost 9.2 s + 1.6 s +
 /// 1.3 s in a debug build — and a serial loop is also a loop with one token:
 /// an edit to `client.vl` could only stop the union by stopping all of it.
+#[derive(Clone)]
 pub struct EntryReach {
     pub reached: HashSet<ItemKey>,
     pub sources: HashSet<PathBuf>,
@@ -107,6 +108,18 @@ pub fn analyze_entry(
     text: &str,
 ) -> Option<EntryReach> {
     let document = Document::analyze_cancellable(text, std_dir, entry, cancel)?;
+    entry_reach_of(&document)
+}
+
+/// An entry's leg read off an analysis OF that entry — [`analyze_entry`]'s
+/// answer without its analysis. The language server analyzes an open file as
+/// the entry, so when the open file IS one of the package's declared entries
+/// (`client.vl` open beside the module being typed in), the document's own
+/// analysis is the very analysis the union's leg would make: the same text,
+/// std and path through the same `Document::analyze_cancellable`. M104: the
+/// union paid it again — a full analysis of the entry, ~2 s on kolt's client —
+/// once per typing pause, right after the dependency sweep had re-landed it.
+pub fn entry_reach_of(document: &Document) -> Option<EntryReach> {
     if !document.diagnostics.is_empty() {
         return None;
     }
@@ -114,6 +127,18 @@ pub fn analyze_entry(
     let reached = reached_item_keys(program)?;
     let sources = program.canonical_sources.iter().cloned().collect();
     Some(EntryReach { reached, sources })
+}
+
+/// Whether `path` is one of the declared entries of the package whose
+/// manifest sits in `manifest_dir` — compared canonically, as the union keys
+/// its sources.
+pub fn is_declared_entry(manifest_dir: &Path, path: &Path) -> bool {
+    let path = vilan_core::util::canonical_path(path);
+    entry_paths(manifest_dir).is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|(_, entry)| vilan_core::util::canonical_path(entry) == path)
+    })
 }
 
 /// The union of the legs, or `None` if any of them refused.
