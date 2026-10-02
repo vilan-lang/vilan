@@ -8686,3 +8686,32 @@ fn a_variant_of_an_enum_with_a_bounded_parameter_is_identical_on_both_backends()
         "a variant of an enum whose parameter is bounded must build and print the same"
     );
 }
+
+/// F76: a bare variant of a generic USER enum — `let n: Maybe<i32> =
+/// Maybe::Nothing` — builds natively; it was refused as "an unbound generic
+/// type parameter (parameter 1 of enum `Maybe`)" under its own annotation. A
+/// bare variant is an `Expr::Local` of the variant's declaration, and its arm
+/// minted the enum at NO arguments, never asking the position — where a
+/// constructor with a payload reads the site's record, then the position, then
+/// the payload (`variant_arguments`), and a bare one has only the first two.
+/// It takes that rule now, and a constructor's payload is a position of its
+/// own (`Some(Maybe::Nothing)` under `Option<Maybe<i32>>`). `None` built all
+/// along because `Option` is Rust's enum, whose path names no instance. The
+/// probe covers an annotated binding, an argument, a generic function's
+/// return at two instances, `ret` and a tail, a mixed list literal, an
+/// assignment, a nested payload, both arms of an `if`, a field written
+/// through a generic impl, and a two-parameter enum with a bound.
+#[test]
+fn a_bare_variant_of_a_generic_enum_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_bare_generic_variants.vl"),
+        include_str!("native/bare_generic_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_bare_generic_variants.vl"),
+        Verdict::Identical,
+        "a bare variant of a generic enum must close from its position and print the same"
+    );
+}

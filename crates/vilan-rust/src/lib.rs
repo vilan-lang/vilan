@@ -3916,9 +3916,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Local(_) if self.program.variant_coercions.contains_key(&id) => {
                 self.variant_closure(id, span)?
             }
-            // J6: a `None` or a variant the context pass synthesized as an
-            // argument names the VARIANT, not a place — `Expr::Local` of the
-            // variant's own declaration id.
+            // A bare variant — `None`, `Maybe::Nothing`, or one the context
+            // pass synthesized as an argument (J6) — names the VARIANT, not a
+            // place: `Expr::Local` of the variant's own declaration id. It is a
+            // constructor with no payload, and takes its enum's arguments by
+            // the constructor's rule (F76): the type recorded at THIS site,
+            // else the position's. It passed none, so a generic user enum's
+            // bare variant was refused as unbound under its own annotation.
             Expr::Local(binding)
                 if matches!(
                     self.program.entity_map.get(&binding),
@@ -3930,7 +3934,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 else {
                     unreachable!("the guard just matched an enum variant");
                 };
-                self.variant_path(enum_id, index, &[], span)?
+                let arguments = self.variant_arguments(id, enum_id, index, &[]);
+                self.variant_path(enum_id, index, &arguments, span)?
             }
             // F35: a named FUNCTION in a value position — `map_each(source,
             // counted)` hands `counted` itself where a closure could stand.
@@ -4115,8 +4120,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let value = self.copy_a_consumed_place_read(subject, value);
                 format!("let {bound} = {value}")
             }
+            // The variant's declaration itself: the constructor's rule, as
+            // for the bare variant above.
             Expr::EnumVariant(enum_id, index) => {
-                let arguments = self.enum_arguments_at(id, enum_id);
+                let arguments = self.variant_arguments(id, enum_id, index, &[]);
                 self.variant_path(enum_id, index, &arguments, span)?
             }
             Expr::TryAssert(receiver) => self.try_assert(id, receiver, depth, span)?,
@@ -6327,7 +6334,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// The arguments a VARIANT CONSTRUCTOR instantiates its enum at.
     ///
-    /// Two sources, in order, because neither is total. The type recorded at the
+    /// Three sources, in order, because none is total. The type recorded at the
     /// call site is the general answer, but for a generic enum it can be
     /// OPEN — `Tree::Leaf(7)` records `Tree<any>`, its parameter still a hole
     /// the surrounding `let`'s annotation closes later (this is B357's shape
@@ -6336,9 +6343,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// bound against the variant's declared payload types by the same walk that
     /// binds an impl subject.
     ///
-    /// A NULLARY variant of a generic enum has neither — nothing to read the
-    /// parameter off — and the refusal names it rather than instantiating a
-    /// second Rust enum over a hole.
+    /// Between the two, the POSITION the constructor is emitted into, when it
+    /// expects the same enum with its arguments closed — the only source a
+    /// NULLARY variant has (`let n: Maybe<i32> = Maybe::Nothing`, F76), whose
+    /// recorded type stays open, and which used to read the recorded type
+    /// alone and was refused under its annotation. A variant with none of the
+    /// three names
+    /// the unbound parameter rather than instantiating a second Rust enum over
+    /// a hole.
     fn variant_arguments(
         &mut self,
         expr_id: Id,
@@ -8726,8 +8738,39 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if function_call.argument_ids.is_empty() {
                 return Ok(path);
             }
-            let arguments = self.value_arguments(&function_call.argument_ids, depth)?;
-            return Ok(format!("{path}({})", arguments.join(", ")));
+            // Each payload is a POSITION, so a constructor nested in it closes
+            // from it the way it would under a `let`'s annotation (F76):
+            // `Some(Maybe::Nothing)` under `Option<Maybe<i32>>`. The payload
+            // types are read off the position's own expectation, never off the
+            // arguments the site recorded — inside a generic instance those
+            // can name the wrong parameter (F66), and an expectation is
+            // something a literal or a struct obeys. Only a CLOSED payload type
+            // is handed down: an open one says nothing, and an `any` one would
+            // wrap the value.
+            let payload_types = match self.expected_type.and_then(|type_id| self.resolve(type_id)) {
+                Some(Type::Enum(expected, expected_arguments))
+                    if *expected == enum_id
+                        && expected_arguments
+                            .iter()
+                            .all(|argument| self.is_grounded(*argument)) =>
+                {
+                    let expected_arguments = expected_arguments.clone();
+                    self.variant_payload_types(enum_id, index, &expected_arguments)
+                }
+                _ => Vec::new(),
+            };
+            let mut rendered = Vec::new();
+            for (slot, argument) in function_call.argument_ids.iter().enumerate() {
+                let expecting = payload_types
+                    .get(slot)
+                    .copied()
+                    .filter(|payload_type| self.is_grounded(*payload_type));
+                rendered.push(match expecting {
+                    Some(_) => self.consumed_value_of_expecting(*argument, expecting, depth)?,
+                    None => self.consumed_value_of(*argument, depth)?,
+                });
+            }
+            return Ok(format!("{path}({})", rendered.join(", ")));
         }
 
         // A124 R3: `o.member(..)` where `o` is a trait OBJECT — a slot call.

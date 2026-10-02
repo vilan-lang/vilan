@@ -268,6 +268,14 @@ written down.
 <!-- family: fix -->
 **Native builds construct a variant of an enum whose type parameter is BOUNDED: `enum Op<T: Hashable> { Add(T), Gone }` then `let op: Op<i32> = Op::Add(3)` was refused by name as "a value of type `a trait object`", and builds and prints node's bytes now.** A constructor's site records its enum open, its argument the parameter's own constraint id, and that id's type is the parameter's BOUND — `any` for `enum Tree<T>`, which the emitter reads as open and closes from the position or the payload, but the trait itself for `T: Hashable`, which it took for a closed argument and minted the enum over. A bare trait is never a closed type argument now (an object is `dyn`, a distinct type). A second, unbounded parameter had hidden it: `MapOp<K: Hashable, V>` built because its open `V` sent the whole list to the fallback. It blocked std's `SetCell`, `SetOp` and `MapCell::keys()` natively. The JS backend is unchanged. Pin: `a_variant_of_an_enum_with_a_bounded_parameter_is_identical_on_both_backends` (an annotated binding, the payload alone, an argument position, `Option` and list nesting, a generic function at two instances, a generic impl, two bounds on one parameter, two bounded parameters). Tracker F72.
 
+---
+
+<!-- family: fix -->
+---
+
+<!-- family: fix -->
+**Native builds a bare variant of a generic user enum: `let n: Maybe<i32> = Maybe::Nothing;` was refused by name as "an unbound generic type parameter (parameter 1 of enum `Maybe`)" under its own annotation, and builds and prints node's bytes now — as do `show(Maybe::Nothing)`, a generic function's `Maybe::Nothing` return, a list literal, an assignment and `Some(Maybe::Nothing)`.** A bare variant minted its enum at no arguments and never asked the position it was written into. It takes the constructor's rule now — the type recorded at the site, else the position's — and a constructor's payload is a position of its own, read off the position's closed type rather than the site's record (which can name the wrong parameter inside a generic instance). `None` had built all along: `Option` is Rust's own enum, whose path names no instance. The JS backend is unchanged. The native copy census moves by scalar payloads alone (a natively `Copy` payload is not a counted copy; one `.clone()` of a `usize` drops). Pin: `a_bare_variant_of_a_generic_enum_is_identical_on_both_backends`. Tracker F76.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->
