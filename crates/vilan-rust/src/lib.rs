@@ -2013,12 +2013,38 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// own generic parameters bound to the arguments `type_id` implements the
     /// trait at, plus the providing impl's binders bound from the concrete
     /// receiver. The JS emitter's `trait_parameter_substitution` (B58).
+    ///
+    /// F75: plus the binders of the impl that PROVIDES a blanket's bound, as
+    /// [`Self::dispatch_to_member`] adds them for a member (F58). A default
+    /// reached through `impl type S: Source<type T> with Flow<T>` at `S =
+    /// W<str>` binds `T` from `impl W<type P> with Source<Option<P>>` — as
+    /// `Option<P>`, in the provider's binder — and without `P = str` beside it
+    /// `w.effect(..)` was refused as an unbound parameter of `W`. The JS
+    /// emitter needs no concrete type, so its half stays as it is.
     fn trait_parameter_substitution(
         &self,
         default_id: Id,
         type_id: TypeId,
     ) -> HashMap<TypeId, TypeId> {
-        mono::trait_parameter_substitution(self.program, None, default_id, type_id)
+        let mut substitution =
+            mono::trait_parameter_substitution(self.program, None, default_id, type_id);
+        let declaring_trait = self
+            .program
+            .traits
+            .iter()
+            .find(|(_, trait_)| trait_.declarations.values().any(|id| *id == default_id))
+            .map(|(trait_id, _)| *trait_id);
+        if let Some(trait_id) = declaring_trait
+            && let Some(implementation) =
+                impl_select::select_implementation(self.program, None, type_id, trait_id)
+        {
+            impl_select::bind_provider_binders(
+                self.program,
+                implementation.subject,
+                &mut substitution,
+            );
+        }
+        substitution
     }
 
     /// Composes `entries` onto the substitution in force and installs the

@@ -276,6 +276,14 @@ written down.
 <!-- family: fix -->
 **Native builds a bare variant of a generic user enum: `let n: Maybe<i32> = Maybe::Nothing;` was refused by name as "an unbound generic type parameter (parameter 1 of enum `Maybe`)" under its own annotation, and builds and prints node's bytes now — as do `show(Maybe::Nothing)`, a generic function's `Maybe::Nothing` return, a list literal, an assignment and `Some(Maybe::Nothing)`.** A bare variant minted its enum at no arguments and never asked the position it was written into. It takes the constructor's rule now — the type recorded at the site, else the position's — and a constructor's payload is a position of its own, read off the position's closed type rather than the site's record (which can name the wrong parameter inside a generic instance). `None` had built all along: `Option` is Rust's own enum, whose path names no instance. The JS backend is unchanged. The native copy census moves by scalar payloads alone (a natively `Copy` payload is not a counted copy; one `.clone()` of a `usize` drops). Pin: `a_bare_variant_of_a_generic_enum_is_identical_on_both_backends`. Tracker F76.
 
+---
+
+<!-- family: fix -->
+---
+
+<!-- family: fix -->
+**Native builds observe a generic source whose `Source` argument is written in its own binder: `impl W<type P> with Source<Option<P>>` then `w.effect(|n| ..)` was refused by name as "an unbound generic type parameter (parameter 1 of struct `W`)", and builds and prints node's bytes now — `effect`, `effect_on_change` and the rest of `Flow`'s defaults, over one- and two-parameter sources and a `List` argument.** A default reached through the `Flow` blanket binds the blanket's `T` from the receiver's `Source` impl, and that answer is written in the PROVIDER's binder (`Option<P>`); the provider's binders were bound where a member is dispatched (F58) and not where a default is specialized, so `P` stayed open. It blocked observing std's `StoreSome<P>` natively. The JS backend is unchanged. Pin: `a_default_over_a_source_written_in_its_providers_binder_is_identical_on_both_backends`. Tracker F75.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->

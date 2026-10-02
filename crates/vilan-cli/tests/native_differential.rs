@@ -8715,3 +8715,30 @@ fn a_bare_variant_of_a_generic_enum_is_identical_on_both_backends() {
         "a bare variant of a generic enum must close from its position and print the same"
     );
 }
+
+/// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
+/// source whose `Source` argument is written in the source impl's own binder
+/// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds
+/// natively; it was refused as "an unbound generic type parameter (parameter
+/// 1 of struct `W`)". The default's substitution binds the blanket's `T` from
+/// the receiver's `Source` impl, as `Option<P>` in that PROVIDER's binder, and
+/// nothing bound `P`: F58 had added the provider's binders where a MEMBER is
+/// dispatched (`on_change`, `start`), not where a default is specialized
+/// (`effect`, `effect_on_change`). The probe covers both, a two-parameter
+/// source whose argument is in its second parameter, a list argument, and the
+/// pipes (`derive(..).memo()`, `sample()`). It blocked observing std's
+/// `StoreSome<P>` natively.
+#[test]
+fn a_default_over_a_source_written_in_its_providers_binder_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_provider_binder_defaults.vl"),
+        include_str!("native/provider_binder_defaults.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_provider_binder_defaults.vl"),
+        Verdict::Identical,
+        "a Flow default over a source written in its provider's binder must build and run the same"
+    );
+}
