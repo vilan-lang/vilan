@@ -352,6 +352,17 @@ fn every_example_builds() {
                 failures.push(failure);
                 continue;
             }
+            // B519: a bundle that reads an A134 mirror table it never declares
+            // builds clean and throws `ReferenceError` at the first handle-stub
+            // call, so no example may ship one.
+            let dangling = support::mirror_tables::dangling_in_tree(&staged);
+            if !dangling.is_empty() {
+                failures.push(format!(
+                    "{directory}: emitted code reads mirror tables it never declares:\n{}",
+                    dangling.join("\n")
+                ));
+                continue;
+            }
             let _ = std::fs::remove_dir_all(&staged);
         } else {
             // The staged tree is deliberately left behind for a failure: it is

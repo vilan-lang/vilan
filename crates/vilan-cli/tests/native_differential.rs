@@ -8895,6 +8895,44 @@ fn an_in_process_mirror_program_is_identical_on_both_backends() {
     );
 }
 
+/// B519: a `[service(Client)]` declared in a module the entry IMPORTS. Its
+/// generated module-level `let __mirrors_StoreClient_<method>` tables are the
+/// module's bindings on both backends — natively the table was an E0425
+/// ("not found in this scope") in the emitted Rust, on JS a `ReferenceError`
+/// at the first stub call — and the stubs dedup per origin the same way.
+#[test]
+fn b519_a_service_in_an_imported_module_is_identical_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        ("b519_store.vl", include_str!("native/b519_store.vl")),
+        (
+            "native_probe_b519_imported_service.vl",
+            include_str!("native/b519_imported_service.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+    }
+    assert_eq!(
+        compare(&staged, "native_probe_b519_imported_service.vl"),
+        Verdict::Identical,
+        "a service in an imported module must build and print the same on both backends"
+    );
+    let output = vilan(&staged)
+        .args([
+            "run",
+            "--backend",
+            "rust",
+            "native_probe_b519_imported_service.vl",
+        ])
+        .output()
+        .expect("run the probe natively");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "same-origin:true\nsame-args:true\nother-args:false\nunleased:calls=0\ndone\n",
+        "one mirror per origin, natively"
+    );
+}
+
 /// F79: a `mut` pattern binder — `Some(mut p)` in a `match`, `mut (c, d) =
 /// (3, 4)`, an `is` capture, a generic body's `match` — is emitted `mut`, so a
 /// `&mut` of it builds (rustc E0596 before), and the matched place a program

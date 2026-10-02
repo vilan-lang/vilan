@@ -1,0 +1,40 @@
+// B519: the A134 store as its OWN module. `[service(StoreClient)]` writes one
+// module-level `let __mirrors_StoreClient_<method>` per handle stub; outside
+// the entry file it was never declared. Imported by `b519_imported_service.vl`
+// (both backends) and by `reactive_channels.rs`'s B519 pins.
+import std::hash_map::HashMap;
+import std::reactive::{ Signal, SignalCell };
+import std::shared::Shared;
+
+export *;
+
+[service(StoreClient)]
+struct Store {
+	channels: SignalCell<List<i32>>,
+	names: Shared<HashMap<i32, SignalCell<str>>>,
+	calls: Shared<i32>,
+}
+
+impl Store {
+	[rpc]
+	fun create_channel(self, id: i32, name: str): i32 {
+		self.channels.update(|&mut ids| {
+			ids.push(id);
+		});
+		let cell: SignalCell<str> = Signal::new(name);
+		self.names.write().insert(id, cell);
+		id
+	}
+
+	[rpc]
+	fun get_channels(self): SignalCell<List<i32>> {
+		self.calls.write() += 1;
+		self.channels
+	}
+
+	[rpc]
+	fun get_name(self, id: i32): Option<SignalCell<str>> {
+		self.calls.write() += 1;
+		self.names.read().get(id)
+	}
+}

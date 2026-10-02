@@ -571,13 +571,31 @@ fn run_program_warning(tag: &str, source: &str, warning: &str) -> String {
 }
 
 fn run_program_capturing(tag: &str, source: &str) -> (String, String) {
+    run_package_capturing(tag, &[("src/main.vl", source)])
+}
+
+/// [`run_program`] over a PACKAGE: `files` (path relative to the project root →
+/// contents) beside the manifest, `src/main.vl` among them — for the pins whose
+/// claim is about a service declared in a module the entry imports (B519).
+fn run_package(tag: &str, files: &[(&str, &str)]) -> String {
+    let (stdout, stderr) = run_package_capturing(tag, files);
+    assert!(
+        stderr.trim().is_empty(),
+        "the program wrote to stderr:\n{stderr}\n--- stdout ---\n{stdout}"
+    );
+    stdout
+}
+
+fn run_package_capturing(tag: &str, files: &[(&str, &str)]) -> (String, String) {
     let dir = temp_project(tag);
     write(
         &dir,
         "vilan.toml",
         "[package]\nname = \"app\"\ntarget = \"node\"\n",
     );
-    write(&dir, "src/main.vl", source);
+    for (relative, contents) in files {
+        write(&dir, relative, contents);
+    }
     let liveness = support::run_liveness();
     let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", dir.to_str().unwrap()])
@@ -2999,6 +3017,123 @@ fn a134_two_stub_calls_for_one_origin_are_one_mirror_and_one_subscribe() {
             "done",
         ],
         "a stub call must be idempotent per origin; got:\n{stdout}"
+    );
+}
+
+// --- B519: the service in a module the entry IMPORTS -------------------------
+
+/// The A134 store, as its own module: the shape every multi-file app writes and
+/// no A134 pin did — they were all single-file, which is why none saw a table
+/// the generated code read and the bundle never declared.
+const B519_STORE_MODULE: &str = include_str!("native/b519_store.vl");
+
+const B519_IMPORTING_MAIN: &str = include_str!("native/b519_imported_service.vl");
+
+/// B519, RUN: A134's identity claims with the service declared in a module
+/// the entry imports. The table each stub reads (`__mirrors_StoreClient_*`)
+/// was never declared there, so the first stub call threw `ReferenceError` —
+/// the owner's `__mirrors_KoltClient_get_channels is not defined`. Two calls
+/// for one origin are one mirror, another argument another, and minting
+/// asked nothing of the server.
+#[test]
+fn b519_a_service_in_an_imported_module_mints_one_mirror_per_origin() {
+    let stdout = run_package(
+        "b519_imported_service",
+        &[
+            ("src/main.vl", B519_IMPORTING_MAIN),
+            ("src/b519_store.vl", B519_STORE_MODULE),
+        ],
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "same-origin:true",
+            "same-args:true",
+            "other-args:false",
+            "unleased:calls=0",
+            "done",
+        ],
+        "a stub of a service declared in an imported module must be idempotent \
+         per origin; got:\n{stdout}"
+    );
+}
+
+/// B519, the FULL-STACK shape: `vilan build .` on a two-entry package whose
+/// service lives in a shared module. Each leg's output declares every mirror
+/// table it reads (the generic check every example and golden is also held
+/// to), and the client leg — the one whose stubs read them — reads at least
+/// one, so the claim is not vacuous.
+#[test]
+fn b519_both_legs_of_a_fullstack_build_declare_every_mirror_table_they_read() {
+    let dir = temp_project("b519_fullstack");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"mir\"\ndefault-entry = \"client\"\n\n\
+         [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/b519_store.vl", B519_STORE_MODULE);
+    write(
+        &dir,
+        "src/client.vl",
+        r#"import std::io::print;
+import std::json::json_codec;
+import pkg::b519_store::StoreClient;
+
+fun main() {
+	match StoreClient::connect("/", json_codec()) {
+		Ok(let client) => {
+			print(client.get_channels().get().is_some());
+			print(client.get_name(1).get().is_some());
+		}
+		Err(let failure) => print("no"),
+	}
+}
+"#,
+    );
+    write(
+        &dir,
+        "src/server.vl",
+        r#"import std::io::print;
+import std::hash_map::HashMap;
+import std::reactive::Signal;
+import std::shared::Shared;
+import pkg::b519_store::Store;
+
+fun main() {
+	let store = Store { channels = Signal::new([]), names = Shared::new(HashMap::new()), calls = Shared::new(0) };
+	print(store.calls.read());
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "the build failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let client = std::fs::read_to_string(dir.join("dist/client.js")).expect("the client leg");
+    assert!(
+        dir.join("dist/server.mjs").is_file(),
+        "the server leg was not emitted"
+    );
+    let (read, _) = support::mirror_tables::mirror_tables(&client);
+    let dangling = support::mirror_tables::dangling_in_tree(&dir.join("dist"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        read.contains("__mirrors_StoreClient_get_channels")
+            && read.contains("__mirrors_StoreClient_get_name"),
+        "the client leg's stubs must read their tables (else this pin is vacuous): {read:?}"
+    );
+    assert!(
+        dangling.is_empty(),
+        "emitted legs read mirror tables they never declare:\n{}",
+        dangling.join("\n")
     );
 }
 

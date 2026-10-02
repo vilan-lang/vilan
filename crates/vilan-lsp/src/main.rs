@@ -1689,6 +1689,32 @@ struct LandedEntryLeg {
     leg: Option<Arc<dead_items::EntryReach>>,
 }
 
+/// The URI the client opened the file at `path` under, if it is open.
+///
+/// The documents map is keyed by the CLIENT's spelling of a file, and the
+/// package clock knows an entry only by the path the manifest declares — two
+/// spellings that agree on Linux and need not on Windows: a temp root's 8.3
+/// short name (`RUNNER~1`) against its canonical long one, or VS Code's
+/// `file:///c%3A/…` against `Url::from_file_path`'s `file:///C:/…`. Rebuilding
+/// a URI from the manifest's path and looking it up therefore missed every
+/// open entry there. Both sides are compared canonical instead, as
+/// [`Backend::location_for_path`] does: an analyzed document answers with its
+/// analysis's canonical entry path, one with no analysis yet with its URI's
+/// path canonicalized.
+fn open_document_uri(documents: &DashMap<Url, Document>, path: &Path) -> Option<Url> {
+    let path = vilan_core::util::canonical_path(path);
+    documents.iter().find_map(|document| {
+        let matches = match document.entry_path() {
+            Some(entry_path) => entry_path == path,
+            None => document
+                .key()
+                .to_file_path()
+                .is_ok_and(|own| vilan_core::util::canonical_path(own) == path),
+        };
+        matches.then(|| document.key().clone())
+    })
+}
+
 /// The leg the clock may take for `entry` instead of analyzing it (M104), or
 /// `None` when it must analyze.
 ///
@@ -1713,7 +1739,12 @@ fn reusable_leg(
         && document.analysis_revision() == landed.revision
         && document.text_hash == landed.text_hash
         && hash_text(&document.text) == landed.text_hash
-        && landed.std_dir == std_dir;
+        // Canonical both sides: the analysis found its std from the CLIENT's
+        // spelling of the entry and the clock from the manifest directory's
+        // canonical one, and on Windows those two walks can spell one checkout
+        // two ways (`open_document_uri`'s reason).
+        && vilan_core::util::canonical_path(&landed.std_dir)
+            == vilan_core::util::canonical_path(std_dir);
     current.then(|| landed.leg.as_deref().cloned())
 }
 
@@ -1777,15 +1808,24 @@ fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
         // (no map guard may cross an await): a buffered entry is what the
         // user is looking at, and a union taken off the stale disk copy
         // would gray on a world nobody can see.
-        let buffers: HashMap<PathBuf, String> = entries
+        //
+        // Each entry is resolved to the URI its open buffer is keyed under
+        // (`open_document_uri`) — never rebuilt from the manifest's path, which
+        // on Windows spells the same file differently from the client.
+        let open_entries: HashMap<PathBuf, Url> = entries
             .iter()
             .filter_map(|(_, path)| {
-                let uri = Url::from_file_path(path).ok()?;
-                let document = documents.get(&uri)?;
                 Some((
                     vilan_core::util::canonical_path(path),
-                    document.text.clone(),
+                    open_document_uri(&documents, path)?,
                 ))
+            })
+            .collect();
+        let buffers: HashMap<PathBuf, String> = open_entries
+            .iter()
+            .filter_map(|(path, uri)| {
+                let document = documents.get(uri)?;
+                Some((path.clone(), document.text.clone()))
             })
             .collect();
         let std_dir = discover_std_dir(&manifest_dir);
@@ -1806,7 +1846,8 @@ fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
         let mut tokens = Vec::with_capacity(entries.len());
         let world = revision.load(Ordering::SeqCst);
         for (_, entry) in &entries {
-            let entry_uri = Url::from_file_path(entry).ok();
+            let canonical_entry = vilan_core::util::canonical_path(entry);
+            let entry_uri = open_entries.get(&canonical_entry).cloned();
             // M104: an open entry whose landed analysis is of this very world
             // already answered its leg — the dependency sweep has typically
             // just re-landed it — so the clock takes that answer rather than
@@ -1831,7 +1872,7 @@ fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
             let entry = entry.clone();
             let std_dir = std_dir.clone();
             let text = buffers
-                .get(&vilan_core::util::canonical_path(&entry))
+                .get(&canonical_entry)
                 .cloned()
                 .or_else(|| std::fs::read_to_string(&entry).ok());
             let schedule_for_leg = Arc::clone(&schedule);
@@ -9723,31 +9764,69 @@ mod dead_item_clock_tests {
     async fn an_open_entrys_landed_analysis_answers_its_union_leg() {
         let (directory, shared) = workspace();
         let client = Url::from_file_path(directory.join("src/client.vl")).expect("a file url");
+        open_entry_leg_is_reused(&client, &shared).await;
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The same claim with the package opened through a SPELLING of its
+    /// directory that is not the canonical one — a symlink here; on Windows
+    /// the temp root's 8.3 short name (`RUNNER~1`), or an editor's
+    /// lower-case, percent-encoded drive (`file:///c%3A/…`). The clock knows
+    /// an entry by the manifest's canonical path and the documents map by the
+    /// client's URI; it rebuilt a URI from the first and looked it up in the
+    /// second, missed, and analyzed the open entry again (`(2, 0)`, red on
+    /// `windows-latest` for the pin above). It resolves the entry to the open
+    /// document's own URI now, canonical against canonical.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_open_entry_reached_by_another_spelling_still_answers_its_union_leg() {
+        let (directory, _) = workspace();
+        let spelled = directory.with_file_name(format!(
+            "{}-link",
+            directory
+                .file_name()
+                .expect("a scratch directory name")
+                .to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(&spelled);
+        std::os::unix::fs::symlink(&directory, &spelled).expect("a symlinked spelling");
+        let client = Url::from_file_path(spelled.join("src/client.vl")).expect("a file url");
+        let shared = Url::from_file_path(spelled.join("src/shared.vl")).expect("a file url");
+        open_entry_leg_is_reused(&client, &shared).await;
+        let _ = std::fs::remove_file(&spelled);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// M104's claim over `client` (an open entry) and `shared` (the module
+    /// both entries' union paints): after an edit to `shared`, the clock
+    /// analyzes only the entry that is NOT open and takes the open one's leg
+    /// from its landed analysis.
+    async fn open_entry_leg_is_reused(client: &Url, shared: &Url) {
         let (service, _socket) = backend();
         let server = service.inner();
 
-        server.did_open(open_params(&client, CLIENT)).await;
-        server.did_open(open_params(&shared, SHARED)).await;
+        server.did_open(open_params(client, CLIENT)).await;
+        server.did_open(open_params(shared, SHARED)).await;
         assert!(
-            wait_for_grays(server, &shared, true).await,
+            wait_for_grays(server, shared, true).await,
             "the package clock lands a union and `used_by_nobody` fades",
         );
         let before = server.analyses.union_legs();
 
         let edited = format!("{SHARED}\nfun just_typed() {{\n\tprint(\"t\");\n}}\n");
         server
-            .did_change(whole_file_change(&shared, 2, &edited))
+            .did_change(whole_file_change(shared, 2, &edited))
             .await;
         assert!(
-            wait_for_grays(server, &shared, false).await,
+            wait_for_grays(server, shared, false).await,
             "the edit withdraws the paint",
         );
         assert!(
-            wait_for_grays(server, &shared, true).await,
+            wait_for_grays(server, shared, true).await,
             "the editor came to rest, the union recomputed, and the gray is back",
         );
         assert_eq!(
-            grays(server, &shared),
+            grays(server, shared),
             2,
             "the same union as an analyzed leg gives: `used_by_nobody` and the \
              just-typed `just_typed`, both reached by no entry",
@@ -9760,7 +9839,6 @@ mod dead_item_clock_tests {
              `client.vl`'s leg from the analysis the dependency sweep had just landed \
              — {before:?} -> {after:?} (analyzed, reused)",
         );
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[tokio::test]

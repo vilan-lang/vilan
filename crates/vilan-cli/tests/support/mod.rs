@@ -10,6 +10,7 @@
 
 pub mod boot;
 pub mod ladder;
+pub mod mirror_tables;
 pub mod port;
 
 /// The directory this test binary's scratch goes in — cargo's own

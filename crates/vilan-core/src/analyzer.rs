@@ -4866,6 +4866,14 @@ pub struct Analyzer<'src> {
     // bare-trait *value* receiver elsewhere, which has no concrete type and is
     // rejected.
     trait_body_scopes: HashSet<Id>,
+    /// B519: each macro expansion's walk scope → the module scope its
+    /// definitions are hoisted into ([`Analyzer::walk_generated_items`]). A
+    /// generated item is DECLARED in the expansion's child scope (so the
+    /// expansion's imports stay its own), but it belongs to the module: a
+    /// generated module-level `let` is a module-level binding exactly as a
+    /// written one is. Every question "is this binding module-level" resolves a
+    /// declaring scope through this map first ([`expansion_home_scope`]).
+    generated_expansion_scopes: HashMap<Id, Id>,
     // Type ids written where a TRAIT is the legitimate spelling — a generic
     // parameter's bound, a tuple bound's element bound, a supertrait, and an
     // `impl` subject (`impl Iterator<type T> with Iterable<T>` blankets over a
@@ -6757,6 +6765,7 @@ impl<'src> Analyzer<'src> {
             variables: IndexMap::default(),
             walking_trait_body: false,
             trait_body_scopes: HashSet::default(),
+            generated_expansion_scopes: HashMap::default(),
             trait_position_type_ids: HashSet::default(),
             bound_position_type_ids: HashSet::default(),
             path_head_type_ids: HashSet::default(),
@@ -12915,7 +12924,12 @@ impl<'src> Analyzer<'src> {
             .filter(|variable_id| {
                 self.expr_id_to_scope_id_map
                     .get(variable_id)
-                    .is_some_and(|scope_id| module_scopes.contains(scope_id))
+                    .is_some_and(|scope_id| {
+                        module_scopes.contains(&expansion_home_scope(
+                            &self.generated_expansion_scopes,
+                            *scope_id,
+                        ))
+                    })
             })
             .collect()
     }
@@ -23297,6 +23311,8 @@ impl<'src> Analyzer<'src> {
     /// own references resolve through the child scope's parent fallthrough.
     fn walk_generated_items(&mut self, generated: &'src NodeList<'src>, module_scope_id: Id) {
         let expansion_scope_id = self.create_owned_scope(Some(module_scope_id)).id;
+        self.generated_expansion_scopes
+            .insert(expansion_scope_id, module_scope_id);
         self.walk_expr_nodes(generated, expansion_scope_id);
         for item in generated {
             self.hoist_generated_declarations(&item.0, expansion_scope_id, module_scope_id);
@@ -60984,6 +61000,10 @@ pub struct Program<'src> {
     /// it. The import walk is what consults it to resolve a path; the editor
     /// reads it to answer for a module that names no file of its own (E152).
     pub module_children_scopes: HashMap<Id, Id>,
+    /// B519: each macro expansion's walk scope → the module scope it hoists
+    /// into (the analyzer's table of the same name). Read through
+    /// [`expansion_home_scope`] by [`Program::module_level_bindings`].
+    pub generated_expansion_scopes: HashMap<Id, Id>,
     pub reference_count: HashMap<Id, u32>,
     pub scopes: IndexMap<Id, Scope<'src>>,
     pub span_map: HashMap<Id, &'src Span>,
@@ -62059,7 +62079,12 @@ impl<'src> Program<'src> {
             let Some(scope_id) = self.entity_scope_map.get(variable_id) else {
                 continue;
             };
-            if let Some(slot) = module_slot.get(scope_id) {
+            // B519: a macro-generated `let` is declared in its expansion's
+            // scope, a child of the module's; it is the module's binding all
+            // the same. (The entry's half needs no help: its generated names
+            // are hoisted into the global scope `from_names` reads.)
+            let scope_id = expansion_home_scope(&self.generated_expansion_scopes, *scope_id);
+            if let Some(slot) = module_slot.get(&scope_id) {
                 by_module[*slot].push(*variable_id);
             }
         }
@@ -62070,6 +62095,21 @@ impl<'src> Program<'src> {
         bindings.retain(|id| seen.insert(*id));
         bindings
     }
+}
+
+/// B519: the scope a declaration in `scope_id` BELONGS to — the module scope
+/// a macro expansion hoists into when `scope_id` is that expansion's walk
+/// scope, else `scope_id` itself. The expansion scope exists so the
+/// expansion's imports stay its own; it is not a level of nesting, and a
+/// binding declared at its top level is a module-level binding. Followed to a
+/// fixed point, so an expansion walked inside another one answers the
+/// outermost module either way.
+fn expansion_home_scope(generated_expansion_scopes: &HashMap<Id, Id>, scope_id: Id) -> Id {
+    let mut scope_id = scope_id;
+    while let Some(home) = generated_expansion_scopes.get(&scope_id) {
+        scope_id = *home;
+    }
+    scope_id
 }
 
 /// Lexes and parses a Vilan source file into an AST, leaking the source and the
@@ -70875,6 +70915,7 @@ fn analyze_over_world<'src>(
         import_aliases: std::mem::take(&mut analyzer.import_aliases),
         import_alias_spans: std::mem::take(&mut analyzer.import_alias_spans),
         module_children_scopes: std::mem::take(&mut analyzer.module_children_scopes),
+        generated_expansion_scopes: std::mem::take(&mut analyzer.generated_expansion_scopes),
         prelude_bindings: analyzer.prelude_entry_bindings.clone(),
         expr_types,
         hint_labels,
