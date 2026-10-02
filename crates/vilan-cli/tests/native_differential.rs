@@ -8894,3 +8894,22 @@ fn an_in_process_mirror_program_is_identical_on_both_backends() {
         "one edge per source, mirrors included, natively (A146)"
     );
 }
+
+/// F79: a `mut` pattern binder — `Some(mut p)` in a `match`, `mut (c, d) =
+/// (3, 4)`, an `is` capture, a generic body's `match` — is emitted `mut`, so a
+/// `&mut` of it builds (rustc E0596 before), and the matched place a program
+/// reads again keeps its value.
+#[test]
+fn a_mut_pattern_binder_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_mut_pattern_binders.vl"),
+        include_str!("native/mut_pattern_binders.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_mut_pattern_binders.vl"),
+        Verdict::Identical,
+        "a `mut` pattern binder must be mutable natively and print the same"
+    );
+}

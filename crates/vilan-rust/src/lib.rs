@@ -6221,7 +6221,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) -> Result<String, Error> {
         match pattern {
             ExprPattern::Wildcard => Ok("_".to_string()),
-            ExprPattern::Binding(id) => Ok(self.binding_name(*id)),
+            // F79: a `mut` binder — `Some(mut p)`, `mut (c, d) = ..` — is a
+            // `mut` Rust binder, or a `&mut p` of it is refused (E0596).
+            ExprPattern::Binding(id) => Ok(
+                if self
+                    .program
+                    .variables
+                    .get(id)
+                    .is_some_and(|variable| variable.mutable)
+                {
+                    format!("mut {}", self.binding_name(*id))
+                } else {
+                    self.binding_name(*id)
+                },
+            ),
             // A `str` LITERAL pattern (F20). A vilan `str` is an `Rc<str>` and
             // its literal emits `vilan_rt::str_new("..")`, which is a function
             // CALL and no pattern at all — `parse-bool.vl` matches `"true"` /

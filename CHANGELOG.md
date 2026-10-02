@@ -293,6 +293,11 @@ written down.
 <!-- family: fix -->
 **Native builds an in-process `duplex_pair` program that mirrors a cell and a keyed cell (`client.source(..)`, `client.attached_keyed_source(..)`), which was refused by name as "an unresolved type".** Two bindings in `std::rpc`'s `keyed_mirror_of` were typed only by their written annotations. `Shared::new(|_key| {})` under `Shared<|Hash| void>`: the analyzer leaves a closure parameter nothing constrains untyped, so a closure literal now takes such a parameter's type from the closure type it is rendered into. And `Shared::new([])` under `Shared<List<KeyLease>>`, whose first use read a field of an element before rustc had settled the `Vec<_>` (E0282): a `Shared` cell around an empty list literal has its binding's type written, as an empty literal always had (when that type is closed). A body that READS a parameter only its position types (`|key| print(i"{key}")`) is still refused natively — the analyzer's half, reported. The JS backend is unchanged. Pin: `an_in_process_mirror_program_is_identical_on_both_backends` (A146's mirror program, which reactive-45 pinned on JS only for this, and both shapes outside std). Tracker F74.
 
+---
+
+<!-- family: fix -->
+**Native builds a `&mut` of a `mut` PATTERN binder: `match Some(1) { Some(mut p) => bump(&mut p), .. }`, `mut (c, d) = (3, 4); bump(&mut c)` and an `is` capture were refused by rustc (E0596), and build and print node's bytes now.** A pattern binder was emitted without its `mut`. The JS backend is unchanged. Pin: `a_mut_pattern_binder_is_identical_on_both_backends`. Tracker F79.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->
