@@ -23,7 +23,7 @@ written down.
 -->
 
 
-## Unreleased
+## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->
 <!-- family: performance -->
