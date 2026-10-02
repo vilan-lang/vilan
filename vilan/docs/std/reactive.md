@@ -302,7 +302,9 @@ Two kinds of reactive value (A142's pipe model):
   `and_then`, `then_some`, `flatten`, `distinct`, `distinct_by`, `combine` —
   a description with no `get`. It is consumed exactly once: sealed with
   `.memo()`, `.cell()`, the `_global` twins or `.sample()`, or handed to a
-  consumer (an `effect`, a UI binding).
+  consumer (an `effect`, a UI binding). A pipe built as a bare statement runs nothing,
+  and the compiler WARNS about it (`unused pipe`) — whichever function built it,
+  std's or your own; `let _ = …` says the drop is meant.
 
 **`Flow`** is what both are: every `Source` through a blanket, and every pipe
 stage directly. The consumers and the combinators live there, and every one of

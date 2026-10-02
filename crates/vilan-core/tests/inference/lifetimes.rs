@@ -2759,3 +2759,110 @@ fn a142_s2_scoped_effect_is_a_deprecated_alias_of_effect() {
         "scoped_effect warns as deprecated"
     );
 }
+
+// --- F60 (R-d door (a)): a pipe dropped unconsumed WARNS ----------------------
+//
+// A pipe node runs nothing until a consumer starts it, so a pipe built as a bare
+// statement is a mistake the type can name: every pipe node type (anything std's
+// `Pipe`/`CollPipe` is implemented for, and a `dyn Pipe`) is must-use. It warns —
+// a dropped value is not an error anywhere else in the language — and still
+// builds on both backends (`native_differential`'s dropped-pipes probe).
+
+const F60_UNUSED_PIPE: &str = "unused pipe: a pipe runs nothing until it is consumed";
+
+#[test]
+fn f60_a_dropped_pipe_warns_whichever_function_built_it() {
+    // One warning per dropped pipe statement: a `derive`, a `distinct_by`, a
+    // chain, the free `derive`, a `switch`, an `Option` `flatten`, the
+    // collection pipes (`coll`, `coll().map`), a transient's `latest()` (a
+    // `dyn Pipe`), and an application's own function that answers a pipe. Red
+    // before F60: none of them said anything.
+    let found = warnings(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Derive, Signal, SignalCell, Source, derive };
+        import std::transient::{ Transient, TransientSource };
+
+        fun doubled(source: SignalCell<i32>): Derive<SignalCell<i32>, i32, i32> {
+            source.derive(|value| value * 2)
+        }
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            count.derive(|value| value * 2);
+            count.distinct_by(|value| value);
+            count.derive(|value| value * 2).derive(|value| i"{value}");
+            derive(|| count.track() + 1);
+            let first: SignalCell<i32> = Signal::new(1);
+            let outer: SignalCell<SignalCell<i32>> = Signal::new(first);
+            outer.switch(|inner| inner);
+            let maybe: SignalCell<Option<SignalCell<i32>>> = Signal::new(Some(first));
+            maybe.flatten();
+            let items: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+            items.coll();
+            items.coll().map(|x| x * 2);
+            let fetched: Transient<i32, str> = count.derive(|x| async x).transient_global();
+            fetched.latest();
+            doubled(count);
+        }
+
+        main();
+        "#,
+    );
+    let dropped = found
+        .iter()
+        .filter(|message| message.starts_with(F60_UNUSED_PIPE))
+        .count();
+    assert_eq!(dropped, 10, "{found:#?}");
+}
+
+#[test]
+fn f60_a_consumed_sealed_or_discarded_pipe_does_not_warn() {
+    // The controls: a sealed pipe (`.memo()` answers a cell, not a pipe), one
+    // consumed by an `effect`, one bound with `let _`, one returned, a source
+    // (`Signal::new`), and an application's OWN trait named `Pipe` — none warns.
+    let found = warnings(
+        r#"
+        import std::reactive::{ Derive, Owner, Signal, SignalCell, Source, run_with_owner };
+
+        trait Pipe {
+            fun go(self): i32;
+        }
+
+        struct Mine {}
+
+        impl Mine with Pipe {
+            fun go(self): i32 { 1 }
+        }
+
+        fun make(): Mine {
+            Mine {}
+        }
+
+        fun doubled(source: SignalCell<i32>): Derive<SignalCell<i32>, i32, i32> {
+            source.derive(|value| value * 2)
+        }
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                count.derive(|value| value + 1).memo();
+                count.derive(|value| value + 1).effect(|value: i32| print(value));
+            });
+            let _ = count.derive(|value| value * 2);
+            Signal::new(3);
+            make();
+            let _kept = doubled(count);
+        }
+
+        main();
+        "#,
+    );
+    assert!(
+        !found
+            .iter()
+            .any(|message| message.starts_with(F60_UNUSED_PIPE)),
+        "{found:#?}"
+    );
+}
