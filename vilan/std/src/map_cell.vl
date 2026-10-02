@@ -39,10 +39,9 @@ import pkg::reactive::{
 	Subscriber,
 	Subscription,
 	also_releasing,
-	fresh_id,
 	observe,
 };
-import pkg::shared::Shared;
+import pkg::shared::{ Shared, fresh_identity };
 
 // === The per-key slot table (§4, Q4, Q5) =====================================
 
@@ -85,7 +84,7 @@ export impl KeySlots {
 		match self.identities.read().get(hash) {
 			Some(let held) => held,
 			None => {
-				let minted = fresh_id();
+				let minted = fresh_identity();
 				self.identities.write().insert(hash, minted);
 				minted
 			},

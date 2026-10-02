@@ -61,11 +61,24 @@ use crate::node::{
     CssBody, CssDeclaration, CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem,
     EnumVariant, ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
     GenericParameters, If, IfSpelling, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr,
-    StructField, TupleBound,
+    ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, Reactivity,
+    ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
+
+/// Whether `text` is spelled like an identifier: a letter or `_`, then letters,
+/// digits and `_` — what `[reactive(name = "..")]` may name, since the name
+/// becomes a method.
+fn is_identifier_text(text: &str) -> bool {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) if first.is_alphabetic() || first == '_' => {
+            characters.all(|character| character.is_alphanumeric() || character == '_')
+        }
+        _ => false,
+    }
+}
 
 /// Every `(impl …)` selector element's span in an import/use tree — what the
 /// `use` refusal reports at.
@@ -1425,6 +1438,9 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "internal",
     "resource",
     "hint",
+    // A142 S7: a struct field's store knobs, `[reactive(coarse)]` and
+    // `[reactive(name = "..")]` — a field-position attribute, like `expose`.
+    "reactive",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -7033,7 +7049,20 @@ impl<'a, 'src> Parser<'a, 'src> {
         let internal = self.parse_internal_attribute();
         // B413: a FIELD is no type declaration; refused, and parsed past.
         self.refuse_misplaced_resource_attribute();
+        // A142 S7: the store's knobs, on either side of `[expose]` — both are
+        // about what the field becomes elsewhere, and neither outranks the other.
+        let reactivity = self.parse_reactive_attribute();
         let exposed = self.eat_expose_attribute();
+        let reactivity = match reactivity {
+            Some(written) => written,
+            None => match self.parse_reactive_attribute() {
+                Some(written) => Reactivity {
+                    after_expose: true,
+                    ..written
+                },
+                None => Reactivity::default(),
+            },
+        };
         let name_start = self.position;
         // B414 S4: a declared field is a member position — any word.
         let name = self.eat_member_name()?;
@@ -7043,7 +7072,121 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
-        Some(((name, type_, exposed, internal), self.span_from(start)))
+        Some((
+            (name, type_, exposed, internal, reactivity),
+            self.span_from(start),
+        ))
+    }
+
+    /// `[reactive(coarse)]`, `[reactive(name = "nick")]`, or both, comma-separated
+    /// (tracker A142 S7, `proposal/store.md` Q4 and Q9): a struct field's store
+    /// knobs, read by `[derive(Storable)]` and by nothing else. `None` when no
+    /// such attribute leads.
+    ///
+    /// COMMITTED once `[reactive` is read: an argument this does not know, or a
+    /// `name` that is not an identifier, is refused where it stands and the
+    /// attribute is parsed past, rather than rolled back into "expected a field
+    /// name" at the bracket.
+    fn parse_reactive_attribute(&mut self) -> Option<Reactivity<'src>> {
+        self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("reactive")) {
+                return None;
+            }
+            parser.bump();
+            Some(())
+        })?;
+        let mut reactivity = Reactivity::default();
+        if self.expect_ctrl('(').is_none() {
+            self.refuse_reactive_argument(self.span_from(self.position));
+            self.skip_past_attribute();
+            return Some(reactivity);
+        }
+        loop {
+            let argument_start = self.position;
+            if self.peek() == Some(&Token::Ident("coarse")) {
+                self.bump();
+                reactivity.coarse = true;
+            } else if self.peek() == Some(&Token::Ident("name")) {
+                self.bump();
+                let literal_start = self.position;
+                let written = if self.eat_op("=") {
+                    match self.peek() {
+                        Some(Token::String(text)) => {
+                            let text = *text;
+                            self.bump();
+                            Some(text)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                match written {
+                    Some(text) if is_identifier_text(text) => reactivity.name = Some(text),
+                    Some(_) => {
+                        self.errors.push(ParseError {
+                            span: self.span_from(literal_start),
+                            reason: ParseErrorReason::Rule(
+                                "`[reactive(name = \"..\")]` names the field's PROJECTION — a \
+                                 method on the store handle — so it must be an identifier: \
+                                 letters, digits and `_`, not starting with a digit",
+                            ),
+                            context: Vec::new(),
+                            hint: None,
+                        });
+                    }
+                    None => {
+                        self.refuse_reactive_argument(self.span_from(argument_start));
+                        self.skip_past_attribute();
+                        return Some(reactivity);
+                    }
+                }
+            } else {
+                self.bump();
+                self.refuse_reactive_argument(self.span_from(argument_start));
+                self.skip_past_attribute();
+                return Some(reactivity);
+            }
+            if !self.eat_ctrl(',') {
+                break;
+            }
+        }
+        if self.expect_ctrl(')').is_none() || self.expect_ctrl(']').is_none() {
+            self.refuse_reactive_argument(self.span_from(self.position));
+            self.skip_past_attribute();
+        }
+        Some(reactivity)
+    }
+
+    /// The one refusal `[reactive(..)]`'s arguments share.
+    fn refuse_reactive_argument(&mut self, span: Span) {
+        self.errors.push(ParseError {
+            span,
+            reason: ParseErrorReason::Rule(
+                "`[reactive(..)]` on a field takes `coarse` (one slot, compared whole, even when \
+                 the field's type derives `Storable`) and `name = \"..\"` (the name its store \
+                 projection is generated under), comma-separated: `[reactive(coarse)]`, \
+                 `[reactive(name = \"nick\")]`",
+            ),
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// Skip to just past the `]` that closes the attribute being refused, so the
+    /// field after it still parses.
+    fn skip_past_attribute(&mut self) {
+        while let Some(token) = self.peek() {
+            if token == &Token::Ctrl(']') {
+                self.bump();
+                return;
+            }
+            if token == &Token::Ctrl('}') {
+                return;
+            }
+            self.bump();
+        }
     }
 
     /// `labels [resource]? enum name generics? { variants }`. There is no
@@ -9501,6 +9644,95 @@ mod tests {
                 assert_eq!(exposed, vec![Exposure::Whole, Exposure::None]);
             }
             other => panic!("expected a struct with fields, got {other:?}"),
+        }
+    }
+
+    /// A142 S7: `[reactive(..)]`'s two arguments, alone and together, on either
+    /// side of `[expose]` — recorded on the field's fifth slot, which the
+    /// `Storable` derive reads.
+    #[test]
+    fn a_reactive_attribute_is_recorded_on_its_field() {
+        let source = "struct S { [reactive(coarse)] a: i32, [reactive(name = \"verb\")] get: str, \
+                      [reactive(coarse, name = \"all\")] [expose] b: C, \
+                      [expose] [reactive(name = \"c2\")] c: C, d: i32 }";
+        match only_item(source) {
+            Node::Struct(_, _, _, _, Some(fields), _) => {
+                let knobs: Vec<Reactivity> = fields.0.iter().map(|field| field.0.4).collect();
+                assert_eq!(
+                    knobs,
+                    vec![
+                        Reactivity {
+                            coarse: true,
+                            name: None,
+                            after_expose: false,
+                        },
+                        Reactivity {
+                            coarse: false,
+                            name: Some("verb"),
+                            after_expose: false,
+                        },
+                        Reactivity {
+                            coarse: true,
+                            name: Some("all"),
+                            after_expose: false,
+                        },
+                        Reactivity {
+                            coarse: false,
+                            name: Some("c2"),
+                            after_expose: true,
+                        },
+                        Reactivity::default(),
+                    ]
+                );
+                let exposed: Vec<Exposure> = fields.0.iter().map(|field| field.0.2).collect();
+                assert_eq!(
+                    exposed,
+                    vec![
+                        Exposure::None,
+                        Exposure::None,
+                        Exposure::Whole,
+                        Exposure::Whole,
+                        Exposure::None
+                    ]
+                );
+            }
+            other => panic!("expected a struct with fields, got {other:?}"),
+        }
+    }
+
+    /// A142 S7: a malformed `[reactive(..)]` is refused where it stands, and the
+    /// fields around it still parse — the refusal is the attribute's, not
+    /// "expected a field name".
+    #[test]
+    fn a_malformed_reactive_attribute_is_refused_and_parsed_past() {
+        for (source, expected) in [
+            (
+                "struct S { [reactive(fine)] a: i32, b: i32 }",
+                "takes `coarse`",
+            ),
+            (
+                "struct S { [reactive(name = \"1x\")] a: i32, b: i32 }",
+                "must be an identifier",
+            ),
+            (
+                "struct S { [reactive(name)] a: i32, b: i32 }",
+                "takes `coarse`",
+            ),
+            ("struct S { [reactive] a: i32, b: i32 }", "takes `coarse`"),
+        ] {
+            let (tree, errors) = parse(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| format!("{:?}", error.reason).contains(expected)),
+                "{source}: expected a refusal containing {expected:?}, got {errors:?}"
+            );
+            let statements = tree.map(|(statements, _)| statements).unwrap_or_default();
+            let field_count = statements.iter().find_map(|node| match &node.0 {
+                Node::Struct(_, _, _, _, Some(fields), _) => Some(fields.0.len()),
+                _ => None,
+            });
+            assert_eq!(field_count, Some(2), "{source}: both fields still parse");
         }
     }
 

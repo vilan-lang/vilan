@@ -46,6 +46,7 @@ import pkg::reactive::{
 	turn_scope,
 };
 import pkg::shared::Shared;
+import pkg::store::{ Store, StoreFlag, StoreSome };
 import pkg::style::Style;
 
 /// One attribute in an element's ordered attribute list. Ordering is INSERTION
@@ -891,6 +892,28 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 		},
 		None => {},
 	}
+}
+
+// === `when_live`: a store's variant as content (A142 S7) ====================
+//
+// `when_some` hands its body a `SignalCell<T>` of the WHOLE payload, so every
+// binding in the body is a projection of that cell and reruns on every write to
+// any of the payload's fields. A store already knows the payload's shape: this
+// rebuilds ONLY on the variant (it follows the discriminant slot,
+// `proposal/store.md` §2.6) and hands the body the payload's own `Store<P>`, whose
+// field handles wake one by one. KEEP IN STEP with the browser twin's copy
+// (browser/ui.vl).
+
+/// A store's variant as CONTENT at THIS position, with the payload's `Store<P>` in
+/// hand, read once: the body renders when the variant is live now, and nothing when
+/// it is not.
+///
+///     <aside>{when_live(presence.online(), |device| device_panel(device))}</aside>
+export fun when_live<P, C: Slot>(
+	handle: StoreSome<P>,
+	render: (sync |Store<P>| C) context owner_scope,
+): Conditional<StoreFlag, C> {
+	when(handle.live(), || render(handle.assume()))
 }
 
 // === A121: focus scopes, server side (proposal/focus-scope.md) ===============

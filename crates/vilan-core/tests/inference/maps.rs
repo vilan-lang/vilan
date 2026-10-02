@@ -651,3 +651,66 @@ fn a138_every_handle_to_one_cell_or_one_key_shares_an_identity() {
         "true\nfalse\ntrue\nfalse\nfalse\ntrue\nfalse\ntrue\ntrue\nfalse\n",
     );
 }
+
+/// A147: a per-key handle's identity and a cell's are drawn from ONE space. A
+/// tracker keeps one edge per identity across every source a body reads, so a
+/// `MapEntry` (or `SetCell::contains`) numbered from `fresh_id` — the SUBSCRIBER
+/// counter — could equal a `SignalCell`'s (`Shared::identity`'s counter) and be
+/// deduped against it: the body never heard the key. Every cell here is paired
+/// with every key in a tracked body, the numbers having been minted where the old
+/// counters overlap; each body must hear its key's write. Red with
+/// `KeySlots::identity` minting from `fresh_id`: some sums stay at the cell's
+/// value.
+#[test]
+fn a147_a_key_handle_and_a_cell_never_share_an_identity() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ MapCell, SetCell, Signal, SignalCell, Source, derive };
+
+        fun main() {
+            mut cells: List<SignalCell<i32>> = [];
+            mut i = 0;
+            for i < 30 {
+                let cell: SignalCell<i32> = Signal::new(0);
+                let _stamped = cell.identity();
+                cells.push(cell);
+                i += 1;
+            }
+            let map: MapCell<i32, i32> = MapCell::new();
+            let set: SetCell<i32> = SetCell::new();
+            mut key = 0;
+            for key < 6 {
+                map.insert(key, 0);
+                let _entry = map.at(key).identity();
+                let _member = set.contains(key).identity();
+                key += 1;
+            }
+            mut deaf = 0;
+            mut checked = 0;
+            for cell in cells {
+                key = 0;
+                for key < 6 {
+                    let k = key;
+                    let by_map = derive(|| cell.track() + map.at(k).track().unwrap_or(-100)).memo_global();
+                    let by_set = derive(|| cell.track() + if set.contains(k).track() { 1 } else { 0 }).memo_global();
+                    map.insert(k, 7);
+                    set.insert(k);
+                    if by_map.get() != 7 {
+                        deaf += 1;
+                    }
+                    if by_set.get() != 1 {
+                        deaf += 1;
+                    }
+                    map.insert(k, 0);
+                    set.remove(k);
+                    checked += 2;
+                    key += 1;
+                }
+            }
+            print(i"checked={checked} deaf={deaf}");
+        }
+        main();
+        "#,
+        "checked=360 deaf=0\n",
+    );
+}

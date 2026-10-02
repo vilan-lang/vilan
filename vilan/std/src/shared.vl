@@ -105,6 +105,22 @@ impl Shared<type T> {
 	external fun downgrade(&self): Weak<T>;
 }
 
+/// A fresh IDENTITY number — for a source whose identity is not a cell's own
+/// (`Source::identity`, A146): a map's per-key handle, a store's path.
+///
+/// **Every `identity()` in std draws from this one space**, which is the space
+/// `Shared::identity` stamps a cell from, and so a `SignalCell`'s. A tracker
+/// compares identities ACROSS sources to keep one edge per source, so a second
+/// counter collides in its dedup: a per-key identity minted from `fresh_id` (the
+/// SUBSCRIBER counter) once equalled a cell's, and a body that tracked both kept
+/// one edge and never heard the other (A147). The draw is a cell made for its stamp
+/// and dropped — the counter is the host's, reached through the one call that
+/// advances it.
+export [internal("the one identity space every `Source::identity` draws from (A147)")]
+fun fresh_identity(): i32 {
+	Shared::new(0).identity()
+}
+
 /// The optional cell, filled on first ask (tracker I8) — `Memo::get_or_insert`'s
 /// one-slot twin, for the value an app keeps in a `Shared<Option<T>>` and builds
 /// once: a module-level handle, a lazily opened connection.
