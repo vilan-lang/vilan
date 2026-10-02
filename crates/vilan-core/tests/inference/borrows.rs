@@ -11199,3 +11199,117 @@ fn b464_a_closure_view_parameter_called_with_a_view_writes_through() {
         "a `&mut` parameter takes a view; pass `&mut <place>` (there is no implicit borrow).",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B504: a binder a view is taken of is a cell wherever it is declared.
+// ---------------------------------------------------------------------------
+
+/// B504: `&binder` of a PATTERN binder — a `match` leg's capture, a
+/// destructuring `let`'s, a `for` element, an `is` capture — is a view into
+/// the binder's one-slot cell, as `&x` of a `let x` always was. The analyzer
+/// boxed every viewed scalar local, but only a `let` and a `mut` parameter
+/// were DECLARED as the cell: a capture was declared bare, so `&payload`
+/// paired the value itself (`'ally'[0]` read `a`, a number read `undefined`)
+/// and a later read of the binder took its first character.
+#[test]
+fn b504_a_pattern_binder_a_view_is_taken_of_is_a_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun show(v: &i32) {
+            print(*v);
+        }
+
+        fun show_str(v: &str) {
+            print(*v);
+        }
+
+        fun lend_match(held: Option<str>, f: |&str| void) {
+            match held {
+                Some(let payload) => {
+                    f(&payload);
+                    print(payload);
+                },
+                None => {},
+            }
+        }
+
+        fun lend_generic<T>(held: Option<T>, f: |&T| void) {
+            match held {
+                Some(let payload) => f(&payload),
+                None => {},
+            }
+        }
+
+        fun main() {
+            lend_match(Some("ally"), |&v: &str| print(*v));
+            lend_generic(Some("ally"), |&v: &str| print(*v));
+            lend_generic(Some(7), |&v: &i32| print(*v));
+            let (a, b) = (4, "five");
+            show(&a);
+            show_str(&b);
+            print(a + 1);
+            for i in [6, 7] {
+                show(&i);
+                print(i * 10);
+            }
+            if Some(9) is Some(let nine) {
+                show(&nine);
+                print(nine);
+            }
+            match Some(10) {
+                Some(let q) => {
+                    let w = &q;
+                    print(*w + q);
+                },
+                None => {},
+            }
+        }
+        "#,
+        "ally\nally\nally\n7\n4\nfive\n5\n6\n60\n7\n70\n9\n9\n20\n",
+    );
+}
+
+/// B504: a `mut` pattern binder written through `&mut` keeps the write — a
+/// `match` capture, a destructured `mut (..)`, an `is` capture — and a view
+/// taken in a GUARD names the capture's cell, which the leg declares before
+/// the guard reads it.
+#[test]
+fn b504_a_mut_pattern_binder_writes_through_its_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun bump(v: &mut i32) {
+            v = *v + 1;
+        }
+
+        fun peek(v: &i32): i32 {
+            *v
+        }
+
+        fun main() {
+            match Some(1) {
+                Some(mut p) => {
+                    bump(&mut p);
+                    print(p);
+                },
+                None => {},
+            }
+            mut (c, d) = (3, 4);
+            bump(&mut c);
+            print(c + d);
+            if Some(40) is Some(mut m) {
+                bump(&mut m);
+                print(m);
+            }
+            match Some(5) {
+                Some(let n) if peek(&n) > 4 => print(n * 2),
+                _ => print("no"),
+            }
+        }
+        "#,
+        "2\n8\n41\n10\n",
+    );
+}

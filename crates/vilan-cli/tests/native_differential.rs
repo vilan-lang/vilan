@@ -347,6 +347,59 @@ const B464_PROBE: &str = concat!(
     "\t});\n",
     "}\n",
 );
+const B504_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun show(v: &i32) {\n",
+    "\tprint(*v);\n",
+    "}\n",
+    "\n",
+    "fun show_str(v: &str) {\n",
+    "\tprint(*v);\n",
+    "}\n",
+    "\n",
+    "fun lend_match(held: Option<str>, f: |&str| void) {\n",
+    "\tmatch held {\n",
+    "\t\tSome(let payload) => {\n",
+    "\t\t\tf(&payload);\n",
+    "\t\t\tprint(payload);\n",
+    "\t\t},\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun lend_generic<T>(held: Option<T>, f: |&T| void) {\n",
+    "\tmatch held {\n",
+    "\t\tSome(let payload) => f(&payload),\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlend_match(Some(\"ally\"), |&v: &str| print(*v));\n",
+    "\tlend_generic(Some(\"ally\"), |&v: &str| print(*v));\n",
+    "\tlend_generic(Some(7), |&v: &i32| print(*v));\n",
+    "\tlet (a, b) = (4, \"five\");\n",
+    "\tshow(&a);\n",
+    "\tshow_str(&b);\n",
+    "\tprint(a + 1);\n",
+    "\tfor i in [6, 7] {\n",
+    "\t\tshow(&i);\n",
+    "\t\tprint(i * 10);\n",
+    "\t}\n",
+    "\tif Some(9) is Some(let nine) {\n",
+    "\t\tshow(&nine);\n",
+    "\t\tprint(nine);\n",
+    "\t}\n",
+    "\tmatch Some(10) {\n",
+    "\t\tSome(let q) => {\n",
+    "\t\t\tlet w = &q;\n",
+    "\t\t\tprint(*w + q);\n",
+    "\t\t},\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+);
 
 /// The programs the default suite runs — small, fast, and between them they
 /// cover every value shape S1a claims: scalars, `str`, `bool`, a struct with an
@@ -8205,5 +8258,21 @@ fn a_closure_view_parameter_takes_a_view_on_both_backends() {
         compare(&staged, "native_probe_b464.vl"),
         Verdict::Identical,
         "a closure's view parameter must write through on both backends"
+    );
+}
+
+/// B504: a view of a pattern binder — a `match` capture (concrete and
+/// generic), a destructured `let`'s, a `for` element, an `is` capture — reads
+/// the binder on both backends (`inference::borrows`' `b504_*` pins are the
+/// JS half; JS read the value's first character, or `undefined`).
+#[test]
+fn a_view_of_a_pattern_binder_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b504.vl"), B504_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b504.vl"),
+        Verdict::Identical,
+        "a view of a pattern binder must read the binder on both backends"
     );
 }
