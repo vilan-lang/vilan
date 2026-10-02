@@ -4318,6 +4318,58 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// B444: per argument position of the callee `subject_id` names, whether
+    /// the parameter there takes a VALUE (bare or `own`) — known only for a
+    /// callee that resolves to a declared function or external; empty (every
+    /// position unknown, nothing read through) for any other callee.
+    fn by_value_argument_positions(&self, subject_id: Id) -> Vec<bool> {
+        let Some(Expr::Local(callee_id)) = self.program.entity_map.get(&subject_id) else {
+            return Vec::new();
+        };
+        let parameter_ids = self
+            .program
+            .functions
+            .get(callee_id)
+            .map(|function| &function.parameters)
+            .or_else(|| {
+                self.program
+                    .external_functions
+                    .get(callee_id)
+                    .map(|external| &external.parameters)
+            });
+        parameter_ids
+            .map(|parameter_ids| {
+                parameter_ids
+                    .iter()
+                    .map(|parameter_id| {
+                        self.program
+                            .parameters
+                            .get(parameter_id)
+                            .is_some_and(|parameter| {
+                                matches!(parameter.convention, Convention::Bare | Convention::Own)
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// B444: `node`, the emission of `id`, read THROUGH when it is a scalar
+    /// view's `(base, key)` pair standing where a VALUE is read (an operand, a
+    /// by-value argument); anything else passes through untouched.
+    fn read_through_a_scalar_view(
+        &mut self,
+        id: Id,
+        node: js::Node<'src>,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        if self.emits_scalar_view_pair(id) {
+            self.emit_scalar_view_read(id, node, block)
+        } else {
+            node
+        }
+    }
+
     /// Read the value out of a scalar `(base, key)` view: `view[0][view[1]]`.
     /// A view produced by a CALL is bound to a temp first, so the two reads do
     /// not evaluate it twice; a plain binding or reference is cheap to repeat.
@@ -5172,6 +5224,7 @@ impl<'src> Transformer<'src> {
             }
             Expr::Call(id) => {
                 let function_call = self.program.function_calls.get(id).unwrap().clone();
+                let value_positions = self.by_value_argument_positions(function_call.subject_id);
                 // B452: in source order, an argument that needs statements
                 // spilling the ones before it.
                 let args = self
@@ -5190,8 +5243,19 @@ impl<'src> Transformer<'src> {
                             }
                             // An argument to an `own` parameter is copied (marked in
                             // `clone_sites`), like a binding copy.
-                            this.walk_entity(arg, block)
-                                .map(|node| this.maybe_clone(arg, node))
+                            let node = this.walk_entity(arg, block)?;
+                            // B444: a scalar view handed to a BY-VALUE parameter
+                            // is read through — the callee wants the value.
+                            let position = function_call
+                                .argument_ids
+                                .iter()
+                                .position(|argument| *argument == arg);
+                            let node =
+                                match position.and_then(|position| value_positions.get(position)) {
+                                    Some(true) => this.read_through_a_scalar_view(arg, node, block),
+                                    _ => node,
+                                };
+                            Some(this.maybe_clone(arg, node))
                         },
                     )
                     .into_iter()
@@ -5925,9 +5989,17 @@ impl<'src> Transformer<'src> {
                 }
                 // B452: the left operand runs first, so a right operand that
                 // needs statements spills it ahead of them.
+                //
+                // B444: an operand is a VALUE, so a scalar view reaching one —
+                // a `borrows` call answering `&i32`, or a binding it
+                // initialized, which the checker's `*` rule (C5.1) does not
+                // see — reads through its `(base, key)` pair, as the native
+                // backend reads it (B109). The i-string hole is this operand
+                // (`("" + part + ..)`), which printed `7,8,0` for `{first(&xs)}`.
                 let mut operands = self
                     .walk_siblings_in_order(&[*lhs_id, *rhs_id], block, |this, id, block| {
-                        Some(this.walk_entity(id, block).unwrap_or(js::Node::Void))
+                        let node = this.walk_entity(id, block).unwrap_or(js::Node::Void);
+                        Some(this.read_through_a_scalar_view(id, node, block))
                     })
                     .into_iter()
                     .map(|(_, node)| node);
@@ -6127,6 +6199,20 @@ impl<'src> Transformer<'src> {
                             self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
                             js::Node::Number(field_index.to_string(), None),
                         ),
+                        // B453: `&mut pair.1` — a tuple POSITION is a slot of the
+                        // tuple's flat array, exactly as a struct field is a slot
+                        // of its, so the view is the tuple plus the position's
+                        // flat offset. It fell to the arm below, which made a pair
+                        // of the slot's VALUE and `0`: a write through it threw
+                        // (`Cannot create property '0' on number`) and a read gave
+                        // `undefined`. A scalar view is width 1 by construction.
+                        Some(Expr::TupleIndex(subject, offset, width)) => {
+                            let (offset, _) = self.tuple_index_slot(*operand, (*offset, *width));
+                            (
+                                self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
+                                js::Node::Number(offset.to_string(), None),
+                            )
+                        }
                         // `&mut list[i]` — the checked mint (`__at_view`): the
                         // scalar `(base, key)` pair exists only for an in-bounds
                         // element, so a view of an absent element panics at the
@@ -10159,68 +10245,20 @@ impl<'src> Transformer<'src> {
         ) {
             return Some((selected.member_id, selected.impl_subject));
         }
-        // B359: the member may be declared by a SUPERTRAIT while the
-        // implementor named only a sub-trait of it — `Source<T>::sub`'s body
-        // calls `self.on_change(..)`, and a type that writes `impl C with
-        // Signal<T>` provides `Source`'s members through that clause and never
-        // names `Source`. The wanted-trait filter is a membership test on the
-        // clause's own traits, so it turns that impl down and the caller falls
-        // to the by-name lookup — which is exactly the lookup an inherent
-        // member of the same name wins. So ask the type's PROVIDED traits
-        // (most specific first) for the ones whose supertrait closure reaches
-        // `trait_id`, and take the member from there.
-        //
-        // The retries go through `impl_select::select_member` rather than
-        // `select_member_here`: a failed scoped lookup RECORDS an admission
-        // miss (E185's plumbing), and a probe that is expected to miss must not
-        // leave one behind.
-        for provided in
-            impl_select::applying_trait_ids(self.program, self.current_admitting_file, type_id)
-        {
-            if provided == trait_id || !self.trait_reaches_supertrait(provided, trait_id) {
-                continue;
-            }
-            if let Some(selected) = impl_select::select_member(
-                self.program,
-                self.current_admitting_file,
-                type_id,
-                member,
-                Some(impl_select::WantedTrait {
-                    trait_id: provided,
-                    arguments: &[],
-                }),
-            ) {
-                return Some((selected.member_id, selected.impl_subject));
-            }
-        }
-        None
-    }
-
-    /// Whether `trait_id`'s supertrait closure contains `supertrait_id` — "is
-    /// an impl of `trait_id` also an impl of `supertrait_id`'s surface"
-    /// (B359's supertrait face).
-    fn trait_reaches_supertrait(&self, trait_id: Id, supertrait_id: Id) -> bool {
-        let mut stack = vec![trait_id];
-        let mut seen = HashSet::default();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            if id == supertrait_id {
-                return true;
-            }
-            let Some(trait_) = self.program.traits.get(&id) else {
-                continue;
-            };
-            for supertrait_type_id in &trait_.supertraits {
-                if let Some(Type::Trait(super_id, _)) =
-                    self.program.type_id_to_type_map.get(supertrait_type_id)
-                {
-                    stack.push(*super_id);
-                }
-            }
-        }
-        false
+        // B359: the member may be provided through a SUB-trait's clause —
+        // [`crate::mono::select_member_through_subtraits`] has the rule, shared
+        // with the native emitter. It goes through `impl_select::select_member`
+        // rather than `select_member_here`: a failed scoped lookup RECORDS an
+        // admission miss (E185's plumbing), and a probe that is expected to
+        // miss must not leave one behind.
+        crate::mono::select_member_through_subtraits(
+            self.program,
+            self.current_admitting_file,
+            type_id,
+            trait_id,
+            member,
+        )
+        .map(|selected| (selected.member_id, selected.impl_subject))
     }
 
     /// Lowers a resolved [`Dispatch`] to its call node with `args` (the receiver

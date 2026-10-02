@@ -112,6 +112,15 @@ projection and keeps naming the receiver's storage. Together these are what
 make "a call owns its result" true, which is the premise every elision below
 rests on:
 
+The rule underneath all of these is one sentence: **a value taken out of a place
+the binding does not own is copied.** A dereference is the plainest such place —
+`*v` names the storage the view's OWNER holds — so `mut c: P = *v` copies, and a
+later `c.x = 99` never writes the caller's `P`; `Some(*v)` is a snapshot that a
+later write through `v` does not reach; and `out = *v` and a body returning `*v`
+copy alike. A constructor that KEEPS its argument (`Shared::new`, `ListCell::of`)
+declares it `own`, so a value its caller still reads afterwards is copied in
+rather than shared with the new cell.
+
 The return reads **through** a view to reach the place, because a returned
 expression can name storage without being a place: `fun grab(&self): Inner {
 &self.inner }` hands back a reference, and `fun get(h: &Holder): (i32, i32) {
@@ -237,10 +246,14 @@ deliberately second-class; a view may not outlive the thing it views:
 
 Mutating through a view writes the viewed place; reading its value
 requires an explicit `*`. A view in **value position** (passed where a
-value is expected, used as an operator's operand, or bound to a value
-type) is a compile error, never a silent coercion to the pointee (so the
-`(base, key)` representation of a scalar view can't leak); write `*v` to
-copy the value out. Iteration by view (`for e in &mut list`) binds each
+value is expected, used as an operator's operand, or bound or ASSIGNED to a
+value type — `out = v` as much as `let out: T = v`) is a compile error, never
+a silent coercion to the pointee (so the `(base, key)` representation of a
+scalar view can't leak); write `*v` to copy the value out. A closure's view
+parameter is a view by the same rule, whether the literal spells it
+(`|&mut list|`) or takes it from the closure type it is handed to: `|c|`
+passed where `|&str| void` is expected receives a `&str`, and reads it as
+`*c`. Iteration by view (`for e in &mut list`) binds each
 element as a view: assignment and field writes go through; `*e` reads the
 element. The parameter conventions:
 

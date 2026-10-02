@@ -278,7 +278,7 @@ function drain_mirror(source2, cursor, held, label, at_turn) {
 }
 function $c(value2) {
 	let subscribers = [  ];
-	return [ __shared_new(value2), __shared_new(subscribers) ];
+	return [ __shared_new(__clone(value2)), __shared_new(subscribers) ];
 }
 function $b(value2) {
 	return $c(value2);

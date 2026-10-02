@@ -54,6 +54,300 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const B473_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Base<T> {\n",
+    "\tfun name(self, value: T): str {\n",
+    "\t\t\"the default\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Sub<T> with Base<T> {\n",
+    "\tfun tag(self): i32;\n",
+    "}\n",
+    "\n",
+    "trait Deeper with Sub<i32> {}\n",
+    "\n",
+    "struct Mine {}\n",
+    "\n",
+    "impl Mine with Sub<i32> {\n",
+    "\tfun tag(self): i32 {\n",
+    "\t\t7\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Mine with Base<i32> {\n",
+    "\tfun name(self, value: i32): str {\n",
+    "\t\ti\"the override {value}\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Mine with Deeper {}\n",
+    "\n",
+    "struct Plain {}\n",
+    "\n",
+    "impl Plain with Base<i32> {}\n",
+    "\n",
+    "impl Plain with Sub<i32> {\n",
+    "\tfun tag(self): i32 {\n",
+    "\t\t8\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Walk {\n",
+    "\tfun next(&mut self): Option<i32> {\n",
+    "\t\tNone\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait SubWalk with Walk {}\n",
+    "\n",
+    "struct Count { n: i32 }\n",
+    "\n",
+    "impl Count with Walk {\n",
+    "\tfun next(&mut self): Option<i32> {\n",
+    "\t\tif self.n >= 3 {\n",
+    "\t\t\tret None;\n",
+    "\t\t}\n",
+    "\t\tself.n += 1;\n",
+    "\t\tSome(self.n)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Count with SubWalk {}\n",
+    "\n",
+    "fun through_sub<S: Sub<i32>>(value: S): str {\n",
+    "\tvalue.name(1)\n",
+    "}\n",
+    "\n",
+    "fun through_deeper<S: Deeper>(value: S): str {\n",
+    "\tvalue.name(2)\n",
+    "}\n",
+    "\n",
+    "fun qualified<S: Sub<i32>>(value: S): str {\n",
+    "\tSub::name(value, 3)\n",
+    "}\n",
+    "\n",
+    "fun walk<W: SubWalk>(mut walker: W): i32 {\n",
+    "\tmut total = 0;\n",
+    "\tfor value in walker {\n",
+    "\t\ttotal += value;\n",
+    "\t}\n",
+    "\ttotal\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(through_sub(Mine {}));\n",
+    "\tprint(through_deeper(Mine {}));\n",
+    "\tprint(qualified(Mine {}));\n",
+    "\tprint(Sub::name(Mine {}, 4));\n",
+    "\tprint(through_sub(Plain {}));\n",
+    "\tprint(walk(Count { n = 0 }));\n",
+    "}\n",
+);
+const B467_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Holder {\n",
+    "\tf: |&mut str| void,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet h = Holder { f = |&mut p| {\n",
+    "\t\tp = \"direct ok\";\n",
+    "\t} };\n",
+    "\tmut s = \"old\";\n",
+    "\t(h.f)(&mut s);\n",
+    "\tprint(s);\n",
+    "\tmut edits: List<|&mut List<i32>| void> = [];\n",
+    "\tedits.push(|&mut list| list.push(7));\n",
+    "\tprint(edits.len());\n",
+    "}\n",
+);
+const RC_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "import std::delta::ListCell;\n",
+    "\n",
+    "struct P { x: i32, tags: List<i32> }\n",
+    "\n",
+    "struct Address { city: str, zip: str }\n",
+    "\n",
+    "fun copy_out(v: &P): P {\n",
+    "\tmut c: P = *v;\n",
+    "\tc.x = 99;\n",
+    "\tc.tags.push(5);\n",
+    "\tc\n",
+    "}\n",
+    "\n",
+    "fun returned(v: &P): P {\n",
+    "\t*v\n",
+    "}\n",
+    "\n",
+    "fun snapshot(v: &mut P): Option<P> {\n",
+    "\tlet snap = Some(*v);\n",
+    "\tv.x = 7;\n",
+    "\tv.tags.push(8);\n",
+    "\tsnap\n",
+    "}\n",
+    "\n",
+    "fun with_city(a: Address, f: |&str| void) {\n",
+    "\tf(&a.city);\n",
+    "}\n",
+    "\n",
+    "fun with_flag(f: |&bool| void) {\n",
+    "\tlet flag = true;\n",
+    "\tf(&flag);\n",
+    "}\n",
+    "\n",
+    "fun with_point(p: P, f: |&P| void) {\n",
+    "\tf(&p);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet xs: List<i32> = [1, 2];\n",
+    "\tlet cell = Shared::new(xs);\n",
+    "\tcell.write().push(3);\n",
+    "\tprint(i\"shared {xs.len()} {cell.read().len()}\");\n",
+    "\tlet ys: List<i32> = [1, 2];\n",
+    "\tlet list = ListCell::of(ys);\n",
+    "\tlist.push(3);\n",
+    "\tprint(i\"list {ys.len()} {list.get().len()}\");\n",
+    "\tlet zs: List<i32> = [1];\n",
+    "\tlet limited = ListCell::with_limit(zs, 4);\n",
+    "\tlimited.push(2);\n",
+    "\tprint(i\"limited {zs.len()} {limited.get().len()}\");\n",
+    "\tlet p = P { x = 1, tags = [] };\n",
+    "\tlet c = copy_out(&p);\n",
+    "\tprint(i\"deref {p.x} {p.tags.len()} {c.x} {c.tags.len()}\");\n",
+    "\tmut r = returned(&p);\n",
+    "\tr.tags.push(1);\n",
+    "\tprint(i\"returned {p.tags.len()} {r.tags.len()}\");\n",
+    "\tmut q = P { x = 2, tags = [] };\n",
+    "\tlet snap = snapshot(&mut q);\n",
+    "\tmatch snap {\n",
+    "\t\tSome(let s) => print(i\"snapshot {s.x} {s.tags.len()} {q.x} {q.tags.len()}\"),\n",
+    "\t\tNone => print(\"none\"),\n",
+    "\t}\n",
+    "\tlet home = Address { city = \"Oslo\", zip = \"1\" };\n",
+    "\tmut out = \"\";\n",
+    "\twith_city(home, |c| {\n",
+    "\t\tout = *c;\n",
+    "\t});\n",
+    "\tprint(out);\n",
+    "\tmut seen = false;\n",
+    "\twith_flag(|b| {\n",
+    "\t\tseen = *b;\n",
+    "\t});\n",
+    "\tprint(seen);\n",
+    "\tmut total = 0;\n",
+    "\twith_point(p, |point| {\n",
+    "\t\ttotal = point.x;\n",
+    "\t});\n",
+    "\tprint(total);\n",
+    "}\n",
+);
+const B474_PROBE: &str = concat!(
+    "import std::json::json_codec;\n",
+    "import std::io::print;\n",
+    "import std::option::Option::{ None, Some, self };\n",
+    "import std::reactive::{ Signal, SignalCell, Source };\n",
+    "import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };\n",
+    "\n",
+    "fun through_the_trait<T, S: Source<T>>(source: S, observe: |T| void) {\n",
+    "\tlet live = source.sub(observe);\n",
+    "\tlive.dispose();\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet (client_end, server_end) = duplex_pair();\n",
+    "\tlet counter: SignalCell<i32> = Signal::new(9);\n",
+    "\tlet channel = ReactiveServer::new(server_end, json_codec()).expose(counter);\n",
+    "\tlet remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);\n",
+    "\tthrough_the_trait(remote, |value: Option<i32>| match value {\n",
+    "\t\tSome(let n) => print(i\"trait:{n}\"),\n",
+    "\t\tNone => print(\"trait:none\"),\n",
+    "\t});\n",
+    "\tlet present = remote.sub(|value: i32| print(i\"inherent:{value}\"));\n",
+    "\tcounter.set(10);\n",
+    "\tpresent.dispose();\n",
+    "}\n",
+);
+const B453_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun bump(slot: &mut i32) {\n",
+    "\tslot += 10;\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut pair = (1, 2);\n",
+    "\tlet v = &mut pair.1;\n",
+    "\tv = 3;\n",
+    "\tprint(pair.1);\n",
+    "\tbump(&mut pair.0);\n",
+    "\tprint(pair.0);\n",
+    "\tmut triple: (str, i32, bool) = (\"a\", 5, false);\n",
+    "\tlet flag = &mut triple.2;\n",
+    "\tflag = true;\n",
+    "\tprint(i\"{triple.0} {triple.1} {triple.2}\");\n",
+    "}\n",
+);
+const B444_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Box2 { n: i32, label: str }\n",
+    "\n",
+    "fun first(xs: &List<i32>): &i32 borrows xs {\n",
+    "\t&xs[0]\n",
+    "}\n",
+    "\n",
+    "fun label_of(b: &Box2): &str borrows b {\n",
+    "\t&b.label\n",
+    "}\n",
+    "\n",
+    "fun twice(n: i32): i32 {\n",
+    "\tn * 2\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet xs = [7, 8];\n",
+    "\tprint(i\"{first(&xs)}\");\n",
+    "\tlet v = first(&xs);\n",
+    "\tprint(i\"v={v}\");\n",
+    "\tprint(v + 1);\n",
+    "\tprint(twice(first(&xs)));\n",
+    "\tprint(first(&xs));\n",
+    "\tlet b = Box2 { n = 1, label = \"lab\" };\n",
+    "\tprint(i\"{label_of(&b)}!\");\n",
+    "\tprint(*v);\n",
+    "}\n",
+);
+const B464_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct A { x: i32, s: str }\n",
+    "\n",
+    "fun apply(f: sync |&mut str| void) {\n",
+    "\tmut a = A { x = 1, s = \"old\" };\n",
+    "\tf(&mut a.s);\n",
+    "\tprint(a.s);\n",
+    "\tmut s = \"old\";\n",
+    "\tf(&mut s);\n",
+    "\tprint(s);\n",
+    "\tmut xs = [\"old\"];\n",
+    "\tf(&mut xs[0]);\n",
+    "\tprint(xs[0]);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tapply(|&mut p| {\n",
+    "\t\tp = \"new\";\n",
+    "\t});\n",
+    "}\n",
+);
+
 /// The programs the default suite runs — small, fast, and between them they
 /// cover every value shape S1a claims: scalars, `str`, `bool`, a struct with an
 /// `impl`, an enum with a payload, a `List`, a `match`, a loop, recursion.
@@ -7397,5 +7691,124 @@ fn a_generic_inferred_return_is_per_instance_on_both_backends() {
         compare(&staged, "native_probe_generic_inferred_return.vl"),
         Verdict::Identical,
         "each instance of a generic inferred-return function returns its own type"
+    );
+}
+
+/// B473: a member a supertrait declares, reached through a SUB-trait — a
+/// bound, a deeper bound over a parameterized chain, a qualified call at a
+/// generic and at a concrete receiver, a `for` loop's `next` — answers out of
+/// the receiver's impl of the declaring trait: the override, then the default.
+/// Both backends took the default over the override (`inference::traits`'
+/// `b473_*` pins hold the JS values; this is the native half).
+#[test]
+fn a_supertrait_override_is_dispatched_through_a_subtrait_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b473.vl"), B473_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b473.vl"),
+        Verdict::Identical,
+        "a supertrait's override must answer through a sub-trait on both backends"
+    );
+}
+
+/// B467: a closure whose `&mut` is its own PARAMETER is stored in a struct
+/// field and called through it on both backends — the analyzer refused it as a
+/// view escape before. (`inference::borrows`' `b467_*` pin covers the other
+/// depths on JS; natively a closure VALUE reached through a match capture, a
+/// loop binding or a nested closure parameter does not yet carry its view
+/// parameters to the call site — a native find filed from this lane.)
+#[test]
+fn a_closure_with_its_own_view_parameter_is_stored_in_a_field_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b467.vl"), B467_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b467.vl"),
+        Verdict::Identical,
+        "a closure with its own view parameter must store and run the same on both backends"
+    );
+}
+
+/// R-c (B483 + B466 + B465): a value taken out of a place the binding does not
+/// own is copied, on both backends. `Shared::new`/`ListCell::of`/`with_limit`
+/// take their argument `own` (natively the constructor's argument was MOVED,
+/// rustc E0382 at the caller's next read); `*view` of an aggregate is copied
+/// where it is bound, returned or wrapped (natively a move out of a reference,
+/// E0507); and a closure literal at a view position of its closure type reads
+/// the element through `*c` (natively a value was passed where the type wants
+/// a reference). `inference::borrows`' `b483_*`/`b466_*`/`b465_*` pins hold
+/// the JS values.
+#[test]
+fn a_value_taken_out_of_a_place_it_does_not_own_is_copied_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_rc.vl"), RC_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_rc.vl"),
+        Verdict::Identical,
+        "a value taken out of a place it does not own must be a copy on both backends"
+    );
+}
+
+/// B474: `sub` called through an `S: Source<T>` bound is `Flow`'s member (the
+/// trait answers through a bound, B408's rule) — not `RemoteSource`'s
+/// inherent `sub(|T|)`, which the native emitter picked by name and rustc
+/// refused (E0308) — while the same `sub` on the concrete mirror is still the
+/// inherent one. `inference::markdown`'s
+/// `a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none` is
+/// the JS half.
+#[test]
+fn sub_through_a_source_bound_takes_the_trait_member_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b474.vl"), B474_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b474.vl"),
+        Verdict::Identical,
+        "`sub` through a `Source` bound must dispatch to the trait's member on both backends"
+    );
+}
+
+/// B453: a view of a tuple position writes and reads through on both
+/// backends (`inference::tuples`' `b453_*` pin is the JS half; JS threw).
+#[test]
+fn a_view_of_a_tuple_position_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b453.vl"), B453_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b453.vl"),
+        Verdict::Identical,
+        "a view of a tuple position must write through on both backends"
+    );
+}
+
+/// B444: a scalar view read where a value is read prints the element on both
+/// backends (`inference::borrows`' `b444_*` pin is the JS half; JS printed the
+/// `(base, key)` pair).
+#[test]
+fn a_scalar_view_read_as_a_value_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b444.vl"), B444_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b444.vl"),
+        Verdict::Identical,
+        "a scalar view read as a value must print the element on both backends"
+    );
+}
+
+/// B464: a closure's `&mut` parameter called with `&mut <place>` — a field,
+/// a local, a subscript — writes through the same on both backends (the bare
+/// spelling is refused; JS threw on it).
+#[test]
+fn a_closure_view_parameter_takes_a_view_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b464.vl"), B464_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b464.vl"),
+        Verdict::Identical,
+        "a closure's view parameter must write through on both backends"
     );
 }

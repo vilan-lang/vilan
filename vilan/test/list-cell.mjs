@@ -386,7 +386,7 @@ function $b() {
 }
 function $d(value2) {
 	let subscribers = [  ];
-	return [ __shared_new(value2), __shared_new(subscribers) ];
+	return [ __shared_new(__clone(value2)), __shared_new(subscribers) ];
 }
 function $c(elements, log) {
 	return [ __shared_new(elements), $d(0), __clone(log) ];
@@ -919,10 +919,10 @@ function $ci(self, at, $cj) {
 	return $ch(self, at, 1, [  ], $cj);
 }
 function $cm(elements) {
-	return [ __clone(elements), [  ] ];
+	return [ elements, [  ] ];
 }
 function $ck(self, body, $cl) {
-	let recorder = $cm(self[0].v);
+	let recorder = $cm(__clone(self[0].v));
 	body(recorder);
 	const produced = __clone(recorder[0]);
 	const recorded = __clone(recorder[1]);
@@ -1154,7 +1154,7 @@ function $dt(self, value2, $cf) {
 	return $ch(self, $cg(self), 0, [ __clone(value2) ], $cf);
 }
 function $dv(self, body, $cl) {
-	let recorder = $cm(self[0].v);
+	let recorder = $cm(__clone(self[0].v));
 	body(recorder);
 	const produced = __clone(recorder[0]);
 	const recorded = __clone(recorder[1]);

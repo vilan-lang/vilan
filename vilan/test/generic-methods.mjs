@@ -8,7 +8,7 @@ function __shared_new(value) {
 	return { v: value };
 }
 function $a(value) {
-	return [ __shared_new(value) ];
+	return [ __shared_new(__clone(value)) ];
 }
 function $c(self) {
 	return __clone(self[0].v);

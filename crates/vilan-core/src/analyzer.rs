@@ -23631,6 +23631,13 @@ impl<'src> Analyzer<'src> {
                     .or_else(|| self.place_value_type_id(leaf_id))
                     .or_else(|| self.call_declared_return_type_id(call_id))
             }
+            // B466: `*view` hands back its pointee, whose type the view's own
+            // binding carries (references are transparent in the type system).
+            Some(Expr::Dereference(operand)) => {
+                let operand = *operand;
+                self.place_value_type_id(leaf_id)
+                    .or_else(|| self.place_value_type_id(operand))
+            }
             _ => self.place_value_type_id(leaf_id),
         }
     }
@@ -25398,28 +25405,48 @@ impl<'src> Analyzer<'src> {
     fn derives_from_view_param(&self, expr_id: Id) -> bool {
         let mut found = false;
         let mut visited = HashSet::default();
-        self.scan_view_param_ref(expr_id, &mut found, &mut visited);
+        self.scan_view_param_ref(&[], expr_id, &mut found, &mut visited);
         found
     }
 
-    /// Whether a closure body references a `&` / `&mut` parameter — necessarily
-    /// one captured from an enclosing function, since closure parameters are
-    /// always bare. That capture stays legal (the parameter views the CALLER's
-    /// place, which outlives the call); making the closure second-class is the
-    /// whole of its policing. An outer view *BINDING* is a different matter and
-    /// no longer reaches here at all: `check_closure_view_capture_ban` refuses
-    /// it at the capture (C12), so nothing is left for the escape rule to catch.
+    /// Whether a closure body references a `&` / `&mut` parameter it CAPTURES —
+    /// one declared by an enclosing function (or enclosing closure). That
+    /// capture stays legal (the parameter views the CALLER's place, which
+    /// outlives the call); making the closure second-class is the whole of its
+    /// policing. An outer view *BINDING* is a different matter and no longer
+    /// reaches here at all: `check_closure_view_capture_ban` refuses it at the
+    /// capture (C12), so nothing is left for the escape rule to catch.
+    ///
+    /// B439/B467: the closure's OWN view parameters are not captures. A
+    /// closure parameter is not always bare — `|&mut list|` declares a view,
+    /// and so does a literal at a view position of its closure type (B465) —
+    /// and a view parameter is lent per CALL, which is the very form the
+    /// escape message recommends. Counted as a capture, `edits.push(|&mut
+    /// list| list.push(7))` and `Holder { f = |&mut p| .. }` were refused
+    /// while the same closure one level down (an `Option`'s payload, a nested
+    /// closure type) was accepted; the answer is now the same at every depth.
     fn closure_captures_view_param(&self, closure_id: Id) -> bool {
         let Some(closure) = self.closures.get(&closure_id) else {
             return false;
         };
         let mut captured = false;
         let mut visited = HashSet::default();
-        self.scan_view_param_ref(closure.return_, &mut captured, &mut visited);
+        self.scan_view_param_ref(
+            &closure.parameters,
+            closure.return_,
+            &mut captured,
+            &mut visited,
+        );
         captured
     }
 
-    fn scan_view_param_ref(&self, expr_id: Id, captured: &mut bool, visited: &mut HashSet<Id>) {
+    fn scan_view_param_ref(
+        &self,
+        own_parameters: &[Id],
+        expr_id: Id,
+        captured: &mut bool,
+        visited: &mut HashSet<Id>,
+    ) {
         if *captured || !visited.insert(expr_id) {
             return;
         }
@@ -25428,9 +25455,11 @@ impl<'src> Analyzer<'src> {
         };
         match expr {
             Expr::Local(binding_id) => {
-                if self.parameters.get(&binding_id).is_some_and(|parameter| {
-                    matches!(parameter.convention, Convention::Ref | Convention::RefMut)
-                }) {
+                if !own_parameters.contains(&binding_id)
+                    && self.parameters.get(&binding_id).is_some_and(|parameter| {
+                        matches!(parameter.convention, Convention::Ref | Convention::RefMut)
+                    })
+                {
                     *captured = true;
                 }
             }
@@ -25439,106 +25468,109 @@ impl<'src> Analyzer<'src> {
             Expr::Closure(_) | Expr::Async(_) => {}
             Expr::Variable(variable_id) => {
                 if let Some(initial) = self.variables.get(&variable_id).and_then(|v| v.initial) {
-                    self.scan_view_param_ref(initial, captured, visited);
+                    self.scan_view_param_ref(own_parameters, initial, captured, visited);
                 }
             }
             Expr::Reference(operand, _) | Expr::Dereference(operand) | Expr::Unary(_, operand) => {
-                self.scan_view_param_ref(operand, captured, visited)
+                self.scan_view_param_ref(own_parameters, operand, captured, visited)
             }
             Expr::Binary(_, lhs, rhs) => {
-                self.scan_view_param_ref(lhs, captured, visited);
-                self.scan_view_param_ref(rhs, captured, visited);
+                self.scan_view_param_ref(own_parameters, lhs, captured, visited);
+                self.scan_view_param_ref(own_parameters, rhs, captured, visited);
             }
             Expr::Assignment(target, value) => {
-                self.scan_view_param_ref(target, captured, visited);
-                self.scan_view_param_ref(value, captured, visited);
+                self.scan_view_param_ref(own_parameters, target, captured, visited);
+                self.scan_view_param_ref(own_parameters, value, captured, visited);
             }
             Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
-                self.scan_view_param_ref(subject, captured, visited)
+                self.scan_view_param_ref(own_parameters, subject, captured, visited)
             }
             Expr::Index(subject, index) => {
-                self.scan_view_param_ref(subject, captured, visited);
-                self.scan_view_param_ref(index, captured, visited);
+                self.scan_view_param_ref(own_parameters, subject, captured, visited);
+                self.scan_view_param_ref(own_parameters, index, captured, visited);
             }
             Expr::FunctionReturn(Some(value)) | Expr::Await(value) => {
-                self.scan_view_param_ref(value, captured, visited)
+                self.scan_view_param_ref(own_parameters, value, captured, visited)
             }
             Expr::Call(call_id) => {
                 if let Some(function_call) = self.function_calls.get(&call_id) {
                     for argument in function_call.argument_ids.clone() {
-                        self.scan_view_param_ref(argument, captured, visited);
+                        self.scan_view_param_ref(own_parameters, argument, captured, visited);
                     }
                 }
             }
             Expr::Block((statements, tail)) => {
                 for statement in statements {
-                    self.scan_view_param_ref(statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, statement, captured, visited);
                 }
-                self.scan_view_param_ref(tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, tail, captured, visited);
             }
             Expr::For(condition, (statements, tail)) => {
                 if let Some(condition) = condition {
-                    self.scan_view_param_ref(condition, captured, visited);
+                    self.scan_view_param_ref(own_parameters, condition, captured, visited);
                 }
                 for statement in statements {
-                    self.scan_view_param_ref(statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, statement, captured, visited);
                 }
-                self.scan_view_param_ref(tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, tail, captured, visited);
             }
             Expr::ForEach(iterable, _, (statements, tail)) => {
-                self.scan_view_param_ref(iterable, captured, visited);
+                self.scan_view_param_ref(own_parameters, iterable, captured, visited);
                 for statement in statements {
-                    self.scan_view_param_ref(statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, statement, captured, visited);
                 }
-                self.scan_view_param_ref(tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, tail, captured, visited);
             }
             Expr::Match(subject, legs) => {
-                self.scan_view_param_ref(subject, captured, visited);
+                self.scan_view_param_ref(own_parameters, subject, captured, visited);
                 for leg in legs {
                     if let Some(guard) = leg.guard {
-                        self.scan_view_param_ref(guard, captured, visited);
+                        self.scan_view_param_ref(own_parameters, guard, captured, visited);
                     }
-                    self.scan_view_param_ref(leg.body, captured, visited);
+                    self.scan_view_param_ref(own_parameters, leg.body, captured, visited);
                 }
             }
             Expr::List(ids) | Expr::Tuple(ids) => {
                 for id in ids {
-                    self.scan_view_param_ref(id, captured, visited);
+                    self.scan_view_param_ref(own_parameters, id, captured, visited);
                 }
             }
             Expr::StructInitializer(_, fields) => {
                 for value in fields.values() {
-                    self.scan_view_param_ref(*value, captured, visited);
+                    self.scan_view_param_ref(own_parameters, *value, captured, visited);
                 }
             }
             // `If` is the one branch form left; walk it explicitly.
-            Expr::If(branch) => self.scan_view_param_ref_if(&branch, captured, visited),
+            Expr::If(branch) => {
+                self.scan_view_param_ref_if(own_parameters, &branch, captured, visited)
+            }
             _ => {}
         }
     }
 
     fn scan_view_param_ref_if(
         &self,
+        own_parameters: &[Id],
         branch: &ExprIfBranch,
         captured: &mut bool,
         visited: &mut HashSet<Id>,
     ) {
         match branch {
             ExprIfBranch::If(condition, (statements, tail), else_branch) => {
-                self.scan_view_param_ref(*condition, captured, visited);
+                self.scan_view_param_ref(own_parameters, *condition, captured, visited);
                 for statement in statements {
-                    self.scan_view_param_ref(*statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, *statement, captured, visited);
                 }
-                self.scan_view_param_ref(*tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, *tail, captured, visited);
                 if let Some(else_branch) = else_branch {
-                    self.scan_view_param_ref_if(else_branch, captured, visited);
+                    self.scan_view_param_ref_if(own_parameters, else_branch, captured, visited);
                 }
             }
             ExprIfBranch::Else((statements, tail)) => {
                 for statement in statements {
-                    self.scan_view_param_ref(*statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, *statement, captured, visited);
                 }
-                self.scan_view_param_ref(*tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, *tail, captured, visited);
             }
         }
     }
@@ -25810,8 +25842,14 @@ impl<'src> Analyzer<'src> {
     /// clause and its return type's pointee is a scalar (`&mut i32` collapses to
     /// `i32`, so the scalar check is on the collapsed `return_type_id`).
     fn function_returns_scalar_view(&self, function_id: Id) -> bool {
+        // B444: the RETURN TYPE says whether a view comes back, not the
+        // inferred `borrows` set — `fun get(h: &Holder): i32 { peek(h) }`
+        // infers `borrows h` from the projection it reads, yet hands back an
+        // `i32` (the return seam reads the pair through, B108), so its call is
+        // a value, never a `(base, key)` pair to read again.
         self.functions.get(&function_id).is_some_and(|function| {
             !function.borrows.is_empty()
+                && (function.returns_view || function.returns_mut_view)
                 && function
                     .return_type_id
                     .map(|type_id| type_id.get_type(self))
@@ -27916,6 +27954,16 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Whether an expression reads a view BINDING or `&`/`&mut` parameter — of
+    /// any pointee, aggregate included — rather than a value (B465). The
+    /// compiler-synthesized re-read of a compound write-through is a sanctioned
+    /// view use (R5), not a value read.
+    fn is_view_binding_read(&self, expr_id: Id, view_bindings: &HashSet<Id>) -> bool {
+        !self.compound_reread_ids.contains(&expr_id)
+            && matches!(self.expr_id_to_expr_map.get(&expr_id), Some(Expr::Local(_)))
+            && self.is_view_expr(expr_id, view_bindings)
+    }
+
     /// Whether an expression is a **scalar** view being read as a value — a bare
     /// view binding / `&[mut] place` whose element is a scalar primitive, so its
     /// runtime form is the `(base, key)` pair rather than the value. Reading it
@@ -27976,6 +28024,22 @@ impl<'src> Analyzer<'src> {
                         if self.is_scalar_view_read(operand, &view_bindings) {
                             leaks.push(operand);
                         }
+                    }
+                }
+                // B465 (R-c): the value an assignment stores is a VALUE, so a
+                // view binding or parameter on its right reads into a `T`
+                // place only through `*` — `out = c` with `c: &str` is the
+                // `let out: str = c` refusal (R1) at an assignment, for a
+                // `fun`'s view parameter and a closure's alike. An aggregate
+                // view is included: it is the caller's own storage on JS, so
+                // `out = c` aliased it where `out = *c` copies (rule 1). A
+                // compound write's synthesized re-read is excluded inside
+                // `is_scalar_view_read`, and it is a binary operand anyway.
+                Expr::Assignment(_, value) => {
+                    if self.is_scalar_view_read(*value, &view_bindings)
+                        || self.is_view_binding_read(*value, &view_bindings)
+                    {
+                        leaks.push(*value);
                     }
                 }
                 // A call argument whose parameter is NOT a view (`&[mut] T`) wants
@@ -28161,23 +28225,22 @@ impl<'src> Analyzer<'src> {
             // argument, and a write to the cell inside showed through it (JS
             // `seen=3`, native `seen=2`).
             //
-            // SCOPED to that hazard (the owner's ruling, 2026-09-26): a CALL's
-            // result — a temporary, which for `Shared::read()` is the cell's
-            // own storage, uncopied — at a closure's view parameter. A PLACE
-            // (`mutate(list[at])` at a `|&mut T|`, std's `KeyedCell::update`)
-            // names storage the caller holds, and is not refused here, where a
-            // `fun`'s parameter still asks for the `&`-spelling below.
+            // B464 (Order 45): the rule is the `fun` path's WHOLE rule, not the
+            // temporary-only scope it first shipped with (the owner's
+            // 2026-09-26 ruling, superseded at Order 45's GO). A bare PLACE at
+            // a closure's view parameter (`f(a.s)` at a `|&mut str|`) was
+            // accepted, and the JS build handed the VALUE to a body that
+            // writes through a `(base, key)` pair — `TypeError: Cannot create
+            // property` — while native printed the right answer. One rule: a
+            // view parameter takes a view (`&mut a.s`, or an existing view),
+            // for a `fun` and a closure alike.
             if let Some(views) = self.closure_callee_views(function_call.subject_id) {
                 for (view, argument_id) in views.iter().zip(argument_ids.iter()) {
                     let Some(mutable) = view else {
                         continue;
                     };
                     let kind = if *mutable { "&mut" } else { "&" };
-                    let temporary = matches!(
-                        self.expr_id_to_expr_map.get(argument_id),
-                        Some(Expr::Call(_))
-                    );
-                    if temporary && !self.assignment_target_is_view(*argument_id) {
+                    if !self.assignment_target_is_view(*argument_id) {
                         self.push_anchored(Error { trace: Vec::new(), note: None,
                             span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -28229,13 +28292,151 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// B400: the per-parameter view conventions of a call whose callee is a
-    /// CLOSURE-typed value — a parameter, a local, or a field holding one —
-    /// read off the closure type as written (`|&List<T>| U`). `None` for a
-    /// named function (its parameters carry their conventions) and for a
-    /// closure type with no view parameter.
-    fn closure_callee_views(&self, subject_id: Id) -> Option<Vec<Option<bool>>> {
-        let type_id = match self.expr_id_to_expr_map.get(&subject_id)? {
+    /// B465 (R-c): a closure LITERAL that lands where a closure type takes a
+    /// VIEW (`f: |&str| void`, `update(f: |&mut T| void)`) has view
+    /// parameters there, written or not. `|c|` handed to `f` receives the
+    /// view the caller passes (`f(&a.city)`), so `c` IS a `&str` and reading
+    /// its value takes `*c`, as it does for a `fun`'s `&` parameter. Its
+    /// convention was the bare one the literal was written with, so the JS
+    /// emitter read the view's `(base, key)` pair as the value (`out = *c`
+    /// stored `[ [ 'Oslo', '1' ], 0 ]`), the checker took `out = c` without
+    /// the `*`, and the native emitter passed a value where the literal's type
+    /// wanted a reference.
+    ///
+    /// The positions read are the ones a closure type is WRITTEN at, which is
+    /// where `closure_type_parameter_views` records a view: a parameter of
+    /// the callee a call resolves to (a function, an external, a method, or a
+    /// closure-typed value whose own parameter is a closure type), a field of
+    /// the struct a literal builds, and an annotated binding. A literal
+    /// reached through a `let` (`let f = |c| ..; with_city(home, f)`) adopts
+    /// at the position it is handed to. A parameter the literal spells with
+    /// `&`/`&mut` already has its convention; only a bare one adopts.
+    ///
+    /// Runs once, after inference and before every pass that reads a
+    /// parameter's convention (`infer_borrows`, the view checks, the
+    /// primitive-view classification the emitters read). Whole-program and
+    /// deterministic, so a reused module's literals adopt exactly as they did
+    /// when the module was recorded.
+    fn adopt_closure_parameter_views(&mut self) {
+        let mut adoptions: Vec<(Id, Vec<Option<bool>>)> = Vec::new();
+        let mut call_ids: Vec<Id> = self.function_calls.keys().copied().collect();
+        call_ids.sort_unstable_by_key(|call_id| call_id.0);
+        for call_id in call_ids {
+            let Some(function_call) = self.function_calls.get(&call_id) else {
+                continue;
+            };
+            let argument_ids = function_call.argument_ids.clone();
+            let subject_id = function_call.subject_id;
+            let position_type_ids = self.callee_parameter_type_ids(subject_id);
+            for (type_id, argument_id) in position_type_ids.iter().zip(&argument_ids) {
+                if let Some(views) = self.closure_type_parameter_views.get(type_id)
+                    && let Some(closure_id) = self.closure_behind_callee(*argument_id)
+                {
+                    adoptions.push((closure_id, views.clone()));
+                }
+            }
+        }
+        for (expr_id, expr) in &self.expr_id_to_expr_map {
+            match expr {
+                Expr::StructInitializer(_, fields) => {
+                    let Some(Type::Struct(struct_id, _)) = self
+                        .type_id_of_expr(*expr_id)
+                        .and_then(|type_id| self.type_id_to_type_map.get(&type_id))
+                    else {
+                        continue;
+                    };
+                    let Some(struct_) = self.structs.get(struct_id) else {
+                        continue;
+                    };
+                    for (index, value_id) in fields {
+                        if let Some(field) = struct_.fields.get(*index)
+                            && let Some(views) =
+                                self.closure_type_parameter_views.get(&field.type_id)
+                            && let Some(closure_id) = self.closure_behind_callee(*value_id)
+                        {
+                            adoptions.push((closure_id, views.clone()));
+                        }
+                    }
+                }
+                Expr::Variable(variable_id) => {
+                    if let Some(variable) = self.variables.get(variable_id)
+                        && variable.annotated
+                        && let Some(initial) = variable.initial
+                        && let Some(views) =
+                            self.closure_type_parameter_views.get(&variable.type_id)
+                        && let Some(closure_id) = self.closure_behind_callee(initial)
+                    {
+                        adoptions.push((closure_id, views.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (closure_id, views) in adoptions {
+            let Some(parameter_ids) = self
+                .closures
+                .get(&closure_id)
+                .map(|closure| closure.parameters.clone())
+            else {
+                continue;
+            };
+            if parameter_ids.len() != views.len() {
+                continue;
+            }
+            for (parameter_id, view) in parameter_ids.iter().zip(views) {
+                let Some(mutable) = view else {
+                    continue;
+                };
+                if let Some(parameter) = self.parameters.get_mut(parameter_id)
+                    && parameter.convention == Convention::Bare
+                {
+                    parameter.convention = if mutable {
+                        Convention::RefMut
+                    } else {
+                        Convention::Ref
+                    };
+                }
+            }
+        }
+    }
+
+    /// The written TYPE of each parameter position of the callee `subject_id`
+    /// names — a function's or an external's declared parameters (the receiver
+    /// first for a method), or the parameter types of a closure-typed value's
+    /// closure type. Empty when the callee is neither.
+    fn callee_parameter_type_ids(&self, subject_id: Id) -> Vec<TypeId> {
+        if let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) {
+            let parameter_ids = self
+                .functions
+                .get(callee_id)
+                .map(|function| &function.parameters)
+                .or_else(|| {
+                    self.external_functions
+                        .get(callee_id)
+                        .map(|external| &external.parameters)
+                });
+            if let Some(parameter_ids) = parameter_ids {
+                return parameter_ids
+                    .iter()
+                    .filter_map(|parameter_id| self.parameters.get(parameter_id))
+                    .map(|parameter| parameter.type_id)
+                    .collect();
+            }
+        }
+        match self
+            .closure_value_type_id(subject_id)
+            .and_then(|type_id| self.type_id_to_type_map.get(&type_id))
+        {
+            Some(Type::Closure(parameter_type_ids, _, _)) => parameter_type_ids.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The closure TYPE a closure-typed value carries — a parameter, a local,
+    /// or a field holding one: the type as written, which is where
+    /// `closure_type_parameter_views` keys its views.
+    fn closure_value_type_id(&self, subject_id: Id) -> Option<TypeId> {
+        match self.expr_id_to_expr_map.get(&subject_id)? {
             Expr::Local(binding_id) | Expr::Parameter(binding_id) => self
                 .parameters
                 .get(binding_id)
@@ -28244,10 +28445,44 @@ impl<'src> Analyzer<'src> {
                     self.variables
                         .get(binding_id)
                         .map(|variable| variable.type_id)
-                })?,
-            Expr::Field(..) => self.expr_id_to_type_id_map.get(&subject_id).copied()?,
-            _ => return None,
-        };
+                }),
+            Expr::Field(..) => self.expr_id_to_type_id_map.get(&subject_id).copied(),
+            _ => None,
+        }
+    }
+
+    /// B400: the per-parameter view conventions of a call whose callee is a
+    /// CLOSURE-typed value — a parameter, a local, or a field holding one —
+    /// read off the closure type as written (`|&List<T>| U`). `None` for a
+    /// named function (its parameters carry their conventions) and for a
+    /// closure type with no view parameter.
+    ///
+    /// B465: a callee that IS a closure literal (through `let` bindings,
+    /// `let f = |c: &str| ..; f(..)`) answers from the literal's own
+    /// parameters — written with `&`/`&mut` or adopted from where the literal
+    /// was handed — since its type was never written.
+    fn closure_callee_views(&self, subject_id: Id) -> Option<Vec<Option<bool>>> {
+        if let Some(closure_id) = self.closure_behind_callee(subject_id)
+            && let Some(closure) = self.closures.get(&closure_id)
+        {
+            let views: Vec<Option<bool>> = closure
+                .parameters
+                .iter()
+                .map(|parameter_id| {
+                    match self
+                        .parameters
+                        .get(parameter_id)
+                        .map(|parameter| parameter.convention)
+                    {
+                        Some(Convention::Ref) => Some(false),
+                        Some(Convention::RefMut) => Some(true),
+                        _ => None,
+                    }
+                })
+                .collect();
+            return views.iter().any(Option::is_some).then_some(views);
+        }
+        let type_id = self.closure_value_type_id(subject_id)?;
         self.closure_type_parameter_views.get(&type_id).cloned()
     }
 
@@ -28908,7 +29143,19 @@ impl<'src> Analyzer<'src> {
         // here rather than inside `is_elidable_copy` because its answer is
         // about the BINDING this read initializes, not about a dying
         // source.
+        // B466 (R-c): `*view` is a place too — the storage a VIEW names, which
+        // the binding taking it does not own. Rule 1 copies a value taken out
+        // of such a place: `mut c: P = *v; c.x = 99` must not write the
+        // caller's `P`, and `Some(*v)` is a snapshot a later write through `v`
+        // does not reach. `is_place_expr` stays as it is (rule 3's binding
+        // question, B81's note); the dereference is admitted here, at the copy
+        // positions, and is never an elidable dying source.
+        let is_dereference = matches!(
+            self.expr_id_to_expr_map.get(&value_id),
+            Some(Expr::Dereference(_))
+        );
         if !(self.is_place_expr(value_id)
+            || is_dereference
             || (self.is_shared_read(value_id) && !self.elided_shared_reads.contains(&value_id)))
         {
             return None;
@@ -28928,6 +29175,12 @@ impl<'src> Analyzer<'src> {
         declared_type
             .or_else(|| self.shared_read_value_type_id(value_id))
             .or_else(|| self.place_value_type_id(value_id))
+            .or_else(|| match self.expr_id_to_expr_map.get(&value_id) {
+                // A view's type is its pointee's (references are transparent in
+                // the type system), so the operand answers for `*v`.
+                Some(Expr::Dereference(operand)) => self.place_value_type_id(*operand),
+                _ => None,
+            })
     }
 
     /// B418: the expressions a CHOOSING value can hand back — the tail of a
@@ -30147,7 +30400,28 @@ impl<'src> Analyzer<'src> {
         if shared_captures.contains(binding_id) || self.shared_read_bindings.contains(binding_id) {
             return false;
         }
-        self.variables.contains_key(binding_id) && self.last_use.is_last_use(value_id, *binding_id)
+        // An `own` PARAMETER is a dead owner at its last use exactly as a local
+        // is (R-c): the callee owns its storage — the caller copied it in at a
+        // use that was not its last, or donated one that was — so a storing
+        // constructor written over `own` (`ListCell::of` handing `elements` on
+        // to `list_cell`, and that to `Shared::new`) moves it down the chain
+        // instead of copying at every hop, as the native backend does. A bare
+        // or view parameter is a LOAN, the caller's storage, and never donates.
+        //
+        // Only at a type the CALLER copies, though: rule 1's argument copy is
+        // taken of a cloneable aggregate (or a generic, copied whole at every
+        // instantiation), and an enum is passed as it stands — `held.unwrap()`
+        // hands `own self` the caller's `Option<List<i32>>` itself, so the
+        // payload capture inside is the one copy that keeps `held` intact.
+        let owned = self.variables.contains_key(binding_id)
+            || self.parameters.get(binding_id).is_some_and(|parameter| {
+                parameter.convention == Convention::Own && {
+                    let parameter_type = parameter.type_id.get_type(self);
+                    self.is_cloneable_aggregate(&parameter_type)
+                        || matches!(parameter_type, Type::Generic(_))
+                }
+            });
+        owned && self.last_use.is_last_use(value_id, *binding_id)
     }
 
     /// Resolves a value-name USE at a byte offset, honoring positional
@@ -45406,6 +45680,14 @@ impl<'src> Analyzer<'src> {
         // No receiver at all: the trait member takes `self`, so the ordinary
         // arity check reports it — and better than a bespoke message would.
         let receiver_id = *argument_ids.first()?;
+        // B473: the trait that ANSWERS is the one in the named trait's chain
+        // that DECLARES the member — `Sub::name(value)` over a `name` that
+        // `Base` declares is answered out of the receiver's impl of `Base`, its
+        // override first and the default second, exactly as `value.name()`
+        // through a `Sub` bound is.
+        let declaring_trait_id = self
+            .method_member_in_trait_at(trait_id, &[], member_name)
+            .map_or(trait_id, |(_, declaring_trait_id, _)| declaring_trait_id);
         let receiver_type = self.infer_type(receiver_id, &Type::Unknown, &HashMap::default());
         if matches!(receiver_type, Type::Unresolved) {
             return Some(Resolution::Deferred);
@@ -45423,7 +45705,7 @@ impl<'src> Analyzer<'src> {
             // The qualified spelling names a trait and no arguments, so the
             // instantiation is left unconstrained (B73 R1's empty-list case).
             self.bound_dispatch_traits
-                .insert(call_id, (trait_id, Vec::new()));
+                .insert(call_id, (declaring_trait_id, Vec::new()));
             return None;
         }
         if !matches!(receiver_type, Type::Struct(..) | Type::Enum(..)) {
@@ -45431,34 +45713,51 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         self.trait_qualified_calls.remove(&subject_id);
-        // Every impl of the named trait whose subject matches, not just the
+        // Every impl of the DECLARING trait whose subject matches, not just the
         // first: one subject may implement the trait at two instantiations
         // (`Into<Bar>` beside `Into<str>`), and naming the trait says
         // nothing about which — §3.1's spelling has no argument slot (B73 R2).
-        let providers: Vec<(Option<Id>, TypeId)> = self
-            .implementations
-            .iter()
-            .filter(|implementation| {
-                self.impl_subject_admits(
-                    &receiver_type,
-                    implementation.subject.borrow_type(self),
-                    &HashMap::default(),
-                )
-            })
-            .filter(|implementation| {
-                implementation.trait_ids.iter().any(|id| {
-                    // A supertrait's member counts: `PartialEq::eq` is provided
-                    // by `impl Point with Ord`, which lists only `Ord`.
-                    self.trait_with_supertraits(*id).contains(&trait_id)
+        // The receiver must implement the NAMED trait as well: `Sub::name` on
+        // a type that implements only `Base` is still refused below.
+        let implements_named_trait = self.implementations.iter().any(|implementation| {
+            self.impl_subject_admits(
+                &receiver_type,
+                implementation.subject.borrow_type(self),
+                &HashMap::default(),
+            ) && implementation
+                .trait_ids
+                .iter()
+                .any(|id| self.trait_with_supertraits(*id).contains(&trait_id))
+        });
+        let providers: Vec<(Option<Id>, TypeId)> = match implements_named_trait {
+            false => Vec::new(),
+            true => self
+                .implementations
+                .iter()
+                .filter(|implementation| {
+                    self.impl_subject_admits(
+                        &receiver_type,
+                        implementation.subject.borrow_type(self),
+                        &HashMap::default(),
+                    )
                 })
-            })
-            .map(|implementation| {
-                (
-                    implementation.declarations.get(member_name).copied(),
-                    implementation.subject,
-                )
-            })
-            .collect();
+                .filter(|implementation| {
+                    implementation.trait_ids.iter().any(|id| {
+                        // A supertrait's member counts: `PartialEq::eq` is
+                        // provided by `impl Point with Ord`, which lists only
+                        // `Ord`.
+                        self.trait_with_supertraits(*id)
+                            .contains(&declaring_trait_id)
+                    })
+                })
+                .map(|implementation| {
+                    (
+                        implementation.declarations.get(member_name).copied(),
+                        implementation.subject,
+                    )
+                })
+                .collect(),
+        };
         let declaring: Vec<(Id, TypeId)> = providers
             .iter()
             .filter_map(|(member_id, impl_subject)| {
@@ -45470,12 +45769,22 @@ impl<'src> Analyzer<'src> {
         // the first-declared still wins, as it always has — the reported
         // ambiguity belongs to `receiver.member()`, which is where a reader can
         // act on it; there is no *further* spelling to steer a qualified call to.
+        //
+        // One declaring impl answers whatever order the blocks were written
+        // in: an impl of a SUBTRAIT that inherits the member is a provider too
+        // (B473's `impl Mine with Sub` beside `impl Mine with Base { name }`),
+        // and the override outranks the default it would inherit.
+        let first_declaring = || {
+            declaring
+                .first()
+                .map(|(member_id, impl_subject)| (Some(*member_id), *impl_subject))
+        };
         let provider = match declaring.len() > 1 {
             true => self
                 .select_home_by_expected_type(call_id, &receiver_type, &declaring)
                 .map(|(member_id, impl_subject)| (Some(member_id), impl_subject))
-                .or_else(|| providers.first().copied()),
-            false => providers.first().copied(),
+                .or_else(first_declaring),
+            false => first_declaring().or_else(|| providers.first().copied()),
         };
         match provider {
             Some((Some(member_id), impl_subject)) => {
@@ -45513,7 +45822,7 @@ impl<'src> Analyzer<'src> {
                 // share a name are exactly the case the call named one to
                 // resolve, so a by-name lookup would undo the disambiguation.
                 self.bound_dispatch_traits
-                    .insert(call_id, (trait_id, Vec::new()));
+                    .insert(call_id, (declaring_trait_id, Vec::new()));
                 let rest: Vec<Id> = argument_ids[1..].to_vec();
                 self.constraints.push(Constraint::MethodArgCheck {
                     call_id,
@@ -47016,7 +47325,16 @@ impl<'src> Analyzer<'src> {
                             continue;
                         };
                         member = Some(found_member);
-                        member_trait = Some((*trait_id, trait_arguments.clone()));
+                        // B473: the trait that ANSWERS is the one that declares
+                        // the member, at the arguments the bound's chain passes
+                        // it — not the bound's own trait. Through `S: Sub` a
+                        // member `Base` declares is selected out of the
+                        // receiver's impl OF `Base` (its override first, the
+                        // default second); recorded as `Sub`, emission looked
+                        // for it in the impl of `Sub`, found nothing there and
+                        // took the default the chain reached, on both
+                        // backends — over a type that overrides it.
+                        member_trait = Some((declaring_trait_id, declaring_arguments.clone()));
                         // A parameterized bound (`F: Feed<T>`) substitutes the trait's
                         // parameters with the bound's arguments, so a method parameter
                         // typed in the trait's terms (`each(observer: |T| ..)`) is typed
@@ -47050,9 +47368,10 @@ impl<'src> Analyzer<'src> {
                             GenericDispatch::OnConstraint(*constraint_id, member_name),
                         );
                         if let Some((trait_id, trait_arguments)) = member_trait {
-                            // The bound's own arguments (`T: Conv<Baz>` -> `[Baz]`)
-                            // travel with the trait, so codegen re-dispatches into
-                            // the impl of THAT instantiation (B73 R1, row 20).
+                            // The bound's own arguments (`T: Conv<Baz>` -> `[Baz]`,
+                            // carried up the chain to the declaring trait) travel
+                            // with the trait, so codegen re-dispatches into the
+                            // impl of THAT instantiation (B73 R1, row 20).
                             self.bound_dispatch_traits
                                 .insert(id, (trait_id, trait_arguments));
                         }
@@ -55983,18 +56302,19 @@ impl<'src> Analyzer<'src> {
                         .generic_bound_traits(constraint_id)
                         .into_iter()
                         .find_map(|(trait_id, trait_arguments)| {
-                            self.method_member_in_trait(trait_id, next_method)
-                                .map(|next_id| (trait_id, trait_arguments, next_id))
+                            self.method_member_in_trait_at(trait_id, &trait_arguments, next_method)
                         });
                     match resolved {
-                        Some((trait_id, trait_arguments, next_id)) => {
+                        Some((next_id, declaring_trait_id, declaring_arguments)) => {
                             self.for_each_next.insert(for_each_id, next_id);
                             self.generic_dispatch.insert(
                                 for_each_id,
                                 GenericDispatch::OnConstraint(constraint_id, next_method),
                             );
+                            // B473: the DECLARING trait answers, as for a
+                            // `value.next()` through the same bound.
                             self.bound_dispatch_traits
-                                .insert(for_each_id, (trait_id, trait_arguments));
+                                .insert(for_each_id, (declaring_trait_id, declaring_arguments));
                         }
                         None => self.report_uniterable_for_each(
                             for_each_id,
@@ -68162,6 +68482,9 @@ fn analyze_over_world<'src>(
         // The splice (§3.2). Before every check that could add to the lists,
         // and the published order is `sort_in_step`'s either way.
         analyzer.replay_world_diagnostics(&replay_records);
+        // B465: a closure literal at a view position of a written closure type
+        // takes view parameters there — before anything reads a convention.
+        analyzer.adopt_closure_parameter_views();
         // Infer the `borrows` effect before any check reads it (readonly-mutation
         // and the scalar-view lowering both consult `Function.borrows`).
         analyzer.infer_borrows();

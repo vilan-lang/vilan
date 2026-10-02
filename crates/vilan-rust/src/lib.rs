@@ -9408,6 +9408,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, _)) => {
                 self.spine_names_storage(subject) && !self.is_natively_copy(id)
             }
+            // B466 (R-c): `*view` names storage the view's OWNER holds — a
+            // place no binding here owns — so a consumed read of it is rule
+            // 1's copy, never a move out of the reference (rustc E0507). It is
+            // never a last use either: what dies here is the view, not the
+            // place it names.
+            Some(Expr::Dereference(_)) => {
+                if self.is_natively_copy(id) {
+                    return rendered;
+                }
+                self.copies_taken += 1;
+                return format!("({rendered}).clone()");
+            }
             _ => false,
         };
         if reads_a_place {
@@ -10053,8 +10065,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 trait_id,
                 arguments: &arguments,
             };
+            // The impl's override — of the trait itself, then through a
+            // sub-trait's clause (B359, shared with the JS emitter) — and only
+            // then the trait's default (B473).
             if let Some(selected) =
                 impl_select::select_member(self.program, None, type_id, member, Some(wanted))
+                    .or_else(|| {
+                        mono::select_member_through_subtraits(
+                            self.program,
+                            None,
+                            type_id,
+                            trait_id,
+                            member,
+                        )
+                    })
             {
                 return self
                     .dispatch_to_member(selected, type_id, own_generic_values)
@@ -10401,7 +10425,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut arguments = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
             let expecting = self.intrinsic_argument_expectation(intrinsic, index);
-            arguments.push(if index == 0 {
+            arguments.push(if index == 0 && matches!(intrinsic, Intrinsic::SharedNew) {
+                // B483 (R-c): `Shared::new(own value)` is a CONSTRUCTOR, not a
+                // method — its argument 0 is the value the cell keeps, and a
+                // place the caller still reads afterwards is copied in (rule 1)
+                // rather than moved out from under the caller.
+                let saved = std::mem::replace(&mut self.expected_type, expecting);
+                let rendered = self.consumed_value_of(*argument, depth);
+                self.expected_type = saved;
+                rendered?
+            } else if index == 0 {
                 if mutating {
                     self.mutable_receiver(*argument, depth)?
                 } else {

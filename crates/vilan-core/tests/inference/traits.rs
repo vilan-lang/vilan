@@ -8220,11 +8220,20 @@ fn a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter() {
     );
 }
 
+// --- B473: through a SUBTRAIT, the declaring trait's impl answers -------------
+//
+// A member a supertrait declares, reached through a bound (or a qualified
+// call, or a `for` loop) naming one of its SUB-traits, is selected out of the
+// receiver's impl of the DECLARING trait — its override first, the default
+// second. The analyzer recorded the bound's own trait for emission, which
+// looked for the member in the impl of `Sub`, found nothing there, and took
+// the default the chain reached, on both backends. The native half is
+// `native_differential`'s `a_supertrait_override_is_dispatched_through_a_subtrait_on_both_backends`.
+
 #[test]
-#[ignore = "A142: reactive-44 find (MISCOMPILE, both backends, predates A142): through a subtrait bound, a supertrait method with a default runs the default even where the type overrides it"]
 fn a_supertrait_defaults_override_is_dispatched_through_a_subtrait_bound() {
     // `Mine` overrides `Base::name`. Through `S: Base` the override runs;
-    // through `S: Sub` (a subtrait of `Base`) the DEFAULT runs today, on JS and
+    // through `S: Sub` (a subtrait of `Base`) the DEFAULT ran, on JS and
     // natively, and on the 0.41.1 toolchain as well. A142 reached it: `map_each`
     // over a `DeltaSource` bound called `Source::attach_observer`, and a
     // `ListCell`'s own observer was bypassed for the default, which captures the
@@ -8274,6 +8283,186 @@ fn a_supertrait_defaults_override_is_dispatched_through_a_subtrait_bound() {
         main();
         "#,
         "the override\nthe override\n",
+    );
+}
+
+/// B473 at a PARAMETERIZED chain, two levels deep, and through the qualified
+/// spelling: the bound's arguments are carried up to the declaring trait
+/// (`Sub<i32>` passes `Base<i32>`), so the override of THAT instantiation
+/// answers. A type that overrides nothing still takes the default.
+#[test]
+fn b473_a_parameterized_supertraits_override_answers_through_a_deeper_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun name(self, value: T): str {
+                "the default"
+            }
+        }
+
+        trait Sub<T> with Base<T> {
+            fun tag(self): i32;
+        }
+
+        trait Deeper with Sub<i32> {}
+
+        struct Mine {}
+
+        impl Mine with Base<i32> {
+            fun name(self, value: i32): str {
+                i"the override {value}"
+            }
+        }
+
+        impl Mine with Sub<i32> {
+            fun tag(self): i32 {
+                7
+            }
+        }
+
+        impl Mine with Deeper {}
+
+        struct Plain {}
+
+        impl Plain with Base<i32> {}
+
+        impl Plain with Sub<i32> {
+            fun tag(self): i32 {
+                8
+            }
+        }
+
+        fun through_sub<S: Sub<i32>>(value: S): str {
+            value.name(1)
+        }
+
+        fun through_deeper<S: Deeper>(value: S): str {
+            value.name(2)
+        }
+
+        fun qualified<S: Sub<i32>>(value: S): str {
+            Sub::name(value, 3)
+        }
+
+        fun main() {
+            print(through_sub(Mine {}));
+            print(through_deeper(Mine {}));
+            print(qualified(Mine {}));
+            print(through_sub(Plain {}));
+        }
+        "#,
+        "the override 1\nthe override 2\nthe override 3\nthe default\n",
+    );
+}
+
+/// B473 at a CONCRETE receiver named through the sub-trait (`Sub::name(late)`),
+/// with the sub-trait's impl written BEFORE the override's: the impl that
+/// declares the member answers whatever order the blocks were written in. And
+/// a `for` loop over a sub-trait bound drives the declaring trait's `next`
+/// override (the default would end the loop at once: `0`).
+#[test]
+fn b473_a_qualified_call_and_a_for_loop_through_a_subtrait_take_the_override() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base {
+            fun name(self): str {
+                "the default"
+            }
+        }
+
+        trait Sub with Base {
+            fun tag(self): i32;
+        }
+
+        struct Late {}
+
+        impl Late with Sub {
+            fun tag(self): i32 {
+                1
+            }
+        }
+
+        impl Late with Base {
+            fun name(self): str {
+                "the late override"
+            }
+        }
+
+        struct Only {}
+
+        impl Only with Base {}
+
+        trait Walk {
+            fun next(&mut self): Option<i32> {
+                None
+            }
+        }
+
+        trait SubWalk with Walk {}
+
+        struct Count { n: i32 }
+
+        impl Count with Walk {
+            fun next(&mut self): Option<i32> {
+                if self.n >= 3 {
+                    ret None;
+                }
+                self.n += 1;
+                Some(self.n)
+            }
+        }
+
+        impl Count with SubWalk {}
+
+        fun walk<W: SubWalk>(mut walker: W): i32 {
+            mut total = 0;
+            for value in walker {
+                total += value;
+            }
+            total
+        }
+
+        fun main() {
+            print(Sub::name(Late {}));
+            print(Base::name(Late {}));
+            print(Base::name(Only {}));
+            print(walk(Count { n = 0 }));
+        }
+        "#,
+        "the late override\nthe late override\nthe default\n6\n",
+    );
+}
+
+/// The qualified spelling still names a trait the receiver must IMPLEMENT:
+/// `Sub::name` on a type that implements only `Base` is refused, although the
+/// member it reaches is `Base`'s (B473 kept the check on the named trait).
+#[test]
+fn b473_a_qualified_subtrait_call_on_a_type_without_the_subtrait_is_refused() {
+    assert_fails_with(
+        r#"
+        trait Base {
+            fun name(self): str {
+                "the default"
+            }
+        }
+
+        trait Sub with Base {
+            fun tag(self): i32;
+        }
+
+        struct Only {}
+
+        impl Only with Base {}
+
+        fun main() {
+            let label = Sub::name(Only {});
+        }
+        "#,
+        "does not implement 'Sub'",
     );
 }
 

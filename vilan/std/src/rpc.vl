@@ -4998,9 +4998,11 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 			Some(let at) => self.elements.update(|&mut list| {
 				// Bound BEFORE the mutation: `list[at]` on the right of a `let` is
 				// a copy of the element (it is the `&mut` view that `mutate` gets),
-				// so `previous` is the element as it was.
+				// so `previous` is the element as it was. The view is spelled
+				// `&mut list[at]`: a closure's view parameter takes a view, as a
+				// `fun`'s does (B464).
 				let previous = list[at];
-				mutate(list[at]);
+				mutate(&mut list[at]);
 				self.log.record(SeqOp::SetAt(at, KeyedElement { key, value = previous }, KeyedElement {
 					key,
 					value = list[at],
