@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: performance -->
+**A store write diffs through views: `Storable::store_diff(&self, other: &Self, ..)`, so a whole write no longer copies each level of the value to compare it.** The first build took `self` and `other` by value because a scalar `&self` receiver, and a `&b` of a generic scalar, reached the wrong slot on the JS emit (B505, fixed on next); natively that cost a clone of every field it descended into — a 1,000-key map field included, even where the diff then compared nothing. Measured on a root holding a 1,000-key map with two slots live, 2,000 whole writes each changing one leaf: native (debug) 578–613 ms → 439–469 ms; JS 134–213 ms → 134–136 ms (what is left on both is the caller's own copy of the value it writes). Handle writes stay at 2–4 ms and leaf reads at 0–2 ms (against 133–156 ms when the value is handed up each level). `[derive(Storable)]` re-expands; a hand-written `Storable` impl moves its signature to the views. Tracker A142 S7.
+
+---
+
 <!-- family: fix -->
 **`std::store` lends a generic-typed field and an enum payload in place, and writes a single payload through a `mut` binder: the copies the store's first build took to route around B504, B506 and F79 are gone.** A field typed by the subject's own parameter (`Pair<T>.left`) was lent through a local and written back, and a `Some`/variant payload was rebound before its view was taken — on the JS emit a view of a pattern binder, or of a field whose declared type is a parameter resolving to a scalar, reached the wrong slot. Both are fixed on next, so the derive emits `f(&held.left)`, `Some(let payload) => f(&payload)` and `Online(mut p0) => { f(&mut p0); held = Online(p0); }` (a multi-payload variant still gathers its tuple). Observing a `StoreSome` builds natively now (F75), so the probe that pinned its refusal is retired and `native/store_struct.vl` and `native/store_variant.vl` observe through one; a bare variant of a generic enum (`Maybe::Nothing`, F76) is written in the variant probe again. Tracker A142 S7.
 

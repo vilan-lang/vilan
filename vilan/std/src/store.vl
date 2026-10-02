@@ -324,7 +324,7 @@ fun write_at<T: Storable>(
 	mut changed = false;
 	modify(|place: &mut T| {
 		landed = true;
-		changed = place.store_diff(value, node, need, &mut woken);
+		changed = place.store_diff(&value, node, need, &mut woken);
 		place = value;
 	});
 	if changed {
@@ -361,14 +361,15 @@ fun child_path(path: List<usize>, index: usize): List<usize> {
 /// Not `diff`: an inherent method wins over a trait's of the same name (spec
 /// `names.md` §4.6), and `i32` has an inherent `diff`.
 export trait Storable {
-	/// Diff `self` (what the place holds) against `other` (what is written) under
-	/// `node`: collect into `woken` every live slot whose value changes, and answer
-	/// whether the value changed. The answer must be exact when `need` is true or a
-	/// slot stands at `node`; otherwise `false` is allowed, and is what lets a
-	/// write into an unwatched subtree compare nothing.
+	/// Diff `self` (what the place holds) against `other` (what is written), both
+	/// lent in place — a diff copies nothing it does not compare — under `node`:
+	/// collect into `woken` every live slot whose value changes, and answer whether
+	/// the value changed. The answer must be exact when `need` is true or a slot
+	/// stands at `node`; otherwise `false` is allowed, and is what lets a write
+	/// into an unwatched subtree compare nothing.
 	fun store_diff(
-		self,
-		other: Self,
+		&self,
+		other: &Self,
 		node: Option<Shared<StoreNode>>,
 		need: bool,
 		woken: &mut List<StoreSlot>,
@@ -380,8 +381,8 @@ export trait Storable {
 /// `Storable` (Q4).
 export trait StoreLeaf {
 	fun store_leaf_diff(
-		self,
-		other: Self,
+		&self,
+		other: &Self,
 		node: Option<Shared<StoreNode>>,
 		need: bool,
 		woken: &mut List<StoreSlot>,
@@ -392,8 +393,8 @@ export trait StoreLeaf {
 /// it is a change.
 export impl type T with StoreLeaf {
 	fun store_leaf_diff(
-		self,
-		other: T,
+		&self,
+		other: &T,
 		node: Option<Shared<StoreNode>>,
 		need: bool,
 		woken: &mut List<StoreSlot>,
@@ -408,8 +409,8 @@ export impl type T with StoreLeaf {
 /// and a slot below it has no diff of its own to wake it.
 export impl type T: PartialEq with StoreLeaf {
 	fun store_leaf_diff(
-		self,
-		other: T,
+		&self,
+		other: &T,
 		node: Option<Shared<StoreNode>>,
 		need: bool,
 		woken: &mut List<StoreSlot>,
@@ -417,7 +418,7 @@ export impl type T: PartialEq with StoreLeaf {
 		if !need && node.is_none() {
 			ret false;
 		}
-		let changed = self != other;
+		let changed = *self != *other;
 		if changed {
 			store_wake_all(node, woken);
 		}
@@ -428,8 +429,8 @@ export impl type T: PartialEq with StoreLeaf {
 /// Every type is `Storable`: a type nothing derives is a leaf (Q3).
 export impl type T: StoreLeaf with Storable {
 	fun store_diff(
-		self,
-		other: T,
+		&self,
+		other: &T,
 		node: Option<Shared<StoreNode>>,
 		need: bool,
 		woken: &mut List<StoreSlot>,
@@ -443,8 +444,8 @@ export impl type T: StoreLeaf with Storable {
 /// changes only what the payload holds.
 export impl Option<type P: Storable> with Storable {
 	fun store_diff(
-		self,
-		other: Option<P>,
+		&self,
+		other: &Option<P>,
 		node: Option<Shared<StoreNode>>,
 		need: bool,
 		woken: &mut List<StoreSlot>,
@@ -459,7 +460,7 @@ export impl Option<type P: Storable> with Storable {
 			},
 			Some(let held) => match other {
 				None => store_switch(node, 1, 1, woken),
-				Some(let written) => held.store_diff(written, store_kid(node, 1), need || store_has_me(node), woken),
+				Some(let written) => held.store_diff(&written, store_kid(node, 1), need || store_has_me(node), woken),
 			},
 		};
 		store_wake_me(node, changed, woken);
@@ -989,8 +990,8 @@ export macro fun store_struct_impls(target: StructItem): str {
 
 	let subject = target.subject();
 	mut diff = fun_of("store_diff")
-		.parameter("self")
-		.parameter(i"other: {subject}")
+		.parameter("&self")
+		.parameter(i"other: &{subject}")
 		.parameter("node: Option<Shared<StoreNode>>")
 		.parameter("need: bool")
 		.parameter("woken: &mut List<StoreSlot>")
@@ -1012,7 +1013,7 @@ export macro fun store_struct_impls(target: StructItem): str {
 			diff = diff.line(i"changed = store_opaque(store_kid(node, {index}), woken) || changed;");
 		} else {
 			let step = if field.reactive_coarse { "store_leaf_diff" } else { "store_diff" };
-			diff = diff.line(i"changed = self.{field.name}.{step}(other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
+			diff = diff.line(i"changed = self.{field.name}.{step}(&other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
 		}
 		store_impl = store_impl.member(store_projection("Store", subject, method, field.name, index, field.type_));
 		some_impl = some_impl.member(store_projection("StoreSome", subject, method, field.name, index, field.type_));
@@ -1107,7 +1108,7 @@ export macro fun store_enum_impls(target: EnumItem): str {
 				if variant.payload[0].render().contains("|") {
 					same.push(i"store_opaque(store_kid(node, {child}), woken)");
 				} else {
-					same.push(i"a0.store_diff(b0, store_kid(node, {child}), here, woken)");
+					same.push(i"a0.store_diff(&b0, store_kid(node, {child}), here, woken)");
 				}
 			} else {
 				same.push(i"let payload = store_kid(node, {child});");
@@ -1118,7 +1119,7 @@ export macro fun store_enum_impls(target: EnumItem): str {
 					if type_.render().contains("|") {
 						same.push(i"moved = store_opaque(store_kid(payload, {position}), woken) || moved;");
 					} else {
-						same.push(i"moved = a{position}.store_diff(b{position}, store_kid(payload, {position}), deep && !moved, woken) || moved;");
+						same.push(i"moved = a{position}.store_diff(&b{position}, store_kid(payload, {position}), deep && !moved, woken) || moved;");
 					}
 					position = position + 1;
 				}
@@ -1178,8 +1179,8 @@ export macro fun store_enum_impls(target: EnumItem): str {
 		index = index + 1;
 	}
 	let diff = fun_of("store_diff")
-		.parameter("self")
-		.parameter(i"other: {subject}")
+		.parameter("&self")
+		.parameter(i"other: &{subject}")
 		.parameter("node: Option<Shared<StoreNode>>")
 		.parameter("need: bool")
 		.parameter("woken: &mut List<StoreSlot>")
