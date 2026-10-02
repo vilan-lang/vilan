@@ -11313,3 +11313,164 @@ fn b504_a_mut_pattern_binder_writes_through_its_cell() {
         "2\n8\n41\n10\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B506: a view of a generic place is a pair exactly where its type is a
+// scalar at the instance.
+// ---------------------------------------------------------------------------
+
+/// B506: `&pair.left` with `left: T`, `&x` with `x: T` a parameter, a view
+/// binding of either, an inline transient's capture, a `mut x: T` parameter's
+/// `&mut x`, a `for e in &mut xs` element over `List<T>`, `&mut pair.left`
+/// written through, and a re-borrow `&x` of a `x: &T` are `(base, key)`
+/// pairs at an instance where `T` is a scalar, and the value's own reference
+/// where it is an aggregate. The analyzer decided them on the generic body,
+/// where `T` is abstract, and only a generic `let` ROOT was re-decided per
+/// instance: the field and the parameter passed the VALUE to a callee reading
+/// a pair (`TypeError`), and a view binding's `*v` read the pair as the value.
+#[test]
+fn b506_a_view_of_a_generic_place_is_decided_per_instance() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Pair<T> {
+            left: T,
+        }
+
+        fun lend<T>(pair: &Pair<T>, f: |&T| void) {
+            f(&pair.left);
+        }
+
+        fun lend_through_bindings<T>(pair: &Pair<T>, f: |&T| void) {
+            let v = &pair.left;
+            f(v);
+            let w = v;
+            f(w);
+        }
+
+        fun lend_parameter<T>(x: T, f: |&T| void) {
+            f(&x);
+        }
+
+        fun read_back<T>(x: T): T {
+            let v = &x;
+            *v
+        }
+
+        fun lend_transient<T>(x: T, f: |&T| void) {
+            match Some(&x) {
+                Some(let v) => f(v),
+                None => {},
+            }
+        }
+
+        fun bump_generic<T>(mut x: T, f: |&mut T| void): T {
+            f(&mut x);
+            x
+        }
+
+        fun each_mut<T>(xs: &mut List<T>, f: |&mut T| void) {
+            for e in &mut xs {
+                f(e);
+            }
+        }
+
+        fun reset_all<T>(xs: &mut List<T>, value: T) {
+            for e in &mut xs {
+                e = value;
+            }
+        }
+
+        fun write_left<T>(pair: &mut Pair<T>, f: |&mut T| void) {
+            f(&mut pair.left);
+        }
+
+        fun relend<T>(x: &T, f: |&T| void) {
+            f(&x);
+        }
+
+        fun relend_closure<T>(x: T, f: |&T| void) {
+            let through = |held: &T| f(&held);
+            through(&x);
+        }
+
+        fun main() {
+            lend(&Pair { left = 1 }, |v: &i32| print(*v));
+            lend(&Pair { left = "ab" }, |v: &str| print(*v));
+            lend(&Pair { left = [2, 3] }, |v: &List<i32>| print(v.len()));
+            lend_through_bindings(&Pair { left = 4 }, |v: &i32| print(*v));
+            lend_parameter(5, |v: &i32| print(*v));
+            lend_parameter(true, |v: &bool| print(*v));
+            print(read_back(6));
+            print(read_back("seven"));
+            lend_transient(8, |v: &i32| print(*v));
+            print(bump_generic(9, |v: &mut i32| { v = *v + 1; }));
+            mut xs = [10, 20];
+            each_mut(&mut xs, |v: &mut i32| { v = *v * 2; });
+            print(xs[0] + xs[1]);
+            reset_all(&mut xs, 3);
+            print(xs[0] + xs[1]);
+            mut pair = Pair { left = 1 };
+            write_left(&mut pair, |v: &mut i32| { v = *v + 41; });
+            print(pair.left);
+            mut words = Pair { left = "a" };
+            write_left(&mut words, |v: &mut str| { v = *v + "b"; });
+            print(words.left);
+            relend(&pair.left, |v: &i32| print(*v));
+            relend_closure(5, |v: &i32| print(*v));
+        }
+        "#,
+        "1\nab\n2\n4\n4\n5\ntrue\n6\nseven\n8\n10\n60\n6\n42\nab\n42\n5\n",
+    );
+}
+
+/// B506's boundary: a view handed back through a RETURN keeps the generic
+/// body's verdict, because the caller reads it by the callee's declared
+/// pointee — a `borrows` return of `&T`, a wrapped `Option<&T>`, and
+/// `Arena::get` at `Arena<i32>` hand the element's value back as before.
+#[test]
+fn b506_a_returned_generic_view_keeps_the_declared_protocol() {
+    assert_compiles_and_runs(
+        r#"
+        import std::arena::Arena;
+        import std::io::print;
+
+        struct Pair<T> {
+            left: T,
+        }
+
+        fun first<T>(xs: &List<T>): &T borrows xs {
+            &xs[0]
+        }
+
+        fun left_of<T>(pair: &Pair<T>): &T borrows pair {
+            &pair.left
+        }
+
+        fun maybe_left<T>(pair: &Pair<T>): Option<&T> borrows pair {
+            Some(&pair.left)
+        }
+
+        fun main() {
+            let xs = [1, 2];
+            print(*first(&xs));
+            let v = first(&xs);
+            print(*v);
+            let pair = Pair { left = 3 };
+            print(*left_of(&pair));
+            match maybe_left(&pair) {
+                Some(let l) => print(*l),
+                None => {},
+            }
+            mut arena: Arena<i32> = Arena::new();
+            let handle = arena.insert(4);
+            match arena.get(handle) {
+                Some(let value) => print(*value),
+                None => {},
+            }
+        }
+        "#,
+        "1\n1\n3\n3\n4\n",
+    );
+}

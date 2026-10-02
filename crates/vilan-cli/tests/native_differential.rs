@@ -400,6 +400,81 @@ const B504_PROBE: &str = concat!(
     "\t}\n",
     "}\n",
 );
+const B506_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Pair<T> {\n",
+    "\tleft: T,\n",
+    "}\n",
+    "\n",
+    "fun first<T>(xs: &List<T>): &T borrows xs {\n",
+    "\t&xs[0]\n",
+    "}\n",
+    "\n",
+    "fun left_of<T>(pair: &Pair<T>): &T borrows pair {\n",
+    "\t&pair.left\n",
+    "}\n",
+    "\n",
+    "fun lend<T>(pair: &Pair<T>, f: |&T| void) {\n",
+    "\tf(&pair.left);\n",
+    "}\n",
+    "\n",
+    "fun lend_through_binding<T>(pair: &Pair<T>, f: |&T| void) {\n",
+    "\tlet v = &pair.left;\n",
+    "\tf(v);\n",
+    "}\n",
+    "\n",
+    "fun lend_parameter<T>(x: T, f: |&T| void) {\n",
+    "\tf(&x);\n",
+    "}\n",
+    "\n",
+    "fun read_back<T>(x: T): T {\n",
+    "\tlet v = &x;\n",
+    "\t*v\n",
+    "}\n",
+    "\n",
+    "fun lend_transient<T>(x: T, f: |&T| void) {\n",
+    "\tmatch Some(&x) {\n",
+    "\t\tSome(let v) => f(v),\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun bump_generic<T>(mut x: T, f: |&mut T| void): T {\n",
+    "\tf(&mut x);\n",
+    "\tx\n",
+    "}\n",
+    "\n",
+    "fun write_left<T>(pair: &mut Pair<T>, f: |&mut T| void) {\n",
+    "\tf(&mut pair.left);\n",
+    "}\n",
+    "\n",
+    "fun relend<T>(x: &T, f: |&T| void) {\n",
+    "\tf(&x);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlend(&Pair { left = 1 }, |v: &i32| print(*v));\n",
+    "\tlend(&Pair { left = \"ab\" }, |v: &str| print(*v));\n",
+    "\tlend(&Pair { left = [2, 3] }, |v: &List<i32>| print(v.len()));\n",
+    "\tlend_through_binding(&Pair { left = 4 }, |v: &i32| print(*v));\n",
+    "\tlend_parameter(5, |v: &i32| print(*v));\n",
+    "\tlend_parameter(true, |v: &bool| print(*v));\n",
+    "\tprint(read_back(6));\n",
+    "\tprint(read_back(\"seven\"));\n",
+    "\tlend_transient(8, |v: &i32| print(*v));\n",
+    "\tprint(bump_generic(9, |v: &mut i32| { v = *v + 1; }));\n",
+    "\tprint(*first(&[11, 12]));\n",
+    "\tprint(*left_of(&Pair { left = 13 }));\n",
+    "\tmut pair = Pair { left = 1 };\n",
+    "\twrite_left(&mut pair, |v: &mut i32| { v = *v + 41; });\n",
+    "\tprint(pair.left);\n",
+    "\tmut words = Pair { left = \"a\" };\n",
+    "\twrite_left(&mut words, |v: &mut str| { v = *v + \"b\"; });\n",
+    "\tprint(words.left);\n",
+    "\trelend(&pair.left, |v: &i32| print(*v));\n",
+    "}\n",
+);
 
 /// The programs the default suite runs — small, fast, and between them they
 /// cover every value shape S1a claims: scalars, `str`, `bool`, a struct with an
@@ -8274,5 +8349,22 @@ fn a_view_of_a_pattern_binder_is_identical_on_both_backends() {
         compare(&staged, "native_probe_b504.vl"),
         Verdict::Identical,
         "a view of a pattern binder must read the binder on both backends"
+    );
+}
+
+/// B506: a view of a generic place — a field typed `T`, a parameter typed
+/// `T`, a view binding of one, an inline transient's capture, a `mut x: T`
+/// parameter's `&mut x`, `&mut pair.left` written through, a re-borrow — is
+/// the same on both backends at a scalar and an aggregate instance, and a
+/// view RETURNED keeps its protocol (`*first(..)`, `*left_of(..)`).
+#[test]
+fn a_view_of_a_generic_place_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b506.vl"), B506_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b506.vl"),
+        Verdict::Identical,
+        "a view of a generic place must be decided per instance on both backends"
     );
 }
