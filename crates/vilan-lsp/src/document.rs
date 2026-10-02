@@ -3279,6 +3279,12 @@ impl Document {
         if let Some(rendered) = self.field_declaration_hover(program, offset) {
             return Some(rendered);
         }
+        // A type PARAMETER or a TRAIT named in type position (E240): the
+        // parameter with its bound and the declaration that introduces it; the
+        // trait's required members and its `///`.
+        if let Some(rendered) = self.reference_hover(program, offset) {
+            return Some(rendered);
+        }
         // A type name in type position: the full declaration when known.
         if let Some((definition, label)) = self.type_reference_at(program, offset) {
             if let Some(definition) = definition
@@ -3441,6 +3447,42 @@ impl Document {
         });
         if let Some(docs) =
             variant_entity.and_then(|entity| self.analysis(program).doc_comment_of(entity))
+        {
+            out.push_str("\n\n");
+            out.push_str(&docs);
+        }
+        Some(out)
+    }
+
+    /// E240's hover for a type-position name: a TYPE PARAMETER — `type I:
+    /// Read<U>`, then the declaration that introduces it — or a TRAIT, as its
+    /// required members at the arguments written, then its `///`. Both used
+    /// to answer the bare name (`T`, `Read<U>`), unfenced.
+    fn reference_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let hover = program
+            .reference_hovers
+            .iter()
+            .filter(|hover| {
+                let range = hover.span.into_range();
+                range.start <= offset && offset < range.end
+            })
+            .min_by_key(|hover| hover.span.into_range().len())?;
+        let named_trait = self
+            .type_reference_at(program, offset)
+            .and_then(|(definition, _)| definition)
+            .filter(|definition| program.traits.contains_key(definition));
+        let mut out = String::new();
+        // E221: a labelled trait leads with its reason here too.
+        if let Some(lead) = named_trait.and_then(|definition| internal_lead(program, definition)) {
+            out.push_str(&lead);
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("```vilan\n{}\n```", hover.code));
+        if let Some(owner) = &hover.declared_by {
+            out.push_str(&format!("\n\nA type parameter of `{owner}`"));
+        }
+        if let Some(docs) =
+            named_trait.and_then(|definition| self.analysis(program).doc_comment_of(definition))
         {
             out.push_str("\n\n");
             out.push_str(&docs);
@@ -23429,6 +23471,92 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover(&document, "mut out: List", 0, 4),
             fence("mut out: List<i32>")
+        );
+    }
+}
+
+/// E240: a TYPE PARAMETER hovers as one — `type I: Read<U>`, and the
+/// declaration that introduces it — at its declaration and at every use; a
+/// TRAIT named in a bound, a `with` clause or a supertrait list hovers with its
+/// required members at the arguments written, and its `///`. Both answered the
+/// bare name, unfenced (`T`, `Read<U>`).
+#[cfg(test)]
+mod hover_generics {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    const FIXTURE: &str = "import std::io::print;\n\n\
+/// Something that reads a value.\ntrait Read<T> {\n\tfun read(self): T;\n\tfun twice(self): (T, T) {\n\t\t(self.read(), self.read())\n\t}\n}\n\n\
+struct Boxed<T> {\n\tvalue: T,\n}\n\n\
+impl Boxed<type T> with Read<T> {\n\tfun read(self): T {\n\t\tself.value\n\t}\n}\n\n\
+trait Show {\n\tfun show(self): str;\n}\n\n\
+impl type F: Read<type T> with Show {\n\tfun show(self): str {\n\t\t\"f\"\n\t}\n}\n\n\
+fun pick<U, I: Read<U>>(source: I): U {\n\tsource.read()\n}\n\n\
+fun each<T>(items: List<T>, observer: |T| void) {\n\tfor item in items {\n\t\tobserver(item);\n\t}\n}\n\n\
+fun main() {\n\tlet boxed = Boxed { value = 3 };\n\tprint(pick(boxed));\n\teach([1], |x| print(x));\n}\n\nmain();\n";
+
+    fn hover(needle: &str, at: usize) -> String {
+        let document = Document::analyze(FIXTURE, &std_root(), Path::new("test.vl"));
+        let errors: Vec<String> = document
+            .published_diagnostics()
+            .into_iter()
+            .filter(|diagnostic| !diagnostic.warning)
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(errors.is_empty(), "the fixture compiles: {errors:?}");
+        let start = FIXTURE.find(needle).unwrap_or_else(|| panic!("{needle:?}"));
+        document
+            .hover(start + at)
+            .unwrap_or_else(|| panic!("a hover at {needle:?} +{at}"))
+    }
+
+    fn parameter(line: &str, owner: &str) -> String {
+        format!("```vilan\n{line}\n```\n\nA type parameter of `{owner}`")
+    }
+
+    const PICK: &str = "fun pick<U, I: Read<U>>(source: I): U";
+
+    #[test]
+    fn e240_a_functions_type_parameters_hover_at_their_declaration_and_every_use() {
+        assert_eq!(hover("fun pick<U", 9), parameter("type U", PICK));
+        assert_eq!(hover("I: Read<U>>", 0), parameter("type I: Read<U>", PICK));
+        assert_eq!(hover("(source: I)", 9), parameter("type I: Read<U>", PICK));
+        assert_eq!(hover("): U {\n\tsource", 3), parameter("type U", PICK));
+    }
+
+    #[test]
+    fn e240_a_type_parameter_inside_a_closure_type_hovers_as_the_parameter() {
+        assert_eq!(
+            hover("observer: |T| void", 11),
+            parameter("type T", "fun each<T>(items: List<T>, observer: |T| void)")
+        );
+    }
+
+    #[test]
+    fn e240_a_blankets_binders_hover_with_their_bounds_and_the_head() {
+        let head = "impl type F: Read<type T> with Show";
+        assert_eq!(hover("type F: Read", 5), parameter("type F: Read<T>", head));
+        assert_eq!(
+            hover("Read<type T> with Show", 10),
+            parameter("type T", head)
+        );
+        // An impl's binder used inside one of its methods.
+        assert_eq!(
+            hover("fun read(self): T {", 16),
+            parameter("type T", "impl Boxed<type T> with Read<T>")
+        );
+    }
+
+    #[test]
+    fn e240_a_trait_in_a_bound_or_a_with_clause_hovers_with_its_required_members() {
+        // At the arguments written: `Read<U>`'s `read` returns `U`.
+        assert_eq!(
+            hover("Read<U>>(source", 1),
+            "```vilan\ntrait Read<U> {\n\tfun read(self): U;\n}\n```\n\nSomething that reads a value."
+        );
+        assert_eq!(
+            hover("with Show {", 6),
+            "```vilan\ntrait Show {\n\tfun show(self): str;\n}\n```"
         );
     }
 }

@@ -20,7 +20,7 @@ mod hover_labels;
 mod liveness;
 
 pub use hint_labels::HintLabel;
-pub use hover_labels::{DEFINITION_MEMBER_CAP, PatternLabel, TypeDefinitions};
+pub use hover_labels::{DEFINITION_MEMBER_CAP, PatternLabel, ReferenceHover, TypeDefinitions};
 pub use liveness::DropExtent;
 
 /// Distinguishes the recursive type operations that resolve generics through a
@@ -2460,6 +2460,11 @@ enum SignatureSide<'a> {
     /// parameter is the matching clause argument, falling back to the subject
     /// when the clause supplied none. The conformance steer reads this side.
     Impl(TypeId, &'a [TypeId]),
+    /// The trait APPLIED to arguments with no subject in hand — a bound's
+    /// `Read<U>` or a `dyn`'s object, as hover lists its required members
+    /// (E237, E240): `Self` reads `Self`, as on the declaration side, and the
+    /// trait's own parameters take the arguments, as on the impl side.
+    Applied(&'a [TypeId]),
 }
 
 /// A supertrait member reached from a sub-trait's default body (B205/B216):
@@ -21564,7 +21569,9 @@ impl<'src> Analyzer<'src> {
     /// Source<T>`) already reads right, and rendering it through a substitution
     /// would be the same string by a longer road.
     fn trait_argument_substitution(&self, subject: &SignatureSubject<'_>) -> SubstitutionContext {
-        let SignatureSide::Impl(_, trait_arguments) = subject.rendered_for else {
+        let (SignatureSide::Impl(_, trait_arguments) | SignatureSide::Applied(trait_arguments)) =
+            subject.rendered_for
+        else {
             return SubstitutionContext::default();
         };
         let Some(trait_) = self.traits.get(&subject.declaring_trait_id) else {
@@ -21615,7 +21622,9 @@ impl<'src> Analyzer<'src> {
             _ => return None,
         }
         let (impl_subject, trait_arguments) = match subject.rendered_for {
-            SignatureSide::Declaration => return Some("Self".to_string()),
+            SignatureSide::Declaration | SignatureSide::Applied(_) => {
+                return Some("Self".to_string());
+            }
             SignatureSide::Impl(impl_subject, trait_arguments) => (impl_subject, trait_arguments),
         };
         let written = self
@@ -61191,6 +61200,10 @@ pub struct Program<'src> {
     /// the variant of the matched value's type with its payload substituted
     /// (`Option<i32>::Some(i32)`) — and the enum and variant it names.
     pub pattern_labels: Vec<PatternLabel>,
+    /// E240: the entry's type-position names that are a type parameter
+    /// (`type I: Read<U>` and the declaration introducing it) or a trait (its
+    /// required members), by span.
+    pub reference_hovers: Vec<ReferenceHover>,
     /// E206: the signature a GENERIC call site reached, rendered under the
     /// bindings the solver chose there — `fun get_or(self, key: UserId, make:
     /// || SignalCell<Option<User>>): SignalCell<Option<User>>` where the
@@ -70456,6 +70469,8 @@ fn analyze_over_world<'src>(
     let type_definitions = analyzer.type_definitions(&expr_type_ids);
     // E241: a variant pattern's label, rendered once its types have settled.
     let pattern_labels = analyzer.pattern_labels();
+    // E240: type parameters and traits named in type position.
+    let reference_hovers = analyzer.reference_hovers();
 
     // E145: which identifiers spell an `as` alias rather than its target.
     analyzer.collect_import_alias_spans();
@@ -70868,6 +70883,7 @@ fn analyze_over_world<'src>(
         member_headers,
         type_definitions,
         pattern_labels,
+        reference_hovers,
         call_signature_labels,
         expr_type_ids,
         inferred_return_types: std::mem::take(&mut analyzer.inferred_return_types),

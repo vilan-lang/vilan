@@ -88,6 +88,19 @@ pub struct PatternLabel {
     pub matched: bool,
 }
 
+/// A type-position name's hover (E240), for the two kinds the plain label
+/// answered with a bare name: a TYPE PARAMETER (`type I: Read<U>`, and the
+/// declaration that introduces it) and a TRAIT named in a bound, a `with`
+/// clause or a supertrait list (its required members, as E237's block).
+#[derive(Debug, Clone)]
+pub struct ReferenceHover {
+    pub span: Span,
+    /// The fenced line or block.
+    pub code: String,
+    /// The declaration a type parameter belongs to, as written.
+    pub declared_by: Option<String>,
+}
+
 impl Parameter<'_> {
     /// One parameter as a signature writes it (E235): the receiver in its
     /// convention's own form (`self`, `own self`, `&self`, `&mut self`), any
@@ -293,7 +306,7 @@ impl<'src> Analyzer<'src> {
         }
         let type_ = type_id.borrow_type(self);
         let mut generics = Vec::new();
-        self.collect_generics(type_, 0, &mut generics);
+        self.collect_head_generics(type_, 0, &mut generics);
         let opens_a_binder = match type_ {
             Type::Generic(constraint_id) => !introduced.contains(constraint_id),
             _ => generics.iter().any(|generic| !introduced.contains(generic)),
@@ -475,6 +488,184 @@ impl<'src> Analyzer<'src> {
         labels
     }
 
+    /// [`Analyzer::collect_generics`] through a TRAIT's or an object's
+    /// arguments too — a head writes binders there (`impl type S: Read<type
+    /// T>`, `with DescribeInto<type S: Sink>`), which a value type never does.
+    fn collect_head_generics(&self, type_: &Type, depth: usize, out: &mut Vec<TypeId>) {
+        if depth > 24 {
+            return;
+        }
+        match type_ {
+            Type::Trait(_, arguments) | Type::Dyn(_, arguments) => {
+                for argument in arguments {
+                    self.collect_head_generics(argument.borrow_type(self), depth + 1, out);
+                }
+            }
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => {
+                for argument in arguments {
+                    self.collect_head_generics(argument.borrow_type(self), depth + 1, out);
+                }
+            }
+            Type::Tuple(items) => {
+                for item in items {
+                    self.collect_head_generics(item.borrow_type(self), depth + 1, out);
+                }
+            }
+            other => self.collect_generics(other, depth, out),
+        }
+    }
+
+    /// E240: the entry's type-position names that are a type parameter or a
+    /// trait, rendered — every other row keeps its plain label.
+    pub(super) fn reference_hovers(&self) -> Vec<ReferenceHover> {
+        let owners = self.generic_owners();
+        let mut hovers: Vec<ReferenceHover> = Vec::new();
+        for (source, span, definition, type_id) in &self.type_references {
+            if *source != SourceId(0) || hovers.iter().any(|hover| hover.span == *span) {
+                continue;
+            }
+            match type_id.borrow_type(self) {
+                Type::Generic(constraint_id) => {
+                    if self.implicit_generic_scopes.contains_key(constraint_id) {
+                        continue;
+                    }
+                    let hover = ReferenceHover {
+                        span: *span,
+                        code: self.type_parameter_line(*constraint_id),
+                        declared_by: owners.get(constraint_id).cloned(),
+                    };
+                    // The row's definition is the BINDER — the `U` of
+                    // `fun pick<U, ..>` — which no row covers: its declaration
+                    // answers the same as every use.
+                    if let Some(binder_span) = definition
+                        .filter(|binder| self.source_of_id(*binder) == Some(SourceId(0)))
+                        .and_then(|binder| self.span_map.get(&binder))
+                        && !hovers.iter().any(|known| known.span == **binder_span)
+                    {
+                        hovers.push(ReferenceHover {
+                            span: **binder_span,
+                            ..hover.clone()
+                        });
+                    }
+                    hovers.push(hover);
+                }
+                Type::Trait(trait_id, _) if *definition == Some(*trait_id) => {
+                    let Some(block) = self.type_definition_block(*type_id) else {
+                        continue;
+                    };
+                    hovers.push(ReferenceHover {
+                        span: *span,
+                        code: block,
+                        declared_by: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        hovers
+    }
+
+    /// `type T`, or `type I: Read<U>` with its bound — a type parameter as its
+    /// declaration introduces it.
+    fn type_parameter_line(&self, constraint_id: TypeId) -> String {
+        let name = self
+            .generic_constraint_names
+            .get(&constraint_id)
+            .copied()
+            .unwrap_or("_");
+        match constraint_id.borrow_type(self) {
+            Type::Trait(..) => format!(
+                "type {name}: {}",
+                self.declaration_type_label(constraint_id)
+            ),
+            _ => format!("type {name}"),
+        }
+    }
+
+    /// Every type parameter the ENTRY declares, mapped to the declaration
+    /// that introduces it, as written: a function's signature, an impl's or a
+    /// trait's head, a struct's or an enum's name line.
+    fn generic_owners(&self) -> HashMap<TypeId, String> {
+        let entry = Some(SourceId(0));
+        let mut owners: HashMap<TypeId, String> = HashMap::default();
+        let own = |owners: &mut HashMap<TypeId, String>, ids: &[TypeId], label: &str| {
+            for id in ids {
+                owners.entry(*id).or_insert_with(|| label.to_string());
+            }
+        };
+        for (id, function) in &self.functions {
+            if self.source_of_id(*id) == entry
+                && !function.generic_parameter_constraint_ids.is_empty()
+            {
+                let label = self.function_signature_label(function);
+                own(
+                    &mut owners,
+                    &function.generic_parameter_constraint_ids,
+                    &label,
+                );
+            }
+        }
+        for implementation in &self.implementations {
+            if implementation.source != SourceId(0) {
+                continue;
+            }
+            let mut generics = Vec::new();
+            self.collect_head_generics(implementation.subject.borrow_type(self), 0, &mut generics);
+            for (_, arguments) in &implementation.trait_args {
+                for argument in arguments {
+                    self.collect_head_generics(argument.borrow_type(self), 0, &mut generics);
+                }
+            }
+            // A binder's bound introduces binders of its own (`type S:
+            // Read<type T>`): walk the bounds until nothing new appears.
+            let mut index = 0;
+            while index < generics.len() {
+                let bound = generics[index];
+                self.collect_head_generics(bound.borrow_type(self), 0, &mut generics);
+                index += 1;
+            }
+            if !generics.is_empty() {
+                let label = self.impl_header_label(implementation);
+                own(&mut owners, &generics, &label);
+            }
+        }
+        for (id, trait_) in &self.traits {
+            if self.source_of_id(*id) == entry {
+                let label = self.trait_header_label(trait_);
+                own(
+                    &mut owners,
+                    &trait_.generic_parameter_constraint_ids,
+                    &label,
+                );
+            }
+        }
+        for (id, struct_) in &self.structs {
+            if self.source_of_id(*id) == entry {
+                let label = format!(
+                    "struct {}{}",
+                    struct_.name,
+                    self.generic_list_label(&struct_.generic_parameter_constraint_ids)
+                );
+                own(
+                    &mut owners,
+                    &struct_.generic_parameter_constraint_ids,
+                    &label,
+                );
+            }
+        }
+        for (id, enum_) in &self.enums {
+            if self.source_of_id(*id) == entry {
+                let label = format!(
+                    "enum {}{}",
+                    enum_.name,
+                    self.generic_list_label(&enum_.generic_parameter_constraint_ids)
+                );
+                own(&mut owners, &enum_.generic_parameter_constraint_ids, &label);
+            }
+        }
+        owners
+    }
+
     /// E237: the definition blocks for the entry's typed positions — every
     /// binding and parameter it declares, every member it reads, every field
     /// of a struct it declares — deduplicated by rendered type.
@@ -630,7 +821,7 @@ impl<'src> Analyzer<'src> {
             declaring_trait_id: trait_id,
             rendered_for: match self_type {
                 Some(self_type) => SignatureSide::Impl(self_type, arguments),
-                None => SignatureSide::Declaration,
+                None => SignatureSide::Applied(arguments),
             },
         };
         let members: Vec<String> = trait_
