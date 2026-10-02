@@ -648,7 +648,7 @@ function detached_nursery() {
 }
 function $b(value) {
 	let subscribers = [  ];
-	return [ __shared_new(__clone(value)), __shared_new(subscribers) ];
+	return [ __shared_new(value), __shared_new(subscribers) ];
 }
 function $a(value) {
 	return $b(value);

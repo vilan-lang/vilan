@@ -278,7 +278,7 @@ function drain_mirror(source2, cursor, held, label, at_turn) {
 }
 function $c(value2) {
 	let subscribers = [  ];
-	return [ __shared_new(__clone(value2)), __shared_new(subscribers) ];
+	return [ __shared_new(value2), __shared_new(subscribers) ];
 }
 function $b(value2) {
 	return $c(value2);
@@ -287,7 +287,7 @@ function $d(limit) {
 	return [ __shared_new([  ]), __shared_new(0), __shared_new(0), __shared_new([  ]), limit ];
 }
 function $a(initial, limit) {
-	return [ $b(initial), $d(limit) ];
+	return [ $b(__clone(initial)), $d(limit) ];
 }
 function $h(self) {
 	const minted = [ fresh_id(), __shared_new(self[1].v) ];
@@ -307,7 +307,7 @@ function $l() {
 	return [ __shared_new([  ]), __shared_new(0), __shared_new(0), __shared_new([  ]), delta_log_limit ];
 }
 function $k(initial) {
-	return [ $b(initial), $l() ];
+	return [ $b(__clone(initial)), $l() ];
 }
 function $o(self, cursor) {
 	const at = cursor[1].v;

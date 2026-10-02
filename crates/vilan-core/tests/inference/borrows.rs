@@ -10828,6 +10828,45 @@ fn b483_a_storing_constructor_copies_an_argument_the_caller_still_reads() {
     );
 }
 
+/// R-c, the reactive cell: `SignalCell::new` and the trait's `Signal::new` STORE
+/// their argument, so they take it `own` like `Shared::new` — a list the caller
+/// still reads is copied in and a write through the cell never reaches it, and
+/// at the argument's LAST use it is moved in with no copy at the call. Red with
+/// the bare `value` planted back: the constructor copies every argument inside.
+#[test]
+fn rc_signal_cell_new_takes_its_value_own() {
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        fun main() {
+            let items: List<i32> = [1, 2];
+            let cell: SignalCell<List<i32>> = SignalCell::new(items);
+            cell.value.write().push(3);
+            let others: List<i32> = [7];
+            let held: SignalCell<List<i32>> = Signal::new(others);
+            held.update(|list| list.push(8));
+            print(i"items={items.len()} cell={cell.get().len()} others={others.len()} held={held.get().len()}");
+            let last: List<i32> = [5, 6, 7];
+            let moved: SignalCell<List<i32>> = SignalCell::new(last);
+            print(i"moved={moved.get().len()}");
+        }
+        "#;
+    assert_compiles_and_runs(source, "items=2 cell=3 others=1 held=2\nmoved=3\n");
+    let js = compile(source).expect("compiles");
+    // The copy is the CALLER's, at a use that is not the last (`__clone(items)`),
+    // and none inside the constructor: with a bare `value` the body copied every
+    // argument, the last use included.
+    assert!(
+        js.contains("__clone(items)") && !js.contains("__clone(last)"),
+        "a still-read argument is copied at the call, the last use moved:\n{js}"
+    );
+    assert!(
+        !js.contains("__shared_new(__clone(value))"),
+        "the constructor stores what it is handed without copying it again:\n{js}"
+    );
+}
+
 /// B466: `*view` of an aggregate is a place the binding does not own, so
 /// binding it, returning it, or wrapping it copies — JS bound the caller's
 /// storage itself (`c.x = 99` wrote the caller's `P`, and a snapshot

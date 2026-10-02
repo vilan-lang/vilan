@@ -35,7 +35,7 @@ fun main() {
 A `SignalCell<T>` is a mutable cell whose readers can subscribe to changes.
 
 ```vilan,fragment
-Signal::new(value: T): SignalCell<T>       // a fresh signal
+Signal::new(own value: T): SignalCell<T>   // a fresh signal
 signal.get(): T                        // current value
 signal.set(value: T)                   // write + notify subscribers
 signal.set_with(transform: sync |T| T) // read-modify-write in one step

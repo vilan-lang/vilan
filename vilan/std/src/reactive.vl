@@ -2319,7 +2319,7 @@ export trait Signal<T> with Source<T> {
 	/// The canonical cell, concretely — deliberately not `Self`: a bare
 	/// `Signal::new(1)` has no receiver and no bound in scope to resolve a `Self`
 	/// against.
-	fun new(value: T): SignalCell<T> {
+	fun new(own value: T): SignalCell<T> {
 		SignalCell::new(value)
 	}
 
@@ -2471,7 +2471,10 @@ export impl SignalCell<type T> with Signal<T> {
 	/// Declared, not inherited: `Type::func` reads the type's OWN members, so the
 	/// trait's default body is reachable at `Signal::new` and this one is reachable
 	/// at `SignalCell::new`. They are the same cell either way.
-	fun new(value: T): SignalCell<T> {
+	///
+	/// The cell STORES `value`, so it takes it `own` (R-c): a caller's last use
+	/// moves it in, any other use hands over a copy — never the caller's own value.
+	fun new(own value: T): SignalCell<T> {
 		mut subscribers: List<Subscriber> = [];
 		SignalCell { value = Shared::new(value), subscribers = Shared::new(subscribers) }
 	}

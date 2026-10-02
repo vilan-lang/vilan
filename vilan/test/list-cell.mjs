@@ -386,7 +386,7 @@ function $b() {
 }
 function $d(value2) {
 	let subscribers = [  ];
-	return [ __shared_new(__clone(value2)), __shared_new(subscribers) ];
+	return [ __shared_new(value2), __shared_new(subscribers) ];
 }
 function $c(elements, log) {
 	return [ __shared_new(elements), $d(0), __clone(log) ];

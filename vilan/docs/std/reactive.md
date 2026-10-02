@@ -69,7 +69,7 @@ in-place `update` — names `SignalCell`.
 
 ```vilan,fragment
 trait Signal<T> with Source<T> {
-	fun new(value: T): SignalCell<T>             // default body: the canonical cell
+	fun new(own value: T): SignalCell<T>         // default body: the canonical cell
 	fun set(self, value: T)                      // required
 	fun notify(self)                             // required
 	fun set_with(self, transform: sync |T| T)    // default: set(transform(get()))
@@ -83,7 +83,7 @@ it hands back is a `SignalCell<T>`.
 
 ```vilan,fragment
 impl SignalCell<type T> with Signal<T> {
-	fun new(value: T): SignalCell<T>
+	fun new(own value: T): SignalCell<T>
 	fun set(self, value: T)                 // write + notify
 	fun notify(self)                        // publish without changing
 	// from the trait default:
