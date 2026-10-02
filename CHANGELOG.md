@@ -378,6 +378,11 @@ written down.
 <!-- family: fix -->
 **`vilan fmt` formats a parameter written with a view prefix AND a reference type — `|&x: &i32|`, `fun f(&mut y: &mut T)` — where it declined the whole file; the convention is written once, in the type (`|x: &i32|`).** The printer dropped a prefix whenever the type was a reference, and the safety net, seeing `&` vanish, threw the reprint away. The net now folds a prefix the type REPEATS, on both streams, at a parameter's head (`(`, `,` or a closure's `|`). The printer also stopped dropping a prefix the type CONTRADICTS: `&x: &mut i32` takes `&`, because the prefix wins (§6.3), and dropping it would have changed the convention. Both are kept as written. **Pin:** `formatter::reformats::b507_…` covers a function's and a closure's `&`/`&mut` pairs reprinted in the type, and the contradicting pairs reprinted unchanged through `reprint`. Each half is red with its fix planted back: without the fold the file declines, and with a blanket drop the contradiction declines. Tracker B507.
 
+---
+
+<!-- family: fix -->
+**`vilan fmt` reprints a prefix operator over an `if` or a `match` (`*if c { &a } else { &b }`, `-if c { 1 } else { 2 }`) and a call on a member chain that ends in a call (`kept.read()(2)`) as written. It used to add parentheses, and the safety net then declined the whole file.** Both shapes arrived on `next` in Order 45's native fixtures (`deref_of_a_conditional_view.vl`, F81, and `position_typed_bindings.vl`), so `scripts/ci-local.sh vilan-fmt` was red on `next` before this lane's rebase. To the parser an `if`/`match` after a prefix operator is an atom that ends at its own brace, so it prints bare. A call after a chain that already ends in a call applies to that call's result, which is what the postfix chain reads anyway. A written group keeps its parentheses, and so does a callee whose chain ends in a field (`(holder.callback)(3)`). **Pin:** `formatter::reformats::a_prefix_over_a_block_form_and_a_call_after_a_call_reprint_as_written` reprints all seven shapes byte-identically through `reprint`, and each half is red with its fix planted back. Found at the rebase. It has no tracker item yet.
+
 ## v0.42.1 — 2026-10-01
 
 <!-- commit: 3d1791a3 -->

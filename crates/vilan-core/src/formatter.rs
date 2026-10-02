@@ -7348,6 +7348,35 @@ impl<'src> Printer<'src> {
         self.indent -= 1;
     }
 
+    /// Whether a member chain's last link is a CALL (`a.b()`, `a.b.c()`), so
+    /// a call written after it applies to its result without parentheses.
+    fn member_chain_ends_in_a_call(node: &Node<'src>) -> bool {
+        match node {
+            Node::MemberAccessor(_, member) => match &member.0 {
+                Node::Call(..) => true,
+                inner @ Node::MemberAccessor(..) => Self::member_chain_ends_in_a_call(inner),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// A prefix operator's operand (`-`, `!`, `&`, `*`, `await`). An `if` or a
+    /// `match` there is an ATOM to the parser — it ends at its own closing
+    /// brace — so it prints bare, as written: `*if c { &a } else { &b }`.
+    /// The operand rule would wrap it (both rank 0, the statement-like
+    /// forms), and the added parentheses are token drift the net declines
+    /// the whole file for (F81's fixture). A written group still reprints
+    /// as one; everything else keeps the operand rule.
+    fn print_prefix_operand(&mut self, operand: &Spanned<Node<'src>>, split: Split) {
+        if matches!(operand.0, Node::If(_) | Node::Match(_, _)) {
+            self.split = Split::Off;
+            self.print_expr(operand);
+        } else {
+            self.print_split_operand(operand, 10, split);
+        }
+    }
+
     fn print_split_operand(&mut self, expr: &Spanned<Node<'src>>, minimum: u8, split: Split) {
         self.split = if Self::expression_precedence(&expr.0) >= minimum {
             split
@@ -7642,10 +7671,16 @@ impl<'src> Printer<'src> {
                 // callee must be parenthesized — `(a.b)(c)` — or it reparses wrong.
                 // A `?.` lift chain likewise absorbs a following call into its
                 // continuation, so a `Lift` callee needs its own parens: `(a?.b)()`.
+                //
+                // A member chain that already ENDS in a call is the exception:
+                // `kept.read()(2)` calls the result of `kept.read()`, which is
+                // what the postfix chain reads anyway, so it prints as written
+                // rather than as `(kept.read())(2)`, which the net declined.
                 if matches!(
                     callee.0,
                     Node::MemberAccessor(_, _) | Node::Index(_, _) | Node::Lift(_, _)
-                ) {
+                ) && !Self::member_chain_ends_in_a_call(&callee.0)
+                {
                     self.out.push('(');
                     self.print_expr(callee);
                     self.out.push(')');
@@ -7730,7 +7765,7 @@ impl<'src> Printer<'src> {
             // unwrapped.
             Node::Unary(operator, operand) => {
                 self.out.push(*operator);
-                self.print_split_operand(operand, 10, split);
+                self.print_prefix_operand(operand, split);
             }
             Node::TryAssert(subject) => {
                 self.print_operand(subject, 100);
@@ -7775,11 +7810,11 @@ impl<'src> Printer<'src> {
                 if *mutable {
                     self.out.push_str("mut ");
                 }
-                self.print_split_operand(operand, 10, split);
+                self.print_prefix_operand(operand, split);
             }
             Node::Dereference(operand) => {
                 self.out.push('*');
-                self.print_split_operand(operand, 10, split);
+                self.print_prefix_operand(operand, split);
             }
             // `..e` — a tuple-value spread (variadic-generics.md §T). The operand
             // is printed WITHOUT the operand rule's parentheses: `..` takes the
@@ -7793,7 +7828,7 @@ impl<'src> Printer<'src> {
             }
             Node::Await(operand) => {
                 self.out.push_str("await ");
-                self.print_split_operand(operand, 10, split);
+                self.print_prefix_operand(operand, split);
             }
             Node::Async(operand) => {
                 self.out.push_str("async ");
@@ -8709,6 +8744,30 @@ mod reformats {
         }
     }
 
+    // Two shapes next's fixtures write and the printer could not reprint, so
+    // `vilan fmt` declined both files (`ci-local.sh vilan-fmt` red): a prefix
+    // operator over an `if`/`match` (F81's `*if c { &a } else { &b }`) and a
+    // call on a member chain that ends in a call (`kept.read()(2)`). Each
+    // prints as written; a written group and a chain that does NOT end in a
+    // call keep their parentheses.
+    #[test]
+    fn a_prefix_over_a_block_form_and_a_call_after_a_call_reprint_as_written() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tmut picked = *if c { &a } else { &b };\n",
+            "\tlet negated = -if c { 1 } else { 2 } * 3;\n",
+            "\tlet flipped = !match n {\n\t\t0 => true,\n\t\t_ => false,\n\t};\n",
+            "\tlet grouped = *(if c { &a } else { &b });\n",
+            "\tkept.read()(2);\n",
+            "\tpair.inner.read()(\"a\", 2);\n",
+            "\t(holder.callback)(3);\n",
+            "}\n",
+        );
+        let reprinted = super::reprint(source)
+            .unwrap_or_else(|declined| panic!("the formatter declined: {}", declined.sentence()));
+        assert_eq!(reprinted, source);
+    }
+
     // B507: a parameter's view prefix the type repeats reprints in the type
     // alone, in a closure and in a function; one the type contradicts (the
     // prefix wins, §6.3) is kept, so the convention survives the reprint.
@@ -8722,9 +8781,8 @@ mod reformats {
         // the convention.
         let kept = "fun f(&x: &mut i32, &mut y: &i32) {}\n";
         // Through `reprint`, so a decline (which hands the input back) reds.
-        let reprinted = super::reprint(kept).unwrap_or_else(|declined| {
-            panic!("the formatter declined: {}", declined.sentence())
-        });
+        let reprinted = super::reprint(kept)
+            .unwrap_or_else(|declined| panic!("the formatter declined: {}", declined.sentence()));
         assert_eq!(reprinted, kept);
     }
 
