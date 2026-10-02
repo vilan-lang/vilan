@@ -5,10 +5,12 @@ Drives a `vilan-lsp` process over stdio (JSON-RPC, the protocol an editor
 speaks) through a FIXED edit script on a scratch COPY of a package — kolt by
 default, at a pinned commit — and prints one table row per edit:
 
-  - time to diagnostics: the first `publishDiagnostics` for the edited file
-    after the `didChange` (wall, debounce included — the server waits
-    `clamp(0.3 x last analysis, 150, 500)` ms before it starts), and the CPU
-    the server process spent from the edit until it went idle again;
+  - time to diagnostics: the LAST `publishDiagnostics` for the edited file
+    before the server goes idle — the analysis's; since E242 the first one is
+    the immediate repaint of the followed diagnostics — (wall, debounce
+    included: the server waits `clamp(0.3 x last analysis, 150, 500)` ms
+    before it starts), the CPU spent up to it, and the CPU the server process
+    spent from the edit until it went idle again;
   - the keystroke path: hover, completion, inlay hints and semantic tokens
     asked IMMEDIATELY after the edit, before any analysis has landed — E121's
     <10 ms path (wall: the analysis is running beside them, so their own CPU
@@ -391,10 +393,14 @@ def measure_edit(server, document, scenario, apply):
         wall = document.ask(kind, scenario)
         settled[kind] = ((live_threads_ns(server.pid) - before) / 1e6, wall * 1000)
     errors = sum(1 for diagnostic in last[2] if diagnostic.get("severity", 1) == 1) if last else 0
+    # The ANALYSIS's publish is the last one before idle: since E242 the
+    # server republishes the followed diagnostics at once, before any
+    # analysis, and that repaint is the first publish an edit gets.
+    landed = last or first
     return {
-        "diagnostics_ms": (first[0] - started) * 1000,
-        "diagnostics_cpu_ms": first[3] - cpu_before,
-        "last_diagnostics_ms": (last[0] - started) * 1000 if last else None,
+        "diagnostics_ms": (landed[0] - started) * 1000,
+        "diagnostics_cpu_ms": landed[3] - cpu_before,
+        "first_publish_ms": (first[0] - started) * 1000,
         "cpu_ms": cpu_after - cpu_before,
         "settle_ms": (settled_at - started) * 1000,
         "errors": errors,
@@ -505,7 +511,7 @@ def print_table(cold_rows, rows, header):
     print()
     print("Medians over the runs. E121's targets: <10 ms on the keystroke path, <500 ms to errors.")
     print(
-        "CPU is the whole server process (every thread) from the edit to the first publish for the file, and "
+        "CPU is the whole server process (every thread) from the edit to the analysis's publish for the file, and "
         "to idle; wall includes the debounce and the machine's load. Keystroke requests are asked before the "
         "analysis lands; idle requests after it."
     )
