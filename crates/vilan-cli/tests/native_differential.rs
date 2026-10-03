@@ -8847,6 +8847,24 @@ fn a_view_closure_reached_by_another_route_keeps_its_views_on_both_backends() {
     );
 }
 
+/// F48 (pinned, not reproduced at the Order 46 base): a reassigned
+/// closure-typed `mut` binding and a `List` of closures build — F44's counted
+/// literal closed what was filed as rustc E0308 in Order 43.
+#[test]
+fn a_reassigned_closure_binding_and_a_list_of_closures_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_reassigned_closures.vl"),
+        include_str!("native/reassigned_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_reassigned_closures.vl"),
+        Verdict::Identical,
+        "a reassigned closure binding and a list of closures must build and run the same"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds

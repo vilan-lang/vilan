@@ -1,0 +1,28 @@
+// F48 (pinned; not reproduced at the Order 46 base): a REASSIGNED
+// closure-typed `mut` binding and a `List` holding several closures. Filed in
+// Order 43 as rustc E0308 ("each closure is its own type"); F44 made every
+// closure literal the counted `Rc<dyn Fn>` its type renders as from the moment
+// it is built, which closed both shapes. Each line is one: a binding
+// reassigned to a closure that captures, an annotated list of two closures
+// iterated, a list literal of two closures with a third pushed, and a call
+// through a subscript.
+import std::io::print;
+
+fun main() {
+	mut pick = || 1;
+	print(pick());
+	pick = || 2;
+	print(pick());
+	let base = 10;
+	pick = || base + 3;
+	print(pick());
+	let fns: List<|| i32> = [|| 4, || base + 5];
+	for f in fns {
+		print(f());
+	}
+	mut adders = [|n: i32| n + 1, |n: i32| n * 2];
+	adders.push(|n: i32| n - base);
+	let third = adders[2];
+	print(third(30));
+	print(adders.len());
+}
