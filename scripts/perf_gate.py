@@ -138,6 +138,10 @@ def measure_subject(vilan, subject, work, counter, env=None):
     """One subject's `vilan check`: a discarded warm-up (std materialized, macro table written), then the
     measured run."""
     directory = subject_dir(subject, work)
+    # The members of a multi-entry package one after another (M100 overlaps them by default): two
+    # threads racing for std's clean-parse cache make the count move by ~0.2% run to run, which is
+    # noise a ceiling at +1% should not have to absorb. The work is the same work either way.
+    env = dict(os.environ if env is None else env, VILAN_SEQUENTIAL_CHECK="1")
     perf_count.measure([vilan, "check", "."], cwd=directory, env=env, counter=counter)
     result = perf_count.measure([vilan, "check", "."], cwd=directory, env=env, counter=counter,
                                 log=os.path.join(work, subject.replace(":", "-") + ".log"))

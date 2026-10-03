@@ -490,6 +490,7 @@ fn run_cli() -> ExitCode {
                 if let Some(limit) = explain_cost {
                     vilan_core::counters::set_cost_attribution(limit);
                 }
+                ONE_SHOT_CHECK.store(!watch, std::sync::atomic::Ordering::Relaxed);
                 let roots = watch.then(|| watch_roots(&file));
                 run_or_watch(roots, move || {
                     check_once(file.clone(), platform.clone(), debug)
@@ -5503,30 +5504,45 @@ fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
         .is_ok()
     };
 
-    // The FIRST member runs alone, on this thread, writing its diagnostics
-    // straight out (M35). It is what fills the process-global caches — the
-    // clean-parse cache, the base world, the macro worlds — and starting every
-    // member cold at once would have each of them analyze `std` from scratch:
-    // N times the CPU for one world, and N threads queued on the one mutex that
-    // hands it out. Every member after it meets those caches warm, which is
-    // where the parallelism is actually free. The caches themselves need
-    // nothing: each is a content-keyed `Mutex`, M23's claims are taken under
-    // the lookup's own lock, and every counter and scope inside an analysis
-    // (`cancel`, `owned_modules`, `leak_tally`, `depth_stats`, the analyzer's
-    // own probes) is already thread-local, because an analysis has run on a
-    // thread of its own since the language server's first one.
-    let mut ok = check(first_unit, *first_platform);
-    if rest.is_empty() || sequential_check() {
+    // M100: every member starts at once, one thread each, capturing its
+    // diagnostics. M35 ran the FIRST member alone to warm the process-global
+    // caches — the clean-parse cache, the base world, the macro worlds — so
+    // the rest would meet them warm. That made a two-entry package (a client
+    // and a server, the commonest shape there is) fully serial: the second
+    // entry had nothing to overlap with, and wall equalled CPU. What the warm-up
+    // protected against does not happen any more: a base world two members
+    // share is built ONCE whoever misses first (M44: the second waits on the
+    // first's claim rather than recomputing), and members with different
+    // keys — a browser leg and a node leg — never shared one. What is left to
+    // race is std's clean parse, which costs a few percent of one analysis.
+    // The caches are content-keyed mutexes and every per-analysis scope is
+    // thread-local (M35's reasoning, unchanged), so nothing else is shared.
+    // A one-shot round whose members all key distinct worlds (a client and
+    // a server do: the platform is in the key) can never hit a world one of
+    // them stores, so none is stored (M100/M108: the clones were the largest
+    // thing left alive once the members overlap).
+    if ONE_SHOT_CHECK.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut platforms: Vec<String> = members
+            .iter()
+            .map(|(_, platform)| format!("{platform:?}"))
+            .collect();
+        platforms.sort();
+        platforms.dedup();
+        if platforms.len() == members.len() {
+            vilan_core::analyzer::set_base_cache_store(false);
+        }
+    }
+    if members.len() == 1 || sequential_check() {
+        let mut ok = check(first_unit, *first_platform);
         for (unit, platform) in rest {
             ok &= check(unit, *platform);
         }
         return outcome(ok);
     }
+    let mut ok = true;
 
-    // The rest, one thread each, each capturing its diagnostics rather than
-    // racing to stderr with them.
     let captured: Vec<(bool, Vec<CapturedReport>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = rest
+        let workers: Vec<_> = members
             .iter()
             .map(|(unit, platform)| {
                 spawn_scoped_compiler_thread(scope, || {
@@ -6769,6 +6785,10 @@ fn json_string(text: &str) -> String {
 /// signature and call site would touch far more than it informs. Under
 /// `--watch` the flag stays set, so every rebuild re-reports — intended.
 static PRINT_CHUNKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `vilan check` without `--watch`: one round, then the process exits — so
+/// a world stored for a later round has no later round (M100).
+static ONE_SHOT_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn compile_to_js(
     file: &Path,

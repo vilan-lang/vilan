@@ -66199,6 +66199,21 @@ pub const BASE_CACHE_RESIDENT_BUDGET: usize = 192 * 1024 * 1024;
 /// [`base_cache_budget_for_resident`].
 pub const BASE_CACHE_DEFAULT_BUDGET: usize = BASE_CACHE_RESIDENT_BUDGET / BASE_CACHE_WEIGHT_FACTOR;
 
+/// Whether a top-level analysis stores its pre-entry world in the base cache
+/// (M100/M108). On by default: the language server re-analyzes the same
+/// worlds all session, a `--watch` round re-checks them, and members of one
+/// workspace that share a key build the world once. A one-shot CLI check
+/// whose members all have distinct keys can never hit what it stores, so it
+/// turns the store off rather than holding a clone of each member's whole
+/// world (72 MB of kolt's client) to the end of the process. Macro worlds are
+/// not affected — they keep their own reuse.
+static BASE_CACHE_STORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Sets [`BASE_CACHE_STORE`] for every analysis this process runs from now on.
+pub fn set_base_cache_store(enabled: bool) {
+    BASE_CACHE_STORE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 static BASE_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(BASE_CACHE_DEFAULT_BUDGET);
 
@@ -70288,6 +70303,8 @@ fn analyze_inner<'src>(
     // the analysis would simply store nothing, which is what B239 did.
     crate::counters::checkpoint("world");
     if base_cacheable
+        && (crate::macros::in_macro_world()
+            || BASE_CACHE_STORE.load(std::sync::atomic::Ordering::Relaxed))
         && !entry_is_module
         && (!entry_is_open_module || base_cache_key.entry_open_module.is_some())
     {

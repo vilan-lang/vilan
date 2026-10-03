@@ -190,6 +190,11 @@ written down.
 
 ---
 
+<!-- family: performance -->
+**`vilan check` of a multi-entry package starts every entry at once, and a one-shot check whose entries key distinct worlds keeps no copy of them: kolt's client and server now overlap — wall 2.12 → 1.87 s (median of five, loadavg ~2.5; CPU unchanged) — and the check's peak RSS is 250 MB, under v0.42.1's 259 MB, where overlapping alone would have cost +80 MB.** M100. M35 ran the first member alone to warm the process caches, which made the commonest package shape (a browser client and a node server) fully serial: the second entry had nothing to overlap with. What the warm-up protected is covered without it — a base world two members share is built once whoever misses first (M44's claim), and members on different platforms never shared one — so every member now gets its own thread and its diagnostics are captured and replayed in member order, as the later members' always were (`VILAN_SEQUENTIAL_CHECK=1` still runs them one by one). And a one-shot `vilan check` whose members all key distinct worlds no longer stores a clone of each world in the base cache (`analyzer::set_base_cache_store`): nothing in the process can hit it, and it was 72 MB of the client's heap held to the exit. `--watch`, the language server, `vilan build` and a round with two members on one platform store as before. Instructions on kolt: 23.62 G sequential before → 23.50 G (no clones), 23.66 G overlapped (two threads race for std's clean parse; `perf_gate.py` measures sequentially so the count stays deterministic). Pins: `diagnostics::a_one_shot_check_stores_a_base_world_only_when_two_members_could_share_it` (red with the policy planted out); M35's determinism pins (the same bytes every run, the sequential round's bytes, member order) hold the overlapped round.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
