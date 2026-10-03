@@ -565,6 +565,14 @@ mod tests {
     }
 
     #[test]
+    fn a_tuple_nested_in_a_tuple_is_spliced_in() {
+        assert_eq!((1, (2, crate::str_new("x"))).js(), "[ 1, 2, 'x' ]");
+        assert_eq!(((1, 2), (3, (4, 5))).js(), "[ 1, 2, 3, 4, 5 ]");
+        assert_eq!(vec![(1, (2, 3))].js(), "[ [ 1, 2, 3 ] ]");
+        assert_eq!(Some((1, 2)).js(), "[ 0, [ 1, 2 ] ]");
+    }
+
+    #[test]
     fn a_nested_string_is_quoted_by_strescapes_rule() {
         assert_eq!(string("plain"), "'plain'");
         assert_eq!(string("it's"), "\"it's\"");

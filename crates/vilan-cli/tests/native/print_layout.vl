@@ -7,11 +7,12 @@
 // fourth level of nesting printed `[Array]`, a list past 100 entries with "...
 // n more items", a nested string quoted by node's escape rule and split at its
 // newlines when long, a cell's `{ v: .. }`, a `HashMap` and a `HashSet` past
-// the line, and a tuple. B503: a `List` of trait objects prints each object's
-// VALUE (the JS backend maps the list at the host boundary, as B436 converts a
-// lone object), nested lists of them too, while an object inside any other
-// container — an `Option`, a struct field — still prints as the stored pair on
-// both backends.
+// the line, and a tuple — a tuple nested in a tuple spliced in, as the JS
+// backend stores it flat, and one in an enum payload not. B503: a `List` of
+// trait objects prints each object's VALUE (the JS backend maps the list at
+// the host boundary, as B436 converts a lone object), nested lists of them
+// too, while an object inside any other container — an `Option`, a struct
+// field — still prints as the stored pair on both backends.
 import std::hash_map::HashMap;
 import std::hash_set::HashSet;
 import std::io::print;
@@ -114,6 +115,10 @@ fun main() {
 	}
 	print(seen);
 	print((1, "two", 3.5));
+	print((1, (2, "x")));
+	print(((1, 2), (3, (4, 5))));
+	print([(1, (2, 3)), (4, (5, 6))]);
+	print(Some((1, "a")));
 	print([Some(1), None, Some(3), None, Some(5), None, Some(7)]);
 
 	let shapes: List<dyn Shape> = [Square { side = 2 }, Square { side = 3 }];

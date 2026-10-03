@@ -95,6 +95,15 @@ pub trait Js {
     fn js_is_number(&self) -> bool {
         false
     }
+    /// The slots this value occupies in an enclosing TUPLE's JS array: itself
+    /// — except a tuple, whose elements' slots are spliced in, since the JS
+    /// backend stores a tuple FLAT (`(1, (2, "x"))` is `[ 1, 2, 'x' ]` there).
+    fn js_tuple_slots<'a>(&'a self, slots: &mut Vec<&'a dyn Js>)
+    where
+        Self: Sized,
+    {
+        slots.push(self);
+    }
 }
 
 macro_rules! js_via_display {
@@ -165,15 +174,21 @@ impl Js for () {
 
 /// A TUPLE renders as the array it is on the JS backend — a vilan tuple and a
 /// vilan struct are both flat arrays there, so `print((a, b))` is `[ a, b ]`
-/// with node's spacing. Written for the arities a program reaches; a wider one
+/// with node's spacing, and a tuple nested in a tuple is spliced in
+/// ([`Js::js_tuple_slots`]). Written for the arities a program reaches; a wider one
 /// is a refusal in the emitter rather than a silently different rendering.
 macro_rules! js_for_tuple {
     ($($name:ident),+) => {
         impl<$($name: Js),+> Js for ($($name,)+) {
             fn js(&self) -> String {
+                let mut slots = Vec::new();
+                self.js_tuple_slots(&mut slots);
+                js_items(&slots)
+            }
+            fn js_tuple_slots<'a>(&'a self, slots: &mut Vec<&'a dyn Js>) {
                 #[allow(non_snake_case, reason = "the binders are the type parameters' own names")]
                 let ($($name,)+) = self;
-                js_items(&[$($name as &dyn Js),+])
+                $($name.js_tuple_slots(slots);)+
             }
         }
     };

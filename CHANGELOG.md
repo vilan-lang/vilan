@@ -70,6 +70,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**Native: a tuple nested in a tuple prints spliced in, as the JS backend stores it — `print((1, (2, "x")))` is `[ 1, 2, 'x' ]` on both backends, where the native build printed `[ 1, [ 2, 'x' ] ]`.** The JS backend keeps a tuple FLAT (a tuple-typed element splices its slots in, spec §5.9), so node prints the flat array; the native tuple `Js` rendered each element as its own array. Each tuple now contributes its elements' slots to the enclosing tuple's array (`Js::js_tuple_slots`); a tuple in a `List`, a struct field or an enum payload stays an array of its own, as it is on the JS backend. Found with F68's printer work. Pins: `native/print_layout.vl` (four tuple lines) and `vilan_rt::inspect`'s `a_tuple_nested_in_a_tuple_is_spliced_in`. native-46's find (F68's family).
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
