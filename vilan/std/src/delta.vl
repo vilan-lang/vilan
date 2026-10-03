@@ -2184,16 +2184,6 @@ export struct CollTally<F, T, R, U> {
 }
 
 export impl CollTally<type F: CollFlow<type T>, T, type R: IntoFlow<bool>, type U> with Flow<U> {
-	[must_use]
-	fun on_change(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<U> {
 		let test = self.test;
 		let finish = self.finish;
@@ -3591,16 +3581,6 @@ export struct MapCount<F, K, V> {
 }
 
 export impl MapCount<type F: MapFlow<type K, type V>, K, V> with Flow<usize> {
-	[must_use]
-	fun on_change(own self, observer: (|usize| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|usize| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<usize> {
 		let upstream = self.up.open();
 		let held: Shared<usize> = Shared::new((upstream.snapshot)().len());
@@ -3645,16 +3625,6 @@ export struct MapSum<F, K, V, R, N> {
 export impl MapSum<type F: MapFlow<type K, type V>, K, V, type R: IntoFlow<N>, type N: Add + Sub + Default> with Flow<
 	N,
 > {
-	[must_use]
-	fun on_change(own self, observer: (|N| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|N| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<N> {
 		let measure = self.measure;
 		let upstream = self.up.open();

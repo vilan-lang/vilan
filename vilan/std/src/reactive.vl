@@ -1838,16 +1838,6 @@ export struct TrackedDerive<T> {
 }
 
 export impl TrackedDerive<type T> with Flow<T> {
-	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<T> {
 		let body = self.body;
 		let runs = Owner::new();
@@ -2041,22 +2031,29 @@ export trait Flow<T> {
 	/// immediate call IS the initial paint), which is why `sub`/`effect` exist
 	/// beside it.
 	///
-	/// A CALLBACK, not a body (A142 §7.3, B482): every impl runs `observer` under
+	/// A CALLBACK, not a body (A142 §7.3, B482): it runs `observer` under
 	/// `tracking.clear(..)`, so a `track()` in it is refused at compile time and a
 	/// `tracking.get_safe()` reads `None` — it runs after whatever body minted it.
 	///
-	/// REQUIRED rather than a default, like `sub`, so that each impl answers it
-	/// itself: a stage with `observe_flow`, and every source through the blanket
-	/// below with its own `attach_observer` (a mirror's lease, a cell's direct
-	/// attach).
+	/// A DEFAULT over `start` (F78): a stage takes it as written — start the flow,
+	/// attach one pulling subscriber — and every source overrides it through the
+	/// blanket below with its own `attach_observer` (a mirror's lease, a cell's
+	/// direct attach). Until Order 46 it was required and every stage carried the
+	/// same copy, because the native backend refused a default calling a hook it
+	/// reached through a blanket.
 	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription;
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
+	}
 
 	/// Subscribe: `observer` fires ONCE NOW with the current value, then once per
 	/// change. The eager form. You hold the `Subscription`; `effect` is the
-	/// owner-tied spelling. A callback, cleared as `on_change`'s is.
+	/// owner-tied spelling. A callback, cleared as `on_change`'s is; a default over
+	/// `start`, as `on_change` is.
 	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription;
+	fun sub(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
+	}
 
 	/// `effect` WITHOUT the immediate first call: `body` runs on every CHANGE from
 	/// here on, each run under an owner of its own (`effect`'s contract otherwise).
@@ -2923,16 +2920,6 @@ export struct Derive<S, T, U> {
 }
 
 export impl Derive<type S: Flow<type T>, T, type U> with Flow<U> {
-	[must_use]
-	fun on_change(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<U> {
 		let transform = self.transform;
 		let upstream = self.up.start();
@@ -2986,16 +2973,6 @@ export struct Switch<S, T, I, U> {
 }
 
 export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U> {
-	[must_use]
-	fun on_change(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<U> {
 		let select = self.select;
 		let runs = Owner::new();
@@ -3054,16 +3031,6 @@ export struct SwitchSome<S, T, I, U> {
 export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U> with Flow<
 	Option<U>,
 > {
-	[must_use]
-	fun on_change(own self, observer: (|Option<U>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|Option<U>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<Option<U>> {
 		let select = self.select;
 		let runs = Owner::new();
@@ -3151,16 +3118,6 @@ export struct AndThen<S, T, I, U> {
 export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, type U> with Flow<
 	Option<U>,
 > {
-	[must_use]
-	fun on_change(own self, observer: (|Option<U>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|Option<U>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<Option<U>> {
 		let select = self.select;
 		let runs = Owner::new();
@@ -3246,16 +3203,6 @@ export struct ThenSome<F, S, T> {
 }
 
 export impl ThenSome<type F: Flow<bool>, type S: Source<T>, type T> with Flow<Option<T>> {
-	[must_use]
-	fun on_change(own self, observer: (|Option<T>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|Option<T>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<Option<T>> {
 		let source = self.source;
 		let outer = self.up.start();
@@ -3303,16 +3250,6 @@ export struct Combine<T: (2..)> {
 }
 
 export impl Combine<type T> with Flow<T> {
-	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<T> {
 		let sources = self.sources;
 		Instance<T> {
@@ -3341,16 +3278,6 @@ export struct ZipSome<T: (2..)> {
 }
 
 export impl ZipSome<type T> with Flow<Option<T>> {
-	[must_use]
-	fun on_change(own self, observer: (|Option<T>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|Option<T>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<Option<T>> {
 		let instances = (flow in self.flows => flow.start());
 		Instance<Option<T>> {
@@ -3385,16 +3312,6 @@ export struct Distinct<S, T> {
 }
 
 export impl Distinct<type S: Flow<T>, type T: PartialEq> with Flow<T> {
-	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<T> {
 		let upstream = self.up.start();
 		let pull = upstream.pull;
@@ -3429,16 +3346,6 @@ export struct DistinctBy<S, T, K> {
 }
 
 export impl DistinctBy<type S: Flow<T>, type T, type K: PartialEq> with Flow<T> {
-	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<T> {
 		let key = self.key;
 		let upstream = self.up.start();

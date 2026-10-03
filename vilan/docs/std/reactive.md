@@ -273,16 +273,14 @@ trait Source<T> with Flow<T> {
 [resource]
 trait Flow<T> {
 	[must_use]
-	fun start(own self): Instance<T>                                  // the stage author's member
-	[must_use]
-	fun observe(own self, observer: |T| void, immediately: bool): Subscription
-	                                                                  // the stage author's attach (required)
+	fun start(own self): Instance<T>                                  // the stage author's member (required)
 	[must_use]
 	fun on_change(own self, observer: (|T| void) context tracking): Subscription
-	                                                                  // no first call; a callback (cleared)
+	                                                                  // no first call; a callback (cleared);
+	                                                                  // a default over `start`, a source's own
 	[must_use]
 	fun sub(own self, observer: (|T| void) context tracking): Subscription
-	                                                                  // + one immediate call; cleared
+	                                                                  // + one immediate call; cleared; likewise
 	fun effect_on_change(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
 	                                                                  // owner-registered; an owner per run; cleared
 	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
