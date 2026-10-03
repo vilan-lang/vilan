@@ -19832,6 +19832,27 @@ impl<'src> Analyzer<'src> {
     /// `List<T: Wire>`'s own `describe` fails at the element — two labels for
     /// one mistake. A Wire component is not recorded, so a `HashMap<str, Password>`
     /// contributes `HashMap<str, Password>` and `Password` and never `str`.
+    fn record_refused_rpc_wire_type(&mut self, type_id: TypeId) {
+        if self.resolved_type_is_wire(type_id) {
+            return;
+        }
+        let type_ = type_id.get_type(self);
+        let label = self.pretty_print_type(&type_, &HashMap::default());
+        if !self.rpc_refused_wire_types.insert(without_spaces(&label)) {
+            // Already recorded: a type that contains itself through a field is
+            // not expressible here, but a shape like `HashMap<Password, Password>`
+            // reaches the same argument twice and the walk must end.
+            return;
+        }
+        let arguments = match &type_ {
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => arguments.clone(),
+            _ => Vec::new(),
+        };
+        for argument in arguments {
+            self.record_refused_rpc_wire_type(argument);
+        }
+    }
+
     /// The origin a `[service]` expansion re-anchors at for `subject`: the
     /// derived origin in the method's own file whose span covers the
     /// subject's declaration (an attribute's expansion is anchored at the
@@ -19853,27 +19874,6 @@ impl<'src> Analyzer<'src> {
                     && subject_span.end <= span.end
             })
             .map(|(_, span, _)| (source, *span))
-    }
-
-    fn record_refused_rpc_wire_type(&mut self, type_id: TypeId) {
-        if self.resolved_type_is_wire(type_id) {
-            return;
-        }
-        let type_ = type_id.get_type(self);
-        let label = self.pretty_print_type(&type_, &HashMap::default());
-        if !self.rpc_refused_wire_types.insert(without_spaces(&label)) {
-            // Already recorded: a type that contains itself through a field is
-            // not expressible here, but a shape like `HashMap<Password, Password>`
-            // reaches the same argument twice and the walk must end.
-            return;
-        }
-        let arguments = match &type_ {
-            Type::Struct(_, arguments) | Type::Enum(_, arguments) => arguments.clone(),
-            _ => Vec::new(),
-        };
-        for argument in arguments {
-            self.record_refused_rpc_wire_type(argument);
-        }
     }
 
     fn resolved_type_is_wire(&mut self, type_id: TypeId) -> bool {
