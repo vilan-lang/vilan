@@ -8885,6 +8885,29 @@ fn a_capture_returned_from_a_closure_is_identical_on_both_backends() {
     );
 }
 
+/// F78 (pinned, not reproduced at the Order 46 base): a trait DEFAULT calling
+/// an overridable hook reached through a BLANKET — `Flow`'s `on_change`/`sub`
+/// as defaults over `start`, with a generic cell reaching `Flow<List<E>>` only
+/// through the `Source` blanket — builds; Order 45 saw it refused as "an
+/// unbound generic type parameter … of `ListCell`". (The lane also built
+/// `delta-law.vl`, `list-cell.vl` and the reactive programs against a std copy
+/// with those defaults written and eight pipe impls' copies removed:
+/// identical.)
+#[test]
+fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_default_hook_through_blanket.vl"),
+        include_str!("native/default_hook_through_blanket.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_default_hook_through_blanket.vl"),
+        Verdict::Identical,
+        "a default calling a hook a blanket supplies must build and run the same"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds

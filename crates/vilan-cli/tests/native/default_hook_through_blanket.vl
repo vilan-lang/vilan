@@ -1,0 +1,94 @@
+// F78 (pinned; not reproduced at the Order 46 base): a trait DEFAULT that
+// calls an overridable hook reached through a BLANKET — std's shape, where
+// `Flow`'s `on_change`/`sub` would be defaults over `start`, and a
+// `ListCell<T>` reaches `Flow<List<T>>` only through `impl type S:
+// Source<type T> with Flow<T>`. Reported as "an unbound generic type
+// parameter … of `ListCell`" in Order 45 (`delta-law.vl` with the defaults
+// written); it builds at the base, and so does std with those defaults (the
+// lane's probe). This is the shape in miniature: the default consumes `self`,
+// calls the hook the blanket supplies, and hands the instance (a closure
+// capturing the receiver) to a generic helper; the cell is generic over its
+// element and
+// implements the source trait at `List<E>`; a node type overrides the hook
+// and inherits the default; and the default runs at two element types.
+// (Passing `self` itself to a generic over `Flow` from the default is B510's
+// internal error on the JS backend, the solver's — not this pin's.)
+import std::io::print;
+
+struct Instance<T> {
+	pull: || T,
+}
+
+trait Source<T> with Flow<T> {
+	fun get(self): T;
+}
+
+trait Flow<T> {
+	fun start(own self): Instance<T>;
+
+	fun on_change(own self, observer: |T| void): i32 {
+		let instance = self.start();
+		observe(instance, observer, false)
+	}
+
+	fun sub(own self, observer: |T| void): i32 {
+		let instance = self.start();
+		observe(instance, observer, true)
+	}
+}
+
+fun observe<T>(instance: Instance<T>, observer: |T| void, immediately: bool): i32 {
+	let pull = instance.pull;
+	if immediately {
+		observer(pull());
+		ret 1;
+	}
+	0
+}
+
+impl type S: Source<type T> with Flow<T> {
+	fun start(own self): Instance<T> {
+		Instance<T> { pull = || self.get() }
+	}
+}
+
+struct ListCell<E> {
+	items: List<E>,
+}
+
+impl ListCell<type E> with Source<List<E>> {
+	fun get(self): List<E> {
+		self.items
+	}
+}
+
+struct Doubled<S> {
+	upstream: S,
+}
+
+impl Doubled<type S: Source<i32>> with Flow<i32> {
+	fun start(own self): Instance<i32> {
+		let upstream = self.upstream;
+		Instance<i32> { pull = || upstream.get() * 2 }
+	}
+}
+
+struct Number {
+	value: i32,
+}
+
+impl Number with Source<i32> {
+	fun get(self): i32 {
+		self.value
+	}
+}
+
+fun main() {
+	let numbers = ListCell { items = [1, 2, 3] };
+	print(numbers.sub(|items| print(i"sub saw {items.len()}")));
+	print(numbers.on_change(|items| print(i"never {items.len()}")));
+	let words = ListCell { items = ["a"] };
+	print(words.sub(|items| print(i"sub saw {items[0]}")));
+	let doubled = Doubled { upstream = Number { value = 21 } };
+	print(doubled.sub(|value| print(i"doubled {value}")));
+}
