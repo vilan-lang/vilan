@@ -6502,12 +6502,9 @@ export macro fun service(item: Item): Source {
 				match field.type_.arguments.get(0) {
 					Some(let element) => {
 						if field.keyed {
-							// `Map` is the hash map's spelling before tracker I9,
-							// kept one release as `std::map`'s deprecated alias of
-							// the same type — the annotation is read as WRITTEN, so
-							// both spellings are the map here until the alias goes
-							// (the analyzer's `is_hash_map_head` is the twin).
-							if (element.name == "HashMap" || element.name == "Map") && element.arguments.len() == 2 {
+							// The annotation is read as WRITTEN (the analyzer's
+							// `is_hash_map_head` is the twin).
+							if element.name == "HashMap" && element.arguments.len() == 2 {
 								match element.arguments.get(0) {
 									Some(let key) => match element.arguments.get(1) {
 										Some(let value) => {
@@ -6537,9 +6534,7 @@ export macro fun service(item: Item): Source {
 									},
 									None => {},
 								}
-							} else if field.key != ""
-								&& element.name == "List"
-								&& element.arguments.len() == 1 {
+							} else if field.key != "" && element.name == "List" && element.arguments.len() == 1 {
 								match element.arguments.get(0) {
 									Some(let value) => {
 										exposed_names.push(field.name);

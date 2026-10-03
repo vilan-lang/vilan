@@ -3058,73 +3058,15 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
     );
 }
 
-/// I9: `Map` is `HashMap`'s spelling before the rename, kept one release as
-/// `std::map`'s deprecated alias — and the keyed exposure reads its annotation
-/// AS WRITTEN, before any type resolves, in two places (the analyzer's shape
-/// check and the `[service]` expansion). Both must take the old spelling as the
-/// map: the program compiles, and the contract it states is the `HashMap`
-/// spelling's, keyed — not the whole-value channel's, which is what the
-/// expansion would fall back to if it did not recognise the element.
-#[test]
-fn i9_the_deprecated_map_spelling_is_still_a_keyed_expose_map() {
-    assert_compiles_and_runs(
-        r#"
-        import std::io::print;
-        import std::hash_map::HashMap;
-        import std::map::Map;
-        import std::reactive::{ Signal, SignalCell };
-        import std::wire::Keyed;
-        [derive(Wire, PartialEq, Debug)]
-        struct Task { id: str }
-        impl Task with Keyed<str> {
-            fun key(self): str { self.id }
-        }
-        [service(NewClient)]
-        struct NewStore {
-            [expose(keyed)] tasks: SignalCell<HashMap<str, Task>>,
-        }
-        impl NewStore {
-            [rpc]
-            fun count(self): usize { self.tasks.get().len() }
-        }
-        [service(OldClient)]
-        struct OldStore {
-            [expose(keyed)] tasks: SignalCell<Map<str, Task>>,
-        }
-        impl OldStore {
-            [rpc]
-            fun count(self): usize { self.tasks.get().len() }
-        }
-        [service(WholeClient)]
-        struct WholeStore {
-            [expose] tasks: SignalCell<HashMap<str, Task>>,
-        }
-        impl WholeStore {
-            [rpc]
-            fun count(self): usize { self.tasks.get().len() }
-        }
-        fun main() {
-            let keyed = NewStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
-            let old = OldStore { tasks = Signal::new(Map::new()) }.contract_hash();
-            let whole = WholeStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
-            print(old == keyed);
-            print(keyed == whole);
-        }
-        main();
-        "#,
-        "true\nfalse\n",
-    );
-}
-
 /// A144 (R-f): the contract hash reads the RESOLVED type, so every spelling of
-/// one wire contract hashes alike — the deprecated `Map<..>`, `HashMap<..>`, a
-/// renaming import of it, on an `[rpc]` signature and on a WHOLE-value
-/// `[expose]` (whose element the hash names). Red before A144 (the hash read
-/// the types as written): the three `[rpc]` services printed `7edcd9bc`,
-/// `966c1d7c` and `1956457c`, and the two whole exposures differed. The value
-/// itself is djb2 over the canonical surface,
+/// one wire contract hashes alike — `HashMap<..>` and a renaming import of it,
+/// on an `[rpc]` signature and on a WHOLE-value `[expose]` (whose element the
+/// hash names). Red before A144 (the hash read the types as written): the
+/// `[rpc]` services printed different hashes, and the two whole exposures
+/// differed. The value itself is djb2 over the canonical surface,
 /// `counts(HashMap<str, i32>)->HashMap<str, i32>;` — the spelling a plainly
-/// written service already had, so its hash did not move.
+/// written service already had, so its hash did not move. (The deprecated
+/// `Map<..>` spelling was the third until R-e removed it.)
 #[test]
 fn a144_an_alias_and_its_target_hash_alike() {
     assert_compiles_and_runs(
@@ -3132,7 +3074,6 @@ fn a144_an_alias_and_its_target_hash_alike() {
         import std::io::print;
         import std::hash_map::HashMap;
         import std::hash_map::HashMap as Table;
-        import std::map::Map;
         import std::reactive::{ Signal, SignalCell };
         [service(NewClient)]
         struct NewSpelling {
@@ -3141,14 +3082,6 @@ fn a144_an_alias_and_its_target_hash_alike() {
         impl NewSpelling {
             [rpc]
             fun counts(self, names: HashMap<str, i32>): HashMap<str, i32> { names }
-        }
-        [service(OldClient)]
-        struct OldSpelling {
-            unused: i32,
-        }
-        impl OldSpelling {
-            [rpc]
-            fun counts(self, names: Map<str, i32>): Map<str, i32> { names }
         }
         [service(RenamedClient)]
         struct RenamedSpelling {
@@ -3166,25 +3099,24 @@ fn a144_an_alias_and_its_target_hash_alike() {
             [rpc]
             fun size(self): usize { self.counts.get().len() }
         }
-        [service(WholeOldClient)]
-        struct WholeOld {
-            [expose] counts: SignalCell<Map<str, i32>>,
+        [service(WholeRenamedClient)]
+        struct WholeRenamed {
+            [expose] counts: SignalCell<Table<str, i32>>,
         }
-        impl WholeOld {
+        impl WholeRenamed {
             [rpc]
             fun size(self): usize { self.counts.get().len() }
         }
         fun main() {
             print(NewSpelling { unused = 0 }.contract_hash());
-            print(OldSpelling { unused = 0 }.contract_hash());
             print(RenamedSpelling { unused = 0 }.contract_hash());
             let whole_new = WholeNew { counts = Signal::new(HashMap::new()) }.contract_hash();
-            let whole_old = WholeOld { counts = Signal::new(Map::new()) }.contract_hash();
-            print(whole_new == whole_old);
+            let whole_renamed = WholeRenamed { counts = Signal::new(HashMap::new()) }.contract_hash();
+            print(whole_new == whole_renamed);
         }
         main();
         "#,
-        "7edcd9bc\n7edcd9bc\n7edcd9bc\ntrue\n",
+        "7edcd9bc\n7edcd9bc\ntrue\n",
     );
 }
 

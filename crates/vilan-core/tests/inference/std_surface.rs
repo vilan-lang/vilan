@@ -357,43 +357,92 @@ fn the_std_surface_batch_needs_no_import() {
     );
 }
 
-// --- I9: `HashMap`/`HashSet`, and the old names as deprecated aliases ---------
+// --- I9: `HashMap`/`HashSet`; R-e: the old names are gone ---------------------
 //
 // The hash collections are `std::hash_map::HashMap` and `std::hash_set::HashSet`.
-// `std::map::Map` and `std::set::Set` stay one release as `[deprecated]`
-// re-exports of the SAME types: a program that still spells them compiles,
-// warns at the name with the steer, and its values pass for the new type's in
-// both directions (a second spelling of one item, not a second type).
+// `std::map::Map` and `std::set::Set` had their one release as `[deprecated]`
+// re-exports (v0.42.0) and R-e (Order 46, ruled) removed them, with the reactive
+// cells' short names A148 renamed in v0.43.0: a use of an old name is refused,
+// and the refusal names the new one.
 
 #[test]
-fn i9_std_map_map_is_a_deprecated_alias_that_warns_with_the_steer() {
-    assert_warns_spanning(
-        r#"
-        import std::map::Map;
-
-        fun main() {
-            mut scores: Map<str, i32> = Map::new();
-            scores.insert("a", 1);
-        }
-        "#,
-        "Map",
-        "`Map` is deprecated; use std::hash_map::HashMap",
-    );
+fn r_e_the_removed_collection_modules_are_refused_with_the_new_path() {
+    for (import, steer) in [
+        (
+            "import std::map::Map;",
+            "`std::map` was removed: its `Map` is `std::hash_map::HashMap`",
+        ),
+        (
+            "import std::set::Set;",
+            "`std::set` was removed: its `Set` is `std::hash_set::HashSet`",
+        ),
+        (
+            "import std::map;",
+            "`std::map` was removed: its `Map` is `std::hash_map::HashMap`",
+        ),
+        (
+            "import std::map_cell::MapCell;",
+            "`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell`",
+        ),
+        (
+            "import std::set_cell;",
+            "`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell`",
+        ),
+    ] {
+        assert_fails_once_with(&format!("{import}\n\nfun main() {{}}\n"), steer);
+    }
 }
 
 #[test]
-fn i9_std_set_set_is_a_deprecated_alias_that_warns_with_the_steer() {
-    assert_warns_spanning(
+fn r_e_every_renamed_collection_name_is_refused_with_its_new_name() {
+    for (old, new, module) in [
+        ("Map", "HashMap", "hash_map"),
+        ("Set", "HashSet", "hash_set"),
+        ("MapCell", "HashMapCell", "reactive"),
+        ("SetCell", "HashSetCell", "reactive"),
+        ("MapEntry", "HashMapEntry", "reactive"),
+        ("SetEntry", "HashSetEntry", "reactive"),
+        ("MapMemo", "HashMapMemo", "reactive"),
+        ("SetMemo", "HashSetMemo", "reactive"),
+        ("TrackedMap", "TrackedHashMap", "reactive"),
+    ] {
+        // Imported from the module that declares the new name: the old one is
+        // refused there, naming the new.
+        assert_fails_once_with(
+            &format!("import std::{module}::{old};\n\nfun main() {{}}\n"),
+            &format!("`{old}` was renamed `{new}`: write `import std::{module}::{new};`"),
+        );
+    }
+    // Written with no import at all, in a type and in a value position: the
+    // ordinary miss, carrying the same steer.
+    assert_fails_with(
+        "fun main() {\n\tlet table: Map<str, i32> = HashMap::new();\n}\n",
+        "cannot find type 'Map'; `Map` was renamed `HashMap` — `import std::hash_map::HashMap;`",
+    );
+    assert_fails_with(
+        "fun main() {\n\tlet cell = MapCell::new();\n}\n",
+        "`MapCell` was renamed `HashMapCell` — `import std::reactive::HashMapCell;`",
+    );
+}
+
+/// A program's own `Map` is its own: the steer is a miss's, so a declaration
+/// of the name never meets it.
+#[test]
+fn r_e_a_programs_own_map_is_untouched() {
+    assert_compiles_and_runs(
         r#"
-        import std::set::Set;
+        import std::io::print;
+
+        struct Map {
+            size: i32,
+        }
 
         fun main() {
-            mut seen: Set<i32> = Set::new();
-            seen.insert(1);
+            let map = Map { size = 3 };
+            print(map.size);
         }
         "#,
-        "Set",
-        "`Set` is deprecated; use std::hash_set::HashSet",
+        "3\n",
     );
 }
 
@@ -521,41 +570,6 @@ fn i9_a_map_of_incomparable_values_has_no_equality() {
         }
         "#,
         "PartialEq",
-    );
-}
-
-/// The alias IS the type: an old-spelled value goes where the new type is
-/// declared and back, the old import still reaches the `List` terminators
-/// (`to_map`/`to_set`, extension impls declared in the new modules), and a
-/// `for` over an old-spelled set still takes the set's native lowering (it is
-/// keyed on the declaring struct, which the alias shares).
-#[test]
-fn i9_the_old_names_are_the_same_types_as_the_new() {
-    assert_compiles_and_runs(
-        r#"
-        import std::io::print;
-        import std::hash_map::HashMap;
-        import std::hash_set::HashSet;
-        import std::map::Map;
-        import std::set::Set;
-
-        fun size_new(table: HashMap<str, i32>): usize { table.len() }
-        fun size_old(table: Map<str, i32>): usize { table.len() }
-        fun make_old(): Set<i32> { [3, 1, 3].to_set() }
-
-        fun main() {
-            let old: Map<str, i32> = [("a", 1), ("b", 2)].to_map();
-            let new: HashMap<str, i32> = old;
-            print(size_new(old));
-            print(size_old(new));
-            let seen: HashSet<i32> = make_old();
-            for value in make_old() {
-                print(value);
-            }
-            print(seen.contains(1));
-        }
-        "#,
-        "2\n2\n3\n1\ntrue\n",
     );
 }
 

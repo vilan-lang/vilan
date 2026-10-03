@@ -5735,6 +5735,73 @@ fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String
     })
 }
 
+/// R-e (Order 46, ruled): the collection names that had their one release and
+/// are gone — `std::map`'s `Map` and `std::set`'s `Set` (deprecated by I9 in
+/// v0.42.0), and the reactive cells' short names (renamed by A148 in v0.43.0).
+/// Each old name with the name that replaced it and the module that declares
+/// it; the import path's miss and the bare name's miss both read this one
+/// table, so a steer can never name a path the other does not.
+const RENAMED_STD_NAMES: &[(&str, &str, &str)] = &[
+    ("Map", "HashMap", "hash_map"),
+    ("Set", "HashSet", "hash_set"),
+    ("MapCell", "HashMapCell", "reactive"),
+    ("SetCell", "HashSetCell", "reactive"),
+    ("MapEntry", "HashMapEntry", "reactive"),
+    ("SetEntry", "HashSetEntry", "reactive"),
+    ("MapMemo", "HashMapMemo", "reactive"),
+    ("SetMemo", "HashSetMemo", "reactive"),
+    ("TrackedMap", "TrackedHashMap", "reactive"),
+];
+
+/// R-e's modules: `std::map` and `std::set` (I9's deprecated aliases, removed),
+/// and `std::map_cell`/`std::set_cell` (A148's renamed modules).
+const REMOVED_STD_MODULES: &[(&str, &str)] = &[
+    (
+        "map",
+        "`std::map` was removed: its `Map` is `std::hash_map::HashMap`",
+    ),
+    (
+        "set",
+        "`std::set` was removed: its `Set` is `std::hash_set::HashSet`",
+    ),
+    (
+        "map_cell",
+        "`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell` \
+         (re-exported from `std::reactive`)",
+    ),
+    (
+        "set_cell",
+        "`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell` \
+         (re-exported from `std::reactive`)",
+    ),
+];
+
+/// The steer for an import path segment that names one of R-e's removed std
+/// names: a module at std's root, or an old item name anywhere under `std`.
+fn renamed_std_segment(root: &str, part: &str, at_std_root: bool) -> Option<String> {
+    if root != "std" {
+        return None;
+    }
+    if at_std_root
+        && let Some((_, steer)) = REMOVED_STD_MODULES
+            .iter()
+            .find(|(module, _)| *module == part)
+    {
+        return Some((*steer).to_string());
+    }
+    renamed_std_name(part).map(|(new, module)| {
+        format!("`{part}` was renamed `{new}`: write `import std::{module}::{new};`")
+    })
+}
+
+/// R-e's renamed name for `old`, with the module that declares the new one.
+fn renamed_std_name(old: &str) -> Option<(&'static str, &'static str)> {
+    RENAMED_STD_NAMES
+        .iter()
+        .find(|(name, _, _)| *name == old)
+        .map(|(_, new, module)| (*new, *module))
+}
+
 /// The `export` marker on a top-level item, and the item under it (B318 §1.1).
 ///
 /// `unwrap_item` is the sibling that answers only the second half; it stays as
@@ -45569,11 +45636,12 @@ impl<'src> Analyzer<'src> {
                             });
                             return false;
                         }
-                        let msg =
-                            removed_std_alias(root, part, namespace_scope_id == root_scope_id)
-                                .unwrap_or_else(|| {
-                                    format!("cannot find '{}' in the imported path", part)
-                                });
+                        let at_std_root = namespace_scope_id == root_scope_id;
+                        let msg = removed_std_alias(root, part, at_std_root)
+                            .or_else(|| renamed_std_segment(root, part, at_std_root))
+                            .unwrap_or_else(|| {
+                                format!("cannot find '{}' in the imported path", part)
+                            });
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,
@@ -50969,6 +51037,14 @@ impl<'src> Analyzer<'src> {
     /// the SAME name (a layered std twin) keep the steer, genuinely
     /// different modules make it ambiguous and it stays silent.
     fn import_steer(&mut self, name: &str) -> Option<String> {
+        // R-e: a collection name that had its one release. A program of the
+        // program's own may still declare one (`struct Map`), and then this
+        // miss never happens.
+        if let Some((new, module)) = renamed_std_name(name) {
+            return Some(format!(
+                "; `{name}` was renamed `{new}` — `import std::{module}::{new};`"
+            ));
+        }
         // B414: `jump` is a CONTEXTUAL keyword — the jump only when its target
         // follows — so a forgotten target reads a name `jump` and misses here.
         // The miss is the old "expected a jump target" in other words.
@@ -64145,13 +64221,11 @@ fn annotation_is_keyed_cell(type_node: Option<&Node<'_>>) -> bool {
     )
 }
 
-/// Whether a WRITTEN type head names the hash map: `HashMap`, or `Map`, its
-/// spelling before tracker I9, which `std::map` keeps one release as a
-/// deprecated re-export of the same type. The `[expose]` shape checks read the
-/// annotation before any type resolves, so both spellings are the map here —
-/// drop `Map` with the alias.
+/// Whether a WRITTEN type head names the hash map. The `[expose]` shape checks
+/// read the annotation before any type resolves. (`Map`, the spelling before
+/// tracker I9, went with its alias in R-e.)
 fn is_hash_map_head(head: &str) -> bool {
-    matches!(head, "HashMap" | "Map")
+    head == "HashMap"
 }
 
 fn sole_argument_is_map(type_node: Option<&Node<'_>>) -> bool {
@@ -70302,9 +70376,7 @@ fn analyze_inner<'src>(
     // The `std::hash_set` `HashSet` struct, if `hash_set.vl` loaded. Its
     // `new`/`insert`/... method ids are captured below after `build()`. `HashSet`
     // is imported explicitly (not an always-loaded core module), so it isn't bound
-    // into the global scope. Read from the DECLARING module: `std::set`'s
-    // deprecated `Set` (I9) is a re-export of this same entity, so a program that
-    // still spells the old name lands here too.
+    // into the global scope. Read from the DECLARING module.
     let set_struct_id = module_scopes
         .get("hash_set")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
@@ -70318,8 +70390,7 @@ fn analyze_inner<'src>(
     // The `std::hash_map` `HashMap` struct, if `hash_map.vl` loaded — captured so
     // R10 (destruction.md §4) can reject a resource type argument (`HashMap<str,
     // Database>`). `HashMap` is a vilan wrapper over `NativeMap`, so its element
-    // still lands in host-opaque storage. `std::map`'s deprecated `Map` is the same
-    // entity (I9), as `HashSet` is above.
+    // still lands in host-opaque storage.
     let map_struct_id = module_scopes
         .get("hash_map")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
