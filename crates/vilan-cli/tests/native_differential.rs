@@ -147,6 +147,36 @@ const B473_PROBE: &str = concat!(
     "}\n",
 );
 
+const B514_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct P {\n",
+    "\tx: i32,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet n = 4;\n",
+    "\tlet m = 5;\n",
+    "\tprint(*if n < m { &n } else { &m });\n",
+    "\tlet s = \"a\";\n",
+    "\tlet t = \"b\";\n",
+    "\tprint(*if n > m { &s } else { &t });\n",
+    "\tlet picked = *if n < m { &n } else { &m };\n",
+    "\tprint(picked + 1);\n",
+    "\tprint(*match n {\n",
+    "\t\t4 => &m,\n",
+    "\t\t_ => &n,\n",
+    "\t});\n",
+    "\tprint(*if n > m { &n } else if n == 4 { &m } else { &n });\n",
+    "\tlet flag = n < m;\n",
+    "\tprint(*if flag { &true } else { &false });\n",
+    "\tlet p = P { x = 1 };\n",
+    "\tlet q = P { x = 2 };\n",
+    "\tlet r = *if n < m { &q } else { &p };\n",
+    "\tprint(r.x);\n",
+    "}\n",
+);
+
 const B511_PROBE: &str = concat!(
     "import std::compare::PartialEq;\n",
     "import std::io::print;\n",
@@ -8559,6 +8589,24 @@ fn a_qualified_call_to_a_blankets_member_is_monomorphized_on_both_backends() {
         compare(&staged, "native_probe_b511.vl"),
         Verdict::Identical,
         "a qualified call to a blanket's member must answer as the method form does on both backends"
+    );
+}
+
+/// B514: `*` over a value `if`/`match` of scalar views reads the value on both
+/// backends — a scalar, a `str`, a `bool`, an `else if` chain, a bound result,
+/// and an aggregate beside them. JS printed the chosen place's `(base, key)`
+/// pair. (`*{ &m }`, a block tail, is held out: the native backend refuses it at
+/// rustc, E0614, on 0.43.0 as well — a native find; `inference::borrows`' `b514_*`
+/// pin holds the JS value.)
+#[test]
+fn a_dereferenced_conditional_of_scalar_views_reads_the_value_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b514.vl"), B514_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b514.vl"),
+        Verdict::Identical,
+        "a dereferenced conditional of scalar views must read the value on both backends"
     );
 }
 

@@ -28606,6 +28606,48 @@ impl<'src> Analyzer<'src> {
             .is_some_and(|type_| self.is_scalar_view_pointee(&type_))
     }
 
+    /// The view LEAVES of a value `if`/`match`/block standing where a value is
+    /// read (B496, B512, B514): each branch tail that is `&place`, a `borrows`
+    /// call or a view binding — only the scalar ones (whose runtime form is the
+    /// `(base, key)` pair) when `scalar_only`. Nothing for any other expression:
+    /// a bare view there is the caller's own question (a `&place` initializes a
+    /// view binding, a bare view argument is `is_scalar_view_read`'s).
+    fn collect_view_leaves(
+        &self,
+        value: Id,
+        view_bindings: &HashSet<Id>,
+        scalar_only: bool,
+        leaks: &mut Vec<Id>,
+    ) {
+        if !matches!(
+            self.expr_id_to_expr_map.get(&value),
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..))
+        ) {
+            return;
+        }
+        let mut leaves = Vec::new();
+        self.collect_tail_leaves(value, &mut leaves);
+        for leaf in leaves {
+            let is_view_leaf = match self.expr_id_to_expr_map.get(&leaf) {
+                // The pointee's own type decides the pair: a `&place` read
+                // is a plain local's, whose type sits on its binding.
+                Some(Expr::Reference(operand, _)) => !scalar_only || self.place_is_scalar(*operand),
+                Some(Expr::Call(call_id)) => match scalar_only {
+                    true => self.call_returns_scalar_view(*call_id),
+                    false => self.call_returns_view(*call_id),
+                },
+                Some(Expr::Local(_)) => {
+                    self.is_scalar_view_read(leaf, view_bindings)
+                        || (!scalar_only && self.is_view_binding_read(leaf, view_bindings))
+                }
+                _ => false,
+            };
+            if is_view_leaf {
+                leaks.push(leaf);
+            }
+        }
+    }
+
     /// Transparent references: a view's value is explicit (`*v` is the only way
     /// to cross from view to value — `transparent-references.md`). A **scalar**
     /// view used where a value is expected — a value/`any` call argument or a
@@ -28630,6 +28672,23 @@ impl<'src> Analyzer<'src> {
                         if self.is_scalar_view_read(operand, &view_bindings) {
                             leaks.push(operand);
                         }
+                        self.collect_view_leaves(operand, &view_bindings, true, &mut leaks);
+                    }
+                }
+                // B512: a `let` initialized by a value `if`/`match`/block whose
+                // leaf is a view is neither a view binding (only a `&place`, a
+                // view binding or a `borrows` call initializes one) nor a copy
+                // (rule 3 keeps a view expression out of the copies): JS bound
+                // the chosen aggregate itself, or a scalar's `(base, key)` pair,
+                // where native copied the value. B496's assignment rule, at
+                // the binding: `*` is the spelling that copies.
+                Expr::Variable(binding_id) => {
+                    if let Some(initial) = self
+                        .variables
+                        .get(binding_id)
+                        .and_then(|variable| variable.initial)
+                    {
+                        self.collect_view_leaves(initial, &view_bindings, false, &mut leaks);
                     }
                 }
                 // B465 (R-c): the value an assignment stores is a VALUE, so a
@@ -28656,22 +28715,12 @@ impl<'src> Analyzer<'src> {
                         leaks.push(*value);
                         continue;
                     }
-                    let mut leaves = Vec::new();
-                    self.collect_tail_leaves(*value, &mut leaves);
-                    for leaf in leaves {
-                        let is_view_expression = match self.expr_id_to_expr_map.get(&leaf) {
-                            Some(Expr::Reference(..)) => true,
-                            Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
-                            Some(Expr::Local(_)) => {
-                                leaf != *value
-                                    && (self.is_scalar_view_read(leaf, &view_bindings)
-                                        || self.is_view_binding_read(leaf, &view_bindings))
-                            }
-                            _ => false,
-                        };
-                        if is_view_expression {
-                            leaks.push(leaf);
+                    match self.expr_id_to_expr_map.get(value) {
+                        Some(Expr::Reference(..)) => leaks.push(*value),
+                        Some(Expr::Call(call_id)) if self.call_returns_view(*call_id) => {
+                            leaks.push(*value);
                         }
+                        _ => self.collect_view_leaves(*value, &view_bindings, false, &mut leaks),
                     }
                 }
                 // A call argument whose parameter is NOT a view (`&[mut] T`) wants
@@ -28699,11 +28748,15 @@ impl<'src> Analyzer<'src> {
                     for (parameter_id, argument_id) in
                         parameter_ids.iter().zip(function_call.argument_ids.iter())
                     {
-                        if !self.binding_or_param_is_view(*parameter_id)
-                            && self.is_scalar_view_read(*argument_id, &view_bindings)
-                        {
+                        if self.binding_or_param_is_view(*parameter_id) {
+                            continue;
+                        }
+                        if self.is_scalar_view_read(*argument_id, &view_bindings) {
                             leaks.push(*argument_id);
                         }
+                        // B514: `show(if c { &n } else { &m })` passed the
+                        // chosen scalar's pair where the value was wanted.
+                        self.collect_view_leaves(*argument_id, &view_bindings, true, &mut leaks);
                     }
                 }
                 _ => {}

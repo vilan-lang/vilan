@@ -30,6 +30,16 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**`*` over a value `if`/`match`/block of SCALAR views reads the value: `print(*if n < m { &n } else { &m })` prints `4` — where JS printed the chosen place's `(base, key)` pair (`[ [ 4 ], 0 ]`), for a `str` and a `bool` alike — and the same conditional standing where a value is read without the `*` is refused.** A conditional evaluates to what its tail leaves emit, and a `&place` leaf emits the pair; the `*` read through a bare view binding or a `borrows` call but not through a conditional, a `match` or a block tail (B444's read-through, one level short). The emitter now asks the conditional's leaves (`collect_value_tail_leaves`), and evaluates a computed pair once into a temporary before reading through it. Without the `*` — `show(if c { &n } else { &m })` with a by-value parameter, `print(..)`, an arithmetic operand — the pair reached the callee (`+ 1` concatenated `4,01`); each scalar view leaf there is refused with the sentence a bare view binding gets (row 15): `` a view can't be read as a value here; write `*` to copy the value out ``. What to change: write the `*`. An aggregate conditional held because an aggregate's view is the value. Native printed the values throughout. Pins: `inference::borrows`' `b514_a_dereferenced_conditional_of_scalar_views_reads_the_value` (a scalar, a `str`, a bound result, a `match`, a block tail, an `else if` chain, a `bool`, an aggregate beside them) and `b514_a_conditional_of_scalar_views_read_as_a_value_is_refused` (four positions); `native_differential`'s `a_dereferenced_conditional_of_scalar_views_reads_the_value_on_both_backends` (the block tail held out: rustc refuses `*{ &m }` natively, E0614, on 0.43.0 as well — filed). No golden moves. Tracker B514.
+
+---
+
+<!-- family: breaking -->
+**A `let` initialized by a value `if`/`match`/block whose leaf is a VIEW is refused at the leaf — `let v = if c { &a } else { &b };` — with the sentence an assignment of one already gets (B496): `` a view can't be read as a value here; write `*` to copy the value out ``.** Such a binding was neither a view binding (only a `&place`, a view binding or a `borrows` call initializes one) nor a copy (rule 3 keeps a view expression out of the copies): JS bound the chosen aggregate itself — a write through `mut v` reached `a`, and a later write to `a` showed through `v` — or a scalar's `(base, key)` pair, while native copied the value, so the two backends disagreed and `let v = if c { &mut a } else { &mut b }; v.x = 10` was refused only at the write ("cannot mutate immutable 'v'"). Annotated or not, `mut` or not, a `match` or a block tail, a `borrows` call as a leaf — all refused. What to change: `let v = *if c { &a } else { &b };` copies (the B496 spelling). Choosing between two VIEWS as a view binding is not a form the language has; filed as a design item. The corpus, the examples, the docs and kolt carry none. Pins: `inference::borrows`' `b512_a_let_initialized_by_a_conditional_of_views_is_refused` (eight bindings) and `b512_the_spelled_copy_of_a_conditional_view_is_a_copy`. No golden moves. Tracker B512.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

@@ -4324,7 +4324,52 @@ impl<'src> Transformer<'src> {
             Some(Expr::Call(..)) => {
                 self.program.scalar_view_calls.contains(&id) || self.call_is_scalar_shared_write(id)
             }
+            // B514: a value `if`/`match`/block evaluates to whatever its tail
+            // leaves emit, so it IS a pair when they are — `*if c { &a } else {
+            // &b }` over a scalar binds the chosen `[base, key]` and must read
+            // through it like `*v` does. Each leaf is asked the full question
+            // (a `&place` leaf included): under a value conditional a `&place`
+            // emits its pair, since B108's return seam collects its leaves from
+            // the RETURNED expression and never from beneath a `*`.
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..)) => {
+                let mut leaves = Vec::new();
+                self.collect_value_tail_leaves(id, &mut leaves);
+                leaves.iter().any(|leaf| self.derefs_scalar_view(*leaf))
+            }
             _ => false,
+        }
+    }
+
+    /// The tail leaves a value expression evaluates to: an `if`, a `match` and
+    /// a block contribute each branch's tail, anything else is itself — the
+    /// analyzer's `collect_tail_leaves`, asked at emission.
+    fn collect_value_tail_leaves(&self, id: Id, leaves: &mut Vec<Id>) {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::If(branch)) => {
+                let mut branch = branch;
+                loop {
+                    match branch {
+                        ExprIfBranch::If(_, (_, tail), else_branch) => {
+                            self.collect_value_tail_leaves(*tail, leaves);
+                            match else_branch {
+                                Some(else_branch) => branch = else_branch,
+                                None => break,
+                            }
+                        }
+                        ExprIfBranch::Else((_, tail)) => {
+                            self.collect_value_tail_leaves(*tail, leaves);
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(Expr::Match(_, legs)) => {
+                for leg in legs {
+                    self.collect_value_tail_leaves(leg.body, leaves);
+                }
+            }
+            Some(Expr::Block((_, tail))) => self.collect_value_tail_leaves(*tail, leaves),
+            _ => leaves.push(id),
         }
     }
 
@@ -4420,7 +4465,17 @@ impl<'src> Transformer<'src> {
         block: &mut Vec<js::Node<'src>>,
     ) -> js::Node<'src> {
         let mut view = view;
-        if matches!(self.program.entity_map.get(&view_id), Some(Expr::Call(..))) {
+        // The pair is read twice (`base[key]`), so an expression that computes
+        // it — a call, or a value block / conditional whose tail emitted inline
+        // (B514) — is evaluated once into a temporary first.
+        let computed = match self.program.entity_map.get(&view_id) {
+            Some(Expr::Call(..)) => true,
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..)) => {
+                !matches!(view, js::Node::Local(_))
+            }
+            _ => false,
+        };
+        if computed {
             let name = self.ng.next_name();
             block.push(js::Node::ConstVariable(js::Variable {
                 name: name.clone(),
