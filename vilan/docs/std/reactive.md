@@ -10,7 +10,7 @@ Import what you use:
 ```vilan,fragment
 import std::reactive::{
 	Signal, SignalCell, Source, Flow, Pipe, MemoCell, MaybeSignal, Subscriber, Subscription,
-	Disposable, combine, divorce, selector, Selector, derive, tracking,
+	Disposable, combine, divorce, zip_some, selector, Selector, derive, tracking,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
 	Turn, FlushPolicy, turn_scope, turn, batch, flush, at_settle,
 	optimistic, Optimistic, WriteState,
@@ -29,7 +29,7 @@ import std::reactive::{
 | `Subscriber` | struct | one observer's record — its id (a turn's dedup key), `notify`, liveness and class; what `on_settle` carries |
 | `MemoCell<T>` | struct | a sealed derivation's read-only face — what `.memo()` returns |
 | `Constant<T>` | struct | `Source::constant(v)`: a source that never changes |
-| `Derive`, `Switch`, `SwitchSome`, `AndThen`, `ThenSome`, `Combine`, `Distinct`, `DistinctBy` | `[resource]` structs | the pipe stages: hold their upstream until a consumer starts them; what the combinators return |
+| `Derive`, `Switch`, `SwitchSome`, `AndThen`, `ThenSome`, `Combine`, `ZipSome`, `Distinct`, `DistinctBy` | `[resource]` structs | the pipe stages: hold their upstream until a consumer starts them; what the combinators return |
 | `Instance<T>` | struct | a started flow — the one consumer's `pull`/`attach`/`release` (for stage authors) |
 | `TransientState`, `TransientSource`, `.transient()` | `std::transient` | values that come and go — pending, ready, refreshing, failed with the stale value, absent; a flow of tasks sealed so the latest task wins ([std::transient](transient.md)) |
 | `track` | method (every `Source`) | read AND make the source a dependency of the body that is running — tracked reads (A142 §7) |
@@ -42,6 +42,8 @@ import std::reactive::{
 | `Subscription` | struct | an explicit subscription; `Disposable` |
 | `combine` | fn | a pipe of the tuple of 2+ sources |
 | `divorce` | fn | the reverse: one derived pipe per position of a tuple-valued source |
+| `zip_some` | fn | wait for several maybes: `Some` of the tuple of payloads while every input is `Some` |
+| `unzip` | method (`SignalCell<T: (2..)>`) | one cell per position of a tuple-valued cell, written in place |
 | `selector`, `Selector<T>` | fn/struct | per-key selection: one subscription, two writes per change |
 | `Owner` | struct | disposal bag; the lifetime unit |
 | `on_cleanup` | fn | run a cleanup when the ambient owner is released |
@@ -910,6 +912,72 @@ of it — a change to another position, and a `set` that changes nothing,
 included. A consumer that wants its output to fire only when that position
 moved gates it: `divorce(pair).0.distinct()`, which asks `PartialEq` of that
 one element. `.memo()` an output where it is shared or read.
+
+## zip_some
+
+```vilan,fragment
+fun zip_some<T: (2..)>(flows: (U in T: dyn Flow<Option<U>>)): ZipSome<T>
+```
+
+Wait for several maybes at once: a pipe that is `Some` of the tuple of the
+inputs' payloads while EVERY input is `Some`, and `None` while any one is
+`None`. Over flows of `Option<Message>` and `Option<User>` it is a
+`Pipe<Option<(Message, User)>>`, so the negative states are handled in one
+place — where the zip is read — and nothing past it re-matches them. It is
+`combine` and `Option::zip` written once: variadic over the payload types,
+stateless, and needing no owner, so it composes like any stage. Each input is
+any flow of a maybe — a cell, a sealed memo, a pipe such as a mirror's
+`.latest()` or a transient's `.derive(|state| state.ready())` — and a pipe input
+is moved in:
+
+```vilan
+import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, zip_some };
+
+fun main() {
+	let name: SignalCell<Option<str>> = Signal::new(Some("Ada"));
+	let age: SignalCell<Option<i32>> = Signal::new(None);
+	let both = zip_some((name, age.derive(|value| value))).memo();
+	print(both.get().is_none());
+	age.set(Some(36));
+	if both.get() is Some((let who, let years)) {
+		print(i"{who} {years}");
+	}
+}
+```
+
+A dependent input needs nothing new — `message.and_then(|m| m.author.user())`
+sealed with `.memo()` beside `message` itself. A diamond like that one notifies
+the zip once per arm outside a turn, as any `combine` does; inside a `batch`
+or a turn it runs once, on settled values.
+
+What it does not do is hand back a flow per part: the parts of a zipped value
+are values. For a body that wants one live cell per part, `std::ui`'s
+`when_all_some((a, b), |(a, b)| ..)` is `when_some` over `zip_some` plus the
+split below.
+
+### unzip — a tuple cell, split
+
+```vilan,fragment
+impl SignalCell<type T: (2..)> { fun unzip(self): (U in T: SignalCell<U>) }
+```
+
+One cell per position of a tuple-valued cell, each seeded with its part and
+written IN PLACE on every change of the whole, so a binding over a part updates
+where it stands. It is a materialising node, like `.cell()`: the follow
+registers with the ambient owner when there is one, and dies with it. Every
+part is written on every change of the whole (a cell never compares, so `T`
+needs no `PartialEq`), and a part's own `set` does not write back:
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source };
+
+fun main() {
+	let pair = Signal::new((1, "one"));
+	let (number, word) = pair.unzip();
+	pair.set((2, "two"));
+	print(i"{number.get()} {word.get()}");
+}
+```
 
 ## Subscription, Disposable
 

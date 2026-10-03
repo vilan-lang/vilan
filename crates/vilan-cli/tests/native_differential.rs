@@ -9244,6 +9244,34 @@ fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
     );
 }
 
+/// A152: `zip_some`'s mapped-tuple stage (start, pull and attach over every
+/// input flow) and `unzip`'s split of a tuple-valued cell, at arity two and
+/// three. Both are mapped tuples, which the native backend refuses by name
+/// today (`combine`'s state, B397's pin above); the claim is the
+/// differential's own — a refusal now, never a different answer, and the same
+/// bytes once it lowers comprehensions.
+#[test]
+fn zip_some_and_unzip_are_never_a_different_answer_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_zip_some_unzip.vl"),
+        include_str!("native/zip_some_unzip.vl"),
+    )
+    .expect("write the probe program");
+    let verdict = compare(&staged, "native_probe_zip_some_unzip.vl");
+    match &verdict {
+        Verdict::Identical => {}
+        Verdict::Refused(reason) => assert!(
+            reason.contains("a mapped tuple"),
+            "refused for another reason than the mapped tuple: {reason}"
+        ),
+        other => panic!(
+            "the native backend must refuse this program by name or print what node prints: \
+             {other:?}"
+        ),
+    }
+}
+
 /// F68 + B503: `print` lays a value out by ONE rule on both backends — node's
 /// `console.log`, which the JS backend binds and `vilan_rt::inspect` ports.
 /// Natively every container printed on one line, so a 22-element `List<str>`

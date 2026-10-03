@@ -3491,6 +3491,181 @@ fn a119_the_ssr_twin_renders_a_some_body_and_omits_a_none() {
     );
 }
 
+// --- A152: `when_all_some`, several maybes and one body ---------------------
+//
+// The ruling (2026-10-03): the body takes ONE parameter, a tuple of
+// `SignalCell`s; the cells are created under the body's owner when every input
+// turns `Some`, written IN PLACE while all stay `Some`, and released when any
+// input goes `None`. One program, because the claim is about the sequence: the
+// row's identity across a payload change, and the `build` count across every
+// transition.
+
+const WHEN_ALL_SOME: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Flow, Signal, SignalCell, on_cleanup };
+import std::ui::{ View, mount_root, view, when_all_some };
+
+fun main() {
+	let name: SignalCell<Option<str>> = Signal::new(Some("Ada"));
+	let count: SignalCell<Option<i32>> = Signal::new(None);
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("h1").text("head"))
+			.child(when_all_some((name, count.derive(|value| value)), |(name, count)| {
+				print("build");
+				on_cleanup(|| print("released"));
+				view("p")
+					.child(view("i").bind_text(name.derive(|current| current)))
+					.child(view("b").bind_text(count.derive(|current| i"{current}")))
+			}))
+			.child(view("footer").text("foot"))
+	});
+	print(i"partial={tree()}");
+	count.set(Some(1));
+	print(i"some={tree()}");
+
+	// A changed payload in EITHER part: the row is the same node, carrying the
+	// new text, and the body does not run again.
+	name.set(Some("Grace"));
+	count.set(Some(2));
+	print(i"changed={tree()}");
+
+	// Any part going `None` releases the body and removes the row.
+	count.set(None);
+	print(i"cleared={tree()}");
+
+	count.set(Some(3));
+	print(i"again={tree()}");
+
+	root.dispose();
+	name.set(Some("Nobody"));
+	print(i"disposed={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+#[test]
+fn a152_when_all_some_updates_its_cells_in_place_and_releases_on_none() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("when_all_some", WHEN_ALL_SOME, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    let identity_of = |tree: &str| {
+        tree.split_whitespace()
+            .find(|token| token.starts_with("p#"))
+            .map(|token| token.split('\'').next().unwrap_or_default().to_string())
+    };
+    // One input still `None`: nothing is built, and the siblings keep their
+    // places around the region's anchor.
+    let partial = line("partial=");
+    assert!(
+        identity_of(&partial).is_none(),
+        "a body must not build while any input is `None`; got:\n{stdout}"
+    );
+    assert!(
+        partial.contains("h1#") && partial.contains("footer#"),
+        "the static siblings must be there; got:\n{stdout}"
+    );
+
+    let some = line("some=");
+    let row = identity_of(&some)
+        .unwrap_or_else(|| panic!("every input `Some` must build the row; got:\n{stdout}"));
+    assert!(
+        some.contains("'Ada'") && some.contains("'1'"),
+        "the body's cells must carry both payloads; got:\n{stdout}"
+    );
+
+    // IN PLACE: the same `<p>`, the new texts, no second `build`.
+    let changed = line("changed=");
+    assert_eq!(
+        identity_of(&changed).as_deref(),
+        Some(row.as_str()),
+        "a changed payload must KEEP the row, not rebuild it; got:\n{stdout}"
+    );
+    assert!(
+        changed.contains("'Grace'") && changed.contains("'2'"),
+        "both parts' cells must carry their new values; got:\n{stdout}"
+    );
+
+    let cleared = line("cleared=");
+    assert!(
+        identity_of(&cleared).is_none(),
+        "a part going `None` must remove the row; got:\n{stdout}"
+    );
+    let again = line("again=");
+    assert!(
+        identity_of(&again).is_some() && again.contains("'Grace'") && again.contains("'3'"),
+        "the next all-`Some` must build a fresh row over the current payloads; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("build\n").count(),
+        2,
+        "the body runs once per INSTANTIATION (the first all-`Some` and the one \
+         after the `None`), never for a payload change; got:\n{stdout}"
+    );
+    // The body's owner is released when a part goes `None`, and again when the
+    // root is disposed with the second instantiation live.
+    assert_eq!(
+        stdout.matches("released\n").count(),
+        2,
+        "the body's owner must be released on `None` and at disposal; \
+         got:\n{stdout}"
+    );
+    let disposed = line("disposed=");
+    assert!(
+        identity_of(&disposed).is_none() && !disposed.contains("'Nobody'"),
+        "disposing the root must take the row and stop the follow; got:\n{stdout}"
+    );
+}
+
+/// The server twin: the zip is read ONCE — an all-`Some` renders the body with
+/// its cells holding the current payloads, and any `None` renders nothing.
+const WHEN_ALL_SOME_SSR: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view, when_all_some };
+
+fun main() {
+	let name: SignalCell<Option<str>> = Signal::new(Some("Ada"));
+	let count: SignalCell<Option<i32>> = Signal::new(Some(7));
+	let absent: SignalCell<Option<i32>> = Signal::new(None);
+	print(render(view("aside").child(when_all_some((name, count), |(name, count)| {
+		print("build");
+		view("p")
+			.child(view("i").bind_text(name.derive(|current| current)))
+			.child(view("b").bind_text(count.derive(|current| i"{current}")))
+	}))));
+	print(render(view("aside").child(when_all_some((name, absent), |(name, count)| {
+		print("never");
+		view("p").bind_text(name.derive(|current| current))
+	}))));
+}
+
+main();
+"#;
+
+#[test]
+fn a152_the_ssr_twin_renders_an_all_some_body_once_and_omits_a_none() {
+    let stdout = build_and_run_process("when_all_some_ssr", WHEN_ALL_SOME_SSR);
+    assert_eq!(
+        stdout, "build\n<aside><p><i>Ada</i><b>7</b></p></aside>\n<aside></aside>\n",
+        "the server render must run the body ONCE with both payloads, and \
+         render nothing (and run no body) when a part is `None`"
+    );
+}
+
 #[test]
 fn b369_an_inferred_generic_constructor_places_its_slot_in_the_live_tree() {
     let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");

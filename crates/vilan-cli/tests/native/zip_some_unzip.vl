@@ -1,0 +1,31 @@
+// A152: `zip_some` over a tuple of flows of maybes, and `unzip` over a
+// tuple-valued cell, at arity two and three - the mapped-tuple stage's start,
+// pull, attach and release, and the split's in-place writes.
+import std::io::print;
+import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, zip_some };
+
+fun main() {
+	let name: SignalCell<Option<str>> = Signal::new(Some("Ada"));
+	let age: SignalCell<Option<i32>> = Signal::new(None);
+	let flag: SignalCell<Option<bool>> = Signal::new(Some(true));
+	let pair = zip_some((name, age.derive(|value| value))).memo();
+	let triple = zip_some((name, age, flag)).memo();
+	print(pair.get().is_none());
+	age.set(Some(36));
+	match pair.get() {
+		Some((let n, let a)) => print(n),
+		None => print("none"),
+	}
+	match triple.get() {
+		Some((let n, let a, let f)) => print(a),
+		None => print("none"),
+	}
+	flag.set(None);
+	print(triple.get().is_none());
+
+	let whole = Signal::new((1, "one"));
+	let (number, word) = whole.unzip();
+	whole.set((2, "two"));
+	print(number.get());
+	print(word.get());
+}

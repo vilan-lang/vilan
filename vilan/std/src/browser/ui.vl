@@ -58,6 +58,7 @@ import pkg::reactive::{
 	Signal,
 	SignalCell,
 	Source,
+	ZipSome,
 	also_releasing,
 	comp,
 	get_owner,
@@ -69,6 +70,7 @@ import pkg::reactive::{
 	tracking,
 	turn,
 	turn_scope,
+	zip_some,
 };
 import pkg::shared::Shared;
 import pkg::store::{ Store, StoreFlag, StoreSome };
@@ -2398,6 +2400,34 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 			},
 		}
 	});
+}
+
+// === `when_all_some`: several maybes, one body (A152) =======================
+//
+// Waiting for several maybes at once was a nest of `when_some`s, each one a region,
+// an owner and a place where the negative state is handled again. This is
+// `when_some` over `zip_some` plus the split: ONE region and ONE owner, the
+// negative states handled here, and a body that reads plain values through one cell
+// per part. KEEP IN STEP with the process twin's copy (process/ui.vl).
+
+/// Content that exists while EVERY one of `flows` is `Some`, with the parts bound —
+/// the body takes ONE parameter, a tuple of `SignalCell`s, destructured at the call
+/// site:
+///
+///     <li>{when_all_some((message, author), |(message, author)| row(message, author))}</li>
+///
+/// The cells are created under the body's owner when every input turns `Some`,
+/// written IN PLACE while all of them stay `Some` (a changed payload updates the
+/// bindings the body made, it never rebuilds the body — `when_some`'s rule), and
+/// released with the body when any input goes `None`. Each input is any flow of a
+/// maybe, as `zip_some` takes it.
+export fun when_all_some<T: (2..), C: Slot>(
+	flows: (U in T: dyn Flow<Option<U>>),
+	render: (sync |(U in T: SignalCell<U>)| C) context owner_scope,
+): WhenSome<T, ZipSome<T>, C> {
+	// The split runs INSIDE the body, under the owner `when_some` makes for it, so
+	// the parts' follow dies with the row.
+	when_some(zip_some(flows), |whole: SignalCell<T>| render(whole.unzip()))
 }
 
 // === `when_live`: a store's variant as content (A142 S7) ====================

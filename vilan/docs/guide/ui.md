@@ -654,6 +654,21 @@ Read the cell inside a binding, exactly as an `each_by` row does:
 {when_some(selected, |account| <p>{account.derive(|current| current.name)}</p>)}
 ```
 
+When the content needs SEVERAL maybes — a message and its author — reach for
+`ui::when_all_some` rather than nesting `when_some`s. It takes a tuple of flows
+of `Option`s and builds while EVERY one is `Some`; the body takes ONE
+parameter, a tuple of cells, destructured where it is written. The cells are
+made under the body's owner, written in place while everything stays `Some`,
+and released with the body when any part goes `None` — so the negative states
+are handled once, here, and the body reads plain values:
+
+```vilan,fragment
+{ui::when_all_some((message, author), |(message, author)| <p>
+	<b>{author.derive(|user| user.name)}</b>
+	{message.derive(|current| current.content)}
+</p>)}
+```
+
 ### Position, and placing one at the end
 
 A value fills a child position, so the conditional or the run sits exactly

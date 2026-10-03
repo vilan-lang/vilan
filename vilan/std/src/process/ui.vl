@@ -39,11 +39,13 @@ import pkg::reactive::{
 	Signal,
 	SignalCell,
 	Source,
+	ZipSome,
 	owner_scope,
 	read_once,
 	run_with_owner,
 	tracking,
 	turn_scope,
+	zip_some,
 };
 import pkg::shared::Shared;
 import pkg::store::{ Store, StoreFlag, StoreSome };
@@ -892,6 +894,24 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 		},
 		None => {},
 	}
+}
+
+// === `when_all_some`: several maybes, one body (A152) =======================
+//
+// The server twin: `when_some` over `zip_some`, so it reads the zip ONCE and runs
+// the body for the current payloads, or renders nothing. The body is handed one
+// cell per part for the browser twin's reason (the same component source compiles
+// on both legs). KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+
+/// Content that exists while EVERY one of `flows` is `Some`, read once, with the
+/// parts bound — one `SignalCell` per part, in a tuple the body destructures.
+///
+///     <li>{when_all_some((message, author), |(message, author)| row(message, author))}</li>
+export fun when_all_some<T: (2..), C: Slot>(
+	flows: (U in T: dyn Flow<Option<U>>),
+	render: (sync |(U in T: SignalCell<U>)| C) context owner_scope,
+): WhenSome<T, ZipSome<T>, C> {
+	when_some(zip_some(flows), |whole: SignalCell<T>| render(whole.unzip()))
 }
 
 // === `when_live`: a store's variant as content (A142 S7) ====================
