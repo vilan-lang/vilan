@@ -9002,6 +9002,84 @@ fn r11_instantiations_do_not_mint_a_type_slot_per_place_in_the_program() {
     );
 }
 
+// --- M108: past the constraint fixpoint, a type is minted once ---
+//
+// The checks passes ask the same type questions at every call site: each
+// bound check substitutes the callee's bound arguments, each resource
+// classification substitutes a declaration's members, each place's value type
+// is interned to be classified. Every one of those minted a fresh slot, held
+// until the program drops — 604k of a kolt client analysis's 782k slots, the
+// table holding them past a megabyte buckets. Once the types are settled no
+// slot is rewritten, so equal types are interned and a substitution that
+// changes nothing hands back the slot it was given. Only a count can see it.
+
+/// The slots minted after the types settled, for one analysis on a fresh
+/// thread (the counter is per thread, so it starts at zero there).
+fn settled_slots_of_one_analysis(source: &str) -> u64 {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            vilan_core::analyzer::base_cache_clear();
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            vilan_core::counters::settled_type_slots_minted()
+        })
+        .expect("spawn the analysis thread")
+        .join()
+        .expect("the analysis thread panicked")
+}
+
+#[test]
+fn the_checks_mint_a_type_once_and_not_once_per_call_site() {
+    const SMALL: usize = 10;
+    const LARGE: usize = 60;
+    let program = |functions: usize| {
+        let mut source = String::from(
+            "import std::io::print;\n\
+             import std::compare::PartialEq;\n\
+             struct Holder<T> { items: List<T>, first: Option<T> }\n\
+             fun same<T: PartialEq>(a: T, b: T): bool { a == b }\n",
+        );
+        for index in 0..functions {
+            source.push_str(&format!(
+                "fun filler_{index}(): bool {{ let held = Holder {{ items = [1, 2], first = Some({index}) }}; \
+                 same(held.first, Some(2)) && same(held.items, [{index}]) }}\n"
+            ));
+        }
+        source.push_str("fun main() { print(filler_0()); }\n");
+        source
+    };
+    let small = settled_slots_of_one_analysis(&program(SMALL));
+    let large = settled_slots_of_one_analysis(&program(LARGE));
+    // Fifty more functions, each with two bound-checked calls and a
+    // `Holder<i32>` to classify, over the SAME handful of types. Interning
+    // is by the slot ids a type carries, so a type built from a function's
+    // own occurrence slots (its places' value types, `Option<i32>` over that
+    // function's `i32`) is still new per function: four, measured. Read with
+    // the interning and the sharing planted out, each function added thirty.
+    let added = LARGE - SMALL;
+    let per_function = large.saturating_sub(small) as f64 / added as f64;
+    assert!(
+        per_function < 8.0,
+        "adding {added} functions over the same types grew the slots the checks mint from \
+         {small} to {large} ({per_function:.1} per function): a pass past the constraint \
+         fixpoint is minting a fresh slot per call site for a type it has already minted (M108)"
+    );
+}
+
 // --- M95: resource classification mints no slot a substitution cannot change ---
 //
 // `compute_resource_types` classifies every type slot, and classifying an

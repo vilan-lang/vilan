@@ -3943,6 +3943,19 @@ pub struct Analyzer<'src> {
     // world's OWN resolution writes slots constantly and dirties nothing; only
     // writes past this point are the entry's.
     entry_phase: bool,
+    // M108: whether the constraint fixpoint has finished and the checks
+    // passes have begun. No pass past that point writes a type slot it did
+    // not just mint (`counters::late_type_slot_writes` counts any that does,
+    // and the corpus reads zero), so a slot that mentions no generic means the
+    // same thing to every reader for the rest of the analysis — which is what
+    // lets a substitution SHARE it instead of minting a copy
+    // ([`Analyzer::substitute_argument_types`]).
+    types_settled: bool,
+    // M108: the slots minted since `types_settled`, by the hash of their type
+    // — the settled half of [`Analyzer::type_id_for_type`]'s interning. A hash
+    // and not the `Type` itself, so the index costs a word per slot rather
+    // than a second copy of every type; a hit is confirmed against the slot.
+    settled_type_index: HashMap<u64, TypeId>,
     // Each analyzed file's text, keyed by its SourceId (element-syntax S4):
     // lets a diagnostic inspect the source its span points into — the
     // element-origin detectors read it. First entry wins; files this never
@@ -6599,6 +6612,8 @@ impl<'src> Analyzer<'src> {
             entry_dirty_sources: HashSet::default(),
             import_targets: Vec::new(),
             entry_phase: false,
+            types_settled: false,
+            settled_type_index: HashMap::default(),
             source_texts: Vec::new(),
             type_references: Vec::new(),
             external_functions: IndexMap::default(),
@@ -7560,11 +7575,7 @@ impl<'src> Analyzer<'src> {
                     // substitution grounds them.
                     let required_arguments: Vec<TypeId> = required_arguments
                         .iter()
-                        .map(|argument| {
-                            let argument = argument.get_type(self);
-                            self.substitute_type(&argument, &substitution)
-                                .get_type_id(self)
-                        })
+                        .map(|argument| self.substitute_type_id(*argument, &substitution))
                         .collect();
                     // The memo key: the value's resolved type, the required
                     // trait, and the required arguments RESOLVED (they are
@@ -23501,6 +23512,7 @@ impl<'src> Analyzer<'src> {
         // dirty bit attributable to a MODULE rather than to the program.
         debug_assert_eq!(self.type_id_sources.len(), id as usize);
         self.type_id_sources.push(self.current_source_id);
+        crate::counters::count_type_slot();
         TypeId(id)
     }
 
@@ -23512,6 +23524,37 @@ impl<'src> Analyzer<'src> {
         // becoming concrete, a deferred accessor id resolving — so any mutated id
         // must stay unshared. A correct interner would have to exclude `Unknown` /
         // `Unresolved` (and anything else later mutated) and require `Type: Hash + Eq`.
+        //
+        // M108: ONCE THE TYPES ARE SETTLED the edge is gone, and the slots are
+        // interned. Past the constraint fixpoint no slot is rewritten (the
+        // invariant `types_settled` names, counted and debug-asserted at
+        // `write_type_slot`), so two slots holding equal types answer every
+        // reader identically for the rest of the analysis — and the checks
+        // passes mint the same handful of types over and over (each
+        // classification, each bound check, each place's value type): 604k
+        // fresh slots of a kolt client analysis's 782k, held until the
+        // program drops. Only slots minted after settling are indexed, so a
+        // slot inference may still resolve in place is never shared.
+        if self.types_settled {
+            let hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = crate::fx::FxHasher::default();
+                type_.hash(&mut hasher);
+                hasher.finish()
+            };
+            if let Some(existing) = self.settled_type_index.get(&hash).copied()
+                && self.type_id_to_type_map.get(&existing) == Some(&type_)
+            {
+                return existing;
+            }
+            let type_id = self.new_type_id();
+            crate::counters::count_settled_type_slot();
+            self.type_id_to_type_map.insert(type_id, type_);
+            // A hash collision keeps the first slot indexed; the second simply
+            // is not shared, which costs a slot and nothing else.
+            self.settled_type_index.entry(hash).or_insert(type_id);
+            return type_id;
+        }
         let type_id = self.new_type_id();
         self.type_id_to_type_map.insert(type_id, type_);
         type_id
@@ -23545,6 +23588,14 @@ impl<'src> Analyzer<'src> {
             .get(&type_id)
             .is_some_and(|existing| *existing != type_);
         if changes_the_world {
+            if self.types_settled {
+                crate::counters::count_late_type_slot_write();
+                debug_assert!(
+                    false,
+                    "M108: a type slot was rewritten after the checks began, which \
+                     substitution sharing (`substitute_type_id`) assumes never happens"
+                );
+            }
             self.type_map_writes += 1;
             // M19 T0's second addition: the same write, read as an
             // ATTRIBUTION. A world-changing write made after the entry tail
@@ -44399,13 +44450,10 @@ impl<'src> Analyzer<'src> {
             // without this an unannotated closure argument's parameter stays the
             // abstract `T`.
             Type::Closure(parameters, return_type_id, contexts) => {
-                let parameters = parameters.clone();
+                let (parameters, return_type_id) = (parameters.clone(), *return_type_id);
                 let contexts = contexts.clone();
-                let return_type = return_type_id.get_type(self);
                 let parameters = self.substitute_argument_types(&parameters, substitution_context);
-                let return_type = self
-                    .substitute_type(&return_type, substitution_context)
-                    .get_type_id(self);
+                let return_type = self.substitute_type_id(return_type_id, substitution_context);
                 // B309: the clause survives substitution — this is the arm that
                 // makes a GENERIC ARGUMENT able to carry one, since a field
                 // declared `held: T` reads its clause out of the argument `T`
@@ -44419,9 +44467,11 @@ impl<'src> Analyzer<'src> {
             // `[T; n]` substitutes its element (the length is a constant, carried
             // through), so a generic `[T; 4]` monomorphizes to `[i32; 4]`.
             Type::Array(element_id, length) => {
-                let element = element_id.get_type(self);
-                let substituted = self.substitute_type(&element, substitution_context);
-                Type::Array(substituted.get_type_id(self), *length)
+                let (element_id, length) = (*element_id, *length);
+                Type::Array(
+                    self.substitute_type_id(element_id, substitution_context),
+                    length,
+                )
             }
             // A mapped tuple substitutes its source; once that is a concrete tuple
             // it expands element-wise (`F[U := X]` per element `X`), otherwise it
@@ -44472,12 +44522,47 @@ impl<'src> Analyzer<'src> {
     ) -> Vec<TypeId> {
         arguments
             .iter()
-            .map(|argument| {
-                let argument_type = argument.get_type(self);
-                let substituted = self.substitute_type(&argument_type, substitution_context);
-                substituted.get_type_id(self)
-            })
+            .map(|argument| self.substitute_type_id(*argument, substitution_context))
             .collect()
+    }
+
+    /// The slot `type_id` substitutes to under `substitution_context`: the
+    /// substitution's own result, re-interned — or, once the analysis'
+    /// types are SETTLED, the slot it already is (M108).
+    ///
+    /// A substitution that cannot change its subject hands back a copy of the
+    /// subject's own type ([`Analyzer::substitution_fixed`]: no generic
+    /// anywhere, and neither of the two shapes rewritten without one), and so
+    /// does a generic bound to such a slot. Minting that copy was most of what
+    /// the checks passes allocated on kolt — 604k of a client analysis's 782k
+    /// type slots, each held until the program drops, and the table that holds
+    /// them doubling past a megabyte. Sharing the slot instead is the same
+    /// answer for every reader as long as nobody rewrites it, and after the
+    /// constraint fixpoint nobody does: `types_settled` is set where the
+    /// checks begin, and a write that changes a slot from then on is counted
+    /// (`counters::late_type_slot_writes`) and refused in debug builds.
+    /// Before that point a slot may still be resolved in place (an `Unknown`
+    /// becoming concrete), so every substitution mints, as it always has.
+    fn substitute_type_id(
+        &mut self,
+        type_id: TypeId,
+        substitution_context: &SubstitutionContext,
+    ) -> TypeId {
+        if self.types_settled {
+            let shared = match self.borrow_type_by_type_id(type_id) {
+                Type::Generic(constraint) => substitution_context
+                    .get(constraint)
+                    .copied()
+                    .filter(|bound| self.substitution_fixed(*bound)),
+                _ => self.substitution_fixed(type_id).then_some(type_id),
+            };
+            if let Some(shared) = shared {
+                return shared;
+            }
+        }
+        let type_ = type_id.get_type(self);
+        self.substitute_type(&type_, substitution_context)
+            .get_type_id(self)
     }
 
     /// Attempts to resolve one `import`/`export import` and bind it into its
@@ -69686,11 +69771,13 @@ fn analyze_inner<'src>(
     // The condition that computes it is a superset of the aliased case, so
     // this is belt and braces rather than a live branch; if it ever failed,
     // the analysis would simply store nothing, which is what B239 did.
+    crate::counters::checkpoint("world");
     if base_cacheable
         && !entry_is_module
         && (!entry_is_open_module || base_cache_key.entry_open_module.is_some())
     {
         base_cache_store(base_cache_key.clone(), &world);
+        crate::counters::checkpoint("world-stored");
     }
     // After the store, so the world the cache holds is the pre-entry one it
     // has always been.
@@ -69915,6 +70002,7 @@ fn analyze_over_world<'src>(
     // Each call closes a `VILAN_PHASE_TIMING=passes` mark (M98) — a cached
     // `bool` load when the split is off.
     crate::phase_pass_mark_start();
+    crate::counters::checkpoint("checks-start");
     macro_rules! unless_cancelled {
         ($($call:expr;)+) => {
             $( if !crate::cancel::cancelled() {
@@ -69928,6 +70016,7 @@ fn analyze_over_world<'src>(
     if build_twice_forced() {
         analyzer.build();
     }
+    analyzer.types_settled = true;
     // ------------------------------------------------------------------
     // M19 T1: which of this world's modules are reusable for THIS analysis
     // (`per-module-analysis-reuse.md` §4.1). Three terms, and all three have
@@ -71132,6 +71221,7 @@ fn analyze_over_world<'src>(
     // the same reason the leak line is: `build --stdout`'s JavaScript must stay
     // clean.
     crate::phase_pass_mark("the remaining tables, labels and records");
+    crate::counters::checkpoint("analysis");
     let phase_checks = phase_checks_start.elapsed();
     if crate::phase_timing_enabled() && crate::macros::in_macro_world() {
         crate::macros::world_phases_record_analysis(

@@ -603,7 +603,8 @@ fn phase_timing_env_var_prints_the_phase_split() {
 }
 
 /// M98: `VILAN_PHASE_TIMING=passes` adds the checks phase's per-pass split —
-/// one `[vilan pass]` line per pass that cost a millisecond, its own prefix so
+/// one `[vilan pass]` line per pass that cost a millisecond (or minted a
+/// thousand type slots, M108), its own prefix so
 /// the positional `[vilan phase]` readers never see it — and every value of
 /// the switch prints the `emission-walk … program-drop …` row, the two costs
 /// after the post-passes that no phase line used to name.
@@ -650,9 +651,17 @@ fn phase_timing_passes_prints_the_per_pass_split_and_the_emission_row() {
             .trim_end_matches("cpu")
             .parse()
             .unwrap_or_else(|_| panic!("`{line}`'s cpu figure must be a number"));
+        // M108: a pass that minted a thousand type slots prints however
+        // little CPU it took — the slots are held until the program drops.
+        let slots: u64 = line
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("slots+"))
+            .unwrap_or_else(|| panic!("`{line}` carries no `slots+<n>` figure"))
+            .parse()
+            .unwrap_or_else(|_| panic!("`{line}`'s slots figure must be a number"));
         assert!(
-            milliseconds >= 1.0,
-            "`{line}` is under the one-millisecond floor the split prints at"
+            milliseconds >= 1.0 || slots >= 1000,
+            "`{line}` is under both floors the split prints at (a millisecond, a thousand slots)"
         );
     }
     assert!(

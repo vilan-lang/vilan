@@ -26,6 +26,12 @@ use vilan_core::manifest::Package;
 use vilan_core::transformer::{EmittedChunk, transform};
 use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
 
+/// The system allocator, counting heap bytes when `VILAN_COUNTERS` arms it
+/// (M105 S5, M108): the live heap and its peak per pass, beside RSS.
+/// Disarmed it is one relaxed load per allocation.
+#[global_allocator]
+static ALLOCATOR: vilan_core::counters::CountingAllocator = vilan_core::counters::CountingAllocator;
+
 /// The vilan language toolchain.
 #[derive(clap::Parser)]
 #[command(
@@ -290,6 +296,7 @@ fn spawn_scoped_compiler_thread<'scope, 'env, T: Send + 'scope>(
 }
 
 fn main() -> ExitCode {
+    vilan_core::counters::arm_from_env();
     // Compilation recurses over deeply-nested ASTs and type graphs, which can
     // run past the default main-thread stack on otherwise-valid programs. Do the
     // work on a worker with a generous stack, as rustc and other compilers do;
@@ -7190,8 +7197,10 @@ fn compile_to_js(
         }
         // And the program's drop, timed by making it explicit: a whole-world
         // analysis frees its tables here, ~0.3 s on kolt's client (M98).
+        vilan_core::counters::checkpoint("emission");
         let drop_clock = vilan_core::PhaseClock::now();
         drop(program);
+        vilan_core::counters::checkpoint("program-drop");
         if vilan_core::phase_timing_enabled() {
             eprintln!(
                 "[vilan phase] emission-walk {phase_emission} program-drop {}",
