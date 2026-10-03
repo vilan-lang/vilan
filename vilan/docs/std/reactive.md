@@ -1426,11 +1426,13 @@ re-runs it at all, which makes the contract sharper rather than different.
 ## Collection pipes — operators per shape
 
 ```vilan,fragment
-[resource] trait CollFlow<T> {                 // anything a collection pipeline starts from
+[resource]
+trait CollFlow<T> {                            // anything a collection pipeline starts from
 	fun open(own self): CollInstance<T>;       // the node author's member
 }
 trait CollSource<T> with DeltaSource<List<T>, SeqOp<T>> {}   // ListCell, ListMemo
-[resource] trait CollPipe<T> with CollFlow<T> {
+[resource]
+trait CollPipe<T> with CollFlow<T> {
 	fun memo(own self): ListMemo<T>            // seal: a read-only CollSource
 	fun memo_global(own self): ListMemo<T>     // ... for the program (A130)
 	fun sample(own self): List<T>              // one read: start, take, release
@@ -1710,8 +1712,10 @@ collection as one `Reset`.
 ## Map pipes — operators for maps and sets
 
 ```vilan,fragment
-[resource] trait MapFlow<K: Hashable, V> { fun open(own self): MapInstance<K, V>; }   // MapSource, every map pipe
-[resource] trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
+[resource]
+trait MapFlow<K: Hashable, V> { fun open(own self): MapInstance<K, V>; }              // MapSource, every map pipe
+[resource]
+trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
 	fun memo(own self): HashMapMemo<K, V>          // seal: a read-only MapSource with get(key)/at(key)
 	fun memo_global(own self): HashMapMemo<K, V>
 	fun sample(own self): HashMap<K, V>

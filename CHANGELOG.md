@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**The book writes `[resource]` on its own line above the declaration, as `vilan fmt` has since B485 Q10, in all 20 fence lines that still put it on the declaration line.** K28: the tour's resources page (6), the persistence guide's file-API summary (3), `std::process` (4), `std::reactive`'s collection- and map-pipe traits (4), `std::misc` (1) and the memory spec (2). Where a summary aligns a trailing comment, the comment keeps its column. The docs gate compiles every rewritten fence. Tracker K28.
+
+---
+
 <!-- family: tooling -->
 **`vilan fmt` formats a call through an indexed closure — `print(adders[2](30));`, `h.fs[0](30)` — where it declined the whole file ("reprinting it would have changed the code at this line").** E252 (native-46's find). The printer parenthesized an index callee as it must a member one (`(a.b)(c)`, since `a.b(c)` is a method call), but the postfix chain reads `[..]` and then the call on its result, so `adders[2](30)` already is a call of the index; the added `( )` changed the tokens and the safety net threw the reprint away. An index callee now prints as written; an author's own group (`(h.fs[0])(30)`) is a group node and prints its parens. **Pin:** `formatter::reformats::e252_a_call_through_an_indexed_closure_prints_as_written` (eight shapes through `reprint`, which errs on a decline — `format` hands the source back and an identity expectation cannot tell the two apart), red with the parens planted back. Tracker E252.
 
