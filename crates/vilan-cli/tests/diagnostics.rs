@@ -406,6 +406,58 @@ fn a_module_warning_renders_in_the_module_file() {
     );
 }
 
+/// B536: a declaration whose attributes are out of THE order is a parse
+/// WARNING, reported for the entry (served by the clean-parse cache, which
+/// carries a clean source's warnings) and for an imported module (the
+/// loader's), under `build` and `check`, in the file that holds it, once per
+/// head, and never fatal.
+#[test]
+fn b536_an_attribute_order_warning_renders_in_its_file_and_is_not_fatal() {
+    let dir = temp_files(
+        "attribute_order_warning",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import std::io::print;\nimport pkg::alpha::value;\n\n[must_use] [deprecated(\"use value\")]\nfun old(): i32 {\n\t1\n}\n\nfun main() {\n\tprint(value());\n}\n",
+            ),
+            (
+                "src/alpha.vl",
+                "[platform(\"node\")] [must_use]\nexport fun value(): i32 {\n\t2\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let checked = vilan(&dir, &["check", "."], true);
+    let check_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(output.status.success(), "a warning is not fatal: {stderr}");
+    assert!(checked.status.success(), "nor under check: {check_stderr}");
+    for stderr in [&stderr, &check_stderr] {
+        let warnings: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.starts_with("Warning: a declaration's attributes"))
+            .collect();
+        assert_eq!(warnings.len(), 2, "one per head: {stderr}");
+        assert!(
+            warnings[0].ends_with("write `[deprecated(..)] [must_use] fun`")
+                || warnings[1].ends_with("write `[deprecated(..)] [must_use] fun`"),
+            "the entry's head, in THE order: {stderr}"
+        );
+        assert!(
+            renders_in(stderr, "main.vl", "[must_use] [deprecated(\"use value\")]"),
+            "the entry's warning renders in the entry: {stderr}"
+        );
+        assert!(
+            renders_in(stderr, "alpha.vl", "[platform(\"node\")] [must_use]")
+                && stderr.contains("write `[must_use] [platform(..)] export fun`"),
+            "the module's renders in the module: {stderr}"
+        );
+        assert!(!stderr.contains("Error:"), "{stderr}");
+    }
+}
+
 #[test]
 fn a_macro_registration_diagnostic_renders_once_at_the_entry_and_leads() {
     // E16's original repro (`macros.rs`): a std file that defines a macro, with
@@ -2116,13 +2168,13 @@ fn a_parallel_check_reports_in_member_order() {
 
 /// `helper.vl`: one of each labelled position, and a use of its own label.
 const LABELLED_HELPER: &str = concat!(
-    "export [internal(\"a struct\")]\n",
-    "struct Region {\n\t[internal(\"a field\")] anchor: str,\n\tlabel: str,\n}\n\n",
+    "[internal(\"a struct\")]\n",
+    "export struct Region {\n\t[internal(\"a field\")] anchor: str,\n\tlabel: str,\n}\n\n",
     "export enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
-    "export [internal(\"a binding\")]\n",
-    "let cache = 3;\n\n",
-    "export [internal(\"a function\")]\n",
-    "fun seam(): i32 {\n\tcache\n}\n",
+    "[internal(\"a binding\")]\n",
+    "export let cache = 3;\n\n",
+    "[internal(\"a function\")]\n",
+    "export fun seam(): i32 {\n\tcache\n}\n",
 );
 
 /// `main.vl`: a use of each, from outside the declaring module.
@@ -2204,10 +2256,10 @@ fn e224_an_import_line_alone_never_warns() {
     std::fs::write(
         dir.join("src/stale.vl"),
         concat!(
-            "export [deprecated(\"use Fresh\")]\n",
-            "struct Stale {\n\tat: i32,\n}\n\n",
-            "export [deprecated(\"use fresh()\")]\n",
-            "fun stale(): i32 {\n\t1\n}\n",
+            "[deprecated(\"use Fresh\")]\n",
+            "export struct Stale {\n\tat: i32,\n}\n\n",
+            "[deprecated(\"use fresh()\")]\n",
+            "export fun stale(): i32 {\n\t1\n}\n",
         ),
     )
     .unwrap();
@@ -2266,15 +2318,15 @@ fn internal_use_is_silent_unless_the_package_asks() {
 /// module; `re.vl`: a deprecated renaming re-export, and a deprecated
 /// NON-renaming one.
 const DEPRECATED_INNER: &str = concat!(
-    "export [deprecated(\"use DeltaCursor\")]\n",
-    "struct KeyedThing {\n\tat: i32,\n}\n\n",
+    "[deprecated(\"use DeltaCursor\")]\n",
+    "export struct KeyedThing {\n\tat: i32,\n}\n\n",
     "export struct DeltaCursor {\n\tat: i32,\n}\n\n",
     "export struct Kept {\n\tat: i32,\n}\n\n",
     "export fun own_use(): KeyedThing {\n\tKeyedThing { at = 1 }\n}\n",
 );
 const DEPRECATED_RE: &str = concat!(
-    "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n",
-    "export [deprecated(\"import it from pkg::inner\")] import pkg::inner::Kept;\n",
+    "[deprecated(\"use pkg::inner::DeltaCursor\")] export import pkg::inner::DeltaCursor as KeyedCursor;\n",
+    "[deprecated(\"import it from pkg::inner\")] export import pkg::inner::Kept;\n",
 );
 
 fn deprecated_package(tag: &str, main: &str) -> PathBuf {

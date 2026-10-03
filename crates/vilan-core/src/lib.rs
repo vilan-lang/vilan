@@ -426,9 +426,24 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
 /// [`parse_clean_cached`]'s store: clean parses by content hash. At module
 /// scope (rather than local to the function, as it began) only so
 /// [`parse_clean_cache_clear`] can reach it.
-static PARSE_CLEAN_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<u64, (&'static Spanned<node::NodeList<'static>>, &'static str)>>,
-> = std::sync::OnceLock::new();
+static PARSE_CLEAN_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, CleanParse>>> =
+    std::sync::OnceLock::new();
+
+/// One parse WARNING as the pipeline reports it (B536): its span into its own
+/// file's text, and its rendered message
+/// ([`parsing::parse_with_warnings`]).
+pub type ParseWarning = (span::Span, String);
+
+/// A clean parse ([`parse_clean_cached_with_warnings`]): the leaked tree, its
+/// leaked text, and the parse's warnings — empty for nearly every source. A
+/// warning does not make a source unclean (B536): the head it reports parses
+/// to the tree its canonical spelling does.
+#[derive(Clone, Copy)]
+pub struct CleanParse {
+    pub ast: &'static Spanned<node::NodeList<'static>>,
+    pub text: &'static str,
+    pub warnings: &'static [ParseWarning],
+}
 /// Content hashes known NOT to parse clean — so a broken file (an entry
 /// mid-edit under `--watch`, say) is leaked and re-parsed once per distinct
 /// content, not once per round.
@@ -482,6 +497,12 @@ pub fn parse_clean_cache_clear() {
 pub fn parse_clean_cached(
     source: &str,
 ) -> Option<(&'static Spanned<node::NodeList<'static>>, &'static str)> {
+    parse_clean_cached_with_warnings(source).map(|parsed| (parsed.ast, parsed.text))
+}
+
+/// [`parse_clean_cached`], with the parse's warnings (B536) — what a pipeline
+/// that REPORTS diagnostics reads (the CLI's entry, the module loader).
+pub fn parse_clean_cached_with_warnings(source: &str) -> Option<CleanParse> {
     let cache = PARSE_CLEAN_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let broken = PARSE_CLEAN_BROKEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
 
@@ -518,7 +539,7 @@ pub fn parse_clean_cached(
     leak_tally::record(leak_tally::LeakSite::ParseCleanCacheText, leaked.len());
     // The handwritten frontend always returns a (possibly recovered) tree; a
     // source is "clean" — and cacheable — exactly when it produced no diagnostics.
-    let (tree, errors) = parsing::parse(leaked);
+    let (tree, errors, warnings) = parsing::parse_with_warnings(leaked);
     let Some(mut root) = tree.filter(|_| errors.is_empty()) else {
         // Recovering (E97): the insert is one step over a `Copy` key, so a
         // recovered guard sees a well-formed set either way.
@@ -536,13 +557,57 @@ pub fn parse_clean_cached(
         leak_tally::LeakSite::ParseCleanCacheAst,
         std::mem::size_of_val(leaked_root),
     );
+    let warnings: &'static [ParseWarning] = if warnings.is_empty() {
+        &[]
+    } else {
+        let rendered: Box<[ParseWarning]> = warnings
+            .iter()
+            .map(|warning| (warning.span, parsing::render(warning)))
+            .collect();
+        let leaked_warnings: &'static [ParseWarning] = Box::leak(rendered);
+        leak_tally::record(
+            leak_tally::LeakSite::ParseCleanCacheAst,
+            std::mem::size_of_val(leaked_warnings),
+        );
+        leaked_warnings
+    };
+    let parsed = CleanParse {
+        ast: leaked_root,
+        text: leaked,
+        warnings,
+    };
     // Recovering (E97): the tree and its text are both leaked and complete
     // BEFORE the lock is taken, so the entry is whole or absent, never torn.
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, (leaked_root, leaked));
-    Some((leaked_root, leaked))
+        .insert(key, parsed);
+    Some(parsed)
+}
+
+/// Adds the ENTRY file's parse warnings (B536) to an analyzed program's
+/// warnings, as the entry's ([`analyzer::SourceId`] 0) — before the
+/// post-passes, whose last step orders every diagnostic. Both pipelines call
+/// it: [`analyze_source`]'s and the CLI's, which parse the entry themselves;
+/// a module's warnings ride its load instead.
+pub fn add_entry_parse_warnings(
+    program: &mut analyzer::Program<'_>,
+    warnings: impl IntoIterator<Item = ParseWarning>,
+) {
+    for (span, msg) in warnings {
+        // `warning_sources` is padded lazily: materialize the implicit tail
+        // first, or this pair would land on an earlier warning's index.
+        program
+            .warning_sources
+            .resize(program.warnings.len(), analyzer::SourceId(0));
+        program.warnings.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg,
+        });
+        program.warning_sources.push(analyzer::SourceId(0));
+    }
 }
 
 /// The content hash the compiler keys its caches and source fingerprints on —
@@ -742,7 +807,7 @@ fn analyze_source_unfenced(
     if !macros::in_macro_world() {
         depth_stats::begin();
     }
-    let (tree, parse_errors) = parsing::parse(source);
+    let (tree, parse_errors, parse_warnings) = parsing::parse_with_warnings(source);
     let mut diagnostics: Vec<Error> = parse_errors
         .iter()
         .map(|error| Error {
@@ -925,6 +990,12 @@ fn analyze_source_unfenced(
         let mut program = analyzer::analyze_cancellable(
             root, source, std, pkg_root, entry_path, platform, workspace,
         )?;
+        add_entry_parse_warnings(
+            &mut program,
+            parse_warnings
+                .iter()
+                .map(|warning| (warning.span, parsing::render(warning))),
+        );
         // The post-pass half of the `VILAN_PHASE_TIMING` split prints inside
         // `post_analysis_passes` itself (backlog M5), so BOTH pipelines —
         // this one (LSP, wasm, the test harnesses) and the CLI's — show it.

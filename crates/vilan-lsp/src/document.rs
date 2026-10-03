@@ -12377,7 +12377,7 @@ pub(crate) mod tests {
                 "helper.vl",
                 "export struct Region {\n\t[internal(\"place against it, never through it\")] \
                  anchor: str,\n\tlabel: str,\n}\n\n\
-                 export [internal(\"the reconciler's own bookkeeping\")] fun anchor_row() {}\n\n\
+                 [internal(\"the reconciler's own bookkeeping\")] export fun anchor_row() {}\n\n\
                  export fun anchor_label(): str {\n\t\"x\"\n}\n",
             ),
         ]);
@@ -12803,13 +12803,13 @@ pub(crate) mod tests {
             (
                 "helper.vl",
                 concat!(
-                    "export [internal(\"a struct\")]\n",
-                    "struct Region {\n\tlabel: str,\n}\n\n",
+                    "[internal(\"a struct\")]\n",
+                    "export struct Region {\n\tlabel: str,\n}\n\n",
                     "export enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
-                    "export [internal(\"a trait\")]\n",
-                    "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
-                    "export [internal(\"a binding\")]\n",
-                    "let cache = 3;\n",
+                    "[internal(\"a trait\")]\n",
+                    "export trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+                    "[internal(\"a binding\")]\n",
+                    "export let cache = 3;\n",
                 ),
             ),
         ]);

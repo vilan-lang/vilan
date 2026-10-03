@@ -472,7 +472,8 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   ```vilan
   import std::drop::Drop;
 
-  [resource] struct Guard { label: str }
+  [resource]
+  struct Guard { label: str }
   impl Guard with Drop {
       fun drop(&mut self) { print(self.label); }
   }
@@ -513,7 +514,8 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   ```vilan
   import std::drop::Drop;
 
-  [resource] struct Guard { label: str }
+  [resource]
+  struct Guard { label: str }
   impl Guard with Drop {
       fun drop(&mut self) { print(self.label); }
   }

@@ -7,7 +7,8 @@ usage: [Persistence and the server](../guide/persistence.md).
 ## std::db: SQLite
 
 ```vilan,fragment
-[resource] external struct Database;       // a resource: moves, closes on drop
+[resource]
+external struct Database;                  // a resource: moves, closes on drop
 
 struct Migration { name: str, sql: str }
 
@@ -370,7 +371,8 @@ struct Entry {
 }
 
 // the handle tier — an open file, positional and stateless
-[resource] external struct File
+[resource]
+external struct File
 
 impl File {
     fun open(path: str): File        // "r"  — read; must exist
@@ -395,7 +397,8 @@ fun with_file_append<T>(path: str, body: |File| T): T       // File::append_to
 fun with_file_modify<T>(path: str, body: |File| T): T       // File::modify
 
 // the incremental reader — a cursor over an open file, built on read_at
-[resource] struct Reader { file: File, cursor: Shared<i53> }
+[resource]
+struct Reader { file: File, cursor: Shared<i53> }
 
 impl Reader {
     fun of(own file: File): Reader     // takes the handle; starts at byte 0
@@ -405,7 +408,8 @@ impl Reader {
 }
 
 // the watch tier — a live watch, pulled one change at a time
-[resource] external struct Watcher
+[resource]
+external struct Watcher
 
 enum ChangeKind { Created, Modified, Removed }
 
