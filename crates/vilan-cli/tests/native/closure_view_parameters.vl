@@ -34,32 +34,35 @@ struct Lend<T> {
 
 fun lender<T>(own value: T): Lend<T> {
 	let cell = Shared::new(value);
-	Lend<T> {
-		lend = |f| f(&cell.write()),
-		modify = |f| f(&mut cell.write()),
-	}
+	Lend<T> { lend = |f| f(&cell.write()), modify = |f| f(&mut cell.write()) }
 }
 
 fun main() {
-	let n = Nested { g = |f| {
-		mut s = "old";
-		f(&mut s);
-		print(s);
-	} };
+	let n = Nested {
+		g = |f| {
+			mut s = "old";
+			f(&mut s);
+			print(s);
+		},
+	};
 	(n.g)(|&mut p| {
 		p = "nested ok";
 	});
 
-	let h = Holder { f = |&mut p| {
-		p = "direct ok";
-	} };
+	let h = Holder {
+		f = |&mut p| {
+			p = "direct ok";
+		},
+	};
 	mut s = "old";
 	(h.f)(&mut s);
 	print(s);
 
-	let m = Maybe { f = Some(|&mut p| {
-		p = "option ok";
-	}) };
+	let m = Maybe {
+		f = Some(|&mut p| {
+			p = "option ok";
+		}),
+	};
 	match m.f {
 		Some(let f) => {
 			mut t = "old";
