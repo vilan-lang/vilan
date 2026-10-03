@@ -100,7 +100,9 @@ fn code_tokens_spanned(source: &str) -> Option<Vec<Spanned<Token<'_>>>> {
 /// nothing but trivia and the canonical orders. Order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
 /// (dropped), an `export` marker written after its item's attributes (moved
-/// ahead of them, B445), the canonical ordering of a top-level import run (see the
+/// ahead of them, B445), a declaration's attribute run written in any order
+/// (sorted by `parsing::attribute_rank`, B485 Q7), the canonical ordering of a
+/// top-level import run (see the
 /// canonical-import-order section below), the canonical ordering of an ELEMENT
 /// HEAD's items (see the canonical-element-head-order section), the canonical
 /// ordering of an `on` HEAD's condition values (see the canonical-on-head-order
@@ -117,9 +119,9 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_on_heads(sort_element_heads(
         sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
             canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
-                collapse_field_shorthands(lead_export_past_attribute_runs(
+                collapse_field_shorthands(sort_attribute_runs(lead_export_past_attribute_runs(
                     drop_redundant_view_prefixes(drop_trailing_commas(tokens)),
-                )),
+                ))),
             )),
         ))),
     ))))
@@ -192,6 +194,112 @@ fn lead_export_past_attribute_runs(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
         }
         result.push(tokens[index].clone());
         index += 1;
+    }
+    result
+}
+
+/// Sorts a declaration's attribute run into the canonical order
+/// ([`crate::parsing::attribute_rank`], B485 Q7 RULED: attributes in any
+/// order, printed in one) in BOTH streams, so the safety net accepts the
+/// printer writing `[deprecated(..)]` ahead of an `[internal(..)]` the author
+/// wrote first. The parser sorts the same run before a production reads it
+/// (`Parser::canonicalize_marker_run`), so the tree holds every attribute
+/// whatever order it was written in.
+///
+/// Recognized by SHAPE where a statement can begin (the stream's start, or
+/// after a `;`, `{` or `}`), past an `export (in PATH)?` already moved ahead
+/// of the run ([`lead_export_past_attribute_runs`]): two or more `[name …]`
+/// groups followed by a marker keyword or a declaration word — never by a
+/// `;` or an operator, so `[a][b];`, a list indexed by a list, is untouched.
+/// A `macro` after a run (of one or more) moves ahead of it, where a macro's
+/// production reads it and where the printer's `[..]` ⏎ `macro fun` reduces.
+/// A stable sort, a relocation of whole groups: the net still sees every
+/// attribute survive.
+fn sort_attribute_runs(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let past_group = |open: usize| -> Option<usize> {
+        let mut depth = 0usize;
+        let mut at = open;
+        loop {
+            match tokens.get(at)? {
+                Token::Ctrl('[' | '(' | '{') => depth += 1,
+                Token::Ctrl(']' | ')' | '}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at + 1);
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+    };
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let at_statement_head = matches!(result.last(), None | Some(Token::Ctrl(';' | '{' | '}')));
+        if !at_statement_head {
+            result.push(tokens[index].clone());
+            index += 1;
+            continue;
+        }
+        let mut run_start = index;
+        if tokens.get(run_start) == Some(&Token::Export) {
+            run_start += 1;
+            if tokens.get(run_start) == Some(&Token::Ctrl('('))
+                && tokens.get(run_start + 1) == Some(&Token::In)
+                && let Some(after) = past_group(run_start)
+            {
+                run_start = after;
+            }
+        }
+        let mut groups: Vec<(u8, std::ops::Range<usize>)> = Vec::new();
+        let mut at = run_start;
+        while tokens.get(at) == Some(&Token::Ctrl('['))
+            && let Some(Token::Ident(name)) = tokens.get(at + 1)
+            && let Some(after) = past_group(at)
+        {
+            groups.push((crate::parsing::attribute_rank(name), at..after));
+            at = after;
+        }
+        let declares = matches!(
+            tokens.get(at),
+            Some(
+                Token::Fun
+                    | Token::Struct
+                    | Token::Enum
+                    | Token::Trait
+                    | Token::Impl
+                    | Token::Let
+                    | Token::Mut
+                    | Token::Mod
+                    | Token::Import
+                    | Token::Use
+                    | Token::Export
+                    | Token::Const
+                    | Token::Async
+                    | Token::External
+                    | Token::Macro
+                    | Token::Ident("lazy")
+            )
+        );
+        // `macro` written after the run is printed ahead of it — the reading
+        // a macro's production takes either way (`Parser::canonicalize_marker_run`).
+        let leads_macro = !groups.is_empty() && tokens.get(at) == Some(&Token::Macro);
+        if (groups.len() < 2 && !leads_macro) || !declares {
+            result.push(tokens[index].clone());
+            index += 1;
+            continue;
+        }
+        result.extend(tokens[index..run_start].iter().cloned());
+        if leads_macro {
+            result.push(Token::Macro);
+            at += 1;
+        }
+        groups.sort_by_key(|(rank, _)| *rank);
+        for (_, group) in groups {
+            result.extend(tokens[group].iter().cloned());
+        }
+        index = at;
     }
     result
 }
@@ -3590,11 +3698,13 @@ struct Printer<'src> {
     head_start: Option<usize>,
 }
 
-/// `[resource]` as it prints today: on the declaration line, in the slot the
-/// keyword it was until B413 held. B485's layout (Q10) moves it to a line of
-/// its own; until then it is the one attribute the declaration line opens
-/// with, and an `export` placed on that line goes after it.
-const RESOURCE_ON_THE_HEAD: &str = "[resource] ";
+/// `[resource]`, on a line of its own above the declaration like every other
+/// attribute (B485 Q10, RULED): until B413 it was a keyword in the
+/// declaration line's slot, and it printed there — `[resource] export struct
+/// H` — which needed one attribute AFTER the keywords' line start, an
+/// exception to the one order. A field's or a variant's attributes are not
+/// declarations' and stay inline (the 2026-10-02 amendment).
+const RESOURCE_ATTRIBUTE: &str = "[resource]";
 
 /// `(in PATH)` after an `export` — printed verbatim, `::`-joined, with no
 /// space before the `(` (`export(in pkg) fun f()`). Empty when the marker
@@ -4497,8 +4607,7 @@ impl<'src> Printer<'src> {
     /// line begins; the marker is placed THERE once the item is printed, so
     /// every item kind — and a derive, a service or a macro attribute
     /// wrapping one — takes it at its signature without an arm of its own.
-    /// `[resource]`, which still prints on the declaration line, is an
-    /// attribute and stays ahead of it (`[resource] export struct H`). An item
+    /// `[resource]` is an attribute line like the rest (B485 Q10). An item
     /// with no attribute takes the marker at its start, as it always did. The
     /// declaration line's width rule measures from the same offset, so it
     /// reads the line with the marker on it.
@@ -4507,9 +4616,23 @@ impl<'src> Printer<'src> {
         scope: Option<&ExportScope<'src>>,
         exported: &Spanned<Node<'src>>,
     ) {
+        let marker = format!("export{} ", export_scope_text(scope));
+        self.print_item_under_keyword(&marker, |printer| printer.print_item(exported));
+    }
+
+    /// Prints a declaration with a marker KEYWORD on its signature line, after
+    /// every attribute line the declaration prints above it — B485 §6.2's one
+    /// order, for `export` ([`Printer::print_exported_item`]) and for the two
+    /// keywords that wrap a declaration node of their own, `const` (B487) and
+    /// `macro`. `print` prints the declaration; the keyword (with its trailing
+    /// space) is placed at the declaration line it marked, or at the start
+    /// when it printed no attribute. The declaration line stays marked at the
+    /// keyword, so an enclosing `export` lands ahead of it: `[deprecated(..)]`
+    /// ⏎ `export const fun f()`.
+    fn print_item_under_keyword(&mut self, keyword: &str, print: impl FnOnce(&mut Self)) {
         let start = self.out.len();
         let enclosing_head = self.head_start.take();
-        self.print_item(exported);
+        print(self);
         let declaration = match self.head_start {
             Some(head) if head >= start => head,
             _ => {
@@ -4517,13 +4640,7 @@ impl<'src> Printer<'src> {
                 start
             }
         };
-        let declaration = if self.out[declaration..].starts_with(RESOURCE_ON_THE_HEAD) {
-            declaration + RESOURCE_ON_THE_HEAD.len()
-        } else {
-            declaration
-        };
-        let marker = format!("export{} ", export_scope_text(scope));
-        self.out.insert_str(declaration, &marker);
+        self.out.insert_str(declaration, keyword);
     }
 
     /// `(in PATH)` after an `export` — see [`export_scope_text`].
@@ -4609,13 +4726,14 @@ impl<'src> Printer<'src> {
     /// handled, so `format` falls back to the original source.
     fn print_item(&mut self, item: &Spanned<Node<'src>>) {
         match &item.0 {
-            // `[[resource] ][external ]struct Name[<…>][;|{ fields }]` — canonical
-            // order is `[resource] external struct` (destruction.md §3; B413's
-            // attribute, printed on the declaration's line as the keyword was).
+            // `[[resource] ⏎ ][external ]struct Name[<…>][;|{ fields }]` —
+            // canonical order is `[resource] external struct` (destruction.md
+            // §3; B413's attribute, on its own line since B485 Q10).
             Node::Struct(name, generics, external, resource, body, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str(RESOURCE_ON_THE_HEAD);
+                    self.out.push_str(RESOURCE_ATTRIBUTE);
+                    self.end_attribute_line();
                 }
                 if *external {
                     self.out.push_str("external ");
@@ -4689,11 +4807,12 @@ impl<'src> Printer<'src> {
                     }
                 }
             }
-            // `[[resource] ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
+            // `[[resource] ⏎ ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
             Node::Enum(name, generics, resource, variants, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str(RESOURCE_ON_THE_HEAD);
+                    self.out.push_str(RESOURCE_ATTRIBUTE);
+                    self.end_attribute_line();
                 }
                 self.out.push_str("enum ");
                 self.out.push_str(name.0);
@@ -4788,7 +4907,8 @@ impl<'src> Printer<'src> {
             Node::Trait(name, generics, supertraits, body, labels) => {
                 self.print_item_labels(labels);
                 if labels.as_ref().is_some_and(|labels| labels.resource) {
-                    self.out.push_str(RESOURCE_ON_THE_HEAD);
+                    self.out.push_str(RESOURCE_ATTRIBUTE);
+                    self.end_attribute_line();
                 }
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
@@ -4853,9 +4973,17 @@ impl<'src> Printer<'src> {
             // estate file writes the form, which is why nothing noticed —
             // `formatter_never_silently_bails` asserts the bail set over the
             // tree, and the tree had no exhibit.
-            Node::Const(inner) if matches!(inner.0, Node::Func(_)) => {
-                self.out.push_str("const ");
-                self.print_item(inner);
+            //
+            // B487: a `const` declaration carries the label prefix, which the
+            // keyword follows as `export` does — `[deprecated(..)]` ⏎ `const
+            // fun f()` — so the declaration prints its own attribute lines and
+            // the keyword goes on its signature. A labelled `const let` takes
+            // this arm too; an unlabelled one stays the expression printer's.
+            Node::Const(inner)
+                if matches!(inner.0, Node::Func(_))
+                    || matches!(inner.0, Node::Let(.., Some(_))) =>
+            {
+                self.print_item_under_keyword("const ", |printer| printer.print_item(inner));
             }
             // `export *;` — the module-wide marker. It carries no inner item, so
             // `needs_semicolon` leaves it out of its exclusion list and the
@@ -4880,9 +5008,10 @@ impl<'src> Printer<'src> {
             }
             // `macro fun name(..) { .. }` — a macro definition. The `macro`
             // keyword then the ordinary function form.
+            // Its attributes, if any, print above it with the keyword on the
+            // signature line, as `export`'s do.
             Node::MacroFun(func) => {
-                self.out.push_str("macro ");
-                self.print_func(func);
+                self.print_item_under_keyword("macro ", |printer| printer.print_func(func));
             }
             // `[name(args)?] <item>` — a user macro attribute, on its own line
             // above the struct/enum/function it annotates (like `[derive(..)]`).
@@ -8693,7 +8822,7 @@ mod reformats {
     // the keywords with `export` first, then the declaration word — so the
     // signature is one line. Every item kind a label leads, a run of several,
     // a scoped marker, a re-export's label, a comment above the statement, a
-    // run split across the marker, `[resource]` on the declaration line, an
+    // run split across the marker, `[resource]` on its own line (Q10), an
     // unattributed export (unchanged), and a rotated statement after an
     // untouched one.
     #[test]
@@ -8729,15 +8858,52 @@ mod reformats {
             ),
             (
                 "export [resource] struct Handle { id: i32 }\n",
-                "[resource] export struct Handle {\n\tid: i32,\n}\n",
+                "[resource]\nexport struct Handle {\n\tid: i32,\n}\n",
             ),
             (
                 "export [hint(Show)] [resource] external struct Handle;\n",
-                "[hint(Show)]\n[resource] export external struct Handle;\n",
+                "[hint(Show)]\n[resource]\nexport external struct Handle;\n",
             ),
             (
                 "export fun a() {}\n\n[must_use] export fun b(): i32 { 1 }\n",
                 "export fun a() {}\n\n[must_use]\nexport fun b(): i32 {\n\t1\n}\n",
+            ),
+        ] {
+            assert_formats(written, expected);
+        }
+    }
+
+    // B485 Q7 (RULED): attributes are written in ANY order, and `vilan fmt`
+    // prints them in the one canonical order (`parsing::attribute_rank`) — on
+    // a function, a struct (with `[derive]` and `[resource]`), a labelled
+    // `let`, a trait, under `export` on either side, and in a trait body.
+    // The net sorts both streams the same way, so none of these declines.
+    #[test]
+    fn b485_an_attribute_run_in_any_order_prints_in_the_canonical_one() {
+        for (written, expected) in [
+            (
+                "[platform(\"node\")] [must_use] [internal(\"r\")] [deprecated(\"d\")] fun f(): i32 { 1 }\n",
+                "[deprecated(\"d\")]\n[internal(\"r\")]\n[must_use]\n[platform(\"node\")]\nfun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "[resource] [internal(\"r\")] [derive(PartialEq)] struct S { a: i32 }\n",
+                "[derive(PartialEq)]\n[internal(\"r\")]\n[resource]\nstruct S {\n\ta: i32,\n}\n",
+            ),
+            (
+                "[internal(\"r\")] [deprecated(\"d\")] lazy let x = 1;\n",
+                "[deprecated(\"d\")]\n[internal(\"r\")]\nlazy let x = 1;\n",
+            ),
+            (
+                "[resource] [platform(\"node\")] export trait T {\n\tfun t(self): i32;\n}\n",
+                "[platform(\"node\")]\n[resource]\nexport trait T {\n\tfun t(self): i32;\n}\n",
+            ),
+            (
+                "export [must_use] [deprecated(\"d\")] async fun f(): i32 { 1 }\n",
+                "[deprecated(\"d\")]\n[must_use]\nexport async fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "trait T {\n\t[must_use] [deprecated(\"d\")] fun t(self): i32;\n}\n",
+                "trait T {\n\t[deprecated(\"d\")]\n\t[must_use]\n\tfun t(self): i32;\n}\n",
             ),
         ] {
             assert_formats(written, expected);
@@ -8921,7 +9087,7 @@ mod reformats {
     fn resource_struct_modifier_round_trips() {
         assert_formats(
             "[resource] struct S{x:i32}\n",
-            "[resource] struct S {\n\tx: i32,\n}\n",
+            "[resource]\nstruct S {\n\tx: i32,\n}\n",
         );
     }
 
@@ -8929,7 +9095,7 @@ mod reformats {
     fn resource_external_struct_keeps_canonical_order() {
         assert_formats(
             "[resource] external struct Database;\n",
-            "[resource] external struct Database;\n",
+            "[resource]\nexternal struct Database;\n",
         );
     }
 
@@ -8938,11 +9104,11 @@ mod reformats {
         // B470: `[resource]` closes a trait's label prefix, as on a struct.
         assert_formats(
             "[resource] trait Flow<T>{fun start(own self);}\n",
-            "[resource] trait Flow<T> {\n\tfun start(own self);\n}\n",
+            "[resource]\ntrait Flow<T> {\n\tfun start(own self);\n}\n",
         );
         assert_formats(
             "[deprecated(\"use Flow\")] [resource] trait Old{}\n",
-            "[deprecated(\"use Flow\")]\n[resource] trait Old {}\n",
+            "[deprecated(\"use Flow\")]\n[resource]\ntrait Old {}\n",
         );
     }
 
@@ -8950,7 +9116,7 @@ mod reformats {
     fn resource_enum_modifier_round_trips() {
         assert_formats(
             "[resource] enum E{A,B}\n",
-            "[resource] enum E {\n\tA,\n\tB,\n}\n",
+            "[resource]\nenum E {\n\tA,\n\tB,\n}\n",
         );
     }
 
@@ -9489,7 +9655,8 @@ mod idempotency {
             "export struct Map<S, T, U> {\n\tup: S,\n}\n\n",
             "[internal(\"a node\")]\n",
             "[hint(Iterator<(usize, T)>)]\n",
-            "[resource] struct Enumerated<I, T> {\n\tupstream: I,\n}\n\n",
+            "[resource]\n",
+            "struct Enumerated<I, T> {\n\tupstream: I,\n}\n\n",
             "[hint(Source<Option<T>>)]\n",
             "enum Maybe<T> {\n\tSome(T),\n\tNone,\n}\n",
         );
@@ -10242,6 +10409,34 @@ mod const_declaration_printing {
             "export const let    value: i32 = 1;\n",
             "export const let value: i32 = 1;\n",
         );
+    }
+
+    /// B487: a `const` declaration carries the label prefix, and prints it as
+    /// every declaration does (B485 §6.2) — each attribute on its own line,
+    /// the keywords on the signature, `export` ahead of `const`. Written in
+    /// either order around `export`.
+    #[test]
+    fn a_const_declarations_labels_print_above_its_keywords() {
+        for (written, expected) in [
+            (
+                "[deprecated(\"use g\")] [must_use] const fun f(): i32 { 1 }\n",
+                "[deprecated(\"use g\")]\n[must_use]\nconst fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "export [internal(\"why\")] const fun f(): i32 { 1 }\n",
+                "[internal(\"why\")]\nexport const fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "[internal(\"why\")] const let x = 1;\n",
+                "[internal(\"why\")]\nconst let x = 1;\n",
+            ),
+            (
+                "[deprecated(\"use y\")] export const let y: i32 = 1;\n",
+                "[deprecated(\"use y\")]\nexport const let y: i32 = 1;\n",
+            ),
+        ] {
+            assert_construct(written, expected);
+        }
     }
 
     /// N108: the other half of `Node::Const` — the weak-precedence EXPRESSION

@@ -18,7 +18,8 @@ import pkg::time::now;
 /// moves rather than copies, and its `Drop` (below) closes the underlying handle at
 /// the owner's scope end. A module-level `Database` is process-lifetime and never
 /// drops — the serve-forever server idiom.
-[resource] export external struct Database;
+[resource]
+export external struct Database;
 
 /// A prepared statement (reusable; parameters bind per call).
 export external struct Statement;

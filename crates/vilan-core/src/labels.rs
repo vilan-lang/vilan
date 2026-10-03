@@ -18,6 +18,7 @@ use crate::error::Error;
 use crate::fx::FxHashSet as HashSet;
 use crate::id::Id;
 use crate::manifest::LintLevel;
+use crate::node::Labels;
 use crate::span::Span;
 
 /// The `[internal("reason")]` label on the declaration `target` names — a
@@ -165,6 +166,40 @@ impl ImportLines {
     }
 }
 
+/// The refusal for labels on a LOCAL binding, naming the labels written
+/// (B493): it used to say `[internal(..)]` whatever the label was, so a
+/// `[platform(..)]` or a `[deprecated(..)]` on a local read as a refusal of a
+/// label nobody wrote. Canonical order, as `vilan fmt` prints them.
+fn local_label_refusal(name: &str, labels: &Labels<'_>) -> String {
+    let mut written: Vec<&str> = Vec::new();
+    if labels.deprecated.is_some() {
+        written.push("`[deprecated(..)]`");
+    }
+    if labels.internal.is_some() {
+        written.push("`[internal(..)]`");
+    }
+    if !labels.hint.is_empty() {
+        written.push("`[hint(..)]`");
+    }
+    if !labels.platform.is_empty() {
+        written.push("`[platform(..)]`");
+    }
+    let (labels, verb, subject, object) = match written.as_slice() {
+        [one] => (one.to_string(), "labels", "the label has", "it"),
+        [init @ .., last] => (
+            format!("{} and {last}", init.join(", ")),
+            "label",
+            "the labels have",
+            "them",
+        ),
+        [] => ("a label".to_string(), "labels", "the label has", "it"),
+    };
+    format!(
+        "`{name}` is a local binding, and {labels} {verb} an item on a module's surface: nothing \
+         outside this body can name it, so {subject} no reader — delete {object}"
+    )
+}
+
 fn refuse_local_labels(program: &mut Program) {
     let module_bindings: HashSet<Id> = program.module_level_bindings().into_iter().collect();
     let mut refused: Vec<(Span, SourceId, String)> = program
@@ -173,15 +208,11 @@ fn refuse_local_labels(program: &mut Program) {
         .filter(|id| !module_bindings.contains(id))
         .filter_map(|id| {
             let variable = program.variables.get(id)?;
+            let labels = program.item_labels.get(id)?;
             Some((
                 variable.name_span,
                 program.diagnostic_source_of(*id),
-                format!(
-                    "`{}` is a local binding, and `[internal(..)]` labels an item on a module's \
-                     surface: nothing outside this body can name it, so the label has no reader \
-                     — delete it",
-                    variable.name
-                ),
+                local_label_refusal(variable.name, labels),
             ))
         })
         .collect();

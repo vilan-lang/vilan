@@ -588,7 +588,7 @@ row	flagship	key
 564	flagship	`{root_name}` cannot be a `dyn` object: {reason}.{through} An object dispatches through a table of its trait's members, so every member it requires must take a receiver, name no `Self` in its signature, and be non-generic. Use a generic parameter (`<T: {root_name}>`) for a value whose type is known where it is written
 565	-	{subject_name} `{member}` is async, but `{trait_name}::{member}` is declared sync, so this value cannot become a `dyn {trait_name}`: a call through an object is compiled once, against the declaration, and would hand back an unawaited promise. Declare `{trait_name}::{member}` `async` (an implementation may then be either), or keep the value behind a generic bound, where each implementation is awaited as it is written
 566	-	`{name}` is internal: {reason}
-567	-	`{name}` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+567	-	`{name}` is a local binding, and {labels} {label} an item on a module's surface: nothing outside this body can name it, so {the label has} no reader — delete {it}
 568	-	`[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about
 569	-	Expected {expected}, but got {got} instead. There are no implicit numeric conversions; convert with `.as_{target}()`
 570	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
@@ -633,3 +633,8 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 608	-	`[derive(Storable)]` on `{name}`: the field `{field}` would project as `{method}()`, which a store handle already has (`{method}` is a handle member, and an inherent member wins over a projection) — rename the projection with `[reactive(name = "..")]` on the field
 609	-	`[derive(Storable)]` on `{name}`: the variant `{variant}` would project as `{snake}()`/`{flag}()`, which a store handle already has — rename the variant
 610	-	`[derive(Storable)]` on `{name}`: two variants project as `{snake}()`
+611	-	`return` is not a vilan keyword: vilan spells this `ret` — `ret value;` returns a value, and a bare `ret;` leaves a function that returns nothing
+612	-	`{word}` is not a vilan keyword: vilan spells this `fun` — `fun name(parameter: Type): Result { … }`
+613	-	`->` is not how vilan writes a return type: vilan spells this `:` — `fun name(parameter: Type): Result`, and `|parameter: Type|: Result` on a closure
+614	-	`->` is not how vilan writes a closure type: its result follows the `|..|` directly — `|Type| Result`, and `|| Result` with no parameters
+615	-	a declaration's markers are written in one order — its attributes, then the keywords `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration word: write `{canonical}`

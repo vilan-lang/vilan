@@ -89,6 +89,26 @@ written rather than where it is read (N113). A member — a struct
 field, a method — may still be called `void`: it is reached through a
 receiver, not through the atom production.
 
+**Which a new marker becomes** (B485, RULED 2026-10-01). A word is a
+**keyword** when it changes what may be written after it (`export` takes
+`(in PATH)` or `*`, `external` licenses a `;` body, `macro` declares a
+compile-time function, `const` and `async` also prefix an expression), or
+when a reader of the signature line needs it to know how a use calls,
+passes, receives, awaits or evaluates the declaration (`async`, `const
+fun`, `lazy`, `own`, `&`, `mut`, `borrows`, `context`, `sync`, `dyn`).
+Everything else about a declaration is an **attribute**: its labels, its
+generated companions, its host binding, its platform fence, the class of a
+declared type — on the proviso that skipping it while reading never
+misleads silently, so every effect it has on a use is a diagnostic at that
+use. Attributes stand above the signature, keywords in it, in one order
+(§3.2).
+
+Words other languages reserve for vilan's constructs — `return`, `fn`,
+`function`, `func`, `def` — are ordinary identifiers. Where one stands in
+the place of `ret` or `fun` (`return value;`, `fn name(`), or `->` in the
+place of a return type's `:`, the parser refuses it once with vilan's
+spelling and reads on as if that had been written (B520).
+
 ## 2.3 Literals
 
 ### Numbers

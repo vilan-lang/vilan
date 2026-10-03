@@ -3449,6 +3449,36 @@ fn an_internal_label_on_a_local_binding_is_refused() {
     );
 }
 
+/// B493: the refusal names the label WRITTEN. It said `[internal(..)]`
+/// whatever the label was, so a `[platform(..)]` or `[deprecated(..)]` on a
+/// local was refused for a label nobody wrote.
+#[test]
+fn b493_a_local_label_refusal_names_the_label_written() {
+    for (labels, named) in [
+        (
+            "[platform(\"node\")]",
+            "`[platform(..)]` labels an item on a module's surface: nothing outside this body \
+             can name it, so the label has no reader — delete it",
+        ),
+        (
+            "[deprecated(\"use y\")]",
+            "`[deprecated(..)]` labels an item on a module's surface",
+        ),
+        (
+            "[deprecated(\"use y\")] [internal(\"why\")]",
+            "`[deprecated(..)]` and `[internal(..)]` label an item on a module's surface: \
+             nothing outside this body can name it, so the labels have no reader — delete them",
+        ),
+    ] {
+        let source = format!("fun main() {{\n\t{labels}\n\tlet local = 1;\n\tprint(local);\n}}\n");
+        assert_fails_spanning(
+            &source,
+            "local",
+            &format!("`local` is a local binding, and {named}"),
+        );
+    }
+}
+
 /// Nothing warns by default: the lint is opt-in (`[lints] internal_use`), and
 /// a file with no manifest has not opted in. (The warning itself is pinned
 /// end to end in `vilan-cli`'s `diagnostics.rs`, where a manifest can say so.)
