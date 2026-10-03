@@ -50,8 +50,28 @@ struct Holds {
 
 fun main() {
 	let words = [
-		"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
-		"lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi", "chi",
+		"alpha",
+		"beta",
+		"gamma",
+		"delta",
+		"epsilon",
+		"zeta",
+		"eta",
+		"theta",
+		"iota",
+		"kappa",
+		"lambda",
+		"mu",
+		"nu",
+		"xi",
+		"omicron",
+		"pi",
+		"rho",
+		"sigma",
+		"tau",
+		"upsilon",
+		"phi",
+		"chi",
 	];
 	print(words);
 	print([1, 2, 3, 4, 5, 6, 7]);
@@ -78,9 +98,7 @@ fun main() {
 	}
 	print(many);
 	print(["it's", "say \"hi\"", "tab\there", "back\\slash"]);
-	print([
-		"a first line that is long enough to split\nand a second line after it\nand a third",
-	]);
+	print(["a first line that is long enough to split\nand a second line after it\nand a third"]);
 	print(Shared::new([1, 2, 3]));
 	print(Shared::new(["a string that is quite long indeed", "and another one that is long"]));
 	mut table: HashMap<str, i32> = HashMap::new();
