@@ -42640,6 +42640,22 @@ impl<'src> Analyzer<'src> {
                             })
                             .map(|(_, chain_arguments)| chain_arguments)
                     }
+                    // B502: a trait OBJECT provides its trait, and the
+                    // supertraits at the arguments its chain passes, at the
+                    // arguments it CARRIES. Asked of the impls, a type behind
+                    // the object that implements the trait twice answered for
+                    // it: `measure(named)` with `named: dyn Shape<str>` bound
+                    // `T` to the first impl's `i32` and refused the call.
+                    Type::Dyn(object_trait_id, object_arguments) => self
+                        .trait_with_supertraits_at(*object_trait_id, object_arguments)
+                        .into_iter()
+                        .find(|(chain_trait_id, chain_arguments)| {
+                            *chain_trait_id == trait_id && !chain_arguments.is_empty()
+                        })
+                        .map(|(_, chain_arguments)| chain_arguments)
+                        .or_else(|| {
+                            self.trait_args_for_pattern(&concrete, trait_id, &trait_arguments)
+                        }),
                     _ => self.trait_args_for_pattern(&concrete, trait_id, &trait_arguments),
                 };
                 let Some(impl_arguments) = provided else {

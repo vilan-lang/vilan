@@ -1852,3 +1852,60 @@ fn b437_two_positions_of_one_application_share_one_table_and_one_instance() {
     assert_eq!(js.matches("(shape) {").count(), 1, "one instance:\n{js}");
     assert_compiles_and_runs(source, "[ 4 ]\n[ 9 ]\n");
 }
+
+// --- B502: a trait object binds a bound's arguments from what it CARRIES ------
+
+/// B502: `measure<T, S: Shape<T>>(shape: S)` called with a `dyn Shape<str>`
+/// whose type behind it implements `Shape` twice bound `T` from the first impl
+/// (`i32`) and refused: "'dyn Shape<str>' does not implement trait
+/// 'Shape<i32>'". The object's own arguments answer — both objects of one type,
+/// in either call order, and a list of objects. (A `dyn Named<str>` over the
+/// supertrait `Shape<str>` binds `T` too, but its table answers `area` from
+/// `Shape<i32>` on JS — on 0.43.0 as well, outside a bound — a find filed from
+/// this lane.)
+#[test]
+fn b502_a_trait_object_binds_a_bounds_arguments_from_its_own() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Shape<T> {
+            fun area(self): T;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape<i32> {
+            fun area(self): i32 {
+                self.side * self.side
+            }
+        }
+
+        impl Square with Shape<str> {
+            fun area(self): str {
+                "big"
+            }
+        }
+
+        fun measure<T, S: Shape<T>>(shape: S): T {
+            shape.area()
+        }
+
+        fun main() {
+            let named: dyn Shape<str> = Square { side = 4 };
+            let counted: dyn Shape<i32> = Square { side = 5 };
+            print(measure(named));
+            print(measure(counted));
+            let again: dyn Shape<str> = Square { side = 1 };
+            print(measure(again));
+            let shapes: List<dyn Shape<i32>> = [Square { side = 3 }];
+            for shape in shapes {
+                print(measure(shape));
+            }
+        }
+        "#,
+        "big\n25\nbig\n9\n",
+    );
+}

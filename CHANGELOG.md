@@ -50,6 +50,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**A trait object binds a bound's arguments from the arguments it CARRIES: `measure<T, S: Shape<T>>(shape: S)` called with a `dyn Shape<str>` returns the `str` area — where it was refused "'dyn Shape<str>' does not implement trait 'Shape<i32>'" whenever the type behind the object implements `Shape` at two instantiations.** The bound-argument derivation asked the impls, and the first one (`Shape<i32>`) answered for the object. It now reads the object's own trait chain first (as emission's `object_trait_arguments` does, B475), and falls back to the impls only for a trait the object's chain does not reach. Reduced from editor-45's observation: it needed the two impls on one type, not two calls. A `dyn Named<str>` over the supertrait `Shape<str>` binds too, but its table answers `area` from `Shape<i32>` on JS (outside a bound as well, on 0.43.0) — filed. Pins: `inference::dyn_objects`' `b502_a_trait_object_binds_a_bounds_arguments_from_its_own`; `native_differential`'s `a_trait_object_binds_a_bounds_arguments_from_its_own_on_both_backends`. No golden moves. Tracker B502.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

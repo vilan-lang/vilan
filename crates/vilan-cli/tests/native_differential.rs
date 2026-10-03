@@ -147,6 +147,47 @@ const B473_PROBE: &str = concat!(
     "}\n",
 );
 
+const B502_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Shape<T> {\n",
+    "\tfun area(self): T;\n",
+    "}\n",
+    "\n",
+    "struct Square {\n",
+    "\tside: i32,\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<i32> {\n",
+    "\tfun area(self): i32 {\n",
+    "\t\tself.side * self.side\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<str> {\n",
+    "\tfun area(self): str {\n",
+    "\t\t\"big\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun measure<T, S: Shape<T>>(shape: S): T {\n",
+    "\tshape.area()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet named: dyn Shape<str> = Square { side = 4 };\n",
+    "\tlet counted: dyn Shape<i32> = Square { side = 5 };\n",
+    "\tprint(measure(named));\n",
+    "\tprint(measure(counted));\n",
+    "\tlet again: dyn Shape<str> = Square { side = 1 };\n",
+    "\tprint(measure(again));\n",
+    "\tlet shapes: List<dyn Shape<i32>> = [Square { side = 3 }];\n",
+    "\tfor shape in shapes {\n",
+    "\t\tprint(measure(shape));\n",
+    "\t}\n",
+    "}\n",
+);
+
 const B510_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -8689,6 +8730,23 @@ fn a_trait_default_passing_self_to_a_generic_over_its_trait_runs_on_both_backend
         compare(&staged, "native_probe_b510.vl"),
         Verdict::Identical,
         "a trait default passing self to a generic over its trait must run on both backends"
+    );
+}
+
+/// B502: a trait object binds a bound's arguments from what it carries — a
+/// `dyn Shape<str>` whose type implements `Shape` twice, both objects in one
+/// program, and a list of objects — on both backends. Both refused "'dyn
+/// Shape<str>' does not implement trait 'Shape<i32>'" (the first impl answered
+/// for the object).
+#[test]
+fn a_trait_object_binds_a_bounds_arguments_from_its_own_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b502.vl"), B502_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b502.vl"),
+        Verdict::Identical,
+        "a trait object must bind a bound's arguments from its own on both backends"
     );
 }
 
