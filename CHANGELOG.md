@@ -323,6 +323,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**A closure literal whose parameters only its binding's annotation types, and whose body needs one of them, takes the annotation: `let lend: |(|&i32| void)| void = |f| f(&cell.write());` compiles — where it was refused "`f` is never given a type: this closure is never called …" (it is called).** The binding's readiness probe inferred its initializer UNDIRECTED, and such a literal can never type undirected: its body waits on `f`, and `f` waits on the direction, so the binding deferred for good unless a call site happened to fill the parameter. A binding annotated with a closure type now probes in that direction. An annotated binding whose type is its annotation also keeps the annotation's own type id, which the closure type's view conventions are keyed by (B465's adoption at an annotated binding) — so B400's refusal of a value at the annotation's `&` parameter (`count(holder.items.read())`) now stands alone, where it carried a spurious "`list` is never given a type" beside it. Pin: `inference::generics`' `b516_an_annotated_bindings_closure_types_a_parameter_its_body_needs` (an expression body, a block body, a nested closure-typed parameter, two parameters; and B400's refusal as the only diagnostic) — red on the 0.43.0 toolchain. No golden moves. Tracker B516.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

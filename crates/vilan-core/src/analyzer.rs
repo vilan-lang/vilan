@@ -50314,12 +50314,23 @@ impl<'src> Analyzer<'src> {
             let annotated_type = initial_type_id.get_type(self);
             self.seed_expectation(first_value_id, &annotated_type);
         }
+        // B516: a binding annotated with a CLOSURE type probes its initializer
+        // in that direction. A closure literal whose parameters only the
+        // annotation types, and whose body needs one of them (`let lend:
+        // |(|&i32| void)| void = |f| f(&n);`), can never type undirected — the
+        // body waits on `f`, and `f` waits on the direction — so the
+        // undirected probe deferred for good and the parameter was reported
+        // "never given a type" (unless a call site happened to fill it).
+        let probe_direction = match initial_type_id.get_type(self) {
+            closure @ Type::Closure(..) => closure,
+            _ => Type::Unknown,
+        };
         let first_ready = value_ids
             .first()
             .map(|&value_id| {
                 self.expr_id_to_expr_map.contains_key(&value_id)
                     && !matches!(
-                        self.infer_type(value_id, &Type::Unknown, &HashMap::default()),
+                        self.infer_type(value_id, &probe_direction, &HashMap::default()),
                         Type::Unresolved
                     )
             })
@@ -50426,7 +50437,15 @@ impl<'src> Analyzer<'src> {
 
         // Ground the variable's type before checking reassignments so
         // self-referential values like `i + 1` can resolve.
-        let var_type_id = variable_type.clone().get_type_id(self);
+        // An annotated binding whose type IS its annotation keeps the
+        // annotation's own id: tables keyed by the written type (the closure
+        // type's view conventions, B465's adoption at an annotated binding)
+        // read the binding through it (B516).
+        let var_type_id = if !unannotated && variable_type == initial_type_id.get_type(self) {
+            initial_type_id
+        } else {
+            variable_type.clone().get_type_id(self)
+        };
         self.variables.get_mut(&variable_id).unwrap().type_id = var_type_id;
         self.resolved_types.insert(variable_id, var_type_id);
 

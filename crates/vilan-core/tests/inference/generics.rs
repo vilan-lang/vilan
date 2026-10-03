@@ -5356,6 +5356,52 @@ fn b185_a_never_called_closure_still_names_its_starved_parameter() {
     );
 }
 
+/// B516: a closure literal whose parameters ONLY its binding's annotation
+/// types, and whose body needs one of them, takes the annotation — `let lend:
+/// |(|&i32| void)| void = |f| f(&n);` was refused "`f` is never given a
+/// type": the binding's readiness probe was undirected, and the body waits on
+/// `f` while `f` waits on the direction. A block body, a nested closure-typed
+/// parameter and a two-parameter literal are pinned beside it; B400's refusal
+/// of a value at the annotation's `&` parameter now stands ALONE (it carried a
+/// spurious "never given a type" beside it).
+#[test]
+fn b516_an_annotated_bindings_closure_types_a_parameter_its_body_needs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(1);
+            let lend: |(|&i32| void)| void = |f| f(&cell.write());
+            lend(|v: &i32| print(*v));
+            let three: |(|&i32| void)| void = |f| f(&3);
+            three(|v: &i32| print(*v));
+            let block: |(|i32| str)| str = |f| { f(4) };
+            print(block(|n: i32| i"n={n}"));
+            let pair: |(|i32| i32), i32| i32 = |f, x| f(x);
+            print(pair(|n: i32| n * 10, 5));
+        }
+        "#,
+        "1\n3\nn=4\n50\n",
+    );
+    let refused = compile(
+        r#"
+        import std::shared::Shared;
+        struct Holder { items: Shared<List<i32>> }
+        fun main() {
+            let holder = Holder { items = Shared::new([1, 2]) };
+            let count: |&List<i32>| usize = |list| list.len();
+            print(count(holder.items.read()));
+        }
+        "#,
+    )
+    .expect_err("a value at the annotation's `&` parameter is refused");
+    assert_eq!(refused.len(), 1, "B400's refusal alone; got: {refused:#?}");
+    assert!(
+        refused[0].contains("a `&` parameter takes a view"),
+        "got: {refused:#?}"
+    );
+}
+
 #[test]
 fn b185_a_rebinding_walk_terminates_on_a_module_level_binding_cycle() {
     // Following initializers put the walk on a graph that can CYCLE: module
@@ -9425,3 +9471,4 @@ fn b454_an_argument_constructor_takes_the_receivers_error_type() {
         "Result<i32, str>",
     );
 }
+
