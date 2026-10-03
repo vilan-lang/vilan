@@ -141,7 +141,10 @@ def measure_subject(vilan, subject, work, counter, env=None):
     # The members of a multi-entry package one after another (M100 overlaps them by default): two
     # threads racing for std's clean-parse cache make the count move by ~0.2% run to run, which is
     # noise a ceiling at +1% should not have to absorb. The work is the same work either way.
-    env = dict(os.environ if env is None else env, VILAN_SEQUENTIAL_CHECK="1")
+    # And the macro-expansion tables under the work directory (N137's `VILAN_CHECK_CACHE`): the gate
+    # warms its own subjects and leaves the developer's `~/.vilan/check-cache` alone.
+    env = dict(os.environ if env is None else env, VILAN_SEQUENTIAL_CHECK="1",
+               VILAN_CHECK_CACHE=os.path.join(os.path.abspath(work), "check-cache"))
     perf_count.measure([vilan, "check", "."], cwd=directory, env=env, counter=counter)
     result = perf_count.measure([vilan, "check", "."], cwd=directory, env=env, counter=counter,
                                 log=os.path.join(work, subject.replace(":", "-") + ".log"))

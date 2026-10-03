@@ -39,85 +39,85 @@ subjects = [
 subject = "example:math"
 counter = "instructions:u"
 class = "reference"
-ceiling = 242_942_792
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 242_938_743
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:watch"
 counter = "instructions:u"
 class = "reference"
-ceiling = 307_992_081
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 307_934_680
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_532_650_952
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 1_534_135_713
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:fullstack"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_363_844_790
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 3_330_302_550
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_920_169_529
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 1_920_451_465
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_423_749_158
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 2_423_751_436
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 4_228_734_946
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 4_206_577_329
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_542_845_757
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 1_543_469_338
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_145_930_169
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 2_147_294_096
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 5_954_243_404
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 5_927_325_650
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 6_166_480_934
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 6_174_998_419
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 10_023_433_080
-measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+ceiling = 9_918_111_176
+measured_at = "perf-46 tip (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[growth]]
 small = 160
