@@ -1902,9 +1902,8 @@ fn b437_two_positions_of_one_application_share_one_table_and_one_instance() {
 /// (`i32`) and refused: "'dyn Shape<str>' does not implement trait
 /// 'Shape<i32>'". The object's own arguments answer — both objects of one type,
 /// in either call order, and a list of objects. (A `dyn Named<str>` over the
-/// supertrait `Shape<str>` binds `T` too, but its table answers `area` from
-/// `Shape<i32>` on JS — on 0.43.0 as well, outside a bound — a find filed from
-/// this lane.)
+/// supertrait `Shape<str>` binds `T` too; its table's answer is B532's pin,
+/// below.)
 #[test]
 fn b502_a_trait_object_binds_a_bounds_arguments_from_its_own() {
     assert_compiles_and_runs(
@@ -1950,4 +1949,73 @@ fn b502_a_trait_object_binds_a_bounds_arguments_from_its_own() {
         "#,
         "big\n25\nbig\n9\n",
     );
+}
+
+/// The program both B532 pins run: one type implementing `Shape` at two
+/// instantiations, reached through objects of SUB-traits — one level up
+/// (`Named<T> with Shape<T>`), two levels up (`Titled<T> with Named<T>`), a
+/// clause that writes a concrete argument (`Big with Shape<str>`), and the
+/// same sub-trait at the other instantiation — plus a call through a bound.
+const B532_PROGRAM: &str = r#"
+import std::io::print;
+
+trait Shape<T> {
+    fun area(self): T;
+}
+
+trait Named<T> with Shape<T> {}
+
+trait Titled<T> with Named<T> {}
+
+trait Big with Shape<str> {}
+
+struct Square {
+    side: i32,
+}
+
+impl Square with Shape<i32> {
+    fun area(self): i32 {
+        self.side * self.side
+    }
+}
+
+impl Square with Shape<str> {
+    fun area(self): str {
+        "big"
+    }
+}
+
+impl Square with Named<str> {}
+
+impl Square with Named<i32> {}
+
+impl Square with Titled<str> {}
+
+impl Square with Big {}
+
+fun through_bound<S: Named<str>>(shape: S): str {
+    shape.area()
+}
+
+fun main() {
+    let titled: dyn Named<str> = Square { side = 2 };
+    print(titled.area());
+    let counted: dyn Named<i32> = Square { side = 3 };
+    print(counted.area());
+    let deeper: dyn Titled<str> = Square { side = 4 };
+    print(deeper.area());
+    let big: dyn Big = Square { side = 5 };
+    print(big.area());
+    print(through_bound(Square { side = 6 }));
+}
+"#;
+
+/// B532: an object over a SUB-trait answers a supertrait's member from the
+/// supertrait's instantiation the clause chain passes — `dyn Named<str>` over
+/// `Named<T> with Shape<T>` answers `area` from `Shape<str>` (JS answered from
+/// `Shape<i32>`, printing `4` for `big`; natively rustc refused the emitted
+/// table, E0308). `native_differential` runs the same program on both backends.
+#[test]
+fn b532_an_object_over_a_subtrait_answers_from_the_supertraits_instantiation() {
+    assert_compiles_and_runs(B532_PROGRAM, "big\n9\nbig\nbig\nbig\n");
 }

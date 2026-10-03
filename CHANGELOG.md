@@ -293,6 +293,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**An object over a SUB-trait answers a supertrait's member from the supertrait's instantiation the `with` clauses pass: on a type implementing `Shape<i32>` and `Shape<str>`, `let titled: dyn Named<str> = Square { side = 2 }` over `trait Named<T> with Shape<T>` answers `titled.area()` with `"big"` — where JS answered from `Shape<i32>`'s table entry (`4`), and the native backend's emitted table was refused by rustc (E0308).** Both emitters built each slot of the object's table by asking for the member on the OBJECT's trait application (`Named<str>`); no impl of `Named` provides `area`, so the lookup fell through to the by-name one, which took whichever impl of `Shape` came first. The slot is now selected at the DECLARING trait's application, with the clause chain's arguments substituted down (`mono::object_member_preference`, shared by both emitters; native's private `object_member_declaration` moved beside it). Two levels up (`Titled<T> with Named<T>`), a clause that writes a concrete argument (`Big with Shape<str>`) and the other instantiation (`dyn Named<i32>` answers `9`) are pinned with it; a clause argument written in a nested form (`with Shape<Option<T>>`) is resolved by the caller's substitution as before. Pins: `inference::dyn_objects`' `b532_an_object_over_a_subtrait_answers_from_the_supertraits_instantiation` and `native_differential`'s `an_object_over_a_subtrait_answers_from_the_supertraits_instantiation_on_both_backends` — red on the 0.43.0 toolchain. No golden moves. Tracker B532.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
