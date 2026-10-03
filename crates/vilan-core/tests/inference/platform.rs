@@ -4391,6 +4391,21 @@ fn an_unannotated_map_new_requires_an_annotation() {
     );
 }
 
+/// B497: the steer's example annotation spells the type by its current
+/// name — `: HashMap<str, i32>`, not the deprecated `Map` (removed by R-e).
+#[test]
+fn b497_the_never_determined_steer_spells_hash_map() {
+    let source = r#"
+        import std::hash_map::HashMap;
+        fun main() {
+            mut table = HashMap::new();
+            table.insert("k", 1);
+        }
+        "#;
+    assert_fails_with(source, "annotate the binding (e.g. `: HashMap<str, i32>`)");
+    assert_fails_without(source, "`: Map<");
+}
+
 #[test]
 fn an_unannotated_set_new_requires_an_annotation() {
     assert_fails_with(

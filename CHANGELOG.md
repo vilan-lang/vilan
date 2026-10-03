@@ -348,6 +348,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**The "never fully determined" steer's example annotation spells the type by its current name — "annotate the binding (e.g. `: HashMap<str, i32>`)" — where it named the deprecated `Map` that R-e removes this release.** A sweep of every steer and example string in the compiler found no other `Map<`/`Set<`. Pin: `inference::platform`'s `b497_the_never_determined_steer_spells_hash_map` — red on the 0.43.0 toolchain. No golden moves. Tracker B497.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

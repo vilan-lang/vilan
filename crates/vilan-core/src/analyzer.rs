@@ -61335,7 +61335,7 @@ impl<'src> Analyzer<'src> {
                         msg: format!(
                             "the type of '{name}' is never fully determined: `{rendered}` keeps \
                              its callee's type parameters, so uses of it cannot be checked; \
-                             annotate the binding (e.g. `: Map<str, i32>`)"
+                             annotate the binding (e.g. `: HashMap<str, i32>`)"
                         ),
                     },
                     variable_id,
