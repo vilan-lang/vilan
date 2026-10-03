@@ -96,7 +96,7 @@ fn an_aliased_module_import_merges_as_self_as() {
         &format!("import std::json as j;\nimport std::json::{{ Json, JsonValue }};\n{body}"),
         // `self as j` keys as the rename it is (E146: only a bare `self`
         // ranks first), so it sorts among the names.
-        &format!("import std::json::{{ Json, JsonValue, self as j }};\n{body}"),
+        &format!("import std::json::{{ self as j, Json, JsonValue }};\n{body}"),
     );
 }
 
