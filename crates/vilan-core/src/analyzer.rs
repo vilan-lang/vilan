@@ -56749,6 +56749,10 @@ impl<'src> Analyzer<'src> {
                                 .get(&function_id)
                                 .map(|function| function.name)
                                 .unwrap_or("this method");
+                            // B491: the steer writes the application, so the
+                            // `dyn` it names is the one that compiles.
+                            let application =
+                                self.trait_label_with_arguments(trait_name, arguments);
                             self.push_at_written_type(
                                 Error {
                                     trace: Vec::new(),
@@ -56758,9 +56762,9 @@ impl<'src> Analyzer<'src> {
                                         "'{trait_name}' is a trait, not a type: a TRAIT method \
                                          cannot return a bare trait yet — each impl would pick its \
                                          own type, an associated type vilan does not have. Return \
-                                         `dyn {trait_name}` from `{member}` (the object), or a \
+                                         `dyn {application}` from `{member}` (the object), or a \
                                          concrete type; a free `fun` or an inherent method may \
-                                         return `{trait_name}` itself"
+                                         return `{application}` itself"
                                     ),
                                 },
                                 source_id,

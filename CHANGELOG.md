@@ -308,6 +308,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**The refusal of a bare-trait return on a TRAIT method steers to the trait's application — "Return `dyn Holder<i32>` from `make` (the object) … a free `fun` or an inherent method may return `Holder<i32>` itself" — where it printed `dyn Holder`, a type that does not compile for a parameterized trait.** Pin: `inference::traits`' `b491_the_trait_method_steer_writes_the_traits_arguments` — red on the 0.43.0 toolchain. Ledger: row 596's slot is re-keyed `{application}` (its literal fragments are unchanged). No golden moves. Tracker B491.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

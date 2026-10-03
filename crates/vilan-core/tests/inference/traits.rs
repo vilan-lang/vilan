@@ -8285,6 +8285,23 @@ fn b460_a_trait_methods_bare_trait_return_stays_refused() {
     );
 }
 
+/// B491: the trait-method refusal steers to the APPLICATION — `dyn
+/// Holder<i32>` — where it printed `dyn Holder`, a type that does not compile.
+#[test]
+fn b491_the_trait_method_steer_writes_the_traits_arguments() {
+    let source = "
+trait Holder<T> {
+    fun held(self): T;
+}
+trait Maker {
+    fun make(self): Holder<i32>;
+}
+fun main() {}
+";
+    assert_fails_with(source, "Return `dyn Holder<i32>` from `make`");
+    assert_fails_with(source, "may return `Holder<i32>` itself");
+}
+
 // --- A142 §3.3: a read on a pipe steers to sealing (Order 44, item 12) ------
 //
 // A PLACEHOLDER fixture: the pipe layer is reactive-44's, so the traits are
