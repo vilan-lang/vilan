@@ -52112,6 +52112,168 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// A155: one element whose class is written twice in one chain — an element
+    /// head's `class("x")` and a `.styled(card)`, two `.styled`s, a `.class` and
+    /// a `.bind_styled` — keeps only the LAST write: every one of std's `View`
+    /// class writers SETS the attribute, on both ui twins, so the earlier write is
+    /// silently lost (`<div class("x") .styled(card) />` renders only `card`'s
+    /// classes, and the reverse order only `x`). A WARNING naming both writers,
+    /// at the one that wins.
+    ///
+    /// Statically visible means one receiver chain: from each writer, the walk
+    /// follows the receiver while it is a dotted call of one of std's `View`
+    /// methods (every one of which hands back the element it was called on), so
+    /// an element head — which lowers to exactly such a chain — and a written
+    /// chain over `view("..")` are both seen, and a chain broken by a function
+    /// of the program's own is not. Whether the writers should APPEND instead is
+    /// an open design question (census first); this pass does not change them.
+    fn check_class_written_twice(&mut self) {
+        // Each class writer: its call, its receiver entity, its source.
+        let mut writers: HashMap<Id, (Id, SourceId)> = HashMap::default();
+        // Every dotted call of a std `View` method, by its CALL ENTITY, with its
+        // receiver entity: the links the walk may cross.
+        let mut links: HashMap<Id, (Id, Id)> = HashMap::default();
+        let call_entities: HashMap<Id, Id> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter_map(|(entity, expr)| match expr {
+                Expr::Call(call_id) => Some((*call_id, *entity)),
+                _ => None,
+            })
+            .collect();
+        for (call_id, function_call) in &self.function_calls {
+            if !self.member_name_spans.contains_key(call_id) {
+                continue;
+            }
+            let Some(Expr::Local(member_id)) =
+                self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            if !self.is_std_view_member(*member_id) {
+                continue;
+            }
+            let Some(&receiver) = function_call.argument_ids.first() else {
+                continue;
+            };
+            if let Some(&entity) = call_entities.get(call_id) {
+                links.insert(entity, (*call_id, receiver));
+            }
+            let writes_class = match self.callable_name(*member_id) {
+                Some("class" | "styled" | "bind_class" | "bind_styled") => true,
+                Some("attr") => matches!(
+                    function_call
+                        .argument_ids
+                        .get(1)
+                        .and_then(|name| self.expr_id_to_expr_map.get(name)),
+                    Some(Expr::String("class"))
+                ),
+                _ => false,
+            };
+            if !writes_class {
+                continue;
+            }
+            let Some(source) = self.source_of_id(*call_id) else {
+                continue;
+            };
+            if self.std_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+                || self.derived_origin_file(*call_id).is_some()
+            {
+                continue;
+            }
+            writers.insert(*call_id, (receiver, source));
+        }
+        if writers.len() < 2 {
+            return;
+        }
+        // From each writer, the nearest writer BELOW it on its receiver chain:
+        // the write it overrides. Reported once per pair, at the later writer.
+        let mut pairs: Vec<(SourceId, Id, Id)> = Vec::new();
+        for (call_id, (receiver, source)) in &writers {
+            let mut current = *receiver;
+            while let Some(&(inner_call, inner_receiver)) = links.get(&current) {
+                if writers.contains_key(&inner_call) {
+                    pairs.push((*source, inner_call, *call_id));
+                    break;
+                }
+                current = inner_receiver;
+            }
+        }
+        let mut sites: Vec<(SourceId, Span, String, String, Span)> = pairs
+            .into_iter()
+            .filter_map(|(source, earlier, later)| {
+                let (earlier_text, earlier_span) = self.class_writer_text(earlier, source)?;
+                let (later_text, later_span) = self.class_writer_text(later, source)?;
+                Some((source, later_span, earlier_text, later_text, earlier_span))
+            })
+            .collect();
+        sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
+        sites.dedup_by_key(|(source, span, ..)| (source.0, span.start, span.end));
+        for (source, span, earlier, later, earlier_span) in sites {
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: Some(Note::here(
+                    earlier_span,
+                    format!("`{earlier}` writes this element's class first"),
+                )),
+                span,
+                msg: format!(
+                    "this element's class is written twice — `{earlier}` and then \
+                     `{later}` — and only the last write stays: `{later}` replaces \
+                     what `{earlier}` wrote. Compose them into one writer (two styles \
+                     add: `.styled(a + b)`), or drop one"
+                ),
+            });
+            self.warning_sources.push(source);
+        }
+    }
+
+    /// Whether `member_id` is a method of std's own `View` (either ui twin).
+    fn is_std_view_member(&self, member_id: Id) -> bool {
+        let Some(index) = self.implementation_by_declaration.get(&member_id) else {
+            return false;
+        };
+        let implementation = &self.implementations[*index];
+        let Some(Type::Struct(struct_id, _)) =
+            self.type_id_to_type_map.get(&implementation.subject)
+        else {
+            return false;
+        };
+        self.structs.get(struct_id).is_some_and(|struct_| {
+            struct_.name == "View"
+                && self
+                    .source_of_id(struct_.id)
+                    .is_some_and(|source| self.std_sources.contains(&source))
+        })
+    }
+
+    /// A class writer as its author wrote it — `.styled(card)` for a chain link,
+    /// `class("x")` for an element head's attribute — and the span to point at:
+    /// from the member's name to the end of its arguments.
+    fn class_writer_text(&self, call_id: Id, source: SourceId) -> Option<(String, Span)> {
+        let name = *self.member_name_spans.get(&call_id)?;
+        let arguments = self.function_calls.get(&call_id)?.arguments_span;
+        let text = self.source_text(source)?;
+        let start = name.start.min(arguments.start);
+        let mut end = arguments.end.max(name.end);
+        // An element head's attribute spans its name through its VALUE, and the
+        // closing parenthesis belongs to neither: take it back.
+        let rest = text.get(end..)?;
+        let blank = rest.len() - rest.trim_start().len();
+        if rest.trim_start().starts_with(')') && !text.get(start..end)?.ends_with(')') {
+            end += blank + 1;
+        }
+        let written = text.get(start..end)?;
+        let dotted = text[..start].trim_end().ends_with('.');
+        let label = if dotted {
+            format!(".{written}")
+        } else {
+            written.to_string()
+        };
+        Some((label, (start..end).into()))
+    }
+
     /// B382: `export [deprecated("use …")] import a::X as Y;` deprecates the
     /// name `Y` the re-export publishes. Every OTHER file's import of it warns
     /// `` `Y` is deprecated; use … `` — the function attribute's own warning —
@@ -70995,6 +71157,10 @@ fn analyze_over_world<'src>(
         // past.
         // B515 reads the import reaches, which the plain-reach pass consumes.
         analyzer.check_trait_method_scope(global_scope_id);
+        // A155: one element's class written twice in one statically visible
+        // chain. Post-build because it reads which `View` member each link
+        // resolved to.
+        analyzer.check_class_written_twice();
         analyzer.check_plain_reaches();
         analyzer.check_duplicate_module_declarations();
         // Two impls declaring one name for one subject (B57): a coherence rule, so
