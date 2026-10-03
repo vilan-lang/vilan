@@ -52,6 +52,7 @@ for the explicit keywords when you *don't* want to wait. The
 | You write in JS/TS              | You write in Vilan                              |
 | ------------------------------- | ----------------------------------------------- |
 | `function f(x) { … }`           | `fun f(x: i32): i32 { … }`                      |
+| `return x;`                     | `ret x;` — the compiler steers `return` here    |
 | `const x = …` / `let x = …`     | `let x = …` / `mut x = …`                       |
 | `x === y`                       | `x == y` (type-checked equality)                |
 | `` `Hello ${name}` ``           | `i"Hello {name}"`                               |

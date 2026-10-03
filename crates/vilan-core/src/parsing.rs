@@ -177,6 +177,9 @@ pub enum ParseErrorReason {
     /// [`Parser::visibility_marker_before`] recognizes ever reach here, which is
     /// what keeps the payload `'static`.
     VisibilityMarker { marker: &'static str },
+    /// A spelling another language uses, written where vilan has its own
+    /// (B520): the parse went on as if vilan's had been written.
+    ForeignSpelling(ForeignSpelling),
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -558,6 +561,284 @@ fn visibility_marker_rule(marker: &str) -> String {
     )
 }
 
+/// A spelling another language uses for something vilan writes differently
+/// (B520, R-h RULED 2026-10-03): `return` for `ret`, `fn`/`function`/`func`/
+/// `def` for `fun`, and the `->` arrow for the `:` before a return type.
+///
+/// None of the four words is reserved — each stays an ordinary name wherever
+/// it is one today (`let return = 1;`, a field `fn: i32`, `fun def()`). The
+/// parser recognizes them only where no name can stand, so no valid program
+/// reads differently:
+///
+/// - `return` at the head of an expression, followed by a token that BEGINS
+///   an expression and cannot CONTINUE one after a name — another name, a
+///   literal, `if`/`match`/`await`/`const`/`css`/`async`
+///   ([`starts_foreign_return`]). Two names side by side are never an
+///   expression, so `return x` has no other reading. `return;`, `return
+///   (x)` and `return -x` DO have one — a read of a binding named `return`, a
+///   call, a subtraction — and are left to the analyzer;
+/// - `fn`/`function`/`func`/`def` at an item head (past any attribute run and
+///   marker keywords), followed by a name and the `(` or `<` that opens a
+///   signature ([`Parser::take_foreign_item_word`]);
+/// - `->`, the two tokens written against each other, where a return type's
+///   `:` may stand: after a `fun`'s parameter list, a closure literal's, and
+///   a closure type's. A `-` followed directly by `>` is never an expression.
+///
+/// Each reports ONE diagnostic at the foreign token — "vilan spells this
+/// `ret`" — and the parse goes on as if the right spelling had been written:
+/// the word's token is rewritten in place (to `ret` or `fun`), and the arrow
+/// is read as the `:`. So the declaration or the return is in the tree, and
+/// nothing after it cascades.
+///
+/// **The editor's half.** [`ForeignSpelling::code`] is the diagnostic's stable
+/// code, [`ForeignSpelling::of_message`] recognizes the diagnostic from its
+/// rendered text (the one field a diagnostic carries through the pipeline),
+/// and [`foreign_spelling_fix`] is the quick fix's edit: the span to replace
+/// and the text to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForeignSpelling {
+    /// `return value;` — vilan writes `ret value;`.
+    Return,
+    /// `fn name(..)` (Rust) — vilan writes `fun`.
+    Fn,
+    /// `function name(..)` (JavaScript, Lua, PHP) — vilan writes `fun`.
+    Function,
+    /// `func name(..)` (Go, Swift) — vilan writes `fun`.
+    Func,
+    /// `def name(..)` (Python, Ruby, Scala) — vilan writes `fun`.
+    Def,
+    /// `fun name() -> T` (Rust, Swift, Python's annotations) — vilan writes
+    /// `fun name(): T`, and `|x| -> T body` on a closure literal is `|x|: T
+    /// body`.
+    Arrow,
+    /// `|i32| -> str` in a closure TYPE — vilan writes the result directly
+    /// after the `|..|`, `|i32| str`, so the fix deletes the arrow rather
+    /// than writing a `:`.
+    TypeArrow,
+}
+
+/// The `fun` steer's sentence for one written word — one literal per word, so
+/// each message is a fixed string the diagnostics ledger can key on.
+macro_rules! fun_spelling_steer {
+    ($word:literal) => {
+        concat!(
+            "`",
+            $word,
+            "` is not a vilan keyword: vilan spells this `fun` — `fun name(parameter: Type): \
+             Result { … }`"
+        )
+    };
+}
+
+impl ForeignSpelling {
+    /// Every foreign spelling, in a fixed order.
+    pub const ALL: [ForeignSpelling; 7] = [
+        ForeignSpelling::Return,
+        ForeignSpelling::Fn,
+        ForeignSpelling::Function,
+        ForeignSpelling::Func,
+        ForeignSpelling::Def,
+        ForeignSpelling::Arrow,
+        ForeignSpelling::TypeArrow,
+    ];
+
+    /// The foreign spelling as the author wrote it.
+    pub fn written(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => "return",
+            ForeignSpelling::Fn => "fn",
+            ForeignSpelling::Function => "function",
+            ForeignSpelling::Func => "func",
+            ForeignSpelling::Def => "def",
+            ForeignSpelling::Arrow | ForeignSpelling::TypeArrow => "->",
+        }
+    }
+
+    /// The spelling vilan uses in its place — the quick fix's replacement
+    /// text for the foreign token (empty for a closure type's arrow, which
+    /// vilan does not write at all).
+    pub fn vilan(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => "ret",
+            ForeignSpelling::Fn
+            | ForeignSpelling::Function
+            | ForeignSpelling::Func
+            | ForeignSpelling::Def => "fun",
+            ForeignSpelling::Arrow => ":",
+            ForeignSpelling::TypeArrow => "",
+        }
+    }
+
+    /// The diagnostic's STABLE code: `foreign-spelling/<what was written>`,
+    /// with the arrow named `arrow` (`type-arrow` in a closure type). The editor publishes it as the LSP
+    /// diagnostic's `code` and keys its quick fix on it; it never changes
+    /// when the message is reworded.
+    pub fn code(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => "foreign-spelling/return",
+            ForeignSpelling::Fn => "foreign-spelling/fn",
+            ForeignSpelling::Function => "foreign-spelling/function",
+            ForeignSpelling::Func => "foreign-spelling/func",
+            ForeignSpelling::Def => "foreign-spelling/def",
+            ForeignSpelling::Arrow => "foreign-spelling/arrow",
+            ForeignSpelling::TypeArrow => "foreign-spelling/type-arrow",
+        }
+    }
+
+    /// The diagnostic's text.
+    pub fn message(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => {
+                "`return` is not a vilan keyword: vilan spells this `ret` — `ret value;` returns \
+                 a value, and a bare `ret;` leaves a function that returns nothing"
+            }
+            ForeignSpelling::Fn => fun_spelling_steer!("fn"),
+            ForeignSpelling::Function => fun_spelling_steer!("function"),
+            ForeignSpelling::Func => fun_spelling_steer!("func"),
+            ForeignSpelling::Def => fun_spelling_steer!("def"),
+            ForeignSpelling::Arrow => {
+                "`->` is not how vilan writes a return type: vilan spells this `:` — `fun \
+                 name(parameter: Type): Result`, and `|parameter: Type|: Result` on a closure"
+            }
+            ForeignSpelling::TypeArrow => {
+                "`->` is not how vilan writes a closure type: its result follows the `|..|` \
+                 directly — `|Type| Result`, and `|| Result` with no parameters"
+            }
+        }
+    }
+
+    /// The quick fix's title.
+    pub fn fix_title(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => "Write `ret`",
+            ForeignSpelling::Fn
+            | ForeignSpelling::Function
+            | ForeignSpelling::Func
+            | ForeignSpelling::Def => "Write `fun`",
+            ForeignSpelling::Arrow => "Write `:` for the return type",
+            ForeignSpelling::TypeArrow => "Remove the `->`",
+        }
+    }
+
+    /// The foreign spelling a diagnostic's rendered message reports, if it
+    /// reports one. The parser renders these with no context and no hint, so
+    /// the message is exactly [`ForeignSpelling::message`].
+    pub fn of_message(message: &str) -> Option<ForeignSpelling> {
+        Self::ALL
+            .into_iter()
+            .find(|spelling| message == spelling.message())
+    }
+
+    /// The `fun` steer's word, by its text.
+    fn item_word(word: &str) -> Option<ForeignSpelling> {
+        match word {
+            "fn" => Some(ForeignSpelling::Fn),
+            "function" => Some(ForeignSpelling::Function),
+            "func" => Some(ForeignSpelling::Func),
+            "def" => Some(ForeignSpelling::Def),
+            _ => None,
+        }
+    }
+}
+
+/// The quick fix for a foreign-spelling diagnostic (B520): the span to
+/// replace and the text to write there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpellingFix {
+    /// The diagnostic's stable code ([`ForeignSpelling::code`]).
+    pub code: &'static str,
+    /// The quick fix's title ([`ForeignSpelling::fix_title`]).
+    pub title: &'static str,
+    /// The source range the edit replaces.
+    pub span: Span,
+    /// What the edit writes there.
+    pub replacement: &'static str,
+}
+
+/// The quick fix for the diagnostic `message` anchored at `span` in `source`,
+/// or `None` when it is not a foreign-spelling diagnostic (B520).
+///
+/// A word's fix replaces the word: its span IS the diagnostic's. The arrow's
+/// also takes the blanks written between the parameter list and the `->`, so
+/// `fun f() -> i32` becomes `fun f(): i32` — the `:` against the `)`, the way
+/// the formatter prints it — rather than `fun f() : i32`. A closure type's
+/// arrow is deleted with the blanks AFTER it, so `|i32| -> str` becomes
+/// `|i32| str`.
+pub fn foreign_spelling_fix(source: &str, message: &str, span: Span) -> Option<SpellingFix> {
+    const BLANKS: [char; 4] = [' ', '\t', '\r', '\n'];
+    let spelling = ForeignSpelling::of_message(message)?;
+    let (mut start, mut end) = (span.start, span.end);
+    match spelling {
+        ForeignSpelling::Arrow => {
+            start = source.get(..span.start)?.trim_end_matches(BLANKS).len();
+        }
+        ForeignSpelling::TypeArrow => {
+            let after = source.get(span.end..)?;
+            end += after.len() - after.trim_start_matches(BLANKS).len();
+        }
+        _ => {}
+    }
+    Some(SpellingFix {
+        code: spelling.code(),
+        title: spelling.fix_title(),
+        span: Span::from(start..end),
+        replacement: spelling.vilan(),
+    })
+}
+
+/// Whether the identifier `return` at `index` begins a FOREIGN return (B520):
+/// the token after it begins an expression and cannot continue one after a
+/// name. Anything else after the word — `;`, `}`, `(`, `-`, `.`, `=`, an
+/// operator, `then` — reads the NAME `return` as it always did.
+fn starts_foreign_return(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
+    if tokens.get(index).map(|(token, _)| token) != Some(&Token::Ident("return")) {
+        return false;
+    }
+    matches!(
+        tokens.get(index + 1).map(|(token, _)| token),
+        Some(
+            Token::Number(..)
+                | Token::String(_)
+                | Token::MultilineString(_)
+                | Token::Bool(_)
+                | Token::Null
+                | Token::If
+                | Token::Match
+                | Token::Await
+                | Token::Const
+                | Token::Css
+                | Token::Async
+        )
+    ) || matches!(
+        tokens.get(index + 1).map(|(token, _)| token),
+        // `then` is the one name that continues an operand (B459's infix
+        // conditional): `return then go();` tests a binding named `return`.
+        Some(Token::Ident(name)) if *name != "then"
+    )
+}
+
+/// Whether `fn`/`function`/`func`/`def` at `index` heads a foreign item
+/// (B520): followed by a name and the `(` or `<` that opens a signature —
+/// [`Parser::take_foreign_item_word`]'s shape at a statement head, for the
+/// recovery's sync points.
+fn starts_foreign_item(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
+    let token = |offset: usize| tokens.get(index + offset).map(|(token, _)| token);
+    matches!(token(0), Some(Token::Ident(word)) if ForeignSpelling::item_word(word).is_some())
+        && matches!(token(1), Some(Token::Ident(name)) if *name != "then")
+        && matches!(token(2), Some(Token::Ctrl('(' | '<')))
+}
+
+/// Whether the two tokens at `index` are the `->` arrow (B520): a `-` written
+/// directly against a `>`, with nothing between them.
+fn is_foreign_arrow(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
+    match (tokens.get(index), tokens.get(index + 1)) {
+        (Some((Token::Op("-"), minus)), Some((Token::Ctrl('>'), greater))) => {
+            minus.end == greater.start
+        }
+        _ => false,
+    }
+}
+
 /// The rule an impl selector written OUTSIDE a brace set breaks (B318 S3,
 /// `proposal/visibility.md` §2.5). Curated (diagnostics-standard.md B6): the
 /// prohibition explains itself and names the sanctioned spelling.
@@ -931,13 +1212,19 @@ fn starts_item(token: &Token<'_>) -> bool {
 /// pick up cleanly. Identifiers and literals are deliberately NOT: they begin an
 /// expression statement, but they also appear all through a broken one, so
 /// stopping at them would resume mid-garbage and report again (the cascade
-/// `editing-dx.md` §9 records vilan as not having).
+/// `editing-dx.md` §9 records vilan as not having). B520's foreign heads are the
+/// exception, by shape rather than by word: `fn name(` and `return value` are
+/// two names (or a name and a literal) side by side, which no broken statement
+/// is made of either, and a `pub fn f()` reaches the visibility rule through
+/// here.
 fn starts_statement_or_item(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
     let Some((token, _)) = tokens.get(index) else {
         return false;
     };
     starts_item(token)
         || starts_contextual_statement(tokens, index)
+        || starts_foreign_item(tokens, index)
+        || starts_foreign_return(tokens, index)
         || matches!(
             token,
             Token::Let
@@ -1013,6 +1300,7 @@ pub fn render(error: &ParseError) -> String {
     let mut message = match &error.reason {
         ParseErrorReason::Rule(rule) => rule.to_string(),
         ParseErrorReason::VisibilityMarker { marker } => visibility_marker_rule(marker),
+        ParseErrorReason::ForeignSpelling(spelling) => spelling.message().to_string(),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -1146,6 +1434,8 @@ fn parse_with(
     // that `attempt` could not roll it back — see `Parser::nesting_refusal`. It
     // sorts into place with the rest below.
     errors.extend(parser.nesting_refusal.take());
+    // B520's rewrites, held off `parser.errors` for the same reason.
+    errors.append(&mut parser.rewrite_refusals);
     // A stable, span-ordered diagnostic list (diagnostics-standard.md C1): lexer
     // errors and recovered-region errors interleave by where they occur.
     errors.sort_by_key(|error| (error.span.start, error.span.end));
@@ -1326,6 +1616,15 @@ struct Parser<'a, 'src> {
     /// restored around each statement's expression, so a statement nested in
     /// a block inside it has its own.
     statement_head: Option<usize>,
+    /// The diagnostics of the parser's in-place TOKEN REWRITES (B520's
+    /// foreign spellings), held aside from `errors` for `nesting_refusal`'s
+    /// reason: [`Parser::attempt`] truncates `errors` when a branch declines,
+    /// but the rewrite it reports is not undone — the token stays `ret` or
+    /// `fun` for every alternative read after it — so a refusal rolled back
+    /// with the branch would leave the foreign word silently accepted. One
+    /// per span ([`Parser::record_rewrite`]); [`parse_with`] folds them into
+    /// the error list at the end.
+    rewrite_refusals: Vec<ParseError>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -1563,6 +1862,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             contextual_readings: Vec::new(),
             member_readings: Vec::new(),
             statement_head: None,
+            rewrite_refusals: Vec::new(),
         }
     }
 
@@ -2895,6 +3195,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // nested inside this one reads false.
         let file_head = std::mem::take(&mut self.file_head);
         let _ = self.lead_export_past_its_attributes();
+        self.take_foreign_item_word();
         if let Some(item) = self.attempt(Self::parse_module_self) {
             if !file_head {
                 self.errors.push(ParseError {
@@ -3057,6 +3358,122 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         self.tokens[start..past_marker].rotate_left(marker - start);
         self.assignment_reachable[start..past_marker].rotate_left(marker - start);
+        true
+    }
+
+    /// Records the refusal for a token rewrite ([`Parser::rewrite_refusals`]),
+    /// once per span: a rewrite reached again by a later alternative is the
+    /// same rewrite.
+    fn record_rewrite(&mut self, span: Span, reason: ParseErrorReason) {
+        if self
+            .rewrite_refusals
+            .iter()
+            .any(|refusal| refusal.span == span)
+        {
+            return;
+        }
+        self.rewrite_refusals.push(ParseError {
+            span,
+            reason,
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// B520: `fn`/`function`/`func`/`def` at the ITEM HEAD at the cursor —
+    /// past any attribute run and marker keywords (`export`, `async`,
+    /// `external`, `const`, `macro`) — followed by a name and the `(` or `<`
+    /// that opens a signature, is refused once and rewritten to `fun` in
+    /// place, so every production reads the declaration it is.
+    ///
+    /// A name followed by a name is never an expression, and none of the four
+    /// words is a contextual keyword, so nothing that parses today reaches
+    /// the rewrite. `then` is the one exception the name test makes (`fn then
+    /// (go());` is B459's conditional over a binding named `fn`). In a member
+    /// body a method may be named by a reserved word, so one is admitted
+    /// there as the name — except `else`, `is` and `in`, which continue an
+    /// operand.
+    fn take_foreign_item_word(&mut self) {
+        let mut at = self.position;
+        loop {
+            match self.tokens.get(at).map(|(token, _)| token) {
+                Some(Token::Ctrl('['))
+                    if matches!(self.tokens.get(at + 1), Some((Token::Ident(_), _))) =>
+                {
+                    let Some(after) = self.past_balanced_group(at) else {
+                        return;
+                    };
+                    at = after;
+                }
+                Some(Token::Export) => {
+                    at += 1;
+                    if self.tokens.get(at).map(|(token, _)| token) == Some(&Token::Ctrl('('))
+                        && self.tokens.get(at + 1).map(|(token, _)| token) == Some(&Token::In)
+                    {
+                        let Some(after) = self.past_balanced_group(at) else {
+                            return;
+                        };
+                        at = after;
+                    }
+                }
+                Some(Token::Async | Token::External | Token::Const | Token::Macro) => at += 1,
+                _ => break,
+            }
+        }
+        let Some((Token::Ident(word), span)) = self.tokens.get(at) else {
+            return;
+        };
+        let Some(spelling) = ForeignSpelling::item_word(word) else {
+            return;
+        };
+        let span = *span;
+        let named = match self.tokens.get(at + 1).map(|(token, _)| token) {
+            Some(Token::Ident(name)) => *name != "then",
+            Some(Token::Else | Token::Is | Token::In) => false,
+            Some(token) => self.in_member_body && is_reserved_word(token),
+            None => false,
+        };
+        let opens_signature = matches!(
+            self.tokens.get(at + 2).map(|(token, _)| token),
+            Some(Token::Ctrl('(' | '<'))
+        );
+        if !named || !opens_signature {
+            return;
+        }
+        self.tokens[at].0 = Token::Fun;
+        self.record_rewrite(span, ParseErrorReason::ForeignSpelling(spelling));
+    }
+
+    /// B520: the identifier `return` at the cursor, where it begins a foreign
+    /// return ([`starts_foreign_return`]), refused once and rewritten to `ret`
+    /// in place, then read as the return it is. Its own method so the arm in
+    /// [`Parser::parse_secondary_inner`] adds nothing to that frame.
+    #[inline(never)]
+    fn parse_foreign_return(&mut self) -> Option<Spanned<Node<'src>>> {
+        let span = self.here_span();
+        self.tokens[self.position].0 = Token::Ret;
+        self.record_rewrite(
+            span,
+            ParseErrorReason::ForeignSpelling(ForeignSpelling::Return),
+        );
+        self.parse_return()
+    }
+
+    /// B520: the `->` arrow at the cursor, where a return type's `:` may
+    /// stand (or, `spelling` [`ForeignSpelling::TypeArrow`], where a closure
+    /// type's result may) — refused once and read past, so the caller reads
+    /// the return type the arrow introduced. `false`, consuming nothing, when the cursor
+    /// is not at an arrow.
+    fn eat_foreign_arrow(&mut self, spelling: ForeignSpelling) -> bool {
+        if !is_foreign_arrow(self.tokens, self.position) {
+            return false;
+        }
+        let span = Span::from(
+            self.token_span(self.position).start..self.token_span(self.position + 1).end,
+        );
+        self.record_rewrite(span, ParseErrorReason::ForeignSpelling(spelling));
+        self.bump();
+        self.bump();
         true
     }
 
@@ -3352,6 +3769,11 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return self.parse_let();
             }
             Some(Token::Ret) => return self.parse_return(),
+            // B520: `return value` — vilan's `ret`, written another
+            // language's way where no name can stand.
+            Some(Token::Ident("return")) if starts_foreign_return(self.tokens, self.position) => {
+                return self.parse_foreign_return();
+            }
             // The four block-bearing heads. They share one rule past their closing
             // brace — B248/B259's: the form is COMPLETE there, so an operator or a
             // `.` after it is refused rather than read as a continuation.
@@ -4291,7 +4713,12 @@ impl<'a, 'src> Parser<'a, 'src> {
         if let Some(macro_block) = self.parse_macro_block() {
             return Some(macro_block);
         }
-        if let Some(Token::Ident(name)) = self.peek() {
+        // B520: a foreign `return value` is no operand — the same as the `ret`
+        // it stands for — so `1 + return 5` declines at the word, and the
+        // statement's recovery resumes there and reads the return.
+        if let Some(Token::Ident(name)) = self.peek()
+            && !starts_foreign_return(self.tokens, self.position)
+        {
             let node = Node::Accessor(name);
             let span = self.here_span();
             self.bump();
@@ -5834,11 +6261,13 @@ impl<'a, 'src> Parser<'a, 'src> {
                  value is wanted",
             );
             let parameters = (parameters, parser.span_from(start));
-            let return_type = if parser.eat_op(":") {
-                Some(Box::new(parser.parse_type()?))
-            } else {
-                None
-            };
+            // B520: `|x| -> T body` reads as `|x|: T body`.
+            let return_type =
+                if parser.eat_op(":") || parser.eat_foreign_arrow(ForeignSpelling::Arrow) {
+                    Some(Box::new(parser.parse_type()?))
+                } else {
+                    None
+                };
             let return_value = parser.parse_expression()?;
             Some((
                 Node::Closure(Closure {
@@ -6278,6 +6707,8 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         };
         let parameters = (parameters, self.span_from(start));
+        // B520: `|i32| -> str` reads as `|i32| str`, refused at the arrow.
+        self.eat_foreign_arrow(ForeignSpelling::TypeArrow);
         let return_type = self.attempt(|parser| parser.parse_type()).map(Box::new);
         Some((
             Node::ClosureType(parameters, return_type),
@@ -6494,6 +6925,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             if self.peek_is_ctrl('}') || self.at_end() {
                 break;
             }
+            self.take_foreign_item_word();
             match self.attempt(Self::parse_function) {
                 Some(function) => functions.push(function),
                 None => break,
@@ -6664,7 +7096,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             );
         }
         self.reject_misplaced_spread(&parameters.0);
-        let mut return_type = if self.eat_op(":") {
+        // B520: `fun f() -> T` reads as `fun f(): T`, refused at the arrow.
+        let mut return_type = if self.eat_op(":") || self.eat_foreign_arrow(ForeignSpelling::Arrow)
+        {
             Some(Box::new(self.in_context("return type", Self::parse_type)?))
         } else {
             None
@@ -11994,5 +12428,273 @@ mod tests {
         assert_eq!(readings(source), vec!["then"]);
         let at = source.find("then go").expect("the keyword");
         assert_eq!(contextual_keyword_readings(source)[0].start, at);
+    }
+
+    /// The source with each `(foreign, vilan)` spelling replaced, padded with
+    /// spaces to the foreign text's length so every other token keeps its
+    /// offset — the tree of the rewrite is then comparable span for span.
+    fn respelled(source: &str, replacements: &[(&str, &str)]) -> String {
+        let mut respelled = source.to_string();
+        for (foreign, vilan) in replacements {
+            assert!(
+                vilan.len() <= foreign.len(),
+                "{vilan} must fit in {foreign}"
+            );
+            let padded = format!("{vilan:width$}", width = foreign.len());
+            respelled = respelled.replace(foreign, &padded);
+        }
+        respelled
+    }
+
+    #[test]
+    fn b520_a_foreign_spelling_is_refused_once_and_read_as_vilans() {
+        use ForeignSpelling::*;
+        // (source, the spellings it refuses in order, the replacements that
+        // make it vilan). The refusal spans the foreign token, and the tree is
+        // the tree of the source with vilan's spelling written instead.
+        let cases: &[(&str, &[ForeignSpelling], &[(&str, &str)])] = &[
+            ("fn  add(a: i32): i32 { a }", &[Fn], &[("fn ", "fun")]),
+            (
+                "function add(a: i32): i32 { a }",
+                &[Function],
+                &[("function", "fun")],
+            ),
+            ("func add(a: i32): i32 { a }", &[Func], &[("func", "fun")]),
+            ("def add(a: i32): i32 { a }", &[Def], &[("def", "fun")]),
+            // Past the markers and attributes that lead an item.
+            ("export fn  f() {}", &[Fn], &[("fn ", "fun")]),
+            ("async fn  f(): i32 { 1 }", &[Fn], &[("fn ", "fun")]),
+            ("[must_use] fn  f(): i32 { 1 }", &[Fn], &[("fn ", "fun")]),
+            ("const fn  f(): i32 { 1 }", &[Fn], &[("fn ", "fun")]),
+            (
+                "[platform(\"node\")] export def f() {}",
+                &[Def],
+                &[("def", "fun")],
+            ),
+            ("fn  id<T>(x: T): T { x }", &[Fn], &[("fn ", "fun")]),
+            // Members: an impl's item list, a trait body, a method named by a
+            // reserved word.
+            (
+                "impl S { fn  get(self): i32 { 1 } }",
+                &[Fn],
+                &[("fn ", "fun")],
+            ),
+            ("trait T { fn  t(self): i32; }", &[Fn], &[("fn ", "fun")]),
+            (
+                "impl S { def type(self): i32 { 1 } }",
+                &[Def],
+                &[("def", "fun")],
+            ),
+            // `return` wherever an expression begins.
+            (
+                "fun f(): i32 { return 1; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            ("fun f(): i32 { return 1 }", &[Return], &[("return", "ret")]),
+            (
+                "fun f(x: i32): i32 { if x > 0 { return x; } x }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(x: i32): i32 { match x { 1 => return 2, _ => 3 } }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(): i32 { let g = |x: i32| { return x; }; g(1) }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(c: bool): i32 { return if c { 1 } else { 2 }; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(): str { return \"s\"; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(self): i32 { return self.x; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(): bool { return true; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            // The arrow, where a return type's `:` stands — and in a closure
+            // type, where the result follows the `|..|` directly.
+            ("fun f() -> i32 { 1 }", &[Arrow], &[("->", ":")]),
+            ("trait T { fun t(self) -> i32; }", &[Arrow], &[("->", ":")]),
+            (
+                "fun f(): i32 { let g = |x: i32| -> i32 { x }; g(1) }",
+                &[Arrow],
+                &[("->", ":")],
+            ),
+            ("fun f(g: |i32| -> i32) {}", &[TypeArrow], &[("->", "")]),
+            ("fun f(g: || -> void) {}", &[TypeArrow], &[("->", "")]),
+            // Several in one declaration: each its own refusal, nothing more.
+            (
+                "fn  f() -> i32 { return 1; }",
+                &[Fn, Arrow, Return],
+                &[("fn ", "fun"), ("->", ":"), ("return", "ret")],
+            ),
+        ];
+        for (source, spellings, replacements) in cases {
+            let (tree, errors) = parse(source);
+            let refused: Vec<(Option<ForeignSpelling>, &str)> = errors
+                .iter()
+                .map(|error| {
+                    (
+                        ForeignSpelling::of_message(&render(error)),
+                        &source[error.span.start..error.span.end],
+                    )
+                })
+                .collect();
+            let expected: Vec<(Option<ForeignSpelling>, &str)> = spellings
+                .iter()
+                .map(|spelling| (Some(*spelling), spelling.written()))
+                .collect();
+            assert_eq!(refused, expected, "{source}");
+            let vilan = respelled(source, replacements);
+            let clean = program(&vilan);
+            assert_eq!(
+                format!("{:?}", tree.expect("a tree")),
+                format!("{clean:?}"),
+                "{source} reads as {vilan}"
+            );
+        }
+    }
+
+    #[test]
+    fn b520_the_foreign_words_stay_names_wherever_they_are_names() {
+        // None of the four words is reserved, and nothing that parses today
+        // reads differently: each of these is clean and means what it meant.
+        for source in [
+            "fun main() { let return = 1; let fn = 2; let function = 3; let def = 4; }",
+            "fun main() { let func = 5; return; fn; }",
+            "fun main() { return(1); fn(2); def(3); }",
+            "fun main() { return - 1; return.x; return = 2; return += 1; }",
+            "fun main() { return then go(); fn then (go()); return else go(); }",
+            "fun main() { let total = return + fn * def; }",
+            "fun main() { print(return); print([return, fn]); }",
+            "struct S { return: i32, fn: i32, function: i32, def: i32, func: i32 }",
+            "fun def(fn: i32): i32 { fn }",
+            "fun return(): i32 { 1 }",
+            "fun f(return: i32, own function: i32) {}",
+            "import a::{ fn, return };",
+            "import a::b as fn;",
+            "fun main() { x.return(1); x.fn; let s = S { return = 1, fn = 2 }; }",
+            "fun main() { if fn is Some(x) { } }",
+            "fun main() { match return { _ => 1 } }",
+            "fun main() { for x in fn { } }",
+            "fun main() { let f = |return: i32| return; }",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(errors.is_empty(), "{source}: {errors:?}");
+        }
+        // A `-` and a `>` apart are not the arrow: the parse errors stay
+        // today's, and none of them is the steer.
+        let (_, errors) = parse("fun f() - > i32 { 1 }");
+        assert!(!errors.is_empty());
+        for error in &errors {
+            assert_eq!(ForeignSpelling::of_message(&render(error)), None);
+        }
+    }
+
+    #[test]
+    fn b520_the_recovery_resumes_at_a_foreign_head() {
+        // `1 + return 5`: `return value` is no operand, as `ret` is none — the
+        // operand's refusal, then the return read as one.
+        let source = "fun main() {\n    let y = 1 +\n    return 5;\n}\n";
+        let (_, errors) = parse(source);
+        let rendered: Vec<String> = errors.iter().map(render).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "found 'return' expected an expression".to_string(),
+                ForeignSpelling::Return.message().to_string(),
+            ],
+            "{source}"
+        );
+        // `pub fn f()`: the visibility rule at `pub` — `fn name(` is a fresh
+        // item — then the `fun` steer; nothing else.
+        let source = "pub fn f(): i32 { 1 }\n";
+        let (tree, errors) = parse(source);
+        let rendered: Vec<String> = errors.iter().map(render).collect();
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
+        assert!(rendered[0].starts_with("`pub` is not a vilan keyword"));
+        assert_eq!(rendered[1], ForeignSpelling::Fn.message());
+        let (statements, _) = tree.expect("a tree");
+        assert!(
+            statements
+                .iter()
+                .any(|(node, _)| matches!(node, Node::Func(_))),
+            "the declaration is in the tree: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn b520_each_foreign_spelling_carries_its_code_and_its_fix() {
+        // The codes are the editor's keys: stable, distinct, and spelled here
+        // so a rename reds.
+        let codes: Vec<&str> = ForeignSpelling::ALL
+            .iter()
+            .map(|spelling| spelling.code())
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                "foreign-spelling/return",
+                "foreign-spelling/fn",
+                "foreign-spelling/function",
+                "foreign-spelling/func",
+                "foreign-spelling/def",
+                "foreign-spelling/arrow",
+                "foreign-spelling/type-arrow",
+            ]
+        );
+        // (source, the source after the fix): applying the diagnostic's own
+        // fix turns each into vilan, which parses clean.
+        for (source, fixed) in [
+            ("fun f(): i32 { return 1; }", "fun f(): i32 { ret 1; }"),
+            ("fn add(a: i32): i32 { a }", "fun add(a: i32): i32 { a }"),
+            ("function f() {}", "fun f() {}"),
+            ("func f() {}", "fun f() {}"),
+            ("def f() {}", "fun f() {}"),
+            ("fun f() -> i32 { 1 }", "fun f(): i32 { 1 }"),
+            ("fun f()->i32 { 1 }", "fun f():i32 { 1 }"),
+            ("fun f()\n    -> i32 { 1 }", "fun f(): i32 { 1 }"),
+            (
+                "fun f(): i32 { let g = |x: i32| -> i32 { x }; g(1) }",
+                "fun f(): i32 { let g = |x: i32|: i32 { x }; g(1) }",
+            ),
+            ("fun f(g: |i32| -> i32) {}", "fun f(g: |i32| i32) {}"),
+        ] {
+            let (_, errors) = parse(source);
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+            let message = render(&errors[0]);
+            let fix = foreign_spelling_fix(source, &message, errors[0].span)
+                .unwrap_or_else(|| panic!("{source}: no fix for {message}"));
+            let spelling = ForeignSpelling::of_message(&message).expect("a spelling");
+            assert_eq!(fix.code, spelling.code());
+            assert_eq!(fix.replacement, spelling.vilan());
+            let mut edited = source.to_string();
+            edited.replace_range(fix.span.start..fix.span.end, fix.replacement);
+            assert_eq!(edited, fixed, "{source}");
+            program(&edited);
+        }
+        // Any other diagnostic has no such fix.
+        let (_, errors) = parse("fun f( {");
+        let message = render(&errors[0]);
+        assert_eq!(
+            foreign_spelling_fix("fun f( {", &message, errors[0].span),
+            None
+        );
     }
 }
