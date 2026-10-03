@@ -1894,8 +1894,10 @@ fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subs
     // other, which is exactly right: the frames differ. The plain-`[expose]`
     // hash pinned in `a_factory_service_builds_one_instance_per_connection`
     // (`d1d5fba0`) is the other half of the claim: it did not move at all.
+    // B525 (v0.44.0) moved both of these on purpose — `43077e29` and
+    // `d093c571` before it: the surface writes `Message`'s fields now.
     assert!(
-        stdout.contains("hash:43077e29"),
+        stdout.contains("hash:b034cc03"),
         "the keyed service's contract hash moved:\n{stdout}"
     );
     // I9 moved this one on purpose: the whole-value channel hashes its element
@@ -1903,7 +1905,7 @@ fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subs
     // (`c63e39e3` was the `Map<str, Message>` spelling's). The keyed hash above
     // hashes the map's VALUE type and did not move.
     assert!(
-        stdout.contains("plain-hash:d093c571"),
+        stdout.contains("plain-hash:9f8b135b"),
         "the plain twin's contract hash moved:\n{stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -3748,31 +3750,35 @@ fn a_handle_returning_method_hands_the_client_a_mirror_and_hashes_as_the_mapped_
             "`{expected}` is missing from the handle service's run:\n{stdout}"
         );
     }
-    // The hash halves.
+    // The hash halves. Since B525 a surface writes each of its own Wire types'
+    // SHAPE where it first reaches the type (`MessageBody{id: str, ..}`).
     let handle_surface = "get_messages(str,i32)->List<str>;\
-                          get_message(str)->RemoteSource<MessageBody>;\
+                          get_message(str)->RemoteSource<MessageBody{id: str, author: str, body: str}>;\
                           edit(str,str)->bool;\
                           expose:topic:str;";
     let value_surface = "get_messages(str,i32)->List<str>;\
-                         get_message(str)->MessageBody;\
+                         get_message(str)->MessageBody{id: str, author: str, body: str};\
                          edit(str,str)->bool;\
                          expose:topic:str;";
     let option_surface = "get_messages(str,i32)->List<str>;\
-                          get_message(str)->RemoteSource<MessageBody>?;\
+                          get_message(str)->RemoteSource<MessageBody{id: str, author: str, body: str}>?;\
                           edit(str,str)->bool;\
                           expose:topic:str;";
     let plain_surface = "get_messages(str,i32)->List<str>;\
-                         get_message(str)->MessageBody;\
+                         get_message(str)->MessageBody{id: str, author: str, body: str};\
                          expose:topic:str;";
+    // Frozen: a service with no handle return hashed `78bdada7` from c3ed9239
+    // until B525 (v0.44.0) moved it on purpose — the surface names
+    // `MessageBody`'s fields now. The handle forms still do not move it.
     assert_eq!(
         line_of("plain-hash:"),
-        "78bdada7",
+        "ddcd4de6",
         "a service with no handle return must hash byte-identically to what it \
-         hashed at c3ed9239 — this number was measured there:\n{stdout}"
+         hashed at B525 — this number was measured there:\n{stdout}"
     );
     assert_eq!(
         contract_hash_of(plain_surface),
-        "78bdada7",
+        "ddcd4de6",
         "the frozen number and the surface it was measured from disagree"
     );
     assert_eq!(
@@ -5564,7 +5570,8 @@ fn a_keyed_handle_return_hands_the_client_a_patched_mirror_minted_at_its_first_l
         "both mirrors of the one source must be fed, each in its own frame \
          shape:\n{stdout}"
     );
-    let keyed_surface = "tasks_in(str)->KeyedSource<i32, Task>;\
+    // B525: `Task`'s shape is written where the surface first reaches it.
+    let keyed_surface = "tasks_in(str)->KeyedSource<i32, Task{id: i32, title: str}>;\
                          rows_in(str)->RemoteSource<List<Task>>;\
                          add(str,i32,str)->bool;\
                          stats()->List<i32>;\
