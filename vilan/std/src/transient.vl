@@ -21,8 +21,10 @@
 /// Reading one: `get()` is `Some` only while READY — a refresh reads `None`, and a
 /// binding over `get()` goes blank for it (R5). A view that should keep the old
 /// value on screen while the new one loads binds `latest()` instead (R27), which
-/// opts in to the stale value; `is_pending()` is the spinner; `state()` is the
+/// opts in to the stale value; `is_pending()` is the spinner; `states()` is the
 /// whole story, `Absent` included — which is what tells a spinner from "not found".
+/// (`state()` is the same story as a passive report: on a mirror it leases
+/// nothing.)
 
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
@@ -97,6 +99,75 @@ export impl TransientState<type T, type E> {
 	fun failed(self, error: E): TransientState<T, E> {
 		TransientState::Failed(error, self.latest())
 	}
+
+	/// The same state over `transform(value)` (A150): every value it holds is
+	/// transformed — a `Refreshing`'s and a `Failed`'s stale one included — and the
+	/// arm is kept, so `Pending` and `Absent` pass through.
+	///
+	///     ids.map(|ids| ids.len())   // Ready([1, 2]) -> Ready(2), Pending -> Pending
+	fun map<U>(own self, transform: |T| U): TransientState<U, E> {
+		match self {
+			TransientState::Pending => TransientState::Pending,
+			TransientState::Ready(let value) => TransientState::Ready(transform(value)),
+			TransientState::Refreshing(let value) => TransientState::Refreshing(transform(value)),
+			TransientState::Failed(let error, let stale) => TransientState::Failed(error, stale.map(transform)),
+			TransientState::Absent => TransientState::Absent,
+		}
+	}
+
+	/// Chain a state that DEPENDS on the value (A150): `next(value)` decides the
+	/// state for a held value, and the arms without one pass through. The common
+	/// use is a transient of a maybe, read as a transient that can be absent —
+	/// `state.and_then(|found| match found { Some(let c) => Ready(c), None =>
+	/// Absent })`.
+	///
+	/// - `Ready(v)` is `next(v)`.
+	/// - `Refreshing(v)` is `next(v)` with a newer value still on its way: its
+	///   `Ready(u)` or `Refreshing(u)` is `Refreshing(u)`; its `Pending` or `Absent`
+	///   is `Pending` (nothing to show, and the refresh may yet find one); its
+	///   `Failed` stands.
+	/// - `Failed(e, stale)` keeps `e`, and its stale value is what `next` makes of
+	///   the old one (`next(v).latest()`).
+	/// - `Pending` and `Absent` pass through.
+	fun and_then<U>(own self, next: |T| TransientState<U, E>): TransientState<U, E> {
+		match self {
+			TransientState::Pending => TransientState::Pending,
+			TransientState::Ready(let value) => next(value),
+			TransientState::Refreshing(let value) => match next(value) {
+				TransientState::Ready(let fresh) => TransientState::Refreshing(fresh),
+				TransientState::Refreshing(let fresh) => TransientState::Refreshing(fresh),
+				TransientState::Failed(let error, let stale) => TransientState::Failed(error, stale),
+				_ => TransientState::Pending,
+			},
+			TransientState::Failed(let error, let stale) => TransientState::Failed(error, stale
+				.and_then(|value| next(value).latest())),
+			TransientState::Absent => TransientState::Absent,
+		}
+	}
+
+	/// Both states at once, as one (A150): the pair of values while both hold one,
+	/// and otherwise the arm that says the most about why not — in this order:
+	///
+	/// - `Failed` if either failed (this one's error first), carrying the pair of
+	///   their latest values when both have one;
+	/// - `Absent` if either is absent — there is no pair to wait for;
+	/// - `Pending` if either has nothing yet;
+	/// - `Refreshing((a, b))` if either is refreshing, over their latest values;
+	/// - `Ready((a, b))` when both are ready.
+	fun zip<U>(own self, own other: TransientState<U, E>): TransientState<(T, U), E> {
+		let stale = self.latest().zip(other.latest());
+		match (self, other) {
+			(TransientState::Failed(let error, let _mine), _) => TransientState::Failed(error, stale),
+			(_, TransientState::Failed(let error, let _theirs)) => TransientState::Failed(error, stale),
+			(TransientState::Absent, _) => TransientState::Absent,
+			(_, TransientState::Absent) => TransientState::Absent,
+			(TransientState::Ready(let mine), TransientState::Ready(let theirs)) => TransientState::Ready((mine, theirs)),
+			_ => match stale {
+				Some(let both) => TransientState::Refreshing(both),
+				None => TransientState::Pending,
+			},
+		}
+	}
 }
 
 /// A `Source<Option<T>>` that also says where it stands (R5, R25).
@@ -104,9 +175,16 @@ export impl TransientState<type T, type E> {
 /// `get()` is `Some(v)` only in `Ready(v)`: `Refreshing` reads `None`, and so does
 /// every other state. The three accessors answer the rest.
 export trait TransientSource<T, E> with Source<Option<T>> {
-	/// The state, as the READ-ONLY face (R28): a sealed source nobody downstream
-	/// can `set`.
+	/// The state as a PASSIVE report — it leases nothing, so a mirror nobody else
+	/// watches stays `Pending` here; bind `states()` to watch it. The READ-ONLY
+	/// face (R28): a sealed source nobody downstream can `set`.
 	fun state(self): MemoCell<TransientState<T, E>>;
+
+	/// A FRESH pipe per call of the whole state, that WATCHES what it reports (A150,
+	/// R-c door (b)): a mirror's pipe LEASES it while its consumer holds it, as
+	/// `latest()` does, so `Pending` moves on to `Ready`, `Absent` or `Failed`.
+	/// What a view binds when it needs to tell a spinner from "not found".
+	fun states(self): dyn Pipe<TransientState<T, E>>;
 
 	/// A FRESH pipe per call that opts in to the stale value: `Ready(v)`,
 	/// `Refreshing(v)` and `Failed(_, Some(v))` are `Some(v)` — what a view binds to
@@ -216,6 +294,13 @@ export impl Transient<type T, type E> with Source<Option<T>> {
 export impl Transient<type T, type E> with TransientSource<T, E> {
 	fun state(self): MemoCell<TransientState<T, E>> {
 		MemoCell { cell = self.cell }
+	}
+
+	/// The cell's state as a pipe: there is no lease here to take, so it is
+	/// `state()` that a consumer starts.
+	fun states(self): dyn Pipe<TransientState<T, E>> {
+		let pipe: dyn Pipe<TransientState<T, E>> = self.cell.derive(|state| state);
+		pipe
 	}
 
 	fun latest(self): dyn Pipe<Option<T>> {
@@ -374,6 +459,13 @@ export impl TaskSource<type T, type E> with Source<Option<T>> {
 export impl TaskSource<type T, type E> with TransientSource<T, E> {
 	fun state(self): MemoCell<TransientState<T, E>> {
 		MemoCell { cell = self.cell }
+	}
+
+	/// The cell's state as a pipe: there is no lease here to take, so it is
+	/// `state()` that a consumer starts.
+	fun states(self): dyn Pipe<TransientState<T, E>> {
+		let pipe: dyn Pipe<TransientState<T, E>> = self.cell.derive(|state| state);
+		pipe
 	}
 
 	fun latest(self): dyn Pipe<Option<T>> {

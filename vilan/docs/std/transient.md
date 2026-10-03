@@ -14,7 +14,8 @@ import std::transient::{ TransientState, TransientSource, Transient, TaskSource 
 | Item | Kind | One line |
 |---|---|---|
 | `TransientState<T, E>` | enum | `Pending`, `Ready(T)`, `Refreshing(T)`, `Failed(E, Option<T>)`, `Absent` |
-| `TransientSource<T, E>` | trait | a `Source<Option<T>>` that also says where it stands: `state()`, `latest()`, `is_pending()` |
+| `TransientSource<T, E>` | trait | a `Source<Option<T>>` that also says where it stands: `states()`, `state()`, `latest()`, `is_pending()` |
+| `map`, `and_then`, `zip` | methods on `TransientState` | move the value and keep the arm; let the value decide the state; pair two states |
 | `.transient()` | method on a pipe of tasks | seal a flow of tasks: the latest task wins |
 | `.transient_global()` | method on a pipe of tasks | `.transient()` for the program's lifetime (a module binding's spelling) |
 | `Transient<T, E>` | struct | what `.transient()` returns |
@@ -36,11 +37,46 @@ import std::transient::{ TransientState, TransientSource, Transient, TaskSource 
 read `None` through `get()`. The same readings are methods on the state itself
 (`state.ready()`, `state.latest()`, `state.is_pending()`).
 
+Three combinators change what a state carries without re-matching its arms:
+
+- **`map(|T| U)`** transforms every value the state holds — a `Refreshing`'s
+  and a `Failed`'s stale one included — and keeps the arm.
+- **`and_then(|T| TransientState<U, E>)`** lets the value decide the state:
+  `Ready(v)` is `next(v)`; `Refreshing(v)` is `next(v)` with a newer value still
+  on its way (its `Ready`/`Refreshing` read `Refreshing`, its `Pending`/`Absent`
+  read `Pending`, its `Failed` stands); `Failed(e, stale)` keeps `e` with
+  `next` applied to the stale value; `Pending` and `Absent` pass through. The
+  common use reads a transient of a maybe as a transient that can be absent.
+- **`zip(other)`** is `Ready((a, b))` while both are ready, and otherwise the
+  arm that says the most about why not, in this order: `Failed` (this one's
+  error first, carrying the pair of latest values when both have one), `Absent`,
+  `Pending`, `Refreshing((a, b))`.
+
+```vilan
+import std::transient::TransientState;
+
+fun found(maybe: Option<str>): TransientState<str, str> {
+	match maybe {
+		Some(let name) => TransientState::Ready(name),
+		None => TransientState::Absent,
+	}
+}
+
+fun main() {
+	let fetched: TransientState<Option<str>, str> = TransientState::Refreshing(Some("kolt"));
+	let channel = fetched.and_then(|maybe| found(maybe));
+	let length = channel.map(|name| name.len());
+	print(length.latest().unwrap_or(0));
+	print(length.zip(channel).is_pending());
+}
+```
+
 ## TransientSource
 
 ```vilan,fragment
 export trait TransientSource<T, E> with Source<Option<T>> {
 	fun state(self): MemoCell<TransientState<T, E>>;
+	fun states(self): dyn Pipe<TransientState<T, E>>;
 	fun latest(self): dyn Pipe<Option<T>>;
 	fun is_pending(self): dyn Pipe<bool>;
 }
@@ -57,8 +93,13 @@ export trait TransientSource<T, E> with Source<Option<T>> {
   ```
 
 - **`is_pending()`** is a fresh pipe per call: the spinner.
-- **`state()`** is the whole story, as a read-only source (a `MemoCell`, which
-  nothing downstream can `set`).
+- **`states()`** is the whole story, `Absent` included, as a FRESH pipe per
+  call that watches what it reports — on a mirror it LEASES while its consumer
+  holds it, as `latest()` does. Bind it where a view must tell a spinner from
+  "not found".
+- **`state()`** is the same story as a PASSIVE report, a read-only source (a
+  `MemoCell`, which nothing downstream can `set`). It leases nothing: a mirror
+  nobody else watches stays `Pending` here.
 
 ## `.transient()`: a flow of tasks
 
@@ -109,6 +150,8 @@ answers `Result<T, E>`; `TaskSource::of` watches a bare task, whose panic is
 `RemoteSource<T>` maps its `Status` arm for arm: `Waiting` is `Pending`,
 `Ready` is `Ready(v)`, `Absent` is `Absent`, and `Failed(e)` is
 `Failed(e, stale)`, carrying what the mirror last held. `state()` reports, like
-`status()`: it leases nothing, so an unwatched mirror is `Pending`. `latest()`
-and `is_pending()` lease the mirror while a view binds them. The mirror's own
+`status()`: it leases nothing, so an unwatched mirror is `Pending`. `states()`,
+`latest()` and `is_pending()` lease the mirror while a view binds them —
+`states()` is the whole state watched, so binding it alone moves a mirror from
+`Pending` to `Ready`, `Absent` or `Failed`. The mirror's own
 `get()` reads what it holds, as it always has. See [std::rpc](rpc.md).

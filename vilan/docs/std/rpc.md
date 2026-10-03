@@ -64,7 +64,8 @@ impl RemoteSource<type T> {
 
 // A mirror is a transient source (std::transient): Status mapped arm for arm.
 impl RemoteSource<type T> with TransientSource<T, RpcError> {
-	fun state(self): MemoCell<TransientState<T, RpcError>>   // passive, like `status`
+	fun state(self): MemoCell<TransientState<T, RpcError>>   // passive, like `status`: leases nothing
+	fun states(self): dyn Pipe<TransientState<T, RpcError>>  // leases while bound; the whole state
 	fun latest(self): dyn Pipe<Option<T>>                    // leases while bound; keeps the stale value
 	fun is_pending(self): dyn Pipe<bool>                     // leases while bound
 }

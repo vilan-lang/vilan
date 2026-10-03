@@ -7489,3 +7489,132 @@ fn b416_a_field_named_like_the_expansions_own_bindings_round_trips() {
         "1 s 2 2\n",
     );
 }
+
+// --- A150: `TransientState::map`, `and_then`, `zip` -----------------------------
+//
+// Every consumer of a transient re-matched its five arms to change the value it
+// carries (kolt wrote a `map_state` of its own). The three combinators keep the
+// arm and move the value; each arm is pinned.
+
+const A150_SHOW: &str = concat!(
+    "import std::io::print;\n",
+    "import std::transient::TransientState;\n",
+    "\n",
+    "fun show(state: TransientState<i32, str>): str {\n",
+    "\tmatch state {\n",
+    "\t\tTransientState::Pending => \"Pending\",\n",
+    "\t\tTransientState::Ready(let v) => i\"Ready({v})\",\n",
+    "\t\tTransientState::Refreshing(let v) => i\"Refreshing({v})\",\n",
+    "\t\tTransientState::Failed(let e, let stale) => match stale {\n",
+    "\t\t\tSome(let v) => i\"Failed({e}, {v})\",\n",
+    "\t\t\tNone => i\"Failed({e})\",\n",
+    "\t\t},\n",
+    "\t\tTransientState::Absent => \"Absent\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+);
+
+/// `map` transforms every value the state holds — a `Refreshing`'s and a
+/// `Failed`'s stale one included — and keeps the arm.
+#[test]
+fn a150_transient_state_map_keeps_the_arm_and_moves_every_value() {
+    let source = format!(
+        "{A150_SHOW}{}",
+        concat!(
+            "fun main() {\n",
+            "\tlet states: List<TransientState<i32, str>> = [\n",
+            "\t\tTransientState::Pending,\n",
+            "\t\tTransientState::Ready(1),\n",
+            "\t\tTransientState::Refreshing(2),\n",
+            "\t\tTransientState::Failed(\"x\", Some(3)),\n",
+            "\t\tTransientState::Failed(\"y\", None),\n",
+            "\t\tTransientState::Absent,\n",
+            "\t];\n",
+            "\tfor state in states {\n",
+            "\t\tprint(show(state.map(|v| v * 10)));\n",
+            "\t}\n",
+            "}\n",
+        )
+    );
+    assert_compiles_and_runs(
+        &source,
+        "Pending\nReady(10)\nRefreshing(20)\nFailed(x, 30)\nFailed(y)\nAbsent\n",
+    );
+}
+
+/// `and_then` lets the value decide the state: the transient-of-a-maybe read as
+/// a transient that can be absent (kolt's `Channel::find`), with a refresh's
+/// `Ready`/`Absent` read as `Refreshing`/`Pending`, a failure's stale value
+/// passed through `next`, and an inner failure standing.
+#[test]
+fn a150_transient_state_and_then_lets_the_value_decide_the_state() {
+    let source = format!(
+        "{A150_SHOW}{}",
+        concat!(
+            "fun found(maybe: Option<i32>): TransientState<i32, str> {\n",
+            "\tmatch maybe {\n",
+            "\t\tSome(let v) => if v < 0 { TransientState::Failed(\"neg\", None) } else { TransientState::Ready(v) },\n",
+            "\t\tNone => TransientState::Absent,\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet states: List<TransientState<Option<i32>, str>> = [\n",
+            "\t\tTransientState::Pending,\n",
+            "\t\tTransientState::Ready(Some(1)),\n",
+            "\t\tTransientState::Ready(None),\n",
+            "\t\tTransientState::Refreshing(Some(2)),\n",
+            "\t\tTransientState::Refreshing(None),\n",
+            "\t\tTransientState::Refreshing(Some(-1)),\n",
+            "\t\tTransientState::Failed(\"x\", Some(Some(3))),\n",
+            "\t\tTransientState::Failed(\"y\", Some(None)),\n",
+            "\t\tTransientState::Absent,\n",
+            "\t];\n",
+            "\tfor state in states {\n",
+            "\t\tprint(show(state.and_then(|maybe| found(maybe))));\n",
+            "\t}\n",
+            "}\n",
+        )
+    );
+    assert_compiles_and_runs(
+        &source,
+        concat!(
+            "Pending\nReady(1)\nAbsent\nRefreshing(2)\nPending\nFailed(neg)\n",
+            "Failed(x, 3)\nFailed(y)\nAbsent\n",
+        ),
+    );
+}
+
+/// `zip` is the pair while both hold a value, and otherwise the arm that says
+/// the most about why not: `Failed` (this one's error first, with the pair of
+/// latest values — none when a side is absent), then `Absent`, then `Pending`,
+/// then `Refreshing`.
+#[test]
+fn a150_transient_state_zip_pairs_two_states_by_precedence() {
+    let source = format!(
+        "{A150_SHOW}{}",
+        concat!(
+            "fun pair(a: TransientState<i32, str>, b: TransientState<i32, str>): str {\n",
+            "\tshow(a.zip(b).map(|(x, y)| x * 10 + y))\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(pair(TransientState::Ready(1), TransientState::Ready(2)));\n",
+            "\tprint(pair(TransientState::Ready(1), TransientState::Refreshing(2)));\n",
+            "\tprint(pair(TransientState::Refreshing(1), TransientState::Pending));\n",
+            "\tprint(pair(TransientState::Pending, TransientState::Absent));\n",
+            "\tprint(pair(TransientState::Absent, TransientState::Failed(\"b\", Some(2))));\n",
+            "\tprint(pair(TransientState::Failed(\"a\", Some(1)), TransientState::Failed(\"b\", Some(2))));\n",
+            "\tprint(pair(TransientState::Ready(1), TransientState::Failed(\"b\", None)));\n",
+            "}\n",
+        )
+    );
+    assert_compiles_and_runs(
+        &source,
+        concat!(
+            "Ready(12)\nRefreshing(12)\nPending\nAbsent\nFailed(b)\n",
+            "Failed(a, 12)\nFailed(b)\n",
+        ),
+    );
+}
