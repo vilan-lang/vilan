@@ -333,6 +333,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**A MAPPED parameter with a CONSTANT template takes its matching argument when ANOTHER parameter binds the family: `fun first_label<T: (2..)>(labels: (U in T: str), cells: (U in T: SignalCell<U>))` accepts `first_label(("first", "second"), cells)` in either parameter order — where it was refused "Expected (U in ((i32, i32), str): str), but got (str, str)".** The mapped-argument check inverted the template per element to recover `T`, and a template naming no `U` recovers nothing, so the check failed. A constant template now checks each element against itself and leaves `T` to the other parameter; and a family already bound in the call (by an earlier parameter) checks the argument against the template expanded over that binding, element by element, which also holds the arity (`("a", "b", "c")` against a pair is refused). The same expansion closes B442 where `T` is bound elsewhere: a bare `None` at `(U in T: Option<U>)` takes the family's element (alone, with no other evidence for that element, the call is still refused; its message is filed). Pins: `inference::tuples`' `b440_a_constant_mapped_template_takes_its_argument_when_another_parameter_binds_the_family` and `b442_a_bare_none_in_a_mapped_argument_takes_the_bound_familys_element` — red on the 0.43.0 toolchain. No golden moves. Tracker B440; B442 (the bound-elsewhere shape).
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

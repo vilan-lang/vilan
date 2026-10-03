@@ -43252,17 +43252,68 @@ impl<'src> Analyzer<'src> {
             _ => return None,
         };
         let template = template_id.get_type(self);
+        // B440: the source already bound in THIS call (by another parameter,
+        // `cells: (U in T: SignalCell<U>)` beside `labels: (U in T: str)`):
+        // nothing is left to infer, and the argument checks against the
+        // template expanded over that binding, element by element.
+        if let Some(bound) = substitution_context.get(&source_constraint).copied()
+            && let Type::Tuple(source_elements) = self.expand_mapped(bound.get_type(self))
+        {
+            if source_elements.len() != argument_element_ids.len() {
+                return None;
+            }
+            // The family's binding travels on with the answer, as the
+            // inverting path below returns it.
+            let mut bindings = vec![(source_constraint, bound)];
+            for (source_element, argument_element) in
+                source_elements.iter().zip(argument_element_ids)
+            {
+                let mut element_context = substitution_context.clone();
+                element_context.insert(binder_id, *source_element);
+                let expected = self.substitute_type(&template, &element_context);
+                let argument = argument_element.get_type(self);
+                let (_, element_bindings) =
+                    self.reconcile_type(&argument, &expected, substitution_context)?;
+                bindings.extend(element_bindings);
+            }
+            return Some((Type::Tuple(argument_element_ids.to_vec()), bindings));
+        }
         let mut inner_ids = Vec::with_capacity(argument_element_ids.len());
+        // B440: a CONSTANT template (`(U in T: str)`) binds no `U` at any
+        // element, so the argument says nothing about `T` — its elements only
+        // check against the template, and `T` is left for another parameter
+        // to bind (the expanded check above then holds the arity).
+        let mut unbound_elements = 0;
+        let mut constant_bindings = Vec::new();
         for element_id in argument_element_ids {
             let element = element_id.get_type(self);
             let (_, bindings) = self.reconcile_type(&element, &template, substitution_context)?;
             // The template's single hole is `binder_id`; recover its binding.
-            let inner = bindings
+            match bindings
                 .iter()
                 .rev()
                 .find(|(constraint_id, _)| *constraint_id == binder_id)
-                .map(|(_, type_id)| *type_id)?;
-            inner_ids.push(inner);
+                .map(|(_, type_id)| *type_id)
+            {
+                Some(inner) => inner_ids.push(inner),
+                None => {
+                    unbound_elements += 1;
+                    constant_bindings.extend(bindings);
+                }
+            }
+        }
+        if unbound_elements > 0 {
+            let constant = unbound_elements == argument_element_ids.len() && {
+                let mut template_generics = Vec::new();
+                self.collect_generics(&template, 0, &mut template_generics);
+                !template_generics.contains(&binder_id)
+            };
+            return constant.then(|| {
+                (
+                    Type::Tuple(argument_element_ids.to_vec()),
+                    constant_bindings,
+                )
+            });
         }
         let tuple_type_id = Type::Tuple(inner_ids).get_type_id(self);
         Some((

@@ -8257,3 +8257,64 @@ fn b447_integer_literals_in_tuples_in_a_list_take_the_expected_element_type() {
     );
 }
 
+/// B440: a MAPPED parameter with a CONSTANT template, `(U in T: str)`, takes its
+/// matching concrete argument when `T` is bound by ANOTHER parameter — in
+/// either parameter order — and still refuses a mis-sized or mis-typed one.
+#[test]
+fn b440_a_constant_mapped_template_takes_its_argument_when_another_parameter_binds_the_family() {
+    let program = |call: &str| {
+        format!(
+            r#"
+            import std::reactive::SignalCell;
+            fun first_label<T: (2..)>(labels: (U in T: str), cells: (U in T: SignalCell<U>)): i32 {{
+                0
+            }}
+            fun cells_first<T: (2..)>(cells: (U in T: SignalCell<U>), labels: (U in T: str)): i32 {{
+                1
+            }}
+            fun main() {{
+                let cells = (SignalCell::new((1, 2)), SignalCell::new("b"));
+                print({call});
+            }}
+            "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program("first_label((\"first\", \"second\"), cells)"),
+        "0\n",
+    );
+    assert_compiles_and_runs(
+        &program("cells_first(cells, (\"first\", \"second\"))"),
+        "1\n",
+    );
+    assert_fails(&program("cells_first(cells, (\"a\", \"b\", \"c\"))"));
+    assert_fails(&program("cells_first(cells, (\"a\", 2))"));
+}
+
+/// B442 (with B440's change): a bare `None` in a MAPPED-tuple argument takes
+/// the element type the mapped position names once ANOTHER parameter binds the
+/// family — `(Some(1), None, Some("two"))` at `(U in T: Option<U>)` beside
+/// `seeds: T` — where it stayed `Option<unknown>` and the argument was refused.
+/// (Alone, as in the item's repro, `T`'s middle element has no evidence at all,
+/// and the call is still refused.)
+#[test]
+fn b442_a_bare_none_in_a_mapped_argument_takes_the_bound_familys_element() {
+    let program = |call: &str| {
+        format!(
+            r#"
+            import std::option::Option::{{ self, Some, None }};
+            fun count<T: (2..)>(seeds: T, items: (U in T: Option<U>)): i32 {{
+                3
+            }}
+            fun main() {{
+                print({call});
+            }}
+            "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program("count((1, true, \"x\"), (Some(1), None, Some(\"two\")))"),
+        "3\n",
+    );
+    assert_fails(&program("count((1, true), (Some(1), Some(2)))"));
+}
