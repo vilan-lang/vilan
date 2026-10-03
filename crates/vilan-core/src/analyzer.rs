@@ -3108,6 +3108,18 @@ enum Constraint<'src> {
     /// return-position generic call (`Option::from_json(t)` returning `Option<T>`
     /// where `R = Option<User>`) leaves `T` unbound and lowers to the abstract
     /// trait method. Mirrors `Variable`.
+    /// B489: `fun f(): Trait<args> { .. tail }` — once the tail has typed, a
+    /// hole it left (`SignalCell::new(None)` is `SignalCell<Option<unknown>>`)
+    /// is filled from the annotation's arguments, read through the tail
+    /// type's impl of the trait: the tail is checked against that concrete
+    /// type exactly as `ReturnType` checks a concrete annotation.
+    OpaqueReturn {
+        function_id: Id,
+        body_id: Id,
+        trait_id: Id,
+        arguments: Vec<TypeId>,
+        statement_ids: Vec<Id>,
+    },
     ReturnType {
         body_id: Id,
         return_type_id: TypeId,
@@ -3186,6 +3198,7 @@ impl Constraint<'_> {
             Constraint::ForEachItem { item_id, .. } => *item_id,
             Constraint::CallSubject(constraint) => constraint.call_id,
             Constraint::ReturnType { body_id, .. } => *body_id,
+            Constraint::OpaqueReturn { body_id, .. } => *body_id,
             Constraint::TryAssert { id, .. } => *id,
             Constraint::Lift { id, .. } => *id,
             Constraint::LiftRegion { id, .. } => *id,
@@ -3234,6 +3247,8 @@ impl Constraint<'_> {
             // consumes, so it reads a settled target and a settled value
             // instead of deferring on each of them in turn.
             Constraint::PlaceAssignment { .. } => 12,
+            // After `CallSubject` (11): it reads the tail's settled type.
+            Constraint::OpaqueReturn { .. } => 12,
         }
     }
 }
@@ -40142,6 +40157,57 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B489: the type a value headed like `result` must be for its impl of
+    /// `trait_id` to be instantiated at `arguments` — `SignalCell<T>` expected
+    /// at `Source<Option<i32>>` is `SignalCell<Option<i32>>`, read through
+    /// `impl SignalCell<type T> with Source<T>`. The ONE impl of the trait
+    /// whose subject has the result's nominal head answers; its binders bind
+    /// from the trait arguments it writes, and the subject is instantiated
+    /// with them. `None` when no single impl answers or a binder stays open.
+    fn type_expected_through_impl(
+        &mut self,
+        result: &Type,
+        trait_id: Id,
+        arguments: &[TypeId],
+    ) -> Option<Type> {
+        let head = |type_: &Type| match type_ {
+            Type::Struct(id, _) | Type::Enum(id, _) => Some(*id),
+            _ => None,
+        };
+        let result_head = head(result)?;
+        let candidates: Vec<(TypeId, Vec<TypeId>)> = self
+            .implementations
+            .iter()
+            .filter(|implementation| {
+                head(&implementation.subject.get_type(self)) == Some(result_head)
+            })
+            .filter_map(|implementation| {
+                implementation
+                    .trait_args
+                    .iter()
+                    .find(|(provided, _)| *provided == trait_id)
+                    .map(|(_, written)| (implementation.subject, written.clone()))
+            })
+            .collect();
+        let [(subject, written)] = candidates.as_slice() else {
+            return None;
+        };
+        if written.len() != arguments.len() {
+            return None;
+        }
+        let mut bindings = SubstitutionContext::default();
+        for (pattern, actual) in written.iter().zip(arguments) {
+            self.bind_pattern_binders(*pattern, *actual, &mut bindings);
+        }
+        let subject_type = subject.get_type(self);
+        let mut binders = Vec::new();
+        self.collect_generics(&subject_type, 0, &mut binders);
+        if binders.iter().any(|binder| !bindings.contains_key(binder)) {
+            return None;
+        }
+        Some(self.substitute_type(&subject_type, &bindings))
+    }
+
     /// Whether `type_id` carries an `Unknown` or `Unresolved` anywhere in its
     /// structure — a still-open slot, as opposed to an abstract but fixed
     /// generic (`type_is_ground` refuses those too; `type_is_fully_determined`
@@ -46972,6 +47038,24 @@ impl<'src> Analyzer<'src> {
                 let statement_ids = statement_ids.clone();
                 self.resolve_return_type(*body_id, *return_type_id, &statement_ids)
             }
+            Constraint::OpaqueReturn {
+                function_id,
+                body_id,
+                trait_id,
+                arguments,
+                statement_ids,
+            } => {
+                let (function_id, body_id, trait_id) = (*function_id, *body_id, *trait_id);
+                let arguments = arguments.clone();
+                let statement_ids = statement_ids.clone();
+                self.resolve_opaque_return(
+                    function_id,
+                    body_id,
+                    trait_id,
+                    &arguments,
+                    &statement_ids,
+                )
+            }
             Constraint::TryAssert {
                 id,
                 receiver_id,
@@ -50782,6 +50866,75 @@ impl<'src> Analyzer<'src> {
         }
         let type_id = constraint.clone().get_type_id(self);
         self.expected_types.insert(expr, type_id);
+    }
+
+    /// [`Constraint::OpaqueReturn`]'s resolution (B489).
+    fn resolve_opaque_return(
+        &mut self,
+        function_id: Id,
+        body_id: Id,
+        trait_id: Id,
+        arguments: &[TypeId],
+        statement_ids: &[Id],
+    ) -> Resolution {
+        let inferred =
+            self.infer_function_returns(function_id, &HashMap::default(), &mut HashSet::default());
+        if matches!(inferred.type_, Type::Unresolved) {
+            return Resolution::Deferred;
+        }
+        let inferred_id = inferred.type_.clone().get_type_id(self);
+        if !self.type_has_hole(inferred_id) {
+            return Resolution::Resolved;
+        }
+        let Some(concrete) = self.type_expected_through_impl(&inferred.type_, trait_id, arguments)
+        else {
+            return Resolution::Resolved;
+        };
+        // The tail has already typed — its call bound its generics with the
+        // hole in them — so the hole is FILLED where it stands: each `Unknown`
+        // slot the inferred type holds takes the concrete type's component at
+        // that position, which every reader of the slot (the call's recorded
+        // binding, the `None` literal) then sees. A position that disagrees is
+        // the ordinary return check's to report.
+        self.fill_holes_from(inferred_id, &concrete);
+        let concrete_id = concrete.get_type_id(self);
+        self.resolve_return_type(body_id, concrete_id, statement_ids)
+    }
+
+    /// Writes `wanted`'s components into the `Unknown` slots of `held`, at
+    /// matching positions of matching shapes (B489). Only a ground component
+    /// is written; a slot that is already a type is left as it is.
+    fn fill_holes_from(&mut self, held: TypeId, wanted: &Type) {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return;
+        };
+        match (held.get_type(self), wanted) {
+            (Type::Unknown, wanted) => {
+                let wanted_id = wanted.clone().get_type_id(self);
+                if self.type_is_ground(wanted_id) {
+                    self.write_type_slot(held, wanted.clone());
+                }
+            }
+            (Type::Struct(left, held_arguments), Type::Struct(right, wanted_arguments))
+            | (Type::Enum(left, held_arguments), Type::Enum(right, wanted_arguments))
+                if left == *right && held_arguments.len() == wanted_arguments.len() =>
+            {
+                for (held_argument, wanted_argument) in held_arguments.iter().zip(wanted_arguments)
+                {
+                    let wanted_argument = wanted_argument.get_type(self);
+                    self.fill_holes_from(*held_argument, &wanted_argument);
+                }
+            }
+            (Type::Tuple(held_elements), Type::Tuple(wanted_elements))
+                if held_elements.len() == wanted_elements.len() =>
+            {
+                for (held_element, wanted_element) in held_elements.iter().zip(wanted_elements) {
+                    let wanted_element = wanted_element.get_type(self);
+                    self.fill_holes_from(*held_element, &wanted_element);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn resolve_return_type(
@@ -56801,6 +56954,25 @@ impl<'src> Analyzer<'src> {
                                 .functions
                                 .get(&function_id)
                                 .map(|function| function.body.1);
+                            // B489: the annotation's ARGUMENTS reach the body.
+                            // Once the tail has typed, a hole the arguments
+                            // fill is filled: the tail is checked against the
+                            // type its impl of the trait must be at them, as a
+                            // concrete annotation's `ReturnType` checks it.
+                            if let Some(tail) = tail {
+                                let statement_ids = self
+                                    .functions
+                                    .get(&function_id)
+                                    .map(|function| function.body.0.clone())
+                                    .unwrap_or_default();
+                                self.constraints.push(Constraint::OpaqueReturn {
+                                    function_id,
+                                    body_id: tail,
+                                    trait_id: *trait_id,
+                                    arguments: arguments.clone(),
+                                    statement_ids,
+                                });
+                            }
                             let mut stack: Vec<Id> = tail.into_iter().collect();
                             while let Some(tail_id) = stack.pop() {
                                 self.opaque_return_tails.insert(tail_id, function_id);

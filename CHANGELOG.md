@@ -318,6 +318,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**A bare-trait return's TYPE ARGUMENTS reach the body: `fun nothing(): Source<Option<i32>> { SignalCell::new(None) }` types its tail as `SignalCell<Option<i32>>` — where it was `SignalCell<Option<unknown>>`, accepted by the after-build trait check (an unknown argument satisfies the bound), run by JS (where `None` needs no type) and refused natively ("the `rust` backend does not emit a value of type `an unresolved type`").** B460 typed such a function as if unannotated and checked the trait only after the build, so nothing carried the annotation's arguments into the body. A new constraint (`OpaqueReturn`, after the tail's call has resolved) reads the annotation through the tail type's ONE impl of the trait (`impl SignalCell<type T> with Source<T>` at `Source<Option<i32>>` is `SignalCell<Option<i32>>`), fills the holes the tail left where they stand, and checks the tail against that type as a concrete annotation's `ReturnType` does. A block tail, both arms of an `if`, a generic argument (`fun empty<T>(): Source<Option<T>>`) and a trait of two parameters are pinned. opaque-returns.md's find 2 (a generic bare-trait return instantiated twice, natively one instantiation's type for both) does not reproduce on this base and is pinned beside it. The same hole at a trait-annotated `let` (`let a: Source<Option<i32>> = SignalCell::new(None)`) is a different path and is filed. Pins: `inference::traits`' `b489_a_bare_trait_returns_arguments_reach_the_body` (its typing half red on the 0.43.0 toolchain) and `native_differential`'s `a_bare_trait_returns_arguments_reach_the_body_on_both_backends`. No golden moves. Tracker B489; opaque-returns.md S0.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

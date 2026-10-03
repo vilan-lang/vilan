@@ -149,6 +149,28 @@ const B473_PROBE: &str = concat!(
 
 /// B532's program, `inference::dyn_objects`' `B532_PROGRAM`: objects over
 /// SUB-traits of a trait implemented at two instantiations.
+/// B489 + opaque-returns.md find 2: a bare-trait return's arguments reach the
+/// body, and a generic one instantiated twice returns each instantiation's type.
+const B489_PROBE: &str = concat!(
+    "import std::reactive::{ Source, SignalCell };\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "\n",
+    "fun nothing(): Source<Option<i32>> { SignalCell::new(None) }\n",
+    "\n",
+    "fun chosen(flag: bool): Source<Option<str>> {\n",
+    "    if flag { SignalCell::new(None) } else { SignalCell::new(Some(\"x\")) }\n",
+    "}\n",
+    "\n",
+    "fun wrap<T>(value: T): Source<T> { SignalCell::new(value) }\n",
+    "\n",
+    "fun main() {\n",
+    "    print(nothing().get().is_none());\n",
+    "    print(chosen(false).get().is_none());\n",
+    "    print(wrap(1).get());\n",
+    "    print(wrap(\"s\").get());\n",
+    "}\n",
+);
+
 const B532_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -8886,6 +8908,23 @@ fn a_trait_object_binds_a_bounds_arguments_from_its_own_on_both_backends() {
         compare(&staged, "native_probe_b502.vl"),
         Verdict::Identical,
         "a trait object must bind a bound's arguments from its own on both backends"
+    );
+}
+
+/// B489: `SignalCell::new(None)` under a `Source<Option<i32>>` return types
+/// from the annotation's arguments — natively it was refused "an unresolved
+/// type". With it, opaque-returns.md's find 2 (a generic bare-trait return
+/// instantiated twice, which JS's pin cannot see): already right on this base,
+/// pinned so it stays so.
+#[test]
+fn a_bare_trait_returns_arguments_reach_the_body_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b489.vl"), B489_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b489.vl"),
+        Verdict::Identical,
+        "a bare-trait return's arguments must reach the body on both backends"
     );
 }
 

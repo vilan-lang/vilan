@@ -8208,6 +8208,61 @@ fn b460_a_free_fun_returns_the_one_type_its_body_picks() {
     );
 }
 
+/// B489: a bare-trait return's ARGUMENTS reach the body. `SignalCell::new(None)`
+/// under `Source<Option<i32>>` typed as `SignalCell<Option<unknown>>` (JS ran
+/// it; native refused "an unresolved type"); the annotation is now the tail's
+/// expectation, read through the result's impl of the trait — in a block
+/// tail, in both arms of an `if`, with a generic argument, and through a
+/// trait of two parameters.
+#[test]
+fn b489_a_bare_trait_returns_arguments_reach_the_body() {
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            import std::option::Option::{ self, None, Some };
+            trait Pair<A, B> {
+                fun left(self): A;
+            }
+            struct Both<A, B> { a: A, b: B }
+            impl Both<type A, type B> with Pair<A, B> {
+                fun left(self): A { self.a }
+            }
+            fun nothing(): Source<Option<i32>> { SignalCell::new(None) }
+            fun nested(): Source<List<str>> {
+                let unused = 1;
+                { SignalCell::new([]) }
+            }
+            fun chosen(flag: bool): Source<Option<str>> {
+                if flag { SignalCell::new(None) } else { SignalCell::new(Some("x")) }
+            }
+            fun empty<T>(): Source<Option<T>> { SignalCell::new(None) }
+            fun both(): Pair<Option<i32>, List<str>> { Both { a = None, b = [] } }
+            fun main() {
+                let n: Option<i32> = nothing().get();
+                print(n.is_none());
+                print(nested().get().len());
+                print(chosen(true).get().is_none());
+                let e: Option<bool> = empty().get();
+                print(e.is_none());
+                print(both().left().is_none());
+            }
+            "#,
+        ),
+        "true\n0\ntrue\ntrue\ntrue\n",
+    );
+    // The typing itself (JS ran the hole; the type is what changed).
+    assert_fails_with(
+        &b460_program(
+            r#"
+            import std::option::Option::{ self, None };
+            fun nothing(): Source<Option<i32>> { SignalCell::new(None) }
+            fun main() { let wrong: i32 = nothing(); }
+            "#,
+        ),
+        "got SignalCell<Option<i32>>",
+    );
+}
+
 #[test]
 fn b460_a_generic_fun_and_an_inherent_method_pick_per_instantiation() {
     assert_compiles_and_runs(
