@@ -8064,23 +8064,40 @@ const SIGNATURE_EXPOSES_A_PRIVATE_TYPE: &str = "is exported, but";
 /// declaration here to export and the message says what the two ways out are.
 const EXPOSED_TYPE_IS_FOREIGN: &str = "in another package, and cannot be exported from here";
 
-/// The name in an unknown-name diagnostic's message: `cannot find 'X' in this
-/// scope...` (a bare value) or `cannot find type 'X'...` — the two "cannot
-/// find" shapes B4's import steer already targets
-/// (`analyzer.rs::import_steer`/`import_steer_inner`). `None` for every other
-/// diagnostic shape (a module-path segment, a trait, a struct field, a
-/// context …) — E54's add-import quickfix is deliberately scoped to these
-/// two; the others are the filing's own later customers (E58d's rule for the
-/// closest-name primitive applies here too).
+/// The name an import would bring, read off an unknown-name diagnostic — the
+/// shapes the analyzer's import steer (`analyzer.rs::import_steer`) attaches
+/// to, at every position an unresolved name can stand in (E250's census):
+///
+/// - `cannot find 'X' in this scope…` — an expression;
+/// - `cannot find type 'X'…` — an annotation, a generic argument, a bound, an
+///   impl subject, a static call's receiver, a parameter or return type;
+/// - `cannot find trait 'X'…` — an `impl`'s `with` trait;
+/// - `unknown struct: X…` — a struct literal's head;
+/// - `cannot find 'X::Variant' in this scope…` — a pattern's PATH (`match`,
+///   `is`): no module declares the path, the import brings its HEAD, so the
+///   head is the name.
+///
+/// `None` for every other diagnostic shape (a module-path segment, a struct
+/// field, a context …) — E58d's rule for the closest-name primitive applies
+/// to those.
 fn unresolved_name(message: &str) -> Option<&str> {
-    for prefix in ["cannot find '", "cannot find type '"] {
-        if let Some(rest) = message.strip_prefix(prefix)
-            && let Some(end) = rest.find('\'')
-        {
-            return Some(&rest[..end]);
-        }
-    }
-    None
+    let quoted = ["cannot find '", "cannot find type '", "cannot find trait '"]
+        .iter()
+        .find_map(|prefix| {
+            let rest = message.strip_prefix(prefix)?;
+            Some(&rest[..rest.find('\'')?])
+        });
+    let name = quoted.or_else(|| {
+        let rest = message.strip_prefix("unknown struct: ")?;
+        let end = rest
+            .find(|character: char| {
+                !(character.is_alphanumeric() || character == '_' || character == ':')
+            })
+            .unwrap_or(rest.len());
+        Some(&rest[..end])
+    })?;
+    let head = name.split("::").next().unwrap_or(name);
+    (!head.is_empty()).then_some(head)
 }
 
 /// The NAME LIST of the clause B242's subset refusal spells out — the text

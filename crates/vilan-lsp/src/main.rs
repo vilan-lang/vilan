@@ -20,6 +20,8 @@ mod world;
 #[cfg(test)]
 mod entry_world_tests;
 #[cfg(test)]
+mod import_position_tests;
+#[cfg(test)]
 mod member_admission_tests;
 
 use std::collections::HashMap;
