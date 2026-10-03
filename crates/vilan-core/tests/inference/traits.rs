@@ -8738,6 +8738,56 @@ fn b511_a_qualified_call_reaches_a_blanket_through_a_bound_and_a_tuple_subject()
     );
 }
 
+// --- B498: a static call on a NESTED binder, reached through a bound ---------
+//
+// `N::default()` in a member of `impl Stage<type S, type R: IntoFlow<type N:
+// Default>>` named `N`, which only `R`'s own `IntoFlow` impl grounds. A direct
+// call recorded it; reached through a bound (`f.fresh()` with `F: Fresh<T>`) the
+// JS emitter bound the impl's binders from the receiver's SHAPE alone, and the
+// static landed on `Default`'s bodiless requirement — "internal: a call resolved
+// to `Default`'s requirement `default`, which has no body".
+
+/// B498: the nested binder is grounded however the member is reached — the
+/// direct method call, through a generic bound at two instantiations, and the
+/// qualified spelling.
+#[test]
+fn b498_a_static_call_on_a_nested_binder_reached_through_a_bound_is_grounded() {
+    assert_compiles_and_runs(
+        r#"
+        import std::default::Default;
+        import std::delta::IntoFlow;
+        import std::io::print;
+
+        trait Fresh<T> {
+            fun fresh(self): T;
+        }
+
+        struct Stage<S, R> {
+            s: S,
+            r: R,
+        }
+
+        impl Stage<type S, type R: IntoFlow<type N: Default>> with Fresh<N> {
+            fun fresh(self): N {
+                N::default()
+            }
+        }
+
+        fun through<F: Fresh<T>, T>(f: F): T {
+            f.fresh()
+        }
+
+        fun main() {
+            print(Stage { s = "x", r = 1 }.fresh());
+            print(through(Stage { s = "x", r = "y" }) == "");
+            print(through(Stage { s = 1, r = 5 }) + 1);
+            print(Fresh::fresh(Stage { s = 1, r = true }));
+        }
+        "#,
+        "0\ntrue\n1\nfalse\n",
+    );
+}
+
 // --- B510: a trait default hands `self` to a generic over the same trait -----
 //
 // `Obs<T>`'s default `observe` calling `observe_flow<U, F: Obs<U>>(self, ..)`:

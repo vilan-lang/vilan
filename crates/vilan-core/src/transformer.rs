@@ -10496,8 +10496,21 @@ impl<'src> Transformer<'src> {
         // in `intrinsics` now, so every external a dispatch can land on has a
         // lowering keyed by member id and this function cannot be incomplete
         // again for the same reason.
+        // The impl's binders bind from the receiver's SHAPE and then from its
+        // BOUNDS: in `impl Stage<type S, type R: IntoFlow<type N: Default>>`
+        // the body's `N::default()` names `N`, which only `R`'s own `IntoFlow`
+        // impl grounds. Reached through a bound (`f.fresh()` with `F:
+        // Fresh<T>`), the shape alone left `N` open and the static call landed
+        // on `Default`'s bodiless requirement — B498's internal error. The
+        // analyzer's direct call records the same binders, and the native
+        // emitter has always bound both halves.
         let mut substitution = HashMap::default();
-        self.bind_generics(impl_subject, type_id, &mut substitution);
+        impl_select::bind_subject_and_bounds(
+            self.program,
+            impl_subject,
+            type_id,
+            &mut substitution,
+        );
         if !own_generic_values.is_empty()
             && let Some(function) = self.program.functions.get(&member_id)
         {
@@ -12360,15 +12373,6 @@ impl<'src> Transformer<'src> {
             declared_in,
         });
         None
-    }
-
-    /// Binds the generic parameters in `pattern` (an impl subject in its own
-    /// generic terms, `List<Generic(T)>`) from the matching positions of the
-    /// concrete `type_id` (`List<i32>`), accumulating `{T -> i32}` — the
-    /// shared walk [`crate::impl_select`] owns, since selecting an impl and
-    /// monomorphizing the member it declares must recover the same bindings.
-    fn bind_generics(&self, pattern: TypeId, type_id: TypeId, out: &mut HashMap<TypeId, TypeId>) {
-        impl_select::bind_subject(self.program, pattern, type_id, out);
     }
 }
 

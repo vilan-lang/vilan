@@ -253,6 +253,38 @@ const B510_PROBE: &str = concat!(
     "}\n",
 );
 
+const B498_PROBE: &str = concat!(
+    "import std::default::Default;\n",
+    "import std::delta::IntoFlow;\n",
+    "import std::io::print;\n",
+    "\n",
+    "trait Fresh<T> {\n",
+    "\tfun fresh(self): T;\n",
+    "}\n",
+    "\n",
+    "struct Stage<S, R> {\n",
+    "\ts: S,\n",
+    "\tr: R,\n",
+    "}\n",
+    "\n",
+    "impl Stage<type S, type R: IntoFlow<type N: Default>> with Fresh<N> {\n",
+    "\tfun fresh(self): N {\n",
+    "\t\tN::default()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun through<F: Fresh<T>, T>(f: F): T {\n",
+    "\tf.fresh()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(Stage { s = \"x\", r = 1 }.fresh());\n",
+    "\tprint(through(Stage { s = \"x\", r = \"y\" }) == \"\");\n",
+    "\tprint(through(Stage { s = 1, r = 5 }) + 1);\n",
+    "\tprint(Fresh::fresh(Stage { s = 1, r = true }));\n",
+    "}\n",
+);
+
 const B514_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -8713,6 +8745,23 @@ fn a_dereferenced_conditional_of_scalar_views_reads_the_value_on_both_backends()
         compare(&staged, "native_probe_b514.vl"),
         Verdict::Identical,
         "a dereferenced conditional of scalar views must read the value on both backends"
+    );
+}
+
+/// B498: a static call on an impl's NESTED binder (`N::default()` under `type R:
+/// IntoFlow<type N: Default>`) is grounded when the member is reached through a
+/// generic bound, on both backends. The JS emitter bound the impl's binders from
+/// the receiver's shape alone and raised "internal: a call resolved to
+/// `Default`'s requirement `default`"; native printed the values.
+#[test]
+fn a_static_call_on_a_nested_binder_reached_through_a_bound_is_grounded_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b498.vl"), B498_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b498.vl"),
+        Verdict::Identical,
+        "a nested binder must be grounded through a bound on both backends"
     );
 }
 

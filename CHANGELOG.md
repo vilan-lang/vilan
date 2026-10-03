@@ -60,6 +60,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**A static call on an impl's NESTED binder runs when the member is reached through a bound: `N::default()` in a member of `impl Stage<type S, type R: IntoFlow<type N: Default>> with Fresh<N>`, called as `f.fresh()` with `F: Fresh<T>`, returns `N`'s default — where JS raised "internal: a call resolved to `Default`'s requirement `default`, which has no body … please report".** A dispatch through a bound bound the selected impl's binders from the receiver's SHAPE alone (`S`, `R`), and `N` is written only in `R`'s bound; the direct method call recorded it, and the native emitter has always grounded both halves (`impl_select::bind_subject_and_bounds`, which the JS dispatch now calls too). **Goldens:** 2 corpus goldens move, both runtime-identical — `reactive-selector` loses one duplicate `on_change` wrapper instance (the dispatched instance now keys as the direct one does) and `reactive-on-change` renumbers its temporaries. The copy census is unchanged. Pins: `inference::traits`' `b498_a_static_call_on_a_nested_binder_reached_through_a_bound_is_grounded` (direct, through a bound at two instantiations, qualified); `native_differential`'s `a_static_call_on_a_nested_binder_reached_through_a_bound_is_grounded_on_both_backends`. Tracker B498.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
