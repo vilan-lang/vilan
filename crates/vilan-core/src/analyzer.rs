@@ -5292,6 +5292,12 @@ pub struct Analyzer<'src> {
     // `List<Password>` parameter fails the bound at `Password`, so the label
     // the bound check computes is the ELEMENT's and the label the refusal
     // reported is the collection's.
+    /// B490: the `[service]` attributes (source, span) whose expansion
+    /// carries an `[rpc]` method with a bare-trait return. The method-level
+    /// refusal is that report; what the generated code then fails ("'Source'
+    /// is a trait, not a type", an uninferrable `call<T: Wire>`) restates it at
+    /// the attribute, so those generated-code diagnostics stand down.
+    rpc_opaque_return_origins: HashSet<(SourceId, Span)>,
     rpc_refused_wire_types: HashSet<String>,
     /// B319's half of the set above: the KEY types a keyed-handle return
     /// refusal has already named, whose generated bound failures are `Wire`
@@ -7093,6 +7099,7 @@ impl<'src> Analyzer<'src> {
             expose_refused_elements: HashSet::default(),
             expose_refused_key_bounds: HashSet::default(),
             rpc_refused_wire_types: HashSet::default(),
+            rpc_opaque_return_origins: HashSet::default(),
             rpc_refused_key_types: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
@@ -19196,6 +19203,54 @@ impl<'src> Analyzer<'src> {
                 {
                     continue;
                 }
+                // B490 (opaque-returns.md Q9): a bare-trait return is the ONE
+                // type the body picks, hidden from callers — and what that
+                // means on the wire (the client holds a mirror, not the
+                // server's cell) is not designed. Refused at the method, in
+                // the attribute's vocabulary, with the concrete handle the body
+                // builds as the steer.
+                if label == "return type"
+                    && let Some((trait_id, arguments, _)) =
+                        self.opaque_returns.get(&method_id).cloned()
+                {
+                    let written = self
+                        .bound_trait_label(trait_id, &arguments)
+                        .unwrap_or_else(|| type_node.map(render_type).unwrap_or_default());
+                    let produced = self.inferred_return_type_of(method_id);
+                    let steer = match produced {
+                        Type::Any | Type::Unknown | Type::Unresolved | Type::Never => {
+                            "the concrete handle type the body builds".to_string()
+                        }
+                        _ => {
+                            // The generated client's `call<T: Wire>` fails at
+                            // this same type; this refusal is that report.
+                            let produced_id = produced.clone().get_type_id(self);
+                            self.record_refused_rpc_wire_type(produced_id);
+                            format!(
+                                "`{}`, the type the body builds",
+                                self.pretty_print_type(&produced, &HashMap::default())
+                            )
+                        }
+                    };
+                    if let Some(origin) = self.service_attribute_origin(method_id, subject_name) {
+                        self.rpc_opaque_return_origins.insert(origin);
+                    }
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!(
+                                "`[rpc]` method `{method_name}` returns `{written}`, a trait: a \
+                                 bare-trait return hides the body's type from the caller, and \
+                                 what crosses the wire for a hidden type is not designed — \
+                                 return {steer}"
+                            ),
+                        },
+                        method_id,
+                    );
+                    continue;
+                }
                 // A RETURN that is a signal HANDLE is not a Wire type and is
                 // not meant to be (`transport-rpc.md` §9.2): the source stays
                 // on the server, a `ChannelId` crosses in its place, and the
@@ -19762,6 +19817,29 @@ impl<'src> Analyzer<'src> {
     /// `List<T: Wire>`'s own `describe` fails at the element — two labels for
     /// one mistake. A Wire component is not recorded, so a `HashMap<str, Password>`
     /// contributes `HashMap<str, Password>` and `Password` and never `str`.
+    /// The origin a `[service]` expansion re-anchors at for `subject`: the
+    /// derived origin in the method's own file whose span covers the
+    /// subject's declaration (an attribute's expansion is anchored at the
+    /// item it decorates). B490.
+    fn service_attribute_origin(&self, method_id: Id, subject: &str) -> Option<(SourceId, Span)> {
+        let source = self.source_of_id(method_id)?;
+        let subject_span = self
+            .structs
+            .values()
+            .find(|struct_| {
+                struct_.name == subject && self.source_of_id(struct_.id) == Some(source)
+            })
+            .map(|struct_| struct_.name_span)?;
+        self.derived_origins
+            .iter()
+            .find(|(_, span, origin_source)| {
+                *origin_source == source
+                    && span.start <= subject_span.start
+                    && subject_span.end <= span.end
+            })
+            .map(|(_, span, _)| (source, *span))
+    }
+
     fn record_refused_rpc_wire_type(&mut self, type_id: TypeId) {
         if self.resolved_type_is_wire(type_id) {
             return;
@@ -47272,8 +47350,8 @@ impl<'src> Analyzer<'src> {
             "'{trait_name}' is a trait, not a type: a trait names a bound, and a value needs \
              a type. Write `fun f(x: {trait_name})` for a parameter, `dyn {trait_name}` for a \
              field or any other position that holds a value — the trait OBJECT, whose concrete \
-             type is erased — or a generic for a return, `<T: {trait_name}>` with 'T' written \
-             here."
+             type is erased — and `fun f(): {trait_name}` for a return, the ONE type its body \
+             picks."
         );
         // `Self` in scope, resolving to this very trait, means the annotation
         // sits inside the trait's own declaration. The lookup is by the type
@@ -72188,7 +72266,7 @@ fn analyze_over_world<'src>(
     // Resolve the diagnostic attribution marks before `diagnostics` moves into
     // the Program: a diagnostic's source is the last mark at or before its index
     // (default: the entry).
-    let diagnostic_sources: Vec<SourceId> = {
+    let mut diagnostic_sources: Vec<SourceId> = {
         let marks = &analyzer.diagnostic_source_marks;
         (0..analyzer.diagnostics.len())
             .map(|index| {
@@ -72201,6 +72279,29 @@ fn analyze_over_world<'src>(
             })
             .collect()
     };
+    // B490's stand-down, applied once every pass has spoken: a generated-code
+    // diagnostic re-anchored at a `[service]` attribute whose `[rpc]` method
+    // was refused for its bare-trait return restates that refusal.
+    if !analyzer.rpc_opaque_return_origins.is_empty() {
+        let origins = std::mem::take(&mut analyzer.rpc_opaque_return_origins);
+        let mut kept_sources = Vec::with_capacity(diagnostic_sources.len());
+        let mut kept = Vec::with_capacity(analyzer.diagnostics.len());
+        for (diagnostic, source) in std::mem::take(&mut analyzer.diagnostics)
+            .into_iter()
+            .zip(diagnostic_sources)
+        {
+            let restates = diagnostic
+                .msg
+                .starts_with("in code generated by this attribute:")
+                && origins.contains(&(source, diagnostic.span));
+            if !restates {
+                kept.push(diagnostic);
+                kept_sources.push(source);
+            }
+        }
+        analyzer.diagnostics = kept;
+        diagnostic_sources = kept_sources;
+    }
     // The library platform map for coloring: every layer root with its
     // patterns, and every base root (empty patterns) so user-code detection
     // knows library territory.

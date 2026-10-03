@@ -313,6 +313,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**An `[rpc]` method returning a bare trait is refused ONCE, at the method — "`[rpc]` method `doubled` returns `Source<i32>`, a trait: a bare-trait return hides the body's type from the caller, and what crosses the wire for a hidden type is not designed — return `MemoCell<i32>`, the type the body builds" — where it failed three times inside the `[service]` expansion, at the attribute, with nothing pointing at the method: a non-Wire `MemoCell<i32>`, an uninferrable `call<T: Wire>`, and B253's steer for `Source` "or a generic for a return, `<T: Source>`".** opaque-returns.md Q9: a client of such a method would hold a mirror, not the server's cell, and that wire meaning is not designed, so the refusal stands until it is. The generated client's failures restate it and stand down (the `[service]` origin is recorded, and its generated-code diagnostics are dropped once every pass has spoken). The "is a trait, not a type" steer itself loses its stale return clause: a function's return may name the trait (`fun f(): Source`, the ONE type the body picks), which B460 made legal. Pin: `inference::generics`' `b490_an_rpc_method_returning_a_bare_trait_is_refused_once_at_the_method` (exactly one diagnostic) — red on the 0.43.0 toolchain. Ledger: one `NEW` row. No golden moves. Tracker B490.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

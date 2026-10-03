@@ -2587,6 +2587,49 @@ fn rpc_rejects_a_non_wire_return() {
     );
 }
 
+/// B490 (opaque-returns.md Q9): an `[rpc]` method returning a bare trait is
+/// refused ONCE, at the method, with the concrete type the body builds as the
+/// steer. It used to fail inside the `[service]` expansion three times over —
+/// a non-Wire `MemoCell<i32>`, B253's stale "a generic for a return" steer
+/// for `Source`, and an uninferrable `call<T: Wire>` — at the attribute, with
+/// nothing pointing at the method.
+#[test]
+fn b490_an_rpc_method_returning_a_bare_trait_is_refused_once_at_the_method() {
+    let errors = compile(
+        r#"
+        import std::reactive::{ Source, SignalCell, Pipe, Flow };
+
+        [service(CounterClient)]
+        struct Counter {
+            count: SignalCell<i32>,
+        }
+
+        impl Counter {
+            [rpc]
+            fun doubled(self): Source<i32> {
+                self.count.derive(|x| x * 2).memo()
+            }
+        }
+
+        fun main() {
+            let c = Counter { count = SignalCell::new(2) };
+            print(c.doubled().get());
+        }
+        "#,
+    )
+    .expect_err("a bare-trait `[rpc]` return must be refused");
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one diagnostic, at the method; got: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("`[rpc]` method `doubled` returns `Source<i32>`, a trait")
+            && errors[0].contains("return `MemoCell<i32>`, the type the body builds"),
+        "got: {errors:#?}"
+    );
+}
+
 #[test]
 fn expose_accepts_a_signal_of_wire() {
     // An `[expose]`d field must be a `Signal` of a Wire element — a scalar and a
