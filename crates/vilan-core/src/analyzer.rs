@@ -54940,11 +54940,22 @@ impl<'src> Analyzer<'src> {
                 // which is what keeps the rest of the walk quiet; only the
                 // second telling is dropped.
                 if !self.entry_cycle_refusal_covers(self.source_of_id(id), name) {
+                    // B523: an unbound `return` is B520's foreign spelling in
+                    // the shapes the parser must leave a name (`return;`,
+                    // `return (x)`, `return -x`, a tail): the same message,
+                    // so the same code and quick fix (`foreign_spelling_fix`).
+                    let msg = if name == "return" {
+                        crate::parsing::ForeignSpelling::Return
+                            .message()
+                            .to_string()
+                    } else {
+                        format!("cannot find '{}' in this scope{}", name, steer)
+                    };
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!("cannot find '{}' in this scope{}", name, steer),
+                        msg,
                     });
                     if let Some(source) = self.source_of_id(id) {
                         self.attribute_new_diagnostics(diagnostics_before, source);

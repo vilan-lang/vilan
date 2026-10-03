@@ -107,7 +107,10 @@ Words other languages reserve for vilan's constructs — `return`, `fn`,
 `function`, `func`, `def` — are ordinary identifiers. Where one stands in
 the place of `ret` or `fun` (`return value;`, `fn name(`), or `->` in the
 place of a return type's `:`, the parser refuses it once with vilan's
-spelling and reads on as if that had been written (B520).
+spelling and reads on as if that had been written (B520). Where `return` can
+only be a name — `return;`, `return (x)`, `return -x`, a block's tail `{
+return }` — the same steer is given where the name fails to resolve, unless
+the program binds one (B523).
 
 ## 2.3 Literals
 
