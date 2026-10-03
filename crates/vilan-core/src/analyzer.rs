@@ -41853,6 +41853,20 @@ impl<'src> Analyzer<'src> {
                     }
                     None => None,
                 };
+                // B447: B389's rule one level in — a TUPLE literal element that
+                // holds an unsuffixed numeric literal (`[(0, 3), (7, 11)]`
+                // against `List<(usize, usize)>`) takes the expected tuple
+                // type, so its literals type as `usize` exactly as the
+                // annotated `let one: (usize, usize) = (0, 3)` does. Literal
+                // tuples only, and only a fully determined expectation: the
+                // note above stands for every other element.
+                let tuple_literal_element = seeded_element
+                    .as_ref()
+                    .filter(|expected| {
+                        matches!(expected, Type::Tuple(_))
+                            && self.type_is_fully_determined(expected)
+                    })
+                    .cloned();
                 let mut element_type = match seeded_element {
                     Some(expected @ Type::Dyn(..)) => expected,
                     _ => Type::Unknown,
@@ -41863,6 +41877,12 @@ impl<'src> Analyzer<'src> {
                             if self.is_unsuffixed_numeric(*item_id) =>
                         {
                             literal_element.clone()
+                        }
+                        (_, Type::Unknown)
+                            if tuple_literal_element.is_some()
+                                && self.tuple_literal_holds_unsuffixed_numeric(*item_id) =>
+                        {
+                            tuple_literal_element.clone().unwrap_or(Type::Unknown)
                         }
                         _ => element_type.clone(),
                     };
@@ -50595,6 +50615,18 @@ impl<'src> Analyzer<'src> {
             .iter()
             .find(|name| self.primitive_struct_ids.get(**name) == Some(struct_id))
             .copied()
+    }
+
+    /// Whether `expr_id` is a tuple literal holding an unsuffixed numeric
+    /// literal at any depth (`(0, 3)`, `((1, 2), "x")`) — B447's literal tuple.
+    fn tuple_literal_holds_unsuffixed_numeric(&self, expr_id: Id) -> bool {
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Tuple(element_ids)) => element_ids.iter().any(|element_id| {
+                self.is_unsuffixed_numeric(*element_id)
+                    || self.tuple_literal_holds_unsuffixed_numeric(*element_id)
+            }),
+            _ => false,
+        }
     }
 
     /// B389 — whether `expr_id` is built from UNSUFFIXED numeric literals

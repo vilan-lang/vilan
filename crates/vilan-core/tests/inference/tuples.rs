@@ -8218,3 +8218,42 @@ fn b441_a_tuple_pattern_of_the_values_shape_destructures_at_every_depth() {
         "1 2 3 4 5 6\n1 4 5\n1 3\n1 2 3\na 1 2\n42\n6\n15\n",
     );
 }
+
+/// B447: integer literals inside TUPLES inside a LIST literal type from the
+/// expected element type — `total([(0, 3), (7, 11)])` against `total(ranges:
+/// List<(usize, usize)>)` was refused "Expected List<(usize, usize)>, but got
+/// List<(i32, i32)>", while `let one: (usize, usize) = (0, 3)` typed. At an
+/// argument, at an annotated binding, nested a level deeper, beside a
+/// non-literal element, and with an explicit suffix that still wins.
+#[test]
+fn b447_integer_literals_in_tuples_in_a_list_take_the_expected_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        fun total(ranges: List<(usize, usize)>): usize {
+            mut sum = 0usize;
+            for range in ranges {
+                sum += range.1 - range.0;
+            }
+            sum
+        }
+        fun labelled(pairs: List<((u32, u32), str)>): u32 {
+            mut sum = 0u32;
+            for pair in pairs {
+                sum += pair.0.0 + pair.0.1;
+            }
+            sum
+        }
+        fun main() {
+            print(i"{total([(0, 3), (7, 11)])}");
+            let spans: List<(usize, usize)> = [(1, 2), (5, 9)];
+            print(i"{total(spans)}");
+            print(i"{labelled([((1, 2), "a"), ((3, 4), "b")])}");
+            let start: usize = 4;
+            print(i"{total([(start, 6), (0, 1)])}");
+            print(i"{total([(0usize, 2usize)])}");
+        }
+        "#,
+        "7\n5\n10\n3\n2\n",
+    );
+}
+

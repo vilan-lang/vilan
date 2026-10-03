@@ -328,6 +328,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**Integer literals inside TUPLES inside a LIST literal type from the expected element type: `total([(0, 3), (7, 11)])` against `total(ranges: List<(usize, usize)>)` compiles — where it was refused "Expected List<(usize, usize)>, but got List<(i32, i32)> instead", and `let spans: List<(usize, usize)> = [(1, 2)]` with it, while `let one: (usize, usize) = (0, 3)` typed.** B389 directs an unsuffixed literal ELEMENT by the list's expected element type; a tuple literal element holding one now takes the expected tuple type too, so its literals type as the tuple arm already types them. Literal tuples only, under a fully determined expectation (the list arm's note on not directing every element stands). Nested a level deeper (`List<((u32, u32), str)>`), beside a non-literal element (`(start, 6)`) and with an explicit suffix are pinned. Pin: `inference::tuples`' `b447_integer_literals_in_tuples_in_a_list_take_the_expected_element_type` — red on the 0.43.0 toolchain. Workaround retired: suffixing every literal. No golden moves. Tracker B447.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
