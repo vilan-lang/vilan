@@ -1032,6 +1032,14 @@ pub struct Document {
     /// leg sees it; the editor answers caret requests from `world_root`'s.
     /// Empty for every file one entry reaches, which is nearly all of them.
     further_worlds: Vec<PathBuf>,
+    /// M104's hybrid (the owner's ruling on editor-46's report): the entry
+    /// whose world this file belongs to while it is the ONLY open document of
+    /// that world — then it keeps its own cheap analysis for keystroke
+    /// diagnostics, as on v0.43.0, and a cross-file request (Find References,
+    /// rename) reads the entry's world, built on demand. `None` for a document
+    /// served from a world (`world_root` names it), for an entry, and for a
+    /// file no entry reaches.
+    lone_world: Option<PathBuf>,
     /// E247: what the status bar's menu reports about this analysis, captured
     /// when it was built so a released document (M63) still answers — the
     /// platform and why, and the analysis's size in COUNTS (the M106 ruling:
@@ -1829,6 +1837,7 @@ impl Document {
             focus: SourceId(0),
             world_root: None,
             further_worlds: Vec::new(),
+            lone_world: None,
             status: None,
         }
     }
@@ -2162,6 +2171,7 @@ impl Document {
             focus: SourceId(0),
             world_root: None,
             further_worlds: Vec::new(),
+            lone_world: None,
             status: None,
         };
         document.status = document.program.as_ref().map(AnalysisStatus::of);
@@ -2483,6 +2493,7 @@ impl Document {
             focus,
             world_root: Some(vilan_core::util::canonical_path(world_root)),
             further_worlds,
+            lone_world: None,
             status: world.status.clone(),
         };
         document.landed = document.capture_landed(path, Some(&world.landed.index.completion));
@@ -3069,8 +3080,10 @@ impl Document {
             focus,
             world_root,
             further_worlds,
+            lone_world,
             status,
         } = analysis;
+        self.lone_world = lone_world;
         self.status = status;
         self.focus = focus;
         self.world_root = world_root;
@@ -5512,6 +5525,18 @@ impl Document {
     /// under another platform (see the field).
     pub fn further_worlds(&self) -> &[PathBuf] {
         &self.further_worlds
+    }
+
+    /// M104's hybrid: the entry whose world this lone document belongs to
+    /// (see the field).
+    pub fn lone_world(&self) -> Option<&Path> {
+        self.lone_world.as_deref()
+    }
+
+    /// Record that this analysis is a lone document's own (M104's hybrid):
+    /// `entry` is the world it belongs to and is not served from.
+    pub fn set_lone_world(&mut self, entry: PathBuf) {
+        self.lone_world = Some(entry);
     }
 
     /// M104: whether this analysis loaded the file at `canonical` (a

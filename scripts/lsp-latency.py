@@ -117,6 +117,10 @@ SCENARIOS = [
         "text": " ",
         "hover": ("create_channel(name)", 3),
         "completion": ("get_client().get_safe()!.create_channel", len("get_client().")),
+        # M104's hybrid: model.vl open ALONE answers Find References from its
+        # entry's world, built on demand after an edit — `messages` is used in
+        # `channel.vl`, which is not open.
+        "references": ("fun messages(self)", 5),
     },
     {
         # The same edit with the files that import the model OPEN beside it,
@@ -537,6 +541,37 @@ def measure_edit(server, document, scenario, apply):
     }
 
 
+def measure_references(server, document, scenario):
+    """One Find References at the scenario's anchor, at rest: CPU of the whole
+    process (the request may build the entry's world), instructions, wall, and
+    how many locations in how many files it answered."""
+    at = anchor_offset(document.text, scenario["references"], scenario, "references")
+    cpu_before = cpu_ms(server.pid)
+    instructions_before = server.instructions.read()
+    result, wall = server.request(
+        "textDocument/references",
+        {
+            "textDocument": {"uri": document.uri},
+            "position": position(document.text, at),
+            "context": {"includeDeclaration": True},
+        },
+    )
+    server.settle()
+    instructions_after = server.instructions.read()
+    locations = result or []
+    return {
+        "cpu_ms": cpu_ms(server.pid) - cpu_before,
+        "wall_ms": wall * 1000,
+        "instructions": (
+            instructions_after - instructions_before
+            if instructions_before is not None and instructions_after is not None
+            else None
+        ),
+        "locations": len(locations),
+        "files": len({location["uri"] for location in locations}),
+    }
+
+
 def run_scenario(server, root, scenario, runs, callgrind=False):
     companions = [Document(server, root / relative) for relative in scenario.get("also_open", [])]
     for companion in companions:
@@ -576,6 +611,8 @@ def run_scenario(server, root, scenario, runs, callgrind=False):
             undo()
             server.wait_publish(document.uri, undone)
             server.settle()
+    if scenario.get("references"):
+        cold["references"] = [measure_references(server, document, scenario) for _ in range(2)]
     document.close()
     for samples in rows.values():
         for sample in samples:
@@ -664,6 +701,14 @@ def print_table(cold_rows, rows, header):
             f"| {samples[-1]['errors']} | {keystroke} | {settled} "
             f"| {max(s['memory']['VmHWM'] for s in samples) / 1024:.0f} |"
         )
+    for name, cold in cold_rows.items():
+        for label, sample in zip(("first", "warm"), cold.get("references", [])):
+            instructions = sample["instructions"]
+            print(
+                f"| {name}: Find References ({label}) | {sample['cpu_ms']:.0f} | | "
+                f"{'-' if instructions is None else f'{instructions / 1e9:.2f}'} | | {sample['wall_ms']:.0f} "
+                f"| {sample['locations']} locations in {sample['files']} files | | | |"
+            )
     for name, samples in rows.items():
         if any(s.get("companions") for s in samples):
             print(

@@ -198,15 +198,29 @@ async fn m104_a_keystroke_in_a_module_analyses_its_entrys_world_once() {
 }
 
 /// The entry need not be open for the count to hold: a keystroke in a module
-/// whose entry is CLOSED analyzes the entry's world once — the dependency
-/// sweep does not analyze the kept world a second time because it, too, read
-/// the edited module.
+/// whose entry is CLOSED (two of its modules open) analyzes the entry's world
+/// once — the dependency sweep does not analyze the kept world a second time
+/// because it, too, read the edited module.
 #[tokio::test]
 async fn m104_a_keystroke_in_a_module_whose_entry_is_closed_analyses_once() {
     let package = Package::new("closed-once");
     let (service, _socket) = backend();
     let server = service.inner();
-    open_all(server, &package, &[("model.vl", MODEL)]).await;
+    open_all(
+        server,
+        &package,
+        &[("views.vl", VIEWS), ("model.vl", MODEL)],
+    )
+    .await;
+    assert_eq!(
+        server
+            .documents
+            .get(&package.uri("model.vl"))
+            .expect("open")
+            .world_root(),
+        Some(package.canonical("client.vl").as_path()),
+        "two open documents of the world: the world serves them",
+    );
     let before = server.analyses.counts().started;
     edit(
         server,
@@ -269,7 +283,12 @@ async fn m104_a_module_shows_its_diagnostics_as_its_entry_sees_them() {
     let package = Package::new("attribution");
     let (service, _socket) = backend();
     let server = service.inner();
-    open_all(server, &package, &[("model.vl", MODEL)]).await;
+    open_all(
+        server,
+        &package,
+        &[("views.vl", VIEWS), ("model.vl", MODEL)],
+    )
+    .await;
     let broken = MODEL.replace(
         "let doubled = model.count * 2;",
         "let doubled: i32 = \"text\";",
@@ -294,7 +313,7 @@ async fn m104_a_module_shows_its_diagnostics_as_its_entry_sees_them() {
             &package.uri("model.vl"),
         ))
         .is_empty(),
-        "the client entry's analysis owns it — the entry is not even open",
+        "the client entry's analysis owns it — the entry is not even open, two of its modules are",
     );
 }
 
@@ -451,8 +470,8 @@ async fn m104_a_module_no_entry_reaches_keeps_its_own_analysis() {
     assert!(document.holds_program());
 }
 
-/// The entry need not be open: a module alone is served from its entry's
-/// world, and closing the module retires that world — nothing it published
+/// A world lives while two of its documents are open; the survivor of a close
+/// goes back to its own analysis (M104's hybrid), and nothing either published
 /// stays behind.
 #[tokio::test]
 async fn m104_a_world_lives_while_a_document_it_serves_is_open() {
@@ -472,8 +491,9 @@ async fn m104_a_world_lives_while_a_document_it_serves_is_open() {
     edit(server, &package.uri("model.vl"), 2, &broken).await;
     at_rest(server).await;
 
-    // The entry closes; the module it serves is still open, so its world
-    // goes on — the module's error stays, and a fix still lands.
+    // The entry closes and the module is left ALONE (M104's hybrid): it goes
+    // back to its own analysis, the world it no longer reads retires, and
+    // its error is still shown — now its own analysis's — then a fix lands.
     server
         .did_close(DidCloseTextDocumentParams {
             text_document: TextDocumentIdentifier {
@@ -481,9 +501,25 @@ async fn m104_a_world_lives_while_a_document_it_serves_is_open() {
             },
         })
         .await;
+    at_rest(server).await;
+    let lone = |server: &Backend| {
+        let document = server
+            .documents
+            .get(&package.uri("model.vl"))
+            .expect("open");
+        (
+            document.world_root().map(Path::to_path_buf),
+            document.lone_world().map(Path::to_path_buf),
+        )
+    };
+    assert_eq!(lone(server), (None, Some(package.canonical("client.vl"))));
+    assert!(
+        server.worlds.is_empty(),
+        "the world it stopped reading retired"
+    );
     assert!(
         !errors(&shown(server, &package.uri("model.vl"))).is_empty(),
-        "closing the entry does not take its world's diagnostics off the module",
+        "the module's error stays on it, from its own analysis",
     );
     edit(server, &package.uri("model.vl"), 3, MODEL).await;
     at_rest(server).await;
@@ -491,16 +527,8 @@ async fn m104_a_world_lives_while_a_document_it_serves_is_open() {
         errors(&shown(server, &package.uri("model.vl"))),
         Vec::<String>::new()
     );
-    assert_eq!(
-        server
-            .documents
-            .get(&package.uri("model.vl"))
-            .expect("open")
-            .world_root(),
-        Some(package.canonical("client.vl").as_path()),
-    );
 
-    // The last document the world serves closes: the world is retired.
+    // The last document closes: nothing it published stays behind.
     server
         .did_close(DidCloseTextDocumentParams {
             text_document: TextDocumentIdentifier {
@@ -509,13 +537,17 @@ async fn m104_a_world_lives_while_a_document_it_serves_is_open() {
         })
         .await;
     assert!(server.worlds.is_empty(), "no world outlives its documents");
+    assert!(
+        errors(&shown(server, &package.uri("model.vl"))).is_empty(),
+        "nothing published stays behind"
+    );
 }
 
 /// E113 survives the move: a module BOTH platforms compile is served from the
 /// browser entry's world and reported by the node entry's too — here the
 /// browser `View`'s `element` field, clean under the browser leg and "no
-/// field" under the node leg. With only the module open, neither entry is,
-/// and the node leg's error still reaches it.
+/// field" under the node leg. Alone, the module's own analysis carries both
+/// legs; beside its browser entry, the node entry's kept world does.
 #[tokio::test]
 async fn m104_a_module_both_entries_reach_reports_both_legs() {
     const WIDGET: &str = "import std::ui::{ View, view };\n\n\
@@ -532,7 +564,15 @@ async fn m104_a_module_both_entries_reach_reports_both_legs() {
     }
     let (service, _socket) = backend();
     let server = service.inner();
+    // Alone, the module keeps its own analysis — and E113's node leg with it.
     open_all(server, &package, &[("widget.vl", WIDGET)]).await;
+    let alone = errors(&shown(server, &package.uri("widget.vl")));
+    assert!(
+        alone.iter().any(|message| message.contains("element")),
+        "a lone module's own analysis reports the node leg: {alone:?}",
+    );
+    // With the browser entry open beside it, the entry's world serves it.
+    open_all(server, &package, &[("client.vl", REACHES)]).await;
     let document = server
         .documents
         .get(&package.uri("widget.vl"))
@@ -624,4 +664,228 @@ async fn answer(server: &Backend, uri: &Url) -> Option<serde_json::Value> {
         .analysis_platform(TextDocumentIdentifier { uri: uri.clone() })
         .await
         .expect("the request answers")
+}
+
+// --- M104's hybrid (the owner's ruling on editor-46's report) ----------------
+
+fn reference_params(uri: &Url, position: Position) -> ReferenceParams {
+    ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+        context: ReferenceContext {
+            include_declaration: true,
+        },
+    }
+}
+
+fn position_of(text: &str, needle: &str, delta: usize) -> Position {
+    let offset = text.find(needle).expect("the fixture") + delta;
+    let line = text[..offset].matches('\n').count() as u32;
+    let line_start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
+    Position {
+        line,
+        character: (offset - line_start) as u32,
+    }
+}
+
+/// The files Find References answers in, by name.
+async fn referencing_files(server: &Backend, uri: &Url, position: Position) -> Vec<String> {
+    let mut files: Vec<String> = server
+        .references(reference_params(uri, position))
+        .await
+        .expect("the request answers")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|location| location.uri.path().rsplit('/').next().map(str::to_string))
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// A file open ALONE keeps its own cheap analysis for its keystrokes, as on
+/// v0.43.0 — one analysis, of the module's own world, which does not load the
+/// entry — and remembers the world it belongs to.
+#[tokio::test]
+async fn m104_a_lone_module_keeps_its_own_cheap_analysis() {
+    let package = Package::new("lone");
+    let (service, _socket) = backend();
+    let server = service.inner();
+    open_all(server, &package, &[("model.vl", MODEL)]).await;
+    let before = server.analyses.counts().started;
+    edit(
+        server,
+        &package.uri("model.vl"),
+        2,
+        &MODEL.replace("model.count * 2", "model.count * 3"),
+    )
+    .await;
+    at_rest(server).await;
+    assert_eq!(server.analyses.counts().started - before, 1);
+    let document = server
+        .documents
+        .get(&package.uri("model.vl"))
+        .expect("open");
+    assert_eq!(document.world_root(), None, "not served from the world");
+    assert_eq!(
+        document.lone_world(),
+        Some(package.canonical("client.vl").as_path())
+    );
+    assert!(
+        !document.loads(&package.canonical("client.vl")),
+        "its own analysis: the entry's world is not paid for a keystroke"
+    );
+    assert!(server.worlds.is_empty());
+}
+
+/// THE CONDITION: Find References on a lone module's exported name returns
+/// its uses in files that are NOT open — the entry's whole world, built on
+/// demand — before an edit and after it. Rename answers the same set.
+#[tokio::test]
+async fn m104_find_references_on_a_lone_module_reaches_files_that_are_not_open() {
+    let package = Package::new("lone-references");
+    let (service, _socket) = backend();
+    let server = service.inner();
+    open_all(server, &package, &[("model.vl", MODEL)]).await;
+    let uri = package.uri("model.vl");
+    let at = position_of(MODEL, "fun total", 5);
+    let everywhere = vec![
+        "channel.vl".to_string(),
+        "client.vl".to_string(),
+        "model.vl".to_string(),
+        "views.vl".to_string(),
+    ];
+    assert_eq!(referencing_files(server, &uri, at).await, everywhere);
+    assert_eq!(
+        server.reference_worlds.len(),
+        1,
+        "the world built on demand is kept"
+    );
+    let started = server.analyses.counts().started;
+    assert_eq!(
+        referencing_files(server, &uri, at).await,
+        everywhere,
+        "and answered from again"
+    );
+    assert_eq!(
+        server.analyses.counts().started,
+        started,
+        "a second request builds nothing (the world is not a scheduled analysis either way)"
+    );
+
+    // An edit stales the world; the next request rebuilds it.
+    let edited = MODEL.replace("model.count * 2", "model.count * 5");
+    edit(server, &uri, 2, &edited).await;
+    at_rest(server).await;
+    assert!(
+        server.reference_worlds.is_empty(),
+        "an edit drops the stale world"
+    );
+    assert_eq!(
+        referencing_files(server, &uri, position_of(&edited, "fun total", 5)).await,
+        everywhere,
+        "after the edit, every use again"
+    );
+
+    let renamed = server
+        .rename(RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: position_of(&edited, "fun total", 5),
+            },
+            new_name: "sum".to_string(),
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("the rename answers")
+        .expect("edits");
+    let mut files: Vec<String> = renamed
+        .changes
+        .expect("changes")
+        .keys()
+        .filter_map(|uri| uri.path().rsplit('/').next().map(str::to_string))
+        .collect();
+    files.sort();
+    assert_eq!(files, everywhere, "rename rewrites every use too");
+}
+
+/// The switch, both ways, with no stale diagnostics: a lone module's own
+/// analysis owns its error; a second document of the world opening hands it
+/// to the world (and the module's own group carries none); the second
+/// closing hands it back, and the world retires.
+#[tokio::test]
+async fn m104_the_switch_both_ways_leaves_no_stale_diagnostics() {
+    let package = Package::new("switch");
+    let (service, _socket) = backend();
+    let server = service.inner();
+    let broken = MODEL.replace(
+        "let doubled = model.count * 2;",
+        "let doubled: i32 = \"text\";",
+    );
+    let model = package.uri("model.vl");
+    let client_owner = Url::from_file_path(package.canonical("client.vl")).expect("a file url");
+    open_all(server, &package, &[("model.vl", &broken)]).await;
+    let owned = |server: &Backend, owner: &Url| {
+        errors(
+            &server
+                .publish_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .owned_by(owner, &model),
+        )
+    };
+    assert!(
+        !owned(server, &model).is_empty(),
+        "lone: its own analysis owns the error"
+    );
+    assert!(owned(server, &client_owner).is_empty());
+
+    open_all(server, &package, &[("views.vl", VIEWS)]).await;
+    assert!(
+        owned(server, &model).is_empty(),
+        "served: the module's own group is paint only"
+    );
+    assert!(
+        !owned(server, &client_owner).is_empty(),
+        "the world owns it now"
+    );
+    assert_eq!(errors(&shown(server, &model)).len(), 1, "shown once");
+
+    edit(server, &model, 2, MODEL).await;
+    at_rest(server).await;
+    for name in ["model.vl", "views.vl"] {
+        assert_eq!(
+            errors(&shown(server, &package.uri(name))),
+            Vec::<String>::new(),
+            "{name}"
+        );
+    }
+
+    edit(server, &model, 3, &broken).await;
+    at_rest(server).await;
+    server
+        .did_close(DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier {
+                uri: package.uri("views.vl"),
+            },
+        })
+        .await;
+    at_rest(server).await;
+    assert!(server.worlds.is_empty(), "the world retires");
+    assert!(
+        owned(server, &client_owner).is_empty(),
+        "nothing of the world stays on the module"
+    );
+    assert!(
+        !owned(server, &model).is_empty(),
+        "lone again: its own analysis owns the error"
+    );
+    assert_eq!(errors(&shown(server, &model)).len(), 1, "shown once");
+    edit(server, &model, 4, MODEL).await;
+    at_rest(server).await;
+    assert_eq!(errors(&shown(server, &model)), Vec::<String>::new());
 }

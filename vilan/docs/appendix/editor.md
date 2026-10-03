@@ -145,10 +145,14 @@ the workspace setting where one is set and the user setting otherwise; and
 restart, stop or start, the status page and the output channel. A stopped
 server reads `vilan (stopped)`.
 
-**A file is analyzed as its entry sees it.** A module one of your
-package's entries reaches is analyzed in that entry's world: the editor
-analyzes the entry — `client.vl`, say — once per edit, and every open file
-it reaches is answered from that one analysis. Edit `model.vl` with
+**A file is analyzed as its entry sees it, once two of them are open.** A
+file open on its own keeps its own quick analysis for its squiggles; as soon
+as a second file of the same entry's world is open, the editor analyzes the
+entry — `client.vl`, say — once per edit, and every open file it reaches is
+answered from that one analysis. Find References and rename always answer
+from the entry's whole world, every file it reaches open or not: for a file
+open on its own, the first such request after an edit analyzes the entry,
+and the next one reuses it. Edit `model.vl` with
 `client.vl`, `views.vl` and `channel.vl` open and the four are re-analyzed
 together, not one after another; open a fifth file of the same world and
 it is answered at once, from the analysis already in hand. A module's

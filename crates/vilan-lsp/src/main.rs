@@ -671,6 +671,13 @@ struct Backend {
     /// their diagnostics can be republished and, at the last close, retired.
     /// An open entry's world is its own document.
     worlds: Arc<DashMap<PathBuf, WorldEntry>>,
+    /// M104's hybrid: the entry worlds a LONE document's cross-file requests
+    /// read, keyed by the entry's canonical path — built on demand by the first
+    /// Find References or rename (`Backend::reference_world`), kept until an
+    /// edit stales them (`did_change` drops them), and evicted once no lone
+    /// document belongs to them. Never published: the lone document's own
+    /// analysis owns its diagnostics.
+    reference_worlds: Arc<DashMap<PathBuf, ReferenceWorld>>,
     /// M63: the documents the editor has most recently worked IN, newest
     /// first, at most [`RETAINED_PROGRAMS`] of them — and therefore the
     /// documents that keep their `Program`. Every other open document holds
@@ -1645,6 +1652,9 @@ struct AnalysisContext {
     entry_legs: Arc<DashMap<PathBuf, LandedEntryLeg>>,
     /// M104: [`Backend`]'s kept worlds.
     worlds: Arc<DashMap<PathBuf, WorldEntry>>,
+    /// M104's hybrid: [`Backend`]'s reference worlds, evicted where a
+    /// document stops being lone.
+    reference_worlds: Arc<DashMap<PathBuf, ReferenceWorld>>,
     /// M63's retained set, so the seam where an analysis LANDS can apply the
     /// retention rule: the dependency sweep re-analyzes background documents,
     /// and a program that lands on one of them has to go straight back.
@@ -2058,11 +2068,60 @@ fn analyze_world(
     cancel: &CancelToken,
 ) -> Option<WorldAnalysis> {
     let trigger_text = trigger_text.or_else(|| world::current_text(trigger_path))?;
+    let trigger_canonical = vilan_core::util::canonical_path(trigger_path);
     let resolver = world::RootResolver::for_file(trigger_path);
     let roots = resolver
         .as_ref()
         .map(|resolver| resolver.roots(trigger_path, &trigger_text))
         .unwrap_or_default();
+    // Every open document with the world it belongs to, read once: the reach
+    // walks are memoized on the resolver, so a pass over the whole package is
+    // one walk per entry.
+    let open_worlds: Vec<OpenMember> = resolver
+        .as_ref()
+        .map(|resolver| {
+            open.iter()
+                .filter_map(|(uri, path)| {
+                    let text = world::current_text(path)?;
+                    let roots = resolver.roots(path, &text);
+                    Some(OpenMember {
+                        uri: uri.clone(),
+                        path: path.clone(),
+                        canonical: vilan_core::util::canonical_path(path),
+                        text,
+                        roots,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // The open documents a world `entry` would serve: the entry itself and
+    // every file whose primary world it is.
+    let members = |entry: &Path| -> usize {
+        open_worlds
+            .iter()
+            .filter(|member| {
+                member.canonical == entry || member.roots.primary.as_deref() == Some(entry)
+            })
+            .count()
+    };
+    // M104's hybrid (the owner's ruling): a file that is the ONLY open
+    // document of its entry's world keeps its own analysis, as on v0.43.0 —
+    // the cheap one, for keystroke diagnostics — and remembers the world it
+    // belongs to, which cross-file requests read (`Backend::reference_world`).
+    // A second open document of the world is what makes the world serve them.
+    if let Some(entry) = roots.primary.as_ref()
+        && members(entry) < 2
+    {
+        let mut own = Document::analyze_cancellable(&trigger_text, std_dir, trigger_path, cancel)?;
+        own.set_lone_world(entry.clone());
+        return (!cancel.is_cancelled()).then_some(WorldAnalysis {
+            root_path: trigger_canonical,
+            root: own,
+            views: Vec::new(),
+            entry_leg: None,
+        });
+    }
     let (root_path, root_text) = match roots
         .primary
         .as_ref()
@@ -2082,31 +2141,36 @@ fn analyze_world(
             program: root.program.share(),
             clean: root.diagnostics.is_empty(),
         });
+    // A world serves views only while it has two open documents or more: a
+    // lone module of a world analyzed for another reason (a kept further
+    // world, the sweep over a closed entry) keeps its own analysis.
+    let serves = members(&root_path) >= 2;
     // The views, on an analysis-sized stack: each captures its keystroke
     // answers, which parses the module's text, and a parse recurses with the
     // nesting it reads.
     let views = document::on_analysis_stack(|| {
         let mut views = Vec::new();
-        let Some(resolver) = resolver.as_ref() else {
+        if !serves {
             return views;
-        };
-        for (uri, path) in open {
+        }
+        for member in &open_worlds {
             if cancel.is_cancelled() {
                 break;
             }
-            let canonical = vilan_core::util::canonical_path(path);
-            if canonical == root_path || !root.loads(&canonical) {
+            if member.canonical == root_path
+                || member.roots.primary.as_deref() != Some(root_path.as_path())
+                || !root.loads(&member.canonical)
+            {
                 continue;
             }
-            let Some(text) = world::current_text(path) else {
-                continue;
-            };
-            let roots = resolver.roots(path, &text);
-            if roots.primary.as_deref() != Some(root_path.as_path()) {
-                continue;
-            }
-            if let Some(view) = Document::view_of(&root, &root_path, path, &text, roots.further) {
-                views.push((uri.clone(), view));
+            if let Some(view) = Document::view_of(
+                &root,
+                &root_path,
+                &member.path,
+                &member.text,
+                member.roots.further.clone(),
+            ) {
+                views.push((member.uri.clone(), view));
             }
         }
         views
@@ -2117,6 +2181,16 @@ fn analyze_world(
         views,
         entry_leg,
     })
+}
+
+/// One open document as [`analyze_world`] reads it: where it is, what its
+/// buffer says, and which worlds it belongs to.
+struct OpenMember {
+    uri: Url,
+    path: PathBuf,
+    canonical: PathBuf,
+    text: String,
+    roots: world::WorldRoots,
 }
 
 /// The URI a world's diagnostics are published under: the entry's own open
@@ -2380,6 +2454,8 @@ async fn land_world(
     }
     // A document that moved INTO this world may have left another behind.
     retire_dead_worlds(context).await;
+    // And a document that is no longer lone needs no reference world.
+    evict_reference_worlds(&context.documents, &context.reference_worlds);
     // M63, and the seam that makes the policy hold: this analysis has been
     // adopted and published, so its editor tables are current — and if a
     // document it landed on is not one of the focused few, the program it
@@ -2478,6 +2554,48 @@ async fn serve_from_held_world(context: &AnalysisContext, uri: &Url, text: &str)
         memory::trim_if_released(before_release);
     }
     true
+}
+
+/// M104's hybrid: one entry's world as a lone document's cross-file requests
+/// read it, with the world revision it was analyzed at — current while no
+/// notification has moved the world since.
+struct ReferenceWorld {
+    revision: u64,
+    document: Document,
+}
+
+/// Drop every reference world no lone document belongs to any more, off the
+/// runtime (a world's program is a large reclaim).
+fn evict_reference_worlds(
+    documents: &DashMap<Url, Document>,
+    reference_worlds: &DashMap<PathBuf, ReferenceWorld>,
+) {
+    let wanted: std::collections::HashSet<PathBuf> = documents
+        .iter()
+        .filter_map(|document| document.lone_world().map(Path::to_path_buf))
+        .collect();
+    let gone: Vec<ReferenceWorld> = reference_worlds
+        .iter()
+        .map(|world| world.key().clone())
+        .filter(|entry| !wanted.contains(entry))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|entry| reference_worlds.remove(&entry).map(|(_, world)| world))
+        .collect();
+    drop_off_runtime(gone);
+}
+
+/// Drop `value` on a blocking thread when a runtime is running, here
+/// otherwise.
+fn drop_off_runtime<T: Send + 'static>(value: Vec<T>) {
+    if value.is_empty() {
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::spawn_blocking(move || drop(value));
+    } else {
+        drop(value);
+    }
 }
 
 /// M104: an analysis of an entry the editor does not have open, kept so the
@@ -3302,6 +3420,60 @@ impl Backend {
         });
     }
 
+    /// M104's hybrid, its CONDITION: a lone document's cross-file answer —
+    /// Find References, rename — must hold every use across its entry, files
+    /// that are not open included, never only what its own analysis loaded.
+    /// So it reads the entry's world: the one in hand when it is current
+    /// (no notification has moved the world since it was analyzed), else one
+    /// analyzed now, off the runtime, and kept for the next request until an
+    /// edit stales it. Answers the entry's key into
+    /// [`Backend::reference_worlds`], or `None` for a document that is not
+    /// lone (a world serves it, or it is its own world) — its own program
+    /// already holds the entry's every use, or there is no entry to ask.
+    ///
+    /// A world the editor moved under while it was analyzed is not kept and
+    /// not used: it is analyzed again, a bounded number of times.
+    async fn reference_world(&self, uri: &Url) -> Option<PathBuf> {
+        let entry = self
+            .documents
+            .get(uri)
+            .and_then(|document| document.lone_world().map(Path::to_path_buf))?;
+        for _ in 0..3 {
+            let started = self.revision.load(Ordering::SeqCst);
+            if self
+                .reference_worlds
+                .get(&entry)
+                .is_some_and(|world| world.revision == started)
+            {
+                return Some(entry);
+            }
+            let path = entry.clone();
+            let document = tokio::task::spawn_blocking(move || {
+                let text = world::current_text(&path)?;
+                let std_dir = discover_std_dir(&path);
+                Document::analyze_cancellable(&text, &std_dir, &path, &CancelToken::new())
+            })
+            .await
+            .ok()
+            .flatten()?;
+            if self.revision.load(Ordering::SeqCst) != started {
+                drop_off_runtime(vec![document]);
+                continue;
+            }
+            if let Some(stale) = self.reference_worlds.insert(
+                entry.clone(),
+                ReferenceWorld {
+                    revision: started,
+                    document,
+                },
+            ) {
+                drop_off_runtime(vec![stale]);
+            }
+            return Some(entry);
+        }
+        None
+    }
+
     /// The shared state one scheduled analysis needs, cloned out of `self` so a
     /// spawned task owns it.
     fn analysis_context(&self) -> AnalysisContext {
@@ -3318,6 +3490,7 @@ impl Backend {
             union_tokens: Arc::clone(&self.union_tokens),
             entry_legs: Arc::clone(&self.entry_legs),
             worlds: Arc::clone(&self.worlds),
+            reference_worlds: Arc::clone(&self.reference_worlds),
             focus: Arc::clone(&self.focus),
         }
     }
@@ -4319,6 +4492,18 @@ impl LanguageServer for Backend {
             // debounce, before any analysis — the withdrawal is the half of the
             // staleness rule that must not wait for anything.
             self.withdraw_package_grays_for(&uri);
+            // M104's hybrid: an edit stales every reference world (a lone
+            // document's cross-file answers are rebuilt on the next request),
+            // and a stale world is only memory.
+            let stale: Vec<ReferenceWorld> = self
+                .reference_worlds
+                .iter()
+                .map(|world| world.key().clone())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|entry| self.reference_worlds.remove(&entry).map(|(_, world)| world))
+                .collect();
+            drop_off_runtime(stale);
             self.on_change(uri.clone(), text);
             follows_diagnostics.then_some(uri)
         });
@@ -4473,6 +4658,15 @@ impl LanguageServer for Backend {
         // Dropping the overlay changes what every other analysis reads (E117).
         self.revision.fetch_add(1, Ordering::SeqCst);
         let closed = self.documents.remove(&uri).map(|(_, document)| document);
+        // M104's hybrid: the world this document belonged to — the one it was
+        // served from, or its own when it was that world's entry.
+        let closed_world: Option<PathBuf> = closed.as_ref().and_then(|document| {
+            document.world_root().map(Path::to_path_buf).or_else(|| {
+                uri.to_file_path()
+                    .ok()
+                    .map(vilan_core::util::canonical_path)
+            })
+        });
         self.semantic_token_cache.remove(&uri);
         // E197: and the formatting-decline record, so re-opening the file hears
         // its decline once more rather than inheriting a silence from a session
@@ -4561,8 +4755,35 @@ impl LanguageServer for Backend {
             self.client.publish_diagnostics(uri, Vec::new(), None).await;
         }
         drop(_sending);
+        // M104's hybrid: a world left with ONE open document no longer serves
+        // it — that document goes back to its own analysis (the world it then
+        // stops reading retires when that analysis lands).
+        if let Some(world) = closed_world {
+            let left: Vec<Url> = self
+                .documents
+                .iter()
+                .filter(|document| document.world_root() == Some(world.as_path()))
+                .map(|document| document.key().clone())
+                .collect();
+            let entry_open = open_document_uri(&self.documents, &world).is_some();
+            if left.len() + usize::from(entry_open) < 2 {
+                let context = self.analysis_context();
+                for lone in left {
+                    let generation = self.schedule.supersede(&lone);
+                    let text = key_text(&self.documents, &lone);
+                    let context = context.clone();
+                    tokio::spawn(async move {
+                        let landed = analyze_and_publish(&context, lone, text, generation)
+                            .await
+                            .landed();
+                        send_refreshes(&context.client, refresh_plan(landed)).await;
+                    });
+                }
+            }
+        }
         // M104: and a world no open document is served from any more retires.
         retire_dead_worlds(&self.analysis_context()).await;
+        evict_reference_worlds(&self.documents, &self.reference_worlds);
         // M64: the close above dropped this document's whole analysis — its
         // program, its entry text and tree, its editor tables — and glibc does
         // not hand that back to the OS on its own: closing kolt's eighteen
@@ -4964,6 +5185,10 @@ impl LanguageServer for Backend {
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        // M104's hybrid: a lone document reads its entry's world too.
+        let world = self
+            .reference_world(&params.text_document_position.text_document.uri)
+            .await;
         self.fenced("references", Ok(None), || {
             let uri = params.text_document_position.text_document.uri;
             let position = params.text_document_position.position;
@@ -4980,10 +5205,14 @@ impl LanguageServer for Backend {
                 return Ok(None);
             };
             let offset = origin.value().analyzed_offset(position);
+            let entry_world = world
+                .as_ref()
+                .and_then(|entry| self.reference_worlds.get(entry));
             let neighbors = open
                 .iter()
                 .filter(|entry| *entry.key() != uri)
-                .map(|entry| entry.value());
+                .map(|entry| entry.value())
+                .chain(entry_world.as_ref().map(|world| &world.document));
             let locations = origin
                 .value()
                 .references_across(offset, neighbors)
@@ -4995,6 +5224,10 @@ impl LanguageServer for Backend {
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        // M104's hybrid: a lone document renames across its entry's world.
+        let world = self
+            .reference_world(&params.text_document_position.text_document.uri)
+            .await;
         self.fenced("rename", Err(handler_panicked()), || {
             let uri = params.text_document_position.text_document.uri;
             let position = params.text_document_position.position;
@@ -5022,10 +5255,14 @@ impl LanguageServer for Backend {
             // find-references answers with, checked for the extra things a rename
             // needs (a spellable name, files this project may edit, nothing known
             // to be missing) and refused with a reason when any fails.
+            let entry_world = world
+                .as_ref()
+                .and_then(|entry| self.reference_worlds.get(entry));
             let neighbors = open
                 .iter()
                 .filter(|entry| *entry.key() != uri)
-                .map(|entry| entry.value());
+                .map(|entry| entry.value())
+                .chain(entry_world.as_ref().map(|world| &world.document));
             let edits = match document.rename_edits_across(offset, &new_name, neighbors) {
                 Ok(edits) => edits,
                 Err(crate::document::RenameRefusal::NotAnIdentifier) => return Ok(None),
@@ -5067,6 +5304,7 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
+        let world = self.reference_world(&params.text_document.uri).await;
         self.fenced("prepare_rename", Ok(None), || {
             let uri = params.text_document.uri;
             // M63: a caret request, and one the program answers — focus it.
@@ -5084,10 +5322,14 @@ impl LanguageServer for Backend {
             // is whether a rename COULD proceed, decided by exactly the checks
             // the rename itself will run — neighbors included — so the two
             // cannot disagree.
+            let entry_world = world
+                .as_ref()
+                .and_then(|entry| self.reference_worlds.get(entry));
             let neighbors = open
                 .iter()
                 .filter(|entry| *entry.key() != uri)
-                .map(|entry| entry.value());
+                .map(|entry| entry.value())
+                .chain(entry_world.as_ref().map(|world| &world.document));
             match document.rename_edits_across(offset, "placeholder", neighbors) {
                 Ok(_) => {}
                 Err(crate::document::RenameRefusal::NotAnIdentifier) => return Ok(None),
@@ -5582,6 +5824,7 @@ mod snapshot_consistency_tests {
             union_tokens: Arc::new(DashMap::new()),
             entry_legs: Arc::new(DashMap::new()),
             worlds: Arc::new(DashMap::new()),
+            reference_worlds: Arc::new(DashMap::new()),
             focus: Arc::new(std::sync::Mutex::new(Vec::new())),
             formatting_declines: Arc::new(DashMap::new()),
         })
@@ -7429,6 +7672,7 @@ async fn main() {
         union_tokens: Arc::new(DashMap::new()),
         entry_legs: Arc::new(DashMap::new()),
         worlds: Arc::new(DashMap::new()),
+        reference_worlds: Arc::new(DashMap::new()),
         focus: Arc::new(std::sync::Mutex::new(Vec::new())),
         formatting_declines: Arc::new(DashMap::new()),
     })

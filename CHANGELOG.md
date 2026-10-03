@@ -193,6 +193,11 @@ written down.
 <!-- family: tooling -->
 **A foreign spelling carries its quick fix: `return` → `ret`, `fn`/`function`/`func`/`def` → `fun`, a `->` return type → `:`, and a closure type's `->` removed — and the diagnostic is published with its stable code (`foreign-spelling/return`, `…/fn`, `…/arrow`, `…/type-arrow`, …).** B520's editor half, over syntax-46's diagnostics and fix data (`vilan_core::parsing::{ForeignSpelling, foreign_spelling_fix}`): the diagnostic is recognized by its exact message, the one field a diagnostic carries through the pipeline, and the code is published as the LSP `Diagnostic.code`. A module served from its entry's world (M104) offers the same fix. Pins: `foreign_spelling_tests` (each spelling fixed to a program that checks clean, the published code, the module in a world). Tracker B520.
 
+---
+
+<!-- family: performance -->
+**M104 is a HYBRID (the owner's ruling on the entry-world report): a file open ALONE keeps its own analysis for its keystrokes, as on v0.43.0 (kolt's `model.vl` back to its own-world cost), and the entry's world serves every open document of it once a SECOND one is open (one analysis for `model.vl` and its importers, as built). Find References and rename on a lone file still answer from the entry's whole world — every use, in files that are not open — built on the first such request after an edit and kept until the next edit stales it.** The condition the owner set: a lone file's Find References used to miss uses in files nobody had open, and whole-entry analysis is what fixed it; it does not come back. The switch is clean both ways: a second document of the world opening hands a lone file's diagnostics to the world (its own group keeps only its paint), and the second closing hands them back and retires the world. `scripts/lsp-latency.py` measures the first and the warm Find References on the lone `model.vl`. Pins: `entry_world_tests::m104_a_lone_module_keeps_its_own_cheap_analysis`, `m104_find_references_on_a_lone_module_reaches_files_that_are_not_open` (before and after an edit, and rename; red without the entry world — `["model.vl"]` alone), `m104_the_switch_both_ways_leaves_no_stale_diagnostics`; the entry-world pins moved to two open documents where they meant world mode. Docs: the editor appendix. Tracker M104.
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
