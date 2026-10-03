@@ -976,6 +976,8 @@ fun check<T: PartialEq>(x: T, y: T) { if x == y { … } }  // the test produces 
 "p=" + point.to_string()     // the fix the error names
 count + "n="                 // error: only a `str` LEFT operand concatenates
 1.5 + count                  // error: f64 and i32; no implicit conversions
+count * true                 // error: `*` computes on two numbers, and `bool` is not one
+count * "2"                  // error: the same, for `str`
 ```
 
 ```vilan,fragment

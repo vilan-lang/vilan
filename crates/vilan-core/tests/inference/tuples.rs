@@ -8218,3 +8218,103 @@ fn b441_a_tuple_pattern_of_the_values_shape_destructures_at_every_depth() {
         "1 2 3 4 5 6\n1 4 5\n1 3\n1 2 3\na 1 2\n42\n6\n15\n",
     );
 }
+
+/// B447: integer literals inside TUPLES inside a LIST literal type from the
+/// expected element type — `total([(0, 3), (7, 11)])` against `total(ranges:
+/// List<(usize, usize)>)` was refused "Expected List<(usize, usize)>, but got
+/// List<(i32, i32)>", while `let one: (usize, usize) = (0, 3)` typed. At an
+/// argument, at an annotated binding, nested a level deeper, beside a
+/// non-literal element, and with an explicit suffix that still wins.
+#[test]
+fn b447_integer_literals_in_tuples_in_a_list_take_the_expected_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        fun total(ranges: List<(usize, usize)>): usize {
+            mut sum = 0usize;
+            for range in ranges {
+                sum += range.1 - range.0;
+            }
+            sum
+        }
+        fun labelled(pairs: List<((u32, u32), str)>): u32 {
+            mut sum = 0u32;
+            for pair in pairs {
+                sum += pair.0.0 + pair.0.1;
+            }
+            sum
+        }
+        fun main() {
+            print(i"{total([(0, 3), (7, 11)])}");
+            let spans: List<(usize, usize)> = [(1, 2), (5, 9)];
+            print(i"{total(spans)}");
+            print(i"{labelled([((1, 2), "a"), ((3, 4), "b")])}");
+            let start: usize = 4;
+            print(i"{total([(start, 6), (0, 1)])}");
+            print(i"{total([(0usize, 2usize)])}");
+        }
+        "#,
+        "7\n5\n10\n3\n2\n",
+    );
+}
+
+/// B440: a MAPPED parameter with a CONSTANT template, `(U in T: str)`, takes its
+/// matching concrete argument when `T` is bound by ANOTHER parameter — in
+/// either parameter order — and still refuses a mis-sized or mis-typed one.
+#[test]
+fn b440_a_constant_mapped_template_takes_its_argument_when_another_parameter_binds_the_family() {
+    let program = |call: &str| {
+        format!(
+            r#"
+            import std::reactive::SignalCell;
+            fun first_label<T: (2..)>(labels: (U in T: str), cells: (U in T: SignalCell<U>)): i32 {{
+                0
+            }}
+            fun cells_first<T: (2..)>(cells: (U in T: SignalCell<U>), labels: (U in T: str)): i32 {{
+                1
+            }}
+            fun main() {{
+                let cells = (SignalCell::new((1, 2)), SignalCell::new("b"));
+                print({call});
+            }}
+            "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program("first_label((\"first\", \"second\"), cells)"),
+        "0\n",
+    );
+    assert_compiles_and_runs(
+        &program("cells_first(cells, (\"first\", \"second\"))"),
+        "1\n",
+    );
+    assert_fails(&program("cells_first(cells, (\"a\", \"b\", \"c\"))"));
+    assert_fails(&program("cells_first(cells, (\"a\", 2))"));
+}
+
+/// B442 (with B440's change): a bare `None` in a MAPPED-tuple argument takes
+/// the element type the mapped position names once ANOTHER parameter binds the
+/// family — `(Some(1), None, Some("two"))` at `(U in T: Option<U>)` beside
+/// `seeds: T` — where it stayed `Option<unknown>` and the argument was refused.
+/// (Alone, as in the item's repro, `T`'s middle element has no evidence at all,
+/// and the call is still refused.)
+#[test]
+fn b442_a_bare_none_in_a_mapped_argument_takes_the_bound_familys_element() {
+    let program = |call: &str| {
+        format!(
+            r#"
+            import std::option::Option::{{ self, Some, None }};
+            fun count<T: (2..)>(seeds: T, items: (U in T: Option<U>)): i32 {{
+                3
+            }}
+            fun main() {{
+                print({call});
+            }}
+            "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program("count((1, true, \"x\"), (Some(1), None, Some(\"two\")))"),
+        "3\n",
+    );
+    assert_fails(&program("count((1, true), (Some(1), Some(2)))"));
+}

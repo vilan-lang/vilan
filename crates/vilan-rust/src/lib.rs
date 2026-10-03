@@ -10319,7 +10319,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         span: Span,
     ) -> Result<Option<ObjectSlot>, Error> {
         let Some((declaration, declaring_trait, chain)) =
-            object_member_declaration(self.program, trait_id, member)
+            vilan_core::mono::object_member_declaration(self.program, trait_id, member)
         else {
             return Ok(None);
         };
@@ -10467,7 +10467,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut out = String::new();
         let _ = writeln!(out, "impl {} for {rendered_subject} {{", object.name);
         for slot in &object.slots {
-            let preferred = Some((trait_id, arguments.clone()));
+            // B532: a supertrait's member is selected at the SUPERTRAIT's
+            // instantiation, which the clause chain passes down.
+            let preferred = vilan_core::mono::object_member_preference(
+                self.program,
+                trait_id,
+                &arguments,
+                &slot.member,
+            )
+            .or_else(|| Some((trait_id, arguments.clone())));
             let dispatch = self.resolve_dispatch(subject, &slot.member, &[], preferred, span)?;
             let Some(NativeDispatch::Call(function_name)) = dispatch else {
                 self.object_impls
@@ -10655,7 +10663,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // falls through to the selection below, where the blanket applies with
         // the object as its subject.
         if let Some(Type::Dyn(trait_id, _)) = self.resolve(type_id).cloned()
-            && object_member_declaration(self.program, trait_id, member).is_some()
+            && vilan_core::mono::object_member_declaration(self.program, trait_id, member).is_some()
         {
             return Ok(Some(NativeDispatch::Object(type_id, member.to_string())));
         }
@@ -11338,46 +11346,6 @@ enum NativeDispatch {
     /// A124 R3: a call through an OBJECT's table — the receiver's `dyn` type
     /// and the member.
     Object(TypeId, String),
-}
-
-/// A124 R3: `member` as the object's trait or one of its supertraits DECLARES
-/// it — the declaration, the declaring trait, and the substitution the chain's
-/// `with` clauses make for that trait's own parameters (`trait Signal<T> with
-/// Source<T>` reaches `Source`'s `T` at `Signal`'s).
-fn object_member_declaration(
-    program: &Program<'_>,
-    trait_id: Id,
-    member: &str,
-) -> Option<(Id, Id, Vec<(TypeId, TypeId)>)> {
-    let mut stack: Vec<(Id, Vec<(TypeId, TypeId)>)> = vec![(trait_id, Vec::new())];
-    let mut seen: HashSet<Id> = HashSet::new();
-    while let Some((id, chain)) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        let trait_ = program.traits.get(&id)?;
-        if let Some(declaration) = trait_.declarations.get(member) {
-            return Some((*declaration, id, chain));
-        }
-        for supertrait_type_id in &trait_.supertraits {
-            if let Some(Type::Trait(super_id, super_arguments)) =
-                program.type_id_to_type_map.get(supertrait_type_id)
-            {
-                let mut extended = chain.clone();
-                if let Some(supertrait) = program.traits.get(super_id) {
-                    extended.extend(
-                        supertrait
-                            .generic_parameter_constraint_ids
-                            .iter()
-                            .copied()
-                            .zip(super_arguments.iter().copied()),
-                    );
-                }
-                stack.push((*super_id, extended));
-            }
-        }
-    }
-    None
 }
 
 /// Whether an intrinsic MUTATES the value its receiver names — the set whose

@@ -617,6 +617,171 @@ fn transparent_references_reject_deref_assignment() {
     );
 }
 
+/// B522: the parser takes any chain as an assignment's left side, so the
+/// analyzer is where a non-place is refused — one diagnostic per assignment,
+/// for `=` and every compound operator, on both backends (the JS module threw
+/// `Invalid left-hand side in assignment` at load).
+#[test]
+fn b522_an_assignment_to_something_that_is_not_a_place_is_refused() {
+    for (statement, what) in [
+        ("(x + 1) = 2;", "an arithmetic expression"),
+        ("-x = 1;", "a negation"),
+        ("-x += 1;", "a negation"),
+        ("!flag = true;", "a `!` expression"),
+        ("seven() = 1;", "a call"),
+        ("x.abs() = 3;", "a call"),
+        ("1 = 2;", "a literal"),
+        ("\"s\" = name;", "a literal"),
+        ("(if flag { x } else { x }) = 4;", "an `if`"),
+        ("({ x }) = 3;", "a block"),
+        ("[x] = [1];", "a list literal"),
+        ("Some(x) = Some(1);", "a variant constructor"),
+        ("(x, x + 1) = (1, 2);", "an arithmetic expression"),
+    ] {
+        let source = format!(
+            r#"
+            import std::option::Option::{{ self, Some }};
+            fun seven(): i32 {{ 7 }}
+            fun main() {{
+                mut x = 0;
+                mut flag = false;
+                mut name = "n";
+                {statement}
+                print(i"{{x}} {{flag}} {{name}}");
+            }}
+            "#
+        );
+        assert_fails_once_with(&source, "is not a place");
+        assert_fails_with(&source, what);
+    }
+}
+
+/// B522's other side: every place shape keeps assigning — a binding, a
+/// parenthesized binding, a field, an element, a tuple of bindings, a compound
+/// operator, a view parameter, and a call that returns a `&mut` view. (A tuple
+/// target holding an element, a nested tuple or a tuple-typed binding is a
+/// place too, but its JS emission is a separate defect, filed by this lane.)
+#[test]
+fn b522_every_place_shape_still_assigns() {
+    assert_compiles_and_runs(
+        r#"
+        import std::shared::Shared;
+        struct P { x: i32, pair: (i32, i32) }
+        fun bump(n: &mut i32) { n += 1; }
+        fun main() {
+            mut x = 0;
+            mut y = 10;
+            mut p = P { x = 1, pair = (2, 3) };
+            mut list = [1, 2];
+            (x) = 3;
+            p.x = 2;
+            p.pair.1 = 30;
+            list[0] = 5;
+            x += 1;
+            (x, y) = (y, x);
+            (x, y) = (1, 2);
+            p.x = 9;
+            bump(&mut x);
+            let cell = Shared::new(1);
+            cell.write() += 1;
+            print(i"{x} {y} {p.x} {p.pair.1} {list[0]} {cell.read()}");
+        }
+        "#,
+        "2 2 9 30 5 2\n",
+    );
+}
+
+/// B529's shapes: a `Bag` whose `items` a view reaches into, and `first`, a
+/// `borrows` function handing back a wrapped view of an element.
+const B529_PRELUDE: &str = r#"
+    import std::io::print;
+    import std::option::Option::{ self, None, Some };
+
+    struct P { x: i32 }
+    struct Bag { items: List<P>, count: i32 }
+    struct Outer { bag: Bag, label: str }
+
+    fun first(bag: &mut Bag): Option<&mut P> {
+        if bag.items.len() > 0 { Some(&mut bag.items[0]) } else { None }
+    }
+"#;
+
+/// B529: rule 4 refuses a write to a PART of the root that holds a live view
+/// — `bag.items = [..]` under a wrapped-view capture of `first(&mut bag)`
+/// (papers-46's `b9_wrapped_subject_write.vl`: JS printed `items[0].x=50`, the
+/// write through `p` lost), under a `&mut bag.items[0]`, under a `for e in &mut
+/// bag.items`, and the element itself (`bag.items[0] = ..`). E1 fired only on a
+/// reassignment of the WHOLE root.
+#[test]
+fn b529_a_write_to_the_part_of_the_root_a_live_view_points_into_is_refused() {
+    for body in [
+        // The item's repro: the wrapped capture.
+        "match first(&mut bag) {
+            Some(let p) => { bag.items = [P { x = 50 }]; p.x = 7; },
+            None => {},
+        }",
+        // A `borrows` call's result bound by `let`, through a nested place.
+        "mut outer = Outer { bag = bag, label = \"o\" };
+        match first(&mut outer.bag) {
+            Some(let p) => { outer.bag.items = []; p.x = 7; },
+            None => {},
+        }
+        print(outer.label);",
+        // A direct view of an element, and of the list itself.
+        "let q = &mut bag.items[0]; bag.items = [P { x = 60 }]; q.x = 8;",
+        "let q = &mut bag.items; bag.items = []; q.push(P { x = 1 });",
+        "let q = &mut bag.items[0]; bag.items[0] = P { x = 60 }; q.x = 8;",
+        // A loop view of the elements.
+        "for e in &mut bag.items { bag.items = []; e.x = 1; }",
+    ] {
+        let source = format!(
+            "{B529_PRELUDE}
+            fun main() {{
+                mut bag = Bag {{ items = [P {{ x = 1 }}], count = 0 }};
+                {body}
+                print(bag.count);
+            }}"
+        );
+        assert_fails_once_with(&source, "while a view into it is live");
+    }
+}
+
+/// B529's other side: a write that replaces no storage a live view points
+/// into stays legal — a sibling field of an exact view, a write below the
+/// viewed place, a SCALAR written under a capture (a content write, which a
+/// view reads through), a scalar element beside a scalar element's view, a
+/// write through the view itself, and a write after the view's block ends.
+#[test]
+fn b529_a_write_beside_a_live_view_is_still_legal() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B529_PRELUDE}
+            fun main() {{
+                mut bag = Bag {{ items = [P {{ x = 1 }}], count = 0 }};
+                {{
+                    let q = &mut bag.items[0];
+                    bag.count = 5;
+                    q.x = 8;
+                    bag.items[0].x = 9;
+                }}
+                match first(&mut bag) {{
+                    Some(let p) => {{ bag.count = 6; p.x = 7; }},
+                    None => {{}},
+                }}
+                mut numbers = [1, 2, 3];
+                {{
+                    let third = &mut numbers[2];
+                    numbers[0] = 10;
+                    third += 1;
+                }}
+                bag.items = [P {{ x = 2 }}, P {{ x = 3 }}];
+                print(i\"{{bag.count}} {{bag.items[0].x}} {{bag.items.len()}} {{numbers[0]}} {{numbers[2]}}\");
+            }}"
+        ),
+        "6 2 2 10 4\n",
+    );
+}
+
 #[test]
 fn transparent_references_reject_mut_view_binding() {
     // R7: a view binding cannot be `mut` — a view cannot be rebound.
@@ -11887,5 +12052,33 @@ fn b512_the_spelled_copy_of_a_conditional_view_is_a_copy() {
         }
         "#,
         "1\n10\n5\n3\n",
+    );
+}
+
+/// B534 (B465's family): a closure literal takes its position's `&mut`
+/// parameters at a function's RETURN — `fun make(): |&mut List<i32>| void {
+/// |list| list.push(9) }` was refused "cannot mutate immutable 'list'" — and at
+/// an annotated binding, called or never called (closed by B516's change to the
+/// binding's probe). The third position the item names, a generic parameter
+/// instantiated with the closure type (`List<|&mut ..|>::push`), is not taken.
+#[test]
+fn b534_a_closure_literal_takes_view_parameters_at_a_return_and_an_annotated_binding() {
+    assert_compiles_and_runs(
+        r#"
+        fun make(): |&mut List<i32>| void { |list| list.push(9) }
+        fun chosen(flag: bool): |&mut List<i32>| void {
+            if flag { |list| list.push(1) } else { |list| list.push(2) }
+        }
+        fun main() {
+            mut numbers = [0];
+            make()(&mut numbers);
+            chosen(false)(&mut numbers);
+            let single: |&mut List<i32>| void = |list| list.push(8);
+            single(&mut numbers);
+            let unused: |&mut List<i32>| void = |list| list.push(7);
+            print(numbers.len());
+        }
+        "#,
+        "4\n",
     );
 }

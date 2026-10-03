@@ -10702,7 +10702,15 @@ impl<'src> Transformer<'src> {
         let members = self.object_dispatchable_members(trait_id);
         let mut entries: Vec<(String, js::Node<'src>)> = Vec::with_capacity(members.len());
         for member_name in members {
-            let preferred = Some((trait_id, trait_arguments.to_vec()));
+            // B532: a supertrait's member is selected at the SUPERTRAIT's
+            // instantiation, which the clause chain passes down.
+            let preferred = crate::mono::object_member_preference(
+                self.program,
+                trait_id,
+                trait_arguments,
+                member_name,
+            )
+            .or_else(|| Some((trait_id, trait_arguments.to_vec())));
             let Some(dispatch) = self.resolve_dispatch_with(type_id, member_name, &[], preferred)
             else {
                 continue;

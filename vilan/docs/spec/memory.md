@@ -304,7 +304,14 @@ through the parameter) passes freely. Views anchor at their origin roots
 wherever they arise: a direct `&place`, a view-returning call (the
 callee's `borrows` positions mapped through the arguments), or a
 wrapped-view `match` capture. A projection returned through a call is
-policed exactly like the `&place` it came from.
+policed exactly like the `&place` it came from. An enclosing place is any
+prefix of the viewed path (`bag.items` under a view of `bag.items[0]`, an
+aggregate element at any index); a view a call hands back may point anywhere
+under the place the call was lent, so writing any AGGREGATE at or under that
+place is an event while it is live (`match first(&mut bag) { Some(let p) =>
+.. }` forbids `bag.items = []`). A write beside the viewed path (`bag.items`
+under a view of `bag.label`), and a write of a scalar (`bag.count = 3`, a
+content write the view reads through), are not.
 
 *Implementation note: the dynamic remainder (aliasing reached through
 calls, container-internal invalidation) is tracked future work. When it

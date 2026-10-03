@@ -8208,6 +8208,61 @@ fn b460_a_free_fun_returns_the_one_type_its_body_picks() {
     );
 }
 
+/// B489: a bare-trait return's ARGUMENTS reach the body. `SignalCell::new(None)`
+/// under `Source<Option<i32>>` typed as `SignalCell<Option<unknown>>` (JS ran
+/// it; native refused "an unresolved type"); the annotation is now the tail's
+/// expectation, read through the result's impl of the trait — in a block
+/// tail, in both arms of an `if`, with a generic argument, and through a
+/// trait of two parameters.
+#[test]
+fn b489_a_bare_trait_returns_arguments_reach_the_body() {
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            import std::option::Option::{ self, None, Some };
+            trait Pair<A, B> {
+                fun left(self): A;
+            }
+            struct Both<A, B> { a: A, b: B }
+            impl Both<type A, type B> with Pair<A, B> {
+                fun left(self): A { self.a }
+            }
+            fun nothing(): Source<Option<i32>> { SignalCell::new(None) }
+            fun nested(): Source<List<str>> {
+                let unused = 1;
+                { SignalCell::new([]) }
+            }
+            fun chosen(flag: bool): Source<Option<str>> {
+                if flag { SignalCell::new(None) } else { SignalCell::new(Some("x")) }
+            }
+            fun empty<T>(): Source<Option<T>> { SignalCell::new(None) }
+            fun both(): Pair<Option<i32>, List<str>> { Both { a = None, b = [] } }
+            fun main() {
+                let n: Option<i32> = nothing().get();
+                print(n.is_none());
+                print(nested().get().len());
+                print(chosen(true).get().is_none());
+                let e: Option<bool> = empty().get();
+                print(e.is_none());
+                print(both().left().is_none());
+            }
+            "#,
+        ),
+        "true\n0\ntrue\ntrue\ntrue\n",
+    );
+    // The typing itself (JS ran the hole; the type is what changed).
+    assert_fails_with(
+        &b460_program(
+            r#"
+            import std::option::Option::{ self, None };
+            fun nothing(): Source<Option<i32>> { SignalCell::new(None) }
+            fun main() { let wrong: i32 = nothing(); }
+            "#,
+        ),
+        "got SignalCell<Option<i32>>",
+    );
+}
+
 #[test]
 fn b460_a_generic_fun_and_an_inherent_method_pick_per_instantiation() {
     assert_compiles_and_runs(
@@ -8283,6 +8338,23 @@ fn b460_a_trait_methods_bare_trait_return_stays_refused() {
         ),
         steer,
     );
+}
+
+/// B491: the trait-method refusal steers to the APPLICATION — `dyn
+/// Holder<i32>` — where it printed `dyn Holder`, a type that does not compile.
+#[test]
+fn b491_the_trait_method_steer_writes_the_traits_arguments() {
+    let source = "
+trait Holder<T> {
+    fun held(self): T;
+}
+trait Maker {
+    fun make(self): Holder<i32>;
+}
+fun main() {}
+";
+    assert_fails_with(source, "Return `dyn Holder<i32>` from `make`");
+    assert_fails_with(source, "may return `Holder<i32>` itself");
 }
 
 // --- A142 §3.3: a read on a pipe steers to sealing (Order 44, item 12) ------
@@ -9178,5 +9250,37 @@ fn b479_a_stage_selector_in_a_generic_body_takes_the_receivers_own_answer() {
             "}\n",
         ),
         "2\n",
+    );
+}
+
+/// B508: a blanket `impl type T with Trait` reaches a CLOSURE-typed receiver —
+/// `f.named()` on a `|| void` was "cannot call method 'named' on || void",
+/// which is why the Store held closure-typed fields behind `store_opaque`. A
+/// closure value of each arity, and one held in a struct field, are pinned.
+#[test]
+fn b508_a_blanket_reaches_a_closure_typed_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        trait Named {
+            fun named(self): str;
+        }
+        impl type T with Named {
+            fun named(self): str {
+                "anything"
+            }
+        }
+        struct Holder { run: |i32| i32 }
+        fun nothing() {}
+        fun main() {
+            print(5.named());
+            let f: || void = nothing;
+            print(f.named());
+            let g = |x: i32| x + 1;
+            print(g.named());
+            let holder = Holder { run = |x| x * 2 };
+            print(holder.run.named());
+        }
+        "#,
+        "anything\nanything\nanything\nanything\n",
     );
 }

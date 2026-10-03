@@ -147,6 +147,84 @@ const B473_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B532's program, `inference::dyn_objects`' `B532_PROGRAM`: objects over
+/// SUB-traits of a trait implemented at two instantiations.
+/// B489 + opaque-returns.md find 2: a bare-trait return's arguments reach the
+/// body, and a generic one instantiated twice returns each instantiation's type.
+const B489_PROBE: &str = concat!(
+    "import std::reactive::{ Source, SignalCell };\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "\n",
+    "fun nothing(): Source<Option<i32>> { SignalCell::new(None) }\n",
+    "\n",
+    "fun chosen(flag: bool): Source<Option<str>> {\n",
+    "    if flag { SignalCell::new(None) } else { SignalCell::new(Some(\"x\")) }\n",
+    "}\n",
+    "\n",
+    "fun wrap<T>(value: T): Source<T> { SignalCell::new(value) }\n",
+    "\n",
+    "fun main() {\n",
+    "    print(nothing().get().is_none());\n",
+    "    print(chosen(false).get().is_none());\n",
+    "    print(wrap(1).get());\n",
+    "    print(wrap(\"s\").get());\n",
+    "}\n",
+);
+
+const B532_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Shape<T> {\n",
+    "    fun area(self): T;\n",
+    "}\n",
+    "\n",
+    "trait Named<T> with Shape<T> {}\n",
+    "\n",
+    "trait Titled<T> with Named<T> {}\n",
+    "\n",
+    "trait Big with Shape<str> {}\n",
+    "\n",
+    "struct Square {\n",
+    "    side: i32,\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<i32> {\n",
+    "    fun area(self): i32 {\n",
+    "        self.side * self.side\n",
+    "    }\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<str> {\n",
+    "    fun area(self): str {\n",
+    "        \"big\"\n",
+    "    }\n",
+    "}\n",
+    "\n",
+    "impl Square with Named<str> {}\n",
+    "\n",
+    "impl Square with Named<i32> {}\n",
+    "\n",
+    "impl Square with Titled<str> {}\n",
+    "\n",
+    "impl Square with Big {}\n",
+    "\n",
+    "fun through_bound<S: Named<str>>(shape: S): str {\n",
+    "    shape.area()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "    let titled: dyn Named<str> = Square { side = 2 };\n",
+    "    print(titled.area());\n",
+    "    let counted: dyn Named<i32> = Square { side = 3 };\n",
+    "    print(counted.area());\n",
+    "    let deeper: dyn Titled<str> = Square { side = 4 };\n",
+    "    print(deeper.area());\n",
+    "    let big: dyn Big = Square { side = 5 };\n",
+    "    print(big.area());\n",
+    "    print(through_bound(Square { side = 6 }));\n",
+    "}\n",
+);
+
 const B502_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -8830,6 +8908,39 @@ fn a_trait_object_binds_a_bounds_arguments_from_its_own_on_both_backends() {
         compare(&staged, "native_probe_b502.vl"),
         Verdict::Identical,
         "a trait object must bind a bound's arguments from its own on both backends"
+    );
+}
+
+/// B489: `SignalCell::new(None)` under a `Source<Option<i32>>` return types
+/// from the annotation's arguments — natively it was refused "an unresolved
+/// type". With it, opaque-returns.md's find 2 (a generic bare-trait return
+/// instantiated twice, which JS's pin cannot see): already right on this base,
+/// pinned so it stays so.
+#[test]
+fn a_bare_trait_returns_arguments_reach_the_body_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b489.vl"), B489_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b489.vl"),
+        Verdict::Identical,
+        "a bare-trait return's arguments must reach the body on both backends"
+    );
+}
+
+/// B532: an object over a SUB-trait answers a supertrait's member from the
+/// supertrait's instantiation the clause chain passes (`dyn Named<str>` over
+/// `Named<T> with Shape<T>` answers `area` from `Shape<str>`). JS answered from
+/// `Shape<i32>`; natively rustc refused the emitted table (E0308).
+#[test]
+fn an_object_over_a_subtrait_answers_from_the_supertraits_instantiation_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b532.vl"), B532_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b532.vl"),
+        Verdict::Identical,
+        "an object over a sub-trait must answer from the supertrait's instantiation on both backends"
     );
 }
 
