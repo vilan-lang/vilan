@@ -22,6 +22,7 @@ use vilan_core::{
 };
 use vilan_ide::numeric_fix::NumericEdit;
 
+use crate::hover_blocks::{Block, HoverBlocks};
 use crate::keystroke::{
     Anchor, CursorContext, EditTrail, LandedHint, LandedSnapshot, ModuleSymbols, ServedHint,
     SymbolEntry, SymbolIndex, Verdict, candidates, cursor_context, is_identifier_char,
@@ -670,18 +671,13 @@ pub struct Symbol {
 /// Empty where the type has no definition to show (a primitive, an opaque
 /// external, a closure).
 ///
-/// E246: set off by a RULE, and appended LAST. Two fenced blocks back to back
-/// render as one run in VS Code's hover — the `name: Type` line ran straight
-/// on into the `struct …` shape, with nothing to say where the declaration
-/// ended and the reference material began — so a horizontal rule separates
-/// them. And the shape is the reference material: the doc comment is what the
-/// author wrote for THIS name, so it comes first, and every caller pushes this
-/// paragraph after it.
-fn definition_paragraph(program: &Program, type_id: vilan_core::type_::TypeId) -> String {
-    match program.type_definitions.of(type_id) {
-        Some(block) => format!("\n\n---\n\n```vilan\n{block}\n```"),
-        None => String::new(),
-    }
+/// E246: a [`Block::Preview`] — reference material, ordered after the doc
+/// comment and set off by a rule (`hover_blocks`' canonical order).
+fn definition_paragraph(program: &Program, type_id: vilan_core::type_::TypeId) -> Option<String> {
+    program
+        .type_definitions
+        .of(type_id)
+        .map(|block| format!("```vilan\n{block}\n```"))
 }
 
 /// `self` hovered as the binding it is (E239): the block that introduces it
@@ -693,7 +689,7 @@ fn definition_paragraph(program: &Program, type_id: vilan_core::type_::TypeId) -
 /// written against, and its definition is the trait's required members — the
 /// bound is what `self` promises there. In a blanket the subject is the
 /// binder (`self: S`), whose bound the header line spells.
-fn self_hover(program: &Program, parameter: &Parameter, type_label: &str) -> String {
+fn self_hover(program: &Program, parameter: &Parameter, type_label: &str) -> HoverBlocks {
     let in_a_trait = program
         .member_owners
         .get(&parameter.function_id)
@@ -704,10 +700,13 @@ fn self_hover(program: &Program, parameter: &Parameter, type_label: &str) -> Str
         Some(header) => format!("{header}\n{line}"),
         None => line,
     };
-    format!(
-        "```vilan\n{fenced}\n```{}",
-        definition_paragraph(program, parameter.type_id)
-    )
+    let mut out = HoverBlocks::new();
+    out.push_code(Block::Signature, &fenced);
+    out.push_some(
+        Block::Preview,
+        definition_paragraph(program, parameter.type_id),
+    );
+    out
 }
 
 /// Clamp a rendered hover preview to its display budget, cutting at a char
@@ -3585,11 +3584,13 @@ impl Document {
             }
             // E221: a labelled nominal hovers with its reason even where no
             // declaration block answers (a trait in a bound).
-            if let Some(lead) = definition.and_then(|definition| internal_lead(program, definition))
-            {
-                return Some(format!("{lead}\n\n{label}"));
-            }
-            return Some(label);
+            let mut blocks = HoverBlocks::new();
+            blocks.push_some(
+                Block::Diagnostic,
+                definition.and_then(|definition| internal_lead(program, definition)),
+            );
+            blocks.push(Block::Signature, label);
+            return blocks.rendered();
         }
         // Everything below answers by span CONTAINMENT, and an entity's span
         // contains its trivia — a comment or blank line inside a function body
@@ -3630,7 +3631,7 @@ impl Document {
         // binder) or a parameter: its typed declaration; a member read: the
         // fenced `name: T` (E72); else the bare type — fenced too, so every
         // hover reads as code.
-        let type_label = self
+        let mut blocks = self
             .binding_hover(program, id)
             .or_else(|| self.member_hover(program, id))
             .or_else(|| {
@@ -3640,31 +3641,30 @@ impl Document {
                         Some(value) => format!("{label} = {value}"),
                         None => label,
                     };
-                    format!("```vilan\n{label}\n```")
+                    let mut blocks = HoverBlocks::new();
+                    blocks.push_code(Block::Signature, &label);
+                    blocks
                 })
-            });
-        let requirement = self
-            .analysis(program)
-            .function_target(id)
-            .and_then(|function| self.platform_requirements.get(&function))
-            .cloned();
-        let answer = match (type_label, requirement) {
-            // A blank markdown line, so the requirement renders as its own
-            // paragraph under the type.
-            (Some(type_label), Some(requirement)) => Some(format!("{type_label}\n\n{requirement}")),
-            (Some(type_label), None) => Some(type_label),
-            (None, requirement) => requirement,
-        }?;
+            })
+            .unwrap_or_default();
+        blocks.push_some(
+            Block::Platform,
+            self.analysis(program)
+                .function_target(id)
+                .and_then(|function| self.platform_requirements.get(&function))
+                .cloned(),
+        );
+        if blocks.is_empty() {
+            return None;
+        }
         // E221: a labelled MODULE BINDING leads with its reason too, at its
         // declaration and at every read of it.
         let binding = match program.entity_map.get(&id) {
             Some(Expr::Local(target)) => *target,
             _ => id,
         };
-        Some(match internal_lead(program, binding) {
-            Some(lead) => format!("{lead}\n\n{answer}"),
-            None => answer,
-        })
+        blocks.push_some(Block::Diagnostic, internal_lead(program, binding));
+        blocks.rendered()
     }
 
     /// The hover for an identifier that spells an `as` alias — its own name
@@ -3700,16 +3700,14 @@ impl Document {
         } else {
             declaration
         };
-        let mut out = format!("```vilan\n(alias) {declaration}\n```");
-        if let Some(docs) = self.analysis(program).doc_comment_of(target) {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        if let Some(requirement) = self.platform_requirements.get(&target) {
-            out.push_str("\n\n");
-            out.push_str(requirement);
-        }
-        Some(out)
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &format!("(alias) {declaration}"));
+        out.push_some(Block::Doc, self.analysis(program).doc_comment_of(target));
+        out.push_some(
+            Block::Platform,
+            self.platform_requirements.get(&target).cloned(),
+        );
+        out.rendered()
     }
 
     /// The hover for a PATTERN position (E241): a variant's name as
@@ -3725,7 +3723,8 @@ impl Document {
             let range = site.name_span.into_range();
             range.start <= offset && offset < range.end
         })?;
-        let mut out = format!("```vilan\n{}\n```", site.label);
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &site.label);
         let variant_entity = site.variant.and_then(|(enum_id, variant_index)| {
             let enumeration = program.enums.get(&enum_id)?;
             let name = enumeration.variants.get(variant_index)?.name;
@@ -3736,13 +3735,11 @@ impl Document {
                 .get(name)
                 .copied()
         });
-        if let Some(docs) =
-            variant_entity.and_then(|entity| self.analysis(program).doc_comment_of(entity))
-        {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        Some(out)
+        out.push_some(
+            Block::Doc,
+            variant_entity.and_then(|entity| self.analysis(program).doc_comment_of(entity)),
+        );
+        out.rendered()
     }
 
     /// E240's hover for a type-position name: a TYPE PARAMETER — `type I:
@@ -3762,23 +3759,25 @@ impl Document {
             .type_reference_at(program, offset)
             .and_then(|(definition, _)| definition)
             .filter(|definition| program.traits.contains_key(definition));
-        let mut out = String::new();
+        let mut out = HoverBlocks::new();
         // E221: a labelled trait leads with its reason here too.
-        if let Some(lead) = named_trait.and_then(|definition| internal_lead(program, definition)) {
-            out.push_str(&lead);
-            out.push_str("\n\n");
-        }
-        out.push_str(&format!("```vilan\n{}\n```", hover.code));
-        if let Some(owner) = &hover.declared_by {
-            out.push_str(&format!("\n\nA type parameter of `{owner}`"));
-        }
-        if let Some(docs) =
-            named_trait.and_then(|definition| self.analysis(program).doc_comment_of(definition))
-        {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        Some(out)
+        out.push_some(
+            Block::Diagnostic,
+            named_trait.and_then(|definition| internal_lead(program, definition)),
+        );
+        out.push_code(Block::Signature, &hover.code);
+        out.push_some(
+            Block::SignatureNote,
+            hover
+                .declared_by
+                .as_ref()
+                .map(|owner| format!("A type parameter of `{owner}`")),
+        );
+        out.push_some(
+            Block::Doc,
+            named_trait.and_then(|definition| self.analysis(program).doc_comment_of(definition)),
+        );
+        out.rendered()
     }
 
     /// Whether `id` is a module directory with NO body of its own — A65's pure
@@ -3906,15 +3905,16 @@ impl Document {
         }
         let module = program.modules.get(&definition)?;
         let children = self.namespace_children(program, definition);
-        let mut out = format!("```vilan\nnamespace {}\n```", module.name);
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &format!("namespace {}", module.name));
         if !children.is_empty() {
             let names: Vec<String> = children
                 .iter()
                 .map(|(name, _)| format!("`{name}`"))
                 .collect();
-            out.push_str(&format!("\n\nHolds {}.", names.join(", ")));
+            out.push(Block::Preview, format!("Holds {}.", names.join(", ")));
         }
-        Some(out)
+        out.rendered()
     }
 
     /// Assembles a declaration hover: the fenced declaration (with inferred
@@ -3973,24 +3973,18 @@ impl Document {
             Some(header) => format!("{header}\n{declaration}"),
             None => declaration,
         };
-        let mut out = String::new();
+        let mut out = HoverBlocks::new();
         // E213: hover LEADS with the reason. The declaration is reachable —
         // that is what visibility already answered — and what the reader needs
         // before the signature is that reaching for it is a decision.
-        if let Some(lead) = internal_lead(program, declaration_id) {
-            out.push_str(&lead);
-            out.push_str("\n\n");
-        }
-        out.push_str(&format!("```vilan\n{declaration}\n```"));
-        if let Some(docs) = self.analysis(program).doc_comment_of(declaration_id) {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        if let Some(requirement) = requirement {
-            out.push_str("\n\n");
-            out.push_str(&requirement);
-        }
-        out
+        out.push_some(Block::Diagnostic, internal_lead(program, declaration_id));
+        out.push_code(Block::Signature, &declaration);
+        out.push_some(
+            Block::Doc,
+            self.analysis(program).doc_comment_of(declaration_id),
+        );
+        out.push_some(Block::Platform, requirement);
+        out.render()
     }
 
     /// The hover for a binary OPERATOR token under `offset`: the declaration
@@ -4115,7 +4109,7 @@ impl Document {
     /// hover the same. The type is the resolved label the analyzer pre-rendered
     /// (`expr_types`) — the element type for a destructured binder. Returns
     /// `None` for anything that is not a binding, leaving the bare-type path.
-    fn binding_hover(&self, program: &Program, id: Id) -> Option<String> {
+    fn binding_hover(&self, program: &Program, id: Id) -> Option<HoverBlocks> {
         let binding = match program.entity_map.get(&id) {
             Some(Expr::Local(inner) | Expr::Variable(inner) | Expr::Parameter(inner)) => *inner,
             _ => id,
@@ -4128,7 +4122,8 @@ impl Document {
             if let Some(value) = self.const_value_label(program, binding) {
                 signature.push_str(&format!(" = {value}"));
             }
-            let mut out = format!("```vilan\n{signature}\n```");
+            let mut out = HoverBlocks::new();
+            out.push_code(Block::Signature, &signature);
             // E227 (Q5): the abbreviation beneath the full type, when the inlay
             // hint shows one — outside the fence, because the fence is vilan
             // and `~` is not. The reader who wonders what the hint means
@@ -4140,17 +4135,16 @@ impl Document {
                     .map(|host| format!("`{host}`"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                out.push_str(&format!(
-                    "\n\nShown as `{}` (`[hint]` on {hosts})",
-                    hint.label
-                ));
+                out.push(
+                    Block::SignatureNote,
+                    format!("Shown as `{}` (`[hint]` on {hosts})", hint.label),
+                );
             }
-            if let Some(docs) = self.analysis(program).doc_comment_of(binding) {
-                out.push_str("\n\n");
-                out.push_str(&docs);
-            }
-            // E246: the type's shape last, under its rule.
-            out.push_str(&definition_paragraph(program, variable.type_id));
+            out.push_some(Block::Doc, self.analysis(program).doc_comment_of(binding));
+            out.push_some(
+                Block::Preview,
+                definition_paragraph(program, variable.type_id),
+            );
             return Some(out);
         }
         if let Some(parameter) = program.parameters.get(&binding) {
@@ -4158,11 +4152,13 @@ impl Document {
             if parameter.name == "self" {
                 return Some(self_hover(program, parameter, type_label));
             }
-            return Some(format!(
-                "```vilan\n{}\n```{}",
-                parameter.signature_label(type_label),
-                definition_paragraph(program, parameter.type_id)
-            ));
+            let mut out = HoverBlocks::new();
+            out.push_code(Block::Signature, &parameter.signature_label(type_label));
+            out.push_some(
+                Block::Preview,
+                definition_paragraph(program, parameter.type_id),
+            );
+            return Some(out);
         }
         None
     }
@@ -4175,28 +4171,29 @@ impl Document {
     /// call shape is skipped here rather than dressed in a field's clothes.
     /// `None` for anything that is not a member read, leaving the bare-type
     /// path.
-    fn member_hover(&self, program: &Program, id: Id) -> Option<String> {
+    fn member_hover(&self, program: &Program, id: Id) -> Option<HoverBlocks> {
         let member_span = program.member_name_spans.get(&id)?;
         if program.function_calls.contains_key(&id) {
             return None;
         }
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
-        let mut out = format!("```vilan\n{name}: {type_label}\n```");
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &format!("{name}: {type_label}"));
         // E204: a FIELD's own `///`, where the read resolves to one. A field
         // carries no entity id, so `doc_comment_of` has nothing to look up —
         // `Expr::Field`'s (struct, index) key is what names the declaration,
         // and `doc_comment_at` reads the block above its name span in the
         // DECLARING source, which is the same read every other doc consumer
         // performs.
-        if let Some(docs) = self.field_docs(program, id) {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        // E246: the type's shape last, under its rule.
-        if let Some(type_id) = program.expr_type_ids.get(&id) {
-            out.push_str(&definition_paragraph(program, *type_id));
-        }
+        out.push_some(Block::Doc, self.field_docs(program, id));
+        out.push_some(
+            Block::Preview,
+            program
+                .expr_type_ids
+                .get(&id)
+                .and_then(|type_id| definition_paragraph(program, *type_id)),
+        );
         Some(out)
     }
 
@@ -4242,21 +4239,17 @@ impl Document {
         let type_label = self
             .analysis(program)
             .field_type_label(struct_id, index, field.name)?;
-        let mut out = String::new();
+        let mut out = HoverBlocks::new();
         // E213: a FIELD is the case visibility cannot serve at all, and the
         // one the item was filed about.
-        if let Some(reason) = field.internal {
-            out.push_str(&internal_line(reason));
-            out.push_str("\n\n");
-        }
-        out.push_str(&format!("```vilan\n{}: {type_label}\n```", field.name));
-        if let Some(docs) = self.struct_field_docs(program, struct_id, index) {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        // E246: the type's shape last, under its rule.
-        out.push_str(&definition_paragraph(program, field.type_id));
-        Some(out)
+        out.push_some(Block::Diagnostic, field.internal.map(internal_line));
+        out.push_code(Block::Signature, &format!("{}: {type_label}", field.name));
+        out.push_some(
+            Block::Doc,
+            self.struct_field_docs(program, struct_id, index),
+        );
+        out.push_some(Block::Preview, definition_paragraph(program, field.type_id));
+        out.rendered()
     }
 
     /// The struct field whose DECLARATION name span, or whose initializer KEY
@@ -23441,7 +23434,7 @@ fun main() {
         let offset = E152_ENTRY.find("::ui").expect("the `ui` segment") + 2;
         assert_eq!(
             document.hover(offset).as_deref(),
-            Some("```vilan\nnamespace ui\n```\n\nHolds `widget`."),
+            Some("```vilan\nnamespace ui\n```\n\n---\n\nHolds `widget`."),
         );
         // B335: `lib` has a body file, so it hovers as the MODULE it is — it
         // read as a namespace only because the entry-attributed placeholder
@@ -23883,6 +23876,64 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
             fence("mut out: List<i32>")
         );
     }
+    // --- E246 extended: the canonical order of hover blocks ------------------
+
+    /// Every block a FUNCTION hover carries, in the ruled order: the
+    /// diagnostic-kind lead (a `[deprecated]` steer), the signature, the doc
+    /// comment, then the platform fact — whatever order the builder met them.
+    #[test]
+    fn e246_a_function_hover_orders_lead_signature_doc_platform() {
+        let source = "import std::fs;\n\n/// Writes the state.\n[deprecated(\"use keep()\")]\n\
+             fun save() {\n\tfs::write_file(\"state\", \"data\");\n}\n\n\
+             fun keep() {}\n\nfun main() {\n\tsave();\n}\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let at = source.rfind("save();").expect("the call") + 1;
+        let hover = document.hover(at).expect("a hover");
+        let blocks: Vec<&str> = hover.split("\n\n").collect();
+        assert_eq!(blocks[0], "**deprecated** — use keep()", "{hover}");
+        assert_eq!(blocks[1], "```vilan\nasync fun save()\n```", "{hover}");
+        assert_eq!(blocks[2], "Writes the state.", "{hover}");
+        assert!(
+            blocks[3].starts_with("requires the `process` layer of `std`"),
+            "{hover}"
+        );
+        assert_eq!(blocks.len(), 4, "{hover}");
+    }
+
+    /// Every block a BINDING hover carries, in the ruled order: the
+    /// signature, the note that belongs with it (E227's `Shown as`), the doc
+    /// comment, then the shape under its rule.
+    #[test]
+    fn e246_a_binding_hover_orders_signature_note_doc_preview() {
+        let source = "import std::reactive::{ MemoCell, SignalCell };\n\n\
+             struct Holder {\n\tat: i32,\n}\n\n\
+             fun main() {\n\t/// The one holder.\n\tlet holder = Holder { at = 1 };\n\t\
+             let cell = SignalCell::new(holder);\n\t/// Derived.\n\tlet derived = cell.derive(|value| value.at);\n\t\
+             let _ = derived;\n}\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let hover = document
+            .hover(source.find("let holder").expect("fixture") + 4)
+            .expect("a hover");
+        assert_eq!(
+            hover,
+            format!(
+                "{}\n\nThe one holder.\n\n---\n\n{}",
+                fence("let holder: Holder"),
+                fence("struct Holder {\n\tat: i32,\n}")
+            )
+        );
+        let derived = document
+            .hover(source.find("let derived").expect("fixture") + 4)
+            .expect("a hover");
+        let blocks: Vec<&str> = derived.split("\n\n").collect();
+        assert!(blocks[0].starts_with("```vilan\nlet derived:"), "{derived}");
+        assert!(
+            blocks[1].starts_with("Shown as `~"),
+            "the hint note under the signature: {derived}"
+        );
+        assert_eq!(blocks[2], "Derived.", "{derived}");
+    }
+
     // --- E246: the shape under a rule, after the docs -----------------------
 
     /// The gap: the `name: Type` line and the `struct …` shape are set apart

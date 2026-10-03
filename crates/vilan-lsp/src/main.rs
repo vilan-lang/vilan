@@ -6,6 +6,7 @@
 mod book_sync;
 mod dead_items;
 mod document;
+mod hover_blocks;
 mod keystroke;
 mod line_index;
 mod manifest_completion;
