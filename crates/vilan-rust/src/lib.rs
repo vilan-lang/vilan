@@ -906,7 +906,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // like a function body's tail, so a place read there takes rule 1's
         // copy — `|index| cells[index]` moved an element out of the captured
         // `Vec` (E0507), and `|| row.name` a field out of the captured `row`.
-        let expecting = self.expected_type;
+        //
+        // The body's POSITION is the closure's RETURN, not the closure: the
+        // expectation the literal arrived under is the closure TYPE, and handing
+        // that down unchanged told the body it was producing a closure — which
+        // matched nothing, so a constructor whose site recorded an open type
+        // (`|k: i32| Maybe::Just(k + 1)`, recorded `Maybe<any>`) had no position
+        // to close from and was refused as instantiated at `any`. The return
+        // the position declares, else the one the literal wrote; only a closed
+        // one, since an open expectation says nothing and an `any` would wrap.
+        let expecting = self
+            .expected_type
+            .and_then(|type_id| match self.resolve(type_id) {
+                Some(Type::Closure(_, returns, _)) => Some(*returns),
+                _ => None,
+            })
+            .filter(|returns| self.is_grounded(*returns))
+            .or(closure.return_type_id)
+            .filter(|returns| self.is_grounded(*returns));
         let body = self.value_of_expecting_in(closure.return_, expecting, depth, true)?;
         if closure.parameter_destructures.is_empty() {
             if boxed.is_empty() {

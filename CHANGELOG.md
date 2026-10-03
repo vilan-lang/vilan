@@ -30,8 +30,13 @@ written down.
 
 ---
 
-<!-- family: miscompile -->
+<!-- family: fix -->
 **Native: a variant constructor inside a generic body takes the INSTANCE's arguments — `Maybe<T>::map<U>`'s `Maybe::Just(f(x))`, a nullary `Maybe::Nothing` at a generic return, `Outcome::Bad(value)` building `Outcome<E, T>` from an `Outcome<T, E>` — where it took the type the analyzer recorded at the site, which is one per site and named the receiver's `T`, and rustc refused the emission (E0308).** The emitter's `variant_arguments` read the recorded type first and the position and the payload only when the record was open; it now reads the POSITION (the generic return, a parameter, an annotation — each read under the instance), then the PAYLOAD bound against the variant's declared payload types, then the record — first only when the record is closed in itself, naming no parameter, so no instance can change it. Struct literals already put the position first (`struct_arguments_at`). `Option`/`Result` were latent rather than wrong: Rust's own enums name no instance in a path, which is why native-45's turbofish attempt surfaced it. Pin: `native_differential`'s `a_variant_built_inside_a_generic_instance_is_identical_on_both_backends` (`native/generic_instance_variants.vl`: a payload of the method's own parameter, a nullary variant at a generic return, a two-parameter enum built swapped at two instances each way, a nested payload, an annotated binding in the instance's parameter, `Option`'s constructors in a generic body; rustc refused it on 0.43.0). Tracker F66.
+
+---
+
+<!-- family: fix -->
+**Native: a closure's expression body is emitted at the closure's RETURN position — `|k: i32| Maybe::Just(k + 1)`, `|_k: i32| Maybe::Just("lit")`, `|k: i32| if k > 2 { Maybe::Just(i"big {k}") } else { Maybe::Nothing }` build and print node's bytes, where each was refused by name as "a generic type instantiated at `any`".** The body was handed the expectation the literal itself arrived under — the closure TYPE — which matched nothing, so a constructor whose site recorded an open type and whose payload records none (a sum, a literal, an interpolation) had no position to close from. The body takes the position's return when it is closed, else the literal's written return type (`|_k: i32|: u8 200`). Remainder, filed: a closure handed to a GENERIC callee without a written return still reads the callee's parameter type unsubstituted, so `apply(4, |k| Maybe::Just(k * 10))` stays refused. Pin: `native_differential`'s `a_closure_body_takes_the_closures_return_as_its_position_on_both_backends` (`native/closure_body_positions.vl`; refused on 0.43.0). The whole-set differential holds at 0 broken (129 / 101 identical / 28 refused). native-46's find beside F66.
 
 ---
 

@@ -8747,6 +8747,32 @@ fn a_variant_built_inside_a_generic_instance_is_identical_on_both_backends() {
     );
 }
 
+/// A closure's expression body is the closure's RETURN position (native-46's
+/// find, beside F66). `closure_body` handed the body the expectation the
+/// literal arrived under — the closure TYPE — so a variant constructor whose
+/// site recorded an open type (`|k: i32| Maybe::Just(k + 1)`, recorded
+/// `Maybe<any>`, a payload with no record of its own) had nothing to close
+/// from and was refused as "a generic type instantiated at `any`". The body
+/// now takes the position's return when it is closed, else the literal's
+/// written one. The probe: a sum, a string literal, an interpolation and a
+/// nested constructor as payloads, an `if` choosing between two constructors,
+/// a written return (also handed to a generic callee), and a literal at a
+/// narrow `u8` return.
+#[test]
+fn a_closure_body_takes_the_closures_return_as_its_position_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_closure_body_positions.vl"),
+        include_str!("native/closure_body_positions.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_closure_body_positions.vl"),
+        Verdict::Identical,
+        "a closure body must be emitted at the closure's return position"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds
