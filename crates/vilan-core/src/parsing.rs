@@ -184,6 +184,10 @@ pub enum ParseErrorReason {
     /// B485 Q6/Q8): `canonical` is the head respelled in it. The parse went on
     /// as if it had been written so.
     MarkerOrder { canonical: String },
+    /// A WARNING, never an error (B536): a declaration head whose attributes
+    /// are written out of [`attribute_rank`]'s order, and nothing else out of
+    /// order. `canonical` is the head respelled in it; the parse read it so.
+    AttributeOrder { canonical: String },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -1315,6 +1319,7 @@ pub fn render(error: &ParseError) -> String {
         ParseErrorReason::VisibilityMarker { marker } => visibility_marker_rule(marker),
         ParseErrorReason::ForeignSpelling(spelling) => spelling.message().to_string(),
         ParseErrorReason::MarkerOrder { canonical } => marker_order_rule(canonical),
+        ParseErrorReason::AttributeOrder { canonical } => attribute_order_rule(canonical),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -1381,8 +1386,29 @@ pub fn render(error: &ParseError) -> String {
 /// slices are `&'src str` copied out of the tokens), exactly like the chumsky
 /// parser; the intermediate token vector does not outlive this call.
 pub fn parse(source: &str) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
+    let (tree, errors, _) = parse_with(source, false);
+    (tree, errors)
+}
+
+/// [`parse`], and the parse's WARNINGS beside its errors (B536): what the
+/// parser accepted and reads as written in canonical form, and still reports
+/// — today, a declaration's attributes written out of [`attribute_rank`]'s
+/// order ([`ParseErrorReason::AttributeOrder`]). A warning never makes a
+/// source unclean: the tree is the one the canonical spelling parses to.
+///
+/// The pipelines that REPORT diagnostics read this (the entry analysis, the
+/// CLI, the module loader, the clean-parse cache); every other reader of a
+/// tree keeps calling [`parse`].
+pub fn parse_with_warnings(source: &str) -> ParsedWithWarnings<'_> {
     parse_with(source, false)
 }
+
+/// What [`parse_with_warnings`] returns: the tree, the errors, the warnings.
+pub type ParsedWithWarnings<'src> = (
+    Option<Spanned<NodeList<'src>>>,
+    Vec<ParseError>,
+    Vec<ParseError>,
+);
 
 /// [`parse`], but every parenthesized expression is RECORDED as a
 /// [`Node::LiftGroup`] node instead of dissolving into its inner expression.
@@ -1399,13 +1425,11 @@ pub fn parse(source: &str) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
 /// tree, so nothing downstream changes. That separation is what the corpus
 /// byte-gate and `tests/parse_differential.rs` guard.
 pub fn parse_preserving_groups(source: &str) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
-    parse_with(source, true)
+    let (tree, errors, _) = parse_with(source, true);
+    (tree, errors)
 }
 
-fn parse_with(
-    source: &str,
-    preserve_paren_groups: bool,
-) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
+fn parse_with(source: &str, preserve_paren_groups: bool) -> ParsedWithWarnings<'_> {
     let (mut tokens, lex_errors) = lexing::tokenize(source);
     let token_count = tokens.len();
 
@@ -1453,8 +1477,10 @@ fn parse_with(
     // A stable, span-ordered diagnostic list (diagnostics-standard.md C1): lexer
     // errors and recovered-region errors interleave by where they occur.
     errors.sort_by_key(|error| (error.span.start, error.span.end));
+    let mut warnings = std::mem::take(&mut parser.warnings);
+    warnings.sort_by_key(|warning| (warning.span.start, warning.span.end));
 
-    (Some(root), errors)
+    (Some(root), errors, warnings)
 }
 
 /// The spans of `source`'s CONTEXTUAL keywords (B414) where the parser read
@@ -1647,6 +1673,12 @@ struct Parser<'a, 'src> {
     /// — rather than at whichever unit the reorder placed first.
     /// [`Parser::span_from`] reads it; empty unless a run was reordered.
     written_starts: Vec<(usize, usize)>,
+    /// The parse's WARNINGS (B536): a declaration head whose attributes are
+    /// written out of [`attribute_rank`]'s order. The head parses and analyzes
+    /// as if written in it ([`Parser::canonicalize_marker_run`]), so nothing
+    /// is refused; [`parse_with_warnings`] hands them back beside the errors.
+    /// One per span, held aside from `errors` for `rewrite_refusals`' reason.
+    warnings: Vec<ParseError>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -1941,15 +1973,270 @@ fn marker_keywords_are_legal(keywords: &[MarkerKeyword], word: &str) -> bool {
 }
 
 /// The steer for a declaration head written out of order (B486; B485 Q6 and
-/// Q8, RULED): the markers stack attributes first, then the keywords in one
-/// order, then the declaration word. `canonical` is the head respelled in
-/// that order, attributes abbreviated.
+/// Q8, RULED; B485 S3 for `export` and `macro`): the markers stack
+/// attributes first, then the keywords in one order, then the declaration
+/// word. `canonical` is the head respelled in that order, attributes
+/// abbreviated. An ERROR ([`MarkerOrderDiagnostic::Keywords`]).
 fn marker_order_rule(canonical: &str) -> String {
     format!(
         "a declaration's markers are written in one order — its attributes, then the keywords \
          `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration \
          word: write `{canonical}`"
     )
+}
+
+/// [`marker_order_rule`]'s fixed head, which recognizes it (the rule spells
+/// it out in full, for the diagnostics ledger's literal search; the fix pin
+/// holds the two together).
+const MARKER_ORDER_HEAD: &str = "a declaration's markers are written in one order — ";
+
+/// The warning for a declaration whose attributes alone are out of
+/// [`attribute_rank`]'s order (B536, the owner's ruling revising Q7). The
+/// head parses as written in the order, so it is not refused; `vilan fmt`
+/// writes it so. A WARNING ([`MarkerOrderDiagnostic::Attributes`]).
+fn attribute_order_rule(canonical: &str) -> String {
+    format!(
+        "a declaration's attributes are written in one order — `[derive]` and the other \
+         generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, \
+         `[trait_only]`, `[platform]`, `[resource]`: write `{canonical}`"
+    )
+}
+
+/// [`attribute_order_rule`]'s fixed head, which recognizes it (spelled out
+/// there in full, as [`MARKER_ORDER_HEAD`] is).
+const ATTRIBUTE_ORDER_HEAD: &str = "a declaration's attributes are written in one order — ";
+
+/// The two diagnostics a declaration head written out of THE order carries
+/// (B536), as the editor keys them. The head is read as if written in the
+/// order either way; what differs is whether the order it broke is one this
+/// release refuses.
+///
+/// **The editor's half**, the same shape as [`ForeignSpelling`]'s:
+/// [`MarkerOrderDiagnostic::code`] is the stable code to publish as the
+/// diagnostic's `code`, [`MarkerOrderDiagnostic::of_message`] recognizes the
+/// diagnostic from its rendered text, and [`marker_order_fix`] is the quick
+/// fix's edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MarkerOrderDiagnostic {
+    /// A WARNING: the attributes are out of [`attribute_rank`]'s order, and
+    /// nothing else is ([`ParseErrorReason::AttributeOrder`]).
+    Attributes,
+    /// An ERROR: a keyword stands ahead of an attribute — `export` and
+    /// `macro` included (B485 S3) — or two keywords are inverted
+    /// ([`ParseErrorReason::MarkerOrder`]).
+    Keywords,
+}
+
+impl MarkerOrderDiagnostic {
+    /// The diagnostic's stable code.
+    pub fn code(self) -> &'static str {
+        match self {
+            MarkerOrderDiagnostic::Attributes => "marker-order/attributes",
+            MarkerOrderDiagnostic::Keywords => "marker-order/keywords",
+        }
+    }
+
+    /// Whether the diagnostic is a warning (the program is accepted).
+    pub fn is_warning(self) -> bool {
+        self == MarkerOrderDiagnostic::Attributes
+    }
+
+    /// The marker-order diagnostic a rendered message reports, if it reports
+    /// one. The parser renders both with no context and no hint, so each
+    /// message begins with its fixed head.
+    pub fn of_message(message: &str) -> Option<MarkerOrderDiagnostic> {
+        if message.starts_with(ATTRIBUTE_ORDER_HEAD) {
+            Some(MarkerOrderDiagnostic::Attributes)
+        } else if message.starts_with(MARKER_ORDER_HEAD) {
+            Some(MarkerOrderDiagnostic::Keywords)
+        } else {
+            None
+        }
+    }
+}
+
+/// The quick fix for a marker-order diagnostic (B536): replace `span` — the
+/// diagnostic's own, the head's marker run — with `replacement`, the run's
+/// units in THE order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkerOrderFix {
+    /// The diagnostic's stable code ([`MarkerOrderDiagnostic::code`]).
+    pub code: &'static str,
+    /// The quick fix's title: "Write `[deprecated(..)] [must_use] fun`".
+    pub title: String,
+    /// The source range the edit replaces.
+    pub span: Span,
+    /// What the edit writes there.
+    pub replacement: String,
+}
+
+/// The quick fix for the diagnostic `message` anchored at `span` in `source`,
+/// or `None` when it is not a marker-order diagnostic (B536), or `span` is
+/// not a marker run in `source` (the buffer moved on since the diagnostic).
+///
+/// The edit permutes the run's UNITS — each attribute group and keyword
+/// (`export` with its `(in PATH)`) exactly as written, arguments and all —
+/// into THE order, and keeps what stood BETWEEN them where it stood: the
+/// blanks, a line break, a comment. So `[must_use]` ⏎ `[deprecated("d")]` ⏎
+/// `fun` becomes `[deprecated("d")]` ⏎ `[must_use]` ⏎ `fun`, and `export
+/// [must_use] fun` becomes `[must_use] export fun`. The result is the head
+/// the parser read; `vilan fmt` lays it out.
+pub fn marker_order_fix(source: &str, message: &str, span: Span) -> Option<MarkerOrderFix> {
+    let diagnostic = MarkerOrderDiagnostic::of_message(message)?;
+    let (tokens, _) = lexing::tokenize(source);
+    let start = tokens
+        .iter()
+        .position(|(_, token_span)| token_span.start == span.start)?;
+    let run = marker_run_at(&tokens, start)?;
+    let unit_range = |unit: &MarkerUnit<'_>| {
+        tokens[unit.tokens.start].1.start..tokens[unit.tokens.end - 1].1.end
+    };
+    let mut written = run.units.clone();
+    written.sort_by_key(|unit| tokens[unit.tokens.start].1.start);
+    let run_end = written.iter().map(|unit| unit_range(unit).end).max()?;
+    if run_end != span.end {
+        return None;
+    }
+    let mut canonical = written.clone();
+    canonical.sort_by_key(|unit| unit.kind.written_key());
+    let mut replacement = String::new();
+    for (index, (slot, unit)) in written.iter().zip(&canonical).enumerate() {
+        if index > 0 {
+            let gap = unit_range(&written[index - 1]).end..unit_range(slot).start;
+            replacement.push_str(source.get(gap)?);
+        }
+        replacement.push_str(source.get(unit_range(unit))?);
+    }
+    let mut spelled: Vec<String> = canonical.iter().map(|unit| unit.kind.spelled()).collect();
+    spelled.push(run.word.to_string());
+    Some(MarkerOrderFix {
+        code: diagnostic.code(),
+        title: format!("Write `{}`", spelled.join(" ")),
+        span,
+        replacement,
+    })
+}
+
+/// A declaration's marker run: its units in STREAM order, and the declaration
+/// word it ends at.
+struct MarkerRun<'src> {
+    units: Vec<MarkerUnit<'src>>,
+    /// The declaration word, as the steer spells it.
+    word: &'static str,
+    /// The word's token index.
+    word_at: usize,
+}
+
+/// The token index just past the balanced group opening at `open`, or `None`
+/// when it never closes.
+fn past_balanced_group_in(tokens: &[Spanned<Token<'_>>], open: usize) -> Option<usize> {
+    past_balanced_group_with(|at| tokens.get(at).map(|(token, _)| token), open)
+}
+
+/// [`past_balanced_group_in`] over any token reader.
+fn past_balanced_group_with<'t, 'src: 't>(
+    token_at: impl Fn(usize) -> Option<&'t Token<'src>>,
+    open: usize,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut at = open;
+    loop {
+        match token_at(at)? {
+            Token::Ctrl('[' | '(' | '{') => depth += 1,
+            Token::Ctrl(']' | ')' | '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at + 1);
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+}
+
+/// The run of attribute groups and marker keywords starting at `start` in
+/// `tokens`, when it ends at a declaration word ([`declaration_word`]);
+/// `None` for any other run — `[a][b];`, `async { .. }`, an unclosed group.
+/// The ONE scanner the parser's canonicalizer, the quick fix and the
+/// formatter's safety net share ([`marker_run_with`]).
+fn marker_run_at<'src>(tokens: &[Spanned<Token<'src>>], start: usize) -> Option<MarkerRun<'src>> {
+    marker_run_with(|at| tokens.get(at).map(|(token, _)| token), start)
+}
+
+/// The token ranges of the marker run at `start` in a bare token stream, in
+/// THE written order (attributes by [`attribute_rank`], then the keywords by
+/// Q8's), ties as written, and the index of the declaration word it ends at;
+/// `None` when no run of two or more units ending at a declaration word
+/// starts there. The formatter's safety net puts both of its streams' heads
+/// into this order (B536), so it accepts the printer writing a head the
+/// parser read in THE order whatever order it was written in.
+pub(crate) fn marker_run_in_written_order(
+    tokens: &[Token<'_>],
+    start: usize,
+) -> Option<(Vec<std::ops::Range<usize>>, usize)> {
+    let run = marker_run_with(|at| tokens.get(at), start)?;
+    if run.units.len() < 2 {
+        return None;
+    }
+    let mut units = run.units;
+    units.sort_by_key(|unit| unit.kind.written_key());
+    Some((
+        units.into_iter().map(|unit| unit.tokens).collect(),
+        run.word_at,
+    ))
+}
+
+/// [`marker_run_at`] over any token reader.
+fn marker_run_with<'t, 'src: 't>(
+    token_at: impl Fn(usize) -> Option<&'t Token<'src>> + Copy,
+    start: usize,
+) -> Option<MarkerRun<'src>> {
+    let mut units: Vec<MarkerUnit<'src>> = Vec::new();
+    let mut at = start;
+    loop {
+        let keyword = match token_at(at) {
+            Some(Token::Ctrl('[')) => {
+                let Some(Token::Ident(name)) = token_at(at + 1) else {
+                    break;
+                };
+                let name = *name;
+                let end = past_balanced_group_with(token_at, at)?;
+                let arguments = token_at(at + 2) == Some(&Token::Ctrl('('));
+                units.push(MarkerUnit {
+                    tokens: at..end,
+                    kind: MarkerUnitKind::Attribute { name, arguments },
+                });
+                at = end;
+                continue;
+            }
+            Some(Token::Export) => MarkerKeyword::Export,
+            Some(Token::Const) => MarkerKeyword::Const,
+            Some(Token::Ident("lazy")) => MarkerKeyword::Lazy,
+            Some(Token::Async) => MarkerKeyword::Async,
+            Some(Token::External) => MarkerKeyword::External,
+            Some(Token::Macro) => MarkerKeyword::Macro,
+            _ => break,
+        };
+        let mut end = at + 1;
+        if keyword == MarkerKeyword::Export
+            && token_at(end) == Some(&Token::Ctrl('('))
+            && token_at(end + 1) == Some(&Token::In)
+        {
+            end = past_balanced_group_with(token_at, end)?;
+        }
+        units.push(MarkerUnit {
+            tokens: at..end,
+            kind: MarkerUnitKind::Keyword(keyword),
+        });
+        at = end;
+    }
+    let word = declaration_word(token_at(at))?;
+    Some(MarkerRun {
+        units,
+        word,
+        word_at: at,
+    })
 }
 
 thread_local! {
@@ -2056,6 +2343,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             statement_head: None,
             rewrite_refusals: Vec::new(),
             written_starts: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -3584,34 +3872,38 @@ impl<'a, 'src> Parser<'a, 'src> {
         });
     }
 
-    /// B485 Q7/Q8 and B486 (RULED): the declaration head at the cursor —
-    /// a run of attribute groups and marker keywords ending at a declaration
-    /// word — is put into the order the productions read, once, before any of
-    /// them reads it.
+    /// B485 and B536 (RULED): the declaration head at the cursor — a run of
+    /// attribute groups and marker keywords ending at a declaration word — is
+    /// put into the order the productions read, once, before any of them
+    /// reads it. THE order it is WRITTEN in is the attributes by
+    /// [`attribute_rank`], then the keywords — `export`, `const`|`lazy`,
+    /// `async`, `external`|`macro` (Q8) — then the declaration word (Q6).
     ///
-    /// - **Attributes are free (Q7).** Written in any order, they are sorted
-    ///   by [`attribute_rank`], so `[internal(..)] [deprecated(..)] fun` reads
-    ///   as the canonical `[deprecated(..)] [internal(..)] fun` and `vilan fmt`
-    ///   prints it so. No diagnostic.
-    /// - **`export` may stand on either side of them** in this release (B445,
-    ///   Q9), and so may `macro`, whose production read its attributes after
-    ///   it before B485. No diagnostic.
-    /// - **Keywords take one order (Q8)** — `export`, `const`|`lazy`,
-    ///   `async`, `external`|`macro` — and come AFTER the attributes (Q6). A
-    ///   head that breaks either rule is refused ONCE, spanning the run, with
-    ///   the head respelled in the ruled order
-    ///   ([`ParseErrorReason::MarkerOrder`]), and read as if written so: `async
-    ///   [platform(..)] fun`, `external async fun`, `lazy export let`. Before,
-    ///   each fell to "cannot find '<attr>'" or "expected `;`" (B486).
+    /// - **Attributes out of rank** (and nothing else out of order) are read
+    ///   in rank and WARNED, once, spanning the run
+    ///   ([`ParseErrorReason::AttributeOrder`], B536 revising Q7's free
+    ///   order): `[internal(..)] [deprecated(..)] fun` reads as
+    ///   `[deprecated(..)] [internal(..)] fun`, which `vilan fmt` writes.
+    /// - **A keyword ahead of an attribute, or two keywords inverted**, is
+    ///   REFUSED once, spanning the run, with the head respelled in the order
+    ///   ([`ParseErrorReason::MarkerOrder`]), and read as if written so:
+    ///   `async [platform(..)] fun`, `external async fun`, `lazy export let`.
+    ///   That includes `export` and `macro` ahead of the attributes (B485 S3,
+    ///   v0.44.0): `export [must_use] fun`, the order before B485, and
+    ///   `macro [deprecated(..)] fun`.
+    ///
+    /// The WRITTEN order is read off the tokens' spans, not their places on
+    /// the stream: [`Parser::lead_export_past_its_attributes`] has already
+    /// rotated a canonical `[..] export` into the `export [..]` the
+    /// productions read, and each token kept its own span.
     ///
     /// The run is rewritten by permuting whole units on the token stream, as
-    /// [`Parser::lead_export_past_its_attributes`] rotates one; every token
-    /// keeps its own span, and [`Parser::written_starts`] keeps each node
-    /// beginning where its first unit was written. Only a run that ENDS at a
-    /// declaration word is touched — `[a][b];` is a list indexed by a list,
-    /// `async { .. }` a block — and no run that ends there parses today in
-    /// any order but its own, so a valid program reads exactly as before. A
-    /// keyword set no order makes legal (`async const fun`, `lazy const let`) is left as
+    /// that rotation does; every token keeps its own span, and
+    /// [`Parser::written_starts`] keeps each node beginning where its first
+    /// unit was written. Only a run that ENDS at a declaration word is touched
+    /// — `[a][b];` is a list indexed by a list, `async { .. }` a block — and
+    /// a run in THE order reads exactly as it did before B486. A keyword set
+    /// no order makes legal (`async const fun`, `lazy const let`) is left as
     /// written, for its production's own refusal.
     fn canonicalize_marker_run(&mut self) {
         let start = self.position;
@@ -3626,53 +3918,12 @@ impl<'a, 'src> Parser<'a, 'src> {
         {
             return;
         }
-        let mut units: Vec<MarkerUnit<'src>> = Vec::new();
-        let mut at = start;
-        loop {
-            let token = self.tokens.get(at).map(|(token, _)| token);
-            let keyword = match token {
-                Some(Token::Ctrl('[')) => {
-                    let Some((Token::Ident(name), _)) = self.tokens.get(at + 1) else {
-                        break;
-                    };
-                    let name = *name;
-                    let Some(end) = self.past_balanced_group(at) else {
-                        return;
-                    };
-                    let arguments =
-                        self.tokens.get(at + 2).map(|(token, _)| token) == Some(&Token::Ctrl('('));
-                    units.push(MarkerUnit {
-                        tokens: at..end,
-                        kind: MarkerUnitKind::Attribute { name, arguments },
-                    });
-                    at = end;
-                    continue;
-                }
-                Some(Token::Export) => MarkerKeyword::Export,
-                Some(Token::Const) => MarkerKeyword::Const,
-                Some(Token::Ident("lazy")) => MarkerKeyword::Lazy,
-                Some(Token::Async) => MarkerKeyword::Async,
-                Some(Token::External) => MarkerKeyword::External,
-                Some(Token::Macro) => MarkerKeyword::Macro,
-                _ => break,
-            };
-            let mut end = at + 1;
-            if keyword == MarkerKeyword::Export
-                && self.tokens.get(end).map(|(token, _)| token) == Some(&Token::Ctrl('('))
-                && self.tokens.get(end + 1).map(|(token, _)| token) == Some(&Token::In)
-            {
-                let Some(after) = self.past_balanced_group(end) else {
-                    return;
-                };
-                end = after;
-            }
-            units.push(MarkerUnit {
-                tokens: at..end,
-                kind: MarkerUnitKind::Keyword(keyword),
-            });
-            at = end;
-        }
-        let Some(word) = declaration_word(self.tokens.get(at).map(|(token, _)| token)) else {
+        let Some(MarkerRun {
+            units,
+            word,
+            word_at: at,
+        }) = marker_run_at(self.tokens, start)
+        else {
             return;
         };
         if units.len() < 2 {
@@ -3689,30 +3940,36 @@ impl<'a, 'src> Parser<'a, 'src> {
                 keywords_seen.push(keyword);
             }
         }
-        // Out of the ruled order: a keyword other than `export` ahead of an
-        // attribute (Q6), or two keywords inverted (Q8).
+        let mut written = units.clone();
+        written.sort_by_key(|unit| self.token_span(unit.tokens.start).start);
+        // Out of THE order: a keyword ahead of an attribute (Q6; `export` and
+        // `macro` too since B485 S3), or two keywords inverted (Q8) — refused;
+        // or, short of either, two attributes out of rank (B536) — warned.
         let mut out_of_order = false;
+        let mut out_of_rank = false;
         let mut keyword_written = false;
-        let mut highest_rank = None;
-        for unit in &units {
+        let mut highest_keyword = None;
+        let mut highest_attribute = None;
+        for unit in &written {
             match unit.kind {
-                MarkerUnitKind::Attribute { .. } => out_of_order |= keyword_written,
+                MarkerUnitKind::Attribute { name, .. } => {
+                    out_of_order |= keyword_written;
+                    let rank = attribute_rank(name);
+                    out_of_rank |= highest_attribute.is_some_and(|highest| rank < highest);
+                    highest_attribute = highest_attribute.max(Some(rank));
+                }
                 MarkerUnitKind::Keyword(keyword) => {
                     let rank = keyword.written_rank();
-                    out_of_order |= highest_rank.is_some_and(|highest| rank < highest);
-                    highest_rank = highest_rank.max(Some(rank));
-                    // `export` and `macro` ahead of the attributes are the
-                    // order this release still reads (Q9): `macro
-                    // [deprecated(..)] fun` parsed before B485, as `export
-                    // [..] fun` did, and `vilan fmt` rewrites both.
-                    keyword_written |=
-                        !matches!(keyword, MarkerKeyword::Export | MarkerKeyword::Macro);
+                    out_of_order |= highest_keyword.is_some_and(|highest| rank < highest);
+                    highest_keyword = highest_keyword.max(Some(rank));
+                    keyword_written = true;
                 }
             }
         }
-        let mut written: Vec<MarkerUnitKind<'src>> = units.iter().map(|unit| unit.kind).collect();
-        written.sort_by_key(|kind| kind.written_key());
-        let keywords: Vec<MarkerKeyword> = written
+        let mut canonical: Vec<MarkerUnitKind<'src>> =
+            written.iter().map(|unit| unit.kind).collect();
+        canonical.sort_by_key(|kind| kind.written_key());
+        let keywords: Vec<MarkerKeyword> = canonical
             .iter()
             .filter_map(|kind| match kind {
                 MarkerUnitKind::Keyword(MarkerKeyword::Export) => None,
@@ -3735,15 +3992,23 @@ impl<'a, 'src> Parser<'a, 'src> {
             .any(|(read, written)| read.tokens != written.tokens);
         // `const [deprecated(..)] fun` is already in the order the production
         // reads, and still out of the written one: refused, not reordered.
-        if !reordered && !out_of_order {
+        if !reordered && !out_of_order && !out_of_rank {
             return;
         }
+        // The run as WRITTEN: from its first unit to the end of its last —
+        // which, after `lead_export_past_its_attributes`' rotation, is not
+        // the token ahead of the word.
         let run_span = Span::from(
             units
                 .iter()
                 .map(|unit| self.token_span(unit.tokens.start).start)
                 .min()
-                .unwrap_or_default()..self.token_span(at - 1).end,
+                .unwrap_or_default()
+                ..units
+                    .iter()
+                    .map(|unit| self.token_span(unit.tokens.end - 1).end)
+                    .max()
+                    .unwrap_or_default(),
         );
         // Each suffix of the reading order begins where the earliest of its
         // units was written — and is marked as read, so a production reading
@@ -3775,16 +4040,27 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.tokens[start..at].clone_from_slice(&tokens);
             self.assignment_reachable[start..at].copy_from_slice(&reachable);
         }
+        let mut spelled: Vec<String> = canonical.iter().map(|kind| kind.spelled()).collect();
+        spelled.push(word.to_string());
+        let canonical = spelled.join(" ");
         if out_of_order {
-            let mut canonical: Vec<String> = written.iter().map(|kind| kind.spelled()).collect();
-            canonical.push(word.to_string());
-            self.record_rewrite(
-                run_span,
-                ParseErrorReason::MarkerOrder {
-                    canonical: canonical.join(" "),
-                },
-            );
+            self.record_rewrite(run_span, ParseErrorReason::MarkerOrder { canonical });
+        } else if out_of_rank {
+            self.record_warning(run_span, ParseErrorReason::AttributeOrder { canonical });
         }
+    }
+
+    /// Records a WARNING ([`Parser::warnings`]), once per span.
+    fn record_warning(&mut self, span: Span, reason: ParseErrorReason) {
+        if self.warnings.iter().any(|warning| warning.span == span) {
+            return;
+        }
+        self.warnings.push(ParseError {
+            span,
+            reason,
+            context: Vec::new(),
+            hint: None,
+        });
     }
 
     /// B520: `fn`/`function`/`func`/`def` at the ITEM HEAD at the cursor —
@@ -3887,21 +4163,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// The index just past the bracket group opening at `open` (a `[`, `(` or
     /// `{`), counting every bracket kind, or `None` if the stream ends first.
     fn past_balanced_group(&self, open: usize) -> Option<usize> {
-        let mut depth = 0usize;
-        let mut at = open;
-        loop {
-            match &self.tokens.get(at)?.0 {
-                Token::Ctrl('[' | '(' | '{') => depth += 1,
-                Token::Ctrl(']' | ')' | '}') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(at + 1);
-                    }
-                }
-                _ => {}
-            }
-            at += 1;
-        }
+        past_balanced_group_in(self.tokens, open)
     }
 
     // --- Expressions ---------------------------------------------------------
@@ -11281,10 +11543,18 @@ mod tests {
             Node::Struct(_, _, external, resource, ..) => assert!(resource && !external),
             other => panic!("expected a resource Struct, got {other:?}"),
         }
-        // Both sides at once: one prefix, read in its order.
-        match exported(only_item(
-            "[deprecated(\"use g()\")] export [platform(\"node\")] fun f(): i32 { 1 }",
-        )) {
+        // Both sides at once: refused since B485 S3 (an attribute after the
+        // marker), and still read as one prefix, in its order.
+        let source = "[deprecated(\"use g()\")] export [platform(\"node\")] fun f(): i32 { 1 }";
+        let (tree, errors) = parse(source);
+        assert_eq!(
+            errors.iter().map(render).collect::<Vec<_>>(),
+            vec![marker_order_rule(
+                "[deprecated(..)] [platform(..)] export fun"
+            )]
+        );
+        let (mut statements, _) = tree.expect("a tree");
+        match exported(statements.remove(0).0) {
             Node::Func(function) => {
                 assert_eq!(function.deprecated, Some("use g()"));
                 assert_eq!(function.platform_fence.len(), 1);
@@ -11595,7 +11865,7 @@ mod tests {
             Some("use B")
         );
         // …and on an `export import`, the re-export the ruling names.
-        match only_item("export [deprecated(\"use D\")] import pkg::a::D as K;") {
+        match only_item("[deprecated(\"use D\")] export import pkg::a::D as K;") {
             Node::Export(_, inner, Some(labels)) => {
                 assert_eq!(labels.deprecated, Some("use D"));
                 assert!(matches!(&inner.0, Node::Import(..)));
@@ -11845,7 +12115,7 @@ mod tests {
             other => panic!("expected an Enum, got {other:?}"),
         }
         // Behind `export`, and after a `[derive(..)]`, as a function's is.
-        match only_item("export [internal(\"x\")] struct Marker {}") {
+        match only_item("[internal(\"x\")] export struct Marker {}") {
             Node::Export(_, inner, _) => {
                 assert!(
                     matches!(&inner.0, Node::Struct(.., Some(labels)) if labels.internal == Some("x"))
@@ -12517,7 +12787,7 @@ mod tests {
             "export use pkg::a::b;\n",
             // The attribute wrappers are transparent: the rule asks about the
             // declaration under them, not about the wrapper.
-            "export [derive(Wire)] struct S { x: i32 }\n",
+            "[derive(Wire)] export struct S { x: i32 }\n",
             "export external fun serve();\n",
         ] {
             assert!(
@@ -13237,18 +13507,19 @@ mod tests {
         );
     }
 
-    /// B486's matrix (papers-45's `order_matrix.py`): each declaration kind's
-    /// full stack in the order the parser took before B485, and every
-    /// ADJACENT swap of it — 29 in all.
+    /// B486's matrix (papers-45's `order_matrix.py`), re-read in B536's THE
+    /// order: each declaration kind's full stack — its attributes by
+    /// [`attribute_rank`], then `export` and the other keywords by Q8's — and
+    /// every ADJACENT swap of it, 29 in all.
     const B486_STACKS: &[(&[&str], &str)] = &[
         (
             &[
-                "export",
                 "[deprecated(\"use g\")]",
                 "[internal(\"why\")]",
                 "[extern(\"f\")]",
                 "[must_use]",
                 "[platform(\"node\")]",
+                "export",
                 "async",
                 "external",
             ],
@@ -13256,127 +13527,367 @@ mod tests {
         ),
         (
             &[
-                "export",
                 "[deprecated(\"use g\")]",
                 "[internal(\"why\")]",
                 "[must_use]",
                 "[platform(\"node\")]",
+                "export",
                 "async",
             ],
             "fun f(): i32 { 1 }",
         ),
         (
             &[
-                "export",
                 "[deprecated(\"use T\")]",
                 "[internal(\"why\")]",
                 "[platform(\"node\")]",
                 "[resource]",
+                "export",
                 "external",
             ],
             "struct H;",
         ),
         (
             &[
-                "export",
                 "[derive(PartialEq)]",
                 "[deprecated(\"use T\")]",
                 "[internal(\"why\")]",
                 "[platform(\"node\")]",
                 "[resource]",
+                "export",
             ],
             "struct S { a: i32 }",
         ),
         (
             &[
-                "export",
                 "[deprecated(\"use U\")]",
                 "[internal(\"why\")]",
                 "[platform(\"node\")]",
                 "[resource]",
+                "export",
             ],
             "trait T { fun t(self): i32; }",
         ),
         (
             &[
-                "export",
                 "[deprecated(\"use y\")]",
                 "[internal(\"why\")]",
+                "export",
                 "lazy",
             ],
             "let x = 1;",
         ),
     ];
 
+    /// The declaration head a stack spells, attributes abbreviated as the
+    /// marker-order diagnostics write them.
+    fn b486_spelled(stack: &[&str], declaration: &str) -> String {
+        let mut spelled: Vec<String> = stack
+            .iter()
+            .map(|marker| {
+                if !marker.starts_with('[') {
+                    return marker.to_string();
+                }
+                let name = marker[1..].split(['(', ']']).next().unwrap();
+                if marker.contains('(') {
+                    format!("[{name}(..)]")
+                } else {
+                    format!("[{name}]")
+                }
+            })
+            .collect();
+        spelled.push(declaration.split(' ').next().unwrap().to_string());
+        spelled.join(" ")
+    }
+
+    /// B536's classification of the 29 swaps (RULED 2026-10-03): the stack is
+    /// CANONICAL; a swap of two attributes WARNS (out of rank, read in it); a
+    /// swap that puts a keyword ahead of an attribute — `export` included,
+    /// B485 S3 — or inverts two keywords is REFUSED, and read as the stack.
+    /// Every one of them `vilan fmt` writes as the stack, idempotently.
     #[test]
-    fn b486_every_adjacent_marker_swap_is_read_or_steered_to_the_order() {
-        let mut swaps = 0;
+    fn b536_every_adjacent_marker_swap_is_canonical_warned_or_refused() {
+        let is_attribute = |marker: &str| marker.starts_with('[');
+        let (mut warned, mut refused) = (0, 0);
         for (stack, declaration) in B486_STACKS {
             let canonical = format!("{} {declaration}\n", stack.join(" "));
+            let spelled = b486_spelled(stack, declaration);
+            let (_, errors, warnings) = parse_with_warnings(&canonical);
+            assert!(
+                errors.is_empty() && warnings.is_empty(),
+                "{canonical}: {errors:?} {warnings:?}"
+            );
             let canonical_print = crate::formatter::reprint(&canonical)
                 .unwrap_or_else(|decline| panic!("{canonical}: {decline:?}"));
+            assert_eq!(
+                crate::formatter::reprint(&canonical_print).as_deref(),
+                Ok(canonical_print.as_str()),
+                "{canonical}: not idempotent"
+            );
+            // The printer writes THE order itself — the net sorts both of its
+            // streams, so only this says the print is not merely the source's
+            // tokens in some order the net accepts.
+            let (_, errors, warnings) = parse_with_warnings(&canonical_print);
+            assert!(
+                errors.is_empty() && warnings.is_empty(),
+                "{canonical_print}: {errors:?} {warnings:?}"
+            );
             for at in 0..stack.len() - 1 {
-                swaps += 1;
                 let mut swapped = stack.to_vec();
                 swapped.swap(at, at + 1);
                 let source = format!("{} {declaration}\n", swapped.join(" "));
-                let (first, second) = (swapped[at], swapped[at + 1]);
-                let is_attribute = |marker: &str| marker.starts_with('[');
-                // A keyword other than `export` written ahead of an attribute
-                // (Q6), or two keywords inverted (Q8), is steered; every
-                // other swap is two attributes (free, Q7) or `export` and an
-                // attribute (either side, B445).
-                let steered = !is_attribute(first) && (!is_attribute(second) || first != "export");
-                let (tree, errors) = parse(&source);
-                let rendered: Vec<String> = errors.iter().map(render).collect();
-                if steered {
-                    // ONE refusal, spanning the run, naming the ruled order —
-                    // the attributes, `export`, the keywords, the word — and
-                    // the declaration read as written in it.
-                    let mut attributes: Vec<String> = stack
-                        .iter()
-                        .filter(|marker| is_attribute(marker))
-                        .map(|marker| {
-                            let name = marker[1..].split(['(', ']']).next().unwrap();
-                            if marker.contains('(') {
-                                format!("[{name}(..)]")
-                            } else {
-                                format!("[{name}]")
-                            }
-                        })
-                        .collect();
-                    attributes.extend(
-                        stack
-                            .iter()
-                            .filter(|marker| !is_attribute(marker))
-                            .map(|marker| marker.to_string()),
-                    );
-                    let word = declaration.split(' ').next().unwrap();
-                    attributes.push(word.to_string());
+                let (tree, errors, warnings) = parse_with_warnings(&source);
+                let errors: Vec<String> = errors.iter().map(render).collect();
+                let warnings: Vec<(Span, String)> = warnings
+                    .iter()
+                    .map(|warning| (warning.span, render(warning)))
+                    .collect();
+                let run = Span::from(0..source.find(declaration).unwrap() - 1);
+                if is_attribute(swapped[at]) && is_attribute(swapped[at + 1]) {
+                    warned += 1;
+                    assert!(errors.is_empty(), "{source}: {errors:?}");
                     assert_eq!(
-                        rendered,
-                        vec![marker_order_rule(&attributes.join(" "))],
+                        warnings,
+                        vec![(run, attribute_order_rule(&spelled))],
                         "{source}"
                     );
-                    let run_end = source.find(word).unwrap();
-                    assert_eq!(errors[0].span, Span::from(0..run_end - 1), "{source}");
+                } else {
+                    refused += 1;
+                    assert!(warnings.is_empty(), "{source}: {warnings:?}");
+                    assert_eq!(errors, vec![marker_order_rule(&spelled)], "{source}");
                     let (statements, _) = tree.expect("a tree");
                     assert_eq!(statements.len(), 1, "{source}: {statements:?}");
                     assert!(
                         matches!(statements[0].0, Node::Export(..)),
                         "{source}: {statements:?}"
                     );
-                } else {
-                    // Read clean, as the canonical stack: `vilan fmt` prints
-                    // the two alike.
-                    assert!(rendered.is_empty(), "{source}: {rendered:?}");
-                    let print = crate::formatter::reprint(&source)
-                        .unwrap_or_else(|decline| panic!("{source}: {decline:?}"));
-                    assert_eq!(print, canonical_print, "{source}");
                 }
+                let print = crate::formatter::reprint(&source)
+                    .unwrap_or_else(|decline| panic!("{source}: {decline:?}"));
+                assert_eq!(print, canonical_print, "{source}");
             }
         }
-        assert_eq!(swaps, 29);
+        assert_eq!((warned, refused), (18, 11));
+    }
+
+    /// B536: attributes out of [`attribute_rank`]'s order, and nothing else
+    /// out of order, are a WARNING — beside the errors, never among them, so
+    /// the source stays clean — spanning the run and naming the head in THE
+    /// order; the tree is the canonical spelling's.
+    #[test]
+    fn b536_attributes_out_of_rank_warn_and_read_in_it() {
+        for (source, canonical, spelled) in [
+            (
+                "[internal(\"r\")] [deprecated(\"d\")] fun f() {}",
+                "[deprecated(\"d\")] [internal(\"r\")] fun f() {}",
+                "[deprecated(..)] [internal(..)] fun",
+            ),
+            (
+                "[platform(\"node\")]\n[must_use]\nexport async fun f(): i32 { 1 }",
+                "[must_use]\n[platform(\"node\")]\nexport async fun f(): i32 { 1 }",
+                "[must_use] [platform(..)] export async fun",
+            ),
+            (
+                "[resource] [derive(PartialEq)] struct S { a: i32 }",
+                "[derive(PartialEq)] [resource] struct S { a: i32 }",
+                "[derive(..)] [resource] struct",
+            ),
+            (
+                "[internal(\"r\")] [deprecated(\"d\")] lazy let x = 1;",
+                "[deprecated(\"d\")] [internal(\"r\")] lazy let x = 1;",
+                "[deprecated(..)] [internal(..)] lazy let",
+            ),
+            (
+                "[must_use] [deprecated(\"d\")] const fun f(): i32 { 1 }",
+                "[deprecated(\"d\")] [must_use] const fun f(): i32 { 1 }",
+                "[deprecated(..)] [must_use] const fun",
+            ),
+            (
+                "trait T {\n\t[must_use] [deprecated(\"d\")] fun t(self): i32;\n}",
+                "trait T {\n\t[deprecated(\"d\")] [must_use] fun t(self): i32;\n}",
+                "[deprecated(..)] [must_use] fun",
+            ),
+        ] {
+            let (tree, errors, warnings) = parse_with_warnings(source);
+            assert!(errors.is_empty(), "{source}: {errors:?}");
+            let rendered: Vec<String> = warnings.iter().map(render).collect();
+            assert_eq!(rendered, vec![attribute_order_rule(spelled)], "{source}");
+            let run_start = source.find('[').unwrap();
+            let word = spelled.rsplit(' ').next().unwrap();
+            let run_end = source[..source.find(&format!(" {word} ")).unwrap()]
+                .trim_end()
+                .len();
+            assert_eq!(warnings[0].span, Span::from(run_start..run_end), "{source}");
+            assert_eq!(
+                MarkerOrderDiagnostic::of_message(&rendered[0]),
+                Some(MarkerOrderDiagnostic::Attributes)
+            );
+            // The tree is the canonical spelling's: `vilan fmt` prints the
+            // two alike.
+            assert!(tree.is_some());
+            let (_, canonical_errors, canonical_warnings) = parse_with_warnings(canonical);
+            assert!(canonical_errors.is_empty() && canonical_warnings.is_empty());
+            assert_eq!(
+                crate::formatter::reprint(source),
+                crate::formatter::reprint(canonical),
+                "{source}"
+            );
+            // `parse` — what every reader but the reporting pipelines calls —
+            // hands back the same clean result, and no warning.
+            let (_, errors) = parse(source);
+            assert!(errors.is_empty(), "{source}: {errors:?}");
+        }
+        // Nothing to warn about: THE order, a tie kept as written (two
+        // generators, two `[hint]`s), one attribute, a run that is not a
+        // declaration head.
+        for source in [
+            "[deprecated(\"d\")] [internal(\"r\")] [must_use] [platform(\"node\")] export async fun f(): i32 { 1 }",
+            "[service(Api)] [derive(PartialEq)] struct S { a: i32 }",
+            "[hint(Show)] [hint(Eq)] [resource] external struct H;",
+            "[must_use] fun f(): i32 { 1 }",
+            "fun main() { let a = [1]; let b = [0]; [a][b]; }",
+        ] {
+            let (_, errors, warnings) = parse_with_warnings(source);
+            assert!(warnings.is_empty(), "{source}: {warnings:?}");
+            assert!(
+                errors
+                    .iter()
+                    .all(|error| !matches!(error.reason, ParseErrorReason::MarkerOrder { .. })),
+                "{source}: {errors:?}"
+            );
+        }
+    }
+
+    /// B536's editor half: the stable codes, the message recognizer, and the
+    /// quick fix — the run's units permuted into THE order with what stood
+    /// between them kept in place — which re-parses with neither the error
+    /// nor the warning.
+    #[test]
+    fn b536_the_marker_order_fix_writes_the_head_in_the_order() {
+        assert_eq!(
+            MarkerOrderDiagnostic::Attributes.code(),
+            "marker-order/attributes"
+        );
+        assert_eq!(
+            MarkerOrderDiagnostic::Keywords.code(),
+            "marker-order/keywords"
+        );
+        assert!(MarkerOrderDiagnostic::Attributes.is_warning());
+        assert!(!MarkerOrderDiagnostic::Keywords.is_warning());
+        assert_eq!(
+            MarkerOrderDiagnostic::of_message(&attribute_order_rule("[must_use] fun")),
+            Some(MarkerOrderDiagnostic::Attributes)
+        );
+        assert_eq!(
+            MarkerOrderDiagnostic::of_message(&marker_order_rule("[must_use] export fun")),
+            Some(MarkerOrderDiagnostic::Keywords)
+        );
+        assert_eq!(MarkerOrderDiagnostic::of_message("cannot find 'x'"), None);
+        for (source, fixed, code, title) in [
+            (
+                "[internal(\"r\")] [deprecated(\"d\")] fun f() {}",
+                "[deprecated(\"d\")] [internal(\"r\")] fun f() {}",
+                "marker-order/attributes",
+                "Write `[deprecated(..)] [internal(..)] fun`",
+            ),
+            (
+                "// lead\n[must_use]\n// between\n[deprecated(\"d\")]\nfun f(): i32 { 1 }",
+                "// lead\n[deprecated(\"d\")]\n// between\n[must_use]\nfun f(): i32 { 1 }",
+                "marker-order/attributes",
+                "Write `[deprecated(..)] [must_use] fun`",
+            ),
+            (
+                "export [must_use] fun f(): i32 { 1 }",
+                "[must_use] export fun f(): i32 { 1 }",
+                "marker-order/keywords",
+                "Write `[must_use] export fun`",
+            ),
+            (
+                "export(in pkg)\n[deprecated(\"d\")]\nfun f() {}",
+                "[deprecated(\"d\")]\nexport(in pkg)\nfun f() {}",
+                "marker-order/keywords",
+                "Write `[deprecated(..)] export fun`",
+            ),
+            (
+                "[internal(\"r\")] export [deprecated(\"d\")] struct S {}",
+                "[deprecated(\"d\")] [internal(\"r\")] export struct S {}",
+                "marker-order/keywords",
+                "Write `[deprecated(..)] [internal(..)] export struct`",
+            ),
+            (
+                "async [platform(\"node\")] fun f() {}",
+                "[platform(\"node\")] async fun f() {}",
+                "marker-order/keywords",
+                "Write `[platform(..)] async fun`",
+            ),
+            (
+                "external async fun f(): i32;",
+                "async external fun f(): i32;",
+                "marker-order/keywords",
+                "Write `async external fun`",
+            ),
+            (
+                "fun main() {}\nexport [must_use] [deprecated(\"d\")] fun f(): i32 { 1 }\n",
+                "fun main() {}\n[deprecated(\"d\")] [must_use] export fun f(): i32 { 1 }\n",
+                "marker-order/keywords",
+                "Write `[deprecated(..)] [must_use] export fun`",
+            ),
+        ] {
+            let (_, errors, warnings) = parse_with_warnings(source);
+            let diagnostics: Vec<&ParseError> = errors.iter().chain(&warnings).collect();
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            let message = render(diagnostics[0]);
+            let fix = marker_order_fix(source, &message, diagnostics[0].span)
+                .unwrap_or_else(|| panic!("{source}: no fix for {message}"));
+            assert_eq!(fix.code, code, "{source}");
+            assert_eq!(fix.title, title, "{source}");
+            let mut edited = source.to_string();
+            edited.replace_range(fix.span.start..fix.span.end, &fix.replacement);
+            assert_eq!(edited, fixed, "{source}");
+            let (_, errors, warnings) = parse_with_warnings(&edited);
+            assert!(
+                errors.is_empty() && warnings.is_empty(),
+                "{edited}: {errors:?} {warnings:?}"
+            );
+        }
+        // Any other diagnostic, and a span that is no longer a run, has none.
+        let (_, errors) = parse("fun f( {");
+        assert_eq!(
+            marker_order_fix("fun f( {", &render(&errors[0]), errors[0].span),
+            None
+        );
+        let source = "export [must_use] fun f(): i32 { 1 }";
+        let (_, errors) = parse(source);
+        let message = render(&errors[0]);
+        assert_eq!(
+            marker_order_fix("fun g() {}", &message, errors[0].span),
+            None
+        );
+    }
+
+    /// B485 S3 (RULED for v0.44.0): each stack in the order before B485 —
+    /// `export` ahead of every attribute — is refused, steered to THE order,
+    /// read as it, and written in it by `vilan fmt`.
+    #[test]
+    fn b485_s3_export_ahead_of_the_attributes_is_refused_and_formatted() {
+        for (stack, declaration) in B486_STACKS {
+            let canonical = format!("{} {declaration}\n", stack.join(" "));
+            let mut old = stack.to_vec();
+            old.retain(|marker| *marker != "export");
+            old.insert(0, "export");
+            let source = format!("{} {declaration}\n", old.join(" "));
+            let (_, errors) = parse(&source);
+            assert_eq!(
+                errors.iter().map(render).collect::<Vec<_>>(),
+                vec![marker_order_rule(&b486_spelled(stack, declaration))],
+                "{source}"
+            );
+            assert_eq!(
+                crate::formatter::reprint(&source),
+                crate::formatter::reprint(&canonical),
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -13409,6 +13920,34 @@ mod tests {
                 "lazy [internal(\"x\")] let x = 1;",
                 "[internal(..)] lazy let",
             ),
+            // B485 S3: `export` and `macro` ahead of the attributes, the
+            // order before B485 — and a run split across the marker.
+            (
+                "export [must_use] async fun f(): i32 { 1 }",
+                "[must_use] export async fun",
+            ),
+            (
+                "export(in pkg) [deprecated(\"x\")] fun f() {}",
+                "[deprecated(..)] export fun",
+            ),
+            (
+                "[deprecated(\"x\")] export [must_use] fun f(): i32 { 1 }",
+                "[deprecated(..)] [must_use] export fun",
+            ),
+            (
+                "export [deprecated(\"use b\")] import a::b as c;",
+                "[deprecated(..)] export import",
+            ),
+            (
+                "macro [deprecated(\"x\")] fun m() { }",
+                "[deprecated(..)] macro fun",
+            ),
+            // A keyword ahead of attributes that are out of rank as well: the
+            // one refusal, spelling the whole head in the order.
+            (
+                "export [must_use] [deprecated(\"x\")] fun f(): i32 { 1 }",
+                "[deprecated(..)] [must_use] export fun",
+            ),
         ] {
             let (tree, errors) = parse(source);
             let rendered: Vec<String> = errors.iter().map(render).collect();
@@ -13428,14 +13967,14 @@ mod tests {
                 );
             }
         }
-        // The ruled order and the one this release still takes (`export`
-        // ahead of the attributes, B445) read clean, and a run the order does
-        // not reach — a list indexed by a list, an `async` block — is the
-        // expression it always was.
+        // The ruled order reads clean, and a run the order does not reach — a
+        // list indexed by a list, an `async` block — is the expression it
+        // always was. (`export` ahead of the attributes, the order this test
+        // read clean before B485 S3, is in the list above.)
         for source in [
             "[must_use] export async fun f(): i32 { 1 }",
-            "export [must_use] async fun f(): i32 { 1 }",
             "[deprecated(\"x\")] export const fun f(): i32 { 1 }",
+            "[deprecated(\"x\")] export(in pkg) fun f() {}",
             "[resource] export external struct H;",
             "fun main() { [a][b]; }",
             "fun main() { let x = async { 1 }; }",
@@ -13485,11 +14024,8 @@ mod tests {
             },
             other => panic!("{other:?}"),
         }
-        // Under `export`, on either side of it.
-        for source in [
-            "[deprecated(\"use y\")] export const let y = 1;",
-            "export [deprecated(\"use y\")] const let y = 1;",
-        ] {
+        // Under `export` (the other side of it is B485 S3's refusal).
+        for source in ["[deprecated(\"use y\")] export const let y = 1;"] {
             match only_item(source) {
                 Node::Export(_, inner, None) => match &inner.0 {
                     Node::Const(declaration) => {

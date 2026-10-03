@@ -126,22 +126,22 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 | `then` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
 | `void` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
 | `with` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
-| `[derive(Debug)]` | · | · | · | ✓ | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | s2 |
-| `[service]` | · | · | · | a5 | a5 | a5 | · | · | · | · | · | · | · | · | · | · | · | s2 |
-| `[client_service]` | · | · | · | a5 | a5 | a5 | · | · | · | · | · | · | · | · | · | · | · | s2 |
-| `[extern("f")]` | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
-| `[must_use]` | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
-| `[rpc]` | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
-| `[trait_only]` | ✓ | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
+| `[derive(Debug)]` | · | · | · | ✓ | ✓ | · | ✓ | · | · | · | · | · | · | · | · | · | · | s2 |
+| `[service]` | · | · | · | a5 | a5 | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
+| `[client_service]` | · | · | · | a5 | a5 | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
+| `[extern("f")]` | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
+| `[must_use]` | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
+| `[rpc]` | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
+| `[trait_only]` | ✓ | ✓ | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
 | `[doc(hidden)]` | s6 | s6 | s6 | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
 | `[expose]` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
-| `[platform("browser")]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | · | · | · | a7 |
-| `[deprecated("use g")]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | a8 | a8 | a8 | ✓ | ✓ | ✓ | · | s9 | ✓ | s2 |
-| `[internal("why")]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | a8 | a8 | a8 | ✓ | ✓ | ✓ | · | · | · | s2 |
-| `[resource]` | s10 | s10 | s10 | ✓ | ✓ | ✓ | ✓ | ✓ | s10 | s10 | s10 | s10 | s10 | s10 | s10 | s10 | s10 | s10 |
-| `[hint(Show)]` | · | · | · | a11 | a11 | a11 | a11 | a12 | a13 | a13 | a13 | a14 | a14 | a14 | · | · | · | s2 |
+| `[platform("browser")]` | ✓ | ✓ | · | ✓ | ✓ | · | ✓ | ✓ | ✓ | ✓ | · | ✓ | ✓ | · | · | · | · | a7 |
+| `[deprecated("use g")]` | ✓ | ✓ | · | ✓ | ✓ | · | ✓ | ✓ | a8 | a8 | · | ✓ | ✓ | · | · | s9 | · | s2 |
+| `[internal("why")]` | ✓ | ✓ | · | ✓ | ✓ | · | ✓ | ✓ | a8 | a8 | · | ✓ | ✓ | · | · | · | · | s2 |
+| `[resource]` | s10 | s10 | s10 | ✓ | ✓ | · | ✓ | ✓ | s10 | s10 | s10 | s10 | s10 | s10 | s10 | s10 | s10 | s10 |
+| `[hint(Show)]` | · | · | · | a11 | a11 | · | a11 | a12 | a13 | a13 | · | a14 | a14 | · | · | · | · | s2 |
 | `[reactive(coarse)]` | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | · | s2 |
-| `[user_macro]` | a15 | a15 | a15 | a15 | a15 | a15 | a15 | · | · | · | · | · | · | · | · | · | · | s2 |
+| `[user_macro]` | a15 | a15 | · | a15 | a15 | · | a15 | · | · | · | · | · | · | · | · | · | · | s2 |
 
 ### 2.2 Member heads
 
@@ -266,22 +266,22 @@ The positions whose cell is `✓` or `aN` (the parser takes the marker there).
 - `then`: none of the probed positions
 - `void`: none of the probed positions
 - `with`: none of the probed positions
-- `[derive(Debug)]`: I4, I5, I6, I7
-- `[service]`: I4, I5, I6
-- `[client_service]`: I4, I5, I6
-- `[extern("f")]`: I1, I2, I3, M1, M2, M3
-- `[must_use]`: I1, I2, I3, M1, M2, M3
-- `[rpc]`: I1, I2, I3, M1, M2, M3
-- `[trait_only]`: I1, I2, I3, M1, M2, M3
+- `[derive(Debug)]`: I4, I5, I7
+- `[service]`: I4, I5
+- `[client_service]`: I4, I5
+- `[extern("f")]`: I1, I2, M1, M2, M3
+- `[must_use]`: I1, I2, M1, M2, M3
+- `[rpc]`: I1, I2, M1, M2, M3
+- `[trait_only]`: I1, I2, M1, M2, M3
 - `[doc(hidden)]`: none of the probed positions
 - `[expose]`: M4
-- `[platform("browser")]`: I1, I2, I3, I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14, I18, M1, M2, M3, B4
-- `[deprecated("use g")]`: I1, I2, I3, I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14, I17, M1, M2, M3, B4
-- `[internal("why")]`: I1, I2, I3, I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14, M1, M2, M3, M4, M5, B4
-- `[resource]`: I4, I5, I6, I7, I8
-- `[hint(Show)]`: I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14, B4
+- `[platform("browser")]`: I1, I2, I4, I5, I7, I8, I9, I10, I12, I13, I18, M1, M2, M3, B4
+- `[deprecated("use g")]`: I1, I2, I4, I5, I7, I8, I9, I10, I12, I13, M1, M2, M3, B4
+- `[internal("why")]`: I1, I2, I4, I5, I7, I8, I9, I10, I12, I13, M1, M2, M3, M4, M5, B4
+- `[resource]`: I4, I5, I7, I8
+- `[hint(Show)]`: I4, I5, I7, I8, I9, I10, I12, I13, B4
 - `[reactive(coarse)]`: M4
-- `[user_macro]`: I1, I2, I3, I4, I5, I6, I7, M1
+- `[user_macro]`: I1, I2, I4, I5, I7, M1
 
 ## 3. Stacking order
 
@@ -291,56 +291,59 @@ For each position, every two markers the PARSER takes there one at a time, writt
 
 Taken alone: `async`, `const`, `export`, `external`, `macro`, `[extern("f")]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform("browser")]`, `[deprecated("use g")]`, `[internal("why")]`, `[user_macro]`.
 
-- The order every one-order pair agrees with: `export` < `macro` < `[extern("f")]` < `[must_use]` < `[rpc]` < `[trait_only]` < `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `const` < `[user_macro]` < `async` < `external`
-- One order only: `export` < `async`; `async` < `external`; `macro` < `async`; `[extern("f")]` < `async`; `[must_use]` < `async`; `[rpc]` < `async`; `[trait_only]` < `async`; `[platform("browser")]` < `async`; `[deprecated("use g")]` < `async`; `[internal("why")]` < `async`; `[user_macro]` < `async`; `export` < `const`; `[extern("f")]` < `const`; `[must_use]` < `const`; `[rpc]` < `const`; `[trait_only]` < `const`; `[platform("browser")]` < `const`; `[deprecated("use g")]` < `const`; `[internal("why")]` < `const`; `export` < `external`; `export` < `macro`; `macro` < `external`; `[extern("f")]` < `external`; `[must_use]` < `external`; `[rpc]` < `external`; `[trait_only]` < `external`; `[platform("browser")]` < `external`; `[deprecated("use g")]` < `external`; `[internal("why")]` < `external`; `[user_macro]` < `external`
-- Either order: `export` <> `[extern("f")]`; `export` <> `[must_use]`; `export` <> `[rpc]`; `export` <> `[trait_only]`; `export` <> `[platform("browser")]`; `export` <> `[deprecated("use g")]`; `export` <> `[internal("why")]`; `export` <> `[user_macro]`; `macro` <> `[extern("f")]`; `macro` <> `[must_use]`; `macro` <> `[rpc]`; `macro` <> `[trait_only]`; `macro` <> `[platform("browser")]`; `macro` <> `[deprecated("use g")]`; `macro` <> `[internal("why")]`; `[extern("f")]` <> `[must_use]`; `[extern("f")]` <> `[rpc]`; `[extern("f")]` <> `[trait_only]`; `[extern("f")]` <> `[platform("browser")]`; `[extern("f")]` <> `[deprecated("use g")]`; `[extern("f")]` <> `[internal("why")]`; `[extern("f")]` <> `[user_macro]`; `[must_use]` <> `[rpc]`; `[must_use]` <> `[trait_only]`; `[must_use]` <> `[platform("browser")]`; `[must_use]` <> `[deprecated("use g")]`; `[must_use]` <> `[internal("why")]`; `[must_use]` <> `[user_macro]`; `[rpc]` <> `[trait_only]`; `[rpc]` <> `[platform("browser")]`; `[rpc]` <> `[deprecated("use g")]`; `[rpc]` <> `[internal("why")]`; `[rpc]` <> `[user_macro]`; `[trait_only]` <> `[platform("browser")]`; `[trait_only]` <> `[deprecated("use g")]`; `[trait_only]` <> `[internal("why")]`; `[trait_only]` <> `[user_macro]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[user_macro]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[user_macro]`; `[internal("why")]` <> `[user_macro]`
+- The order every one-order pair agrees with: `[extern("f")]` < `[must_use]` < `[rpc]` < `[trait_only]` < `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `[user_macro]` < `export` < `const` < `macro` < `async` < `external`
+- One order only: `export` < `async`; `async` < `external`; `macro` < `async`; `[extern("f")]` < `async`; `[must_use]` < `async`; `[rpc]` < `async`; `[trait_only]` < `async`; `[platform("browser")]` < `async`; `[deprecated("use g")]` < `async`; `[internal("why")]` < `async`; `[user_macro]` < `async`; `export` < `const`; `[extern("f")]` < `const`; `[must_use]` < `const`; `[rpc]` < `const`; `[trait_only]` < `const`; `[platform("browser")]` < `const`; `[deprecated("use g")]` < `const`; `[internal("why")]` < `const`; `export` < `external`; `export` < `macro`; `[extern("f")]` < `export`; `[must_use]` < `export`; `[rpc]` < `export`; `[trait_only]` < `export`; `[platform("browser")]` < `export`; `[deprecated("use g")]` < `export`; `[internal("why")]` < `export`; `[user_macro]` < `export`; `macro` < `external`; `[extern("f")]` < `external`; `[must_use]` < `external`; `[rpc]` < `external`; `[trait_only]` < `external`; `[platform("browser")]` < `external`; `[deprecated("use g")]` < `external`; `[internal("why")]` < `external`; `[user_macro]` < `external`; `[extern("f")]` < `macro`; `[must_use]` < `macro`; `[rpc]` < `macro`; `[trait_only]` < `macro`; `[platform("browser")]` < `macro`; `[deprecated("use g")]` < `macro`; `[internal("why")]` < `macro`
+- Either order: `[extern("f")]` <> `[must_use]`; `[extern("f")]` <> `[rpc]`; `[extern("f")]` <> `[trait_only]`; `[extern("f")]` <> `[platform("browser")]`; `[extern("f")]` <> `[deprecated("use g")]`; `[extern("f")]` <> `[internal("why")]`; `[extern("f")]` <> `[user_macro]`; `[must_use]` <> `[rpc]`; `[must_use]` <> `[trait_only]`; `[must_use]` <> `[platform("browser")]`; `[must_use]` <> `[deprecated("use g")]`; `[must_use]` <> `[internal("why")]`; `[must_use]` <> `[user_macro]`; `[rpc]` <> `[trait_only]`; `[rpc]` <> `[platform("browser")]`; `[rpc]` <> `[deprecated("use g")]`; `[rpc]` <> `[internal("why")]`; `[rpc]` <> `[user_macro]`; `[trait_only]` <> `[platform("browser")]`; `[trait_only]` <> `[deprecated("use g")]`; `[trait_only]` <> `[internal("why")]`; `[trait_only]` <> `[user_macro]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[user_macro]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[user_macro]`; `[internal("why")]` <> `[user_macro]`
 - Do not stack: `async` × `const`; `const` × `external`; `const` × `macro`; `const` × `[user_macro]`; `macro` × `[user_macro]`
 
 ### I3 — between `export` and `fun`
 
-Taken alone: `async`, `const`, `external`, `macro`, `[extern("f")]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform("browser")]`, `[deprecated("use g")]`, `[internal("why")]`, `[user_macro]`.
+Taken alone: `async`, `const`, `external`, `macro`.
 
-- The order every one-order pair agrees with: `macro` < `[extern("f")]` < `[must_use]` < `[rpc]` < `[trait_only]` < `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `const` < `[user_macro]` < `async` < `external`
-- One order only: `async` < `external`; `macro` < `async`; `[extern("f")]` < `async`; `[must_use]` < `async`; `[rpc]` < `async`; `[trait_only]` < `async`; `[platform("browser")]` < `async`; `[deprecated("use g")]` < `async`; `[internal("why")]` < `async`; `[user_macro]` < `async`; `[extern("f")]` < `const`; `[must_use]` < `const`; `[rpc]` < `const`; `[trait_only]` < `const`; `[platform("browser")]` < `const`; `[deprecated("use g")]` < `const`; `[internal("why")]` < `const`; `macro` < `external`; `[extern("f")]` < `external`; `[must_use]` < `external`; `[rpc]` < `external`; `[trait_only]` < `external`; `[platform("browser")]` < `external`; `[deprecated("use g")]` < `external`; `[internal("why")]` < `external`; `[user_macro]` < `external`
-- Either order: `macro` <> `[extern("f")]`; `macro` <> `[must_use]`; `macro` <> `[rpc]`; `macro` <> `[trait_only]`; `macro` <> `[platform("browser")]`; `macro` <> `[deprecated("use g")]`; `macro` <> `[internal("why")]`; `[extern("f")]` <> `[must_use]`; `[extern("f")]` <> `[rpc]`; `[extern("f")]` <> `[trait_only]`; `[extern("f")]` <> `[platform("browser")]`; `[extern("f")]` <> `[deprecated("use g")]`; `[extern("f")]` <> `[internal("why")]`; `[extern("f")]` <> `[user_macro]`; `[must_use]` <> `[rpc]`; `[must_use]` <> `[trait_only]`; `[must_use]` <> `[platform("browser")]`; `[must_use]` <> `[deprecated("use g")]`; `[must_use]` <> `[internal("why")]`; `[must_use]` <> `[user_macro]`; `[rpc]` <> `[trait_only]`; `[rpc]` <> `[platform("browser")]`; `[rpc]` <> `[deprecated("use g")]`; `[rpc]` <> `[internal("why")]`; `[rpc]` <> `[user_macro]`; `[trait_only]` <> `[platform("browser")]`; `[trait_only]` <> `[deprecated("use g")]`; `[trait_only]` <> `[internal("why")]`; `[trait_only]` <> `[user_macro]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[user_macro]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[user_macro]`; `[internal("why")]` <> `[user_macro]`
-- Do not stack: `async` × `const`; `const` × `external`; `const` × `macro`; `const` × `[user_macro]`; `macro` × `[user_macro]`
+- The order every one-order pair agrees with: `const` < `macro` < `async` < `external`
+- One order only: `async` < `external`; `macro` < `async`; `macro` < `external`
+- Do not stack: `async` × `const`; `const` × `external`; `const` × `macro`
 
 ### I4 — before `struct`
 
 Taken alone: `export`, `external`, `[derive(Debug)]`, `[service]`, `[client_service]`, `[platform("browser")]`, `[deprecated("use g")]`, `[internal("why")]`, `[resource]`, `[hint(Show)]`, `[user_macro]`.
 
-- The order every one-order pair agrees with: `export` < `[derive(Debug)]` < `[service]` < `[client_service]` < `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `[resource]` < `[hint(Show)]` < `[user_macro]` < `external`
-- One order only: `export` < `external`; `[derive(Debug)]` < `external`; `[service]` < `external`; `[client_service]` < `external`; `[platform("browser")]` < `external`; `[deprecated("use g")]` < `external`; `[internal("why")]` < `external`; `[resource]` < `external`; `[hint(Show)]` < `external`; `[user_macro]` < `external`
-- Either order: `export` <> `[derive(Debug)]`; `export` <> `[service]`; `export` <> `[client_service]`; `export` <> `[platform("browser")]`; `export` <> `[deprecated("use g")]`; `export` <> `[internal("why")]`; `export` <> `[resource]`; `export` <> `[hint(Show)]`; `export` <> `[user_macro]`; `[derive(Debug)]` <> `[platform("browser")]`; `[derive(Debug)]` <> `[deprecated("use g")]`; `[derive(Debug)]` <> `[internal("why")]`; `[derive(Debug)]` <> `[resource]`; `[derive(Debug)]` <> `[hint(Show)]`; `[service]` <> `[client_service]`; `[service]` <> `[platform("browser")]`; `[service]` <> `[deprecated("use g")]`; `[service]` <> `[internal("why")]`; `[service]` <> `[resource]`; `[service]` <> `[hint(Show)]`; `[client_service]` <> `[platform("browser")]`; `[client_service]` <> `[deprecated("use g")]`; `[client_service]` <> `[internal("why")]`; `[client_service]` <> `[resource]`; `[client_service]` <> `[hint(Show)]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[resource]`; `[platform("browser")]` <> `[hint(Show)]`; `[platform("browser")]` <> `[user_macro]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[resource]`; `[deprecated("use g")]` <> `[hint(Show)]`; `[deprecated("use g")]` <> `[user_macro]`; `[internal("why")]` <> `[resource]`; `[internal("why")]` <> `[hint(Show)]`; `[internal("why")]` <> `[user_macro]`; `[resource]` <> `[hint(Show)]`; `[resource]` <> `[user_macro]`; `[hint(Show)]` <> `[user_macro]`
+- The order every one-order pair agrees with: `[derive(Debug)]` < `[service]` < `[client_service]` < `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `[resource]` < `[hint(Show)]` < `[user_macro]` < `export` < `external`
+- One order only: `export` < `external`; `[derive(Debug)]` < `export`; `[service]` < `export`; `[client_service]` < `export`; `[platform("browser")]` < `export`; `[deprecated("use g")]` < `export`; `[internal("why")]` < `export`; `[resource]` < `export`; `[hint(Show)]` < `export`; `[user_macro]` < `export`; `[derive(Debug)]` < `external`; `[service]` < `external`; `[client_service]` < `external`; `[platform("browser")]` < `external`; `[deprecated("use g")]` < `external`; `[internal("why")]` < `external`; `[resource]` < `external`; `[hint(Show)]` < `external`; `[user_macro]` < `external`
+- Either order: `[derive(Debug)]` <> `[platform("browser")]`; `[derive(Debug)]` <> `[deprecated("use g")]`; `[derive(Debug)]` <> `[internal("why")]`; `[derive(Debug)]` <> `[resource]`; `[derive(Debug)]` <> `[hint(Show)]`; `[service]` <> `[client_service]`; `[service]` <> `[platform("browser")]`; `[service]` <> `[deprecated("use g")]`; `[service]` <> `[internal("why")]`; `[service]` <> `[resource]`; `[service]` <> `[hint(Show)]`; `[client_service]` <> `[platform("browser")]`; `[client_service]` <> `[deprecated("use g")]`; `[client_service]` <> `[internal("why")]`; `[client_service]` <> `[resource]`; `[client_service]` <> `[hint(Show)]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[resource]`; `[platform("browser")]` <> `[hint(Show)]`; `[platform("browser")]` <> `[user_macro]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[resource]`; `[deprecated("use g")]` <> `[hint(Show)]`; `[deprecated("use g")]` <> `[user_macro]`; `[internal("why")]` <> `[resource]`; `[internal("why")]` <> `[hint(Show)]`; `[internal("why")]` <> `[user_macro]`; `[resource]` <> `[hint(Show)]`; `[resource]` <> `[user_macro]`; `[hint(Show)]` <> `[user_macro]`
 - Do not stack: `[derive(Debug)]` × `[service]`; `[derive(Debug)]` × `[client_service]`; `[derive(Debug)]` × `[user_macro]`; `[service]` × `[user_macro]`; `[client_service]` × `[user_macro]`
 
 ### I8 — before `trait`
 
 Taken alone: `export`, `[platform("browser")]`, `[deprecated("use g")]`, `[internal("why")]`, `[resource]`, `[hint(Show)]`.
 
-- Either order: `export` <> `[platform("browser")]`; `export` <> `[deprecated("use g")]`; `export` <> `[internal("why")]`; `export` <> `[resource]`; `export` <> `[hint(Show)]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[resource]`; `[platform("browser")]` <> `[hint(Show)]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[resource]`; `[deprecated("use g")]` <> `[hint(Show)]`; `[internal("why")]` <> `[resource]`; `[internal("why")]` <> `[hint(Show)]`; `[resource]` <> `[hint(Show)]`
+- The order every one-order pair agrees with: `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `[resource]` < `[hint(Show)]` < `export`
+- One order only: `[platform("browser")]` < `export`; `[deprecated("use g")]` < `export`; `[internal("why")]` < `export`; `[resource]` < `export`; `[hint(Show)]` < `export`
+- Either order: `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[resource]`; `[platform("browser")]` <> `[hint(Show)]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[resource]`; `[deprecated("use g")]` <> `[hint(Show)]`; `[internal("why")]` <> `[resource]`; `[internal("why")]` <> `[hint(Show)]`; `[resource]` <> `[hint(Show)]`
 
 ### I9 — before `impl`
 
 Taken alone: `export`, `[platform("browser")]`, `[deprecated("use g")]`, `[internal("why")]`, `[hint(Show)]`.
 
-- Either order: `export` <> `[platform("browser")]`; `export` <> `[deprecated("use g")]`; `export` <> `[internal("why")]`; `export` <> `[hint(Show)]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[hint(Show)]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[hint(Show)]`; `[internal("why")]` <> `[hint(Show)]`
+- The order every one-order pair agrees with: `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `[hint(Show)]` < `export`
+- One order only: `[platform("browser")]` < `export`; `[deprecated("use g")]` < `export`; `[internal("why")]` < `export`; `[hint(Show)]` < `export`
+- Either order: `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[hint(Show)]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[hint(Show)]`; `[internal("why")]` <> `[hint(Show)]`
 
 ### I12 — before a module `let`
 
 Taken alone: `const`, `export`, `lazy`, `[platform("browser")]`, `[deprecated("use g")]`, `[internal("why")]`, `[hint(Show)]`.
 
-- The order every one-order pair agrees with: `export` < `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `[hint(Show)]` < `const` < `lazy`
-- One order only: `export` < `const`; `const` < `lazy`; `[platform("browser")]` < `const`; `[deprecated("use g")]` < `const`; `[internal("why")]` < `const`; `[hint(Show)]` < `const`; `export` < `lazy`; `[platform("browser")]` < `lazy`; `[deprecated("use g")]` < `lazy`; `[internal("why")]` < `lazy`; `[hint(Show)]` < `lazy`
-- Either order: `export` <> `[platform("browser")]`; `export` <> `[deprecated("use g")]`; `export` <> `[internal("why")]`; `export` <> `[hint(Show)]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[hint(Show)]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[hint(Show)]`; `[internal("why")]` <> `[hint(Show)]`
+- The order every one-order pair agrees with: `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `[hint(Show)]` < `export` < `const` < `lazy`
+- One order only: `export` < `const`; `const` < `lazy`; `[platform("browser")]` < `const`; `[deprecated("use g")]` < `const`; `[internal("why")]` < `const`; `[hint(Show)]` < `const`; `export` < `lazy`; `[platform("browser")]` < `export`; `[deprecated("use g")]` < `export`; `[internal("why")]` < `export`; `[hint(Show)]` < `export`; `[platform("browser")]` < `lazy`; `[deprecated("use g")]` < `lazy`; `[internal("why")]` < `lazy`; `[hint(Show)]` < `lazy`
+- Either order: `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[hint(Show)]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[hint(Show)]`; `[internal("why")]` <> `[hint(Show)]`
 
 ### M1 — before a method in an `impl`
 
 Taken alone: `async`, `const`, `export`, `external`, `macro`, `[extern("f")]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform("browser")]`, `[deprecated("use g")]`, `[internal("why")]`, `[user_macro]`.
 
-- The order every one-order pair agrees with: `export` < `macro` < `[extern("f")]` < `[must_use]` < `[rpc]` < `[trait_only]` < `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `const` < `[user_macro]` < `async` < `external`
-- One order only: `export` < `async`; `async` < `external`; `macro` < `async`; `[extern("f")]` < `async`; `[must_use]` < `async`; `[rpc]` < `async`; `[trait_only]` < `async`; `[platform("browser")]` < `async`; `[deprecated("use g")]` < `async`; `[internal("why")]` < `async`; `[user_macro]` < `async`; `export` < `const`; `[extern("f")]` < `const`; `[must_use]` < `const`; `[rpc]` < `const`; `[trait_only]` < `const`; `[platform("browser")]` < `const`; `[deprecated("use g")]` < `const`; `[internal("why")]` < `const`; `export` < `external`; `export` < `macro`; `macro` < `external`; `[extern("f")]` < `external`; `[must_use]` < `external`; `[rpc]` < `external`; `[trait_only]` < `external`; `[platform("browser")]` < `external`; `[deprecated("use g")]` < `external`; `[internal("why")]` < `external`; `[user_macro]` < `external`
-- Either order: `export` <> `[extern("f")]`; `export` <> `[must_use]`; `export` <> `[rpc]`; `export` <> `[trait_only]`; `export` <> `[platform("browser")]`; `export` <> `[deprecated("use g")]`; `export` <> `[internal("why")]`; `export` <> `[user_macro]`; `macro` <> `[extern("f")]`; `macro` <> `[must_use]`; `macro` <> `[rpc]`; `macro` <> `[trait_only]`; `macro` <> `[platform("browser")]`; `macro` <> `[deprecated("use g")]`; `macro` <> `[internal("why")]`; `[extern("f")]` <> `[must_use]`; `[extern("f")]` <> `[rpc]`; `[extern("f")]` <> `[trait_only]`; `[extern("f")]` <> `[platform("browser")]`; `[extern("f")]` <> `[deprecated("use g")]`; `[extern("f")]` <> `[internal("why")]`; `[extern("f")]` <> `[user_macro]`; `[must_use]` <> `[rpc]`; `[must_use]` <> `[trait_only]`; `[must_use]` <> `[platform("browser")]`; `[must_use]` <> `[deprecated("use g")]`; `[must_use]` <> `[internal("why")]`; `[must_use]` <> `[user_macro]`; `[rpc]` <> `[trait_only]`; `[rpc]` <> `[platform("browser")]`; `[rpc]` <> `[deprecated("use g")]`; `[rpc]` <> `[internal("why")]`; `[rpc]` <> `[user_macro]`; `[trait_only]` <> `[platform("browser")]`; `[trait_only]` <> `[deprecated("use g")]`; `[trait_only]` <> `[internal("why")]`; `[trait_only]` <> `[user_macro]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[user_macro]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[user_macro]`; `[internal("why")]` <> `[user_macro]`
+- The order every one-order pair agrees with: `[extern("f")]` < `[must_use]` < `[rpc]` < `[trait_only]` < `[platform("browser")]` < `[deprecated("use g")]` < `[internal("why")]` < `[user_macro]` < `export` < `const` < `macro` < `async` < `external`
+- One order only: `export` < `async`; `async` < `external`; `macro` < `async`; `[extern("f")]` < `async`; `[must_use]` < `async`; `[rpc]` < `async`; `[trait_only]` < `async`; `[platform("browser")]` < `async`; `[deprecated("use g")]` < `async`; `[internal("why")]` < `async`; `[user_macro]` < `async`; `export` < `const`; `[extern("f")]` < `const`; `[must_use]` < `const`; `[rpc]` < `const`; `[trait_only]` < `const`; `[platform("browser")]` < `const`; `[deprecated("use g")]` < `const`; `[internal("why")]` < `const`; `export` < `external`; `export` < `macro`; `[extern("f")]` < `export`; `[must_use]` < `export`; `[rpc]` < `export`; `[trait_only]` < `export`; `[platform("browser")]` < `export`; `[deprecated("use g")]` < `export`; `[internal("why")]` < `export`; `[user_macro]` < `export`; `macro` < `external`; `[extern("f")]` < `external`; `[must_use]` < `external`; `[rpc]` < `external`; `[trait_only]` < `external`; `[platform("browser")]` < `external`; `[deprecated("use g")]` < `external`; `[internal("why")]` < `external`; `[user_macro]` < `external`; `[extern("f")]` < `macro`; `[must_use]` < `macro`; `[rpc]` < `macro`; `[trait_only]` < `macro`; `[platform("browser")]` < `macro`; `[deprecated("use g")]` < `macro`; `[internal("why")]` < `macro`
+- Either order: `[extern("f")]` <> `[must_use]`; `[extern("f")]` <> `[rpc]`; `[extern("f")]` <> `[trait_only]`; `[extern("f")]` <> `[platform("browser")]`; `[extern("f")]` <> `[deprecated("use g")]`; `[extern("f")]` <> `[internal("why")]`; `[extern("f")]` <> `[user_macro]`; `[must_use]` <> `[rpc]`; `[must_use]` <> `[trait_only]`; `[must_use]` <> `[platform("browser")]`; `[must_use]` <> `[deprecated("use g")]`; `[must_use]` <> `[internal("why")]`; `[must_use]` <> `[user_macro]`; `[rpc]` <> `[trait_only]`; `[rpc]` <> `[platform("browser")]`; `[rpc]` <> `[deprecated("use g")]`; `[rpc]` <> `[internal("why")]`; `[rpc]` <> `[user_macro]`; `[trait_only]` <> `[platform("browser")]`; `[trait_only]` <> `[deprecated("use g")]`; `[trait_only]` <> `[internal("why")]`; `[trait_only]` <> `[user_macro]`; `[platform("browser")]` <> `[deprecated("use g")]`; `[platform("browser")]` <> `[internal("why")]`; `[platform("browser")]` <> `[user_macro]`; `[deprecated("use g")]` <> `[internal("why")]`; `[deprecated("use g")]` <> `[user_macro]`; `[internal("why")]` <> `[user_macro]`
 - Do not stack: `async` × `const`; `const` × `external`; `const` × `macro`; `const` × `[user_macro]`; `macro` × `[user_macro]`
 
 ### M2 — before a required trait method

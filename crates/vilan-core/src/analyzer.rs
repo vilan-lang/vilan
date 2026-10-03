@@ -62619,6 +62619,10 @@ pub(crate) struct LoadedModule {
     pub(crate) ast: &'static crate::span::Spanned<NodeList<'static>>,
     pub(crate) text: &'static str,
     pub(crate) parse_errors: &'static [ModuleParseError],
+    /// The parse's WARNINGS (B536), the same shape: a declaration head whose
+    /// attributes are out of order. Reported as warnings, attributed to the
+    /// module ([`report_module_parse_warnings`]).
+    pub(crate) parse_warnings: &'static [ModuleParseError],
 }
 
 /// One lex/parse error the loader recovered from, kept the way the ENTRY file's
@@ -62973,9 +62977,13 @@ fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
     // The same pipeline as the global paths: the handwritten frontend always
     // recovers a (possibly partial) tree beside its diagnostics, and the
     // element/lift rewrites run before the tree freezes.
-    let (tree, parse_errors) = crate::parsing::parse(text);
+    let (tree, parse_errors, parse_warnings) = crate::parsing::parse_with_warnings(text);
+    // The errors, then the warnings, in ONE owned slice (one handle to
+    // reclaim), split after it is leaked.
+    let error_count = parse_errors.len();
     let rendered: Vec<ModuleParseError> = parse_errors
         .iter()
+        .chain(&parse_warnings)
         .map(|error| (error.span, crate::parsing::render(error)))
         .collect();
     let root: Box<crate::span::Spanned<NodeList<'static>>> = match tree {
@@ -63009,10 +63017,12 @@ fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
             );
             (Some(handle), borrow)
         };
+    let (parse_errors, parse_warnings) = parse_errors.split_at(error_count);
     let loaded = LoadedModule {
         ast,
         text,
         parse_errors,
+        parse_warnings,
     };
     crate::owned_modules::adopt(
         path,
@@ -63086,11 +63096,12 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
 
     // The fast path: a clean module reuses the shared clean-parse cache, already
     // lift-rewritten and leaked to `'static`.
-    if let Some((ast, text)) = crate::parse_clean_cached(&source) {
+    if let Some(parsed) = crate::parse_clean_cached_with_warnings(&source) {
         return Some(LoadedModule {
-            ast,
-            text,
+            ast: parsed.ast,
+            text: parsed.text,
             parse_errors: &[],
+            parse_warnings: parsed.warnings,
         });
     }
 
@@ -63114,11 +63125,18 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     // The handwritten frontend lexes and parses in one pass, always recovering a
     // (possibly partial) tree alongside its diagnostics (lexer and parser errors,
     // span-ordered). Each keeps its own span into THIS file's text.
-    let (tree, parse_errors) = crate::parsing::parse(source);
+    let (tree, parse_errors, parse_warnings) = crate::parsing::parse_with_warnings(source);
     errors.extend(
         parse_errors
             .iter()
             .map(|error| (error.span, crate::parsing::render(error))),
+    );
+    // The warnings ride the same leaked slice, after the errors.
+    let error_count = errors.len();
+    errors.extend(
+        parse_warnings
+            .iter()
+            .map(|warning| (warning.span, crate::parsing::render(warning))),
     );
     let root: &'static crate::span::Spanned<NodeList<'static>> = match tree {
         Some(mut root) => {
@@ -63141,10 +63159,12 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
         crate::leak_tally::LeakSite::ModuleErrorAst,
         std::mem::size_of_val(parse_errors),
     );
+    let (parse_errors, parse_warnings) = parse_errors.split_at(error_count);
     let loaded = LoadedModule {
         ast: root,
         text: source,
         parse_errors,
+        parse_warnings,
     };
     error_cache
         .lock()
@@ -63189,6 +63209,34 @@ fn report_module_parse_errors(
             span: *span,
             msg: reason.clone(),
         });
+    }
+}
+
+/// Pushes a loaded module's parse WARNINGS (B536) as warnings of `source`,
+/// once per file, position and message across the analysis's seams — the
+/// same key [`report_module_parse_errors`] dedups on, in the same set.
+fn report_module_parse_warnings(
+    analyzer: &mut Analyzer,
+    reported: &mut HashSet<(PathBuf, Span, String)>,
+    path: &Path,
+    loaded: &LoadedModule,
+    source: SourceId,
+) {
+    for (span, reason) in loaded.parse_warnings {
+        if !reported.insert((path.to_path_buf(), *span, reason.clone())) {
+            continue;
+        }
+        // `warning_sources` is padded lazily: materialize it first.
+        analyzer
+            .warning_sources
+            .resize(analyzer.warnings.len(), SourceId(0));
+        analyzer.warnings.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: *span,
+            msg: reason.clone(),
+        });
+        analyzer.warning_sources.push(source);
     }
 }
 
@@ -67724,6 +67772,13 @@ fn analyze_inner<'src>(
         );
         // The lib is registered as the next source below.
         analyzer.attribute_new_diagnostics(diagnostics_before, SourceId(sources.len() as u32));
+        report_module_parse_warnings(
+            &mut analyzer,
+            &mut reported_parse_errors,
+            &lib_path,
+            loaded,
+            SourceId(sources.len() as u32),
+        );
     }
     let lib_ast = lib_loaded.map(|loaded| loaded.ast);
     sources.push(lib_path);
@@ -68055,6 +68110,13 @@ fn analyze_inner<'src>(
                 &lib_loaded,
             );
             analyzer.attribute_new_diagnostics(diagnostics_before, SourceId(sources.len() as u32));
+            report_module_parse_warnings(
+                &mut analyzer,
+                &mut reported_parse_errors,
+                &lib_path,
+                &lib_loaded,
+                SourceId(sources.len() as u32),
+            );
             let lib_ast = lib_loaded.ast;
             // A dependency's surface is dependency code like any of its
             // modules (E84): the context-coverage pass demotes it, unless the
@@ -68556,6 +68618,13 @@ fn analyze_inner<'src>(
                     );
                     analyzer.attribute_new_diagnostics(
                         diagnostics_before,
+                        SourceId(sources.len() as u32),
+                    );
+                    report_module_parse_warnings(
+                        &mut analyzer,
+                        &mut reported_parse_errors,
+                        &module_path,
+                        &loaded,
                         SourceId(sources.len() as u32),
                     );
                     // E198: residence and freezing are two facts, recorded

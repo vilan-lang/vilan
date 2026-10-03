@@ -2229,7 +2229,7 @@ const DECLARED_REGION_MODULE: &str = "[platform(\"browser\")] mod self;\n\nimpor
 
 /// The same body under a function FENCE — which, before R1, changed nothing
 /// about how its body resolved.
-const FENCED_REGION_MODULE: &str = "import std::ui::Region;\n\nexport [platform(\"browser\")]\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+const FENCED_REGION_MODULE: &str = "import std::ui::Region;\n\n[platform(\"browser\")]\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
 
 fn f27_package(tag: &str, slot: &str, server: &str) -> PathBuf {
     let dir = temp_project(tag);
@@ -2323,8 +2323,8 @@ fn f27_a_bare_files_declaration_is_its_platform_on_the_terminal_too() {
 fn slot_twins_module(browser_value: &str) -> String {
     format!(
         "import std::ui;\nimport std::ui::{{ Slot, View }};\n\nexport struct Badge {{\n\tlabel: str,\n}}\n\n\
-         export [platform(\"browser\")]\nimpl Badge with Slot {{\n\tfun place(own self, parent: View) {{\n\t\tparent.element.set_attribute(\"data-badge\", {browser_value});\n\t}}\n}}\n\n\
-         export [platform(\"@process\")]\nimpl Badge with Slot {{\n\tfun place(own self, parent: View) {{\n\t\tui::set_attribute(parent.attributes, \"data-badge\", self.label);\n\t}}\n}}\n"
+         [platform(\"browser\")]\nexport impl Badge with Slot {{\n\tfun place(own self, parent: View) {{\n\t\tparent.element.set_attribute(\"data-badge\", {browser_value});\n\t}}\n}}\n\n\
+         [platform(\"@process\")]\nexport impl Badge with Slot {{\n\tfun place(own self, parent: View) {{\n\t\tui::set_attribute(parent.attributes, \"data-badge\", self.label);\n\t}}\n}}\n"
     )
 }
 

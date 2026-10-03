@@ -92,10 +92,11 @@ fn an_impl_declared_browser_requires_it_of_its_members_alone() {
     assert_fails_without(source, "`plain` requires");
 }
 
-/// B445: the attribute may stand AHEAD of `export` as well as after it — the
-/// issue's own `[platform("browser")] export impl` — and it is the impl's
-/// declaration either way: the members require the platform, the browser
-/// build is clean, and both spellings emit the same program.
+/// B445: the attribute stands AHEAD of `export` — the issue's own
+/// `[platform("browser")] export impl` — and it is the impl's declaration:
+/// the members require the platform and the browser build is clean. The
+/// other side of the marker, which B445 also read, is refused since B485 S3
+/// (v0.44.0), steered to this order, and still read as it.
 #[test]
 fn b445_an_impl_platform_written_ahead_of_export_is_the_impls() {
     let program = |head: &str| {
@@ -114,23 +115,21 @@ fn b445_an_impl_platform_written_ahead_of_export_is_the_impls() {
             "`show` requires the `browser` platform its `impl` declares",
         );
     }
-    let emitted_ahead = compile_browser(&ahead).expect("the browser build is clean");
-    let emitted_after = compile_browser(&after).expect("the browser build is clean");
-    assert_eq!(emitted_ahead, emitted_after);
+    compile_browser(&ahead).expect("the browser build is clean");
+    assert_fails_with(
+        &after,
+        "a declaration's markers are written in one order — its attributes, then the keywords \
+         `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration word: \
+         write `[platform(..)] export impl`",
+    );
     // A function's whole prefix, with a scope, ahead of the marker.
     let function = |head: &str| {
         format!("{head} fun answer(): i32 {{\n\t42\n}}\n\nfun main() {{\n\tprint(answer());\n}}\n")
     };
-    assert_eq!(
-        compile(&function(
-            "[deprecated(\"use other()\")] [must_use] export(in pkg)"
-        ))
-        .expect("the attributed, scoped export compiles"),
-        compile(&function(
-            "export(in pkg) [deprecated(\"use other()\")] [must_use]"
-        ))
-        .expect("the attributed, scoped export compiles"),
-    );
+    compile(&function(
+        "[deprecated(\"use other()\")] [must_use] export(in pkg)",
+    ))
+    .expect("the attributed, scoped export compiles");
 }
 
 /// A pattern no platform answers to is reported ONCE, where it is written —
@@ -10759,5 +10758,17 @@ fn a_supertrait_member_called_through_a_bound_reaches_only_its_implementors() {
             print(next.get());
         }
         "#,
+    );
+}
+
+/// B536: attributes out of THE order are a WARNING of the analysis the
+/// language server and the harnesses run (`analyze_source`), spanning the
+/// head's run — and only a warning: the analysis is otherwise clean.
+#[test]
+fn b536_an_attribute_order_warning_rides_the_analysis() {
+    assert_warns_spanning(
+        "[must_use] [deprecated(\"use b\")]\nfun answer(): i32 {\n\t42\n}\n\nfun main() {\n\tif answer() > 0 {}\n}\n",
+        "[must_use] [deprecated(\"use b\")]",
+        "a declaration's attributes are written in one order",
     );
 }

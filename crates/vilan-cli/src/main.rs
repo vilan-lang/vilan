@@ -6774,7 +6774,15 @@ fn compile_to_js(
     // clean-parse cache below — rather than anything inside `analyze` (B139
     // added the parser to the instrument, and it is the family with no bound).
     vilan_core::begin_depth_stats();
-    let cached = vilan_core::parse_clean_cached(&src);
+    let cached = vilan_core::parse_clean_cached_with_warnings(&src)
+        .map(|parsed| ((parsed.ast, parsed.text), parsed.warnings));
+    // The entry's parse WARNINGS (B536), from whichever parse served it: the
+    // cache's, or the fresh one below. They join the program's warnings
+    // before the post-passes order them.
+    let mut entry_parse_warnings: Vec<vilan_core::ParseWarning> = cached
+        .map(|(_, warnings)| warnings.to_vec())
+        .unwrap_or_default();
+    let cached = cached.map(|(clean, _)| clean);
 
     // Analyzer and codegen diagnostics, collected as `(source, span, message)`
     // for ariadne — the source being the file the span indexes into, so each one
@@ -6806,9 +6814,13 @@ fn compile_to_js(
     let mut parse_errors: Vec<vilan_core::parsing::ParseError> = Vec::new();
     let fresh_root: Option<vilan_core::Spanned<vilan_core::node::NodeList>> = match &cached {
         None => {
-            let (tree, errors) = vilan_core::parsing::parse(src.as_str());
+            let (tree, errors, warnings) = vilan_core::parsing::parse_with_warnings(src.as_str());
             let analyzable = errors.is_empty() || goal.analyzes_recovered_trees();
             parse_errors = errors;
+            entry_parse_warnings = warnings
+                .iter()
+                .map(|warning| (warning.span, vilan_core::parsing::render(warning)))
+                .collect();
             tree.filter(|_| analyzable).map(|(mut items, span)| {
                 // Elements desugar, then bare-`?` marks become lift regions,
                 // before analysis (element-syntax.md §4, expression-lifting.md);
@@ -6863,6 +6875,7 @@ fn compile_to_js(
         }
 
         let mut program = analyze(root, source_ref, &std, pkg_root, file, platform, workspace);
+        vilan_core::add_entry_parse_warnings(&mut program, entry_parse_warnings);
 
         // The whole-program passes that follow analysis — context threading,
         // async inference, the drop checks, platform coloring, const

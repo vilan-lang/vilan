@@ -99,9 +99,8 @@ fn code_tokens_spanned(source: &str) -> Option<Vec<Spanned<Token<'_>>>> {
 /// The formatter's token-level canonicalization, used to check a reprint changed
 /// nothing but trivia and the canonical orders. Order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
-/// (dropped), an `export` marker written after its item's attributes (moved
-/// ahead of them, B445), a declaration's attribute run written in any order
-/// (sorted by `parsing::attribute_rank`, B485 Q7), the canonical ordering of a
+/// (dropped), a declaration head's markers — its attributes and keywords —
+/// written in any order (put into THE order, B536), the canonical ordering of a
 /// top-level import run (see the
 /// canonical-import-order section below), the canonical ordering of an ELEMENT
 /// HEAD's items (see the canonical-element-head-order section), the canonical
@@ -119,8 +118,8 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_on_heads(sort_element_heads(
         sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
             canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
-                collapse_field_shorthands(sort_attribute_runs(lead_export_past_attribute_runs(
-                    drop_redundant_view_prefixes(drop_trailing_commas(tokens)),
+                collapse_field_shorthands(canonicalize_marker_heads(drop_redundant_view_prefixes(
+                    drop_trailing_commas(tokens),
                 ))),
             )),
         ))),
@@ -166,186 +165,42 @@ fn drop_redundant_view_prefixes(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     result
 }
 
-/// Moves a declaration's `export (in PATH)?` marker AHEAD of an attribute run
-/// written before it — `[platform("browser")] export impl …` becomes `export
-/// [platform("browser")] impl …` — in BOTH streams, so the safety net reads
-/// the two sides of the marker (B445) as one spelling and accepts the printer
-/// moving it to the ruled side, after the attributes
-/// ([`Printer::print_exported_item`], B485 §6.2). The parser reads the same
-/// rotation (`Parser::lead_export_past_its_attributes`), so the tree the
-/// printer walks holds the run as the item's prefix whichever side it was on.
+/// Puts a declaration head's marker run — its attribute groups and its
+/// keywords, `export (in PATH)?` included — into THE order (B485 §6.2, B536:
+/// the attributes by `parsing::attribute_rank`, then `export`,
+/// `const`|`lazy`, `async`, `external`|`macro`) in BOTH streams, so the safety
+/// net accepts the printer writing the head the parser read, whatever order
+/// it was written in: `[internal(..)] [deprecated(..)] fun` (warned), `export
+/// [must_use] fun` and `async [platform(..)] fun` (refused, and still read —
+/// [`parse`] formats a source whose only errors are marker-order ones). The
+/// parser reorders the same run before a production reads it
+/// (`Parser::canonicalize_marker_run`), through the same scanner
+/// ([`crate::parsing::marker_run_in_written_order`]).
 ///
-/// Recognized by SHAPE where a statement can begin (the stream's start, or
-/// after a `;`, `{` or `}`): a run of `[name …]` groups ending at `export`.
-/// A relocation, not a deletion, so the net still sees every attribute and
-/// the marker survive; it runs over both streams.
-fn lead_export_past_attribute_runs(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+/// Recognized where a statement can begin (the stream's start, or after a
+/// `;`, `{` or `}`): two or more units ending at a declaration word — never
+/// at a `;` or an operator, so `[a][b];`, a list indexed by a list, is
+/// untouched. A stable relocation of whole units: the net still sees every
+/// attribute and keyword survive.
+fn canonicalize_marker_heads(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
     let mut index = 0;
     while index < tokens.len() {
         let at_statement_head = matches!(result.last(), None | Some(Token::Ctrl(';' | '{' | '}')));
         if at_statement_head
-            && let Some((marker, past_marker)) = attribute_run_before_export(&tokens, index)
+            && let Some((units, word_at)) =
+                crate::parsing::marker_run_in_written_order(&tokens, index)
         {
-            result.extend(tokens[marker..past_marker].iter().cloned());
-            result.extend(tokens[index..marker].iter().cloned());
-            index = past_marker;
+            for unit in units {
+                result.extend(tokens[unit].iter().cloned());
+            }
+            index = word_at;
             continue;
         }
         result.push(tokens[index].clone());
         index += 1;
     }
     result
-}
-
-/// Sorts a declaration's attribute run into the canonical order
-/// ([`crate::parsing::attribute_rank`], B485 Q7 RULED: attributes in any
-/// order, printed in one) in BOTH streams, so the safety net accepts the
-/// printer writing `[deprecated(..)]` ahead of an `[internal(..)]` the author
-/// wrote first. The parser sorts the same run before a production reads it
-/// (`Parser::canonicalize_marker_run`), so the tree holds every attribute
-/// whatever order it was written in.
-///
-/// Recognized by SHAPE where a statement can begin (the stream's start, or
-/// after a `;`, `{` or `}`), past an `export (in PATH)?` already moved ahead
-/// of the run ([`lead_export_past_attribute_runs`]): two or more `[name …]`
-/// groups followed by a marker keyword or a declaration word — never by a
-/// `;` or an operator, so `[a][b];`, a list indexed by a list, is untouched.
-/// A `macro` after a run (of one or more) moves ahead of it, where a macro's
-/// production reads it and where the printer's `[..]` ⏎ `macro fun` reduces.
-/// A stable sort, a relocation of whole groups: the net still sees every
-/// attribute survive.
-fn sort_attribute_runs(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
-    let past_group = |open: usize| -> Option<usize> {
-        let mut depth = 0usize;
-        let mut at = open;
-        loop {
-            match tokens.get(at)? {
-                Token::Ctrl('[' | '(' | '{') => depth += 1,
-                Token::Ctrl(']' | ')' | '}') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(at + 1);
-                    }
-                }
-                _ => {}
-            }
-            at += 1;
-        }
-    };
-    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
-    let mut index = 0;
-    while index < tokens.len() {
-        let at_statement_head = matches!(result.last(), None | Some(Token::Ctrl(';' | '{' | '}')));
-        if !at_statement_head {
-            result.push(tokens[index].clone());
-            index += 1;
-            continue;
-        }
-        let mut run_start = index;
-        if tokens.get(run_start) == Some(&Token::Export) {
-            run_start += 1;
-            if tokens.get(run_start) == Some(&Token::Ctrl('('))
-                && tokens.get(run_start + 1) == Some(&Token::In)
-                && let Some(after) = past_group(run_start)
-            {
-                run_start = after;
-            }
-        }
-        let mut groups: Vec<(u8, std::ops::Range<usize>)> = Vec::new();
-        let mut at = run_start;
-        while tokens.get(at) == Some(&Token::Ctrl('['))
-            && let Some(Token::Ident(name)) = tokens.get(at + 1)
-            && let Some(after) = past_group(at)
-        {
-            groups.push((crate::parsing::attribute_rank(name), at..after));
-            at = after;
-        }
-        let declares = matches!(
-            tokens.get(at),
-            Some(
-                Token::Fun
-                    | Token::Struct
-                    | Token::Enum
-                    | Token::Trait
-                    | Token::Impl
-                    | Token::Let
-                    | Token::Mut
-                    | Token::Mod
-                    | Token::Import
-                    | Token::Use
-                    | Token::Export
-                    | Token::Const
-                    | Token::Async
-                    | Token::External
-                    | Token::Macro
-                    | Token::Ident("lazy")
-            )
-        );
-        // `macro` written after the run is printed ahead of it — the reading
-        // a macro's production takes either way (`Parser::canonicalize_marker_run`).
-        let leads_macro = !groups.is_empty() && tokens.get(at) == Some(&Token::Macro);
-        if (groups.len() < 2 && !leads_macro) || !declares {
-            result.push(tokens[index].clone());
-            index += 1;
-            continue;
-        }
-        result.extend(tokens[index..run_start].iter().cloned());
-        if leads_macro {
-            result.push(Token::Macro);
-            at += 1;
-        }
-        groups.sort_by_key(|(rank, _)| *rank);
-        for (_, group) in groups {
-            result.extend(tokens[group].iter().cloned());
-        }
-        index = at;
-    }
-    result
-}
-
-/// When a run of `[name …]` groups starting at `start` ends at an `export`
-/// marker, the marker's index and the index just past it (and past its `(in
-/// PATH)` scope); `None` otherwise, and for `export *;`, which takes no
-/// attributes.
-fn attribute_run_before_export(tokens: &[Token<'_>], start: usize) -> Option<(usize, usize)> {
-    let past_group = |open: usize| -> Option<usize> {
-        let mut depth = 0usize;
-        let mut at = open;
-        loop {
-            match tokens.get(at)? {
-                Token::Ctrl('[' | '(' | '{') => depth += 1,
-                Token::Ctrl(']' | ')' | '}') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(at + 1);
-                    }
-                }
-                _ => {}
-            }
-            at += 1;
-        }
-    };
-    let mut at = start;
-    while tokens.get(at) == Some(&Token::Ctrl('['))
-        && matches!(tokens.get(at + 1), Some(Token::Ident(_)))
-    {
-        at = past_group(at)?;
-    }
-    if at == start || tokens.get(at) != Some(&Token::Export) {
-        return None;
-    }
-    let marker = at;
-    let mut past_marker = marker + 1;
-    if tokens.get(past_marker) == Some(&Token::Ctrl('('))
-        && tokens.get(past_marker + 1) == Some(&Token::In)
-    {
-        past_marker = past_group(past_marker)?;
-    }
-    if tokens.get(past_marker) == Some(&Token::Op("*")) {
-        return None;
-    }
-    Some((marker, past_marker))
 }
 
 /// Moves every bare `export *;` to the FRONT of the token stream, so the safety
@@ -3150,10 +3005,24 @@ fn insert_import_into(
 /// two missing tokens and silently bail the whole file. Recording them makes
 /// user-written parentheses PRESERVED: the formatter reprints the group it was
 /// given and never adjudicates whether it was redundant.
+///
+/// One refusal does not stop it: a declaration head written out of THE order
+/// (`ParseErrorReason::MarkerOrder` — `export [must_use] fun`, the order
+/// before B485 S3, or `async [platform(..)] fun`). The parser reads such a
+/// head exactly as written in the order, so the tree is the canonical one,
+/// and `vilan fmt` writing it is the migration the refusal asks for (B536).
 fn parse(source: &str) -> Option<NodeList<'_>> {
     BUFFER_PARSES.with(|count| count.set(count.get() + 1));
     let (tree, errors) = crate::parsing::parse_preserving_groups(source);
-    tree.filter(|_| errors.is_empty()).map(|(items, _)| items)
+    tree.filter(|_| {
+        errors.iter().all(|error| {
+            matches!(
+                error.reason,
+                crate::parsing::ParseErrorReason::MarkerOrder { .. }
+            )
+        })
+    })
+    .map(|(items, _)| items)
 }
 
 /// Why a reprint handed back the original bytes instead of a reprint
@@ -4631,7 +4500,7 @@ impl<'src> Printer<'src> {
         exported: &Spanned<Node<'src>>,
     ) {
         let marker = format!("export{} ", export_scope_text(scope));
-        self.print_item_under_keyword(&marker, |printer| printer.print_item(exported));
+        let _ = self.print_item_under_keyword(&marker, |printer| printer.print_item(exported));
     }
 
     /// Prints a declaration with a marker KEYWORD on its signature line, after
@@ -4643,7 +4512,7 @@ impl<'src> Printer<'src> {
     /// when it printed no attribute. The declaration line stays marked at the
     /// keyword, so an enclosing `export` lands ahead of it: `[deprecated(..)]`
     /// ⏎ `export const fun f()`.
-    fn print_item_under_keyword(&mut self, keyword: &str, print: impl FnOnce(&mut Self)) {
+    fn print_item_under_keyword(&mut self, keyword: &str, print: impl FnOnce(&mut Self)) -> usize {
         let start = self.out.len();
         let enclosing_head = self.head_start.take();
         print(self);
@@ -4655,6 +4524,7 @@ impl<'src> Printer<'src> {
             }
         };
         self.out.insert_str(declaration, keyword);
+        declaration
     }
 
     /// `(in PATH)` after an `export` — see [`export_scope_text`].
@@ -4997,7 +4867,8 @@ impl<'src> Printer<'src> {
                 if matches!(inner.0, Node::Func(_))
                     || matches!(inner.0, Node::Let(.., Some(_))) =>
             {
-                self.print_item_under_keyword("const ", |printer| printer.print_item(inner));
+                let _ =
+                    self.print_item_under_keyword("const ", |printer| printer.print_item(inner));
             }
             // `export *;` — the module-wide marker. It carries no inner item, so
             // `needs_semicolon` leaves it out of its exclusion list and the
@@ -5025,7 +4896,7 @@ impl<'src> Printer<'src> {
             // Its attributes, if any, print above it with the keyword on the
             // signature line, as `export`'s do.
             Node::MacroFun(func) => {
-                self.print_item_under_keyword("macro ", |printer| printer.print_func(func));
+                let _ = self.print_item_under_keyword("macro ", |printer| printer.print_func(func));
             }
             // `[name(args)?] <item>` — a user macro attribute, on its own line
             // above the struct/enum/function it annotates (like `[derive(..)]`).
@@ -8835,10 +8706,12 @@ mod reformats {
         );
     }
 
-    // B445 + B485 §6.2 (RULED): an attribute run may stand on either side of
-    // `export`, and the formatter prints the ruled order — attributes, then
-    // the keywords with `export` first, then the declaration word — so the
-    // signature is one line. Every item kind a label leads, a run of several,
+    // B445 + B485 §6.2 (RULED): the formatter prints the ruled order —
+    // attributes, then the keywords with `export` first, then the declaration
+    // word — so the signature is one line. The run written on the other side
+    // of `export` is refused since B485 S3 and still read as the order, so
+    // `vilan fmt` writes it in the order too: the migration the refusal asks
+    // for (B536). Every item kind a label leads, a run of several,
     // a scoped marker, a re-export's label, a comment above the statement, a
     // run split across the marker, `[resource]` on its own line (Q10), an
     // unattributed export (unchanged), and a rotated statement after an
