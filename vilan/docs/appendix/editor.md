@@ -130,10 +130,39 @@ follows.
 
 **Which platform, and why, before any error.** The platform a file is
 analyzed under decides which `std` twin its types come from, so the status
-bar says it for the vilan file in front of you — `analyzed as: browser —
-declared`, `analyzed as: node — default-entry` — with the whole reason in
-its tooltip. A file can say it itself: `[platform("browser")] mod self;` as
-its first line — and at the top of a file, completion offers that line.
+bar's `vilan 0.43.0` item says it for the vilan file in front of you, in its
+tooltip — `This file is analyzed under browser: the client entry reaches it`.
+A file can say it itself: `[platform("browser")] mod self;` as its first line
+— and at the top of a file, completion offers that line.
+
+**The status bar menu.** Click the `vilan` item for a menu: the platform the
+file is analyzed under and why, the entry whose world it is analyzed in, the
+server's version and commit, and the last analysis' size as counts (files,
+entities, impls — work, not milliseconds); a switch for each feature the
+server reads live (inlay hints, the `~Trait` abbreviation, semantic
+highlighting, the generic `<` pairing, Organize Imports on save), which flips
+the workspace setting where one is set and the user setting otherwise; and
+restart, stop or start, the status page and the output channel. A stopped
+server reads `vilan (stopped)`.
+
+**A file is analyzed as its entry sees it, once two of them are open.** A
+file open on its own keeps its own quick analysis for its squiggles; as soon
+as a second file of the same entry's world is open, the editor analyzes the
+entry — `client.vl`, say — once per edit, and every open file it reaches is
+answered from that one analysis. Find References and rename always answer
+from the entry's whole world, every file it reaches open or not: for a file
+open on its own, the first such request after an edit analyzes the entry,
+and the next one reuses it. Edit `model.vl` with
+`client.vl`, `views.vl` and `channel.vl` open and the four are re-analyzed
+together, not one after another; open a fifth file of the same world and
+it is answered at once, from the analysis already in hand. A module's
+diagnostics are the ones its entry's build would report (an error a caller
+provokes shows in the module), and hover, go-to-definition and completion
+read the entry's program. The entry does not need to be open. A module
+both a browser and a node entry reach is answered from the browser
+entry's world and reports the node entry's diagnostics too; an entry, a
+module no entry reaches, and a file outside any package are each analyzed
+on their own, as before.
 
 A file holding platform-fenced **twins** (a function or a trait `impl`
 written once under `[platform("browser")]` and once under
@@ -284,11 +313,12 @@ sees it.
 
 ## Quick fixes
 
-Eighteen, each attached to the diagnostic that earns it:
+Nineteen, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
-| ``Import `X` from std::json`` | `cannot find 'X'` where `X` is importable. One action per module when more than one exports the name — never a guess between them |
+| ``Import `X` from std::json`` | `cannot find 'X'` where `X` is importable — in an expression, a type, a struct literal's head, a pattern's path head or an impl's `with` trait. One action per module when more than one exports the name — never a guess between them |
+| ``Remove the duplicate import (Organize Imports)`` | ``Json is already imported on line 1`` — the warning a repeated import leaf carries; the fix is Organize Imports' own edit for that run, which merges the repeat away |
 | ``Change to `entries` `` | a `did you mean …?` note on a misspelled struct-initializer field |
 | ``Analyze this file under its platform: add `[platform("browser")] mod self;` `` | a member the OTHER `std` twin declares (`struct 'Region' has no field 'anchor'` in a file analyzed under node, whose note names the `browser` twin that has it). The edit is the file's first line — the one place a file's platform may be written — and the attribute is the one the note spells |
 | ``Insert `;` `` | ``expected `;` to end this statement``, at the gap the diagnostic points at |
@@ -409,6 +439,10 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 Everything but the two paths applies live. **Vilan: Restart Language
 Server** is in the command palette when you want the blunt instrument, and
 the **Vilan Language Server** output channel carries the server's own log.
+**Vilan: Stop Language Server** silences a server that is misbehaving or a
+file it cannot get through: its squiggles are cleared and nothing starts it
+again — not a settings change, not a crash policy — until **Vilan: Start
+Language Server** or a window reload.
 
 **Vilan: Show Language Server Status** writes this session's profile to that
 same channel: the extension's request tally first — session age, server

@@ -120,10 +120,20 @@ pub fn analyze_entry(
 /// union paid it again — a full analysis of the entry, ~2 s on kolt's client —
 /// once per typing pause, right after the dependency sweep had re-landed it.
 pub fn entry_reach_of(document: &Document) -> Option<EntryReach> {
-    if !document.diagnostics.is_empty() {
+    entry_reach_of_program(document.program.as_ref(), document.diagnostics.is_empty())
+}
+
+/// [`entry_reach_of`] over a program handle the landing kept (M104): `clean`
+/// says whether the analysis produced no diagnostic at all, which the leg
+/// requires.
+pub fn entry_reach_of_program(
+    program: Option<&vilan_core::Program>,
+    clean: bool,
+) -> Option<EntryReach> {
+    if !clean {
         return None;
     }
-    let program = document.program.as_ref()?;
+    let program = program?;
     let reached = reached_item_keys(program)?;
     let sources = program.canonical_sources.iter().cloned().collect();
     Some(EntryReach { reached, sources })

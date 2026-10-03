@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location, Range,
-    Url,
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
+    NumberOrString, Range, Url,
 };
 
 use vilan_core::Span;
@@ -102,6 +102,27 @@ impl PublishState {
         owner: &Url,
         document: &Document,
     ) -> Vec<(Url, Vec<Diagnostic>)> {
+        self.plan(owner, document, true)
+    }
+
+    /// [`Self::plan_publish`] for a world whose entry the editor does NOT have
+    /// open (M104): its diagnostics on every file they belong to, and none of
+    /// the entry's PAINT — the faded imports, locals and dead items are drawn
+    /// for a buffer someone is looking at, and nobody is looking at this one.
+    pub fn plan_publish_unpainted(
+        &mut self,
+        owner: &Url,
+        document: &Document,
+    ) -> Vec<(Url, Vec<Diagnostic>)> {
+        self.plan(owner, document, false)
+    }
+
+    fn plan(
+        &mut self,
+        owner: &Url,
+        document: &Document,
+        paint: bool,
+    ) -> Vec<(Url, Vec<Diagnostic>)> {
         let owner_key = self.key(owner);
         let revision = document.analysis_revision();
         if self
@@ -126,7 +147,7 @@ impl PublishState {
         let previous = self.owned.remove(&owner_key);
         // The groups come back addressed (the owner's own URI, each module's
         // minted one); key them, and remember the address each key was seen at.
-        let groups: Vec<(Url, Vec<Diagnostic>)> = diagnostic_groups(document, owner)
+        let groups: Vec<(Url, Vec<Diagnostic>)> = diagnostic_groups(document, owner, paint)
             .into_iter()
             .map(|(address, group)| {
                 let key = self.key(&address);
@@ -220,6 +241,32 @@ impl PublishState {
             }
         }
         touched
+    }
+
+    /// What `owner` contributes to `target` — one owner's half of a merged
+    /// view, for the M104 pins that tell a world's diagnostics from a
+    /// document's own paint.
+    #[cfg(test)]
+    pub fn owned_by(&self, owner: &Url, target: &Url) -> Vec<Diagnostic> {
+        let target = self.key(target);
+        self.owned
+            .get(&self.key(owner))
+            .into_iter()
+            .flatten()
+            .filter(|(candidate, _)| *candidate == target)
+            .flat_map(|(_, group)| group.iter().cloned())
+            .collect()
+    }
+
+    /// Whether any owner still contributes a non-empty group to `target` —
+    /// a close asks this before clearing the file it closed (M104: a world
+    /// that stays alive goes on reporting the closed module's diagnostics).
+    pub fn has_contributions(&self, target: &Url) -> bool {
+        let target = self.key(target);
+        self.owned
+            .values()
+            .flatten()
+            .any(|(candidate, group)| *candidate == target && !group.is_empty())
     }
 
     /// E242: the action that repaints `target` with what [`Self::follow_edit`]
@@ -457,7 +504,7 @@ fn trace_call_diagnostics(
 /// and every diagnostic in an edited-but-unsaved module landed off by the
 /// buffer-versus-disk line delta. Routing both through one reader is what makes
 /// the sentence above hold rather than merely assert.
-fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnostic>)> {
+fn diagnostic_groups(document: &Document, owner: &Url, paint: bool) -> Vec<(Url, Vec<Diagnostic>)> {
     let mut entry_group: Vec<Diagnostic> = Vec::new();
     let mut extra_groups: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
     let mut extra_indices: HashMap<PathBuf, Option<Arc<LineIndex>>> = HashMap::new();
@@ -471,9 +518,14 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
         } else {
             DiagnosticSeverity::ERROR
         };
+        // B520: a diagnostic with a stable code publishes it — the foreign
+        // spellings, recognized by their exact message.
+        let code = vilan_core::parsing::ForeignSpelling::of_message(&item.message)
+            .map(|spelling| NumberOrString::String(spelling.code().to_string()));
         let diagnostic = |range| Diagnostic {
             range,
             severity: Some(severity),
+            code: code.clone(),
             source: Some("vilan".to_string()),
             message: item.message.clone(),
             ..Default::default()
@@ -619,6 +671,25 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
     // statement Organize Imports REWRITES rather than deletes (E168) needs to
     // say so, and said "unused import" instead, which is the one place the fade
     // and the action it names disagreed.
+    let mut groups = vec![(owner.clone(), entry_group)];
+    if !paint {
+        groups.extend(extra_groups);
+        return groups;
+    }
+    let entry_group = &mut groups[0].1;
+    // E255: a duplicate import is a WARNING, with Organize Imports as its fix
+    // (`Document::quickfixes`), and published only for a buffer someone has
+    // open, like the paint below.
+    for (span, message) in document.duplicate_import_warnings() {
+        entry_group.push(Diagnostic {
+            range: document.analyzed_range(&span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("duplicate-import".to_string())),
+            source: Some("vilan".to_string()),
+            message,
+            ..Default::default()
+        });
+    }
     let mut faded: Vec<(Span, String)> = document.unused_import_spans();
     for (message, spans) in [
         ("unused local", document.unused_local_spans()),
@@ -640,7 +711,6 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
             ..Default::default()
         });
     }
-    let mut groups = vec![(owner.clone(), entry_group)];
     groups.extend(extra_groups);
     groups
 }

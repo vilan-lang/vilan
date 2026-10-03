@@ -283,7 +283,7 @@ struct Retained {
 
 impl Retained {
     fn new(text: &'static str, program: Program<'static>) -> Retained {
-        let entity_spans = vilan_ide::entity_spans(&program);
+        let entity_spans = vilan_ide::entity_spans(&program, SourceId(0));
         let platform_requirements = vilan_core::platform_color::requirements(&program);
         let import_roots = ImportRoots {
             std: embedded_std_spec(),
@@ -770,6 +770,8 @@ pub fn complete_program(source: &str, line: u32, character: u32) -> Vec<Completi
         };
         let analysis = Analysis {
             program: &retained.program,
+            // The playground's buffer is always its own entry.
+            focus: SourceId(0),
             analyzed: &retained.analyzed,
             live,
             entity_spans: &retained.entity_spans,

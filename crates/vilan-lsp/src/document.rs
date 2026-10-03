@@ -22,6 +22,7 @@ use vilan_core::{
 };
 use vilan_ide::numeric_fix::NumericEdit;
 
+use crate::hover_blocks::{Block, HoverBlocks};
 use crate::keystroke::{
     Anchor, CursorContext, EditTrail, LandedHint, LandedSnapshot, ModuleSymbols, ServedHint,
     SymbolEntry, SymbolIndex, Verdict, candidates, cursor_context, is_identifier_char,
@@ -419,6 +420,7 @@ fn union(a: Span, b: Span) -> Span {
 /// the regions and is the only ordering anything downstream needs.
 fn block_regions<'a>(
     program: &'a Program<'a>,
+    focus: SourceId,
     entry_ids: &[std::ops::Range<u32>],
 ) -> Vec<(&'a [Id], Id)> {
     fn if_arms<'a>(branch: &'a ExprIfBranch, regions: &mut Vec<(&'a [Id], Id)>) {
@@ -434,7 +436,7 @@ fn block_regions<'a>(
     }
 
     let mut regions: Vec<(&[Id], Id)> = Vec::new();
-    for (_, expression) in program.entities_of(SourceId(0)) {
+    for (_, expression) in program.entities_of(focus) {
         match expression {
             Expr::Block((statements, tail))
             | Expr::For(_, (statements, tail))
@@ -479,6 +481,38 @@ fn is_within(directory: &Path, file: &Path) -> bool {
 }
 
 /// A package source root for a file with no manifest: its own directory.
+/// Runs `work` on a thread with the analysis's own stack (128 MiB, the
+/// pipeline's `ANALYSIS_STACK_SIZE`) and joins it — for the editor-table work
+/// M104 does beside an analysis rather than inside one (a world's views
+/// capture their keystroke answers, which parses each module's text, and a
+/// parse recurses with the nesting it reads). Declares the stack to the
+/// analyzer's probe, as the analysis thread does (N121).
+pub fn on_analysis_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    const ANALYSIS_STACK_SIZE: usize = 128 * 1024 * 1024;
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(ANALYSIS_STACK_SIZE)
+            .spawn_scoped(scope, || {
+                vilan_core::stack_guard::with_declared_stack(ANALYSIS_STACK_SIZE, work)
+            })
+            .expect("spawn an analysis-stack thread")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
+}
+
+/// Whether `path` lies under the `generated` root the manifest in
+/// `manifest_dir` declares — E124's no-gray rule, asked for a file served from
+/// its entry's world (M104), whose own project resolution never ran.
+fn generated_under(manifest_dir: &Path, path: &Path) -> bool {
+    std::fs::read_to_string(manifest_dir.join("vilan.toml"))
+        .ok()
+        .and_then(|contents| Manifest::parse(&contents).ok())
+        .is_some_and(|(manifest, _warnings)| {
+            vilan_core::dead_items::is_generated(manifest_dir, &manifest, path)
+        })
+}
+
 fn pkg_root_fallback(entry_path: &Path) -> PathBuf {
     entry_path
         .parent()
@@ -636,11 +670,14 @@ pub struct Symbol {
 /// members — fenced, with the blank line that makes it its own paragraph.
 /// Empty where the type has no definition to show (a primitive, an opaque
 /// external, a closure).
-fn definition_paragraph(program: &Program, type_id: vilan_core::type_::TypeId) -> String {
-    match program.type_definitions.of(type_id) {
-        Some(block) => format!("\n\n```vilan\n{block}\n```"),
-        None => String::new(),
-    }
+///
+/// E246: a [`Block::Preview`] — reference material, ordered after the doc
+/// comment and set off by a rule (`hover_blocks`' canonical order).
+fn definition_paragraph(program: &Program, type_id: vilan_core::type_::TypeId) -> Option<String> {
+    program
+        .type_definitions
+        .of(type_id)
+        .map(|block| format!("```vilan\n{block}\n```"))
 }
 
 /// `self` hovered as the binding it is (E239): the block that introduces it
@@ -652,7 +689,7 @@ fn definition_paragraph(program: &Program, type_id: vilan_core::type_::TypeId) -
 /// written against, and its definition is the trait's required members — the
 /// bound is what `self` promises there. In a blanket the subject is the
 /// binder (`self: S`), whose bound the header line spells.
-fn self_hover(program: &Program, parameter: &Parameter, type_label: &str) -> String {
+fn self_hover(program: &Program, parameter: &Parameter, type_label: &str) -> HoverBlocks {
     let in_a_trait = program
         .member_owners
         .get(&parameter.function_id)
@@ -663,10 +700,13 @@ fn self_hover(program: &Program, parameter: &Parameter, type_label: &str) -> Str
         Some(header) => format!("{header}\n{line}"),
         None => line,
     };
-    format!(
-        "```vilan\n{fenced}\n```{}",
-        definition_paragraph(program, parameter.type_id)
-    )
+    let mut out = HoverBlocks::new();
+    out.push_code(Block::Signature, &fenced);
+    out.push_some(
+        Block::Preview,
+        definition_paragraph(program, parameter.type_id),
+    );
+    out
 }
 
 /// Clamp a rendered hover preview to its display budget, cutting at a char
@@ -873,7 +913,7 @@ pub struct Document {
     /// definition it names — the one table find-references and rename both read
     /// (see `crate::references`). Computed with the analysis so a query is a
     /// lookup rather than a scan of the whole entity map.
-    reference_index: ReferenceIndex,
+    reference_index: Arc<ReferenceIndex>,
     /// Salvage tail retention (B38): the PREVIOUS analysis's semantic tokens
     /// for the byte-identical, line-aligned common suffix of the old and new
     /// analyzed texts, already shifted into the new text's coordinates.
@@ -888,7 +928,7 @@ pub struct Document {
     /// Per-function platform requirements (`platform_color::requirements`),
     /// rendered lines like ``requires the `process` layer of `std` (via `…`)``
     /// — appended to the hover of any function that carries one.
-    platform_requirements: HashMap<Id, String>,
+    platform_requirements: Arc<HashMap<Id, String>>,
     /// The `vilan.toml` failure behind this analysis, if any — published as one
     /// diagnostic on the manifest itself (see [`ManifestProblem`]).
     manifest_problem: Option<ManifestProblem>,
@@ -971,6 +1011,66 @@ pub struct Document {
     /// analysis fenced out is answered by the leg that admits it
     /// ([`Document::answering`]). Empty unless `twin_fenced_out` is not.
     twin_legs: Vec<TwinLeg>,
+    /// M104: the source in `program` this document IS. `SourceId(0)` when the
+    /// document was analyzed as its own entry — a declared entry, a module no
+    /// entry reaches, a file with no project — and the module's own source when
+    /// it is served from its entry's world, where the program's `SourceId(0)`
+    /// is that ENTRY. Every "this file's own" question (its entities, its
+    /// diagnostics, its tokens and hints, its import list) asks about this
+    /// source; `analyzed_index` is this source's text as the analysis read it.
+    focus: SourceId,
+    /// M104: the entry whose world this document is served from, canonical —
+    /// `None` when the document is its own entry (`focus` is then
+    /// `SourceId(0)`). A document served from a world publishes nothing of its
+    /// own: the world's entry owns every diagnostic its analysis produced,
+    /// this file's included, and the server publishes them under the entry.
+    world_root: Option<PathBuf>,
+    /// M104: the OTHER entries whose worlds load this file under a different
+    /// platform — a module both the browser and the node entry reach (E113's
+    /// shared module). Their analyses report this file's diagnostics as each
+    /// leg sees it; the editor answers caret requests from `world_root`'s.
+    /// Empty for every file one entry reaches, which is nearly all of them.
+    further_worlds: Vec<PathBuf>,
+    /// M104's hybrid (the owner's ruling on editor-46's report): the entry
+    /// whose world this file belongs to while it is the ONLY open document of
+    /// that world — then it keeps its own cheap analysis for keystroke
+    /// diagnostics, as on v0.43.0, and a cross-file request (Find References,
+    /// rename) reads the entry's world, built on demand. `None` for a document
+    /// served from a world (`world_root` names it), for an entry, and for a
+    /// file no entry reaches.
+    lone_world: Option<PathBuf>,
+    /// E247: what the status bar's menu reports about this analysis, captured
+    /// when it was built so a released document (M63) still answers — the
+    /// platform and why, and the analysis's size in COUNTS (the M106 ruling:
+    /// work, never milliseconds). `None` on a document that never analyzed.
+    status: Option<AnalysisStatus>,
+}
+
+/// E247: one analysis as the status bar's menu describes it.
+#[derive(Clone, Debug)]
+pub struct AnalysisStatus {
+    pub platform: &'static str,
+    pub kind: Option<&'static str>,
+    pub reason: Option<String>,
+    /// The files the analysis loaded (the entry, its modules, std).
+    pub files: usize,
+    /// The entity ids it minted — every declaration, expression and binding.
+    pub entities: u32,
+    /// The `impl` blocks in its world.
+    pub impls: usize,
+}
+
+impl AnalysisStatus {
+    fn of(program: &Program) -> AnalysisStatus {
+        AnalysisStatus {
+            platform: program.platform.runtime_name(),
+            kind: program.platform_kind,
+            reason: program.platform_reason.clone(),
+            files: program.sources.len(),
+            entities: program.next_entity_id,
+            impls: program.implementations.len(),
+        }
+    }
 }
 
 /// One further leg of a file carrying platform-fenced twins (F27 R3), kept
@@ -1028,6 +1128,16 @@ fn twins_fenced_out(text: &str, platform: BuildPlatform) -> Vec<Span> {
 /// `Drop` does the ordering in one visible place — program first, then the
 /// reclaims — rather than leaning on field declaration order.
 pub struct AnalyzedProgram {
+    /// The pair, SHARED (M104): every document served from one entry's world
+    /// holds a handle on the one analysis, and the allocations are given back
+    /// when the last handle goes. `None` on a document that analyzed nothing.
+    pair: Option<Arc<ProgramPair>>,
+}
+
+/// The program and the allocations it borrows — what [`AnalyzedProgram`]
+/// shares. Its `Drop` is the reclaim, and it runs exactly once: when the last
+/// document holding the analysis lets go.
+struct ProgramPair {
     program: Option<Program<'static>>,
     /// The leaked entry text the program borrows (`None` on a document that
     /// analyzed nothing — the degraded internal-error document).
@@ -1050,11 +1160,11 @@ impl AnalyzedProgram {
     /// `*text`, `*ast`, and the allocations `owned_modules` holds claims on —
     /// it is the program `analyze_source_owning_overlay_modules` built over
     /// exactly that text and returned with exactly these handles. Nothing
-    /// else may hold a reference derived from `*text` or `*ast`: when this
-    /// value drops, both are freed. An owned module allocation is freed only
-    /// if this document's claim was the LAST (M23), so another holder's
-    /// reference into one is fine — and is what the claim protocol exists
-    /// for.
+    /// else may hold a reference derived from `*text` or `*ast`: when the
+    /// last handle on this value drops, both are freed. An owned module
+    /// allocation is freed only if this analysis's claim was the LAST (M23),
+    /// so another holder's reference into one is fine — and is what the claim
+    /// protocol exists for.
     unsafe fn new(
         program: Option<Program<'static>>,
         text: Option<Leaked<str>>,
@@ -1062,33 +1172,51 @@ impl AnalyzedProgram {
         owned_modules: OwnedModules,
     ) -> AnalyzedProgram {
         AnalyzedProgram {
-            program,
-            text,
-            ast,
-            owned_modules,
+            pair: Some(Arc::new(ProgramPair {
+                program,
+                text,
+                ast,
+                owned_modules,
+            })),
         }
     }
 
     /// No program, nothing leaked — the internal-error document's analysis.
     pub fn none() -> AnalyzedProgram {
+        AnalyzedProgram { pair: None }
+    }
+
+    /// Another handle on the same analysis (M104): a module served from its
+    /// entry's world reads the entry's program, and holds it alive while it
+    /// does. Sound under `new`'s contract unchanged — the handles are the
+    /// borrowers' keep-alive, and the reclaim waits for the last of them.
+    pub fn share(&self) -> AnalyzedProgram {
         AnalyzedProgram {
-            program: None,
-            text: None,
-            ast: None,
-            owned_modules: OwnedModules::none(),
+            pair: self.pair.clone(),
         }
     }
 
     pub fn as_ref(&self) -> Option<&Program<'static>> {
-        self.program.as_ref()
+        self.pair.as_ref().and_then(|pair| pair.program.as_ref())
+    }
+
+    /// The program, mutably — only while this is the ONE handle on it (a
+    /// fresh analysis no view shares yet). Test-only: the pins that plant a
+    /// shape the analyzer never produces edit the program in place.
+    #[cfg(test)]
+    pub fn as_mut_unshared(&mut self) -> Option<&mut Program<'static>> {
+        self.pair
+            .as_mut()
+            .and_then(Arc::get_mut)
+            .and_then(|pair| pair.program.as_mut())
     }
 
     pub fn is_some(&self) -> bool {
-        self.program.is_some()
+        self.as_ref().is_some()
     }
 }
 
-impl Drop for AnalyzedProgram {
+impl Drop for ProgramPair {
     fn drop(&mut self) {
         // The program borrows the two allocations: it goes FIRST, and only
         // then are they given back. Nothing else borrows them (the `new`
@@ -1104,7 +1232,7 @@ impl Drop for AnalyzedProgram {
             unsafe { ast.reclaim() };
         }
         // SAFETY: as above — the program was the only thing borrowing
-        // through THIS document's claims (the `new` contract). Giving them
+        // through THIS analysis's claims (the `new` contract). Giving them
         // back frees an allocation only if no stored base world still claims
         // it (M23); one that does keeps it, correctly, alive.
         unsafe { std::mem::take(&mut self.owned_modules).reclaim() };
@@ -1420,6 +1548,8 @@ enum EmptiedStatement {
 /// one) nothing here is built at all, which matters because this runs on the
 /// debounced diagnostics path (E114's 6.2 ms budget).
 struct ImportUseContext<'a> {
+    /// The source the pass is judging — the document's focus (M104).
+    focus: SourceId,
     /// The text the pass is reading — the analyzed text for the fades, the live
     /// text for the action. Both callers already hold it; the collision guard
     /// needs it to read a module SEGMENT's name.
@@ -1448,7 +1578,7 @@ impl ImportUseContext<'_> {
             program
                 .member_name_spans
                 .iter()
-                .filter(|(id, _)| lookup.of(**id) == Some(SourceId(0)))
+                .filter(|(id, _)| lookup.of(**id) == Some(self.focus))
                 .map(|(_, span)| *span)
                 .collect()
         })
@@ -1683,10 +1813,10 @@ impl Document {
             text_hash: hash_text(text),
             entity_spans: Vec::new(),
             field_spans: Vec::new(),
-            reference_index: ReferenceIndex::default(),
+            reference_index: Arc::default(),
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
-            platform_requirements: HashMap::default(),
+            platform_requirements: Arc::default(),
             manifest_problem: None,
             shared_diagnostics: Vec::new(),
             import_roots: None,
@@ -1703,6 +1833,11 @@ impl Document {
             released: None,
             twin_fenced_out: Vec::new(),
             twin_legs: Vec::new(),
+            focus: SourceId(0),
+            world_root: None,
+            further_worlds: Vec::new(),
+            lone_world: None,
+            status: None,
         }
     }
 
@@ -1854,20 +1989,25 @@ impl Document {
         // function both front-ends use (`vilan_ide::entity_spans`).
         let entity_spans = program
             .as_ref()
-            .map(vilan_ide::entity_spans)
+            .map(|program| vilan_ide::entity_spans(program, SourceId(0)))
             .unwrap_or_default();
 
         // M85's field-position table, built here for `entity_spans`'s reason:
         // the question is "which field is under this offset", it is asked once
         // per hover-on-move, and answering it by walking the world's structs
         // made the answer cost the codebase rather than the buffer.
-        let field_spans = program.as_ref().map(field_spans_of).unwrap_or_default();
+        let field_spans = program
+            .as_ref()
+            .map(|program| field_spans_of(program, SourceId(0)))
+            .unwrap_or_default();
 
         // The identifier-occurrence table the reference queries read.
-        let reference_index = program
-            .as_ref()
-            .map(ReferenceIndex::build)
-            .unwrap_or_default();
+        let reference_index = Arc::new(
+            program
+                .as_ref()
+                .map(ReferenceIndex::build)
+                .unwrap_or_default(),
+        );
 
         // `diagnostics` = the entry's own lex/parse errors, then the program's
         // (see `analyze_source`) — so the source list is an entry-attributed
@@ -1889,10 +2029,12 @@ impl Document {
             .as_ref()
             .map(|program| program.warning_sources.clone())
             .unwrap_or_default();
-        let platform_requirements = program
-            .as_ref()
-            .map(vilan_core::platform_color::requirements)
-            .unwrap_or_default();
+        let platform_requirements = Arc::new(
+            program
+                .as_ref()
+                .map(vilan_core::platform_color::requirements)
+                .unwrap_or_default(),
+        );
         // SAFETY: `program` was built by `analyze_source_owning_overlay_modules`
         // over `leaked` (the text `leaked_text` owns) and returned with `ast`
         // — the handle to the very tree it borrows — and `owned_modules`, the
@@ -2025,12 +2167,18 @@ impl Document {
             released: None,
             twin_fenced_out,
             twin_legs,
+            focus: SourceId(0),
+            world_root: None,
+            further_worlds: Vec::new(),
+            lone_world: None,
+            status: None,
         };
+        document.status = document.program.as_ref().map(AnalysisStatus::of);
         // E121: the keystroke path's whole-program walk, paid HERE — once per
         // analysis, on the analysis thread — instead of once per request on
         // the keystroke thread. See [`LandedSnapshot`].
         let phase_landed_start = vilan_core::PhaseClock::now();
-        document.landed = document.capture_landed(entry_path);
+        document.landed = document.capture_landed(entry_path, None);
         let phase_landed = phase_landed_start.elapsed();
         // M27: the editor tables, as ONE number the server can carry — the
         // reference/entity index and the landed walk are the same family of
@@ -2067,7 +2215,16 @@ impl Document {
 
     /// Capture what this freshly analyzed document's answers are, for the
     /// keystroke path to re-serve until the next analysis lands.
-    fn capture_landed(&self, entry_path: &Path) -> LandedSnapshot {
+    ///
+    /// `world_index` is the completion index of the analysis a VIEW is served
+    /// from (M104): its program-wide tables are shared rather than derived a
+    /// second time, and only the import edits — a function of this file's own
+    /// text — are computed here.
+    fn capture_landed(
+        &self,
+        entry_path: &Path,
+        world_index: Option<&vilan_ide::CompletionIndex>,
+    ) -> LandedSnapshot {
         if !self.program.is_some() {
             return LandedSnapshot::default();
         }
@@ -2079,7 +2236,7 @@ impl Document {
             tokens,
             token_lines: Vec::new(),
             hints,
-            index: self.landed_symbol_index(entry_path),
+            index: self.landed_symbol_index(entry_path, world_index),
             landed: true,
         };
         // E122: the viewport index over the tokens just captured, paid on the
@@ -2100,7 +2257,11 @@ impl Document {
     ///
     /// Derive-generated entities (`DERIVED_SOURCE`) are skipped: their spans
     /// are offsets into a template, not into any file a user can complete in.
-    fn landed_symbol_index(&self, entry_path: &Path) -> SymbolIndex {
+    fn landed_symbol_index(
+        &self,
+        entry_path: &Path,
+        world_index: Option<&vilan_ide::CompletionIndex>,
+    ) -> SymbolIndex {
         let Some(program) = self.program.as_ref() else {
             return SymbolIndex::default();
         };
@@ -2129,7 +2290,11 @@ impl Document {
                 return *known;
             }
             let slot = (|| {
-                if source == SourceId(0) {
+                // The slot the keystroke path re-reads from live syntax is
+                // THIS document's (M104: its focus, which in a world is not
+                // the program's `SourceId(0)` — that is the entry, and it gets
+                // a module slot like any other loaded file).
+                if source == self.focus {
                     return Some(SymbolIndex::ENTRY);
                 }
                 if source == DERIVED_SOURCE {
@@ -2231,14 +2396,108 @@ impl Document {
             // functions of the analyzed program and the package tree it
             // resolved, so they are derived here, on the analysis thread, and
             // never in a request.
-            completion: Arc::new(vilan_ide::CompletionIndex::build(
-                program,
-                self.import_roots.as_ref(),
-                self.analyzed_text(),
-            )),
+            completion: Arc::new(match world_index {
+                Some(world_index) => world_index.sharing_world(self.analyzed_text()),
+                None => vilan_ide::CompletionIndex::build(
+                    program,
+                    self.import_roots.as_ref(),
+                    self.analyzed_text(),
+                ),
+            }),
         };
         index.refresh_entry_from_syntax(self.analyzed_text());
         index
+    }
+
+    /// M104: the document `path` IS, served from `world` — the analysis of the
+    /// entry `world_root`, whose world loads the file. The ruled entry-world
+    /// design: a module its entry reaches is analysed in that entry's world,
+    /// once per edit, and every open document of the world is answered from
+    /// the one analysis — its diagnostics as its entry sees them, hover, goto
+    /// and completion over the entry's program.
+    ///
+    /// The program is SHARED ([`AnalyzedProgram::share`]), and so are the
+    /// whole-program tables (the reference index, the platform requirements,
+    /// the completion index's program-wide half); what is built here is what
+    /// is about THIS file — its entities, its field positions, its captured
+    /// keystroke answers — the per-file share of an analysis's editor tables.
+    ///
+    /// `None` when the world did not load the file, or loaded a DIFFERENT text
+    /// than `text`: the overlay is live, so a buffer edited while the world
+    /// ran was read at whatever it said then, and a view over that text would
+    /// describe bytes the editor no longer holds. The edit that moved the
+    /// buffer has scheduled the analysis that will describe it.
+    pub fn view_of(
+        world: &Document,
+        world_root: &Path,
+        path: &Path,
+        text: &str,
+        further_worlds: Vec<PathBuf>,
+    ) -> Option<Document> {
+        let program = world.program.as_ref()?;
+        let canonical = vilan_core::util::canonical_path(path);
+        let focus = program
+            .canonical_sources
+            .iter()
+            .position(|source| *source == canonical)
+            .filter(|index| *index != 0)?;
+        let focus = SourceId(u32::try_from(focus).ok()?);
+        if program.source_hashes.get(focus.0 as usize) != Some(&vilan_core::content_hash(text)) {
+            return None;
+        }
+        let started = vilan_core::PhaseClock::now();
+        let line_index = Arc::new(LineIndex::new(text));
+        let generated = world
+            .manifest_dir
+            .as_deref()
+            .is_some_and(|manifest_dir| generated_under(manifest_dir, path));
+        let mut document = Document {
+            live_edits: Some(Vec::new()),
+            analyzed_index: Arc::clone(&line_index),
+            line_index,
+            program: world.program.share(),
+            index_time: std::time::Duration::ZERO,
+            // The world's, whole: a quick fix reads the diagnostics attributed
+            // to `focus` out of them, exactly as an entry reads its own.
+            diagnostics: world.diagnostics.clone(),
+            diagnostic_sources: world.diagnostic_sources.clone(),
+            warnings: world.warnings.clone(),
+            warning_sources: world.warning_sources.clone(),
+            text: text.to_string(),
+            text_hash: hash_text(text),
+            entity_spans: vilan_ide::entity_spans(program, focus),
+            field_spans: field_spans_of(program, focus),
+            reference_index: Arc::clone(&world.reference_index),
+            retained_tail: Vec::new(),
+            retained_tail_start: usize::MAX,
+            platform_requirements: Arc::clone(&world.platform_requirements),
+            // The entry's analysis owns the manifest's diagnostic and every
+            // leg's; a view publishes neither.
+            manifest_problem: None,
+            shared_diagnostics: Vec::new(),
+            import_roots: world.import_roots.clone(),
+            analysis_revision: world.analysis_revision,
+            // One package: the entry's root, manifest and import roots are the
+            // file's own.
+            package_root: world.package_root.clone(),
+            manifest_dir: world.manifest_dir.clone(),
+            // An entry loads it — that is what made it a view.
+            unloaded_by_entries: None,
+            generated,
+            package_reach: None,
+            landed: LandedSnapshot::default(),
+            released: None,
+            twin_fenced_out: Vec::new(),
+            twin_legs: Vec::new(),
+            focus,
+            world_root: Some(vilan_core::util::canonical_path(world_root)),
+            further_worlds,
+            lone_world: None,
+            status: world.status.clone(),
+        };
+        document.landed = document.capture_landed(path, Some(&world.landed.index.completion));
+        document.index_time = started.elapsed().wall;
+        Some(document)
     }
 
     /// One further leg's verdict on this file: analyze it under `platform` and
@@ -2321,6 +2580,14 @@ impl Document {
     /// compiles agree about most of a shared module, and one mistake reported
     /// twice is one squiggle.
     pub fn published_diagnostics(&self) -> Vec<PublishedDiagnostic> {
+        // M104: a document served from its entry's world publishes no
+        // diagnostic of its own — the world's entry owns every one its analysis
+        // produced, this file's included, and the server publishes them under
+        // that entry. What such a document still publishes is its paint, which
+        // `publish::diagnostic_groups` asks it for directly.
+        if self.world_root.is_some() {
+            return Vec::new();
+        }
         // M63: a released document publishes the groups it published while it
         // held its program. `publish` needs the program to turn a `SourceId`
         // into the file it names, and that resolution is exactly what was
@@ -2612,10 +2879,11 @@ impl Document {
     ) -> Analysis<'a, 'src> {
         Analysis {
             program,
+            focus: self.focus,
             analyzed: self.analyzed_index.shared(),
             live: self.line_index.shared(),
             entity_spans: &self.entity_spans,
-            platform_requirements: &self.platform_requirements,
+            platform_requirements: self.platform_requirements.as_ref(),
             import_roots: self.import_roots.as_ref(),
             index,
             source_texts: Default::default(),
@@ -2805,7 +3073,20 @@ impl Document {
             released: _,
             twin_fenced_out,
             mut twin_legs,
+            // M104: which source of the program this document is, and whose
+            // world it is served from, are facts of the ANALYSIS — the next
+            // one may move the file into its entry's world or out of it.
+            focus,
+            world_root,
+            further_worlds,
+            lone_world,
+            status,
         } = analysis;
+        self.lone_world = lone_world;
+        self.status = status;
+        self.focus = focus;
+        self.world_root = world_root;
+        self.further_worlds = further_worlds;
         // F27 R3: the kept legs are the analysis side too, and they were built
         // over the ANALYZED text; bring each leg's live side to this
         // document's, so a request routed to one reads the buffer on screen.
@@ -2911,13 +3192,19 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return false;
         };
-        let diagnostics = publish(
-            Some(program),
-            &self.diagnostics,
-            &self.diagnostic_sources,
-            &self.warnings,
-            &self.warning_sources,
-        );
+        let diagnostics = if self.world_root.is_some() {
+            // A world's document publishes no diagnostic of its own (M104),
+            // released or not.
+            Vec::new()
+        } else {
+            publish(
+                Some(program),
+                &self.diagnostics,
+                &self.diagnostic_sources,
+                &self.warnings,
+                &self.warning_sources,
+            )
+        };
         let canonical_sources = program.canonical_sources.clone();
         let mut declarations: HashMap<Definition, (Box<str>, Option<DefinitionKind>)> =
             HashMap::default();
@@ -3181,15 +3468,18 @@ impl Document {
     /// the platform the last analysis ran under, the one-word kind of fact
     /// that chose it, and the full reason clause (its tooltip). `None` before
     /// any analysis has produced a program.
+    #[cfg(test)]
     pub fn analysis_platform(
         &self,
     ) -> Option<(&'static str, Option<&'static str>, Option<String>)> {
-        let program = self.program.as_ref()?;
-        Some((
-            program.platform.runtime_name(),
-            program.platform_kind,
-            program.platform_reason.clone(),
-        ))
+        let status = self.status.as_ref()?;
+        Some((status.platform, status.kind, status.reason.clone()))
+    }
+
+    /// E247: the last analysis as the status bar's menu describes it — kept
+    /// through a release (M63), so a background tab still answers.
+    pub fn analysis_status(&self) -> Option<&AnalysisStatus> {
+        self.status.as_ref()
     }
 
     /// Whether the `<` ending at `offset` opens a generic argument or
@@ -3294,11 +3584,13 @@ impl Document {
             }
             // E221: a labelled nominal hovers with its reason even where no
             // declaration block answers (a trait in a bound).
-            if let Some(lead) = definition.and_then(|definition| internal_lead(program, definition))
-            {
-                return Some(format!("{lead}\n\n{label}"));
-            }
-            return Some(label);
+            let mut blocks = HoverBlocks::new();
+            blocks.push_some(
+                Block::Diagnostic,
+                definition.and_then(|definition| internal_lead(program, definition)),
+            );
+            blocks.push(Block::Signature, label);
+            return blocks.rendered();
         }
         // Everything below answers by span CONTAINMENT, and an entity's span
         // contains its trivia — a comment or blank line inside a function body
@@ -3339,7 +3631,7 @@ impl Document {
         // binder) or a parameter: its typed declaration; a member read: the
         // fenced `name: T` (E72); else the bare type — fenced too, so every
         // hover reads as code.
-        let type_label = self
+        let mut blocks = self
             .binding_hover(program, id)
             .or_else(|| self.member_hover(program, id))
             .or_else(|| {
@@ -3349,31 +3641,30 @@ impl Document {
                         Some(value) => format!("{label} = {value}"),
                         None => label,
                     };
-                    format!("```vilan\n{label}\n```")
+                    let mut blocks = HoverBlocks::new();
+                    blocks.push_code(Block::Signature, &label);
+                    blocks
                 })
-            });
-        let requirement = self
-            .analysis(program)
-            .function_target(id)
-            .and_then(|function| self.platform_requirements.get(&function))
-            .cloned();
-        let answer = match (type_label, requirement) {
-            // A blank markdown line, so the requirement renders as its own
-            // paragraph under the type.
-            (Some(type_label), Some(requirement)) => Some(format!("{type_label}\n\n{requirement}")),
-            (Some(type_label), None) => Some(type_label),
-            (None, requirement) => requirement,
-        }?;
+            })
+            .unwrap_or_default();
+        blocks.push_some(
+            Block::Platform,
+            self.analysis(program)
+                .function_target(id)
+                .and_then(|function| self.platform_requirements.get(&function))
+                .cloned(),
+        );
+        if blocks.is_empty() {
+            return None;
+        }
         // E221: a labelled MODULE BINDING leads with its reason too, at its
         // declaration and at every read of it.
         let binding = match program.entity_map.get(&id) {
             Some(Expr::Local(target)) => *target,
             _ => id,
         };
-        Some(match internal_lead(program, binding) {
-            Some(lead) => format!("{lead}\n\n{answer}"),
-            None => answer,
-        })
+        blocks.push_some(Block::Diagnostic, internal_lead(program, binding));
+        blocks.rendered()
     }
 
     /// The hover for an identifier that spells an `as` alias — its own name
@@ -3409,16 +3700,14 @@ impl Document {
         } else {
             declaration
         };
-        let mut out = format!("```vilan\n(alias) {declaration}\n```");
-        if let Some(docs) = self.analysis(program).doc_comment_of(target) {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        if let Some(requirement) = self.platform_requirements.get(&target) {
-            out.push_str("\n\n");
-            out.push_str(requirement);
-        }
-        Some(out)
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &format!("(alias) {declaration}"));
+        out.push_some(Block::Doc, self.analysis(program).doc_comment_of(target));
+        out.push_some(
+            Block::Platform,
+            self.platform_requirements.get(&target).cloned(),
+        );
+        out.rendered()
     }
 
     /// The hover for a PATTERN position (E241): a variant's name as
@@ -3434,7 +3723,8 @@ impl Document {
             let range = site.name_span.into_range();
             range.start <= offset && offset < range.end
         })?;
-        let mut out = format!("```vilan\n{}\n```", site.label);
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &site.label);
         let variant_entity = site.variant.and_then(|(enum_id, variant_index)| {
             let enumeration = program.enums.get(&enum_id)?;
             let name = enumeration.variants.get(variant_index)?.name;
@@ -3445,13 +3735,11 @@ impl Document {
                 .get(name)
                 .copied()
         });
-        if let Some(docs) =
-            variant_entity.and_then(|entity| self.analysis(program).doc_comment_of(entity))
-        {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        Some(out)
+        out.push_some(
+            Block::Doc,
+            variant_entity.and_then(|entity| self.analysis(program).doc_comment_of(entity)),
+        );
+        out.rendered()
     }
 
     /// E240's hover for a type-position name: a TYPE PARAMETER — `type I:
@@ -3471,23 +3759,25 @@ impl Document {
             .type_reference_at(program, offset)
             .and_then(|(definition, _)| definition)
             .filter(|definition| program.traits.contains_key(definition));
-        let mut out = String::new();
+        let mut out = HoverBlocks::new();
         // E221: a labelled trait leads with its reason here too.
-        if let Some(lead) = named_trait.and_then(|definition| internal_lead(program, definition)) {
-            out.push_str(&lead);
-            out.push_str("\n\n");
-        }
-        out.push_str(&format!("```vilan\n{}\n```", hover.code));
-        if let Some(owner) = &hover.declared_by {
-            out.push_str(&format!("\n\nA type parameter of `{owner}`"));
-        }
-        if let Some(docs) =
-            named_trait.and_then(|definition| self.analysis(program).doc_comment_of(definition))
-        {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        Some(out)
+        out.push_some(
+            Block::Diagnostic,
+            named_trait.and_then(|definition| internal_lead(program, definition)),
+        );
+        out.push_code(Block::Signature, &hover.code);
+        out.push_some(
+            Block::SignatureNote,
+            hover
+                .declared_by
+                .as_ref()
+                .map(|owner| format!("A type parameter of `{owner}`")),
+        );
+        out.push_some(
+            Block::Doc,
+            named_trait.and_then(|definition| self.analysis(program).doc_comment_of(definition)),
+        );
+        out.rendered()
     }
 
     /// Whether `id` is a module directory with NO body of its own — A65's pure
@@ -3615,15 +3905,16 @@ impl Document {
         }
         let module = program.modules.get(&definition)?;
         let children = self.namespace_children(program, definition);
-        let mut out = format!("```vilan\nnamespace {}\n```", module.name);
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &format!("namespace {}", module.name));
         if !children.is_empty() {
             let names: Vec<String> = children
                 .iter()
                 .map(|(name, _)| format!("`{name}`"))
                 .collect();
-            out.push_str(&format!("\n\nHolds {}.", names.join(", ")));
+            out.push(Block::Preview, format!("Holds {}.", names.join(", ")));
         }
-        Some(out)
+        out.rendered()
     }
 
     /// Assembles a declaration hover: the fenced declaration (with inferred
@@ -3682,24 +3973,18 @@ impl Document {
             Some(header) => format!("{header}\n{declaration}"),
             None => declaration,
         };
-        let mut out = String::new();
+        let mut out = HoverBlocks::new();
         // E213: hover LEADS with the reason. The declaration is reachable —
         // that is what visibility already answered — and what the reader needs
         // before the signature is that reaching for it is a decision.
-        if let Some(lead) = internal_lead(program, declaration_id) {
-            out.push_str(&lead);
-            out.push_str("\n\n");
-        }
-        out.push_str(&format!("```vilan\n{declaration}\n```"));
-        if let Some(docs) = self.analysis(program).doc_comment_of(declaration_id) {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        if let Some(requirement) = requirement {
-            out.push_str("\n\n");
-            out.push_str(&requirement);
-        }
-        out
+        out.push_some(Block::Diagnostic, internal_lead(program, declaration_id));
+        out.push_code(Block::Signature, &declaration);
+        out.push_some(
+            Block::Doc,
+            self.analysis(program).doc_comment_of(declaration_id),
+        );
+        out.push_some(Block::Platform, requirement);
+        out.render()
     }
 
     /// The hover for a binary OPERATOR token under `offset`: the declaration
@@ -3722,7 +4007,7 @@ impl Document {
     /// operands, not on either of them, so hovering `a` in `a == b` still
     /// hovers `a`.
     fn operator_hover(&self, program: &Program, offset: usize) -> Option<String> {
-        let entry = SourceId(0);
+        let entry = self.focus;
         let mut best: Option<(Id, usize)> = None;
         for (id, expr) in &program.entity_map {
             let Expr::Binary(_, left, right) = expr else {
@@ -3824,7 +4109,7 @@ impl Document {
     /// hover the same. The type is the resolved label the analyzer pre-rendered
     /// (`expr_types`) — the element type for a destructured binder. Returns
     /// `None` for anything that is not a binding, leaving the bare-type path.
-    fn binding_hover(&self, program: &Program, id: Id) -> Option<String> {
+    fn binding_hover(&self, program: &Program, id: Id) -> Option<HoverBlocks> {
         let binding = match program.entity_map.get(&id) {
             Some(Expr::Local(inner) | Expr::Variable(inner) | Expr::Parameter(inner)) => *inner,
             _ => id,
@@ -3837,8 +4122,8 @@ impl Document {
             if let Some(value) = self.const_value_label(program, binding) {
                 signature.push_str(&format!(" = {value}"));
             }
-            let mut out = format!("```vilan\n{signature}\n```");
-            out.push_str(&definition_paragraph(program, variable.type_id));
+            let mut out = HoverBlocks::new();
+            out.push_code(Block::Signature, &signature);
             // E227 (Q5): the abbreviation beneath the full type, when the inlay
             // hint shows one — outside the fence, because the fence is vilan
             // and `~` is not. The reader who wonders what the hint means
@@ -3850,15 +4135,16 @@ impl Document {
                     .map(|host| format!("`{host}`"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                out.push_str(&format!(
-                    "\n\nShown as `{}` (`[hint]` on {hosts})",
-                    hint.label
-                ));
+                out.push(
+                    Block::SignatureNote,
+                    format!("Shown as `{}` (`[hint]` on {hosts})", hint.label),
+                );
             }
-            if let Some(docs) = self.analysis(program).doc_comment_of(binding) {
-                out.push_str("\n\n");
-                out.push_str(&docs);
-            }
+            out.push_some(Block::Doc, self.analysis(program).doc_comment_of(binding));
+            out.push_some(
+                Block::Preview,
+                definition_paragraph(program, variable.type_id),
+            );
             return Some(out);
         }
         if let Some(parameter) = program.parameters.get(&binding) {
@@ -3866,11 +4152,13 @@ impl Document {
             if parameter.name == "self" {
                 return Some(self_hover(program, parameter, type_label));
             }
-            return Some(format!(
-                "```vilan\n{}\n```{}",
-                parameter.signature_label(type_label),
-                definition_paragraph(program, parameter.type_id)
-            ));
+            let mut out = HoverBlocks::new();
+            out.push_code(Block::Signature, &parameter.signature_label(type_label));
+            out.push_some(
+                Block::Preview,
+                definition_paragraph(program, parameter.type_id),
+            );
+            return Some(out);
         }
         None
     }
@@ -3883,27 +4171,29 @@ impl Document {
     /// call shape is skipped here rather than dressed in a field's clothes.
     /// `None` for anything that is not a member read, leaving the bare-type
     /// path.
-    fn member_hover(&self, program: &Program, id: Id) -> Option<String> {
+    fn member_hover(&self, program: &Program, id: Id) -> Option<HoverBlocks> {
         let member_span = program.member_name_spans.get(&id)?;
         if program.function_calls.contains_key(&id) {
             return None;
         }
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
-        let mut out = format!("```vilan\n{name}: {type_label}\n```");
-        if let Some(type_id) = program.expr_type_ids.get(&id) {
-            out.push_str(&definition_paragraph(program, *type_id));
-        }
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &format!("{name}: {type_label}"));
         // E204: a FIELD's own `///`, where the read resolves to one. A field
         // carries no entity id, so `doc_comment_of` has nothing to look up —
         // `Expr::Field`'s (struct, index) key is what names the declaration,
         // and `doc_comment_at` reads the block above its name span in the
         // DECLARING source, which is the same read every other doc consumer
         // performs.
-        if let Some(docs) = self.field_docs(program, id) {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
+        out.push_some(Block::Doc, self.field_docs(program, id));
+        out.push_some(
+            Block::Preview,
+            program
+                .expr_type_ids
+                .get(&id)
+                .and_then(|type_id| definition_paragraph(program, *type_id)),
+        );
         Some(out)
     }
 
@@ -3949,20 +4239,17 @@ impl Document {
         let type_label = self
             .analysis(program)
             .field_type_label(struct_id, index, field.name)?;
-        let mut out = String::new();
+        let mut out = HoverBlocks::new();
         // E213: a FIELD is the case visibility cannot serve at all, and the
         // one the item was filed about.
-        if let Some(reason) = field.internal {
-            out.push_str(&internal_line(reason));
-            out.push_str("\n\n");
-        }
-        out.push_str(&format!("```vilan\n{}: {type_label}\n```", field.name));
-        out.push_str(&definition_paragraph(program, field.type_id));
-        if let Some(docs) = self.struct_field_docs(program, struct_id, index) {
-            out.push_str("\n\n");
-            out.push_str(&docs);
-        }
-        Some(out)
+        out.push_some(Block::Diagnostic, field.internal.map(internal_line));
+        out.push_code(Block::Signature, &format!("{}: {type_label}", field.name));
+        out.push_some(
+            Block::Doc,
+            self.struct_field_docs(program, struct_id, index),
+        );
+        out.push_some(Block::Preview, definition_paragraph(program, field.type_id));
+        out.rendered()
     }
 
     /// The struct field whose DECLARATION name span, or whose initializer KEY
@@ -4167,7 +4454,7 @@ impl Document {
                 continue;
             };
             let place = (
-                (source != SourceId(0))
+                (source != analysis.focus)
                     .then(|| {
                         analysis
                             .program
@@ -4269,7 +4556,7 @@ impl Document {
         let source_of = program.source_lookup();
         let mut hints: Vec<LandedHint> = Vec::new();
         for (id, variable) in &program.variables {
-            if variable.annotated || source_of.of(*id) != Some(SourceId(0)) {
+            if variable.annotated || source_of.of(*id) != Some(self.focus) {
                 continue;
             }
             let Some(label) = program.expr_types.get(id) else {
@@ -4324,7 +4611,7 @@ impl Document {
         // and disjoint rather than assuming they are), and is taken ONCE here
         // because the ranges do not move while a walk reads them.
         let source_of = program.source_lookup();
-        let entry = |id: Id| source_of.of(id) == Some(SourceId(0));
+        let entry = |id: Id| source_of.of(id) == Some(self.focus);
         let mut tokens: Vec<(Span, TokenKind, u32)> = Vec::new();
         let classify_target = |target: Id| -> TokenKind {
             use vilan_core::analyzer::Expr;
@@ -4495,7 +4782,7 @@ impl Document {
         }
         // Type-position references (macro names arrive here too).
         for (source, span, definition, _) in &program.type_references {
-            if *source != SourceId(0) {
+            if *source != self.focus {
                 continue;
             }
             // A reference with no resolved definition (an unresolved or
@@ -4922,7 +5209,7 @@ impl Document {
             .type_references
             .iter()
             .filter(|(source, span, _, _)| {
-                *source == SourceId(0) && {
+                *source == self.focus && {
                     let range = span.into_range();
                     range.start <= offset && offset < range.end
                 }
@@ -5214,18 +5501,85 @@ impl Document {
             .collect()
     }
 
-    /// The canonical path of the file this document's analysis read as its
-    /// entry (`None` when nothing was analyzed) — how the location conversion
-    /// recognizes a path-space span as belonging to an open document.
+    /// M104: the source in the program this document IS — `SourceId(0)` for
+    /// a document analyzed as its own entry, the module's own source for one
+    /// served from its entry's world.
+    pub fn focus(&self) -> SourceId {
+        self.focus
+    }
+
+    /// M104: the entry whose world this document is served from, canonical —
+    /// `None` when the document is its own entry.
+    pub fn world_root(&self) -> Option<&Path> {
+        self.world_root.as_deref()
+    }
+
+    /// M104: the further entries whose worlds report this file's diagnostics
+    /// under another platform (see the field).
+    pub fn further_worlds(&self) -> &[PathBuf] {
+        &self.further_worlds
+    }
+
+    /// M104's hybrid: the entry whose world this lone document belongs to
+    /// (see the field).
+    pub fn lone_world(&self) -> Option<&Path> {
+        self.lone_world.as_deref()
+    }
+
+    /// Record that this analysis is a lone document's own (M104's hybrid):
+    /// `entry` is the world it belongs to and is not served from.
+    pub fn set_lone_world(&mut self, entry: PathBuf) {
+        self.lone_world = Some(entry);
+    }
+
+    /// M104: whether this analysis loaded the file at `canonical` (a
+    /// canonical path) — the question a world asks of each open document
+    /// before serving it.
+    pub fn loads(&self, canonical: &Path) -> bool {
+        self.program.as_ref().is_some_and(|program| {
+            program
+                .canonical_sources
+                .iter()
+                .any(|source| source == canonical)
+        })
+    }
+
+    /// M104: whether this analysis read the file at `canonical` as `text` —
+    /// `true` for a file it did not load at all (nothing it says depends on
+    /// that file), and for an analysis that holds no program. The overlay is
+    /// live, so an open buffer edited while the analysis ran was read at
+    /// whatever it said then; this is how a world finds out it describes a
+    /// buffer the editor no longer holds.
+    pub fn read_matches(&self, canonical: &Path, text: &str) -> bool {
+        let Some(program) = self.program.as_ref() else {
+            return true;
+        };
+        let Some(index) = program
+            .canonical_sources
+            .iter()
+            .position(|source| source == canonical)
+        else {
+            return true;
+        };
+        program.source_hashes.get(index) == Some(&vilan_core::content_hash(text))
+    }
+
+    /// The canonical path of THIS document's file in its analysis (`None` when
+    /// nothing was analyzed) — how the location conversion recognizes a
+    /// path-space span as belonging to an open document. The analysis's entry
+    /// for a document analyzed as its own; the module's path for one served
+    /// from its entry's world (M104).
     pub fn entry_path(&self) -> Option<&Path> {
-        self.canonical_sources().first().map(PathBuf::as_path)
+        self.canonical_sources()
+            .get(self.focus.0 as usize)
+            .map(PathBuf::as_path)
     }
 
     /// The definition the identifier under `offset` names, with its kind — the
     /// shared front half of find-references and rename.
     pub fn reference_target(&self, offset: usize) -> Option<(Definition, DefinitionKind)> {
         let program = self.program.as_ref()?;
-        let occurrence = self.reference_index.at(SourceId(0), offset)?;
+        let occurrence = self.reference_index.at(self.focus, offset)?;
         // E149: a struct-init shorthand `A { x }` is ONE identifier naming two
         // definitions (E134), and the row carries whichever of them
         // `Definition::sort_key` put first — declaration order. So a caret
@@ -5529,6 +5883,30 @@ impl Document {
             .unwrap_or_default()
     }
 
+    /// E255: the import leaves of this file that repeat an earlier one, each
+    /// with the warning it publishes — in the ANALYZED text's coordinates, like
+    /// every published span. Syntactic (`formatter::duplicate_import_leaves`),
+    /// so a file with errors still hears about them; what it reports is
+    /// exactly what Organize Imports' duplicate pass (E251) removes, which is
+    /// the warning's quick fix.
+    pub fn duplicate_import_warnings(&self) -> Vec<(Span, String)> {
+        let text = self.analyzed_text();
+        let index = self.analyzed_index();
+        vilan_core::formatter::duplicate_import_leaves(text)
+            .into_iter()
+            .map(|duplicate| {
+                let line = index.range(&duplicate.first).start.line + 1;
+                (
+                    duplicate.span,
+                    format!(
+                        "`{}` is already imported on line {line} — Organize Imports removes the repeat",
+                        duplicate.name
+                    ),
+                )
+            })
+            .collect()
+    }
+
     /// The fade text of an unused import leaf: what the editor writes beside
     /// the gray, and what the user reads before running the action.
     ///
@@ -5648,7 +6026,7 @@ impl Document {
         // rule (0) declines it too.
         if program
             .import_alias_spans
-            .contains_key(&(SourceId(0), leaf_span))
+            .contains_key(&(self.focus, leaf_span))
         {
             return None;
         }
@@ -5795,7 +6173,7 @@ impl Document {
         // The entry's id ranges first, because every later test is cheaper than
         // `source_of` (a linear scan of `source_ranges`, which asked per
         // variable is that scan re-run once per row).
-        let entry_ids = program.id_ranges_of(SourceId(0));
+        let entry_ids = program.id_ranges_of(self.focus);
         let module_level: HashSet<Id> = program.module_level_bindings().into_iter().collect();
         program
             .variables
@@ -5843,7 +6221,7 @@ impl Document {
             .program
             .as_ref()
             .filter(|_| self.diagnostics.is_empty() && !self.is_stale())?;
-        let spans: Vec<Span> = vilan_core::dead_items::paintable_items(program, SourceId(0))
+        let spans: Vec<Span> = vilan_core::dead_items::paintable_items(program, self.focus)
             .into_iter()
             .map(|item| item.name_span)
             .collect();
@@ -5909,10 +6287,10 @@ impl Document {
         if self.unloaded_by_entries.is_some() {
             return Vec::new();
         }
-        let Some(path) = program.canonical_sources.first() else {
+        let Some(path) = program.canonical_sources.get(self.focus.0 as usize) else {
             return Vec::new();
         };
-        vilan_core::dead_items::paintable_items(program, SourceId(0))
+        vilan_core::dead_items::paintable_items(program, self.focus)
             .into_iter()
             .filter(|item| {
                 !reach.reached.contains(&vilan_core::dead_items::ItemKey {
@@ -5969,10 +6347,10 @@ impl Document {
         else {
             return Vec::new();
         };
-        let entry_ids = program.id_ranges_of(SourceId(0));
+        let entry_ids = program.id_ranges_of(self.focus);
         let divergence = vilan_core::analyzer::Divergence::of_program(program);
         let mut spans: Vec<Span> = Vec::new();
-        for (statements, tail) in block_regions(program, &entry_ids) {
+        for (statements, tail) in block_regions(program, self.focus, &entry_ids) {
             let Some(diverging) = statements
                 .iter()
                 .position(|statement| divergence.expr(*statement))
@@ -6070,7 +6448,7 @@ impl Document {
         import_spans: &[Span],
         context: &ImportUseContext<'_>,
     ) -> bool {
-        let entry = SourceId(0);
+        let entry = self.focus;
         // B318 S3: an `(impl …)` selector is a terminal the organizer prunes,
         // and it binds no NAME at all — so rule (1)'s question ("does this file
         // spell the thing this leaf binds") is not the question. The selector's
@@ -6187,7 +6565,7 @@ impl Document {
     /// definitions it binds, so counting them would let a statement justify
     /// itself and nothing would ever prune.
     fn selector_member_is_used(&self, members: &[Id], import_spans: &[Span]) -> bool {
-        let entry = SourceId(0);
+        let entry = self.focus;
         members.iter().any(|member| {
             self.reference_index
                 .occurrences_of(Definition::Entity(*member))
@@ -6213,7 +6591,7 @@ impl Document {
             .type_references
             .iter()
             .find_map(|(source, at, definition, _)| {
-                (*source == SourceId(0) && *at == span).then_some(*definition)
+                (*source == self.focus && *at == span).then_some(*definition)
             })
             .flatten()
     }
@@ -6239,7 +6617,7 @@ impl Document {
         program: &Program,
         source: &str,
     ) -> HashSet<Definition> {
-        let entry = SourceId(0);
+        let entry = self.focus;
         vilan_core::formatter::import_leaf_name_spans(source)
             .into_iter()
             .filter_map(|leaf_span| {
@@ -6259,6 +6637,7 @@ impl Document {
     /// the one table that predates E180.
     fn import_use_context<'a>(&self, program: &Program, source: &'a str) -> ImportUseContext<'a> {
         ImportUseContext {
+            focus: self.focus,
             source,
             bound_by_leaves: self.definitions_bound_by_import_leaves(program, source),
             receiver_members: std::cell::OnceCell::new(),
@@ -6288,7 +6667,7 @@ impl Document {
         import_spans: &[Span],
         context: &ImportUseContext<'_>,
     ) -> bool {
-        let entry = SourceId(0);
+        let entry = self.focus;
         let Some(home) = program.source_of(module_id) else {
             return false;
         };
@@ -6450,7 +6829,7 @@ impl Document {
         import_spans: &[Span],
         context: &ImportUseContext<'_>,
     ) -> Option<String> {
-        let entry = SourceId(0);
+        let entry = self.focus;
         let home = program.source_of(module_id)?;
         let mut subject: Option<String> = None;
         for occurrence in self.reference_index.occurrences_in(entry) {
@@ -6620,7 +6999,7 @@ impl Document {
                 .get(index)
                 .copied()
                 .unwrap_or(SourceId(0))
-                != SourceId(0)
+                != self.focus
             {
                 continue;
             }
@@ -6644,7 +7023,7 @@ impl Document {
             .functions
             .keys()
             .copied()
-            .filter(|id| program.source_of(*id) == Some(SourceId(0)))
+            .filter(|id| program.source_of(*id) == Some(self.focus))
             .filter_map(|id| vilan_ide::analysis::span_of(program, id).map(|whole| (id, whole)))
             .filter(|(_, whole)| whole.start <= span.start && span.end <= whole.end)
             .min_by_key(|(_, whole)| whole.end - whole.start)
@@ -6672,7 +7051,7 @@ impl Document {
                 .get(index)
                 .copied()
                 .unwrap_or(SourceId(0))
-                != SourceId(0)
+                != self.focus
                 || !diagnostic.msg.starts_with(A_CSS_DECLARATION_IS_A_CALL)
             {
                 continue;
@@ -6732,7 +7111,7 @@ impl Document {
                 .get(index)
                 .copied()
                 .unwrap_or(SourceId(0))
-                != SourceId(0)
+                != self.focus
             {
                 continue;
             }
@@ -6786,17 +7165,58 @@ impl Document {
     /// safe substitution.
     pub fn quickfixes(&self, program: &Program, range: Span) -> Vec<QuickFix> {
         let mut fixes = Vec::new();
+        // E255: a duplicate import's fix is Organize Imports' own edit for the
+        // run it is in — E251's merge, which removes exactly the repeat (and
+        // tidies the run the way the organize action always does).
+        let duplicates: Vec<Span> = self
+            .duplicate_import_warnings()
+            .into_iter()
+            .map(|(span, _)| span)
+            .filter(|span| spans_overlap(*span, range))
+            .collect();
+        if !duplicates.is_empty() {
+            for (span, replacement) in self.organize_import_edits() {
+                if duplicates
+                    .iter()
+                    .any(|duplicate| spans_contain(span, *duplicate))
+                {
+                    fixes.push(QuickFix {
+                        title: "Remove the duplicate import (Organize Imports)".to_string(),
+                        span,
+                        replacement,
+                        target: None,
+                    });
+                }
+            }
+        }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             if self
                 .diagnostic_sources
                 .get(index)
                 .copied()
                 .unwrap_or(SourceId(0))
-                != SourceId(0)
+                != self.focus
             {
                 continue; // an edit can only ever reach this document
             }
             if !spans_overlap(diagnostic.span, range) {
+                continue;
+            }
+            // B520: a foreign spelling (`return`, `fn`, `->`, …) — the
+            // parser's own fix data, recognized by the diagnostic's exact
+            // message (the one field a diagnostic carries through the
+            // pipeline).
+            if let Some(fix) = vilan_core::parsing::foreign_spelling_fix(
+                &self.text,
+                &diagnostic.msg,
+                diagnostic.span,
+            ) {
+                fixes.push(QuickFix {
+                    title: fix.title.to_string(),
+                    span: fix.span,
+                    replacement: fix.replacement.to_string(),
+                    target: None,
+                });
                 continue;
             }
             if let Some(name) = unresolved_name(&diagnostic.msg) {
@@ -6982,7 +7402,7 @@ impl Document {
                 .get(index)
                 .copied()
                 .unwrap_or(SourceId(0))
-                != SourceId(0)
+                != self.focus
                 || !spans_overlap(warning.span, range)
             {
                 continue;
@@ -7053,7 +7473,7 @@ impl Document {
         let path = warning.msg.strip_prefix('`')?.split('`').next()?;
         let leaf = path.rsplit("::").next()?;
         self.reference_index
-            .occurrences_in(SourceId(0))
+            .occurrences_in(self.focus)
             .find(|occurrence| {
                 spans_contain(warning.span, occurrence.span)
                     && !occurrence.is_declaration
@@ -7113,7 +7533,7 @@ impl Document {
         // The current buffer answers from its LIVE text — `quickfixes` runs
         // only on a document whose snapshots agree, so that is also the
         // analyzed text the span came from.
-        if declaration.source == SourceId(0) {
+        if declaration.source == self.focus {
             let at = top_level_item_start(&self.text, declaration.span.start)?;
             return Some(QuickFix {
                 title,
@@ -7174,7 +7594,7 @@ impl Document {
         program
             .exposed_private_types
             .iter()
-            .find(|(source, recorded, _)| *source == SourceId(0) && *recorded == span)
+            .find(|(source, recorded, _)| *source == self.focus && *recorded == span)
             .map(|(_, _, definition)| *definition)
     }
 
@@ -7431,7 +7851,7 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
-        let mut seen = vec![SourceId(0)];
+        let mut seen = vec![self.focus];
         seen.extend(skip);
         let mut texts = Vec::new();
         for implementation in program.implementations.iter() {
@@ -7468,7 +7888,7 @@ impl Document {
                 .get(index)
                 .copied()
                 .unwrap_or(SourceId(0))
-                != SourceId(0)
+                != self.focus
             {
                 continue;
             }
@@ -7504,7 +7924,7 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
-        let in_entry = |id: Id| program.source_of(id) == Some(SourceId(0));
+        let in_entry = |id: Id| program.source_of(id) == Some(self.focus);
         let mut symbols = Vec::new();
 
         for (id, function) in &program.functions {
@@ -7779,23 +8199,40 @@ const SIGNATURE_EXPOSES_A_PRIVATE_TYPE: &str = "is exported, but";
 /// declaration here to export and the message says what the two ways out are.
 const EXPOSED_TYPE_IS_FOREIGN: &str = "in another package, and cannot be exported from here";
 
-/// The name in an unknown-name diagnostic's message: `cannot find 'X' in this
-/// scope...` (a bare value) or `cannot find type 'X'...` — the two "cannot
-/// find" shapes B4's import steer already targets
-/// (`analyzer.rs::import_steer`/`import_steer_inner`). `None` for every other
-/// diagnostic shape (a module-path segment, a trait, a struct field, a
-/// context …) — E54's add-import quickfix is deliberately scoped to these
-/// two; the others are the filing's own later customers (E58d's rule for the
-/// closest-name primitive applies here too).
+/// The name an import would bring, read off an unknown-name diagnostic — the
+/// shapes the analyzer's import steer (`analyzer.rs::import_steer`) attaches
+/// to, at every position an unresolved name can stand in (E250's census):
+///
+/// - `cannot find 'X' in this scope…` — an expression;
+/// - `cannot find type 'X'…` — an annotation, a generic argument, a bound, an
+///   impl subject, a static call's receiver, a parameter or return type;
+/// - `cannot find trait 'X'…` — an `impl`'s `with` trait;
+/// - `unknown struct: X…` — a struct literal's head;
+/// - `cannot find 'X::Variant' in this scope…` — a pattern's PATH (`match`,
+///   `is`): no module declares the path, the import brings its HEAD, so the
+///   head is the name.
+///
+/// `None` for every other diagnostic shape (a module-path segment, a struct
+/// field, a context …) — E58d's rule for the closest-name primitive applies
+/// to those.
 fn unresolved_name(message: &str) -> Option<&str> {
-    for prefix in ["cannot find '", "cannot find type '"] {
-        if let Some(rest) = message.strip_prefix(prefix)
-            && let Some(end) = rest.find('\'')
-        {
-            return Some(&rest[..end]);
-        }
-    }
-    None
+    let quoted = ["cannot find '", "cannot find type '", "cannot find trait '"]
+        .iter()
+        .find_map(|prefix| {
+            let rest = message.strip_prefix(prefix)?;
+            Some(&rest[..rest.find('\'')?])
+        });
+    let name = quoted.or_else(|| {
+        let rest = message.strip_prefix("unknown struct: ")?;
+        let end = rest
+            .find(|character: char| {
+                !(character.is_alphanumeric() || character == '_' || character == ':')
+            })
+            .unwrap_or(rest.len());
+        Some(&rest[..end])
+    })?;
+    let head = name.split("::").next().unwrap_or(name);
+    (!head.is_empty()).then_some(head)
 }
 
 /// The NAME LIST of the clause B242's subset refusal spells out — the text
@@ -9090,10 +9527,10 @@ fn spans_contain(outer: Span, inner: Span) -> bool {
 ///
 /// Entry file only, like `entity_spans`: every span-containment answer in this
 /// file is about this buffer's coordinate space.
-fn field_spans_of(program: &Program) -> Vec<(usize, usize, Id, usize)> {
+fn field_spans_of(program: &Program, focus: SourceId) -> Vec<(usize, usize, Id, usize)> {
     let mut rows: Vec<(usize, usize, Id, usize)> = Vec::new();
     for (struct_id, structure) in &program.structs {
-        if program.source_of(*struct_id) != Some(SourceId(0)) {
+        if program.source_of(*struct_id) != Some(focus) {
             continue;
         }
         for (index, field) in structure.fields.iter().enumerate() {
@@ -9104,7 +9541,7 @@ fn field_spans_of(program: &Program) -> Vec<(usize, usize, Id, usize)> {
         }
     }
     for (source, span, struct_id, index) in &program.struct_initializer_field_spans {
-        if *source != SourceId(0) {
+        if *source != focus {
             continue;
         }
         let range = span.into_range();
@@ -15853,8 +16290,7 @@ pub(crate) mod tests {
         let mut document = Document::analyze("fun main() {}\n", &std_root(), Path::new("test.vl"));
         let program = document
             .program
-            .program
-            .as_mut()
+            .as_mut_unshared()
             .expect("the program analyzes");
         let first = Id(program.next_entity_id);
         let second = Id(program.next_entity_id + 1);
@@ -15874,8 +16310,7 @@ pub(crate) mod tests {
         let mut document = Document::analyze("fun main() {}\n", &std_root(), Path::new("test.vl"));
         let program = document
             .program
-            .program
-            .as_mut()
+            .as_mut_unshared()
             .expect("the program analyzes");
         let call = Id(program.next_entity_id);
         program.entity_map.insert(call, Expr::Call(call));
@@ -15902,8 +16337,7 @@ pub(crate) mod tests {
         let mut document = Document::analyze("fun main() {}\n", &std_root(), Path::new("test.vl"));
         let program = document
             .program
-            .program
-            .as_mut()
+            .as_mut_unshared()
             .expect("the program analyzes");
         let first = Id(program.next_entity_id);
         let second = Id(program.next_entity_id + 1);
@@ -20740,7 +21174,14 @@ pub(crate) mod tests {
             "the pin needs a green program"
         );
         assert!(faded(&document).is_empty(), "{:?}", faded(&document));
-        assert_eq!(organized(&document), None, "both imports are used");
+        // Both imports are used, so nothing is pruned — and E251 (ruled at
+        // Order 46's GO) merges a module import beside a member import of the
+        // same module into the `self` form, which keeps both.
+        assert_eq!(
+            organized(&document).as_deref(),
+            Some("import pkg::a::{ self, b };\n\nfun main(): i32 {\n\tb() + a::b()\n}\n"),
+            "both imports are used, merged",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -20761,10 +21202,14 @@ pub(crate) mod tests {
             "the pin needs a green program"
         );
         assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        // Kept (it brings `doubled`), and merged with its member into the
+        // `self` form (E251).
         assert_eq!(
-            organized(&document),
-            None,
-            "the module import brings `doubled`"
+            organized(&document).as_deref(),
+            Some(
+                "import pkg::a::{ self, b };\n\nfun main(): i32 {\n\tlet n = b();\n\tn.doubled()\n}\n"
+            ),
+            "the module import brings `doubled`",
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -23037,7 +23482,7 @@ fun main() {
         let offset = E152_ENTRY.find("::ui").expect("the `ui` segment") + 2;
         assert_eq!(
             document.hover(offset).as_deref(),
-            Some("```vilan\nnamespace ui\n```\n\nHolds `widget`."),
+            Some("```vilan\nnamespace ui\n```\n\n---\n\nHolds `widget`."),
         );
         // B335: `lib` has a body file, so it hovers as the MODULE it is — it
         // read as a namespace only because the entry-attributed placeholder
@@ -23346,7 +23791,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover,
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("trait Greeter\nself: Self"),
                 fence("trait Greeter {\n\tfun greet(self): str;\n}")
             )
@@ -23360,7 +23805,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover,
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("impl type S: Greeter with Named\nself: S"),
                 fence("trait Greeter {\n\tfun greet(self): str;\n}")
             )
@@ -23376,7 +23821,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover(&document, "mut user = ", 0, 4),
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("mut user: User"),
                 fence("struct User {\n\tid: UserId,\n\tname: str,\n\ttags: List<str>,\n}")
             )
@@ -23388,9 +23833,12 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         let block = fence("struct UserId {\n\tvalue: i32,\n}");
         let read = hover(&document, "print(user.id.value)", 0, 11);
-        assert_eq!(read, format!("{}\n\n{block}", fence("id: UserId")));
+        assert_eq!(read, format!("{}\n\n---\n\n{block}", fence("id: UserId")));
         let declared = hover(&document, "\tid: UserId,", 0, 1);
-        assert_eq!(declared, format!("{}\n\n{block}", fence("id: UserId")));
+        assert_eq!(
+            declared,
+            format!("{}\n\n---\n\n{block}", fence("id: UserId"))
+        );
     }
 
     #[test]
@@ -23399,7 +23847,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover(&document, "let pair = ", 0, 4),
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("let pair: Pair<i32, str>"),
                 fence("struct Pair<i32, str> {\n\tleft: i32,\n\tright: str,\n}")
             )
@@ -23440,7 +23888,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover(&document, "fun describe(greeter", 0, 14),
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("greeter: Greeter"),
                 fence("trait Greeter {\n\tfun greet(self): str;\n}")
             )
@@ -23451,7 +23899,10 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
     fn e237_a_long_definition_is_capped_at_twelve_members() {
         let document = analyzed();
         let hover = hover(&document, "let wide = ", 0, 4);
-        let block = hover.split("\n\n").nth(1).expect("a definition block");
+        let block = hover
+            .split("\n\n---\n\n")
+            .nth(1)
+            .expect("a definition block");
         assert_eq!(
             block,
             fence(
@@ -23472,6 +23923,112 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
             hover(&document, "mut out: List", 0, 4),
             fence("mut out: List<i32>")
         );
+    }
+    // --- E246 extended: the canonical order of hover blocks ------------------
+
+    /// Every block a FUNCTION hover carries, in the ruled order: the
+    /// diagnostic-kind lead (a `[deprecated]` steer), the signature, the doc
+    /// comment, then the platform fact — whatever order the builder met them.
+    #[test]
+    fn e246_a_function_hover_orders_lead_signature_doc_platform() {
+        let source = "import std::fs;\n\n/// Writes the state.\n[deprecated(\"use keep()\")]\n\
+             fun save() {\n\tfs::write_file(\"state\", \"data\");\n}\n\n\
+             fun keep() {}\n\nfun main() {\n\tsave();\n}\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let at = source.rfind("save();").expect("the call") + 1;
+        let hover = document.hover(at).expect("a hover");
+        let blocks: Vec<&str> = hover.split("\n\n").collect();
+        assert_eq!(blocks[0], "**deprecated** — use keep()", "{hover}");
+        assert_eq!(blocks[1], "```vilan\nasync fun save()\n```", "{hover}");
+        assert_eq!(blocks[2], "Writes the state.", "{hover}");
+        assert!(
+            blocks[3].starts_with("requires the `process` layer of `std`"),
+            "{hover}"
+        );
+        assert_eq!(blocks.len(), 4, "{hover}");
+    }
+
+    /// Every block a BINDING hover carries, in the ruled order: the
+    /// signature, the note that belongs with it (E227's `Shown as`), the doc
+    /// comment, then the shape under its rule.
+    #[test]
+    fn e246_a_binding_hover_orders_signature_note_doc_preview() {
+        let source = "import std::reactive::{ MemoCell, SignalCell };\n\n\
+             struct Holder {\n\tat: i32,\n}\n\n\
+             fun main() {\n\t/// The one holder.\n\tlet holder = Holder { at = 1 };\n\t\
+             let cell = SignalCell::new(holder);\n\t/// Derived.\n\tlet derived = cell.derive(|value| value.at);\n\t\
+             let _ = derived;\n}\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let hover = document
+            .hover(source.find("let holder").expect("fixture") + 4)
+            .expect("a hover");
+        assert_eq!(
+            hover,
+            format!(
+                "{}\n\nThe one holder.\n\n---\n\n{}",
+                fence("let holder: Holder"),
+                fence("struct Holder {\n\tat: i32,\n}")
+            )
+        );
+        let derived = document
+            .hover(source.find("let derived").expect("fixture") + 4)
+            .expect("a hover");
+        let blocks: Vec<&str> = derived.split("\n\n").collect();
+        assert!(blocks[0].starts_with("```vilan\nlet derived:"), "{derived}");
+        assert!(
+            blocks[1].starts_with("Shown as `~"),
+            "the hint note under the signature: {derived}"
+        );
+        assert_eq!(blocks[2], "Derived.", "{derived}");
+    }
+
+    // --- E246: the shape under a rule, after the docs -----------------------
+
+    /// The gap: the `name: Type` line and the `struct …` shape are set apart
+    /// by a horizontal rule — two fences back to back render as one run.
+    #[test]
+    fn e246_the_shape_is_set_apart_by_a_rule() {
+        let document = analyzed();
+        let hover = hover(&document, "mut user = ", 0, 4);
+        let (signature, shape) = hover
+            .split_once("\n\n---\n\n")
+            .expect("a rule between the declaration and the shape");
+        assert_eq!(signature, fence("mut user: User"));
+        assert!(shape.starts_with("```vilan\nstruct User {"), "{shape}");
+    }
+
+    /// The order: the declaration, then the doc comment the author wrote for
+    /// this name, then the shape — reference material last — for a variable,
+    /// a field read and a field declaration alike.
+    #[test]
+    fn e246_the_doc_comment_comes_before_the_shape() {
+        let source = "struct Point {\n\tx: i32,\n}\n\nstruct Holder {\n\t/// Where it is.\n\tat: Point,\n}\n\n\
+             fun main() {\n\t/// The one holder.\n\tlet holder = Holder { at = Point { x = 1 } };\n\tlet _ = holder.at;\n}\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let shape = fence("struct Point {\n\tx: i32,\n}");
+        let at = |needle: &str, delta: usize| {
+            document
+                .hover(source.find(needle).expect("the fixture") + delta)
+                .expect("a hover")
+        };
+        assert_eq!(
+            at("let holder", 4),
+            format!(
+                "{}\n\nThe one holder.\n\n---\n\n{}",
+                fence("let holder: Holder"),
+                fence("struct Holder {\n\tat: Point,\n}")
+            )
+        );
+        for (position, hovered) in [
+            ("a field read", at("holder.at;", 7)),
+            ("a field declaration", at("\tat: Point", 1)),
+        ] {
+            assert_eq!(
+                hovered,
+                format!("{}\n\nWhere it is.\n\n---\n\n{shape}", fence("at: Point")),
+                "{position}"
+            );
+        }
     }
 }
 

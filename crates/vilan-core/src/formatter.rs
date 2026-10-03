@@ -2783,6 +2783,102 @@ pub fn import_leaf_name_spans(source: &str) -> Vec<Span> {
     spans
 }
 
+/// E255: one import leaf that binds what an EARLIER leaf of the file already
+/// binds — the same path under the same name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DuplicateImport {
+    /// The repeated leaf's name span (its alias's, where it has one).
+    pub span: Span,
+    /// The name it binds.
+    pub name: String,
+    /// The span of the earlier leaf it repeats.
+    pub first: Span,
+}
+
+/// E255: every top-level `import` leaf that repeats an earlier one — what
+/// Organize Imports' duplicate pass (E251) removes. Two leaves repeat when
+/// they reach the same path and bind the same name: `import a::B;` twice,
+/// `import a::{ B, B };`, `import a::B;` beside `import a::{ B, C };`, and a
+/// module import beside a `self` leaf of the same module. An alias is a
+/// different binding (`import a::B as D;` repeats nothing), and an `only`
+/// import, a `use`, a re-export and a marked or selector branch are not
+/// compared at all — the organizer leaves them as written.
+pub fn duplicate_import_leaves(source: &str) -> Vec<DuplicateImport> {
+    let Some(items) = parse(source) else {
+        return Vec::new();
+    };
+    let mut seen: Vec<(Vec<&str>, &str, Span)> = Vec::new();
+    let mut duplicates = Vec::new();
+    for item in items.iter() {
+        let Node::Import(branch, ImportModifier::None) = &item.0 else {
+            continue;
+        };
+        let mut leaves: Vec<(Vec<&str>, &str, Span)> = Vec::new();
+        if !collect_bound_leaves(branch, &mut Vec::new(), &mut leaves) {
+            continue;
+        }
+        for (path, bound, span) in leaves {
+            match seen
+                .iter()
+                .find(|(seen_path, seen_bound, _)| *seen_path == path && *seen_bound == bound)
+            {
+                Some((_, _, first)) => duplicates.push(DuplicateImport {
+                    span,
+                    name: bound.to_string(),
+                    first: *first,
+                }),
+                None => seen.push((path, bound, span)),
+            }
+        }
+    }
+    duplicates
+}
+
+/// [`duplicate_import_leaves`]' walk: each leaf as (the full path it reaches,
+/// the name it binds, its span) — a `self` leaf reaches its group's own path
+/// and binds that path's last segment. `false` for a branch the duplicate
+/// pass does not compare (a reach marker, a selector).
+fn collect_bound_leaves<'src>(
+    branch: &ImportBranch<'src>,
+    prefix: &mut Vec<&'src str>,
+    out: &mut Vec<(Vec<&'src str>, &'src str, Span)>,
+) -> bool {
+    match branch {
+        ImportBranch::Path(name, span, tail) => {
+            let (path, default_name) = if *name == "self" {
+                (prefix.clone(), prefix.last().copied())
+            } else {
+                let mut path = prefix.clone();
+                path.push(name);
+                (path, Some(*name))
+            };
+            match tail {
+                ImportTail::Continue(child) => {
+                    prefix.push(name);
+                    let compared = collect_bound_leaves(child, prefix, out);
+                    prefix.pop();
+                    compared
+                }
+                ImportTail::Leaf => match default_name {
+                    Some(bound) => {
+                        out.push((path, bound, *span));
+                        true
+                    }
+                    None => false,
+                },
+                ImportTail::Alias(alias, alias_span) => {
+                    out.push((path, alias, *alias_span));
+                    true
+                }
+            }
+        }
+        ImportBranch::Set(branches) => branches
+            .iter()
+            .all(|branch| collect_bound_leaves(branch, prefix, out)),
+        ImportBranch::Reach(..) | ImportBranch::Selector(_) => false,
+    }
+}
+
 /// [`import_leaf_name_spans`]' recursion: a `Path` with a `::` continuation
 /// defers to the continuation, a brace `Set` yields every member's leaf, and a
 /// terminal `Path` IS the leaf.
@@ -2834,6 +2930,301 @@ pub fn organize_import_runs(
     // so the comment width knob cannot reach its output.
     let mut printer = Printer::new(source, FormatOptions::default());
     Some(printer.organize_runs(&items, keep, keep_module))
+}
+
+/// One organizer entry: its sort key, its source position, the statement, and
+/// the trailing comment that travels with it.
+type ImportEntry<'ast, 'src> = (
+    ImportSortKey,
+    usize,
+    PrunedStatement<'ast, 'src>,
+    Option<&'src str>,
+);
+
+/// E251: Organize Imports removes DUPLICATE imports. The code action only —
+/// `vilan fmt` deletes no code, and never reaches here.
+///
+/// - **Identical statements collapse** to the first, under the same key the
+///   run is sorted by (a brace set's order is not part of an import's
+///   identity) — and an `export`, a `use` and an `only` import are each their
+///   own kind, never one another's duplicate.
+/// - **Statements over one module merge** into one group when the module has
+///   a brace group — `import a::b::C;` and `import a::b::{ C, D };` are
+///   `import a::b::{ C, D };`, and so are `import a::b::D;` and `import
+///   a::b::{ C }` — or when a name is reachable through two of them; a name
+///   repeated in one group drops. Distinct single members with no group stay
+///   the separate lines they are (`import a::b::C; import a::b::D;` is
+///   canonical, as it always was). "One module"
+///   is a prefix of at least two segments: `import std::json;` and `import
+///   std::io;` share only the ORIGIN.
+/// - **A module import beside a member import of that module** merges into the
+///   `self` form: `import std::json;` and `import std::json::{ Json };` are
+///   `import std::json::{ self, Json };` (the printer puts `self` first, E146);
+///   `import std::json as j;` becomes `self as j`.
+/// - **An alias is a different import**: `import a::B as D;` stays beside
+///   `import a::B;`.
+///
+/// Conservative where an edit could lose something: a statement carrying a
+/// trailing comment, an `only` or `use` statement, a re-export, and any branch
+/// holding a reach marker, a selector or a nested path is left exactly as it
+/// is (identical-statement collapse aside, which keeps the first and its
+/// comment). Idempotent: a merged run has nothing left to merge.
+fn merge_duplicate_imports<'ast, 'src>(
+    entries: Vec<ImportEntry<'ast, 'src>>,
+) -> Vec<ImportEntry<'ast, 'src>> {
+    // Identical statements: the first stays; a later one's comment moves up
+    // only when the first has none, and two different comments keep both.
+    let mut kept: Vec<ImportEntry<'ast, 'src>> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let shape = statement_shape(entry.2.node());
+        if let Some(first) = kept
+            .iter_mut()
+            .find(|first| first.0 == entry.0 && statement_shape(first.2.node()) == shape)
+        {
+            match (first.3, entry.3) {
+                (_, None) => continue,
+                (None, Some(comment)) => {
+                    first.3 = Some(comment);
+                    continue;
+                }
+                (Some(left), Some(right)) if left == right => continue,
+                _ => {}
+            }
+        }
+        kept.push(entry);
+    }
+
+    // The mergeable statements, flattened to (module prefix, leaves).
+    let flat: Vec<Option<FlatImport<'src>>> = kept
+        .iter()
+        .map(
+            |(_, _, statement, trailing)| match (statement.node(), trailing) {
+                (Node::Import(branch, ImportModifier::None), None) => flatten_import(branch),
+                _ => None,
+            },
+        )
+        .collect();
+    // Every module a group can form over: a braced statement's prefix, or a
+    // single member's.
+    let modules: Vec<&[&'src str]> = flat
+        .iter()
+        .flatten()
+        .map(|import| import.prefix.as_slice())
+        .filter(|prefix| prefix.len() >= 2)
+        .collect();
+    // Each mergeable entry's group: the module it imports from, or — a module
+    // import of a module another statement imports from — that module, as
+    // its `self`.
+    // (module, member entries, their leaves, whether a module import joined
+    // it as `self`)
+    let mut groups: Vec<(Vec<&'src str>, Vec<usize>, Vec<FlatLeaf<'src>>, bool)> = Vec::new();
+    for (index, import) in flat.iter().enumerate() {
+        let Some(import) = import else {
+            continue;
+        };
+        let (prefix, leaves, as_self) = match import.leaves.as_slice() {
+            [leaf] if !import.braced => {
+                let mut full = import.prefix.clone();
+                full.push(leaf.name);
+                if modules.contains(&full.as_slice()) {
+                    (
+                        full,
+                        vec![FlatLeaf {
+                            name: "self",
+                            alias: leaf.alias,
+                        }],
+                        true,
+                    )
+                } else if leaf.alias.is_some() {
+                    // An aliased member is its own import (case 4).
+                    continue;
+                } else {
+                    (import.prefix.clone(), import.leaves.clone(), false)
+                }
+            }
+            _ => (import.prefix.clone(), import.leaves.clone(), false),
+        };
+        if prefix.len() < 2 {
+            continue;
+        }
+        match groups.iter_mut().find(|(module, ..)| *module == prefix) {
+            Some((_, members, group_leaves, joined)) => {
+                members.push(index);
+                group_leaves.extend(leaves);
+                *joined |= as_self;
+            }
+            None => groups.push((prefix, vec![index], leaves, as_self)),
+        }
+    }
+
+    let mut merged: Vec<Option<ImportEntry<'ast, 'src>>> = kept.into_iter().map(Some).collect();
+    for (prefix, members, leaves, joined_as_self) in groups {
+        let mut unique: Vec<FlatLeaf<'src>> = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            if !unique.contains(&leaf) {
+                unique.push(leaf);
+            }
+        }
+        // What merges: a leaf reachable twice (across the group's statements
+        // or inside one brace set), a brace group the module's other lines
+        // join, or a module import joining its members as `self`. Single
+        // unbraced members with nothing else stay separate lines.
+        let repeated = unique.len()
+            < members
+                .iter()
+                .filter_map(|member| flat[*member].as_ref())
+                .map(|import| import.leaves.len())
+                .sum::<usize>();
+        let braced_groups = members
+            .iter()
+            .filter_map(|member| flat[*member].as_ref())
+            .filter(|import| import.braced)
+            .count();
+        if !(repeated || (braced_groups >= 1 && members.len() >= 2) || joined_as_self) {
+            continue;
+        }
+        let position = members
+            .iter()
+            .filter_map(|member| merged[*member].as_ref().map(|entry| entry.1))
+            .min()
+            .unwrap_or(0);
+        for member in &members {
+            merged[*member] = None;
+        }
+        let node = Node::Import(build_import(&prefix, unique), ImportModifier::None);
+        merged[members[0]] = Some((
+            node_import_key(&node),
+            position,
+            PrunedStatement::Rebuilt(node),
+            None,
+        ));
+    }
+    merged.into_iter().flatten().collect()
+}
+
+/// What an import statement IS, beyond its path — E251's duplicate test keeps
+/// an `export`, a `use` and an `only` import apart from a plain `import` of
+/// the same path.
+#[derive(PartialEq, Eq)]
+enum StatementShape {
+    Import,
+    ImportOnly,
+    Use,
+    Export,
+}
+
+fn statement_shape(node: &Node<'_>) -> StatementShape {
+    match node {
+        Node::Import(_, ImportModifier::None) => StatementShape::Import,
+        Node::Import(_, ImportModifier::Only(_)) => StatementShape::ImportOnly,
+        Node::Use(_) => StatementShape::Use,
+        _ => StatementShape::Export,
+    }
+}
+
+/// An import statement as E251 merges it: the module path its leaves are
+/// taken from, the leaves, and whether it was written with braces.
+struct FlatImport<'src> {
+    prefix: Vec<&'src str>,
+    leaves: Vec<FlatLeaf<'src>>,
+    braced: bool,
+}
+
+/// One leaf — a name (or `self`) and its alias, if any. An alias naming the
+/// leaf itself is no alias (E145, which the printer drops too).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FlatLeaf<'src> {
+    name: &'src str,
+    alias: Option<&'src str>,
+}
+
+/// `branch` as a [`FlatImport`], or `None` for a shape E251 leaves alone: a
+/// reach marker, a selector, a nested path inside braces, a root-level set.
+fn flatten_import<'src>(branch: &ImportBranch<'src>) -> Option<FlatImport<'src>> {
+    let leaf = |name: &'src str, tail: &ImportTail<'src>| match tail {
+        ImportTail::Leaf => Some(FlatLeaf { name, alias: None }),
+        ImportTail::Alias(alias, _) => Some(FlatLeaf {
+            name,
+            alias: (*alias != name).then_some(*alias),
+        }),
+        ImportTail::Continue(_) => None,
+    };
+    let mut prefix: Vec<&'src str> = Vec::new();
+    let mut current = branch;
+    loop {
+        match current {
+            ImportBranch::Path(name, _, ImportTail::Continue(child)) => {
+                prefix.push(name);
+                current = child;
+            }
+            ImportBranch::Path(name, _, tail) => {
+                return Some(FlatImport {
+                    prefix,
+                    leaves: vec![leaf(name, tail)?],
+                    braced: false,
+                });
+            }
+            ImportBranch::Set(branches) if !prefix.is_empty() => {
+                let leaves = branches
+                    .iter()
+                    .map(|branch| match branch {
+                        ImportBranch::Path(name, _, tail) => leaf(name, tail),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                return Some(FlatImport {
+                    prefix,
+                    leaves,
+                    braced: true,
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The merged statement's branch: `prefix::{ leaves }`, or `prefix::leaf` for
+/// one leaf (a lone `self` is the module itself, `prefix`). Spans are empty —
+/// a rebuilt statement is printed, never walked.
+fn build_import<'src>(prefix: &[&'src str], leaves: Vec<FlatLeaf<'src>>) -> ImportBranch<'src> {
+    let nowhere = Span::from(0..0);
+    let leaf_branch = |leaf: FlatLeaf<'src>| {
+        ImportBranch::Path(
+            leaf.name,
+            nowhere,
+            match leaf.alias {
+                Some(alias) => ImportTail::Alias(alias, nowhere),
+                None => ImportTail::Leaf,
+            },
+        )
+    };
+    let (segments, tail) = match leaves.as_slice() {
+        [
+            FlatLeaf {
+                name: "self",
+                alias,
+            },
+        ] => {
+            let (last, head) = prefix.split_last().expect("a module prefix");
+            let tail = ImportBranch::Path(
+                last,
+                nowhere,
+                match alias {
+                    Some(alias) => ImportTail::Alias(alias, nowhere),
+                    None => ImportTail::Leaf,
+                },
+            );
+            (head, tail)
+        }
+        [only] => (prefix, leaf_branch(*only)),
+        _ => (
+            prefix,
+            ImportBranch::Set(leaves.into_iter().map(leaf_branch).collect()),
+        ),
+    };
+    segments.iter().rev().fold(tail, |child, segment| {
+        ImportBranch::Path(segment, nowhere, ImportTail::Continue(Box::new(child)))
+    })
 }
 
 // --- Insert an import (the add-import quickfix and auto-import completion) --
@@ -4467,6 +4858,11 @@ impl<'src> Printer<'src> {
                 replacement: String::new(),
             });
         }
+
+        // E251: duplicates go — identical statements collapse, a name repeated
+        // in one group drops, statements over one module merge into one group
+        // (a module import becoming its `self`).
+        let mut entries = merge_duplicate_imports(entries);
 
         // Canonical order — a stable sort, so equal keys keep their source order.
         entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));

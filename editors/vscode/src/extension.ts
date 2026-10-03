@@ -8,11 +8,14 @@ import {
     CancellationToken,
     CodeAction,
     CodeActionKind,
+    ConfigurationTarget,
     Disposable,
     env as vscodeEnvironment,
     FileSystemWatcher,
     LogOutputChannel,
     ExtensionContext,
+    QuickPickItem,
+    QuickPickItemKind,
     Range,
     Selection,
     StatusBarAlignment,
@@ -21,9 +24,19 @@ import {
     TextDocumentChangeEvent,
     TextEdit,
     TextEditor,
+    ThemeColor,
     Uri,
 } from 'vscode';
 import { PlacedClosers } from './closers';
+import {
+    FileStatus,
+    MenuRow,
+    TOGGLES,
+    buildMenu,
+    statusText,
+    statusTooltip,
+    toggleTarget,
+} from './menu';
 import { BUILD_SHA_FILE, versionGap } from './versions';
 import {
     DidChangeConfigurationNotification,
@@ -405,64 +418,97 @@ async function closeGenericList(editor: TextEditor): Promise<void> {
     placedClosers.place(document.uri.toString(), document.offsetAt(caret));
 }
 
-// --- F27 R1/R6: the platform a file is analyzed under -------------------------
+// --- F27 R1/R6, E247: the status bar item and its menu -------------------------
 //
 // The platform decides which `std` twin a file's types come from, so a file
 // analyzed under the wrong one is full of errors about members that "do not
-// exist". The overlay note on such an error says why the file is where it is;
-// this says it BEFORE any error: `analyzed as: browser — declared` in the
-// status bar, the full reason in its tooltip, for the vilan file in front of
-// the author. The server answers from its last analysis
-// (`vilan/analysisPlatform`), so the line follows the file as it is edited —
-// type `[platform("browser")] mod self;` at the top and it turns to `declared`.
+// exist". F27 put `analyzed as: browser — declared` in the status bar for the
+// vilan file in front of the author; E247 (R-a, ruled 2026-10-03) makes the
+// item read the server's version — `vilan 0.43.0` — keeps the platform and its
+// reason in its tooltip, and opens a menu on a click (`menu.ts` decides its
+// rows; `npm test` pins them): the platform and why, the entry whose world the
+// file is analyzed in (M104), the server's version and the last analysis' work
+// counts; a toggle per feature switch; and restart, stop or start (E248), the
+// status page and the output channel. The server answers from its last
+// analysis (`vilan/analysisPlatform`), so the facts follow the file as it is
+// edited — type `[platform("browser")] mod self;` at the top and the platform
+// row turns to `declared`.
 
 /// The server's status request, spelled exactly as `vilan-lsp`'s
 /// `ANALYSIS_PLATFORM` declares it; `book_sync` gates the two spellings.
 const ANALYSIS_PLATFORM = 'vilan/analysisPlatform';
 
-/// How long after an edit the line asks again — past the server's own
+/// How long after an edit the item asks again — past the server's own
 /// analysis debounce, so it asks about the analysis the edit produced.
 const PLATFORM_REFRESH_MS = 600;
 
 let platformStatus: StatusBarItem | undefined;
 let platformRefresh: ReturnType<typeof setTimeout> | undefined;
 
-interface AnalysisPlatform {
-    platform: string;
-    kind: string | null;
-    reason: string | null;
-}
+/// The active vilan file's last answer, for the menu (`undefined` when there is
+/// no vilan file in front of the author, or the server has not answered).
+let fileStatus: FileStatus | undefined;
 
-/// Ask the server about the active editor's file and show the answer, or hide
-/// the line for anything that is not a vilan file.
+/// E248: the author stopped the server. Nothing restarts it — not a settings
+/// change, not a crash policy (a stopped client is disposed), not a status
+/// refresh — until `Vilan: Start Language Server` or a window reload.
+let stopped = false;
+
+/// Ask the server about the active editor's file and show the item, or hide it
+/// for anything that is not a vilan file (a stopped server shows it anyway, so
+/// the way back to a running one is one click away).
 async function refreshPlatformStatus(): Promise<void> {
     const editor = window.activeTextEditor;
     if (!platformStatus) {
         return;
     }
-    if (!client || !editor || editor.document.languageId !== 'vilan') {
+    const vilanFile = editor !== undefined && editor.document.languageId === 'vilan';
+    if (!client) {
+        fileStatus = undefined;
+        renderStatus();
+        if (stopped) {
+            platformStatus.show();
+        } else {
+            platformStatus.hide();
+        }
+        return;
+    }
+    if (!editor || editor.document.languageId !== 'vilan') {
+        fileStatus = undefined;
         platformStatus.hide();
         return;
     }
-    let answer: AnalysisPlatform | null = null;
+    let answer: FileStatus | null = null;
     try {
-        answer = await client.sendRequest<AnalysisPlatform | null>(ANALYSIS_PLATFORM, {
+        answer = await client.sendRequest<FileStatus | null>(ANALYSIS_PLATFORM, {
             uri: editor.document.uri.toString(),
         });
     } catch {
         answer = null;
     }
-    if (!answer || window.activeTextEditor !== editor) {
-        platformStatus.hide();
+    if (window.activeTextEditor !== editor) {
         return;
     }
-    platformStatus.text = answer.kind
-        ? `analyzed as: ${answer.platform} — ${answer.kind}`
-        : `analyzed as: ${answer.platform}`;
-    platformStatus.tooltip = answer.reason
-        ? `This file is analyzed under ${answer.platform}: ${answer.reason}`
-        : `This file is analyzed under ${answer.platform}`;
-    platformStatus.show();
+    fileStatus = answer ?? undefined;
+    renderStatus();
+    if (vilanFile) {
+        platformStatus.show();
+    }
+}
+
+/// Paint the item from the current state: its text (`vilan 0.43.0`, or
+/// `vilan (stopped)` in the warning colour), its tooltip, its command.
+function renderStatus(): void {
+    if (!platformStatus) {
+        return;
+    }
+    const running = client !== undefined;
+    platformStatus.text = statusText(running, client?.initializeResult?.serverInfo?.version);
+    platformStatus.tooltip = statusTooltip(running, fileStatus);
+    platformStatus.backgroundColor = running
+        ? undefined
+        : new ThemeColor('statusBarItem.warningBackground');
+    platformStatus.command = 'vilan.showMenu';
 }
 
 /// Ask again once the edits have settled into an analysis.
@@ -474,6 +520,52 @@ function schedulePlatformRefresh(): void {
         platformRefresh = undefined;
         void refreshPlatformStatus();
     }, PLATFORM_REFRESH_MS);
+}
+
+/// One quick-pick item per menu row, carrying the row it came from.
+interface MenuItem extends QuickPickItem {
+    row: MenuRow;
+}
+
+/// E247: open the menu, and do what the chosen row says.
+async function showMenu(): Promise<void> {
+    const config = workspace.getConfiguration('vilan');
+    const rows = buildMenu({
+        running: client !== undefined,
+        serverVersion: client?.initializeResult?.serverInfo?.version,
+        file: fileStatus,
+        toggles: TOGGLES.map((toggle) => ({
+            ...toggle,
+            value: config.get<boolean>(toggle.key, true),
+        })),
+    });
+    const items: MenuItem[] = rows.map((row) =>
+        row.kind === 'separator'
+            ? { label: row.label, kind: QuickPickItemKind.Separator, row }
+            : {
+                  label: row.label,
+                  detail: row.kind === 'info' ? row.detail : undefined,
+                  row,
+              },
+    );
+    const chosen = await window.showQuickPick(items, { title: 'Vilan', matchOnDetail: true });
+    if (!chosen) {
+        return;
+    }
+    const row = chosen.row;
+    if (row.kind === 'toggle') {
+        // The workspace's setting when one is set there — the value actually
+        // in force — else the user's. The change event pushes it to the
+        // running server live.
+        const inspected = config.inspect<boolean>(row.setting) ?? {};
+        const target =
+            toggleTarget(inspected) === 'workspace'
+                ? ConfigurationTarget.Workspace
+                : ConfigurationTarget.Global;
+        await config.update(row.setting, !row.value, target);
+    } else if (row.kind === 'action') {
+        await commands.executeCommand(row.command);
+    }
 }
 
 /// Keep every placed `>` at its character through edits; one an edit replaces
@@ -702,6 +794,36 @@ async function startClient(context: ExtensionContext): Promise<void> {
         reportMissingServer(command);
         console.error('vilan-lsp failed to start:', error);
     }
+    // E247: the item reads the version the server just reported.
+    void refreshPlatformStatus();
+}
+
+/// E248: stop the server and keep it stopped. The session's profile is logged
+/// first, as a restart logs it; the client's diagnostics are cleared (a
+/// stopped server's squiggles describe nothing anyone is analyzing); and the
+/// client is disposed, so no restart policy of the client library's can bring
+/// the process back. `stopped` is what keeps the extension's own triggers — a
+/// settings change, a status refresh — from starting it again.
+async function stopClient(context: ExtensionContext): Promise<void> {
+    stopped = true;
+    outputChannel?.info(
+        ['session status before stop:', ...sessionStatusLines(context)].join('\n  '),
+    );
+    const stopping = client;
+    client = undefined;
+    if (stopping) {
+        stopping.diagnostics?.clear();
+        try {
+            await stopping.stop();
+            outputChannel?.info('language server stopped; Vilan: Start Language Server brings it back');
+        } catch (error) {
+            outputChannel?.warn(
+                `the language server did not stop cleanly (${error instanceof Error ? error.message : String(error)}); ` +
+                    'the client library terminates the orphan shortly after',
+            );
+        }
+    }
+    await refreshPlatformStatus();
 }
 
 /// The Organize Imports text edits the server offers for `document`, or `[]`.
@@ -742,9 +864,10 @@ export function activate(context: ExtensionContext): void {
         ),
     );
 
-    // F27 R1/R6: the platform status line.
+    // F27 R1/R6, E247: the status bar item and its menu.
     platformStatus = window.createStatusBarItem(StatusBarAlignment.Right, 100);
-    platformStatus.name = 'Vilan analysis platform';
+    platformStatus.name = 'Vilan';
+    platformStatus.command = 'vilan.showMenu';
     context.subscriptions.push(
         platformStatus,
         { dispose: () => platformRefresh !== undefined && clearTimeout(platformRefresh) },
@@ -766,11 +889,24 @@ export function activate(context: ExtensionContext): void {
             outputChannel?.info(
                 ['session status before restart:', ...sessionStatusLines(context)].join('\n  '),
             );
+            // A restart is also a start: it clears E248's stop.
+            stopped = false;
             await startClient(context);
             if (client) {
                 window.showInformationMessage('Vilan: language server restarted.');
             }
         }),
+        // E248: stop and start, beside restart.
+        commands.registerCommand('vilan.stopServer', () => stopClient(context)),
+        commands.registerCommand('vilan.startServer', async () => {
+            stopped = false;
+            if (!client) {
+                await startClient(context);
+            }
+        }),
+        // E247: the menu the status bar item opens, and its output-channel row.
+        commands.registerCommand('vilan.showMenu', () => showMenu()),
+        commands.registerCommand('vilan.showOutput', () => outputChannel?.show(true)),
     );
 
     // E106: the tally on demand, for the moment the session starts feeling slow.
@@ -796,7 +932,11 @@ export function activate(context: ExtensionContext): void {
                 event.affectsConfiguration('vilan.server.path') ||
                 event.affectsConfiguration('vilan.stdPath')
             ) {
-                await startClient(context);
+                // E248: a stopped server stays stopped; Start picks the new
+                // path up.
+                if (!stopped) {
+                    await startClient(context);
+                }
                 return;
             }
             // E222: the override follows its setting live, and the server

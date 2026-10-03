@@ -212,6 +212,14 @@ impl Schedule {
     pub fn len(&self) -> usize {
         self.documents.len()
     }
+
+    /// How many analyses are in flight across every schedule — zero is the
+    /// server at rest, which is what the M104 pins wait for rather than a
+    /// fixed sleep.
+    #[cfg(test)]
+    pub fn running(&self) -> usize {
+        self.documents.iter().map(|entry| entry.running.len()).sum()
+    }
 }
 
 /// Cancel every analysis registered for a generation older than `generation`.

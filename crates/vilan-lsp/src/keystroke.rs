@@ -3568,12 +3568,15 @@ fun main() {
                 .program
                 .as_ref()
                 .expect("the view exhibit must analyze");
-            let mut fetched = vilan_ide::entity_spans(program);
+            let mut fetched = vilan_ide::entity_spans(program, vilan_core::analyzer::SourceId(0));
             let mut scanned = entity_spans_by_whole_program_scan(program);
             fetched.sort_unstable_by_key(|(start, end, id)| (*start, *end, id.0));
             scanned.sort_unstable_by_key(|(start, end, id)| (*start, *end, id.0));
             let (cpu, wall) = per_call(|| {
-                std::hint::black_box(vilan_ide::entity_spans(program));
+                std::hint::black_box(vilan_ide::entity_spans(
+                    program,
+                    vilan_core::analyzer::SourceId(0),
+                ));
             });
             let (scan_cpu, scan_wall) = per_call(|| {
                 std::hint::black_box(entity_spans_by_whole_program_scan(program));

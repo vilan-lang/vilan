@@ -77,6 +77,26 @@
         "command": "vilan.showServerStatus",
         "title": "Show Language Server Status",
         "category": "Vilan"
+      },
+      {
+        "command": "vilan.stopServer",
+        "title": "Stop Language Server",
+        "category": "Vilan"
+      },
+      {
+        "command": "vilan.startServer",
+        "title": "Start Language Server",
+        "category": "Vilan"
+      },
+      {
+        "command": "vilan.showMenu",
+        "title": "Show Menu",
+        "category": "Vilan"
+      },
+      {
+        "command": "vilan.showOutput",
+        "title": "Show Output Channel",
+        "category": "Vilan"
       }
     ],
     "tomlValidation": [
