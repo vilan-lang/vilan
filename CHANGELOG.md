@@ -170,6 +170,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**A nightly performance REPORT (`.github/workflows/perf.yml`) and a per-release one (`perf/report-vX.Y.Z.md`, written by the cut from the seal's verdict): the instruction table on a CI runner, the ignored measurement pins in release (`perf_baseline_full_run` and E121/E126's four editor gates), a callgrind top 25 of the generated app on a `profiling` build, and the macOS row.** M105 S7 (`performance-gates.md` §3's report tier, §6.3, §6.4). The nightly refuses nothing — every job is `continue-on-error` and nothing needs it — and uploads its JSON, which doubles as S2's runner-spread sample every night. `perf_gate.py report` renders a verdict: its first line names the most expensive phase as a share of the generated app's thread CPU (the seal records the split), then the T2 table against the previous verdict, the kolt rows, E121's targets, the growth figure and the bumps since the release; `cut-release.sh` writes it after the bump when a verdict exists and stages it with the release files. `perf_gate.py seal` gains `--base-std` and refuses a kolt copy that sits inside a vilan checkout without one (a binary run there reads that checkout's std, so the release would be measured with the tip's); the phase-split reader skips the `reused` census and the buckets the line itself calls slices. Calibration at this tip (`perf_gate.py calibrate`, kolt @984a1dfb): every phase of the generated app within 10 points of kolt's share but the emission walk (5.3% against 23.9%) — filed for retuning, not retuned silently.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

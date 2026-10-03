@@ -694,6 +694,15 @@ say "CHANGELOG.md: '## Unreleased' is now '$HEADING', ordered."
 say ""
 run sh scripts/bump-version.sh "$VERSION"
 say ""
+# The release's performance report (M105 S7, performance-gates.md §6.4): the
+# seal's verdict for this commit, rendered beside the release - the T2 table,
+# the kolt rows, E121's targets, the growth figure and the bumps. Written when
+# there is a verdict to render (an overridden cut may have none).
+if [ -f "$PERF_FILE" ] && [ -f scripts/perf_gate.py ] && command -v python3 > /dev/null 2>&1; then
+    run python3 scripts/perf_gate.py report --verdict "$PERF_FILE" --title "v$VERSION" \
+        --out "perf/report-v$VERSION.md"
+    say ""
+fi
 
 # Every file the bump rewrites, which is exactly what the release commit stages:
 # the CHANGELOG, the lockfile, EVERY workspace member's manifest — DERIVED, the
@@ -706,6 +715,9 @@ say ""
 release_files() {
     printf '%s\n' CHANGELOG.md Cargo.lock crates/*/Cargo.toml \
         editors/vscode/package.json editors/vscode/package-lock.json
+    if [ -f "perf/report-v${VERSION:-}.md" ]; then
+        printf '%s\n' "perf/report-v$VERSION.md"
+    fi
 }
 RELEASE_FILES="$(release_files)"
 

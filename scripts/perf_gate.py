@@ -311,6 +311,17 @@ def prepare_kolt(kolt, commit, scratch):
     return copy, sha
 
 
+def inside_a_checkout(path):
+    path = os.path.abspath(path)
+    while True:
+        if os.path.isdir(os.path.join(path, "vilan", "std")) and os.path.isdir(os.path.join(path, "crates")):
+            return True
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
+
+
 def loadavg():
     with open("/proc/loadavg") as handle:
         return float(handle.read().split()[0])
@@ -321,6 +332,13 @@ def t3_compare(options, scratch):
     env_base, env_tip = dict(os.environ), dict(os.environ)
     if options.tip_std:
         env_tip["VILAN_STD"] = options.tip_std
+    if options.base_std:
+        env_base["VILAN_STD"] = options.base_std
+    elif inside_a_checkout(copy):
+        # A binary run inside a vilan checkout reads THAT checkout's std, not its embedded one, so the
+        # release would be measured with the tip's std — a different program.
+        sys.exit(f"perf_gate: the kolt copy {copy} sits inside a vilan checkout; pass --base-std (the release's "
+                 "std) or a --scratch outside it")
     counter = resolve_counter("auto")
     runs = {"base": [], "tip": []}
     for binary, env in ((options.base, env_base), (options.tip, env_tip)):
@@ -431,6 +449,9 @@ def command_seal(options):
         if options.lsp_json:
             lsp_rows, lsp_red = lsp_compare(options.lsp_json[0], options.lsp_json[1], options.threshold)
         e121, e121_red = e121_rows(data, options.lsp_json[1] if options.lsp_json else None)
+        # §6.4: the report's first line names the most expensive phase — a SHARE of thread CPU on the
+        # generated app, which a load moves far less than it moves the absolute figures.
+        phases = phase_split(options.tip, subject_dir("genapp:46", options.work))
         bumps = [b for b in data["bump"]]
         owner_bumps = [b for b in bumps if b["ratio"] > 1.03 or b["subject"].startswith("kolt")]
         red = t2_red + (t3["red"] if t3 else []) + lsp_red + e121_red
@@ -438,7 +459,7 @@ def command_seal(options):
             "sha": sha, "date": datetime.date.today().isoformat(), "verdict": "red" if red else "green",
             "red": red, "load": loadavg(), "class": options.klass, "counter": counter,
             "t2": {"results": results, "judged": t2_lines}, "t3": t3, "lsp": lsp_rows, "e121": e121,
-            "bumps": bumps, "bumps_for_the_owner": owner_bumps,
+            "bumps": bumps, "bumps_for_the_owner": owner_bumps, "genapp_phases_cpu_ms": phases,
         }
         os.makedirs(options.verdict_dir, exist_ok=True)
         out = os.path.join(options.verdict_dir, f"perf-{sha}.json")
@@ -462,6 +483,7 @@ def command_seal(options):
 def phase_split(vilan, directory):
     """Thread-CPU per top-level phase, summed over a check's analyses, from `VILAN_PHASE_TIMING`."""
     env = dict(os.environ, VILAN_PHASE_TIMING="1")
+    vilan = os.path.abspath(vilan) if os.sep in vilan else vilan
     run = subprocess.run([vilan, "check", "."], cwd=directory, env=env, capture_output=True, text=True)
     phases = {}
     for line in run.stderr.splitlines():
@@ -469,7 +491,9 @@ def phase_split(vilan, directory):
             continue
         words = line[len("[vilan phase] "):].split()
         for name, value in zip(words[::2], words[1::2]):
-            if "/" not in value or name in ("post-passes",):
+            # `<wall>ms/<cpu>cpu` figures only; `post-passes` is the sum of the buckets beside it, and
+            # const-lower/const-interp/dispatch-refine are slices THROUGH other buckets (the line says so).
+            if "ms/" not in value or name in ("post-passes", "const-lower", "const-interp", "dispatch-refine"):
                 continue
             cpu = value.split("/")[1].replace("cpu", "")
             try:
@@ -518,6 +542,12 @@ def command_report(options):
         with open(options.previous) as handle:
             previous = json.load(handle)
     out = [f"# Performance report — {options.title or verdict['sha'][:10]}", ""]
+    phases = verdict.get("genapp_phases_cpu_ms") or {}
+    if phases:
+        total = sum(phases.values()) or 1.0
+        name, cost = max(phases.items(), key=lambda item: item[1])
+        out += [f"**The most expensive phase is `{name}`: {100 * cost / total:.0f}% of the generated app's "
+                f"thread CPU** — the first place to optimize next.", ""]
     t3 = verdict.get("t3")
     if t3:
         out.append(f"Verdict **{verdict['verdict']}** at `{verdict['sha'][:10]}`, {verdict['date']}, load "
@@ -598,6 +628,7 @@ def main():
     p.add_argument("--tip", "--vilan", dest="tip", required=True)
     p.add_argument("--base", required=True)
     p.add_argument("--tip-std")
+    p.add_argument("--base-std", help="VILAN_STD for the base (needed when the copy sits inside a checkout)")
     p.add_argument("--kolt")
     p.add_argument("--commit", default="HEAD")
     p.add_argument("--runs", type=int, default=5)
