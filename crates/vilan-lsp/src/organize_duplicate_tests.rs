@@ -119,3 +119,81 @@ fn distinct_single_members_stay_separate() {
     let source = format!("import std::json::Json;\nimport std::json::JsonValue;\n{body}");
     assert_organizes("distinct members", &source, &source);
 }
+
+// --- E255: a duplicate import carries a warning, and its fix is E251's merge --
+
+fn warnings(source: &str) -> Vec<(String, String)> {
+    let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+    document
+        .duplicate_import_warnings()
+        .into_iter()
+        .map(|(span, message)| (source[span.into_range()].to_string(), message))
+        .collect()
+}
+
+#[test]
+fn e255_each_repeat_carries_a_warning_naming_the_first_line() {
+    let repeated = warnings(&format!(
+        "import std::json::{{ self, Json, JsonValue }};\nimport std::json::Json;\n{BODY}"
+    ));
+    assert_eq!(
+        repeated,
+        vec![(
+            "Json".to_string(),
+            "`Json` is already imported on line 1 — Organize Imports removes the repeat"
+                .to_string()
+        )]
+    );
+    assert_eq!(
+        warnings(&format!(
+            "import std::json::{{ self, Json, JsonValue, Json }};\n{BODY}"
+        ))
+        .len(),
+        1,
+        "a name repeated in one group"
+    );
+    assert_eq!(
+        warnings(&format!(
+            "import std::json;\nimport std::json::{{ self, Json, JsonValue }};\n{BODY}"
+        ))
+        .iter()
+        .map(|(leaf, _)| leaf.as_str())
+        .collect::<Vec<_>>(),
+        vec!["self"],
+        "a `self` leaf repeats the module import"
+    );
+}
+
+/// No warning where nothing repeats: an alias, distinct members, two
+/// modules' imports.
+#[test]
+fn e255_an_alias_or_a_distinct_member_is_no_duplicate() {
+    let body = "\nfun main() {\n\tlet _: Option<Json> = None;\n\tlet _: Option<Document> = None;\n\tlet _: Option<JsonValue> = None;\n}\n";
+    assert!(warnings(&format!(
+        "import std::json::Json;\nimport std::json::Json as Document;\nimport std::json::JsonValue;\n{body}"
+    ))
+    .is_empty());
+}
+
+/// The fix: the organize action's edit for the run — applied, the warning is
+/// gone and the run is E251's merge.
+#[test]
+fn e255_the_quick_fix_is_the_organize_edit_and_clears_the_warning() {
+    let source =
+        format!("import std::json::{{ self, Json, JsonValue }};\nimport std::json::Json;\n{BODY}");
+    let document = Document::analyze(&source, &std_root(), Path::new("test.vl"));
+    let program = document.program.as_ref().expect("a program");
+    let (span, _) = document.duplicate_import_warnings()[0].clone();
+    let fixes = document.quickfixes(program, span);
+    let fix = fixes
+        .iter()
+        .find(|fix| fix.title == "Remove the duplicate import (Organize Imports)")
+        .expect("the fix is offered");
+    let mut fixed = source.clone();
+    fixed.replace_range(fix.span.into_range(), &fix.replacement);
+    assert_eq!(
+        fixed,
+        format!("import std::json::{{ self, Json, JsonValue }};\n{BODY}")
+    );
+    assert!(warnings(&fixed).is_empty());
+}

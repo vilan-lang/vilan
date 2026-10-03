@@ -2783,6 +2783,102 @@ pub fn import_leaf_name_spans(source: &str) -> Vec<Span> {
     spans
 }
 
+/// E255: one import leaf that binds what an EARLIER leaf of the file already
+/// binds — the same path under the same name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DuplicateImport {
+    /// The repeated leaf's name span (its alias's, where it has one).
+    pub span: Span,
+    /// The name it binds.
+    pub name: String,
+    /// The span of the earlier leaf it repeats.
+    pub first: Span,
+}
+
+/// E255: every top-level `import` leaf that repeats an earlier one — what
+/// Organize Imports' duplicate pass (E251) removes. Two leaves repeat when
+/// they reach the same path and bind the same name: `import a::B;` twice,
+/// `import a::{ B, B };`, `import a::B;` beside `import a::{ B, C };`, and a
+/// module import beside a `self` leaf of the same module. An alias is a
+/// different binding (`import a::B as D;` repeats nothing), and an `only`
+/// import, a `use`, a re-export and a marked or selector branch are not
+/// compared at all — the organizer leaves them as written.
+pub fn duplicate_import_leaves(source: &str) -> Vec<DuplicateImport> {
+    let Some(items) = parse(source) else {
+        return Vec::new();
+    };
+    let mut seen: Vec<(Vec<&str>, &str, Span)> = Vec::new();
+    let mut duplicates = Vec::new();
+    for item in items.iter() {
+        let Node::Import(branch, ImportModifier::None) = &item.0 else {
+            continue;
+        };
+        let mut leaves: Vec<(Vec<&str>, &str, Span)> = Vec::new();
+        if !collect_bound_leaves(branch, &mut Vec::new(), &mut leaves) {
+            continue;
+        }
+        for (path, bound, span) in leaves {
+            match seen
+                .iter()
+                .find(|(seen_path, seen_bound, _)| *seen_path == path && *seen_bound == bound)
+            {
+                Some((_, _, first)) => duplicates.push(DuplicateImport {
+                    span,
+                    name: bound.to_string(),
+                    first: *first,
+                }),
+                None => seen.push((path, bound, span)),
+            }
+        }
+    }
+    duplicates
+}
+
+/// [`duplicate_import_leaves`]' walk: each leaf as (the full path it reaches,
+/// the name it binds, its span) — a `self` leaf reaches its group's own path
+/// and binds that path's last segment. `false` for a branch the duplicate
+/// pass does not compare (a reach marker, a selector).
+fn collect_bound_leaves<'src>(
+    branch: &ImportBranch<'src>,
+    prefix: &mut Vec<&'src str>,
+    out: &mut Vec<(Vec<&'src str>, &'src str, Span)>,
+) -> bool {
+    match branch {
+        ImportBranch::Path(name, span, tail) => {
+            let (path, default_name) = if *name == "self" {
+                (prefix.clone(), prefix.last().copied())
+            } else {
+                let mut path = prefix.clone();
+                path.push(name);
+                (path, Some(*name))
+            };
+            match tail {
+                ImportTail::Continue(child) => {
+                    prefix.push(name);
+                    let compared = collect_bound_leaves(child, prefix, out);
+                    prefix.pop();
+                    compared
+                }
+                ImportTail::Leaf => match default_name {
+                    Some(bound) => {
+                        out.push((path, bound, *span));
+                        true
+                    }
+                    None => false,
+                },
+                ImportTail::Alias(alias, alias_span) => {
+                    out.push((path, alias, *alias_span));
+                    true
+                }
+            }
+        }
+        ImportBranch::Set(branches) => branches
+            .iter()
+            .all(|branch| collect_bound_leaves(branch, prefix, out)),
+        ImportBranch::Reach(..) | ImportBranch::Selector(_) => false,
+    }
+}
+
 /// [`import_leaf_name_spans`]' recursion: a `Path` with a `::` continuation
 /// defers to the continuation, a brace `Set` yields every member's leaf, and a
 /// terminal `Path` IS the leaf.

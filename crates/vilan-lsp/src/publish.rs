@@ -677,6 +677,19 @@ fn diagnostic_groups(document: &Document, owner: &Url, paint: bool) -> Vec<(Url,
         return groups;
     }
     let entry_group = &mut groups[0].1;
+    // E255: a duplicate import is a WARNING, with Organize Imports as its fix
+    // (`Document::quickfixes`), and published only for a buffer someone has
+    // open, like the paint below.
+    for (span, message) in document.duplicate_import_warnings() {
+        entry_group.push(Diagnostic {
+            range: document.analyzed_range(&span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("duplicate-import".to_string())),
+            source: Some("vilan".to_string()),
+            message,
+            ..Default::default()
+        });
+    }
     let mut faded: Vec<(Span, String)> = document.unused_import_spans();
     for (message, spans) in [
         ("unused local", document.unused_local_spans()),

@@ -5883,6 +5883,30 @@ impl Document {
             .unwrap_or_default()
     }
 
+    /// E255: the import leaves of this file that repeat an earlier one, each
+    /// with the warning it publishes — in the ANALYZED text's coordinates, like
+    /// every published span. Syntactic (`formatter::duplicate_import_leaves`),
+    /// so a file with errors still hears about them; what it reports is
+    /// exactly what Organize Imports' duplicate pass (E251) removes, which is
+    /// the warning's quick fix.
+    pub fn duplicate_import_warnings(&self) -> Vec<(Span, String)> {
+        let text = self.analyzed_text();
+        let index = self.analyzed_index();
+        vilan_core::formatter::duplicate_import_leaves(text)
+            .into_iter()
+            .map(|duplicate| {
+                let line = index.range(&duplicate.first).start.line + 1;
+                (
+                    duplicate.span,
+                    format!(
+                        "`{}` is already imported on line {line} — Organize Imports removes the repeat",
+                        duplicate.name
+                    ),
+                )
+            })
+            .collect()
+    }
+
     /// The fade text of an unused import leaf: what the editor writes beside
     /// the gray, and what the user reads before running the action.
     ///
@@ -7141,6 +7165,30 @@ impl Document {
     /// safe substitution.
     pub fn quickfixes(&self, program: &Program, range: Span) -> Vec<QuickFix> {
         let mut fixes = Vec::new();
+        // E255: a duplicate import's fix is Organize Imports' own edit for the
+        // run it is in — E251's merge, which removes exactly the repeat (and
+        // tidies the run the way the organize action always does).
+        let duplicates: Vec<Span> = self
+            .duplicate_import_warnings()
+            .into_iter()
+            .map(|(span, _)| span)
+            .filter(|span| spans_overlap(*span, range))
+            .collect();
+        if !duplicates.is_empty() {
+            for (span, replacement) in self.organize_import_edits() {
+                if duplicates
+                    .iter()
+                    .any(|duplicate| spans_contain(span, *duplicate))
+                {
+                    fixes.push(QuickFix {
+                        title: "Remove the duplicate import (Organize Imports)".to_string(),
+                        span,
+                        replacement,
+                        target: None,
+                    });
+                }
+            }
+        }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             if self
                 .diagnostic_sources

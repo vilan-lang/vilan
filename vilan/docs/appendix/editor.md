@@ -313,11 +313,12 @@ sees it.
 
 ## Quick fixes
 
-Eighteen, each attached to the diagnostic that earns it:
+Nineteen, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
-| ``Import `X` from std::json`` | `cannot find 'X'` where `X` is importable. One action per module when more than one exports the name — never a guess between them |
+| ``Import `X` from std::json`` | `cannot find 'X'` where `X` is importable — in an expression, a type, a struct literal's head, a pattern's path head or an impl's `with` trait. One action per module when more than one exports the name — never a guess between them |
+| ``Remove the duplicate import (Organize Imports)`` | ``Json is already imported on line 1`` — the warning a repeated import leaf carries; the fix is Organize Imports' own edit for that run, which merges the repeat away |
 | ``Change to `entries` `` | a `did you mean …?` note on a misspelled struct-initializer field |
 | ``Analyze this file under its platform: add `[platform("browser")] mod self;` `` | a member the OTHER `std` twin declares (`struct 'Region' has no field 'anchor'` in a file analyzed under node, whose note names the `browser` twin that has it). The edit is the file's first line — the one place a file's platform may be written — and the attribute is the one the note spells |
 | ``Insert `;` `` | ``expected `;` to end this statement``, at the gap the diagnostic points at |
