@@ -477,6 +477,28 @@ def command_seal(options):
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def command_e121(options):
+    """E121's rows alone, on one LSP harness JSON (`scripts/lsp-latency.py --json`): print each row's state
+    and, with `--advance`, count this seal toward the two-green rule and write `perf/budgets.toml`. Exit 1
+    only when a BLOCKING row is red (Q9) — a row still reporting never refuses."""
+    data = load_budgets(options.budgets)
+    rows, blocking = e121_rows(data, options.lsp_json)
+    for row in rows:
+        if "median_ms" in row:
+            print(f"  {row['state']:16} {row['scenario']} ({row['metric']}): {row['median_ms']:.0f} ms "
+                  f"against {row['target_ms']} ms (green at {row['green_seals']} consecutive seals)")
+        else:
+            print(f"  absent           {row['scenario']}: the harness has no such row")
+    if options.advance:
+        advance_e121(data, rows)
+        write_budgets(data, options.budgets)
+    if blocking:
+        print("E121 VERDICT: RED — " + "; ".join(blocking))
+        return 1
+    print("E121 VERDICT: green (no blocking row is red)")
+    return 0
+
+
 # ---------------------------------------------------------------------------- S4's calibration
 
 
@@ -640,6 +662,11 @@ def main():
     p.add_argument("--advance", action="store_true", help="count this seal toward E121's two-green rule")
     add_class(p)
     p.set_defaults(run=command_seal)
+
+    p = sub.add_parser("e121")
+    p.add_argument("--lsp-json", required=True, help="the tip's `scripts/lsp-latency.py --json` output")
+    p.add_argument("--advance", action="store_true", help="count this seal toward the two-green rule")
+    p.set_defaults(run=command_e121)
 
     p = sub.add_parser("calibrate")
     p.add_argument("--vilan", required=True)

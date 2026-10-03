@@ -175,6 +175,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**E121's editor targets become budgets the way the owner ruled them (Q9): six `[[e121]]` rows in `perf/budgets.toml` — the leaf, `shared.vl`, `model.vl`, css and parse-break keystrokes at 500 ms of CPU to diagnostics, and the `model.vl` keystroke with its importers open at 500 ms of CPU to idle — each RED-REPORTING until it has been green at two consecutive seals, then BLOCKING for good.** M105 S8. `perf_gate.py e121 --lsp-json TIP.json [--advance]` (and the seal, which carries the rows into the verdict) reads `scripts/lsp-latency.py`'s JSON, prints each row's median against its target, and with `--advance` counts the seal: a green adds one, a red resets a row that is not yet blocking, and the second consecutive green flips `blocking`, which a later red never demotes. Today every row but `shared.vl` and `model.vl` is red on the reference machine (E121's table in `performance-gates.md` §6.1), so nothing blocks yet. Pins: `perf_gate_script`'s `an_e121_row_reports_until_green_at_two_consecutive_seals_and_then_blocks` (red with the reset planted out) and `the_ratchet_adopts_a_new_class_lowers_past_two_percent_and_resets_bumps_at_a_release`.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
