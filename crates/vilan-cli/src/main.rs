@@ -317,6 +317,17 @@ enum CacheCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Delete every `vilan check` macro-expansion table (`~/.vilan/check-cache`).
+    ///
+    /// Each package `vilan check` has warmed keeps one table there, keyed by
+    /// its path; a check holds the root to a bound by itself (thirty days, 256
+    /// tables, 256 MiB, oldest first), and this is the gesture for emptying it
+    /// outright. Every table is re-created by the next check of its package.
+    Clean {
+        /// Print what would be deleted, with sizes, and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// The stack every compile runs on — the one this process's whole CLI runs on,
@@ -543,6 +554,7 @@ fn run_cli() -> ExitCode {
         Command::Upgrade { check, no_vscode } => upgrade::upgrade(check, no_vscode),
         Command::Cache { command } => match command {
             CacheCommand::Prune { all, dry_run } => cache_prune(all, dry_run),
+            CacheCommand::Clean { dry_run } => cache_clean(dry_run),
         },
     }
 }
@@ -589,6 +601,14 @@ fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
         }
     }
     outcome
+}
+
+/// `vilan cache clean` (N137): every check-cache table, whatever its age.
+/// They are caches in the strict sense — a check re-creates its package's
+/// table — so nothing in that root is protected.
+fn cache_clean(dry_run: bool) -> ExitCode {
+    let root = vilan_embedded::default_check_cache_root();
+    prune_one_cache_root(&root, None, dry_run, true, None)
 }
 
 /// One cache root pruned and reported. Split out when the check tables became a
@@ -4537,8 +4557,16 @@ fn expansion_cache_root(package_dir: &Path, goal: CompileGoal) -> PathBuf {
     let canonical = vilan_core::util::canonical_path(package_dir);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&canonical, &mut hasher);
-    vilan_embedded::default_check_cache_root()
-        .join(format!("{:016x}", std::hash::Hasher::finish(&hasher)))
+    let root = vilan_embedded::default_check_cache_root();
+    let table = root.join(format!("{:016x}", std::hash::Hasher::finish(&hasher)));
+    // N137: the root holds itself to a bound — thirty days, 256 tables, 256
+    // MiB, oldest first — checked at most once a day and once per process, and
+    // never at the cost of this package's own table.
+    static BOUNDED: std::sync::Once = std::sync::Once::new();
+    BOUNDED.call_once(|| {
+        vilan_embedded::bound_check_cache(&root, Some(&table));
+    });
+    table
 }
 
 /// Builds a lone package / bare file, writing `<entry>.mjs` on a process leg

@@ -195,6 +195,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**`~/.vilan/check-cache` holds itself to a bound — thirty days, 256 tables, 256 MiB, oldest first — and `vilan cache clean` empties it; the test suite keeps its own tables under `target/` instead of minting thousands in the developer's home.** N137. Each package `vilan check` warms keeps one macro-expansion table there, keyed by its path, and only a manual `vilan cache prune` (seven-day guard) ever removed one: the dev machine had grown 24,745 tables (495 MB), most minted by test temp packages. Now a check bounds the root at most once a day per root (a `.last-bound` stamp) and once per process: every table older than thirty days goes, then — oldest first — enough of the rest to fit 256 tables and 256 MiB, never the package being checked and never a table younger than ten minutes (a check running now may be reading it). `vilan cache clean [--dry-run]` removes every table, whatever its age (each is re-created by the next check of its package). `VILAN_CHECK_CACHE` names the root explicitly; the workspace's `.cargo/config.toml` sets it to `target/test-check-cache` for every test process and every `vilan` a test spawns. The first check on a machine with the old pile pays one walk of it. Pins: `vilan-embedded`'s `check_cache_bound_tests` (an expired table goes and a young one stays; past the count the oldest go first and the kept table never does; past the bytes the oldest go but never inside the grace — ages set by mtime, so they hold on Windows too); `macro_expansion_cache` passes against the redirected root.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
