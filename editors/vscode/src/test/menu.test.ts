@@ -24,7 +24,7 @@ const FILE: FileStatus = {
     platform: 'browser',
     kind: 'declared',
     reason: 'the `client` entry reaches it',
-    world: '/home/user/kolt/src/client.vl',
+    world: '/srv/kolt/src/client.vl',
     work: { files: 82, entities: 104233, impls: 1204 },
 };
 
