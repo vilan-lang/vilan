@@ -165,6 +165,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**`scripts/cut-release.sh` refuses to cut a commit without a GREEN performance verdict: the seal's `perf_gate.py seal` writes `perf-<sha>.json` (into `$VILAN_PERF_VERDICTS`, default `~/.vilan/perf-verdicts`), and a missing, red or unreadable verdict at the commit that becomes the tag stops the cut, fail-closed like the CI check — unless `--allow-perf-regression "<reason>"`, which prints loudly and writes the reason into the release section as its first paragraph (a `> Performance:` note, never a bold line the parser would read as an entry).** M105 S6 (RULED Q4). v0.42.0 shipped a 3x regression with every other gate green; v0.43.0 shipped M108 as a written exception, which is the override's shape. The flag lifts the performance red and nothing else (red CI still refuses), and a blank reason is refused. Pins: `release_scripts`' `the_cut_names_a_green_performance_verdict`, `the_cut_refuses_an_absent_a_red_and_an_unreadable_performance_verdict_each_by_name`, `allow_perf_regression_writes_its_reason_into_the_release_notes_and_lifts_only_the_perf_red`; the fixture writes a green verdict for every commit by default (the cut's default world, as its `gh` shim answers green CI), and `traced_entries` no longer counts the verdict's `ok` line as an entry.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

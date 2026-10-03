@@ -20,6 +20,17 @@
 #                       else (implies --dry-run) - the seam the pins use
 #   --allow-red-ci      cut although CI is not verifiably green on the commit
 #                       (printed loudly; the L17 escape hatch, not a shortcut)
+#   --allow-perf-regression "<reason>"
+#                       cut although the commit has no GREEN performance
+#                       verdict; the reason is written into the release notes
+#                       (M105 S6 - a release that knowingly gets slower says so)
+#
+# And the commit's PERFORMANCE verdict (M105 S6, performance-gates.md §3 and
+# Q4): the seal's perf leg (`scripts/perf_gate.py seal`) writes
+# `perf-<full sha>.json` into $VILAN_PERF_VERDICTS (default
+# ~/.vilan/perf-verdicts) on the reference machine, and the cut refuses a
+# commit with no verdict, or a red one - fail-closed for the reason the CI
+# check is: v0.42.0 shipped a 3x regression with every other gate green.
 #
 # Before any of it, the commit's CI (releases.md §7.2 step 4, backlog L17):
 # ci.yml must be GREEN on origin for the commit that will become the tag, the
@@ -68,6 +79,7 @@ SECTION_DATE=""
 AGAINST="HEAD"
 OUT=""
 ALLOW_RED_CI=0
+PERF_REASON=""
 INVOKED_FROM="$PWD"
 TAB="$(printf '\t')"
 
@@ -81,7 +93,7 @@ run() {
 usage() {
     say "usage: scripts/cut-release.sh [--dry-run] [--commit] [--date YYYY-MM-DD]"
     say "                              [--against <commit>] [--out FILE]"
-    say "                              [--allow-red-ci] <X.Y.Z>"
+    say "                              [--allow-red-ci] [--allow-perf-regression REASON] <X.Y.Z>"
 }
 
 while [ $# -gt 0 ]; do
@@ -89,6 +101,12 @@ while [ $# -gt 0 ]; do
         --dry-run) DRY_RUN=1 ;;
         --commit) DO_COMMIT=1 ;;
         --allow-red-ci) ALLOW_RED_CI=1 ;;
+        --allow-perf-regression)
+            PERF_REASON="${2:?--allow-perf-regression needs a reason in quotes}"
+            [ -n "$(printf '%s' "$PERF_REASON" | tr -d '[:space:]')" ] ||
+                fail "--allow-perf-regression needs a reason in quotes (it goes into the release notes)"
+            shift
+            ;;
         --date)
             SECTION_DATE="${2:?--date needs a YYYY-MM-DD argument}"
             shift
@@ -427,6 +445,53 @@ if [ -n "$ci_verdict" ]; then
 fi
 say ""
 
+# ---------------------------------------------------------------------------
+# The commit's performance verdict - M105 S6 (performance-gates.md §3, Q4). The
+# seal measures the tip against the previous release on the reference machine
+# (`scripts/perf_gate.py seal`: kolt's `vilan check` CPU and peak RSS, the
+# instruction budgets, E121's blocking rows) and writes its verdict for the
+# exact sha. No verdict, a red one, or one this script cannot read refuses -
+# fail-closed, like the CI check above. `--allow-perf-regression "<reason>"`
+# overrides loudly, and the reason goes into the release section, so a release
+# that knowingly gets slower says so where its readers look.
+# ---------------------------------------------------------------------------
+say "perf (M105 S6) — the seal's performance verdict, at the commit that becomes the tag"
+say ""
+PERF_RED=0
+PERF_NOTE=""
+TARGET_FULL="$(git rev-parse "$TARGET")"
+PERF_DIR="${VILAN_PERF_VERDICTS:-$HOME/.vilan/perf-verdicts}"
+PERF_FILE="$PERF_DIR/perf-$TARGET_FULL.json"
+perf_verdict=""
+if [ ! -f "$PERF_FILE" ]; then
+    perf_verdict="no performance verdict at $TARGET_SHORT ($PERF_FILE) - run the seal's perf leg (scripts/perf_gate.py seal) at this commit, on the reference machine"
+else
+    perf_state="$(sed -n 's/^[[:space:]]*"verdict":[[:space:]]*"\([a-z]*\)".*/\1/p' "$PERF_FILE" | head -n 1)"
+    case "$perf_state" in
+        green)
+            say "  ok    the performance verdict is green at $TARGET_SHORT"
+            ;;
+        red)
+            perf_verdict="the performance verdict at $TARGET_SHORT is RED - $PERF_FILE names the rows"
+            ;;
+        *)
+            perf_verdict="$PERF_FILE holds no verdict this script can read - unreadable is not green"
+            ;;
+    esac
+fi
+if [ -n "$perf_verdict" ]; then
+    if [ -n "$PERF_REASON" ]; then
+        say "  !!    OVERRIDDEN by --allow-perf-regression: $perf_verdict"
+        say "  !!    reason, written into the release notes: $PERF_REASON"
+        PERF_NOTE="> Performance: this release was cut over a performance verdict that was not green ($perf_verdict). $PERF_REASON"
+    else
+        say "  RED   $perf_verdict"
+        say "        (--allow-perf-regression \"<reason>\" overrides this check; the reason goes into the release notes)"
+        PERF_RED=1
+    fi
+fi
+say ""
+
 REFUSED="$AWK_STATUS"
 if [ "$REFUSED" = 3 ]; then
     say 'REFUSED — the section is not in the shape §7.2 step 3 asks for, and this script never guesses.'
@@ -587,7 +652,8 @@ if [ "$REFUSED" != 3 ]; then
     say ""
 fi
 
-if [ "$REFUSED" = 3 ] || [ "$SWEEP_RED" != 0 ] || [ "$LIFE_RED" != 0 ] || [ "$CI_RED" != 0 ]; then
+if [ "$REFUSED" = 3 ] || [ "$SWEEP_RED" != 0 ] || [ "$LIFE_RED" != 0 ] || [ "$CI_RED" != 0 ] ||
+    [ "$PERF_RED" != 0 ]; then
     fail "refusing to cut - fix the reds above (nothing was changed)"
 fi
 
@@ -596,6 +662,17 @@ fi
 # ---------------------------------------------------------------------------
 PROPOSED="$WORK/CHANGELOG.md"
 awk -v mode=rewrite -v heading="$HEADING" "$CHANGELOG_AWK" CHANGELOG.md > "$PROPOSED"
+# The override's reason, as the first paragraph of the release section: a
+# blockquote rather than a bold line, because a line starting with `**` is an
+# entry head to every reader of this file.
+if [ -n "$PERF_NOTE" ]; then
+    # Through the environment, not `-v`: awk would read backslash escapes in a
+    # reason as escapes.
+    HEADING="$HEADING" PERF_NOTE="$PERF_NOTE" awk '
+        !done && $0 == ENVIRON["HEADING"] { print; print ""; print ENVIRON["PERF_NOTE"]; done = 1; next }
+        { print }' "$PROPOSED" > "$PROPOSED.note"
+    mv "$PROPOSED.note" "$PROPOSED"
+fi
 
 if [ -n "$OUT" ]; then
     cp "$PROPOSED" "$OUT"
