@@ -2172,10 +2172,111 @@ impl<'a, 'src> Analysis<'a, 'src> {
         tokens: &[(Token<'_>, Span)],
         receiver_end: usize,
     ) -> Vec<Completion> {
-        let Some(type_id) = self.receiver_nominal_id(tokens, receiver_end) else {
-            return Vec::new();
-        };
-        self.nominal_member_completions(type_id)
+        // E249: the receiver's whole TYPE, where it can be had — the blanket
+        // impls admit a type, not a nominal (`Flow<Option<T>>`'s members are
+        // `MemoCell<Option<i32>>`'s and not `MemoCell<i32>`'s).
+        let receiver_type = self.receiver_type_id(tokens, receiver_end);
+        let nominal = receiver_type
+            .and_then(|type_id| nominal_type_id(self.program, type_id))
+            .or_else(|| self.receiver_nominal_id(tokens, receiver_end));
+        let mut items = nominal
+            .map(|type_id| self.nominal_member_completions(type_id))
+            .unwrap_or_default();
+        if let Some(type_id) = receiver_type {
+            self.push_blanket_methods(type_id, &mut items);
+        }
+        items
+    }
+
+    /// The receiver's resolved type — its live-token walk (E131) first, then
+    /// the analyzed entity that ends where the receiver ends, gated on the
+    /// analyzed text still describing those bytes exactly as
+    /// [`Self::receiver_nominal_id`] gates its own fallback. `None` where
+    /// neither can type it.
+    fn receiver_type_id(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        receiver_end: usize,
+    ) -> Option<TypeId> {
+        if let Some(type_id) = self
+            .live_receiver_index(tokens, receiver_end)
+            .and_then(|index| self.live_receiver_type_id(tokens, index, 0))
+        {
+            return Some(type_id);
+        }
+        if !self.analyzed_agrees_at(receiver_end) {
+            return None;
+        }
+        self.entity_at(self.to_analyzed_offset(receiver_end))
+            .and_then(|receiver| self.expression_type_id(receiver, 0))
+    }
+
+    /// E249: the instance methods the BLANKET impls give a receiver of type
+    /// `type_id` — the impls whose subject is a binder (`impl type F:
+    /// Flow<Option<type T>>`), a tuple or any other shape no nominal heads,
+    /// which [`MemberTable`] (grouped by the nominal an impl's subject names)
+    /// never holds.
+    ///
+    /// Which of them apply is the SOLVER's answer, not one kept here:
+    /// [`vilan_core::impl_select::applying_implementations`] is the selection
+    /// emission dispatches a call through — the subject's shape, every
+    /// binder's bounds at the type that position binds (`Flow<type T:
+    /// PartialEq>` reaches `MemoCell<i32>`, `Flow<Option<type T>>` does not),
+    /// and the per-importer namespace of the file asking (B318 S4). Memoized
+    /// on the program per concrete type (M98), so a receiver's second request
+    /// is a lookup.
+    ///
+    /// The members are what [`MemberTable`] offers a nominal's impls: each
+    /// impl's own `self` methods, then the default-bodied instance methods its
+    /// traits (and their supertraits) declare, under the analyzer's admission
+    /// rule — and a name already offered (a field, the nominal's own member)
+    /// keeps its first answer.
+    fn push_blanket_methods(&self, type_id: TypeId, items: &mut Vec<Completion>) {
+        let program = self.program;
+        let mut offered: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
+        let applying = vilan_core::impl_select::applying_implementations(
+            program,
+            Some(self.focus),
+            type_id,
+            None,
+        );
+        let blankets: Vec<&Implementation> = applying
+            .into_iter()
+            .filter(|implementation| nominal_type_id(program, implementation.subject).is_none())
+            .collect();
+        for implementation in &blankets {
+            for (name, member_id) in &implementation.declarations {
+                if is_self_method(program, *member_id) && offered.insert(name.to_string()) {
+                    items.push(self.entity_completion(
+                        name.to_string(),
+                        *member_id,
+                        CompletionKind::Method,
+                    ));
+                }
+            }
+        }
+        for implementation in &blankets {
+            for trait_id in &implementation.trait_ids {
+                for home_id in trait_with_supertraits(program, *trait_id) {
+                    let Some(home) = program.traits.get(&home_id) else {
+                        continue;
+                    };
+                    for (name, member_id) in &home.declarations {
+                        if member_has_default_body(program, *member_id)
+                            && !declaration_is_trait_only(program, *member_id)
+                            && is_self_method(program, *member_id)
+                            && offered.insert(name.to_string())
+                        {
+                            items.push(self.entity_completion(
+                                name.to_string(),
+                                *member_id,
+                                CompletionKind::Method,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The fields + methods of one nominal type — the member-completion list.

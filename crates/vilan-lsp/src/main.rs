@@ -19,6 +19,8 @@ mod world;
 
 #[cfg(test)]
 mod entry_world_tests;
+#[cfg(test)]
+mod member_admission_tests;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
