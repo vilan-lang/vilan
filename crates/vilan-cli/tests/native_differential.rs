@@ -8798,6 +8798,29 @@ fn a_nested_tuple_access_reads_the_nested_element_on_both_backends() {
     );
 }
 
+/// F67: a LOCAL closure binding called and then read. The literal's cast
+/// left its return to Rust (`as Rc<dyn Fn(i32) -> _>`), which settles it from
+/// the closure's first use — too late for `make(1).name` (E0282) and wrongly
+/// for `i"{f()}"` over `f = || row.name` (the unsized `str`, E0277). The cast
+/// writes the return the body was rendered at, else the literal's recorded
+/// one. The probe: a field read and arithmetic on a call, a `str` and an `i32`
+/// return interpolated, a method on the result, a closure returning a
+/// closure, a list and an `Option`.
+#[test]
+fn a_local_closures_result_is_read_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_local_closure_returns.vl"),
+        include_str!("native/local_closure_returns.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_local_closure_returns.vl"),
+        Verdict::Identical,
+        "a local closure's result must be readable the same way on both backends"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds

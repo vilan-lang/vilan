@@ -924,15 +924,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // to close from and was refused as instantiated at `any`. The return
         // the position declares, else the one the literal wrote; only a closed
         // one, since an open expectation says nothing and an `any` would wrap.
-        let expecting = self
-            .expected_type
-            .and_then(|type_id| match self.resolve(type_id) {
-                Some(Type::Closure(_, returns, _)) => Some(*returns),
-                _ => None,
-            })
-            .filter(|returns| self.is_grounded(*returns))
-            .or(closure.return_type_id)
-            .filter(|returns| self.is_grounded(*returns));
+        let expecting = self.closure_return_position(closure);
         let body = self.value_of_expecting_in(closure.return_, expecting, depth, true)?;
         if closure.parameter_destructures.is_empty() {
             if boxed.is_empty() {
@@ -946,6 +938,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = write!(prefix, "{rendered}; ");
         }
         Ok(format!("{{ {prefix}{body} }}"))
+    }
+
+    /// The position a closure's body fills: the RETURN of the closure type
+    /// the literal is rendered into, when that is closed, else the literal's
+    /// own written return type, when that is. [`Self::closure_body`] renders
+    /// the body at it, and [`Self::closure`] writes it into the literal's
+    /// `dyn Fn` cast, so the two always agree.
+    fn closure_return_position(&self, closure: &vilan_core::analyzer::Closure) -> Option<TypeId> {
+        self.expected_type
+            .and_then(|type_id| match self.resolve(type_id) {
+                Some(Type::Closure(_, returns, _)) => Some(*returns),
+                _ => None,
+            })
+            .filter(|returns| self.is_grounded(*returns))
+            .or(closure.return_type_id)
+            .filter(|returns| self.is_grounded(*returns))
     }
 
     /// Every name a closure's PARAMETER LIST introduces: the parameters
@@ -7252,7 +7260,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let object = self.ensure_object_trait(trait_id, &arguments, span)?;
                 format!("vilan_rt::Dyn<dyn {}>", object.name)
             }
-            _ => "_".to_string(),
+            _ => self.written_closure_return(&closure, is_async_closure || wants_a_future, span)?,
         };
         let as_counted = format!(
             " as std::rc::Rc<dyn Fn({}) -> {returns}>",
@@ -7384,6 +7392,44 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "{{ {prelude}std::rc::Rc::new(move |{}| {{ {body} }}){as_counted} }}",
             parameters.join(", ")
         ))
+    }
+
+    /// The return type a closure literal's `dyn Fn` cast WRITES (F67), or
+    /// `_` to leave it to Rust.
+    ///
+    /// Left to Rust, the `_` is settled by the first USE of the closure, and a
+    /// use can come too late or settle it wrong: `make(1).name` reads a field
+    /// off a call whose type is still `_` (E0282), and `i"{f()}"` with
+    /// `f = || row.name` hands `str_concat` a `&_` that Rust settles as the
+    /// unsized `str` (E0277). The closure's return is known: the position
+    /// [`Self::closure_body`] rendered the body at, else the type the analyzer
+    /// recorded for the literal. Written only when it is closed; never for a
+    /// future-answering or floating closure (whose cast answers a future), or
+    /// for a body that hands back a VIEW (a reference whose lifetime the cast
+    /// cannot name).
+    fn written_closure_return(
+        &mut self,
+        closure: &vilan_core::analyzer::Closure,
+        answers_a_future: bool,
+        span: Span,
+    ) -> Result<String, Error> {
+        if answers_a_future || self.reads_through_a_view(closure.return_) {
+            return Ok("_".to_string());
+        }
+        let recorded = self
+            .type_of(closure.id)
+            .and_then(|type_id| match self.resolve(type_id) {
+                Some(Type::Closure(_, returns, _)) => Some(*returns),
+                _ => None,
+            });
+        match self
+            .closure_return_position(closure)
+            .or(recorded)
+            .filter(|returns| self.is_grounded(*returns))
+        {
+            Some(returns) => self.rust_type(returns, span),
+            None => Ok("_".to_string()),
+        }
     }
 
     // ----------------------------------------------------------- async ----

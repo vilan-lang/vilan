@@ -50,6 +50,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**Native: a local closure's result can be read where it is called — `let make = |n: i32| Row { .. }; print(make(1).name)` and `let f = || row.name; print(i"{f()}")` build and print node's bytes, where rustc refused them (E0282: type annotations needed for `Rc<dyn Fn(i32) -> _>`; E0277: `str` cannot be known at compilation time).** Every closure literal is cast to the counted `Rc<dyn Fn(..) -> _>` it lands as, and Rust settles that `_` from the closure's first use — too late for a field read off the call, and wrongly where the use is `str_concat`'s `&_` (the unsized `str`). The cast now writes the closure's return: the position the body was rendered at (the return of the closure type it lands in, else the literal's written one — one helper, so the two cannot disagree), else the type the analyzer recorded for the literal. Never for a future-answering or floating closure, nor for a body that hands back a view. The whole-set differential holds at 0 broken (129 / 102 identical / 27 refused); the copy and leak censuses do not move. Pin: `native_differential`'s `a_local_closures_result_is_read_the_same_on_both_backends` (`native/local_closure_returns.vl`: a field read and arithmetic on a call, `str` and `i32` returns interpolated, a method on the result, a closure returning a closure, a list and an `Option`; rustc refused it on 0.43.0). Tracker F67.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

@@ -1,0 +1,36 @@
+// F67: a LOCAL closure binding called and then read — `make(1).name`,
+// `i"{f()}"` — natively. The literal was cast `as Rc<dyn Fn(..) -> _>` and
+// Rust settles that `_` from the closure's first use, which came too late
+// (`make(1).name`: E0282, a field off an unsettled type) or settled it wrong
+// (`f = || row.name` read through `str_concat`'s `&_`: the unsized `str`,
+// E0277). The cast writes the closure's return now. Each line is one use: a
+// field read off a call, arithmetic on one, an interpolation of a `str`
+// return, of an `i32` return, a method call on the result, a closure
+// returning a closure, one returning a list, and an `Option`.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Row {
+	name: str,
+	count: i32,
+}
+
+fun main() {
+	let make = |n: i32| Row { name = i"row {n}", count = n };
+	print(make(1).name);
+	print(make(2).count + 1);
+	let row = Row { name = "kept", count = 3 };
+	let f = || row.name;
+	print(i"{f()}");
+	let g = || row.count;
+	print(i"{g()} and {f()}");
+	print(f().len());
+	let adder = |n: i32| |m: i32| n + m;
+	print(adder(2)(5));
+	let listed = |n: i32| [n, n + 1];
+	print(listed(4).len());
+	print(listed(4)[1]);
+	let found = |n: i32| if n > 0 { Some(n) } else { None };
+	print(found(3).unwrap_or(0));
+	print(found(-1).unwrap_or(0));
+}
