@@ -42574,6 +42574,20 @@ impl<'src> Analyzer<'src> {
         None
     }
 
+    /// A trait's own parameters as the types its body spells them with
+    /// (`Generic(T)` per parameter, B366's one spelling).
+    fn own_parameter_types(&mut self, trait_id: Id) -> Vec<TypeId> {
+        let parameters = self
+            .traits
+            .get(&trait_id)
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default();
+        parameters
+            .into_iter()
+            .map(|constraint_id| Type::Generic(constraint_id).get_type_id(self))
+            .collect()
+    }
+
     fn derive_generics_from_bounds(
         &mut self,
         bound_owners: &[TypeId],
@@ -42600,9 +42614,31 @@ impl<'src> Analyzer<'src> {
                 // `Option`), as an impl's bound binders are (B408). The first
                 // provider answered `IntoFlow<SignalCell<..>>`, which no
                 // `Option<U>` reconciles with, and `U` went uninferred.
-                let provided = match concrete {
+                let provided = match &concrete {
                     Type::Generic(caller_constraint_id) => {
-                        self.abstract_trait_arguments(caller_constraint_id, trait_id)
+                        self.abstract_trait_arguments(*caller_constraint_id, trait_id)
+                    }
+                    // B510: `Self` inside a trait's own default is as abstract
+                    // as a caller's parameter — its trait, and the supertraits
+                    // at the arguments the chain passes them, are all it
+                    // promises. Asked of the impls, the FIRST implementor
+                    // answered: `observe_flow(self)` in `Obs<T>`'s default bound
+                    // `U` to `Thing`'s `i32` and refused the default's own `T`.
+                    //
+                    // `self` there is typed as the bare trait (`Obs`, no
+                    // arguments): its arguments are the trait's OWN
+                    // parameters, which is what the body spells them as.
+                    Type::Trait(self_trait_id, self_arguments) => {
+                        let self_arguments = match self_arguments.is_empty() {
+                            true => self.own_parameter_types(*self_trait_id),
+                            false => self_arguments.clone(),
+                        };
+                        self.trait_with_supertraits_at(*self_trait_id, &self_arguments)
+                            .into_iter()
+                            .find(|(chain_trait_id, chain_arguments)| {
+                                *chain_trait_id == trait_id && !chain_arguments.is_empty()
+                            })
+                            .map(|(_, chain_arguments)| chain_arguments)
                     }
                     _ => self.trait_args_for_pattern(&concrete, trait_id, &trait_arguments),
                 };
@@ -42627,7 +42663,10 @@ impl<'src> Analyzer<'src> {
                     let impl_argument_type = impl_argument.get_type(self);
                     let mut argument_generics = Vec::new();
                     self.collect_generics(&impl_argument_type, 0, &mut argument_generics);
-                    if !matches!(concrete, Type::Generic(_))
+                    // A caller's parameter and a trait default's `Self` answer
+                    // from their own declared bounds, so a binder there is the
+                    // caller's own (the default's `T`, B510) and binds.
+                    if !matches!(concrete, Type::Generic(_) | Type::Trait(..))
                         && argument_generics
                             .iter()
                             .any(|generic| !receiver_generics.contains(generic))

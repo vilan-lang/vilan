@@ -147,6 +147,71 @@ const B473_PROBE: &str = concat!(
     "}\n",
 );
 
+const B510_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Obs<T> {\n",
+    "\tfun start(own self): T;\n",
+    "\tfun observe(own self, observer: |T| void) {\n",
+    "\t\tobserve_flow(self, |value| observer(value), true)\n",
+    "\t}\n",
+    "\tfun first(own self): T {\n",
+    "\t\tfirst_of(self)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun observe_flow<U, F: Obs<U>>(own flow: F, observer: |U| void, immediately: bool) {\n",
+    "\tlet value = flow.start();\n",
+    "\tif immediately {\n",
+    "\t\tobserver(value);\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun first_of<U, F: Obs<U>>(own flow: F): U {\n",
+    "\tflow.start()\n",
+    "}\n",
+    "\n",
+    "trait Wrap<T> with Obs<T> {\n",
+    "\tfun wrapped(own self): T {\n",
+    "\t\tthrough_sub(self)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun through_sub<U, W: Wrap<U>>(own wrap: W): U {\n",
+    "\twrap.start()\n",
+    "}\n",
+    "\n",
+    "struct Thing {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Thing with Obs<i32> {\n",
+    "\tfun start(own self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Thing with Wrap<i32> {}\n",
+    "\n",
+    "struct Word {\n",
+    "\ts: str,\n",
+    "}\n",
+    "\n",
+    "impl Word with Obs<str> {\n",
+    "\tfun start(own self): str {\n",
+    "\t\tself.s\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tThing { n = 5 }.observe(|n| print(n + 1));\n",
+    "\tWord { s = \"w\" }.observe(|s| print(s));\n",
+    "\tprint(Thing { n = 6 }.first());\n",
+    "\tprint(Word { s = \"v\" }.first());\n",
+    "\tprint(Thing { n = 7 }.wrapped());\n",
+    "}\n",
+);
+
 const B514_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -8607,6 +8672,23 @@ fn a_dereferenced_conditional_of_scalar_views_reads_the_value_on_both_backends()
         compare(&staged, "native_probe_b514.vl"),
         Verdict::Identical,
         "a dereferenced conditional of scalar views must read the value on both backends"
+    );
+}
+
+/// B510: a trait default handing `self` to a generic over its own trait runs on
+/// both backends — the observer passed on, wrapped in a closure literal, and
+/// through a sub-trait's default. Both refused "Expected T, but got i32" (the
+/// first implementor answered for `Self`); past that, JS raised "internal: a call
+/// resolved to `Obs`'s requirement `start`".
+#[test]
+fn a_trait_default_passing_self_to_a_generic_over_its_trait_runs_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b510.vl"), B510_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b510.vl"),
+        Verdict::Identical,
+        "a trait default passing self to a generic over its trait must run on both backends"
     );
 }
 

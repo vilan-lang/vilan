@@ -11719,7 +11719,9 @@ impl<'src> Transformer<'src> {
         // instantiation composes) and order by constraint id for a stable key.
         let mut entries: Vec<(TypeId, TypeId)> = substitution
             .iter()
-            .map(|(constraint_id, type_id)| (*constraint_id, self.resolve_type_id(*type_id)))
+            .map(|(constraint_id, type_id)| {
+                (*constraint_id, self.resolve_binding_type_id(*type_id))
+            })
             .collect();
         entries.sort_by_key(|(constraint_id, _)| constraint_id.0);
         let key = (
@@ -11980,6 +11982,25 @@ impl<'src> Transformer<'src> {
                     .is_some_and(|struct_| struct_.name == "HashSet"),
                 _ => false,
             })
+    }
+
+    /// [`Self::resolve_type_id`] for a type a call BINDS a callee's parameter
+    /// to. Inside a trait default's instance the receiver's `Self` is typed as
+    /// the bare trait (`Obs<T>`), the one place a trait type is a value's type;
+    /// a call that hands `self` on (`observe_flow(self)`, B510) binds its `F`
+    /// to that trait type, and the callee's `flow.start()` then dispatched on
+    /// a type no impl provides — the trait's bodyless requirement, the
+    /// never-silent internal error. The default's instance knows what `Self`
+    /// is (`current_self_type`), and that is what the binding means.
+    fn resolve_binding_type_id(&self, type_id: TypeId) -> TypeId {
+        let resolved = self.resolve_type_id(type_id);
+        match (
+            self.program.type_id_to_type_map.get(&resolved),
+            self.current_self_type,
+        ) {
+            (Some(Type::Trait(..)), Some(self_type)) => self_type,
+            _ => resolved,
+        }
     }
 
     fn resolve_type_id(&self, type_id: TypeId) -> TypeId {

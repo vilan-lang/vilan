@@ -45,6 +45,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**A trait default that hands `self` to a generic over its own trait compiles and runs: `trait Obs<T> { fun observe(own self, observer: |T| void) { observe_flow(self, |value| observer(value), true) } }` with `observe_flow<U, F: Obs<U>>` — where both backends refused "Expected T, but got i32" and, past that, JS raised "internal: a call resolved to `Obs`'s requirement `start`, which has no body".** Three holes in one shape. `Self` inside a trait default is typed as the bare trait, and the bound-argument derivation asked the IMPLS for its `Obs` arguments, so the first implementor answered (`i32`); it now answers from the trait's own parameters, and the supertraits at the arguments its chain passes, as a caller's parameter answers from its bounds. A binder so derived is the default's own and binds (it was dropped as foreign, so a closure literal in the call typed its parameter at the callee's unbound `U`). And a call that binds a callee's parameter to that bare-trait `Self` now binds it, inside the default's instance, to the type the instance is for (`resolve_binding_type_id`); it bound the trait itself and the callee's `flow.start()` dispatched on nothing. reactive-45 met it making `Flow::observe` a default. Pins: `inference::traits`' `b510_a_trait_default_passing_self_to_a_generic_over_its_trait_runs` (two implementors at two instantiations, the observer passed on and wrapped in a literal, `own self`, a sub-trait's default); `native_differential`'s `a_trait_default_passing_self_to_a_generic_over_its_trait_runs_on_both_backends`. No golden moves. Tracker B510.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

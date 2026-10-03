@@ -8738,6 +8738,91 @@ fn b511_a_qualified_call_reaches_a_blanket_through_a_bound_and_a_tuple_subject()
     );
 }
 
+// --- B510: a trait default hands `self` to a generic over the same trait -----
+//
+// `Obs<T>`'s default `observe` calling `observe_flow<U, F: Obs<U>>(self, ..)`:
+// the analyzer read `F`'s `Obs` arguments off the FIRST implementor of `Obs`
+// (`Self` is typed as the bare trait there), refusing the default's own `T`
+// ("Expected T, but got i32"); with that answered, a closure literal in the call
+// typed its parameter at the callee's unbound `U`, and the JS instance bound `F`
+// to the bare trait — "internal: a call resolved to `Obs`'s requirement
+// `start`, which has no body" (reactive-45 met it making `Flow::observe` a
+// default).
+
+/// B510: the default runs for two implementors at two instantiations — with
+/// the observer passed on, with a closure literal wrapping it, `own self`, and
+/// through a SUB-trait's default reaching a generic over the sub-trait.
+#[test]
+fn b510_a_trait_default_passing_self_to_a_generic_over_its_trait_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Obs<T> {
+            fun start(own self): T;
+            fun observe(own self, observer: |T| void) {
+                observe_flow(self, |value| observer(value), true)
+            }
+            fun first(own self): T {
+                first_of(self)
+            }
+        }
+
+        fun observe_flow<U, F: Obs<U>>(own flow: F, observer: |U| void, immediately: bool) {
+            let value = flow.start();
+            if immediately {
+                observer(value);
+            }
+        }
+
+        fun first_of<U, F: Obs<U>>(own flow: F): U {
+            flow.start()
+        }
+
+        trait Wrap<T> with Obs<T> {
+            fun wrapped(own self): T {
+                through_sub(self)
+            }
+        }
+
+        fun through_sub<U, W: Wrap<U>>(own wrap: W): U {
+            wrap.start()
+        }
+
+        struct Thing {
+            n: i32,
+        }
+
+        impl Thing with Obs<i32> {
+            fun start(own self): i32 {
+                self.n
+            }
+        }
+
+        impl Thing with Wrap<i32> {}
+
+        struct Word {
+            s: str,
+        }
+
+        impl Word with Obs<str> {
+            fun start(own self): str {
+                self.s
+            }
+        }
+
+        fun main() {
+            Thing { n = 5 }.observe(|n| print(n + 1));
+            Word { s = "w" }.observe(|s| print(s));
+            print(Thing { n = 6 }.first());
+            print(Word { s = "v" }.first());
+            print(Thing { n = 7 }.wrapped());
+        }
+        "#,
+        "6\nw\n6\nv\n7\n",
+    );
+}
+
 // --- One trait at two instantiations: every provider is asked ------------------
 //
 // A type may provide one trait at two instantiations: `impl type T with Into2<T>`
