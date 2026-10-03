@@ -74,6 +74,13 @@ fn analyze_package_raw(files: &[(&str, &str)], entry: &str, platform: Platform) 
 /// whole pipeline and runs the result with `node`, returning its stdout — for
 /// the pins whose claim is WHICH body a cross-module call reached.
 fn run_package(files: &[(&str, &str)], entry: &str) -> String {
+    run_node(&emit_package(files, entry, Platform::default()))
+}
+
+/// Writes `files` into a fresh package and compiles `entry` through the whole
+/// pipeline for `platform`, returning the emitted JavaScript — for the pins
+/// whose claim is about what a cross-module program EMITS (B519).
+fn emit_package(files: &[(&str, &str)], entry: &str, platform: Platform) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = scratch::root().join(format!("vilan_modres_run_{}_{unique}", std::process::id()));
@@ -91,7 +98,7 @@ fn run_package(files: &[(&str, &str)], entry: &str) -> String {
         &std_spec(),
         &dir,
         &entry_path,
-        Some(Platform::default()),
+        Some(platform),
         &Workspace::default(),
     );
     assert!(
@@ -104,13 +111,25 @@ fn run_package(files: &[(&str, &str)], entry: &str) -> String {
         &vilan_core::BuildOptions::default(),
     )
     .expect("the program emits");
-    let script = dir.join("out.mjs");
+    let _ = std::fs::remove_dir_all(&dir);
+    js
+}
+
+/// Runs emitted JavaScript with `node` and returns its stdout; a failing run
+/// fails the test with its stderr.
+fn run_node(js: &str) -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let script = scratch::root().join(format!(
+        "vilan_modres_script_{}_{unique}.mjs",
+        std::process::id()
+    ));
     std::fs::write(&script, js).unwrap();
     let output = std::process::Command::new("node")
         .arg(&script)
         .output()
         .expect("run node");
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&script);
     assert!(
         output.status.success(),
         "{}",
@@ -379,6 +398,32 @@ fn analyze_workspace_files(
     deps: &[Dep],
     platform: Platform,
 ) -> Vec<String> {
+    with_workspace(entry_files, deps, platform, |_program, errors| {
+        errors
+            .into_iter()
+            .map(|error| {
+                format!(
+                    "{}{}",
+                    error.msg,
+                    error
+                        .note
+                        .map(|note| format!(" || NOTE: {}", note.msg))
+                        .unwrap_or_default()
+                )
+            })
+            .collect()
+    })
+}
+
+/// Lays the workspace of [`analyze_workspace_files`] out on disk, analyzes its
+/// entry, and hands the analysis to `then` while the files still exist (so a
+/// caller can emit from it), removing the tree afterwards.
+fn with_workspace<R>(
+    entry_files: &[(&str, &str)],
+    deps: &[Dep],
+    platform: Platform,
+    then: impl FnOnce(Option<vilan_core::Program<'static>>, Vec<Error>) -> R,
+) -> R {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let root = scratch::root().join(format!("vilan_ws_{}_{unique}", std::process::id()));
@@ -422,7 +467,7 @@ fn analyze_workspace_files(
 
     let source = std::fs::read_to_string(&entry_path).unwrap();
     let leaked: &'static str = Box::leak(source.into_boxed_str());
-    let (_program, errors) = analyze_source(
+    let (program, errors) = analyze_source(
         leaked,
         &std_spec(),
         &app_dir,
@@ -430,20 +475,9 @@ fn analyze_workspace_files(
         Some(platform),
         &workspace,
     );
+    let answer = then(program, errors);
     let _ = std::fs::remove_dir_all(&root);
-    errors
-        .into_iter()
-        .map(|error| {
-            format!(
-                "{}{}",
-                error.msg,
-                error
-                    .note
-                    .map(|note| format!(" || NOTE: {}", note.msg))
-                    .unwrap_or_default()
-            )
-        })
-        .collect()
+    answer
 }
 
 #[test]
@@ -1018,11 +1052,10 @@ fn a_library_contract_check_keeps_the_position_in_prose() {
     // without registering any of them as a source and renders MESSAGES only, so
     // there is no file for a span to index into — the file and the position stay
     // in the text, which is exactly what every module parse error used to do.
-    let violations = contract_violations(
-        &[("lib.vl", ""), ("broken.vl", "fun broken( {\n")],
-        &[],
-        &[],
-    );
+    // The mid-edit unclosed `(` at end of input (B446: `fun broken( {` is a
+    // located demand at the `{` now, not an unclosed opener).
+    let violations =
+        contract_violations(&[("lib.vl", ""), ("broken.vl", "fun broken(\n")], &[], &[]);
     assert!(
         violations.iter().any(|violation| {
             violation.contains("parse error in")
@@ -1175,6 +1208,182 @@ fn derive_in_a_dependency_library_resolves() {
         errors.is_empty(),
         "a derived type from a dependency library should round-trip, got: {errors:#?}"
     );
+}
+
+// --- B519: a macro-generated module-level `let` outside the entry ------------
+//
+// A macro expansion walks under its own child scope (so the expansion's
+// imports stay its own) and hoists its definitions into the module scope by
+// name. `Program::module_level_bindings` found a module's `let`s by their
+// DECLARING scope, which for a generated one is the expansion's — so outside
+// the entry file (whose bindings are read off the hoisted names instead) a
+// generated module-level `let` was no module-level binding at all: never
+// declared, while the generated code that reads it was emitted. A134's
+// `[service(Client)]` writes one per handle stub (`__mirrors_<Client>_<m>`), and
+// a service declared in an imported module threw `ReferenceError` at its first
+// handle-stub call.
+
+/// Every `__mirrors_*` identifier `js` names, and the subset it DECLARES
+/// (`const`/`let`/`var` immediately before the name).
+fn mirror_tables(
+    js: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut used = std::collections::BTreeSet::new();
+    let mut declared = std::collections::BTreeSet::new();
+    for (start, _) in js.match_indices("__mirrors_") {
+        let name: String = js[start..]
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect();
+        let before = js[..start].trim_end();
+        if ["const", "let", "var"]
+            .iter()
+            .any(|keyword| before.ends_with(keyword))
+        {
+            declared.insert(name.clone());
+        }
+        used.insert(name);
+    }
+    (used, declared)
+}
+
+const B519_STORE: &str = concat!(
+    "import std::reactive::{ Signal, SignalCell };\n",
+    "\n",
+    "export *;\n",
+    "\n",
+    "[service(MirClient)]\n",
+    "struct MirStore {\n",
+    "    count: SignalCell<i32>,\n",
+    "}\n",
+    "\n",
+    "impl MirStore {\n",
+    "    [rpc]\n",
+    "    fun get_count(self): SignalCell<i32> {\n",
+    "        self.count\n",
+    "    }\n",
+    "}\n",
+);
+
+const B519_CLIENT_MAIN: &str = concat!(
+    "fun main() {\n",
+    "    match MirClient::connect(\"/\", json_codec()) {\n",
+    "        Ok(let client) => {\n",
+    "            let count = client.get_count();\n",
+    "            print(count.get());\n",
+    "        }\n",
+    "        Err(let failure) => print(\"no\"),\n",
+    "    }\n",
+    "}\n",
+);
+
+/// The owner's shape, reduced: a `[service(Client)]` in an IMPORTED module and
+/// a client entry calling a handle stub. The browser bundle declares every
+/// mirror table it reads. The single-file layout is the control (it was always
+/// declared there).
+#[test]
+fn b519_a_service_in_an_imported_module_declares_every_mirror_table_it_uses() {
+    let imported_entry = format!(
+        "import std::io::print;\nimport std::json::json_codec;\nimport pkg::store::MirClient;\n\n{B519_CLIENT_MAIN}"
+    );
+    let single_file = format!(
+        "import std::io::print;\nimport std::json::json_codec;\n{}\n{B519_CLIENT_MAIN}",
+        B519_STORE.replace("export *;\n", "")
+    );
+    for (layout, files) in [
+        (
+            "imported",
+            vec![
+                ("client.vl", imported_entry.as_str()),
+                ("store.vl", B519_STORE),
+            ],
+        ),
+        ("single file", vec![("client.vl", single_file.as_str())]),
+    ] {
+        let js = emit_package(&files, "client.vl", Platform::Browser);
+        let (used, declared) = mirror_tables(&js);
+        assert!(
+            used.contains("__mirrors_MirClient_get_count"),
+            "{layout}: the stub must read its table (else this pin is vacuous): {used:?}"
+        );
+        let dangling: Vec<&String> = used.difference(&declared).collect();
+        assert!(
+            dangling.is_empty(),
+            "{layout}: the bundle reads mirror tables it never declares: {dangling:?}"
+        );
+    }
+}
+
+/// The macro that writes a module-level `let` beside a function reading it —
+/// the shape of B519 with no `std::rpc` in it, so the pins below are about
+/// generated bindings rather than about one generator.
+const B519_TABLE_MACRO: &str = concat!(
+    "macro fun tabled(item: Item): Source {\n",
+    "    import macro_std::source;\n",
+    "    import macro_std::meta::{ Item, Source };\n",
+    "\n",
+    "    source(\"let __made: List<i32> = [1, 2, 3];\\nfun made_len(): usize {\\n__made.len()\\n}\\n\")\n",
+    "}\n",
+);
+
+const B519_TABLE_SEED: &str = "[tabled]\nstruct Seed {\n    unused: i32,\n}\n";
+
+/// The general case: any macro's module-level `let` in an imported module is
+/// that module's binding, and the program that reads it runs.
+#[test]
+fn b519_a_macro_generated_let_in_an_imported_module_is_declared_and_runs() {
+    let table = format!("export *;\n\n{B519_TABLE_MACRO}\n{B519_TABLE_SEED}");
+    let entry = "import std::io::print;\nimport pkg::table::made_len;\n\nfun main() {\n    print(made_len());\n}\n";
+    assert_eq!(
+        run_package(&[("main.vl", entry), ("table.vl", &table)], "main.vl").trim(),
+        "3"
+    );
+}
+
+/// The same cause inside the entry file: a generated `let` placed into an
+/// inline `mod` (B201) belongs to that module's body scope, which the entry's
+/// own names never reached.
+#[test]
+fn b519_a_macro_generated_let_in_an_inline_mod_is_declared_and_runs() {
+    let entry = format!(
+        "import std::io::print;\n\n{B519_TABLE_MACRO}\nmod inner {{\n    export *;\n\n{B519_TABLE_SEED}}}\n\nfun main() {{\n    print(inner::made_len());\n}}\n"
+    );
+    assert_eq!(run_package(&[("main.vl", &entry)], "main.vl").trim(), "3");
+}
+
+/// And in a dependency library's `lib.vl`, whose generated items walk into the
+/// dependency's namespace scope.
+#[test]
+fn b519_a_macro_generated_let_in_a_dependency_library_is_declared_and_runs() {
+    let lib: &'static str =
+        Box::leak(format!("export *;\n\n{B519_TABLE_MACRO}\n{B519_TABLE_SEED}").into_boxed_str());
+    let files: &'static [(&'static str, &'static str)] = Box::leak(Box::new([("lib.vl", lib)]));
+    let common = Dep {
+        import_name: "common",
+        files,
+    };
+    let entry = "import std::io::print;\nimport common::made_len;\n\nfun main() {\n    print(made_len());\n}\n";
+    let js = with_workspace(
+        &[("main.vl", entry)],
+        &[common],
+        Platform::default(),
+        |program, errors| {
+            assert!(
+                errors.is_empty(),
+                "{:?}",
+                errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+            );
+            vilan_core::transform(
+                &program.expect("a program"),
+                &vilan_core::BuildOptions::default(),
+            )
+            .expect("the program emits")
+        },
+    );
+    assert_eq!(run_node(&js).trim(), "3");
 }
 
 // --- Diagnostic source attribution (backlog E1) --------------------------------
@@ -1349,7 +1558,8 @@ fn module_parse_errors_attribute_to_the_broken_module() {
                 "main.vl",
                 "import pkg::util::util;\nfun main() { let _ = util(); }\n",
             ),
-            ("util.vl", "fun util(): i32 { 1 }\nfun broken( {\n"),
+            // An unclosed `(` at end of input (see the B446 note below).
+            ("util.vl", "fun util(): i32 { 1 }\nfun broken(\n"),
         ],
         "main.vl",
         Platform::default(),
@@ -1385,9 +1595,12 @@ fn a_module_parse_error_anchors_at_its_true_position() {
         "main.vl",
         Platform::default(),
     );
+    // B446: the parameter list's located demand, at the `{` it found where a
+    // name or its `)` goes (it said "unclosed `(`" at the opener while the
+    // binder recorded nothing).
     let (message, file, range) = spanned
         .iter()
-        .find(|(message, ..)| message.contains("expected a matching `)`"))
+        .find(|(message, ..)| message.contains("found '{' expected a name or ')'"))
         .expect("the module parse error should be reported");
     assert_eq!(file, "util.vl", "{spanned:?}");
     assert_ne!(*range, 0..0, "an empty span is the bug: {spanned:?}");
@@ -1398,8 +1611,8 @@ fn a_module_parse_error_anchors_at_its_true_position() {
     );
     assert_eq!(
         &helper[range.clone()],
-        "(",
-        "the span covers the unclosed `(`: {spanned:?}"
+        "{",
+        "the span covers the `{{` found in the parameter list: {spanned:?}"
     );
 }
 
@@ -1451,7 +1664,11 @@ fn a_module_parse_error_is_the_parsers_own_error_unaltered() {
     // `parsing::render(error)` as the message — and a loaded module now does
     // exactly the same, so the two are comparable against the same source of
     // truth rather than against each other.
-    let broken = "fun util(): i32 { 1 }\nfun broken( {\n";
+    // B446: the fixture is the mid-edit `fun broken(` at end of input — an
+    // unclosed `(` and nothing else. `fun broken( {` used to be one too, until
+    // the parameter list's binder recorded what it wanted: it is now the
+    // located "found '{' expected a name or ')'" plus the `{` left unclosed.
+    let broken = "fun util(): i32 { 1 }\nfun broken(\n";
     let (_tree, parse_errors) = vilan_core::parsing::parse(broken);
     assert_eq!(parse_errors.len(), 1, "the fixture holds one parse error");
     let expected_message = vilan_core::parsing::render(&parse_errors[0]);
@@ -8188,6 +8405,54 @@ fn b401_a_declared_member_is_narrowed_the_same_way() {
     owned[2].1 = "import pkg::b::Box;\nimport pkg::t::One;\n\nexport impl Box with One {\n\tfun describe(self): str { \"one\" }\n}\n".to_string();
     owned[3].1 = "import pkg::b::Box;\nimport pkg::t::Two;\n\nexport impl Box with Two {\n\tfun describe(self): str { \"two\" }\n}\n".to_string();
     assert_eq!(run_package(&b401_borrowed(&owned), "c.vl").trim(), "one");
+}
+
+// --- B481: a `for` loop's `next` answers to the file's admission like a call -
+
+/// A custom iterator whose `next` is an INHERITED default, provided by `p1`'s
+/// empty block, and a `c.vl` that loops over it with `imports`.
+fn b481_files(imports: &str) -> Vec<(String, String)> {
+    vec![
+        ("b.vl".to_string(), "export struct Box { n: i32 }\n".to_string()),
+        (
+            "t.vl".to_string(),
+            "import std::option::Option::{ self, None, Some };\nexport trait Counting {\n\tfun next(mut self): Option<i32> { None }\n}\n".to_string(),
+        ),
+        (
+            "p1.vl".to_string(),
+            "import pkg::b::Box;\nimport pkg::t::Counting;\n\nexport impl Box with Counting {}\n".to_string(),
+        ),
+        (
+            "c.vl".to_string(),
+            format!(
+                "import pkg::b::Box;\n{imports}\n\nfun main() {{\n\tmut box = Box {{ n = 1 }};\n\tfor item in box {{\n\t\tprint(item);\n\t}}\n\tprint(\"done\");\n}}\n"
+            ),
+        ),
+    ]
+}
+
+/// The loop drove `next` through the block `import pkg::p1 only;` declined —
+/// compiled and ran, where `box.next()` written as a call was refused. B401's
+/// post-build pass looked only at calls; a loop's `next` is a site now, refused
+/// by the same sentence at the iterable.
+#[test]
+fn b481_a_loops_inherited_next_through_a_declined_block_is_refused() {
+    let owned = b481_files("import pkg::p1 only;");
+    let diagnostics = analyze_package(&b401_borrowed(&owned), "c.vl", Platform::default());
+    assert!(
+        diagnostics.iter().any(|message| message.contains(
+            "'next' is provided by an `impl` in module `p1`, and this file imports that \
+             module `only`, which admits none"
+        )),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The control: the plain import admits the block, and the loop runs.
+#[test]
+fn b481_an_admitted_loop_next_still_runs() {
+    let owned = b481_files("import pkg::p1;");
+    assert_eq!(run_package(&b401_borrowed(&owned), "c.vl").trim(), "done");
 }
 
 #[test]

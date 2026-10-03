@@ -1,0 +1,86 @@
+// A142 S7 S2 on both backends: a derived enum's store — the paper's variant
+// scenarios (`proposal/store.md` §2.6, Appendix A): a same-variant write that
+// patches the payload, a switch away and back, a `patch` through a dead and a
+// live variant, a multi-payload variant read as a tuple, a generic enum with a
+// scalar payload, a payload `Store` assumed past the variant's end, and an
+// observer through the variant.
+import std::compare::PartialEq;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+import std::shared::Shared;
+import std::store::{ Storable, Store, StoreSome };
+
+[derive(PartialEq, Storable)]
+struct Device {
+	name: str,
+	since: i32,
+}
+
+[derive(PartialEq, Storable)]
+enum Presence {
+	Offline,
+	Online(Device),
+	Away(str, i32),
+}
+
+[derive(Storable)]
+enum Maybe<T> {
+	Nothing,
+	Just(T),
+}
+
+let woke = Shared::new([""]);
+
+fun mark(name: str) {
+	woke.write().push(name);
+}
+
+fun drained(): str {
+	mut out = "";
+	for name in woke.read() {
+		if out != "" {
+			out = out + " ";
+		}
+		out = out + name;
+	}
+	woke.write() = [];
+	if out == "" {
+		"-"
+	} else {
+		out
+	}
+}
+
+fun main() {
+	let presence = Store::new(Presence::Online(Device { name = "laptop", since = 1 }));
+	let name: StoreSome<str> = presence.online().name();
+	let watching = Owner::new();
+	run_with_owner(watching, || {
+		presence.is_online().effect_on_change(|t| mark(i"tag={t}"));
+		presence.is_away().effect_on_change(|a| mark(i"away={a}"));
+		name.effect_on_change(|n| mark(i"name={n.unwrap_or("-")}"));
+		presence.effect_on_change(|_p| mark("presence"));
+	});
+	presence.set(Presence::Online(Device { name = "laptop", since = 2 }));
+	print(i"same-variant write: [{drained()}] since={presence.online().since().get().unwrap_or(0)}");
+	presence.set(Presence::Offline);
+	print(i"to Offline: [{drained()}] name={name.get().unwrap_or("-")}");
+	print(i"patch through the dead variant: {name.patch("ghost")} [{drained()}]");
+	presence.set(Presence::Online(Device { name = "phone", since = 5 }));
+	print(i"back Online: [{drained()}] name={name.get().unwrap_or("-")}");
+	print(i"patch through the live variant: {name.patch("tablet")} [{drained()}] name={name.get().unwrap_or("-")}");
+	let device: Store<Device> = presence.online().assume();
+	presence.set(Presence::Away("lunch", 30));
+	print(i"to Away: [{drained()}] assumed={device.name().get()}");
+	let (why, minutes) = presence.away().get().unwrap_or(("-", 0));
+	print(i"away: {why} {minutes} live={presence.away().live().get()}");
+	let _patched = presence.away().patch(("meeting", 60));
+	let (why_now, minutes_now) = presence.away().get().unwrap_or(("-", 0));
+	print(i"patched: {why_now} {minutes_now} [{drained()}]");
+	watching.dispose();
+	let maybe = Store::new(Maybe::Just(1));
+	print(i"maybe: {maybe.just().get().unwrap_or(0)} {maybe.just().patch(2)} {maybe.just().get().unwrap_or(0)}");
+	maybe.set(Maybe::Nothing);
+	print(i"nothing: {maybe.just().patch(3)} {maybe.is_nothing().get()} just={maybe.is_just().get()}");
+}

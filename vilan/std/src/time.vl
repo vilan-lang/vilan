@@ -17,8 +17,8 @@ import pkg::task::{ CancelSignal, ambient_signal };
 
 /// Milliseconds since the Unix epoch, read from the host clock (`Date.now`) — the
 /// raw sample, for hot paths that just want float math (benchmarks).
-export [extern("Date.now")]
-external fun now_millis(): f64;
+[extern("Date.now")]
+export external fun now_millis(): f64;
 
 /// The current moment, typed.
 export fun now(): Instant {
@@ -29,15 +29,15 @@ export fun now(): Instant {
 
 /// A moment in time: milliseconds since the Unix epoch. Plain data — compare it,
 /// ship it over the wire, subtract two for a `Duration`.
-export [derive(Wire, PartialEq)]
-struct Instant {
+[derive(Wire, PartialEq)]
+export struct Instant {
 	millis: i53,
 }
 
 /// A signed span of time in milliseconds (`later.since(earlier)` is negative when
 /// `later` is actually earlier).
-export [derive(Wire, PartialEq)]
-struct Duration {
+[derive(Wire, PartialEq)]
+export struct Duration {
 	millis: i53,
 }
 

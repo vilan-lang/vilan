@@ -64,7 +64,19 @@ export impl Nursery {
 	/// std's IO wrappers already do (`ambient_signal`).
 	[extern(method, "signal_of")]
 	external fun signal(self): CancelSignal;
+
+	/// Whether any task has registered with this nursery, ever — a finished one
+	/// included. A pipe stage asks it to keep one nursery across runs that start no
+	/// task (M92): a nursery nothing registered with has nothing to cancel, so the
+	/// next run can take it as it is.
+	[internal("a pipe stage's nursery reuse (M92); an application cancels a nursery it owns")]
+	fun has_spawned(self): bool {
+		__nursery_has_spawned(self)
+	}
 }
+
+[extern("__nursery_has_spawned")]
+external fun __nursery_has_spawned(nursery: Nursery): bool;
 
 /// The ambient nursery's cancel signal, if any — read this to bridge an abortable
 /// host API that std doesn't wrap.
@@ -101,8 +113,8 @@ async external fun __nursery_run<T>(n: Nursery, body: async || T): T;
 /// holds it — `OwnedNursery`'s, without the resource. What a pipe run owns its
 /// tasks through (A142 §4.1): the run's owner holds it and cancels it when the run
 /// is released.
-export [internal("a pipe run's nursery (A142 §4.1); an application owns tasks with `nursery` or `OwnedNursery`")]
-fun detached_nursery(): Nursery {
+[internal("a pipe run's nursery (A142 §4.1); an application owns tasks with `nursery` or `OwnedNursery`")]
+export fun detached_nursery(): Nursery {
 	__nursery_new_detached()
 }
 
@@ -134,7 +146,7 @@ external fun __nursery_new_detached(): Nursery;
 /// children die at their next suspension. This is the owner for object-lifetime
 /// spawns that no function-scoped `nursery` can hold. The wrapped `Nursery` stays
 /// data (it is the ambient handle); ownership lives only in this wrapper.
-export [resource] struct OwnedNursery {
+[resource] export struct OwnedNursery {
 	nursery: Nursery,
 }
 

@@ -231,7 +231,8 @@ fn memo_maker_warnings(
     found
 }
 
-/// A135 door (c): a handle-returning `[rpc]` method whose tail is `.cell()`.
+/// A135 door (c): a handle-returning `[rpc]` method whose tail is `.cell()` or
+/// `.memo()` — the warning names whichever it is.
 ///
 /// A method is known to return a handle by the generated route that exports
 /// its answer: the `[service]` expansion writes `rpc::reply_source*(__request,
@@ -286,18 +287,24 @@ fn handle_tail_warnings(
             continue;
         };
         let name = function.name;
+        // The seal the tail names (`.cell()` or `.memo()`), and its program-lifetime
+        // twin for the steer — the warning names what the body wrote.
+        let seal = named_callee(program, tail_call)
+            .and_then(|callee| program.functions.get(&callee))
+            .map(|callee| callee.name)
+            .unwrap_or("cell");
         found.push(program.anchored(
             Error {
                 trace: Vec::new(),
                 span: call_span(program, tail_call),
                 msg: format!(
-                    "`{name}` returns a signal handle it builds with `.cell()` on every call: \
+                    "`{name}` returns a signal handle it builds with `.{seal}()` on every call: \
                      each call mints a fresh cell, so the reply never matches a channel this \
                      connection already carries (a capability and a forward per call), and \
                      the cell's subscription lives as long as the handler's owner (the \
                      connection under `Service::factory`, the service under `Service::new`). \
                      Return a cell that outlives the call — keep it on the service, keyed by \
-                     the arguments (a `Memo` whose maker writes `.cell_global()`)"
+                     the arguments (a `Memo` whose maker writes `.{seal}_global()`)"
                 ),
                 note: None,
             },

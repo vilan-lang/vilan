@@ -54,6 +54,564 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const B473_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Base<T> {\n",
+    "\tfun name(self, value: T): str {\n",
+    "\t\t\"the default\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Sub<T> with Base<T> {\n",
+    "\tfun tag(self): i32;\n",
+    "}\n",
+    "\n",
+    "trait Deeper with Sub<i32> {}\n",
+    "\n",
+    "struct Mine {}\n",
+    "\n",
+    "impl Mine with Sub<i32> {\n",
+    "\tfun tag(self): i32 {\n",
+    "\t\t7\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Mine with Base<i32> {\n",
+    "\tfun name(self, value: i32): str {\n",
+    "\t\ti\"the override {value}\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Mine with Deeper {}\n",
+    "\n",
+    "struct Plain {}\n",
+    "\n",
+    "impl Plain with Base<i32> {}\n",
+    "\n",
+    "impl Plain with Sub<i32> {\n",
+    "\tfun tag(self): i32 {\n",
+    "\t\t8\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Walk {\n",
+    "\tfun next(&mut self): Option<i32> {\n",
+    "\t\tNone\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait SubWalk with Walk {}\n",
+    "\n",
+    "struct Count { n: i32 }\n",
+    "\n",
+    "impl Count with Walk {\n",
+    "\tfun next(&mut self): Option<i32> {\n",
+    "\t\tif self.n >= 3 {\n",
+    "\t\t\tret None;\n",
+    "\t\t}\n",
+    "\t\tself.n += 1;\n",
+    "\t\tSome(self.n)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Count with SubWalk {}\n",
+    "\n",
+    "fun through_sub<S: Sub<i32>>(value: S): str {\n",
+    "\tvalue.name(1)\n",
+    "}\n",
+    "\n",
+    "fun through_deeper<S: Deeper>(value: S): str {\n",
+    "\tvalue.name(2)\n",
+    "}\n",
+    "\n",
+    "fun qualified<S: Sub<i32>>(value: S): str {\n",
+    "\tSub::name(value, 3)\n",
+    "}\n",
+    "\n",
+    "fun walk<W: SubWalk>(mut walker: W): i32 {\n",
+    "\tmut total = 0;\n",
+    "\tfor value in walker {\n",
+    "\t\ttotal += value;\n",
+    "\t}\n",
+    "\ttotal\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(through_sub(Mine {}));\n",
+    "\tprint(through_deeper(Mine {}));\n",
+    "\tprint(qualified(Mine {}));\n",
+    "\tprint(Sub::name(Mine {}, 4));\n",
+    "\tprint(through_sub(Plain {}));\n",
+    "\tprint(walk(Count { n = 0 }));\n",
+    "}\n",
+);
+const B467_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Holder {\n",
+    "\tf: |&mut str| void,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet h = Holder { f = |&mut p| {\n",
+    "\t\tp = \"direct ok\";\n",
+    "\t} };\n",
+    "\tmut s = \"old\";\n",
+    "\t(h.f)(&mut s);\n",
+    "\tprint(s);\n",
+    "\tmut edits: List<|&mut List<i32>| void> = [];\n",
+    "\tedits.push(|&mut list| list.push(7));\n",
+    "\tprint(edits.len());\n",
+    "}\n",
+);
+const RC_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "import std::delta::ListCell;\n",
+    "\n",
+    "struct P { x: i32, tags: List<i32> }\n",
+    "\n",
+    "struct Address { city: str, zip: str }\n",
+    "\n",
+    "fun copy_out(v: &P): P {\n",
+    "\tmut c: P = *v;\n",
+    "\tc.x = 99;\n",
+    "\tc.tags.push(5);\n",
+    "\tc\n",
+    "}\n",
+    "\n",
+    "fun returned(v: &P): P {\n",
+    "\t*v\n",
+    "}\n",
+    "\n",
+    "fun snapshot(v: &mut P): Option<P> {\n",
+    "\tlet snap = Some(*v);\n",
+    "\tv.x = 7;\n",
+    "\tv.tags.push(8);\n",
+    "\tsnap\n",
+    "}\n",
+    "\n",
+    "fun with_city(a: Address, f: |&str| void) {\n",
+    "\tf(&a.city);\n",
+    "}\n",
+    "\n",
+    "fun with_flag(f: |&bool| void) {\n",
+    "\tlet flag = true;\n",
+    "\tf(&flag);\n",
+    "}\n",
+    "\n",
+    "fun with_point(p: P, f: |&P| void) {\n",
+    "\tf(&p);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet xs: List<i32> = [1, 2];\n",
+    "\tlet cell = Shared::new(xs);\n",
+    "\tcell.write().push(3);\n",
+    "\tprint(i\"shared {xs.len()} {cell.read().len()}\");\n",
+    "\tlet ys: List<i32> = [1, 2];\n",
+    "\tlet list = ListCell::of(ys);\n",
+    "\tlist.push(3);\n",
+    "\tprint(i\"list {ys.len()} {list.get().len()}\");\n",
+    "\tlet zs: List<i32> = [1];\n",
+    "\tlet limited = ListCell::with_limit(zs, 4);\n",
+    "\tlimited.push(2);\n",
+    "\tprint(i\"limited {zs.len()} {limited.get().len()}\");\n",
+    "\tlet p = P { x = 1, tags = [] };\n",
+    "\tlet c = copy_out(&p);\n",
+    "\tprint(i\"deref {p.x} {p.tags.len()} {c.x} {c.tags.len()}\");\n",
+    "\tmut r = returned(&p);\n",
+    "\tr.tags.push(1);\n",
+    "\tprint(i\"returned {p.tags.len()} {r.tags.len()}\");\n",
+    "\tmut q = P { x = 2, tags = [] };\n",
+    "\tlet snap = snapshot(&mut q);\n",
+    "\tmatch snap {\n",
+    "\t\tSome(let s) => print(i\"snapshot {s.x} {s.tags.len()} {q.x} {q.tags.len()}\"),\n",
+    "\t\tNone => print(\"none\"),\n",
+    "\t}\n",
+    "\tlet home = Address { city = \"Oslo\", zip = \"1\" };\n",
+    "\tmut out = \"\";\n",
+    "\twith_city(home, |c| {\n",
+    "\t\tout = *c;\n",
+    "\t});\n",
+    "\tprint(out);\n",
+    "\tmut seen = false;\n",
+    "\twith_flag(|b| {\n",
+    "\t\tseen = *b;\n",
+    "\t});\n",
+    "\tprint(seen);\n",
+    "\tmut total = 0;\n",
+    "\twith_point(p, |point| {\n",
+    "\t\ttotal = point.x;\n",
+    "\t});\n",
+    "\tprint(total);\n",
+    "}\n",
+);
+const B474_PROBE: &str = concat!(
+    "import std::json::json_codec;\n",
+    "import std::io::print;\n",
+    "import std::option::Option::{ None, Some, self };\n",
+    "import std::reactive::{ Signal, SignalCell, Source };\n",
+    "import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };\n",
+    "\n",
+    "fun through_the_trait<T, S: Source<T>>(source: S, observe: |T| void) {\n",
+    "\tlet live = source.sub(|value| observe(value));\n",
+    "\tlive.dispose();\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet (client_end, server_end) = duplex_pair();\n",
+    "\tlet counter: SignalCell<i32> = Signal::new(9);\n",
+    "\tlet channel = ReactiveServer::new(server_end, json_codec()).expose(counter);\n",
+    "\tlet remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);\n",
+    "\tthrough_the_trait(remote, |value: Option<i32>| match value {\n",
+    "\t\tSome(let n) => print(i\"trait:{n}\"),\n",
+    "\t\tNone => print(\"trait:none\"),\n",
+    "\t});\n",
+    "\tlet present = remote.sub(|value: i32| print(i\"inherent:{value}\"));\n",
+    "\tcounter.set(10);\n",
+    "\tpresent.dispose();\n",
+    "}\n",
+);
+const B453_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun bump(slot: &mut i32) {\n",
+    "\tslot += 10;\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut pair = (1, 2);\n",
+    "\tlet v = &mut pair.1;\n",
+    "\tv = 3;\n",
+    "\tprint(pair.1);\n",
+    "\tbump(&mut pair.0);\n",
+    "\tprint(pair.0);\n",
+    "\tmut triple: (str, i32, bool) = (\"a\", 5, false);\n",
+    "\tlet flag = &mut triple.2;\n",
+    "\tflag = true;\n",
+    "\tprint(i\"{triple.0} {triple.1} {triple.2}\");\n",
+    "}\n",
+);
+const B444_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Box2 { n: i32, label: str }\n",
+    "\n",
+    "fun first(xs: &List<i32>): &i32 borrows xs {\n",
+    "\t&xs[0]\n",
+    "}\n",
+    "\n",
+    "fun label_of(b: &Box2): &str borrows b {\n",
+    "\t&b.label\n",
+    "}\n",
+    "\n",
+    "fun twice(n: i32): i32 {\n",
+    "\tn * 2\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet xs = [7, 8];\n",
+    "\tprint(i\"{first(&xs)}\");\n",
+    "\tlet v = first(&xs);\n",
+    "\tprint(i\"v={v}\");\n",
+    "\tprint(v + 1);\n",
+    "\tprint(twice(first(&xs)));\n",
+    "\tprint(first(&xs));\n",
+    "\tlet b = Box2 { n = 1, label = \"lab\" };\n",
+    "\tprint(i\"{label_of(&b)}!\");\n",
+    "\tprint(*v);\n",
+    "}\n",
+);
+const B464_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct A { x: i32, s: str }\n",
+    "\n",
+    "fun apply(f: sync |&mut str| void) {\n",
+    "\tmut a = A { x = 1, s = \"old\" };\n",
+    "\tf(&mut a.s);\n",
+    "\tprint(a.s);\n",
+    "\tmut s = \"old\";\n",
+    "\tf(&mut s);\n",
+    "\tprint(s);\n",
+    "\tmut xs = [\"old\"];\n",
+    "\tf(&mut xs[0]);\n",
+    "\tprint(xs[0]);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tapply(|&mut p| {\n",
+    "\t\tp = \"new\";\n",
+    "\t});\n",
+    "}\n",
+);
+const B504_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun show(v: &i32) {\n",
+    "\tprint(*v);\n",
+    "}\n",
+    "\n",
+    "fun show_str(v: &str) {\n",
+    "\tprint(*v);\n",
+    "}\n",
+    "\n",
+    "fun lend_match(held: Option<str>, f: |&str| void) {\n",
+    "\tmatch held {\n",
+    "\t\tSome(let payload) => {\n",
+    "\t\t\tf(&payload);\n",
+    "\t\t\tprint(payload);\n",
+    "\t\t},\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun lend_generic<T>(held: Option<T>, f: |&T| void) {\n",
+    "\tmatch held {\n",
+    "\t\tSome(let payload) => f(&payload),\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlend_match(Some(\"ally\"), |&v: &str| print(*v));\n",
+    "\tlend_generic(Some(\"ally\"), |&v: &str| print(*v));\n",
+    "\tlend_generic(Some(7), |&v: &i32| print(*v));\n",
+    "\tlet (a, b) = (4, \"five\");\n",
+    "\tshow(&a);\n",
+    "\tshow_str(&b);\n",
+    "\tprint(a + 1);\n",
+    "\tfor i in [6, 7] {\n",
+    "\t\tshow(&i);\n",
+    "\t\tprint(i * 10);\n",
+    "\t}\n",
+    "\tif Some(9) is Some(let nine) {\n",
+    "\t\tshow(&nine);\n",
+    "\t\tprint(nine);\n",
+    "\t}\n",
+    "\tmatch Some(10) {\n",
+    "\t\tSome(let q) => {\n",
+    "\t\t\tlet w = &q;\n",
+    "\t\t\tprint(*w + q);\n",
+    "\t\t},\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+);
+const B506_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Pair<T> {\n",
+    "\tleft: T,\n",
+    "}\n",
+    "\n",
+    "fun first<T>(xs: &List<T>): &T borrows xs {\n",
+    "\t&xs[0]\n",
+    "}\n",
+    "\n",
+    "fun left_of<T>(pair: &Pair<T>): &T borrows pair {\n",
+    "\t&pair.left\n",
+    "}\n",
+    "\n",
+    "fun lend<T>(pair: &Pair<T>, f: |&T| void) {\n",
+    "\tf(&pair.left);\n",
+    "}\n",
+    "\n",
+    "fun lend_through_binding<T>(pair: &Pair<T>, f: |&T| void) {\n",
+    "\tlet v = &pair.left;\n",
+    "\tf(v);\n",
+    "}\n",
+    "\n",
+    "fun lend_parameter<T>(x: T, f: |&T| void) {\n",
+    "\tf(&x);\n",
+    "}\n",
+    "\n",
+    "fun read_back<T>(x: T): T {\n",
+    "\tlet v = &x;\n",
+    "\t*v\n",
+    "}\n",
+    "\n",
+    "fun lend_transient<T>(x: T, f: |&T| void) {\n",
+    "\tmatch Some(&x) {\n",
+    "\t\tSome(let v) => f(v),\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun bump_generic<T>(mut x: T, f: |&mut T| void): T {\n",
+    "\tf(&mut x);\n",
+    "\tx\n",
+    "}\n",
+    "\n",
+    "fun write_left<T>(pair: &mut Pair<T>, f: |&mut T| void) {\n",
+    "\tf(&mut pair.left);\n",
+    "}\n",
+    "\n",
+    "fun relend<T>(x: &T, f: |&T| void) {\n",
+    "\tf(&x);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlend(&Pair { left = 1 }, |v: &i32| print(*v));\n",
+    "\tlend(&Pair { left = \"ab\" }, |v: &str| print(*v));\n",
+    "\tlend(&Pair { left = [2, 3] }, |v: &List<i32>| print(v.len()));\n",
+    "\tlend_through_binding(&Pair { left = 4 }, |v: &i32| print(*v));\n",
+    "\tlend_parameter(5, |v: &i32| print(*v));\n",
+    "\tlend_parameter(true, |v: &bool| print(*v));\n",
+    "\tprint(read_back(6));\n",
+    "\tprint(read_back(\"seven\"));\n",
+    "\tlend_transient(8, |v: &i32| print(*v));\n",
+    "\tprint(bump_generic(9, |v: &mut i32| { v = *v + 1; }));\n",
+    "\tprint(*first(&[11, 12]));\n",
+    "\tprint(*left_of(&Pair { left = 13 }));\n",
+    "\tmut pair = Pair { left = 1 };\n",
+    "\twrite_left(&mut pair, |v: &mut i32| { v = *v + 41; });\n",
+    "\tprint(pair.left);\n",
+    "\tmut words = Pair { left = \"a\" };\n",
+    "\twrite_left(&mut words, |v: &mut str| { v = *v + \"b\"; });\n",
+    "\tprint(words.left);\n",
+    "\trelend(&pair.left, |v: &i32| print(*v));\n",
+    "}\n",
+);
+const B505_PROBE: &str = concat!(
+    "import std::compare::PartialEq;\n",
+    "import std::io::print;\n",
+    "\n",
+    "trait Same {\n",
+    "\tfun same(&self, other: &Self): bool;\n",
+    "}\n",
+    "\n",
+    "impl type T: PartialEq with Same {\n",
+    "\tfun same(&self, other: &T): bool {\n",
+    "\t\t*self == *other\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Bump {\n",
+    "\tfun bump(&mut self);\n",
+    "\tfun peek(&self): i32;\n",
+    "}\n",
+    "\n",
+    "impl i32 with Bump {\n",
+    "\tfun bump(&mut self) {\n",
+    "\t\tself = *self + 1;\n",
+    "\t}\n",
+    "\tfun peek(&self): i32 {\n",
+    "\t\t*self\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Flip {\n",
+    "\tfun flip(&mut self);\n",
+    "}\n",
+    "\n",
+    "impl bool with Flip {\n",
+    "\tfun flip(&mut self) {\n",
+    "\t\tself = !*self;\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Counter {\n",
+    "\tcount: i32,\n",
+    "}\n",
+    "\n",
+    "fun show(v: &i32) {\n",
+    "\tprint(*v);\n",
+    "}\n",
+    "\n",
+    "fun generic<T: Same>(a: T, b: T): bool {\n",
+    "\ta.same(&b)\n",
+    "}\n",
+    "\n",
+    "fun bump_twice<T: Bump>(mut x: T): T {\n",
+    "\tx.bump();\n",
+    "\tx.bump();\n",
+    "\tx\n",
+    "}\n",
+    "\n",
+    "fun peek_view(v: &i32): i32 {\n",
+    "\tv.peek()\n",
+    "}\n",
+    "\n",
+    "fun bump_view(v: &mut i32) {\n",
+    "\tv.bump();\n",
+    "}\n",
+    "\n",
+    "fun param(x: i32) {\n",
+    "\tshow(&x);\n",
+    "\tprint(x.peek());\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(1.same(&1));\n",
+    "\tprint(generic(\"x\", \"x\"));\n",
+    "\tprint(generic(1, 2));\n",
+    "\tlet a = 1;\n",
+    "\tlet b = 1;\n",
+    "\tprint(a.same(&b));\n",
+    "\tmut x = 1;\n",
+    "\tx.bump();\n",
+    "\tprint(x);\n",
+    "\tprint(x.peek());\n",
+    "\tprint(7.peek());\n",
+    "\tprint((3 + 4).peek());\n",
+    "\tshow(&11);\n",
+    "\tshow(&(a + 8));\n",
+    "\tparam(12);\n",
+    "\tlet apply = |n: i32| show(&n);\n",
+    "\tapply(13);\n",
+    "\tmut counter = Counter { count = 1 };\n",
+    "\tcounter.count.bump();\n",
+    "\tprint(counter.count);\n",
+    "\tmut xs = [10, 20];\n",
+    "\txs[0].bump();\n",
+    "\tprint(xs[0]);\n",
+    "\tmut pair = (5, \"p\");\n",
+    "\tpair.0.bump();\n",
+    "\tprint(pair.0);\n",
+    "\tprint(bump_twice(7));\n",
+    "\tprint(peek_view(&xs[1]));\n",
+    "\tbump_view(&mut xs[1]);\n",
+    "\tprint(xs[1]);\n",
+    "\tmut flag = false;\n",
+    "\tflag.flip();\n",
+    "\tprint(flag);\n",
+    "}\n",
+);
+const B496_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct P {\n",
+    "\tx: i32,\n",
+    "}\n",
+    "\n",
+    "struct Holder {\n",
+    "\tp: P,\n",
+    "}\n",
+    "\n",
+    "fun inner(holder: &Holder): &P borrows holder {\n",
+    "\t&holder.p\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut a = P { x = 1 };\n",
+    "\tmut out = P { x = 0 };\n",
+    "\tout = *&a;\n",
+    "\tout.x = 99;\n",
+    "\tprint(a.x);\n",
+    "\tlet holder = Holder { p = P { x = 2 } };\n",
+    "\tout = *inner(&holder);\n",
+    "\tout.x = 98;\n",
+    "\tprint(holder.p.x);\n",
+    "\tmut n = 1;\n",
+    "\tlet m = 5;\n",
+    "\tn = *&m;\n",
+    "\tprint(n + 1);\n",
+    "}\n",
+);
+
 /// The programs the default suite runs — small, fast, and between them they
 /// cover every value shape S1a claims: scalars, `str`, `bool`, a struct with an
 /// `impl`, an enum with a payload, a `List`, a `match`, a loop, recursion.
@@ -176,6 +734,10 @@ const DEFAULT_SUITE: &[&str] = &[
     // over a `"type"` key — and the Rust emitter's own keywords (`type`,
     // `match`, `if`, `in`, `for`, `ret`) must survive as member names natively.
     "keyword-members.vl",
+    // F62: `a.write().count = a.write().count + 1` — a field read and written
+    // through a `Shared` view, refused by name until the read became a scoped
+    // borrow and the place's statement settled its value first.
+    "shared.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -219,6 +781,25 @@ const ASYNC_SUITE: &[&str] = &[
     "reactive-turns.vl",
     "time.vl",
 ];
+
+/// F57: the corpus programs that reach a platform module and that the
+/// backend BUILDS — the ones the platform-free sweep leaves out by
+/// construction, so no gate saw them. `crypto.vl` was rustc E0382 at the
+/// Order 44 seal (a host binding's by-value argument moved its `salt`) behind
+/// an E0308 (a `match` literal pattern written at the arms' width over a
+/// `usize`), and nothing ran it. [`every_platform_bound_program_is_identical_or_named`]
+/// requires these four and classifies the rest.
+const PLATFORM_BOUND_REQUIRED: &[&str] =
+    &["crypto.vl", "db.vl", "asset_bundle.vl", "element-syntax.vl"];
+
+/// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
+/// agree on for a reason that is not the program's, named with the reason.
+const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[(
+    "estate.vl",
+    "the JS `vilan run` prints its build's asset report (`Bundled  robots.txt`, ...) on \
+     STDOUT ahead of the program's output, and the native run reports nothing; the \
+     program's own three lines are identical",
+)];
 
 /// Modules whose presence in an `import` means the program reaches a platform
 /// surface S1a has none of. Written as a support list so Order 38 widens the
@@ -287,6 +868,30 @@ pub fn platform_free_programs() -> Vec<String> {
                 .iter()
                 .any(|(excluded, _)| *excluded == name);
             if !reaches_a_platform && !outside {
+                programs.push(name);
+            }
+        }
+    }
+    programs.sort();
+    programs
+}
+
+/// Every corpus program that reaches a platform module and is not one of
+/// [`ASYNC_SUITE`]'s (which has its own gate), in a stable order — the
+/// complement of [`platform_free_programs`] over the same walk.
+fn platform_bound_programs() -> Vec<String> {
+    let free = platform_free_programs();
+    let mut programs = Vec::new();
+    let entries = std::fs::read_dir(corpus_dir()).expect("read the corpus directory");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "vl") {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let outside = OUTSIDE_THE_DIFFERENTIAL
+                .iter()
+                .chain(PLATFORM_BOUND_OUTSIDE)
+                .any(|(excluded, _)| *excluded == name);
+            if !free.contains(&name) && !ASYNC_SUITE.contains(&name.as_str()) && !outside {
                 programs.push(name);
             }
         }
@@ -856,6 +1461,78 @@ const HASH_PROBE: &str = concat!(
     "}\n",
 );
 
+/// A138 S0 (`reactive-maps-sets.md` §6.1, I10): insertion order is the contract
+/// of `HashMap` and `HashSet`, and the case the overwrite pin above does not
+/// reach is a key REMOVED and inserted again — it goes to the END, on both
+/// backends, as a JS `Map` puts it. The native map keeps a tombstone where the
+/// key stood, so a runtime that revived the tombstone (or a compaction that
+/// re-slotted it) would print the key back in its old place; the walks below
+/// print the order after each step, with a removal at the front, in the middle
+/// and of the last key, then a churn through the same key that leaves a hole
+/// behind every pass.
+#[test]
+fn a_removed_and_reinserted_key_goes_to_the_end_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_reinsert.vl"),
+        REINSERT_ORDER_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_reinsert.vl"),
+        Verdict::Identical,
+        "a removed and re-inserted key must go to the end on both backends"
+    );
+}
+
+const REINSERT_ORDER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::hash_map::HashMap;\n",
+    "import std::hash_set::HashSet;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut map: HashMap<str, i32> = HashMap::new();\n",
+    "\tmap.insert(\"a\", 1);\n",
+    "\tmap.insert(\"b\", 2);\n",
+    "\tmap.insert(\"c\", 3);\n",
+    // The front leaves and comes back: the end.
+    "\tmap.remove(\"a\");\n",
+    "\tmap.insert(\"a\", 10);\n",
+    "\tprint(map.keys());\n",
+    // The middle.
+    "\tmap.remove(\"c\");\n",
+    "\tmap.insert(\"d\", 4);\n",
+    "\tmap.insert(\"c\", 30);\n",
+    "\tprint(map.keys());\n",
+    "\tprint(map.values());\n",
+    // The last key, out and back: nothing moves.
+    "\tmap.remove(\"c\");\n",
+    "\tmap.insert(\"c\", 31);\n",
+    "\tprint(map.entries());\n",
+    // A churn through one key, with another arriving between passes.
+    "\tmut pass = 0;\n",
+    "\tfor pass < 3 {\n",
+    "\t\tmap.remove(\"b\");\n",
+    "\t\tmap.insert(\"e\", pass);\n",
+    "\t\tmap.remove(\"e\");\n",
+    "\t\tmap.insert(\"b\", pass);\n",
+    "\t\tpass += 1;\n",
+    "\t}\n",
+    "\tprint(map.keys());\n",
+    "\tprint(map.len());\n",
+    // The set's members, the same way.
+    "\tmut set: HashSet<i32> = [3, 1, 2].to_set();\n",
+    "\tset.remove(3);\n",
+    "\tset.insert(3);\n",
+    "\tset.insert(1);\n",
+    "\tprint(set.values());\n",
+    "\tset.remove(2);\n",
+    "\tset.insert(4);\n",
+    "\tset.insert(2);\n",
+    "\tprint(set.values());\n",
+    "}\n",
+);
+
 /// I9 / Q8: `HashMap` and `HashSet` equality is ORDER-INSENSITIVE on both
 /// backends — the same keys with equal values (the same members), whatever the
 /// insertion order. The native runtime's own `PartialEq for Map` is
@@ -945,6 +1622,54 @@ fn a142_collection_pipes_build_the_same_on_both_backends() {
             compare(&staged, name),
             Verdict::Identical,
             "{name}: a collection pipe must build and answer the same on both backends"
+        );
+    }
+}
+
+/// A138 S1 and S2: `HashMapCell`, `HashSetCell` and the map operators on both backends —
+/// their seeded random walks (`inference/maps.rs` runs the same programs on JS),
+/// checked against a plain `HashMap`/`HashSet` after every write: the collection
+/// and its order, a mirror replayed from the drained ops, every watched key's
+/// handle and how often it woke — plus `keys()`, a set pipe, and a `HashMapEntry`'s
+/// `set(Some(v))`/`set(None)` writes. `HashSetCell`, `SetOp` and `keys()` were
+/// refused natively until F72 (a variant of the one-parameter, BOUNDED
+/// `SetOp<T: Hashable>` was typed as a bare trait object).
+#[test]
+fn a138_map_and_set_cells_build_the_same_on_both_backends() {
+    let staged = stage();
+    for (name, program, what) in [
+        (
+            "native_probe_map_walk.vl",
+            include_str!("native/map_walk.vl"),
+            "a HashMapCell",
+        ),
+        // A138 S2: the map operators' walk.
+        (
+            "native_probe_map_operator_walk.vl",
+            include_str!("native/map_operator_walk.vl"),
+            "the map operators",
+        ),
+        (
+            "native_probe_set_walk.vl",
+            include_str!("native/set_walk.vl"),
+            "a HashSetCell",
+        ),
+        (
+            "native_probe_map_keys_pipe.vl",
+            include_str!("native/map_keys_pipe.vl"),
+            "`keys()` and `values()`",
+        ),
+        (
+            "native_probe_map_entry_writes.vl",
+            include_str!("native/map_entry_writes.vl"),
+            "a HashMapEntry's writes",
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{what} must build and answer the same on both backends"
         );
     }
 }
@@ -1980,6 +2705,401 @@ const TRACKING_PROBE: &str = concat!(
     "\ta.set(6);\n",
     "\tprint(i\"untracked {untracked.get()}\");\n",
     "\tsums.dispose();\n",
+    "\towner.dispose();\n",
+    "}\n",
+);
+
+/// B475: a pipe over a `dyn Source<T>` STARTS the object through a `Flow`
+/// bound, so the object's table carries `Flow::start` (a supertrait member) —
+/// a `derive` sealed with `.cell()`, one consumed by `on_change`, one read with
+/// `.sample()`, and the total join `switch(|inner| inner)` over a cell of
+/// objects. JS threw "start is not a function"; both backends agree now.
+#[test]
+fn a_pipe_over_a_source_object_starts_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b475.vl"), B475_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b475.vl"),
+        Verdict::Identical,
+        "a pipe over a source object must start it the same way on both backends"
+    );
+}
+
+const B475_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ SignalCell, Source };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet cell = SignalCell::new(1);\n",
+    "\tlet object: dyn Source<i32> = cell;\n",
+    "\tlet cached = object.derive(|n: i32| n + 1).cell();\n",
+    "\tlet watch = object.derive(|n: i32| n * 10).on_change(|n: i32| print(i\"saw {n}\"));\n",
+    "\tlet outer = SignalCell::new(object);\n",
+    "\tlet flat = outer.switch(|inner: dyn Source<i32>| inner).memo();\n",
+    "\tcell.set(5);\n",
+    "\tprint(i\"{object.derive(|n: i32| n + 1).sample()} {cached.get()} {flat.get()}\");\n",
+    "\twatch.dispose();\n",
+    "}\n",
+);
+
+/// B478: a named function and a variant at a `context`-typed closure position
+/// — `count.derive(Some)`, `count.derive(double)`, `count.effect(show)`. JS
+/// ignores the hidden context arguments the caller appends; natively the value
+/// is adapted to the position's arity (the function item alone was refused by
+/// rustc, E0593).
+#[test]
+fn a_named_function_at_a_context_typed_position_runs_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b478.vl"), B478_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b478.vl"),
+        Verdict::Identical,
+        "a named function or a variant must stand for a context-typed body on both backends"
+    );
+}
+
+const B478_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Owner, SignalCell, Source, run_with_owner };\n",
+    "\n",
+    "fun show(value: i32) {\n",
+    "\tprint(i\"show {value}\");\n",
+    "}\n",
+    "\n",
+    "fun double(value: i32): i32 {\n",
+    "\tvalue * 2\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = SignalCell::new(4);\n",
+    "\tlet wrapped = count.derive(Some).memo();\n",
+    "\tlet doubled = count.derive(double).memo();\n",
+    "\tlet owner = Owner::new();\n",
+    "\trun_with_owner(owner, || {\n",
+    "\t\tcount.effect(show);\n",
+    "\t});\n",
+    "\tcount.set(5);\n",
+    "\tprint(wrapped.get().unwrap() + doubled.get());\n",
+    "\towner.dispose();\n",
+    "}\n",
+);
+
+/// B480 + B484: a binder bound through a trait ARGUMENT, reached through an
+/// object — `switch`'s `U` from a `dyn Flow<i32>` selector with nothing
+/// written, and a collection pipe over a list of `dyn Source<Option<str>>`
+/// whose `filter_map(|source| source)` binds `R: IntoFlow<Option<U>>`'s `U`
+/// from the object's own trait argument. Natively the second reached the
+/// emitter with `U` unbound and was refused by name.
+#[test]
+fn a_binder_through_an_objects_trait_argument_is_bound_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b480.vl"), B480_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b480.vl"),
+        Verdict::Identical,
+        "a binder through an object's trait argument must bind on both backends"
+    );
+}
+
+const B480_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Flow, ListCell, Signal, SignalCell, Source, comp };\n",
+    "\n",
+    "fun arm(on: bool, count: SignalCell<i32>): dyn Flow<i32> {\n",
+    "\tif on {\n",
+    "\t\tcount.derive(|value| value * 100)\n",
+    "\t} else {\n",
+    "\t\tcount\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet flag = Signal::new(true);\n",
+    "\tlet count = Signal::new(1);\n",
+    "\tlet picked = flag.switch(|on| arm(on, count)).memo();\n",
+    "\tprint(picked.get());\n",
+    "\tflag.set(false);\n",
+    "\tcount.set(3);\n",
+    "\tprint(picked.get());\n",
+    "\tlet a: SignalCell<Option<str>> = Signal::new(Some(\"a\"));\n",
+    "\tlet b: SignalCell<Option<str>> = Signal::new(None);\n",
+    "\tlet first: dyn Source<Option<str>> = a;\n",
+    "\tlet second: dyn Source<Option<str>> = b;\n",
+    "\tlet sources: ListCell<dyn Source<Option<str>>> = ListCell::of([first, second]);\n",
+    "\tlet (loaded, scope) = comp(|| sources.filter_map(|source| source).memo());\n",
+    "\tprint(loaded.get().len());\n",
+    "\tb.set(Some(\"b\"));\n",
+    "\tlet names = loaded.get();\n",
+    "\tprint(names[0] + names[1]);\n",
+    "\tscope.dispose();\n",
+    "}\n",
+);
+
+/// B482: an injected callback called inside `clear` of its own context gets
+/// the CLEARED state — `get_safe` is `None` there and the bare value's `Some`
+/// from a plain call through the same position — and natively the position's
+/// closure type carries the context as an `Option` (`cleared_clause_contexts`),
+/// which every literal landing there agrees with, beside a `run` body and a
+/// plain injected position that stay bare.
+#[test]
+fn a_callback_called_inside_clear_reads_the_context_as_absent_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b482.vl"), B482_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b482.vl"),
+        Verdict::Identical,
+        "a cleared callback must read the context as absent on both backends"
+    );
+}
+
+const B482_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::option::Option::{ Some, None };\n",
+    "\n",
+    "let current: Context<i32> = Context::new();\n",
+    "\n",
+    "fun describe(): str {\n",
+    "\tmatch current.get_safe() {\n",
+    "\t\tSome(let value) => i\"some {value}\",\n",
+    "\t\tNone => \"none\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun notify(callback: (|i32| void) context current) {\n",
+    "\tcurrent.clear(|| callback(1));\n",
+    "}\n",
+    "\n",
+    "fun twice(callback: (|i32| void) context current) {\n",
+    "\tcallback(1);\n",
+    "\tcurrent.clear(|| callback(2));\n",
+    "}\n",
+    "\n",
+    "fun plain(callback: (|i32, i32| void) context current) {\n",
+    "\tcallback(3, 4);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tcurrent.run(7, || {\n",
+    "\t\tnotify(|n: i32| print(i\"{n} {describe()}\"));\n",
+    "\t\ttwice(|n: i32| print(i\"{n} {describe()}\"));\n",
+    "\t\tplain(|n: i32, m: i32| print(n + m + current.get()));\n",
+    "\t});\n",
+    "}\n",
+);
+
+/// J7 + M92: a spawn in a literal born under `context ambient_nursery` — a
+/// user-written clause, and a pipe body's — is OWNED by the nursery its caller
+/// injects: cancelled with it, and its cancellation absorbed (native-44 found JS
+/// reporting two "unhandled task error … AbortError" lines here and native none).
+/// A run that starts no task hands its nursery on (`nurseries=0`). Stdout the
+/// same on both backends, and stderr empty on both.
+#[test]
+fn an_injected_nurserys_spawn_is_owned_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_j7.vl"), J7_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_j7.vl"),
+        Verdict::Identical,
+        "an injected nursery's spawn must be owned the same way on both backends"
+    );
+    for backend in [None, Some("rust")] {
+        let mut command = vilan(&staged);
+        command.arg("run");
+        if let Some(backend) = backend {
+            command.args(["--backend", backend]);
+        }
+        let output = command
+            .arg("native_probe_j7.vl")
+            .output()
+            .expect("run the probe");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "nurseries=0 value=12\nfetched 3\ndone\n",
+            "backend {backend:?}"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "a cancelled owned task reports nothing (backend {backend:?}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+const J7_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Owner, Signal, SignalCell, Source, run_nurseries_allocated, run_with_owner };\n",
+    "import std::task::{ ambient_nursery, detached_nursery };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "fun single(body: (|| void) context ambient_nursery) {\n",
+    "\tlet held = detached_nursery();\n",
+    "\tambient_nursery.run(held, body);\n",
+    "\theld.cancel();\n",
+    "}\n",
+    "\n",
+    "fun fetch_later(value: i32) {\n",
+    "\tlet _pending = async {\n",
+    "\t\tsleep(30);\n",
+    "\t\tprint(i\"fetched {value}\");\n",
+    "\t};\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tsingle(|| {\n",
+    "\t\tlet _task = async {\n",
+    "\t\t\tsleep(20);\n",
+    "\t\t\tprint(\"single survived\");\n",
+    "\t\t};\n",
+    "\t});\n",
+    "\tlet id: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet boundary = Owner::new();\n",
+    "\tlet sealed = run_with_owner(boundary, || id.derive(|value: i32| value * 4).memo());\n",
+    "\tlet before = run_nurseries_allocated();\n",
+    "\tid.set(2);\n",
+    "\tid.set(3);\n",
+    "\tprint(i\"nurseries={run_nurseries_allocated() - before} value={sealed.get()}\");\n",
+    "\trun_with_owner(boundary, || {\n",
+    "\t\tid.effect(|value: i32| fetch_later(value));\n",
+    "\t});\n",
+    "\tid.set(4);\n",
+    "\tid.set(3);\n",
+    "\tsleep(120);\n",
+    "\tboundary.dispose();\n",
+    "\tprint(\"done\");\n",
+    "}\n",
+);
+
+/// A146: `ListCell` and `KeyedCell` name their identity, so a body that tracks
+/// one on every run keeps ONE edge on it (`attaches=1`) on both backends. (The
+/// mirror half, `RemoteSource` and `KeyedSource` over `duplex_pair`, is
+/// `inference::tracking`'s A146 program, natively in
+/// `an_in_process_mirror_program_is_identical_on_both_backends` since F74.)
+#[test]
+fn a_tracked_list_or_keyed_cell_keeps_one_edge_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_a146.vl"), A146_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_a146.vl"),
+        Verdict::Identical,
+        "a tracked list or keyed cell must keep one edge the same way on both backends"
+    );
+    let output = vilan(&staged)
+        .args(["run", "native_probe_a146.vl"])
+        .output()
+        .expect("run the probe");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "list attaches=1\nkeyed cell attaches=1\n5 2 1\n",
+        "one edge per source across six runs (red before A146: `attaches=6`)"
+    );
+}
+
+const A146_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, derive };\n",
+    "import std::delta::ListCell;\n",
+    "import std::rpc::{ KeyedCell, Keyed };\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "// Counts the edges a tracked read attaches to the wrapped source, and answers the\n",
+    "// wrapped source's identity.\n",
+    "struct Counted<S> {\n",
+    "\tinner: S,\n",
+    "\tattaches: Shared<i32>,\n",
+    "}\n",
+    "\n",
+    "impl Counted<type S: Source<type T>> with Source<T> {\n",
+    "\tfun get(self): T {\n",
+    "\t\tself.inner.get()\n",
+    "\t}\n",
+    "\n",
+    "\tfun on_settle(self, subscriber: Subscriber): Subscription {\n",
+    "\t\tself.attaches.write() = self.attaches.read() + 1;\n",
+    "\t\tself.inner.on_settle(subscriber)\n",
+    "\t}\n",
+    "\n",
+    "\tfun identity(self): Option<i32> {\n",
+    "\t\tself.inner.identity()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun counted<S>(inner: S): Counted<S> {\n",
+    "\tCounted { inner, attaches = Shared::new(0) }\n",
+    "}\n",
+    "\n",
+    "[derive(Wire)]\n",
+    "struct Row {\n",
+    "\tid: str,\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Row with Keyed<str> {\n",
+    "\tfun key(self): str {\n",
+    "\t\tself.id\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet list = counted(ListCell::of([1, 2]));\n",
+    "\tlet keyed: Counted<KeyedCell<str, Row>> = counted(KeyedCell::new([Row { id = \"a\", n = 1 }]));\n",
+    "\tlet trigger: SignalCell<i32> = Signal::new(0);\n",
+    "\tlet sealed = derive(|| {\n",
+    "\t\ti\"{trigger.track()} {list.track().len()} {keyed.track().len()}\"\n",
+    "\t}).memo();\n",
+    "\tmut step = 1;\n",
+    "\tfor step <= 5 {\n",
+    "\t\ttrigger.set(step);\n",
+    "\t\tstep += 1;\n",
+    "\t}\n",
+    "\tprint(i\"list attaches={list.attaches.read()}\");\n",
+    "\tprint(i\"keyed cell attaches={keyed.attaches.read()}\");\n",
+    "\tprint(sealed.get());\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);
+
+/// B482's std half: `on_change`, `sub` and `effect_on_change` call their
+/// callback under `tracking.clear(..)`, so a callback minted inside an effect
+/// body reads `tracking` as absent — the same on both backends.
+#[test]
+fn a_base_callback_runs_with_tracking_cleared_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b482_std.vl"), B482_STD_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b482_std.vl"),
+        Verdict::Identical,
+        "a base callback must run with tracking cleared the same way on both backends"
+    );
+}
+
+const B482_STD_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner, tracking };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet other: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet owner = Owner::new();\n",
+    "\trun_with_owner(owner, || {\n",
+    "\t\tcount.effect(|_value: i32| {\n",
+    "\t\t\tprint(i\"body {tracking.get_safe().is_some()}\");\n",
+    "\t\t\tlet _changed = other.on_change(|value| print(i\"on_change {value} {tracking.get_safe().is_none()}\"));\n",
+    "\t\t\tlet _subbed = other.sub(|value| print(i\"sub {value} {tracking.get_safe().is_none()}\"));\n",
+    "\t\t\tother.effect_on_change(|value| print(i\"effect_on_change {value} {tracking.get_safe().is_none()}\"));\n",
+    "\t\t});\n",
+    "\t});\n",
+    "\tother.set(2);\n",
     "\towner.dispose();\n",
     "}\n",
 );
@@ -4722,23 +5842,22 @@ const AND_THEN_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F38's boundary, moved by B424: `result-combinators.vl` stopped at
-/// `or_else<F>` over an `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose
-/// `F` nothing in the program constrained. The ruling (R-h, door (b)) gives
-/// that `F` the input's error type, and `err.or(Ok(3))`'s likewise, so both
-/// emit now. The program stops one wall further on: `ok.and(Ok(5))`'s
-/// ARGUMENT, a constructor whose own error parameter the analyzer leaves
-/// open although its landing position (`Result<U, E>` at the receiver's
-/// `E`) fixes it — refused by name, not broken.
+/// F38's boundary, moved by B424 and closed by B454: `result-combinators.vl`
+/// stopped at `or_else<F>` over an `Ok`-only closure (`err.or_else(|e|
+/// Ok(7))`), whose `F` nothing in the program constrained — the ruling (R-h,
+/// door (b)) gives that `F` the input's error type, and `err.or(Ok(3))`'s
+/// likewise — and then at `ok.and(Ok(5))`, whose result lost the receiver's
+/// `E`: the argument, typed in `Result`'s own terms, reconciled `E` back to
+/// itself over the receiver's `str` (a self-binding is no evidence now). The
+/// whole program builds natively and prints node's bytes.
 #[test]
-fn an_unconstrained_generic_parameter_is_refused_by_name() {
+fn result_combinators_is_identical_on_both_backends() {
     let staged = stage();
-    match compare(&staged, "result-combinators.vl") {
-        Verdict::Refused(reason) => {
-            assert!(reason.contains("parameter 2 of enum `Result`"), "{reason}")
-        }
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
+    assert_eq!(
+        compare(&staged, "result-combinators.vl"),
+        Verdict::Identical,
+        "every combinator of `result-combinators.vl` must build natively and agree"
+    );
 }
 
 /// **F37**: a PARTIAL move where the source's order asks for one, and the
@@ -4757,9 +5876,13 @@ fn an_unconstrained_generic_parameter_is_refused_by_name() {
 /// and it builds and answers node's bytes. The overlap cases keep their copies:
 /// a field read twice, and a nested path followed by its parent.
 ///
-/// The copy count is held too: 5 copied / 3 moved. With the path and the
+/// The copy count is held too: 5 copied / 5 moved. With the path and the
 /// branch halves planted out ("a field never moves, and branches are walked
-/// in sequence") the same program takes 7 copies and moves 1.
+/// in sequence") the same program takes 7 copies and moves 1. (It read 5 / 3
+/// until native-45 made a `match` leg's body and a closure's body consuming
+/// positions (F63, F64): two reads that were already moves — a leg handing
+/// back a binding at its last use — are counted as elided copies now. No copy
+/// was added.)
 #[test]
 fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
     let staged = stage();
@@ -4780,7 +5903,7 @@ fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
     );
     assert_eq!(
         copy_census_of(&staged, "native_probe_moves.vl"),
-        (5, 3),
+        (5, 5),
         "the copies the path- and branch-aware last use leaves"
     );
 }
@@ -7030,3 +8153,901 @@ const B470_ONCE_PROBE: &str = concat!(
     "\n",
     "main();\n",
 );
+
+/// F62: a field read or written through a `Shared` view builds natively and
+/// prints what node prints.
+///
+/// It was refused by name ("a field read of an unresolved subject"): the view
+/// call records no type, so the field had no struct to be found in — which is
+/// why A142's `OwnerCell` and S6's `TrackRuns` were written WHOLE. Typing the
+/// call was half of it. A read through the view holds no borrow past itself
+/// now (`read_with`, one borrow per spine, copying only the field), and every
+/// site that takes the cell's `borrow_mut` as a place — an assignment, a
+/// mutating call's receiver, a `&mut` argument — settles what it reads first,
+/// so `a.write().n = a.write().n + 1` and `cell.write().items.push(cell.read()
+/// .n)` meet no live borrow. The second probe is the `OwnerCell` shape written
+/// field by field, the shape reactive-45 may return to.
+#[test]
+fn a_field_read_or_written_through_a_shared_view_is_identical_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        (
+            "native_probe_shared_view_fields.vl",
+            include_str!("native/shared_view_fields.vl"),
+        ),
+        (
+            "native_probe_shared_view_places.vl",
+            include_str!("native/shared_view_places.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{name}: a field through a `Shared` view must read and write the same on both backends"
+        );
+    }
+}
+
+/// F57: every platform-bound corpus program the backend ACCEPTS prints what
+/// node prints, the ones it refuses say which construct stopped them, and the
+/// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is
+/// printed, as the corpus sweep's is: its refusals are the work list.
+#[test]
+fn every_platform_bound_program_is_identical_or_named() {
+    let staged = stage();
+    let programs = platform_bound_programs();
+    let mut identical_programs: Vec<String> = Vec::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut broken = Vec::new();
+    for program in &programs {
+        match compare(&staged, program) {
+            Verdict::Identical => identical_programs.push(program.clone()),
+            Verdict::Refused(reason) => refused.push((program.clone(), reason)),
+            Verdict::Broken(detail) => broken.push(format!("{program}: {detail}")),
+        }
+    }
+    eprintln!(
+        "platform-bound differential: {} enumerated, {} identical, {} refused by name, {} broken",
+        programs.len(),
+        identical_programs.len(),
+        refused.len(),
+        broken.len()
+    );
+    for (program, reason) in &refused {
+        eprintln!("  refused  {program}: {reason}");
+    }
+    for program in &identical_programs {
+        eprintln!("  identical  {program}");
+    }
+    assert!(
+        broken.is_empty(),
+        "platform-bound programs the native backend ACCEPTED and then got wrong:\n{}",
+        broken.join("\n")
+    );
+    for required in PLATFORM_BOUND_REQUIRED {
+        assert!(
+            identical_programs.iter().any(|program| program == required),
+            "{required} builds natively and prints node's bytes; it must stay that way"
+        );
+    }
+    for (program, _) in PLATFORM_BOUND_OUTSIDE {
+        assert!(
+            corpus_dir().join(program).is_file(),
+            "{program} is named outside the platform-bound differential but is not a corpus program"
+        );
+    }
+}
+
+/// F57's second defect: a `match` literal pattern takes the SUBJECT's width,
+/// never the expectation around the `match` (the arms' type). It stood behind
+/// `crypto.vl`'s E0382 in `std::base64::decode_url`, so the platform-bound pin
+/// reaches it only through a platform; this probe holds it platform-free.
+#[test]
+fn a_literal_pattern_takes_its_subjects_width_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_literal_pattern_width.vl"),
+        include_str!("native/literal_pattern_width.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_literal_pattern_width.vl"),
+        Verdict::Identical,
+        "a literal pattern over a `usize`/`u8`/`u53` subject must build and match the same"
+    );
+}
+
+/// F60, R-d door (a)'s native half: a pipe that is never consumed — built as a
+/// statement and dropped — builds natively and the program runs as it does on
+/// JS. The pipe nodes' `[must_use]` (reactive-45) makes the drop a WARNING on
+/// both backends; this pin holds the build.
+///
+/// The item's repro, `outer.flatten();` over a `SignalCell<SignalCell<i32>>`,
+/// is not a dropped-pipe defect: KEPT (`let kept = outer.flatten();`) it is
+/// refused natively the same way, because the `flatten` it selects is the
+/// blanket over `Flow<Option<I: Source<U>>>`, whose bound that receiver does
+/// not meet, so `I` and `U` bind to nothing. B476/B477 refuse that selection in
+/// the analyzer. Every well-typed dropped pipe already built; this keeps it so.
+#[test]
+fn a_dropped_pipe_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_dropped_pipes.vl"),
+        include_str!("native/dropped_pipes.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_dropped_pipes.vl"),
+        Verdict::Identical,
+        "a pipe built and dropped must build and run the same on both backends"
+    );
+}
+
+/// F61: an injected closure's hidden parameters take ONE order natively — the
+/// contexts' declaration order, the context pass's own — at the closure literal
+/// and at the closure TYPE. The type had followed the clause as written, so a
+/// clause out of declaration order (`context (second, first)`) typed its slots
+/// `(str, i32)` while the literal landing there took `(i32, str)`, and rustc
+/// refused it; std wrote every clause in declaration order, with a comment, to
+/// keep out of the way. Two contexts backwards, three rotated with a value
+/// parameter ahead of them, and a struct field carrying a backwards clause.
+#[test]
+fn an_injected_clause_written_out_of_order_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_clause_order.vl"),
+        include_str!("native/clause_order.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_clause_order.vl"),
+        Verdict::Identical,
+        "a `context` clause in any written order must build and thread the same values"
+    );
+}
+
+/// F63: a closure's expression body is the value it hands back, a CONSUMING
+/// position like a function body's tail, so a place read there takes rule 1's
+/// copy. `id.derive(|index| cells[index])` moved a `str` out of the captured
+/// `Vec` (rustc E0507), and `|| row.name` moved a field out of its capture,
+/// which made the closure `FnOnce` where every closure type is a `dyn Fn`.
+#[test]
+fn a_closure_handing_back_an_indexed_element_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_indexed_closure_reads.vl"),
+        include_str!("native/indexed_closure_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_indexed_closure_reads.vl"),
+        Verdict::Identical,
+        "a closure handing back an element or a field of a capture must copy it"
+    );
+}
+
+/// F64: an `Option` of a closure as a field of a GENERIC struct builds natively
+/// — stored through a cell's write view, pulled per element, read by a
+/// `match` — and a `match` leg handing back a place copies it.
+///
+/// Two defects stood in front of the field, and neither was the field. A struct
+/// literal pushed through `core.holds.write()` had no element type to close
+/// `Hold<V>`'s `V` with, because the view call recorded none — refused by name
+/// as "an unbound generic type parameter (parameter 1 of struct `Hold`)"; F62
+/// typed the view. And a leg's body was read as a plain value, so `None =>
+/// self.fallback` over a loaned `self` (E0507) and `None => before` read again
+/// after the `match` (E0382) moved; a leg is a block tail's position now.
+/// std's collection core (`ElementHold`) holds its closures bare to avoid this
+/// shape; with `Option` fields it builds and prints node's bytes.
+#[test]
+fn an_optional_closure_field_of_a_generic_struct_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_option_closure_fields.vl"),
+        include_str!("native/option_closure_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_option_closure_fields.vl"),
+        Verdict::Identical,
+        "an `Option<|| V>` field of a generic struct must build and read the same"
+    );
+}
+
+/// F52: a module-level `lazy let` handed to a `lazy` parameter. Natively the
+/// binding is a `thread_local!` initialized at its first read — the deferral
+/// `lazy` promises — and not a `Lazy` cell, so the analyzer's FORWARD (hand
+/// the cell on) named a local nothing declares, and a binding reached only
+/// that way was never emitted (rustc E0425). The parameter takes a thunk that
+/// reads the binding: never forced, the initializer never runs; forced twice,
+/// it runs once; forwarded on, it still runs once.
+#[test]
+fn a_lazy_module_binding_handed_to_a_lazy_parameter_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_lazy_module_forward.vl"),
+        include_str!("native/lazy_module_forward.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_lazy_module_forward.vl"),
+        Verdict::Identical,
+        "a module `lazy let` at a `lazy` parameter must defer and initialize once"
+    );
+}
+
+/// F54: a comparison answers a `bool`, so the expectation around it is never
+/// its operands' — a literal in it takes its comparand's type.
+/// `let two = if n > 2 { 1 } else { 2 }` over `n: u53` rendered `2` at the
+/// arms' `i32` (the `if`'s value expectation reached its condition), and rustc
+/// refused `u64 > i32` (E0308). `&&`/`||` beside `i16`/`f64` arms, a `bool`
+/// binding, and a `while` condition inside an `i32`-valued block hold the same
+/// rule.
+#[test]
+fn a_comparison_literal_takes_its_comparands_width_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_comparison_literal_width.vl"),
+        include_str!("native/comparison_literal_width.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_comparison_literal_width.vl"),
+        Verdict::Identical,
+        "a comparison's literal must take its comparand's width"
+    );
+}
+
+/// F55: an annotated `Option`/`Result` binding nothing reads builds natively.
+/// The binding's annotation is not written (a view binding's type is its
+/// pointee's, so writing every annotation would be wrong), and `Option` and
+/// `Result` are Rust's own enums, whose bare path names no instance — so
+/// `let ok: Result<i32, str> = Ok(10)`, never read, left `E` open (rustc
+/// E0282). A written annotation over an `Option`/`Result` variant is written
+/// natively now. (Writing the variant's own type arguments instead —
+/// `Ok::<i32, Str>(10)` everywhere — was tried and is wrong: the arguments a
+/// constructor records inside a generic instance are not reliable, and Rust's
+/// inference had been covering for them.)
+#[test]
+fn an_unread_annotated_variant_binding_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_unread_annotated_variants.vl"),
+        include_str!("native/unread_annotated_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_unread_annotated_variants.vl"),
+        Verdict::Identical,
+        "an annotated `Option`/`Result` binding nothing reads must build"
+    );
+}
+
+/// M91: a churned native `HashMap`/`HashSet` walks its live entries in the
+/// order node's `Map` does — insertion order, a removed-then-re-inserted key at
+/// the end, an overwritten one in place — through the compactions the native
+/// map makes as its removed slots come to outnumber its live ones. The bound
+/// itself (slots at most twice the live count, the storage released) is
+/// `vilan-rt`'s `a_churned_map_compacts_and_keeps_insertion_order`: this suite
+/// reads no clock (N116), so the 2,000 walks here are the shape, not a timing.
+#[test]
+fn a_churned_hash_map_walks_in_insertion_order_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_churned_map_walk.vl"),
+        include_str!("native/churned_map_walk.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_churned_map_walk.vl"),
+        Verdict::Identical,
+        "a churned map and set must walk in insertion order on both backends"
+    );
+}
+
+/// F65 (native-45 STOPPED it as the analyzer's; solver-b-45 fixed the record):
+/// a generic function whose return is inferred, called at two instantiations,
+/// emitted ONE instantiation's return type for every instance. `wrap<T>(x: T):
+/// Source<T> { SignalCell::new(x) }` at `i32` and `str` emits both instances
+/// returning the `str` cell, and the `i32` caller's reads meet the wrong
+/// struct (rustc E0308). The same holds with no return written at all, so it
+/// is not B460's opacity: `inferred_return_types` records the function's
+/// return as the LAST call site's `SignalCell<str>` rather than
+/// `SignalCell<T>`, and both call expressions share that one type id — so
+/// nothing per call carries the instance's return for the emitter to read.
+/// The record is written only under an empty substitution now — in the
+/// function's own terms — so each instance substitutes its own.
+#[test]
+fn a_generic_inferred_return_is_per_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_inferred_return.vl"),
+        include_str!("native/generic_inferred_return.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_inferred_return.vl"),
+        Verdict::Identical,
+        "each instance of a generic inferred-return function returns its own type"
+    );
+}
+
+/// B473: a member a supertrait declares, reached through a SUB-trait — a
+/// bound, a deeper bound over a parameterized chain, a qualified call at a
+/// generic and at a concrete receiver, a `for` loop's `next` — answers out of
+/// the receiver's impl of the declaring trait: the override, then the default.
+/// Both backends took the default over the override (`inference::traits`'
+/// `b473_*` pins hold the JS values; this is the native half).
+#[test]
+fn a_supertrait_override_is_dispatched_through_a_subtrait_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b473.vl"), B473_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b473.vl"),
+        Verdict::Identical,
+        "a supertrait's override must answer through a sub-trait on both backends"
+    );
+}
+
+/// B467: a closure whose `&mut` is its own PARAMETER is stored in a struct
+/// field and called through it on both backends — the analyzer refused it as a
+/// view escape before. (`inference::borrows`' `b467_*` pin covers the other
+/// depths on JS; natively a closure VALUE reached through a match capture, a
+/// loop binding or a nested closure parameter does not yet carry its view
+/// parameters to the call site — a native find filed from this lane.)
+#[test]
+fn a_closure_with_its_own_view_parameter_is_stored_in_a_field_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b467.vl"), B467_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b467.vl"),
+        Verdict::Identical,
+        "a closure with its own view parameter must store and run the same on both backends"
+    );
+}
+
+/// R-c (B483 + B466 + B465): a value taken out of a place the binding does not
+/// own is copied, on both backends. `Shared::new`/`ListCell::of`/`with_limit`
+/// take their argument `own` (natively the constructor's argument was MOVED,
+/// rustc E0382 at the caller's next read); `*view` of an aggregate is copied
+/// where it is bound, returned or wrapped (natively a move out of a reference,
+/// E0507); and a closure literal at a view position of its closure type reads
+/// the element through `*c` (natively a value was passed where the type wants
+/// a reference). `inference::borrows`' `b483_*`/`b466_*`/`b465_*` pins hold
+/// the JS values.
+#[test]
+fn a_value_taken_out_of_a_place_it_does_not_own_is_copied_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_rc.vl"), RC_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_rc.vl"),
+        Verdict::Identical,
+        "a value taken out of a place it does not own must be a copy on both backends"
+    );
+}
+
+/// B474: `sub` called through an `S: Source<T>` bound is `Flow`'s member (the
+/// trait answers through a bound, B408's rule) — not `RemoteSource`'s
+/// inherent `sub(|T|)`, which the native emitter picked by name and rustc
+/// refused (E0308) — while the same `sub` on the concrete mirror is still the
+/// inherent one. `inference::markdown`'s
+/// `a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none` is
+/// the JS half.
+#[test]
+fn sub_through_a_source_bound_takes_the_trait_member_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b474.vl"), B474_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b474.vl"),
+        Verdict::Identical,
+        "`sub` through a `Source` bound must dispatch to the trait's member on both backends"
+    );
+}
+
+/// B453: a view of a tuple position writes and reads through on both
+/// backends (`inference::tuples`' `b453_*` pin is the JS half; JS threw).
+#[test]
+fn a_view_of_a_tuple_position_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b453.vl"), B453_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b453.vl"),
+        Verdict::Identical,
+        "a view of a tuple position must write through on both backends"
+    );
+}
+
+/// B444: a scalar view read where a value is read prints the element on both
+/// backends (`inference::borrows`' `b444_*` pin is the JS half; JS printed the
+/// `(base, key)` pair).
+#[test]
+fn a_scalar_view_read_as_a_value_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b444.vl"), B444_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b444.vl"),
+        Verdict::Identical,
+        "a scalar view read as a value must print the element on both backends"
+    );
+}
+
+/// B464: a closure's `&mut` parameter called with `&mut <place>` — a field,
+/// a local, a subscript — writes through the same on both backends (the bare
+/// spelling is refused; JS threw on it).
+#[test]
+fn a_closure_view_parameter_takes_a_view_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b464.vl"), B464_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b464.vl"),
+        Verdict::Identical,
+        "a closure's view parameter must write through on both backends"
+    );
+}
+
+/// B504: a view of a pattern binder — a `match` capture (concrete and
+/// generic), a destructured `let`'s, a `for` element, an `is` capture — reads
+/// the binder on both backends (`inference::borrows`' `b504_*` pins are the
+/// JS half; JS read the value's first character, or `undefined`).
+#[test]
+fn a_view_of_a_pattern_binder_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b504.vl"), B504_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b504.vl"),
+        Verdict::Identical,
+        "a view of a pattern binder must read the binder on both backends"
+    );
+}
+
+/// B506: a view of a generic place — a field typed `T`, a parameter typed
+/// `T`, a view binding of one, an inline transient's capture, a `mut x: T`
+/// parameter's `&mut x`, `&mut pair.left` written through, a re-borrow — is
+/// the same on both backends at a scalar and an aggregate instance, and a
+/// view RETURNED keeps its protocol (`*first(..)`, `*left_of(..)`).
+#[test]
+fn a_view_of_a_generic_place_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b506.vl"), B506_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b506.vl"),
+        Verdict::Identical,
+        "a view of a generic place must be decided per instance on both backends"
+    );
+}
+
+/// B505: a scalar receiver at a `&self`/`&mut self` — a local, a literal, an
+/// rvalue, a field, an element, a tuple position, a `bool`, a generic — and a
+/// view of a scalar with no cell (`&11`, `&(a + 8)`, an immutable or closure
+/// parameter) are identical on both backends; JS passed the value bare.
+#[test]
+fn a_scalar_receiver_and_a_cell_less_view_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b505.vl"), B505_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b505.vl"),
+        Verdict::Identical,
+        "a scalar receiver at a view self must be a view on both backends"
+    );
+}
+
+/// B496: the spelled copy of a view expression assigned into a value place
+/// (`out = *&a`, `out = *inner(&holder)`, `n = *&m`) copies on both backends
+/// (the unspelled assignment is refused; JS aliased it).
+#[test]
+fn the_spelled_copy_of_a_view_expression_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b496.vl"), B496_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b496.vl"),
+        Verdict::Identical,
+        "the spelled copy of a view expression must copy on both backends"
+    );
+}
+
+/// F72: a variant constructor of an enum whose parameter is BOUNDED builds
+/// natively — `enum Op<T: Hashable> { Add(T), Drop(T) }` then
+/// `let op: Op<i32> = Op::Add(3)`, which was refused as "a value of type `a
+/// trait object`". The constructor's site records the enum OPEN, its argument
+/// the parameter's constraint id, and that id's type is the parameter's bound:
+/// `any` for an unbounded `T` (read as open, so the emitter fell back to the
+/// position or the payload) but `Hashable` itself for a bounded one, which the
+/// emitter took for a closed argument and minted the enum over. That is why a
+/// second, unbounded parameter (`MapOp<K: Hashable, V>`) built: one open
+/// argument sent the whole list to the fallback. The probe covers an annotated
+/// binding, the payload alone, an argument position, `Option` and list
+/// nesting, a generic function at two instances, a generic impl, two bounds
+/// on one parameter, and two bounded parameters. It blocked `HashSetCell`,
+/// `SetOp` and `HashMapCell::keys()`.
+#[test]
+fn a_variant_of_an_enum_with_a_bounded_parameter_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_bounded_variant_constructors.vl"),
+        include_str!("native/bounded_variant_constructors.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_bounded_variant_constructors.vl"),
+        Verdict::Identical,
+        "a variant of an enum whose parameter is bounded must build and print the same"
+    );
+}
+
+/// F76: a bare variant of a generic USER enum — `let n: Maybe<i32> =
+/// Maybe::Nothing` — builds natively; it was refused as "an unbound generic
+/// type parameter (parameter 1 of enum `Maybe`)" under its own annotation. A
+/// bare variant is an `Expr::Local` of the variant's declaration, and its arm
+/// minted the enum at NO arguments, never asking the position — where a
+/// constructor with a payload reads the site's record, then the position, then
+/// the payload (`variant_arguments`), and a bare one has only the first two.
+/// It takes that rule now, and a constructor's payload is a position of its
+/// own (`Some(Maybe::Nothing)` under `Option<Maybe<i32>>`). `None` built all
+/// along because `Option` is Rust's enum, whose path names no instance. The
+/// probe covers an annotated binding, an argument, a generic function's
+/// return at two instances, `ret` and a tail, a mixed list literal, an
+/// assignment, a nested payload, both arms of an `if`, a field written
+/// through a generic impl, and a two-parameter enum with a bound.
+#[test]
+fn a_bare_variant_of_a_generic_enum_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_bare_generic_variants.vl"),
+        include_str!("native/bare_generic_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_bare_generic_variants.vl"),
+        Verdict::Identical,
+        "a bare variant of a generic enum must close from its position and print the same"
+    );
+}
+
+/// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
+/// source whose `Source` argument is written in the source impl's own binder
+/// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds
+/// natively; it was refused as "an unbound generic type parameter (parameter
+/// 1 of struct `W`)". The default's substitution binds the blanket's `T` from
+/// the receiver's `Source` impl, as `Option<P>` in that PROVIDER's binder, and
+/// nothing bound `P`: F58 had added the provider's binders where a MEMBER is
+/// dispatched (`on_change`, `start`), not where a default is specialized
+/// (`effect`, `effect_on_change`). The probe covers both, a two-parameter
+/// source whose argument is in its second parameter, a list argument, and the
+/// pipes (`derive(..).memo()`, `sample()`). It blocked observing std's
+/// `StoreSome<P>` natively.
+#[test]
+fn a_default_over_a_source_written_in_its_providers_binder_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_provider_binder_defaults.vl"),
+        include_str!("native/provider_binder_defaults.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_provider_binder_defaults.vl"),
+        Verdict::Identical,
+        "a Flow default over a source written in its provider's binder must build and run the same"
+    );
+}
+
+/// F73: `set(None)` on a two-parameter struct's `Signal<Option<V>>` impl, and
+/// the struct literal that builds it, are identical on both backends.
+///
+/// The item's own refusal ("an unbound generic type parameter (parameter 2 of
+/// struct `Pair`)" at the `impl .. with Signal<Option<V>>` header) reproduces
+/// on 0.42.0 and not on this order's base, where an earlier merge had closed
+/// it; the probe pins it. Reproducing it found the literal beside it: a struct
+/// literal's field expectation was its declared type's HEAD, resolved under the
+/// instance and then dropped, so `cell = SignalCell::new(None)` met
+/// `SignalCell<Option<V>>` with the struct's own `V` unbound. The instance's
+/// bindings stay in force while a field's value is rendered now — in `main`
+/// under an annotation, in the struct's own static at two instantiations, and
+/// for a generic struct literal nested in another's field.
+///
+/// Inside the struct's OWN impl a literal of ANOTHER instantiation
+/// (`Pair<V, K>` in `impl Pair<type K, type V>`) cannot take that rule — the
+/// impl's binders are the declaration's parameters, and installing the
+/// literal's bindings would retype the value's own reads — so a field that
+/// only mentions a parameter expects nothing there, and a value that needed
+/// the expectation is refused by name rather than built at the wrong
+/// instantiation (rustc E0308 before).
+#[test]
+fn a_struct_literals_fields_close_their_values_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_struct_literal_field_positions.vl"),
+        include_str!("native/struct_literal_field_positions.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_struct_literal_field_positions.vl"),
+        Verdict::Identical,
+        "a struct literal's field must close its value from the instance on both backends"
+    );
+    std::fs::write(
+        staged.join("native_probe_swapped_literal.vl"),
+        SWAPPED_LITERAL_PROBE,
+    )
+    .expect("write the probe program");
+    match compare(&staged, "native_probe_swapped_literal.vl") {
+        Verdict::Identical => {}
+        Verdict::Refused(reason) => assert!(
+            reason.contains("instantiated at `any`"),
+            "the swapped literal's refusal moved to another construct: {reason}"
+        ),
+        Verdict::Broken(detail) => {
+            panic!("a swapped literal in its own impl was built wrong: {detail}")
+        }
+    }
+}
+
+const SWAPPED_LITERAL_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "enum Maybe<T> {\n",
+    "\tNothing,\n",
+    "\tJust(T),\n",
+    "}\n",
+    "\n",
+    "struct Pair<K, V> {\n",
+    "\tkey: K,\n",
+    "\theld: Maybe<V>,\n",
+    "}\n",
+    "\n",
+    "impl Pair<type K, type V> {\n",
+    "\tfun swap(self, value: V): Pair<V, K> {\n",
+    "\t\tPair { key = value, held = Maybe::Nothing }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet pair: Pair<str, i32> = Pair { key = \"k\", held = Maybe::Just(1) };\n",
+    "\tlet swapped = pair.swap(9);\n",
+    "\tprint(swapped.key);\n",
+    "\tprint(swapped.held is Maybe::Nothing);\n",
+    "}\n",
+);
+
+/// F71: a pipe built and SEALED inside a generic body — `source.derive(|v|
+/// f(v)).switch(|inner| inner).cell()` in `fun switch_to<T, U, S: Source<T>,
+/// I: Source<U>>` — builds natively; it was refused as "an unbound generic
+/// type parameter (parameter 3 of `switch_to`)". The sealing call is a trait
+/// DEFAULT whose receiver is written in the generic body's binders
+/// (`Switch<Derive<S, ..>, ..>`), and a default body ran under the trait's
+/// bindings ALONE — the caller's `S` replaced away — where a function instance
+/// composes onto its caller's. The probe covers the item's repro, B479's
+/// unannotated selector (`inference::traits`' pin is its JS half), `memo()`
+/// and `sample()` as the seal, the blanket-method spelling, and an `Option`
+/// source.
+#[test]
+fn a_pipe_sealed_in_a_generic_body_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_pipe_defaults.vl"),
+        include_str!("native/generic_pipe_defaults.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_pipe_defaults.vl"),
+        Verdict::Identical,
+        "a pipe sealed in a generic body must build and run the same on both backends"
+    );
+}
+
+/// F74: an in-process `duplex_pair` program — A146's inference pin, a server
+/// and a client mirroring a cell and a keyed cell, each source wrapped in a
+/// generic `Counted<S>` — builds natively and prints node's bytes; it was
+/// refused as "an unresolved type". The wrapper was not the cause: the program
+/// reaches `std::rpc`'s `keyed_mirror_of`, and two of its bindings were typed
+/// only by their written annotations. `Shared::new(|_key| {})` under
+/// `Shared<|Hash| void>` — the analyzer leaves a closure parameter nothing
+/// constrains untyped, so the literal takes its parameter types from the
+/// closure type it is rendered into; and `Shared::new([])` under
+/// `Shared<List<KeyLease>>`, whose first use reads `lease.key` off a `Vec<_>`
+/// rustc had not settled (E0282) — a cell around an empty literal has its
+/// binding's type written, as an empty literal always had. The second program
+/// holds both shapes outside std.
+#[test]
+fn an_in_process_mirror_program_is_identical_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        (
+            "native_probe_in_process_mirrors.vl",
+            include_str!("native/in_process_mirrors.vl"),
+        ),
+        (
+            "native_probe_position_typed_bindings.vl",
+            include_str!("native/position_typed_bindings.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{name}: must build and print the same on both backends"
+        );
+    }
+    // A146's mirror half, natively: one edge per source across the runs.
+    let output = vilan(&staged)
+        .args([
+            "run",
+            "--backend",
+            "rust",
+            "native_probe_in_process_mirrors.vl",
+        ])
+        .output()
+        .expect("run the probe natively");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "list attaches=1\nkeyed cell attaches=1\nmirror attaches=1\nkeyed mirror attaches=1\n5 2 1 7 1\n",
+        "one edge per source, mirrors included, natively (A146)"
+    );
+}
+
+/// B519: a `[service(Client)]` declared in a module the entry IMPORTS. Its
+/// generated module-level `let __mirrors_StoreClient_<method>` tables are the
+/// module's bindings on both backends — natively the table was an E0425
+/// ("not found in this scope") in the emitted Rust, on JS a `ReferenceError`
+/// at the first stub call — and the stubs dedup per origin the same way.
+#[test]
+fn b519_a_service_in_an_imported_module_is_identical_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        ("b519_store.vl", include_str!("native/b519_store.vl")),
+        (
+            "native_probe_b519_imported_service.vl",
+            include_str!("native/b519_imported_service.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+    }
+    assert_eq!(
+        compare(&staged, "native_probe_b519_imported_service.vl"),
+        Verdict::Identical,
+        "a service in an imported module must build and print the same on both backends"
+    );
+    let output = vilan(&staged)
+        .args([
+            "run",
+            "--backend",
+            "rust",
+            "native_probe_b519_imported_service.vl",
+        ])
+        .output()
+        .expect("run the probe natively");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "same-origin:true\nsame-args:true\nother-args:false\nunleased:calls=0\ndone\n",
+        "one mirror per origin, natively"
+    );
+}
+
+/// F79: a `mut` pattern binder — `Some(mut p)` in a `match`, `mut (c, d) =
+/// (3, 4)`, an `is` capture, a generic body's `match` — is emitted `mut`, so a
+/// `&mut` of it builds (rustc E0596 before), and the matched place a program
+/// reads again keeps its value.
+#[test]
+fn a_mut_pattern_binder_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_mut_pattern_binders.vl"),
+        include_str!("native/mut_pattern_binders.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_mut_pattern_binders.vl"),
+        Verdict::Identical,
+        "a `mut` pattern binder must be mutable natively and print the same"
+    );
+}
+
+/// F80: a `for e in &mut xs` element is a `&mut` loan natively (an `iter_mut`
+/// item), so handing it on — `f(e)` to a `|&mut T|` closure in a generic body
+/// or a concrete one, `bump(&mut counter)`, a field write through it — is a
+/// reborrow (`&mut *e`). It was emitted `&mut e`, which rustc refused (E0596).
+#[test]
+fn a_for_mut_element_handed_on_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_for_mut_element_loans.vl"),
+        include_str!("native/for_mut_element_loans.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_for_mut_element_loans.vl"),
+        Verdict::Identical,
+        "a `for` element over `&mut xs` must be handed on by reborrow and print the same"
+    );
+}
+
+/// F81: `*if c { &a } else { &b }` — the spelled copy B496's refusal steers to
+/// — builds natively over a list and a struct, through a `match`, and nested;
+/// it was emitted as a deref of the branches' COPIES (rustc E0599/E0614). A
+/// branch tail is a value position here, so each leaf is its copy already and
+/// the `*` is dropped. (A SCALAR or `str` chosen this way prints the place pair
+/// on JS — reported — so the probe holds aggregates.)
+#[test]
+fn a_deref_of_a_conditional_view_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_deref_of_a_conditional_view.vl"),
+        include_str!("native/deref_of_a_conditional_view.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_deref_of_a_conditional_view.vl"),
+        Verdict::Identical,
+        "`*` over a conditional view must copy the chosen value on both backends"
+    );
+}
+
+/// A142 S7 S1 (`proposal/store.md`): a derived struct's store builds and wakes
+/// the same on both backends — a nested struct, a whole write that wakes only the
+/// changed spine, a handle write committed along the spine, a write of the value
+/// held, `notify`, a `[reactive(coarse)]` field, a `[reactive(name = "..")]`
+/// projection, an `Option` field through its `Some` (observed, read and patched), a generic
+/// struct, and the slot census through subscribe and dispose.
+#[test]
+fn a142_s7_a_struct_store_builds_and_wakes_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_struct.vl"),
+        include_str!("native/store_struct.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_struct.vl"),
+        Verdict::Identical,
+        "a struct store must build and wake the same on both backends"
+    );
+}
+
+/// A142 S7 S2: a derived enum's store builds and wakes the same on both
+/// backends — a same-variant write patching the payload, a switch away and back,
+/// a `patch` through a dead and a live variant, a multi-payload variant read and
+/// patched as a tuple, `assume()` read past the variant's end, and a generic
+/// enum with a scalar payload.
+#[test]
+fn a142_s7_an_enum_store_builds_and_wakes_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_variant.vl"),
+        include_str!("native/store_variant.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_variant.vl"),
+        Verdict::Identical,
+        "an enum store must build and wake the same on both backends"
+    );
+}
+
+/// B436 + B437: a trait object prints as its value, alone, and as the pair a
+/// list holds; two applications of one trait over one type dispatch through
+/// their own tables — identical on both backends (the JS leg printed the pair
+/// and answered `Shape<str>`'s `area` from the `i32` table).
+#[test]
+fn a_trait_objects_print_and_its_tables_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_dyn_print_and_tables.vl"),
+        include_str!("native/dyn_print_and_tables.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_dyn_print_and_tables.vl"),
+        Verdict::Identical,
+        "an object prints its value and dispatches through its own application's table"
+    );
+}

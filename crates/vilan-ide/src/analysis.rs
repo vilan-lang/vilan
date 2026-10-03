@@ -192,13 +192,22 @@ pub fn source_call_subject(program: &Program, call_id: Id) -> Option<Id> {
 /// [`Document::compose_hover`]. `target` is a function DEFINITION id (resolve a
 /// use site through [`Document::function_target`] first). `None` when the id
 /// names no declaration.
+///
+/// A MEMBER's label leads with the block it is declared in, on its own line
+/// (E238, ruled door (b): "completion's detail line takes the same header"):
+/// `impl Memo<type K: Hashable, type V>` above `fun get_or_insert(..)`.
 pub fn signature_label(program: &Program, target: Id) -> Option<String> {
     let declaration = program.declaration_labels.get(&target)?;
-    if program.async_functions.contains(&target) && !declaration.starts_with("async ") {
-        Some(format!("async {declaration}"))
-    } else {
-        Some(declaration.clone())
-    }
+    let declaration =
+        if program.async_functions.contains(&target) && !declaration.starts_with("async ") {
+            format!("async {declaration}")
+        } else {
+            declaration.clone()
+        };
+    Some(match program.member_header(target) {
+        Some(header) => format!("{header}\n{declaration}"),
+        None => declaration,
+    })
 }
 
 /// The parameter names of the function/external at `target`, in order, with

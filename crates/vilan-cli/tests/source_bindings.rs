@@ -292,3 +292,103 @@ fun main() {{
         "`swap` must remove the previous subtree; got:\n{updated}"
     );
 }
+
+// ── A142 S7: `when_live`, a store's variant as content ─────────────────────────
+//
+// `when_some` hands its body a cell of the WHOLE payload, so the body's bindings
+// rerun on every payload write. `when_live` follows only the store's
+// discriminant slot and hands the body the payload's own `Store<P>`: a write
+// inside the payload updates the one binding that reads it, and only a variant
+// change builds or tears down. Only a running program shows that — a helper that
+// rebuilt on every payload write would compile, mount and update identically.
+
+/// A store whose variant carries a payload, behind `when_live`. The body PRINTS
+/// each time it is built, so the build count is on stdout beside the dumps.
+#[test]
+fn a142_s7_when_live_rebuilds_only_when_the_variant_changes() {
+    let app = r#"import std::io::print;
+import std::reactive::{ Signal, Source };
+import std::store::{ Storable, Store };
+import std::ui::{ View, mount_root, view, when_live };
+
+/// The harness serializes the mounted tree under this tag.
+[extern("__dump")]
+external fun dump(tag: str): void;
+
+[derive(PartialEq, Storable)]
+struct Device {
+	name: str,
+	since: i32,
+}
+
+[derive(PartialEq, Storable)]
+enum Presence {
+	Offline,
+	Online(Device),
+}
+
+fun main() {
+	let presence = Store::new(Presence::Online(Device { name = "laptop", since = 1 }));
+	let _root = mount_root("app", || view("main").child(when_live(presence.online(), |device| {
+		print("built");
+		// The handles bind through the `Flow` arms alone (B476): a text binding
+		// and an attribute value.
+		view("p").attr("title", device.name()).bind_text(device.name())
+	})));
+	dump("mounted");
+	let _renamed = presence.online().name().patch("phone");
+	presence.set(Presence::Online(Device { name = "phone", since = 2 }));
+	dump("patched");
+	presence.set(Presence::Offline);
+	dump("offline");
+	presence.set(Presence::Online(Device { name = "tablet", since = 3 }));
+	dump("online");
+}
+"#;
+    let stdout = build_and_run("when_live", app);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let position = |tag: &str| {
+        lines
+            .iter()
+            .position(|line| line.starts_with(tag))
+            .unwrap_or_else(|| panic!("no {tag} dump in:\n{stdout}"))
+    };
+    let builds_before = |index: usize| {
+        lines[..index]
+            .iter()
+            .filter(|line| **line == "built")
+            .count()
+    };
+    let (mounted, patched, offline, online) = (
+        position("mounted"),
+        position("patched"),
+        position("offline"),
+        position("online"),
+    );
+    assert!(
+        lines[mounted].contains(r#"<p title="laptop">laptop</p>"#),
+        "mount:\n{stdout}"
+    );
+    assert!(
+        lines[patched].contains(r#"<p title="phone">phone</p>"#),
+        "a payload write must reach the body's binding:\n{stdout}"
+    );
+    assert_eq!(
+        builds_before(patched),
+        1,
+        "a payload write must not rebuild the body:\n{stdout}"
+    );
+    assert!(
+        !lines[offline].contains("<p>"),
+        "the variant ending must take the body down:\n{stdout}"
+    );
+    assert!(
+        lines[online].contains(r#"<p title="tablet">tablet</p>"#),
+        "rebuilt:\n{stdout}"
+    );
+    assert_eq!(
+        builds_before(online),
+        2,
+        "the variant coming back builds the body once more:\n{stdout}"
+    );
+}

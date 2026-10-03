@@ -1,0 +1,94 @@
+// F72: a variant constructor of an enum whose parameter is BOUNDED. The
+// constructor's site records the open `Op<T>`, and a bounded `T` reads as its
+// bound — `Hashable` itself — so the native backend minted the enum over "a
+// trait object" instead of closing `T` from the position or the payload.
+import std::compare::PartialEq;
+import std::hash::Hashable;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+enum Op<T: Hashable> {
+	Add(T),
+	Drop(T),
+}
+
+enum Tagged<T: Hashable + PartialEq> {
+	Held(T, i32),
+}
+
+enum Both<K: Hashable, V: Hashable> {
+	Pair(K, V),
+}
+
+fun describe(op: Op<i32>): str {
+	match op {
+		Op::Add(let x) => i"add {x}",
+		Op::Drop(let x) => i"drop {x}",
+	}
+}
+
+fun describe_str(op: Op<str>): str {
+	match op {
+		Op::Add(let x) => i"add {x}",
+		Op::Drop(let x) => i"drop {x}",
+	}
+}
+
+/// Inside a generic function: `T` comes from the enclosing instance.
+fun adding<T: Hashable>(value: T): Op<T> {
+	Op::Add(value)
+}
+
+struct Log<T: Hashable> {
+	ops: List<Op<T>>,
+}
+
+impl Log<type T: Hashable> {
+	fun record(&mut self, value: T) {
+		self.ops.push(Op::Add(value));
+		self.ops.push(Op::Drop(value));
+	}
+
+	fun count(self): i32 {
+		self.ops.len().as_i32()
+	}
+}
+
+fun main() {
+	// Annotated binding, payload present.
+	let first: Op<i32> = Op::Add(3);
+	print(describe(first));
+	// No annotation: the payload closes `T`.
+	let second = Op::Drop(4);
+	print(describe(second));
+	print(describe_str(Op::Add("k")));
+	// Straight into an argument position.
+	print(describe(Op::Drop(5)));
+	// Nested in an `Option` and a list.
+	let maybe: Option<Op<i32>> = Some(Op::Add(6));
+	match maybe {
+		Some(let op) => print(describe(op)),
+		None => print("none"),
+	}
+	let ops: List<Op<str>> = [Op::Add("a"), Op::Drop("b")];
+	for op in ops {
+		print(describe_str(op));
+	}
+	// Through a generic function, at two instances.
+	print(describe(adding(7)));
+	print(describe_str(adding("s")));
+	// Through a generic impl.
+	mut log: Log<i32> = Log { ops = [] };
+	log.record(8);
+	log.record(9);
+	print(log.count());
+	// Two bounds, and two bounded parameters.
+	let tagged: Tagged<str> = Tagged::Held("t", 1);
+	match tagged {
+		Tagged::Held(let value, let tag) => print(i"{value} {tag}"),
+	}
+	let both: Both<str, i32> = Both::Pair("p", 2);
+	match both {
+		Both::Pair(let key, let value) => print(i"{key} {value}"),
+	}
+}

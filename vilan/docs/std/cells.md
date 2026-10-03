@@ -12,7 +12,7 @@ value-semantics copying.
 
 ```vilan,fragment
 impl Shared<type T> {
-	fun new(value: T): Shared<T>
+	fun new(own value: T): Shared<T>
 	fun read(self): T                      // a COPY of the contents
 	fun clone(self): Shared<T>             // another handle to the SAME cell
 	fun write(self): &mut T borrows self   // a writable view of the contents

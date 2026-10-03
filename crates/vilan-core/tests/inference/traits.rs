@@ -3116,6 +3116,78 @@ fn i9_the_deprecated_map_spelling_is_still_a_keyed_expose_map() {
     );
 }
 
+/// A144 (R-f): the contract hash reads the RESOLVED type, so every spelling of
+/// one wire contract hashes alike — the deprecated `Map<..>`, `HashMap<..>`, a
+/// renaming import of it, on an `[rpc]` signature and on a WHOLE-value
+/// `[expose]` (whose element the hash names). Red before A144 (the hash read
+/// the types as written): the three `[rpc]` services printed `7edcd9bc`,
+/// `966c1d7c` and `1956457c`, and the two whole exposures differed. The value
+/// itself is djb2 over the canonical surface,
+/// `counts(HashMap<str, i32>)->HashMap<str, i32>;` — the spelling a plainly
+/// written service already had, so its hash did not move.
+#[test]
+fn a144_an_alias_and_its_target_hash_alike() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_map::HashMap as Table;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        [service(NewClient)]
+        struct NewSpelling {
+            unused: i32,
+        }
+        impl NewSpelling {
+            [rpc]
+            fun counts(self, names: HashMap<str, i32>): HashMap<str, i32> { names }
+        }
+        [service(OldClient)]
+        struct OldSpelling {
+            unused: i32,
+        }
+        impl OldSpelling {
+            [rpc]
+            fun counts(self, names: Map<str, i32>): Map<str, i32> { names }
+        }
+        [service(RenamedClient)]
+        struct RenamedSpelling {
+            unused: i32,
+        }
+        impl RenamedSpelling {
+            [rpc]
+            fun counts(self, names: Table<str, i32>): Table<str, i32> { names }
+        }
+        [service(WholeNewClient)]
+        struct WholeNew {
+            [expose] counts: SignalCell<HashMap<str, i32>>,
+        }
+        impl WholeNew {
+            [rpc]
+            fun size(self): usize { self.counts.get().len() }
+        }
+        [service(WholeOldClient)]
+        struct WholeOld {
+            [expose] counts: SignalCell<Map<str, i32>>,
+        }
+        impl WholeOld {
+            [rpc]
+            fun size(self): usize { self.counts.get().len() }
+        }
+        fun main() {
+            print(NewSpelling { unused = 0 }.contract_hash());
+            print(OldSpelling { unused = 0 }.contract_hash());
+            print(RenamedSpelling { unused = 0 }.contract_hash());
+            let whole_new = WholeNew { counts = Signal::new(HashMap::new()) }.contract_hash();
+            let whole_old = WholeOld { counts = Signal::new(Map::new()) }.contract_hash();
+            print(whole_new == whole_old);
+        }
+        main();
+        "#,
+        "7edcd9bc\n7edcd9bc\n7edcd9bc\ntrue\n",
+    );
+}
+
 /// A56 / R6: the field names its key TWICE — once in the attribute, once in the
 /// `Map` element — and the two disagree.
 ///
@@ -3410,6 +3482,82 @@ fn a145_a_memo_handle_return_whose_element_is_not_wire_is_refused_at_the_element
             "returns a signal handle whose element `Secret` is not Wire",
         );
     }
+}
+
+/// A138: a map's PER-KEY handle — `HashMapCell::at(key)`'s `HashMapEntry<K, V>`, and a
+/// sealed map pipe's `MemoEntry<K, V>` — is a handle return, a mirror of
+/// `Option<V>` at the client, so `V` is what must be Wire and the refusal names it;
+/// over a Wire value both compile. `Option<HashMapEntry<..>>` is NOT a handle (a
+/// per-key handle already answers `None` for an absent key), so it meets the
+/// ordinary Wire refusal, on both the written and the resolved side.
+#[test]
+fn a138_a_map_entry_handle_return_is_judged_by_its_value() {
+    for (returned, body) in [
+        ("HashMapEntry<i32, Secret>", "self.secrets.at(1)"),
+        (
+            "MemoEntry<i32, Secret>",
+            "self.secrets.map_values(|secret| secret).memo().at(1)",
+        ),
+    ] {
+        let source = format!(
+            r#"
+        import std::io::print;
+        import std::reactive::{{ HashMapCell, HashMapEntry, MemoEntry }};
+        struct Secret {{ token: str }}
+        [service(StoreClient)]
+        struct Store {{
+            secrets: HashMapCell<i32, Secret>,
+        }}
+        impl Store {{
+            [rpc]
+            fun watch(self): {returned} {{ {body} }}
+        }}
+        fun main() {{ print("store"); }}
+        main();
+        "#
+        );
+        assert_fails_with(
+            &source,
+            "returns a signal handle whose element `Secret` is not Wire",
+        );
+    }
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ HashMapCell, HashMapEntry, MemoEntry };
+        [service(InboxClient)]
+        struct Inbox {
+            messages: HashMapCell<i32, str>,
+        }
+        impl Inbox {
+            [rpc]
+            fun message(self, id: i32): HashMapEntry<i32, str> { self.messages.at(id) }
+            [rpc]
+            fun shouted(self, id: i32): MemoEntry<i32, str> {
+                self.messages.map_values(|text| text.to_uppercase()).memo_global().at(id)
+            }
+        }
+        fun main() { print("inbox"); }
+        main();
+        "#,
+    );
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ HashMapCell, HashMapEntry };
+        [service(InboxClient)]
+        struct Inbox {
+            messages: HashMapCell<i32, str>,
+        }
+        impl Inbox {
+            [rpc]
+            fun message(self, id: i32): Option<HashMapEntry<i32, str>> { Some(self.messages.at(id)) }
+        }
+        fun main() { print("inbox"); }
+        main();
+        "#,
+        "is not Wire",
+    );
 }
 
 /// The control, and the two shapes the mapping admits: `SignalCell<T>` becomes
@@ -8190,14 +8338,18 @@ fn a_pipe_asked_for_a_member_no_source_declares_keeps_its_ordinary_message() {
     assert_fails_without(&source, "a pipe has no");
 }
 
-/// reactive-44's find (REPORT-reactive-44): the total join written as a pipe in
-/// a generic body, with the selector's parameter UNannotated. `.derive(f)` is a
-/// `Derive<S, T, I>` over the caller's abstract `I`, and `.switch(|inner| inner)`
-/// types `inner` as an unsubstituted `T` — "cannot infer 'U'" and "generic
-/// parameter 'T' is missing the bound ': Flow<U>'". The same body at concrete
-/// types, or with `|inner: I|`, compiles (the three B371 pins above).
+/// reactive-44's find (REPORT-reactive-44), B479: the total join written as a
+/// pipe in a generic body, with the selector's parameter UNannotated.
+/// `.derive(..)` is a `Derive<S, T, I>` over the caller's abstract `I`, which
+/// provides `Flow<I>` — and `.switch(|inner| inner)` typed `inner` as the
+/// Source blanket's bare `T` ("cannot infer 'U'", "generic parameter 'T' is
+/// missing the bound ': Flow<U>'"), because an answer written in the CALLER's
+/// own parameter read as a hole and the blanket's ungrounded one, declared
+/// first, won. The same body at concrete types, or with `|inner: I|`, always
+/// compiled (the three B371 pins above). The transform is a literal over `f`:
+/// a closure PARAMETER carries no clause, and `derive`'s body takes one
+/// (A142 S2's migration).
 #[test]
-#[ignore = "A142: reactive-44 find: a pipe stage's closure parameter in a generic body is typed as the trait's unsubstituted T"]
 fn a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter() {
     assert_compiles_and_runs(
         r#"
@@ -8205,7 +8357,7 @@ fn a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter() {
         import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
 
         fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
-            source.derive(f).switch(|inner| inner).cell()
+            source.derive(|value| f(value)).switch(|inner| inner).cell()
         }
 
         fun main() {
@@ -8220,11 +8372,20 @@ fn a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter() {
     );
 }
 
+// --- B473: through a SUBTRAIT, the declaring trait's impl answers -------------
+//
+// A member a supertrait declares, reached through a bound (or a qualified
+// call, or a `for` loop) naming one of its SUB-traits, is selected out of the
+// receiver's impl of the DECLARING trait — its override first, the default
+// second. The analyzer recorded the bound's own trait for emission, which
+// looked for the member in the impl of `Sub`, found nothing there, and took
+// the default the chain reached, on both backends. The native half is
+// `native_differential`'s `a_supertrait_override_is_dispatched_through_a_subtrait_on_both_backends`.
+
 #[test]
-#[ignore = "A142: reactive-44 find (MISCOMPILE, both backends, predates A142): through a subtrait bound, a supertrait method with a default runs the default even where the type overrides it"]
 fn a_supertrait_defaults_override_is_dispatched_through_a_subtrait_bound() {
     // `Mine` overrides `Base::name`. Through `S: Base` the override runs;
-    // through `S: Sub` (a subtrait of `Base`) the DEFAULT runs today, on JS and
+    // through `S: Sub` (a subtrait of `Base`) the DEFAULT ran, on JS and
     // natively, and on the 0.41.1 toolchain as well. A142 reached it: `map_each`
     // over a `DeltaSource` bound called `Source::attach_observer`, and a
     // `ListCell`'s own observer was bypassed for the default, which captures the
@@ -8274,6 +8435,186 @@ fn a_supertrait_defaults_override_is_dispatched_through_a_subtrait_bound() {
         main();
         "#,
         "the override\nthe override\n",
+    );
+}
+
+/// B473 at a PARAMETERIZED chain, two levels deep, and through the qualified
+/// spelling: the bound's arguments are carried up to the declaring trait
+/// (`Sub<i32>` passes `Base<i32>`), so the override of THAT instantiation
+/// answers. A type that overrides nothing still takes the default.
+#[test]
+fn b473_a_parameterized_supertraits_override_answers_through_a_deeper_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun name(self, value: T): str {
+                "the default"
+            }
+        }
+
+        trait Sub<T> with Base<T> {
+            fun tag(self): i32;
+        }
+
+        trait Deeper with Sub<i32> {}
+
+        struct Mine {}
+
+        impl Mine with Base<i32> {
+            fun name(self, value: i32): str {
+                i"the override {value}"
+            }
+        }
+
+        impl Mine with Sub<i32> {
+            fun tag(self): i32 {
+                7
+            }
+        }
+
+        impl Mine with Deeper {}
+
+        struct Plain {}
+
+        impl Plain with Base<i32> {}
+
+        impl Plain with Sub<i32> {
+            fun tag(self): i32 {
+                8
+            }
+        }
+
+        fun through_sub<S: Sub<i32>>(value: S): str {
+            value.name(1)
+        }
+
+        fun through_deeper<S: Deeper>(value: S): str {
+            value.name(2)
+        }
+
+        fun qualified<S: Sub<i32>>(value: S): str {
+            Sub::name(value, 3)
+        }
+
+        fun main() {
+            print(through_sub(Mine {}));
+            print(through_deeper(Mine {}));
+            print(qualified(Mine {}));
+            print(through_sub(Plain {}));
+        }
+        "#,
+        "the override 1\nthe override 2\nthe override 3\nthe default\n",
+    );
+}
+
+/// B473 at a CONCRETE receiver named through the sub-trait (`Sub::name(late)`),
+/// with the sub-trait's impl written BEFORE the override's: the impl that
+/// declares the member answers whatever order the blocks were written in. And
+/// a `for` loop over a sub-trait bound drives the declaring trait's `next`
+/// override (the default would end the loop at once: `0`).
+#[test]
+fn b473_a_qualified_call_and_a_for_loop_through_a_subtrait_take_the_override() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base {
+            fun name(self): str {
+                "the default"
+            }
+        }
+
+        trait Sub with Base {
+            fun tag(self): i32;
+        }
+
+        struct Late {}
+
+        impl Late with Sub {
+            fun tag(self): i32 {
+                1
+            }
+        }
+
+        impl Late with Base {
+            fun name(self): str {
+                "the late override"
+            }
+        }
+
+        struct Only {}
+
+        impl Only with Base {}
+
+        trait Walk {
+            fun next(&mut self): Option<i32> {
+                None
+            }
+        }
+
+        trait SubWalk with Walk {}
+
+        struct Count { n: i32 }
+
+        impl Count with Walk {
+            fun next(&mut self): Option<i32> {
+                if self.n >= 3 {
+                    ret None;
+                }
+                self.n += 1;
+                Some(self.n)
+            }
+        }
+
+        impl Count with SubWalk {}
+
+        fun walk<W: SubWalk>(mut walker: W): i32 {
+            mut total = 0;
+            for value in walker {
+                total += value;
+            }
+            total
+        }
+
+        fun main() {
+            print(Sub::name(Late {}));
+            print(Base::name(Late {}));
+            print(Base::name(Only {}));
+            print(walk(Count { n = 0 }));
+        }
+        "#,
+        "the late override\nthe late override\nthe default\n6\n",
+    );
+}
+
+/// The qualified spelling still names a trait the receiver must IMPLEMENT:
+/// `Sub::name` on a type that implements only `Base` is refused, although the
+/// member it reaches is `Base`'s (B473 kept the check on the named trait).
+#[test]
+fn b473_a_qualified_subtrait_call_on_a_type_without_the_subtrait_is_refused() {
+    assert_fails_with(
+        r#"
+        trait Base {
+            fun name(self): str {
+                "the default"
+            }
+        }
+
+        trait Sub with Base {
+            fun tag(self): i32;
+        }
+
+        struct Only {}
+
+        impl Only with Base {}
+
+        fun main() {
+            let label = Sub::name(Only {});
+        }
+        "#,
+        "does not implement 'Sub'",
     );
 }
 
@@ -8544,5 +8885,43 @@ fn a_second_emission_of_one_program_computes_no_impl_selection() {
         second, 0,
         "the second emission computed {second} impl selections (the first computed \
          {first}): every one was already answered for this program (M98)"
+    );
+}
+
+/// B479 without std: a stage type's own impl provides `Fl<U>` in the caller's
+/// parameter (`Der<S, T, I>` → `Fl<I>`), and a blanket over every `Src`
+/// provides `Fl` too — written first, its `T` grounded by nothing a `Der` has.
+/// The selector's parameter is typed from the stage's answer, the caller's `I`,
+/// not from the blanket's bare `T`.
+#[test]
+fn b479_a_stage_selector_in_a_generic_body_takes_the_receivers_own_answer() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Fl<T> { fun pull(self): T; }\n",
+            "trait Src<T> with Fl<T> { fun get(self): T; }\n",
+            "impl type S: Src<type T> with Fl<T> { fun pull(self): T { self.get() } }\n",
+            "struct Cell<T> { v: T }\n",
+            "impl Cell<type T> with Src<T> { fun get(self): T { self.v } }\n",
+            "struct Der<S, T, U> { up: S, f: |T| U }\n",
+            "impl Der<type S: Fl<type T>, T, type U> with Fl<U> {\n",
+            "\tfun pull(self): U { (self.f)(self.up.pull()) }\n",
+            "}\n",
+            "struct Sw<S, T, I, U> { up: S, sel: |T| I }\n",
+            "impl Sw<type S: Fl<type T>, T, type I: Fl<type U>, U> with Fl<U> {\n",
+            "\tfun pull(self): U { (self.sel)(self.up.pull()).pull() }\n",
+            "}\n",
+            "impl type F: Fl<type T> {\n",
+            "\tfun der<U>(self, f: |T| U): Der<F, T, U> { Der<F, T, U> { up = self, f } }\n",
+            "\tfun sw<U, I: Fl<U>>(self, sel: |T| I): Sw<F, T, I, U> { Sw<F, T, I, U> { up = self, sel } }\n",
+            "}\n",
+            "fun switch_to<T, U, S: Src<T>, I: Src<U>>(source: S, f: |T| I): U {\n",
+            "\tsource.der(f).sw(|inner| inner).pull()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(switch_to(Cell { v = 1 }, |m| Cell { v = m * 2 }));\n",
+            "}\n",
+        ),
+        "2\n",
     );
 }

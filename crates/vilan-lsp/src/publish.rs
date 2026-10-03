@@ -176,6 +176,60 @@ impl PublishState {
         actions
     }
 
+    /// E242: carry every outstanding diagnostic on `target` through one edit
+    /// of its text — `old_len` bytes at `start` became `new_len` bytes,
+    /// offsets in the text `before` indexes — so between a keystroke and the
+    /// next published analysis a squiggle stays on the code it was about.
+    /// Without it the client kept the old line/column against the new text,
+    /// and a line typed above an error moved the squiggle onto the line above
+    /// the code.
+    ///
+    /// Every owner's group for the target moves (a dependent's view of this
+    /// file read the same buffer). Answers whether anything was published
+    /// for the target at all — the caller republishes [`Self::republish`]
+    /// then, and only then. The next analysis replaces the groups whole, as
+    /// it always did.
+    pub fn follow_edit(
+        &mut self,
+        target: &Url,
+        before: &LineIndex,
+        edit: crate::document::EditDelta,
+        after: &LineIndex,
+    ) -> bool {
+        let target = self.key(target);
+        let mut touched = false;
+        for groups in self.owned.values_mut() {
+            for (candidate, group) in groups.iter_mut() {
+                if *candidate != target || group.is_empty() {
+                    continue;
+                }
+                touched = true;
+                group.retain_mut(|diagnostic| {
+                    let span = Span {
+                        start: before.offset(diagnostic.range.start),
+                        end: before.offset(diagnostic.range.end),
+                    };
+                    match follow_span(span, &edit) {
+                        Some(followed) => {
+                            diagnostic.range = after.range(&followed);
+                            true
+                        }
+                        None => false,
+                    }
+                });
+            }
+        }
+        touched
+    }
+
+    /// E242: the action that repaints `target` with what [`Self::follow_edit`]
+    /// left — the merged view, at the client's spelling.
+    pub fn republish(&self, target: &Url) -> (Url, Vec<Diagnostic>) {
+        let key = self.key(target);
+        let merged = self.merged(&key);
+        (self.address(&key), merged)
+    }
+
     /// The canonical key for a URL, under this planner's platform rule.
     fn key(&self, url: &Url) -> Url {
         crate::uri::normalize(url, self.windows)
@@ -210,6 +264,38 @@ impl PublishState {
         }
         merged
     }
+}
+
+/// E242's rule for one diagnostic span under one edit (`old_len` bytes at
+/// `start` replaced by `new_len`):
+///
+/// - the edit ends at or before the span's start — text typed or deleted
+///   above it, or before it on its line: the span moves by the edit's width;
+/// - the edit starts at or after the span's end — typing after it: unchanged;
+/// - the edit lies wholly inside the span — typing inside the flagged code:
+///   the span keeps its start and its end moves with the edit, so the
+///   squiggle still covers what it covered;
+/// - the edit straddles a boundary: the code the diagnostic was about is
+///   partly gone, and so is the diagnostic until the analysis says again.
+pub(crate) fn follow_span(span: Span, edit: &crate::document::EditDelta) -> Option<Span> {
+    let old_end = edit.start + edit.old_len;
+    let shift = |offset: usize| offset + edit.new_len - edit.old_len;
+    if old_end <= span.start {
+        return Some(Span {
+            start: shift(span.start),
+            end: shift(span.end),
+        });
+    }
+    if edit.start >= span.end {
+        return Some(span);
+    }
+    if edit.start >= span.start && old_end <= span.end {
+        return Some(Span {
+            start: span.start,
+            end: shift(span.end),
+        });
+    }
+    None
 }
 
 /// A secondary location resolved to the wire: the file's URI and the span's
@@ -1749,6 +1835,146 @@ mod tests {
             },
             "one character wide — not the old start == end zero-width range"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- E242: a published diagnostic follows the edits until the next one ---
+
+    /// The planner after analyzing `text`, then `edit` (`old_len` bytes at the
+    /// `at`-th byte of `text` replaced by `inserted`) followed — as
+    /// `did_change` does — and the repaint it republishes for the file.
+    fn follow_one_edit(
+        text: &str,
+        at: usize,
+        old_len: usize,
+        inserted: &str,
+    ) -> (String, Vec<Range>) {
+        let path = std::env::temp_dir().join(format!("vilan_e242_{}.vl", std::process::id()));
+        let uri = Url::from_file_path(&path).unwrap();
+        let document = Document::analyze(text, &std_root(), &path);
+        let mut state = PublishState::new();
+        state.plan_publish(&uri, &document);
+        let mut edited = text.to_string();
+        edited.replace_range(at..at + old_len, inserted);
+        let edit = crate::document::EditDelta {
+            start: at,
+            old_len,
+            new_len: inserted.len(),
+        };
+        assert!(state.follow_edit(&uri, &LineIndex::new(text), edit, &LineIndex::new(&edited)));
+        let (_, diagnostics) = state.republish(&uri);
+        (
+            edited,
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.range)
+                .collect(),
+        )
+    }
+
+    fn fresh_ranges(text: &str) -> Vec<Range> {
+        published(text)
+            .into_iter()
+            .map(|diagnostic| diagnostic.range)
+            .collect()
+    }
+
+    const E242_SOURCE: &str = "fun main() {\n\tlet ok = 1;\n\tlet wrong: i32 = \"text\";\n\tlet after = ok;\n}\n\nmain();\n";
+
+    #[test]
+    fn e242_a_line_inserted_above_an_error_carries_it_down_a_line() {
+        let at = E242_SOURCE.find("\tlet ok").unwrap();
+        let (edited, followed) = follow_one_edit(E242_SOURCE, at, 0, "\tlet extra = 2;\n");
+        assert!(!followed.is_empty(), "the fixture has an error");
+        assert_eq!(followed, fresh_ranges(&edited), "the next analysis agrees");
+        assert_eq!(followed[0].start.line, 3);
+    }
+
+    #[test]
+    fn e242_a_line_deleted_above_an_error_carries_it_up_a_line() {
+        let line = "\tlet ok = 1;\n";
+        // `ok` is read below, so the line deleted is one nothing reads.
+        let source = E242_SOURCE.replacen(line, &format!("{line}\tlet spare = 0;\n"), 1);
+        let spare = source.find("\tlet spare = 0;\n").unwrap();
+        let (edited, followed) = follow_one_edit(&source, spare, "\tlet spare = 0;\n".len(), "");
+        assert_eq!(followed, fresh_ranges(&edited));
+        assert_eq!(followed[0].start.line, 2);
+    }
+
+    #[test]
+    fn e242_typing_before_an_error_on_its_line_moves_its_column() {
+        let at = E242_SOURCE.find("let wrong").unwrap();
+        let (edited, followed) = follow_one_edit(E242_SOURCE, at, 0, "  ");
+        assert_eq!(followed, fresh_ranges(&edited));
+    }
+
+    #[test]
+    fn e242_typing_after_an_error_leaves_it_alone() {
+        let at = E242_SOURCE.find("\tlet after").unwrap();
+        let before = fresh_ranges(E242_SOURCE);
+        let (_, followed) = follow_one_edit(E242_SOURCE, at, 0, "\t// a note\n");
+        assert_eq!(followed, before);
+    }
+
+    #[test]
+    fn e242_typing_inside_an_error_keeps_its_start_and_stretches_its_end() {
+        let before = fresh_ranges(E242_SOURCE);
+        // Inside the flagged string literal.
+        let at = E242_SOURCE.find("text\"").unwrap() + 2;
+        let (_, followed) = follow_one_edit(E242_SOURCE, at, 0, "ab");
+        assert_eq!(followed.len(), before.len());
+        assert_eq!(followed[0].start, before[0].start);
+        assert_eq!(followed[0].end.character, before[0].end.character + 2);
+    }
+
+    #[test]
+    fn e242_an_edit_across_an_errors_edge_drops_it_until_the_next_analysis() {
+        let before = fresh_ranges(E242_SOURCE);
+        let start = E242_SOURCE.find("\"text\"").unwrap();
+        // From before the literal's opening quote into its middle.
+        let (_, followed) = follow_one_edit(E242_SOURCE, start - 2, 4, "");
+        assert_eq!(followed.len(), before.len() - 1);
+    }
+
+    #[test]
+    fn e242_an_edit_moves_only_its_own_files_diagnostics_and_an_analysis_replaces_them() {
+        // An error in an imported module is published to the MODULE; an edit
+        // of the entry must not move it.
+        let (dir, _) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::greet;\n\nfun main() {\n\tgreet();\n}\n\nmain();\n",
+            ),
+            (
+                "helper.vl",
+                "export fun greet(): i32 {\n\t\"not a number\"\n}\n",
+            ),
+        ]);
+        let (uri, document) = open(&dir, "main.vl");
+        let mut state = PublishState::new();
+        let actions = state.plan_publish(&uri, &document);
+        let module = actions
+            .iter()
+            .find(|(target, group)| *target != uri && !group.is_empty())
+            .map(|(target, group)| (target.clone(), group.clone()))
+            .expect("the module's error is published to the module");
+        let text = std::fs::read_to_string(dir.join("main.vl")).unwrap();
+        let edited = format!("\n\n{text}");
+        let edit = crate::document::EditDelta {
+            start: 0,
+            old_len: 0,
+            new_len: 2,
+        };
+        state.follow_edit(&uri, &LineIndex::new(&text), edit, &LineIndex::new(&edited));
+        assert_eq!(
+            state.republish(&module.0).1,
+            module.1,
+            "the module's squiggle stays put"
+        );
+        // The next analysis replaces the followed set whole.
+        let fresh = Document::analyze(&edited, &std_root(), &dir.join("main.vl"));
+        let replanned = state.plan_publish(&uri, &fresh);
+        assert!(replanned.iter().any(|(target, _)| *target == uri));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -102,6 +102,61 @@ fn b414_own_is_a_name_everywhere_but_before_a_parameters_binder() {
     );
 }
 
+/// B446: a parameter NAMED `own` right after a generic-typed parameter — the
+/// `>`/`>>` that closes its type is the token before the `,` — is a name. The
+/// item's report had it refused as "found '>' expected ','" at the previous
+/// parameter's `>`; `own` is the convention only when a binder follows it
+/// (`eat_binder_prefix`), and a `:` is no binder. Every parameter list that
+/// reads the rule: a free function (one and two closing `>`s, an `Option` of
+/// one, a view of one), a method, a trait requirement, a closure literal, and
+/// `lazy`, the other binder prefix, in the same place.
+#[test]
+fn b446_a_parameter_named_own_after_a_generic_typed_one_is_a_name() {
+    assert_compiles(
+        r#"
+        import std::shared::Shared;
+
+        struct Foo { n: i32 }
+
+        fun repro(a: Shared<List<Foo>>, own: i32) {}
+
+        fun main() {}
+        "#,
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Box2 { items: List<i32> }
+
+        trait Weigh { fun weigh(self, xs: List<List<i32>>, own: i32): i32; }
+
+        impl Box2 with Weigh {
+            fun weigh(self, xs: List<List<i32>>, own: i32): i32 { xs.len().as_i32() + own }
+        }
+
+        impl Box2 {
+            fun add(self, xs: List<i32>, own: i32): i32 { self.items.len().as_i32() + xs.len().as_i32() + own }
+        }
+
+        fun one(xs: List<i32>, own: i32): i32 { xs.len().as_i32() + own }
+        fun two(xs: List<List<i32>>, own: i32): i32 { xs.len().as_i32() + own }
+        fun maybe(xs: Option<List<i32>>, own: i32, after: i32): i32 { own + after }
+        fun viewed(xs: &List<i32>, own: i32): i32 { xs.len().as_i32() + own }
+        fun both(xs: List<List<i32>>, own own: i32): i32 { own }
+        fun deferred(xs: List<List<i32>>, lazy: i32): i32 { lazy }
+
+        fun main() {
+            let closure = |xs: List<List<i32>>, own: i32| xs.len().as_i32() + own;
+            let shelf = Box2 { items = [ 1 ] };
+            print(i"{one([ 1 ], 10)} {two([ [ 1 ], [ 2 ] ], 10)} {maybe(None, 1, 2)} {viewed(&[ 1, 2 ], 1)}");
+            print(i"{both([], 7)} {deferred([], 8)} {closure([ [ 1 ] ], 4)} {shelf.weigh([ [ 1 ] ], 1)} {shelf.add([ 1 ], 1)}");
+        }
+        "#,
+        "11 12 3 3\n7 8 5 2 3\n",
+    );
+}
+
 #[test]
 fn b414_dyn_is_a_name_everywhere_but_a_type_head() {
     assert_compiles_and_runs(

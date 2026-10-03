@@ -66,18 +66,21 @@ import pkg::reactive::{
 	reconcile,
 	run_with_owner,
 	subscriber_of,
+	tracking,
 	turn,
 	turn_scope,
 };
 import pkg::shared::Shared;
+import pkg::store::{ Store, StoreFlag, StoreSome };
 import pkg::style::Style;
 
 /// A binding's subscription: `observer` now and on every change, released with
 /// the nearest boundary. `effect` without the per-run owner (A142 §4): every body
 /// a binding runs writes the DOM and registers nothing, so it pays for no owner
 /// and no nursery per change. A form that builds per value (`when`, `swap`,
-/// `each`) keeps the owners it makes itself.
-fun follow<T, F: Flow<T>>(own flow: F, observer: |T| void) {
+/// `each`) keeps the owners it makes itself. The observer is a callback position
+/// like `sub`'s (B482): it runs with `tracking` cleared.
+fun follow<T, F: Flow<T>>(own flow: F, observer: (|T| void) context tracking) {
 	get_owner().take(flow.sub(observer));
 }
 
@@ -196,18 +199,19 @@ export impl View {
 	/// below, and each dispatch runs the clause-typed handler inside a fresh turn —
 	/// an event's signal writes settle as one wave. (`AtSuspension` behaves as
 	/// `AtEnd` until the async hook lands.) Handlers die with the DOM node — no
-	/// registration needed.
-	fun on(self, event: str, handler: (|| void) context turn_scope): View {
-		self.element.on(event, || turn(FlushPolicy::AtSuspension, || handler()));
+	/// registration needed. A handler is a CALLBACK (A142 §7.3, B482): it runs
+	/// under `tracking.clear(..)`, so a `track()` in it is refused at compile time.
+	fun on(self, event: str, handler: (|| void) context (turn_scope, tracking)): View {
+		self.element.on(event, || turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler())));
 		self
 	}
 
 	/// Like `on`, but the handler receives the DOM `Event` — for `prevent_default`,
 	/// modifier keys, key names. The same turn discipline: each dispatch settles as
 	/// one wave.
-	fun on_event(self, event: str, handler: (|Event| void) context turn_scope): View {
-		self.element
-			.on_event(event, |dispatched| turn(FlushPolicy::AtSuspension, || handler(dispatched)));
+	fun on_event(self, event: str, handler: (|Event| void) context (turn_scope, tracking)): View {
+		self.element.on_event(event, |dispatched| turn(FlushPolicy::AtSuspension, || tracking
+			.clear(|| handler(dispatched))));
 		self
 	}
 
@@ -863,18 +867,6 @@ export impl type S: Flow<str> with Slot {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<str> with Slot {
-	fun place(own self, parent: View) {
-		place_text_flow(self, parent);
-	}
-}
-
 fun place_text_flow<F: Flow<str>>(own flow: F, parent: View) {
 	let node = create_text_node("");
 	parent.element.append_text(node);
@@ -931,18 +923,6 @@ export impl type S: Flow<View> with Slot {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<View> with Slot {
-	fun place(own self, parent: View) {
-		place_view_flow(self, parent);
-	}
-}
-
 fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
 	let region = Region::open(parent);
 	let live: Shared<Option<View>> = Shared::new(None);
@@ -973,18 +953,6 @@ fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
 /// with the same ownership story as the single-view arm above — and, with it,
 /// the same `Region`, so the whole run keeps the hole's position (A71).
 export impl type S: Flow<List<View>> with Slot {
-	fun place(own self, parent: View) {
-		place_views_flow(self, parent);
-	}
-}
-
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<List<View>> with Slot {
 	fun place(own self, parent: View) {
 		place_views_flow(self, parent);
 	}
@@ -2161,18 +2129,6 @@ export impl type S: Flow<str> with AttrValue {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<str> with AttrValue {
-	fun apply(own self, parent: View, name: str) {
-		apply_text_flow(self, parent, name);
-	}
-}
-
 fun apply_text_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2203,18 +2159,6 @@ export impl Option<str> with AttrValue {
 /// that reads PRESENCE (`[data-dragging] *`), where there is no string that turns
 /// the attribute off.
 export impl type S: Flow<Option<str>> with AttrValue {
-	fun apply(own self, parent: View, name: str) {
-		apply_optional_flow(self, parent, name);
-	}
-}
-
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<Option<str>> with AttrValue {
 	fun apply(own self, parent: View, name: str) {
 		apply_optional_flow(self, parent, name);
 	}
@@ -2256,18 +2200,6 @@ export impl type S: Flow<str> with AttrBinding {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<str> with AttrBinding {
-	fun bind_attribute(own self, parent: View, name: str) {
-		bind_text_attribute_flow(self, parent, name);
-	}
-}
-
 fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2278,18 +2210,6 @@ fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str)
 /// Present exactly while the source says `Some`, and gone while it says `None` —
 /// the shape kolt hand-wrote as `bind_attr_proper` (A105).
 export impl type S: Flow<Option<str>> with AttrBinding {
-	fun bind_attribute(own self, parent: View, name: str) {
-		bind_optional_attribute_flow(self, parent, name);
-	}
-}
-
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<Option<str>> with AttrBinding {
 	fun bind_attribute(own self, parent: View, name: str) {
 		bind_optional_attribute_flow(self, parent, name);
 	}
@@ -2311,8 +2231,8 @@ fun bind_optional_attribute_flow<F: Flow<Option<str>>>(own flow: F, parent: View
 /// IT an `Option<Element>` signature is a wider API question (A24, fullstack-dx.md
 /// §9.5) deliberately NOT taken here — this is a private guard at the mount seam
 /// alone.
-export [extern("__is_null")]
-external fun is_null(value: Element): bool;
+[extern("__is_null")]
+export external fun is_null(value: Element): bool;
 
 /// The lookup `mount`/`mount_root` share: fails loud, naming the id, instead
 /// of leaving `element.clear()` below to throw "Cannot read properties of
@@ -2478,6 +2398,29 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 			},
 		}
 	});
+}
+
+// === `when_live`: a store's variant as content (A142 S7) ====================
+//
+// `when_some` hands its body a `SignalCell<T>` of the WHOLE payload, so every
+// binding in the body is a projection of that cell and reruns on every write to
+// any of the payload's fields. A store already knows the payload's shape: this
+// rebuilds ONLY on the variant (it follows the discriminant slot,
+// `proposal/store.md` §2.6) and hands the body the payload's own `Store<P>`, whose
+// field handles wake one by one. KEEP IN STEP with the process twin's copy
+// (process/ui.vl).
+
+/// A store's variant as CONTENT at THIS position, with the payload's `Store<P>` in
+/// hand: built under a fresh owner when the variant goes live, and disposed when it
+/// goes away. A write inside the payload wakes only the bindings that read what
+/// changed; it never rebuilds the body.
+///
+///     <aside>{when_live(presence.online(), |device| device_panel(device))}</aside>
+export fun when_live<P, C: Slot>(
+	handle: StoreSome<P>,
+	render: (sync |Store<P>| C) context owner_scope,
+): Conditional<StoreFlag, C> {
+	when(handle.live(), || render(handle.assume()))
 }
 
 // === A121: focus scopes (proposal/focus-scope.md) ============================

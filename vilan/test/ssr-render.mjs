@@ -45,7 +45,7 @@ function open(parent) {
 	return [ __clone(parent) ];
 }
 function place(self, parent) {
-	parent[2].v.push([ 0, __clone(self) ]);
+	parent[2].v.push([ 0, self ]);
 }
 function place2(self, parent) {
 	parent[2].v.push([ 1, self ]);
@@ -174,18 +174,18 @@ function $i(self) {
 	} ];
 }
 function $h(flow) {
-	const instance = $i(__clone(flow));
+	const instance = $i(flow);
 	const value = instance[0]();
 	instance[2]();
 	return value;
 }
 function $g(self, source) {
-	self[3].v = $h(__clone(source));
+	self[3].v = $h(source);
 	self[2].v = [  ];
 	return __clone(self);
 }
 function $n(source, key, render2) {
-	return [ __clone(source), key, render2 ];
+	return [ source, key, render2 ];
 }
 function $t(self) {
 	return [ 1 ];
@@ -228,13 +228,13 @@ function $s(self) {
 	return $v;
 }
 function $r(source) {
-	const instance = $s(__clone(source));
+	const instance = $s(source);
 	const items = instance[0]();
 	instance[3]();
 	return items;
 }
 function $C(self, content) {
-	place(__clone(content), self[0]);
+	place(content, self[0]);
 	return [  ];
 }
 function $D(owner, body) {
@@ -242,7 +242,7 @@ function $D(owner, body) {
 }
 function $q(parent, source, key, render2) {
 	const region = open(parent);
-	const items = $r(__clone(source));
+	const items = $r(source);
 	for (const item of items) {
 		const owner = new2();
 		$D(owner, ($B) => {
@@ -254,15 +254,15 @@ function $p(self, parent) {
 	$q(parent, __clone(self[0]), self[1], self[2]);
 }
 function $o(self, content) {
-	$p(__clone(content), self);
+	$p(content, self);
 	return __clone(self);
 }
 function $H(self, name2, value) {
-	apply(__clone(value), self, name2);
+	apply(value, self, name2);
 	return __clone(self);
 }
 function $I(source, render2) {
-	return [ __clone(source), render2 ];
+	return [ source, render2 ];
 }
 function $N(self) {
 	return [ () => {
@@ -274,14 +274,14 @@ function $N(self) {
 	} ];
 }
 function $M(flow) {
-	const instance = $N(__clone(flow));
+	const instance = $N(flow);
 	const value = instance[0]();
 	instance[2]();
 	return value;
 }
 function $L(parent, source, render2) {
 	const region = open(parent);
-	const value = $M(__clone(source));
+	const value = $M(source);
 	const owner = new2();
 	$D(owner, ($R) => {
 		return $C(region, render2(value, $R));
@@ -291,39 +291,39 @@ function $K(self, parent) {
 	$L(parent, __clone(self[0]), self[1]);
 }
 function $J(self, content) {
-	$K(__clone(content), self);
+	$K(content, self);
 	return __clone(self);
 }
 function $S(self, content) {
-	place(__clone(content), self);
+	place(content, self);
 	return __clone(self);
 }
 function $Z(flow, parent, name2) {
-	set_attribute(parent[1], name2, $h(__clone(flow)));
+	set_attribute(parent[1], name2, $h(flow));
 }
 function $Y(self, parent, name2) {
-	$Z(__clone(self), parent, name2);
+	$Z(self, parent, name2);
 }
 function $X(self, name2, value) {
-	$Y(__clone(value), self, name2);
+	$Y(value, self, name2);
 	return __clone(self);
 }
 function $aa(self, content) {
-	place2(__clone(content), self);
+	place2(content, self);
 	return __clone(self);
 }
 function $ad(flow, parent) {
-	parent[2].v.push([ 1, $h(__clone(flow)) ]);
+	parent[2].v.push([ 1, $h(flow) ]);
 }
 function $ac(self, parent) {
-	$ad(__clone(self), parent);
+	$ad(self, parent);
 }
 function $ab(self, content) {
-	$ac(__clone(content), self);
+	$ac(content, self);
 	return __clone(self);
 }
 function $ae(self, content) {
-	place3(__clone(content), self);
+	place3(content, self);
 	return __clone(self);
 }
 const no_cleanups = __shared_new([  ]);

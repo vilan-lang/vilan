@@ -1,7 +1,9 @@
 # std::reactive reference
 
 Signals, effects, ownership, turns, and the higher-level cells. Concepts and
-usage patterns: the [reactive guide](../guide/reactive.md).
+usage patterns: the [reactive guide](../guide/reactive.md). The fine-grained
+version of a whole struct — a handle per field, generated from the type — is a
+[store](store.md).
 
 Import what you use:
 
@@ -59,6 +61,11 @@ import std::reactive::{
 | `ListMemo<T>` | struct | a sealed collection pipe: a read-only granular source |
 | `RowFeed<T>` | trait | what `each`/`each_by` read their rows from: a list source or a collection pipe |
 | `coll`, `coll_by`, `Coll`, `CollBy`, `SameElement` | methods/structs/trait | a flow of whole lists into a collection pipe: the positional diff (prefix/suffix trim) and the keyed one (`ReconcilePlan`, emits `Move`) |
+| `HashMapCell<K, V>`, `HashMapEntry<K, V>`, `MapSignal`, `MapSource`, `TrackedHashMap` | structs/traits | a `HashMap` cell whose writes ARE its `MapOp`s; `at(key)`, a handle that depends on ONE key |
+| `HashSetCell<T>`, `HashSetEntry<T>`, `SetSignal`, `SetSource` | structs/traits | the same for a `HashSet`; `contains(x)`, a `Source<bool>` for one member |
+| `MapFlow`, `MapPipe`, `HashMapMemo`, `MemoEntry`, `SetFlow`, `SetPipe`, `HashSetMemo` | traits/structs | the Map and Set shapes' pipes: anything a map (set) pipeline starts from; a move-only map (set) pipe (`memo`/`memo_global`/`sample`); what it seals into |
+| `keys`, `values`, `entries`, `map_values`, `filter`, `count`, `sum_by` | methods | the map operators — a set pipe, collection pipes in insertion order (a Fenwick rank), map pipes, scalar pipes; each costs what the op names |
+| `KeySlots` | struct | the per-key slot table both stand on: a slot per WATCHED key, counted per subscription |
 
 ## Signal and SignalCell
 
@@ -69,7 +76,7 @@ in-place `update` — names `SignalCell`.
 
 ```vilan,fragment
 trait Signal<T> with Source<T> {
-	fun new(value: T): SignalCell<T>             // default body: the canonical cell
+	fun new(own value: T): SignalCell<T>         // default body: the canonical cell
 	fun set(self, value: T)                      // required
 	fun notify(self)                             // required
 	fun set_with(self, transform: sync |T| T)    // default: set(transform(get()))
@@ -83,7 +90,7 @@ it hands back is a `SignalCell<T>`.
 
 ```vilan,fragment
 impl SignalCell<type T> with Signal<T> {
-	fun new(value: T): SignalCell<T>
+	fun new(own value: T): SignalCell<T>
 	fun set(self, value: T)                 // write + notify
 	fun notify(self)                        // publish without changing
 	// from the trait default:
@@ -266,11 +273,16 @@ trait Flow<T> {
 	[must_use]
 	fun start(own self): Instance<T>                                  // the stage author's member
 	[must_use]
-	fun on_change(own self, observer: |T| void): Subscription         // no first call
+	fun observe(own self, observer: |T| void, immediately: bool): Subscription
+	                                                                  // the stage author's attach (required)
 	[must_use]
-	fun sub(own self, observer: |T| void): Subscription               // + one immediate call
-	fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
-	                                                                  // owner-registered; an owner per run
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription
+	                                                                  // no first call; a callback (cleared)
+	[must_use]
+	fun sub(own self, observer: (|T| void) context tracking): Subscription
+	                                                                  // + one immediate call; cleared
+	fun effect_on_change(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
+	                                                                  // owner-registered; an owner per run; cleared
 	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
 	                                                                  // the same, eager; the body tracks
 	fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
@@ -297,7 +309,9 @@ Two kinds of reactive value (A142's pipe model):
   `and_then`, `then_some`, `flatten`, `distinct`, `distinct_by`, `combine` —
   a description with no `get`. It is consumed exactly once: sealed with
   `.memo()`, `.cell()`, the `_global` twins or `.sample()`, or handed to a
-  consumer (an `effect`, a UI binding).
+  consumer (an `effect`, a UI binding). A pipe built as a bare statement runs nothing,
+  and the compiler WARNS about it (`unused pipe`) — whichever function built it,
+  std's or your own; `let _ = …` says the drop is meant.
 
 **`Flow`** is what both are: every `Source` through a blanket, and every pipe
 stage directly. The consumers and the combinators live there, and every one of
@@ -550,7 +564,7 @@ fun main() {
 
 ```vilan,fragment
 fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
-fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+fun effect_on_change(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
 fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
 fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, tracking, ambient_nursery)): Switch<Self, T, I, U>
 fun on_cleanup(cleanup: || void)
@@ -564,16 +578,19 @@ an `owner.take`, a mirror's lease — is released before the next run, and the
 last run's when the consumer is released (the enclosing boundary, for an
 `effect` or a `.memo()`; the call itself, for `.sample()`). A task the body
 starts runs in the run's nursery and is **cancelled** when the run is released,
-so a superseded fetch stops rather than landing late. A pipe has exactly one
+so a superseded fetch stops rather than landing late. The task is OWNED by that
+nursery — spawned in the body or in anything the body calls — so its
+cancellation is absorbed, never reported as an unhandled task error. A pipe has exactly one
 consumer, so every body runs once per change inside one instance, and "a run"
 always means "one run per change".
 
 The owner is allocated LAZILY: a stage keeps one owner cell for the life of its
 instance, each run is the next epoch of it, and the cleanup list is made at the
 run's first registration — a body that registers nothing costs a read and a
-write, and allocates no owner. (A run's nursery is created per run: the host's
-spawn machinery registers a task at the `async` expression, so one has to
-exist before the body runs.) The bindings in `std::ui` do not pay even that:
+write, and allocates no owner. A run's nursery has to exist before the body
+runs (the spawn machinery registers a task at the `async` expression), but a
+run that started no task hands its nursery on to the next run: a stage makes a
+nursery at its first run, and again only after a run that spawned. The bindings in `std::ui` do not pay even that:
 their bodies write the DOM and register nothing, so they attach plainly.
 
 ```vilan
@@ -610,9 +627,12 @@ consumer's release). A registration that arrives after its run was released —
 an `await` that resumed late — is released on the spot.
 
 The body's owner and nursery are INJECTED (the `context` clause), which is what
-makes them the RUN's rather than the boundary's; the price is that a body is a
-closure literal or a local closure — a named function is refused at the call
-(`count.derive(|n| label(n))`, not `count.derive(label)`). `scoped_effect` and
+makes them the RUN's rather than the boundary's. A body is a closure literal, a
+local closure, or a named function or variant that reads none of the injected
+contexts — `count.derive(label)` and `count.derive(Some)` hand the call its
+body as directly as `count.derive(|n| label(n))` does; a function that reads
+one (a `.track()` inside it) is refused as a value and written as a literal
+at the call. `scoped_effect` and
 `scoped_effect_on_change` are `effect`'s and `effect_on_change`'s names before
 the two merged, kept one release as deprecated aliases.
 
@@ -650,7 +670,8 @@ The guide's [tracked reads](../guide/tracked-reads.md) chapter is the tour.
   its reads with the edges it holds, in order: an edge to a source read again is
   kept, a new read attaches one, an edge nothing read is detached. A source keeps
   its edge across runs when it can say what state it is — `Source::identity()`,
-  answered by `SignalCell` and `MemoCell` (their cell); `None`, the default,
+  answered by `SignalCell`, `MemoCell`, `ListCell`, `KeyedCell`, `RemoteSource`
+  and `KeyedSource` (their value cell); `None`, the default,
   re-attaches each run and releases the old edge. A source that names its identity
   and is read twice in one run is one edge.
 - **Glitch-free.** An edge wakes through a DERIVATION relay (the turn's first
@@ -688,8 +709,9 @@ fun main() {
 }
 ```
 
-`TrackScope`, `Tracker`, `Dependency` and `TrackedEdge` are the layer's own
-records (a run's scope, a stage's dependencies across runs, one read, one edge);
+`TrackScope`, `Tracker`, `TrackRuns`, `TrackLists`, `Dependency` and `TrackedEdge`
+are the layer's own records (a run's scope, a stage's dependencies across runs —
+its lists made at the stage's first `track()` — one read, one edge);
 an application never builds them.
 
 ## selector — per-key selection
@@ -1538,6 +1560,221 @@ fun main() {
 
 The real fix is upstream — keep the source of truth granular (`ListCell`), and
 diff only at the boundaries: a fetch result, a wire snapshot.
+
+## HashMapCell and HashSetCell — maps and sets whose writes are their deltas
+
+```vilan,fragment
+struct HashMapCell<K: Hashable, V> { … }   // the map, a DeltaLog<MapOp<K, V>>, one notification, per-key slots
+
+impl HashMapCell<type K: Hashable, type V> {
+	fun new(): HashMapCell<K, V>
+	fun of(own map: HashMap<K, V>): HashMapCell<K, V>
+	fun with_limit(own map: HashMap<K, V>, limit: usize): HashMapCell<K, V>
+	fun get(self, key: K): Option<V>                    // the per-key READ
+	fun contains_key(self, key: K): bool
+	fun len(self): usize
+	fun is_empty(self): bool
+	fun peek<U>(self, read: sync |&HashMap<K, V>| U): U  // read IN PLACE
+	fun at(self, key: K): HashMapEntry<K, V>                 // the per-key HANDLE
+	fun edit(self, body: sync |&mut TrackedHashMap<K, V>| void)  // many writes, ONE notification
+	fun logged(self): usize
+	fun watched(self): usize                             // keys with a live slot
+}
+impl HashMapCell<type K: Hashable, type V: PartialEq> { fun reconcile_to(self, own target: HashMap<K, V>) }
+
+trait MapSignal<K: Hashable, V> with Signal<HashMap<K, V>> {   // the writes
+	fun insert(self, key: K, value: V);                 // Put(key, what was there, value)
+	fun remove(self, key: K);                           // Delete(key, what left); absent: nothing
+	fun update(self, key: K, mutate: sync |&mut V| void);   // Put(key, Some(before), after)
+	fun get_or_insert(self, key: K, make: || V): V;     // Put(key, None, made) on a miss
+	fun clear(self);                                    // ONE Reset; empty: nothing
+}
+trait MapSource<K: Hashable, V> with DeltaSource<HashMap<K, V>, MapOp<K, V>> {}
+// HashMapCell: Source<HashMap<K, V>>, Signal<HashMap<K, V>> (`set` is a Reset), MapSignal, MapSource
+// HashMapEntry<K, V>: Source<Option<V>> on its key's slot, Signal<Option<V>> (Some = insert, None = remove)
+
+struct HashSetCell<T: Hashable> { … }      // the set, a DeltaLog<SetOp<T>>, one notification, per-member slots
+impl HashSetCell<type T: Hashable> {
+	fun new(): HashSetCell<T>
+	fun of(own set: HashSet<T>): HashSetCell<T>
+	fun len(self): usize
+	fun peek<U>(self, read: sync |&HashSet<T>| U): U
+	fun contains(self, value: T): HashSetEntry<T>           // a Source<bool> for one member
+	fun reconcile_to(self, own target: HashSet<T>)
+}
+trait SetSignal<T: Hashable> with Signal<HashSet<T>> {
+	fun insert(self, value: T): bool;                   // Add, and true, when it was new
+	fun remove(self, value: T): bool;                   // Remove, and true, when it was held
+	fun clear(self);                                    // ONE Reset
+}
+```
+
+A `HashMapCell<K, V>` is what `ListCell` is for a list: a `HashMap` whose writes are
+recorded as the Map shape's ops (`MapOp`: `Put(key, what was there, what is there
+now)`, `Delete(key, what left)`, `Reset(map)`), so a delta consumer is told what
+each write did. What it adds is the reason a map wants a cell at all: most readers
+of a map read ONE KEY, and `at(key)` is a handle that depends on that key only.
+
+```vilan
+import std::hash_map::HashMap;
+import std::reactive::{ HashMapCell, comp };
+
+fun main() {
+	let scores: HashMapCell<str, i32> = HashMapCell::of([("ada", 1), ("bo", 2)].to_map());
+	mut runs = 0;
+	let (doubled, scope) = comp(|| scores.at("ada").derive(|score| {
+		runs += 1;
+		score.unwrap_or(0) * 2
+	}).memo());
+	scores.insert("bo", 20);       // another key: nothing runs
+	scores.insert("cy", 3);        // nor here
+	scores.insert("ada", 5);       // runs once
+	print(i"{doubled.get()} runs={runs}");   // 10 runs=2
+	scope.dispose();
+}
+```
+
+`at(key)` is a `Source<Option<V>>` — `derive`, `effect`, `switch`, a tracked
+`.track()`, a UI binding all take it — and a `Signal<Option<V>>` whose
+`set(Some(v))` is `insert(key, v)` and `set(None)` is `remove(key)`. It is data,
+not a subscription: two consumers of one `at(key)` need no seal, and an `[rpc]`
+method may answer it — it crosses as a `RemoteSource<Option<V>>` mirror that the
+key's writes alone update. Its
+subscriptions land on the key's SLOT, a notification-only cell made by the first
+subscription and dropped with the last (`watched()` counts them), so the table is
+the size of what is watched and a write to a key nobody watches costs one hash
+probe. A thousand readers of a thousand keys and a thousand single-key writes are
+a thousand observer calls, where a `SignalCell<HashMap<..>>` with a
+`derive(|map| map.get(key))` per reader is a million projections, each of which
+copies the whole map.
+
+What wakes, per write:
+
+| write | records | wakes |
+|---|---|---|
+| `insert`, `update`, `get_or_insert` (a miss), `remove` (held) | one `Put` or `Delete` | that key's slot, then the whole-map observers |
+| `remove` of an absent key, `update` of an absent key, `get_or_insert` (a hit) | nothing | nothing |
+| `set(map)`, `clear()` | one `Reset` | EVERY watched key — a `Reset` cannot say which keys changed without comparing, and a cell never compares |
+| `reconcile_to(map)` | a `Delete`/`Put` per key that left, arrived or changed | only those keys; an identical map, nothing |
+| `edit(body)` | one op per mutation | each key it named, once; one whole-map notification |
+
+The per-key read is `get(key)`, and vilan has no overloading, so the WHOLE map is
+read through the `Source` bound — any generic consumer does that already — or as
+`Source::get(cell)` with the type written, or in place with `peek`:
+
+```vilan
+import std::hash_map::HashMap;
+import std::reactive::{ HashMapCell, Source };
+
+fun main() {
+	let ages: HashMapCell<str, i32> = HashMapCell::new();
+	ages.insert("ada", 36);
+	print(ages.get("ada").unwrap_or(0));                 // 36: one key
+	print(ages.peek(|map| map.len()));                   // 1: in place, no copy
+	let whole: HashMap<str, i32> = Source::get(ages);   // a copy of all of it
+	print(whole.keys());
+}
+```
+
+The map iterates in INSERTION order, as every `HashMap` does: an overwrite keeps
+its key's place, and a key removed and inserted again goes to the end.
+`reconcile_to` keeps a held key's place and appends an arriving one in the
+target's order, so the cell equals the target (`==` is order-insensitive) without
+taking its order.
+
+A `HashSetCell<T>` is the same cell for the Set shape (`SetOp`: `Add`, `Remove`,
+`Reset`), over the same slot table. Its per-member handle is `contains(x)`, a
+`Source<bool>` that wakes for `x` alone; `insert` and `remove` answer whether they
+changed the set and record only when they did.
+
+```vilan
+import std::hash_set::HashSet;
+import std::reactive::{ HashSetCell };
+
+fun main() {
+	let online: HashSetCell<str> = HashSetCell::new();
+	mut flips = 0;
+	let watch = online.contains("ada").on_change(|here| flips += 1);
+	print(online.insert("bo"));    // true — "ada" does not wake
+	print(online.insert("ada"));   // true — it does
+	print(online.insert("ada"));   // false: nothing recorded, nothing woken
+	print(flips);                  // 1
+	watch.dispose();
+}
+```
+
+Both are `DeltaSource`s (`MapSource`, `SetSource`), with `cursor`/`since`/`reader`
+as `ListCell` has them: a cursor that fell behind the log is told the whole
+collection as one `Reset`.
+
+## Map pipes — operators for maps and sets
+
+```vilan,fragment
+[resource] trait MapFlow<K: Hashable, V> { fun open(own self): MapInstance<K, V>; }   // MapSource, every map pipe
+[resource] trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
+	fun memo(own self): HashMapMemo<K, V>          // seal: a read-only MapSource with get(key)/at(key)
+	fun memo_global(own self): HashMapMemo<K, V>
+	fun sample(own self): HashMap<K, V>
+}
+impl type F: MapFlow<type K, type V> {
+	fun keys(own self): MapKeys<F, K, V>                       // a SetPipe<K>
+	fun values(own self): MapValues<F, K, V>                   // a CollPipe<V>, in insertion order
+	fun entries(own self): MapEntries<F, K, V>                 // a CollPipe<(K, V)>
+	fun map_values<R>(own self, transform: |V| R): MapMapValues<F, K, V, R>   // R: IntoElement<U>
+	fun filter<R>(own self, keep: |K, V| R): MapFilter<F, K, V, R>           // R: IntoFlow<bool>
+	fun count(own self): MapCount<F, K, V>                     // a Pipe<usize>
+	fun sum_by<N: Add + Sub + Default, R: IntoFlow<N>>(own self, measure: |V| R): MapSum<F, K, V, R, N>   // a Pipe<N>
+}
+// SetFlow<T>, SetPipe<T> (memo → HashSetMemo<T>, with contains(x)), the Set shape's twins
+```
+
+A map OPERATOR is a collection pipe for the Map shape: it is consumed once —
+sealed with `.memo()`, handed to a consumer, or read once with `.sample()` — and
+what travels between its stages is the `MapOp`, which names KEYS. So every
+operator costs what the op names: `map_values` runs its closure once per `Put` and
+never for a `Delete`, `filter` once per `Put`, `keys()` turns a new key's `Put`
+into an `Add` and ignores an overwrite, and `count`/`sum_by` add what arrived and
+subtract what left.
+
+```vilan
+import std::hash_map::HashMap;
+import std::reactive::{ HashMapCell, comp };
+
+fun main() {
+	let stock: HashMapCell<str, i32> = HashMapCell::of([("pens", 3), ("ink", 0)].to_map());
+	let ((names, low, total), scope) = comp(|| (
+		stock.keys().memo(),                                  // a HashSetMemo
+		stock.filter(|item, count| count < 2).values().memo(),   // a ListMemo
+		stock.sum_by(|count| count).memo()
+	));
+	stock.insert("pens", 1);       // one Put: the filter runs once
+	stock.insert("pads", 9);       // the key set gains one Add
+	print(names.get().len());      // 3
+	print(low.get());              // [ 0, 1 ]: "pens" joined the filter after "ink"
+	print(total.get());            // 10
+	scope.dispose();
+}
+```
+
+**The positional face is where order lives.** `values()` and `entries()` are
+collection pipes in the map's insertion order — what `each_by` and a `ListMemo`
+consume. A new key is a one-element `Splice` at its RANK, the number of live keys
+before it, which a Fenwick tree over the keys' slots answers in O(log n); an
+overwrite is a `SetAt` there, a removal a one-element `Splice` out; a removed and
+re-inserted key goes to the end, as the map puts it. Every other operator is
+order-free — and a map PIPE's order is the order its keys arrived in it: a key
+that flips into a `filter` joins its output at the end.
+
+**Following and owners**, as for the collection operators: a `filter` predicate
+that answers a flow is FOLLOWED per key (a flip is a `Put` or a `Delete`
+downstream), a `map_values` closure that answers a pipe has it started per key
+and its value carried, and each key's run gets an owner of its own — released
+when the key's value is replaced or the key leaves. A `sum_by` measure that answers
+a flow is followed the same way: the sum moves by the difference.
+
+A sealed map pipe is a `HashMapMemo`: a read-only granular map source with `get(key)`,
+`len`, `peek`, and `at(key)` — a read-only per-key handle on the sealed map's
+slots, so a key's reader wakes only when the pipe changed that key.
 
 ## reconcile: keyed list diffing
 

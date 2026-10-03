@@ -1,0 +1,27 @@
+// F65: a generic function whose return is INFERRED — a bare trait written as
+// the return (B460's checked return) or no return written at all — called at
+// two instantiations, each caller holding its own instantiation's cell.
+import std::io::print;
+import std::reactive::{ SignalCell, Source };
+
+fun wrap<T>(x: T): Source<T> {
+	SignalCell::new(x)
+}
+
+fun cell<T>(x: T) {
+	SignalCell::new(x)
+}
+
+fun main() {
+	let a = wrap(1);
+	let b = wrap("s");
+	a.set(2);
+	b.set("t");
+	print(a.get());
+	print(b.get());
+	let c = cell(3);
+	let d = cell("u");
+	c.set(4);
+	d.set("v");
+	print(i"{c.get()} {d.get()}");
+}

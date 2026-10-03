@@ -208,12 +208,22 @@ fn a_burst_fires_once_with_the_last_callback_and_cancel_fires_nothing() {
 
 /// B277: the driving loop runs under the AMBIENT NURSERY, so a nursery
 /// cancellation unwinds it at its parked `wait`.
+///
+/// The numbers are margins, not a schedule. The claim is "cancelled
+/// mid-window", so the window must outlast EVERYTHING between `run` and the
+/// cancel: the `sleep(10)` plus any stall of the process in between. A 50 ms
+/// window left 40 ms for that, and a loaded Windows runner (15.6 ms timer
+/// ticks, a preempted test process) spent it — the window's timer fell due
+/// before the sleep's, fired first, and `cancelled-never` printed: the
+/// order-45 CI find on `windows-latest`. A 1 s window leaves ~990 ms; the
+/// final `sleep(3000)` likewise outlasts the second 1 s window by 2 s, so
+/// `after-nursery-cancel` lands before `mark-done` under the same stall.
 const DEBOUNCE_AFTER_A_NURSERY_CANCEL: &str = r#"import std::io::print;
 import std::task::{ Nursery, nursery };
 import std::time::{ Debounce, Duration, sleep };
 
 async fun main() {
-	let debounce = Debounce::new(Duration::millis(50));
+	let debounce = Debounce::new(Duration::millis(1000));
 	// The driving loop is spawned inside the nursery's extent, so the
 	// cancellation below unwinds it where it is parked — mid-window, with a
 	// deadline still pushed and nothing fired.
@@ -226,7 +236,7 @@ async fun main() {
 
 	// And the debounce is still a debounce.
 	debounce.run(|| print("after-nursery-cancel"));
-	sleep(1000);
+	sleep(3000);
 	print("mark-done");
 }
 "#;

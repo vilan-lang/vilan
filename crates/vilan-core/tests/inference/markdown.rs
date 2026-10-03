@@ -5669,8 +5669,15 @@ fn a52_an_rpc_mirror_feeds_selector_and_two_cells_move_per_change() {
 /// own parameter type: this one takes `|T|`, `Source::sub` takes `|Option<T>|`
 /// and confronts the Option, so nothing silently reaches the other one. Both
 /// take the same counted lease and both make exactly ONE immediate call.
+///
+/// B474: through the `S: Source<T>` bound, `sub` is `Flow`'s (a supertrait
+/// member since A142), and the emitter took `RemoteSource`'s INHERENT
+/// `sub(|T|)` at the mono site — the observer got a bare `9` and its `match`
+/// read it as `None` (`trait:none`; natively rustc E0308). The bound recorded
+/// `Source` for emission, whose impl declares no `sub`, and the dispatch fell
+/// through to the by-name lookup. B473 records the DECLARING trait (`Flow`),
+/// which the receiver's impl answers.
 #[test]
-#[ignore = "A142: reactive-44 find (MISCOMPILE): through an S: Source bound, `sub` (a Flow member since A142) is emitted as RemoteSource's inherent sub(|T|)"]
 fn a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none() {
     assert_compiles_and_runs(
         r#"
@@ -5683,7 +5690,7 @@ fn a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none() {
         // The trait's `sub`, reached through a generic receiver: it makes the
         // immediate call with whatever the mirror holds, `None` included.
         fun through_the_trait<T, S: Source<T>>(source: S, observe: |T| void) {
-            let live = source.sub(observe);
+            let live = source.sub(|value| observe(value));
             live.dispose();
         }
 

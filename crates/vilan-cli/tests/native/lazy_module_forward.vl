@@ -1,0 +1,45 @@
+// F52: a module-level `lazy let` handed to a `lazy` parameter — never forced
+// (its initializer never runs), forced twice (it runs once), forwarded on to a
+// second `lazy` parameter, and read directly afterwards.
+import std::io::print;
+
+struct Settings {
+	name: str,
+	level: i32,
+}
+
+fun loud(text: str): str {
+	print(i"computing {text}");
+	text
+}
+
+lazy let config = loud("config");
+lazy let unused = loud("never");
+lazy let settings: Settings = Settings { name = loud("settings"), level = 3 };
+
+fun twice(lazy message: str): str {
+	message + message
+}
+
+fun ignore(lazy message: str): i32 {
+	1
+}
+
+fun forwards(lazy message: str): str {
+	twice(message)
+}
+
+fun level(lazy held: Settings): i32 {
+	held.level
+}
+
+fun main() {
+	print("start");
+	print(ignore(config));
+	print(twice(config));
+	print(config);
+	print(ignore(unused));
+	print(forwards(config));
+	print(level(settings));
+	print(settings.name);
+}

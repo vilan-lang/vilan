@@ -1,0 +1,127 @@
+// F64: an `Option` of a closure as a field of a GENERIC struct — read by a
+// `match` whose `None` leg hands back another field of a loaned `self`, built
+// with `Some(|| ..)` and `None` inside generic functions, stored in a cell's
+// list and pulled per element (std's collection core, `ElementHold`, is the
+// shape) — and the `match` leg's own copy: a leg handing back a place copies
+// it, as a block's tail does.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
+
+struct Plain {
+	make: Option<str>,
+	fallback: str,
+}
+
+impl Plain {
+	fun read(self): str {
+		match self.make {
+			Some(let make) => make,
+			None => self.fallback,
+		}
+	}
+}
+
+struct Gen<V> {
+	make: Option<V>,
+	fallback: V,
+}
+
+impl Gen<type V> {
+	fun read(self): V {
+		match self.make {
+			Some(let make) => make,
+			None => self.fallback,
+		}
+	}
+	fun direct(self): V {
+		self.fallback
+	}
+}
+
+fun legs() {
+	let p = Plain { make = None, fallback = "plain" };
+	print(p.read());
+	let g = Gen<str> { make = None, fallback = "gen" };
+	print(g.read());
+	print(g.direct());
+}
+
+struct Hold<V> {
+	follows: bool,
+	pull: Option<|| V>,
+	release: Option<|| void>,
+}
+
+struct Core<V> {
+	holds: Shared<List<Hold<V>>>,
+}
+
+fun core<V>(): Core<V> {
+	let holds: List<Hold<V>> = [];
+	Core<V> { holds = Shared::new(holds) }
+}
+
+fun hold<V>(core: Core<V>, value: V) {
+	core.holds.write().push(Hold<V> { follows = true, pull = Some(|| value), release = None });
+	core.holds
+		.write()
+		.push(Hold<V> { follows = false, pull = None, release = Some(|| print("released")) });
+}
+
+fun pulled<V>(core: Core<V>, fallback: V): List<V> {
+	mut out: List<V> = [];
+	for held in core.holds.read() {
+		match held.pull {
+			Some(let pull) => out.push(pull()),
+			None => out.push(fallback),
+		}
+		match held.release {
+			Some(let release) => release(),
+			None => {},
+		}
+	}
+	out
+}
+
+fun cells() {
+	let numbers: Core<i32> = core();
+	hold(numbers, 5);
+	print(pulled(numbers, 0));
+	let words: Core<str> = core();
+	hold(words, "w");
+	print(pulled(words, "-"));
+}
+
+struct Lazy<V> {
+	make: Option<|| V>,
+	fallback: V,
+}
+
+impl Lazy<type V> {
+	fun read(self): V {
+		match self.make {
+			Some(let make) => make(),
+			None => self.fallback,
+		}
+	}
+}
+
+struct Pair<K, V> {
+	key: K,
+	pick: Option<|K| V>,
+}
+
+fun main() {
+	legs();
+	cells();
+	let a = Lazy<i32> { make = Some(|| 4), fallback = 0 };
+	let b = Lazy<str> { make = None, fallback = "none" };
+	let c: Lazy<str> = Lazy { make = Some(|| "made"), fallback = "-" };
+	print(i"{a.read()} {b.read()} {c.read()}");
+	let p = Pair { key = 3, pick = Some(|k: i32| k * 2) };
+	match p.pick {
+		Some(let pick) => print(pick(p.key)),
+		None => print("no pick"),
+	}
+}

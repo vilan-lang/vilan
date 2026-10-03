@@ -1,0 +1,32 @@
+// B519: A134's identity claims with the service declared in a module this
+// entry imports (`b519_store.vl`, staged beside it as `pkg::b519_store`).
+import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::reactive::Signal;
+import std::rpc::{ ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import pkg::b519_store::{ Store, StoreClient };
+
+fun same<T>(left: RemoteSource<T>, right: RemoteSource<T>): bool {
+	left.count.identity() == right.count.identity()
+}
+
+fun main() {
+	let store = Store {
+		channels = Signal::new([]),
+		names = Shared::new(HashMap::new()),
+		calls = Shared::new(0),
+	};
+	let (client_end, server_end) = duplex_pair();
+	register_session(7, server_end, json_codec());
+	let transport = local_rpc(store.dispatcher().into_protocol(json_codec()).for_connection(7));
+	let reactive = ReactiveClient::new(client_end, json_codec());
+	let client = StoreClient { transport, codec = json_codec(), reactive };
+
+	print(i"same-origin:{same(client.get_channels(), client.get_channels())}");
+	print(i"same-args:{same(client.get_name(1), client.get_name(1))}");
+	print(i"other-args:{same(client.get_name(1), client.get_name(2))}");
+	print(i"unleased:calls={store.calls.read()}");
+	print("done");
+}

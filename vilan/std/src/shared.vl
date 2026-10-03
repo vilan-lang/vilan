@@ -54,8 +54,11 @@ export *;
 external struct Shared<T>;
 
 impl Shared<type T> {
-	/// Wrap `value` in a fresh shared cell.
-	external fun new(value: T): Shared<T>;
+	/// Wrap `value` in a fresh shared cell. The cell KEEPS what it is given, so the
+	/// parameter is `own` (R-c, B483): a value the caller still reads afterwards is
+	/// copied in (rule 1), and a write through the cell never reaches the caller's
+	/// binding; at its last use the value is moved in.
+	external fun new(own value: T): Shared<T>;
 
 	/// Another handle to the *same* cell (shared, not copied).
 	external fun clone(self): Shared<T>;
@@ -100,6 +103,22 @@ impl Shared<type T> {
 	/// — a thing reachable FROM the cell holding the cell, which under counting is
 	/// a cycle no count can collect.
 	external fun downgrade(&self): Weak<T>;
+}
+
+/// A fresh IDENTITY number — for a source whose identity is not a cell's own
+/// (`Source::identity`, A146): a map's per-key handle, a store's path.
+///
+/// **Every `identity()` in std draws from this one space**, which is the space
+/// `Shared::identity` stamps a cell from, and so a `SignalCell`'s. A tracker
+/// compares identities ACROSS sources to keep one edge per source, so a second
+/// counter collides in its dedup: a per-key identity minted from `fresh_id` (the
+/// SUBSCRIBER counter) once equalled a cell's, and a body that tracked both kept
+/// one edge and never heard the other (A147). The draw is a cell made for its stamp
+/// and dropped — the counter is the host's, reached through the one call that
+/// advances it.
+[internal("the one identity space every `Source::identity` draws from (A147)")]
+export fun fresh_identity(): i32 {
+	Shared::new(0).identity()
 }
 
 /// The optional cell, filled on first ask (tracker I8) — `Memo::get_or_insert`'s

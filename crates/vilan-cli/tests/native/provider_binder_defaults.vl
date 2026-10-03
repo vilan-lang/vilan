@@ -1,0 +1,92 @@
+// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
+// source whose `Source` argument is written in its own binder —
+// `impl W<type P> with Source<Option<P>>` — binds `T = Option<P>` in the
+// PROVIDER's binder, and the native backend refused `w.effect(..)` as an
+// unbound parameter of `W` until `P` was bound beside it.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{
+	Owner,
+	Signal,
+	SignalCell,
+	Source,
+	Subscriber,
+	Subscription,
+	run_with_owner,
+};
+
+struct W<P> {
+	cell: SignalCell<Option<P>>,
+}
+
+impl W<type P> with Source<Option<P>> {
+	fun get(self): Option<P> {
+		self.cell.get()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.cell.on_settle(subscriber)
+	}
+}
+
+/// Two parameters, the source's argument in the second.
+struct Keyed<K, V> {
+	key: K,
+	cell: SignalCell<Option<V>>,
+}
+
+impl Keyed<type K, type V> with Source<Option<V>> {
+	fun get(self): Option<V> {
+		self.cell.get()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.cell.on_settle(subscriber)
+	}
+}
+
+/// A list argument in the provider's binder.
+struct Many<E> {
+	cell: SignalCell<List<E>>,
+}
+
+impl Many<type E> with Source<List<E>> {
+	fun get(self): List<E> {
+		self.cell.get()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.cell.on_settle(subscriber)
+	}
+}
+
+fun main() {
+	let named = W { cell = SignalCell::new(Some("a")) };
+	let counted = W { cell = SignalCell::new(Some(1)) };
+	let keyed = Keyed { key = "k", cell = SignalCell::new(Some(2.5)) };
+	let many = Many { cell = SignalCell::new(["x"]) };
+	let watching = Owner::new();
+	run_with_owner(watching, || {
+		named.effect(|n| print(i"effect {n.unwrap_or("-")}"));
+		named.effect_on_change(|n| print(i"changed {n.unwrap_or("-")}"));
+		counted.effect(|n| print(i"count {n.unwrap_or(0)}"));
+		keyed.effect(|v| print(i"{keyed.key} {v.unwrap_or(0.0)}"));
+		many.effect(|items| print(i"many {items.len()}"));
+	});
+	let doubled = counted.derive(|n| n.unwrap_or(0) * 2).memo();
+	let watch = counted.on_change(|n| print(i"on_change {n.unwrap_or(0)}"));
+	named.cell.set(Some("b"));
+	named.cell.set(None);
+	counted.cell.set(Some(5));
+	keyed.cell.set(None);
+	many.cell.set(["x", "y"]);
+	print(i"doubled {doubled.get()}");
+	print(i"sample {counted.derive(|n| n.unwrap_or(0) + 1).sample()}");
+	watch.dispose();
+	watching.dispose();
+	counted.cell.set(Some(9));
+	print(i"after {doubled.get()}");
+}

@@ -1,0 +1,111 @@
+// F73: a struct literal's field is a POSITION of the literal's instance, so a
+// value closed only by its position — `SignalCell::new(None)`, a bare variant
+// of a generic enum, an empty list — closes from the field's whole declared
+// type under that instance. Natively only the type's head was resolved and the
+// instance's bindings were dropped before the value was rendered, so
+// `cell = SignalCell::new(None)` met `SignalCell<Option<V>>` with `V` the
+// struct's own parameter, and was refused as "an unbound generic type
+// parameter (parameter 2 of struct `Pair`)".
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
+
+enum Maybe<T> {
+	Nothing,
+	Just(T),
+}
+
+struct Pair<K, V> {
+	cell: SignalCell<Option<V>>,
+	key: K,
+	held: Maybe<V>,
+	history: List<Option<V>>,
+}
+
+impl Pair<type K, type V> {
+	/// The literal inside the struct's own impl, at its own instantiation.
+	fun fresh(key: K): Pair<K, V> {
+		Pair { cell = SignalCell::new(None), key, held = Maybe::Nothing, history = [] }
+	}
+
+	fun remember(&mut self) {
+		self.history.push(self.cell.get());
+	}
+}
+
+impl Pair<type K, type V> with Source<Option<V>> {
+	fun get(self): Option<V> {
+		self.cell.get()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.cell.on_settle(subscriber)
+	}
+}
+
+impl Pair<type K, type V> with Signal<Option<V>> {
+	fun set(self, value: Option<V>) {
+		self.cell.set(value);
+	}
+
+	fun notify(self) {
+		self.cell.notify();
+	}
+}
+
+/// A generic struct holding another: the inner literal's fields close through
+/// the outer one's.
+struct Outer<T> {
+	inner: Pair<str, T>,
+	scale: T,
+}
+
+fun outer_of<T>(scale: T): Outer<T> {
+	Outer {
+		inner = Pair {
+			cell = SignalCell::new(None),
+			key = "inner",
+			held = Maybe::Nothing,
+			history = [],
+		},
+		scale,
+	}
+}
+
+fun show(pair: Pair<str, i32>): str {
+	let held = match pair.held {
+		Maybe::Nothing => "nothing",
+		Maybe::Just(let value) => i"just {value}",
+	};
+	i"{pair.key} {pair.get().unwrap_or(-1)} {held} {pair.history.len()}"
+}
+
+fun main() {
+	// The item's repro: `set(None)` on a pair built with an open cell.
+	let pair: Pair<str, i32> = Pair {
+		cell = SignalCell::new(None),
+		key = "k",
+		held = Maybe::Just(1),
+		history = [],
+	};
+	print(show(pair));
+	pair.set(Some(3));
+	print(show(pair));
+	pair.set(None);
+	print(show(pair));
+	// Built by the struct's own static, at two instantiations.
+	mut fresh: Pair<str, i32> = Pair::fresh("f");
+	fresh.set(Some(4));
+	fresh.remember();
+	fresh.set(None);
+	fresh.remember();
+	print(show(fresh));
+	let flags: Pair<i32, bool> = Pair::fresh(7);
+	flags.set(Some(true));
+	print(i"{flags.key} {flags.get().unwrap_or(false)}");
+	// Nested through a generic function.
+	let outer = outer_of(2.5);
+	outer.inner.set(Some(1.5));
+	print(i"{outer.inner.key} {outer.inner.get().unwrap_or(0.0) * outer.scale}");
+}

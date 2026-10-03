@@ -5,4 +5,4 @@
 // `Set` IS `HashSet` — the re-export publishes a second spelling of the same item.
 // Every use outside std warns with the steer; the module goes in the release after
 // the one that deprecated it.
-export [deprecated("use std::hash_set::HashSet")] import pkg::hash_set::HashSet as Set;
+[deprecated("use std::hash_set::HashSet")] export import pkg::hash_set::HashSet as Set;

@@ -1,0 +1,57 @@
+// F62: a field read or written through a `Shared` view — both views, a
+// nested field, a tuple slot, a `str` and an `Option` field, a compound write,
+// a push whose argument reads the same cell, and a snapshot that survives a
+// later write. Natively each read is a scoped borrow, so the read-modify-write
+// line finds no live borrow at its left side.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
+
+struct Inner {
+	depth: i32,
+	label: str,
+}
+
+struct Counter {
+	count: i32,
+	name: str,
+	items: List<i32>,
+	inner: Inner,
+	note: Option<str>,
+}
+
+fun bump(cell: Shared<Counter>) {
+	cell.write().count = cell.write().count + 1;
+}
+
+fun main() {
+	let s: Shared<Counter> = Shared::new(Counter {
+		count = 0,
+		name = "a",
+		items = [],
+		inner = Inner { depth = 1, label = "in" },
+		note = None,
+	});
+	let a = s.clone();
+	a.write().count = a.write().count + 1;
+	a.write().count += 2;
+	bump(a);
+	print(s.write().count);
+	print(s.read().count);
+	a.write().name = a.write().name + "b";
+	let name = s.write().name;
+	print(name);
+	a.write().inner.depth = s.read().inner.depth * 10;
+	a.write().inner.label = "deep";
+	print(i"{s.write().inner.depth} {s.read().inner.label}");
+	a.write().items.push(a.read().count);
+	a.write().items.push(7);
+	print(s.read().items.len());
+	print(s.write().items.len());
+	a.write().note = Some("n");
+	let note: str = s.write().note.unwrap_or("-");
+	print(note);
+	let snapshot = s.read().inner;
+	a.write().inner.depth = 99;
+	print(i"{snapshot.depth} {s.read().inner.depth}");
+}

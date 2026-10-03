@@ -82,7 +82,7 @@ fun main() {
 	let _root = mount_root("app", || {
 		// Built where it is consumed: the route is a pipe, and `swap` is its one
 		// consumer.
-		let route = current_path().derive(|path| parse(path));
+		let route = current_path().derive(parse);
 		view("div").child(swap(route, |current| match current {
 			Route::Home => view("h1").text("Home"),
 			Route::Workspace(let id, let _inner) => view("h1").text(i"Workspace {id}"),
@@ -184,7 +184,7 @@ current across `navigate` calls and the browser's back/forward buttons.
 Derive your typed route from it where you consume it:
 
 ```vilan,fragment
-let route = current_path().derive(|path| parse(path));
+let route = current_path().derive(parse);
 ```
 
 The route is a pipe, consumed once — by the `swap` below. Where several parts of

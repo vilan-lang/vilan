@@ -43,19 +43,19 @@ import pkg::task::{ CancelSignal, ambient_signal };
 /// lie. No deprecated alias kept (pre-1.0; the sole caller was `read_file_to_str`,
 /// updated in the same commit — `numeric-types.md` §8's precedent for a rename that
 /// fixes a wrong name).
-export [extern("node:fs/promises", "readFile")]
-async external fun read_file_encoded(path: str, encoding: str): str;
+[extern("node:fs/promises", "readFile")]
+export async external fun read_file_encoded(path: str, encoding: str): str;
 
 /// Reads a whole file's raw bytes — the binary read F13 asked for. `readFile`
 /// called with NO encoding argument hands back a host `Buffer`, which IS a
 /// `Uint8Array` (runtime-verified: `buffer instanceof Uint8Array` is `true`),
 /// so it binds directly to `Bytes` with no conversion — the same interop
 /// `std::http`'s `read_request_bytes` already relies on.
-export [extern("node:fs/promises", "readFile")]
-async external fun read_bytes(path: str): Bytes;
+[extern("node:fs/promises", "readFile")]
+export async external fun read_bytes(path: str): Bytes;
 
-export [extern("node:fs/promises", "writeFile")]
-async external fun write_file(path: str, contents: str): void;
+[extern("node:fs/promises", "writeFile")]
+export async external fun write_file(path: str, contents: str): void;
 
 /// Writes raw bytes to `path`, creating it or truncating what was there — the
 /// missing mirror of `read_bytes`, and the reason it was missing is worth
@@ -70,8 +70,8 @@ async external fun write_file(path: str, contents: str): void;
 /// character. That is not a small promise — a text round trip through UTF-8 turned
 /// kolt's 483-byte favicon into 853 bytes served, one U+FFFD per byte that was not
 /// a legal sequence.
-export [extern("node:fs/promises", "writeFile")]
-async external fun write_bytes(path: str, contents: Bytes): void;
+[extern("node:fs/promises", "writeFile")]
+export async external fun write_bytes(path: str, contents: Bytes): void;
 
 /// Reads a UTF-8 text file to a string. Async (it awaits `readFile`), so callers
 /// implicitly await it.
@@ -86,8 +86,8 @@ export fun read_file_to_str(path: str): str {
 /// one, never a mix. ACROSS filesystems the host raises `EXDEV` and nothing moves —
 /// which is why `write_atomic` below keeps its temporary a SIBLING of its target
 /// rather than putting it in a temp dir.
-export [extern("node:fs/promises", "rename")]
-async external fun rename(from: str, to: str): void;
+[extern("node:fs/promises", "rename")]
+export async external fun rename(from: str, to: str): void;
 
 /// Writes `contents` to `path` atomically: into a uniquely-named sibling first,
 /// then `rename` over the target. A crash at any point leaves either the previous
@@ -133,16 +133,16 @@ export fun write_bytes_atomic(path: str, contents: Bytes) {
 /// no `append_bytes` twin — nothing in the tree or in kolt has asked for one,
 /// and §9's rule for this module is to bind a host call when something needs
 /// it rather than to fill in the grid.
-export [extern("node:fs/promises", "appendFile")]
-async external fun append(path: str, contents: str): void;
+[extern("node:fs/promises", "appendFile")]
+export async external fun append(path: str, contents: str): void;
 
 /// Copies the file at `from` to `to`, replacing `to` if it exists. Copies a FILE
 /// only: `copyFile` on a directory raises `EISDIR`, and `copy_dir` below is the
 /// directory form. The copy is not atomic — a reader watching `to` can observe it
 /// partially written — so a destination something else reads back wants `copy` to a
 /// temporary plus `rename`, which is `write_atomic`'s shape spelled out by hand.
-export [extern("node:fs/promises", "copyFile")]
-async external fun copy(from: str, to: str): void;
+[extern("node:fs/promises", "copyFile")]
+export async external fun copy(from: str, to: str): void;
 
 /// Removes the FILE at `path` (`unlink`). A directory raises host-side
 /// (`EPERM` or `EISDIR` depending on the platform) rather than being removed:
@@ -150,8 +150,8 @@ async external fun copy(from: str, to: str): void;
 /// split is the host's, kept rather than papered over. A missing path throws,
 /// matching every other operation in this module except `stat` — probe with
 /// `stat(path).is_some()` first if a missing file is an ordinary outcome.
-export [extern("node:fs/promises", "unlink")]
-async external fun remove(path: str): void;
+[extern("node:fs/promises", "unlink")]
+export async external fun remove(path: str): void;
 
 /// Reads `path` as UTF-8 text, hands it to `revise`, and writes what comes back
 /// atomically. The read-modify-write every JSON store and every config rewrite is
@@ -188,8 +188,8 @@ export fun update(path: str, revise: |str| str) {
 /// file vs. directory calls `scan_dir`, which gets the kind back from the same
 /// host call for free. Throws host-side on a missing or unreadable directory,
 /// matching `read_file_to_str`'s posture above.
-export [extern("node:fs/promises", "readdir")]
-async external fun read_dir(path: str): List<str>;
+[extern("node:fs/promises", "readdir")]
+export async external fun read_dir(path: str): List<str>;
 
 /// Lists EVERY entry under `path` — files and subdirectories alike, however deep —
 /// as paths RELATIVE to `path` (`"sub/c.txt"`, joined with the host's own
@@ -212,8 +212,8 @@ async external fun read_dir(path: str): List<str>;
 /// forms cannot spell, so the call is host-side glue (`__fs_read_dir_all`,
 /// `transformer.rs`, the same seam as `__fs_stat`). Throws host-side on a missing
 /// or unreadable directory, matching `read_dir`.
-export [extern("__fs_read_dir_all")]
-async external fun read_dir_all(path: str): List<str>;
+[extern("__fs_read_dir_all")]
+export async external fun read_dir_all(path: str): List<str>;
 
 // --- directories ---------------------------------------------------------
 
@@ -259,8 +259,8 @@ impl FsOptions {
 /// there" is how a process claims a name, and it is the only exclusive-create
 /// primitive this module has until the handle tier's `create_new` lands
 /// (proposal/filesystem.md §3.3).
-export [extern("node:fs/promises", "mkdir")]
-async external fun create_dir(path: str): void;
+[extern("node:fs/promises", "mkdir")]
+export async external fun create_dir(path: str): void;
 
 [extern("node:fs/promises", "mkdir")]
 async external fun mkdir_with(path: str, options: FsOptions): void;
@@ -280,8 +280,8 @@ export fun create_dir_all(path: str) {
 /// `ENOTEMPTY` and a missing one `ENOENT` — `remove_dir_all` is the recursive
 /// form. The strict version is worth having for the same reason `create_dir`
 /// is: it refuses to destroy anything you did not know was there.
-export [extern("node:fs/promises", "rmdir")]
-async external fun remove_dir(path: str): void;
+[extern("node:fs/promises", "rmdir")]
+export async external fun remove_dir(path: str): void;
 
 [extern("node:fs/promises", "rm")]
 async external fun rm_with(path: str, options: FsOptions): void;
@@ -458,7 +458,7 @@ export fun stat(path: str): Option<Stat> {
 /// below hands the body its file as a per-call parameter instead), and
 /// `List`/`HashMap`/`HashSet` cannot hold one — `Option<File>` is the sanctioned
 /// container, so "a pool of open files" is not expressible in v1.
-export [resource] external struct File;
+[resource] export external struct File;
 
 /// The raw host open. Kept behind the five named constructors: node's flags
 /// string is an untyped eleven-member enum whose failure mode is a runtime
@@ -736,7 +736,7 @@ export fun with_file_modify<T>(path: str, body: |File| T): T {
 /// file, which is exactly the property the host's hidden cursor would have
 /// destroyed. (R5 keeps the door one-way: the `File` cannot be moved out of a
 /// live `Reader`.)
-export [resource] struct Reader {
+[resource] export struct Reader {
 	file: File,
 	cursor: Shared<i53>,
 }
@@ -860,7 +860,7 @@ export impl Reader {
 /// The stop is not decoration: a watcher polls on a host timer, and a pending host
 /// timer KEEPS THE PROCESS ALIVE — exactly as `std::time::Timer` documents for
 /// itself. A watcher that is never dropped is a program that never exits.
-export [resource] external struct Watcher;
+[resource] export external struct Watcher;
 
 /// What happened to a path between two observations. Three variants and no
 /// catch-all, because comparing two stats leaves no fourth possibility — the

@@ -1,0 +1,116 @@
+// A142 S7 S1 on both backends: a derived struct's store — the paper's scenarios
+// (`proposal/store.md` Appendix A) for a nested struct, a whole write, the spine
+// commit, a write of the value held, `notify`, a coarse field, a renamed
+// projection, an `Option` field through its `Some` (observed, read and patched), a generic struct, and the slot
+// census through subscribe and dispose.
+import std::compare::PartialEq;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+import std::shared::Shared;
+import std::store::{ Storable, Store, StoreSome, store_census };
+
+[derive(PartialEq, Storable)]
+struct Address {
+	city: str,
+	zip: str,
+}
+
+[derive(Storable)]
+struct User {
+	name: str,
+	age: i32,
+	address: Address,
+	[reactive(coarse)] billing: Address,
+	[reactive(name = "nickname")] get: Option<str>,
+}
+
+[derive(Storable)]
+struct Pair<T> {
+	left: T,
+	right: T,
+}
+
+let woke = Shared::new([""]);
+
+fun mark(name: str) {
+	woke.write().push(name);
+}
+
+fun drained(): str {
+	mut out = "";
+	for name in woke.read() {
+		if out != "" {
+			out = out + " ";
+		}
+		out = out + name;
+	}
+	woke.write() = [];
+	if out == "" {
+		"-"
+	} else {
+		out
+	}
+}
+
+fun census<T>(store: Store<T>): str {
+	let (slots, nodes) = store_census(store);
+	i"slots={slots} nodes={nodes}"
+}
+
+fun alice(): User {
+	User {
+		name = "Alice",
+		age = 30,
+		address = Address { city = "Oslo", zip = "0150" },
+		billing = Address { city = "Oslo", zip = "0150" },
+		get = None,
+	}
+}
+
+fun main() {
+	let user = Store::new(alice());
+	let city = user.address().city();
+	print(i"read {city.get()}: {census(user)}");
+	let watching = Owner::new();
+	run_with_owner(watching, || {
+		user.name().effect_on_change(|_n| mark("name"));
+		user.age().effect_on_change(|_a| mark("age"));
+		city.effect_on_change(|_c| mark("address.city"));
+		user.address().zip().effect_on_change(|_z| mark("address.zip"));
+		user.address().effect_on_change(|_a| mark("address"));
+		user.billing().effect_on_change(|_b| mark("billing"));
+		user.billing().zip().effect_on_change(|_z| mark("billing.zip"));
+		user.nickname().is_some().effect_on_change(|s| mark(i"nickname.is_some={s}"));
+		user.nickname().some().effect_on_change(|n| mark(i"nick={n.unwrap_or("-")}"));
+		user.effect_on_change(|_u| mark("user"));
+	});
+	print(i"subscribed: {census(user)}");
+	mut next = alice();
+	next.address.zip = "0151";
+	user.set(next);
+	print(i"whole write, zip changed: [{drained()}]");
+	user.set(next);
+	print(i"whole write, nothing changed: [{drained()}]");
+	next.billing.city = "Bergen";
+	user.set(next);
+	print(i"coarse field changed: [{drained()}]");
+	city.set("Bergen");
+	let now: User = user.get();
+	print(i"handle set address.city: [{drained()}] root.city={now.address.city}");
+	city.set("Bergen");
+	print(i"handle set, same value: [{drained()}]");
+	user.age().notify();
+	print(i"notify age: [{drained()}]");
+	let nick: StoreSome<str> = user.nickname().some();
+	print(i"patch while None: {nick.patch("al")} [{drained()}]");
+	user.nickname().set(Some("ally"));
+	print(i"None -> Some: [{drained()}] nick={nick.get().unwrap_or("-")}");
+	print(i"patch while Some: {nick.patch("al")} [{drained()}] nick={nick.get().unwrap_or("-")}");
+	watching.dispose();
+	print(i"released: {census(user)}");
+	let pair = Store::new(Pair { left = 1, right = 2 });
+	pair.left().set(5);
+	let both: Pair<i32> = pair.get();
+	print(i"pair: {both.left} {both.right} {pair.right().get()}");
+}

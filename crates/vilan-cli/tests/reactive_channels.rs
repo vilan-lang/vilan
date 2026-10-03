@@ -571,13 +571,31 @@ fn run_program_warning(tag: &str, source: &str, warning: &str) -> String {
 }
 
 fn run_program_capturing(tag: &str, source: &str) -> (String, String) {
+    run_package_capturing(tag, &[("src/main.vl", source)])
+}
+
+/// [`run_program`] over a PACKAGE: `files` (path relative to the project root →
+/// contents) beside the manifest, `src/main.vl` among them — for the pins whose
+/// claim is about a service declared in a module the entry imports (B519).
+fn run_package(tag: &str, files: &[(&str, &str)]) -> String {
+    let (stdout, stderr) = run_package_capturing(tag, files);
+    assert!(
+        stderr.trim().is_empty(),
+        "the program wrote to stderr:\n{stderr}\n--- stdout ---\n{stdout}"
+    );
+    stdout
+}
+
+fn run_package_capturing(tag: &str, files: &[(&str, &str)]) -> (String, String) {
     let dir = temp_project(tag);
     write(
         &dir,
         "vilan.toml",
         "[package]\nname = \"app\"\ntarget = \"node\"\n",
     );
-    write(&dir, "src/main.vl", source);
+    for (relative, contents) in files {
+        write(&dir, relative, contents);
+    }
     let liveness = support::run_liveness();
     let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", dir.to_str().unwrap()])
@@ -3002,6 +3020,123 @@ fn a134_two_stub_calls_for_one_origin_are_one_mirror_and_one_subscribe() {
     );
 }
 
+// --- B519: the service in a module the entry IMPORTS -------------------------
+
+/// The A134 store, as its own module: the shape every multi-file app writes and
+/// no A134 pin did — they were all single-file, which is why none saw a table
+/// the generated code read and the bundle never declared.
+const B519_STORE_MODULE: &str = include_str!("native/b519_store.vl");
+
+const B519_IMPORTING_MAIN: &str = include_str!("native/b519_imported_service.vl");
+
+/// B519, RUN: A134's identity claims with the service declared in a module
+/// the entry imports. The table each stub reads (`__mirrors_StoreClient_*`)
+/// was never declared there, so the first stub call threw `ReferenceError` —
+/// the owner's `__mirrors_KoltClient_get_channels is not defined`. Two calls
+/// for one origin are one mirror, another argument another, and minting
+/// asked nothing of the server.
+#[test]
+fn b519_a_service_in_an_imported_module_mints_one_mirror_per_origin() {
+    let stdout = run_package(
+        "b519_imported_service",
+        &[
+            ("src/main.vl", B519_IMPORTING_MAIN),
+            ("src/b519_store.vl", B519_STORE_MODULE),
+        ],
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "same-origin:true",
+            "same-args:true",
+            "other-args:false",
+            "unleased:calls=0",
+            "done",
+        ],
+        "a stub of a service declared in an imported module must be idempotent \
+         per origin; got:\n{stdout}"
+    );
+}
+
+/// B519, the FULL-STACK shape: `vilan build .` on a two-entry package whose
+/// service lives in a shared module. Each leg's output declares every mirror
+/// table it reads (the generic check every example and golden is also held
+/// to), and the client leg — the one whose stubs read them — reads at least
+/// one, so the claim is not vacuous.
+#[test]
+fn b519_both_legs_of_a_fullstack_build_declare_every_mirror_table_they_read() {
+    let dir = temp_project("b519_fullstack");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"mir\"\ndefault-entry = \"client\"\n\n\
+         [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/b519_store.vl", B519_STORE_MODULE);
+    write(
+        &dir,
+        "src/client.vl",
+        r#"import std::io::print;
+import std::json::json_codec;
+import pkg::b519_store::StoreClient;
+
+fun main() {
+	match StoreClient::connect("/", json_codec()) {
+		Ok(let client) => {
+			print(client.get_channels().get().is_some());
+			print(client.get_name(1).get().is_some());
+		}
+		Err(let failure) => print("no"),
+	}
+}
+"#,
+    );
+    write(
+        &dir,
+        "src/server.vl",
+        r#"import std::io::print;
+import std::hash_map::HashMap;
+import std::reactive::Signal;
+import std::shared::Shared;
+import pkg::b519_store::Store;
+
+fun main() {
+	let store = Store { channels = Signal::new([]), names = Shared::new(HashMap::new()), calls = Shared::new(0) };
+	print(store.calls.read());
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "the build failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let client = std::fs::read_to_string(dir.join("dist/client.js")).expect("the client leg");
+    assert!(
+        dir.join("dist/server.mjs").is_file(),
+        "the server leg was not emitted"
+    );
+    let (read, _) = support::mirror_tables::mirror_tables(&client);
+    let dangling = support::mirror_tables::dangling_in_tree(&dir.join("dist"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        read.contains("__mirrors_StoreClient_get_channels")
+            && read.contains("__mirrors_StoreClient_get_name"),
+        "the client leg's stubs must read their tables (else this pin is vacuous): {read:?}"
+    );
+    assert!(
+        dangling.is_empty(),
+        "emitted legs read mirror tables they never declare:\n{}",
+        dangling.join("\n")
+    );
+}
+
 /// A134 OVER A SOCKET: the same cold-select shape, server and client in one
 /// process joined by a real WebSocket (`Server` on port 0, the generated
 /// `connect`). The in-process pin above is not evidence for this one (the
@@ -4748,6 +4883,101 @@ fn a145_a_memo_cell_is_an_rpc_handle_return_over_a_socket() {
             "after: doubled=10 label=n5"
         ],
         "a MemoCell handle must cross as a mirror; got:\n{stdout}"
+    );
+}
+
+// --- A138: a map's per-key handle crosses as a mirror -------------------------
+
+/// A138: an `[rpc]` method answering `HashMapCell::at(key)` — a `HashMapEntry<K, V>` —
+/// replies with a plain channel, `RemoteSource<Option<V>>` at the client (the
+/// mirror a `MemoCell<Option<V>>` reply makes, so the contract does not move),
+/// and the forward rides the key's SLOT: a post to key 1 sends nothing to the
+/// mirror of key 2.
+const A138_MAP_ENTRY_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::hash_map::HashMap;
+import std::process::exit;
+import std::reactive::{ HashMapCell, HashMapEntry, Source };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::RemoteSource;
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(InboxClient)]
+struct Inbox {
+	messages: HashMapCell<i32, str>,
+}
+
+impl Inbox {
+	[rpc]
+	fun post(self, id: i32, text: str): i32 {
+		self.messages.insert(id, text);
+		id
+	}
+
+	[rpc]
+	fun message(self, id: i32): HashMapEntry<i32, str> {
+		self.messages.at(id)
+	}
+}
+
+fun main() {
+	let inbox = Inbox { messages = HashMapCell::of([(1, "hello")].to_map()) };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(inbox.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 300 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+async fun run(port: i32) {
+	match InboxClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let first: RemoteSource<Option<str>> = client.message(1);
+			let second: RemoteSource<Option<str>> = client.message(2);
+			let second_updates = Shared::new(0);
+			let _a = first.sub(|value| {});
+			let _b = second.sub(|value| second_updates.write() += 1);
+			until(|| first.get().is_some() && second.get().is_some());
+			print(i"seed: first={first.get().unwrap_or(None).unwrap_or("-")} second={second.get().unwrap_or(None).unwrap_or("-")}");
+			let seeded = second_updates.read();
+			print(i"post:{client.post(1, "edited").unwrap_or(0 - 1)}");
+			until(|| first.get() == Some(Some("edited")));
+			print(i"post:{client.post(2, "new").unwrap_or(0 - 1)}");
+			until(|| second.get() == Some(Some("new")));
+			print(i"after: first={first.get().unwrap_or(None).unwrap_or("-")} second={second.get().unwrap_or(None).unwrap_or("-")} second_updates={second_updates.read() - seeded}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a138_a_map_entry_is_an_rpc_handle_return_over_a_socket() {
+    let stdout = run_program("a138_map_entry_socket", A138_MAP_ENTRY_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "seed: first=hello second=-",
+            "post:1",
+            "post:2",
+            "after: first=edited second=new second_updates=1"
+        ],
+        "a HashMapEntry handle must cross as a per-key mirror; got:\n{stdout}"
     );
 }
 

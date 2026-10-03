@@ -443,6 +443,8 @@ std/reactive.md h2 listcell--a-list-whose-writes-are-its-deltas
 std/reactive.md h2 map_each--the-first-derivative
 std/reactive.md h2 collection-pipes--operators-per-shape
 std/reactive.md h2 coll-and-coll_by--coarse-into-granular
+std/reactive.md h2 hashmapcell-and-hashsetcell--maps-and-sets-whose-writes-are-their-deltas
+std/reactive.md h2 map-pipes--operators-for-maps-and-sets
 std/reactive.md h2 reconcile-keyed-list-diffing
 std/rpc.md h1 stdrpc-reference
 std/rpc.md h2 the-generated-surface-service
@@ -455,6 +457,15 @@ std/rpc.md h2 connection-state
 std/rpc.md h2 transports
 std/rpc.md h2 server-plumbing-stdrpc_server-process-layer
 std/rpc.md h2 envelope--codec-layer
+std/store.md h1 stdstore-reference
+std/store.md h2 at-a-glance
+std/store.md h2 a-store
+std/store.md h2 what-a-write-wakes
+std/store.md h2 derivestorable
+std/store.md h2 through-an-option
+std/store.md h2 enums
+std/store.md h3 when_live--rebuild-only-on-the-variant
+std/store.md h2 what-it-costs
 std/strings.md h1 strings-reference
 std/strings.md h2 str
 std/strings.md h3 case-the-full-pair-and-the-ascii-pair

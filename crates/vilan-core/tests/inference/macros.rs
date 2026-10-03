@@ -4769,7 +4769,7 @@ fun main() {
 }
 main();
         "#,
-        "a `context`-typed binding takes a closure literal, or a value with the same `context` clause",
+        "a `context`-typed binding takes a closure literal, a named function or variant, or a value with the same `context` clause",
     );
 }
 
@@ -4920,7 +4920,7 @@ fun main() {
 }
 main();
         "#,
-        "a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)",
+        "a `context`-typed parameter takes a closure literal, a named function or variant, a value with the same `context` clause, or a local closure binding (which adopts the clause)",
     );
 }
 
@@ -5574,7 +5574,7 @@ fn b376_the_refusal_names_what_is_derivable() {
 
         fun main() {}
         "#,
-        "std derives `PartialEq`, `Default`, `Debug`, `Json`, `Wire`, `Hashable`",
+        "std derives `PartialEq`, `Default`, `Debug`, `Json`, `Wire`, `Hashable`, `Storable`",
     );
 }
 

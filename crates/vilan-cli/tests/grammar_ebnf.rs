@@ -98,6 +98,14 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
          declaration (transport-rpc.md §9.7.5, A120 S5)",
     ),
     ("_", "the wildcard pattern"),
+    (
+        "coarse",
+        "the flag argument of a field's `[reactive(coarse)]` (A142 S7, `proposal/store.md` Q4)",
+    ),
+    (
+        "name",
+        "the named argument of a field's `[reactive(name = \"..\")]` (A142 S7, `proposal/store.md` Q9)",
+    ),
 ];
 
 /// Nonterminals the document defines in PROSE rather than with a production,

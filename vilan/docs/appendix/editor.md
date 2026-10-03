@@ -59,6 +59,27 @@ above `fun get_or_insert(self, key: UserId, make: || SignalCell<Option<User>>):
 SignalCell<Option<User>>`. A call that substitutes nothing, and a hover on
 the declaration itself, show the one line they always did.
 
+A METHOD's hover names the block it is declared in, on its own line above
+the `fun` line and in real syntax: `impl Memo<type K: Hashable, type V>`
+for an inherent method, `impl MemoCell<type T> with Source<T>` for a
+trait's implementation, `impl type S: Source<type T>` for a blanket's, and
+`trait Flow<T>` for a trait's own requirement or default. A completion
+item's detail line carries the same header. Every signature prints each
+parameter's convention — `own self`, `&mut self`, `own item: T`,
+`xs: &List<i32>` — because it is part of what a caller and an implementor
+write against.
+
+`self` hovers like any other binding: the block that introduces it, then
+`self: User` in the receiver's convention (`own self: User`), or
+`self: Self` inside a trait and `self: S` inside a blanket, whose header
+line spells the bound. A variable, a parameter, a field and `self` all show
+their type's DEFINITION in a second block under the `name: Type` line —
+a struct's fields or an enum's variants, one level deep and with the
+instantiation's arguments substituted (`let pair: Pair<i32, str>` shows
+`left: i32` and `right: str`), and for a trait-typed or `dyn` value the
+trait's required members. A long definition lists twelve members and then
+`…`; a primitive or an opaque host type shows none.
+
 **Inlay hints** — the inferred type of a binding you left unannotated
 (`let`/`mut`, a `for` binder, a comprehension binder). A parameter is not
 hinted: its type is written in the signature already. While you type, a

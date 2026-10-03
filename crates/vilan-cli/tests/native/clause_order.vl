@@ -1,0 +1,33 @@
+// F61: an injected closure's hidden parameters take ONE order — the contexts'
+// declaration order — at the literal and at the closure type, whatever order
+// the clause is written in: two contexts written backwards, three written in a
+// rotated order, and a field whose closure type carries a backwards clause.
+import std::context::Context;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+let first: Context<i32> = Context::new();
+let second: Context<str> = Context::new();
+let third: Context<bool> = Context::new();
+
+fun both(body: (|| str) context (second, first)): str {
+	first.run(1, || second.run("two", || body()))
+}
+
+fun all(body: (|i32| str) context (third, first, second)): str {
+	first.run(10, || second.run("twenty", || third.run(true, || body(5))))
+}
+
+struct Holder {
+	held: (|| str) context (second, first),
+}
+
+fun hold(holder: Holder): str {
+	second.run("held", || first.run(7, || (holder.held)()))
+}
+
+fun main() {
+	print(both(|| i"{first.get()} {second.get()}"));
+	print(all(|n| i"{n} {first.get()} {second.get()} {third.get()}"));
+	print(hold(Holder { held = || i"{second.get()} {first.get()}" }));
+}

@@ -42,6 +42,8 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/mirror_tables.rs"]
+mod mirror_tables;
 mod scratch;
 
 /// The extension a corpus golden carries. Corpus programs are bare files with
@@ -740,6 +742,20 @@ fn no_corpus_golden_carries_hmr_instrumentation() {
         checked += 1;
     }
     assert!(checked > 60, "suspiciously few goldens swept: {checked}");
+}
+
+/// B519: no golden reads an A134 mirror table (`__mirrors_<Client>_<method>`)
+/// it never declares. Such a bundle builds clean and throws `ReferenceError`
+/// at its first handle-stub call; the byte gate above would only ever have
+/// blessed one. Swept over every golden in the tree, subdirectories included.
+#[test]
+fn no_corpus_golden_reads_an_undeclared_mirror_table() {
+    let dangling = mirror_tables::dangling_in_tree(&corpus_dir());
+    assert!(
+        dangling.is_empty(),
+        "goldens that read mirror tables they never declare:\n{}",
+        dangling.join("\n")
+    );
 }
 
 /// The emitted JS must not depend on how a file SPELLS its imports — neither

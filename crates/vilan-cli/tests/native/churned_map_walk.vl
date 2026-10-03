@@ -1,0 +1,44 @@
+// M91: a map and a set that churned — tens of thousands of keys inserted and
+// removed around a few that stay — walk their live entries in INSERTION order,
+// a removed-then-re-inserted key at the end, exactly as a JS `Map` does,
+// through every compaction the native map makes on the way.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::range::Range;
+
+fun main() {
+	mut map: HashMap<i32, str> = HashMap::new();
+	map.insert(-1, "first");
+	for key in Range::new(0, 20000) {
+		map.insert(key, i"v{key}");
+		if key % 1000 != 7 {
+			map.remove(key);
+		}
+	}
+	map.remove(5007);
+	map.insert(-2, "late");
+	map.insert(5007, "back");
+	map.insert(-1, "rewritten");
+	print(map.len());
+	for key in map.keys() {
+		print(i"{key} {map.get(key).unwrap_or(\"?\")}");
+	}
+	mut walks = 0;
+	for _ in Range::new(0, 2000) {
+		walks += map.keys().len();
+	}
+	print(walks);
+	mut set: HashSet<str> = HashSet::new();
+	for key in Range::new(0, 5000) {
+		set.insert(i"k{key}");
+		if key % 997 != 3 {
+			set.remove(i"k{key}");
+		}
+	}
+	set.remove("k3");
+	set.insert("k3");
+	for value in set.values() {
+		print(value);
+	}
+}

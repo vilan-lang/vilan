@@ -107,6 +107,18 @@ fn analyze_on_64_mib(source: String) -> Analysis {
         .expect("worker panicked — the depth bound must refuse, never overflow")
 }
 
+/// The WALK canary's thread size (the parser canary has no such margin in a
+/// debug build and stays at 2 MiB): libtest's own 2 MiB, or `VILAN_CANARY_STACK_KIB`
+/// when the seal asks for the MARGIN (it runs them at 1536). Order 44 grew
+/// the walk's frame past the 2 MiB thread and only Windows CI saw it; a run
+/// at three quarters of the size says so a whole order earlier.
+fn canary_stack_bytes() -> usize {
+    std::env::var("VILAN_CANARY_STACK_KIB")
+        .ok()
+        .and_then(|kib| kib.parse::<usize>().ok())
+        .map_or(2 * 1024 * 1024, |kib| kib * 1024)
+}
+
 #[test]
 fn a_5000_deep_expression_is_refused_cleanly() {
     // A method chain nests the walk once per link (each call's subject is the
@@ -286,7 +298,7 @@ fn a_thirty_level_chain_still_fits_libtests_own_two_mib_thread() {
         ".trim()".repeat(30)
     );
     let produced = std::thread::Builder::new()
-        .stack_size(2 * 1024 * 1024)
+        .stack_size(canary_stack_bytes())
         .spawn(move || {
             let leaked: &'static str = Box::leak(source.into_boxed_str());
             let (program, _errors) = analyze_source(
@@ -720,10 +732,6 @@ fn nesting_doors(levels: usize) -> Vec<(&'static str, String)> {
             "nested `mod`",
             format!("{}\n{}\n", "mod a {".repeat(n), "}".repeat(n)),
         ),
-        (
-            "`export` chain",
-            format!("{}fun f() {{\n\tvoid\n}}\n", "export ".repeat(n)),
-        ),
         // Import paths and elements.
         ("import path", format!("use {}a;\n", "a::".repeat(n))),
         (
@@ -739,6 +747,23 @@ fn nesting_doors(levels: usize) -> Vec<(&'static str, String)> {
             ),
         ),
     ]
+}
+
+/// B492 closed the `export` chain as a nesting door: a repeated marker is
+/// refused and read past rather than parsed as an export of an export, so
+/// 5000 markers are one refusal and no nesting at all — not the item bound's
+/// refusal, and not 4999 of anything. (It was a door of its own, at this
+/// depth, until then.)
+#[test]
+fn an_export_chain_is_one_refusal_and_no_nesting() {
+    let source = format!("{}fun f() {{\n\tvoid\n}}\n", "export ".repeat(5000));
+    let (produced, messages) = parse_on_64_mib(source);
+    assert!(produced, "the chain still produces a tree");
+    assert_eq!(messages.len(), 1, "{messages:#?}");
+    assert!(
+        messages[0].starts_with("`export` is written once"),
+        "{messages:#?}"
+    );
 }
 
 #[test]

@@ -510,10 +510,10 @@ fn b462_a_user_variant_with_two_payloads_coerces_to_a_two_parameter_closure() {
 }
 
 #[test]
-#[ignore = "B478: a variant (like a named function) is not yet admitted at a `context`-typed closure parameter, which `derive`'s body became under A142 S2"]
 fn b462_a_source_derivation_takes_the_variant() {
     // The sketch's `count.derive(Some)`, as A142 spells it (sealed with `.memo()`).
-    // Red since the reactive-44 merge: B478's rule, not B462's — see the ignore.
+    // `derive`'s body is a `context`-typed closure parameter since A142 S2, and
+    // B478 admits a variant there as at a plain closure position.
     assert_compiles_and_runs(
         r#"
         import std::reactive::SignalCell;
@@ -526,6 +526,106 @@ fn b462_a_source_derivation_takes_the_variant() {
         }
         "#,
         "4\n5\n",
+    );
+}
+
+// --- B478: a named function or a variant at a `context`-typed closure ------------
+// --- parameter coerces as at a plain one: the context is the CALLER's to supply. -
+
+#[test]
+fn b478_a_named_function_is_a_derive_body_and_an_effect_body() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Owner, SignalCell, Source, run_with_owner };
+        fun show(value: i32) {
+            print(i"show {value}");
+        }
+        fun double(value: i32): i32 {
+            value * 2
+        }
+        fun main() {
+            let count = SignalCell::new(4);
+            let doubled = count.derive(double).memo();
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                count.effect(show);
+            });
+            count.set(5);
+            print(doubled.get());
+            owner.dispose();
+        }
+        "#,
+        "show 4\nshow 5\n10\n",
+    );
+}
+
+/// The rule at the other three landings a clause has — a binding, a field
+/// and a return — each handing a named function on to a call through the value.
+#[test]
+fn b478_a_named_function_lands_at_a_context_typed_binding_field_and_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::context::Context;
+        let current: Context<i32> = Context::new();
+        fun shout(value: i32): i32 {
+            value * 100
+        }
+        struct Held {
+            body: (|i32| i32) context current,
+        }
+        fun make(): (|i32| i32) context current {
+            shout
+        }
+        fun main() {
+            let bound: (|i32| i32) context current = shout;
+            let held = Held { body = shout };
+            let made = make();
+            current.run(7, || {
+                print(bound(1) + (held.body)(2) + made(3));
+            });
+        }
+        "#,
+        "600\n",
+    );
+}
+
+/// A function that READS one of the injected contexts is not admitted by the
+/// rule: it is the context pass's own refusal of a context-reading function
+/// used as a value, and a literal at the call is the spelling.
+#[test]
+fn b478_a_named_function_that_reads_an_injected_context_is_still_refused() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ SignalCell, Source };
+        let other: SignalCell<i32> = SignalCell::new(10);
+        fun plus_other(value: i32): i32 {
+            value + other.track()
+        }
+        fun main() {
+            let count = SignalCell::new(4);
+            let summed = count.derive(plus_other).memo();
+            print(summed.get());
+        }
+        "#,
+        "`plus_other` reads context `tracking`, so it can't be used as a value",
+    );
+}
+
+/// A closure PARAMETER carries no clause, so it is not one of these — it is
+/// still told what the position takes.
+#[test]
+fn b478_a_clause_less_closure_parameter_is_still_refused() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ SignalCell, Source };
+        fun relabel(count: SignalCell<i32>, label: |i32| str): str {
+            count.derive(label).sample()
+        }
+        fun main() {
+            print(relabel(SignalCell::new(1), |n| i"n={n}"));
+        }
+        "#,
+        "a `context`-typed parameter takes a closure literal, a named function or variant",
     );
 }
 

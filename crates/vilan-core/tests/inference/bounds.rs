@@ -4651,7 +4651,20 @@ fn the_js_refugee_hint_names_the_idiom() {
         main();
         "#,
         "const x = 3",
-        "Vilan has no const declarations; write `let x = const ..`",
+        "`const x = …` is not a declaration: a compile-time binding is `const let x = …`, and a runtime one seeded from a build-time value is `let x = const …`",
+    );
+    // B488: both spellings the steer names compile — it named only the second
+    // until G24 gave the declaration its own.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            const let x = 3;
+            let y = const 4;
+            print(x + y);
+        }
+        "#,
+        "7\n",
     );
 }
 
@@ -6260,7 +6273,7 @@ fn b158_the_maybe_signal_probe_dispatches_through_a_blanket_and_a_signal_impl() 
 
         impl SignalCell<type T> with MaybeSignal<T> {
             fun bind(self, react: |T| void) {
-                let _watching = self.sub(react);
+                let _watching = self.sub(|value| react(value));
             }
         }
 
@@ -6363,7 +6376,7 @@ fn b158_a_nested_bound_reaches_the_blanket_for_a_value_the_signal_impl_also_matc
         }
 
         impl SignalCell<type T> with MaybeSignal<T> {
-            fun bind(self, react: |T| void) { let _watching = self.sub(react); }
+            fun bind(self, react: |T| void) { let _watching = self.sub(|value| react(value)); }
         }
 
         fun badge<V: MaybeSignal<str>>(label: V) {
@@ -7301,7 +7314,7 @@ fn b165_the_static_blanket_and_a_source_bounded_blanket_coexist() {
         }
 
         impl type S: Source<type T> with Maybe<T> {
-            fun show(self, react: |T| void) { let _watching = self.sub(react); }
+            fun show(self, react: |T| void) { let _watching = self.sub(|value| react(value)); }
         }
 
         fun badge<V: Maybe<str>>(label: V) { label.show(|text| print(i"[{text}]")); }
@@ -8172,6 +8185,253 @@ fn a_refinement_after_the_passes_computes_no_selection_the_passes_already_made()
         "{evaluated} selections were asked a second time and {computed} were \
          COMPUTED again: dispatch refinement must answer a question the program \
          has already answered from its memo (M97)"
+    );
+}
+
+/// M103: a bound selection tests only the impls that can change its answer.
+///
+/// `impl_members_for_bound` used to run `subject_applies` — a recursive bound
+/// proof for every blanket impl — over EVERY implementation in the program,
+/// and keep only the matches that declare the member or inherit it from a
+/// trait. Every blanket std added made every selection dearer: maps-45's map
+/// and set operators took a kolt `check` from 24.3G instructions to 29.1G,
+/// 7.0G of it inside this selection. An impl that declares no `member`,
+/// provides no trait declaring it and names none of the bound's traits cannot
+/// move the answer, so it is no longer tested. Here std is loaded (hundreds of
+/// impls, dozens of blankets) and ONE impl in the program mentions `show4` —
+/// so one subject test, and the answer is that impl's member.
+#[test]
+fn a_bound_selection_tests_only_the_impls_that_can_answer_it() {
+    use vilan_core::dispatch_refine;
+    use vilan_core::type_::Type;
+
+    let source = r#"
+        trait Show4 { fun show4(self): str; }
+        struct Plaque { size: i32 }
+        impl Plaque with Show4 { fun show4(self): str { "plaque" } }
+
+        fun tell<V: Show4>(value: V) { print(value.show4()); }
+
+        fun main() {
+            tell(Plaque { size = 1 });
+        }
+        main();
+        "#;
+    let (selected, expected, tests, implementations) = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let plaque = program
+                .structs
+                .values()
+                .find(|struct_| struct_.name == "Plaque")
+                .expect("the program declares `Plaque`")
+                .id;
+            let subject = program
+                .type_id_to_type_map
+                .iter()
+                .find(|(_, type_)| matches!(type_, Type::Struct(id, arguments) if *id == plaque && arguments.is_empty()))
+                .map(|(type_id, _)| *type_id)
+                .expect("`Plaque` has a type slot");
+            let expected: Vec<_> = program
+                .implementations
+                .iter()
+                .filter_map(|implementation| implementation.declarations.get("show4").copied())
+                .collect();
+            dispatch_refine::reset_bound_selection_subject_tests();
+            // A member nothing has asked about under this key yet: the
+            // empty-traits reading, so the memo cannot answer it.
+            let selected =
+                dispatch_refine::impl_members_for_bound(&program, None, subject, "show4", &[]);
+            (
+                selected,
+                expected,
+                dispatch_refine::bound_selection_subject_tests(),
+                program.implementations.len(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+
+    assert_eq!(expected.len(), 1, "one impl declares `show4`");
+    assert_eq!(selected, expected, "the selection is `Plaque`'s own member");
+    assert!(
+        implementations > 50,
+        "std must be loaded for the count to mean anything ({implementations} impls)"
+    );
+    assert_eq!(
+        tests, 1,
+        "{tests} of the program's {implementations} impls were subject-tested for a \
+         member exactly one of them can provide (M103)"
+    );
+}
+
+/// M103: an inherited default's dispatch candidates are computed once per
+/// member, not once per call site.
+///
+/// `async_infer` asks, at every `OnType` dispatch site (a `self` call in a
+/// default body, an inherited default on a concrete receiver), which impl
+/// members a `Self` declaring that member can reach — a scan of every impl with
+/// a `subject_applies` bound proof per blanket implementor. The answer depends
+/// on the member name alone, and on kolt's client the scan was 1.9G
+/// instructions of a `check` once maps-45's blankets landed. Memoized per
+/// member on the `Program`: six call sites of `chime` ask six times and compute
+/// exactly what one call site computes.
+#[test]
+fn an_inherited_defaults_candidates_are_computed_once_per_member() {
+    fn counts(calls: usize) -> (usize, usize) {
+        let mut source = String::from(
+            r#"
+            trait Chime { fun ring(self): str; fun chime(self): str { self.ring() } }
+            struct Bell { size: i32 }
+            impl Bell with Chime { fun ring(self): str { "ding" } }
+
+            fun main() {
+                let bell = Bell { size = 1 };
+            "#,
+        );
+        for _ in 0..calls {
+            source.push_str("    print(bell.chime());\n");
+        }
+        source.push_str("}\nmain();\n");
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                // The program borrows its source for `'static`.
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                vilan_core::async_infer::reset_trait_subject_counts();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                drop(program);
+                vilan_core::async_infer::trait_subject_counts()
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    let (asked_once, computed_once) = counts(1);
+    let (asked_six, computed_six) = counts(6);
+    assert!(
+        asked_six > asked_once,
+        "six `bell.chime()` sites must ask more often than one ({asked_six} vs \
+         {asked_once}), or the count below proves nothing"
+    );
+    assert_eq!(
+        computed_six, computed_once,
+        "{asked_six} asks computed {computed_six} reachable sets where one call site's \
+         {asked_once} asks computed {computed_once}: the set is the member's, so a \
+         second site of the same member must read it from the memo (M103)"
+    );
+}
+
+/// M103: method lookup compares a receiver only against the impls that can
+/// provide the member it looks up.
+///
+/// The inherited-member scans of method resolution (a trait default the
+/// receiver inherits, and the default-taking impls ranked beside a declaring
+/// one) compared the receiver against EVERY impl in the program — a recursive
+/// type walk each — and only then asked whether the impl's traits had the
+/// member. With std's pipe nodes that was most of `compare_type_rigid`'s 3.9G
+/// instructions in a kolt `check`. The trait test now comes first, so impls
+/// that cannot answer the lookup cost nothing: twenty more of them, of a trait
+/// with no such member, leave the comparison count exactly where it was.
+#[test]
+fn method_lookup_compares_only_the_impls_that_can_provide_the_member() {
+    fn subject_tests(unrelated: usize) -> (usize, bool) {
+        let mut source = String::from(
+            r#"
+            trait Chime5 { fun ring5(self): str; fun chime5(self): str { self.ring5() } }
+            trait Unrelated5 { fun unrelated5(self): i32; }
+            struct Bell5 { size: i32 }
+            impl Bell5 with Chime5 { fun ring5(self): str { "ding" } }
+            "#,
+        );
+        for index in 0..unrelated {
+            source.push_str(&format!(
+                "struct Filler{index} {{ size: i32 }}\n\
+                 impl Filler{index} with Unrelated5 {{ fun unrelated5(self): i32 {{ {index} }} }}\n"
+            ));
+        }
+        source.push_str(
+            "fun main() {\n    let bell = Bell5 { size = 1 };\n    print(bell.chime5());\n}\nmain();\n",
+        );
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                // The program borrows its source for `'static`.
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                vilan_core::analyzer::reset_inherited_subject_tests();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                assert!(program.is_some(), "analysis should produce a program");
+                (
+                    vilan_core::analyzer::inherited_subject_tests(),
+                    vilan_core::analyzer::served_from_base_cache(),
+                )
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    // The base cache serves std's resolved world to every analysis after the
+    // first in this process, and std's own lookups are made while resolving
+    // it: both measured analyses must be served from it, so each counts the
+    // same thing — its entry's lookups. A concurrent test can evict the world
+    // under plain `cargo test` (one process), so a miss is measured again.
+    let served = |unrelated: usize| {
+        (0..4)
+            .map(|_| subject_tests(unrelated))
+            .find(|(_, served)| *served)
+            .map(|(count, _)| count)
+            .expect("the base cache serves a repeated analysis of the same world")
+    };
+    let without = served(0);
+    let with_twenty = served(20);
+    assert!(
+        without > 0,
+        "`bell.chime5()` must reach the inherited-default scan, or the count proves nothing"
+    );
+    assert_eq!(
+        with_twenty, without,
+        "twenty impls of a trait with no `chime5` took the lookup's subject \
+         comparisons from {without} to {with_twenty}: an impl that cannot provide the \
+         member must not be compared against the receiver (M103)"
     );
 }
 
@@ -9381,13 +9641,12 @@ fn b275_a_bool_signal_is_not_an_attribute_value() {
         }
         "#,
         // A142 moved the attribute arms onto `Flow` (`impl type S: Flow<str>` and
-        // `impl type S: Flow<Option<str>>`), and the solver now reports the
-        // refusal as an ambiguity between those two arms rather than as "does not
-        // implement `AttrValue`" — a known solver find (neither arm applies to a
-        // `Flow<bool>`, so the honest sentence is the old one). The claim stands:
-        // a `SignalCell<bool>` is refused as an attribute value, at `apply`
-        // through the `AttrValue` bound.
-        "'apply' cannot be dispatched on 'SignalCell<bool>' through this call's 'AttrValue' bound",
+        // `impl type S: Flow<Option<str>>`), and until B476 the solver reported
+        // the refusal as an AMBIGUITY between those two arms: a `SignalCell`
+        // meets `Flow` through the blanket over every `Source`, whose element
+        // went unchecked. Neither arm applies to a `Flow<bool>`, so the honest
+        // sentence is the old one, and it is back.
+        "'SignalCell<bool>' does not implement trait 'AttrValue', required by a generic bound",
     );
 }
 
@@ -13762,5 +14021,367 @@ fn b410_two_tuple_instantiations_of_one_trait_stay_apart_through_a_bound() {
             "fun main() { print(ints(Box {})); print(strs(Box {})); }\n",
         ),
         "ints\nstrs\n",
+    );
+}
+
+// --- B476 / B477: a blanket's element bound is checked at candidate selection ---
+// --- when the receiver meets the bounded trait through ANOTHER blanket.        ---
+
+/// The shared shape: `Fl<T>` is provided to every `Src<T>` by a blanket, as
+/// std's `Flow` is to every `Source` — so a receiver meets `Fl<X>` only at the
+/// `X` its own `Src` impl says.
+const FLOW_THROUGH_A_BLANKET: &str = concat!(
+    "import std::io::print;\n",
+    "trait Src<T> { fun get(self): T; }\n",
+    "trait Fl<T> { fun go(self): str; }\n",
+    "impl type S: Src<type T> with Fl<T> { fun go(self): str { \"fl\" } }\n",
+    "struct Cell<T> { v: T }\n",
+    "impl Cell<type T> with Src<T> { fun get(self): T { self.v } }\n",
+);
+
+/// B476: two trait arms over `Fl<str>` and `Fl<i32>` (std::ui's `Slot` shape)
+/// each answer their own receivers — directly and through a `Slot` bound. Both
+/// were candidates for every `Cell`, and every call was ambiguous.
+#[test]
+fn b476_two_arms_over_one_blanket_provided_trait_answer_their_own_element() {
+    assert_compiles_and_runs(
+        &format!(
+            "{FLOW_THROUGH_A_BLANKET}{}",
+            concat!(
+                "trait Slot { fun place(self): str; }\n",
+                "impl type S: Fl<str> with Slot { fun place(self): str { \"str\" } }\n",
+                "impl type S: Fl<i32> with Slot { fun place(self): str { \"i32\" } }\n",
+                "fun put<P: Slot>(p: P): str { p.place() }\n",
+                "fun main() {\n",
+                "\tprint(Cell { v = 1 }.place());\n",
+                "\tprint(Cell { v = \"a\" }.place());\n",
+                "\tprint(put(Cell { v = 1 }));\n",
+                "\tprint(put(Cell { v = \"a\" }));\n",
+                "}\n",
+            )
+        ),
+        "i32\nstr\ni32\nstr\n",
+    );
+}
+
+/// B476: an element the bound does not admit is no candidate — one arm over
+/// `Fl<str>` refuses a `Cell<i32>` at the bound rather than taking it.
+#[test]
+fn b476_an_element_the_arm_does_not_admit_is_refused() {
+    assert_fails_with(
+        &format!(
+            "{FLOW_THROUGH_A_BLANKET}{}",
+            concat!(
+                "trait Slot { fun place(self): str; }\n",
+                "impl type S: Fl<str> with Slot { fun place(self): str { \"str\" } }\n",
+                "fun put<P: Slot>(p: P): str { p.place() }\n",
+                "fun main() { print(put(Cell { v = 1 })); }\n",
+            )
+        ),
+        "'Cell<i32>' does not implement trait 'Slot'",
+    );
+}
+
+/// The two joins, declared in ONE order or the other: the `Option` join over
+/// `Fl<Option<I: Src<U>>>` and the total join over `Fl<I: Src<U>>`.
+fn two_joins(option_first: bool) -> String {
+    let option_join = "impl type F: Fl<Option<type I: Src<type U>>> { fun join(self): str { \"option join\" } }\n";
+    let total_join =
+        "impl type F: Fl<type I: Src<type U>> { fun join(self): str { \"total join\" } }\n";
+    let (first, second) = match option_first {
+        true => (option_join, total_join),
+        false => (total_join, option_join),
+    };
+    format!(
+        "{FLOW_THROUGH_A_BLANKET}{first}{second}{}",
+        concat!(
+            "fun main() {\n",
+            "\tprint(Cell { v = Some(Cell { v = 1 }) }.join());\n",
+            "\tprint(Cell { v = Cell { v = 1 } }.join());\n",
+            "}\n",
+        )
+    )
+}
+
+/// B477: the two same-named blankets resolve by WHICH BOUND HOLDS, in both
+/// declaration orders. Option-first took the `Option` join for a cell of a cell
+/// (then failed its bound); total-first took the total join for a cell of an
+/// `Option`.
+#[test]
+fn b477_two_same_named_blankets_resolve_by_the_bound_that_holds_option_first() {
+    assert_compiles_and_runs(&two_joins(true), "option join\ntotal join\n");
+}
+
+#[test]
+fn b477_two_same_named_blankets_resolve_by_the_bound_that_holds_total_first() {
+    assert_compiles_and_runs(&two_joins(false), "option join\ntotal join\n");
+}
+
+/// B477: when BOTH bounds hold, specificity picks — a bound narrower at its
+/// arguments (`Fl<Task<Result<T, E>>>`) over the wider (`Fl<Task<T>>`), in
+/// both declaration orders. transient-44's two `.transient()` arms are this
+/// shape, and their "declared first" comment was what held them.
+fn task_arms(result_first: bool) -> String {
+    let result_arm =
+        "impl type F: Fl<Task<Result<type T, type E>>> { fun t(self): str { \"result\" } }\n";
+    let bare_arm = "impl type F: Fl<Task<type T>> { fun t(self): str { \"bare\" } }\n";
+    let (first, second) = match result_first {
+        true => (result_arm, bare_arm),
+        false => (bare_arm, result_arm),
+    };
+    format!(
+        "{FLOW_THROUGH_A_BLANKET}struct Task<T> {{ v: T }}\n{first}{second}{}",
+        concat!(
+            "fun main() {\n",
+            "\tlet ok: Result<i32, str> = Ok(1);\n",
+            "\tprint(Cell { v = Task { v = ok } }.t());\n",
+            "\tprint(Cell { v = Task { v = 1 } }.t());\n",
+            "}\n",
+        )
+    )
+}
+
+#[test]
+fn b477_the_narrower_bound_argument_wins_when_both_hold_declared_first() {
+    assert_compiles_and_runs(&task_arms(true), "result\nbare\n");
+}
+
+#[test]
+fn b477_the_narrower_bound_argument_wins_when_both_hold_declared_second() {
+    assert_compiles_and_runs(&task_arms(false), "result\nbare\n");
+}
+
+/// B477: two bounds that both hold and do NOT rank are refused as ambiguous
+/// (A86's rule) — never answered by declaration order.
+#[test]
+fn b477_two_holding_bounds_that_do_not_rank_are_ambiguous() {
+    assert_fails_with(
+        &format!(
+            "{FLOW_THROUGH_A_BLANKET}{}",
+            concat!(
+                "trait A {}\n",
+                "trait B {}\n",
+                "struct Both {}\n",
+                "impl Both with A {}\n",
+                "impl Both with B {}\n",
+                "impl type F: Fl<type I: A> { fun pick(self): str { \"a\" } }\n",
+                "impl type F: Fl<type I: B> { fun pick(self): str { \"b\" } }\n",
+                "fun main() { print(Cell { v = Both {} }.pick()); }\n",
+            )
+        ),
+        "satisfies the bounds of TWO blanket `impl` blocks that both declare 'pick'",
+    );
+}
+
+/// B476 over std: a bare `flatten()` on a flow of SOURCES (the total join A4's
+/// `flatten` used to be) is refused once, at the call, with the steer to
+/// `switch(|inner| inner)` — not taken as the `Option` join and reported as an
+/// undetermined `MemoCell<Option<U>>`, nor repeated at the call chained onto it.
+#[test]
+fn b476_a_bare_total_join_flatten_is_refused_with_the_steer() {
+    let source = concat!(
+        "import std::reactive::{ Source, SignalCell };\n",
+        "fun main() {\n",
+        "\tlet inner = SignalCell::new(1);\n",
+        "\tlet outer = SignalCell::new(inner);\n",
+        "\tlet _watch = outer.flatten().on_change(|value| print(value));\n",
+        "}\n",
+    );
+    assert_fails_once_with(source, "followed with `.switch(|inner| inner)`");
+    assert_fails_once_with(
+        source,
+        "'SignalCell<SignalCell<i32>>' does not implement trait 'Flow<Option<I>>'",
+    );
+}
+
+/// B476's other half over std: the `Option` join is accepted and its sealed
+/// type is DETERMINED (`MemoCell<Option<i32>>`, annotated to prove it), and
+/// the total join's spelling still follows the inner.
+#[test]
+fn b476_the_option_join_flatten_is_accepted_and_typed() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::option::Option::{ self, None, Some };\n",
+            "import std::reactive::{ MemoCell, Source, SignalCell };\n",
+            "fun main() {\n",
+            "\tlet inner = SignalCell::new(1);\n",
+            "\tlet outer: SignalCell<Option<SignalCell<i32>>> = SignalCell::new(Some(inner));\n",
+            "\tlet flat: MemoCell<Option<i32>> = outer.flatten().memo();\n",
+            "\tlet total = SignalCell::new(inner).switch(|cell| cell).memo();\n",
+            "\tinner.set(4);\n",
+            "\tprint(flat.get().unwrap_or(0) + total.get());\n",
+            "\touter.set(None);\n",
+            "\tprint(flat.get().is_none());\n",
+            "}\n",
+        ),
+        "8\ntrue\n",
+    );
+}
+
+// --- B482 (RULED door (a)): an injected closure called inside `clear` of its ---
+// --- own context gets the CLEARED state — reactive-layers.md §7.3's static    ---
+// --- `untrack`. Strict reads in its literal are refused; `get_safe` is `None`. -
+
+/// The callee shape: `notify` calls its callback under `current.clear(..)`;
+/// `twice` calls it once plainly and once cleared.
+const B482_CALLEES: &str = r#"
+fun notify(callback: (|i32| void) context current) {
+    current.clear(|| callback(1));
+}
+
+fun twice(callback: (|i32| void) context current) {
+    callback(1);
+    current.clear(|| callback(2));
+}
+"#;
+
+fn b482_program(main_body: &str) -> String {
+    format!("{B458_HEAD}{B482_CALLEES}\nfun main() {{\n{main_body}\n}}\nmain();\n")
+}
+
+/// The call compiles (it was "an injected closure is called here, but this
+/// code can be reached without an enclosing `run`"), and a safe read in the
+/// literal sees `None` — though the literal was written under `run(7, ..)`.
+#[test]
+fn b482_a_callback_called_inside_clear_reads_the_context_as_absent() {
+    assert_compiles_and_runs(
+        &b482_program(
+            r#"current.run(7, || {
+                notify(|n| print(i"{n} {describe()}"));
+                notify(|n| print(i"{n} {current.get_safe().is_none()}"));
+            });"#,
+        ),
+        "1 none\n1 true\n",
+    );
+}
+
+/// One literal reached by a plain call AND a cleared one: `Some` from the
+/// first, `None` from the second.
+#[test]
+fn b482_the_same_literal_sees_the_value_outside_clear_and_none_inside() {
+    assert_compiles_and_runs(
+        &b482_program(
+            r#"current.run(7, || {
+                twice(|n| print(i"{n} {describe()}"));
+            });"#,
+        ),
+        "1 some 7\n2 none\n",
+    );
+}
+
+/// A STRICT read in a literal that lands at a cleared position is refused at
+/// compile time, at the read, naming the position and the steer.
+#[test]
+fn b482_a_strict_read_in_a_cleared_callback_is_refused() {
+    let source = b482_program(
+        r#"current.run(7, || {
+            notify(|n| print(n + current.get()));
+        });"#,
+    );
+    assert_fails_with(
+        &source,
+        "this closure is called with `current` CLEARED: it lands at the parameter `callback` of \
+         `notify`, which is called under `current.clear(..)`",
+    );
+    assert_fails_without(&source, "an injected closure is called here");
+}
+
+/// The same refusal reached through a FORWARD: `relay` hands its callback to
+/// `notify`, so a literal at `relay` can be called cleared too.
+#[test]
+fn b482_a_forwarded_callback_is_cleared_through_the_forward() {
+    let relay = r#"
+fun relay(callback: (|i32| void) context current) {
+    notify(callback);
+}
+"#;
+    let refused = format!(
+        "{B458_HEAD}{B482_CALLEES}{relay}\nfun main() {{\n{}\n}}\nmain();\n",
+        r#"current.run(7, || { relay(|n| print(n + current.get())); });"#
+    );
+    assert_fails_with(&refused, "this closure is called with `current` CLEARED");
+    let accepted = format!(
+        "{B458_HEAD}{B482_CALLEES}{relay}\nfun main() {{\n{}\n}}\nmain();\n",
+        r#"current.run(7, || { relay(|n| print(i"{n} {describe()}")); });"#
+    );
+    assert_compiles_and_runs(&accepted, "1 none\n");
+}
+
+/// A callback position NOT called under `clear` is untouched: its literal
+/// still reads the context strictly.
+#[test]
+fn b482_an_uncleared_callback_position_still_reads_strictly() {
+    let plain = r#"
+fun plain(callback: (|i32| void) context current) {
+    callback(1);
+}
+"#;
+    assert_compiles_and_runs(
+        &format!(
+            "{B458_HEAD}{plain}\nfun main() {{\n{}\n}}\nmain();\n",
+            r#"current.run(7, || { plain(|n| print(n + current.get())); });"#
+        ),
+        "8\n",
+    );
+}
+
+/// A SEPARATE position written with the same closure type as a cleared one is
+/// its own position: each annotation is its own closure type, so `plain`'s
+/// literal is not reached by `notify`'s `clear` and still reads strictly.
+/// A literal passed through a TRAIT BOUND lands at the trait's declaration of
+/// the member, and the call that clears it is in the impl the bound dispatches
+/// to: the two parameters are one position (reactive-45, found with B482's std
+/// half). The literal reads the cleared state, and a strict read in it is the
+/// cleared refusal. Red before the union: `1 some 7` — the literal was handed
+/// the run's value though the impl called it cleared (and natively its hidden
+/// parameter was rendered bare where the impl's type is an `Option`).
+#[test]
+fn b482_a_literal_through_a_bound_is_cleared_by_the_impl_it_dispatches_to() {
+    let head = r#"
+trait Notifier {
+    fun notify(self, callback: (|i32| void) context current);
+}
+
+struct Plain {}
+
+impl Plain with Notifier {
+    fun notify(self, callback: (|i32| void) context current) {
+        current.clear(|| callback(1));
+    }
+}
+
+fun via<N: Notifier>(notifier: N) {
+    current.run(7, || {
+        notifier.notify(|n| print(i"{n} {describe()}"));
+    });
+}
+"#;
+    assert_compiles_and_runs(
+        &format!("{B458_HEAD}{head}\nfun main() {{\n    via(Plain {{}});\n}}\nmain();\n"),
+        "1 none\n",
+    );
+    let strict = head.replace("print(i\"{n} {describe()}\")", "print(n + current.get())");
+    assert_fails_with(
+        &format!("{B458_HEAD}{strict}\nfun main() {{\n    via(Plain {{}});\n}}\nmain();\n"),
+        "this closure is called with `current` CLEARED",
+    );
+}
+
+#[test]
+fn b482_a_same_typed_separate_position_is_not_cleared() {
+    let plain = r#"
+fun plain(callback: (|i32| void) context current) {
+    callback(1);
+}
+"#;
+    assert_compiles_and_runs(
+        &format!(
+            "{B458_HEAD}{B482_CALLEES}{plain}\nfun main() {{\n{}\n}}\nmain();\n",
+            r#"current.run(7, || {
+                plain(|n| print(n + current.get()));
+                notify(|n| print(i"{n} {describe()}"));
+            });"#
+        ),
+        "8\n1 none\n",
     );
 }

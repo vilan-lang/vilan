@@ -1,0 +1,65 @@
+// F79: a `mut` PATTERN binder is a `mut` Rust binder natively. It was
+// emitted bare, so `&mut p` of one was refused by rustc (E0596).
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+fun bump(n: &mut i32) {
+	n += 1;
+}
+
+fun grow(list: &mut List<str>) {
+	list.push("more");
+}
+
+fun first_bumped<T>(held: Option<T>, fallback: T): T {
+	match held {
+		Some(mut value) => {
+			let copy = value;
+			value = copy;
+			value
+		},
+		None => fallback,
+	}
+}
+
+fun main() {
+	// The item's two shapes.
+	match Some(1) {
+		Some(mut p) => {
+			bump(&mut p);
+			print(p);
+		},
+		None => {},
+	}
+	mut (c, d) = (3, 4);
+	bump(&mut c);
+	print(c + d);
+	// A `match` over a binding the program reads again, with a non-Copy payload.
+	let names: Option<List<str>> = Some(["a"]);
+	match names {
+		Some(mut list) => {
+			grow(&mut list);
+			print(list.len());
+		},
+		None => {},
+	}
+	print(names.unwrap_or([]).len());
+	// A tuple destructure of a place read again, and an `is` capture.
+	let pair = (Point { x = 1, y = 2 }, 7);
+	mut (point, count) = pair;
+	bump(&mut point.x);
+	bump(&mut count);
+	print(i"{point.x} {count} {pair.0.x} {pair.1}");
+	if names is Some(mut again) {
+		grow(&mut again);
+		print(again.len());
+	}
+	// A generic body.
+	print(first_bumped(Some(5), 0));
+	print(first_bumped(None, "none"));
+}

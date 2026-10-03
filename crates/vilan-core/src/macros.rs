@@ -64,6 +64,7 @@ const STD_DERIVE_MACROS: &[(&str, &str)] = &[
     ("Json", "json.vl"),
     ("Wire", "json.vl"),
     ("Hashable", "hash.vl"),
+    ("Storable", "store.vl"),
 ];
 
 /// B376: what to say about `[derive(Name)]` where nothing declares a `Name`
@@ -2948,7 +2949,7 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                 .iter()
                 .flat_map(|fields| &fields.0)
                 .map(|(field, _)| {
-                    let (field_name, field_type, exposed, _internal) = field;
+                    let (field_name, field_type, exposed, _internal, reactivity) = field;
                     array(vec![
                         string_literal(field_name.0),
                         field_type
@@ -2958,6 +2959,8 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                         js::Node::Bool(exposed.is_exposed()),
                         js::Node::Bool(exposed.is_keyed()),
                         string_literal(exposed.key_type()),
+                        js::Node::Bool(reactivity.coarse),
+                        string_literal(reactivity.name.unwrap_or_default()),
                     ])
                 })
                 .collect();
@@ -3024,9 +3027,9 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
 /// included — consumers skip it by name), and the written return type
 /// (`void` when omitted).
 ///
-/// A parameter renders as a `Field` with all five slots written — `exposed`,
-/// `keyed` and `key` are meaningless on a parameter and are the false/empty
-/// constants. They used to be omitted, which left the last two slots `undefined`
+/// A parameter renders as a `Field` with all seven slots written — `exposed`,
+/// `keyed`, `key`, `reactive_coarse` and `reactive_name` are meaningless on a
+/// parameter and are the false/empty constants. They used to be omitted, which left the last two slots `undefined`
 /// in the macro world: harmless only for as long as no macro read them.
 fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
     let parameters = function
@@ -3046,6 +3049,8 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
                     .map(|type_| construct_type_expr(type_, text))
                     .unwrap_or_else(void_type_expr),
                 js::Node::Bool(false),
+                js::Node::Bool(false),
+                string_literal(""),
                 js::Node::Bool(false),
                 string_literal(""),
             ])
@@ -3070,7 +3075,7 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
 /// struct's own text alone would go stale when a method changes.
 /// What `[service]` found to put on the wire, for the one check `run_service`
 /// makes on it (B375). The three counts are the three kinds of contract-surface
-/// entry `service_hash` folds, and `is_empty` is exactly "this service hashes
+/// entry the contract hash folds (`contract_hash.rs`), and `is_empty` is exactly "this service hashes
 /// to the empty-set hash".
 pub(crate) struct ServiceSurface {
     /// The annotated struct's name, for the refusal's sentence.
@@ -3111,7 +3116,7 @@ pub(crate) fn construct_service(
         .0
         .iter()
         .map(|(field, _)| {
-            let (field_name, field_type, exposed, _internal) = field;
+            let (field_name, field_type, exposed, _internal, reactivity) = field;
             array(vec![
                 string_literal(field_name.0),
                 field_type
@@ -3124,6 +3129,8 @@ pub(crate) fn construct_service(
                 // the mirror is keyed by, or `""` for a field that is not keyed
                 // or whose key is read off a `Map<K, V>` element (A51).
                 string_literal(exposed.key_type()),
+                js::Node::Bool(reactivity.coarse),
+                string_literal(reactivity.name.unwrap_or_default()),
             ])
         })
         .collect();
@@ -3214,7 +3221,7 @@ fn service_http_refusals(
             ),
         ));
     }
-    for ((field_name, _field_type, exposure, _internal), _span) in
+    for ((field_name, _field_type, exposure, _internal, _reactivity), _span) in
         fields.iter().flat_map(|fields| &fields.0)
     {
         if !exposure.is_exposed() {
@@ -3289,6 +3296,8 @@ fn handle_spelling(returned: &Node) -> Option<&'static str> {
         ("SignalCell", 1) => Some("SignalCell"),
         ("MemoCell", 1) => Some("MemoCell"),
         ("KeyedCell", 2) => Some("KeyedCell"),
+        ("HashMapEntry", 2) => Some("HashMapEntry"),
+        ("MemoEntry", 2) => Some("MemoEntry"),
         _ => None,
     }
 }

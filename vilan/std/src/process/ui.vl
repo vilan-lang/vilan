@@ -42,9 +42,11 @@ import pkg::reactive::{
 	owner_scope,
 	read_once,
 	run_with_owner,
+	tracking,
 	turn_scope,
 };
 import pkg::shared::Shared;
+import pkg::store::{ Store, StoreFlag, StoreSome };
 import pkg::style::Style;
 
 /// One attribute in an element's ordered attribute list. Ordering is INSERTION
@@ -166,7 +168,7 @@ export impl View {
 	/// An event listener — ACCEPTED AND DISCARDED: a server-rendered element
 	/// carries no handler wiring. Kept in the surface so the same component code
 	/// compiles on both legs; the handler is the client's business.
-	fun on(self, event: str, handler: (|| void) context turn_scope): View {
+	fun on(self, event: str, handler: (|| void) context (turn_scope, tracking)): View {
 		self
 	}
 
@@ -177,7 +179,7 @@ export impl View {
 	/// accepted. (This is what lets a browser module like `std::router`, whose
 	/// `link` binds an `on_event`, still resolve `std::ui` when the analyzer loads
 	/// it to compute a process build's cross-platform requirements.)
-	fun on_event<E>(self, event: str, handler: (|E| void) context turn_scope): View {
+	fun on_event<E>(self, event: str, handler: (|E| void) context (turn_scope, tracking)): View {
 		self
 	}
 
@@ -433,18 +435,6 @@ export impl type S: Flow<str> with Slot {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<str> with Slot {
-	fun place(own self, parent: View) {
-		place_text_flow(self, parent);
-	}
-}
-
 fun place_text_flow<F: Flow<str>>(own flow: F, parent: View) {
 	parent.children.write().push(Child::Text(read_once(flow)));
 }
@@ -469,18 +459,6 @@ export impl type S: Flow<View> with Slot {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<View> with Slot {
-	fun place(own self, parent: View) {
-		place_view_flow(self, parent);
-	}
-}
-
 fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
 	parent.children.write().push(Child::Element(read_once(flow)));
 }
@@ -490,18 +468,6 @@ fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
 /// place through a `Region`, and a one-pass render needs no anchor to do the same.
 /// KEEP IN STEP with the browser twin.
 export impl type S: Flow<List<View>> with Slot {
-	fun place(own self, parent: View) {
-		place_views_flow(self, parent);
-	}
-}
-
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<List<View>> with Slot {
 	fun place(own self, parent: View) {
 		place_views_flow(self, parent);
 	}
@@ -735,18 +701,6 @@ export impl type S: Flow<str> with AttrValue {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<str> with AttrValue {
-	fun apply(own self, parent: View, name: str) {
-		apply_text_flow(self, parent, name);
-	}
-}
-
 fun apply_text_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	set_attribute(parent.attributes, name, read_once(flow));
 }
@@ -766,18 +720,6 @@ export impl Option<str> with AttrValue {
 /// removing arm. Nothing was written, so there is no `remove_attribute` to mirror,
 /// which is `AttrBinding`'s arrangement exactly.
 export impl type S: Flow<Option<str>> with AttrValue {
-	fun apply(own self, parent: View, name: str) {
-		apply_optional_flow(self, parent, name);
-	}
-}
-
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<Option<str>> with AttrValue {
 	fun apply(own self, parent: View, name: str) {
 		apply_optional_flow(self, parent, name);
 	}
@@ -806,18 +748,6 @@ export impl type S: Flow<str> with AttrBinding {
 	}
 }
 
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<str> with AttrBinding {
-	fun bind_attribute(own self, parent: View, name: str) {
-		bind_text_attribute_flow(self, parent, name);
-	}
-}
-
 fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	set_attribute(parent.attributes, name, read_once(flow));
 }
@@ -825,18 +755,6 @@ fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str)
 /// Rendered only for a `Some`: a `None` omits the attribute, which is the server's
 /// whole answer to the browser twin's `remove_attribute`.
 export impl type S: Flow<Option<str>> with AttrBinding {
-	fun bind_attribute(own self, parent: View, name: str) {
-		bind_optional_attribute_flow(self, parent, name);
-	}
-}
-
-/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
-/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
-/// blanket's trait argument is not checked through another blanket, so the flow
-/// arms above all match a `SignalCell` and none is the more specific. `Source` is
-/// the subtrait, so this arm outranks them for every source; the flow arm is left
-/// to the pipes, which implement `Flow` directly.
-export impl type S: Source<Option<str>> with AttrBinding {
 	fun bind_attribute(own self, parent: View, name: str) {
 		bind_optional_attribute_flow(self, parent, name);
 	}
@@ -974,6 +892,28 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 		},
 		None => {},
 	}
+}
+
+// === `when_live`: a store's variant as content (A142 S7) ====================
+//
+// `when_some` hands its body a `SignalCell<T>` of the WHOLE payload, so every
+// binding in the body is a projection of that cell and reruns on every write to
+// any of the payload's fields. A store already knows the payload's shape: this
+// rebuilds ONLY on the variant (it follows the discriminant slot,
+// `proposal/store.md` §2.6) and hands the body the payload's own `Store<P>`, whose
+// field handles wake one by one. KEEP IN STEP with the browser twin's copy
+// (browser/ui.vl).
+
+/// A store's variant as CONTENT at THIS position, with the payload's `Store<P>` in
+/// hand, read once: the body renders when the variant is live now, and nothing when
+/// it is not.
+///
+///     <aside>{when_live(presence.online(), |device| device_panel(device))}</aside>
+export fun when_live<P, C: Slot>(
+	handle: StoreSome<P>,
+	render: (sync |Store<P>| C) context owner_scope,
+): Conditional<StoreFlag, C> {
+	when(handle.live(), || render(handle.assume()))
 }
 
 // === A121: focus scopes, server side (proposal/focus-scope.md) ===============

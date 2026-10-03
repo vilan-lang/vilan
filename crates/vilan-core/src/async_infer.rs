@@ -824,7 +824,69 @@ pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
 /// gets. `call_graph::successors` and `init_order` read this same set to build
 /// reachability edges, so the narrowing removes bogus edges there too — strictly
 /// more accurate in the same direction.
+///
+/// Memoized per member name on the `Program` (M103). The receiver-reachability
+/// half — the trait closure, the implementor heads and the `subject_applies`
+/// test of every non-nominal implementor — reads only the program's traits,
+/// impls and interned type slots, which are settled before the post-passes run;
+/// it is asked once per dispatch SITE, and the bound proof inside
+/// `subject_applies` grows with every blanket impl std declares (maps-45's map
+/// and set operators doubled it: 1.9G instructions of a kolt `check`). The
+/// `is_self_method` filter reads parameters, so it stays outside the memo and
+/// runs per call, as before.
 fn trait_subject_candidates(program: &Program, member: &str) -> Vec<Id> {
+    TRAIT_SUBJECT_ASKED.with(|count| count.set(count.get() + 1));
+    let cached = program.trait_subject_memo().get(member).cloned();
+    let reachable = match cached {
+        Some(reachable) => reachable,
+        None => {
+            TRAIT_SUBJECT_COMPUTED.with(|count| count.set(count.get() + 1));
+            let computed = trait_subject_reachable(program, member);
+            program
+                .trait_subject_memo()
+                .insert(member.to_string(), computed.clone());
+            computed
+        }
+    };
+    match reachable {
+        Some(mut candidates) => {
+            candidates.retain(|member_id| is_self_method(program, *member_id));
+            candidates
+        }
+        None => members_named(program, member),
+    }
+}
+
+thread_local! {
+    /// How many times [`trait_subject_candidates`] was asked on this thread,
+    /// and how many of those COMPUTED the reachable set rather than reading the
+    /// program's memo (M103) — the memo's instrument: the answer is the same
+    /// either way, so only the counts can see it. Thread-local because an
+    /// analysis is single-threaded and plain `cargo test` runs several at once.
+    static TRAIT_SUBJECT_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TRAIT_SUBJECT_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `(asked, computed)` for [`trait_subject_candidates`] on this thread since
+/// the last [`reset_trait_subject_counts`]. See [`TRAIT_SUBJECT_ASKED`].
+pub fn trait_subject_counts() -> (usize, usize) {
+    (
+        TRAIT_SUBJECT_ASKED.with(std::cell::Cell::get),
+        TRAIT_SUBJECT_COMPUTED.with(std::cell::Cell::get),
+    )
+}
+
+/// Zeroes this thread's [`trait_subject_counts`].
+pub fn reset_trait_subject_counts() {
+    TRAIT_SUBJECT_ASKED.with(|count| count.set(0));
+    TRAIT_SUBJECT_COMPUTED.with(|count| count.set(0));
+}
+
+/// [`trait_subject_candidates`]' memoized half: every impl member and trait
+/// declaration named `member` whose subject can be a `Self` of a trait that
+/// declares it, before the receiver filter — or `None` when no trait declares
+/// `member` at all (the caller falls back to [`members_named`]).
+fn trait_subject_reachable(program: &Program, member: &str) -> Option<Vec<Id>> {
     // The traits that could own the body: the ones declaring `member`, plus —
     // since a member reached from a SUPERTRAIT is declared there and inherited
     // here (B205) — every trait whose supertraits reach one. Closing the set
@@ -837,7 +899,7 @@ fn trait_subject_candidates(program: &Program, member: &str) -> Vec<Id> {
         .map(|(trait_id, _)| *trait_id)
         .collect();
     if declaring.is_empty() {
-        return members_named(program, member);
+        return None;
     }
     loop {
         let inheriting: Vec<Id> = program
@@ -914,8 +976,7 @@ fn trait_subject_candidates(program: &Program, member: &str) -> Vec<Id> {
             candidates.push(*member_id);
         }
     }
-    candidates.retain(|member_id| is_self_method(program, *member_id));
-    candidates
+    Some(candidates)
 }
 
 /// An impl subject's nominal head, or `None` when it has none to match on.

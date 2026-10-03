@@ -1,0 +1,105 @@
+// F76: a bare variant of a generic USER enum — `Maybe::Nothing` — closes its
+// enum's arguments from the position it is written into. Natively it took the
+// type recorded at its own site alone, which stays open for a variant with no
+// payload, and was refused as unbound even under an annotation. (`None` built
+// all along: `Option` is Rust's own enum, whose path names no instance.)
+import std::hash::Hashable;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+enum Maybe<T> {
+	Nothing,
+	Just(T),
+}
+
+enum Keyed<K: Hashable, V> {
+	Empty,
+	Entry(K, V),
+}
+
+fun show(maybe: Maybe<i32>): str {
+	match maybe {
+		Maybe::Nothing => "nothing",
+		Maybe::Just(let value) => i"just {value}",
+	}
+}
+
+fun show_keyed(keyed: Keyed<str, i32>): str {
+	match keyed {
+		Keyed::Empty => "empty",
+		Keyed::Entry(let key, let value) => i"{key}={value}",
+	}
+}
+
+/// The return position, inside a generic function at two instances.
+fun nothing<T>(): Maybe<T> {
+	Maybe::Nothing
+}
+
+/// A `ret` and a tail.
+fun pick(flag: bool): Maybe<i32> {
+	if flag {
+		ret Maybe::Nothing;
+	}
+	Maybe::Just(1)
+}
+
+struct Slot<T> {
+	held: Maybe<T>,
+}
+
+impl Slot<type T> {
+	fun clear(&mut self) {
+		self.held = Maybe::Nothing;
+	}
+
+	fun is_empty(self): bool {
+		self.held is Maybe::Nothing
+	}
+}
+
+fun main() {
+	// The item's repro: an annotated binding.
+	let first: Maybe<i32> = Maybe::Nothing;
+	print(show(first));
+	// An argument position.
+	print(show(Maybe::Nothing));
+	// A generic function's return, at two instances.
+	let text: Maybe<str> = nothing();
+	match text {
+		Maybe::Nothing => print("no text"),
+		Maybe::Just(let value) => print(value),
+	}
+	print(show(nothing()));
+	print(show(pick(true)));
+	print(show(pick(false)));
+	// A list literal mixing the bare variant with a payload one.
+	let list: List<Maybe<i32>> = [Maybe::Nothing, Maybe::Just(2)];
+	for item in list {
+		print(show(item));
+	}
+	// An assignment.
+	mut slot: Maybe<i32> = Maybe::Just(3);
+	print(show(slot));
+	slot = Maybe::Nothing;
+	print(show(slot));
+	// Nested in another constructor's payload.
+	let wrapped: Option<Maybe<i32>> = Some(Maybe::Nothing);
+	match wrapped {
+		Some(let inner) => print(show(inner)),
+		None => print("none"),
+	}
+	// Both arms of an `if`.
+	let chosen = if first is Maybe::Nothing { Maybe::Just(5) } else { Maybe::Nothing };
+	print(show(chosen));
+	// A struct field, written through a generic impl.
+	let held: Maybe<str> = Maybe::Just("h");
+	mut holder: Slot<str> = Slot { held };
+	print(holder.is_empty());
+	holder.clear();
+	print(holder.is_empty());
+	// Two parameters, one bounded.
+	let keyed: Keyed<str, i32> = Keyed::Empty;
+	print(show_keyed(keyed));
+	print(show_keyed(Keyed::Entry("k", 4)));
+}

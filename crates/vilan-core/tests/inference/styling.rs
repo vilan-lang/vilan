@@ -7806,6 +7806,38 @@ fn b471_a_css_static_on_length_names_the_rename() {
     assert_fails_with(source, CSS_FIELD_RENAME_NOTE);
 }
 
+/// B471's CONTROL: the did-you-mean is keyed on std's own style values. A
+/// USER type's `css` miss — a field read, a method call and a static — is the
+/// ordinary refusal, carrying no rename note; and a user type that DECLARES a
+/// `css` member (legal again since B414 S4) answers with it.
+#[test]
+fn b471_a_user_types_css_miss_stays_the_ordinary_error() {
+    for (expression, ordinary) in [
+        ("Mine { n = 1 }.css", "'css'"),
+        ("Mine { n = 1 }.css()", "'css'"),
+        ("Mine::css(1)", "'css'"),
+    ] {
+        let source = format!(
+            "import std::io::print;\nstruct Mine {{ n: i32 }}\nfun main() {{\n    print({expression});\n}}\nmain();\n"
+        );
+        assert_fails_with(&source, ordinary);
+        assert_fails_without(&source, CSS_RENAME_NOTE);
+        assert_fails_without(&source, CSS_FIELD_RENAME_NOTE);
+    }
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Mine { css: str }
+        impl Mine { fun render(self): str { self.css } }
+        fun main() {
+            print(Mine { css = "color: red" }.render());
+        }
+        main();
+        "#,
+        "color: red\n",
+    );
+}
+
 #[test]
 fn b471_a_css_call_on_a_style_names_the_rename() {
     let source = r#"

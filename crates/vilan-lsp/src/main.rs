@@ -647,6 +647,11 @@ struct Backend {
     package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
     package_revision: Arc<DashMap<PathBuf, u64>>,
     union_tokens: Arc<DashMap<PathBuf, Vec<CancelToken>>>,
+    /// M104: the union leg each open ENTRY document's last landed analysis
+    /// answers, read off that analysis on its own thread — so the clock can
+    /// take a current one instead of analyzing the entry again. See
+    /// [`LandedEntryLeg`].
+    entry_legs: Arc<DashMap<Url, LandedEntryLeg>>,
     /// M63: the documents the editor has most recently worked IN, newest
     /// first, at most [`RETAINED_PROGRAMS`] of them — and therefore the
     /// documents that keep their `Program`. Every other open document holds
@@ -1616,6 +1621,9 @@ struct AnalysisContext {
     package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
     package_revision: Arc<DashMap<PathBuf, u64>>,
     union_tokens: Arc<DashMap<PathBuf, Vec<CancelToken>>>,
+    /// M104: [`Backend`]'s entry legs — written where an entry's analysis
+    /// lands, read where the clock builds a union.
+    entry_legs: Arc<DashMap<Url, LandedEntryLeg>>,
     /// M63's retained set, so the seam where an analysis LANDS can apply the
     /// retention rule: the dependency sweep re-analyzes background documents,
     /// and a program that lands on one of them has to go straight back.
@@ -1667,6 +1675,79 @@ fn package_of(documents: &DashMap<Url, Document>, uri: &Url) -> Option<PathBuf> 
         .and_then(|document| document.manifest_dir().map(Path::to_path_buf))
 }
 
+/// M104: the union leg an open entry document's last LANDED analysis answers
+/// ([`dead_items::entry_reach_of`]), with what it was computed against.
+struct LandedEntryLeg {
+    /// The world revision the analysis started from (its E117 stamp).
+    revision: u64,
+    /// The hash of the text it analyzed.
+    text_hash: u64,
+    /// The std directory it analyzed against.
+    std_dir: PathBuf,
+    /// The leg itself — `None` is an answer too: the entry refuses the union
+    /// (a diagnostic, no program, no `main`), exactly as its own leg would.
+    leg: Option<Arc<dead_items::EntryReach>>,
+}
+
+/// The URI the client opened the file at `path` under, if it is open.
+///
+/// The documents map is keyed by the CLIENT's spelling of a file, and the
+/// package clock knows an entry only by the path the manifest declares — two
+/// spellings that agree on Linux and need not on Windows: a temp root's 8.3
+/// short name (`RUNNER~1`) against its canonical long one, or VS Code's
+/// `file:///c%3A/…` against `Url::from_file_path`'s `file:///C:/…`. Rebuilding
+/// a URI from the manifest's path and looking it up therefore missed every
+/// open entry there. Both sides are compared canonical instead, as
+/// [`Backend::location_for_path`] does: an analyzed document answers with its
+/// analysis's canonical entry path, one with no analysis yet with its URI's
+/// path canonicalized.
+fn open_document_uri(documents: &DashMap<Url, Document>, path: &Path) -> Option<Url> {
+    let path = vilan_core::util::canonical_path(path);
+    documents.iter().find_map(|document| {
+        let matches = match document.entry_path() {
+            Some(entry_path) => entry_path == path,
+            None => document
+                .key()
+                .to_file_path()
+                .is_ok_and(|own| vilan_core::util::canonical_path(own) == path),
+        };
+        matches.then(|| document.key().clone())
+    })
+}
+
+/// The leg the clock may take for `entry` instead of analyzing it (M104), or
+/// `None` when it must analyze.
+///
+/// Taken only when the entry's landed analysis is of the world as it stands
+/// NOW: the document is open with no edit it has not analyzed, the leg was
+/// read off that very analysis, and no notification has moved the world since
+/// it started — the E117 revision it was stamped with is still the current
+/// one, so every buffer and file it read is what the leg's own analysis would
+/// read. Then the leg's analysis would be the same `analyze_cancellable` over
+/// the same text, std and path, and its answer is already in hand. Anything
+/// else analyzes, as before.
+fn reusable_leg(
+    documents: &DashMap<Url, Document>,
+    entry_legs: &DashMap<Url, LandedEntryLeg>,
+    entry: &Url,
+    current_revision: u64,
+    std_dir: &Path,
+) -> Option<Option<dead_items::EntryReach>> {
+    let landed = entry_legs.get(entry)?;
+    let document = documents.get(entry)?;
+    let current = landed.revision == current_revision
+        && document.analysis_revision() == landed.revision
+        && document.text_hash == landed.text_hash
+        && hash_text(&document.text) == landed.text_hash
+        // Canonical both sides: the analysis found its std from the CLIENT's
+        // spelling of the entry and the clock from the manifest directory's
+        // canonical one, and on Windows those two walks can spell one checkout
+        // two ways (`open_document_uri`'s reason).
+        && vilan_core::util::canonical_path(&landed.std_dir)
+            == vilan_core::util::canonical_path(std_dir);
+    current.then(|| landed.leg.as_deref().cloned())
+}
+
 /// E124's package clock: recompute the union after the editor has been at
 /// rest, off every request path.
 ///
@@ -1696,6 +1777,9 @@ fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
     let package_unions = Arc::clone(&context.package_unions);
     let package_revision = Arc::clone(&context.package_revision);
     let union_tokens = Arc::clone(&context.union_tokens);
+    let entry_legs = Arc::clone(&context.entry_legs);
+    let revision = Arc::clone(&context.revision);
+    let analyses = Arc::clone(&context.analyses);
     let schedule = Arc::clone(&context.schedule);
     let client = context.client.clone();
     let publish_state = Arc::clone(&context.publish_state);
@@ -1724,15 +1808,24 @@ fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
         // (no map guard may cross an await): a buffered entry is what the
         // user is looking at, and a union taken off the stale disk copy
         // would gray on a world nobody can see.
-        let buffers: HashMap<PathBuf, String> = entries
+        //
+        // Each entry is resolved to the URI its open buffer is keyed under
+        // (`open_document_uri`) — never rebuilt from the manifest's path, which
+        // on Windows spells the same file differently from the client.
+        let open_entries: HashMap<PathBuf, Url> = entries
             .iter()
             .filter_map(|(_, path)| {
-                let uri = Url::from_file_path(path).ok()?;
-                let document = documents.get(&uri)?;
                 Some((
                     vilan_core::util::canonical_path(path),
-                    document.text.clone(),
+                    open_document_uri(&documents, path)?,
                 ))
+            })
+            .collect();
+        let buffers: HashMap<PathBuf, String> = open_entries
+            .iter()
+            .filter_map(|(path, uri)| {
+                let document = documents.get(uri)?;
+                Some((path.clone(), document.text.clone()))
             })
             .collect();
         let std_dir = discover_std_dir(&manifest_dir);
@@ -1751,8 +1844,22 @@ fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
         // so the withdrawal above can stop every leg at once.
         let mut legs = Vec::with_capacity(entries.len());
         let mut tokens = Vec::with_capacity(entries.len());
+        let world = revision.load(Ordering::SeqCst);
         for (_, entry) in &entries {
-            let entry_uri = Url::from_file_path(entry).ok();
+            let canonical_entry = vilan_core::util::canonical_path(entry);
+            let entry_uri = open_entries.get(&canonical_entry).cloned();
+            // M104: an open entry whose landed analysis is of this very world
+            // already answered its leg — the dependency sweep has typically
+            // just re-landed it — so the clock takes that answer rather than
+            // paying a second full analysis of the same entry.
+            if let Some(reused) = entry_uri
+                .as_ref()
+                .and_then(|uri| reusable_leg(&documents, &entry_legs, uri, world, &std_dir))
+            {
+                analyses.record_union_leg_reused();
+                legs.push(tokio::spawn(async move { reused }));
+                continue;
+            }
             let started = entry_uri.as_ref().and_then(|uri| {
                 let generation = schedule.generation(uri)?;
                 Some((uri.clone(), schedule.start(uri, generation)))
@@ -1765,12 +1872,14 @@ fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
             let entry = entry.clone();
             let std_dir = std_dir.clone();
             let text = buffers
-                .get(&vilan_core::util::canonical_path(&entry))
+                .get(&canonical_entry)
                 .cloned()
                 .or_else(|| std::fs::read_to_string(&entry).ok());
             let schedule_for_leg = Arc::clone(&schedule);
+            let analyses_for_leg = Arc::clone(&analyses);
             legs.push(tokio::spawn(async move {
                 let text = text?;
+                analyses_for_leg.record_union_leg_analyzed();
                 let leg = tokio::task::spawn_blocking(move || {
                     dead_items::analyze_entry(&entry, &std_dir, &token, &text)
                 })
@@ -1850,8 +1959,18 @@ async fn analyze_and_publish(
     // construction a view of an older world — whatever its own text says.
     let started_at = context.revision.load(Ordering::SeqCst);
     let token = started.token.clone();
+    let leg_std_dir = std_dir.clone();
     let analysis = tokio::task::spawn_blocking(move || {
-        Document::analyze_cancellable(&text, &std_dir, &path, &token)
+        let document = Document::analyze_cancellable(&text, &std_dir, &path, &token)?;
+        // M104: an analysis of a package's declared ENTRY is the analysis the
+        // package clock's leg for that entry would make, so the leg is read
+        // off it here, on the analysis thread, while the program is in hand
+        // (M63 may release it once it lands). `None` for every other file.
+        let leg = document
+            .manifest_dir()
+            .filter(|manifest_dir| dead_items::is_declared_entry(manifest_dir, &path))
+            .map(|_| dead_items::entry_reach_of(&document).map(Arc::new));
+        Some((document, leg))
     })
     .await;
     // The registration goes whatever the outcome: a joined task is an analysis
@@ -1861,7 +1980,7 @@ async fn analyze_and_publish(
     let Ok(analysis) = analysis else {
         return AnalysisOutcome::Dropped;
     };
-    let Some(mut analysis) = analysis else {
+    let Some((mut analysis, entry_leg)) = analysis else {
         // Cancelled: there is no result. The truncated one was destroyed on the
         // analysis thread, so nothing here can land or publish it even by
         // mistake.
@@ -1872,8 +1991,25 @@ async fn analyze_and_publish(
     // M27: read before `land` takes the analysis — the editor tables it built
     // are a per-keystroke cost the session trace had no column for.
     let index_time = analysis.index_time;
+    let analyzed_hash = analysis.text_hash;
     if !land(&context.documents, &uri, analysis) {
         return AnalysisOutcome::Dropped;
+    }
+    match entry_leg {
+        Some(leg) => {
+            context.entry_legs.insert(
+                uri.clone(),
+                LandedEntryLeg {
+                    revision: started_at,
+                    text_hash: analyzed_hash,
+                    std_dir: leg_std_dir,
+                    leg,
+                },
+            );
+        }
+        None => {
+            context.entry_legs.remove(&uri);
+        }
     }
     context.analyses.record_landed();
     context.analyses.record_index(index_time);
@@ -2553,6 +2689,7 @@ impl Backend {
             package_unions: Arc::clone(&self.package_unions),
             package_revision: Arc::clone(&self.package_revision),
             union_tokens: Arc::clone(&self.union_tokens),
+            entry_legs: Arc::clone(&self.entry_legs),
             focus: Arc::clone(&self.focus),
         }
     }
@@ -3439,9 +3576,11 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        self.fenced("did_change", (), || {
+        // E242: the diagnostics this edit carried along, republished at once —
+        // no analysis — so a squiggle stays on its code until the next one.
+        let followed = self.fenced("did_change", None, || {
             if params.content_changes.is_empty() {
-                return;
+                return None;
             }
             let uri = params.text_document.uri;
             if is_manifest(&uri) {
@@ -3467,7 +3606,7 @@ impl LanguageServer for Backend {
                 // the package's union is withdrawn like any other change in it.
                 self.withdraw_package_grays_for(&uri);
                 self.manifests.insert(uri, ManifestDocument::new(text));
-                return;
+                return None;
             }
             // M63: typing in a file is the strongest focus signal there is.
             // Before the edit, so the analysis this change schedules lands on a
@@ -3479,12 +3618,29 @@ impl LanguageServer for Backend {
             // debounced re-analysis still sees the just-typed character.
             // A document the protocol never opened has no base to splice
             // into; ranged events for it are dropped by the same guard.
+            let mut follows_diagnostics = false;
             let text = {
-                let Some(mut document) = self.documents.get_mut(&uri) else {
-                    return;
-                };
+                let mut document = self.documents.get_mut(&uri)?;
+                let mut publish_state = self
+                    .publish_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for change in &params.content_changes {
+                    let before = Arc::clone(&document.line_index);
                     document.apply_change(change.range, &change.text);
+                    // E242: each published diagnostic on this file follows the
+                    // edit — a whole-text replacement has no image to follow.
+                    if let Some(range) = change.range {
+                        let start = before.offset(range.start);
+                        let end = before.offset(range.end).max(start);
+                        let edit = document::EditDelta {
+                            start,
+                            old_len: end - start,
+                            new_len: change.text.len(),
+                        };
+                        follows_diagnostics |=
+                            publish_state.follow_edit(&uri, &before, edit, &document.line_index);
+                    }
                 }
                 document.text.clone()
             };
@@ -3502,8 +3658,24 @@ impl LanguageServer for Backend {
             // debounce, before any analysis — the withdrawal is the half of the
             // staleness rule that must not wait for anything.
             self.withdraw_package_grays_for(&uri);
-            self.on_change(uri, text);
-        })
+            self.on_change(uri.clone(), text);
+            follows_diagnostics.then_some(uri)
+        });
+        if let Some(uri) = followed {
+            // Planned UNDER the publish gate, from the state as it is then: an
+            // analysis that landed meanwhile already replaced the groups, and
+            // repainting those is right, where sending a list planned before
+            // the gate could arrive after the fresh one and undo it.
+            let _sending = self.publish_gate.lock().await;
+            let (target, diagnostics) = self
+                .publish_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .republish(&uri);
+            self.client
+                .publish_diagnostics(target, diagnostics, None)
+                .await;
+        }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -4699,6 +4871,7 @@ mod snapshot_consistency_tests {
             package_unions: Arc::new(DashMap::new()),
             package_revision: Arc::new(DashMap::new()),
             union_tokens: Arc::new(DashMap::new()),
+            entry_legs: Arc::new(DashMap::new()),
             focus: Arc::new(std::sync::Mutex::new(Vec::new())),
             formatting_declines: Arc::new(DashMap::new()),
         })
@@ -6544,6 +6717,7 @@ async fn main() {
         package_unions: Arc::new(DashMap::new()),
         package_revision: Arc::new(DashMap::new()),
         union_tokens: Arc::new(DashMap::new()),
+        entry_legs: Arc::new(DashMap::new()),
         focus: Arc::new(std::sync::Mutex::new(Vec::new())),
         formatting_declines: Arc::new(DashMap::new()),
     })
@@ -9574,6 +9748,97 @@ mod dead_item_clock_tests {
             "an edit to a file the entries DO load withdraws, as it always did",
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// M104: **an open entry's landed analysis answers its own union leg.**
+    ///
+    /// The server analyzes an open file as the entry, so with `client.vl` open
+    /// the dependency sweep re-lands the client's analysis after an edit to
+    /// `shared.vl` — and the package clock, 600 ms later, analyzed the client
+    /// AGAIN for its leg: the same `analyze_cancellable` over the same text,
+    /// std and path, ~2 s of CPU per typing pause on kolt. The clock now takes
+    /// the leg off the landed analysis when nothing has moved since it started,
+    /// and analyzes only the entry that is not open (`server.vl`). The union it
+    /// lands is the one it landed before: the paint is identical.
+    #[tokio::test]
+    async fn an_open_entrys_landed_analysis_answers_its_union_leg() {
+        let (directory, shared) = workspace();
+        let client = Url::from_file_path(directory.join("src/client.vl")).expect("a file url");
+        open_entry_leg_is_reused(&client, &shared).await;
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The same claim with the package opened through a SPELLING of its
+    /// directory that is not the canonical one — a symlink here; on Windows
+    /// the temp root's 8.3 short name (`RUNNER~1`), or an editor's
+    /// lower-case, percent-encoded drive (`file:///c%3A/…`). The clock knows
+    /// an entry by the manifest's canonical path and the documents map by the
+    /// client's URI; it rebuilt a URI from the first and looked it up in the
+    /// second, missed, and analyzed the open entry again (`(2, 0)`, red on
+    /// `windows-latest` for the pin above). It resolves the entry to the open
+    /// document's own URI now, canonical against canonical.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_open_entry_reached_by_another_spelling_still_answers_its_union_leg() {
+        let (directory, _) = workspace();
+        let spelled = directory.with_file_name(format!(
+            "{}-link",
+            directory
+                .file_name()
+                .expect("a scratch directory name")
+                .to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(&spelled);
+        std::os::unix::fs::symlink(&directory, &spelled).expect("a symlinked spelling");
+        let client = Url::from_file_path(spelled.join("src/client.vl")).expect("a file url");
+        let shared = Url::from_file_path(spelled.join("src/shared.vl")).expect("a file url");
+        open_entry_leg_is_reused(&client, &shared).await;
+        let _ = std::fs::remove_file(&spelled);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// M104's claim over `client` (an open entry) and `shared` (the module
+    /// both entries' union paints): after an edit to `shared`, the clock
+    /// analyzes only the entry that is NOT open and takes the open one's leg
+    /// from its landed analysis.
+    async fn open_entry_leg_is_reused(client: &Url, shared: &Url) {
+        let (service, _socket) = backend();
+        let server = service.inner();
+
+        server.did_open(open_params(client, CLIENT)).await;
+        server.did_open(open_params(shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, shared, true).await,
+            "the package clock lands a union and `used_by_nobody` fades",
+        );
+        let before = server.analyses.union_legs();
+
+        let edited = format!("{SHARED}\nfun just_typed() {{\n\tprint(\"t\");\n}}\n");
+        server
+            .did_change(whole_file_change(shared, 2, &edited))
+            .await;
+        assert!(
+            wait_for_grays(server, shared, false).await,
+            "the edit withdraws the paint",
+        );
+        assert!(
+            wait_for_grays(server, shared, true).await,
+            "the editor came to rest, the union recomputed, and the gray is back",
+        );
+        assert_eq!(
+            grays(server, shared),
+            2,
+            "the same union as an analyzed leg gives: `used_by_nobody` and the \
+             just-typed `just_typed`, both reached by no entry",
+        );
+        let after = server.analyses.union_legs();
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (1, 1),
+            "the clock analyzed ONE entry (`server.vl`, not open) and took the open \
+             `client.vl`'s leg from the analysis the dependency sweep had just landed \
+             — {before:?} -> {after:?} (analyzed, reused)",
+        );
     }
 
     #[tokio::test]

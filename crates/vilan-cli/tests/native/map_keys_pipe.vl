@@ -1,0 +1,78 @@
+// A138 S2's `keys()` natively (F72): a map's key set is a set pipe whose ops are
+// `SetOp`s, a one-parameter enum over a BOUNDED parameter — refused by name as
+// "a trait object" until F72. The program is `inference::maps`'
+// `a138_s2_values_ranks_its_ops_and_keys_changes_only_on_arrival_and_removal`.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{
+	DeltaSource,
+	HashMapCell,
+	SeqOp,
+	SetOp,
+	Signal,
+	SignalCell,
+	Source,
+	comp,
+	on_cleanup,
+};
+
+fun nums(xs: List<i32>): str {
+	mut out = "[";
+	for x in xs {
+		out = out + i" {x}";
+	}
+	out + " ]"
+}
+
+fun seq(ops: List<SeqOp<i32>>): str {
+	mut out = "";
+	for op in ops {
+		match op {
+			SeqOp::Splice(let at, let removed, let inserted) => out = out + i"splice({at},{nums(removed)},{nums(inserted)}) ",
+			SeqOp::SetAt(let at, let was, let now) => out = out + i"set({at},{was},{now}) ",
+			SeqOp::Reset(let items) => out = out + i"reset({nums(items)}) ",
+			SeqOp::Move(let from, let count, let to) => out = out + i"move({from},{count},{to}) ",
+		}
+	}
+	out
+}
+
+fun set_ops(ops: List<SetOp<str>>): str {
+	mut out = "";
+	for op in ops {
+		match op {
+			SetOp::Add(let value) => out = out + i"add({value}) ",
+			SetOp::Remove(let value) => out = out + i"remove({value}) ",
+			SetOp::Reset(let set) => out = out + i"reset({set.len()}) ",
+		}
+	}
+	out
+}
+
+fun main() {
+	let cell: HashMapCell<str, i32> = HashMapCell::of([("a", 1), ("b", 2), ("c", 3)].to_map());
+	let ((values, keys), scope) = comp(|| (cell.values().memo(), cell.keys().memo()));
+	let vcursor = values.cursor();
+	let kcursor = keys.cursor();
+	cell.insert("b", 20);
+	cell.insert("d", 4);
+	cell.remove("a");
+	cell.insert("a", 5);
+	cell.remove("zz");
+	print(seq(values.since(vcursor)));
+	print(set_ops(keys.since(kcursor)));
+	print(values.get());
+	mut d_wakes = 0;
+	let watch = keys.contains("d").on_change(|held| d_wakes += 1);
+	cell.insert("d", 40);
+	cell.insert("e", 1);
+	cell.remove("d");
+	print(d_wakes);
+	cell.set([("q", 1)].to_map());
+	print(seq(values.since(vcursor)));
+	print(set_ops(keys.since(kcursor)));
+	watch.dispose();
+	scope.dispose();
+}

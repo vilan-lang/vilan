@@ -563,7 +563,6 @@ fun main() {
 /// `Option` join only), and the inner object is a `Flow` through the blanket
 /// over every `Source`; the result is a pipe, sealed to be read twice.
 #[test]
-#[ignore = "A142: reactive-44 find: a dyn Source's table has no slot for Flow::start, so a pipe over an object fails at run time (start is not a function)"]
 fn a_std_blanket_flattens_through_the_object() {
     assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };
@@ -739,7 +738,6 @@ fun main() {
 /// renamed `map` to `Flow::derive`, reached through the same blanket; the node
 /// is a pipe, read once with `.sample()`.)
 #[test]
-#[ignore = "A142: reactive-44 find: a dyn Source's table has no slot for Flow::start, so a pipe over an object fails at run time (start is not a function)"]
 fn a124_map_through_a_dyn_source_is_the_blanket_node() {
     assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };
@@ -761,7 +759,6 @@ fun main() {
 /// has one consumer, so each of the three builds its own `derive` over the
 /// object (`.cell()`, `.on_change`, `.sample()`).
 #[test]
-#[ignore = "A142: reactive-44 find: a dyn Source's table has no slot for Flow::start, so a pipe over an object fails at run time (start is not a function)"]
 fn a124_the_blanket_node_spelling_reaches_through_a_dyn_source() {
     assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };
@@ -1640,9 +1637,9 @@ fn a142_a_mixed_arm_selector_erases_a_pipe_and_a_root_into_one_flow_object() {
     // B470's shape for A142 (R39): `Flow` is declared `[resource]`, so a
     // `switch` selector whose arms are a PIPE (a `Derive`, a `[resource]`
     // stage) and a ROOT (a `SignalCell`) meets them in one `dyn Flow<i32>`,
-    // the arms erasing where they land: `100` then `3`, on both backends. The
-    // explicit `switch<i32, dyn Flow<i32>>` is reactive-44's find 12: `U` is
-    // not bound through the object's trait argument (`cannot infer 'U'`).
+    // the arms erasing where they land: `100` then `3`, on both backends.
+    // Written WITHOUT `switch`'s type arguments (B480): `U` binds from the
+    // object's trait argument, `I: Flow<U>` at `I = dyn Flow<i32>`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -1659,7 +1656,7 @@ fn a142_a_mixed_arm_selector_erases_a_pipe_and_a_root_into_one_flow_object() {
         fun main() {
             let flag = Signal::new(true);
             let count = Signal::new(1);
-            let picked: MemoCell<i32> = flag.switch<i32, dyn Flow<i32>>(|on: bool| arm(on, count)).memo();
+            let picked: MemoCell<i32> = flag.switch(|on: bool| arm(on, count)).memo();
             print(i"{picked.get()}");
             flag.set(false);
             count.set(3);
@@ -1669,6 +1666,48 @@ fn a142_a_mixed_arm_selector_erases_a_pipe_and_a_root_into_one_flow_object() {
         main();
         "#,
         "100\n3\n",
+    );
+}
+
+/// B480: the same selector with NOTHING written — no `switch` type arguments,
+/// an unannotated closure parameter and an unannotated binding — and the user
+/// shape beneath it: a generic `<U, I: Fl<U>>` binding `U` from a `dyn Fl<i32>`
+/// argument's own trait argument, beside a concrete one.
+#[test]
+fn b480_a_bound_through_a_trait_argument_binds_from_an_object() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Flow, Signal, SignalCell, Source };
+
+        fun arm(on: bool, count: SignalCell<i32>): dyn Flow<i32> {
+            if on {
+                count.derive(|value| value * 100)
+            } else {
+                count
+            }
+        }
+
+        trait Fl<T> { fun go(self): T; }
+        struct Cell<T> { v: T }
+        impl Cell<type T> with Fl<T> { fun go(self): T { self.v } }
+        fun pick<U, I: Fl<U>>(i: I): U { i.go() }
+
+        fun main() {
+            let flag = Signal::new(true);
+            let count = Signal::new(1);
+            let picked = flag.switch(|on| arm(on, count)).memo();
+            print(i"{picked.get()}");
+            flag.set(false);
+            count.set(3);
+            print(i"{picked.get() + 1}");
+            let object: dyn Fl<i32> = Cell { v = 5 };
+            print(pick(object) + pick(Cell { v = 6 }));
+        }
+
+        main();
+        "#,
+        "100\n4\n11\n",
     );
 }
 
@@ -1698,4 +1737,118 @@ fn a142_a_source_object_stays_copyable_though_flow_is_a_resource_trait() {
         "4
 ",
     );
+}
+
+/// B436: `print` of a trait OBJECT prints the value it erased — `[ 5 ]`, the
+/// `Square` — not the backend's `[ value, table ]` pair (`[ [ 5 ], {} ]`). The
+/// pair is how the JS backend carries an object; at the host boundary (an
+/// `any` parameter) the value crosses. Nested in a list the pair is still the
+/// list's element, and prints as one — the native twin reproduces both.
+#[test]
+fn b436_printing_a_trait_object_prints_its_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Shape {
+            fun area(self): i32;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape {
+            fun area(self): i32 { self.side * self.side }
+        }
+
+        fun main() {
+            let shape: dyn Shape = Square { side = 5 };
+            print(shape);
+            print(shape.area());
+        }
+
+        main();
+        "#,
+        "[ 5 ]\n25\n",
+    );
+}
+
+/// B437: an object's TABLE is keyed by the trait APPLICATION, not the trait
+/// alone. `impl Square with Shape<i32>` and `with Shape<str>` are two tables
+/// over one type; keyed by the trait, `dyn Shape<str>` was handed the `i32`
+/// table built first and its `area` answered `16` (native answered `big`).
+#[test]
+fn b437_two_applications_of_one_trait_over_one_type_take_their_own_tables() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Shape<T> {
+            fun area(self): T;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape<i32> {
+            fun area(self): i32 { self.side * self.side }
+        }
+
+        impl Square with Shape<str> {
+            fun area(self): str { "big" }
+        }
+
+        fun main() {
+            let counted: dyn Shape<i32> = Square { side = 2 };
+            let named: dyn Shape<str> = Square { side = 4 };
+            print(counted.area());
+            print(named.area());
+        }
+
+        main();
+        "#,
+        "4\nbig\n",
+    );
+}
+
+/// B437's other half, the control: two positions of ONE application — two
+/// annotations, two type ids, a compound argument — share one table and one
+/// instance of a generic over the object, because both keys spell the type
+/// structurally (`type_key`'s `Dyn` arm, beside the table key's arguments).
+#[test]
+fn b437_two_positions_of_one_application_share_one_table_and_one_instance() {
+    let source = r#"
+        import std::io::print;
+
+        trait Shape<T> {
+            fun area(self): T;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape<List<i32>> {
+            fun area(self): List<i32> { [self.side * self.side] }
+        }
+
+        fun measure<S: Shape<List<i32>>>(shape: S): List<i32> {
+            shape.area()
+        }
+
+        fun main() {
+            let first: dyn Shape<List<i32>> = Square { side = 2 };
+            let second: dyn Shape<List<i32>> = Square { side = 3 };
+            print(measure(first));
+            print(measure(second));
+        }
+
+        main();
+        "#;
+    let js = compile(source).expect("compiles");
+    assert_eq!(js.matches("Object.create(").count(), 1, "one table:\n{js}");
+    assert_eq!(js.matches("(shape) {").count(), 1, "one instance:\n{js}");
+    assert_compiles_and_runs(source, "[ 4 ]\n[ 9 ]\n");
 }

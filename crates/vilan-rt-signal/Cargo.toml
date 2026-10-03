@@ -21,7 +21,7 @@
 # server build now links is `ctrlc`'s, at the OS call.
 [package]
 name = "vilan-rt-signal"
-version = "0.42.1"
+version = "0.43.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The termination-signal half of the runtime for server programs the vilan compiler emits as Rust."

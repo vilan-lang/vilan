@@ -409,11 +409,18 @@ channel id, and what the client's stub answers is a mirror:
 | `MemoCell<T>` | `RemoteSource<T>` |
 | `Option<MemoCell<T>>` | `RemoteSource<T>` |
 | `KeyedCell<K, T>` | `KeyedSource<K, T>` |
+| `HashMapEntry<K, V>`, `MemoEntry<K, V>` | `RemoteSource<Option<V>>` |
 
 A handle is only ever *read* over the wire, so the read-only seal of a
 derivation — `MemoCell<T>`, what `.memo()` answers — crosses exactly as
 the writable cell does. Keep it on the service (a field, or a `Memo`
 whose maker writes `.memo_global()`) rather than sealing one per call.
+
+A map's per-key handle — `messages.at(id)` on a `HashMapCell`, or `at(id)` on a
+sealed map pipe — crosses as a mirror of `Option<V>`, the same mirror a
+`MemoCell<Option<V>>` reply makes, and needs no view kept for it: the forward
+rides the key's own slot in the cell, so a write to another key sends that
+mirror nothing.
 
 **The stub is sync, and it makes no call.** No `async`, no `!`, no
 `Result` — because there is nothing to await: the mirror is handed back

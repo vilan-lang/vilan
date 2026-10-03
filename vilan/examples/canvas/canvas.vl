@@ -31,7 +31,7 @@ impl Event {
 
 	[extern(get, "type")]
 	[platform("browser")]
-	external fun type_(self): str;
+	external fun type(self): str;
 
 	[extern(method, "preventDefault")]
 	[platform("browser")]
@@ -63,7 +63,7 @@ impl MouseEvent {
 
 	[extern(get, "type")]
 	[platform("browser")]
-	external fun type_(self): str;
+	external fun type(self): str;
 
 	[extern(method, "preventDefault")]
 	[platform("browser")]
@@ -110,7 +110,7 @@ impl HTMLCanvasElement {
 	// the same symbol for an arity in between if you need one
 	[extern(method, "toDataURL")]
 	[platform("browser")]
-	external fun to_data_url_with_type__and_quality(self, type_: str, quality: f64): str;
+	external fun to_data_url_with_type_and_quality(self, type_: str, quality: f64): str;
 
 	[extern(get, "id")]
 	[platform("browser")]

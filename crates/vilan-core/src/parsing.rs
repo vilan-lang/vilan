@@ -61,11 +61,24 @@ use crate::node::{
     CssBody, CssDeclaration, CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem,
     EnumVariant, ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
     GenericParameters, If, IfSpelling, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr,
-    StructField, TupleBound,
+    ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, Reactivity,
+    ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
+
+/// Whether `text` is spelled like an identifier: a letter or `_`, then letters,
+/// digits and `_` — what `[reactive(name = "..")]` may name, since the name
+/// becomes a method.
+fn is_identifier_text(text: &str) -> bool {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) if first.is_alphabetic() || first == '_' => {
+            characters.all(|character| character.is_alphanumeric() || character == '_')
+        }
+        _ => false,
+    }
+}
 
 /// Every `(impl …)` selector element's span in an import/use tree — what the
 /// `use` refusal reports at.
@@ -445,6 +458,14 @@ const EXPORT_TAKES_AN_ITEM: &str = "`export` takes an ITEM — a `fun`, `struct`
      `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for \
      the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an \
      expression is none of those, and publishes nothing, checks nothing and emits nothing";
+
+/// B492: a second `export` on one declaration. The marker is a statement
+/// WRAPPER (§3.2), so `export export fun f()` parsed as an export of an
+/// export and was accepted silently, meaning exactly what one marker means.
+/// Refused where it stands, and read past, so the declaration still parses
+/// and the reader gets the one sentence.
+const EXPORT_IS_WRITTEN_ONCE: &str = "`export` is written once: the declaration is already marked, \
+     and a second `export` adds nothing — delete it";
 
 /// The rule a MALFORMED import path breaks (B320). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
@@ -1083,15 +1104,15 @@ fn parse_with(
     source: &str,
     preserve_paren_groups: bool,
 ) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
-    let (tokens, lex_errors) = lexing::tokenize(source);
+    let (mut tokens, lex_errors) = lexing::tokenize(source);
+    let token_count = tokens.len();
 
-    let mut parser = Parser::new(&tokens, source, preserve_paren_groups);
+    let mut parser = Parser::new(&mut tokens, source, preserve_paren_groups);
     let root = parser.parse_program();
     let mut then_form_errors = Vec::new();
     refuse_then_forms_read_as_values(&root, &mut then_form_errors);
     debug_assert_eq!(
-        parser.position,
-        tokens.len(),
+        parser.position, token_count,
         "the statement/item synchronizer consumes the whole token stream: an \
          unparseable statement is reported and skipped past, never left over",
     );
@@ -1141,8 +1162,8 @@ fn parse_with(
 /// binds no entity. Sorted, without duplicates; a recovered parse answers for
 /// what it recovered.
 pub fn contextual_keyword_readings(source: &str) -> Vec<Span> {
-    let (tokens, _) = lexing::tokenize(source);
-    let mut parser = Parser::new(&tokens, source, false);
+    let (mut tokens, _) = lexing::tokenize(source);
+    let mut parser = Parser::new(&mut tokens, source, false);
     parser.parse_program();
     let mut indices = std::mem::take(&mut parser.contextual_readings);
     indices.sort_unstable();
@@ -1160,8 +1181,8 @@ pub fn contextual_keyword_readings(source: &str) -> Vec<Span> {
 /// token, so a keyword hover would otherwise answer for every one of them.
 /// Sorted, without duplicates.
 pub fn keyword_member_readings(source: &str) -> Vec<Span> {
-    let (tokens, _) = lexing::tokenize(source);
-    let mut parser = Parser::new(&tokens, source, false);
+    let (mut tokens, _) = lexing::tokenize(source);
+    let mut parser = Parser::new(&mut tokens, source, false);
     parser.parse_program();
     let mut indices = std::mem::take(&mut parser.member_readings);
     indices.sort_unstable();
@@ -1173,7 +1194,11 @@ pub fn keyword_member_readings(source: &str) -> Vec<Span> {
 }
 
 struct Parser<'a, 'src> {
-    tokens: &'a [Spanned<Token<'src>>],
+    /// The token stream, in SOURCE order but for one rewrite: an attribute run
+    /// written ahead of `export` is rotated behind the marker as the statement
+    /// is reached ([`Parser::lead_export_past_its_attributes`], B445), which is
+    /// why the parser holds it mutably. Every token keeps its own span.
+    tokens: &'a mut [Spanned<Token<'src>>],
     position: usize,
     /// The source the tokens index into — read only to place the **gap anchor** of
     /// a missing statement terminator on the last CHARACTER of the preceding token
@@ -1425,6 +1450,9 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "internal",
     "resource",
     "hint",
+    // A142 S7: a struct field's store knobs, `[reactive(coarse)]` and
+    // `[reactive(name = "..")]` — a field-position attribute, like `expose`.
+    "reactive",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -1512,17 +1540,18 @@ fn assignment_reachable(tokens: &[Spanned<Token<'_>>]) -> Vec<bool> {
 
 impl<'a, 'src> Parser<'a, 'src> {
     fn new(
-        tokens: &'a [Spanned<Token<'src>>],
+        tokens: &'a mut [Spanned<Token<'src>>],
         source: &'src str,
         preserve_paren_groups: bool,
     ) -> Self {
+        let assignment_reachable = assignment_reachable(tokens);
         Parser {
             tokens,
             position: 0,
             source,
             eoi: source.len(),
             errors: Vec::new(),
-            assignment_reachable: assignment_reachable(tokens),
+            assignment_reachable,
             farthest_failure: None,
             context_stack: Vec::new(),
             preserve_paren_groups,
@@ -1813,12 +1842,21 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// begin a binder (a name, `mut`, a destructure's `(`/`[`, a spread's
     /// `...`), and a NAME otherwise (`own: Owner`, `|lazy| lazy.force()`).
     /// Sound because vilan never puts two names side by side.
+    ///
+    /// A spread is all THREE dots (B446): one `.` after the word is a member
+    /// access on a parameter NAMED `own` or `lazy` — `own.x` cannot be a
+    /// binder, and reading the word as the convention there left the binder
+    /// to fail on the `.` and the parameter list to report at the token
+    /// before it.
     fn eat_binder_prefix(&mut self, word: &str) -> bool {
         let prefixes_a_binder = self.peek_is_word(word)
-            && matches!(
-                self.peek_at(1),
-                Some(Token::Ident(_) | Token::Mut | Token::Ctrl('(' | '[' | '.'))
-            );
+            && match self.peek_at(1) {
+                Some(Token::Ident(_) | Token::Mut | Token::Ctrl('(' | '[')) => true,
+                Some(Token::Ctrl('.')) => {
+                    self.peek_at_is_ctrl(2, '.') && self.peek_at_is_ctrl(3, '.')
+                }
+                _ => false,
+            };
         if prefixes_a_binder {
             self.contextual_readings.push(self.position);
             self.bump();
@@ -2136,11 +2174,23 @@ impl<'a, 'src> Parser<'a, 'src> {
             return;
         }
         // `let mut x = …`: two binding forms written as one. The located failure
-        // is on the `let`, which is the token the reader is least likely to
-        // suspect, so the rule replaces the message rather than trailing it.
-        if matches!(self.tokens.get(position), Some((Token::Let, _)))
+        // is on the `let` — or, since the binder records what it wanted
+        // (B446), on the `mut` it found where a name goes — and neither is
+        // the mistake the reader needs named, so the rule replaces the message
+        // rather than trailing it.
+        let let_mut = if matches!(self.tokens.get(position), Some((Token::Let, _)))
             && matches!(self.tokens.get(position + 1), Some((Token::Mut, _)))
         {
+            Some(position)
+        } else if matches!(self.tokens.get(position), Some((Token::Mut, _)))
+            && let Some(previous) = position.checked_sub(1)
+            && matches!(self.tokens.get(previous), Some((Token::Let, _)))
+        {
+            Some(previous)
+        } else {
+            None
+        };
+        if let Some(position) = let_mut {
             let span = (self.token_span(position).start..self.token_span(position + 1).end).into();
             self.errors.push(ParseError {
                 span,
@@ -2816,8 +2866,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// S2 did.
     fn parse_statement(&mut self) -> Option<Spanned<Node<'src>>> {
         // Item nesting is its own recursive grammar and reaches no expression
-        // rule (B142): `fun a() { fun a() { .. } }`, `mod`, `impl`, `trait` and
-        // chained `export` all close their cycle back through here.
+        // rule (B142): `fun a() { fun a() { .. } }`, `mod`, `impl` and `trait`
+        // all close their cycle back through here. A chained `export` did
+        // until B492: a repeated marker is refused and read past, so it no
+        // longer nests.
         //
         // The stand-in CONSUMES a token, which the other funnels' does not, and
         // that is what keeps the refusal linear here: `parse_program` and
@@ -2842,6 +2894,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // host of F27 R1's platform). Taken here, once, so every statement
         // nested inside this one reads false.
         let file_head = std::mem::take(&mut self.file_head);
+        let _ = self.lead_export_past_its_attributes();
         if let Some(item) = self.attempt(Self::parse_module_self) {
             if !file_head {
                 self.errors.push(ParseError {
@@ -2940,6 +2993,93 @@ impl<'a, 'src> Parser<'a, 'src> {
         None
     }
 
+    /// B445: a declaration's attribute run may be written AHEAD of its
+    /// `export` — `[platform("browser")] export impl P with Show { … }` — as
+    /// well as after it, and either way the run is the ITEM's prefix: the
+    /// marker wraps the declaration whole (§3.2), attributes and all.
+    ///
+    /// Read by rotating the tokens, once, where the statement begins: the
+    /// run `[..] [..]` and the marker `export (in PATH)?` after it trade
+    /// places, so every production downstream reads the one spelling it
+    /// always read, `export [..] item`, and the attribute prefixes keep the
+    /// single order each already states rather than gaining a second. Each
+    /// token keeps its own span; [`Parser::parse_export`] widens the export's
+    /// span back over the run, so the statement still begins where it was
+    /// written. The assignment table rotates with the tokens it describes.
+    ///
+    /// Only an ATTRIBUTE run leads: each group is `[` followed by a name, and
+    /// the run must end at the marker. A list literal there (`[1] export …`)
+    /// is the expression statement it always was, and a run before `export
+    /// *;` is left for the statement reader to refuse — `*;` takes no
+    /// attributes. Nothing else in the grammar puts a `[name …]` group in
+    /// front of `export`, so a rotation is never undone: a later alternative
+    /// at this position reads the same rotated stream, and finds no run to
+    /// rotate again.
+    fn lead_export_past_its_attributes(&mut self) -> bool {
+        let start = self.position;
+        let mut at = start;
+        while self.tokens.get(at).map(|(token, _)| token) == Some(&Token::Ctrl('['))
+            && matches!(self.tokens.get(at + 1), Some((Token::Ident(_), _)))
+        {
+            let Some(after) = self.past_balanced_group(at) else {
+                return false;
+            };
+            at = after;
+        }
+        let marker = at;
+        if marker == start
+            || self.tokens.get(marker).map(|(token, _)| token) != Some(&Token::Export)
+        {
+            return false;
+        }
+        // The marker's scope travels with it — and so does a REPEATED marker,
+        // with or without a scope of its own (B492): `[..] export export fun`
+        // reaches `parse_export` as `export export [..] fun` and takes the
+        // repeat's refusal there, rather than nesting one export in another.
+        let mut past_marker = marker + 1;
+        loop {
+            let at = self.tokens.get(past_marker).map(|(token, _)| token);
+            if at == Some(&Token::Export) {
+                past_marker += 1;
+            } else if at == Some(&Token::Ctrl('('))
+                && self.tokens.get(past_marker + 1).map(|(token, _)| token) == Some(&Token::In)
+            {
+                let Some(after) = self.past_balanced_group(past_marker) else {
+                    return false;
+                };
+                past_marker = after;
+            } else {
+                break;
+            }
+        }
+        if matches!(self.tokens.get(past_marker), Some((Token::Op("*"), _))) {
+            return false;
+        }
+        self.tokens[start..past_marker].rotate_left(marker - start);
+        self.assignment_reachable[start..past_marker].rotate_left(marker - start);
+        true
+    }
+
+    /// The index just past the bracket group opening at `open` (a `[`, `(` or
+    /// `{`), counting every bracket kind, or `None` if the stream ends first.
+    fn past_balanced_group(&self, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut at = open;
+        loop {
+            match &self.tokens.get(at)?.0 {
+                Token::Ctrl('[' | '(' | '{') => depth += 1,
+                Token::Ctrl(']' | ')' | '}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at + 1);
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+    }
+
     // --- Expressions ---------------------------------------------------------
 
     /// How deep the parser will descend into nested source before it refuses
@@ -3013,7 +3153,7 @@ impl<'a, 'src> Parser<'a, 'src> {
          which parsing refuses; match the outer shape and destructure the rest inside the arm";
 
     /// [`Parser::NESTING_REFUSAL`] for the item/statement grammar — nested `fun`,
-    /// `mod`, `impl`, `trait` and chained `export`.
+    /// `mod`, `impl` and `trait` (a chained `export` no longer nests, B492).
     const ITEM_NESTING_REFUSAL: &'static str = "this declaration nests more than 500 levels \
          deep, which parsing refuses; lift the inner declarations out to the top level";
 
@@ -3053,7 +3193,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// placed anywhere in the expression grammar could see them: types
     /// ([`Parser::parse_type`], the sole caller of `parse_type_atom`),
     /// binders/patterns, items ([`Parser::parse_statement`] — nested `fun`,
-    /// `mod`, `impl`, `trait`, and `export` chaining), import paths, and nested
+    /// `mod`, `impl` and `trait`; `export` chaining too until B492), import paths, and nested
     /// elements. These are not theoretical: `fun a() { fun a() { .. } }` at 5000
     /// levels overflowed a 64 MiB worker with no diagnostic at all, which is
     /// precisely the outcome B142 exists to prevent. Each of those funnels calls
@@ -5755,7 +5895,16 @@ impl<'a, 'src> Parser<'a, 'src> {
                 Some((Pattern::Array(patterns), parser.span_from(start)))
             });
         }
-        let name = self.eat_ident()?;
+        // B446: a binder that is not one RECORDS what it wanted, here, where
+        // the reader went wrong. Without it the farthest failure on record was
+        // whatever the production before had noted — after a generic-typed
+        // parameter, the `,` its argument list could have taken at its `>` —
+        // and `fun f(a: List<i32>, 5)` reported "found '>' expected ','" one
+        // parameter early. A `let` and a `for` binder read the same production.
+        let Some(name) = self.eat_ident() else {
+            self.note_expected("a name");
+            return None;
+        };
         // A binder's own span IS the bare name, so the name span and the pattern
         // span coincide here. They part company one level up, where the match/`is`
         // grammar's `let`/`mut` arm widens the pattern span over the keyword.
@@ -6733,7 +6882,18 @@ impl<'a, 'src> Parser<'a, 'src> {
         // (diagnostics-standard B5).
         let lazy = lazy | self.eat_binder_prefix("lazy");
         let spread = self.eat_spread();
-        let (pattern, pattern_span) = self.parse_binder()?;
+        let Some((pattern, pattern_span)) = self.parse_binder() else {
+            // B446: the binder noted the name it wanted. With nothing of this
+            // parameter read yet, the list's `)` would have done as well — the
+            // list asks for an item only once its closer is not next — so the
+            // report names both: `fun broken( {` is "found '{' expected a name
+            // or ')'", the located demand `recover_statement` ranks above the
+            // bare unclosed `(`.
+            if self.position == start {
+                self.note_expected("')'");
+            }
+            return None;
+        };
         let parameter_type = if self.eat_op(":") {
             Some(Box::new(
                 self.in_context("parameter type", Self::parse_type)?,
@@ -7033,7 +7193,20 @@ impl<'a, 'src> Parser<'a, 'src> {
         let internal = self.parse_internal_attribute();
         // B413: a FIELD is no type declaration; refused, and parsed past.
         self.refuse_misplaced_resource_attribute();
+        // A142 S7: the store's knobs, on either side of `[expose]` — both are
+        // about what the field becomes elsewhere, and neither outranks the other.
+        let reactivity = self.parse_reactive_attribute();
         let exposed = self.eat_expose_attribute();
+        let reactivity = match reactivity {
+            Some(written) => written,
+            None => match self.parse_reactive_attribute() {
+                Some(written) => Reactivity {
+                    after_expose: true,
+                    ..written
+                },
+                None => Reactivity::default(),
+            },
+        };
         let name_start = self.position;
         // B414 S4: a declared field is a member position — any word.
         let name = self.eat_member_name()?;
@@ -7043,7 +7216,121 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
-        Some(((name, type_, exposed, internal), self.span_from(start)))
+        Some((
+            (name, type_, exposed, internal, reactivity),
+            self.span_from(start),
+        ))
+    }
+
+    /// `[reactive(coarse)]`, `[reactive(name = "nick")]`, or both, comma-separated
+    /// (tracker A142 S7, `proposal/store.md` Q4 and Q9): a struct field's store
+    /// knobs, read by `[derive(Storable)]` and by nothing else. `None` when no
+    /// such attribute leads.
+    ///
+    /// COMMITTED once `[reactive` is read: an argument this does not know, or a
+    /// `name` that is not an identifier, is refused where it stands and the
+    /// attribute is parsed past, rather than rolled back into "expected a field
+    /// name" at the bracket.
+    fn parse_reactive_attribute(&mut self) -> Option<Reactivity<'src>> {
+        self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("reactive")) {
+                return None;
+            }
+            parser.bump();
+            Some(())
+        })?;
+        let mut reactivity = Reactivity::default();
+        if self.expect_ctrl('(').is_none() {
+            self.refuse_reactive_argument(self.span_from(self.position));
+            self.skip_past_attribute();
+            return Some(reactivity);
+        }
+        loop {
+            let argument_start = self.position;
+            if self.peek() == Some(&Token::Ident("coarse")) {
+                self.bump();
+                reactivity.coarse = true;
+            } else if self.peek() == Some(&Token::Ident("name")) {
+                self.bump();
+                let literal_start = self.position;
+                let written = if self.eat_op("=") {
+                    match self.peek() {
+                        Some(Token::String(text)) => {
+                            let text = *text;
+                            self.bump();
+                            Some(text)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                match written {
+                    Some(text) if is_identifier_text(text) => reactivity.name = Some(text),
+                    Some(_) => {
+                        self.errors.push(ParseError {
+                            span: self.span_from(literal_start),
+                            reason: ParseErrorReason::Rule(
+                                "`[reactive(name = \"..\")]` names the field's PROJECTION — a \
+                                 method on the store handle — so it must be an identifier: \
+                                 letters, digits and `_`, not starting with a digit",
+                            ),
+                            context: Vec::new(),
+                            hint: None,
+                        });
+                    }
+                    None => {
+                        self.refuse_reactive_argument(self.span_from(argument_start));
+                        self.skip_past_attribute();
+                        return Some(reactivity);
+                    }
+                }
+            } else {
+                self.bump();
+                self.refuse_reactive_argument(self.span_from(argument_start));
+                self.skip_past_attribute();
+                return Some(reactivity);
+            }
+            if !self.eat_ctrl(',') {
+                break;
+            }
+        }
+        if self.expect_ctrl(')').is_none() || self.expect_ctrl(']').is_none() {
+            self.refuse_reactive_argument(self.span_from(self.position));
+            self.skip_past_attribute();
+        }
+        Some(reactivity)
+    }
+
+    /// The one refusal `[reactive(..)]`'s arguments share.
+    fn refuse_reactive_argument(&mut self, span: Span) {
+        self.errors.push(ParseError {
+            span,
+            reason: ParseErrorReason::Rule(
+                "`[reactive(..)]` on a field takes `coarse` (one slot, compared whole, even when \
+                 the field's type derives `Storable`) and `name = \"..\"` (the name its store \
+                 projection is generated under), comma-separated: `[reactive(coarse)]`, \
+                 `[reactive(name = \"nick\")]`",
+            ),
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// Skip to just past the `]` that closes the attribute being refused, so the
+    /// field after it still parses.
+    fn skip_past_attribute(&mut self) {
+        while let Some(token) = self.peek() {
+            if token == &Token::Ctrl(']') {
+                self.bump();
+                return;
+            }
+            if token == &Token::Ctrl('}') {
+                return;
+            }
+            self.bump();
+        }
     }
 
     /// `labels [resource]? enum name generics? { variants }`. There is no
@@ -7364,7 +7651,30 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.bump();
             return Some((Node::ExportAll, self.span_from(start)));
         }
-        let scope = self.parse_export_scope();
+        // B492: one marker per declaration — a repeated one is refused and
+        // read past, so the tree is the one export it means. Either marker
+        // may carry the scope (`export export(in pkg)`, `export(in pkg)
+        // export`); the first one written is the declaration's.
+        //
+        // A repeat is a marker, a scope, or an attribute run that ends at
+        // another `export` (`export [m] export fun`): the run is the item's,
+        // so it is rotated behind the repeat exactly as at a statement's head,
+        // and the repeat refused. So no `export` nests in another, and a
+        // marker chain is not a nesting door at all.
+        let mut scope = None;
+        loop {
+            self.refuse_repeated_export_markers();
+            if scope.is_none() {
+                scope = self.parse_export_scope();
+                if scope.is_some() {
+                    continue;
+                }
+            }
+            if self.lead_export_past_its_attributes() {
+                continue;
+            }
+            break;
+        }
         // B382: `export [deprecated("use …")] import …;` — the steer is the
         // RE-EXPORT's, so the export carries it. Read only ahead of `import`:
         // before a declaration the same attribute is the declaration's own
@@ -7392,10 +7702,30 @@ impl<'a, 'src> Parser<'a, 'src> {
                 hint: None,
             });
         }
-        Some((
-            Node::Export(scope, Box::new(inner), labels),
-            self.span_from(start),
-        ))
+        // B445: an attribute run written ahead of the marker was rotated
+        // behind it ([`Parser::lead_export_past_its_attributes`]), so the
+        // inner item begins EARLIER in the source than the marker does; the
+        // statement begins where the author began it.
+        let span = self.span_from(start);
+        let span = Span::from(span.start.min(inner.1.start)..span.end);
+        Some((Node::Export(scope, Box::new(inner), labels), span))
+    }
+
+    /// B492's refusal: a run of `export` markers at the cursor is reported
+    /// ONCE, spanning the run, and read past.
+    fn refuse_repeated_export_markers(&mut self) {
+        let start = self.position;
+        while self.peek_is(&Token::Export) {
+            self.bump();
+        }
+        if self.position > start {
+            self.errors.push(ParseError {
+                span: self.span_from(start),
+                reason: ParseErrorReason::Rule(EXPORT_IS_WRITTEN_ONCE),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
     }
 
     /// `(in PATH)` after `export` — B318 §2.2's narrowing, `None` when the
@@ -8717,13 +9047,13 @@ mod tests {
     }
 
     fn expr_in_mode(source: &str, preserve_paren_groups: bool) -> Spanned<Node<'_>> {
-        let (tokens, errors) = lexing::tokenize(source);
+        let (mut tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source, preserve_paren_groups);
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, preserve_paren_groups);
         let node = parser.parse_expression().expect("expression did not parse");
         assert_eq!(
-            parser.position,
-            tokens.len(),
+            parser.position, token_count,
             "unconsumed tokens parsing {source:?}: {node:?}"
         );
         node
@@ -8731,13 +9061,13 @@ mod tests {
 
     /// Parse `source` as a condition-position expression (§H.1: struct-literal-free).
     fn condition(source: &str) -> Spanned<Node<'_>> {
-        let (tokens, errors) = lexing::tokenize(source);
+        let (mut tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source, false);
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
         let node = parser.parse_condition().expect("condition did not parse");
         assert_eq!(
-            parser.position,
-            tokens.len(),
+            parser.position, token_count,
             "unconsumed parsing {source:?}"
         );
         node
@@ -8745,13 +9075,13 @@ mod tests {
 
     /// Parse `source` as a type, asserting a clean full-consumption parse.
     fn type_(source: &str) -> Spanned<Node<'_>> {
-        let (tokens, errors) = lexing::tokenize(source);
+        let (mut tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source, false);
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
         let node = parser.parse_type().expect("type did not parse");
         assert_eq!(
-            parser.position,
-            tokens.len(),
+            parser.position, token_count,
             "unconsumed parsing {source:?}"
         );
         node
@@ -9091,9 +9421,9 @@ mod tests {
         // comparison. As a whole expression the `>` is left dangling, so only the
         // expression prefix is checked here; the generics-attach-to-a-call contrast
         // is `default<Id>()` above.
-        let (tokens, errors) = lexing::tokenize("foo<T>");
+        let (mut tokens, errors) = lexing::tokenize("foo<T>");
         assert!(errors.is_empty());
-        let mut parser = Parser::new(&tokens, "foo<T>", false);
+        let mut parser = Parser::new(&mut tokens, "foo<T>", false);
         let node = parser.parse_expression().expect("prefix parses");
         assert!(matches!(node.0, Node::Binary(BinaryOp::Lt, _, _)));
     }
@@ -9504,6 +9834,95 @@ mod tests {
         }
     }
 
+    /// A142 S7: `[reactive(..)]`'s two arguments, alone and together, on either
+    /// side of `[expose]` — recorded on the field's fifth slot, which the
+    /// `Storable` derive reads.
+    #[test]
+    fn a_reactive_attribute_is_recorded_on_its_field() {
+        let source = "struct S { [reactive(coarse)] a: i32, [reactive(name = \"verb\")] get: str, \
+                      [reactive(coarse, name = \"all\")] [expose] b: C, \
+                      [expose] [reactive(name = \"c2\")] c: C, d: i32 }";
+        match only_item(source) {
+            Node::Struct(_, _, _, _, Some(fields), _) => {
+                let knobs: Vec<Reactivity> = fields.0.iter().map(|field| field.0.4).collect();
+                assert_eq!(
+                    knobs,
+                    vec![
+                        Reactivity {
+                            coarse: true,
+                            name: None,
+                            after_expose: false,
+                        },
+                        Reactivity {
+                            coarse: false,
+                            name: Some("verb"),
+                            after_expose: false,
+                        },
+                        Reactivity {
+                            coarse: true,
+                            name: Some("all"),
+                            after_expose: false,
+                        },
+                        Reactivity {
+                            coarse: false,
+                            name: Some("c2"),
+                            after_expose: true,
+                        },
+                        Reactivity::default(),
+                    ]
+                );
+                let exposed: Vec<Exposure> = fields.0.iter().map(|field| field.0.2).collect();
+                assert_eq!(
+                    exposed,
+                    vec![
+                        Exposure::None,
+                        Exposure::None,
+                        Exposure::Whole,
+                        Exposure::Whole,
+                        Exposure::None
+                    ]
+                );
+            }
+            other => panic!("expected a struct with fields, got {other:?}"),
+        }
+    }
+
+    /// A142 S7: a malformed `[reactive(..)]` is refused where it stands, and the
+    /// fields around it still parse — the refusal is the attribute's, not
+    /// "expected a field name".
+    #[test]
+    fn a_malformed_reactive_attribute_is_refused_and_parsed_past() {
+        for (source, expected) in [
+            (
+                "struct S { [reactive(fine)] a: i32, b: i32 }",
+                "takes `coarse`",
+            ),
+            (
+                "struct S { [reactive(name = \"1x\")] a: i32, b: i32 }",
+                "must be an identifier",
+            ),
+            (
+                "struct S { [reactive(name)] a: i32, b: i32 }",
+                "takes `coarse`",
+            ),
+            ("struct S { [reactive] a: i32, b: i32 }", "takes `coarse`"),
+        ] {
+            let (tree, errors) = parse(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| format!("{:?}", error.reason).contains(expected)),
+                "{source}: expected a refusal containing {expected:?}, got {errors:?}"
+            );
+            let statements = tree.map(|(statements, _)| statements).unwrap_or_default();
+            let field_count = statements.iter().find_map(|node| match &node.0 {
+                Node::Struct(_, _, _, _, Some(fields), _) => Some(fields.0.len()),
+                _ => None,
+            });
+            assert_eq!(field_count, Some(2), "{source}: both fields still parse");
+        }
+    }
+
     #[test]
     fn enum_variants_payloads_and_discriminants() {
         match only_item("enum Sign { Less = -1, Zero = 0, More(i32, str) }") {
@@ -9865,6 +10284,253 @@ mod tests {
             }
             other => panic!("expected a fully-attributed Func, got {other:?}"),
         }
+    }
+
+    /// The exported item under an `Export` with no scope and no re-export
+    /// label, or a panic naming what came back instead.
+    fn exported(node: Node<'_>) -> Node<'_> {
+        match node {
+            Node::Export(None, inner, None) => inner.0,
+            other => panic!("expected a plain `export` of an item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attributes_written_before_export_are_the_exported_items_own() {
+        // B445: the attribute run may stand on either side of `export`, and
+        // either way it is the ITEM's prefix — the tree is the one `export
+        // [..] item` builds. The issue's own program first.
+        match exported(only_item(
+            "[platform(\"browser\")] export impl P with Show { fun show(self): str { \"p\" } }",
+        )) {
+            Node::Impl(_, traits, _, Some(labels)) => {
+                assert_eq!(traits.len(), 1);
+                let patterns: Vec<&str> = labels
+                    .platform
+                    .iter()
+                    .map(|(pattern, _)| *pattern)
+                    .collect();
+                assert_eq!(patterns, ["browser"]);
+            }
+            other => panic!("expected a labelled Impl, got {other:?}"),
+        }
+        // A RUN, in the function prefix's order, before a scoped export.
+        match only_item("[deprecated(\"use g()\")] [must_use] export(in pkg) fun f(): i32 { 1 }") {
+            Node::Export(Some(scope), inner, None) => {
+                assert_eq!(scope.path.len(), 1);
+                match inner.0 {
+                    Node::Func(function) => {
+                        assert_eq!(function.deprecated, Some("use g()"));
+                        assert!(function.must_use);
+                    }
+                    other => panic!("expected a Func, got {other:?}"),
+                }
+            }
+            other => panic!("expected a scoped Export, got {other:?}"),
+        }
+        // A wrapper attribute: the derive still wraps the struct.
+        match exported(only_item("[derive(Debug)] export struct S { x: i32 }")) {
+            Node::Derive(names, inner) => {
+                assert_eq!(names[0].0, "Debug");
+                assert!(matches!(inner.0, Node::Struct(..)));
+            }
+            other => panic!("expected a Derive, got {other:?}"),
+        }
+        // A module binding's label.
+        match exported(only_item("[internal(\"why\")] export let x = 1;")) {
+            Node::Let(_, _, _, _, _, Some(labels)) => assert_eq!(labels.internal, Some("why")),
+            other => panic!("expected a labelled Let, got {other:?}"),
+        }
+        // `[resource]` closes the type's prefix from either side.
+        match exported(only_item("[resource] export struct Handle { id: i32 }")) {
+            Node::Struct(_, _, external, resource, ..) => assert!(resource && !external),
+            other => panic!("expected a resource Struct, got {other:?}"),
+        }
+        // Both sides at once: one prefix, read in its order.
+        match exported(only_item(
+            "[deprecated(\"use g()\")] export [platform(\"node\")] fun f(): i32 { 1 }",
+        )) {
+            Node::Func(function) => {
+                assert_eq!(function.deprecated, Some("use g()"));
+                assert_eq!(function.platform_fence.len(), 1);
+            }
+            other => panic!("expected a Func, got {other:?}"),
+        }
+        // B382's re-export label, written ahead of the marker: still the
+        // EXPORT's (it deprecates the name the re-export publishes).
+        match only_item("[deprecated(\"use a::c\")] export import a::b;") {
+            Node::Export(None, inner, Some(labels)) => {
+                assert!(matches!(inner.0, Node::Import(..)));
+                assert_eq!(labels.deprecated, Some("use a::c"));
+            }
+            other => panic!("expected a labelled re-export, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_export_written_after_its_attributes_spans_them() {
+        // The statement begins at the attribute: a diagnostic about the whole
+        // export, a folding range and the formatter's comment placement all
+        // read the Export's span, and it must cover what the author wrote.
+        let source = "[platform(\"node\")] export fun f(): i32 { 1 }";
+        let (statements, _) = program(source);
+        assert_eq!(statements[0].1.start, 0);
+        assert_eq!(statements[0].1.end, source.len());
+        // Two statements in a row, the second attributed ahead of its marker.
+        let source = "export fun a() {}\n[must_use] export fun b(): i32 { 1 }\nfun c() {}";
+        let (statements, _) = program(source);
+        assert_eq!(statements.len(), 3);
+        assert_eq!(
+            &source[statements[1].1.start..statements[1].1.end],
+            "[must_use] export fun b(): i32 { 1 }"
+        );
+    }
+
+    /// The rendered first error of `source` and the text its span covers.
+    fn first_error(source: &str) -> (String, &str) {
+        let (_, errors) = parse(source);
+        let error = errors
+            .first()
+            .unwrap_or_else(|| panic!("{source:?} parsed clean"));
+        (render(error), &source[error.span.start..error.span.end])
+    }
+
+    #[test]
+    fn b446_a_parameter_that_is_no_binder_is_reported_where_it_is_written() {
+        // A parameter NAMED `own` (or `lazy`) after a generic-typed one is a
+        // name: `:` begins no binder, so the word is not the convention.
+        program("fun f(a: Shared<List<Foo>>, own: i32, lazy: i32) {}");
+        program("fun f(xs: List<i32>, own: i32) {}");
+        // One `.` is not a spread's three: `own.x` is the name `own` and a
+        // stray member access, reported at the `.` — not the convention, a
+        // failed binder, and "found '>' expected ','" one parameter early.
+        for source in [
+            "fun f(a: List<i32>, own.x: i32) {}",
+            "fun f(a: List<i32>, lazy.x: i32) {}",
+            "fun f(a: i32, own.x: i32) {}",
+        ] {
+            let (message, at) = first_error(source);
+            assert_eq!(at, ".", "{source}: {message}");
+            // The NAME reading: the parameter ended at `own`, and the list
+            // wanted its next separator — not "expected a name", which is
+            // the convention reading's binder failing on the same `.`.
+            assert!(
+                message.starts_with("found '.' expected ',' or ')'"),
+                "{source}: {message}"
+            );
+        }
+        // A binder that is not one is reported AT it, whatever led it in:
+        // nothing, a convention, `mut`, a view, a spread, a destructure.
+        for (source, offending) in [
+            ("fun f(a: List<i32>, 5) {}", "5"),
+            ("fun f(a: List<List<i32>>, own (5)) {}", "5"),
+            ("fun f(a: List<i32>, own [1]) {}", "1"),
+            ("fun f(a: List<i32>, mut 5) {}", "5"),
+            ("fun f(a: List<i32>, & 5) {}", "5"),
+            ("fun f(a: List<i32>, ...5) {}", "5"),
+            ("fun f(a: List<i32>, lazy (1)) {}", "1"),
+            ("fun g() { let 5 = 1; }", "5"),
+            ("fun g() { let (5, a) = (1, 2); }", "5"),
+        ] {
+            let (message, at) = first_error(source);
+            assert_eq!(at, offending, "{source}: {message}");
+            assert!(message.contains("expected a name"), "{source}: {message}");
+        }
+        // At a parameter's head, with nothing of it read, the list's `)`
+        // would have done as well, and the report says so.
+        let (message, at) = first_error("fun broken( {");
+        assert_eq!(
+            (message.as_str(), at),
+            ("found '{' expected a name or ')'", "{")
+        );
+        let (message, _) = first_error("fun f(a: List<i32>, 5) {}");
+        assert_eq!(message, "found '5' expected a name or ')'");
+        // After a convention the parameter is under way: a name alone.
+        let (message, _) = first_error("fun f(a: List<i32>, mut 5) {}");
+        assert_eq!(message, "found '5' expected a name");
+        // The spread is still the convention's business, and still refused.
+        let (message, _) = first_error("fun f(a: List<i32>, own ...items: (i32, i32)) {}");
+        assert!(
+            message.starts_with("a spread parameter receives a tuple"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn b492_a_repeated_export_is_refused_and_read_past() {
+        // (source, the text each refusal spans): one refusal per RUN of
+        // repeated markers, wherever the repeat stands.
+        for (source, refused) in [
+            ("export export fun f() {}", vec!["export"]),
+            ("export export export let x = 1;", vec!["export export"]),
+            (
+                "[platform(\"node\")] export export fun f() {}",
+                vec!["export"],
+            ),
+            ("export(in pkg) export struct S {}", vec!["export"]),
+            ("export export(in pkg) struct S {}", vec!["export"]),
+            (
+                "[must_use] export(in pkg) export fun f(): i32 { 1 }",
+                vec!["export"],
+            ),
+            // Separated by an attribute run: the run is the item's.
+            (
+                "export [must_use] export fun f(): i32 { 1 }",
+                vec!["export"],
+            ),
+            (
+                "[deprecated(\"x\")] export [must_use] export fun f(): i32 { 1 }",
+                vec!["export"],
+            ),
+            (
+                "export [must_use] export [platform(\"node\")] export fun f() {}",
+                vec!["export", "export"],
+            ),
+        ] {
+            let (tree, errors) = parse(source);
+            let rendered: Vec<String> = errors.iter().map(render).collect();
+            let spans: Vec<&str> = errors
+                .iter()
+                .map(|error| &source[error.span.start..error.span.end])
+                .collect();
+            assert_eq!(spans, refused, "{source}: {rendered:?}");
+            for message in &rendered {
+                assert_eq!(message, EXPORT_IS_WRITTEN_ONCE, "{source}");
+            }
+            // One export, of the declaration: not an export of an export.
+            let (statements, _) = tree.expect("a tree");
+            match &statements[0].0 {
+                Node::Export(_, inner, _) => {
+                    assert!(!matches!(inner.0, Node::Export(..)), "{source}: {inner:?}")
+                }
+                other => panic!("{source}: expected an Export, got {other:?}"),
+            }
+        }
+        // The attributes on either side of a repeat are the item's prefix.
+        let (tree, _) = parse("[deprecated(\"x\")] export [must_use] export fun f(): i32 { 1 }");
+        match &tree.expect("a tree").0[0].0 {
+            Node::Export(_, inner, _) => match &inner.0 {
+                Node::Func(function) => {
+                    assert_eq!(function.deprecated, Some("x"));
+                    assert!(function.must_use);
+                }
+                other => panic!("expected a Func, got {other:?}"),
+            },
+            other => panic!("expected an Export, got {other:?}"),
+        }
+        // The first marker is not refused, and `export *;` is untouched.
+        program("export fun f() {}");
+        program("export *;");
+    }
+
+    #[test]
+    fn a_list_before_export_is_not_an_attribute_run() {
+        // Only an ATTRIBUTE shape (`[` then a name) leads a marker; a list
+        // literal there is the expression statement it always was, refused
+        // for its missing `;`.
+        assert!(declines("[1] export fun f() {}"));
+        // An attribute run before `export *;` is not an item's prefix.
+        assert!(declines("[platform(\"node\")] export *;"));
     }
 
     #[test]

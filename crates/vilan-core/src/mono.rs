@@ -131,6 +131,73 @@ pub fn trait_default_member(program: &Program<'_>, trait_id: Id, member: &str) -
     None
 }
 
+/// Whether `trait_id`'s supertrait closure contains `supertrait_id` — "is an
+/// impl of `trait_id` also an impl of `supertrait_id`'s surface" (B359's
+/// supertrait face). A trait reaches itself.
+pub fn trait_reaches_supertrait(program: &Program<'_>, trait_id: Id, supertrait_id: Id) -> bool {
+    let mut stack = vec![trait_id];
+    let mut seen = HashSet::default();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if id == supertrait_id {
+            return true;
+        }
+        let Some(trait_) = program.traits.get(&id) else {
+            continue;
+        };
+        for supertrait_type_id in &trait_.supertraits {
+            if let Some(Type::Trait(super_id, _)) =
+                program.type_id_to_type_map.get(supertrait_type_id)
+            {
+                stack.push(*super_id);
+            }
+        }
+    }
+    false
+}
+
+/// The member a call dispatched on `trait_id`'s surface takes from an impl of
+/// one of its SUB-traits — the second step of a bound-directed dispatch, after
+/// the impl of `trait_id` itself has been asked (B359).
+///
+/// The member is declared by `trait_id` (the analyzer records the DECLARING
+/// trait, B473), but the implementor may name only a sub-trait in its clause:
+/// `Source<T>::sub`'s body calls `self.on_change(..)`, and a type that writes
+/// `impl C with Signal<T>` provides `Source`'s members through that clause and
+/// never names `Source`. The wanted-trait filter is a membership test on the
+/// clause's own traits, so it turns that impl down; this asks the type's
+/// PROVIDED traits (most specific first) whose supertrait closure reaches
+/// `trait_id`. Without it the caller fell to the by-name lookup, which an
+/// inherent member of the same name wins, or to the trait's default over the
+/// override. `file` is admission, as in [`resolve_inherited_default`].
+pub fn select_member_through_subtraits(
+    program: &Program<'_>,
+    file: Option<SourceId>,
+    type_id: TypeId,
+    trait_id: Id,
+    member: &str,
+) -> Option<impl_select::SelectedMember> {
+    impl_select::applying_trait_ids(program, file, type_id)
+        .into_iter()
+        .filter(|provided| {
+            *provided != trait_id && trait_reaches_supertrait(program, *provided, trait_id)
+        })
+        .find_map(|provided| {
+            impl_select::select_member(
+                program,
+                file,
+                type_id,
+                member,
+                Some(impl_select::WantedTrait {
+                    trait_id: provided,
+                    arguments: &[],
+                }),
+            )
+        })
+}
+
 /// The default body a concrete receiver INHERITS for `member` from a trait it
 /// implements.
 ///

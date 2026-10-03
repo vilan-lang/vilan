@@ -716,8 +716,11 @@ fn a_parse_error_inside_a_package_module_fails_the_build_loudly() {
         "a module with a parse error must not build"
     );
     let output = combined(&build);
+    // B446: the parameter list's located demand — a name, or its `)` — at the
+    // `{` it found instead, which `recover_statement` ranks above the bare
+    // "unclosed `(`" this said while the binder recorded nothing.
     assert!(
-        output.contains("unclosed `(`: expected a matching `)`"),
+        output.contains("found '{' expected a name or ')'"),
         "the diagnostic should say what is wrong: {output}"
     );
     // E100: the position is a SPAN now, not prose, so the terminal renders the
@@ -725,7 +728,7 @@ fn a_parse_error_inside_a_package_module_fails_the_build_loudly() {
     // this used to read `parse error in \u{60}…/util.vl\u{60}: line 2, column 11`
     // hung off an empty span at line 1.
     assert!(
-        output.contains("util.vl:2:11"),
+        output.contains("util.vl:2:13"),
         "the diagnostic should locate the broken module: {output}"
     );
     let _ = std::fs::remove_dir_all(&dir);

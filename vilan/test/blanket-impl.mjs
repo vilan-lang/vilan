@@ -49,18 +49,18 @@ function subscriber_of(notify, derived) {
 	return [ fresh_id(), notify, __shared_new(true), derived ];
 }
 function is_quiescent(self) {
-	return $u(self[0].v) && $u(self[1].v);
+	return $v(self[0].v) && $v(self[1].v);
 }
 function enqueue(turn, subscribers) {
 	for (const subscriber of subscribers) {
 		const key = hash(subscriber[0]);
-		let $t = null;
+		let $u = null;
 		if (subscriber[3]) {
 			if (!(turn[3].v.has(key))) {
 				turn[3].v.set(key, true);
 				turn[1].v.push(__clone(subscriber));
 			}
-			$t = undefined;
+			$u = undefined;
 		} else if (!(turn[2].v.has(key))) {
 			turn[2].v.set(key, true);
 			let index = turn[0].v.length;
@@ -69,7 +69,7 @@ function enqueue(turn, subscribers) {
 			}
 			__insert_at(turn[0].v, index, __clone(subscriber));
 		}
-		$t;
+		$u;
 	}
 	if (turn[5].v && !(turn[6].v) && !(turn[4].v)) {
 		turn[6].v = true;
@@ -87,7 +87,7 @@ function drain(turn) {
 		__with_finally(() => {
 			let budget = 100000;
 			while (!(is_quiescent(turn)) && budget > 0) {
-				while (!($u(turn[1].v)) && budget > 0) {
+				while (!($v(turn[1].v)) && budget > 0) {
 					const derivations = turn[1].v;
 					turn[1].v = [  ];
 					turn[3].v = new Map();
@@ -134,102 +134,108 @@ function $d(value) {
 function $c(value) {
 	return $d(value);
 }
-function $l(signal, subscriber) {
+function $m(signal, subscriber) {
 	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 	signal[1].v.push(reissued(subscriber));
 	return handle;
 }
-function $i(signal, observer) {
+function $j(signal, observer) {
 	const cell = signal[0];
-	return $l(signal, mint_subscriber(() => {
-		const $j = [ 0, cell ];
-		let $k = null;
-		if ($j[0] === 0) {
-			const live2 = $j[1];
-			$k = observer(live2.v);
+	return $m(signal, mint_subscriber(() => {
+		const $k = [ 0, cell ];
+		let $l = null;
+		if ($k[0] === 0) {
+			const live2 = $k[1];
+			$l = observer(live2.v);
 		} else {
-			$k = undefined;
+			$l = undefined;
 		}
-		return $k;
+		return $l;
 	}));
 }
-function $m(self) {
+function $n(self) {
 	return __clone(self[0].v);
 }
-function $h(self, observer, immediately) {
-	const subscription = $i(self, observer);
+function $i(self, observer, immediately) {
+	const subscription = $j(self, observer);
 	if (immediately) {
-		observer($m(self));
+		observer($n(self));
 	}
 	return subscription;
 }
-function $g(self, observer) {
-	return $h(self, observer, true);
+function $h(self, observer) {
+	return $i(self, (value) => {
+		return (() => {
+			return observer(value, [ 1 ]);
+		})();
+	}, true);
 }
 function $f(self, react) {
-	$g(__clone(self), react);
+	$h(__clone(self), (value, $g) => {
+		return react(value);
+	});
 }
 function $e(label) {
 	$f(label, (text) => {
 		return console.log("[" + text + "]");
 	});
 }
-function $u(self) {
+function $v(self) {
 	return self.length === 0;
 }
-function $v(self) {
-	let $x = null;
-	if ($u(self)) {
-		$x = [ 1 ];
+function $w(self) {
+	let $y = null;
+	if ($v(self)) {
+		$y = [ 1 ];
 	} else {
-		$x = __list_get(self, self.length - 1);
+		$y = __list_get(self, self.length - 1);
 	}
-	return $x;
+	return $y;
 }
-function $p(self, $q) {
-	const $r = $q;
-	let $s = null;
-	if ($r[0] === 0) {
-		const turn = $r[1];
-		$s = enqueue(turn, __clone(self[1].v));
+function $q(self, $r) {
+	const $s = $r;
+	let $t = null;
+	if ($s[0] === 0) {
+		const turn = $s[1];
+		$t = enqueue(turn, __clone(self[1].v));
 	} else {
-		const $y = $v(draining_turns.v);
-		let $z = null;
-		if ($y[0] === 0) {
-			const draining = $y[1];
-			$z = enqueue(draining, __clone(self[1].v));
+		const $z = $w(draining_turns.v);
+		let $A = null;
+		if ($z[0] === 0) {
+			const draining = $z[1];
+			$A = enqueue(draining, __clone(self[1].v));
 		} else {
 			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$z = undefined;
+			$A = undefined;
 		}
-		$s = $z;
+		$t = $A;
 	}
-	return $s;
+	return $t;
 }
-function $n(self, value, $o) {
+function $o(self, value, $p) {
 	self[0].v = __clone(value);
-	$p(self, $o);
+	$q(self, $p);
 }
-function $A(slot) {
+function $B(slot) {
 	$b(slot, (inner) => {
-		return console.log("holder " + $m(inner));
+		return console.log("holder " + $n(inner));
 	});
 }
-function $D(self) {
+function $E(self) {
 	return "plain box";
 }
-function $C(box) {
-	console.log($D(box));
+function $D(box) {
+	console.log($E(box));
 }
-function $F(self) {
+function $G(self) {
 	return "marked box";
 }
-function $E(box) {
-	console.log($F(box));
+function $F(box) {
+	console.log($G(box));
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
@@ -237,7 +243,7 @@ const draining_turns = __shared_new([  ]);
 $a("static");
 const live = $c("first");
 $e(live);
-$n(live, "second", [ 1 ]);
-$A(live);
-$C([ [  ] ]);
-$E([ [  ] ]);
+$o(live, "second", [ 1 ]);
+$B(live);
+$D([ [  ] ]);
+$F([ [  ] ]);
