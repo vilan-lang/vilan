@@ -48,6 +48,11 @@ written down.
 <!-- family: diagnostics -->
 **`async` written where a binding begins — `async x = 1;`, `async x: i32 = 1;`, `async let x = 1;`, `async mut x = 1;` — is refused once at the word, "`async` does not mark a binding: it marks a function, `async fun load()`, or an expression run as a task, `let pending = async load();` — a binding is `let name = …`", and read as the plain binding, so the name is bound and nothing cascades.** `async x = 1;` used to parse as an ASSIGNMENT whose place is `async x`: refused "cannot find 'x' in this scope" when `x` was unbound, and — when it was bound — accepted by `vilan check` and emitted as JavaScript that throws "Invalid left-hand side in assignment" at load (filed apart: other non-place targets take the same path). `async let` fell to "found 'let' expected an expression". `async fun`, `async { … }` and `async load()` are untouched. It is a curated rule statement (`ASYNC_MARKS_NO_BINDING`, the rule-site count 60 → 61). **Pin:** `parsing::tests::b494_async_where_a_binding_begins_is_refused_and_read_as_the_binding` (five shapes, local and module, each one refusal at `async` over a tree holding the binding; four `async` forms that stay clean). The marker census's `async` row takes the rule at the binding positions. Tracker B494.
 
+---
+
+<!-- family: tooling -->
+**The VS Code grammar and the book's highlighter paint `only`, B318's trailing import modifier (`import a::{ b } only;`), as a keyword — after a path's end (a name or a brace set's `}`) and before the statement's `;` — and leave a value named `only` plain, including `ret only;`, `c else only;` and the other words that put a value before a `;`.** It was the one contextual keyword no toolchain grammar coloured (`grammar_sync`'s `UNPAINTED_CONTEXTUAL_WORDS`, now empty); the playground already painted it. `grammar_sync`'s word reader now skips a negative lookbehind's words as it skipped a negative lookahead's, since those are the words a rule rules out. **Pin:** `grammar_sync::the_import_modifier_only_is_coloured_by_position_in_both_grammars` (four modifiers, twelve names, run through both rules in node), and `literal_words_reads_word_lists_and_ignores_shapes` gains the lookbehind case. Tracker K26 (the grammar half).
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

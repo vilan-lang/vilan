@@ -101,6 +101,15 @@
 			className: "keyword",
 			begin: "(?<=[A-Za-z0-9_]\\s{1,8})as\\b(?=\\s{1,8}[A-Za-z_])",
 		};
+		// `only` is CONTEXTUAL too (B318's trailing import modifier, K26):
+		// `import a::{ b } only;`. It sits between a path's end — a name or a
+		// brace set's `}` — and the statement's `;`, which is also where a
+		// VALUE named `only` sits after a word that takes one (`ret only;`,
+		// `c else only;`), so those words are ruled out by name.
+		const IMPORT_ONLY = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_\\}]\\s{1,8})(?<!\\b(?:ret|else|then|await|const|async)\\s{1,8})only\\b(?=\\s{0,8};)",
+		};
 		// B414: the six contextual keywords the lexer demoted, each painted
 		// only where it reads as the keyword. `with` and `borrows` follow a
 		// TYPE (an `impl`/`trait` head, a return type) and precede a name —
@@ -202,6 +211,7 @@
 				CONTEXT_CLAUSE,
 				SYNC_MARKER,
 				IMPORT_ALIAS,
+				IMPORT_ONLY,
 				CONTEXTUAL_WITH,
 				CONTEXTUAL_BORROWS,
 				CONTEXTUAL_OWN,

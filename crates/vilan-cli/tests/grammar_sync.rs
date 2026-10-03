@@ -81,11 +81,12 @@ const CONTEXTUAL_WORDS: &[(&str, &str)] = CONTEXTUAL_KEYWORDS;
 /// [`every_grammar_keyword_is_a_lexer_keyword_or_contextual`] otherwise asks
 /// that each contextual word be coloured somewhere; a word here is exempt, and
 /// the exemption expires the day a grammar starts colouring it.
-const UNPAINTED_CONTEXTUAL_WORDS: &[(&str, &str)] = &[(
-    "only",
-    "the trailing import modifier sits after a path and before `;` — the one shape a \
-     line regex cannot tell from `ret only;`, a value named `only` being returned",
-)];
+///
+/// Empty since K26: `only` was the one word here ("the one shape a line regex
+/// cannot tell from `ret only;`"), and both grammars now paint it with the
+/// words that put a value before a `;` ruled out by name
+/// ([`the_import_modifier_only_is_coloured_by_position_in_both_grammars`]).
+const UNPAINTED_CONTEXTUAL_WORDS: &[(&str, &str)] = &[];
 
 /// Type names the TextMate grammar colours as primitives that are not
 /// scalar-view primitives: `bool` is the numeric enum `type_.rs` keeps BESIDE
@@ -301,8 +302,10 @@ fn literal_words(regex: &str) -> Vec<String> {
         match bytes[index] {
             // An escape and the character it escapes.
             b'\\' => index += 2,
-            // A negative lookahead, to its balanced `)`.
-            b'(' if regex[index..].starts_with("(?!") => {
+            // A negative lookahead or lookbehind, to its balanced `)`: the
+            // words it names are the ones the rule does NOT paint (`only`'s
+            // guard rules out `ret only;` by name, K26).
+            b'(' if regex[index..].starts_with("(?!") || regex[index..].starts_with("(?<!") => {
                 let mut depth = 0usize;
                 while index < bytes.len() {
                     match bytes[index] {
@@ -582,6 +585,53 @@ fn the_import_alias_as_is_coloured_by_position_in_both_grammars() {
             regex_matches(&rule.regex, NOT_ALIASES),
             vec![false; NOT_ALIASES.len()],
             "{file}: {:?} colours `as` where it is an ordinary name ({NOT_ALIASES:?})",
+            rule.regex,
+        );
+    }
+}
+
+/// K26 — `only`, B318's trailing import modifier, colours as a keyword in
+/// BOTH grammars after a path's end and before the statement's `;`, and not
+/// where a VALUE named `only` sits before a `;` — after `ret`, `else`, `then`,
+/// `await`, `const` or `async`, an operator or a bracket. It was the one
+/// contextual word no grammar coloured (`UNPAINTED_CONTEXTUAL_WORDS`).
+#[test]
+fn the_import_modifier_only_is_coloured_by_position_in_both_grammars() {
+    const MODIFIERS: &[&str] = &[
+        "import a::{ b } only;",
+        "import pkg::helper::greet only;",
+        "import a::{ b, c }  only ;",
+        "export import a::b only;",
+    ];
+    const NOT_MODIFIERS: &[&str] = &[
+        "let only = 1;",
+        "ret only;",
+        "ready else only;",
+        "ready then only;",
+        "let x = await only;",
+        "let x = const only;",
+        "let x = async only;",
+        "print(only);",
+        "let x = y + only;",
+        "value.only;",
+        "only;",
+        "import a::{ only };",
+    ];
+    for (file, grammar, key) in [
+        (TEXTMATE_GRAMMAR, textmate_grammar(&[]), "keywords"),
+        (HIGHLIGHT_THEME, highlight_grammar(&[]), "keyword"),
+    ] {
+        let rule = contextual_rule(&grammar, key, "only");
+        assert_eq!(
+            regex_matches(&rule.regex, MODIFIERS),
+            vec![true; MODIFIERS.len()],
+            "{file}: {:?} misses an import modifier among {MODIFIERS:?}",
+            rule.regex,
+        );
+        assert_eq!(
+            regex_matches(&rule.regex, NOT_MODIFIERS),
+            vec![false; NOT_MODIFIERS.len()],
+            "{file}: {:?} colours `only` where it is an ordinary name ({NOT_MODIFIERS:?})",
             rule.regex,
         );
     }
@@ -1095,6 +1145,10 @@ fn literal_words_reads_word_lists_and_ignores_shapes() {
     );
     assert_eq!(literal_words(r"(?<=\)\s{0,8})context\b"), ["context"]);
     assert_eq!(literal_words(r"(?<=\()(sync)\b"), ["sync"]);
+    assert_eq!(
+        literal_words(r"(?<=[A-Za-z0-9_\}])(?<!\bret)(?<!\b(?:else|then))\s+(only)\b"),
+        ["only"]
+    );
     assert_eq!(
         literal_words(r"\b[A-Z][A-Za-z0-9_]*\b"),
         Vec::<String>::new()
