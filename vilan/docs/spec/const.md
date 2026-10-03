@@ -271,3 +271,21 @@ fun main() {
 	print(space(8f));
 }
 ```
+
+Both take the label prefix a plain declaration takes, written ahead of
+the keywords (§3.2's one order), so the deprecation policy reaches a
+compile-time helper too:
+
+```vilan
+[deprecated("use scale_step")]
+export const fun step(rem: f64): |f64| f64 {
+	|n: f64| rem * n
+}
+
+[internal("tuning, not a contract")]
+const let base = 0.25;
+
+fun main() {
+	print(base);
+}
+```

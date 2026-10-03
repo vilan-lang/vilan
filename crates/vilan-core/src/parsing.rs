@@ -6525,15 +6525,46 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// — the initializer evaluated at build time, the body capability-checked
     /// at its declaration — is recorded beside the entity rather than spelled
     /// as a second AST.
+    ///
+    /// B487: both take the label prefix a plain declaration does —
+    /// `[deprecated("use g")] const fun f()`, `[internal("why")] const let x
+    /// = 1;` — so the deprecation policy reaches a `const` item. Written ahead
+    /// of the keyword (B485 §6.2), the run reaches here BEHIND it:
+    /// [`Parser::canonicalize_marker_run`] leads `const` past the attributes
+    /// on the stream, as `export` is led, and the declaration under it reads
+    /// its own prefix — `parse_function`'s for a `fun`, the item labels for a
+    /// `let`. `const mut` takes none: it is refused and read as the `mut` it
+    /// spells.
     fn parse_const_declaration(&mut self) -> Option<Spanned<Node<'src>>> {
         if !self.peek_is(&Token::Const) {
             return None;
         }
         let start = self.position;
-        match self.peek_at(1) {
+        let mut head = start + 1;
+        while self.tokens.get(head).map(|(token, _)| token) == Some(&Token::Ctrl('['))
+            && matches!(self.tokens.get(head + 1), Some((Token::Ident(_), _)))
+        {
+            head = self.past_balanced_group(head)?;
+        }
+        let labelled = head > start + 1;
+        match self.tokens.get(head).map(|(token, _)| token) {
             Some(Token::Let) => {
                 self.bump();
-                let declaration = self.parse_let()?;
+                let labels = self.parse_item_labels();
+                if self.position != head {
+                    // An attribute a binding does not take (`[must_use]`):
+                    // declined, for the statement funnel's refusal.
+                    return None;
+                }
+                let declaration = match (self.parse_let()?, labels) {
+                    (declaration, None) => declaration,
+                    ((Node::Let(name, type_, value, mutable, lazy, None), span), labels) => {
+                        (Node::Let(name, type_, value, mutable, lazy, labels), span)
+                    }
+                    // Only a plain binding takes a label, as a plain `let`'s
+                    // does (`parse_labelled_let`).
+                    _ => return None,
+                };
                 self.eat_declaration_terminator()?;
                 Some((Node::Const(Box::new(declaration)), self.span_from(start)))
             }
@@ -6541,7 +6572,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // it spells, so the rest of the file parses and the author gets
             // one diagnostic rather than a cascade. The error survives the
             // statement funnel's `attempt` because this arm returns `Some`.
-            Some(Token::Mut) => {
+            Some(Token::Mut) if !labelled => {
                 let context = self.context_stack.clone();
                 self.errors.push(ParseError {
                     span: self.here_span(),
@@ -13281,6 +13312,7 @@ mod tests {
         for (source, canonical) in [
             ("async export fun f(): i32 { 1 }", "export async fun"),
             ("lazy export let x = 1;", "export lazy let"),
+            ("const export fun f(): i32 { 1 }", "export const fun"),
             ("macro export fun m() { }", "export macro fun"),
             (
                 "[extern(\"f\")] external async fun f(): i32;",
@@ -13290,6 +13322,14 @@ mod tests {
             (
                 "export async [must_use] fun f(): i32 { 1 }",
                 "[must_use] export async fun",
+            ),
+            (
+                "const [deprecated(\"x\")] fun f(): i32 { 1 }",
+                "[deprecated(..)] const fun",
+            ),
+            (
+                "export const [internal(\"x\")] let x = 1;",
+                "[internal(..)] export const let",
             ),
             (
                 "lazy [internal(\"x\")] let x = 1;",
@@ -13321,6 +13361,7 @@ mod tests {
         for source in [
             "[must_use] export async fun f(): i32 { 1 }",
             "export [must_use] async fun f(): i32 { 1 }",
+            "[deprecated(\"x\")] export const fun f(): i32 { 1 }",
             "[resource] export external struct H;",
             "fun main() { [a][b]; }",
             "fun main() { let x = async { 1 }; }",
@@ -13346,5 +13387,54 @@ mod tests {
         assert_eq!(errors.len(), 1);
         let (statements, _) = tree.expect("a tree");
         assert_eq!(statements[0].1, Span::from(0..source.len()));
+    }
+
+    #[test]
+    fn b487_a_const_declaration_carries_the_label_prefix() {
+        match only_item("[deprecated(\"use g\")] [must_use] const fun f(): i32 { 1 }") {
+            Node::Const(inner) => match &inner.0 {
+                Node::Func(function) => {
+                    assert_eq!(function.deprecated, Some("use g"));
+                    assert!(function.must_use);
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        match only_item("[internal(\"why\")] const let x = 1;") {
+            Node::Const(inner) => match &inner.0 {
+                Node::Let(name, _, _, _, _, Some(labels)) => {
+                    assert_eq!(name.0, "x");
+                    assert_eq!(labels.internal, Some("why"));
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // Under `export`, on either side of it.
+        for source in [
+            "[deprecated(\"use y\")] export const let y = 1;",
+            "export [deprecated(\"use y\")] const let y = 1;",
+        ] {
+            match only_item(source) {
+                Node::Export(_, inner, None) => match &inner.0 {
+                    Node::Const(declaration) => {
+                        assert!(
+                            matches!(&declaration.0, Node::Let(.., Some(labels)) if labels.deprecated == Some("use y")),
+                            "{source}: {declaration:?}"
+                        );
+                    }
+                    other => panic!("{source}: {other:?}"),
+                },
+                other => panic!("{source}: {other:?}"),
+            }
+        }
+        // A binding takes no `[must_use]`, and a destructure no label: not a
+        // declaration this production reads.
+        assert!(declines("[must_use] const let x = 1;"));
+        assert!(declines("[internal(\"x\")] const let (a, b) = (1, 2);"));
+        // `const mut` stays the refusal it was, unlabelled.
+        let (_, errors) = parse("const mut x = 1;");
+        assert_eq!(render(&errors[0]), CONST_HAS_NO_MUTATION);
     }
 }

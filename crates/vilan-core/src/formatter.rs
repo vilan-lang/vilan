@@ -4974,9 +4974,17 @@ impl<'src> Printer<'src> {
             // estate file writes the form, which is why nothing noticed —
             // `formatter_never_silently_bails` asserts the bail set over the
             // tree, and the tree had no exhibit.
-            Node::Const(inner) if matches!(inner.0, Node::Func(_)) => {
-                self.out.push_str("const ");
-                self.print_item(inner);
+            //
+            // B487: a `const` declaration carries the label prefix, which the
+            // keyword follows as `export` does — `[deprecated(..)]` ⏎ `const
+            // fun f()` — so the declaration prints its own attribute lines and
+            // the keyword goes on its signature. A labelled `const let` takes
+            // this arm too; an unlabelled one stays the expression printer's.
+            Node::Const(inner)
+                if matches!(inner.0, Node::Func(_))
+                    || matches!(inner.0, Node::Let(.., Some(_))) =>
+            {
+                self.print_item_under_keyword("const ", |printer| printer.print_item(inner));
             }
             // `export *;` — the module-wide marker. It carries no inner item, so
             // `needs_semicolon` leaves it out of its exclusion list and the
@@ -10401,6 +10409,34 @@ mod const_declaration_printing {
             "export const let    value: i32 = 1;\n",
             "export const let value: i32 = 1;\n",
         );
+    }
+
+    /// B487: a `const` declaration carries the label prefix, and prints it as
+    /// every declaration does (B485 §6.2) — each attribute on its own line,
+    /// the keywords on the signature, `export` ahead of `const`. Written in
+    /// either order around `export`.
+    #[test]
+    fn a_const_declarations_labels_print_above_its_keywords() {
+        for (written, expected) in [
+            (
+                "[deprecated(\"use g\")] [must_use] const fun f(): i32 { 1 }\n",
+                "[deprecated(\"use g\")]\n[must_use]\nconst fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "export [internal(\"why\")] const fun f(): i32 { 1 }\n",
+                "[internal(\"why\")]\nexport const fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "[internal(\"why\")] const let x = 1;\n",
+                "[internal(\"why\")]\nconst let x = 1;\n",
+            ),
+            (
+                "[deprecated(\"use y\")] export const let y: i32 = 1;\n",
+                "[deprecated(\"use y\")]\nexport const let y: i32 = 1;\n",
+            ),
+        ] {
+            assert_construct(written, expected);
+        }
     }
 
     /// N108: the other half of `Node::Const` — the weak-precedence EXPRESSION
