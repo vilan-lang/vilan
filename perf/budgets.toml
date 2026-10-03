@@ -1,0 +1,125 @@
+# perf/budgets.toml — the performance ceilings (M105 S3; `performance-gates.md` §4, RULED Q5–Q7).
+#
+# Read and written by `scripts/perf_gate.py`. Nobody sets a ceiling by hand: the seal sets each one from a
+# measurement (`perf_gate.py ratchet --from MEASURED.json`), and lowers it when a subject comes in more
+# than 2% under. Judged CUMULATIVELY against the ceiling, never against the parent commit, with
+# `tolerance` on top and every `[[bump]]` for the subject multiplied in.
+#
+# A row is a subject's `vilan check` on a release build, counted by `counter` (`instructions:u`, the
+# hardware counter; `callgrind`, its Ir where there is no PMU) on machine `class` — counts are per ISA and
+# per libc, so a ceiling binds only the class it was measured on (`reference` is the owner's 9800X3D,
+# `ci` the GitHub runner once S2's spread is known and a seal adopts CI's own measurement).
+#
+# A change that legitimately costs more adds, IN THE SAME COMMIT:
+#   [[bump]]
+#   subject = "genapp:46"
+#   class = "reference"
+#   ratio = 1.02
+#   reason = "one sentence"
+#   item = "Mnnn"
+# The seal lists every bump since the release; the owner approves one over 3%, or any on kolt (Q6). The
+# bumps reset at each release (`ratchet --release`).
+#
+# `[[growth]]` holds everywhere, whatever the class: the plain package of `small` and of `large` modules,
+# measured in one run, may differ by at most `max_ratio` (≤ x2.3 per doubling, Q11; M107 met it in
+# Order 46 at x1.94 from x2.80).
+#
+# `[[e121]]` are the editor's targets (Q9) on the seal's LSP harness rows: each reports red until it has
+# been green at two consecutive seals (`green_seals`), then `blocking` flips and it refuses (S8).
+tolerance = 0.01
+
+# Every subject the gate measures, whether or not this class has a ceiling for it yet.
+subjects = [
+    "example:math", "example:watch", "example:browser", "example:fullstack", "example:router",
+    "example:reactive-ui", "example:ssr", "example:canvas", "example:rpc", "example:todo",
+    "example:walkthrough", "genapp:46",
+]
+
+[[row]]
+subject = "example:math"
+counter = "instructions:u"
+class = "reference"
+ceiling = 242_942_792
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:watch"
+counter = "instructions:u"
+class = "reference"
+ceiling = 307_992_081
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:browser"
+counter = "instructions:u"
+class = "reference"
+ceiling = 1_532_650_952
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:fullstack"
+counter = "instructions:u"
+class = "reference"
+ceiling = 3_363_844_790
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:router"
+counter = "instructions:u"
+class = "reference"
+ceiling = 1_920_169_529
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:reactive-ui"
+counter = "instructions:u"
+class = "reference"
+ceiling = 2_423_749_158
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:ssr"
+counter = "instructions:u"
+class = "reference"
+ceiling = 4_228_734_946
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:canvas"
+counter = "instructions:u"
+class = "reference"
+ceiling = 1_542_845_757
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:rpc"
+counter = "instructions:u"
+class = "reference"
+ceiling = 2_145_930_169
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:todo"
+counter = "instructions:u"
+class = "reference"
+ceiling = 5_954_243_404
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "example:walkthrough"
+counter = "instructions:u"
+class = "reference"
+ceiling = 6_166_480_934
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[row]]
+subject = "genapp:46"
+counter = "instructions:u"
+class = "reference"
+ceiling = 10_023_433_080
+measured_at = "perf-46 @9cfc2192 (reference: Ryzen 7 9800X3D, WSL2, glibc 2.41)"
+
+[[growth]]
+small = 160
+large = 320
+max_ratio = 2.3

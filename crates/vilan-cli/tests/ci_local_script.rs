@@ -64,6 +64,7 @@ const LEG_JOBS: &[(&str, &str)] = &[
     ("doctest", "test"),
     ("audit", "audit"),
     ("wasm", "wasm"),
+    ("perf", "perf"),
 ];
 
 /// Legs with deliberately no job. See the script's own header for why the
