@@ -669,9 +669,17 @@ pub struct Symbol {
 /// members — fenced, with the blank line that makes it its own paragraph.
 /// Empty where the type has no definition to show (a primitive, an opaque
 /// external, a closure).
+///
+/// E246: set off by a RULE, and appended LAST. Two fenced blocks back to back
+/// render as one run in VS Code's hover — the `name: Type` line ran straight
+/// on into the `struct …` shape, with nothing to say where the declaration
+/// ended and the reference material began — so a horizontal rule separates
+/// them. And the shape is the reference material: the doc comment is what the
+/// author wrote for THIS name, so it comes first, and every caller pushes this
+/// paragraph after it.
 fn definition_paragraph(program: &Program, type_id: vilan_core::type_::TypeId) -> String {
     match program.type_definitions.of(type_id) {
-        Some(block) => format!("\n\n```vilan\n{block}\n```"),
+        Some(block) => format!("\n\n---\n\n```vilan\n{block}\n```"),
         None => String::new(),
     }
 }
@@ -4067,7 +4075,6 @@ impl Document {
                 signature.push_str(&format!(" = {value}"));
             }
             let mut out = format!("```vilan\n{signature}\n```");
-            out.push_str(&definition_paragraph(program, variable.type_id));
             // E227 (Q5): the abbreviation beneath the full type, when the inlay
             // hint shows one — outside the fence, because the fence is vilan
             // and `~` is not. The reader who wonders what the hint means
@@ -4088,6 +4095,8 @@ impl Document {
                 out.push_str("\n\n");
                 out.push_str(&docs);
             }
+            // E246: the type's shape last, under its rule.
+            out.push_str(&definition_paragraph(program, variable.type_id));
             return Some(out);
         }
         if let Some(parameter) = program.parameters.get(&binding) {
@@ -4120,9 +4129,6 @@ impl Document {
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
         let mut out = format!("```vilan\n{name}: {type_label}\n```");
-        if let Some(type_id) = program.expr_type_ids.get(&id) {
-            out.push_str(&definition_paragraph(program, *type_id));
-        }
         // E204: a FIELD's own `///`, where the read resolves to one. A field
         // carries no entity id, so `doc_comment_of` has nothing to look up —
         // `Expr::Field`'s (struct, index) key is what names the declaration,
@@ -4132,6 +4138,10 @@ impl Document {
         if let Some(docs) = self.field_docs(program, id) {
             out.push_str("\n\n");
             out.push_str(&docs);
+        }
+        // E246: the type's shape last, under its rule.
+        if let Some(type_id) = program.expr_type_ids.get(&id) {
+            out.push_str(&definition_paragraph(program, *type_id));
         }
         Some(out)
     }
@@ -4186,11 +4196,12 @@ impl Document {
             out.push_str("\n\n");
         }
         out.push_str(&format!("```vilan\n{}: {type_label}\n```", field.name));
-        out.push_str(&definition_paragraph(program, field.type_id));
         if let Some(docs) = self.struct_field_docs(program, struct_id, index) {
             out.push_str("\n\n");
             out.push_str(&docs);
         }
+        // E246: the type's shape last, under its rule.
+        out.push_str(&definition_paragraph(program, field.type_id));
         Some(out)
     }
 
@@ -23656,7 +23667,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover,
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("trait Greeter\nself: Self"),
                 fence("trait Greeter {\n\tfun greet(self): str;\n}")
             )
@@ -23670,7 +23681,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover,
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("impl type S: Greeter with Named\nself: S"),
                 fence("trait Greeter {\n\tfun greet(self): str;\n}")
             )
@@ -23686,7 +23697,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover(&document, "mut user = ", 0, 4),
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("mut user: User"),
                 fence("struct User {\n\tid: UserId,\n\tname: str,\n\ttags: List<str>,\n}")
             )
@@ -23698,9 +23709,12 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         let block = fence("struct UserId {\n\tvalue: i32,\n}");
         let read = hover(&document, "print(user.id.value)", 0, 11);
-        assert_eq!(read, format!("{}\n\n{block}", fence("id: UserId")));
+        assert_eq!(read, format!("{}\n\n---\n\n{block}", fence("id: UserId")));
         let declared = hover(&document, "\tid: UserId,", 0, 1);
-        assert_eq!(declared, format!("{}\n\n{block}", fence("id: UserId")));
+        assert_eq!(
+            declared,
+            format!("{}\n\n---\n\n{block}", fence("id: UserId"))
+        );
     }
 
     #[test]
@@ -23709,7 +23723,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover(&document, "let pair = ", 0, 4),
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("let pair: Pair<i32, str>"),
                 fence("struct Pair<i32, str> {\n\tleft: i32,\n\tright: str,\n}")
             )
@@ -23750,7 +23764,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(
             hover(&document, "fun describe(greeter", 0, 14),
             format!(
-                "{}\n\n{}",
+                "{}\n\n---\n\n{}",
                 fence("greeter: Greeter"),
                 fence("trait Greeter {\n\tfun greet(self): str;\n}")
             )
@@ -23761,7 +23775,10 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
     fn e237_a_long_definition_is_capped_at_twelve_members() {
         let document = analyzed();
         let hover = hover(&document, "let wide = ", 0, 4);
-        let block = hover.split("\n\n").nth(1).expect("a definition block");
+        let block = hover
+            .split("\n\n---\n\n")
+            .nth(1)
+            .expect("a definition block");
         assert_eq!(
             block,
             fence(
@@ -23782,6 +23799,54 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
             hover(&document, "mut out: List", 0, 4),
             fence("mut out: List<i32>")
         );
+    }
+    // --- E246: the shape under a rule, after the docs -----------------------
+
+    /// The gap: the `name: Type` line and the `struct …` shape are set apart
+    /// by a horizontal rule — two fences back to back render as one run.
+    #[test]
+    fn e246_the_shape_is_set_apart_by_a_rule() {
+        let document = analyzed();
+        let hover = hover(&document, "mut user = ", 0, 4);
+        let (signature, shape) = hover
+            .split_once("\n\n---\n\n")
+            .expect("a rule between the declaration and the shape");
+        assert_eq!(signature, fence("mut user: User"));
+        assert!(shape.starts_with("```vilan\nstruct User {"), "{shape}");
+    }
+
+    /// The order: the declaration, then the doc comment the author wrote for
+    /// this name, then the shape — reference material last — for a variable,
+    /// a field read and a field declaration alike.
+    #[test]
+    fn e246_the_doc_comment_comes_before_the_shape() {
+        let source = "struct Point {\n\tx: i32,\n}\n\nstruct Holder {\n\t/// Where it is.\n\tat: Point,\n}\n\n\
+             fun main() {\n\t/// The one holder.\n\tlet holder = Holder { at = Point { x = 1 } };\n\tlet _ = holder.at;\n}\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let shape = fence("struct Point {\n\tx: i32,\n}");
+        let at = |needle: &str, delta: usize| {
+            document
+                .hover(source.find(needle).expect("the fixture") + delta)
+                .expect("a hover")
+        };
+        assert_eq!(
+            at("let holder", 4),
+            format!(
+                "{}\n\nThe one holder.\n\n---\n\n{}",
+                fence("let holder: Holder"),
+                fence("struct Holder {\n\tat: Point,\n}")
+            )
+        );
+        for (position, hovered) in [
+            ("a field read", at("holder.at;", 7)),
+            ("a field declaration", at("\tat: Point", 1)),
+        ] {
+            assert_eq!(
+                hovered,
+                format!("{}\n\nWhere it is.\n\n---\n\n{shape}", fence("at: Point")),
+                "{position}"
+            );
+        }
     }
 }
 
