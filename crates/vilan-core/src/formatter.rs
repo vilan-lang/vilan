@@ -4895,8 +4895,16 @@ impl<'src> Printer<'src> {
             // keyword then the ordinary function form.
             // Its attributes, if any, print above it with the keyword on the
             // signature line, as `export`'s do.
+            // An async macro is written `async macro fun` (B524: Q8's table,
+            // `async` before `external`|`macro`), so the keyword goes in
+            // after the `async` the function printed.
             Node::MacroFun(func) => {
-                let _ = self.print_item_under_keyword("macro ", |printer| printer.print_func(func));
+                let at =
+                    self.print_item_under_keyword("macro ", |printer| printer.print_func(func));
+                if func.is_async && self.out[at..].starts_with("macro async ") {
+                    self.out
+                        .replace_range(at..at + "macro async ".len(), "async macro ");
+                }
             }
             // `[name(args)?] <item>` — a user macro attribute, on its own line
             // above the struct/enum/function it annotates (like `[derive(..)]`).
@@ -8769,6 +8777,28 @@ mod reformats {
     // a function, a struct (with `[derive]` and `[resource]`), a labelled
     // `let`, a trait, under `export` on either side, and in a trait body.
     // The net sorts both streams the same way, so none of these declines.
+    // B524 (decided by B485 Q8's table): an async macro is written `async
+    // macro fun` — `async` before `external`|`macro` — with its attributes
+    // above; `macro async fun`, the one order the production read before,
+    // is refused and still read, so `vilan fmt` writes it in the order.
+    // Idempotent; a plain macro and a plain async function are untouched.
+    #[test]
+    fn b524_an_async_macro_prints_async_macro_fun() {
+        let canonical = "async macro fun m() {}\n";
+        assert_formats(canonical, canonical);
+        assert_formats("macro async fun m() {}\n", canonical);
+        assert_formats(
+            "macro [deprecated(\"d\")] async fun m() {}\n",
+            "[deprecated(\"d\")]\nasync macro fun m() {}\n",
+        );
+        assert_formats(
+            "[deprecated(\"d\")]\nasync macro fun m() {}\n",
+            "[deprecated(\"d\")]\nasync macro fun m() {}\n",
+        );
+        assert_formats("macro fun m() {}\n", "macro fun m() {}\n");
+        assert_formats("async fun f() {}\n", "async fun f() {}\n");
+    }
+
     #[test]
     fn b485_an_attribute_run_in_any_order_prints_in_the_canonical_one() {
         for (written, expected) in [

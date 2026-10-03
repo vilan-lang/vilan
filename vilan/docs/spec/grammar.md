@@ -126,7 +126,8 @@ each on its own line:
 
 So `[derive(Wire)]` ⏎ `export struct Handle { … }`, `[platform("browser")]`
 ⏎ `export impl …`, `[deprecated("use g")]` ⏎ `[must_use]` ⏎ `export async
-fun f()`, and `[deprecated("use b")] export import a::b as c;`. A head written in another order is read exactly as if written
+fun f()`, `[deprecated("use b")] export import a::b as c;`, and `async macro
+fun` (B524). A head written in another order is read exactly as if written
 in this one, and reported:
 
 - **attributes out of rank**, and nothing else out of order —
@@ -134,8 +135,8 @@ in this one, and reported:
   that names the head in the order (`` write `[deprecated(..)] [internal(..)]
   fun` ``);
 - **a keyword ahead of an attribute, or two keywords inverted** — `async
-  [platform("node")] fun`, `external async fun`, `lazy export let` — an
-  **error**, with the head respelled in the order. That
+  [platform("node")] fun`, `external async fun`, `lazy export let`, `macro
+  async fun` — an **error**, with the head respelled in the order. That
   includes `export` and `macro` ahead of the attributes: `export
   [derive(Wire)] struct Handle`, the spelling before B485, read by v0.43.0
   and refused from v0.44.0 (B485 S3).
@@ -496,7 +497,7 @@ service-arg    = IDENT | "http" | "client" "=" IDENT ;
 client-service-attr = "[" "client_service" "]" ;
 macro-attributed-item = macro-attr ( struct | enum | function ) ;
 macro-attr       = "[" IDENT [ "(" [ expr-span { "," expr-span } ] ")" ] "]" ;
-macro-fun        = "macro" function ;
+macro-fun        = "macro" function ;   (* written in §3.2's order: attributes, [ "async" ] "macro", "fun" *)
 macro-invocation = "macro" IDENT "(" [ expr-span { "," expr-span } ] ")" ;
 macro-block      = "macro" block ;
 ```

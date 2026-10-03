@@ -1959,12 +1959,16 @@ fn declaration_word(token: Option<&Token<'_>>) -> Option<&'static str> {
 /// declaration `word` takes — so a swapped pair can be steered to an order
 /// that then PARSES. A set no order makes legal (`async const fun`, `lazy
 /// fun`) is left as written, for the production's own refusal.
+///
+/// `async macro fun` is one (B524, decided by Q8's table): `async` before
+/// `external`|`macro`, so `macro async fun`, the one order the macro
+/// production read before, is the steered spelling.
 fn marker_keywords_are_legal(keywords: &[MarkerKeyword], word: &str) -> bool {
     use MarkerKeyword::*;
     match word {
         "fun" => matches!(
             keywords,
-            [] | [Async] | [External] | [Async, External] | [Const] | [Macro]
+            [] | [Async] | [External] | [Async, External] | [Const] | [Macro] | [Async, Macro]
         ),
         "struct" => matches!(keywords, [] | [External]),
         "let" | "mut" => matches!(keywords, [] | [Const] | [Lazy]),
@@ -13707,6 +13711,11 @@ mod tests {
                 "trait T {\n\t[deprecated(\"d\")] [must_use] fun t(self): i32;\n}",
                 "[deprecated(..)] [must_use] fun",
             ),
+            (
+                "[platform(\"node\")] [deprecated(\"d\")] async macro fun m() {}",
+                "[deprecated(\"d\")] [platform(\"node\")] async macro fun m() {}",
+                "[deprecated(..)] [platform(..)] async macro fun",
+            ),
         ] {
             let (tree, errors, warnings) = parse_with_warnings(source);
             assert!(errors.is_empty(), "{source}: {errors:?}");
@@ -13825,6 +13834,12 @@ mod tests {
                 "async external fun f(): i32;",
                 "marker-order/keywords",
                 "Write `async external fun`",
+            ),
+            (
+                "macro async fun m() {}",
+                "async macro fun m() {}",
+                "marker-order/keywords",
+                "Write `async macro fun`",
             ),
             (
                 "fun main() {}\nexport [must_use] [deprecated(\"d\")] fun f(): i32 { 1 }\n",
@@ -13948,6 +13963,13 @@ mod tests {
                 "export [must_use] [deprecated(\"x\")] fun f(): i32 { 1 }",
                 "[deprecated(..)] [must_use] export fun",
             ),
+            // B524: `async` before `macro` (Q8's table), so the order the
+            // macro production read before B524 is the steered one.
+            ("macro async fun m() { }", "async macro fun"),
+            (
+                "macro [deprecated(\"x\")] async fun m() { }",
+                "[deprecated(..)] async macro fun",
+            ),
         ] {
             let (tree, errors) = parse(source);
             let rendered: Vec<String> = errors.iter().map(render).collect();
@@ -13974,6 +13996,8 @@ mod tests {
         for source in [
             "[must_use] export async fun f(): i32 { 1 }",
             "[deprecated(\"x\")] export const fun f(): i32 { 1 }",
+            "async macro fun m() { }",
+            "[deprecated(\"x\")] async macro fun m() { }",
             "[deprecated(\"x\")] export(in pkg) fun f() {}",
             "[resource] export external struct H;",
             "fun main() { [a][b]; }",
