@@ -51096,9 +51096,11 @@ impl<'src> Analyzer<'src> {
                     .map(|importable| importable.name.to_string()),
             );
         }
-        // The base seven are in both sets, so a program missing `print` must
+        // The base eight are in both sets, so a program missing `print` must
         // get the ordinary import steer, not "switch to the web set".
-        for shared in ["print", "Option", "Some", "None", "Result", "Ok", "Err"] {
+        for shared in [
+            "print", "Iterator", "Option", "Some", "None", "Result", "Ok", "Err",
+        ] {
             names.remove(shared);
         }
         // A MODULE-carried entry (`style`, `ui`) leaves the steer set too:

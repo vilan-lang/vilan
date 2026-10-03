@@ -5,10 +5,11 @@
 // set serves both a test corpus and an application, so std ships both and the
 // manifest picks.
 //
-// The base seven are re-stated rather than derived. That is the override rule (§8)
+// The base eight are re-stated rather than derived. That is the override rule (§8)
 // applied to std itself: a prelude REPLACES, extension is spelled by re-export, and
 // std does not get a merge mechanism its users lack.
 export import pkg::io::print;
+export import pkg::iterator::Iterator;
 export import pkg::option::Option::{ self, None, Some };
 export import pkg::result::Result::{ self, Err, Ok };
 
@@ -24,6 +25,12 @@ export import pkg::result::Result::{ self, Err, Ok };
 // put back the import this set exists to delete.
 export import pkg::reactive::Signal;
 export import pkg::reactive::SignalCell;
+
+// The collection pipes' SEALERS (B535, ruled in Order 46): `memo` on a collection
+// or set pipe is `CollPipe`'s or `SetPipe`'s, and a trait's methods resolve only
+// where it is in scope (B515), so an application's `todos.filter(..).memo()` would
+// otherwise need an import for its last link.
+export import pkg::reactive::{ CollPipe, SetPipe };
 
 // `view` and `View` — ranks 3 and 4, the builder and its type, one idea. A view
 // tree is dense with `view("div")` calls, which is why these are bare members and

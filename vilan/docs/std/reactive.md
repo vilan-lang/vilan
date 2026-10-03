@@ -1617,7 +1617,7 @@ collection pipe.
 
 ```vilan
 import std::option::Option::{ self, None, Some };
-import std::reactive::{ Signal, SignalCell, comp };
+import std::reactive::{ CollPipe, Signal, SignalCell, comp };
 
 fun main() {
 	let fetched: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
@@ -1759,7 +1759,7 @@ changed the set and record only when they did.
 
 ```vilan
 import std::hash_set::HashSet;
-import std::reactive::{ HashSetCell };
+import std::reactive::{ Disposable, Flow, HashSetCell };
 
 fun main() {
 	let online: HashSetCell<str> = HashSetCell::new();
@@ -1810,7 +1810,7 @@ subtract what left.
 
 ```vilan
 import std::hash_map::HashMap;
-import std::reactive::{ HashMapCell, comp };
+import std::reactive::{ CollPipe, HashMapCell, SetPipe, comp };
 
 fun main() {
 	let stock: HashMapCell<str, i32> = HashMapCell::of([("pens", 3), ("ink", 0)].to_map());

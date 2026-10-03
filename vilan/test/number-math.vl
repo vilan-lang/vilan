@@ -1,3 +1,4 @@
+import std::compare::Ord;
 import std::io::print;
 
 fun main() {

@@ -3141,6 +3141,11 @@ fn the_web_preludes_surface_is_its_members_and_its_ambient_modules() {
         "View",
         "style",
         "ui",
+        // B535 (ruled): the base set's `Iterator`, and the collection pipes'
+        // sealers, so a `memo` at the end of a collection pipe needs no import.
+        "Iterator",
+        "CollPipe",
+        "SetPipe",
         // A99's slot values, bare, and A119's `when_some` with them: the
         // owner's spelling in a hole is `{when_some(selected, ..)}`, so a
         // conditional form left behind `ui::` would put back the import this
@@ -3224,6 +3229,47 @@ fn analyze_under_prelude_repaired(
     );
     let _ = std::fs::remove_dir_all(&dir);
     errors.into_iter().map(|error| error.msg).collect()
+}
+
+/// [`analyze_under_prelude`]'s single-file twin that answers the WARNINGS of a
+/// clean analysis (B535: what B515 says about a trait method the file did not
+/// import), panicking on any error.
+fn warnings_under_prelude(prelude: PreludeSpec, entry: &str, platform: Platform) -> Vec<String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!(
+        "vilan_prelude_warnings_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry_path = dir.join("main.vl");
+    std::fs::write(&entry_path, entry).unwrap();
+    let leaked: &'static str = Box::leak(entry.to_string().into_boxed_str());
+    let workspace = Workspace {
+        entry_prelude: prelude,
+        ..Workspace::default()
+    };
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &workspace,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let errors: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+    assert!(
+        errors.is_empty(),
+        "expected a clean analysis, got: {errors:#?}"
+    );
+    program
+        .expect("a clean analysis produces a program")
+        .warnings
+        .into_iter()
+        .map(|warning| warning.msg)
+        .collect()
 }
 
 fn base_prelude() -> PreludeSpec {
@@ -3595,6 +3641,63 @@ fn the_base_prelude_does_not_bind_the_web_sets_names() {
         Platform::Browser,
     );
     assert!(errors.iter().any(|e| e.contains("Signal")), "{errors:#?}");
+}
+
+/// B535 (ruled): `Iterator` is in the BASE prelude, so an iterator chain
+/// resolves with the trait in scope and no import — and B515's warning, which
+/// becomes a refusal in v0.45.0, says nothing about it. Under the web set too,
+/// which re-states the base set.
+#[test]
+fn b535_an_iterator_chain_needs_no_import_under_either_std_prelude() {
+    let entry = "fun main() {\n\
+        \tlet evens = [1, 2, 3, 4].iter().filter(|n| n % 2 == 0).map(|n| n * 10).to_list();\n\
+        \tlet total = [1, 2, 3].iter().fold(0, |sum, n| sum + n);\n\
+        \tprint(evens.len() + total.as_usize());\n\
+        }\n";
+    for prelude in [base_prelude(), web_prelude()] {
+        let warnings = warnings_under_prelude(prelude, entry, Platform::default());
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("does not import")),
+            "an iterator chain must not lean on another module's import: {warnings:#?}"
+        );
+    }
+}
+
+/// B535 (ruled): the collection pipes' sealers, `CollPipe` and `SetPipe`, are
+/// in the WEB prelude, so `memo` at the end of a collection or set pipe needs no
+/// import there; the base set does not carry them, and there the import is
+/// still what B515 asks for.
+#[test]
+fn b535_a_collection_pipes_memo_needs_no_import_under_the_web_prelude() {
+    let entry = "import std::hash_map::HashMap;\n\
+        import std::reactive::{ HashMapCell, SignalCell, comp };\n\
+        \n\
+        fun main() {\n\
+        \tlet numbers: SignalCell<List<i32>> = SignalCell::new([1, 2, 3, 4]);\n\
+        \tlet stock: HashMapCell<str, i32> = HashMapCell::of([(\"pens\", 3)].to_map());\n\
+        \tlet ((evens, short), _scope) = comp(|| (\n\
+        \t\tnumbers.coll().filter(|n| n % 2 == 0).memo(),\n\
+        \t\tstock.keys().memo()\n\
+        \t));\n\
+        \tprint(evens.get().len());\n\
+        \tprint(short.get().len());\n\
+        }\n";
+    let web = warnings_under_prelude(web_prelude(), entry, Platform::default());
+    assert!(
+        web.iter()
+            .all(|warning| !warning.contains("does not import")),
+        "under the web set both sealers are in scope: {web:#?}"
+    );
+    let base = warnings_under_prelude(base_prelude(), entry, Platform::default());
+    for sealer in ["`CollPipe`", "`SetPipe`"] {
+        assert!(
+            base.iter()
+                .any(|warning| warning.contains("does not import") && warning.contains(sealer)),
+            "the base set does not carry {sealer}, so B515 still asks for its import: {base:#?}"
+        );
+    }
 }
 
 #[test]
