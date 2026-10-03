@@ -155,6 +155,11 @@ written down.
 
 ---
 
+<!-- family: performance -->
+**`vilan check` is linear in package size again: doubling a generated plain package from 24k to 49k lines now costs x1.94 in instructions (it was x2.80 on v0.43.0), and the 49k-line check runs 5.75 G instructions instead of 21.20 G.** M107. Six lookups the solver makes per call site or per anchor scanned something that grows with the package, so each was quadratic: member lookup asked every impl DECLARING the name (every derived `eq` and `debug` in the program, at every `==` and `print`); the two inherited-member scans and `type_implements_trait` walked every impl in the program; wiring an assignment searched the whole constraint queue for its variable; the module drain re-resolved and re-scanned every pending module per module loaded; and `source_of_id` (before the seal), `Program::source_of` and every `derived_origins` lookup were linear scans of the ranges. Each now reads an index with the scan's exact answer: impl rows split by subject HEAD, built lazily (a `Struct`/`Enum` receiver can only reach an impl of its own nominal or one whose head is not nominal — `compare_type` falls through to equality otherwise; a subject not yet resolved waits and is re-read), with the full scan run beside it in debug builds as a differential; `implementations_by_trait` and `provided_trait_rows`, written where `trait_ids` and the provided sets are; a variable-constraint position index that restarts when the queue is drained; a min-heap over the drain's injective load-order key; and a `RangeIndex` over entity-id ranges that falls back to the scan if two ranges ever overlap, so the FIRST containing range is still the answer. Plain-package instructions (`instructions:u`): 160 modules 7.58 G → 2.96 G, 320 modules 21.20 G → 5.75 G, 640 modules 13.33 G (x2.32 from 320, where macro expansion is no longer served from its cache); kolt @984a1dfb 25.91 G → 24.08 G. Pins: `inference::std_surface::m107_impl_lookups_examine_rows_linear_in_the_package` (the margin of a doubling of a derive-heavy package reads x2.00 in impl rows examined, x3.47 with the head index planted out; `analyzer::impl_rows_examined` is the new counter), and the T2 growth row of `perf/budgets.toml` (≤ x2.3 per doubling) holds the whole check. No golden moves.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

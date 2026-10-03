@@ -71,6 +71,29 @@ thread_local! {
     /// thread since [`reset_duplicate_impl_comparisons`] (M107). See
     /// [`duplicate_impl_comparisons`].
     static DUPLICATE_IMPL_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many impl ROWS the member and trait lookups have examined on this
+    /// thread (M107). See [`impl_rows_examined`].
+    static IMPL_ROWS_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The impl rows the member lookup (`impl_member_candidates`), the two
+/// inherited-member scans and `type_implements_trait` have examined on this
+/// thread since the last [`reset_impl_rows_examined`] (M107). Each reads only
+/// the impls of the member's or trait's row whose subject head can admit the
+/// receiver, so a package that adds a type and its derived impls adds rows
+/// for that type's own lookups and not for everyone else's: the count grows
+/// linearly with the package where the scans grew with its square.
+pub fn impl_rows_examined() -> usize {
+    IMPL_ROWS_EXAMINED.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`impl_rows_examined`].
+pub fn reset_impl_rows_examined() {
+    IMPL_ROWS_EXAMINED.with(|count| count.set(0));
+}
+
+fn count_impl_rows(rows: usize) {
+    IMPL_ROWS_EXAMINED.with(|count| count.set(count.get() + rows));
 }
 
 /// The number of impl pairs the duplicate-impl check has compared on this
@@ -87,8 +110,135 @@ pub fn reset_duplicate_impl_comparisons() {
     DUPLICATE_IMPL_COMPARISONS.with(|count| count.set(0));
 }
 
+/// Entity-id ranges by start, extended as ranges are pushed (M107) — the
+/// binary search behind [`Analyzer::source_of_id`] before the seal and behind
+/// every lookup in `derived_origins` (which generated walk produced an id).
+/// Each of those was a linear scan asked per call site or per diagnostic
+/// anchor, which made the walks that ask quadratic in the module count.
+///
+/// Positions, not copies: a module placeholder's `source` is corrected IN
+/// PLACE once its file is known, and reading the range through its position
+/// sees the correction. Bounds are never edited. The search is the scan's
+/// answer only while the ranges are disjoint (then at most one contains an
+/// id); every insertion checks its neighbours, and one overlap sends every
+/// later ask back to the scan, which answers with the FIRST containing range.
+#[derive(Clone, Debug, Default)]
+struct RangeIndex {
+    indexed: usize,
+    by_start: Vec<usize>,
+    overlapping: bool,
+}
+
+impl RangeIndex {
+    fn extend<T>(&mut self, items: &[T], bounds: impl Fn(&T) -> (u32, u32)) {
+        if self.indexed > items.len() {
+            *self = RangeIndex::default();
+        }
+        for position in self.indexed..items.len() {
+            let (start, end) = bounds(&items[position]);
+            let at = self
+                .by_start
+                .partition_point(|existing| bounds(&items[*existing]).0 <= start);
+            let overlaps_before = at
+                .checked_sub(1)
+                .is_some_and(|before| bounds(&items[self.by_start[before]]).1 > start);
+            let overlaps_after = self
+                .by_start
+                .get(at)
+                .is_some_and(|after| end > bounds(&items[*after]).0);
+            if start > end || overlaps_before || overlaps_after {
+                self.overlapping = true;
+            }
+            self.by_start.insert(at, position);
+        }
+        self.indexed = items.len();
+    }
+
+    /// The position of the first item whose range contains `id` — exactly
+    /// what `items.iter().position(..)` over the ranges answers.
+    fn find<T>(
+        &mut self,
+        items: &[T],
+        bounds: impl Fn(&T) -> (u32, u32),
+        id: u32,
+    ) -> Option<usize> {
+        self.extend(items, &bounds);
+        self.search(items, bounds, id)
+    }
+
+    /// [`Self::find`] without extending: the binary search when the index
+    /// covers every item and found them disjoint, the scan otherwise.
+    fn search<T>(&self, items: &[T], bounds: impl Fn(&T) -> (u32, u32), id: u32) -> Option<usize> {
+        if self.overlapping || self.indexed != items.len() {
+            return items.iter().position(|item| {
+                let (start, end) = bounds(item);
+                id >= start && id < end
+            });
+        }
+        let at = self
+            .by_start
+            .partition_point(|position| bounds(&items[*position]).0 <= id);
+        let position = *self.by_start.get(at.checked_sub(1)?)?;
+        (id < bounds(&items[position]).1).then_some(position)
+    }
+}
+
+/// [`RangeIndex`]'s bounds for a `derived_origins` row.
+fn derived_origin_bounds(row: &(std::ops::Range<u32>, Span, SourceId)) -> (u32, u32) {
+    (row.0.start, row.0.end)
+}
+
+/// A row of impl indices split by subject head, built whole (M107) — the
+/// eager twin of [`MemberRowIndex`], for an index rebuilt where its row is
+/// written. A row whose subject was unresolved when the index was built waits
+/// in `unsettled` and is offered to every subject, because it may have
+/// resolved since; `impl_subject_admits` decides it then.
+#[derive(Clone, Debug, Default)]
+struct ImplHeadRows {
+    nominal: HashMap<ImplSubjectBucket, Vec<usize>>,
+    open: Vec<usize>,
+    unsettled: Vec<usize>,
+}
+
+impl ImplHeadRows {
+    /// The rows that can admit a value of `subject_type`, in no particular
+    /// order: for a `Struct`/`Enum`, its own head's, the non-nominal ones and
+    /// the unsettled; for anything else, every row.
+    fn candidates(&self, subject_type: &Type) -> impl Iterator<Item = usize> + '_ {
+        let head = match subject_type {
+            Type::Struct(id, _) => Some(ImplSubjectBucket::Struct(*id)),
+            Type::Enum(id, _) => Some(ImplSubjectBucket::Enum(*id)),
+            _ => None,
+        };
+        let nominal: Box<dyn Iterator<Item = usize> + '_> = match head {
+            Some(head) => Box::new(self.nominal.get(&head).into_iter().flatten().copied()),
+            None => Box::new(self.nominal.values().flatten().copied()),
+        };
+        nominal
+            .chain(self.open.iter().copied())
+            .chain(self.unsettled.iter().copied())
+    }
+}
+
+/// Which row of impl indices a [`MemberRowIndex`] splits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ImplRowKey<'src> {
+    /// `implementations_by_member[name]`: the impls that DECLARE the name.
+    Member(&'src str),
+    /// `implementations_by_trait[id]`: the impls with a clause for the trait.
+    Trait(Id),
+}
+
+#[derive(Clone, Debug, Default)]
+struct MemberRowIndex {
+    indexed: usize,
+    nominal: HashMap<ImplSubjectBucket, Vec<usize>>,
+    open: Vec<usize>,
+    unsettled: Vec<usize>,
+}
+
 /// [`Analyzer::impl_subject_bucket`]'s classes (M107).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ImplSubjectBucket {
     Struct(Id),
     Enum(Id),
@@ -3905,6 +4055,12 @@ pub struct Analyzer<'src> {
     // right answer. The ranges are disjoint by construction (the entity
     // counter only grows), which is what makes the search well-defined.
     sorted_source_ranges: Vec<(u32, u32, SourceId)>,
+    // M107: the same search BEFORE the seal, over the ranges pushed so far —
+    // see [`SourceRangeIndex`]. A cell because `source_of_id` is a read: the
+    // index extends itself as the walk pushes ranges between asks.
+    source_range_index: std::cell::RefCell<RangeIndex>,
+    // M107: `derived_origins` the same way, for the same reason.
+    derived_origin_index: std::cell::RefCell<RangeIndex>,
     // M19 T0 (`per-module-analysis-reuse.md` §3.3): the source each `TypeId`
     // was minted in, indexed by the id's own dense counter. `Id`s get this
     // through `source_ranges`; `TypeId`s are a separate counter and had
@@ -3976,6 +4132,13 @@ pub struct Analyzer<'src> {
     // resolves (dependency-driven re-queue, item 5 v2) rather than retrying every
     // constraint every pass.
     constraints: Vec<Constraint<'src>>,
+    // M107: variable id -> the position of its FIRST `Constraint::Variable` in
+    // `constraints`, over the first `variable_constraint_indexed` entries —
+    // [`Analyzer::variable_constraint_position`]'s index. The queue only grows
+    // by `push` between the drains that take it, so the index extends; the one
+    // drain that takes it (`resolve_constraints`) empties the index too.
+    variable_constraint_index: HashMap<Id, usize>,
+    variable_constraint_indexed: usize,
     // Deferred constraints paired with the expression ids they read as
     // `Unresolved` while resolving — the inputs whose resolution should wake them.
     // A constraint is woken once any of these appears in the type maps; an empty
@@ -4109,6 +4272,21 @@ pub struct Analyzer<'src> {
     /// clones the whole `Analyzer`; a warm analysis walks its entry into that
     /// clone through the same registration).
     implementations_by_member: HashMap<&'src str, Vec<usize>>,
+    /// Trait id -> the indices into `implementations` of every impl whose
+    /// `trait_ids` names it, in the order the conformance pass resolved the
+    /// clauses (M107). Written at the one place `trait_ids` grows, so it
+    /// cannot describe a clause that does not exist — the inherited-member
+    /// scans read it instead of walking every impl in the program per lookup.
+    implementations_by_trait: HashMap<Id, Vec<usize>>,
+    /// Trait id -> the impls whose PROVIDED set (`provided_trait_args`, the
+    /// clauses closed over their supertraits) names it, split by subject head
+    /// — `type_implements_trait`'s index (M107). Rebuilt in the same breath as
+    /// the provided sets, the one place they are written.
+    provided_trait_rows: HashMap<Id, ImplHeadRows>,
+    /// `implementations_by_member`'s and `implementations_by_trait`'s rows
+    /// split by the impl's subject HEAD, built lazily per row as it is asked
+    /// about (M107) — see [`MemberRowIndex`] and [`Analyzer::nominal_rows`].
+    member_row_index: HashMap<ImplRowKey<'src>, MemberRowIndex>,
     /// Member id -> the index into `implementations` of the impl that DECLARES
     /// it, and the twin for `traits` — the inverses of each impl's and each
     /// trait's `declarations` map, keyed the way B102's bindable set asks the
@@ -6606,6 +6784,8 @@ impl<'src> Analyzer<'src> {
             drop_scan_roots: HashSet::default(),
             drop_nominals_world_digest: 0,
             sorted_source_ranges: Vec::new(),
+            source_range_index: std::cell::RefCell::new(RangeIndex::default()),
+            derived_origin_index: std::cell::RefCell::new(RangeIndex::default()),
             type_id_sources: Vec::new(),
             reuse_derived: HashMap::default(),
             reuse_unrecordable: HashSet::default(),
@@ -6618,6 +6798,8 @@ impl<'src> Analyzer<'src> {
             type_references: Vec::new(),
             external_functions: IndexMap::default(),
             constraints: Vec::new(),
+            variable_constraint_index: HashMap::default(),
+            variable_constraint_indexed: 0,
             deferred: Vec::new(),
             current_waiting_on: None,
             rigid_binder_scope: None,
@@ -6641,6 +6823,9 @@ impl<'src> Analyzer<'src> {
             impl_subject_args: HashMap::default(),
             implementations: Vec::new(),
             implementations_by_member: HashMap::default(),
+            implementations_by_trait: HashMap::default(),
+            provided_trait_rows: HashMap::default(),
+            member_row_index: HashMap::default(),
             implementation_by_declaration: HashMap::default(),
             impl_namespaces: Vec::new(),
             import_impl_restrictions: Vec::new(),
@@ -8709,7 +8894,17 @@ impl<'src> Analyzer<'src> {
         {
             return true;
         }
-        self.implementations.iter().any(|implementation| {
+        // M107: only the impls whose provided set names the trait, and of a
+        // nominal subject only its own head's and the non-nominal ones (see
+        // [`ImplHeadRows`]) — a scan of every impl in the program per question
+        // was quadratic in the package, and this is asked per comparison of a
+        // value against a trait-typed slot.
+        let Some(rows) = self.provided_trait_rows.get(&trait_id) else {
+            return false;
+        };
+        rows.candidates(subject_type).any(|index| {
+            count_impl_rows(1);
+            let implementation = &self.implementations[index];
             implementation
                 .provided_trait_args
                 .iter()
@@ -9487,11 +9682,7 @@ impl<'src> Analyzer<'src> {
     /// refused where they are written.
     fn declaring_module_source(&self, id: Id) -> Option<SourceId> {
         match self.source_of_id(id) {
-            Some(DERIVED_SOURCE) => self
-                .derived_origins
-                .iter()
-                .find(|(range, _, _)| range.contains(&id.0))
-                .map(|(_, _, source)| *source),
+            Some(DERIVED_SOURCE) => self.derived_origin_row(id).map(|(_, _, source)| *source),
             other => other,
         }
     }
@@ -19721,6 +19912,96 @@ impl<'src> Analyzer<'src> {
             .collect()
     }
 
+    /// The rows of `implementations_by_member[member_name]` that can admit a
+    /// receiver of `subject_type`, in registration order — or `None` when the
+    /// receiver is not a `Struct`/`Enum` and the whole row has to be asked.
+    fn nominal_member_rows(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> Option<Vec<usize>> {
+        let key = *self.implementations_by_member.get_key_value(member_name)?.0;
+        self.nominal_rows(subject_type, ImplRowKey::Member(key))
+    }
+
+    /// The impls with a clause for any of `traits` that can admit a receiver
+    /// of `subject_type`, ascending and without repeats — exactly the impls a
+    /// scan of `implementations` keeping those with such a clause and an
+    /// admitting subject could keep, without visiting the rest (M107). A
+    /// non-nominal receiver takes every impl of the traits.
+    fn trait_impl_rows(&mut self, subject_type: &Type, traits: &[Id]) -> Vec<usize> {
+        let mut rows: Vec<usize> = Vec::new();
+        for trait_id in traits {
+            match self.nominal_rows(subject_type, ImplRowKey::Trait(*trait_id)) {
+                Some(narrowed) => rows.extend(narrowed),
+                None => rows.extend(
+                    self.implementations_by_trait
+                        .get(trait_id)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                ),
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    /// One row's impls that can admit a receiver of `subject_type`, ascending —
+    /// or `None` when the receiver is not a `Struct`/`Enum`. See
+    /// [`MemberRowIndex`] for why a nominal receiver needs only its own head's
+    /// impls and the non-nominal ones.
+    fn nominal_rows(&mut self, subject_type: &Type, key: ImplRowKey<'src>) -> Option<Vec<usize>> {
+        let head = match subject_type {
+            Type::Struct(id, _) => ImplSubjectBucket::Struct(*id),
+            Type::Enum(id, _) => ImplSubjectBucket::Enum(*id),
+            _ => return None,
+        };
+        let source: &[usize] = match key {
+            ImplRowKey::Member(name) => self.implementations_by_member.get(name)?,
+            ImplRowKey::Trait(trait_id) => self.implementations_by_trait.get(&trait_id)?,
+        };
+        let row_len = source.len();
+        let mut index = self.member_row_index.remove(&key).unwrap_or_default();
+        let mut pending = std::mem::take(&mut index.unsettled);
+        pending.extend(source[index.indexed..row_len].iter().copied());
+        index.indexed = row_len;
+        for row in pending {
+            let subject = self.implementations[row].subject;
+            match self.borrow_type_by_type_id(subject) {
+                Type::Unknown | Type::Unresolved => index.unsettled.push(row),
+                Type::Struct(..) | Type::Enum(..) => {
+                    let bucket = self.impl_subject_bucket(subject);
+                    let rows = index.nominal.entry(bucket).or_default();
+                    let at = rows.partition_point(|existing| *existing < row);
+                    rows.insert(at, row);
+                }
+                _ => {
+                    let at = index.open.partition_point(|existing| *existing < row);
+                    index.open.insert(at, row);
+                }
+            }
+        }
+        let own: &[usize] = index.nominal.get(&head).map(Vec::as_slice).unwrap_or(&[]);
+        // Both lists ascend, so a merge keeps registration order.
+        let mut rows = Vec::with_capacity(own.len() + index.open.len());
+        let (mut left, mut right) = (0, 0);
+        while left < own.len() || right < index.open.len() {
+            let take_own =
+                right == index.open.len() || (left < own.len() && own[left] < index.open[right]);
+            if take_own {
+                rows.push(own[left]);
+                left += 1;
+            } else {
+                rows.push(index.open[right]);
+                right += 1;
+            }
+        }
+        self.member_row_index.insert(key, index);
+        Some(rows)
+    }
+
     fn impl_member_candidates(
         &mut self,
         subject_type: &Type,
@@ -19735,53 +20016,72 @@ impl<'src> Analyzer<'src> {
         // about the ~99% that were going to be dropped a line later anyway.
         // The row is in registration order, so the sequence reaching the sort
         // below is byte-for-byte the one the full scan produced.
+        // M107: and of that row, only the impls whose subject head can admit
+        // this receiver's — the same impls in the same order, without asking
+        // the comparison about every other nominal's.
+        let nominal_rows = self.nominal_member_rows(subject_type, member_name);
         let Some(declaring) = self.implementations_by_member.get(member_name) else {
             return Vec::new();
         };
+        let rows: &[usize] = nominal_rows.as_deref().unwrap_or(declaring);
+        count_impl_rows(rows.len());
         // `(member, impl subject, home trait, the home's arguments AS WRITTEN)`.
         // The written arguments are read here, where the declaring impl is in
         // hand; padding and instantiation happen below, once the immutable
         // borrow of `implementations_by_member` is released.
-        let mut found: Vec<((Id, TypeId, Option<Id>, Vec<TypeId>), bool)> = declaring
-            .iter()
-            .map(|index| &self.implementations[*index])
-            .filter(|implementation| {
-                self.impl_subject_admits(
-                    subject_type,
-                    implementation.subject.borrow_type(self),
-                    &HashMap::default(),
-                ) && !self.tuple_blanket_excludes(implementation.subject, subject_type)
-            })
-            .filter_map(|implementation| {
-                if !allow_trait_only && self.member_is_trait_only(implementation, member_name) {
-                    return None;
-                }
-                let member_id = implementation
-                    .declarations
-                    .get(member_name)
-                    .copied()
-                    .filter(|member_id| !methods_only || self.is_self_method(*member_id))?;
-                let home_trait = self.member_home_trait(implementation, member_name);
-                let written_arguments = home_trait
-                    .and_then(|trait_id| {
-                        implementation
-                            .trait_args
-                            .iter()
-                            .find(|(id, _)| *id == trait_id)
-                            .map(|(_, arguments)| arguments.clone())
-                    })
-                    .unwrap_or_default();
-                Some((
-                    (
-                        member_id,
-                        implementation.subject,
-                        home_trait,
-                        written_arguments,
-                    ),
-                    self.lookup_admits(implementation, member_name),
-                ))
-            })
-            .collect();
+        let admitted = |rows: &[usize]| -> Vec<((Id, TypeId, Option<Id>, Vec<TypeId>), bool)> {
+            rows.iter()
+                .map(|index| &self.implementations[*index])
+                .filter(|implementation| {
+                    self.impl_subject_admits(
+                        subject_type,
+                        implementation.subject.borrow_type(self),
+                        &HashMap::default(),
+                    ) && !self.tuple_blanket_excludes(implementation.subject, subject_type)
+                })
+                .filter_map(|implementation| {
+                    if !allow_trait_only && self.member_is_trait_only(implementation, member_name) {
+                        return None;
+                    }
+                    let member_id = implementation
+                        .declarations
+                        .get(member_name)
+                        .copied()
+                        .filter(|member_id| !methods_only || self.is_self_method(*member_id))?;
+                    let home_trait = self.member_home_trait(implementation, member_name);
+                    let written_arguments = home_trait
+                        .and_then(|trait_id| {
+                            implementation
+                                .trait_args
+                                .iter()
+                                .find(|(id, _)| *id == trait_id)
+                                .map(|(_, arguments)| arguments.clone())
+                        })
+                        .unwrap_or_default();
+                    Some((
+                        (
+                            member_id,
+                            implementation.subject,
+                            home_trait,
+                            written_arguments,
+                        ),
+                        self.lookup_admits(implementation, member_name),
+                    ))
+                })
+                .collect()
+        };
+        let mut found = admitted(rows);
+        // The index is a narrowing of the scan, so in a debug build the scan
+        // runs beside it and the two must agree — the inference suite is the
+        // differential.
+        #[cfg(debug_assertions)]
+        if nominal_rows.is_some() {
+            debug_assert_eq!(
+                found,
+                admitted(declaring),
+                "M107: the head index dropped a candidate for `{member_name}`"
+            );
+        }
         let declared: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> = found
             .iter()
             .map(|(candidate, _)| candidate.clone())
@@ -19864,7 +20164,7 @@ impl<'src> Analyzer<'src> {
     /// a blanket that declares `tag` contributes nothing and the trait's default
     /// is unreachable for `Foo` in either declaration order.
     fn inheriting_impls_of_declared_homes(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
         declared: &[(Id, TypeId, Option<Id>, Vec<TypeId>)],
@@ -19876,21 +20176,17 @@ impl<'src> Analyzer<'src> {
         if homes.is_empty() {
             return Vec::new();
         }
-        self.implementations
-            .iter()
+        // M103: the home test before the subject comparison — a recursive
+        // type walk per impl, and the expensive half. M107: and the home test
+        // by INDEX — the impls with a clause for one of the homes, and of a
+        // nominal receiver's head — instead of a pass over every impl in the
+        // program per method lookup, which made the lookup quadratic in the
+        // package. The rows ascend, so the order is the scan's.
+        let rows = self.trait_impl_rows(subject_type, &homes);
+        count_impl_rows(rows.len());
+        rows.iter()
+            .map(|index| &self.implementations[*index])
             .filter(|implementation| !implementation.declarations.contains_key(member_name))
-            // M103: the home test before the subject comparison — a recursive
-            // type walk per impl, and the expensive half. An impl of none of
-            // the homes is dropped by the `find` below whatever its subject,
-            // so asking the comparison about it first only cost the walk:
-            // every impl in the program per method lookup, which grew with
-            // each pipe node std declared.
-            .filter(|implementation| {
-                implementation
-                    .trait_ids
-                    .iter()
-                    .any(|trait_id| homes.contains(trait_id))
-            })
             .filter(|implementation| {
                 INHERITED_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
                 self.impl_subject_admits(
@@ -23100,24 +23396,28 @@ impl<'src> Analyzer<'src> {
         let mut providers: Vec<(usize, bool)> = Vec::new();
         // Per trait, whether it has a method of this name — asked once per
         // trait rather than once per impl that provides it.
-        let mut trait_has_member: HashMap<Id, bool> = HashMap::default();
-        for (index, implementation) in self
-            .implementations
-            .iter()
-            .enumerate()
-            // M103: the trait test before the subject comparison, for
-            // `inheriting_impls_of_declared_homes`' reason — an impl none
-            // of whose traits has a method of this name reaches nothing in
-            // the loop below, so the comparison's type walk was spent on
-            // every other impl in the program per lookup.
-            .filter(|(_, implementation)| {
-                implementation.trait_ids.iter().any(|trait_id| {
-                    *trait_has_member.entry(*trait_id).or_insert_with(|| {
-                        self.method_member_in_trait(*trait_id, member_name)
-                            .is_some()
-                    })
-                })
+        // M103: the trait test before the subject comparison, for
+        // `inheriting_impls_of_declared_homes`' reason — an impl none of whose
+        // traits has a method of this name reaches nothing in the loop below.
+        // M107: and by index, as there — the traits with such a method, then
+        // their impls of a nominal receiver's head, ascending.
+        let mut providing_traits: Vec<Id> = self
+            .implementations_by_trait
+            .keys()
+            .copied()
+            .filter(|trait_id| {
+                self.method_member_in_trait(*trait_id, member_name)
+                    .is_some()
             })
+            .collect();
+        // The union is sorted by impl index below; this only makes the
+        // trait walk itself deterministic.
+        providing_traits.sort_unstable_by_key(|trait_id| trait_id.0);
+        let rows = self.trait_impl_rows(subject_type, &providing_traits);
+        count_impl_rows(rows.len());
+        for (index, implementation) in rows
+            .iter()
+            .map(|index| (*index, &self.implementations[*index]))
             .filter(|(_, implementation)| {
                 INHERITED_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
                 self.impl_subject_admits(
@@ -32017,9 +32317,7 @@ impl<'src> Analyzer<'src> {
     fn admitting_source_of(&self, anchor: Id) -> Option<SourceId> {
         match self.source_of_id(anchor)? {
             DERIVED_SOURCE => self
-                .derived_origins
-                .iter()
-                .find(|(range, _, _)| range.contains(&anchor.0))
+                .derived_origin_row(anchor)
                 .map(|(_, _, source)| *source),
             source => Some(source),
         }
@@ -45411,9 +45709,7 @@ impl<'src> Analyzer<'src> {
     /// walk produced it, hence which attribute to re-anchor at.
     fn redirect_derived_diagnostics(&mut self, from: usize, anchor: Id) {
         let Some((origin_span, origin_source)) = self
-            .derived_origins
-            .iter()
-            .find(|(range, _, _)| range.contains(&anchor.0))
+            .derived_origin_row(anchor)
             .map(|(_, span, source)| (*span, *source))
         else {
             return;
@@ -45558,10 +45854,27 @@ impl<'src> Analyzer<'src> {
             let (_, end, source) = *self.sorted_source_ranges.get(index.checked_sub(1)?)?;
             return (id.0 < end).then_some(source);
         }
-        self.source_ranges
-            .iter()
-            .find(|range| id.0 >= range.start && id.0 < range.end)
-            .map(|range| range.source)
+        // M107: and before the seal, the index the ranges pushed so far
+        // extend. The constraint fixpoint asks this per diagnostic anchor and
+        // per call site, so the scan it replaces was quadratic in the module
+        // count (6.5% of a 49k-line check).
+        let position = self.source_range_index.borrow_mut().find(
+            &self.source_ranges,
+            |range| (range.start, range.end),
+            id.0,
+        )?;
+        Some(self.source_ranges[position].source)
+    }
+
+    /// The `derived_origins` row whose generated walk produced `id` — the first
+    /// whose range contains it (M107: an index rather than a scan per ask).
+    fn derived_origin_row(&self, id: Id) -> Option<&(std::ops::Range<u32>, Span, SourceId)> {
+        let position = self.derived_origin_index.borrow_mut().find(
+            &self.derived_origins,
+            derived_origin_bounds,
+            id.0,
+        )?;
+        self.derived_origins.get(position)
     }
 
     /// Projects `frozen_sources` onto entity-id space for `frozen_entity`'s
@@ -46006,6 +46319,8 @@ impl<'src> Analyzer<'src> {
         // The sort is stable — tasks of one kind keep their original source order
         // — and the queue is already near-sorted, so it stays cheap.
         let mut queue = std::mem::take(&mut self.constraints);
+        self.variable_constraint_index.clear();
+        self.variable_constraint_indexed = 0;
         queue.sort_by_key(|constraint| constraint.priority());
         for constraint in queue {
             self.current_waiting_on = Some(Vec::new());
@@ -55076,13 +55391,46 @@ impl<'src> Analyzer<'src> {
             });
             return;
         }
-        if let Some(Constraint::Variable(constraint)) =
-            self.constraints.iter_mut().find(|constraint| {
-                matches!(constraint, Constraint::Variable(constraint) if constraint.variable_id == variable_id)
-            })
+        if let Some(position) = self.variable_constraint_position(variable_id)
+            && let Some(Constraint::Variable(constraint)) = self.constraints.get_mut(position)
         {
             constraint.value_ids.push(value_id);
         }
+    }
+
+    /// The position in `constraints` of the first `Constraint::Variable` for
+    /// `variable_id` — what a scan of the queue per assignment answered, which
+    /// made wiring a program's assignments quadratic in its size (M107: every
+    /// assignment walked every queued constraint). The index extends over the
+    /// entries pushed since it last looked; a queue that shrank (taken by a
+    /// drain) restarts it, and an entry that no longer matches is re-scanned
+    /// rather than trusted, so the answer is the scan's.
+    fn variable_constraint_position(&mut self, variable_id: Id) -> Option<usize> {
+        if self.variable_constraint_indexed > self.constraints.len() {
+            self.variable_constraint_index.clear();
+            self.variable_constraint_indexed = 0;
+        }
+        for position in self.variable_constraint_indexed..self.constraints.len() {
+            if let Constraint::Variable(constraint) = &self.constraints[position] {
+                self.variable_constraint_index
+                    .entry(constraint.variable_id)
+                    .or_insert(position);
+            }
+        }
+        self.variable_constraint_indexed = self.constraints.len();
+        let position = *self.variable_constraint_index.get(&variable_id)?;
+        let matches = matches!(
+            self.constraints.get(position),
+            Some(Constraint::Variable(constraint)) if constraint.variable_id == variable_id
+        );
+        if matches {
+            return Some(position);
+        }
+        self.variable_constraint_index.clear();
+        self.variable_constraint_indexed = 0;
+        self.constraints.iter().position(|constraint| {
+            matches!(constraint, Constraint::Variable(constraint) if constraint.variable_id == variable_id)
+        })
     }
 
     /// The resolution preamble and the constraint fixpoint — everything
@@ -56268,6 +56616,12 @@ impl<'src> Analyzer<'src> {
             if let Some(implementation) = self.implementations.get_mut(implementation_index) {
                 implementation.trait_ids.push(trait_id);
                 implementation.trait_args.push((trait_id, trait_arguments));
+                // M107's reverse index, written in the same breath as the
+                // clause it describes.
+                self.implementations_by_trait
+                    .entry(trait_id)
+                    .or_default()
+                    .push(implementation_index);
             }
             let trait_type_id = Type::Trait(trait_id, Vec::new()).get_type_id(self);
             self.type_references
@@ -56302,6 +56656,26 @@ impl<'src> Analyzer<'src> {
             }
             self.implementations[index].provided_trait_args = provided;
         }
+        // M107: `type_implements_trait`'s index over the sets just written.
+        let mut provided_trait_rows: HashMap<Id, ImplHeadRows> = HashMap::default();
+        for (index, implementation) in self.implementations.iter().enumerate() {
+            let head = match implementation.subject.borrow_type(self) {
+                Type::Unknown | Type::Unresolved => None,
+                Type::Struct(..) | Type::Enum(..) => {
+                    Some(Some(self.impl_subject_bucket(implementation.subject)))
+                }
+                _ => Some(None),
+            };
+            for (trait_id, _) in &implementation.provided_trait_args {
+                let rows = provided_trait_rows.entry(*trait_id).or_default();
+                match head {
+                    None => rows.unsettled.push(index),
+                    Some(Some(bucket)) => rows.nominal.entry(bucket).or_default().push(index),
+                    Some(None) => rows.open.push(index),
+                }
+            }
+        }
+        self.provided_trait_rows = provided_trait_rows;
 
         for (id, subject_type_id, member_name) in std::mem::take(&mut self.prepped_static_accessors)
         {
@@ -61604,6 +61978,11 @@ pub struct Program<'src> {
     // Computed once here because the coloring walk asks per reachable node.
     pub canonical_sources: Vec<PathBuf>,
     pub source_ranges: Vec<SourceRange>,
+    /// Whether `source_ranges` is ascending and disjoint, checked once on
+    /// first ask ([`Program::source_lookup`]) — every `source_of` binary-
+    /// searches on it (M107). Nothing writes `source_ranges` after the program
+    /// is built, which is what makes caching the answer sound.
+    source_ranges_searchable: std::sync::OnceLock<bool>,
     /// The sources that ARE std: every module loaded with `Origin::Std`,
     /// overlaid or off disk — never the entry. This is the RESIDENCE question,
     /// the one "is this the standard library's own declaration?" means, and it
@@ -61642,6 +62021,9 @@ pub struct Program<'src> {
     /// and every whole-program pass reaches it through
     /// [`Program::diagnostic_source_of`].
     pub derived_origins: Vec<(std::ops::Range<u32>, Span, SourceId)>,
+    /// `derived_origins` indexed by range, built on first ask (M107);
+    /// nothing writes the rows after the program is built.
+    derived_origin_index: std::sync::OnceLock<RangeIndex>,
     // Library layer roots with their platform patterns (plus base roots with
     // empty patterns, marking library territory) — the seeds and the
     // user-code test for platform coloring (`platform_color`). Roots are
@@ -62215,11 +62597,13 @@ impl<'src> Program<'src> {
         self.member_headers.get(owner).map(String::as_str)
     }
 
+    /// The source file an entity was walked from — a binary search over the
+    /// ranges (M107: the platform-coloring walk asks this per arrival, and the
+    /// linear scan it was made that walk quadratic in the module count),
+    /// falling back to the scan if the ranges are ever not ascending and
+    /// disjoint, so the answer is the scan's under every ordering.
     pub fn source_of(&self, id: Id) -> Option<SourceId> {
-        self.source_ranges
-            .iter()
-            .find(|range| id.0 >= range.start && id.0 < range.end)
-            .map(|range| range.source)
+        self.source_lookup().of(id)
     }
 
     /// [`Self::source_of`], hoisted out of a whole-program loop (M27).
@@ -62234,14 +62618,15 @@ impl<'src> Program<'src> {
     /// scan `source_of` runs when they are not, so the lookup is
     /// answer-identical to `source_of` for every id under every ordering.
     pub fn source_lookup(&self) -> SourceLookup<'_> {
-        let searchable = self
-            .source_ranges
-            .windows(2)
-            .all(|pair| pair[0].end <= pair[1].start)
-            && self
-                .source_ranges
-                .iter()
-                .all(|range| range.start <= range.end);
+        let searchable = *self.source_ranges_searchable.get_or_init(|| {
+            self.source_ranges
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start)
+                && self
+                    .source_ranges
+                    .iter()
+                    .all(|range| range.start <= range.end)
+        });
         SourceLookup {
             ranges: &self.source_ranges,
             searchable,
@@ -62288,9 +62673,14 @@ impl<'src> Program<'src> {
         if self.source_of(id) != Some(DERIVED_SOURCE) {
             return None;
         }
+        let index = self.derived_origin_index.get_or_init(|| {
+            let mut index = RangeIndex::default();
+            index.extend(&self.derived_origins, derived_origin_bounds);
+            index
+        });
+        let position = index.search(&self.derived_origins, derived_origin_bounds, id.0)?;
         self.derived_origins
-            .iter()
-            .find(|(range, _, _)| range.contains(&id.0))
+            .get(position)
             .map(|(_, span, source)| (*span, *source))
     }
 
@@ -67854,6 +68244,15 @@ fn analyze_inner<'src>(
             Origin::Pkg => (2, 0, name),
         }
     }
+    /// [`load_order_key`]'s inverse — the key is injective, which is what
+    /// lets the drain's heap hold keys alone (M107).
+    fn load_order_entry(key: (u8, usize, &str)) -> (Origin, &str) {
+        match key {
+            (0, _, name) => (Origin::Std, name),
+            (1, index, name) => (Origin::Dep(index), name),
+            (_, _, name) => (Origin::Pkg, name),
+        }
+    }
     /// A65: the entity a module PATH denotes, created if this analysis has not
     /// met it yet — the parent chain first, so `lib::ui` exists before
     /// `lib::ui::widget` registers under it.
@@ -68328,7 +68727,14 @@ fn analyze_inner<'src>(
         // only the traversal order is canonicalized. The always-loaded core
         // modules (`boolean`, `list`, ...) fold into this rule rather than
         // keeping their seed-list order.
-        while !to_load.is_empty() {
+        // M107: the resolved module paths waiting to load, as a min-heap on
+        // `load_order_key` (injective over `(origin, path)`, so the heap's
+        // minimum is the one the canonical drain below names). The drain used
+        // to keep them in `to_load`, re-resolve every one and scan them all for
+        // the minimum per module loaded — quadratic in a package's modules.
+        let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<(u8, usize, &str)>> =
+            std::collections::BinaryHeap::new();
+        while !to_load.is_empty() || !ready.is_empty() {
             // A65: each pending entry is an import PATH (`lib::ui::widget::hello`);
             // the loader loads MODULES. Map every one to the longest prefix that
             // names a module here — or, failing that, the module DIRECTORY it
@@ -68376,19 +68782,17 @@ fn analyze_inner<'src>(
                             }
                         })
                     });
+                // A resolved path resolves to itself (it is the longest
+                // prefix naming a module or namespace), so it is resolved once
+                // and waits in `ready`.
                 if let Some(resolved) = resolved {
-                    to_load.push((origin, resolved));
+                    ready.push(std::cmp::Reverse(load_order_key((origin, resolved))));
                 }
             }
-            if to_load.is_empty() {
+            let Some(std::cmp::Reverse(next)) = ready.pop() else {
                 break;
-            }
-            let next = (0..to_load.len())
-                .min_by(|&left, &right| {
-                    load_order_key(to_load[left]).cmp(&load_order_key(to_load[right]))
-                })
-                .expect("to_load is non-empty");
-            let (origin, name) = to_load.swap_remove(next);
+            };
+            let (origin, name) = load_order_entry(next);
             if !loaded_keys.insert((origin, name)) {
                 continue;
             }
@@ -71482,10 +71886,12 @@ fn analyze_over_world<'src>(
         sources,
         source_hashes,
         source_ranges: std::mem::take(&mut analyzer.source_ranges),
+        source_ranges_searchable: std::sync::OnceLock::new(),
         std_sources: std::mem::take(&mut analyzer.std_sources),
         frozen_sources: std::mem::take(&mut analyzer.frozen_sources),
         dependency_sources: std::mem::take(&mut analyzer.dependency_sources),
         derived_origins: std::mem::take(&mut analyzer.derived_origins),
+        derived_origin_index: std::sync::OnceLock::new(),
         layer_platforms,
         diagnostic_sources,
         member_name_spans: analyzer.member_name_spans,
