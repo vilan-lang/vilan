@@ -298,6 +298,11 @@ written down.
 
 ---
 
+<!-- family: breaking -->
+**Rule 4 refuses a write that replaces a PART of a root holding a live view — `match first(&mut bag) { Some(let p) => { bag.items = [P { x = 50 }]; p.x = 7; } }` — with "cannot reassign 'bag.items' while a view into it is live: the view points into the storage this write replaces (rule 4: …)", where it compiled and the write through `p` landed on the element the list no longer held (JS printed `items[0].x=50`; natively rustc refused the emitted borrow).** E1 fired only on a reassignment of the WHOLE root (`bag = ..`), though §6.4 already said "the viewed root (or an enclosing place)". The scan now knows where under its root each view points (`compute_view_anchors`, mirroring `compute_view_origins`' sources): a `&place` names its place, a `for e in &mut c` loop an element of `c`, and a `borrows` call's view or a wrapped-view capture may sit anywhere under the place the call was lent. An assignment to an AGGREGATE place is an event when it is a prefix of a live view's path (or, for a call's view, overlaps the lent place at all): `bag.items = ..` under a view of `bag.items[0]`, of `bag.items`, under a loop over `&mut bag.items`, `bag.items[0] = ..` under a view of an element, and `outer.bag.items = []` under `first(&mut outer.bag)`. A write beside the viewed path, a write below it, and a SCALAR write (a content write the view reads through, `bag.count = 3` under the capture, `numbers[0] = 10` beside `&mut numbers[2]`) stay legal. Pins: `inference::borrows`' `b529_a_write_to_the_part_of_the_root_a_live_view_points_into_is_refused` (six shapes, papers-46's `b9_wrapped_subject_write.vl` first) and `b529_a_write_beside_a_live_view_is_still_legal` — the first red on the 0.43.0 toolchain. Ledger: one `NEW` row. Docs: `memory.md` §6.4. The corpus, the docs, the examples and kolt carry none. No golden moves. Tracker B529.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

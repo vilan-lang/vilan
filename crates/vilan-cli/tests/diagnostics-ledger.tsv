@@ -644,3 +644,4 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 619	-	`{type}` is not a trait: a selector's `with` names the trait the block implements, as its declaration does (`(impl Box with One)` selects `impl Box with One`)
 620	-	a declaration's attributes are written in one order — `[derive]` and the other generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform]`, `[resource]`: write `{canonical}`
 NEW	-	the left side of this assignment is not a place: it is {what} — only a place can be assigned: a binding (`x`), a field (`p.x`), an element (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a `&mut` view
+NEW	-	cannot reassign '{place}' while a view into it is live: the view points into the storage this write replaces (rule 4: no invalidating mutation under a live view).

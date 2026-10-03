@@ -691,6 +691,97 @@ fn b522_every_place_shape_still_assigns() {
     );
 }
 
+/// B529's shapes: a `Bag` whose `items` a view reaches into, and `first`, a
+/// `borrows` function handing back a wrapped view of an element.
+const B529_PRELUDE: &str = r#"
+    import std::io::print;
+    import std::option::Option::{ self, None, Some };
+
+    struct P { x: i32 }
+    struct Bag { items: List<P>, count: i32 }
+    struct Outer { bag: Bag, label: str }
+
+    fun first(bag: &mut Bag): Option<&mut P> {
+        if bag.items.len() > 0 { Some(&mut bag.items[0]) } else { None }
+    }
+"#;
+
+/// B529: rule 4 refuses a write to a PART of the root that holds a live view
+/// — `bag.items = [..]` under a wrapped-view capture of `first(&mut bag)`
+/// (papers-46's `b9_wrapped_subject_write.vl`: JS printed `items[0].x=50`, the
+/// write through `p` lost), under a `&mut bag.items[0]`, under a `for e in &mut
+/// bag.items`, and the element itself (`bag.items[0] = ..`). E1 fired only on a
+/// reassignment of the WHOLE root.
+#[test]
+fn b529_a_write_to_the_part_of_the_root_a_live_view_points_into_is_refused() {
+    for body in [
+        // The item's repro: the wrapped capture.
+        "match first(&mut bag) {
+            Some(let p) => { bag.items = [P { x = 50 }]; p.x = 7; },
+            None => {},
+        }",
+        // A `borrows` call's result bound by `let`, through a nested place.
+        "mut outer = Outer { bag = bag, label = \"o\" };
+        match first(&mut outer.bag) {
+            Some(let p) => { outer.bag.items = []; p.x = 7; },
+            None => {},
+        }
+        print(outer.label);",
+        // A direct view of an element, and of the list itself.
+        "let q = &mut bag.items[0]; bag.items = [P { x = 60 }]; q.x = 8;",
+        "let q = &mut bag.items; bag.items = []; q.push(P { x = 1 });",
+        "let q = &mut bag.items[0]; bag.items[0] = P { x = 60 }; q.x = 8;",
+        // A loop view of the elements.
+        "for e in &mut bag.items { bag.items = []; e.x = 1; }",
+    ] {
+        let source = format!(
+            "{B529_PRELUDE}
+            fun main() {{
+                mut bag = Bag {{ items = [P {{ x = 1 }}], count = 0 }};
+                {body}
+                print(bag.count);
+            }}"
+        );
+        assert_fails_once_with(&source, "while a view into it is live");
+    }
+}
+
+/// B529's other side: a write that replaces no storage a live view points
+/// into stays legal — a sibling field of an exact view, a write below the
+/// viewed place, a SCALAR written under a capture (a content write, which a
+/// view reads through), a scalar element beside a scalar element's view, a
+/// write through the view itself, and a write after the view's block ends.
+#[test]
+fn b529_a_write_beside_a_live_view_is_still_legal() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B529_PRELUDE}
+            fun main() {{
+                mut bag = Bag {{ items = [P {{ x = 1 }}], count = 0 }};
+                {{
+                    let q = &mut bag.items[0];
+                    bag.count = 5;
+                    q.x = 8;
+                    bag.items[0].x = 9;
+                }}
+                match first(&mut bag) {{
+                    Some(let p) => {{ bag.count = 6; p.x = 7; }},
+                    None => {{}},
+                }}
+                mut numbers = [1, 2, 3];
+                {{
+                    let third = &mut numbers[2];
+                    numbers[0] = 10;
+                    third += 1;
+                }}
+                bag.items = [P {{ x = 2 }}, P {{ x = 3 }}];
+                print(i\"{{bag.count}} {{bag.items[0].x}} {{bag.items.len()}} {{numbers[0]}} {{numbers[2]}}\");
+            }}"
+        ),
+        "6 2 2 10 4\n",
+    );
+}
+
 #[test]
 fn transparent_references_reject_mut_view_binding() {
     // R7: a view binding cannot be `mut` — a view cannot be rebound.

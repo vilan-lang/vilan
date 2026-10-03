@@ -1214,6 +1214,70 @@ pub struct Parameter<'src> {
 struct InvalidationScan<'a> {
     view_origins: &'a HashMap<Id, Vec<Id>>,
     view_bindings: &'a HashSet<Id>,
+    /// Where under its root each view points (B529) — what tells a write to
+    /// a PART of the root that contains the view from one beside it.
+    view_anchors: &'a HashMap<Id, Vec<ViewAnchor>>,
+}
+
+/// One step of a place's path below its root binding (B529): a struct field
+/// by index, a tuple slot by flat offset, or a list element at any index (the
+/// container is rule 4's element granularity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaceStep {
+    Field(usize),
+    Slot(usize),
+    Element,
+}
+
+/// How far below its anchor place a view may point (B529).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorDepth {
+    /// At the place itself (`&bag.items[0]`).
+    Exact,
+    /// At an element of it (`for e in &mut bag.items`).
+    Element,
+    /// Anywhere at or under it (a `borrows` call's result, which may hand back
+    /// any part of what it was lent).
+    Unknown,
+}
+
+/// Where a view binding points under its origin root (B529).
+#[derive(Clone, Debug)]
+struct ViewAnchor {
+    root: Id,
+    path: Vec<PlaceStep>,
+    depth: AnchorDepth,
+}
+
+impl ViewAnchor {
+    /// Whether assigning the (aggregate) place `root.written` replaces
+    /// storage this view may point into: the written path is a prefix of the
+    /// viewed one (for an unknown depth, either path a prefix of the other —
+    /// the view may sit anywhere under its anchor, so an aggregate written
+    /// below the anchor may be the storage that holds it).
+    fn overwritten_by(&self, root: Id, written: &[PlaceStep]) -> bool {
+        if self.root != root {
+            return false;
+        }
+        let is_prefix = |shorter: &[PlaceStep], longer: &[PlaceStep]| {
+            shorter.len() <= longer.len()
+                && shorter
+                    .iter()
+                    .zip(longer)
+                    .all(|(left, right)| left == right)
+        };
+        match self.depth {
+            AnchorDepth::Exact => is_prefix(written, &self.path),
+            AnchorDepth::Element => {
+                let mut viewed = self.path.clone();
+                viewed.push(PlaceStep::Element);
+                is_prefix(written, &viewed)
+            }
+            AnchorDepth::Unknown => {
+                is_prefix(written, &self.path) || is_prefix(&self.path, written)
+            }
+        }
+    }
 }
 
 /// One rule-4 violation, by invalidating event kind (view-invalidation.md):
@@ -1221,6 +1285,12 @@ struct InvalidationScan<'a> {
 /// passing the root by `&mut` — as the receiver, or an explicit argument).
 enum InvalidationViolation<'src> {
     Reassignment {
+        anchor: Id,
+        root: Id,
+    },
+    /// E1 at a PART of the root that holds the view (B529): `bag.items = ..`
+    /// under a view of `bag.items[0]`.
+    PartReassignment {
         anchor: Id,
         root: Id,
     },
@@ -26576,6 +26646,212 @@ impl<'src> Analyzer<'src> {
         roots
     }
 
+    /// A place as its root binding and the steps down from it (`bag.items[i]`
+    /// → `bag`, `[Field(items), Element]`) — [`Self::place_root`] keeping the
+    /// path. B529.
+    fn place_path(&self, expr_id: Id) -> Option<(Id, Vec<PlaceStep>)> {
+        match self.expr_id_to_expr_map.get(&expr_id)? {
+            Expr::Local(binding_id) => Some((*binding_id, Vec::new())),
+            Expr::Field(subject_id, _, index) => {
+                let (root, mut path) = self.place_path(*subject_id)?;
+                path.push(PlaceStep::Field(*index));
+                Some((root, path))
+            }
+            Expr::TupleIndex(subject_id, offset, _) => {
+                let (root, mut path) = self.place_path(*subject_id)?;
+                path.push(PlaceStep::Slot(*offset));
+                Some((root, path))
+            }
+            Expr::Index(subject_id, _) => {
+                let (root, mut path) = self.place_path(*subject_id)?;
+                path.push(PlaceStep::Element);
+                Some((root, path))
+            }
+            Expr::Dereference(operand_id) => self.place_path(*operand_id),
+            _ => None,
+        }
+    }
+
+    /// Whether a call's result is a view into its arguments: its callee
+    /// returns a `&`/`&mut` view, or a wrapped one (`Option<&mut T>`). B529.
+    fn call_hands_back_a_view(&self, call_id: Id) -> bool {
+        if self.call_returns_wrapped_view(call_id).is_some() {
+            return true;
+        }
+        let Some(function_call) = self.function_calls.get(&call_id) else {
+            return false;
+        };
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return false;
+        };
+        if let Some(function) = self.functions.get(callee_id) {
+            return function.returns_view || function.returns_mut_view;
+        }
+        self.external_functions
+            .get(callee_id)
+            .is_some_and(|external| !external.borrows.is_empty())
+    }
+
+    /// B529: WHERE under its origin root each view binding points — the
+    /// place a `&place` names, a `for e in &mut c` loop's element of `c`, or,
+    /// for a `borrows` call's result and a wrapped-view `match` capture, the
+    /// projected argument's place with an unknown suffix below it (the callee
+    /// may hand back any part of what it was lent). Mirrors
+    /// [`Self::compute_view_origins`]' sources; a view this does not reach
+    /// keeps rule 4's root-only reading.
+    ///
+    /// Rule 4's E1 used to fire only on a reassignment of the WHOLE root, so a
+    /// write to a part of it that contains the view — `bag.items = [..]`
+    /// under a view of `bag.items[0]`, or under `match first(&mut bag) {
+    /// Some(let p) => .. }` — passed, and the write through the view then
+    /// landed on storage the root no longer held.
+    fn compute_view_anchors(&self) -> HashMap<Id, Vec<ViewAnchor>> {
+        let mut anchors: HashMap<Id, Vec<ViewAnchor>> = HashMap::default();
+        let anchor_of = |place_id: Id, depth: AnchorDepth| {
+            self.place_path(place_id)
+                .map(|(root, path)| ViewAnchor { root, path, depth })
+        };
+        for expr in self.expr_id_to_expr_map.values() {
+            let Expr::ForEach(iterable, Some(item), _) = expr else {
+                continue;
+            };
+            if !self.for_each_views.contains_key(item) {
+                continue;
+            }
+            let operand = match self.expr_id_to_expr_map.get(iterable) {
+                Some(Expr::Reference(operand, _)) => *operand,
+                _ => *iterable,
+            };
+            if let Some(anchor) = anchor_of(operand, AnchorDepth::Element) {
+                anchors.insert(*item, vec![anchor]);
+            }
+        }
+        // A call's result reaches somewhere under each projected argument: a
+        // view binding there forwards its own anchors, deepened to unknown.
+        let call_anchors = |call_id: Id, anchors: &HashMap<Id, Vec<ViewAnchor>>| {
+            let mut found: Vec<ViewAnchor> = Vec::new();
+            // Only a call that HANDS BACK a view (a `&`/`&mut` return, or a
+            // wrapped one) leaves something pointing into its argument: a
+            // by-value return of `&self.inner` projects a copy (B109).
+            if !self.call_hands_back_a_view(call_id) {
+                return found;
+            }
+            for place_id in self.projected_argument_ids(call_id) {
+                let forwarded = match self.expr_id_to_expr_map.get(&place_id) {
+                    Some(Expr::Local(binding)) => anchors.get(binding).cloned(),
+                    _ => None,
+                };
+                match forwarded {
+                    Some(forwarded) => {
+                        found.extend(forwarded.into_iter().map(|anchor| ViewAnchor {
+                            depth: AnchorDepth::Unknown,
+                            ..anchor
+                        }))
+                    }
+                    None => found.extend(anchor_of(place_id, AnchorDepth::Unknown)),
+                }
+            }
+            found
+        };
+        let seeded: Vec<(Id, Id)> = self
+            .variables
+            .values()
+            .filter_map(|variable| variable.initial.map(|initial| (variable.id, initial)))
+            .collect();
+        let wrapped_captures: Vec<(Id, Id)> = self
+            .expr_id_to_expr_map
+            .values()
+            .filter_map(|expr| match expr {
+                Expr::Match(subject_id, legs) => Some((*subject_id, legs)),
+                _ => None,
+            })
+            .flat_map(|(subject_id, legs)| {
+                legs.iter().filter_map(move |leg| {
+                    let ExprPattern::Variant(_, _, sub_patterns) = &leg.pattern else {
+                        return None;
+                    };
+                    let [ExprPattern::Binding(capture_id)] = sub_patterns.as_slice() else {
+                        return None;
+                    };
+                    self.wrapped_view_captures
+                        .contains_key(capture_id)
+                        .then_some((*capture_id, subject_id))
+                })
+            })
+            .collect();
+        loop {
+            let mut changed = false;
+            for (variable_id, initial) in &seeded {
+                if anchors.contains_key(variable_id) {
+                    continue;
+                }
+                let found = match self.expr_id_to_expr_map.get(initial) {
+                    Some(Expr::Reference(operand_id, _)) => {
+                        anchor_of(*operand_id, AnchorDepth::Exact).map(|anchor| vec![anchor])
+                    }
+                    Some(Expr::Local(source_id)) => anchors.get(source_id).cloned(),
+                    Some(Expr::Call(call_id)) => {
+                        Some(call_anchors(*call_id, &anchors)).filter(|found| !found.is_empty())
+                    }
+                    _ => None,
+                };
+                if let Some(found) = found {
+                    anchors.insert(*variable_id, found);
+                    changed = true;
+                }
+            }
+            for (capture_id, subject_id) in &wrapped_captures {
+                if anchors.contains_key(capture_id) {
+                    continue;
+                }
+                let mut leaves = Vec::new();
+                self.collect_tail_leaves(*subject_id, &mut leaves);
+                let mut found: Vec<ViewAnchor> = Vec::new();
+                for leaf in leaves {
+                    match self.expr_id_to_expr_map.get(&leaf) {
+                        Some(Expr::Call(call_id)) => {
+                            let from_call = call_anchors(*call_id, &anchors);
+                            if !from_call.is_empty() {
+                                found.extend(from_call);
+                                continue;
+                            }
+                            // An inline transient `Some(&mut place)`.
+                            let Some(function_call) = self.function_calls.get(call_id) else {
+                                continue;
+                            };
+                            for argument_id in &function_call.argument_ids {
+                                match self.expr_id_to_expr_map.get(argument_id) {
+                                    Some(Expr::Reference(operand, _)) => {
+                                        found.extend(anchor_of(*operand, AnchorDepth::Exact));
+                                    }
+                                    Some(Expr::Local(binding)) => {
+                                        found.extend(
+                                            anchors.get(binding).cloned().unwrap_or_default(),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Some(Expr::Local(binding)) => {
+                            found.extend(anchors.get(binding).cloned().unwrap_or_default());
+                        }
+                        _ => {}
+                    }
+                }
+                if !found.is_empty() {
+                    anchors.insert(*capture_id, found);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        anchors
+    }
+
     /// Slice 4 (primitive-local view boxing): scalar locals that have a view
     /// taken of them. A JS number isn't addressable, so a viewed scalar local is
     /// boxed into a one-slot cell `[value]`; its reads/writes go through `[0]`
@@ -27296,9 +27572,11 @@ impl<'src> Analyzer<'src> {
         // No early return on an empty set: the signature rule (below) must
         // run even in a program with no view BINDINGS at all — an async
         // function's `&mut` parameter is the violation by itself.
+        let view_anchors = self.compute_view_anchors();
         let scanner = InvalidationScan {
             view_origins: &view_origins,
             view_bindings: &view_bindings,
+            view_anchors: &view_anchors,
         };
         let bodies: Vec<(Id, Vec<Id>, Id)> = self
             .functions
@@ -27421,6 +27699,18 @@ impl<'src> Analyzer<'src> {
                         anchor,
                         format!(
                             "cannot reassign '{name}' while a view into it is live (rule 4: no invalidating mutation under a live view)."
+                        ),
+                    )
+                }
+                InvalidationViolation::PartReassignment { anchor, root } => {
+                    let name = self.variables.get(&root).map(|v| v.name).unwrap_or("value");
+                    let place = self.receiver_spelling(anchor).unwrap_or(name);
+                    (
+                        anchor,
+                        format!(
+                            "cannot reassign '{place}' while a view into it is live: the view \
+                             points into the storage this write replaces (rule 4: no \
+                             invalidating mutation under a live view)."
                         ),
                     )
                 }
@@ -28111,6 +28401,26 @@ impl<'src> Analyzer<'src> {
                     violations.push(InvalidationViolation::Reassignment {
                         anchor: target_id,
                         root: *root_id,
+                    });
+                } else if let Some((root_id, written)) = self.place_path(target_id)
+                    && !written.is_empty()
+                    // A SCALAR place holds no storage a view could point
+                    // into: writing it is a content write, which a view of it
+                    // reads through (§6.4 permits overlapping content writes).
+                    && !self.place_is_scalar(target_id)
+                    && live.iter().any(|view| {
+                        scan.view_anchors.get(view).is_some_and(|anchors| {
+                            anchors
+                                .iter()
+                                .any(|anchor| anchor.overwritten_by(root_id, &written))
+                        })
+                    })
+                {
+                    // B529: a write to a PART of the root that holds a live
+                    // view replaces the storage the view points into.
+                    violations.push(InvalidationViolation::PartReassignment {
+                        anchor: target_id,
+                        root: root_id,
                     });
                 }
                 self.scan_invalidation(target_id, scan, live, violations, state);
