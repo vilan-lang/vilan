@@ -162,8 +162,16 @@ export impl View {
 	/// An attribute. The value's TYPE decides its life (proposal/element-syntax.md
 	/// §5): a `str` sets once; a `SignalCell<str>` is read once, exactly
 	/// `bind_attr`. Anything `AttrValue` fills the slot.
+	///
+	/// ONE NAME IS STD'S (A151): `autofocus` — element syntax's bare
+	/// `<input autofocus />` — is std's focus marker, which the browser twin writes
+	/// as `data-autofocus`; a server render DROPS it, exactly as it drops
+	/// `View::autofocus` (a served native `autofocus` would focus the element at
+	/// the browser's initial parse, before the client build ran). KEEP IN STEP.
 	fun attr<V: AttrValue>(self, name: str, own value: V): View {
-		value.apply(self, name);
+		if name != "autofocus" {
+			value.apply(self, name);
+		}
 		self
 	}
 
@@ -276,13 +284,12 @@ export impl View {
 	/// Focus, server side: nothing to focus. Dropped like `on_mount`, whose
 	/// one-word form it is on the browser twin. KEEP IN STEP.
 	///
-	/// The browser twin also WRITES the `autofocus` attribute (A121 §6.1),
-	/// and this deliberately does not: a served `autofocus` attribute is
-	/// honored by the browser's own initial parse, which would focus the
-	/// element before the client build ever ran — a real behaviour change to
-	/// every server-rendered page that chains this, and a wider question than
-	/// the focus scope that motivated the write. The client build sets it at
-	/// mount either way.
+	/// The browser twin also WRITES std's `data-autofocus` marker (A121 §6.1,
+	/// A151), and this deliberately does not: the marker means nothing until a
+	/// focus scope reads it, and there is no focus scope here. The client build
+	/// sets it at mount either way. (A served NATIVE `autofocus` would be honoured
+	/// by the browser's own initial parse and focus the element before the client
+	/// build ran — which is why this never wrote that either.)
 	fun autofocus(self): View {
 		self
 	}
