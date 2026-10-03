@@ -40,6 +40,11 @@ written down.
 
 ---
 
+<!-- family: breaking -->
+**A tuple pattern matches the value's SHAPE: `let (a, b, c, d, e, f) = ((1, 2), (3, 4), (5, 6));` is refused — `` this pattern binds 6 elements, but the value is a 3-tuple `((i32, i32), (i32, i32), (i32, i32))`: a tuple pattern takes one sub-pattern per element, and a nested pattern reaches inside one (`((a, b), c)`) `` — where it compiled and read the flat layout's slots (1 through 6), and a tuple pattern over a value that is no tuple (`let (a, b) = 5;`) is refused `` … but the value is a `i32`, not a tuple ``.** The pattern resolver gave every element `Unknown` whenever the counts disagreed, and emission indexed the slots the pattern named. Every position a tuple pattern stands in takes the rule: `let`, a `for` binding, a closure parameter, a `match` arm. A value whose shape is still open (a generic parameter, a tuple family, an unfilled hole) keeps today's reading. What to change: write one sub-pattern per element and nest to reach inside one — `let ((a, b), (c, d), (e, f)) = t;`. The corpus, the examples, the docs and kolt carry none. Pins: `inference::tuples`' `b441_a_tuple_pattern_of_another_arity_is_refused` (ten forms) and `b441_a_tuple_pattern_of_the_values_shape_destructures_at_every_depth` (the nested forms that keep working). Ledger: two `NEW` rows. No golden moves. Tracker B441.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

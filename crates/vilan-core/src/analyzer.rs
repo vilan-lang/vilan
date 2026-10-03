@@ -37550,15 +37550,55 @@ impl<'src> Analyzer<'src> {
                 // Element types come from the matched tuple type when known (a
                 // concrete-source mapped type expands to one); otherwise each
                 // element resolves against `Unknown`.
+                //
+                // B441: a tuple pattern matches the value's SHAPE, one
+                // sub-pattern per element. A pattern of another arity — or a
+                // tuple pattern over a value that is no tuple at all — was let
+                // through with every element `Unknown`, and emission read
+                // whatever slots the flat layout held there: `let (a, b, c, d,
+                // e, f) = ((1, 2), (3, 4), (5, 6))` bound 1 through 6, and
+                // `let (a, b) = 5` compiled. Only a value whose shape is still
+                // open (a parameter, a hole) keeps the `Unknown` elements.
                 let expected = expected_type_id.get_type(self);
                 let element_type_ids = match self.expand_mapped(expected) {
                     Type::Tuple(ids) if ids.len() == patterns.len() => ids,
-                    _ => {
+                    Type::Generic(_)
+                    | Type::Mapped(..)
+                    | Type::Unknown
+                    | Type::Unresolved
+                    | Type::Any
+                    | Type::Never => {
                         let unknown = Type::Unknown.get_type_id(self);
                         vec![unknown; patterns.len()]
                     }
+                    other => {
+                        let rendered = self.pretty_print_type(&other, &HashMap::default());
+                        let binds = format!(
+                            "this pattern binds {} {}",
+                            patterns.len(),
+                            plural(patterns.len(), "element", "elements")
+                        );
+                        let msg = match &other {
+                            Type::Tuple(ids) => format!(
+                                "{binds}, but the value is a {}-tuple `{rendered}`: a tuple \
+                                 pattern takes one sub-pattern per element, and a nested \
+                                 pattern reaches inside one (`((a, b), c)`)",
+                                ids.len()
+                            ),
+                            _ => format!(
+                                "{binds}, but the value is a `{rendered}`, not a tuple: \
+                                 `(a, b)` destructures a tuple"
+                            ),
+                        };
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: *span,
+                            msg,
+                        });
+                        return None;
+                    }
                 };
-                let _ = span;
                 let mut resolved = Vec::new();
                 for (sub_pattern, element_type_id) in patterns.iter().zip(element_type_ids) {
                     // The element's TYPE, not its width: the width a nested

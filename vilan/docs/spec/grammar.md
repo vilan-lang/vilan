@@ -497,7 +497,9 @@ jump       = "jump" IDENT ;          (* break | continue *)
 ```
 
 `let` binds immutably, `mut` mutably; a tuple binder destructures
-(irrefutably: names and nested tuples only). Both the type and the
+(irrefutably: names and nested tuples only), one sub-pattern per element of
+the value's own shape — `let ((a, b), c) = ((1, 2), 3);` — and a pattern of
+another arity, or over a value that is no tuple, is refused. Both the type and the
 initializer are syntactically optional. `lazy` is accepted only on a
 MODULE-LEVEL `let` binding one name to one initializer (§6.10): a `lazy
 mut`, a lazy destructure, a lazy binding with no initializer and a lazy

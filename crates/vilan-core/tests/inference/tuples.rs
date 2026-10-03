@@ -8101,3 +8101,120 @@ fn b453_a_view_of_a_tuple_position_writes_and_reads_through() {
         "3\n2\n11\n3\na 6 true\n",
     );
 }
+
+// --- B441: a tuple pattern matches the value's SHAPE ---------------------------
+//
+// A pattern of another arity than the tuple it destructures — or a tuple pattern
+// over a value that is no tuple — was let through with every element `Unknown`,
+// and emission read whatever slots the flat layout held at those positions:
+// `let (a, b, c, d, e, f) = ((1, 2), (3, 4), (5, 6))` bound 1 through 6.
+
+/// B441: every position a tuple pattern stands in refuses the arity the value
+/// does not have — `let`, a `for` binding, a closure parameter, a `match` arm —
+/// and a tuple pattern over an `i32` or a struct says it is not a tuple.
+#[test]
+fn b441_a_tuple_pattern_of_another_arity_is_refused() {
+    for (setup, binding, message) in [
+        (
+            "let t = ((1, 2), (3, 4), (5, 6));",
+            "let (a, b, c, d, e, f) = t;",
+            "this pattern binds 6 elements, but the value is a 3-tuple",
+        ),
+        (
+            "",
+            "let (a, b, c, d, e, f) = ((1, 2), (3, 4), (5, 6));",
+            "this pattern binds 6 elements, but the value is a 3-tuple",
+        ),
+        (
+            "let t = (1, 2, 3);",
+            "let (a, b) = t;",
+            "this pattern binds 2 elements, but the value is a 3-tuple",
+        ),
+        (
+            "",
+            "let (a, b, c) = ((1, 2), 3);",
+            "this pattern binds 3 elements, but the value is a 2-tuple",
+        ),
+        (
+            "",
+            "let ((a, b), (c, d, e)) = ((1, 2), (3, 4));",
+            "this pattern binds 3 elements, but the value is a 2-tuple",
+        ),
+        (
+            "",
+            "for (x, y) in [(1, 2, 3)] { print(y); }",
+            "this pattern binds 2 elements, but the value is a 3-tuple",
+        ),
+        (
+            "",
+            "let add = |(p, q)| p + q; print(add((1, 2, 3)));",
+            "this pattern binds 2 elements, but the value is a 3-tuple",
+        ),
+        (
+            "let t = (1, (2, 3));",
+            "match t { (let a, let b, let c) => print(a), }",
+            "this pattern binds 3 elements, but the value is a 2-tuple",
+        ),
+        (
+            "",
+            "let (a, b) = 5;",
+            "this pattern binds 2 elements, but the value is a `i32`, not a tuple",
+        ),
+        (
+            "",
+            "let (a, b) = Point { x = 1, y = 2 };",
+            "this pattern binds 2 elements, but the value is a `Point`, not a tuple",
+        ),
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct Point {{ x: i32, y: i32 }}
+
+                fun main() {{
+                    {setup}
+                    {binding}
+                }}
+                "#
+            ),
+            message,
+        );
+    }
+}
+
+/// B441: the nested forms that match the value's shape keep working — a
+/// pattern per element at every depth, a pattern that stops at an element and
+/// binds the whole inner tuple, a `for` and a closure parameter of the right
+/// arity, and `match`/`is` arms.
+#[test]
+fn b441_a_tuple_pattern_of_the_values_shape_destructures_at_every_depth() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let t = ((1, 2), (3, 4), (5, 6));
+            let ((a, b), (c, d), (e, f)) = t;
+            print(i"{a} {b} {c} {d} {e} {f}");
+            let (x, y, z) = t;
+            print(i"{x.0} {y.1} {z.0}");
+            let (p, q) = (1, (2, 3));
+            print(i"{p} {q.1}");
+            let (u, (v, w)) = (1, (2, 3));
+            print(i"{u} {v} {w}");
+            for (key, (low, high)) in [("a", (1, 2))] {
+                print(i"{key} {low} {high}");
+            }
+            let add = |(left, right)| left + right;
+            print(add((20, 22)));
+            match (1, (2, 3)) {
+                (let first, (let second, let third)) => print(first + second + third),
+            }
+            if (7, 8) is (let g, let h) {
+                print(g + h);
+            }
+        }
+        "#,
+        "1 2 3 4 5 6\n1 4 5\n1 3\n1 2 3\na 1 2\n42\n6\n15\n",
+    );
+}
