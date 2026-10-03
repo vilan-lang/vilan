@@ -100,7 +100,9 @@ fn code_tokens_spanned(source: &str) -> Option<Vec<Spanned<Token<'_>>>> {
 /// nothing but trivia and the canonical orders. Order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
 /// (dropped), an `export` marker written after its item's attributes (moved
-/// ahead of them, B445), the canonical ordering of a top-level import run (see the
+/// ahead of them, B445), a declaration's attribute run written in any order
+/// (sorted by `parsing::attribute_rank`, B485 Q7), the canonical ordering of a
+/// top-level import run (see the
 /// canonical-import-order section below), the canonical ordering of an ELEMENT
 /// HEAD's items (see the canonical-element-head-order section), the canonical
 /// ordering of an `on` HEAD's condition values (see the canonical-on-head-order
@@ -117,9 +119,9 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_on_heads(sort_element_heads(
         sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
             canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
-                collapse_field_shorthands(lead_export_past_attribute_runs(
+                collapse_field_shorthands(sort_attribute_runs(lead_export_past_attribute_runs(
                     drop_redundant_view_prefixes(drop_trailing_commas(tokens)),
-                )),
+                ))),
             )),
         ))),
     ))))
@@ -192,6 +194,112 @@ fn lead_export_past_attribute_runs(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
         }
         result.push(tokens[index].clone());
         index += 1;
+    }
+    result
+}
+
+/// Sorts a declaration's attribute run into the canonical order
+/// ([`crate::parsing::attribute_rank`], B485 Q7 RULED: attributes in any
+/// order, printed in one) in BOTH streams, so the safety net accepts the
+/// printer writing `[deprecated(..)]` ahead of an `[internal(..)]` the author
+/// wrote first. The parser sorts the same run before a production reads it
+/// (`Parser::canonicalize_marker_run`), so the tree holds every attribute
+/// whatever order it was written in.
+///
+/// Recognized by SHAPE where a statement can begin (the stream's start, or
+/// after a `;`, `{` or `}`), past an `export (in PATH)?` already moved ahead
+/// of the run ([`lead_export_past_attribute_runs`]): two or more `[name …]`
+/// groups followed by a marker keyword or a declaration word — never by a
+/// `;` or an operator, so `[a][b];`, a list indexed by a list, is untouched.
+/// A `macro` after a run (of one or more) moves ahead of it, where a macro's
+/// production reads it and where the printer's `[..]` ⏎ `macro fun` reduces.
+/// A stable sort, a relocation of whole groups: the net still sees every
+/// attribute survive.
+fn sort_attribute_runs(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let past_group = |open: usize| -> Option<usize> {
+        let mut depth = 0usize;
+        let mut at = open;
+        loop {
+            match tokens.get(at)? {
+                Token::Ctrl('[' | '(' | '{') => depth += 1,
+                Token::Ctrl(']' | ')' | '}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at + 1);
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+    };
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let at_statement_head = matches!(result.last(), None | Some(Token::Ctrl(';' | '{' | '}')));
+        if !at_statement_head {
+            result.push(tokens[index].clone());
+            index += 1;
+            continue;
+        }
+        let mut run_start = index;
+        if tokens.get(run_start) == Some(&Token::Export) {
+            run_start += 1;
+            if tokens.get(run_start) == Some(&Token::Ctrl('('))
+                && tokens.get(run_start + 1) == Some(&Token::In)
+                && let Some(after) = past_group(run_start)
+            {
+                run_start = after;
+            }
+        }
+        let mut groups: Vec<(u8, std::ops::Range<usize>)> = Vec::new();
+        let mut at = run_start;
+        while tokens.get(at) == Some(&Token::Ctrl('['))
+            && let Some(Token::Ident(name)) = tokens.get(at + 1)
+            && let Some(after) = past_group(at)
+        {
+            groups.push((crate::parsing::attribute_rank(name), at..after));
+            at = after;
+        }
+        let declares = matches!(
+            tokens.get(at),
+            Some(
+                Token::Fun
+                    | Token::Struct
+                    | Token::Enum
+                    | Token::Trait
+                    | Token::Impl
+                    | Token::Let
+                    | Token::Mut
+                    | Token::Mod
+                    | Token::Import
+                    | Token::Use
+                    | Token::Export
+                    | Token::Const
+                    | Token::Async
+                    | Token::External
+                    | Token::Macro
+                    | Token::Ident("lazy")
+            )
+        );
+        // `macro` written after the run is printed ahead of it — the reading
+        // a macro's production takes either way (`Parser::canonicalize_marker_run`).
+        let leads_macro = !groups.is_empty() && tokens.get(at) == Some(&Token::Macro);
+        if (groups.len() < 2 && !leads_macro) || !declares {
+            result.push(tokens[index].clone());
+            index += 1;
+            continue;
+        }
+        result.extend(tokens[index..run_start].iter().cloned());
+        if leads_macro {
+            result.push(Token::Macro);
+            at += 1;
+        }
+        groups.sort_by_key(|(rank, _)| *rank);
+        for (_, group) in groups {
+            result.extend(tokens[group].iter().cloned());
+        }
+        index = at;
     }
     result
 }
@@ -4507,9 +4615,23 @@ impl<'src> Printer<'src> {
         scope: Option<&ExportScope<'src>>,
         exported: &Spanned<Node<'src>>,
     ) {
+        let marker = format!("export{} ", export_scope_text(scope));
+        self.print_item_under_keyword(&marker, |printer| printer.print_item(exported));
+    }
+
+    /// Prints a declaration with a marker KEYWORD on its signature line, after
+    /// every attribute line the declaration prints above it — B485 §6.2's one
+    /// order, for `export` ([`Printer::print_exported_item`]) and for the two
+    /// keywords that wrap a declaration node of their own, `const` (B487) and
+    /// `macro`. `print` prints the declaration; the keyword (with its trailing
+    /// space) is placed at the declaration line it marked, or at the start
+    /// when it printed no attribute. The declaration line stays marked at the
+    /// keyword, so an enclosing `export` lands ahead of it: `[deprecated(..)]`
+    /// ⏎ `export const fun f()`.
+    fn print_item_under_keyword(&mut self, keyword: &str, print: impl FnOnce(&mut Self)) {
         let start = self.out.len();
         let enclosing_head = self.head_start.take();
-        self.print_item(exported);
+        print(self);
         let declaration = match self.head_start {
             Some(head) if head >= start => head,
             _ => {
@@ -4522,8 +4644,7 @@ impl<'src> Printer<'src> {
         } else {
             declaration
         };
-        let marker = format!("export{} ", export_scope_text(scope));
-        self.out.insert_str(declaration, &marker);
+        self.out.insert_str(declaration, keyword);
     }
 
     /// `(in PATH)` after an `export` — see [`export_scope_text`].
@@ -4880,9 +5001,10 @@ impl<'src> Printer<'src> {
             }
             // `macro fun name(..) { .. }` — a macro definition. The `macro`
             // keyword then the ordinary function form.
+            // Its attributes, if any, print above it with the keyword on the
+            // signature line, as `export`'s do.
             Node::MacroFun(func) => {
-                self.out.push_str("macro ");
-                self.print_func(func);
+                self.print_item_under_keyword("macro ", |printer| printer.print_func(func));
             }
             // `[name(args)?] <item>` — a user macro attribute, on its own line
             // above the struct/enum/function it annotates (like `[derive(..)]`).
@@ -8738,6 +8860,43 @@ mod reformats {
             (
                 "export fun a() {}\n\n[must_use] export fun b(): i32 { 1 }\n",
                 "export fun a() {}\n\n[must_use]\nexport fun b(): i32 {\n\t1\n}\n",
+            ),
+        ] {
+            assert_formats(written, expected);
+        }
+    }
+
+    // B485 Q7 (RULED): attributes are written in ANY order, and `vilan fmt`
+    // prints them in the one canonical order (`parsing::attribute_rank`) — on
+    // a function, a struct (with `[derive]` and `[resource]`), a labelled
+    // `let`, a trait, under `export` on either side, and in a trait body.
+    // The net sorts both streams the same way, so none of these declines.
+    #[test]
+    fn b485_an_attribute_run_in_any_order_prints_in_the_canonical_one() {
+        for (written, expected) in [
+            (
+                "[platform(\"node\")] [must_use] [internal(\"r\")] [deprecated(\"d\")] fun f(): i32 { 1 }\n",
+                "[deprecated(\"d\")]\n[internal(\"r\")]\n[must_use]\n[platform(\"node\")]\nfun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "[resource] [internal(\"r\")] [derive(PartialEq)] struct S { a: i32 }\n",
+                "[derive(PartialEq)]\n[internal(\"r\")]\n[resource] struct S {\n\ta: i32,\n}\n",
+            ),
+            (
+                "[internal(\"r\")] [deprecated(\"d\")] lazy let x = 1;\n",
+                "[deprecated(\"d\")]\n[internal(\"r\")]\nlazy let x = 1;\n",
+            ),
+            (
+                "[resource] [platform(\"node\")] export trait T {\n\tfun t(self): i32;\n}\n",
+                "[platform(\"node\")]\n[resource] export trait T {\n\tfun t(self): i32;\n}\n",
+            ),
+            (
+                "export [must_use] [deprecated(\"d\")] async fun f(): i32 { 1 }\n",
+                "[deprecated(\"d\")]\n[must_use]\nexport async fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "trait T {\n\t[must_use] [deprecated(\"d\")] fun t(self): i32;\n}\n",
+                "trait T {\n\t[deprecated(\"d\")]\n\t[must_use]\n\tfun t(self): i32;\n}\n",
             ),
         ] {
             assert_formats(written, expected);

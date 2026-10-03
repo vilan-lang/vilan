@@ -637,3 +637,4 @@ NEW	-	`return` is not a vilan keyword: vilan spells this `ret` — `ret value;` 
 NEW	-	`{word}` is not a vilan keyword: vilan spells this `fun` — `fun name(parameter: Type): Result { … }`
 NEW	-	`->` is not how vilan writes a return type: vilan spells this `:` — `fun name(parameter: Type): Result`, and `|parameter: Type|: Result` on a closure
 NEW	-	`->` is not how vilan writes a closure type: its result follows the `|..|` directly — `|Type| Result`, and `|| Result` with no parameters
+NEW	-	a declaration's markers are written in one order — its attributes, then the keywords `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration word: write `{canonical}`

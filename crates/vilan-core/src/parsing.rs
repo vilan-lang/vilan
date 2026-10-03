@@ -180,6 +180,10 @@ pub enum ParseErrorReason {
     /// A spelling another language uses, written where vilan has its own
     /// (B520): the parse went on as if vilan's had been written.
     ForeignSpelling(ForeignSpelling),
+    /// A declaration head whose markers are out of the ruled order (B486,
+    /// B485 Q6/Q8): `canonical` is the head respelled in it. The parse went on
+    /// as if it had been written so.
+    MarkerOrder { canonical: String },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -1301,6 +1305,7 @@ pub fn render(error: &ParseError) -> String {
         ParseErrorReason::Rule(rule) => rule.to_string(),
         ParseErrorReason::VisibilityMarker { marker } => visibility_marker_rule(marker),
         ParseErrorReason::ForeignSpelling(spelling) => spelling.message().to_string(),
+        ParseErrorReason::MarkerOrder { canonical } => marker_order_rule(canonical),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -1625,6 +1630,14 @@ struct Parser<'a, 'src> {
     /// per span ([`Parser::record_rewrite`]); [`parse_with`] folds them into
     /// the error list at the end.
     rewrite_refusals: Vec<ParseError>,
+    /// Where a REORDERED marker run began in the source, by the stream
+    /// position each suffix of the run now starts at
+    /// ([`Parser::canonicalize_marker_run`]): `(position, offset)`. A node
+    /// beginning at `position` covers that suffix and the declaration after
+    /// it, and so begins at `offset` — the earliest of those units as written
+    /// — rather than at whichever unit the reorder placed first.
+    /// [`Parser::span_from`] reads it; empty unless a run was reordered.
+    written_starts: Vec<(usize, usize)>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -1760,6 +1773,176 @@ fn is_known_attribute_marker(name: &str) -> bool {
     KNOWN_ATTRIBUTE_MARKERS.contains(&name)
 }
 
+/// A declaration attribute's place in the ONE canonical order
+/// (keywords-vs-attributes.md §6.2, Q7 RULED 2026-10-01): attributes are
+/// written in any order, and this is the order `vilan fmt` prints them in —
+/// today's production order, so no attribute moved:
+///
+/// - generation (0): `[derive]`, `[service]`, `[client_service]`, a user
+///   macro attribute (any name the table does not know);
+/// - labels: `[deprecated]` (1), `[internal]` (2), `[hint]` (3);
+/// - binding: `[extern]` (4);
+/// - checks: `[must_use]` (5), `[rpc]` (6), `[trait_only]` (7), and the
+///   retired `[doc(hidden)]` (8), refused where a function's prefix reads it;
+/// - fence: `[platform]` (9);
+/// - class: `[resource]` (10).
+///
+/// Ties keep the order they were written in (a `[service]` and a
+/// `[client_service]`, two `[hint]`s). The parser sorts a run into this
+/// order before a production reads it ([`Parser::canonicalize_marker_run`]),
+/// and the formatter's safety net sorts both streams by it.
+pub fn attribute_rank(name: &str) -> u8 {
+    match name {
+        "deprecated" => 1,
+        "internal" => 2,
+        "hint" => 3,
+        "extern" => 4,
+        "must_use" => 5,
+        "rpc" => 6,
+        "trait_only" => 7,
+        "doc" => 8,
+        "platform" => 9,
+        "resource" => 10,
+        _ => 0,
+    }
+}
+
+/// The marker KEYWORDS of a declaration head (B485 Q8, B486), in the order
+/// they are written: `export`, then `const` or `lazy`, then `async`, then
+/// `external` or `macro` — after every attribute, before the declaration
+/// word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerKeyword {
+    Export,
+    Const,
+    Lazy,
+    Async,
+    External,
+    Macro,
+}
+
+impl MarkerKeyword {
+    fn word(self) -> &'static str {
+        match self {
+            MarkerKeyword::Export => "export",
+            MarkerKeyword::Const => "const",
+            MarkerKeyword::Lazy => "lazy",
+            MarkerKeyword::Async => "async",
+            MarkerKeyword::External => "external",
+            MarkerKeyword::Macro => "macro",
+        }
+    }
+
+    /// The ruled WRITTEN order (Q8).
+    fn written_rank(self) -> u8 {
+        match self {
+            MarkerKeyword::Export => 0,
+            MarkerKeyword::Const | MarkerKeyword::Lazy => 1,
+            MarkerKeyword::Async => 2,
+            MarkerKeyword::External | MarkerKeyword::Macro => 3,
+        }
+    }
+}
+
+/// One unit of a declaration's marker run: an attribute group or a keyword
+/// (with `export`'s `(in PATH)` scope), and the token range it occupies.
+#[derive(Clone, Debug)]
+struct MarkerUnit<'src> {
+    tokens: std::ops::Range<usize>,
+    kind: MarkerUnitKind<'src>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MarkerUnitKind<'src> {
+    Attribute { name: &'src str, arguments: bool },
+    Keyword(MarkerKeyword),
+}
+
+impl MarkerUnitKind<'_> {
+    /// Where the unit stands in the order the PRODUCTIONS read — which is not
+    /// the written one for three keywords: `export` wraps the whole statement,
+    /// and `const` and `macro` each wrap the declaration their production then
+    /// reads with its own attribute prefix (`parse_const_declaration`,
+    /// `parse_macro_fun`), so all three lead the attributes on the stream.
+    fn reading_key(self) -> (u8, u8) {
+        match self {
+            MarkerUnitKind::Keyword(MarkerKeyword::Export) => (0, 0),
+            MarkerUnitKind::Keyword(MarkerKeyword::Const) => (1, 0),
+            MarkerUnitKind::Keyword(MarkerKeyword::Macro) => (2, 0),
+            MarkerUnitKind::Attribute { name, .. } => (3, attribute_rank(name)),
+            MarkerUnitKind::Keyword(MarkerKeyword::Lazy) => (4, 0),
+            MarkerUnitKind::Keyword(MarkerKeyword::Async) => (5, 0),
+            MarkerUnitKind::Keyword(MarkerKeyword::External) => (6, 0),
+        }
+    }
+
+    /// Where the unit stands in the WRITTEN canonical order (§6.2): every
+    /// attribute by its rank, then the keywords by theirs.
+    fn written_key(self) -> (u8, u8) {
+        match self {
+            MarkerUnitKind::Attribute { name, .. } => (0, attribute_rank(name)),
+            MarkerUnitKind::Keyword(keyword) => (1, keyword.written_rank()),
+        }
+    }
+
+    /// The unit as the steer spells it: `[platform(..)]`, `[must_use]`, `async`.
+    fn spelled(self) -> String {
+        match self {
+            MarkerUnitKind::Attribute { name, arguments } => {
+                format!("[{name}{}]", if arguments { "(..)" } else { "" })
+            }
+            MarkerUnitKind::Keyword(keyword) => keyword.word().to_string(),
+        }
+    }
+}
+
+/// The declaration word a marker run may end at, as the steer spells it, or
+/// `None` for any other token — where the run is not a declaration's.
+fn declaration_word(token: Option<&Token<'_>>) -> Option<&'static str> {
+    Some(match token? {
+        Token::Fun => "fun",
+        Token::Struct => "struct",
+        Token::Enum => "enum",
+        Token::Trait => "trait",
+        Token::Impl => "impl",
+        Token::Let => "let",
+        Token::Mut => "mut",
+        Token::Mod => "mod",
+        Token::Import => "import",
+        Token::Use => "use",
+        _ => return None,
+    })
+}
+
+/// Whether `keywords` (in written order, `export` left out) is a set the
+/// declaration `word` takes — so a swapped pair can be steered to an order
+/// that then PARSES. A set no order makes legal (`async const fun`, `lazy
+/// fun`) is left as written, for the production's own refusal.
+fn marker_keywords_are_legal(keywords: &[MarkerKeyword], word: &str) -> bool {
+    use MarkerKeyword::*;
+    match word {
+        "fun" => matches!(
+            keywords,
+            [] | [Async] | [External] | [Async, External] | [Const] | [Macro]
+        ),
+        "struct" => matches!(keywords, [] | [External]),
+        "let" | "mut" => matches!(keywords, [] | [Const] | [Lazy]),
+        _ => keywords.is_empty(),
+    }
+}
+
+/// The steer for a declaration head written out of order (B486; B485 Q6 and
+/// Q8, RULED): the markers stack attributes first, then the keywords in one
+/// order, then the declaration word. `canonical` is the head respelled in
+/// that order, attributes abbreviated.
+fn marker_order_rule(canonical: &str) -> String {
+    format!(
+        "a declaration's markers are written in one order — its attributes, then the keywords \
+         `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration \
+         word: write `{canonical}`"
+    )
+}
+
 thread_local! {
     /// How many atoms ([`Parser::parse_atom`]) this thread's parser has entered
     /// — the parser's unit of real work, and what speculative re-parsing
@@ -1863,6 +2046,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             member_readings: Vec::new(),
             statement_head: None,
             rewrite_refusals: Vec::new(),
+            written_starts: Vec::new(),
         }
     }
 
@@ -2177,7 +2361,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         if start >= self.tokens.len() {
             return (self.eoi..self.eoi).into();
         }
-        let start_offset = self.tokens[start].1.start;
+        let mut start_offset = self.tokens[start].1.start;
+        if let Some((_, written)) = self
+            .written_starts
+            .iter()
+            .find(|(position, _)| *position == start)
+        {
+            start_offset = start_offset.min(*written);
+        }
         let end_offset = if self.position > start {
             self.tokens[self.position - 1].1.end
         } else if start > 0 {
@@ -3196,6 +3387,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let file_head = std::mem::take(&mut self.file_head);
         let _ = self.lead_export_past_its_attributes();
         self.take_foreign_item_word();
+        self.canonicalize_marker_run();
         if let Some(item) = self.attempt(Self::parse_module_self) {
             if !file_head {
                 self.errors.push(ParseError {
@@ -3378,6 +3570,209 @@ impl<'a, 'src> Parser<'a, 'src> {
             context: Vec::new(),
             hint: None,
         });
+    }
+
+    /// B485 Q7/Q8 and B486 (RULED): the declaration head at the cursor —
+    /// a run of attribute groups and marker keywords ending at a declaration
+    /// word — is put into the order the productions read, once, before any of
+    /// them reads it.
+    ///
+    /// - **Attributes are free (Q7).** Written in any order, they are sorted
+    ///   by [`attribute_rank`], so `[internal(..)] [deprecated(..)] fun` reads
+    ///   as the canonical `[deprecated(..)] [internal(..)] fun` and `vilan fmt`
+    ///   prints it so. No diagnostic.
+    /// - **`export` may stand on either side of them** in this release (B445,
+    ///   Q9), and so may `macro`, whose production read its attributes after
+    ///   it before B485. No diagnostic.
+    /// - **Keywords take one order (Q8)** — `export`, `const`|`lazy`,
+    ///   `async`, `external`|`macro` — and come AFTER the attributes (Q6). A
+    ///   head that breaks either rule is refused ONCE, spanning the run, with
+    ///   the head respelled in the ruled order
+    ///   ([`ParseErrorReason::MarkerOrder`]), and read as if written so: `async
+    ///   [platform(..)] fun`, `external async fun`, `lazy export let`. Before,
+    ///   each fell to "cannot find '<attr>'" or "expected `;`" (B486).
+    ///
+    /// The run is rewritten by permuting whole units on the token stream, as
+    /// [`Parser::lead_export_past_its_attributes`] rotates one; every token
+    /// keeps its own span, and [`Parser::written_starts`] keeps each node
+    /// beginning where its first unit was written. Only a run that ENDS at a
+    /// declaration word is touched — `[a][b];` is a list indexed by a list,
+    /// `async { .. }` a block — and no run that ends there parses today in
+    /// any order but its own, so a valid program reads exactly as before. A
+    /// keyword set no order makes legal (`async const fun`, `lazy const let`) is left as
+    /// written, for its production's own refusal.
+    fn canonicalize_marker_run(&mut self) {
+        let start = self.position;
+        // A run already put in reading order — at its head, or at any suffix
+        // a production reads again from (`export`'s statement, `const`'s
+        // declaration) — is not a written one: `const [deprecated(..)] let`
+        // there is this pass's own output, not the author's.
+        if self
+            .written_starts
+            .iter()
+            .any(|(position, _)| *position == start)
+        {
+            return;
+        }
+        let mut units: Vec<MarkerUnit<'src>> = Vec::new();
+        let mut at = start;
+        loop {
+            let token = self.tokens.get(at).map(|(token, _)| token);
+            let keyword = match token {
+                Some(Token::Ctrl('[')) => {
+                    let Some((Token::Ident(name), _)) = self.tokens.get(at + 1) else {
+                        break;
+                    };
+                    let name = *name;
+                    let Some(end) = self.past_balanced_group(at) else {
+                        return;
+                    };
+                    let arguments =
+                        self.tokens.get(at + 2).map(|(token, _)| token) == Some(&Token::Ctrl('('));
+                    units.push(MarkerUnit {
+                        tokens: at..end,
+                        kind: MarkerUnitKind::Attribute { name, arguments },
+                    });
+                    at = end;
+                    continue;
+                }
+                Some(Token::Export) => MarkerKeyword::Export,
+                Some(Token::Const) => MarkerKeyword::Const,
+                Some(Token::Ident("lazy")) => MarkerKeyword::Lazy,
+                Some(Token::Async) => MarkerKeyword::Async,
+                Some(Token::External) => MarkerKeyword::External,
+                Some(Token::Macro) => MarkerKeyword::Macro,
+                _ => break,
+            };
+            let mut end = at + 1;
+            if keyword == MarkerKeyword::Export
+                && self.tokens.get(end).map(|(token, _)| token) == Some(&Token::Ctrl('('))
+                && self.tokens.get(end + 1).map(|(token, _)| token) == Some(&Token::In)
+            {
+                let Some(after) = self.past_balanced_group(end) else {
+                    return;
+                };
+                end = after;
+            }
+            units.push(MarkerUnit {
+                tokens: at..end,
+                kind: MarkerUnitKind::Keyword(keyword),
+            });
+            at = end;
+        }
+        let Some(word) = declaration_word(self.tokens.get(at).map(|(token, _)| token)) else {
+            return;
+        };
+        if units.len() < 2 {
+            return;
+        }
+        // A REPEATED keyword is its own refusal (`export export`, B492) or its
+        // production's, read where it was written.
+        let mut keywords_seen: Vec<MarkerKeyword> = Vec::new();
+        for unit in &units {
+            if let MarkerUnitKind::Keyword(keyword) = unit.kind {
+                if keywords_seen.contains(&keyword) {
+                    return;
+                }
+                keywords_seen.push(keyword);
+            }
+        }
+        // Out of the ruled order: a keyword other than `export` ahead of an
+        // attribute (Q6), or two keywords inverted (Q8).
+        let mut out_of_order = false;
+        let mut keyword_written = false;
+        let mut highest_rank = None;
+        for unit in &units {
+            match unit.kind {
+                MarkerUnitKind::Attribute { .. } => out_of_order |= keyword_written,
+                MarkerUnitKind::Keyword(keyword) => {
+                    let rank = keyword.written_rank();
+                    out_of_order |= highest_rank.is_some_and(|highest| rank < highest);
+                    highest_rank = highest_rank.max(Some(rank));
+                    // `export` and `macro` ahead of the attributes are the
+                    // order this release still reads (Q9): `macro
+                    // [deprecated(..)] fun` parsed before B485, as `export
+                    // [..] fun` did, and `vilan fmt` rewrites both.
+                    keyword_written |=
+                        !matches!(keyword, MarkerKeyword::Export | MarkerKeyword::Macro);
+                }
+            }
+        }
+        let mut written: Vec<MarkerUnitKind<'src>> = units.iter().map(|unit| unit.kind).collect();
+        written.sort_by_key(|kind| kind.written_key());
+        let keywords: Vec<MarkerKeyword> = written
+            .iter()
+            .filter_map(|kind| match kind {
+                MarkerUnitKind::Keyword(MarkerKeyword::Export) => None,
+                MarkerUnitKind::Keyword(keyword) => Some(*keyword),
+                MarkerUnitKind::Attribute { .. } => None,
+            })
+            .collect();
+        // A keyword set no order makes legal is read as written, in whatever
+        // order: reordering it would only trade one refusal for another, and
+        // could hand a production a spelling it reads (`lazy const let`
+        // becoming the `const` prefix over `lazy let`).
+        if !marker_keywords_are_legal(&keywords, word) {
+            return;
+        }
+        let mut reading = units.clone();
+        reading.sort_by_key(|unit| unit.kind.reading_key());
+        let reordered = reading
+            .iter()
+            .zip(&units)
+            .any(|(read, written)| read.tokens != written.tokens);
+        // `const [deprecated(..)] fun` is already in the order the production
+        // reads, and still out of the written one: refused, not reordered.
+        if !reordered && !out_of_order {
+            return;
+        }
+        let run_span = Span::from(
+            units
+                .iter()
+                .map(|unit| self.token_span(unit.tokens.start).start)
+                .min()
+                .unwrap_or_default()..self.token_span(at - 1).end,
+        );
+        // Each suffix of the reading order begins where the earliest of its
+        // units was written — and is marked as read, so a production reading
+        // on from it (`export`'s statement, `const`'s declaration) does not
+        // take this pass's output for a written run and refuse it again.
+        let mut position = start;
+        for (index, unit) in reading.iter().enumerate() {
+            let earliest = reading[index..]
+                .iter()
+                .map(|later| self.token_span(later.tokens.start).start)
+                .min()
+                .unwrap_or_default();
+            self.written_starts.push((position, earliest));
+            position += unit.tokens.len();
+        }
+        if reordered {
+            let tokens: Vec<Spanned<Token<'src>>> = reading
+                .iter()
+                .flat_map(|unit| self.tokens[unit.tokens.clone()].iter().cloned())
+                .collect();
+            let reachable: Vec<bool> = reading
+                .iter()
+                .flat_map(|unit| {
+                    self.assignment_reachable[unit.tokens.clone()]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            self.tokens[start..at].clone_from_slice(&tokens);
+            self.assignment_reachable[start..at].copy_from_slice(&reachable);
+        }
+        if out_of_order {
+            let mut canonical: Vec<String> = written.iter().map(|kind| kind.spelled()).collect();
+            canonical.push(word.to_string());
+            self.record_rewrite(
+                run_span,
+                ParseErrorReason::MarkerOrder {
+                    canonical: canonical.join(" "),
+                },
+            );
+        }
     }
 
     /// B520: `fn`/`function`/`func`/`def` at the ITEM HEAD at the cursor —
@@ -6926,6 +7321,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 break;
             }
             self.take_foreign_item_word();
+            self.canonicalize_marker_run();
             match self.attempt(Self::parse_function) {
                 Some(function) => functions.push(function),
                 None => break,
@@ -10968,15 +11364,49 @@ mod tests {
     }
 
     #[test]
-    fn function_attributes_out_of_order_decline() {
-        // `[must_use]` must precede `[rpc]` (the chumsky attribute chain is ordered):
-        // `[rpc] [must_use] fun` is NOT a function, and no other alternative claims
-        // it, so the whole program declines.
-        assert!(declines("[rpc] [must_use] fun f() { }"));
-        // `[deprecated(..)]` leads the chain: after `[extern(..)]` it declines.
-        assert!(declines(
-            "[extern(\"fs\", \"read\")] [deprecated(\"use read_all()\")] external fun read();"
-        ));
+    fn function_attributes_in_any_order_read_as_the_canonical_prefix() {
+        // B485 Q7 (RULED): attributes are written in any order. The chain the
+        // prefix reads used to be ordered, and `[rpc] [must_use] fun` declined;
+        // the run is now sorted before the production reads it, so it is the
+        // function the canonical order spells, attribute for attribute.
+        for (written, canonical) in [
+            (
+                "[rpc] [must_use] fun f() { }",
+                "[must_use] [rpc] fun f() { }",
+            ),
+            (
+                "[extern(\"fs\", \"read\")] [deprecated(\"use read_all()\")] external fun read();",
+                "[deprecated(\"use read_all()\")] [extern(\"fs\", \"read\")] external fun read();",
+            ),
+        ] {
+            assert_eq!(
+                attributes_of(written),
+                attributes_of(canonical),
+                "{written}"
+            );
+        }
+    }
+
+    /// The attribute fields of the one `fun` in `source`, which must parse
+    /// clean — what a reordered prefix has to agree on with the canonical one.
+    fn attributes_of(source: &str) -> String {
+        match only_item(source) {
+            Node::Func(function) => format!(
+                "{:?} {:?} {:?} {} {} {} {:?}",
+                function.deprecated,
+                function.internal,
+                function.extern_binding,
+                function.must_use,
+                function.rpc,
+                function.trait_only,
+                function
+                    .platform_fence
+                    .iter()
+                    .map(|(pattern, _)| *pattern)
+                    .collect::<Vec<_>>(),
+            ),
+            other => panic!("expected a Func, got {other:?}"),
+        }
     }
 
     #[test]
@@ -11024,15 +11454,17 @@ mod tests {
         // and `internal` is a known marker, so no user-macro reading claims it
         // either: the program declines.
         assert!(declines("[internal] fun one() { }"));
-        // It follows `[deprecated(..)]` in the ordered prefix and precedes
-        // `[extern(..)]`; the other order declines.
+        // It follows `[deprecated(..)]` in the canonical prefix and precedes
+        // `[extern(..)]`; written in the other order it reads the same (B485
+        // Q7), where it used to decline.
         assert!(matches!(
             only_item("[deprecated(\"use two()\")] [internal(\"seam\")] fun one() { }"),
             Node::Func(_)
         ));
-        assert!(declines(
-            "[extern(\"fs\", \"read\")] [internal(\"seam\")] external fun read();"
-        ));
+        assert_eq!(
+            attributes_of("[extern(\"fs\", \"read\")] [internal(\"seam\")] external fun read();"),
+            attributes_of("[internal(\"seam\")] [extern(\"fs\", \"read\")] external fun read();"),
+        );
     }
 
     #[test]
@@ -11075,10 +11507,12 @@ mod tests {
             "{errors:?}"
         );
         assert!(matches!(tree.expect("a tree").0[0].0, Node::Import(..)));
-        // The order is the prefix's: `[internal]` before `[deprecated]` declines.
-        assert!(declines(
-            "[internal(\"x\")] [deprecated(\"use B\")] struct A {}"
-        ));
+        // Either order is the one prefix (B485 Q7): `[internal]` written
+        // before `[deprecated]` used to decline.
+        assert_eq!(
+            steer("[internal(\"x\")] [deprecated(\"use B\")] struct A {}"),
+            Some("use B")
+        );
     }
 
     #[test]
@@ -12696,5 +13130,221 @@ mod tests {
             foreign_spelling_fix("fun f( {", &message, errors[0].span),
             None
         );
+    }
+
+    /// B486's matrix (papers-45's `order_matrix.py`): each declaration kind's
+    /// full stack in the order the parser took before B485, and every
+    /// ADJACENT swap of it — 29 in all.
+    const B486_STACKS: &[(&[&str], &str)] = &[
+        (
+            &[
+                "export",
+                "[deprecated(\"use g\")]",
+                "[internal(\"why\")]",
+                "[extern(\"f\")]",
+                "[must_use]",
+                "[platform(\"node\")]",
+                "async",
+                "external",
+            ],
+            "fun f(): i32;",
+        ),
+        (
+            &[
+                "export",
+                "[deprecated(\"use g\")]",
+                "[internal(\"why\")]",
+                "[must_use]",
+                "[platform(\"node\")]",
+                "async",
+            ],
+            "fun f(): i32 { 1 }",
+        ),
+        (
+            &[
+                "export",
+                "[deprecated(\"use T\")]",
+                "[internal(\"why\")]",
+                "[platform(\"node\")]",
+                "[resource]",
+                "external",
+            ],
+            "struct H;",
+        ),
+        (
+            &[
+                "export",
+                "[derive(PartialEq)]",
+                "[deprecated(\"use T\")]",
+                "[internal(\"why\")]",
+                "[platform(\"node\")]",
+                "[resource]",
+            ],
+            "struct S { a: i32 }",
+        ),
+        (
+            &[
+                "export",
+                "[deprecated(\"use U\")]",
+                "[internal(\"why\")]",
+                "[platform(\"node\")]",
+                "[resource]",
+            ],
+            "trait T { fun t(self): i32; }",
+        ),
+        (
+            &[
+                "export",
+                "[deprecated(\"use y\")]",
+                "[internal(\"why\")]",
+                "lazy",
+            ],
+            "let x = 1;",
+        ),
+    ];
+
+    #[test]
+    fn b486_every_adjacent_marker_swap_is_read_or_steered_to_the_order() {
+        let mut swaps = 0;
+        for (stack, declaration) in B486_STACKS {
+            let canonical = format!("{} {declaration}\n", stack.join(" "));
+            let canonical_print = crate::formatter::reprint(&canonical)
+                .unwrap_or_else(|decline| panic!("{canonical}: {decline:?}"));
+            for at in 0..stack.len() - 1 {
+                swaps += 1;
+                let mut swapped = stack.to_vec();
+                swapped.swap(at, at + 1);
+                let source = format!("{} {declaration}\n", swapped.join(" "));
+                let (first, second) = (swapped[at], swapped[at + 1]);
+                let is_attribute = |marker: &str| marker.starts_with('[');
+                // A keyword other than `export` written ahead of an attribute
+                // (Q6), or two keywords inverted (Q8), is steered; every
+                // other swap is two attributes (free, Q7) or `export` and an
+                // attribute (either side, B445).
+                let steered = !is_attribute(first) && (!is_attribute(second) || first != "export");
+                let (tree, errors) = parse(&source);
+                let rendered: Vec<String> = errors.iter().map(render).collect();
+                if steered {
+                    // ONE refusal, spanning the run, naming the ruled order —
+                    // the attributes, `export`, the keywords, the word — and
+                    // the declaration read as written in it.
+                    let mut attributes: Vec<String> = stack
+                        .iter()
+                        .filter(|marker| is_attribute(marker))
+                        .map(|marker| {
+                            let name = marker[1..].split(['(', ']']).next().unwrap();
+                            if marker.contains('(') {
+                                format!("[{name}(..)]")
+                            } else {
+                                format!("[{name}]")
+                            }
+                        })
+                        .collect();
+                    attributes.extend(
+                        stack
+                            .iter()
+                            .filter(|marker| !is_attribute(marker))
+                            .map(|marker| marker.to_string()),
+                    );
+                    let word = declaration.split(' ').next().unwrap();
+                    attributes.push(word.to_string());
+                    assert_eq!(
+                        rendered,
+                        vec![marker_order_rule(&attributes.join(" "))],
+                        "{source}"
+                    );
+                    let run_end = source.find(word).unwrap();
+                    assert_eq!(errors[0].span, Span::from(0..run_end - 1), "{source}");
+                    let (statements, _) = tree.expect("a tree");
+                    assert_eq!(statements.len(), 1, "{source}: {statements:?}");
+                    assert!(
+                        matches!(statements[0].0, Node::Export(..)),
+                        "{source}: {statements:?}"
+                    );
+                } else {
+                    // Read clean, as the canonical stack: `vilan fmt` prints
+                    // the two alike.
+                    assert!(rendered.is_empty(), "{source}: {rendered:?}");
+                    let print = crate::formatter::reprint(&source)
+                        .unwrap_or_else(|decline| panic!("{source}: {decline:?}"));
+                    assert_eq!(print, canonical_print, "{source}");
+                }
+            }
+        }
+        assert_eq!(swaps, 29);
+    }
+
+    #[test]
+    fn b486_keywords_take_one_order_and_come_after_the_attributes() {
+        // (written, the head the steer spells): Q8's order — `export`,
+        // `const`|`lazy`, `async`, `external`|`macro` — after the attributes.
+        for (source, canonical) in [
+            ("async export fun f(): i32 { 1 }", "export async fun"),
+            ("lazy export let x = 1;", "export lazy let"),
+            ("macro export fun m() { }", "export macro fun"),
+            (
+                "[extern(\"f\")] external async fun f(): i32;",
+                "[extern(..)] async external fun",
+            ),
+            ("external export struct H;", "export external struct"),
+            (
+                "export async [must_use] fun f(): i32 { 1 }",
+                "[must_use] export async fun",
+            ),
+            (
+                "lazy [internal(\"x\")] let x = 1;",
+                "[internal(..)] lazy let",
+            ),
+        ] {
+            let (tree, errors) = parse(source);
+            let rendered: Vec<String> = errors.iter().map(render).collect();
+            assert_eq!(rendered, vec![marker_order_rule(canonical)], "{source}");
+            let (statements, _) = tree.expect("a tree");
+            assert_eq!(statements.len(), 1, "{source}: {statements:?}");
+        }
+        // A set no order makes legal is not steered to one: the production's
+        // own refusal stands.
+        for source in ["async const fun f(): i32 { 1 }", "async lazy let x = 1;"] {
+            let (_, errors) = parse(source);
+            assert!(!errors.is_empty(), "{source}");
+            for error in &errors {
+                assert!(
+                    !matches!(error.reason, ParseErrorReason::MarkerOrder { .. }),
+                    "{source}: {errors:?}"
+                );
+            }
+        }
+        // The ruled order and the one this release still takes (`export`
+        // ahead of the attributes, B445) read clean, and a run the order does
+        // not reach — a list indexed by a list, an `async` block — is the
+        // expression it always was.
+        for source in [
+            "[must_use] export async fun f(): i32 { 1 }",
+            "export [must_use] async fun f(): i32 { 1 }",
+            "[resource] export external struct H;",
+            "fun main() { [a][b]; }",
+            "fun main() { let x = async { 1 }; }",
+            "fun main() { const [1, 2]; }",
+        ] {
+            program(source);
+        }
+    }
+
+    #[test]
+    fn b486_a_reordered_head_still_begins_where_it_was_written() {
+        // The reorder permutes tokens, and every node still begins at the
+        // first unit as written — the statement, the export, the item.
+        let source = "[platform(\"node\")] [deprecated(\"x\")] export fun f() {}";
+        let (statements, _) = program(source);
+        assert_eq!(statements[0].1, Span::from(0..source.len()));
+        match &statements[0].0 {
+            Node::Export(_, inner, _) => assert_eq!(inner.1.start, 0, "{inner:?}"),
+            other => panic!("{other:?}"),
+        }
+        let source = "async [platform(\"node\")] fun f() {}";
+        let (tree, errors) = parse(source);
+        assert_eq!(errors.len(), 1);
+        let (statements, _) = tree.expect("a tree");
+        assert_eq!(statements[0].1, Span::from(0..source.len()));
     }
 }

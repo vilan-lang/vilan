@@ -111,8 +111,22 @@ reads the run on the other side of the marker (`export [derive(Wire)]
 struct Handle`, the spelling before B445), and `vilan fmt` rewrites it into
 the order; the release after refuses it. An attribute written on either
 side is read exactly as one after the marker (and its scope) always was: it
-joins the item's own prefix, whose order and admissions are the item
-production's (§3.3), and a run may be split across the marker. Only an
+joins the item's own prefix, whose admissions are the item production's
+(§3.3), and a run may be split across the marker.
+
+**Attributes are written in any order** (B485 Q7): the productions in §3.3
+list them in the canonical order — generation (`[derive]`, `[service]`,
+`[client_service]`, a macro attribute), the labels (`[deprecated]`,
+`[internal]`, `[hint]`), the binding (`[extern]`), the checks
+(`[must_use]`, `[rpc]`, `[trait_only]`), the fence (`[platform]`), the
+class (`[resource]`) — which is the order `vilan fmt` prints them in, each
+on its own line. **The keywords take one order** (Q8): `export`, then
+`const` or `lazy`, then `async`, then `external` or `macro`, after every
+attribute. A head written otherwise — `async [platform("node")] fun`,
+`external async fun`, `lazy export let` — is refused once, with the head
+respelled in the order (`` write `[platform(..)] async fun` ``), and read
+as if it had been written so. `macro`, like `export`, may still stand
+ahead of the attributes in this release. Only an
 attribute shape — `[` then a name — leads a marker; `export *;` takes none. The marker is written once: a second `export` on one declaration is refused (B492). A `#` before
 a path element is the **reach** marker:
 `import pkg::a::{ #hidden };` imports an item the module does not export,
@@ -230,9 +244,9 @@ combines with a convention — the argument is a tuple the *call site*
 builds, so there is nothing to transfer or alias — but `mut` may precede
 it (`mut ...items: T`).
 
-The attribute prefix is **ordered** — each attribute is optional, but
-they appear in exactly the production's order. `[deprecated("use …")]`
-leads it: the function is **deprecated**, and every use in code outside
+Each attribute of the prefix is optional, and the prefix is written in any
+order (§3.2): the production lists the canonical one, which `vilan fmt`
+prints. `[deprecated("use …")]` leads it: the function is **deprecated**, and every use in code outside
 the standard library — a call, a method call, the function passed as a
 value — still compiles but raises the non-fatal warning
 `` `{name}` is deprecated; {steer} ``, anchored at the using name, once
