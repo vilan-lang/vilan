@@ -51382,6 +51382,252 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B515: a TRAIT's method called on a concrete receiver in a file that
+    /// reaches neither the trait nor the block providing it. An `impl` registers
+    /// when its file LOADS, and loading is program-wide, so `42.to_string()`
+    /// compiled in any file once some loaded module (`std::markdown`) imported
+    /// `std::display` — and a wasm steer test depended on which std modules a
+    /// layer loads. B318's rule is that a trait method needs its trait in
+    /// scope: the file imports the trait, or a name from the trait's module or
+    /// the block's module, or the prelude binds one, or the file declares it.
+    ///
+    /// R-g door (b): a WARNING for one release, refused in v0.45.0.
+    ///
+    /// Calls through a bound are not asked — the bound wrote the trait's name —
+    /// nor are calls in std, in a frozen file or a dependency, nor generated
+    /// code (its source is no user file).
+    /// The file whose attribute generated `id`, when a derive or another macro
+    /// expansion minted it ([`Self::derived_origins`]).
+    fn derived_origin_file(&self, id: Id) -> Option<SourceId> {
+        self.derived_origins
+            .iter()
+            .find(|(range, _, _)| range.contains(&id.0))
+            .map(|(_, _, source)| *source)
+    }
+
+    /// The import path that names `entity` from the module DECLARING it —
+    /// `std::display::Display` — found by the entity rather than by its name,
+    /// so a name two modules declare (`std::style`'s `Display` beside
+    /// `std::display`'s) still answers. `None` for an entity no top-level
+    /// module of `std` or of the package declares.
+    fn import_path_of(&self, entity: Id) -> Option<String> {
+        let std_members: HashSet<Id> = self
+            .module_id_by_name
+            .get("std")
+            .and_then(|std_id| self.modules.get(std_id))
+            .and_then(|module| self.scopes.get(&module.body.1))
+            .map(|scope| scope.name_to_id_map.values().copied().collect())
+            .unwrap_or_default();
+        self.modules.values().find_map(|module| {
+            if module.name == "pkg" || module.name == "std" {
+                return None;
+            }
+            let scope = self.scopes.get(&module.body.1)?;
+            let (name, _) = scope
+                .declaration_order
+                .iter()
+                .find(|(_, id)| *id == entity)?;
+            let root = match std_members.contains(&module.id) {
+                true => "std",
+                false => "pkg",
+            };
+            Some(format!("{root}::{}::{name}", module.name))
+        })
+    }
+
+    /// The file a module scope's own declarations were walked from.
+    fn scope_file(&self, scope_id: Id) -> Option<SourceId> {
+        let scope = self.scopes.get(&scope_id)?;
+        scope
+            .declaration_order
+            .iter()
+            .map(|(_, id)| *id)
+            .chain(
+                scope
+                    .local_value_declarations
+                    .values()
+                    .flatten()
+                    .map(|declaration| declaration.id),
+            )
+            .find_map(|id| self.source_of_id(id))
+    }
+
+    fn check_trait_method_scope(&mut self, global_scope_id: Id) {
+        // The files a user file REACHES: its own, and the declaring file of
+        // every name its module scope binds — its imports, what the prelude
+        // seeded, its own declarations — and of every module it imports whole.
+        let imported_modules: HashSet<(SourceId, Id)> = self
+            .import_reaches
+            .iter()
+            .map(|reach| (reach.source, reach.target))
+            .collect();
+        let mut reached: HashMap<SourceId, HashSet<SourceId>> = HashMap::default();
+        for scope_id in &self.module_scope_ids {
+            // The entry walks in the GLOBAL scope; a module's file is the
+            // file its own declarations were walked from (a scope is minted
+            // before its file's entity range, so it has no source of its own).
+            let source = match *scope_id == global_scope_id {
+                true => Some(SourceId(0)),
+                false => self.scope_file(*scope_id),
+            };
+            let Some(source) = source else {
+                continue;
+            };
+            if self.std_sources.contains(&source)
+                || self.frozen_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+            {
+                continue;
+            }
+            let Some(scope) = self.scopes.get(scope_id) else {
+                continue;
+            };
+            let files = reached.entry(source).or_default();
+            files.insert(source);
+            for id in scope.name_to_id_map.values() {
+                // A MODULE name is reached only where this file imported it:
+                // the loader declares every loaded module's name in the scope
+                // the entry walks in, which is no statement of the file's.
+                let declared = match self.expr_id_to_expr_map.get(id) {
+                    Some(Expr::Module(module_id)) if imported_modules.contains(&(source, *id)) => {
+                        self.modules
+                            .get(module_id)
+                            .and_then(|module| self.scope_file(module.body.1))
+                    }
+                    Some(Expr::Module(_)) => None,
+                    _ => self.source_of_id(*id),
+                };
+                if let Some(declared) = declared {
+                    files.insert(declared);
+                }
+            }
+        }
+        if reached.is_empty() {
+            return;
+        }
+        let mut sites: Vec<(SourceId, Span, Id, &'src str)> = Vec::new();
+        let calls: Vec<(Id, Id, Id)> = self
+            .function_calls
+            .iter()
+            .filter_map(|(call_id, function_call)| {
+                match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+                    Some(Expr::Local(member_id)) => {
+                        Some((*call_id, function_call.subject_id, *member_id))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        for (call_id, subject_id, member_id) in calls {
+            let call_id = &call_id;
+            let member_id = &member_id;
+            let Some(source) = self.source_of_id(*call_id) else {
+                continue;
+            };
+            let Some(files) = reached.get(&source) else {
+                continue;
+            };
+            // The trait the member is, and the files that would bring it in
+            // scope: the trait's own, the impl clause's trait's, the block's.
+            let mut providing: Vec<SourceId> = Vec::new();
+            let trait_id = match self.implementation_by_declaration.get(member_id) {
+                Some(index) => {
+                    let implementation = &self.implementations[*index];
+                    let Some(member_name) = implementation
+                        .declarations
+                        .iter()
+                        .find(|(_, id)| *id == member_id)
+                        .map(|(name, _)| *name)
+                    else {
+                        continue;
+                    };
+                    let Some(home) = self.member_home_trait(implementation, member_name) else {
+                        continue;
+                    };
+                    // A derived block belongs to the file whose attribute
+                    // generated it (B354's rule).
+                    providing.push(
+                        self.derived_origin_file(implementation.impl_id)
+                            .unwrap_or(implementation.source),
+                    );
+                    if let Some(home_source) = self
+                        .traits
+                        .get(&home)
+                        .and_then(|trait_| self.source_of_id(trait_.id))
+                    {
+                        providing.push(home_source);
+                    }
+                    self.method_member_in_trait_at(home, &[], member_name)
+                        .map_or(home, |(_, declaring, _)| declaring)
+                }
+                None => match self.trait_by_declaration.get(member_id) {
+                    // A default reached on a concrete receiver (Gap E's
+                    // re-dispatch); through a bound the bound named the trait.
+                    Some(trait_id)
+                        if matches!(
+                            self.generic_dispatch.get(call_id),
+                            Some(GenericDispatch::OnType(..))
+                        ) =>
+                    {
+                        *trait_id
+                    }
+                    _ => continue,
+                },
+            };
+            let Some(trait_) = self.traits.get(&trait_id) else {
+                continue;
+            };
+            if let Some(trait_source) = self.source_of_id(trait_.id) {
+                providing.push(trait_source);
+            }
+            // Generated code is not the author's spelling: a derive's body
+            // calls what its own expansion needs.
+            if providing.iter().any(|file| files.contains(file))
+                || self.derived_origin_file(*call_id).is_some()
+            {
+                continue;
+            }
+            // At the member's NAME where the call has one (`42.to_string()`
+            // marks `to_string`), the whole call otherwise.
+            let span = self
+                .member_name_spans
+                .get(call_id)
+                .copied()
+                .unwrap_or_else(|| {
+                    **self
+                        .span_map
+                        .get(&subject_id)
+                        .or_else(|| self.span_map.get(call_id))
+                        .unwrap_or(&&EMPTY_SPAN)
+                });
+            let member_name = self.callable_name(*member_id).unwrap_or("this method");
+            sites.push((source, span, trait_id, member_name));
+        }
+        // The calls are visited in the table's order, not the file's — sorted so
+        // `vilan check` prints them stably, and one per site (an entry world
+        // per package entry resolves a shared file's calls once each).
+        sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
+        sites.dedup();
+        for (source, span, trait_id, member_name) in sites {
+            let trait_name = self.traits.get(&trait_id).map_or("", |trait_| trait_.name);
+            let import = match self.import_path_of(trait_id) {
+                Some(path) => format!("import {path};"),
+                None => format!("import {trait_name};"),
+            };
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "`{member_name}` is `{trait_name}`'s, and this file does not import \
+                     `{trait_name}`: the call resolves only because another loaded module does. \
+                     Import it (`{import}`) — this is an error from v0.45.0"
+                ),
+            });
+            self.warning_sources.push(source);
+        }
+    }
+
     /// B382: `export [deprecated("use …")] import a::X as Y;` deprecates the
     /// name `Y` the re-export publishes. Every OTHER file's import of it warns
     /// `` `Y` is deprecated; use … `` — the function attribute's own warning —
@@ -70000,6 +70246,8 @@ fn analyze_over_world<'src>(
         // are the two halves of one release: one tells a module's author what to
         // curate, the other tells a module's CONSUMER what they are reaching
         // past.
+        // B515 reads the import reaches, which the plain-reach pass consumes.
+        analyzer.check_trait_method_scope(global_scope_id);
         analyzer.check_plain_reaches();
         analyzer.check_duplicate_module_declarations();
         // Two impls declaring one name for one subject (B57): a coherence rule, so

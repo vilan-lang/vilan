@@ -7149,3 +7149,87 @@ fn b472_an_unimported_deprecated_alias_steers_to_the_name_it_stands_for() {
         "import it first (`import std::hash_map::HashMap;`)",
     );
 }
+
+// --- B515: a trait method needs its trait in scope ---------------------------
+//
+// An `impl` registers when its file LOADS, and loading is program-wide, so a
+// trait's methods resolved in a file that never imported the trait once any
+// loaded module did: `import std::markdown;` made `42.to_string()` compile with
+// no `Display` in sight. R-g door (b), ruled by the count (55 sites across kolt,
+// the corpus and the docs): a WARNING for one release, refused in v0.45.0.
+
+/// B515: the call warns at the member's name, naming the trait and the import
+/// that brings it — a `Display` method reached through `std::markdown`'s
+/// import, and a `PartialOrd` one through `std::time`'s.
+#[test]
+fn b515_a_trait_method_resolved_through_another_modules_import_warns() {
+    assert_warns_spanning(
+        r#"
+        import std::markdown;
+
+        fun main() {
+            let shown = 42.to_string();
+        }
+        "#,
+        "to_string",
+        "`to_string` is `Display`'s, and this file does not import `Display`: the call resolves \
+         only because another loaded module does. Import it (`import std::display::Display;`)",
+    );
+    assert_warns_spanning(
+        r#"
+        import std::time::Duration;
+
+        fun main() {
+            let longer = Duration::hours(3).gt(Duration::minutes(179));
+        }
+        "#,
+        "gt",
+        "`gt` is `PartialOrd`'s, and this file does not import `PartialOrd`",
+    );
+}
+
+/// B515: a trait the file DOES reach is silent — imported by name, a call
+/// through a bound (the bound wrote the trait), the file's own trait and impl,
+/// a block a derive generated in the file, and a std trait the call names by
+/// its qualified spelling.
+#[test]
+fn b515_a_trait_in_scope_does_not_warn() {
+    let warnings = warning_diagnostics(
+        r#"
+        import std::markdown;
+        import std::display::Display;
+        import std::debug::Debug;
+
+        trait Mine {
+            fun mine(self): i32 {
+                1
+            }
+        }
+
+        impl i32 with Mine {}
+
+        [derive(Debug)]
+        struct Point {
+            x: i32,
+        }
+
+        fun shown<T: Display>(value: T): str {
+            value.to_string()
+        }
+
+        fun main() {
+            let a = 42.to_string();
+            let b = shown(7);
+            let c = 5.mine();
+            let d = Point { x = 1 }.debug();
+            let e = Display::to_string(8);
+        }
+        "#,
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|(message, _)| !message.contains("this file does not import")),
+        "{warnings:#?}"
+    );
+}

@@ -635,3 +635,4 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 610	-	`[derive(Storable)]` on `{name}`: two variants project as `{snake}()`
 NEW	-	this pattern binds {n} {elements}, but the value is a {n}-tuple `{type}`: a tuple pattern takes one sub-pattern per element, and a nested pattern reaches inside one (`((a, b), c)`)
 NEW	-	this pattern binds {n} {elements}, but the value is a `{type}`, not a tuple: `(a, b)` destructures a tuple
+NEW	-	`{member}` is `{trait}`'s, and this file does not import `{trait}`: the call resolves only because another loaded module does. Import it (`{import}`) — this is an error from v0.45.0
