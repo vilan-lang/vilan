@@ -8773,6 +8773,31 @@ fn a_closure_body_takes_the_closures_return_as_its_position_on_both_backends() {
     );
 }
 
+/// F70: a NESTED tuple access natively. The analyzer folds `t.0.1` onto its
+/// root and records the JS layout's FLAT offset, and the emitter wrote that
+/// offset as a Rust tuple index — `t.0.1` over `((1, 2), 3)` read `t.1` and
+/// printed `3` where node prints `2` (a wrong answer with no error whenever the
+/// neighbour has the same type; rustc's E0308 otherwise), and a multi-slot
+/// element was refused by name. The recorded index chain
+/// (`tuple_index_paths`) is the Rust path. The probe: a same-typed
+/// neighbour, a write, a compound write, a `&mut` handed on, a multi-slot read,
+/// a destructure of a nested element, three levels, a `Shared` view read and
+/// write, and a generic function at an instance whose parameter is a tuple.
+#[test]
+fn a_nested_tuple_access_reads_the_nested_element_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_nested_tuple_slots.vl"),
+        include_str!("native/nested_tuple_slots.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_nested_tuple_slots.vl"),
+        Verdict::Identical,
+        "a nested tuple access must read the element its index chain names"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds

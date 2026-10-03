@@ -228,10 +228,11 @@ fn unsupported(what: &str, span: Span) -> Error {
 }
 
 /// One link of a spine read through a `Shared` view (F62): a field, by its
-/// subject and index, or a tuple slot.
+/// subject and index, or a tuple access, as the Rust path it renders to
+/// (`.1.0` for a nested one — see [`Emitter::tuple_slot_path`]).
 enum Step {
     Field(Id, usize),
-    Slot(usize),
+    Slot(String),
 }
 
 /// Where in the emitted file one reserved slot's text goes, and under what name.
@@ -3140,6 +3141,72 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
+    /// The Rust path of one positional tuple access — `.1.0` for `nested.1.0`
+    /// (F70).
+    ///
+    /// The analyzer FOLDS a chained access onto its root and records the JS
+    /// layout's answer: tuples are stored FLAT there (a tuple element splices
+    /// its slots in), so `nested.1.0` over `(i32, (i32, str))` is
+    /// `TupleIndex(nested, 1, 1)` — slot 1 of three. Rust tuples nest, and
+    /// rendering the flat offset wrote `nested.1`, a different element
+    /// (rustc refused the assignment; a read of a same-typed neighbour would
+    /// have been a wrong answer). The analyzer also records the access in
+    /// layout-free terms — the root's tuple type and the chain of element
+    /// indices (`tuple_index_paths`, B310's record) — and that chain IS the
+    /// Rust path, in every instance. An access with no record is walked back
+    /// from its subject's tuple type under the instance: the element whose
+    /// flat span starts at `offset` and is `width` wide, descending into a
+    /// nested tuple that contains it. `None` when the type does not say.
+    fn tuple_slot_path(&self, id: Id, offset: usize, width: usize) -> Option<String> {
+        if let Some((_, path)) = self.program.tuple_index_paths.get(&id) {
+            return Some(path.iter().map(|index| format!(".{index}")).collect());
+        }
+        let Some(Expr::TupleIndex(subject, _, _)) = self.program.entity_map.get(&id) else {
+            return None;
+        };
+        let mut type_id = self.type_of(*subject)?;
+        let mut remaining = offset;
+        let mut path = String::new();
+        loop {
+            let Some(Type::Tuple(elements)) = self.resolve(type_id) else {
+                return None;
+            };
+            let elements = elements.clone();
+            let mut start = 0;
+            let (index, element) = elements.iter().enumerate().find_map(|(index, element)| {
+                let span = self.flat_width(*element);
+                let found = remaining < start + span;
+                let at = start;
+                start += span;
+                found.then_some((index, (*element, at)))
+            })?;
+            let (element, at) = element;
+            let _ = write!(path, ".{index}");
+            remaining -= at;
+            if remaining == 0 && self.flat_width(element) == width {
+                return Some(path);
+            }
+            type_id = element;
+        }
+    }
+
+    /// The number of flat slots a value of `type_id` occupies in the JS
+    /// layout, under the substitution in force: a tuple is the sum of its
+    /// elements', anything else one (the transformer's `flat_width`).
+    fn flat_width(&self, type_id: TypeId) -> usize {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return 1;
+        };
+        match self.resolve(type_id) {
+            Some(Type::Tuple(elements)) => elements
+                .clone()
+                .iter()
+                .map(|element| self.flat_width(*element))
+                .sum(),
+            _ => 1,
+        }
+    }
+
     /// Whether `id` is a field spine read through a `Shared` view — what
     /// [`Self::shared_view_field_read`] renders.
     fn reads_through_a_shared_view(&self, id: Id) -> bool {
@@ -3147,7 +3214,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut stepped = false;
         loop {
             match self.program.entity_map.get(&current) {
-                Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, 1)) => {
+                Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, _)) => {
                     stepped = true;
                     current = subject;
                 }
@@ -3200,8 +3267,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     steps.push(Step::Field(subject, index));
                     current = subject;
                 }
-                Some(&Expr::TupleIndex(subject, offset, 1)) => {
-                    steps.push(Step::Slot(offset));
+                Some(&Expr::TupleIndex(subject, offset, width)) => {
+                    let Some(path) = self.tuple_slot_path(current, offset, width) else {
+                        return Ok(None);
+                    };
+                    steps.push(Step::Slot(path));
                     current = subject;
                 }
                 _ => match self.shared_view_of(current) {
@@ -3217,9 +3287,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     let field = self.field_name(subject, index, self.span_of(id))?;
                     let _ = write!(path, ".{field}");
                 }
-                Step::Slot(offset) => {
-                    let _ = write!(path, ".{offset}");
-                }
+                Step::Slot(ref slot) => path.push_str(slot),
             }
         }
         let cell_text = self.expecting_nothing(|emitter| emitter.expression(cell, depth))?;
@@ -4137,13 +4205,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 format!("({},)", parts.join(", "))
             }
             Expr::TupleIndex(subject, offset, width) => {
-                if width != 1 {
+                let Some(path) = self.tuple_slot_path(id, offset, width) else {
                     return Err(unsupported("a multi-slot tuple element", span));
-                }
+                };
                 if let Some(read) = self.shared_view_field_read(id, depth)? {
                     return Ok(read);
                 }
-                format!("{}.{offset}", self.expression(subject, depth)?)
+                format!("{}{path}", self.expression(subject, depth)?)
             }
             Expr::StructInitializer(named, fields) => {
                 let pairs: Vec<(usize, Id)> = fields
@@ -10988,9 +11056,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
                 Ok(format!("{subject_text}[({index_text}) as usize]"))
             }
-            Some(Expr::TupleIndex(subject, offset, 1)) => {
+            Some(Expr::TupleIndex(subject, offset, width)) => {
+                let Some(path) = self.tuple_slot_path(id, offset, width) else {
+                    return Err(unsupported("a multi-slot tuple element", self.span_of(id)));
+                };
                 let subject_text = self.mutable_place(subject, depth)?;
-                Ok(format!("{subject_text}.{offset}"))
+                Ok(format!("{subject_text}{path}"))
             }
             // Everything else — the source's own `&mut` among it — is the
             // expression arm's, which reborrows a binding that is already a

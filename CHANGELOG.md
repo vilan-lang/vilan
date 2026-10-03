@@ -40,6 +40,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**Native: a NESTED tuple access reads the nested element — `let t = ((1, 2), 3); print(t.0.1)` printed `3` natively and `2` on node.** The analyzer folds a chained access onto its root and records the JS layout's FLAT offset (tuples splice their elements' slots in there), and the Rust emitter wrote that offset as a Rust tuple index: `t.0.1` became `t.1`. Where the neighbour had the same type that was a wrong answer with no error; otherwise rustc refused it (`nested.1.0 = 9` over `(i32, (i32, str))`, the filed shape), and a multi-slot element (`let inner = nested.1;`) was refused by name. The emitter now renders the access's recorded index chain (`tuple_index_paths`, B310's layout-free record) — which IS the Rust path in every instance — at every site: a read, a place, and a spine read through a `Shared` view; an access with no record is walked back from its subject's tuple type. The corpus program `tuple-access.vl` builds natively now (the whole-set differential's refusals 28 → 27). Pin: `native_differential`'s `a_nested_tuple_access_reads_the_nested_element_on_both_backends` (`native/nested_tuple_slots.vl`: a same-typed neighbour, a write, a compound write, a `&mut` handed on, a multi-slot read, a nested destructure, three levels, a `Shared` view read and write, a generic function at an instance whose parameter is a tuple). Tracker F70.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
