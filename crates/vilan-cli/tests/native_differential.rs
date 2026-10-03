@@ -794,18 +794,20 @@ const ASYNC_SUITE: &[&str] = &[
 /// Order 44 seal (a host binding's by-value argument moved its `salt`) behind
 /// an E0308 (a `match` literal pattern written at the arms' width over a
 /// `usize`), and nothing ran it. [`every_platform_bound_program_is_identical_or_named`]
-/// requires these four and classifies the rest.
-const PLATFORM_BOUND_REQUIRED: &[&str] =
-    &["crypto.vl", "db.vl", "asset_bundle.vl", "element-syntax.vl"];
+/// requires these and classifies the rest. `estate.vl` joined them with E243:
+/// the JS `vilan run` printed its asset report on stdout ahead of the
+/// program's output, and reports on stderr now.
+const PLATFORM_BOUND_REQUIRED: &[&str] = &[
+    "crypto.vl",
+    "db.vl",
+    "asset_bundle.vl",
+    "element-syntax.vl",
+    "estate.vl",
+];
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
 /// agree on for a reason that is not the program's, named with the reason.
-const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[(
-    "estate.vl",
-    "the JS `vilan run` prints its build's asset report (`Bundled  robots.txt`, ...) on \
-     STDOUT ahead of the program's output, and the native run reports nothing; the \
-     program's own three lines are identical",
-)];
+const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[];
 
 /// Modules whose presence in an `import` means the program reaches a platform
 /// surface S1a has none of. Written as a support list so Order 38 widens the
@@ -8243,6 +8245,32 @@ fn every_platform_bound_program_is_identical_or_named() {
             "{program} is named outside the platform-bound differential but is not a corpus program"
         );
     }
+}
+
+/// E243: the JS `vilan run` reports the resources its build bundled on
+/// STDERR, so stdout is the program's alone — it printed `Bundled  …` lines on
+/// stdout ahead of the program's first line while the native run printed
+/// nothing, and `estate.vl` sat outside the platform-bound differential for
+/// it. The assertion reads only the word `Bundled` on each stream, never a
+/// path, so it holds on Windows, where the destination prints with `\`.
+#[test]
+fn the_js_run_reports_its_bundled_resources_on_stderr() {
+    let staged = stage();
+    let run = vilan(&staged)
+        .args(["run", "estate.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert!(run.status.success(), "estate.vl runs: {run:?}");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !stdout.contains("Bundled"),
+        "stdout is the program's alone:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("Bundled"),
+        "the build's report still says what it bundled, on stderr:\n{stderr}"
+    );
 }
 
 /// F57's second defect: a `match` literal pattern takes the SUBJECT's width,

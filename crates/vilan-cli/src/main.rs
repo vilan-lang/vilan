@@ -1827,6 +1827,7 @@ fn hmr_round(
             &leg.name,
             &reserved,
             &mut bundled_names,
+            BuildReport::Stderr,
         )
         .unwrap_or_default();
         let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
@@ -2061,6 +2062,7 @@ fn build_and_spawn_run(
                 &leg_name(&output_path),
                 &[],
                 &mut BTreeMap::new(),
+                BuildReport::Stderr,
             )
             .ok()?;
             let script = watch_script_path();
@@ -4500,6 +4502,7 @@ fn build_single(
         &leg,
         &[LegNamespace::of(&leg, platform)],
         &mut BTreeMap::new(),
+        BuildReport::Stdout,
     ) {
         Ok(assets) => assets,
         Err(_) => return RoundOutcome::Failed,
@@ -4640,6 +4643,7 @@ fn run_single(unit: &Unit, args: &[String], backend: Backend) -> ExitCode {
         &leg_name(&output_path),
         &[],
         &mut BTreeMap::new(),
+        BuildReport::Stderr,
     )
     .is_err()
     {
@@ -4981,6 +4985,10 @@ fn build_workspace_artifacts(
                 &unit.name,
                 &reserved,
                 &mut bundled_names,
+                // `vilan build`'s report, and a workspace `vilan run`'s, whose
+                // `Compiled` lines go to stdout beside it; a workspace has no
+                // native leg for that stdout to disagree with.
+                BuildReport::Stdout,
             )?;
             // Unconditional: this is also where a previous build's chunks are swept
             // when this one wrote none, and where a browser leg's build manifest is
@@ -6167,6 +6175,20 @@ fn prune_and_record_bundled(directory: &std::path::Path, leg: &str, bundled: &BT
     write_leg_record(&record, next, "bundled-asset record");
 }
 
+/// Where a build's own report lines (`Bundled  robots.txt`) go.
+///
+/// `vilan build`'s report is its OUTPUT, so it is stdout. `vilan run`'s is
+/// chatter in front of the program's own output, and stdout there belongs to
+/// the program: the JS `run` printed its asset report ahead of the program's
+/// first line while the native `run` printed nothing, so a program that
+/// bundles a resource disagreed between the two backends on bytes it never
+/// wrote (E243; `estate.vl` sat outside the native differential for it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildReport {
+    Stdout,
+    Stderr,
+}
+
 /// Copies every file `const asset::bundle` registered into the build's output
 /// directory, and returns their names — the `assets` array of the leg's build
 /// manifest ([`write_chunks`]), in the order the program asked for them.
@@ -6217,6 +6239,7 @@ fn write_bundled(
     leg: &str,
     reserved: &[LegNamespace],
     written_names: &mut BTreeMap<String, PathBuf>,
+    report: BuildReport,
 ) -> Result<Vec<String>, ExitCode> {
     let mut written = Vec::new();
     // What the record will say. Not the same list as `written`: a resource that
@@ -6284,11 +6307,18 @@ fn write_bundled(
             );
             return Err(ExitCode::FAILURE);
         }
-        println!(
-            "{}  {}",
-            paint::out(paint::Style::GREEN, "Bundled"),
-            paint::out(paint::Style::BOLD, &destination.display().to_string())
-        );
+        match report {
+            BuildReport::Stdout => println!(
+                "{}  {}",
+                paint::out(paint::Style::GREEN, "Bundled"),
+                paint::out(paint::Style::BOLD, &destination.display().to_string())
+            ),
+            BuildReport::Stderr => eprintln!(
+                "{}  {}",
+                paint::err(paint::Style::GREEN, "Bundled"),
+                paint::err(paint::Style::BOLD, &destination.display().to_string())
+            ),
+        }
         explain::bundled(destination, leg, source.clone(), name);
         written.push(name.clone());
         recorded.insert(name.clone());

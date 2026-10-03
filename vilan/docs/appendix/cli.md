@@ -271,6 +271,10 @@ restarts on every save; in a project with a browser leg, hot module
 replacement is on by default: the page swaps changed code in place
 instead of reloading (see [the dev loop](../guide/dev-loop.md)).
 
+Stdout is the program's: what the build itself reports on the way (the
+`Bundled` line for each resource it carries) goes to stderr, so a
+program prints the same bytes under either backend.
+
 - `--watch`: place it before the file, ahead of any program args.
 - `--no-hmr`: plain restart-the-server watching, no dev channel.
 - `--hmr-port <port>`: the `127.0.0.1` port for the HMR channel

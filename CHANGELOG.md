@@ -60,6 +60,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**`vilan run` reports the resources its build bundled on STDERR — stdout is the program's alone.** The JS `run` printed `Bundled  robots.txt` (one line per `const asset::bundle` resource) on stdout ahead of the program's first line, while `vilan run --backend rust` printed nothing, so a program that bundles a resource disagreed between the two backends on bytes it never wrote. `vilan build` keeps its report on stdout, where it is the output; a workspace `vilan run` keeps its `Compiled`/`Bundled` lines beside each other on stdout (a workspace has no native leg to disagree with). `estate.vl` leaves the platform-bound differential's outside list and joins its required list (9 enumerated / 6 identical / 3 refused / 0 broken). Pins: `native_differential`'s `the_js_run_reports_its_bundled_resources_on_stderr` (reads only the word on each stream, so it holds on Windows) and `every_platform_bound_program_is_identical_or_named`. Docs: `appendix/cli.md`'s `vilan run`. Tracker E243.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
