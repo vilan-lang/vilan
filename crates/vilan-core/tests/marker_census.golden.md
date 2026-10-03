@@ -235,8 +235,8 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 | `[doc(hidden)]` | · | · | · | · | · | · | · | · | · | · |
 | `[expose]` | · | · | · | · | · | · | · | · | · | · |
 | `[platform("browser")]` | · | · | · | a32 | · | · | · | · | · | · |
-| `[deprecated("use g")]` | · | · | · | a32 | · | · | · | · | · | · |
-| `[internal("why")]` | · | · | · | a32 | · | · | · | · | · | · |
+| `[deprecated("use g")]` | · | · | · | a33 | · | · | · | · | · | · |
+| `[internal("why")]` | · | · | · | a34 | · | · | · | · | · | · |
 | `[resource]` | · | · | · | s9 | s9 | · | · | · | s9 | s9 |
 | `[hint(Show)]` | · | · | · | a13 | · | · | · | · | · | · |
 | `[reactive(coarse)]` | · | · | · | · | · | · | · | · | · | · |
@@ -383,7 +383,7 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 | `async` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `await` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `const` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `css` | s33 | s33 | · | · | ✓ | ✓ | ✓ | · |
+| `css` | s35 | s35 | · | · | ✓ | ✓ | ✓ | · |
 | `else` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `enum` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `export` | · | · | · | s27 | ✓ | ✓ | ✓ | s27 |
@@ -392,22 +392,22 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 | `for` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `fun` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `if` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `impl` | · | · | s34 | · | ✓ | ✓ | ✓ | · |
-| `import` | s35 | s35 | s35 | · | ✓ | ✓ | ✓ | · |
+| `impl` | · | · | s36 | · | ✓ | ✓ | ✓ | · |
+| `import` | s37 | s37 | s37 | · | ✓ | ✓ | ✓ | · |
 | `in` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `is` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `let` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `macro` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `match` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `mod` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `mut` | s36 | · | · | · | ✓ | ✓ | ✓ | · |
+| `mut` | s38 | · | · | · | ✓ | ✓ | ✓ | · |
 | `null` | · | · | · | ✓ | ✓ | ✓ | ✓ | · |
 | `ret` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `struct` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `trait` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `type` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `true` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `use` | s35 | s35 | s35 | · | ✓ | ✓ | ✓ | · |
+| `use` | s37 | s37 | s37 | · | ✓ | ✓ | ✓ | · |
 | `as` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `borrows` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `context` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -416,11 +416,11 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 | `lazy` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `only` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `own` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `self` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | s37 |
+| `self` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | s39 |
 | `Self` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `sync` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `then` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `void` | s38 | s38 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `void` | s40 | s40 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `with` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `derive` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `service` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -471,10 +471,12 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 - **s29** a closure cannot take a `lazy` parameter: a closure TYPE (`sync \|A\| B`) has no lazy form, so the thunking would be invisible to every position the closure is annotated, stored or passed in. Take a closure parameter (`\|ma…
 - **a30** `x` is a `lazy` binding inside a body: `lazy` defers a MODULE-LEVEL binding, whose lifetime is the process's. A local would need a runtime was-it-initialized flag to know whether to destroy it at the end of its scope — d…
 - **s31** a lazy binding is `lazy let name: T = <initializer>;` — `lazy` defers a BINDING's initializer to its first use, and a parameter's argument to the callee's first read
-- **a32** `x` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
-- **s33** `css` is a keyword: it begins a `css { … }` block. The style values that used to spell it were renamed out of its way — `Length::css(…)` is now `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.t…
-- **s34** the unit type is spelled `void`: `()` is the empty tuple, which no expression can produce
-- **s35** an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
-- **s36** a mutable binding is spelled `mut x = …`: `let` and `mut` are the two binding forms, not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and writing both is neither
-- **s37** `self` is reserved for the file's own module — `mod self;`, with no body, as the file's first statement — so a nested module cannot take the name: give it another
-- **s38** `void` is the unit value's own spelling, so a binding cannot take it: every later `void` still reads as the unit, not as this binding — name it something else
+- **a32** `x` is a local binding, and `[platform(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+- **a33** `x` is a local binding, and `[deprecated(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+- **a34** `x` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+- **s35** `css` is a keyword: it begins a `css { … }` block. The style values that used to spell it were renamed out of its way — `Length::css(…)` is now `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.t…
+- **s36** the unit type is spelled `void`: `()` is the empty tuple, which no expression can produce
+- **s37** an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
+- **s38** a mutable binding is spelled `mut x = …`: `let` and `mut` are the two binding forms, not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and writing both is neither
+- **s39** `self` is reserved for the file's own module — `mod self;`, with no body, as the file's first statement — so a nested module cannot take the name: give it another
+- **s40** `void` is the unit value's own spelling, so a binding cannot take it: every later `void` still reads as the unit, not as this binding — name it something else
