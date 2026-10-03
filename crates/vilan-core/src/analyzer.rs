@@ -29920,6 +29920,40 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        // B534: a literal standing in a function's RETURN position, where the
+        // return type is a written closure type with view parameters (`fun
+        // make(): |&mut List<i32>| void { |list| list.push(9) }`), takes them
+        // there too — it was refused "cannot mutate immutable 'list'".
+        let mut function_ids: Vec<Id> = self.functions.keys().copied().collect();
+        function_ids.sort_unstable_by_key(|function_id| function_id.0);
+        for function_id in function_ids {
+            let Some((return_type_id, tail_id)) = self
+                .functions
+                .get(&function_id)
+                .filter(|function| function.has_body)
+                .and_then(|function| {
+                    function
+                        .return_type_id
+                        .map(|type_id| (type_id, function.body.1))
+                })
+            else {
+                continue;
+            };
+            let Some(views) = self
+                .closure_type_parameter_views
+                .get(&return_type_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let mut leaves = Vec::new();
+            self.collect_tail_leaves(tail_id, &mut leaves);
+            for leaf in leaves {
+                if let Some(closure_id) = self.closure_behind_callee(leaf) {
+                    adoptions.push((closure_id, views.clone()));
+                }
+            }
+        }
         for (expr_id, expr) in &self.expr_id_to_expr_map {
             match expr {
                 Expr::StructInitializer(_, fields) => {

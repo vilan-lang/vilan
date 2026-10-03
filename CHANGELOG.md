@@ -358,6 +358,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**A closure literal takes its position's `&mut` parameters at a function's RETURN — `fun make(): |&mut List<i32>| void { |list| list.push(9) }` and both arms of a returned `if` — and at an annotated binding, called or never called, where each was refused "cannot mutate immutable 'list'" (the binding also "`list` is never given a type").** B465's adoption read the positions a closure type is written at — a parameter, a struct field, an annotated binding — and not a function's return; it reads the return's tail leaves now. The binding position was closed by B516 (the binding keeps its annotation's type id, which the adoption is keyed by). The third position the item names — a generic parameter instantiated with the closure type (`edits.push(|list| ..)` on `List<|&mut List<i32>| void>`) — is not taken: the parameter's written type is `T`, so there is no written closure type to read the conventions from. Pin: `inference::borrows`' `b534_a_closure_literal_takes_view_parameters_at_a_return_and_an_annotated_binding` — red on the 0.43.0 toolchain. No golden moves. Tracker B534 (two of its three positions).
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

@@ -12054,3 +12054,31 @@ fn b512_the_spelled_copy_of_a_conditional_view_is_a_copy() {
         "1\n10\n5\n3\n",
     );
 }
+
+/// B534 (B465's family): a closure literal takes its position's `&mut`
+/// parameters at a function's RETURN — `fun make(): |&mut List<i32>| void {
+/// |list| list.push(9) }` was refused "cannot mutate immutable 'list'" — and at
+/// an annotated binding, called or never called (closed by B516's change to the
+/// binding's probe). The third position the item names, a generic parameter
+/// instantiated with the closure type (`List<|&mut ..|>::push`), is not taken.
+#[test]
+fn b534_a_closure_literal_takes_view_parameters_at_a_return_and_an_annotated_binding() {
+    assert_compiles_and_runs(
+        r#"
+        fun make(): |&mut List<i32>| void { |list| list.push(9) }
+        fun chosen(flag: bool): |&mut List<i32>| void {
+            if flag { |list| list.push(1) } else { |list| list.push(2) }
+        }
+        fun main() {
+            mut numbers = [0];
+            make()(&mut numbers);
+            chosen(false)(&mut numbers);
+            let single: |&mut List<i32>| void = |list| list.push(8);
+            single(&mut numbers);
+            let unused: |&mut List<i32>| void = |list| list.push(7);
+            print(numbers.len());
+        }
+        "#,
+        "4\n",
+    );
+}
