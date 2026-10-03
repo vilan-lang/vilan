@@ -372,6 +372,15 @@ const CONST_HAS_NO_MUTATION: &str = "a compile-time value has no runtime mutatio
      computes, and there is nowhere for a later write to go. Write `const let` for the \
      compile-time binding, or `mut name = const ..;` for a runtime binding seeded from one";
 
+/// The rule `async x = 1;` and `async let x = 1;` break (B494). Curated
+/// (diagnostics-standard.md B6): `async` marks a function or an expression
+/// run as a task, never a binding, and the two spellings the author can have
+/// meant are named. `async x = 1;` was read as an ASSIGNMENT whose place is
+/// `async x` — refused only when `x` was unbound ("cannot find 'x'"), and
+/// emitted as invalid JS when it was bound.
+const ASYNC_MARKS_NO_BINDING: &str = "`async` does not mark a binding: it marks a function, `async fun load()`, or an \
+     expression run as a task, `let pending = async load();` — a binding is `let name = …`";
+
 /// The rule a CSS pseudo-class written CSS-style breaks (tracker E153).
 /// Curated (diagnostics-standard.md B6): the prohibition explains itself and
 /// names the sanctioned spelling.
@@ -3428,6 +3437,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some(item);
         }
         if let Some(item) = self.attempt(Self::parse_labelled_let) {
+            return Some(item);
+        }
+        if let Some(item) = self.attempt(Self::parse_misplaced_async_binding) {
             return Some(item);
         }
         // Items 8-11 & 21: `expression ;`, or a block-bearing form
@@ -6592,6 +6604,43 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             _ => None,
         }
+    }
+
+    /// B494: `async` written where a binding begins — `async x = 1;`,
+    /// `async x: i32 = 1;`, `async let x = 1;`, `async mut x = 1;` — is
+    /// refused once ([`ASYNC_MARKS_NO_BINDING`]) and read as the plain binding
+    /// it spells, so the name is bound and nothing after it cascades. `async x
+    /// = 1;` rewrites the `async` to the `let` it stands in for; before `let`
+    /// or `mut` the word is read past.
+    ///
+    /// Nothing that works today reads differently: `async NAME =` was the
+    /// assignment `(async NAME) = …`, which the JS backend emits as an invalid
+    /// left-hand side, and `async let` never parsed. `async { … }`, `async
+    /// load()` and `async fun` are untouched.
+    fn parse_misplaced_async_binding(&mut self) -> Option<Spanned<Node<'src>>> {
+        if !self.peek_is(&Token::Async) {
+            return None;
+        }
+        let names_a_binding = match self.peek_at(1) {
+            Some(Token::Let | Token::Mut) => true,
+            Some(Token::Ident(_)) => {
+                matches!(self.peek_at(2), Some(Token::Op("=") | Token::Op(":")))
+            }
+            _ => false,
+        };
+        if !names_a_binding {
+            return None;
+        }
+        let span = self.here_span();
+        if matches!(self.peek_at(1), Some(Token::Ident(_))) {
+            self.tokens[self.position].0 = Token::Let;
+        } else {
+            self.bump();
+        }
+        self.record_rewrite(span, ParseErrorReason::Rule(ASYNC_MARKS_NO_BINDING));
+        let declaration = self.parse_let()?;
+        self.eat_declaration_terminator()?;
+        Some(declaration)
     }
 
     /// The `;` a `const let` owes, with the statement funnel's own recovery
@@ -13436,5 +13485,46 @@ mod tests {
         // `const mut` stays the refusal it was, unlabelled.
         let (_, errors) = parse("const mut x = 1;");
         assert_eq!(render(&errors[0]), CONST_HAS_NO_MUTATION);
+    }
+
+    #[test]
+    fn b494_async_where_a_binding_begins_is_refused_and_read_as_the_binding() {
+        // (source, the binding's name): one refusal at `async`, and the
+        // binding bound — so nothing reading it cascades into "cannot find".
+        for (source, name) in [
+            ("fun main() { async x = 1; print(x); }", "x"),
+            (
+                "fun main() { async total: i32 = 1; print(total); }",
+                "total",
+            ),
+            ("fun main() { async let x = 1; print(x); }", "x"),
+            ("fun main() { async mut x = 1; x = 2; }", "x"),
+            ("async config = 1;", "config"),
+        ] {
+            let (tree, errors) = parse(source);
+            let refused: Vec<(String, &str)> = errors
+                .iter()
+                .map(|error| (render(error), &source[error.span.start..error.span.end]))
+                .collect();
+            assert_eq!(
+                refused,
+                vec![(ASYNC_MARKS_NO_BINDING.to_string(), "async")],
+                "{source}"
+            );
+            let printed = format!("{:?}", tree.expect("a tree"));
+            assert!(
+                printed.contains(&format!("Let((\"{name}\"")),
+                "{source}: the binding is in the tree: {printed}"
+            );
+        }
+        // `async` before a function, a block or an expression is untouched.
+        for source in [
+            "async fun f(): i32 { 1 }",
+            "fun main() { let pending = async { 1 }; }",
+            "fun main() { async go(); }",
+            "fun main() { let x = async load(); }",
+        ] {
+            program(source);
+        }
     }
 }

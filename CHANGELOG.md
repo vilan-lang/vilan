@@ -43,6 +43,11 @@ written down.
 <!-- family: diagnostics -->
 **A label on a LOCAL `let` is refused naming the label written — "`x` is a local binding, and `[platform(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it" — where it named `[internal(..)]` whatever the label was.** Several labels are named together ("`[deprecated(..)]` and `[internal(..)]` label … so the labels have no reader — delete them"), in the canonical order. Ledger row 567 is re-keyed. **Pin:** `inference::generics::b493_a_local_label_refusal_names_the_label_written` (`[platform]`, `[deprecated]`, and two at once); the `[internal]` pin beside it is unchanged. The marker census's B4 notes now differ per label. Tracker B493.
 
+---
+
+<!-- family: diagnostics -->
+**`async` written where a binding begins — `async x = 1;`, `async x: i32 = 1;`, `async let x = 1;`, `async mut x = 1;` — is refused once at the word, "`async` does not mark a binding: it marks a function, `async fun load()`, or an expression run as a task, `let pending = async load();` — a binding is `let name = …`", and read as the plain binding, so the name is bound and nothing cascades.** `async x = 1;` used to parse as an ASSIGNMENT whose place is `async x`: refused "cannot find 'x' in this scope" when `x` was unbound, and — when it was bound — accepted by `vilan check` and emitted as JavaScript that throws "Invalid left-hand side in assignment" at load (filed apart: other non-place targets take the same path). `async let` fell to "found 'let' expected an expression". `async fun`, `async { … }` and `async load()` are untouched. It is a curated rule statement (`ASYNC_MARKS_NO_BINDING`, the rule-site count 60 → 61). **Pin:** `parsing::tests::b494_async_where_a_binding_begins_is_refused_and_read_as_the_binding` (five shapes, local and module, each one refusal at `async` over a tree holding the binding; four `async` forms that stay clean). The marker census's `async` row takes the rule at the binding positions. Tracker B494.
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
