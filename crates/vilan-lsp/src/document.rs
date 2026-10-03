@@ -7136,6 +7136,23 @@ impl Document {
             if !spans_overlap(diagnostic.span, range) {
                 continue;
             }
+            // B520: a foreign spelling (`return`, `fn`, `->`, …) — the
+            // parser's own fix data, recognized by the diagnostic's exact
+            // message (the one field a diagnostic carries through the
+            // pipeline).
+            if let Some(fix) = vilan_core::parsing::foreign_spelling_fix(
+                &self.text,
+                &diagnostic.msg,
+                diagnostic.span,
+            ) {
+                fixes.push(QuickFix {
+                    title: fix.title.to_string(),
+                    span: fix.span,
+                    replacement: fix.replacement.to_string(),
+                    target: None,
+                });
+                continue;
+            }
             if let Some(name) = unresolved_name(&diagnostic.msg) {
                 for module_path in self.import_candidates(program, name) {
                     let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();

@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location, Range,
-    Url,
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
+    NumberOrString, Range, Url,
 };
 
 use vilan_core::Span;
@@ -518,9 +518,14 @@ fn diagnostic_groups(document: &Document, owner: &Url, paint: bool) -> Vec<(Url,
         } else {
             DiagnosticSeverity::ERROR
         };
+        // B520: a diagnostic with a stable code publishes it — the foreign
+        // spellings, recognized by their exact message.
+        let code = vilan_core::parsing::ForeignSpelling::of_message(&item.message)
+            .map(|spelling| NumberOrString::String(spelling.code().to_string()));
         let diagnostic = |range| Diagnostic {
             range,
             severity: Some(severity),
+            code: code.clone(),
             source: Some("vilan".to_string()),
             message: item.message.clone(),
             ..Default::default()
