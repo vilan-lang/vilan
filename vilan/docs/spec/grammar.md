@@ -91,7 +91,9 @@ lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
 `import` brings names from another module into scope; `use` brings names
 from a type's namespace (e.g. variants) into scope. In a set, `self` names
 the item itself (`Option::{ self, Some, None }` imports the type and its
-variants). Semantics: §4.
+variants), and `self as name` imports it under another name. `vilan fmt`
+and Organize Imports write a set's `self` first, then `self as name`, then
+the members. Semantics: §4.
 
 `export` is a statement WRAPPER, not a declaration kind: it takes the
 statement under it, which is what lets one production cover every

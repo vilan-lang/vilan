@@ -515,11 +515,17 @@ enum RootRank {
 /// Some }` reprinted as `Option::{ None, Some, self }` in 37 groups under N55's
 /// reformat, std's `prelude.vl` and `web.vl` among them — and `self` first is
 /// what a reader arrives with: it names the group's own namespace, so it reads
-/// as the head of the list rather than one more member of it. Only a bare
-/// `self` ranks: `self as name` is a rename and keys as one.
+/// as the head of the list rather than one more member of it.
+///
+/// `SelfAlias` — `self as name`, the namespace under a name of its own — is
+/// declared right after it (E256, RULED 2026-10-03, E251's ruling that
+/// `self` sorts first): it is still the group's own head, renamed, so it
+/// leads every member and follows only a bare `self`. Two renames of one
+/// namespace order by their alias.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum BranchKey {
     SelfLeaf,
+    SelfAlias(String),
     End,
     Path(String, Box<BranchKey>),
     /// An `(impl TYPE)` selector (B318 S3): its subject's rendered type text
@@ -646,8 +652,10 @@ fn unwrap_singleton_set<'branch, 'src>(
 /// one-member set keys as its member ([`unwrap_singleton_set`]).
 fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
     match unwrap_singleton_set(branch) {
-        // A bare `self` is the group's own namespace and sorts first (E146).
+        // A bare `self` is the group's own namespace and sorts first (E146),
+        // and `self as name` right after it (E256).
         TokenBranch::Path("self", None, None) => BranchKey::SelfLeaf,
+        TokenBranch::Path("self", None, Some(alias)) => BranchKey::SelfAlias((*alias).to_string()),
         // An alias keys as the segment it renames plus the alias itself, so
         // `a::b as c` and `a::b as d` are two imports the run orders stably
         // rather than two spellings of one key (E142).
@@ -13475,20 +13483,48 @@ mod import_sorting {
         );
     }
 
-    // Only a BARE `self` heads the group. `self as name` renames the namespace
-    // — a binding of its own — and keys by the text it writes, so it stays where
-    // the alias sorts it (E142's rule, unchanged).
+    // E256 (RULED 2026-10-03): `self as name` is the group's own namespace
+    // under a name, so it heads the group as a bare `self` does — after a bare
+    // `self`, ahead of every member, two renames by their alias. It sorted
+    // among the names by its text before (E142's key), so E251's merged
+    // `{ Json, JsonValue, self as j }` put the namespace last.
     #[test]
-    fn an_aliased_self_does_not_head_the_group() {
+    fn e256_an_aliased_self_heads_the_group_after_a_bare_self() {
         assert_sorts(
             "import std::option::Option::{ Some, self as Maybe, None };\n",
-            "import std::option::Option::{ None, Some, self as Maybe };\n",
+            "import std::option::Option::{ self as Maybe, None, Some };\n",
         );
-        // A group carrying BOTH: the bare `self` heads it, the rename sorts by
-        // its own text.
+        assert_sorts(
+            "import std::json::{ Json, JsonValue, self as j };\n",
+            "import std::json::{ self as j, Json, JsonValue };\n",
+        );
+        // A group carrying BOTH: the bare `self` first, then the rename.
         assert_sorts(
             "import std::option::Option::{ Some, self as Maybe, None, self };\n",
-            "import std::option::Option::{ self, None, Some, self as Maybe };\n",
+            "import std::option::Option::{ self, self as Maybe, None, Some };\n",
+        );
+        // Two renames order by their alias; already-first is a fixed point.
+        assert_sorts(
+            "import std::option::Option::{ None, self as b, self as a };\n",
+            "import std::option::Option::{ self as a, self as b, None };\n",
+        );
+        assert_sorts(
+            "import std::option::Option::{ self as Maybe, None, Some };\n",
+            "import std::option::Option::{ self as Maybe, None, Some };\n",
+        );
+        // Organize Imports writes the same order: one key serves both.
+        assert_eq!(
+            super::organize::organize("import std::json::{ Json, JsonValue, self as j };\n", &[]),
+            "import std::json::{ self as j, Json, JsonValue };\n"
+        );
+        // The net reads the two orders of one group as one.
+        assert_eq!(
+            normalize(raw_tokens(
+                "import std::option::Option::{ Some, self as Maybe, None };\n"
+            )),
+            normalize(raw_tokens(
+                "import std::option::Option::{ self as Maybe, None, Some };\n"
+            )),
         );
     }
 
@@ -13704,7 +13740,7 @@ mod import_sorting {
     fn an_aliased_brace_member_sorts_and_keeps_its_alias() {
         assert_sorts(
             "import std::option::Option::{ Some, self as Maybe, None };\n",
-            "import std::option::Option::{ None, Some, self as Maybe };\n",
+            "import std::option::Option::{ self as Maybe, None, Some };\n",
         );
     }
 
