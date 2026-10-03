@@ -20876,8 +20876,25 @@ impl<'src> Analyzer<'src> {
         subject_type: &Type,
         member_name: &'src str,
     ) -> Option<ImplMemberResolution> {
+        self.resolve_blanket_through_bounds_in(id, subject_type, member_name, None)
+    }
+
+    /// [`Self::resolve_blanket_through_bounds`], narrowed to the blankets whose
+    /// member is `home_trait`'s when one is given — the trait a QUALIFIED call
+    /// named (`Same::same(&a, &b)` inside `fun f<T: PartialEq>`), which must not
+    /// reach another trait's same-named member through another blanket.
+    fn resolve_blanket_through_bounds_in(
+        &mut self,
+        id: Id,
+        subject_type: &Type,
+        member_name: &'src str,
+        home_trait: Option<Id>,
+    ) -> Option<ImplMemberResolution> {
         let mut candidates = Vec::new();
         for candidate in self.method_member_candidates(subject_type, member_name) {
+            if home_trait.is_some_and(|home_trait| candidate.home_trait != Some(home_trait)) {
+                continue;
+            }
             if self.blanket_holds_through_bounds(candidate.impl_subject, subject_type) {
                 candidates.push(candidate);
             }
@@ -38921,21 +38938,21 @@ impl<'src> Analyzer<'src> {
         else {
             return Vec::new();
         };
-        let mut argument_ids: Vec<TypeId> = Vec::new();
-        if let Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) =
-            implementation.subject.get_type(self)
-        {
-            argument_ids.extend(arguments);
-        }
-        for (_, arguments) in &implementation.trait_args {
-            argument_ids.extend(arguments.iter().copied());
-        }
         // Binders may sit ANYWHERE in the subject pattern
         // (`impl Option<(type T, type U)>` nests them in a tuple), so collect
-        // recursively — the flat scan missed nested binders.
+        // recursively — the flat scan missed nested binders. The subject is
+        // walked WHOLE: a blanket's subject IS its binder (`impl type T: PartialEq
+        // with Same`), and a tuple subject (`impl (type A, type B) with ..`) holds
+        // them at its top level. Reading only a nominal subject's arguments left
+        // a blanket's `T` unbindable at a call, so `Same::same(a, &b)` wired the
+        // call, dropped the receiver's binding with the rest of the working
+        // context, and emitted the blanket body un-instanced (B511).
         let mut binders = Vec::new();
-        for argument in argument_ids {
-            self.collect_residual_generics(&argument.get_type(self), &mut binders);
+        self.collect_residual_generics(&implementation.subject.get_type(self), &mut binders);
+        for (_, arguments) in &implementation.trait_args {
+            for argument in arguments {
+                self.collect_residual_generics(&argument.get_type(self), &mut binders);
+            }
         }
         binders
     }
@@ -46554,6 +46571,34 @@ impl<'src> Analyzer<'src> {
         // on the same receiver already uses.
         if let Type::Generic(constraint_id) = receiver_type {
             self.trait_qualified_calls.remove(&subject_id);
+            // B511: no bound reaches the named trait, but a BLANKET over what the
+            // bounds promise may provide it (`Same::same(&a, &b)` inside `fun
+            // f<T: PartialEq>`, with `impl type T: PartialEq with Same`) — the
+            // route `a.same(&b)` takes (B408). The subject is pointed at the
+            // blanket's member with its binders bound to the caller's
+            // parameter, and the call re-dispatches at each instance like any
+            // call through a bound.
+            let bounds_reach_trait = self
+                .generic_bound_traits(constraint_id)
+                .iter()
+                .any(|(bound, _)| self.trait_with_supertraits(*bound).contains(&trait_id));
+            if !bounds_reach_trait
+                && let Some(ImplMemberResolution::Found(member_id, _)) = self
+                    .resolve_blanket_through_bounds_in(
+                        call_id,
+                        &receiver_type,
+                        member_name,
+                        Some(declaring_trait_id),
+                    )
+            {
+                *self.reference_count.entry(member_id).or_insert(0) += 1;
+                self.expr_id_to_expr_map
+                    .insert(subject_id, Expr::Local(member_id));
+                if let Some(bindings) = self.method_call_substitution.remove(&call_id) {
+                    self.static_subject_bindings.insert(subject_id, bindings);
+                }
+                return None;
+            }
             self.generic_dispatch.insert(
                 call_id,
                 GenericDispatch::OnConstraint(constraint_id, member_name),
@@ -46564,7 +46609,14 @@ impl<'src> Analyzer<'src> {
                 .insert(call_id, (declaring_trait_id, Vec::new()));
             return None;
         }
-        if !matches!(receiver_type, Type::Struct(..) | Type::Enum(..)) {
+        // A tuple or an array is a receiver like a nominal type: a blanket or a
+        // tuple-subject impl answers it here as it answers `value.member()`.
+        // Left to the ordinary path, the call kept the trait's declaration and
+        // typed `Swap::swapped((1, "one"))` as the bare trait `Swap` (B511).
+        if !matches!(
+            receiver_type,
+            Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
+        ) {
             self.trait_qualified_calls.remove(&subject_id);
             return None;
         }

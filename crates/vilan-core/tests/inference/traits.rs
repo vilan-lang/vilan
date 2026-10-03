@@ -8618,6 +8618,126 @@ fn b473_a_qualified_subtrait_call_on_a_type_without_the_subtrait_is_refused() {
     );
 }
 
+// --- B511: a qualified call to a blanket's member is monomorphized ----------
+//
+// `Same::same(a, &b)` over `impl type T: PartialEq with Same` emitted the
+// blanket's body UN-instanced on JS — `self === other`, `false` for two equal
+// structs and even for `1` and `1` — and natively refused "a value of an
+// unbound generic type parameter"; `a.same(&b)` was right. The receiver's
+// binding was found, then dropped with the call's working context: a blanket's
+// subject IS its binder, and the call kept only binders written inside a
+// nominal subject's arguments.
+
+/// The concrete receivers: a struct by view and bare, a scalar, a `str`, a
+/// list, and the blanket's trait DEFAULT reached the same way — each answers
+/// as the method form beside it does.
+#[test]
+fn b511_a_qualified_call_to_a_blankets_member_is_monomorphized() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Same {
+            fun same(&self, other: &Self): bool;
+            fun differs(&self, other: &Self): bool {
+                !self.same(other)
+            }
+        }
+
+        impl type T: PartialEq with Same {
+            fun same(&self, other: &T): bool {
+                *self == *other
+            }
+        }
+
+        [derive(PartialEq)]
+        struct Pair {
+            a: i32,
+            b: i32,
+        }
+
+        fun main() {
+            let x = Pair { a = 1, b = 2 };
+            let y = Pair { a = 1, b = 2 };
+            let z = Pair { a = 1, b = 3 };
+            print(Same::same(&x, &y));
+            print(Same::same(x, &z));
+            print(x.same(&y));
+            print(Same::same(&1, &1));
+            print(Same::same(1, &2));
+            print(Same::same(&"x", &"x"));
+            print(Same::same(&[1, 2], &[1, 2]));
+            print(Same::differs(&x, &z));
+        }
+        "#,
+        "true\nfalse\ntrue\ntrue\nfalse\ntrue\ntrue\ntrue\n",
+    );
+}
+
+/// The receivers the qualified spelling did not route at all: a caller's
+/// parameter whose bound reaches the blanket (`T: PartialEq`, not `T: Same` —
+/// refused "has bare trait type 'Same'"), a tuple subject (typed as the bare
+/// trait `Swap`), and a blanket body that makes the qualified call itself.
+#[test]
+fn b511_a_qualified_call_reaches_a_blanket_through_a_bound_and_a_tuple_subject() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Same {
+            fun same(&self, other: &Self): bool;
+        }
+
+        impl type T: PartialEq with Same {
+            fun same(&self, other: &T): bool {
+                *self == *other
+            }
+        }
+
+        trait Swap {
+            fun swapped(self): Self;
+        }
+
+        impl (type A, type B) with Swap {
+            fun swapped(self): (A, B) {
+                self
+            }
+        }
+
+        trait Describe {
+            fun describe(self): str;
+        }
+
+        impl type T: Same with Describe {
+            fun describe(self): str {
+                if Same::same(&self, &self) { "same" } else { "differs" }
+            }
+        }
+
+        [derive(PartialEq)]
+        struct Pair {
+            a: i32,
+            b: i32,
+        }
+
+        fun through<T: PartialEq>(a: T, b: T): bool {
+            Same::same(&a, &b)
+        }
+
+        fun main() {
+            print(through(Pair { a = 1, b = 2 }, Pair { a = 1, b = 3 }));
+            print(through("a", "a"));
+            print(Describe::describe(4));
+            let pair = Swap::swapped((1, "one"));
+            print(pair.1);
+        }
+        "#,
+        "false\ntrue\nsame\none\n",
+    );
+}
+
 // --- One trait at two instantiations: every provider is asked ------------------
 //
 // A type may provide one trait at two instantiations: `impl type T with Into2<T>`

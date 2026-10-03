@@ -23,6 +23,13 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: miscompile -->
+**A qualified call to a blanket impl's member runs the member at the receiver's type: `Same::same(&a, &b)` over `impl type T: PartialEq with Same` compares `a` and `b` as `a.same(&b)` does — where JS emitted the blanket's body UN-instanced (`self === other`, so two equal structs, and even `1` and `1`, compared `false`) and the native backend refused "a value of an unbound generic type parameter".** The call found the receiver's impl and bound its binder from the receiver, then dropped the binding with the rest of the call's working context: a blanket's subject IS its binder, and a call kept only the binders written inside a NOMINAL subject's arguments (`impl Box<type T>`'s `T`), so `impl type T`'s `T` — and a tuple subject's `impl (type A, type B)` — was never the callee's to bind. Two receivers the qualified spelling did not route at all route as the method form does: a caller's parameter whose bound reaches the trait only through a blanket (`Same::same(&a, &b)` inside `fun f<T: PartialEq>` was refused "parameter 'self' has bare trait type 'Same'"), and a tuple receiver (`Swap::swapped((1, "one"))` typed as the bare trait `Swap`). Pins: `inference::traits`' `b511_a_qualified_call_to_a_blankets_member_is_monomorphized` (a struct by view and bare, a scalar, a `str`, a list, the trait's default through the blanket) and `b511_a_qualified_call_reaches_a_blanket_through_a_bound_and_a_tuple_subject` (the bounded generic, the tuple subject, a qualified call inside another blanket's body); `native_differential`'s `a_qualified_call_to_a_blankets_member_is_monomorphized_on_both_backends` — each red on the 0.43.0 toolchain. No golden moves. Tracker B511.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

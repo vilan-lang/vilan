@@ -146,6 +146,59 @@ const B473_PROBE: &str = concat!(
     "\tprint(walk(Count { n = 0 }));\n",
     "}\n",
 );
+
+const B511_PROBE: &str = concat!(
+    "import std::compare::PartialEq;\n",
+    "import std::io::print;\n",
+    "\n",
+    "trait Same {\n",
+    "\tfun same(&self, other: &Self): bool;\n",
+    "\tfun differs(&self, other: &Self): bool {\n",
+    "\t\t!self.same(other)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl type T: PartialEq with Same {\n",
+    "\tfun same(&self, other: &T): bool {\n",
+    "\t\t*self == *other\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Swap {\n",
+    "\tfun swapped(self): Self;\n",
+    "}\n",
+    "\n",
+    "impl (type A, type B) with Swap {\n",
+    "\tfun swapped(self): (A, B) {\n",
+    "\t\tself\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "[derive(PartialEq)]\n",
+    "struct Pair {\n",
+    "\ta: i32,\n",
+    "\tb: i32,\n",
+    "}\n",
+    "\n",
+    "fun through<T: PartialEq>(a: T, b: T): bool {\n",
+    "\tSame::same(&a, &b)\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet x = Pair { a = 1, b = 2 };\n",
+    "\tlet y = Pair { a = 1, b = 2 };\n",
+    "\tlet z = Pair { a = 1, b = 3 };\n",
+    "\tprint(Same::same(&x, &y));\n",
+    "\tprint(Same::same(x, &z));\n",
+    "\tprint(Same::same(&1, &1));\n",
+    "\tprint(Same::same(&\"x\", &\"y\"));\n",
+    "\tprint(Same::differs(&x, &z));\n",
+    "\tprint(through(x, z));\n",
+    "\tprint(through(\"a\", \"a\"));\n",
+    "\tlet pair = Swap::swapped((1, \"one\"));\n",
+    "\tprint(pair.1);\n",
+    "}\n",
+);
 const B467_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -8488,6 +8541,24 @@ fn a_supertrait_override_is_dispatched_through_a_subtrait_on_both_backends() {
         compare(&staged, "native_probe_b473.vl"),
         Verdict::Identical,
         "a supertrait's override must answer through a sub-trait on both backends"
+    );
+}
+
+/// B511: a qualified call to a blanket impl's member is monomorphized on both
+/// backends — a struct by view and bare, a scalar, a `str`, the blanket's trait
+/// default, a caller's parameter whose bound reaches the blanket, and a tuple
+/// subject. JS emitted the blanket's body un-instanced (`self === other`) and the
+/// native backend refused "a value of an unbound generic type parameter";
+/// `inference::traits`' `b511_*` pins hold the JS values.
+#[test]
+fn a_qualified_call_to_a_blankets_member_is_monomorphized_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b511.vl"), B511_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b511.vl"),
+        Verdict::Identical,
+        "a qualified call to a blanket's member must answer as the method form does on both backends"
     );
 }
 
