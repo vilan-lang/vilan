@@ -59831,6 +59831,49 @@ impl<'src> Analyzer<'src> {
                         );
                         continue;
                     }
+                    // B531: and a grounded right operand that is not a NUMBER
+                    // at all. `f64 * i32` stays the carve-out the SCOPE note
+                    // above keeps (two numbers computing a correct answer of
+                    // the declared type), but `2 * true` emitted the host's
+                    // `2 * true` — `2`, typed `i32` — and `2 * "3"` computed
+                    // `6`: a native left operand never dispatches, so nothing
+                    // typed the right one unless it was a parameter.
+                    let computes = matches!(
+                        op,
+                        BinaryOp::Sub
+                            | BinaryOp::Mul
+                            | BinaryOp::Div
+                            | BinaryOp::Rem
+                            | BinaryOp::Shl
+                            | BinaryOp::Shr
+                            | BinaryOp::UShr
+                            | BinaryOp::BitAnd
+                            | BinaryOp::BitXor
+                            | BinaryOp::BitOr
+                    );
+                    let numeric_right = self.is_native_operator_primitive(&rhs_type)
+                        && !self.is_str_type(&rhs_type);
+                    if numeric_left && computes && grounded(&rhs_type) && !numeric_right {
+                        let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{symbol}` computes on two numbers, but the right operand \
+                                     is `{rhs_label}`, which is not one: there are no implicit \
+                                     conversions, and the host would compute on its lowering \
+                                     (`2 * true` is `2`, typed `{lhs_label}`). Compute on the \
+                                     number you mean (`if flag {{ 1 }} else {{ 0 }}`, or a \
+                                     `parse` of the string)"
+                                ),
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
                 }
                 // Same-type operands on the native path (`B = Self`). The
                 // non-native equality path falls through to the trait

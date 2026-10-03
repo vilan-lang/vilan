@@ -303,6 +303,11 @@ written down.
 
 ---
 
+<!-- family: breaking -->
+**A native number's `-` `*` `/` `%` and bitwise operators refuse a right operand that is not a number — `let x: i32 = 2 * true;` is refused with "`*` computes on two numbers, but the right operand is `bool`, which is not one: there are no implicit conversions, and the host would compute on its lowering (`2 * true` is `2`, typed `i32`) …" — where it checked clean and printed `2`.** A native left operand never dispatches, so nothing typed the right one of these operators unless it was a parameter (B179's refusal); `+` had its own rule (B148), which is why `2 + true` was already refused and `2 * true` was not. A `bool`, a `str` (`count / "2"` computed `1.5`), a struct and an enum on the right are refused at all nine operators; `f64 * i32`, two numbers computing a correct answer of the declared type, stays the carve-out B196 pinned. Pin: `inference::platform`'s `b531_a_non_numeric_right_operand_of_a_numbers_arithmetic_is_refused` (nine expressions, each refused once and naming the operand's type) — red on the 0.43.0 toolchain. Ledger: one `NEW` row. Docs: `types.md`. The corpus, the docs, the examples and kolt carry none. No golden moves. Tracker B531.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

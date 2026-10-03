@@ -9587,6 +9587,38 @@ fn b196_the_numeric_carve_out_is_untouched() {
     );
 }
 
+/// B531: the right operand of a native number's `-` `*` `/` `%` and bitwise
+/// family must be a number too. `let x: i32 = 2 * true;` checked clean and
+/// printed `2` (the host coerces `true` to `1`); a `str`, a struct and an
+/// enum on the right were as quiet. The numeric carve-out above stands.
+#[test]
+fn b531_a_non_numeric_right_operand_of_a_numbers_arithmetic_is_refused() {
+    for (expression, right) in [
+        ("2 * true", "bool"),
+        ("count * false", "bool"),
+        ("2.5 * true", "bool"),
+        ("count - true", "bool"),
+        ("count / \"2\"", "str"),
+        ("count % true", "bool"),
+        ("count & true", "bool"),
+        ("count << true", "bool"),
+        ("count * Point { x = 1 }", "Point"),
+    ] {
+        let source = format!(
+            r#"
+            struct Point {{ x: i32 }}
+            fun main() {{
+                let count: i32 = 3;
+                let x = {expression};
+                print(x);
+            }}
+            "#
+        );
+        assert_fails_once_with(&source, "computes on two numbers");
+        assert_fails_with(&source, &format!("the right operand is `{right}`"));
+    }
+}
+
 #[test]
 fn b196_the_admitted_operators_of_each_left_type_still_run() {
     // The controls. Every operator each refusal NAMES as admitted has to keep
