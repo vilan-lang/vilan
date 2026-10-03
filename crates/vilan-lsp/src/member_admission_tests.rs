@@ -154,7 +154,7 @@ fn hover_on_a_blanket_members_call_names_it() {
 /// lowering), so hover and go-to-definition answer nothing on it. Filed for
 /// the analyzer; pinned here so the day it is fixed this un-ignores.
 #[test]
-#[ignore = "the analyzer drops the call's entity record — E253 (filed from editor-46, E249's probe)"]
+#[ignore = "E253: the analyzer drops the call's entity record (filed from editor-46, E249's probe)"]
 fn hover_on_a_call_taking_a_context_closure_names_the_member() {
     let source = format!(
         "{IMPORTS}fun pick(m: MemoCell<Option<i32>>) {{\n\tlet _ = m.switch_some(|value| MemoCell::new(value));\n}}\n"
