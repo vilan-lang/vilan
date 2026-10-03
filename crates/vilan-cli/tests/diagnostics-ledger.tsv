@@ -644,3 +644,8 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 619	-	`{type}` is not a trait: a selector's `with` names the trait the block implements, as its declaration does (`(impl Box with One)` selects `impl Box with One`)
 620	-	a declaration's attributes are written in one order — `[derive]` and the other generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform]`, `[resource]`: write `{canonical}`
 NEW	-	this element's class is written twice — `{earlier}` and then `{later}` — and only the last write stays: `{later}` replaces what `{earlier}` wrote. Compose them into one writer (two styles add: `.styled(a + b)`), or drop one
+NEW	-	`std::map` was removed: its `Map` is `std::hash_map::HashMap`
+NEW	-	`std::set` was removed: its `Set` is `std::hash_set::HashSet`
+NEW	-	`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell` (re-exported from `std::reactive`)
+NEW	-	`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell` (re-exported from `std::reactive`)
+NEW	-	`{part}` was renamed `{new}`: write `import std::{module}::{new};`
