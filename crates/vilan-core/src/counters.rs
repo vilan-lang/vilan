@@ -233,18 +233,129 @@ pub fn heap_fragment() -> String {
     )
 }
 
-/// One `[vilan counters] <label> …` line when `VILAN_COUNTERS` is set: the
-/// type slots this thread has minted so far and, when the heap is counted, the
-/// live heap and the peak since the previous line. The analysis prints one at
-/// each of its phase boundaries, so the lines read as a heap profile by phase.
+/// One `[vilan counters] <label> …` line when `VILAN_COUNTERS` is set (M105
+/// S5): this thread's work so far — the solver's [`WorkCounts`], the type
+/// slots minted after the types settled, the late slot writes (M108's
+/// invariant, always zero) — and, when the heap is counted, the live heap, the
+/// peak since the previous line and the allocations made. The analysis prints
+/// one at each of its phase boundaries, so the lines read as a work and heap
+/// profile by phase; every figure but the heap's is per thread and
+/// deterministic.
 pub fn checkpoint(label: &str) {
     if !counters_enabled() || crate::macros::in_macro_world() {
         return;
     }
+    let work = WorkCounts::now();
+    let allocations = if heap_armed() {
+        format!(" allocations={}", heap_reading().allocations)
+    } else {
+        String::new()
+    };
     eprintln!(
-        "[vilan counters] {label} slots={} late-writes={}{}",
-        type_slots_minted(),
+        "[vilan counters] {label} slots={} settled-slots={} late-writes={} inferences={} \
+         attempts={} selections={} impl-rows={} bound-checks={}{}{allocations}",
+        work.slots,
+        settled_type_slots_minted(),
         late_type_slot_writes(),
+        work.inferences,
+        work.attempts,
+        work.selections,
+        work.impl_rows,
+        crate::analyzer::generic_bound_checks(),
         heap_fragment()
     );
+}
+
+thread_local! {
+    static CONSTRAINT_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Constraint resolutions attempted on this thread (each `try_resolve`) — the
+/// constraint fixpoint's unit of work, and what a re-queued constraint costs
+/// again each time it is woken.
+pub fn constraint_attempts() -> u64 {
+    CONSTRAINT_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn count_constraint_attempt() {
+    CONSTRAINT_ATTEMPTS.with(|count| count.set(count.get() + 1));
+}
+
+/// The solver's work, counted (M105 S5, M106): what an analysis or one
+/// constraint cost in units that are the same on every machine — never time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkCounts {
+    /// Constraint resolutions attempted ([`constraint_attempts`]).
+    pub attempts: u64,
+    /// Type inferences entered (`analyzer::inference_entry_count`).
+    pub inferences: u64,
+    /// Impl selections computed rather than served from the memo
+    /// (`impl_select::applying_computed`).
+    pub selections: u64,
+    /// Type slots minted ([`type_slots_minted`]).
+    pub slots: u64,
+    /// Impl rows the member and trait lookups examined
+    /// (`analyzer::impl_rows_examined`).
+    pub impl_rows: u64,
+}
+
+impl WorkCounts {
+    /// This thread's counts now; subtract two readings to cost the work in
+    /// between.
+    pub fn now() -> WorkCounts {
+        WorkCounts {
+            attempts: constraint_attempts(),
+            inferences: crate::analyzer::inference_entry_count(),
+            selections: crate::impl_select::applying_computed() as u64,
+            slots: type_slots_minted(),
+            impl_rows: crate::analyzer::impl_rows_examined() as u64,
+        }
+    }
+
+    /// The work done since `before` — saturating, so a counter reset between
+    /// the two readings costs nothing rather than wrapping.
+    pub fn since(self, before: WorkCounts) -> WorkCounts {
+        WorkCounts {
+            attempts: self.attempts.saturating_sub(before.attempts),
+            inferences: self.inferences.saturating_sub(before.inferences),
+            selections: self.selections.saturating_sub(before.selections),
+            slots: self.slots.saturating_sub(before.slots),
+            impl_rows: self.impl_rows.saturating_sub(before.impl_rows),
+        }
+    }
+
+    pub fn add(&mut self, other: WorkCounts) {
+        self.attempts += other.attempts;
+        self.inferences += other.inferences;
+        self.selections += other.selections;
+        self.slots += other.slots;
+        self.impl_rows += other.impl_rows;
+    }
+
+    /// One figure to rank by: the sum of the units. Each counts a distinct
+    /// kind of solver step, none of them free, and no weighting between them
+    /// would be anything but a guess about one machine — so they are summed
+    /// plainly and the report prints every column beside the total.
+    pub fn total(&self) -> u64 {
+        self.attempts + self.inferences + self.selections + self.slots + self.impl_rows
+    }
+}
+
+/// How many declarations a `vilan check --explain-cost` report names, or zero
+/// when per-item cost attribution is off (M106's first slice). Process-wide:
+/// the front end sets it before the first analysis.
+static COST_REPORT_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Turns per-item cost attribution on for every analysis this process runs
+/// from now on, reporting the `limit` costliest declarations (M106).
+pub fn set_cost_attribution(limit: usize) {
+    COST_REPORT_LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The report's length when attribution is on.
+pub fn cost_report_limit() -> Option<usize> {
+    match COST_REPORT_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        limit => Some(limit),
+    }
 }

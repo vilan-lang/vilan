@@ -180,6 +180,16 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**`VILAN_COUNTERS=1` prints the solver's work at every phase boundary — type slots (and those minted after the types settled), late slot writes, type inferences entered, constraint attempts, impl selections computed, impl rows examined, bound checks, and in the CLI the live heap, its peak and the allocations made — all counts but the heap's, the same on every machine.** M105 S5 (`performance-gates.md` §3, tier T1). `counters::WorkCounts` is the shared reading (subtract two to cost the work between), `counters::constraint_attempts` the fixpoint's new unit; the T1 pins that read these counts are M108's settled-slot pin and M107's growth pin. On kolt's client the analysis line reads 192k slots (14k settled), 428k inferences, 109k attempts, 56k impl rows, 0 late writes. Not in this slice: analyses per LSP edit (M104's shape) — the session layer is editor-46's, and the language server does not yet install the counting allocator (`vilan_core::counters::CountingAllocator` is ready for it).
+
+---
+
+<!-- family: feature -->
+**`vilan check --explain-cost [N]` names the declarations whose type inference cost the solver the most WORK — constraint attempts, inferences, impl selections, type slots and impl rows, summed and printed column by column, never time — the package's own declarations only, costliest first.** M106's first slice, ruled 2026-10-02 with the owner's emphasis that the measure is computational complexity and not elapsed time, so the ranking is identical on every machine and every run. With attribution on, each constraint the fixpoint attempts charges its work to the function whose body its anchor sits in (closures to the function that writes them, module-level code to `<module level>`, generated code to the attribute that generated it); `Program::item_costs` carries the ranking. Off (the default), nothing is collected. On kolt the top of the client's list is `sidebar_shell`, `create_search_modal` and two generated-icon lookups. The suggestion itself (annotate this binding, with a quick fix) is the next slice. Pins: `inference::std_surface::m106_cost_attribution_ranks_declarations_by_solver_work_and_repeats_exactly` (a generic-heavy function outranks a trivial one, and two analyses cost the same, declaration by declaration), `diagnostics::explain_cost_ranks_the_packages_own_declarations_by_work` (the CLI's report: header, at most N rows, std left out, nothing without the flag).
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

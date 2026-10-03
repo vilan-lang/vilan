@@ -183,6 +183,20 @@ impl RangeIndex {
     }
 }
 
+/// One declaration's share of the solver's work (M106): what its constraints
+/// cost the fixpoint, in counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemCost {
+    /// The function the work belongs to; `None` is module-level code.
+    pub owner: Option<Id>,
+    /// Its name as written (`<module level>` for none).
+    pub name: String,
+    /// The file it was walked from, and its name's span there.
+    pub source: Option<SourceId>,
+    pub span: Span,
+    pub work: crate::counters::WorkCounts,
+}
+
 /// [`RangeIndex`]'s bounds for a `derived_origins` row.
 fn derived_origin_bounds(row: &(std::ops::Range<u32>, Span, SourceId)) -> (u32, u32) {
     (row.0.start, row.0.end)
@@ -4107,6 +4121,16 @@ pub struct Analyzer<'src> {
     // lets a substitution SHARE it instead of minting a copy
     // ([`Analyzer::substitute_argument_types`]).
     types_settled: bool,
+    // M106's first slice: the solver work each declaration's constraints cost,
+    // keyed by the function whose body the constraint's anchor sits in (`None`
+    // for module-level code), collected only while
+    // `counters::cost_report_limit` is set. Work COUNTS, never time — the
+    // owner's ruling — so the ranking is the same on every machine.
+    item_costs: HashMap<Option<Id>, crate::counters::WorkCounts>,
+    // Body scope -> its function, for the owner walk; rebuilt when `functions`
+    // has grown since (`function_scopes_indexed`).
+    function_by_body_scope: HashMap<Id, Id>,
+    function_scopes_indexed: usize,
     // M108: the slots minted since `types_settled`, by the hash of their type
     // — the settled half of [`Analyzer::type_id_for_type`]'s interning. A hash
     // and not the `Type` itself, so the index costs a word per slot rather
@@ -6793,6 +6817,9 @@ impl<'src> Analyzer<'src> {
             import_targets: Vec::new(),
             entry_phase: false,
             types_settled: false,
+            item_costs: HashMap::default(),
+            function_by_body_scope: HashMap::default(),
+            function_scopes_indexed: 0,
             settled_type_index: HashMap::default(),
             source_texts: Vec::new(),
             type_references: Vec::new(),
@@ -46340,7 +46367,18 @@ impl<'src> Analyzer<'src> {
                 self.lookup_importer = self.admitting_source_of(constraint.anchor());
             }
             let diagnostics_before = self.diagnostics.len();
-            let resolution = self.try_resolve(&constraint);
+            let resolution = if crate::counters::cost_report_limit().is_some() {
+                let before = crate::counters::WorkCounts::now();
+                crate::counters::count_constraint_attempt();
+                let resolution = self.try_resolve(&constraint);
+                let cost = crate::counters::WorkCounts::now().since(before);
+                let owner = self.cost_owner(constraint.anchor());
+                self.item_costs.entry(owner).or_default().add(cost);
+                resolution
+            } else {
+                crate::counters::count_constraint_attempt();
+                self.try_resolve(&constraint)
+            };
             self.rigid_binder_scope = None;
             self.lookup_importer = None;
             self.lookup_anchor = None;
@@ -55398,6 +55436,74 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// [`Self::item_costs`], ranked costliest first (ties by id, so the order
+    /// is the same every run) and named for the report.
+    fn ranked_item_costs(&self) -> Vec<ItemCost> {
+        let mut costs: Vec<ItemCost> = self
+            .item_costs
+            .iter()
+            .map(|(owner, work)| {
+                let function = owner.and_then(|owner| self.functions.get(&owner));
+                let mut name = function
+                    .map(|function| function.name.to_string())
+                    .unwrap_or_else(|| "<module level>".to_string());
+                let mut source = owner.and_then(|owner| self.source_of_id(owner));
+                let mut span = function
+                    .map(|function| function.name_span)
+                    .unwrap_or(EMPTY_SPAN);
+                // Generated code is reported at the attribute that generated
+                // it — the line the author wrote (B391's rule).
+                if source == Some(DERIVED_SOURCE)
+                    && let Some((_, origin_span, origin_source)) =
+                        owner.and_then(|owner| self.derived_origin_row(owner))
+                {
+                    name.push_str(" (generated)");
+                    source = Some(*origin_source);
+                    span = *origin_span;
+                }
+                ItemCost {
+                    owner: *owner,
+                    name,
+                    source,
+                    span,
+                    work: *work,
+                }
+            })
+            .collect();
+        costs.sort_by(|left, right| {
+            right
+                .work
+                .total()
+                .cmp(&left.work.total())
+                .then_with(|| left.owner.map(|id| id.0).cmp(&right.owner.map(|id| id.0)))
+        });
+        costs
+    }
+
+    /// The function whose body `anchor` sits in, by the scope chain — M106's
+    /// owner of a constraint's cost. `None` for module-level code (a `let` at
+    /// the top of a file, a `const` initializer outside any function).
+    /// Closures are part of the function that writes them: the suggestion a
+    /// cost would carry (annotate this) lands on the declaration.
+    fn cost_owner(&mut self, anchor: Id) -> Option<Id> {
+        if self.function_scopes_indexed != self.functions.len() {
+            self.function_by_body_scope = self
+                .functions
+                .iter()
+                .map(|(function_id, function)| (function.body.2, *function_id))
+                .collect();
+            self.function_scopes_indexed = self.functions.len();
+        }
+        let mut scope_id = *self.expr_id_to_scope_id_map.get(&anchor)?;
+        for _ in 0..4096 {
+            if let Some(function_id) = self.function_by_body_scope.get(&scope_id) {
+                return Some(*function_id);
+            }
+            scope_id = self.scopes.get(&scope_id)?.parent_id?;
+        }
+        None
+    }
+
     /// The position in `constraints` of the first `Constraint::Variable` for
     /// `variable_id` — what a scan of the queue per assignment answered, which
     /// made wiring a program's assignments quadratic in its size (M107: every
@@ -62021,6 +62127,11 @@ pub struct Program<'src> {
     /// and every whole-program pass reaches it through
     /// [`Program::diagnostic_source_of`].
     pub derived_origins: Vec<(std::ops::Range<u32>, Span, SourceId)>,
+    /// M106's first slice: the solver work each declaration's constraints
+    /// cost, costliest first — collected only when
+    /// `counters::set_cost_attribution` turned it on (`vilan check
+    /// --explain-cost`), empty otherwise.
+    pub item_costs: Vec<ItemCost>,
     /// `derived_origins` indexed by range, built on first ask (M107);
     /// nothing writes the rows after the program is built.
     derived_origin_index: std::sync::OnceLock<RangeIndex>,
@@ -71762,6 +71873,9 @@ fn analyze_over_world<'src>(
     // `record_object_reachable_members`.
     analyzer.record_object_reachable_members();
 
+    // M106: the per-declaration work, ranked — empty unless attribution is on.
+    let item_costs = analyzer.ranked_item_costs();
+
     Some(Program {
         hidden_impls_pending,
         exported_entities,
@@ -71892,6 +72006,7 @@ fn analyze_over_world<'src>(
         dependency_sources: std::mem::take(&mut analyzer.dependency_sources),
         derived_origins: std::mem::take(&mut analyzer.derived_origins),
         derived_origin_index: std::sync::OnceLock::new(),
+        item_costs,
         layer_platforms,
         diagnostic_sources,
         member_name_spans: analyzer.member_name_spans,

@@ -602,6 +602,70 @@ fn phase_timing_env_var_prints_the_phase_split() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M106: `vilan check --explain-cost N` prints the package's own declarations
+/// ranked by the solver work their constraints cost — counts, never time —
+/// and leaves std's out. The default (no flag) prints nothing of it.
+#[test]
+fn explain_cost_ranks_the_packages_own_declarations_by_work() {
+    let dir = temp_package(
+        "explaincost",
+        "import std::io::print;\n\
+         fun wrap<T>(value: T): Option<T> { Some(value) }\n\
+         fun heavy(): i32 {\n\
+         \tlet a = wrap(wrap(wrap(wrap(wrap(1)))));\n\
+         \tlet c = [wrap(1), wrap(2), wrap(3), wrap(4)];\n\
+         \tlet d = c.map(|item| item.unwrap_or(0)).fold(0, |sum, value| sum + value);\n\
+         \tmatch a { Some(_) => d, None => 0 }\n\
+         }\n\
+         fun light(): i32 { 1 }\n\
+         fun main() { print(heavy() + light()); }\n",
+    );
+    let run = |arguments: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .current_dir(&dir)
+            .arg("check")
+            .args(arguments)
+            .arg(".")
+            .output()
+            .expect("run vilan");
+        assert!(
+            output.status.success(),
+            "the fixture must check cleanly; stderr was: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let report = run(&["--explain-cost", "3"]);
+    let rows: Vec<&str> = report
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with("work"))
+        .skip(1)
+        .take_while(|line| {
+            line.trim_start()
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit())
+        })
+        .collect();
+    assert!(
+        report.starts_with("cost (") && rows.len() <= 3 && !rows.is_empty(),
+        "the report must have its header and at most three rows:\n{report}"
+    );
+    assert!(
+        rows[0].contains(" heavy ("),
+        "`heavy` must rank first:\n{report}"
+    );
+    assert!(
+        !report.contains("std/"),
+        "std's declarations are left out:\n{report}"
+    );
+    assert!(
+        !run(&[]).contains("cost ("),
+        "without the flag there is no report"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// M98: `VILAN_PHASE_TIMING=passes` adds the checks phase's per-pass split —
 /// one `[vilan pass]` line per pass that cost a millisecond (or minted a
 /// thousand type slots, M108), its own prefix so

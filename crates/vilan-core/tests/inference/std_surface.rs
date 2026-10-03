@@ -5371,6 +5371,86 @@ fn m107_impl_lookups_examine_rows_linear_in_the_package() {
     );
 }
 
+/// M106's first slice: per-declaration cost attribution in WORK COUNTS. With
+/// attribution on, every constraint the fixpoint attempts charges its work —
+/// attempts, inferences, slots, impl rows — to the function whose body its
+/// anchor sits in, and the program ranks the declarations costliest first.
+/// The ranking is a count, so it is the same on every run; a function whose
+/// body asks the solver for a long chain of generic calls outranks one that
+/// asks for nothing. (The attribution switch is process-wide, which is safe
+/// here: it only adds the table, and no other pin reads it.)
+#[test]
+fn m106_cost_attribution_ranks_declarations_by_solver_work_and_repeats_exactly() {
+    vilan_core::counters::set_cost_attribution(20);
+    let source = r#"
+        import std::io::print;
+        fun wrap<T>(value: T): Option<T> { Some(value) }
+        fun heavy(): i32 {
+            let a = wrap(wrap(wrap(wrap(wrap(1)))));
+            let b = wrap(wrap(wrap(wrap(wrap("x")))));
+            let c = [wrap(1), wrap(2), wrap(3), wrap(4), wrap(5), wrap(6)];
+            let d = c.map(|item| item.unwrap_or(0)).fold(0, |sum, value| sum + value);
+            match a { Some(_) => d, None => 0 }
+        }
+        fun light(): i32 { 1 }
+        fun main() { print(heavy() + light()); }
+    "#;
+    let costs = || {
+        let source = source.to_string();
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                program
+                    .expect("analysis should produce a program")
+                    .item_costs
+                    .into_iter()
+                    .filter(|cost| ["heavy", "light", "main"].contains(&cost.name.as_str()))
+                    .map(|cost| (cost.name, cost.work))
+                    .collect::<Vec<_>>()
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    };
+    let first = costs();
+    let names: Vec<&str> = first.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names.first(),
+        Some(&"heavy"),
+        "the function that asks the solver for the most work must rank first: {first:#?}"
+    );
+    let heavy = first[0].1;
+    assert!(
+        heavy.attempts > 0 && heavy.inferences > 0,
+        "`heavy`'s constraints were charged no attempts or inferences: {heavy:?}"
+    );
+    if let Some((_, light)) = first.iter().find(|(name, _)| name == "light") {
+        assert!(
+            light.total() < heavy.total(),
+            "`light` outranks or ties `heavy`: {first:#?}"
+        );
+    }
+    assert_eq!(
+        costs(),
+        first,
+        "the same program must cost the same work, declaration by declaration"
+    );
+}
+
 // --- B4 §2.2: a bare trait annotation must not launder a resource -----------
 //
 // `proposal/trait-objects.md` §2.2 (probes P8/P9): the resource analysis

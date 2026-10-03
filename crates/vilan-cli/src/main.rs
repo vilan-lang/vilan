@@ -26,6 +26,58 @@ use vilan_core::manifest::Package;
 use vilan_core::transformer::{EmittedChunk, transform};
 use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
 
+/// `vilan check --explain-cost`'s report (M106's first slice): the package's
+/// own declarations ranked by the solver work their constraints cost. Counts,
+/// never time, by the owner's ruling — so the same program ranks the same on
+/// every machine. std's declarations are left out: the report is about what
+/// the author can change. The suggestion to annotate is a later slice; this
+/// one is the numbers.
+fn print_cost_report(program: &Program, platform: Platform, limit: usize) {
+    let own: Vec<&vilan_core::analyzer::ItemCost> = program
+        .item_costs
+        .iter()
+        .filter(|cost| {
+            cost.source
+                .is_none_or(|source| !program.std_sources.contains(&source))
+        })
+        .collect();
+    let total: u64 = own.iter().map(|cost| cost.work.total()).sum();
+    println!(
+        "cost ({platform:?}): the {} costliest of {} declarations, {total} work units in all \
+         (attempts + inferences + selections + slots + impl rows)",
+        limit.min(own.len()),
+        own.len()
+    );
+    println!(
+        "{:>10} {:>8} {:>10} {:>10} {:>8} {:>9}  declaration",
+        "work", "attempts", "inferences", "selections", "slots", "impl rows"
+    );
+    for cost in own.iter().take(limit) {
+        let place = cost
+            .source
+            .and_then(|source| program.source_path(source))
+            .map(|path| {
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                let line = text[..cost.span.start.min(text.len())]
+                    .matches('\n')
+                    .count()
+                    + 1;
+                format!("{}:{line}", path.display())
+            })
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:>10} {:>8} {:>10} {:>10} {:>8} {:>9}  {} ({place})",
+            cost.work.total(),
+            cost.work.attempts,
+            cost.work.inferences,
+            cost.work.selections,
+            cost.work.slots,
+            cost.work.impl_rows,
+            cost.name,
+        );
+    }
+}
+
 /// The system allocator, counting heap bytes when `VILAN_COUNTERS` arms it
 /// (M105 S5, M108): the live heap and its peak per pass, beside RSS.
 /// Disarmed it is one relaxed load per allocation.
@@ -144,6 +196,13 @@ enum Command {
         /// What is left is reported as usual.
         #[arg(long, conflicts_with = "watch")]
         fix: bool,
+        /// After checking, print the declarations whose type inference cost
+        /// the solver the most work (the top N, default 20) — constraint
+        /// attempts, inferences, impl selections, type slots and impl rows,
+        /// all COUNTS, so the ranking is the same on every machine. Your own
+        /// package's declarations only; std's are left out.
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "20")]
+        explain_cost: Option<usize>,
     },
     /// Build and run a source file, forwarding any trailing arguments to the
     /// program (reach them with `import std::process;` and `process::args()`).
@@ -414,7 +473,11 @@ fn run_cli() -> ExitCode {
             debug,
             watch,
             fix,
+            explain_cost,
         } => match effective_backend(backend.as_deref()) {
+            _ if explain_cost == Some(0) => {
+                report_error("--explain-cost takes a count of at least 1")
+            }
             Err(message) => report_error(&message),
             Ok(_backend) if fix => match fix_project(file.clone(), platform.as_deref()) {
                 Err(message) => report_error(&message),
@@ -424,6 +487,9 @@ fn run_cli() -> ExitCode {
                 }
             },
             Ok(_backend) => {
+                if let Some(limit) = explain_cost {
+                    vilan_core::counters::set_cost_attribution(limit);
+                }
                 let roots = watch.then(|| watch_roots(&file));
                 run_or_watch(roots, move || {
                     check_once(file.clone(), platform.clone(), debug)
@@ -7198,6 +7264,9 @@ fn compile_to_js(
         // And the program's drop, timed by making it explicit: a whole-world
         // analysis frees its tables here, ~0.3 s on kolt's client (M98).
         vilan_core::counters::checkpoint("emission");
+        if let Some(limit) = vilan_core::counters::cost_report_limit() {
+            print_cost_report(&program, platform, limit);
+        }
         let drop_clock = vilan_core::PhaseClock::now();
         drop(program);
         vilan_core::counters::checkpoint("program-drop");
