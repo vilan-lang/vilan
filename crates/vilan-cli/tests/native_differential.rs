@@ -8720,6 +8720,33 @@ fn a_bare_variant_of_a_generic_enum_is_identical_on_both_backends() {
     );
 }
 
+/// F66: a variant constructor INSIDE a generic body closes its enum's
+/// arguments per instance. The analyzer records one type per SITE, and
+/// `variant_arguments` read that record first: inside `Maybe<T>::map<U>` the
+/// site of `Maybe::Just(f(x))` recorded the receiver's `Maybe<T>`, so the
+/// `(str, i32)` instance minted `Maybe<(str, i32)>` for a `Maybe<i32>` value
+/// and rustc refused the emission (E0308 four times on 0.43.0). The position
+/// and the payload are read under the instance and come first; a record closed
+/// in itself (no parameter in it) still wins, being the same in every
+/// instance. The probe: a payload of the method's own parameter, a nullary
+/// variant at a generic return, a two-parameter enum built swapped (two
+/// instances each way), a nested payload, a binding annotated in the
+/// instance's parameter, and `Option`'s constructors inside a generic body.
+#[test]
+fn a_variant_built_inside_a_generic_instance_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_instance_variants.vl"),
+        include_str!("native/generic_instance_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_instance_variants.vl"),
+        Verdict::Identical,
+        "a variant built inside a generic instance must take that instance's arguments"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds

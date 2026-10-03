@@ -6485,23 +6485,35 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// The arguments a VARIANT CONSTRUCTOR instantiates its enum at.
     ///
-    /// Three sources, in order, because none is total. The type recorded at the
-    /// call site is the general answer, but for a generic enum it can be
-    /// OPEN — `Tree::Leaf(7)` records `Tree<any>`, its parameter still a hole
-    /// the surrounding `let`'s annotation closes later (this is B357's shape
-    /// from the emitter's side). So an open argument list falls back to the one
-    /// place the answer is certainly present: the constructor's own arguments,
-    /// bound against the variant's declared payload types by the same walk that
-    /// binds an impl subject.
+    /// Three sources, and none is total, so the order is the claim:
     ///
-    /// Between the two, the POSITION the constructor is emitted into, when it
-    /// expects the same enum with its arguments closed — the only source a
-    /// NULLARY variant has (`let n: Maybe<i32> = Maybe::Nothing`, F76), whose
-    /// recorded type stays open, and which used to read the recorded type
-    /// alone and was refused under its annotation. A variant with none of the
-    /// three names
-    /// the unbound parameter rather than instantiating a second Rust enum over
-    /// a hole.
+    /// 1. The POSITION the constructor is emitted into, when it expects the
+    ///    same enum with its arguments closed. A position is read under the
+    ///    instance being emitted — a generic function's return, a parameter, a
+    ///    `let`'s annotation — so it is right in every instance, and it is the
+    ///    only source a NULLARY variant has whose recorded type stays open
+    ///    (`let n: Maybe<i32> = Maybe::Nothing`, F76).
+    /// 2. The constructor's own PAYLOAD, bound against the variant's declared
+    ///    payload types by the same walk that binds an impl subject — when it
+    ///    binds every parameter. Each payload's type is read under the
+    ///    instance too.
+    /// 3. The type RECORDED at the call site — first when it is closed IN
+    ///    ITSELF (it names no parameter, so no instance can change it: the
+    ///    analyzer's definite answer, `dyn` arguments included), and otherwise
+    ///    only after the payload (F66). The analyzer records one type per site,
+    ///    not one per instance, and inside a generic body it can name the wrong
+    ///    parameter: `Maybe<T>::map<U>`'s
+    ///    `Maybe::Just(f(x))` recorded the RECEIVER's `Maybe<T>`, so the
+    ///    `(str, i32)` instance minted `Maybe<(str, i32)>` for a value that is
+    ///    a `Maybe<i32>`, and rustc refused the emission. It was read first,
+    ///    which is why it reached anything; for a generic enum it can also be
+    ///    OPEN (`Tree::Leaf(7)` records `Tree<any>`, B357's shape), which is
+    ///    why the other two exist at all.
+    ///
+    /// What none of them closes merges: each parameter the payload bound,
+    /// else the recorded argument when it is closed. A variant that still
+    /// names an unbound parameter is refused by [`Self::ensure_enum`] rather
+    /// than instantiating a second Rust enum over a hole.
     fn variant_arguments(
         &mut self,
         expr_id: Id,
@@ -6516,14 +6528,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if parameters.is_empty() {
             return Vec::new();
         }
-        let recorded = self.enum_arguments_at(expr_id, enum_id);
-        if recorded.len() == parameters.len()
-            && recorded.iter().all(|argument| self.is_grounded(*argument))
-        {
-            return recorded;
-        }
-        // The position this constructor is being emitted into, when it declares
-        // the same enum with its arguments closed.
         if let Some(Type::Enum(found, expected)) =
             self.expected_type.and_then(|type_id| self.resolve(type_id))
             && *found == enum_id
@@ -6533,6 +6537,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if expected.iter().all(|argument| self.is_grounded(*argument)) {
                 return expected;
             }
+        }
+        let recorded = self.enum_arguments_at(expr_id, enum_id);
+        if recorded.len() == parameters.len()
+            && recorded
+                .iter()
+                .all(|argument| self.is_closed_in_itself(*argument))
+        {
+            return recorded;
         }
         let mut bound: HashMap<TypeId, TypeId> = HashMap::default();
         if let Some(variant) = declaration.variants.get(index) {
@@ -6544,9 +6556,31 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
             }
         }
+        let from_payload: Vec<Option<TypeId>> = parameters
+            .iter()
+            .map(|parameter| {
+                bound
+                    .get(parameter)
+                    .copied()
+                    .filter(|argument| self.is_grounded(*argument))
+            })
+            .collect();
+        if from_payload.iter().all(Option::is_some) {
+            return from_payload.into_iter().flatten().collect();
+        }
         parameters
             .iter()
-            .map(|parameter| bound.get(parameter).copied().unwrap_or(*parameter))
+            .enumerate()
+            .map(|(slot, parameter)| {
+                from_payload[slot]
+                    .or_else(|| {
+                        recorded
+                            .get(slot)
+                            .copied()
+                            .filter(|argument| self.is_grounded(*argument))
+                    })
+                    .unwrap_or(*parameter)
+            })
             .collect()
     }
 
@@ -6635,6 +6669,38 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// position or the payload. No value is ever typed as a bare trait once
     /// [`Self::concrete`] has rewritten a default body's `Self`; an object is
     /// `Dyn`, which stays grounded.
+    /// Whether a type is closed WITHOUT the instance's substitution — it
+    /// names no generic parameter anywhere, so every instance reads it the
+    /// same. [`Self::is_grounded`] answers under the substitution.
+    fn is_closed_in_itself(&self, type_id: TypeId) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self.program.type_id_to_type_map.get(&type_id) {
+            Some(
+                Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_) | Type::Trait(_, _),
+            )
+            | None => false,
+            Some(
+                Type::Struct(_, arguments)
+                | Type::Enum(_, arguments)
+                | Type::Tuple(arguments)
+                | Type::Dyn(_, arguments),
+            ) => arguments
+                .iter()
+                .all(|inner| self.is_closed_in_itself(*inner)),
+            Some(Type::Array(element, _)) => self.is_closed_in_itself(*element),
+            Some(Type::Mapped(..)) => false,
+            Some(Type::Closure(parameters, returns, _)) => {
+                parameters
+                    .iter()
+                    .all(|inner| self.is_closed_in_itself(*inner))
+                    && self.is_closed_in_itself(*returns)
+            }
+            Some(_) => true,
+        }
+    }
+
     fn is_grounded(&self, type_id: TypeId) -> bool {
         match self.resolve(type_id) {
             Some(

@@ -30,6 +30,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**Native: a variant constructor inside a generic body takes the INSTANCE's arguments — `Maybe<T>::map<U>`'s `Maybe::Just(f(x))`, a nullary `Maybe::Nothing` at a generic return, `Outcome::Bad(value)` building `Outcome<E, T>` from an `Outcome<T, E>` — where it took the type the analyzer recorded at the site, which is one per site and named the receiver's `T`, and rustc refused the emission (E0308).** The emitter's `variant_arguments` read the recorded type first and the position and the payload only when the record was open; it now reads the POSITION (the generic return, a parameter, an annotation — each read under the instance), then the PAYLOAD bound against the variant's declared payload types, then the record — first only when the record is closed in itself, naming no parameter, so no instance can change it. Struct literals already put the position first (`struct_arguments_at`). `Option`/`Result` were latent rather than wrong: Rust's own enums name no instance in a path, which is why native-45's turbofish attempt surfaced it. Pin: `native_differential`'s `a_variant_built_inside_a_generic_instance_is_identical_on_both_backends` (`native/generic_instance_variants.vl`: a payload of the method's own parameter, a nullary variant at a generic return, a two-parameter enum built swapped at two instances each way, a nested payload, an annotated binding in the instance's parameter, `Option`'s constructors in a generic body; rustc refused it on 0.43.0). Tracker F66.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

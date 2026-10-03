@@ -1,0 +1,173 @@
+// F66: a variant constructor INSIDE a generic body closes its enum's arguments
+// per INSTANCE. The analyzer records one type per site, and inside
+// `Maybe<T>::map<U>` the site of `Maybe::Just(f(x))` recorded the receiver's
+// `Maybe<T>`: the `(str, i32)` instance minted `Maybe<(str, i32)>` for a value
+// that is a `Maybe<i32>`, and rustc refused the emission. The position and the
+// payload are read under the instance and come first now; each shape here is
+// one source: a payload of the method's own parameter, a nullary variant at a
+// generic return, a two-parameter enum built with its parameters swapped, a
+// nested payload, a binding annotated in the instance's parameter, and `Option`'s own
+// constructors (Rust's enum, whose path names no instance — pinned so a
+// turbofish there cannot come back wrong).
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+enum Maybe<T> {
+	Just(T),
+	Nothing,
+}
+
+impl Maybe<type T> {
+	fun map<U>(self, f: |T| U): Maybe<U> {
+		match self {
+			Maybe::Just(let x) => Maybe::Just(f(x)),
+			Maybe::Nothing => Maybe::Nothing,
+		}
+	}
+
+	fun and_then<U>(self, f: |T| Maybe<U>): Maybe<U> {
+		match self {
+			Maybe::Just(let x) => f(x),
+			Maybe::Nothing => Maybe::Nothing,
+		}
+	}
+
+	fun nest(self): Maybe<Maybe<T>> {
+		match self {
+			Maybe::Just(let x) => Maybe::Just(Maybe::Just(x)),
+			Maybe::Nothing => Maybe::Just(Maybe::Nothing),
+		}
+	}
+
+	fun to_option(self): Option<T> {
+		match self {
+			Maybe::Just(let x) => Some(x),
+			Maybe::Nothing => None,
+		}
+	}
+
+	fun describe(self): str {
+		match self {
+			Maybe::Just(_) => "just",
+			Maybe::Nothing => "nothing",
+		}
+	}
+}
+
+enum Outcome<T, E> {
+	Good(T),
+	Bad(E),
+}
+
+fun lift<T, E>(value: T, fail: bool, error: E): Outcome<T, E> {
+	if fail {
+		ret Outcome::Bad(error);
+	}
+	Outcome::Good(value)
+}
+
+fun swap<T, E>(outcome: Outcome<T, E>): Outcome<E, T> {
+	match outcome {
+		Outcome::Good(let value) => Outcome::Bad(value),
+		Outcome::Bad(let error) => Outcome::Good(error),
+	}
+}
+
+fun first_good<T, E>(left: Outcome<T, E>, right: T): Maybe<T> {
+	mut found: Maybe<T> = Maybe::Nothing;
+	if left is Outcome::Good(let value) {
+		found = Maybe::Just(value);
+	} else {
+		found = Maybe::Just(right);
+	}
+	found
+}
+
+fun option_map<T, U>(value: Option<T>, f: |T| U): Option<U> {
+	match value {
+		Some(let x) => Some(f(x)),
+		None => None,
+	}
+}
+
+fun show(outcome: Outcome<i32, str>): str {
+	match outcome {
+		Outcome::Good(let value) => i"good {value}",
+		Outcome::Bad(let error) => i"bad {error}",
+	}
+}
+
+fun show_flipped(outcome: Outcome<str, i32>): str {
+	match outcome {
+		Outcome::Good(let value) => i"good {value}",
+		Outcome::Bad(let error) => i"bad {error}",
+	}
+}
+
+fun show_number(maybe: Maybe<i32>): str {
+	match maybe {
+		Maybe::Just(let n) => i"just {n}",
+		Maybe::Nothing => "nothing",
+	}
+}
+
+fun show_text(maybe: Maybe<str>): str {
+	match maybe {
+		Maybe::Just(let text) => i"just {text}",
+		Maybe::Nothing => "nothing",
+	}
+}
+
+fun big(n: i32): Maybe<str> {
+	if n > 2 {
+		ret Maybe::Just(i"big {n}");
+	}
+	Maybe::Nothing
+}
+
+fun main() {
+	let pair = Maybe::Just(("x", 1));
+	print(show_number(pair.map(|pair| pair.1 + 1)));
+	let seven = Maybe::Just(7);
+	print(show_text(seven.map(|n| i"seven is {n}")));
+	let none: Maybe<str> = Maybe::Nothing;
+	print(show_number(none.map(|text| text.len().as_i32())));
+
+	let three = Maybe::Just(3);
+	let one = Maybe::Just(1);
+	print(show_text(three.and_then(big)));
+	print(show_text(one.and_then(big)));
+	let abc = Maybe::Just("abc");
+	print(show_number(abc.and_then(|text| Maybe::Just(text.len().as_i32()))));
+
+	let five = Maybe::Just(5);
+	print(five.nest().describe());
+	let n = Maybe::Just("n");
+	print(n.nest().describe());
+	let empty: Maybe<i32> = Maybe::Nothing;
+	print(empty.nest().describe());
+
+	let why = Maybe::Just(("y", 2));
+	match why.to_option() {
+		Some(let found) => print(found.0),
+		None => print("none"),
+	}
+
+	print(show(lift(1, false, "oops")));
+	print(show(lift(1, true, "oops")));
+	print(show_flipped(swap(lift(5, false, "e"))));
+	print(show_flipped(swap(lift(5, true, "e"))));
+	print(show(swap(lift("s", false, 9))));
+
+	print(show_number(first_good(lift(4, false, "no"), 0)));
+	print(show_text(first_good(lift("a", true, 1.5), "b")));
+
+	match option_map(Some(("z", 3)), |pair| pair.1 * 2) {
+		Some(let doubled) => print(doubled),
+		None => print("none"),
+	}
+	match option_map(Some(4), |n| i"four {n}") {
+		Some(let text) => print(text),
+		None => print("none"),
+	}
+}
