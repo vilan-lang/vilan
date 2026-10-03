@@ -557,30 +557,31 @@ impl Js for JsonValue {
             JsonValue::Number(value) => js_number(*value),
             JsonValue::Text(text) => text.to_string(),
             JsonValue::Array(items) => {
-                if items.is_empty() {
-                    return "[]".to_string();
-                }
-                let parts: Vec<String> = items.iter().map(Js::js_nested).collect();
-                format!("[ {} ]", parts.join(", "))
+                crate::inspect::array(items.iter().map(|item| item as &dyn Js), |item| {
+                    item.js_nested()
+                })
             }
             JsonValue::Object(entries) => {
-                if entries.is_empty() {
-                    return "{}".to_string();
-                }
-                let parts: Vec<String> = entries
+                let keys: Vec<String> = entries.iter().map(|(key, _)| inspect_key(key)).collect();
+                let fields: Vec<(&str, &dyn Js)> = keys
                     .iter()
-                    .map(|(key, value)| format!("{}: {}", inspect_key(key), value.js_nested()))
+                    .zip(entries.iter())
+                    .map(|(key, (_, value))| (key.as_str(), value as &dyn Js))
                     .collect();
-                format!("{{ {} }}", parts.join(", "))
+                crate::inspect::object(&fields)
             }
         }
     }
 
     fn js_nested(&self) -> String {
         match self {
-            JsonValue::Text(text) => format!("'{text}'"),
+            JsonValue::Text(text) => crate::inspect::string(text),
             other => other.js(),
         }
+    }
+
+    fn js_is_number(&self) -> bool {
+        matches!(self, JsonValue::Number(_))
     }
 }
 

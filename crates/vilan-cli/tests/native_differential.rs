@@ -8936,6 +8936,33 @@ fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
     );
 }
 
+/// F68 + B503: `print` lays a value out by ONE rule on both backends — node's
+/// `console.log`, which the JS backend binds and `vilan_rt::inspect` ports.
+/// Natively every container printed on one line, so a 22-element `List<str>`
+/// printed one line against node's nine; and a `List<dyn T>` printed each
+/// object as its `[ value, {} ]` pair on BOTH backends (B436 converted a lone
+/// object only). The JS backend now maps a list of objects at the host
+/// boundary, and the native `Js::js_hosted` renders the same split. The probe
+/// walks node's rules (grouped columns padded by kind, the 80-column break, a
+/// many-field struct, the depth cut, "... n more items", string quoting and
+/// splitting, a cell, a map, a set, a tuple, a list of `Option`s) and B503's
+/// shapes (a list and a nested list of objects; an object in an `Option` and in
+/// a struct field, which stay pairs on both).
+#[test]
+fn print_lays_values_out_by_nodes_rule_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_print_layout.vl"),
+        include_str!("native/print_layout.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_print_layout.vl"),
+        Verdict::Identical,
+        "print must lay every value out by node's console.log rule on both backends"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds

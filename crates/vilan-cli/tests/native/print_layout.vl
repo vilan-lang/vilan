@@ -1,0 +1,110 @@
+// F68 + B503: `print` lays a value out by ONE rule on both backends — node's
+// `console.log` (`util.inspect`), which the JS backend binds and the native
+// backend now ports (`vilan_rt::inspect`). Each line is one of node's rules: an
+// array of more than six entries grouped into columns (padded at the end for
+// strings, at the start for numbers), a container past 80 columns broken one
+// entry per line, a struct (an array on the JS backend) with many fields, a
+// fourth level of nesting printed `[Array]`, a list past 100 entries with "...
+// n more items", a nested string quoted by node's escape rule and split at its
+// newlines when long, a cell's `{ v: .. }`, a `HashMap` and a `HashSet` past
+// the line, and a tuple. B503: a `List` of trait objects prints each object's
+// VALUE (the JS backend maps the list at the host boundary, as B436 converts a
+// lone object), nested lists of them too, while an object inside any other
+// container — an `Option`, a struct field — still prints as the stored pair on
+// both backends.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::range::Range;
+import std::shared::Shared;
+
+trait Shape {
+	fun area(self): i32;
+}
+
+struct Square {
+	side: i32,
+}
+
+impl Square with Shape {
+	fun area(self): i32 {
+		self.side * self.side
+	}
+}
+
+struct Wide {
+	first: i32,
+	second: str,
+	third: f64,
+	fourth: bool,
+	fifth: i32,
+	sixth: str,
+	seventh: i32,
+}
+
+struct Holds {
+	shape: dyn Shape,
+	label: str,
+}
+
+fun main() {
+	let words = [
+		"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+		"lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi", "chi",
+	];
+	print(words);
+	print([1, 2, 3, 4, 5, 6, 7]);
+	print([1, 2, 3, 4, 5, 6]);
+	print([100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200]);
+	print([1.5, -2.25, 3.0, 400.125, 5.5, 6.75, 7.0, 8.5]);
+	print(["a long entry that takes room", "another long entry for the line", "a third"]);
+	let wide = Wide {
+		first = 1,
+		second = "two",
+		third = 3.5,
+		fourth = true,
+		fifth = 5,
+		sixth = "six",
+		seventh = 7,
+	};
+	print(wide);
+	print([wide, wide]);
+	print([[[[1]]]]);
+	print([[[[1]], [[2, 3]]]]);
+	mut many: List<i32> = [];
+	for n in Range::new(0, 103) {
+		many.push(n * 3);
+	}
+	print(many);
+	print(["it's", "say \"hi\"", "tab\there", "back\\slash"]);
+	print([
+		"a first line that is long enough to split\nand a second line after it\nand a third",
+	]);
+	print(Shared::new([1, 2, 3]));
+	print(Shared::new(["a string that is quite long indeed", "and another one that is long"]));
+	mut table: HashMap<str, i32> = HashMap::new();
+	table.insert("first key", 1);
+	table.insert("second key", 2);
+	table.insert("third key", 3);
+	table.insert("fourth key", 4);
+	table.insert("fifth key", 5);
+	print(table);
+	mut seen: HashSet<i32> = HashSet::new();
+	for n in Range::new(0, 9) {
+		seen.insert(n * 11);
+	}
+	print(seen);
+	print((1, "two", 3.5));
+	print([Some(1), None, Some(3), None, Some(5), None, Some(7)]);
+
+	let shapes: List<dyn Shape> = [Square { side = 2 }, Square { side = 3 }];
+	print(shapes);
+	let rows: List<List<dyn Shape>> = [shapes, [Square { side = 4 }]];
+	print(rows);
+	let maybe: Option<dyn Shape> = Some(Square { side = 5 });
+	print(maybe);
+	print(Holds { shape = Square { side = 6 }, label = "held" });
+	let one: dyn Shape = Square { side = 7 };
+	print(one);
+}

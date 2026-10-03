@@ -2802,9 +2802,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let parts: Vec<String> = declaration
                 .fields
                 .iter()
-                .map(|field| format!("self.{}.js_nested()", sanitize(field.name)))
+                .map(|field| format!("&self.{} as &dyn vilan_rt::Js", sanitize(field.name)))
                 .collect();
-            let _ = writeln!(out, "        vilan_rt::js_tuple(&[{}])", parts.join(", "));
+            let _ = writeln!(out, "        vilan_rt::js_items(&[{}])", parts.join(", "));
         }
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
@@ -2988,17 +2988,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if variant.data_type_ids.is_empty() {
                 let _ = writeln!(
                     out,
-                    "            {type_name}::{name} => vilan_rt::js_tuple(&[\"{index}\".to_string()]),"
+                    "            {type_name}::{name} => vilan_rt::js_items(&[&{index}i32]),"
                 );
             } else {
                 let binders: Vec<String> = (0..variant.data_type_ids.len())
                     .map(|slot| format!("p{slot}"))
                     .collect();
-                let mut parts = vec![format!("\"{index}\".to_string()")];
-                parts.extend(binders.iter().map(|binder| format!("{binder}.js_nested()")));
+                let mut parts = vec![format!("&{index}i32 as &dyn vilan_rt::Js")];
+                parts.extend(
+                    binders
+                        .iter()
+                        .map(|binder| format!("{binder} as &dyn vilan_rt::Js")),
+                );
                 let _ = writeln!(
                     out,
-                    "            {type_name}::{name}({}) => vilan_rt::js_tuple(&[{}]),",
+                    "            {type_name}::{name}({}) => vilan_rt::js_items(&[{}]),",
                     binders.join(", "),
                     parts.join(", ")
                 );
