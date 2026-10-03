@@ -338,6 +338,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**A closure literal's unannotated parameters take their types from a generic call's ANNOTATED result: `let shown: Shared<|str| void> = Shared::new(|key| print(i"{key}"));` types `key` as `str` — where it was left untyped (JS ran it; native refused "an interpolation of a value with its own `render`", the unresolved type), and a body that needs the type (`Shared::new(|key| key.len())`) could not check.** B406's expectation step binds an impl binder a literal ARGUMENT alone would fix (`Shared::new(0)` under `Shared<u32>`); a closure literal with an unannotated parameter is the same kind of argument — it cannot type its own parameters — so it now takes the expectation too, when the bound is a closure type of its arity and fully determined. Pins: `inference::generics`' `b513_a_generic_calls_annotated_result_types_a_closure_arguments_parameters` (one, one with a body that needs the type, two parameters) and `native_differential`'s `a_closure_arguments_parameters_take_the_annotated_result_on_both_backends` — red on the 0.43.0 toolchain. No golden moves. Tracker B513.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

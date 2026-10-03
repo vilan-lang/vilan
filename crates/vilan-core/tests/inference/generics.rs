@@ -9472,3 +9472,26 @@ fn b454_an_argument_constructor_takes_the_receivers_error_type() {
     );
 }
 
+/// B513: a closure literal's unannotated parameters take their types from a
+/// generic call's ANNOTATED result — `let shown: Shared<|str| void> =
+/// Shared::new(|key| ..)` left `key` untyped (natively refused, "unresolved
+/// type"), and a body that needs it (`key.len()`) could not check at all.
+/// `native_differential` runs the program on both backends.
+#[test]
+fn b513_a_generic_calls_annotated_result_types_a_closure_arguments_parameters() {
+    assert_compiles_and_runs(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let shown: Shared<|str| void> = Shared::new(|key| print(i"key={key}"));
+            (shown.read())("k");
+            let measured: Shared<|str| usize> = Shared::new(|key| key.len());
+            print((measured.read())("abc"));
+            let summed: Shared<|i32, i32| i32> = Shared::new(|a, b| a + b);
+            print((summed.read())(2, 3));
+        }
+        "#,
+        "key=k\n3\n5\n",
+    );
+}
+

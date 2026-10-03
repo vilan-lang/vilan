@@ -50680,6 +50680,21 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The arity of a closure literal with at least one unannotated
+    /// parameter — one that only its position can type (B513).
+    fn untyped_closure_literal_arity(&self, expr_id: Id) -> Option<usize> {
+        let Some(Expr::Closure(closure_id)) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return None;
+        };
+        let closure = self.closures.get(closure_id)?;
+        let untyped = closure.parameters.iter().any(|parameter_id| {
+            self.parameters.get(parameter_id).is_some_and(|parameter| {
+                matches!(parameter.type_id.borrow_type(self), Type::Unknown)
+            })
+        });
+        untyped.then_some(closure.parameters.len())
+    }
+
     /// B389 — whether `expr_id` is built from UNSUFFIXED numeric literals
     /// alone: a literal, a negation of one, and arithmetic over them. Such an
     /// expression has no type of its own; its context supplies one.
@@ -50922,8 +50937,14 @@ impl<'src> Analyzer<'src> {
             return;
         };
         let mut literal_generics: Vec<TypeId> = Vec::new();
+        // B513: a closure literal whose parameters are unannotated cannot
+        // type them itself either — `Shared::new(|key| ..)` under an annotated
+        // `Shared<|str| void>` is a literal of the same kind as `0` under
+        // `Shared<u32>`, and the expectation is the one thing that knows.
+        let mut closure_generics: Vec<(TypeId, usize)> = Vec::new();
         for (index, argument_id) in argument_ids.iter().enumerate() {
-            if !self.is_unsuffixed_numeric(*argument_id) {
+            let closure_arity = self.untyped_closure_literal_arity(*argument_id);
+            if !self.is_unsuffixed_numeric(*argument_id) && closure_arity.is_none() {
                 continue;
             }
             let Some(parameter_id) = parameter_ids.get(index + self_parameter_offset) else {
@@ -50937,7 +50958,27 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             if !substitution.contains_key(&constraint_id) {
-                literal_generics.push(constraint_id);
+                match closure_arity {
+                    Some(arity) => closure_generics.push((constraint_id, arity)),
+                    None => literal_generics.push(constraint_id),
+                }
+            }
+        }
+        if !closure_generics.is_empty() {
+            let open: Vec<TypeId> = closure_generics
+                .iter()
+                .map(|(generic, _)| *generic)
+                .collect();
+            let mut trial = substitution.clone();
+            self.bind_open_generics_from_expectation(call_id, callee_id, open, &mut trial);
+            for (generic, arity) in closure_generics {
+                if let Some(bound) = trial.get(&generic).copied()
+                    && let Type::Closure(parameter_type_ids, _, _) = bound.get_type(self)
+                    && parameter_type_ids.len() == arity
+                    && self.type_is_fully_determined(&bound.get_type(self))
+                {
+                    self.record_generic_binding(substitution, generic, bound);
+                }
             }
         }
         if literal_generics.is_empty() {
