@@ -58,6 +58,11 @@ written down.
 <!-- family: tooling -->
 **`vilan fmt` no longer walks a cargo workspace's default `target/` directory — one named `target` beside a `Cargo.toml` — so CI's `vilan-fmt` leg (`vilan fmt --check .` at the repository root) stays green after a local full suite.** N133 taught the walk to skip a directory carrying cargo's `CACHEDIR.TAG`, but cargo writes the tag only into a target directory it creates: a `target/` that already existed (a lane's `target/<lane>-scratch/`, made before the first build) has none, and the scratch projects the suite leaves under `target/tmp` turned the leg red. A vilan package may still name a module directory `target`; without a `Cargo.toml` beside it, it is formatted like any other. **Pin:** `fmt_declines::a_cargo_target_directory_is_not_walked_and_a_module_named_target_is` (an untagged `target/tmp` with an unformatted file: `--check` exits 0 and names nothing; the same tree without the `Cargo.toml`: exits 1 and names the file). Tracker N138.
 
+---
+
+<!-- family: tooling -->
+**`vilan fmt` prints `[resource]` on a line of its own above the declaration, like every other attribute — `[resource]` ⏎ `export struct Handle {` — where it printed on the declaration line in the slot the keyword held before B413 (`[resource] export struct Handle {`).** B485 Q10 (RULED): attributes above the signature, the keywords and the declaration word on it; keeping `[resource]` on the line needed one attribute after the line's start, an exception to the one order. Field and variant attributes stay inline (the 2026-10-02 amendment). Both spellings parse as before; only the printed layout moves. std is reformatted (37 heads: 21 in `delta.vl`, 11 in `reactive.vl`, 3 in `process/fs.vl`, one each in `task.vl` and `process/db.vl`), with three corpus programs and one native fixture; no emitted golden moves. The spec's lexical chapter gains B485's rule for which spelling a new marker takes (Q1), and a line on B520's foreign spellings. **Pins:** the formatter's `[resource]` round trips (struct, enum, trait, `external struct`), B485's export and any-order pins, and E227's hint fixed point, all on the new layout. Tracker B485 (Q10).
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

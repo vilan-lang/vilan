@@ -3698,11 +3698,13 @@ struct Printer<'src> {
     head_start: Option<usize>,
 }
 
-/// `[resource]` as it prints today: on the declaration line, in the slot the
-/// keyword it was until B413 held. B485's layout (Q10) moves it to a line of
-/// its own; until then it is the one attribute the declaration line opens
-/// with, and an `export` placed on that line goes after it.
-const RESOURCE_ON_THE_HEAD: &str = "[resource] ";
+/// `[resource]`, on a line of its own above the declaration like every other
+/// attribute (B485 Q10, RULED): until B413 it was a keyword in the
+/// declaration line's slot, and it printed there — `[resource] export struct
+/// H` — which needed one attribute AFTER the keywords' line start, an
+/// exception to the one order. A field's or a variant's attributes are not
+/// declarations' and stay inline (the 2026-10-02 amendment).
+const RESOURCE_ATTRIBUTE: &str = "[resource]";
 
 /// `(in PATH)` after an `export` — printed verbatim, `::`-joined, with no
 /// space before the `(` (`export(in pkg) fun f()`). Empty when the marker
@@ -4605,8 +4607,7 @@ impl<'src> Printer<'src> {
     /// line begins; the marker is placed THERE once the item is printed, so
     /// every item kind — and a derive, a service or a macro attribute
     /// wrapping one — takes it at its signature without an arm of its own.
-    /// `[resource]`, which still prints on the declaration line, is an
-    /// attribute and stays ahead of it (`[resource] export struct H`). An item
+    /// `[resource]` is an attribute line like the rest (B485 Q10). An item
     /// with no attribute takes the marker at its start, as it always did. The
     /// declaration line's width rule measures from the same offset, so it
     /// reads the line with the marker on it.
@@ -4638,11 +4639,6 @@ impl<'src> Printer<'src> {
                 self.head_start = enclosing_head;
                 start
             }
-        };
-        let declaration = if self.out[declaration..].starts_with(RESOURCE_ON_THE_HEAD) {
-            declaration + RESOURCE_ON_THE_HEAD.len()
-        } else {
-            declaration
         };
         self.out.insert_str(declaration, keyword);
     }
@@ -4730,13 +4726,14 @@ impl<'src> Printer<'src> {
     /// handled, so `format` falls back to the original source.
     fn print_item(&mut self, item: &Spanned<Node<'src>>) {
         match &item.0 {
-            // `[[resource] ][external ]struct Name[<…>][;|{ fields }]` — canonical
-            // order is `[resource] external struct` (destruction.md §3; B413's
-            // attribute, printed on the declaration's line as the keyword was).
+            // `[[resource] ⏎ ][external ]struct Name[<…>][;|{ fields }]` —
+            // canonical order is `[resource] external struct` (destruction.md
+            // §3; B413's attribute, on its own line since B485 Q10).
             Node::Struct(name, generics, external, resource, body, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str(RESOURCE_ON_THE_HEAD);
+                    self.out.push_str(RESOURCE_ATTRIBUTE);
+                    self.end_attribute_line();
                 }
                 if *external {
                     self.out.push_str("external ");
@@ -4810,11 +4807,12 @@ impl<'src> Printer<'src> {
                     }
                 }
             }
-            // `[[resource] ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
+            // `[[resource] ⏎ ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
             Node::Enum(name, generics, resource, variants, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str(RESOURCE_ON_THE_HEAD);
+                    self.out.push_str(RESOURCE_ATTRIBUTE);
+                    self.end_attribute_line();
                 }
                 self.out.push_str("enum ");
                 self.out.push_str(name.0);
@@ -4909,7 +4907,8 @@ impl<'src> Printer<'src> {
             Node::Trait(name, generics, supertraits, body, labels) => {
                 self.print_item_labels(labels);
                 if labels.as_ref().is_some_and(|labels| labels.resource) {
-                    self.out.push_str(RESOURCE_ON_THE_HEAD);
+                    self.out.push_str(RESOURCE_ATTRIBUTE);
+                    self.end_attribute_line();
                 }
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
@@ -8823,7 +8822,7 @@ mod reformats {
     // the keywords with `export` first, then the declaration word — so the
     // signature is one line. Every item kind a label leads, a run of several,
     // a scoped marker, a re-export's label, a comment above the statement, a
-    // run split across the marker, `[resource]` on the declaration line, an
+    // run split across the marker, `[resource]` on its own line (Q10), an
     // unattributed export (unchanged), and a rotated statement after an
     // untouched one.
     #[test]
@@ -8859,11 +8858,11 @@ mod reformats {
             ),
             (
                 "export [resource] struct Handle { id: i32 }\n",
-                "[resource] export struct Handle {\n\tid: i32,\n}\n",
+                "[resource]\nexport struct Handle {\n\tid: i32,\n}\n",
             ),
             (
                 "export [hint(Show)] [resource] external struct Handle;\n",
-                "[hint(Show)]\n[resource] export external struct Handle;\n",
+                "[hint(Show)]\n[resource]\nexport external struct Handle;\n",
             ),
             (
                 "export fun a() {}\n\n[must_use] export fun b(): i32 { 1 }\n",
@@ -8888,7 +8887,7 @@ mod reformats {
             ),
             (
                 "[resource] [internal(\"r\")] [derive(PartialEq)] struct S { a: i32 }\n",
-                "[derive(PartialEq)]\n[internal(\"r\")]\n[resource] struct S {\n\ta: i32,\n}\n",
+                "[derive(PartialEq)]\n[internal(\"r\")]\n[resource]\nstruct S {\n\ta: i32,\n}\n",
             ),
             (
                 "[internal(\"r\")] [deprecated(\"d\")] lazy let x = 1;\n",
@@ -8896,7 +8895,7 @@ mod reformats {
             ),
             (
                 "[resource] [platform(\"node\")] export trait T {\n\tfun t(self): i32;\n}\n",
-                "[platform(\"node\")]\n[resource] export trait T {\n\tfun t(self): i32;\n}\n",
+                "[platform(\"node\")]\n[resource]\nexport trait T {\n\tfun t(self): i32;\n}\n",
             ),
             (
                 "export [must_use] [deprecated(\"d\")] async fun f(): i32 { 1 }\n",
@@ -9088,7 +9087,7 @@ mod reformats {
     fn resource_struct_modifier_round_trips() {
         assert_formats(
             "[resource] struct S{x:i32}\n",
-            "[resource] struct S {\n\tx: i32,\n}\n",
+            "[resource]\nstruct S {\n\tx: i32,\n}\n",
         );
     }
 
@@ -9096,7 +9095,7 @@ mod reformats {
     fn resource_external_struct_keeps_canonical_order() {
         assert_formats(
             "[resource] external struct Database;\n",
-            "[resource] external struct Database;\n",
+            "[resource]\nexternal struct Database;\n",
         );
     }
 
@@ -9105,11 +9104,11 @@ mod reformats {
         // B470: `[resource]` closes a trait's label prefix, as on a struct.
         assert_formats(
             "[resource] trait Flow<T>{fun start(own self);}\n",
-            "[resource] trait Flow<T> {\n\tfun start(own self);\n}\n",
+            "[resource]\ntrait Flow<T> {\n\tfun start(own self);\n}\n",
         );
         assert_formats(
             "[deprecated(\"use Flow\")] [resource] trait Old{}\n",
-            "[deprecated(\"use Flow\")]\n[resource] trait Old {}\n",
+            "[deprecated(\"use Flow\")]\n[resource]\ntrait Old {}\n",
         );
     }
 
@@ -9117,7 +9116,7 @@ mod reformats {
     fn resource_enum_modifier_round_trips() {
         assert_formats(
             "[resource] enum E{A,B}\n",
-            "[resource] enum E {\n\tA,\n\tB,\n}\n",
+            "[resource]\nenum E {\n\tA,\n\tB,\n}\n",
         );
     }
 
@@ -9656,7 +9655,8 @@ mod idempotency {
             "export struct Map<S, T, U> {\n\tup: S,\n}\n\n",
             "[internal(\"a node\")]\n",
             "[hint(Iterator<(usize, T)>)]\n",
-            "[resource] struct Enumerated<I, T> {\n\tupstream: I,\n}\n\n",
+            "[resource]\n",
+            "struct Enumerated<I, T> {\n\tupstream: I,\n}\n\n",
             "[hint(Source<Option<T>>)]\n",
             "enum Maybe<T> {\n\tSome(T),\n\tNone,\n}\n",
         );
