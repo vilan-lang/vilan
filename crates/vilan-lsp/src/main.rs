@@ -3078,11 +3078,22 @@ impl Backend {
             let Some(document) = self.documents.get(&params.uri) else {
                 return Ok(None);
             };
-            Ok(document
-                .analysis_platform()
-                .map(|(platform, kind, reason)| {
-                    serde_json::json!({ "platform": platform, "kind": kind, "reason": reason })
-                }))
+            // E247: and, for the status bar's menu, the entry whose world the
+            // file is analyzed in (M104; `null` for a file that is its own
+            // entry) and the analysis's size in counts.
+            Ok(document.analysis_status().map(|status| {
+                serde_json::json!({
+                    "platform": status.platform,
+                    "kind": status.kind,
+                    "reason": status.reason,
+                    "world": document.world_root().map(|root| root.display().to_string()),
+                    "work": {
+                        "files": status.files,
+                        "entities": status.entities,
+                        "impls": status.impls,
+                    },
+                })
+            }))
         })
     }
 

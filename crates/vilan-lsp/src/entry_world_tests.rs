@@ -554,3 +554,74 @@ async fn m104_a_module_both_entries_reach_reports_both_legs() {
         "the node entry's world is kept while the module is open",
     );
 }
+
+/// E247: the status bar's menu asks `vilan/analysisPlatform`, and the answer
+/// names the entry whose world the file is analyzed in — `null` for a file
+/// that is its own entry — and the analysis's size in COUNTS. A released
+/// document (M63: not one of the focused few) still answers.
+#[tokio::test]
+async fn e247_the_platform_answer_names_the_world_and_the_work_counts() {
+    let package = Package::new("status");
+    let (service, _socket) = backend();
+    let server = service.inner();
+    open_all(
+        server,
+        &package,
+        &[
+            ("client.vl", CLIENT),
+            ("views.vl", VIEWS),
+            ("model.vl", MODEL),
+        ],
+    )
+    .await;
+    let model = answer(server, &package.uri("model.vl"))
+        .await
+        .expect("an answer for the module");
+    assert_eq!(
+        model["world"].as_str().map(PathBuf::from),
+        Some(package.canonical("client.vl")),
+        "{model}"
+    );
+    assert!(
+        model["work"]["files"]
+            .as_u64()
+            .is_some_and(|files| files > 3),
+        "{model}"
+    );
+    assert!(
+        model["work"]["entities"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "{model}"
+    );
+    assert_eq!(model["platform"], "browser");
+    let client = answer(server, &package.uri("client.vl"))
+        .await
+        .expect("an answer for the entry");
+    assert!(
+        client["world"].is_null(),
+        "the entry is its own world: {client}"
+    );
+    // `client.vl` was opened first and has since fallen out of the focused
+    // two, so it answers from what it captured before its program went.
+    assert!(
+        !server
+            .documents
+            .get(&package.uri("client.vl"))
+            .expect("open")
+            .holds_program(),
+        "the premise: the entry's document was released"
+    );
+    assert!(
+        client["work"]["files"]
+            .as_u64()
+            .is_some_and(|files| files > 3)
+    );
+}
+
+async fn answer(server: &Backend, uri: &Url) -> Option<serde_json::Value> {
+    server
+        .analysis_platform(TextDocumentIdentifier { uri: uri.clone() })
+        .await
+        .expect("the request answers")
+}

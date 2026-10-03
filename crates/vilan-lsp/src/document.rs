@@ -1032,6 +1032,38 @@ pub struct Document {
     /// leg sees it; the editor answers caret requests from `world_root`'s.
     /// Empty for every file one entry reaches, which is nearly all of them.
     further_worlds: Vec<PathBuf>,
+    /// E247: what the status bar's menu reports about this analysis, captured
+    /// when it was built so a released document (M63) still answers — the
+    /// platform and why, and the analysis's size in COUNTS (the M106 ruling:
+    /// work, never milliseconds). `None` on a document that never analyzed.
+    status: Option<AnalysisStatus>,
+}
+
+/// E247: one analysis as the status bar's menu describes it.
+#[derive(Clone, Debug)]
+pub struct AnalysisStatus {
+    pub platform: &'static str,
+    pub kind: Option<&'static str>,
+    pub reason: Option<String>,
+    /// The files the analysis loaded (the entry, its modules, std).
+    pub files: usize,
+    /// The entity ids it minted — every declaration, expression and binding.
+    pub entities: u32,
+    /// The `impl` blocks in its world.
+    pub impls: usize,
+}
+
+impl AnalysisStatus {
+    fn of(program: &Program) -> AnalysisStatus {
+        AnalysisStatus {
+            platform: program.platform.runtime_name(),
+            kind: program.platform_kind,
+            reason: program.platform_reason.clone(),
+            files: program.sources.len(),
+            entities: program.next_entity_id,
+            impls: program.implementations.len(),
+        }
+    }
 }
 
 /// One further leg of a file carrying platform-fenced twins (F27 R3), kept
@@ -1797,6 +1829,7 @@ impl Document {
             focus: SourceId(0),
             world_root: None,
             further_worlds: Vec::new(),
+            status: None,
         }
     }
 
@@ -2129,7 +2162,9 @@ impl Document {
             focus: SourceId(0),
             world_root: None,
             further_worlds: Vec::new(),
+            status: None,
         };
+        document.status = document.program.as_ref().map(AnalysisStatus::of);
         // E121: the keystroke path's whole-program walk, paid HERE — once per
         // analysis, on the analysis thread — instead of once per request on
         // the keystroke thread. See [`LandedSnapshot`].
@@ -2448,6 +2483,7 @@ impl Document {
             focus,
             world_root: Some(vilan_core::util::canonical_path(world_root)),
             further_worlds,
+            status: world.status.clone(),
         };
         document.landed = document.capture_landed(path, Some(&world.landed.index.completion));
         document.index_time = started.elapsed().wall;
@@ -3033,7 +3069,9 @@ impl Document {
             focus,
             world_root,
             further_worlds,
+            status,
         } = analysis;
+        self.status = status;
         self.focus = focus;
         self.world_root = world_root;
         self.further_worlds = further_worlds;
@@ -3418,15 +3456,18 @@ impl Document {
     /// the platform the last analysis ran under, the one-word kind of fact
     /// that chose it, and the full reason clause (its tooltip). `None` before
     /// any analysis has produced a program.
+    #[cfg(test)]
     pub fn analysis_platform(
         &self,
     ) -> Option<(&'static str, Option<&'static str>, Option<String>)> {
-        let program = self.program.as_ref()?;
-        Some((
-            program.platform.runtime_name(),
-            program.platform_kind,
-            program.platform_reason.clone(),
-        ))
+        let status = self.status.as_ref()?;
+        Some((status.platform, status.kind, status.reason.clone()))
+    }
+
+    /// E247: the last analysis as the status bar's menu describes it — kept
+    /// through a release (M63), so a background tab still answers.
+    pub fn analysis_status(&self) -> Option<&AnalysisStatus> {
+        self.status.as_ref()
     }
 
     /// Whether the `<` ending at `offset` opens a generic argument or

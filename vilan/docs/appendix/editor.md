@@ -130,10 +130,20 @@ follows.
 
 **Which platform, and why, before any error.** The platform a file is
 analyzed under decides which `std` twin its types come from, so the status
-bar says it for the vilan file in front of you — `analyzed as: browser —
-declared`, `analyzed as: node — default-entry` — with the whole reason in
-its tooltip. A file can say it itself: `[platform("browser")] mod self;` as
-its first line — and at the top of a file, completion offers that line.
+bar's `vilan 0.43.0` item says it for the vilan file in front of you, in its
+tooltip — `This file is analyzed under browser: the client entry reaches it`.
+A file can say it itself: `[platform("browser")] mod self;` as its first line
+— and at the top of a file, completion offers that line.
+
+**The status bar menu.** Click the `vilan` item for a menu: the platform the
+file is analyzed under and why, the entry whose world it is analyzed in, the
+server's version and commit, and the last analysis' size as counts (files,
+entities, impls — work, not milliseconds); a switch for each feature the
+server reads live (inlay hints, the `~Trait` abbreviation, semantic
+highlighting, the generic `<` pairing, Organize Imports on save), which flips
+the workspace setting where one is set and the user setting otherwise; and
+restart, stop or start, the status page and the output channel. A stopped
+server reads `vilan (stopped)`.
 
 **A file is analyzed as its entry sees it.** A module one of your
 package's entries reaches is analyzed in that entry's world: the editor
@@ -424,6 +434,10 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 Everything but the two paths applies live. **Vilan: Restart Language
 Server** is in the command palette when you want the blunt instrument, and
 the **Vilan Language Server** output channel carries the server's own log.
+**Vilan: Stop Language Server** silences a server that is misbehaving or a
+file it cannot get through: its squiggles are cleared and nothing starts it
+again — not a settings change, not a crash policy — until **Vilan: Start
+Language Server** or a window reload.
 
 **Vilan: Show Language Server Status** writes this session's profile to that
 same channel: the extension's request tally first — session age, server
