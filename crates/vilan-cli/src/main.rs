@@ -2602,6 +2602,25 @@ fn is_build_cache_dir(directory: &Path) -> bool {
         .is_ok_and(|contents| contents.starts_with(CACHEDIR_TAG_SIGNATURE))
 }
 
+/// Whether `directory` is a cargo workspace's DEFAULT target directory: named
+/// `target`, beside a `Cargo.toml`. [`is_build_cache_dir`]'s tag is the general
+/// rule, and this is the one case it misses: cargo writes `CACHEDIR.TAG` only
+/// into a target directory IT creates, so a `target/` that already existed —
+/// a lane's `target/<lane>-scratch/` made before the first build, a restored
+/// cache — carries none.
+///
+/// N138: the `vilan-fmt` leg (`vilan fmt --check .` at the repository root)
+/// walked such a `target/` after any local full suite, and the scratch
+/// projects the tests leave under `target/tmp` turned it red. A vilan package
+/// may still name a module directory `target`: without a `Cargo.toml` beside
+/// it, it is walked like any other.
+fn is_cargo_target_dir(directory: &Path) -> bool {
+    directory.file_name().is_some_and(|name| name == "target")
+        && directory
+            .parent()
+            .is_some_and(|parent| parent.join("Cargo.toml").is_file())
+}
+
 impl TreeWalk {
     fn rooted_at(root: &Path) -> TreeWalk {
         TreeWalk {
@@ -2703,7 +2722,7 @@ impl TreeWalk {
         if !self.visited.insert(identity) {
             return;
         }
-        if is_build_cache_dir(path) {
+        if is_build_cache_dir(path) || is_cargo_target_dir(path) {
             return;
         }
         let Ok(entries) = fs::read_dir(path) else {
