@@ -269,6 +269,13 @@ struct Emitter<'a, 'src> {
     /// The generic binding in force while a body is walked: generic constraint
     /// id -> the type it is bound to. [`Emitter::concrete`] follows it.
     current_substitution: HashMap<TypeId, TypeId>,
+    /// Types this emitter MINTED (F82): a declared type with some of its
+    /// parameters replaced structurally — a field's `Maybe<V>` read under a
+    /// literal's own instantiation, `Maybe<str>`, which the analyzer never
+    /// interned. Keyed by ids counted DOWN from `u32::MAX`, so they cannot
+    /// meet the program's, and read through [`Emitter::type_entry`] beside the
+    /// program's table. See [`Emitter::substituted`].
+    minted_types: HashMap<TypeId, Type>,
     /// The concrete type a trait default is being specialized for, so a
     /// `self.method()` inside it re-dispatches there (the JS emitter's
     /// `current_self_type`).
@@ -586,6 +593,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             next_function_slot: 0,
             next_type_slot: 0,
             current_substitution: HashMap::default(),
+            minted_types: HashMap::default(),
             current_self_type: None,
             current_self_traits: HashSet::new(),
             current_returns_view: false,
@@ -1497,6 +1505,83 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     // ----------------------------------------------- the substitution ---
 
+    /// One entry of the type table: the program's, else one this emitter
+    /// minted ([`Self::substituted`]). Every read of a type id's `Type` goes
+    /// through here, so a minted id is as good as an interned one inside the
+    /// emitter.
+    fn type_entry(&self, type_id: &TypeId) -> Option<&Type> {
+        self.program
+            .type_id_to_type_map
+            .get(type_id)
+            .or_else(|| self.minted_types.get(type_id))
+    }
+
+    /// `type_id` with each of `entries`' parameters replaced by its argument,
+    /// STRUCTURALLY — minting the types the program never interned (F82).
+    ///
+    /// The substitution in force is a map the emitter READS a type through,
+    /// and it holds one binding per parameter, so it cannot say "the
+    /// method's `V` here, the literal's `V` there": inside `impl Pair<type K,
+    /// type V>` a literal of `Pair<V, K>` binds the same two parameters the
+    /// other way round, and its field `held: Maybe<V>` means `Maybe<K>` read
+    /// in the method. Rebuilding the field's type with the literal's arguments
+    /// written IN gives a type that needs no binding to read: the arguments
+    /// are already the instance's own (concrete) ids, so the result reads the
+    /// same under any substitution. A type no entry reaches is returned as
+    /// itself, so nothing is minted for it.
+    fn substituted(&mut self, type_id: TypeId, entries: &[(TypeId, TypeId)]) -> TypeId {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return type_id;
+        };
+        if let Some((_, argument)) = entries.iter().find(|(parameter, _)| *parameter == type_id) {
+            return *argument;
+        }
+        let Some(entry) = self.type_entry(&type_id).cloned() else {
+            return type_id;
+        };
+        let rebuilt = match entry {
+            Type::Generic(constraint_id) => {
+                return entries
+                    .iter()
+                    .find(|(parameter, _)| *parameter == constraint_id)
+                    .map_or(type_id, |(_, argument)| *argument);
+            }
+            Type::Struct(id, arguments) => {
+                Type::Struct(id, self.substituted_all(&arguments, entries))
+            }
+            Type::Enum(id, arguments) => Type::Enum(id, self.substituted_all(&arguments, entries)),
+            Type::Trait(id, arguments) => {
+                Type::Trait(id, self.substituted_all(&arguments, entries))
+            }
+            Type::Dyn(id, arguments) => Type::Dyn(id, self.substituted_all(&arguments, entries)),
+            Type::Tuple(elements) => Type::Tuple(self.substituted_all(&elements, entries)),
+            Type::Array(element, length) => Type::Array(self.substituted(element, entries), length),
+            Type::Closure(parameters, returns, contexts) => Type::Closure(
+                self.substituted_all(&parameters, entries),
+                self.substituted(returns, entries),
+                contexts,
+            ),
+            _ => return type_id,
+        };
+        if self.type_entry(&type_id) == Some(&rebuilt) {
+            return type_id;
+        }
+        let minted = TypeId(u32::MAX - self.minted_types.len() as u32);
+        self.minted_types.insert(minted, rebuilt);
+        minted
+    }
+
+    fn substituted_all(
+        &mut self,
+        type_ids: &[TypeId],
+        entries: &[(TypeId, TypeId)],
+    ) -> Vec<TypeId> {
+        type_ids
+            .iter()
+            .map(|type_id| self.substituted(*type_id, entries))
+            .collect()
+    }
+
     /// A type id under the active substitution: a bare `Generic` followed to
     /// what it is bound to, anything else left alone. The JS emitter's
     /// `resolve_type_id`, guard included — a substitution that binds a generic
@@ -1529,12 +1614,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             return type_id;
         }
-        match self.program.type_id_to_type_map.get(&type_id) {
+        match self.type_entry(&type_id) {
             Some(Type::Generic(constraint_id)) => {
                 match self.current_substitution.get(constraint_id) {
                     Some(bound)
                         if !matches!(
-                            self.program.type_id_to_type_map.get(bound),
+                            self.type_entry(bound),
                             Some(Type::Generic(other)) if other == constraint_id
                         ) =>
                     {
@@ -1575,9 +1660,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             if let Some(trait_) = self.program.traits.get(&id) {
                 for supertrait_type_id in &trait_.supertraits {
-                    if let Some(Type::Trait(super_id, _)) =
-                        self.program.type_id_to_type_map.get(supertrait_type_id)
-                    {
+                    if let Some(Type::Trait(super_id, _)) = self.type_entry(supertrait_type_id) {
                         stack.push(*super_id);
                     }
                 }
@@ -1612,7 +1695,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return;
         };
         let type_id = self.concrete(type_id);
-        let Some(type_) = self.program.type_id_to_type_map.get(&type_id) else {
+        let Some(type_) = self.type_entry(&type_id) else {
             let _ = write!(out, "?{}", type_id.0);
             return;
         };
@@ -1871,7 +1954,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if let Some(Expr::Closure(closure_id)) = self.program.entity_map.get(argument)
                 && let Some(closure) = self.program.closures.get(closure_id)
                 && let Some(Type::Closure(declared_parameters, declared_return, _)) =
-                    self.program.type_id_to_type_map.get(&parameter.type_id)
+                    self.type_entry(&parameter.type_id)
             {
                 for (declared, literal) in declared_parameters.iter().zip(&closure.parameters) {
                     if let Some(literal) = self.program.parameters.get(literal) {
@@ -1943,8 +2026,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some((enum_id, index)) = variant else {
             return;
         };
-        let Some(Type::Enum(pattern_enum, pattern_arguments)) =
-            self.program.type_id_to_type_map.get(&pattern).cloned()
+        let Some(Type::Enum(pattern_enum, pattern_arguments)) = self.type_entry(&pattern).cloned()
         else {
             return;
         };
@@ -2125,9 +2207,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// followed to its binding in ONE place — a second spelling that forgot to
     /// is how a monomorphized body comes to ask about `T` instead of `i32`.
     fn resolve(&self, type_id: TypeId) -> Option<&Type> {
-        self.program
-            .type_id_to_type_map
-            .get(&self.concrete(type_id))
+        self.type_entry(&self.concrete(type_id))
     }
 
     fn rust_type(&mut self, type_id: TypeId, span: Span) -> Result<String, Error> {
@@ -2325,38 +2405,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let (parameters, returns) = (parameters.clone(), *returns);
                 parameters.iter().any(|inner| self.mentions_any(*inner))
                     || self.mentions_any(returns)
-            }
-            _ => false,
-        }
-    }
-
-    /// Whether a DECLARED type mentions one of a declaration's own
-    /// `parameters` anywhere — read off the declaration, never through the
-    /// substitution in force.
-    fn mentions_a_parameter(&self, type_id: TypeId, parameters: &[TypeId]) -> bool {
-        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
-            return true;
-        };
-        if parameters.contains(&type_id) {
-            return true;
-        }
-        match self.program.type_id_to_type_map.get(&type_id) {
-            Some(Type::Generic(constraint_id)) => parameters.contains(constraint_id),
-            Some(
-                Type::Struct(_, arguments)
-                | Type::Enum(_, arguments)
-                | Type::Tuple(arguments)
-                | Type::Trait(_, arguments)
-                | Type::Dyn(_, arguments),
-            ) => arguments
-                .iter()
-                .any(|argument| self.mentions_a_parameter(*argument, parameters)),
-            Some(Type::Array(element, _)) => self.mentions_a_parameter(*element, parameters),
-            Some(Type::Closure(closure_parameters, returned, _)) => {
-                closure_parameters
-                    .iter()
-                    .any(|parameter| self.mentions_a_parameter(*parameter, parameters))
-                    || self.mentions_a_parameter(*returned, parameters)
             }
             _ => false,
         }
@@ -4411,9 +4459,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // B412: a site erasing a generic parameter may be instantiated at an
         // OBJECT, which is already the erased value — no second pointer.
         if matches!(
-            self.program
-                .type_id_to_type_map
-                .get(&self.concrete(subject)),
+            self.type_entry(&self.concrete(subject)),
             Some(Type::Dyn(..))
         ) {
             return Ok(text);
@@ -5141,12 +5187,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             return Err(unsupported("an unresolved variant coercion", span));
         };
-        let Some(Type::Closure(parameters, returned, _)) =
-            self.program.type_id_to_type_map.get(&closure_type).cloned()
+        let Some(Type::Closure(parameters, returned, _)) = self.type_entry(&closure_type).cloned()
         else {
             return Err(unsupported("a variant coerced to a non-closure type", span));
         };
-        let arguments = match self.program.type_id_to_type_map.get(&returned) {
+        let arguments = match self.type_entry(&returned) {
             Some(Type::Enum(_, arguments)) => arguments.clone(),
             _ => Vec::new(),
         };
@@ -6697,7 +6742,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
             return;
         };
-        match self.program.type_id_to_type_map.get(&pattern) {
+        match self.type_entry(&pattern) {
             Some(Type::Generic(constraint_id)) if parameters.contains(constraint_id) => {
                 out.entry(*constraint_id).or_insert(concrete);
             }
@@ -6707,7 +6752,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 | Type::Tuple(pattern_arguments),
             ) => {
                 let pattern_arguments = pattern_arguments.clone();
-                let concrete_arguments = match self.program.type_id_to_type_map.get(&concrete) {
+                let concrete_arguments = match self.type_entry(&concrete) {
                     Some(
                         Type::Struct(_, arguments)
                         | Type::Enum(_, arguments)
@@ -6728,7 +6773,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let (pattern_parameters, pattern_return) =
                     (pattern_parameters.clone(), *pattern_return);
                 let Some(Type::Closure(concrete_parameters, concrete_return, _)) =
-                    self.program.type_id_to_type_map.get(&concrete).cloned()
+                    self.type_entry(&concrete).cloned()
                 else {
                     return;
                 };
@@ -6743,17 +6788,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// Whether a type argument is CLOSED — something a Rust type can be minted
-    /// from. `any`, an unresolved hole and a still-abstract generic are not.
-    ///
-    /// Nor is a bare TRAIT (F72). A declaration's own parameter can arrive as
-    /// its constraint id, whose `Type` is the parameter's BOUND — `any` for
-    /// `enum Tree<T>`, but `Hashable` itself for `enum Op<T: Hashable>` — so a
-    /// constructor whose site recorded the open `Op<T>` read as closed, and
-    /// the enum was minted over "a trait object" instead of falling back to the
-    /// position or the payload. No value is ever typed as a bare trait once
-    /// [`Self::concrete`] has rewritten a default body's `Self`; an object is
-    /// `Dyn`, which stays grounded.
     /// Whether a type is closed WITHOUT the instance's substitution — it
     /// names no generic parameter anywhere, so every instance reads it the
     /// same. [`Self::is_grounded`] answers under the substitution.
@@ -6761,7 +6795,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
             return false;
         };
-        match self.program.type_id_to_type_map.get(&type_id) {
+        match self.type_entry(&type_id) {
             Some(
                 Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_) | Type::Trait(_, _),
             )
@@ -6786,6 +6820,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
+    /// Whether a type argument is CLOSED — something a Rust type can be minted
+    /// from. `any`, an unresolved hole and a still-abstract generic are not.
+    ///
+    /// Nor is a bare TRAIT (F72). A declaration's own parameter can arrive as
+    /// its constraint id, whose `Type` is the parameter's BOUND — `any` for
+    /// `enum Tree<T>`, but `Hashable` itself for `enum Op<T: Hashable>` — so a
+    /// constructor whose site recorded the open `Op<T>` read as closed, and
+    /// the enum was minted over "a trait object" instead of falling back to the
+    /// position or the payload. No value is ever typed as a bare trait once
+    /// [`Self::concrete`] has rewritten a default body's `Self`; an object is
+    /// `Dyn`, which stays grounded.
     fn is_grounded(&self, type_id: TypeId) -> bool {
         match self.resolve(type_id) {
             Some(
@@ -6927,40 +6972,33 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // and restoring the substitution handed `cell = SignalCell::new(None)`
             // the expectation `SignalCell<Option<V>>` with `V` the struct's own
             // parameter, unbound once the instance's bindings were gone, and the
-            // call closed `T` with it — refused as "an unbound generic type
-            // parameter (parameter 2 of struct `Pair`)". A type id cannot be
-            // minted here, so the instance's bindings stay in force while the
-            // value is rendered, which is how the struct's own field types are
-            // rendered ([`Self::ensure_struct`]). Inside the struct's OWN impl,
-            // whose binders are the declaration's parameters, a literal of
-            // another instantiation (`Pair<V, K>` in `impl Pair<type K, type
-            // V>`) would rebind them under the value's own types. There the
-            // bindings are not installed: a field that IS a parameter expects
-            // its argument, and one that only mentions a parameter expects
-            // nothing — its parameters read under the bindings in force would
-            // name the wrong instantiation (`held: Maybe<V>` expecting the
-            // method's `V` where the literal's `V` is its `K`).
+            // call closed `T` with it. So the instance's bindings stay in force
+            // while the value is rendered, which is how the struct's own field
+            // types are rendered ([`Self::ensure_struct`]).
+            //
+            // F82: except where they would REBIND what is already bound —
+            // inside the struct's OWN impl, whose binders are the declaration's
+            // parameters, a literal of another instantiation (`Pair<V, K>` in
+            // `impl Pair<type K, type V>`) would rebind them under the value's
+            // own types, and the value reads the method's. There the field's
+            // type is rebuilt with the literal's arguments written in
+            // ([`Self::substituted`]), which reads the same under the method's
+            // bindings: `held: Maybe<V>` expects `Maybe<str>` where the guard
+            // that stood here expected nothing, and `Maybe::Nothing` had no
+            // position to close from.
             let rebinds = entries.iter().any(|(parameter, argument)| {
                 self.current_substitution
                     .get(parameter)
                     .is_some_and(|bound| self.type_key(*bound) != self.type_key(*argument))
             });
-            let saved = self.enter_substitution(entries.clone());
-            let expecting = if !rebinds {
-                Some(field.type_id)
-            } else if let Some(Type::Generic(parameter)) =
-                self.program.type_id_to_type_map.get(&field.type_id)
-                && let Some((_, argument)) = entries.iter().find(|(bound, _)| bound == parameter)
-            {
-                self.current_substitution = saved.clone();
-                Some(*argument)
+            let (saved, expecting) = if rebinds {
+                let expecting = self.substituted(field.type_id, &entries);
+                (self.current_substitution.clone(), Some(expecting))
             } else {
-                self.current_substitution = saved.clone();
-                (!self.mentions_a_parameter(
-                    field.type_id,
-                    &declaration.generic_parameter_constraint_ids,
-                ))
-                .then_some(field.type_id)
+                (
+                    self.enter_substitution(entries.clone()),
+                    Some(field.type_id),
+                )
             };
             // A field declared `async |T| U` takes a future-answering closure.
             self.expects_async_value = self.program.async_fields.contains(&(struct_id, *index));
@@ -7207,9 +7245,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some((subject, trait_id, arguments))
                 if !is_async_closure
                     && !matches!(
-                        self.program
-                            .type_id_to_type_map
-                            .get(&self.concrete(subject)),
+                        self.type_entry(&self.concrete(subject)),
                         Some(Type::Dyn(..))
                     ) =>
             {
@@ -10209,7 +10245,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let names_self = function.return_type_id.is_some_and(|type_id| {
             matches!(
-                self.program.type_id_to_type_map.get(&type_id),
+                self.type_entry(&type_id),
                 Some(Type::Trait(mentioned, _)) if *mentioned == declaring_trait
             )
         });
@@ -10634,7 +10670,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// so a blanket subject cannot "apply" to something still abstract.
     fn selectable_receiver(&self, type_id: TypeId) -> bool {
         matches!(
-            self.program.type_id_to_type_map.get(&type_id),
+            self.type_entry(&type_id),
             Some(
                 Type::Struct(..)
                     | Type::Enum(..)

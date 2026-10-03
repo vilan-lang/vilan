@@ -45,6 +45,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**Native: a struct literal of ANOTHER instantiation inside the struct's own impl — `fun swap(self, value: V): Pair<V, K> { Pair { key = value, held = Maybe::Nothing } }` in `impl Pair<type K, type V>` — builds and prints node's bytes, where it was refused by name as "a generic type instantiated at `any`".** The impl's binders are the declaration's own parameters, so the literal binds the same two the other way round, and the emitter's substitution — one binding per parameter, the map every type is READ through — cannot say "the method's `V` here, the literal's `V` there"; F73 had guarded the case by giving a field that only mentions a parameter no expectation, and a value that needed one (`Maybe::Nothing`, `None`, `[]`, `Shared::new(None)`) was refused. The emitter now MINTS the field's type with the literal's arguments written in (`Maybe<V>` → `Maybe<str>`), from a small overlay of types the analyzer never interned, read beside the program's table at every site (`type_entry`; the 21 direct reads route through it). The minted type names no parameter, so it reads the same under the method's bindings. F73's guard is retired with it, and its tolerant pin now requires the swapped probe to be identical. Pins: `native_differential`'s `a_swapped_struct_literal_closes_every_field_on_both_backends` (`native/swapped_struct_literals.vl`: a nullary variant, `None`, an empty list, a cell around `None`, a tuple of both parameters, a bare parameter, a field naming no parameter and a closure field, swapped twice; refused on 0.43.0), and `a_struct_literals_fields_close_their_values_on_both_backends`' swapped probe, now strict. Tracker F82.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

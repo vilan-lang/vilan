@@ -8842,10 +8842,11 @@ fn a_default_over_a_source_written_in_its_providers_binder_is_identical_on_both_
 /// Inside the struct's OWN impl a literal of ANOTHER instantiation
 /// (`Pair<V, K>` in `impl Pair<type K, type V>`) cannot take that rule — the
 /// impl's binders are the declaration's parameters, and installing the
-/// literal's bindings would retype the value's own reads — so a field that
-/// only mentions a parameter expects nothing there, and a value that needed
-/// the expectation is refused by name rather than built at the wrong
-/// instantiation (rustc E0308 before).
+/// literal's bindings would retype the value's own reads. F82: the field's
+/// type is MINTED with the literal's arguments written in there, so the
+/// swapped literal's `held = Maybe::Nothing` closes from `Maybe<str>` and the
+/// probe below is identical (it was refused by name before, and accepted here
+/// only as that refusal).
 #[test]
 fn a_struct_literals_fields_close_their_values_on_both_backends() {
     let staged = stage();
@@ -8864,16 +8865,33 @@ fn a_struct_literals_fields_close_their_values_on_both_backends() {
         SWAPPED_LITERAL_PROBE,
     )
     .expect("write the probe program");
-    match compare(&staged, "native_probe_swapped_literal.vl") {
-        Verdict::Identical => {}
-        Verdict::Refused(reason) => assert!(
-            reason.contains("instantiated at `any`"),
-            "the swapped literal's refusal moved to another construct: {reason}"
-        ),
-        Verdict::Broken(detail) => {
-            panic!("a swapped literal in its own impl was built wrong: {detail}")
-        }
-    }
+    assert_eq!(
+        compare(&staged, "native_probe_swapped_literal.vl"),
+        Verdict::Identical,
+        "a swapped literal in its own impl must close its fields from its own arguments"
+    );
+}
+
+/// F82: a struct literal of another instantiation inside the struct's own
+/// impl closes EVERY field from the field's type read under the literal's
+/// arguments — the emitter mints `Maybe<str>` from `held: Maybe<V>` where
+/// the literal's `V` is the method's `K` (`Emitter::substituted`). The probe:
+/// a nullary variant, `None`, an empty list, a cell around `None`, a tuple of
+/// both parameters, a bare parameter, a field naming no parameter and a
+/// closure field, swapped twice (so both instantiations build each way).
+#[test]
+fn a_swapped_struct_literal_closes_every_field_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_swapped_struct_literals.vl"),
+        include_str!("native/swapped_struct_literals.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_swapped_struct_literals.vl"),
+        Verdict::Identical,
+        "a swapped struct literal must close every field from its own instantiation"
+    );
 }
 
 const SWAPPED_LITERAL_PROBE: &str = concat!(
