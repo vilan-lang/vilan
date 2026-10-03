@@ -546,6 +546,9 @@ def measure_references(server, document, scenario):
     process (the request may build the entry's world), instructions, wall, and
     how many locations in how many files it answered."""
     at = anchor_offset(document.text, scenario["references"], scenario, "references")
+    # Rest past the dead-code clock's idle window (600 ms) first, so its
+    # entry analyses are not counted against the request.
+    server.settle(quiet_polls=15)
     cpu_before = cpu_ms(server.pid)
     instructions_before = server.instructions.read()
     result, wall = server.request(
