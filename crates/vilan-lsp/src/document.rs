@@ -21039,7 +21039,14 @@ pub(crate) mod tests {
             "the pin needs a green program"
         );
         assert!(faded(&document).is_empty(), "{:?}", faded(&document));
-        assert_eq!(organized(&document), None, "both imports are used");
+        // Both imports are used, so nothing is pruned — and E251 (ruled at
+        // Order 46's GO) merges a module import beside a member import of the
+        // same module into the `self` form, which keeps both.
+        assert_eq!(
+            organized(&document).as_deref(),
+            Some("import pkg::a::{ self, b };\n\nfun main(): i32 {\n\tb() + a::b()\n}\n"),
+            "both imports are used, merged",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -21060,10 +21067,14 @@ pub(crate) mod tests {
             "the pin needs a green program"
         );
         assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        // Kept (it brings `doubled`), and merged with its member into the
+        // `self` form (E251).
         assert_eq!(
-            organized(&document),
-            None,
-            "the module import brings `doubled`"
+            organized(&document).as_deref(),
+            Some(
+                "import pkg::a::{ self, b };\n\nfun main(): i32 {\n\tlet n = b();\n\tn.doubled()\n}\n"
+            ),
+            "the module import brings `doubled`",
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

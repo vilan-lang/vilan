@@ -23,6 +23,8 @@ mod entry_world_tests;
 mod import_position_tests;
 #[cfg(test)]
 mod member_admission_tests;
+#[cfg(test)]
+mod organize_duplicate_tests;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
