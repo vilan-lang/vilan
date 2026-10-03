@@ -343,6 +343,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**A closure type whose PARAMETER is itself a closure type prints with the parameter parenthesized, as it is written — `|(|User| void)| void` — in diagnostics and hover alike, where it printed `||User| void| void`, which reads as no closure type at all (the Store's `lend` field).** Pin: `inference::generics`' `b518_a_closure_typed_parameter_prints_parenthesized` — red on the 0.43.0 toolchain. No golden moves. Tracker B518.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

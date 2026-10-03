@@ -9495,3 +9495,18 @@ fn b513_a_generic_calls_annotated_result_types_a_closure_arguments_parameters() 
     );
 }
 
+/// B518: a closure type whose PARAMETER is itself a closure prints with the
+/// parameter parenthesized, as it is written — `|(|i32| void)| void` — in
+/// diagnostics and hover alike; it printed `||i32| void| void`.
+#[test]
+fn b518_a_closure_typed_parameter_prints_parenthesized() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let lend: |(|i32| void)| void = |f: (|i32| void)| f(1);
+            let wrong: i32 = lend;
+        }
+        "#,
+        "but got |(|i32| void)| void",
+    );
+}

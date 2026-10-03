@@ -61697,12 +61697,23 @@ impl<'src> Analyzer<'src> {
                         buf.push_str(", ");
                     }
                     let parameter_type = parameter_id.get_type(self);
-                    buf.push_str(&self.pretty_print_type_at(
+                    let rendered = self.pretty_print_type_at(
                         &parameter_type,
                         substitution,
                         depth + 1,
                         visiting,
-                    ));
+                    );
+                    // B518: a parameter that is itself a closure type is
+                    // parenthesized — `|(|User| void)| void`, which is how it
+                    // is written; bare, `||User| void| void` reads as no
+                    // closure type at all.
+                    if rendered.starts_with('|') || rendered.starts_with("async |") {
+                        buf.push('(');
+                        buf.push_str(&rendered);
+                        buf.push(')');
+                    } else {
+                        buf.push_str(&rendered);
+                    }
                 }
                 buf.push_str("| ");
                 let return_type = return_id.get_type(self);
