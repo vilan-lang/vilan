@@ -4324,7 +4324,52 @@ impl<'src> Transformer<'src> {
             Some(Expr::Call(..)) => {
                 self.program.scalar_view_calls.contains(&id) || self.call_is_scalar_shared_write(id)
             }
+            // B514: a value `if`/`match`/block evaluates to whatever its tail
+            // leaves emit, so it IS a pair when they are — `*if c { &a } else {
+            // &b }` over a scalar binds the chosen `[base, key]` and must read
+            // through it like `*v` does. Each leaf is asked the full question
+            // (a `&place` leaf included): under a value conditional a `&place`
+            // emits its pair, since B108's return seam collects its leaves from
+            // the RETURNED expression and never from beneath a `*`.
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..)) => {
+                let mut leaves = Vec::new();
+                self.collect_value_tail_leaves(id, &mut leaves);
+                leaves.iter().any(|leaf| self.derefs_scalar_view(*leaf))
+            }
             _ => false,
+        }
+    }
+
+    /// The tail leaves a value expression evaluates to: an `if`, a `match` and
+    /// a block contribute each branch's tail, anything else is itself — the
+    /// analyzer's `collect_tail_leaves`, asked at emission.
+    fn collect_value_tail_leaves(&self, id: Id, leaves: &mut Vec<Id>) {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::If(branch)) => {
+                let mut branch = branch;
+                loop {
+                    match branch {
+                        ExprIfBranch::If(_, (_, tail), else_branch) => {
+                            self.collect_value_tail_leaves(*tail, leaves);
+                            match else_branch {
+                                Some(else_branch) => branch = else_branch,
+                                None => break,
+                            }
+                        }
+                        ExprIfBranch::Else((_, tail)) => {
+                            self.collect_value_tail_leaves(*tail, leaves);
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(Expr::Match(_, legs)) => {
+                for leg in legs {
+                    self.collect_value_tail_leaves(leg.body, leaves);
+                }
+            }
+            Some(Expr::Block((_, tail))) => self.collect_value_tail_leaves(*tail, leaves),
+            _ => leaves.push(id),
         }
     }
 
@@ -4420,7 +4465,17 @@ impl<'src> Transformer<'src> {
         block: &mut Vec<js::Node<'src>>,
     ) -> js::Node<'src> {
         let mut view = view;
-        if matches!(self.program.entity_map.get(&view_id), Some(Expr::Call(..))) {
+        // The pair is read twice (`base[key]`), so an expression that computes
+        // it — a call, or a value block / conditional whose tail emitted inline
+        // (B514) — is evaluated once into a temporary first.
+        let computed = match self.program.entity_map.get(&view_id) {
+            Some(Expr::Call(..)) => true,
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..)) => {
+                !matches!(view, js::Node::Local(_))
+            }
+            _ => false,
+        };
+        if computed {
             let name = self.ng.next_name();
             block.push(js::Node::ConstVariable(js::Variable {
                 name: name.clone(),
@@ -10495,8 +10550,21 @@ impl<'src> Transformer<'src> {
         // in `intrinsics` now, so every external a dispatch can land on has a
         // lowering keyed by member id and this function cannot be incomplete
         // again for the same reason.
+        // The impl's binders bind from the receiver's SHAPE and then from its
+        // BOUNDS: in `impl Stage<type S, type R: IntoFlow<type N: Default>>`
+        // the body's `N::default()` names `N`, which only `R`'s own `IntoFlow`
+        // impl grounds. Reached through a bound (`f.fresh()` with `F:
+        // Fresh<T>`), the shape alone left `N` open and the static call landed
+        // on `Default`'s bodiless requirement — B498's internal error. The
+        // analyzer's direct call records the same binders, and the native
+        // emitter has always bound both halves.
         let mut substitution = HashMap::default();
-        self.bind_generics(impl_subject, type_id, &mut substitution);
+        impl_select::bind_subject_and_bounds(
+            self.program,
+            impl_subject,
+            type_id,
+            &mut substitution,
+        );
         if !own_generic_values.is_empty()
             && let Some(function) = self.program.functions.get(&member_id)
         {
@@ -11718,7 +11786,9 @@ impl<'src> Transformer<'src> {
         // instantiation composes) and order by constraint id for a stable key.
         let mut entries: Vec<(TypeId, TypeId)> = substitution
             .iter()
-            .map(|(constraint_id, type_id)| (*constraint_id, self.resolve_type_id(*type_id)))
+            .map(|(constraint_id, type_id)| {
+                (*constraint_id, self.resolve_binding_type_id(*type_id))
+            })
             .collect();
         entries.sort_by_key(|(constraint_id, _)| constraint_id.0);
         let key = (
@@ -11979,6 +12049,25 @@ impl<'src> Transformer<'src> {
                     .is_some_and(|struct_| struct_.name == "HashSet"),
                 _ => false,
             })
+    }
+
+    /// [`Self::resolve_type_id`] for a type a call BINDS a callee's parameter
+    /// to. Inside a trait default's instance the receiver's `Self` is typed as
+    /// the bare trait (`Obs<T>`), the one place a trait type is a value's type;
+    /// a call that hands `self` on (`observe_flow(self)`, B510) binds its `F`
+    /// to that trait type, and the callee's `flow.start()` then dispatched on
+    /// a type no impl provides — the trait's bodyless requirement, the
+    /// never-silent internal error. The default's instance knows what `Self`
+    /// is (`current_self_type`), and that is what the binding means.
+    fn resolve_binding_type_id(&self, type_id: TypeId) -> TypeId {
+        let resolved = self.resolve_type_id(type_id);
+        match (
+            self.program.type_id_to_type_map.get(&resolved),
+            self.current_self_type,
+        ) {
+            (Some(Type::Trait(..)), Some(self_type)) => self_type,
+            _ => resolved,
+        }
     }
 
     fn resolve_type_id(&self, type_id: TypeId) -> TypeId {
@@ -12338,15 +12427,6 @@ impl<'src> Transformer<'src> {
             declared_in,
         });
         None
-    }
-
-    /// Binds the generic parameters in `pattern` (an impl subject in its own
-    /// generic terms, `List<Generic(T)>`) from the matching positions of the
-    /// concrete `type_id` (`List<i32>`), accumulating `{T -> i32}` — the
-    /// shared walk [`crate::impl_select`] owns, since selecting an impl and
-    /// monomorphizing the member it declares must recover the same bindings.
-    fn bind_generics(&self, pattern: TypeId, type_id: TypeId, out: &mut HashMap<TypeId, TypeId>) {
-        impl_select::bind_subject(self.program, pattern, type_id, out);
     }
 }
 

@@ -8618,6 +8618,261 @@ fn b473_a_qualified_subtrait_call_on_a_type_without_the_subtrait_is_refused() {
     );
 }
 
+// --- B511: a qualified call to a blanket's member is monomorphized ----------
+//
+// `Same::same(a, &b)` over `impl type T: PartialEq with Same` emitted the
+// blanket's body UN-instanced on JS — `self === other`, `false` for two equal
+// structs and even for `1` and `1` — and natively refused "a value of an
+// unbound generic type parameter"; `a.same(&b)` was right. The receiver's
+// binding was found, then dropped with the call's working context: a blanket's
+// subject IS its binder, and the call kept only binders written inside a
+// nominal subject's arguments.
+
+/// The concrete receivers: a struct by view and bare, a scalar, a `str`, a
+/// list, and the blanket's trait DEFAULT reached the same way — each answers
+/// as the method form beside it does.
+#[test]
+fn b511_a_qualified_call_to_a_blankets_member_is_monomorphized() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Same {
+            fun same(&self, other: &Self): bool;
+            fun differs(&self, other: &Self): bool {
+                !self.same(other)
+            }
+        }
+
+        impl type T: PartialEq with Same {
+            fun same(&self, other: &T): bool {
+                *self == *other
+            }
+        }
+
+        [derive(PartialEq)]
+        struct Pair {
+            a: i32,
+            b: i32,
+        }
+
+        fun main() {
+            let x = Pair { a = 1, b = 2 };
+            let y = Pair { a = 1, b = 2 };
+            let z = Pair { a = 1, b = 3 };
+            print(Same::same(&x, &y));
+            print(Same::same(x, &z));
+            print(x.same(&y));
+            print(Same::same(&1, &1));
+            print(Same::same(1, &2));
+            print(Same::same(&"x", &"x"));
+            print(Same::same(&[1, 2], &[1, 2]));
+            print(Same::differs(&x, &z));
+        }
+        "#,
+        "true\nfalse\ntrue\ntrue\nfalse\ntrue\ntrue\ntrue\n",
+    );
+}
+
+/// The receivers the qualified spelling did not route at all: a caller's
+/// parameter whose bound reaches the blanket (`T: PartialEq`, not `T: Same` —
+/// refused "has bare trait type 'Same'"), a tuple subject (typed as the bare
+/// trait `Swap`), and a blanket body that makes the qualified call itself.
+#[test]
+fn b511_a_qualified_call_reaches_a_blanket_through_a_bound_and_a_tuple_subject() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Same {
+            fun same(&self, other: &Self): bool;
+        }
+
+        impl type T: PartialEq with Same {
+            fun same(&self, other: &T): bool {
+                *self == *other
+            }
+        }
+
+        trait Swap {
+            fun swapped(self): Self;
+        }
+
+        impl (type A, type B) with Swap {
+            fun swapped(self): (A, B) {
+                self
+            }
+        }
+
+        trait Describe {
+            fun describe(self): str;
+        }
+
+        impl type T: Same with Describe {
+            fun describe(self): str {
+                if Same::same(&self, &self) { "same" } else { "differs" }
+            }
+        }
+
+        [derive(PartialEq)]
+        struct Pair {
+            a: i32,
+            b: i32,
+        }
+
+        fun through<T: PartialEq>(a: T, b: T): bool {
+            Same::same(&a, &b)
+        }
+
+        fun main() {
+            print(through(Pair { a = 1, b = 2 }, Pair { a = 1, b = 3 }));
+            print(through("a", "a"));
+            print(Describe::describe(4));
+            let pair = Swap::swapped((1, "one"));
+            print(pair.1);
+        }
+        "#,
+        "false\ntrue\nsame\none\n",
+    );
+}
+
+// --- B498: a static call on a NESTED binder, reached through a bound ---------
+//
+// `N::default()` in a member of `impl Stage<type S, type R: IntoFlow<type N:
+// Default>>` named `N`, which only `R`'s own `IntoFlow` impl grounds. A direct
+// call recorded it; reached through a bound (`f.fresh()` with `F: Fresh<T>`) the
+// JS emitter bound the impl's binders from the receiver's SHAPE alone, and the
+// static landed on `Default`'s bodiless requirement — "internal: a call resolved
+// to `Default`'s requirement `default`, which has no body".
+
+/// B498: the nested binder is grounded however the member is reached — the
+/// direct method call, through a generic bound at two instantiations, and the
+/// qualified spelling.
+#[test]
+fn b498_a_static_call_on_a_nested_binder_reached_through_a_bound_is_grounded() {
+    assert_compiles_and_runs(
+        r#"
+        import std::default::Default;
+        import std::delta::IntoFlow;
+        import std::io::print;
+
+        trait Fresh<T> {
+            fun fresh(self): T;
+        }
+
+        struct Stage<S, R> {
+            s: S,
+            r: R,
+        }
+
+        impl Stage<type S, type R: IntoFlow<type N: Default>> with Fresh<N> {
+            fun fresh(self): N {
+                N::default()
+            }
+        }
+
+        fun through<F: Fresh<T>, T>(f: F): T {
+            f.fresh()
+        }
+
+        fun main() {
+            print(Stage { s = "x", r = 1 }.fresh());
+            print(through(Stage { s = "x", r = "y" }) == "");
+            print(through(Stage { s = 1, r = 5 }) + 1);
+            print(Fresh::fresh(Stage { s = 1, r = true }));
+        }
+        "#,
+        "0\ntrue\n1\nfalse\n",
+    );
+}
+
+// --- B510: a trait default hands `self` to a generic over the same trait -----
+//
+// `Obs<T>`'s default `observe` calling `observe_flow<U, F: Obs<U>>(self, ..)`:
+// the analyzer read `F`'s `Obs` arguments off the FIRST implementor of `Obs`
+// (`Self` is typed as the bare trait there), refusing the default's own `T`
+// ("Expected T, but got i32"); with that answered, a closure literal in the call
+// typed its parameter at the callee's unbound `U`, and the JS instance bound `F`
+// to the bare trait — "internal: a call resolved to `Obs`'s requirement
+// `start`, which has no body" (reactive-45 met it making `Flow::observe` a
+// default).
+
+/// B510: the default runs for two implementors at two instantiations — with
+/// the observer passed on, with a closure literal wrapping it, `own self`, and
+/// through a SUB-trait's default reaching a generic over the sub-trait.
+#[test]
+fn b510_a_trait_default_passing_self_to_a_generic_over_its_trait_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Obs<T> {
+            fun start(own self): T;
+            fun observe(own self, observer: |T| void) {
+                observe_flow(self, |value| observer(value), true)
+            }
+            fun first(own self): T {
+                first_of(self)
+            }
+        }
+
+        fun observe_flow<U, F: Obs<U>>(own flow: F, observer: |U| void, immediately: bool) {
+            let value = flow.start();
+            if immediately {
+                observer(value);
+            }
+        }
+
+        fun first_of<U, F: Obs<U>>(own flow: F): U {
+            flow.start()
+        }
+
+        trait Wrap<T> with Obs<T> {
+            fun wrapped(own self): T {
+                through_sub(self)
+            }
+        }
+
+        fun through_sub<U, W: Wrap<U>>(own wrap: W): U {
+            wrap.start()
+        }
+
+        struct Thing {
+            n: i32,
+        }
+
+        impl Thing with Obs<i32> {
+            fun start(own self): i32 {
+                self.n
+            }
+        }
+
+        impl Thing with Wrap<i32> {}
+
+        struct Word {
+            s: str,
+        }
+
+        impl Word with Obs<str> {
+            fun start(own self): str {
+                self.s
+            }
+        }
+
+        fun main() {
+            Thing { n = 5 }.observe(|n| print(n + 1));
+            Word { s = "w" }.observe(|s| print(s));
+            print(Thing { n = 6 }.first());
+            print(Word { s = "v" }.first());
+            print(Thing { n = 7 }.wrapped());
+        }
+        "#,
+        "6\nw\n6\nv\n7\n",
+    );
+}
+
 // --- One trait at two instantiations: every provider is asked ------------------
 //
 // A type may provide one trait at two instantiations: `impl type T with Into2<T>`

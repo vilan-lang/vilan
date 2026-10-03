@@ -475,27 +475,20 @@ function $aq(self) {
 	const $ar = self;
 	return $ar[0] === 1;
 }
-function $aB(self, observer) {
-	return $z(self, (value) => {
-		return (() => {
-			return observer(value, [ 1 ]);
-		})();
-	}, false);
-}
-function $aD(body, $aE) {
-	const $aF = $aE;
-	let $aG = null;
-	if ($aF[0] === 0) {
-		const current2 = $aF[1];
-		$aG = body(current2);
+function $aC(body, $aD) {
+	const $aE = $aD;
+	let $aF = null;
+	if ($aE[0] === 0) {
+		const current2 = $aE[1];
+		$aF = body(current2);
 	} else {
 		const fresh = new2();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[5].v = true;
-		$aG = result;
+		$aF = result;
 	}
-	return $aG;
+	return $aF;
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
@@ -529,13 +522,13 @@ dispose2(rows);
 console.log("after dispose=" + selected[0].v.size);
 const counted = $a(0);
 let hits = 0;
-const watch = $aB(__clone(counted), (_, $aA) => {
+const watch = $y(__clone(counted), (_, $aA) => {
 	hits = hits + 1;
 	return;
 });
-$aD(($aC) => {
-	$ah(counted, 1, [ 0, $aC ]);
-	$ah(counted, 2, [ 0, $aC ]);
+$aC(($aB) => {
+	$ah(counted, 1, [ 0, $aB ]);
+	$ah(counted, 2, [ 0, $aB ]);
 	return;
 }, [ 1 ]);
 console.log("hits=" + hits);

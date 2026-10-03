@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 /// channel the macro mints, the `KeyedSource` mirror the generated client
 /// carries, and a per-key subscription taken through it (A39).
 const KEYED_SERVICE: &str = r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
@@ -855,6 +856,7 @@ fn the_segment_match_lets_rpcs_through_where_starts_with_swallowed_it() {
 /// — the identity a method could not learn when one instance served the whole
 /// process (`transport-rpc.md` Q9).
 const FACTORY_SERVER: &str = r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
@@ -2250,6 +2252,7 @@ fun run(port: i32) {
 /// hash the same. `PlainChat` is the control that keeps that from being
 /// vacuous — the same surface with a whole-value exposure hashes differently.
 const KEYED_LIST_SERVICE: &str = r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
@@ -2505,6 +2508,7 @@ fn a_mut_ref_self_rpc_write_survives_the_next_call_on_that_connection_alone() {
         &dir,
         "src/main.vl",
         r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
@@ -4328,6 +4332,7 @@ fn an_rpc_answering_a_result_over_a_u53_id_round_trips_both_arms() {
         &dir,
         "src/main.vl",
         r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
@@ -4451,6 +4456,7 @@ fn an_awaited_void_rpc_acks_after_its_handler_ran() {
         &dir,
         "src/main.vl",
         r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };

@@ -146,6 +146,227 @@ const B473_PROBE: &str = concat!(
     "\tprint(walk(Count { n = 0 }));\n",
     "}\n",
 );
+
+const B502_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Shape<T> {\n",
+    "\tfun area(self): T;\n",
+    "}\n",
+    "\n",
+    "struct Square {\n",
+    "\tside: i32,\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<i32> {\n",
+    "\tfun area(self): i32 {\n",
+    "\t\tself.side * self.side\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<str> {\n",
+    "\tfun area(self): str {\n",
+    "\t\t\"big\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun measure<T, S: Shape<T>>(shape: S): T {\n",
+    "\tshape.area()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet named: dyn Shape<str> = Square { side = 4 };\n",
+    "\tlet counted: dyn Shape<i32> = Square { side = 5 };\n",
+    "\tprint(measure(named));\n",
+    "\tprint(measure(counted));\n",
+    "\tlet again: dyn Shape<str> = Square { side = 1 };\n",
+    "\tprint(measure(again));\n",
+    "\tlet shapes: List<dyn Shape<i32>> = [Square { side = 3 }];\n",
+    "\tfor shape in shapes {\n",
+    "\t\tprint(measure(shape));\n",
+    "\t}\n",
+    "}\n",
+);
+
+const B510_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Obs<T> {\n",
+    "\tfun start(own self): T;\n",
+    "\tfun observe(own self, observer: |T| void) {\n",
+    "\t\tobserve_flow(self, |value| observer(value), true)\n",
+    "\t}\n",
+    "\tfun first(own self): T {\n",
+    "\t\tfirst_of(self)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun observe_flow<U, F: Obs<U>>(own flow: F, observer: |U| void, immediately: bool) {\n",
+    "\tlet value = flow.start();\n",
+    "\tif immediately {\n",
+    "\t\tobserver(value);\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun first_of<U, F: Obs<U>>(own flow: F): U {\n",
+    "\tflow.start()\n",
+    "}\n",
+    "\n",
+    "trait Wrap<T> with Obs<T> {\n",
+    "\tfun wrapped(own self): T {\n",
+    "\t\tthrough_sub(self)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun through_sub<U, W: Wrap<U>>(own wrap: W): U {\n",
+    "\twrap.start()\n",
+    "}\n",
+    "\n",
+    "struct Thing {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Thing with Obs<i32> {\n",
+    "\tfun start(own self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Thing with Wrap<i32> {}\n",
+    "\n",
+    "struct Word {\n",
+    "\ts: str,\n",
+    "}\n",
+    "\n",
+    "impl Word with Obs<str> {\n",
+    "\tfun start(own self): str {\n",
+    "\t\tself.s\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tThing { n = 5 }.observe(|n| print(n + 1));\n",
+    "\tWord { s = \"w\" }.observe(|s| print(s));\n",
+    "\tprint(Thing { n = 6 }.first());\n",
+    "\tprint(Word { s = \"v\" }.first());\n",
+    "\tprint(Thing { n = 7 }.wrapped());\n",
+    "}\n",
+);
+
+const B498_PROBE: &str = concat!(
+    "import std::default::Default;\n",
+    "import std::delta::IntoFlow;\n",
+    "import std::io::print;\n",
+    "\n",
+    "trait Fresh<T> {\n",
+    "\tfun fresh(self): T;\n",
+    "}\n",
+    "\n",
+    "struct Stage<S, R> {\n",
+    "\ts: S,\n",
+    "\tr: R,\n",
+    "}\n",
+    "\n",
+    "impl Stage<type S, type R: IntoFlow<type N: Default>> with Fresh<N> {\n",
+    "\tfun fresh(self): N {\n",
+    "\t\tN::default()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun through<F: Fresh<T>, T>(f: F): T {\n",
+    "\tf.fresh()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(Stage { s = \"x\", r = 1 }.fresh());\n",
+    "\tprint(through(Stage { s = \"x\", r = \"y\" }) == \"\");\n",
+    "\tprint(through(Stage { s = 1, r = 5 }) + 1);\n",
+    "\tprint(Fresh::fresh(Stage { s = 1, r = true }));\n",
+    "}\n",
+);
+
+const B514_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct P {\n",
+    "\tx: i32,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet n = 4;\n",
+    "\tlet m = 5;\n",
+    "\tprint(*if n < m { &n } else { &m });\n",
+    "\tlet s = \"a\";\n",
+    "\tlet t = \"b\";\n",
+    "\tprint(*if n > m { &s } else { &t });\n",
+    "\tlet picked = *if n < m { &n } else { &m };\n",
+    "\tprint(picked + 1);\n",
+    "\tprint(*match n {\n",
+    "\t\t4 => &m,\n",
+    "\t\t_ => &n,\n",
+    "\t});\n",
+    "\tprint(*if n > m { &n } else if n == 4 { &m } else { &n });\n",
+    "\tlet flag = n < m;\n",
+    "\tprint(*if flag { &true } else { &false });\n",
+    "\tlet p = P { x = 1 };\n",
+    "\tlet q = P { x = 2 };\n",
+    "\tlet r = *if n < m { &q } else { &p };\n",
+    "\tprint(r.x);\n",
+    "}\n",
+);
+
+const B511_PROBE: &str = concat!(
+    "import std::compare::PartialEq;\n",
+    "import std::io::print;\n",
+    "\n",
+    "trait Same {\n",
+    "\tfun same(&self, other: &Self): bool;\n",
+    "\tfun differs(&self, other: &Self): bool {\n",
+    "\t\t!self.same(other)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl type T: PartialEq with Same {\n",
+    "\tfun same(&self, other: &T): bool {\n",
+    "\t\t*self == *other\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Swap {\n",
+    "\tfun swapped(self): Self;\n",
+    "}\n",
+    "\n",
+    "impl (type A, type B) with Swap {\n",
+    "\tfun swapped(self): (A, B) {\n",
+    "\t\tself\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "[derive(PartialEq)]\n",
+    "struct Pair {\n",
+    "\ta: i32,\n",
+    "\tb: i32,\n",
+    "}\n",
+    "\n",
+    "fun through<T: PartialEq>(a: T, b: T): bool {\n",
+    "\tSame::same(&a, &b)\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet x = Pair { a = 1, b = 2 };\n",
+    "\tlet y = Pair { a = 1, b = 2 };\n",
+    "\tlet z = Pair { a = 1, b = 3 };\n",
+    "\tprint(Same::same(&x, &y));\n",
+    "\tprint(Same::same(x, &z));\n",
+    "\tprint(Same::same(&1, &1));\n",
+    "\tprint(Same::same(&\"x\", &\"y\"));\n",
+    "\tprint(Same::differs(&x, &z));\n",
+    "\tprint(through(x, z));\n",
+    "\tprint(through(\"a\", \"a\"));\n",
+    "\tlet pair = Swap::swapped((1, \"one\"));\n",
+    "\tprint(pair.1);\n",
+    "}\n",
+);
 const B467_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -8522,6 +8743,93 @@ fn a_supertrait_override_is_dispatched_through_a_subtrait_on_both_backends() {
         compare(&staged, "native_probe_b473.vl"),
         Verdict::Identical,
         "a supertrait's override must answer through a sub-trait on both backends"
+    );
+}
+
+/// B511: a qualified call to a blanket impl's member is monomorphized on both
+/// backends — a struct by view and bare, a scalar, a `str`, the blanket's trait
+/// default, a caller's parameter whose bound reaches the blanket, and a tuple
+/// subject. JS emitted the blanket's body un-instanced (`self === other`) and the
+/// native backend refused "a value of an unbound generic type parameter";
+/// `inference::traits`' `b511_*` pins hold the JS values.
+#[test]
+fn a_qualified_call_to_a_blankets_member_is_monomorphized_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b511.vl"), B511_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b511.vl"),
+        Verdict::Identical,
+        "a qualified call to a blanket's member must answer as the method form does on both backends"
+    );
+}
+
+/// B514: `*` over a value `if`/`match` of scalar views reads the value on both
+/// backends — a scalar, a `str`, a `bool`, an `else if` chain, a bound result,
+/// and an aggregate beside them. JS printed the chosen place's `(base, key)`
+/// pair. (`*{ &m }`, a block tail, is held out: the native backend refuses it at
+/// rustc, E0614, on 0.43.0 as well — a native find; `inference::borrows`' `b514_*`
+/// pin holds the JS value.)
+#[test]
+fn a_dereferenced_conditional_of_scalar_views_reads_the_value_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b514.vl"), B514_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b514.vl"),
+        Verdict::Identical,
+        "a dereferenced conditional of scalar views must read the value on both backends"
+    );
+}
+
+/// B498: a static call on an impl's NESTED binder (`N::default()` under `type R:
+/// IntoFlow<type N: Default>`) is grounded when the member is reached through a
+/// generic bound, on both backends. The JS emitter bound the impl's binders from
+/// the receiver's shape alone and raised "internal: a call resolved to
+/// `Default`'s requirement `default`"; native printed the values.
+#[test]
+fn a_static_call_on_a_nested_binder_reached_through_a_bound_is_grounded_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b498.vl"), B498_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b498.vl"),
+        Verdict::Identical,
+        "a nested binder must be grounded through a bound on both backends"
+    );
+}
+
+/// B510: a trait default handing `self` to a generic over its own trait runs on
+/// both backends — the observer passed on, wrapped in a closure literal, and
+/// through a sub-trait's default. Both refused "Expected T, but got i32" (the
+/// first implementor answered for `Self`); past that, JS raised "internal: a call
+/// resolved to `Obs`'s requirement `start`".
+#[test]
+fn a_trait_default_passing_self_to_a_generic_over_its_trait_runs_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b510.vl"), B510_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b510.vl"),
+        Verdict::Identical,
+        "a trait default passing self to a generic over its trait must run on both backends"
+    );
+}
+
+/// B502: a trait object binds a bound's arguments from what it carries — a
+/// `dyn Shape<str>` whose type implements `Shape` twice, both objects in one
+/// program, and a list of objects — on both backends. Both refused "'dyn
+/// Shape<str>' does not implement trait 'Shape<i32>'" (the first impl answered
+/// for the object).
+#[test]
+fn a_trait_object_binds_a_bounds_arguments_from_its_own_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b502.vl"), B502_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b502.vl"),
+        Verdict::Identical,
+        "a trait object must bind a bound's arguments from its own on both backends"
     );
 }
 

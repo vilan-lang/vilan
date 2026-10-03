@@ -3787,6 +3787,7 @@ fn a139_a_per_key_joiner_is_seeded_over_a_socket() {
 /// goes, the wire hands `a` back to a per-key forward. Red before on
 /// `forwards=2`, both faults and `notified: first=5 second=6`.
 const A143_ONE_FORWARD: &str = r#"import std::io::print;
+import std::hash::Hashable;
 import std::json::json_codec;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
@@ -3935,6 +3936,8 @@ fn a143_mixed_demands_on_one_keyed_channel_share_one_forward_and_fan_out_by_dema
 /// A143 OVER A SOCKET: the same two demands over a real WebSocket. Red before
 /// on both faults and `notified: first=7 second=8`.
 const A143_ONE_FORWARD_SOCKET: &str = r#"import std::io::print;
+import std::debug::Debug;
+import std::hash::Hashable;
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::process::exit;

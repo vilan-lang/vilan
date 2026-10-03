@@ -8472,3 +8472,121 @@ fn b455_a_selector_names_a_block_that_only_inherits() {
         );
     }
 }
+
+// --- B455 (RULED (B)): a selector names a block by its trait -----------------
+
+/// One module, two default-only blocks for one subject — `impl Box with One {}`
+/// and `impl Box with Two {}`, each inheriting a `describe` — and a `c.vl` that
+/// imports the module with `imports`. Without a trait the two blocks are one
+/// subject's, so only the `with` spelling can take one of them.
+fn b455_files(imports: &str, call: &str) -> Vec<(String, String)> {
+    vec![
+        ("b.vl".to_string(), "export struct Box { n: i32 }\n".to_string()),
+        (
+            "t.vl".to_string(),
+            "export trait One {\n\tfun describe(self): str { \"one\" }\n}\n\nexport trait Two {\n\tfun describe(self): str { \"two\" }\n}\n\nexport trait Marker {}\n".to_string(),
+        ),
+        (
+            "p.vl".to_string(),
+            "import pkg::b::Box;\nimport pkg::t::{ Marker, One, Two };\n\nexport impl Box with One {}\n\nexport impl Box with Two {}\n\nexport impl Box with Marker {}\n".to_string(),
+        ),
+        (
+            "c.vl".to_string(),
+            format!(
+                "import pkg::b::Box;\nimport pkg::t::{{ Marker, One, Two }};\n{imports}\n\nfun tagged<T: Marker>(value: T): str {{\n\t\"marked\"\n}}\n\nfun main() {{\n\tprint({call});\n}}\n"
+            ),
+        ),
+    ]
+}
+
+/// `(impl Box with One)` takes `impl Box with One` and no other `Box` block,
+/// so `describe` is `One`'s — and `with Two` takes the other. A tail after the
+/// trait narrows as it does after a subject.
+#[test]
+fn b455_a_selector_names_a_block_by_its_trait() {
+    for (imports, expected) in [
+        ("import pkg::p::{ (impl Box with One) };", "one"),
+        ("import pkg::p::{ (impl Box with Two) };", "two"),
+        ("import pkg::p::{ (impl Box with One)::describe };", "one"),
+    ] {
+        let owned = b455_files(imports, "Box { n = 1 }.describe()");
+        assert_eq!(
+            run_package(&b401_borrowed(&owned), "c.vl").trim(),
+            expected,
+            "{imports}"
+        );
+    }
+}
+
+/// A block that declares and inherits NOTHING — a marker impl — is admitted by
+/// naming it, and a bound on the marker holds in the restricting file. Before
+/// B455 the selector was refused "declares : the selector admits nothing",
+/// with an empty slot and no spelling that could take the block.
+#[test]
+fn b455_a_selector_admits_a_marker_block() {
+    for imports in [
+        "import pkg::p::{ (impl Box with Marker) };",
+        "import pkg::p::{ (impl Box with Marker), (impl Box with One) };",
+    ] {
+        let owned = b455_files(imports, "tagged(Box { n = 1 })");
+        let diagnostics = analyze_package(&b401_borrowed(&owned), "c.vl", Platform::default());
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|message| message.contains("the selector admits nothing")),
+            "{imports}: {diagnostics:#?}"
+        );
+        assert_eq!(
+            run_package(&b401_borrowed(&owned), "c.vl").trim(),
+            "marked",
+            "{imports}"
+        );
+    }
+}
+
+/// A tail that names nothing the selected block provides is still refused at
+/// the selector, and the slot is filled with what the block DOES provide — or,
+/// for a marker block, with the whole-block spelling.
+#[test]
+fn b455_a_selector_that_admits_nothing_names_what_the_block_provides() {
+    let owned = b455_files(
+        "import pkg::p::{ (impl Box with One)::nope };",
+        "Box { n = 1 }.describe()",
+    );
+    let diagnostics = analyze_package(&b401_borrowed(&owned), "c.vl", Platform::default());
+    assert!(
+        diagnostics.iter().any(|message| message.contains(
+            "no `impl Box with One` this statement carries declares `nope`: the selector admits \
+             nothing. The blocks it reaches provide `describe`"
+        )),
+        "{diagnostics:#?}"
+    );
+    let owned = b455_files(
+        "import pkg::p::{ (impl Box with Marker)::nope };",
+        "tagged(Box { n = 1 })",
+    );
+    let diagnostics = analyze_package(&b401_borrowed(&owned), "c.vl", Platform::default());
+    assert!(
+        diagnostics.iter().any(|message| message.contains(
+            "The blocks it reaches provide nothing — select the block whole: `(impl Box with \
+             Marker)`"
+        )),
+        "{diagnostics:#?}"
+    );
+}
+
+/// `with` names a TRAIT: a struct there is refused where it is written.
+#[test]
+fn b455_a_selector_with_a_non_trait_is_refused() {
+    let owned = b455_files(
+        "import pkg::p::{ (impl Box with Box) };",
+        "Box { n = 1 }.describe()",
+    );
+    let diagnostics = analyze_package(&b401_borrowed(&owned), "c.vl", Platform::default());
+    assert!(
+        diagnostics.iter().any(|message| message.contains(
+            "`Box` is not a trait: a selector's `with` names the trait the block implements"
+        )),
+        "{diagnostics:#?}"
+    );
+}

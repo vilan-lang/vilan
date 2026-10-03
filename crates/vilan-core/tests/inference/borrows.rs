@@ -11730,3 +11730,162 @@ fn b496_the_spelled_copy_of_a_view_expression_is_a_copy() {
         "1\n2\n1\n97\n6\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B514: `*` over a value `if`/`match`/block of SCALAR views reads the value.
+// ---------------------------------------------------------------------------
+
+/// B514: `*if c { &a } else { &b }` over a scalar or a `str` printed the chosen
+/// place's `(base, key)` pair on JS (`[ [ 4 ], 0 ]`) — the conditional bound the
+/// pair and the `*` did not read through it, as it reads through `*v`. The
+/// same at a `match`, a block tail, an `else if` chain, a bound result, and an
+/// aggregate beside them (which held because an aggregate's view is the
+/// value). Native printed the values.
+#[test]
+fn b514_a_dereferenced_conditional_of_scalar_views_reads_the_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct P {
+            x: i32,
+        }
+
+        fun main() {
+            let n = 4;
+            let m = 5;
+            print(*if n < m { &n } else { &m });
+            let s = "a";
+            let t = "b";
+            print(*if n > m { &s } else { &t });
+            let picked = *if n < m { &n } else { &m };
+            print(picked + 1);
+            print(*match n {
+                4 => &m,
+                _ => &n,
+            });
+            print(*{ &m });
+            print(*if n > m { &n } else if n == 4 { &m } else { &n });
+            let flag = n < m;
+            print(*if flag { &true } else { &false });
+            let p = P { x = 1 };
+            let q = P { x = 2 };
+            let r = *if n < m { &q } else { &p };
+            print(r.x);
+        }
+        "#,
+        "4\nb\n5\n5\n5\n5\ntrue\n2\n",
+    );
+}
+
+/// B514: a value conditional of scalar views standing where a VALUE is read —
+/// a by-value argument, a binary operand — passed the pair (`print` showed
+/// `[ [ 4 ], 0 ]`, `+ 1` concatenated `4,01`). Refused with B496's sentence at
+/// each leaf, exactly as a bare view binding there is.
+#[test]
+fn b514_a_conditional_of_scalar_views_read_as_a_value_is_refused() {
+    for read in [
+        "show(if c { &n } else { &m });",
+        "print(if c { &n } else { &m });",
+        "let sum = (if c { &n } else { &m }) + 1;",
+        "show(match c { true => &n, false => &m });",
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"
+                fun show(value: i32) {{
+                    print(value);
+                }}
+
+                fun main() {{
+                    let c = true;
+                    let n = 4;
+                    let m = 5;
+                    {read}
+                }}
+                "#
+            ),
+            "a view can't be read as a value here; write `*` to copy the value out",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B512: a `let` initialized by a value conditional of views.
+// ---------------------------------------------------------------------------
+
+/// B512: `let v = if c { &a } else { &b }` was neither a view binding (only a
+/// `&place`, a view binding or a `borrows` call initializes one) nor a copy:
+/// JS bound the chosen aggregate itself — a write through `mut v` reached `a`,
+/// and a later write to `a` showed through `v` — or a scalar's `(base, key)`
+/// pair, where native copied the value. B496's assignment rule now holds at a
+/// binding: each view leaf is refused, and `*` is the spelling that copies.
+#[test]
+fn b512_a_let_initialized_by_a_conditional_of_views_is_refused() {
+    for binding in [
+        "let v = if c { &a } else { &b };",
+        "mut v = if c { &mut a } else { &mut b };",
+        "let v = if c { &mut a } else { &mut b };",
+        "let v = match c { true => &a, false => &b };",
+        "let v = { &a };",
+        "let v = if c { &n } else { &m };",
+        "let v: P = if c { &a } else { &b };",
+        "let v = if c { pick(&a) } else { &b };",
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct P {{ x: i32 }}
+
+                fun pick(p: &P): &P borrows p {{
+                    p
+                }}
+
+                fun main() {{
+                    let c = true;
+                    mut a = P {{ x = 1 }};
+                    mut b = P {{ x = 2 }};
+                    let n = 4;
+                    let m = 5;
+                    {binding}
+                }}
+                "#
+            ),
+            "a view can't be read as a value here; write `*` to copy the value out",
+        );
+    }
+}
+
+/// B512: the spelled copy binds a COPY — a write to it leaves `a` alone and a
+/// later write to `a` does not show through it — and a conditional that picks
+/// a VALUE is untouched.
+#[test]
+fn b512_the_spelled_copy_of_a_conditional_view_is_a_copy() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct P {
+            x: i32,
+        }
+
+        fun main() {
+            let c = true;
+            mut a = P { x = 1 };
+            let b = P { x = 2 };
+            mut v = *if c { &a } else { &b };
+            v.x = 10;
+            print(a.x);
+            a.x = 3;
+            print(v.x);
+            let n = 4;
+            let m = 5;
+            let k = *if c { &n } else { &m };
+            print(k + 1);
+            let plain = if c { a } else { b };
+            print(plain.x);
+        }
+        "#,
+        "1\n10\n5\n3\n",
+    );
+}

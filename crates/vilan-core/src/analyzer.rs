@@ -6165,6 +6165,11 @@ pub struct ImplAdmission {
     /// (importing file, impl block) — a `#(impl T)` selector's reach into a
     /// hidden block. The ONLY way past the export gate.
     reached: HashSet<(SourceId, Id)>,
+    /// (importing file, impl block) — the blocks a WHOLE-block selector took
+    /// (no `::` tail). Members alone cannot say so for a block that declares
+    /// and inherits nothing — a marker impl, `impl Box with Marker {}` — and
+    /// such a block is admitted by naming it (B455).
+    whole_blocks: HashSet<(SourceId, Id)>,
 }
 
 impl ImplAdmission {
@@ -6237,7 +6242,11 @@ impl ImplAdmission {
         if !self.export_gate_admits(importer, implementation) {
             return false;
         }
-        if !self.restricting.contains(&importer) {
+        if !self.restricting.contains(&importer)
+            || self
+                .whole_blocks
+                .contains(&(importer, implementation.impl_id))
+        {
             return true;
         }
         match self.admitted.get(&(importer, implementation.source)) {
@@ -6355,6 +6364,14 @@ pub struct ImportImplSelector {
     /// `(impl List<_>)` reaches a concrete `impl List<i32>` and `(impl _)`
     /// reaches every block.
     pub subject: TypeId,
+    /// `(impl Box with One)` — the trait the selected block implements (B455,
+    /// RULED 2026-10-01), as a type walked in the importer's scope, and its
+    /// text. It narrows the subject's blocks to the one written `impl Box with
+    /// One`, which is how a block with no declarations of its own is named.
+    /// Read as a TYPE, like the subject, because the import walk runs before
+    /// the names it reaches have settled; a name that settles to no trait
+    /// takes no block and is refused after the build.
+    pub trait_type: Option<(TypeId, String)>,
     /// The members the `::` tail named, empty when the selector takes the whole
     /// block.
     pub members: Vec<(String, Span)>,
@@ -20876,8 +20893,25 @@ impl<'src> Analyzer<'src> {
         subject_type: &Type,
         member_name: &'src str,
     ) -> Option<ImplMemberResolution> {
+        self.resolve_blanket_through_bounds_in(id, subject_type, member_name, None)
+    }
+
+    /// [`Self::resolve_blanket_through_bounds`], narrowed to the blankets whose
+    /// member is `home_trait`'s when one is given — the trait a QUALIFIED call
+    /// named (`Same::same(&a, &b)` inside `fun f<T: PartialEq>`), which must not
+    /// reach another trait's same-named member through another blanket.
+    fn resolve_blanket_through_bounds_in(
+        &mut self,
+        id: Id,
+        subject_type: &Type,
+        member_name: &'src str,
+        home_trait: Option<Id>,
+    ) -> Option<ImplMemberResolution> {
         let mut candidates = Vec::new();
         for candidate in self.method_member_candidates(subject_type, member_name) {
+            if home_trait.is_some_and(|home_trait| candidate.home_trait != Some(home_trait)) {
+                continue;
+            }
             if self.blanket_holds_through_bounds(candidate.impl_subject, subject_type) {
                 candidates.push(candidate);
             }
@@ -28589,6 +28623,48 @@ impl<'src> Analyzer<'src> {
             .is_some_and(|type_| self.is_scalar_view_pointee(&type_))
     }
 
+    /// The view LEAVES of a value `if`/`match`/block standing where a value is
+    /// read (B496, B512, B514): each branch tail that is `&place`, a `borrows`
+    /// call or a view binding — only the scalar ones (whose runtime form is the
+    /// `(base, key)` pair) when `scalar_only`. Nothing for any other expression:
+    /// a bare view there is the caller's own question (a `&place` initializes a
+    /// view binding, a bare view argument is `is_scalar_view_read`'s).
+    fn collect_view_leaves(
+        &self,
+        value: Id,
+        view_bindings: &HashSet<Id>,
+        scalar_only: bool,
+        leaks: &mut Vec<Id>,
+    ) {
+        if !matches!(
+            self.expr_id_to_expr_map.get(&value),
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..))
+        ) {
+            return;
+        }
+        let mut leaves = Vec::new();
+        self.collect_tail_leaves(value, &mut leaves);
+        for leaf in leaves {
+            let is_view_leaf = match self.expr_id_to_expr_map.get(&leaf) {
+                // The pointee's own type decides the pair: a `&place` read
+                // is a plain local's, whose type sits on its binding.
+                Some(Expr::Reference(operand, _)) => !scalar_only || self.place_is_scalar(*operand),
+                Some(Expr::Call(call_id)) => match scalar_only {
+                    true => self.call_returns_scalar_view(*call_id),
+                    false => self.call_returns_view(*call_id),
+                },
+                Some(Expr::Local(_)) => {
+                    self.is_scalar_view_read(leaf, view_bindings)
+                        || (!scalar_only && self.is_view_binding_read(leaf, view_bindings))
+                }
+                _ => false,
+            };
+            if is_view_leaf {
+                leaks.push(leaf);
+            }
+        }
+    }
+
     /// Transparent references: a view's value is explicit (`*v` is the only way
     /// to cross from view to value — `transparent-references.md`). A **scalar**
     /// view used where a value is expected — a value/`any` call argument or a
@@ -28613,6 +28689,23 @@ impl<'src> Analyzer<'src> {
                         if self.is_scalar_view_read(operand, &view_bindings) {
                             leaks.push(operand);
                         }
+                        self.collect_view_leaves(operand, &view_bindings, true, &mut leaks);
+                    }
+                }
+                // B512: a `let` initialized by a value `if`/`match`/block whose
+                // leaf is a view is neither a view binding (only a `&place`, a
+                // view binding or a `borrows` call initializes one) nor a copy
+                // (rule 3 keeps a view expression out of the copies): JS bound
+                // the chosen aggregate itself, or a scalar's `(base, key)` pair,
+                // where native copied the value. B496's assignment rule, at
+                // the binding: `*` is the spelling that copies.
+                Expr::Variable(binding_id) => {
+                    if let Some(initial) = self
+                        .variables
+                        .get(binding_id)
+                        .and_then(|variable| variable.initial)
+                    {
+                        self.collect_view_leaves(initial, &view_bindings, false, &mut leaks);
                     }
                 }
                 // B465 (R-c): the value an assignment stores is a VALUE, so a
@@ -28639,22 +28732,12 @@ impl<'src> Analyzer<'src> {
                         leaks.push(*value);
                         continue;
                     }
-                    let mut leaves = Vec::new();
-                    self.collect_tail_leaves(*value, &mut leaves);
-                    for leaf in leaves {
-                        let is_view_expression = match self.expr_id_to_expr_map.get(&leaf) {
-                            Some(Expr::Reference(..)) => true,
-                            Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
-                            Some(Expr::Local(_)) => {
-                                leaf != *value
-                                    && (self.is_scalar_view_read(leaf, &view_bindings)
-                                        || self.is_view_binding_read(leaf, &view_bindings))
-                            }
-                            _ => false,
-                        };
-                        if is_view_expression {
-                            leaks.push(leaf);
+                    match self.expr_id_to_expr_map.get(value) {
+                        Some(Expr::Reference(..)) => leaks.push(*value),
+                        Some(Expr::Call(call_id)) if self.call_returns_view(*call_id) => {
+                            leaks.push(*value);
                         }
+                        _ => self.collect_view_leaves(*value, &view_bindings, false, &mut leaks),
                     }
                 }
                 // A call argument whose parameter is NOT a view (`&[mut] T`) wants
@@ -28682,11 +28765,15 @@ impl<'src> Analyzer<'src> {
                     for (parameter_id, argument_id) in
                         parameter_ids.iter().zip(function_call.argument_ids.iter())
                     {
-                        if !self.binding_or_param_is_view(*parameter_id)
-                            && self.is_scalar_view_read(*argument_id, &view_bindings)
-                        {
+                        if self.binding_or_param_is_view(*parameter_id) {
+                            continue;
+                        }
+                        if self.is_scalar_view_read(*argument_id, &view_bindings) {
                             leaks.push(*argument_id);
                         }
+                        // B514: `show(if c { &n } else { &m })` passed the
+                        // chosen scalar's pair where the value was wanted.
+                        self.collect_view_leaves(*argument_id, &view_bindings, true, &mut leaks);
                     }
                 }
                 _ => {}
@@ -31907,6 +31994,18 @@ impl<'src> Analyzer<'src> {
     /// Whether a selector reaches a block: the block's subject and the
     /// selector's type unify in EITHER direction — [`selector_admits`]'s
     /// reading, over the analyzer's own comparison.
+    /// Whether `selector` takes `implementation`: the subjects unify
+    /// ([`Self::selector_reaches`]) and, where the selector names a trait, the
+    /// block implements it (B455).
+    fn selector_takes(
+        &self,
+        implementation: &Implementation,
+        selector: &ImportImplSelector,
+    ) -> bool {
+        self.selector_reaches(implementation.subject, selector.subject)
+            && selector_names_block_trait(&self.type_id_to_type_map, implementation, selector)
+    }
+
     fn selector_reaches(&self, impl_subject: TypeId, selector: TypeId) -> bool {
         let impl_type = impl_subject.get_type(self);
         let selector_type = selector.get_type(self);
@@ -31967,7 +32066,7 @@ impl<'src> Analyzer<'src> {
                 for selector in row.selectors.iter().filter(|selector| selector.reached) {
                     for implementation in &self.implementations {
                         if hidden.contains(&implementation.impl_id)
-                            && self.selector_reaches(implementation.subject, selector.subject)
+                            && self.selector_takes(implementation, selector)
                         {
                             reached.insert((row.source, implementation.impl_id));
                         }
@@ -31994,7 +32093,7 @@ impl<'src> Analyzer<'src> {
             for selector in &row.selectors {
                 for implementation in &self.implementations {
                     if !sources.contains(&implementation.source)
-                        || !self.selector_reaches(implementation.subject, selector.subject)
+                        || !self.selector_takes(implementation, selector)
                     {
                         continue;
                     }
@@ -37480,15 +37579,55 @@ impl<'src> Analyzer<'src> {
                 // Element types come from the matched tuple type when known (a
                 // concrete-source mapped type expands to one); otherwise each
                 // element resolves against `Unknown`.
+                //
+                // B441: a tuple pattern matches the value's SHAPE, one
+                // sub-pattern per element. A pattern of another arity — or a
+                // tuple pattern over a value that is no tuple at all — was let
+                // through with every element `Unknown`, and emission read
+                // whatever slots the flat layout held there: `let (a, b, c, d,
+                // e, f) = ((1, 2), (3, 4), (5, 6))` bound 1 through 6, and
+                // `let (a, b) = 5` compiled. Only a value whose shape is still
+                // open (a parameter, a hole) keeps the `Unknown` elements.
                 let expected = expected_type_id.get_type(self);
                 let element_type_ids = match self.expand_mapped(expected) {
                     Type::Tuple(ids) if ids.len() == patterns.len() => ids,
-                    _ => {
+                    Type::Generic(_)
+                    | Type::Mapped(..)
+                    | Type::Unknown
+                    | Type::Unresolved
+                    | Type::Any
+                    | Type::Never => {
                         let unknown = Type::Unknown.get_type_id(self);
                         vec![unknown; patterns.len()]
                     }
+                    other => {
+                        let rendered = self.pretty_print_type(&other, &HashMap::default());
+                        let binds = format!(
+                            "this pattern binds {} {}",
+                            patterns.len(),
+                            plural(patterns.len(), "element", "elements")
+                        );
+                        let msg = match &other {
+                            Type::Tuple(ids) => format!(
+                                "{binds}, but the value is a {}-tuple `{rendered}`: a tuple \
+                                 pattern takes one sub-pattern per element, and a nested \
+                                 pattern reaches inside one (`((a, b), c)`)",
+                                ids.len()
+                            ),
+                            _ => format!(
+                                "{binds}, but the value is a `{rendered}`, not a tuple: \
+                                 `(a, b)` destructures a tuple"
+                            ),
+                        };
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: *span,
+                            msg,
+                        });
+                        return None;
+                    }
                 };
-                let _ = span;
                 let mut resolved = Vec::new();
                 for (sub_pattern, element_type_id) in patterns.iter().zip(element_type_ids) {
                     // The element's TYPE, not its width: the width a nested
@@ -38921,21 +39060,21 @@ impl<'src> Analyzer<'src> {
         else {
             return Vec::new();
         };
-        let mut argument_ids: Vec<TypeId> = Vec::new();
-        if let Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) =
-            implementation.subject.get_type(self)
-        {
-            argument_ids.extend(arguments);
-        }
-        for (_, arguments) in &implementation.trait_args {
-            argument_ids.extend(arguments.iter().copied());
-        }
         // Binders may sit ANYWHERE in the subject pattern
         // (`impl Option<(type T, type U)>` nests them in a tuple), so collect
-        // recursively — the flat scan missed nested binders.
+        // recursively — the flat scan missed nested binders. The subject is
+        // walked WHOLE: a blanket's subject IS its binder (`impl type T: PartialEq
+        // with Same`), and a tuple subject (`impl (type A, type B) with ..`) holds
+        // them at its top level. Reading only a nominal subject's arguments left
+        // a blanket's `T` unbindable at a call, so `Same::same(a, &b)` wired the
+        // call, dropped the receiver's binding with the rest of the working
+        // context, and emitted the blanket body un-instanced (B511).
         let mut binders = Vec::new();
-        for argument in argument_ids {
-            self.collect_residual_generics(&argument.get_type(self), &mut binders);
+        self.collect_residual_generics(&implementation.subject.get_type(self), &mut binders);
+        for (_, arguments) in &implementation.trait_args {
+            for argument in arguments {
+                self.collect_residual_generics(&argument.get_type(self), &mut binders);
+            }
         }
         binders
     }
@@ -42464,6 +42603,20 @@ impl<'src> Analyzer<'src> {
         None
     }
 
+    /// A trait's own parameters as the types its body spells them with
+    /// (`Generic(T)` per parameter, B366's one spelling).
+    fn own_parameter_types(&mut self, trait_id: Id) -> Vec<TypeId> {
+        let parameters = self
+            .traits
+            .get(&trait_id)
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default();
+        parameters
+            .into_iter()
+            .map(|constraint_id| Type::Generic(constraint_id).get_type_id(self))
+            .collect()
+    }
+
     fn derive_generics_from_bounds(
         &mut self,
         bound_owners: &[TypeId],
@@ -42490,10 +42643,48 @@ impl<'src> Analyzer<'src> {
                 // `Option`), as an impl's bound binders are (B408). The first
                 // provider answered `IntoFlow<SignalCell<..>>`, which no
                 // `Option<U>` reconciles with, and `U` went uninferred.
-                let provided = match concrete {
+                let provided = match &concrete {
                     Type::Generic(caller_constraint_id) => {
-                        self.abstract_trait_arguments(caller_constraint_id, trait_id)
+                        self.abstract_trait_arguments(*caller_constraint_id, trait_id)
                     }
+                    // B510: `Self` inside a trait's own default is as abstract
+                    // as a caller's parameter — its trait, and the supertraits
+                    // at the arguments the chain passes them, are all it
+                    // promises. Asked of the impls, the FIRST implementor
+                    // answered: `observe_flow(self)` in `Obs<T>`'s default bound
+                    // `U` to `Thing`'s `i32` and refused the default's own `T`.
+                    //
+                    // `self` there is typed as the bare trait (`Obs`, no
+                    // arguments): its arguments are the trait's OWN
+                    // parameters, which is what the body spells them as.
+                    Type::Trait(self_trait_id, self_arguments) => {
+                        let self_arguments = match self_arguments.is_empty() {
+                            true => self.own_parameter_types(*self_trait_id),
+                            false => self_arguments.clone(),
+                        };
+                        self.trait_with_supertraits_at(*self_trait_id, &self_arguments)
+                            .into_iter()
+                            .find(|(chain_trait_id, chain_arguments)| {
+                                *chain_trait_id == trait_id && !chain_arguments.is_empty()
+                            })
+                            .map(|(_, chain_arguments)| chain_arguments)
+                    }
+                    // B502: a trait OBJECT provides its trait, and the
+                    // supertraits at the arguments its chain passes, at the
+                    // arguments it CARRIES. Asked of the impls, a type behind
+                    // the object that implements the trait twice answered for
+                    // it: `measure(named)` with `named: dyn Shape<str>` bound
+                    // `T` to the first impl's `i32` and refused the call.
+                    Type::Dyn(object_trait_id, object_arguments) => self
+                        .trait_with_supertraits_at(*object_trait_id, object_arguments)
+                        .into_iter()
+                        .find(|(chain_trait_id, chain_arguments)| {
+                            *chain_trait_id == trait_id && !chain_arguments.is_empty()
+                        })
+                        .map(|(_, chain_arguments)| chain_arguments)
+                        .or_else(|| {
+                            self.trait_args_for_pattern(&concrete, trait_id, &trait_arguments)
+                        }),
                     _ => self.trait_args_for_pattern(&concrete, trait_id, &trait_arguments),
                 };
                 let Some(impl_arguments) = provided else {
@@ -42517,7 +42708,10 @@ impl<'src> Analyzer<'src> {
                     let impl_argument_type = impl_argument.get_type(self);
                     let mut argument_generics = Vec::new();
                     self.collect_generics(&impl_argument_type, 0, &mut argument_generics);
-                    if !matches!(concrete, Type::Generic(_))
+                    // A caller's parameter and a trait default's `Self` answer
+                    // from their own declared bounds, so a binder there is the
+                    // caller's own (the default's `T`, B510) and binds.
+                    if !matches!(concrete, Type::Generic(_) | Type::Trait(..))
                         && argument_generics
                             .iter()
                             .any(|generic| !receiver_generics.contains(generic))
@@ -44515,10 +44709,27 @@ impl<'src> Analyzer<'src> {
             let reached = self
                 .reach_marked_spans
                 .contains(&(self.current_source_id, selector.span));
+            let trait_type = selector
+                .trait_
+                .as_deref()
+                .zip(selector.trait_text.as_deref())
+                .map(|(trait_, trait_text)| {
+                    // A trait POSITION, like an impl's `with` clause: a trait
+                    // is what belongs here, not the value-position mistake.
+                    (
+                        self.walk_trait_position_type_node(trait_, selector_scope_id),
+                        trait_text.to_string(),
+                    )
+                });
+            let text = match &selector.trait_text {
+                Some(trait_text) => format!("{} with {trait_text}", selector.subject_text),
+                None => selector.subject_text.to_string(),
+            };
             selectors.push(ImportImplSelector {
                 span: selector.span,
-                text: selector.subject_text.to_string(),
+                text,
                 subject: subject_type_id,
+                trait_type,
                 members: selector
                     .members
                     .iter()
@@ -46554,6 +46765,34 @@ impl<'src> Analyzer<'src> {
         // on the same receiver already uses.
         if let Type::Generic(constraint_id) = receiver_type {
             self.trait_qualified_calls.remove(&subject_id);
+            // B511: no bound reaches the named trait, but a BLANKET over what the
+            // bounds promise may provide it (`Same::same(&a, &b)` inside `fun
+            // f<T: PartialEq>`, with `impl type T: PartialEq with Same`) — the
+            // route `a.same(&b)` takes (B408). The subject is pointed at the
+            // blanket's member with its binders bound to the caller's
+            // parameter, and the call re-dispatches at each instance like any
+            // call through a bound.
+            let bounds_reach_trait = self
+                .generic_bound_traits(constraint_id)
+                .iter()
+                .any(|(bound, _)| self.trait_with_supertraits(*bound).contains(&trait_id));
+            if !bounds_reach_trait
+                && let Some(ImplMemberResolution::Found(member_id, _)) = self
+                    .resolve_blanket_through_bounds_in(
+                        call_id,
+                        &receiver_type,
+                        member_name,
+                        Some(declaring_trait_id),
+                    )
+            {
+                *self.reference_count.entry(member_id).or_insert(0) += 1;
+                self.expr_id_to_expr_map
+                    .insert(subject_id, Expr::Local(member_id));
+                if let Some(bindings) = self.method_call_substitution.remove(&call_id) {
+                    self.static_subject_bindings.insert(subject_id, bindings);
+                }
+                return None;
+            }
             self.generic_dispatch.insert(
                 call_id,
                 GenericDispatch::OnConstraint(constraint_id, member_name),
@@ -46564,7 +46803,14 @@ impl<'src> Analyzer<'src> {
                 .insert(call_id, (declaring_trait_id, Vec::new()));
             return None;
         }
-        if !matches!(receiver_type, Type::Struct(..) | Type::Enum(..)) {
+        // A tuple or an array is a receiver like a nominal type: a blanket or a
+        // tuple-subject impl answers it here as it answers `value.member()`.
+        // Left to the ordinary path, the call kept the trait's declaration and
+        // typed `Swap::swapped((1, "one"))` as the bare trait `Swap` (B511).
+        if !matches!(
+            receiver_type,
+            Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
+        ) {
             self.trait_qualified_calls.remove(&subject_id);
             return None;
         }
@@ -51177,6 +51423,252 @@ impl<'src> Analyzer<'src> {
                 note: None,
                 span,
                 msg,
+            });
+            self.warning_sources.push(source);
+        }
+    }
+
+    /// B515: a TRAIT's method called on a concrete receiver in a file that
+    /// reaches neither the trait nor the block providing it. An `impl` registers
+    /// when its file LOADS, and loading is program-wide, so `42.to_string()`
+    /// compiled in any file once some loaded module (`std::markdown`) imported
+    /// `std::display` — and a wasm steer test depended on which std modules a
+    /// layer loads. B318's rule is that a trait method needs its trait in
+    /// scope: the file imports the trait, or a name from the trait's module or
+    /// the block's module, or the prelude binds one, or the file declares it.
+    ///
+    /// R-g door (b): a WARNING for one release, refused in v0.45.0.
+    ///
+    /// Calls through a bound are not asked — the bound wrote the trait's name —
+    /// nor are calls in std, in a frozen file or a dependency, nor generated
+    /// code (its source is no user file).
+    /// The file whose attribute generated `id`, when a derive or another macro
+    /// expansion minted it ([`Self::derived_origins`]).
+    fn derived_origin_file(&self, id: Id) -> Option<SourceId> {
+        self.derived_origins
+            .iter()
+            .find(|(range, _, _)| range.contains(&id.0))
+            .map(|(_, _, source)| *source)
+    }
+
+    /// The import path that names `entity` from the module DECLARING it —
+    /// `std::display::Display` — found by the entity rather than by its name,
+    /// so a name two modules declare (`std::style`'s `Display` beside
+    /// `std::display`'s) still answers. `None` for an entity no top-level
+    /// module of `std` or of the package declares.
+    fn import_path_of(&self, entity: Id) -> Option<String> {
+        let std_members: HashSet<Id> = self
+            .module_id_by_name
+            .get("std")
+            .and_then(|std_id| self.modules.get(std_id))
+            .and_then(|module| self.scopes.get(&module.body.1))
+            .map(|scope| scope.name_to_id_map.values().copied().collect())
+            .unwrap_or_default();
+        self.modules.values().find_map(|module| {
+            if module.name == "pkg" || module.name == "std" {
+                return None;
+            }
+            let scope = self.scopes.get(&module.body.1)?;
+            let (name, _) = scope
+                .declaration_order
+                .iter()
+                .find(|(_, id)| *id == entity)?;
+            let root = match std_members.contains(&module.id) {
+                true => "std",
+                false => "pkg",
+            };
+            Some(format!("{root}::{}::{name}", module.name))
+        })
+    }
+
+    /// The file a module scope's own declarations were walked from.
+    fn scope_file(&self, scope_id: Id) -> Option<SourceId> {
+        let scope = self.scopes.get(&scope_id)?;
+        scope
+            .declaration_order
+            .iter()
+            .map(|(_, id)| *id)
+            .chain(
+                scope
+                    .local_value_declarations
+                    .values()
+                    .flatten()
+                    .map(|declaration| declaration.id),
+            )
+            .find_map(|id| self.source_of_id(id))
+    }
+
+    fn check_trait_method_scope(&mut self, global_scope_id: Id) {
+        // The files a user file REACHES: its own, and the declaring file of
+        // every name its module scope binds — its imports, what the prelude
+        // seeded, its own declarations — and of every module it imports whole.
+        let imported_modules: HashSet<(SourceId, Id)> = self
+            .import_reaches
+            .iter()
+            .map(|reach| (reach.source, reach.target))
+            .collect();
+        let mut reached: HashMap<SourceId, HashSet<SourceId>> = HashMap::default();
+        for scope_id in &self.module_scope_ids {
+            // The entry walks in the GLOBAL scope; a module's file is the
+            // file its own declarations were walked from (a scope is minted
+            // before its file's entity range, so it has no source of its own).
+            let source = match *scope_id == global_scope_id {
+                true => Some(SourceId(0)),
+                false => self.scope_file(*scope_id),
+            };
+            let Some(source) = source else {
+                continue;
+            };
+            if self.std_sources.contains(&source)
+                || self.frozen_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+            {
+                continue;
+            }
+            let Some(scope) = self.scopes.get(scope_id) else {
+                continue;
+            };
+            let files = reached.entry(source).or_default();
+            files.insert(source);
+            for id in scope.name_to_id_map.values() {
+                // A MODULE name is reached only where this file imported it:
+                // the loader declares every loaded module's name in the scope
+                // the entry walks in, which is no statement of the file's.
+                let declared = match self.expr_id_to_expr_map.get(id) {
+                    Some(Expr::Module(module_id)) if imported_modules.contains(&(source, *id)) => {
+                        self.modules
+                            .get(module_id)
+                            .and_then(|module| self.scope_file(module.body.1))
+                    }
+                    Some(Expr::Module(_)) => None,
+                    _ => self.source_of_id(*id),
+                };
+                if let Some(declared) = declared {
+                    files.insert(declared);
+                }
+            }
+        }
+        if reached.is_empty() {
+            return;
+        }
+        let mut sites: Vec<(SourceId, Span, Id, &'src str)> = Vec::new();
+        let calls: Vec<(Id, Id, Id)> = self
+            .function_calls
+            .iter()
+            .filter_map(|(call_id, function_call)| {
+                match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+                    Some(Expr::Local(member_id)) => {
+                        Some((*call_id, function_call.subject_id, *member_id))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        for (call_id, subject_id, member_id) in calls {
+            let call_id = &call_id;
+            let member_id = &member_id;
+            let Some(source) = self.source_of_id(*call_id) else {
+                continue;
+            };
+            let Some(files) = reached.get(&source) else {
+                continue;
+            };
+            // The trait the member is, and the files that would bring it in
+            // scope: the trait's own, the impl clause's trait's, the block's.
+            let mut providing: Vec<SourceId> = Vec::new();
+            let trait_id = match self.implementation_by_declaration.get(member_id) {
+                Some(index) => {
+                    let implementation = &self.implementations[*index];
+                    let Some(member_name) = implementation
+                        .declarations
+                        .iter()
+                        .find(|(_, id)| *id == member_id)
+                        .map(|(name, _)| *name)
+                    else {
+                        continue;
+                    };
+                    let Some(home) = self.member_home_trait(implementation, member_name) else {
+                        continue;
+                    };
+                    // A derived block belongs to the file whose attribute
+                    // generated it (B354's rule).
+                    providing.push(
+                        self.derived_origin_file(implementation.impl_id)
+                            .unwrap_or(implementation.source),
+                    );
+                    if let Some(home_source) = self
+                        .traits
+                        .get(&home)
+                        .and_then(|trait_| self.source_of_id(trait_.id))
+                    {
+                        providing.push(home_source);
+                    }
+                    self.method_member_in_trait_at(home, &[], member_name)
+                        .map_or(home, |(_, declaring, _)| declaring)
+                }
+                None => match self.trait_by_declaration.get(member_id) {
+                    // A default reached on a concrete receiver (Gap E's
+                    // re-dispatch); through a bound the bound named the trait.
+                    Some(trait_id)
+                        if matches!(
+                            self.generic_dispatch.get(call_id),
+                            Some(GenericDispatch::OnType(..))
+                        ) =>
+                    {
+                        *trait_id
+                    }
+                    _ => continue,
+                },
+            };
+            let Some(trait_) = self.traits.get(&trait_id) else {
+                continue;
+            };
+            if let Some(trait_source) = self.source_of_id(trait_.id) {
+                providing.push(trait_source);
+            }
+            // Generated code is not the author's spelling: a derive's body
+            // calls what its own expansion needs.
+            if providing.iter().any(|file| files.contains(file))
+                || self.derived_origin_file(*call_id).is_some()
+            {
+                continue;
+            }
+            // At the member's NAME where the call has one (`42.to_string()`
+            // marks `to_string`), the whole call otherwise.
+            let span = self
+                .member_name_spans
+                .get(call_id)
+                .copied()
+                .unwrap_or_else(|| {
+                    **self
+                        .span_map
+                        .get(&subject_id)
+                        .or_else(|| self.span_map.get(call_id))
+                        .unwrap_or(&&EMPTY_SPAN)
+                });
+            let member_name = self.callable_name(*member_id).unwrap_or("this method");
+            sites.push((source, span, trait_id, member_name));
+        }
+        // The calls are visited in the table's order, not the file's — sorted so
+        // `vilan check` prints them stably, and one per site (an entry world
+        // per package entry resolves a shared file's calls once each).
+        sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
+        sites.dedup();
+        for (source, span, trait_id, member_name) in sites {
+            let trait_name = self.traits.get(&trait_id).map_or("", |trait_| trait_.name);
+            let import = match self.import_path_of(trait_id) {
+                Some(path) => format!("import {path};"),
+                None => format!("import {trait_name};"),
+            };
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "`{member_name}` is `{trait_name}`'s, and this file does not import \
+                     `{trait_name}`: the call resolves only because another loaded module does. \
+                     Import it (`{import}`) — this is an error from v0.45.0"
+                ),
             });
             self.warning_sources.push(source);
         }
@@ -69800,6 +70292,8 @@ fn analyze_over_world<'src>(
         // are the two halves of one release: one tells a module's author what to
         // curate, the other tells a module's CONSUMER what they are reaching
         // past.
+        // B515 reads the import reaches, which the plain-reach pass consumes.
+        analyzer.check_trait_method_scope(global_scope_id);
         analyzer.check_plain_reaches();
         analyzer.check_duplicate_module_declarations();
         // Two impls declaring one name for one subject (B57): a coherence rule, so
@@ -71227,6 +71721,8 @@ pub fn build_impl_admission(program: &mut Program) {
     // marker's job is to name a block, and the block's module is the one the
     // statement walked to, which the subject test already decides.
     let mut reached: HashSet<(SourceId, Id)> = HashSet::default();
+    // B455: the blocks a whole-block selector named, a marker block included.
+    let mut whole_blocks: HashSet<(SourceId, Id)> = HashSet::default();
     let collisions = std::mem::take(&mut program.cross_module_collisions);
     let hidden = std::mem::take(&mut program.hidden_impls_pending);
     // N95: the drain is what makes the field's name true, and the name is all
@@ -71242,7 +71738,7 @@ pub fn build_impl_admission(program: &mut Program) {
             for selector in row.selectors.iter().filter(|selector| selector.reached) {
                 for implementation in &program.implementations {
                     if hidden.contains(&implementation.impl_id)
-                        && selector_admits(program, implementation.subject, selector.subject)
+                        && selector_takes_block(program, implementation, selector)
                     {
                         reached.insert((row.source, implementation.impl_id));
                     }
@@ -71285,19 +71781,48 @@ pub fn build_impl_admission(program: &mut Program) {
         }
         let mut admitted: HashSet<Id> = HashSet::default();
         for selector in &row.selectors {
+            // B455: `with` names a TRAIT. A name that settled to something
+            // else takes no block; say so at the name rather than as the
+            // "admits nothing" miss below.
+            // A name that did not resolve has its own "cannot find" already,
+            // and a second sentence about the selector would bury it.
+            if let Some((type_id, trait_text)) = &selector.trait_type {
+                match program.type_id_to_type_map.get(type_id) {
+                    Some(Type::Trait(..)) => {}
+                    Some(Type::Unknown | Type::Unresolved) | None => continue,
+                    Some(_) => {
+                        selector_misses.push((
+                            row.source,
+                            selector.span,
+                            format!(
+                                "`{trait_text}` is not a trait: a selector's `with` names the \
+                                 trait the block implements, as its declaration does (`(impl \
+                                 Box with One)` selects `impl Box with One`)"
+                            ),
+                        ));
+                        continue;
+                    }
+                }
+            }
             let mut members: Vec<Id> = Vec::new();
+            // What the reached blocks provide, for the refusal that names it.
+            let mut provided: Vec<String> = Vec::new();
             let mut subject_reached = false;
             // B350: whether the `#` on this selector reached anything HIDDEN.
             let mut reached_a_hidden_block = false;
             for implementation in &program.implementations {
                 if !sources.contains(&implementation.source)
-                    || !selector_admits(program, implementation.subject, selector.subject)
+                    || !selector_takes_block(program, implementation, selector)
                 {
                     continue;
                 }
                 subject_reached = true;
                 reached_a_hidden_block |= hidden.contains(&implementation.impl_id);
+                if selector.members.is_empty() {
+                    whole_blocks.insert((row.source, implementation.impl_id));
+                }
                 for (name, member_id) in &implementation.declarations {
+                    provided.push(name.to_string());
                     if selector.members.is_empty()
                         || selector.members.iter().any(|(taken, _)| taken == name)
                     {
@@ -71309,6 +71834,7 @@ pub fn build_impl_admission(program: &mut Program) {
                 // block `(impl Box)` names, and `(impl Box)::describe` takes
                 // the default it inherits.
                 for (name, member_id) in inherited_default_members(program, implementation) {
+                    provided.push(name.clone());
                     if selector.members.is_empty()
                         || selector.members.iter().any(|(taken, _)| *taken == name)
                     {
@@ -71351,7 +71877,15 @@ pub fn build_impl_admission(program: &mut Program) {
             // dropped it. Said HERE, at the selector, where the fix is. Two
             // shapes: a subject no block in the module has, and a subject that
             // reaches a block whose members the `::` tail then misses.
-            if !subject_reached || members.is_empty() {
+            //
+            // B455: a WHOLE-block selector that reaches a block admits it, a
+            // block with no members at all (a marker impl) included — so the
+            // second shape is only a `::` tail naming nothing the blocks
+            // provide, and the refusal names what they do provide. (It read
+            // "declares : the selector admits nothing" for a whole-block
+            // selector over a member-less block, with nothing to fill the
+            // slot and nothing the author could select instead.)
+            if !subject_reached || (!selector.members.is_empty() && members.is_empty()) {
                 let subject = &selector.text;
                 let modules = sources
                     .iter()
@@ -71365,9 +71899,19 @@ pub fn build_impl_admission(program: &mut Program) {
                         .map(|(name, _)| format!("`{name}`"))
                         .collect::<Vec<_>>()
                         .join(", ");
+                    provided.sort();
+                    provided.dedup();
+                    let offers = match provided.is_empty() {
+                        true => format!("nothing — select the block whole: `(impl {subject})`"),
+                        false => provided
+                            .iter()
+                            .map(|name| format!("`{name}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    };
                     format!(
                         "no `impl {subject}` this statement carries declares {named}: the \
-                         selector admits nothing"
+                         selector admits nothing. The blocks it reaches provide {offers}"
                     )
                 } else {
                     format!(
@@ -71431,6 +71975,7 @@ pub fn build_impl_admission(program: &mut Program) {
         selector_of,
         hidden,
         reached,
+        whole_blocks,
     };
     CARRIED_ROWS_CENSUS.with(|census| census.set(carried.len()));
     if !collisions.is_empty() {
@@ -71797,6 +72342,7 @@ pub fn check_call_site_admission(program: &mut Program) {
         selector_of,
         hidden,
         reached,
+        whole_blocks: _,
     } = program.impl_admission.clone();
     // Which implementation declares a member — `declarations` read backwards,
     // built once for the pass rather than scanned per call.
@@ -72195,6 +72741,36 @@ fn merge_admitted_block(
 fn selector_admits(program: &Program, subject: TypeId, selector: TypeId) -> bool {
     crate::impl_select::subject_applies(program, subject, selector)
         || crate::impl_select::subject_applies(program, selector, subject)
+}
+
+/// [`selector_admits`] over a whole block: the subjects unify and, where the
+/// selector names a trait, the block implements it (B455).
+fn selector_takes_block(
+    program: &Program,
+    implementation: &Implementation,
+    selector: &ImportImplSelector,
+) -> bool {
+    selector_admits(program, implementation.subject, selector.subject)
+        && selector_names_block_trait(&program.type_id_to_type_map, implementation, selector)
+}
+
+/// B455: a selector that names a trait (`(impl Box with One)`) takes only the
+/// block whose `with` clause names it — the declaration's own spelling, so
+/// `impl Box with Sub` is `(impl Box with Sub)` even where `Sub` brings a
+/// supertrait along. A selector naming no trait takes every block of the
+/// subject.
+fn selector_names_block_trait(
+    types: &HashMap<TypeId, Type>,
+    implementation: &Implementation,
+    selector: &ImportImplSelector,
+) -> bool {
+    match &selector.trait_type {
+        None => true,
+        Some((type_id, _)) => match types.get(type_id) {
+            Some(Type::Trait(trait_id, _)) => implementation.trait_ids.contains(trait_id),
+            _ => false,
+        },
+    }
 }
 
 /// Reject an async `drop` body (destruction.md §5): teardown must be synchronous
