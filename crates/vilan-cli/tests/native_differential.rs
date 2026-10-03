@@ -8865,6 +8865,26 @@ fn a_reassigned_closure_binding_and_a_list_of_closures_are_identical_on_both_bac
     );
 }
 
+/// F51 (pinned, not reproduced at the Order 46 base): a captured value
+/// returned from a closure — an expression body, a `match` leg, a block tail,
+/// and `KeyedSource::or`'s own shape over a generic list — copies rather than
+/// moving out of the `Fn` closure (F63/F64 closed what was filed as rustc
+/// E0507). The base refuses this probe only for F67's `|| row.name`.
+#[test]
+fn a_capture_returned_from_a_closure_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_captured_returns.vl"),
+        include_str!("native/captured_returns.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_captured_returns.vl"),
+        Verdict::Identical,
+        "a capture handed back from a closure must be copied, not moved"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds
