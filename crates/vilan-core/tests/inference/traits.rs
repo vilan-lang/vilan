@@ -9252,3 +9252,35 @@ fn b479_a_stage_selector_in_a_generic_body_takes_the_receivers_own_answer() {
         "2\n",
     );
 }
+
+/// B508: a blanket `impl type T with Trait` reaches a CLOSURE-typed receiver —
+/// `f.named()` on a `|| void` was "cannot call method 'named' on || void",
+/// which is why the Store held closure-typed fields behind `store_opaque`. A
+/// closure value of each arity, and one held in a struct field, are pinned.
+#[test]
+fn b508_a_blanket_reaches_a_closure_typed_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        trait Named {
+            fun named(self): str;
+        }
+        impl type T with Named {
+            fun named(self): str {
+                "anything"
+            }
+        }
+        struct Holder { run: |i32| i32 }
+        fun nothing() {}
+        fun main() {
+            print(5.named());
+            let f: || void = nothing;
+            print(f.named());
+            let g = |x: i32| x + 1;
+            print(g.named());
+            let holder = Holder { run = |x| x * 2 };
+            print(holder.run.named());
+        }
+        "#,
+        "anything\nanything\nanything\nanything\n",
+    );
+}

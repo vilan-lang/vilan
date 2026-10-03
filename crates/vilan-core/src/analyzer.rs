@@ -49036,10 +49036,15 @@ impl<'src> Analyzer<'src> {
             // `impl (type T, T)` at `(i32, i32)`, and `list_element_slot`
             // answers `None` for a tuple, so the `push`/`run` slot branch is
             // inert here.
+            // B508: a CLOSURE receiver reaches the impls written over closure
+            // shapes and the blankets (`impl type T with Named`) exactly as a
+            // nominal one does — it fell to `NotCallable` before, so `f.named()`
+            // on a `|| void` was "cannot call method".
             Type::Struct(_, _)
             | Type::Enum(_, _)
             | Type::Tuple(_)
             | Type::Array(_, _)
+            | Type::Closure(..)
             | Type::Dyn(_, _)
                 if !object_declares_member =>
             {

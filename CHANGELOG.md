@@ -353,6 +353,11 @@ written down.
 
 ---
 
+<!-- family: feature -->
+**A blanket `impl type T with Trait` reaches a CLOSURE-typed receiver: `f.named()` on `let f: || void = nothing;` answers the blanket's member — where it was "cannot call method 'named' on || void", which is why the Store held closure-typed fields behind `store_opaque`.** Method lookup sent a closure receiver straight to "not callable"; it now takes the impl-member route every nominal, tuple and array receiver takes, where the selection already knew closure shapes (`ImplSubjectBucket::Closure`). A closure of each arity, and one held in a struct field, are pinned. Pin: `inference::traits`' `b508_a_blanket_reaches_a_closure_typed_receiver` — red on the 0.43.0 toolchain. No golden moves. Tracker B508.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->
