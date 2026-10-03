@@ -7700,20 +7700,25 @@ impl<'src> Printer<'src> {
                 self.out.push(']');
             }
             Node::Call(callee, generic_arguments, arguments) => {
-                // A call binds tighter than `.`/`[]`, so `a.b(c)` parses as
-                // `a.(b(c))`. To call the *result* of a member/index access the
+                // A call binds tighter than `.`, so `a.b(c)` parses as
+                // `a.(b(c))`. To call the *result* of a member access the
                 // callee must be parenthesized — `(a.b)(c)` — or it reparses wrong.
                 // A `?.` lift chain likewise absorbs a following call into its
                 // continuation, so a `Lift` callee needs its own parens: `(a?.b)()`.
+                //
+                // An INDEX is not one of them (E252): `adders[2](30)` and
+                // `h.fs[0](30)` parse as a call OF the index — the postfix
+                // chain reads `[..]` and then `(..)` on its result — so the
+                // index prints as written. The parens it used to gain made the
+                // net decline the file. A grouped callee the author wrote,
+                // `(h.fs[0])(30)`, is a `LiftGroup` and prints its own.
                 //
                 // A member chain that already ENDS in a call is the exception:
                 // `kept.read()(2)` calls the result of `kept.read()`, which is
                 // what the postfix chain reads anyway, so it prints as written
                 // rather than as `(kept.read())(2)`, which the net declined.
-                if matches!(
-                    callee.0,
-                    Node::MemberAccessor(_, _) | Node::Index(_, _) | Node::Lift(_, _)
-                ) && !Self::member_chain_ends_in_a_call(&callee.0)
+                if matches!(callee.0, Node::MemberAccessor(_, _) | Node::Lift(_, _))
+                    && !Self::member_chain_ends_in_a_call(&callee.0)
                 {
                     self.out.push('(');
                     self.print_expr(callee);
@@ -8785,6 +8790,33 @@ mod reformats {
     // a function, a struct (with `[derive]` and `[resource]`), a labelled
     // `let`, a trait, under `export` on either side, and in a trait body.
     // The net sorts both streams the same way, so none of these declines.
+    // E252: a call through an indexed closure prints as written — the
+    // postfix chain reads `[..]` and then the call on its result — where the
+    // printer wrapped the index in parens and the net declined the whole file
+    // (native-46's `print(adders[2](30));`). A member chain ahead of the index,
+    // a chained index, a call of the call, and the author's own groups.
+    #[test]
+    fn e252_a_call_through_an_indexed_closure_prints_as_written() {
+        for source in [
+            "fun main() {\n\tprint(adders[2](30));\n}\n",
+            "fun main() {\n\tlet a = adders[0](30);\n}\n",
+            "fun main() {\n\th.fs[0](30);\n}\n",
+            "fun main() {\n\ta[0][1](2);\n}\n",
+            "fun main() {\n\th.fs[0](30)(1);\n}\n",
+            "fun main() {\n\t(h.fs[0])(30);\n}\n",
+            "fun main() {\n\t(h.fs)[0](30);\n}\n",
+            "fun main() {\n\t(a.b)(c);\n}\n",
+        ] {
+            // `reprint`, not `format`: a decline hands the source back, which
+            // an identity expectation cannot tell from a reprint.
+            assert_eq!(
+                crate::formatter::reprint(source).as_deref(),
+                Ok(source),
+                "{source}"
+            );
+        }
+    }
+
     // B524 (decided by B485 Q8's table): an async macro is written `async
     // macro fun` — `async` before `external`|`macro` — with its attributes
     // above; `macro async fun`, the one order the production read before,

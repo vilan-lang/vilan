@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**`vilan fmt` formats a call through an indexed closure — `print(adders[2](30));`, `h.fs[0](30)` — where it declined the whole file ("reprinting it would have changed the code at this line").** E252 (native-46's find). The printer parenthesized an index callee as it must a member one (`(a.b)(c)`, since `a.b(c)` is a method call), but the postfix chain reads `[..]` and then the call on its result, so `adders[2](30)` already is a call of the index; the added `( )` changed the tokens and the safety net threw the reprint away. An index callee now prints as written; an author's own group (`(h.fs[0])(30)`) is a group node and prints its parens. **Pin:** `formatter::reformats::e252_a_call_through_an_indexed_closure_prints_as_written` (eight shapes through `reprint`, which errs on a decline — `format` hands the source back and an identity expectation cannot tell the two apart), red with the parens planted back. Tracker E252.
+
+---
+
 <!-- family: diagnostics -->
 **A bare `return;`, `return (x)`, `return -x` and a block tail `{ return }` get B520's steer — "`return` is not a vilan keyword: vilan spells this `ret` — `ret value;` returns a value, and a bare `ret;` leaves a function that returns nothing" — at the word, where they said "cannot find 'return' in this scope".** B523. Each is a valid PARSE (a read of a binding named `return`, a call, a subtraction), so the parser must leave the name; the steer is given where the name fails to resolve (the analyzer's unresolved-name diagnostic, `resolve_prepped_local`, a few lines), and only there — a program that binds `return` reads it as before. The message is B520's word for word, so it carries the same code (`foreign-spelling/return`) and the editor's existing quick fix (`parsing::foreign_spelling_fix`) writes `ret`. A value body whose last STATEMENT is `return (y);` also gets "this body ends without producing a value", which is true of what was written. **Pin:** `inference::returns::b523_an_unbound_return_is_steered_to_ret` (the four shapes, each one diagnostic spanning `return`, the fix applied and compiled; the bound control runs) — red with the steer planted out. No ledger row: the message is row 611's. Docs: `lexical.md`'s B520 paragraph. Tracker B523.
 
