@@ -135,6 +135,21 @@ declared`, `analyzed as: node — default-entry` — with the whole reason in
 its tooltip. A file can say it itself: `[platform("browser")] mod self;` as
 its first line — and at the top of a file, completion offers that line.
 
+**A file is analyzed as its entry sees it.** A module one of your
+package's entries reaches is analyzed in that entry's world: the editor
+analyzes the entry — `client.vl`, say — once per edit, and every open file
+it reaches is answered from that one analysis. Edit `model.vl` with
+`client.vl`, `views.vl` and `channel.vl` open and the four are re-analyzed
+together, not one after another; open a fifth file of the same world and
+it is answered at once, from the analysis already in hand. A module's
+diagnostics are the ones its entry's build would report (an error a caller
+provokes shows in the module), and hover, go-to-definition and completion
+read the entry's program. The entry does not need to be open. A module
+both a browser and a node entry reach is answered from the browser
+entry's world and reports the node entry's diagnostics too; an entry, a
+module no entry reaches, and a file outside any package are each analyzed
+on their own, as before.
+
 A file holding platform-fenced **twins** (a function or a trait `impl`
 written once under `[platform("browser")]` and once under
 `[platform("@process")]`) is analyzed under each twin's platform, and the

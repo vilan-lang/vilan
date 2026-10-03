@@ -169,6 +169,9 @@ pub struct AnalysisTally {
     /// entry's landed analysis instead. See [`AnalysisTally::union_legs`].
     union_legs_analyzed: AtomicU64,
     union_legs_reused: AtomicU64,
+    /// M104: analyses that ran to the end and landed nowhere — superseded,
+    /// closed under, or a world one of whose buffers moved while it ran.
+    dropped: AtomicU64,
 }
 
 impl AnalysisTally {
@@ -199,6 +202,19 @@ impl AnalysisTally {
 
     pub fn record_landed(&self) {
         self.landed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M104: one analysis that ran to the end and landed nowhere.
+    pub fn record_dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many analyses landed nowhere this session — with `landed` and
+    /// `cancelled`, every analysis `started` accounts for, which is how the
+    /// pins tell a server at rest from one between two analyses.
+    #[cfg(test)]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn record_cancelled(&self) {

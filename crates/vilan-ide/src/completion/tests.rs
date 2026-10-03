@@ -80,7 +80,7 @@ impl Engine {
         };
         let index = CompletionIndex::build(&program, Some(&import_roots), source);
         Engine {
-            entity_spans: entity_spans(&program),
+            entity_spans: entity_spans(&program, vilan_core::analyzer::SourceId(0)),
             platform_requirements: vilan_core::platform_color::requirements(&program),
             analyzed: LineIndex::new(source),
             live: LineIndex::new(source),
@@ -95,6 +95,7 @@ impl Engine {
     fn analysis(&self) -> Analysis<'_, 'static> {
         Analysis {
             program: &self.program,
+            focus: vilan_core::analyzer::SourceId(0),
             analyzed: &self.analyzed,
             live: &self.live,
             entity_spans: &self.entity_spans,

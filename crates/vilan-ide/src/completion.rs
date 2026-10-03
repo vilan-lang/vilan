@@ -674,6 +674,7 @@ fn is_identifier(name: &str) -> bool {
 /// The platform is not among them — it selects which of a library's layers a
 /// module resolves from, and the analysis records the one it settled on as
 /// `Program::platform`.
+#[derive(Clone)]
 pub struct ImportRoots {
     /// The `std` library's layered spec (`resolve_std`, or the playground's
     /// hand-built embedded spec).
@@ -2134,8 +2135,8 @@ impl<'a, 'src> Analysis<'a, 'src> {
             else {
                 continue;
             };
-            // std's `view`, not a same-named entry-file function.
-            if program.source_of(*id) != Some(SourceId(0)) {
+            // std's `view`, not a same-named function of this document's.
+            if program.source_of(*id) != Some(self.focus) {
                 return Some(nominal);
             }
             fallback = fallback.or(Some(nominal));
@@ -2515,6 +2516,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
             return scope.name_to_id_map.get(name).copied();
         }
         self.index
+            .world
             .members
             .methods(namespace, false)
             .iter()
@@ -2527,6 +2529,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// lookup rather than a walk over every impl in the program (M29).
     fn member_id(&self, type_id: Id, name: &str) -> Option<Id> {
         self.index
+            .world
             .members
             .methods(type_id, true)
             .iter()
@@ -2558,7 +2561,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         let Some(Type::Generic(parameter)) = program.type_id_to_type_map.get(&declared) else {
             return None;
         };
-        let subject = self.index.members.subject_of(member)?;
+        let subject = self.index.world.members.subject_of(member)?;
         let mut bindings = HashMap::default();
         vilan_core::impl_select::bind_subject(program, subject, receiver, &mut bindings);
         bindings.get(parameter).copied().filter(|bound| {
@@ -2763,7 +2766,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
             let start = variable.name_span.into_range().start;
             if variable.name == name
                 && start < analyzed_offset
-                && program.source_of(*id) == Some(SourceId(0))
+                && program.source_of(*id) == Some(self.focus)
                 && best.is_none_or(|(best_start, _)| start > best_start)
             {
                 best = Some((start, *id));
@@ -3112,7 +3115,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// and the live buffer: skipping the names already in scope, stopping at
     /// the cap, and rendering each survivor's import edit.
     fn auto_import_completions(&self, in_scope: &HashSet<&str>) -> Vec<Completion> {
-        let order = &self.index.auto_import;
+        let order = &self.index.world.auto_import;
         let chosen = order.take(in_scope, AUTO_IMPORT_COMPLETION_CAP);
         if chosen.is_empty() {
             return Vec::new();
@@ -3132,9 +3135,9 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // where the answer could be wrong, there is no answer.
         chosen
             .into_iter()
-            .filter_map(|candidate| {
+            .filter_map(|(position, candidate)| {
                 let module = &order.modules[candidate.module as usize];
-                let edit = candidate.edit.as_ref()?;
+                let edit = self.index.import_edits.get(position)?.as_ref()?;
                 let span = self.map_analyzed_span(edit.span)?;
                 Some(Completion {
                     label: candidate.name.clone(),
@@ -3280,7 +3283,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 slot.1 = slot.1.max(end);
             };
             for id in program
-                .id_ranges_of(SourceId(0))
+                .id_ranges_of(self.focus)
                 .into_iter()
                 .flatten()
                 .map(Id)
@@ -3348,7 +3351,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// renders it. Deriving them here was a walk over every impl in the program
     /// on every request (M29).
     fn push_methods(&self, type_id: Id, want_self: bool, items: &mut Vec<Completion>) {
-        for (name, member_id) in self.index.members.methods(type_id, want_self) {
+        for (name, member_id) in self.index.world.members.methods(type_id, want_self) {
             items.push(self.entity_completion(name.clone(), *member_id, CompletionKind::Method));
         }
     }
@@ -3895,6 +3898,21 @@ pub fn call_insertion(
 /// invalidation protocol to keep truthful and no way for the two to disagree.
 #[derive(Clone, Debug, Default)]
 pub struct CompletionIndex {
+    /// The tables that are a function of the PROGRAM alone — shared, M104,
+    /// by every document served from one world: the auto-import candidates,
+    /// the origins' module listings, the member surfaces and the rendered doc
+    /// paragraphs. A world's three open modules hold one copy, not three.
+    world: std::sync::Arc<WorldCompletionTables>,
+    /// Each auto-import candidate's import EDIT, parallel to
+    /// `world.auto_import.candidates` — the one part that is a function of the
+    /// DOCUMENT's text (where its import run is), so each document of a world
+    /// computes its own (M29's parse, once per landing).
+    import_edits: Vec<Option<CapturedImportEdit>>,
+}
+
+/// [`CompletionIndex`]'s program-wide half (M104).
+#[derive(Clone, Debug, Default)]
+struct WorldCompletionTables {
     auto_import: AutoImportOrder,
     origins: Vec<OriginListing>,
     members: MemberTable,
@@ -3912,13 +3930,28 @@ impl CompletionIndex {
         import_roots: Option<&ImportRoots>,
         analyzed: &str,
     ) -> CompletionIndex {
-        CompletionIndex {
-            auto_import: AutoImportOrder::build(program, analyzed),
+        let world = WorldCompletionTables {
+            auto_import: AutoImportOrder::build(program),
             origins: import_roots
                 .map(|roots| OriginListing::build(roots, program.platform))
                 .unwrap_or_default(),
             members: MemberTable::build(program),
             docs: DocParagraphs::build(program),
+        };
+        let import_edits = world.auto_import.import_edits(analyzed);
+        CompletionIndex {
+            world: std::sync::Arc::new(world),
+            import_edits,
+        }
+    }
+
+    /// The index for ANOTHER document served from the same analysis (M104):
+    /// the program-wide tables shared, the import edits computed against
+    /// `analyzed` — that document's own text as the analysis read it.
+    pub fn sharing_world(&self, analyzed: &str) -> CompletionIndex {
+        CompletionIndex {
+            world: std::sync::Arc::clone(&self.world),
+            import_edits: self.world.auto_import.import_edits(analyzed),
         }
     }
 
@@ -3932,7 +3965,8 @@ impl CompletionIndex {
     /// renderer would read its module's whole text to discover there was
     /// nothing above it, which is the very cost the table exists to remove.
     pub(crate) fn doc_paragraph(&self, declaration_id: Id) -> Option<Option<&str>> {
-        self.docs
+        self.world
+            .docs
             .by_declaration
             .get(&declaration_id)
             .map(|paragraph| paragraph.as_deref())
@@ -3941,7 +3975,10 @@ impl CompletionIndex {
     /// The modules and surface `origin::` offers, as the package tree stood
     /// when the analysis ran. `None` for a name that is not an origin.
     fn origin(&self, origin: &str) -> Option<&OriginListing> {
-        self.origins.iter().find(|listing| listing.origin == origin)
+        self.world
+            .origins
+            .iter()
+            .find(|listing| listing.origin == origin)
     }
 }
 
@@ -4373,14 +4410,12 @@ struct AutoImportCandidate {
     name: String,
     kind: CompletionKind,
     module: u32,
-    /// The import edit this candidate carries, computed at BUILD time against
-    /// the analyzed text and in that text's coordinates (M29) — `None` for a
-    /// name already imported, or in a buffer that did not parse cleanly, which
-    /// is the same `None` the per-request probe answered.
-    edit: Option<CapturedImportEdit>,
 }
 
-/// One candidate's ready-made `import` edit, in ANALYZED coordinates.
+/// One candidate's ready-made `import` edit, computed at BUILD time against
+/// the analyzed text and in that text's coordinates (M29) — absent for a name
+/// already imported, or in a buffer that did not parse cleanly, which is the
+/// same `None` the per-request probe answered.
 #[derive(Clone, Debug)]
 struct CapturedImportEdit {
     span: Span,
@@ -4388,7 +4423,7 @@ struct CapturedImportEdit {
 }
 
 impl AutoImportOrder {
-    fn build(program: &Program, analyzed: &str) -> AutoImportOrder {
+    fn build(program: &Program) -> AutoImportOrder {
         // M65, as in [`DocParagraphs::build`]: the declares-it test below is
         // asked once per NAME in every module of `std` and `pkg`, and
         // `source_of` is a linear scan.
@@ -4466,7 +4501,6 @@ impl AutoImportOrder {
                         name: name.to_string(),
                         kind,
                         module,
-                        edit: None,
                     });
                 }
             }
@@ -4476,44 +4510,51 @@ impl AutoImportOrder {
                 .cmp(&right.tier)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        // Each candidate's IMPORT EDIT, computed here against the analyzed text
-        // rather than in the request (M29). A request used to parse the whole
-        // live buffer for this — 0.14 ms of a 0.55 ms scope completion on
-        // E121's exhibit, and the largest single item left in it after M25 —
-        // and then probe the parse once per surviving candidate. The probes are
-        // cheap; the parse was the bill, and it is a function of the text the
-        // analysis ran on, so it belongs to the analysis.
-        //
-        // ONE parse fills every candidate. A buffer that does not parse cleanly
-        // has no safe import edit at all, which is exactly the `None` the
-        // per-request probe answered, and the whole table then carries `None`.
-        if let Some(parsed) = vilan_core::formatter::ParsedSource::parse(analyzed) {
-            for candidate in &mut candidates {
-                let module = &modules[candidate.module as usize];
-                let path: Vec<&str> = module.path.iter().map(String::as_str).collect();
-                candidate.edit =
-                    parsed
-                        .insert_import(&path, &candidate.name)
-                        .map(|edit| CapturedImportEdit {
-                            span: edit.span,
-                            replacement: edit.replacement,
-                        });
-            }
-        }
         AutoImportOrder {
             modules,
             candidates,
         }
     }
 
+    /// Each candidate's IMPORT EDIT, computed against the analyzed text rather
+    /// than in the request (M29), in candidate order. A request used to parse
+    /// the whole live buffer for this — 0.14 ms of a 0.55 ms scope completion
+    /// on E121's exhibit, and the largest single item left in it after M25 —
+    /// and then probe the parse once per surviving candidate. The probes are
+    /// cheap; the parse was the bill, and it is a function of the text the
+    /// analysis ran on, so it belongs to the analysis.
+    ///
+    /// ONE parse fills every candidate. A buffer that does not parse cleanly
+    /// has no safe import edit at all, which is exactly the `None` the
+    /// per-request probe answered, and the whole table then carries `None`.
+    fn import_edits(&self, analyzed: &str) -> Vec<Option<CapturedImportEdit>> {
+        let Some(parsed) = vilan_core::formatter::ParsedSource::parse(analyzed) else {
+            return vec![None; self.candidates.len()];
+        };
+        self.candidates
+            .iter()
+            .map(|candidate| {
+                let module = &self.modules[candidate.module as usize];
+                let path: Vec<&str> = module.path.iter().map(String::as_str).collect();
+                parsed
+                    .insert_import(&path, &candidate.name)
+                    .map(|edit| CapturedImportEdit {
+                        span: edit.span,
+                        replacement: edit.replacement,
+                    })
+            })
+            .collect()
+    }
+
     /// The first `cap` candidates whose name is not already offered.
     ///
     /// This is the whole per-request cost of the arm: a walk that stops at the
     /// cap, so it reads about `cap` entries of a table that may hold thousands.
-    fn take(&self, in_scope: &HashSet<&str>, cap: usize) -> Vec<&AutoImportCandidate> {
+    fn take(&self, in_scope: &HashSet<&str>, cap: usize) -> Vec<(usize, &AutoImportCandidate)> {
         self.candidates
             .iter()
-            .filter(|candidate| !in_scope.contains(candidate.name.as_str()))
+            .enumerate()
+            .filter(|(_, candidate)| !in_scope.contains(candidate.name.as_str()))
             .take(cap)
             .collect()
     }
