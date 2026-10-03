@@ -630,10 +630,20 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
             TokenBranch::Set(branches.iter().map(branch_from_ast).collect())
         }
         ImportBranch::Selector(selector) => TokenBranch::Selector(
-            selector_key_text(&selector.subject_text),
+            selector_key_text(&selector_written_text(selector)),
             Vec::new(),
             selector.members.iter().map(|(name, _)| *name).collect(),
         ),
+    }
+}
+
+/// The selector's text between `(impl ` and `)`: the subject, and ` with
+/// TRAIT` when the selector names its block by the trait (B455). The token
+/// path keys on the same run of tokens, so the two keys agree.
+fn selector_written_text<'src>(selector: &ImplSelector<'src>) -> Cow<'src, str> {
+    match &selector.trait_text {
+        Some(trait_text) => Cow::Owned(format!("{} with {trait_text}", selector.subject_text)),
+        None => selector.subject_text.clone(),
     }
 }
 
@@ -2084,6 +2094,8 @@ fn prune_import_branch<'src>(
             ImportBranch::Selector(Box::new(ImplSelector {
                 subject: None,
                 subject_text: selector.subject_text.clone(),
+                trait_: None,
+                trait_text: selector.trait_text.clone(),
                 members: selector.members.clone(),
                 span: selector.span,
             }))
@@ -2236,6 +2248,8 @@ fn attach_selector<'src>(module: ImportBranch<'src>, subject: String) -> ImportB
                 Box::new(ImplSelector {
                     subject: None,
                     subject_text: Cow::Owned(subject),
+                    trait_: None,
+                    trait_text: None,
                     members: Vec::new(),
                     span: Span::default(),
                 }),
@@ -4969,6 +4983,10 @@ impl<'src> Printer<'src> {
             ImportBranch::Selector(selector) => {
                 self.out.push_str("(impl ");
                 self.out.push_str(&selector.subject_text);
+                if let Some(trait_text) = &selector.trait_text {
+                    self.out.push_str(" with ");
+                    self.out.push_str(trait_text);
+                }
                 self.out.push(')');
                 let mut members: Vec<&'src str> =
                     selector.members.iter().map(|(name, _)| *name).collect();
@@ -13443,6 +13461,24 @@ mod import_sorting {
         ] {
             assert_sorts(source, source);
         }
+    }
+
+    // B455: `with TRAIT` names the block by its trait and round-trips with a
+    // tail and beside a plain selector; two selectors over one subject order
+    // by their whole text.
+    #[test]
+    fn a_selector_naming_its_trait_round_trips_and_sorts() {
+        for source in [
+            "import pkg::a::{ (impl Box with One) };\n",
+            "import pkg::a::{ (impl Box with One)::describe };\n",
+            "import pkg::a::{ (impl Box<_> with Feed<i32>) };\n",
+        ] {
+            assert_sorts(source, source);
+        }
+        assert_sorts(
+            "import pkg::a::{ (impl Box with Two), (impl Box with One) };\n",
+            "import pkg::a::{ (impl Box with One), (impl Box with Two) };\n",
+        );
     }
 
     // A `use` always sorts after every `import`, whatever the paths — the kind

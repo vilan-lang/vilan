@@ -74,7 +74,7 @@ path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set )
                    | "as" NAME ] ;        (* alias, §4.3 *)
 path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
 set-element = path-branch | impl-selector ;
-impl-selector = "(" "impl" type ")"
+impl-selector = "(" "impl" type [ "with" type ] ")"
                 [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
@@ -137,7 +137,11 @@ which of the module's `impl` blocks this file admits, and its optional
 `::` tail names the members it takes (§4.3). `_` stands for any type at
 an argument position (`(impl List<_>)`) and `(impl _)` selects every
 implementation the module declares; a selector writes no `type X` binders
-and takes no `as`. The subject is the ordinary `type` production, and it
+and takes no `as`. `with TRAIT` names the block by the trait it implements,
+as its declaration does — `(impl Box with One)` takes `impl Box with One`
+and no other `Box` block — which is how a block with no declarations of its
+own (all defaults, or a marker) is named; the trait resolves in the
+importing file's scope, as the subject does. The subject is the ordinary `type` production, and it
 resolves in the IMPORTING file's scope, so `impl S` reaches an alias that
 file bound and `impl item::Struct` is the qualified spelling.
 

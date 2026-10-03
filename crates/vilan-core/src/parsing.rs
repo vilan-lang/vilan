@@ -7892,6 +7892,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         self.refuse_selector_binders(&subject);
         let subject_text = self.text_of(subject.1);
+        // B455 (RULED 2026-10-01): `with TRAIT` names the block by the trait it
+        // implements, the declaration's own spelling.
+        let trait_ = match self.eat_word("with") {
+            true => match self.parse_type() {
+                Some(trait_) => {
+                    self.refuse_selector_binders(&trait_);
+                    Some(trait_)
+                }
+                None => {
+                    return Some(self.selector_refusal(
+                        start,
+                        Some((subject, subject_text)),
+                        Vec::new(),
+                    ));
+                }
+            },
+            false => None,
+        };
+        let trait_text = trait_
+            .as_ref()
+            .map(|trait_| Cow::Borrowed(self.text_of(trait_.1)));
         if !self.eat_ctrl(')') {
             return Some(self.selector_refusal(start, Some((subject, subject_text)), Vec::new()));
         }
@@ -7934,6 +7955,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some(ImportBranch::Selector(Box::new(ImplSelector {
             subject: Some(Box::new(subject)),
             subject_text: Cow::Borrowed(subject_text),
+            trait_: trait_.map(Box::new),
+            trait_text,
             members,
             span: self.span_from(start),
         })))
@@ -8009,6 +8032,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         ImportBranch::Selector(Box::new(ImplSelector {
             subject,
             subject_text: Cow::Borrowed(subject_text),
+            trait_: None,
+            trait_text: None,
             members,
             span: self.span_from(start),
         }))

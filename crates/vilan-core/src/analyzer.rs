@@ -6165,6 +6165,11 @@ pub struct ImplAdmission {
     /// (importing file, impl block) — a `#(impl T)` selector's reach into a
     /// hidden block. The ONLY way past the export gate.
     reached: HashSet<(SourceId, Id)>,
+    /// (importing file, impl block) — the blocks a WHOLE-block selector took
+    /// (no `::` tail). Members alone cannot say so for a block that declares
+    /// and inherits nothing — a marker impl, `impl Box with Marker {}` — and
+    /// such a block is admitted by naming it (B455).
+    whole_blocks: HashSet<(SourceId, Id)>,
 }
 
 impl ImplAdmission {
@@ -6237,7 +6242,11 @@ impl ImplAdmission {
         if !self.export_gate_admits(importer, implementation) {
             return false;
         }
-        if !self.restricting.contains(&importer) {
+        if !self.restricting.contains(&importer)
+            || self
+                .whole_blocks
+                .contains(&(importer, implementation.impl_id))
+        {
             return true;
         }
         match self.admitted.get(&(importer, implementation.source)) {
@@ -6355,6 +6364,14 @@ pub struct ImportImplSelector {
     /// `(impl List<_>)` reaches a concrete `impl List<i32>` and `(impl _)`
     /// reaches every block.
     pub subject: TypeId,
+    /// `(impl Box with One)` — the trait the selected block implements (B455,
+    /// RULED 2026-10-01), as a type walked in the importer's scope, and its
+    /// text. It narrows the subject's blocks to the one written `impl Box with
+    /// One`, which is how a block with no declarations of its own is named.
+    /// Read as a TYPE, like the subject, because the import walk runs before
+    /// the names it reaches have settled; a name that settles to no trait
+    /// takes no block and is refused after the build.
+    pub trait_type: Option<(TypeId, String)>,
     /// The members the `::` tail named, empty when the selector takes the whole
     /// block.
     pub members: Vec<(String, Span)>,
@@ -31977,6 +31994,18 @@ impl<'src> Analyzer<'src> {
     /// Whether a selector reaches a block: the block's subject and the
     /// selector's type unify in EITHER direction — [`selector_admits`]'s
     /// reading, over the analyzer's own comparison.
+    /// Whether `selector` takes `implementation`: the subjects unify
+    /// ([`Self::selector_reaches`]) and, where the selector names a trait, the
+    /// block implements it (B455).
+    fn selector_takes(
+        &self,
+        implementation: &Implementation,
+        selector: &ImportImplSelector,
+    ) -> bool {
+        self.selector_reaches(implementation.subject, selector.subject)
+            && selector_names_block_trait(&self.type_id_to_type_map, implementation, selector)
+    }
+
     fn selector_reaches(&self, impl_subject: TypeId, selector: TypeId) -> bool {
         let impl_type = impl_subject.get_type(self);
         let selector_type = selector.get_type(self);
@@ -32037,7 +32066,7 @@ impl<'src> Analyzer<'src> {
                 for selector in row.selectors.iter().filter(|selector| selector.reached) {
                     for implementation in &self.implementations {
                         if hidden.contains(&implementation.impl_id)
-                            && self.selector_reaches(implementation.subject, selector.subject)
+                            && self.selector_takes(implementation, selector)
                         {
                             reached.insert((row.source, implementation.impl_id));
                         }
@@ -32064,7 +32093,7 @@ impl<'src> Analyzer<'src> {
             for selector in &row.selectors {
                 for implementation in &self.implementations {
                     if !sources.contains(&implementation.source)
-                        || !self.selector_reaches(implementation.subject, selector.subject)
+                        || !self.selector_takes(implementation, selector)
                     {
                         continue;
                     }
@@ -44680,10 +44709,27 @@ impl<'src> Analyzer<'src> {
             let reached = self
                 .reach_marked_spans
                 .contains(&(self.current_source_id, selector.span));
+            let trait_type = selector
+                .trait_
+                .as_deref()
+                .zip(selector.trait_text.as_deref())
+                .map(|(trait_, trait_text)| {
+                    // A trait POSITION, like an impl's `with` clause: a trait
+                    // is what belongs here, not the value-position mistake.
+                    (
+                        self.walk_trait_position_type_node(trait_, selector_scope_id),
+                        trait_text.to_string(),
+                    )
+                });
+            let text = match &selector.trait_text {
+                Some(trait_text) => format!("{} with {trait_text}", selector.subject_text),
+                None => selector.subject_text.to_string(),
+            };
             selectors.push(ImportImplSelector {
                 span: selector.span,
-                text: selector.subject_text.to_string(),
+                text,
                 subject: subject_type_id,
+                trait_type,
                 members: selector
                     .members
                     .iter()
@@ -71675,6 +71721,8 @@ pub fn build_impl_admission(program: &mut Program) {
     // marker's job is to name a block, and the block's module is the one the
     // statement walked to, which the subject test already decides.
     let mut reached: HashSet<(SourceId, Id)> = HashSet::default();
+    // B455: the blocks a whole-block selector named, a marker block included.
+    let mut whole_blocks: HashSet<(SourceId, Id)> = HashSet::default();
     let collisions = std::mem::take(&mut program.cross_module_collisions);
     let hidden = std::mem::take(&mut program.hidden_impls_pending);
     // N95: the drain is what makes the field's name true, and the name is all
@@ -71690,7 +71738,7 @@ pub fn build_impl_admission(program: &mut Program) {
             for selector in row.selectors.iter().filter(|selector| selector.reached) {
                 for implementation in &program.implementations {
                     if hidden.contains(&implementation.impl_id)
-                        && selector_admits(program, implementation.subject, selector.subject)
+                        && selector_takes_block(program, implementation, selector)
                     {
                         reached.insert((row.source, implementation.impl_id));
                     }
@@ -71733,19 +71781,48 @@ pub fn build_impl_admission(program: &mut Program) {
         }
         let mut admitted: HashSet<Id> = HashSet::default();
         for selector in &row.selectors {
+            // B455: `with` names a TRAIT. A name that settled to something
+            // else takes no block; say so at the name rather than as the
+            // "admits nothing" miss below.
+            // A name that did not resolve has its own "cannot find" already,
+            // and a second sentence about the selector would bury it.
+            if let Some((type_id, trait_text)) = &selector.trait_type {
+                match program.type_id_to_type_map.get(type_id) {
+                    Some(Type::Trait(..)) => {}
+                    Some(Type::Unknown | Type::Unresolved) | None => continue,
+                    Some(_) => {
+                        selector_misses.push((
+                            row.source,
+                            selector.span,
+                            format!(
+                                "`{trait_text}` is not a trait: a selector's `with` names the \
+                                 trait the block implements, as its declaration does (`(impl \
+                                 Box with One)` selects `impl Box with One`)"
+                            ),
+                        ));
+                        continue;
+                    }
+                }
+            }
             let mut members: Vec<Id> = Vec::new();
+            // What the reached blocks provide, for the refusal that names it.
+            let mut provided: Vec<String> = Vec::new();
             let mut subject_reached = false;
             // B350: whether the `#` on this selector reached anything HIDDEN.
             let mut reached_a_hidden_block = false;
             for implementation in &program.implementations {
                 if !sources.contains(&implementation.source)
-                    || !selector_admits(program, implementation.subject, selector.subject)
+                    || !selector_takes_block(program, implementation, selector)
                 {
                     continue;
                 }
                 subject_reached = true;
                 reached_a_hidden_block |= hidden.contains(&implementation.impl_id);
+                if selector.members.is_empty() {
+                    whole_blocks.insert((row.source, implementation.impl_id));
+                }
                 for (name, member_id) in &implementation.declarations {
+                    provided.push(name.to_string());
                     if selector.members.is_empty()
                         || selector.members.iter().any(|(taken, _)| taken == name)
                     {
@@ -71757,6 +71834,7 @@ pub fn build_impl_admission(program: &mut Program) {
                 // block `(impl Box)` names, and `(impl Box)::describe` takes
                 // the default it inherits.
                 for (name, member_id) in inherited_default_members(program, implementation) {
+                    provided.push(name.clone());
                     if selector.members.is_empty()
                         || selector.members.iter().any(|(taken, _)| *taken == name)
                     {
@@ -71799,7 +71877,15 @@ pub fn build_impl_admission(program: &mut Program) {
             // dropped it. Said HERE, at the selector, where the fix is. Two
             // shapes: a subject no block in the module has, and a subject that
             // reaches a block whose members the `::` tail then misses.
-            if !subject_reached || members.is_empty() {
+            //
+            // B455: a WHOLE-block selector that reaches a block admits it, a
+            // block with no members at all (a marker impl) included — so the
+            // second shape is only a `::` tail naming nothing the blocks
+            // provide, and the refusal names what they do provide. (It read
+            // "declares : the selector admits nothing" for a whole-block
+            // selector over a member-less block, with nothing to fill the
+            // slot and nothing the author could select instead.)
+            if !subject_reached || (!selector.members.is_empty() && members.is_empty()) {
                 let subject = &selector.text;
                 let modules = sources
                     .iter()
@@ -71813,9 +71899,19 @@ pub fn build_impl_admission(program: &mut Program) {
                         .map(|(name, _)| format!("`{name}`"))
                         .collect::<Vec<_>>()
                         .join(", ");
+                    provided.sort();
+                    provided.dedup();
+                    let offers = match provided.is_empty() {
+                        true => format!("nothing — select the block whole: `(impl {subject})`"),
+                        false => provided
+                            .iter()
+                            .map(|name| format!("`{name}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    };
                     format!(
                         "no `impl {subject}` this statement carries declares {named}: the \
-                         selector admits nothing"
+                         selector admits nothing. The blocks it reaches provide {offers}"
                     )
                 } else {
                     format!(
@@ -71879,6 +71975,7 @@ pub fn build_impl_admission(program: &mut Program) {
         selector_of,
         hidden,
         reached,
+        whole_blocks,
     };
     CARRIED_ROWS_CENSUS.with(|census| census.set(carried.len()));
     if !collisions.is_empty() {
@@ -72245,6 +72342,7 @@ pub fn check_call_site_admission(program: &mut Program) {
         selector_of,
         hidden,
         reached,
+        whole_blocks: _,
     } = program.impl_admission.clone();
     // Which implementation declares a member — `declarations` read backwards,
     // built once for the pass rather than scanned per call.
@@ -72643,6 +72741,36 @@ fn merge_admitted_block(
 fn selector_admits(program: &Program, subject: TypeId, selector: TypeId) -> bool {
     crate::impl_select::subject_applies(program, subject, selector)
         || crate::impl_select::subject_applies(program, selector, subject)
+}
+
+/// [`selector_admits`] over a whole block: the subjects unify and, where the
+/// selector names a trait, the block implements it (B455).
+fn selector_takes_block(
+    program: &Program,
+    implementation: &Implementation,
+    selector: &ImportImplSelector,
+) -> bool {
+    selector_admits(program, implementation.subject, selector.subject)
+        && selector_names_block_trait(&program.type_id_to_type_map, implementation, selector)
+}
+
+/// B455: a selector that names a trait (`(impl Box with One)`) takes only the
+/// block whose `with` clause names it — the declaration's own spelling, so
+/// `impl Box with Sub` is `(impl Box with Sub)` even where `Sub` brings a
+/// supertrait along. A selector naming no trait takes every block of the
+/// subject.
+fn selector_names_block_trait(
+    types: &HashMap<TypeId, Type>,
+    implementation: &Implementation,
+    selector: &ImportImplSelector,
+) -> bool {
+    match &selector.trait_type {
+        None => true,
+        Some((type_id, _)) => match types.get(type_id) {
+            Some(Type::Trait(trait_id, _)) => implementation.trait_ids.contains(trait_id),
+            _ => false,
+        },
+    }
 }
 
 /// Reject an async `drop` body (destruction.md §5): teardown must be synchronous

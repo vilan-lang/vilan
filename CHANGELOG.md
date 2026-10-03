@@ -65,6 +65,11 @@ written down.
 
 ---
 
+<!-- family: feature -->
+**An impl selector names its block by the trait it implements, as the declaration does: `import pkg::p::{ (impl Box with One) };` takes `impl Box with One` and no other `Box` block — and a whole-block selector admits a block that declares and inherits NOTHING (a marker impl), where the refusal read "no `impl Box` this statement carries declares : the selector admits nothing" with an empty slot and no spelling that could take the block.** B455, RULED 2026-10-01 (B): the spelling mirrors the declaration; `(impl Box)::One` was declined (a `::` tail cannot tell a trait from a member). The parser reads `with TRAIT` after the subject (refusing binders there as in the subject), the formatter prints it and sorts two selectors over one subject by their whole text, and the analyzer resolves the trait in the importing file's scope — a name that is no trait is refused where it is written: `` `Box` is not a trait: a selector's `with` names the trait the block implements, as its declaration does ``. Both admission maps (the lookup's and the post-build `ImplAdmission`) take a block only when the selector's subject reaches it and, where a trait is named, the block's `with` clause names it; `ImplAdmission` keeps the whole blocks a selector named, so a bound on a marker trait holds in a restricting file. A `::` tail that names nothing the selected blocks provide is still refused, and the sentence now says what they DO provide: `` … the selector admits nothing. The blocks it reaches provide `describe` `` (or "nothing — select the block whole"). Grammar: `impl-selector = "(" "impl" type [ "with" type ] ")" …`. Pins: `module_resolution`'s `b455_a_selector_names_a_block_by_its_trait` (with One, with Two, a tail after the trait), `b455_a_selector_admits_a_marker_block`, `b455_a_selector_that_admits_nothing_names_what_the_block_provides`, `b455_a_selector_with_a_non_trait_is_refused`; the formatter's `a_selector_naming_its_trait_round_trips_and_sorts`. Docs: `spec/grammar.md`'s selector rule and prose, `spec/names.md` §4.3. Ledger: one `NEW` row. No golden moves. Tracker B455.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

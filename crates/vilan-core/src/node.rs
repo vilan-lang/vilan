@@ -543,6 +543,14 @@ pub struct ImplSelector<'src> {
     /// and keys the sort on it (`visibility.md` §7.2: selectors sort after
     /// every name in a set, by their rendered type text).
     pub subject_text: Cow<'src, str>,
+    /// `with TRAIT` — the block named by the trait it implements (B455, RULED
+    /// 2026-10-01: `(impl Box with One)` mirrors the declaration it selects).
+    /// It is how a block with NO declarations of its own — all defaults, or a
+    /// marker — is named: a `::` tail cannot tell a trait from a member.
+    /// `None` on a synthesized selector even when its text carries one.
+    pub trait_: Option<Box<Spanned<Node<'src>>>>,
+    /// The trait's text, reprinted verbatim after ` with ` like the subject.
+    pub trait_text: Option<Cow<'src, str>>,
     /// `::name` / `::{ a, b }` — the members this selector takes into the
     /// type's namespace for this file. Empty when the selector takes the whole
     /// block.

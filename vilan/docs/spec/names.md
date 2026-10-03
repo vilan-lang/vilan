@@ -272,7 +272,10 @@ every block declared in `a`'s file and in every file on the path to it,
 `import a::{ (impl T) }` admits exactly the blocks whose subject unifies
 with `T`. A block's members are what it declares AND the trait defaults it
 inherits, so a default-only `impl Box with One {}` is a block `(impl Box)`
-admits, and `(impl Box)::describe` takes the default it inherits. Method
+admits, and `(impl Box)::describe` takes the default it inherits.
+`(impl Box with One)` takes that block alone among `Box`'s, naming it by the
+trait as its declaration does; a whole-block selector admits a block that
+declares and inherits nothing (a marker impl) as well. Method
 lookup reads the file's namespace: two blocks offering one name, one of
 them declined by the file, are not ambiguous — the admitted block answers —
 and a call only a declined block answers is refused, naming the import
