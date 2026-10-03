@@ -214,8 +214,28 @@ compile no macro world at all — and that memory lives under
 `~/.vilan/check-cache/`, keyed by the package's path, *not* in the package.
 `dist/.cache` belongs to `vilan build`, which has a `dist/` because it has
 artifacts; a check has neither, and creating one would make a read-only
-command mutate the tree it was pointed at. `vilan cache prune` sweeps the
-check tables beside the std trees.
+command mutate the tree it was pointed at. The root holds itself to a
+bound — tables untouched for thirty days go, and past 256 tables or 256 MiB
+the oldest go first — and `vilan cache clean` empties it; `vilan cache
+prune` sweeps the check tables beside the std trees. `VILAN_CHECK_CACHE`
+names a different root.
+
+In a multi-entry package the entries are checked **at the same time**, one
+thread each, and their diagnostics are printed in entry order, exactly as
+a one-by-one round would print them (`VILAN_SEQUENTIAL_CHECK=1` runs them
+one by one).
+
+**`--explain-cost [N]`** prints, after checking, the `N` declarations
+(default 20) of your own package whose type inference cost the solver the
+most work: the constraint attempts, inferences, impl selections, type slots
+and impl rows its body's constraints took, each a *count* — never a time —
+so the same program ranks the same on every machine. Closures count toward
+the function that writes them, generated code toward the attribute that
+generated it, and std's declarations are left out.
+
+```sh
+vilan check --explain-cost 5
+```
 
 **`--fix`** is the one exception to "writes nothing", and it is asked for
 by name. Before checking, it applies the fix every **numeric mismatch**
@@ -860,3 +880,19 @@ nothing can keep memory without writing into your tree. Deleting a table
 costs a recompile of that package's macro worlds and nothing else; the
 same seven-day guard applies, because a check running right now is holding
 its own table open.
+
+## `vilan cache clean`
+
+Deletes every macro expansion table `vilan check` keeps in
+`~/.vilan/check-cache/`, whatever its age. Each one is re-created by the
+next check of its package, so nothing is lost but the warm start.
+
+```sh
+vilan cache clean            # every check table
+vilan cache clean --dry-run  # print what would go, with sizes; delete nothing
+```
+
+A check also holds that root to a bound by itself, at most once a day:
+every table untouched for thirty days goes, and past 256 tables or 256 MiB
+the oldest go first — never the package being checked, and never a table
+younger than ten minutes, which a check running right now may be reading.

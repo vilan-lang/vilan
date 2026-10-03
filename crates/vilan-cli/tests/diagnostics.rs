@@ -602,8 +602,73 @@ fn phase_timing_env_var_prints_the_phase_split() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M106: `vilan check --explain-cost N` prints the package's own declarations
+/// ranked by the solver work their constraints cost — counts, never time —
+/// and leaves std's out. The default (no flag) prints nothing of it.
+#[test]
+fn explain_cost_ranks_the_packages_own_declarations_by_work() {
+    let dir = temp_package(
+        "explaincost",
+        "import std::io::print;\n\
+         fun wrap<T>(value: T): Option<T> { Some(value) }\n\
+         fun heavy(): i32 {\n\
+         \tlet a = wrap(wrap(wrap(wrap(wrap(1)))));\n\
+         \tlet c = [wrap(1), wrap(2), wrap(3), wrap(4)];\n\
+         \tlet d = c.map(|item| item.unwrap_or(0)).fold(0, |sum, value| sum + value);\n\
+         \tmatch a { Some(_) => d, None => 0 }\n\
+         }\n\
+         fun light(): i32 { 1 }\n\
+         fun main() { print(heavy() + light()); }\n",
+    );
+    let run = |arguments: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .current_dir(&dir)
+            .arg("check")
+            .args(arguments)
+            .arg(".")
+            .output()
+            .expect("run vilan");
+        assert!(
+            output.status.success(),
+            "the fixture must check cleanly; stderr was: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let report = run(&["--explain-cost", "3"]);
+    let rows: Vec<&str> = report
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with("work"))
+        .skip(1)
+        .take_while(|line| {
+            line.trim_start()
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit())
+        })
+        .collect();
+    assert!(
+        report.starts_with("cost (") && rows.len() <= 3 && !rows.is_empty(),
+        "the report must have its header and at most three rows:\n{report}"
+    );
+    assert!(
+        rows[0].contains(" heavy ("),
+        "`heavy` must rank first:\n{report}"
+    );
+    assert!(
+        !report.contains("std/"),
+        "std's declarations are left out:\n{report}"
+    );
+    assert!(
+        !run(&[]).contains("cost ("),
+        "without the flag there is no report"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// M98: `VILAN_PHASE_TIMING=passes` adds the checks phase's per-pass split —
-/// one `[vilan pass]` line per pass that cost a millisecond, its own prefix so
+/// one `[vilan pass]` line per pass that cost a millisecond (or minted a
+/// thousand type slots, M108), its own prefix so
 /// the positional `[vilan phase]` readers never see it — and every value of
 /// the switch prints the `emission-walk … program-drop …` row, the two costs
 /// after the post-passes that no phase line used to name.
@@ -650,9 +715,17 @@ fn phase_timing_passes_prints_the_per_pass_split_and_the_emission_row() {
             .trim_end_matches("cpu")
             .parse()
             .unwrap_or_else(|_| panic!("`{line}`'s cpu figure must be a number"));
+        // M108: a pass that minted a thousand type slots prints however
+        // little CPU it took — the slots are held until the program drops.
+        let slots: u64 = line
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("slots+"))
+            .unwrap_or_else(|| panic!("`{line}` carries no `slots+<n>` figure"))
+            .parse()
+            .unwrap_or_else(|_| panic!("`{line}`'s slots figure must be a number"));
         assert!(
-            milliseconds >= 1.0,
-            "`{line}` is under the one-millisecond floor the split prints at"
+            milliseconds >= 1.0 || slots >= 1000,
+            "`{line}` is under both floors the split prints at (a millisecond, a thousand slots)"
         );
     }
     assert!(
@@ -1832,12 +1905,64 @@ fn check_of_a_sound_entry_is_green_and_writes_nothing() {
 // --- M35: a multi-entry check compiles its entries in parallel -------------
 //
 // The members of a workspace are independent analyses that shared one thread.
-// They now share a process instead: the first runs alone (it fills the
-// process-global caches every later one hits), and the rest run one thread
-// each. Their diagnostics are captured rather than raced to stderr, and
+// They now share a process instead, one thread each, all started at once
+// (M100: M35 ran the first alone to warm the caches, which left a client and
+// a server fully serial). Their diagnostics are captured rather than raced to stderr, and
 // replayed in MEMBER order with the B182 ledger applied there — so what a
 // reader sees is what a sequential round wrote, and nothing about the
 // scheduler reaches the terminal.
+
+/// M100/M108: a one-shot `vilan check` whose members key distinct worlds
+/// (here a browser and a node entry: the platform is in the key) stores no
+/// base world — no later round and no other member can hit one, and the clones
+/// were the largest thing left alive once the members overlap. Two members on
+/// one platform (the three-entry package's server and probe) may share a world,
+/// so that round stores. Read off `VILAN_COUNTERS`' `world-stored` line.
+#[test]
+fn a_one_shot_check_stores_a_base_world_only_when_two_members_could_share_it() {
+    let stored = |manifest: &'static str, entries: &[&'static str]| {
+        let mut files = vec![
+            ("vilan.toml", manifest),
+            ("src/store.vl", "struct Store {\n\tname: str,\n}\n"),
+        ];
+        files.extend(
+            three_entries()
+                .into_iter()
+                .filter(|(path, _)| entries.iter().any(|entry| path.ends_with(entry))),
+        );
+        let dir = temp_files("store_policy", &files);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .current_dir(&dir)
+            .args(["check", "."])
+            .env("VILAN_COUNTERS", "1")
+            .output()
+            .expect("run vilan");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "the fixture must check cleanly: {stderr}"
+        );
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("[vilan counters] world-stored"))
+            .count()
+    };
+    let two = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\
+               \n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+    assert_eq!(
+        stored(two, &["client.vl", "server.vl"]),
+        0,
+        "a client and a server key distinct worlds, so a one-shot check stores neither"
+    );
+    assert!(
+        stored(
+            THREE_ENTRY_MANIFEST,
+            &["client.vl", "server.vl", "probe.vl"]
+        ) > 0,
+        "two node members may share a world, so the round stores"
+    );
+}
 
 /// A three-entry package with a mistake in the module all three reach AND one
 /// mistake of its own per entry — the shape that makes both halves of the

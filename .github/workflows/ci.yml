@@ -376,6 +376,50 @@ jobs:
       - name: No advisory against the dependency tree
         run: scripts/ci-local.sh audit
 
+  # The instruction budgets (M105 S3, `proposal/performance-gates.md` §3, RULED
+  # Q1/Q4/Q7). v0.42.0 shipped a 3x CPU regression on the owner's application
+  # with every leg above green: nothing gated the aggregate cost. This does,
+  # by COUNT rather than by clock — a shared runner is a loaded machine by
+  # construction, and wall and CPU time move with load while user-space
+  # instructions move by parts per million (§2.2). The subjects are the
+  # examples, the seeded kolt-shaped app of `scripts/perf_genapp.py` (so the
+  # gate never needs the private repository, §5) and a plain package at two
+  # sizes whose RATIO is held to x2.3 per doubling (M107, Q11).
+  #
+  # Whether a GitHub runner exposes the hardware counter was not measurable
+  # from the lane that built this (S2): `perf_count.py` uses it when the
+  # kernel allows and falls back to callgrind's Ir otherwise, which is why
+  # valgrind is installed, and the measured JSON names the counter it used.
+  # Ceilings bind only the class they were measured on, so until a seal adopts
+  # this job's own uploaded counts (`perf_gate.py ratchet --from`), the ci
+  # class's rows report and only the growth ratio refuses — and the artifact
+  # is the spread measurement S2 asks for, one per run.
+  perf:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      VILAN_PERF_CLASS: ci
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # Its own cache entry: a RELEASE `target/`, which no other leg builds.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: perf
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
+      - name: The callgrind fallback, for a runner with no PMU
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: The instruction budgets hold
+        run: scripts/ci-local.sh perf
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: perf-measured
+          path: target/perf-gate/measured.json
+          if-no-files-found: ignore
+
   # **This is the job to make a required status check** (process.md §2.5, where
   # it is called `ci`; the context reads `ci / check`). Everything above it can
   # legitimately not run; this cannot, which is the entire point — a required
@@ -390,13 +434,13 @@ jobs:
   #   cancelled-> FAIL    the result is unknown, and unknown is not green
   #
   # So a docs-only or root-prose-only push takes the cheap path — `changes`
-  # runs, `test`, `wasm`, `fmt`, `vilan-fmt`, `clippy` and `audit` skip, `check`
+  # runs, `test`, `wasm`, `fmt`, `vilan-fmt`, `clippy`, `audit` and `perf` skip, `check`
   # is green —
   # and any red leg turns `check` red. `changes` is in `needs` on purpose: if
   # the filter itself fails, the expensive legs skip, and without this the
   # aggregate would call that a pass.
   check:
-    needs: [changes, test, wasm, fmt, vilan-fmt, clippy, audit]
+    needs: [changes, test, wasm, fmt, vilan-fmt, clippy, audit, perf]
     if: always()
     runs-on: ubuntu-latest
     steps:

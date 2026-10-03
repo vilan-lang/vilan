@@ -39,7 +39,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # misformatted tree is a 20-second red rather than a 10-minute one, then the
 # suite, then the two builds, then the cross-check. THIS LIST IS THE JOB LIST —
 # ci_local_script.rs holds it against ci.yml's jobs in both directions.
-LEGS="fmt vilan-fmt clippy test doctest audit wasm windows"
+LEGS="fmt vilan-fmt clippy test doctest audit wasm perf windows"
 
 # Legs with no ci.yml job, and why (see THE WINDOWS LEG above). A leg named here
 # must not appear in any workflow `run:` step; the pin checks that too, so a leg
@@ -142,6 +142,21 @@ leg_wasm() {
     # And RUN it (N134): v0.41.0 shipped a compiler that built, bound, and
     # trapped on every compile. The smoke is the page's four claims under node.
     node scripts/wasm-smoke.mjs target/wasm-pkg
+}
+
+# The instruction budgets (M105 S3, `proposal/performance-gates.md` §3's T2).
+# A RELEASE build — counts are taken on the binary users run, and debug/release
+# differ by more than a constant (§2.4) — then `perf_gate.py gate`: every row
+# of `perf/budgets.toml` against its ceiling for this machine's CLASS
+# (`VILAN_PERF_CLASS`; ci.yml sets `ci`, the reference machine `reference`), and
+# the growth rows (a package twice the size costs at most x2.3) everywhere.
+# Counts, never clocks: `instructions:u` from the hardware counter, callgrind's
+# Ir where the machine exposes no PMU. A class with no ceilings yet reports its
+# counts and refuses only on growth, until a seal adopts them (`ratchet`).
+leg_perf() {
+    cargo build --release -p vilan-cli
+    python3 scripts/perf_gate.py gate --vilan target/release/vilan \
+        --class "${VILAN_PERF_CLASS:-local}" --json target/perf-gate/measured.json
 }
 
 # LOCAL ONLY. Not the windows suite — the windows COMPILE. See the header.

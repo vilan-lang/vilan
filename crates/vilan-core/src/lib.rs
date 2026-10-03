@@ -12,6 +12,7 @@ pub mod closest_name;
 pub mod const_eval;
 pub mod context;
 pub mod contract_hash;
+pub mod counters;
 pub mod css;
 pub mod css_properties;
 pub mod dead_items;
@@ -1216,6 +1217,7 @@ pub fn post_analysis_passes(
     if !macros::in_macro_world() {
         depth_stats::report();
     }
+    counters::checkpoint("post-passes");
 }
 
 /// Anchor the `VILAN_DEPTH_STATS` instrument for an analysis a front end is
@@ -1493,12 +1495,18 @@ thread_local! {
     /// The thread CPU reading at the previous [`phase_pass_mark`].
     static PHASE_PASS_LAST: std::cell::Cell<std::time::Duration> =
         const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    /// [`counters::type_slots_minted`] at the previous [`phase_pass_mark`].
+    static PHASE_PASS_SLOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Starts a per-pass split: the next [`phase_pass_mark`] measures from here.
 pub fn phase_pass_mark_start() {
     if phase_pass_split_enabled() {
         PHASE_PASS_LAST.with(|last| last.set(thread_cpu_now().unwrap_or_default()));
+        PHASE_PASS_SLOTS.with(|last| last.set(counters::type_slots_minted()));
+        if counters::heap_armed() {
+            counters::reset_heap_peak();
+        }
     }
 }
 
@@ -1510,7 +1518,11 @@ pub fn phase_pass_mark(pass: &str) {
     }
     let now = thread_cpu_now().unwrap_or_default();
     let spent = now.saturating_sub(PHASE_PASS_LAST.with(|last| last.replace(now)));
-    if spent < std::time::Duration::from_millis(1) {
+    let slots_now = counters::type_slots_minted();
+    let slots = slots_now.saturating_sub(PHASE_PASS_SLOTS.with(|last| last.replace(slots_now)));
+    // A pass that minted type slots prints however little CPU it took: the
+    // slots are held until the program drops, so they are M108's measure.
+    if spent < std::time::Duration::from_millis(1) && slots < 1000 {
         return;
     }
     let world = if macros::in_macro_world() {
@@ -1518,16 +1530,17 @@ pub fn phase_pass_mark(pass: &str) {
     } else {
         ""
     };
-    match resident_megabytes() {
-        Some(megabytes) => eprintln!(
-            "[vilan pass]{world} {:.1}cpu rss={megabytes}MB {pass}",
-            spent.as_secs_f64() * 1000.0
-        ),
-        None => eprintln!(
-            "[vilan pass]{world} {:.1}cpu {pass}",
-            spent.as_secs_f64() * 1000.0
-        ),
-    }
+    // The live heap and the pass's own peak when `VILAN_COUNTERS` armed the
+    // counting allocator (M108's heap profile by pass): RSS alone cannot say
+    // which pass held the bytes, because the allocator keeps pages it freed.
+    let heap = counters::heap_fragment();
+    let rss = resident_megabytes()
+        .map(|megabytes| format!(" rss={megabytes}MB"))
+        .unwrap_or_default();
+    eprintln!(
+        "[vilan pass]{world} {:.1}cpu{rss}{heap} slots+{slots} {pass}",
+        spent.as_secs_f64() * 1000.0
+    );
 }
 
 /// The process's resident set in megabytes, where the host says (`VmRSS`).
