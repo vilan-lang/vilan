@@ -22,7 +22,7 @@
 #
 # `[[growth]]` holds everywhere, whatever the class: the plain package of `small` and of `large` modules,
 # measured in one run, may differ by at most `max_ratio` (≤ x2.3 per doubling, Q11; M107 met it in
-# Order 46 at x1.94 from x2.80).
+# Order 46 at x1.94 from v0.43.0's x2.99).
 #
 # `[[e121]]` are the editor's targets (Q9) on the seal's LSP harness rows: each reports red until it has
 # been green at two consecutive seals (`green_seals`), then `blocking` flips and it refuses (S8).
