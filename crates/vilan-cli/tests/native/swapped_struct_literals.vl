@@ -1,0 +1,80 @@
+// F82: a struct literal of ANOTHER instantiation inside the struct's own impl
+// — `Pair<V, K>` built in `impl Pair<type K, type V>` — closes each field from
+// the field's declared type read under the LITERAL's arguments. The impl's
+// binders are the declaration's parameters, so the literal binds the same two
+// the other way round, and the substitution in force (one binding per
+// parameter) could not say both: a field that only MENTIONED a parameter
+// expected nothing, and `held = Maybe::Nothing` was refused as "a generic type
+// instantiated at `any`". The emitter now mints the field's type with the
+// literal's arguments written in. Each field is one shape: a nullary variant,
+// `None`, an empty list, a cell around `None`, a tuple of both parameters, a
+// bare parameter, a field whose type names no parameter, and a closure.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
+
+enum Maybe<T> {
+	Nothing,
+	Just(T),
+}
+
+struct Pair<K, V> {
+	key: K,
+	held: Maybe<V>,
+	spare: Option<V>,
+	seen: List<K>,
+	cell: Shared<Option<V>>,
+	both: (K, V),
+	count: i32,
+	make: |K| V,
+}
+
+impl Pair<type K, type V> {
+	fun swap(self, value: V, fallback: K): Pair<V, K> {
+		Pair {
+			key = value,
+			held = Maybe::Nothing,
+			spare = None,
+			seen = [],
+			cell = Shared::new(None),
+			both = (value, fallback),
+			count = self.count + 1,
+			make = |_v| fallback,
+		}
+	}
+
+	fun describe(self): str {
+		let held = match self.held {
+			Maybe::Nothing => "nothing",
+			Maybe::Just(_) => "just",
+		};
+		let spare = if self.spare is Some(_) { "some" } else { "none" };
+		let stored = if self.cell.read() is Some(_) { "stored" } else { "empty" };
+		i"{held} {spare} {self.seen.len()} {stored} {self.count}"
+	}
+}
+
+fun main() {
+	let pair: Pair<str, i32> = Pair {
+		key = "k",
+		held = Maybe::Just(1),
+		spare = Some(2),
+		seen = ["a"],
+		cell = Shared::new(Some(3)),
+		both = ("b", 4),
+		count = 0,
+		make = |text| text.len().as_i32(),
+	};
+	print(pair.describe());
+	print((pair.make)("four"));
+	let swapped = pair.swap(9, "z");
+	print(swapped.key);
+	print(swapped.describe());
+	print(swapped.both.0);
+	print(swapped.both.1);
+	print((swapped.make)(7));
+	let back = swapped.swap("y", 5);
+	print(back.key);
+	print(back.describe());
+	print((back.make)("q"));
+}

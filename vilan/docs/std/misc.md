@@ -12,6 +12,15 @@ fun panic(message: str)                     // abort with a message
 fun assert(condition: bool, message: str)   // panic when false
 ```
 
+`print` lays a value out as node's `console.log` does, under either
+backend: a string at the top level is written bare and quoted inside a
+container, a struct or a tuple prints as the array it is at run time
+(`[ 1, 'two' ]`), a list of more than six entries is grouped into
+aligned columns, a container wider than 80 columns takes one entry per
+line, and a fourth level of nesting prints `[Array]`. A trait object
+prints as its value — on its own or in a `List` — and as its stored
+`[ value, {} ]` pair inside any other container.
+
 `panic` is for unreachable states (expected failures are `Result`). A
 `panic` arm in a `match` diverges: the other arms decide the match's
 type. `assert` is the `vilan test` failure mechanism.

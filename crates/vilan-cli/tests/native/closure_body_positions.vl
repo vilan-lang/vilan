@@ -1,0 +1,59 @@
+// A closure's expression body is a position of its own: the closure's RETURN.
+// Natively the body was handed the expectation the literal arrived under — the
+// closure TYPE — which matched nothing, so a variant constructor whose site
+// recorded an open type had no position to close from and was refused as
+// "a generic type instantiated at `any`" (`|k: i32| Maybe::Just(k + 1)`).
+// Each payload here records no type of its own: a sum, a string literal, an
+// interpolation, a nested constructor; then an `if` choosing between two
+// constructors, a written return type (also handed to a generic callee), and
+// a numeric literal at a narrow return.
+import std::io::print;
+
+enum Maybe<T> {
+	Just(T),
+	Nothing,
+}
+
+fun describe<T>(maybe: Maybe<T>): str {
+	match maybe {
+		Maybe::Just(_) => "just",
+		Maybe::Nothing => "nothing",
+	}
+}
+
+fun number(maybe: Maybe<i32>): str {
+	match maybe {
+		Maybe::Just(let n) => i"just {n}",
+		Maybe::Nothing => "nothing",
+	}
+}
+
+fun text(maybe: Maybe<str>): str {
+	match maybe {
+		Maybe::Just(let value) => i"just {value}",
+		Maybe::Nothing => "nothing",
+	}
+}
+
+fun apply<T, U>(value: T, f: |T| U): U {
+	f(value)
+}
+
+fun main() {
+	let sum = |k: i32| Maybe::Just(k + 1);
+	print(number(sum(1)));
+	let literal = |_k: i32| Maybe::Just("lit");
+	print(text(literal(1)));
+	let interpolated = |k: i32| Maybe::Just(i"big {k}");
+	print(text(interpolated(2)));
+	let nested = |k: i32| Maybe::Just(Maybe::Just(k * 2));
+	print(describe(nested(3)));
+	let chosen = |k: i32| if k > 2 { Maybe::Just(i"big {k}") } else { Maybe::Nothing };
+	print(text(chosen(1)));
+	print(text(chosen(5)));
+	let written = |k: i32|: Maybe<i32> Maybe::Just(k - 1);
+	print(number(written(10)));
+	print(number(apply(4, |k: i32|: Maybe<i32> Maybe::Just(k * 10))));
+	let narrow = |_k: i32|: u8 200;
+	print(narrow(0));
+}

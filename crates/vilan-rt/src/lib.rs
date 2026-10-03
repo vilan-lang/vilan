@@ -40,6 +40,7 @@ pub mod crypto;
 pub mod executor;
 pub mod fs;
 pub mod http;
+pub mod inspect;
 pub mod json;
 pub mod time;
 
@@ -79,6 +80,30 @@ pub trait Js {
     fn js_nested(&self) -> String {
         self.js()
     }
+    /// The rendering inside a container the JS backend CONVERTS at the host
+    /// boundary (B503): a `List` handed to `print` is mapped element-wise, so
+    /// an object in it reaches node as the value it erased rather than its
+    /// `[ value, table ]` pair. Same as [`Js::js_nested`] for everything but
+    /// a trait object and a list (which carries the conversion into its own
+    /// elements).
+    fn js_hosted(&self) -> String {
+        self.js_nested()
+    }
+    /// Whether the value is a JS `number` (or `bigint`) — the one fact node's
+    /// grouped array layout reads off the values themselves: a column of
+    /// numbers pads at the start, any other at the end ([`inspect`]).
+    fn js_is_number(&self) -> bool {
+        false
+    }
+    /// The slots this value occupies in an enclosing TUPLE's JS array: itself
+    /// — except a tuple, whose elements' slots are spliced in, since the JS
+    /// backend stores a tuple FLAT (`(1, (2, "x"))` is `[ 1, 2, 'x' ]` there).
+    fn js_tuple_slots<'a>(&'a self, slots: &mut Vec<&'a dyn Js>)
+    where
+        Self: Sized,
+    {
+        slots.push(self);
+    }
 }
 
 macro_rules! js_via_display {
@@ -87,6 +112,9 @@ macro_rules! js_via_display {
             fn js(&self) -> String {
                 self.to_string()
             }
+            fn js_is_number(&self) -> bool {
+                true
+            }
         })*
     };
 }
@@ -94,17 +122,29 @@ macro_rules! js_via_display {
 // The integer widths, including R6's: `i53`/`u53` are distinct vilan types with
 // native widths `i64`/`u64` and the documented note that their RANGE guarantee
 // is the JS one, so a program that round-trips both backends behaves the same.
-js_via_display!(bool, i8, u8, i16, u16, i32, u32, i64, u64, usize, isize);
+js_via_display!(i8, u8, i16, u16, i32, u32, i64, u64, usize, isize);
+
+impl Js for bool {
+    fn js(&self) -> String {
+        self.to_string()
+    }
+}
 
 impl Js for f64 {
     fn js(&self) -> String {
         js_number(*self)
+    }
+    fn js_is_number(&self) -> bool {
+        true
     }
 }
 
 impl Js for f32 {
     fn js(&self) -> String {
         js_number(*self as f64)
+    }
+    fn js_is_number(&self) -> bool {
+        true
     }
 }
 
@@ -113,7 +153,7 @@ impl Js for Str {
         self.to_string()
     }
     fn js_nested(&self) -> String {
-        format!("'{self}'")
+        inspect::string(self)
     }
 }
 
@@ -122,7 +162,7 @@ impl Js for str {
         self.to_string()
     }
     fn js_nested(&self) -> String {
-        format!("'{self}'")
+        inspect::string(self)
     }
 }
 
@@ -134,15 +174,21 @@ impl Js for () {
 
 /// A TUPLE renders as the array it is on the JS backend — a vilan tuple and a
 /// vilan struct are both flat arrays there, so `print((a, b))` is `[ a, b ]`
-/// with node's spacing. Written for the arities a program reaches; a wider one
+/// with node's spacing, and a tuple nested in a tuple is spliced in
+/// ([`Js::js_tuple_slots`]). Written for the arities a program reaches; a wider one
 /// is a refusal in the emitter rather than a silently different rendering.
 macro_rules! js_for_tuple {
     ($($name:ident),+) => {
         impl<$($name: Js),+> Js for ($($name,)+) {
             fn js(&self) -> String {
+                let mut slots = Vec::new();
+                self.js_tuple_slots(&mut slots);
+                js_items(&slots)
+            }
+            fn js_tuple_slots<'a>(&'a self, slots: &mut Vec<&'a dyn Js>) {
                 #[allow(non_snake_case, reason = "the binders are the type parameters' own names")]
                 let ($($name,)+) = self;
-                js_tuple(&[$($name.js_nested()),+])
+                $($name.js_tuple_slots(slots);)+
             }
         }
     };
@@ -155,22 +201,23 @@ js_for_tuple!(A, B, C, D);
 js_for_tuple!(A, B, C, D, E);
 js_for_tuple!(A, B, C, D, E, F);
 
+/// A `List` is a JS array: node's layout ([`inspect::array`]). At the top of a
+/// `print`, and inside another list, its elements are in the region the JS
+/// backend converts at the host boundary (B503), so they render HOSTED; inside
+/// any other container they render as stored.
 impl<T: Js> Js for Vec<T> {
     fn js(&self) -> String {
-        if self.is_empty() {
-            // node prints an empty array as `[]`, with no inner space — the one
-            // place the `[ a, b ]` spacing does not apply.
-            return "[]".to_string();
-        }
-        let mut out = String::from("[ ");
-        for (index, item) in self.iter().enumerate() {
-            if index > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(&item.js_nested());
-        }
-        out.push_str(" ]");
-        out
+        self.js_hosted()
+    }
+    fn js_nested(&self) -> String {
+        inspect::array(self.iter().map(|item| item as &dyn Js), |item| {
+            item.js_nested()
+        })
+    }
+    fn js_hosted(&self) -> String {
+        inspect::array(self.iter().map(|item| item as &dyn Js), |item| {
+            item.js_hosted()
+        })
     }
 }
 
@@ -180,8 +227,8 @@ impl<T: Js> Js for Option<T> {
     /// prints `[ 1 ]`. The differential is about bytes, and these are the bytes.
     fn js(&self) -> String {
         match self {
-            Some(value) => format!("[ 0, {} ]", value.js_nested()),
-            None => "[ 1 ]".to_string(),
+            Some(value) => js_items(&[&0i32, value]),
+            None => js_items(&[&1i32]),
         }
     }
 }
@@ -189,20 +236,18 @@ impl<T: Js> Js for Option<T> {
 impl<T: Js, E: Js> Js for Result<T, E> {
     fn js(&self) -> String {
         match self {
-            Ok(value) => format!("[ 0, {} ]", value.js_nested()),
-            Err(error) => format!("[ 1, {} ]", error.js_nested()),
+            Ok(value) => js_items(&[&0i32, value]),
+            Err(error) => js_items(&[&1i32, error]),
         }
     }
 }
 
-/// The rendering an emitted aggregate uses: the JS backend's `[a, b]` array,
-/// with node's spacing. An emitted `impl Js` for a struct or an enum calls this
-/// with its already-rendered parts.
-pub fn js_tuple(parts: &[String]) -> String {
-    if parts.is_empty() {
-        return "[]".to_string();
-    }
-    format!("[ {} ]", parts.join(", "))
+/// The rendering an emitted aggregate uses — a struct's fields, an enum
+/// value's `[index, ...data]` — the JS backend's array, in node's layout
+/// ([`inspect::array`]). Each item renders as stored ([`Js::js_nested`]):
+/// the JS backend converts no aggregate's fields at the host boundary.
+pub fn js_items(items: &[&dyn Js]) -> String {
+    inspect::array(items.iter().copied(), |item| item.js_nested())
 }
 
 impl<T: Js> Js for &T {
@@ -211,6 +256,12 @@ impl<T: Js> Js for &T {
     }
     fn js_nested(&self) -> String {
         (*self).js_nested()
+    }
+    fn js_hosted(&self) -> String {
+        (*self).js_hosted()
+    }
+    fn js_is_number(&self) -> bool {
+        (*self).js_is_number()
     }
 }
 
@@ -640,7 +691,8 @@ impl<T> PartialEq for Shared<T> {
 /// with node's spacing.
 impl<T: Js> Js for Shared<T> {
     fn js(&self) -> String {
-        format!("{{ v: {} }}", self.inner.value.borrow().js_nested())
+        let value = self.inner.value.borrow();
+        inspect::object(&[("v", &*value as &dyn Js)])
     }
 }
 
@@ -829,17 +881,51 @@ impl<T: ?Sized> PartialEq for Dyn<T> {
 
 /// B436: an object printed ITSELF prints as the value it erased — the JS
 /// backend hands the host the value, not its `[ value, table ]` pair, at an
-/// `any` parameter (`print`). NESTED in a container the JS backend still holds
-/// the pair, and the table carries its slots on its PROTOTYPE, so node prints
-/// it `[ value, {} ]`; that is reproduced here, the value rendered through the
-/// object's `Js` supertrait.
+/// `any` parameter (`print`). B503: so does an object in a LIST handed there,
+/// which the JS backend maps element-wise ([`Js::js_hosted`]). NESTED in any
+/// other container the JS backend still holds the pair, and the table carries
+/// its slots on its PROTOTYPE, so node prints it `[ value, {} ]`; that is
+/// reproduced here, the value rendered through the object's `Js` supertrait.
 impl<T: ?Sized + Js> Js for Dyn<T> {
     fn js(&self) -> String {
         self.object.js()
     }
 
     fn js_nested(&self) -> String {
-        js_tuple(&[self.object.js_nested(), "{}".to_string()])
+        js_items(&[&Delegate(&*self.object), &EmptyObject])
+    }
+
+    fn js_hosted(&self) -> String {
+        self.object.js_nested()
+    }
+}
+
+/// A `Js` value behind a reference that may be unsized — a trait object's
+/// value — as a sized `&dyn Js` an [`inspect`] container can hold.
+struct Delegate<'a, T: ?Sized>(&'a T);
+
+impl<T: ?Sized + Js> Js for Delegate<'_, T> {
+    fn js(&self) -> String {
+        self.0.js()
+    }
+    fn js_nested(&self) -> String {
+        self.0.js_nested()
+    }
+    fn js_hosted(&self) -> String {
+        self.0.js_hosted()
+    }
+    fn js_is_number(&self) -> bool {
+        self.0.js_is_number()
+    }
+}
+
+/// `{}` — a trait object's method table as node prints it (its slots are on
+/// its prototype, so it has no own keys).
+struct EmptyObject;
+
+impl Js for EmptyObject {
+    fn js(&self) -> String {
+        "{}".to_string()
     }
 }
 
@@ -999,6 +1085,12 @@ impl<T: Js + Clone> Js for Lazy<T> {
     }
     fn js_nested(&self) -> String {
         self.force().js_nested()
+    }
+    fn js_hosted(&self) -> String {
+        self.force().js_hosted()
+    }
+    fn js_is_number(&self) -> bool {
+        self.force().js_is_number()
     }
 }
 
@@ -1220,25 +1312,18 @@ impl<T: std::hash::Hash + Eq + Clone> PartialEq for Set<T> {
 }
 
 /// Node prints a `Map` as `Map(2) { 'a' => 1, 'b' => 2 }` and an empty one as
-/// `Map(0) {}` — NOT as an array, so this cannot go through [`js_tuple`]. The
+/// `Map(0) {}` — NOT as an array, so this cannot go through [`js_items`]. The
 /// emitter reaches it through the `Map`/`Set` wrapper structs std writes, whose
 /// single field is the raw JS map (`NativeMap`), so a program that prints a
 /// `Map` prints this inside `[ .. ]`.
 impl<K: Js + std::hash::Hash + Eq + Clone, V: Js> Js for Map<K, V> {
     fn js(&self) -> String {
-        if self.is_empty() {
-            return format!("Map({}) {{}}", self.len());
-        }
-        let mut out = String::new();
-        let _ = write!(out, "Map({}) {{ ", self.len());
-        for (index, (key, value)) in self.iter().enumerate() {
-            if index > 0 {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "{} => {}", key.js_nested(), value.js_nested());
-        }
-        out.push_str(" }");
-        out
+        inspect::map(
+            self.iter()
+                .map(|(key, value)| (key as &dyn Js, value as &dyn Js))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
     }
 }
 
@@ -1246,19 +1331,8 @@ impl<K: Js + std::hash::Hash + Eq + Clone, V: Js> Js for Map<K, V> {
 /// sibling.
 impl<T: Js + std::hash::Hash + Eq + Clone> Js for Set<T> {
     fn js(&self) -> String {
-        if self.is_empty() {
-            return format!("Set({}) {{}}", self.len());
-        }
-        let mut out = String::new();
-        let _ = write!(out, "Set({}) {{ ", self.len());
-        for (index, value) in self.values().iter().enumerate() {
-            if index > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(&value.js_nested());
-        }
-        out.push_str(" }");
-        out
+        let values = self.values();
+        inspect::set(values.iter().map(|value| value as &dyn Js))
     }
 }
 
@@ -1359,6 +1433,10 @@ impl Js for Any {
             other => other.js(),
         }
     }
+
+    fn js_is_number(&self) -> bool {
+        matches!(self, Any::Integer(_) | Any::Float(_))
+    }
 }
 
 impl Json for Any {
@@ -1417,6 +1495,9 @@ impl Js for BigInt {
     /// `console.log(1n)` is `1n` and `console.log([1n])` is `[ 1n ]`.
     fn js(&self) -> String {
         format!("{}n", self.0)
+    }
+    fn js_is_number(&self) -> bool {
+        true
     }
 }
 
@@ -1586,6 +1667,9 @@ impl Js for Hash {
             Hash::Text(text) => text.js_nested(),
             other => other.js(),
         }
+    }
+    fn js_is_number(&self) -> bool {
+        matches!(self, Hash::Number(_))
     }
 }
 
@@ -1828,7 +1912,7 @@ json_for_tuple!(A, B, C, D, E);
 json_for_tuple!(A, B, C, D, E, F);
 
 /// The JSON array an emitted aggregate's `impl Json` builds — `[a,b]`, with NO
-/// spacing, which is where it differs from [`js_tuple`].
+/// spacing, which is where it differs from [`js_items`].
 pub fn json_array(parts: &[String]) -> String {
     format!("[{}]", parts.join(","))
 }

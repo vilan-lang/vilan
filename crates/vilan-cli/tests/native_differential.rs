@@ -738,6 +738,12 @@ const DEFAULT_SUITE: &[&str] = &[
     // through a `Shared` view, refused by name until the read became a scoped
     // borrow and the place's statement settled its value first.
     "shared.vl",
+    // F83: `cell.write() += 1` — a compound write through a counted cell, as
+    // a statement, in a closure, on a field, in an effect run inline and from a
+    // turn drain, and on a captured and a module-level `mut`. Every one died
+    // natively with "a cell was read while it is being updated" until the
+    // value was settled before the cell's `set` took its borrow.
+    "shared-compound-write.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -788,18 +794,20 @@ const ASYNC_SUITE: &[&str] = &[
 /// Order 44 seal (a host binding's by-value argument moved its `salt`) behind
 /// an E0308 (a `match` literal pattern written at the arms' width over a
 /// `usize`), and nothing ran it. [`every_platform_bound_program_is_identical_or_named`]
-/// requires these four and classifies the rest.
-const PLATFORM_BOUND_REQUIRED: &[&str] =
-    &["crypto.vl", "db.vl", "asset_bundle.vl", "element-syntax.vl"];
+/// requires these and classifies the rest. `estate.vl` joined them with E243:
+/// the JS `vilan run` printed its asset report on stdout ahead of the
+/// program's output, and reports on stderr now.
+const PLATFORM_BOUND_REQUIRED: &[&str] = &[
+    "crypto.vl",
+    "db.vl",
+    "asset_bundle.vl",
+    "element-syntax.vl",
+    "estate.vl",
+];
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
 /// agree on for a reason that is not the program's, named with the reason.
-const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[(
-    "estate.vl",
-    "the JS `vilan run` prints its build's asset report (`Bundled  robots.txt`, ...) on \
-     STDOUT ahead of the program's output, and the native run reports nothing; the \
-     program's own three lines are identical",
-)];
+const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[];
 
 /// Modules whose presence in an `import` means the program reaches a platform
 /// surface S1a has none of. Written as a support list so Order 38 widens the
@@ -8239,6 +8247,32 @@ fn every_platform_bound_program_is_identical_or_named() {
     }
 }
 
+/// E243: the JS `vilan run` reports the resources its build bundled on
+/// STDERR, so stdout is the program's alone — it printed `Bundled  …` lines on
+/// stdout ahead of the program's first line while the native run printed
+/// nothing, and `estate.vl` sat outside the platform-bound differential for
+/// it. The assertion reads only the word `Bundled` on each stream, never a
+/// path, so it holds on Windows, where the destination prints with `\`.
+#[test]
+fn the_js_run_reports_its_bundled_resources_on_stderr() {
+    let staged = stage();
+    let run = vilan(&staged)
+        .args(["run", "estate.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert!(run.status.success(), "estate.vl runs: {run:?}");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !stdout.contains("Bundled"),
+        "stdout is the program's alone:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("Bundled"),
+        "the build's report still says what it bundled, on stderr:\n{stderr}"
+    );
+}
+
 /// F57's second defect: a `match` literal pattern takes the SUBJECT's width,
 /// never the expectation around the `match` (the arms' type). It stood behind
 /// `crypto.vl`'s E0382 in `std::base64::decode_url`, so the platform-bound pin
@@ -8714,6 +8748,221 @@ fn a_bare_variant_of_a_generic_enum_is_identical_on_both_backends() {
     );
 }
 
+/// F66: a variant constructor INSIDE a generic body closes its enum's
+/// arguments per instance. The analyzer records one type per SITE, and
+/// `variant_arguments` read that record first: inside `Maybe<T>::map<U>` the
+/// site of `Maybe::Just(f(x))` recorded the receiver's `Maybe<T>`, so the
+/// `(str, i32)` instance minted `Maybe<(str, i32)>` for a `Maybe<i32>` value
+/// and rustc refused the emission (E0308 four times on 0.43.0). The position
+/// and the payload are read under the instance and come first; a record closed
+/// in itself (no parameter in it) still wins, being the same in every
+/// instance. The probe: a payload of the method's own parameter, a nullary
+/// variant at a generic return, a two-parameter enum built swapped (two
+/// instances each way), a nested payload, a binding annotated in the
+/// instance's parameter, and `Option`'s constructors inside a generic body.
+#[test]
+fn a_variant_built_inside_a_generic_instance_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_instance_variants.vl"),
+        include_str!("native/generic_instance_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_instance_variants.vl"),
+        Verdict::Identical,
+        "a variant built inside a generic instance must take that instance's arguments"
+    );
+}
+
+/// A closure's expression body is the closure's RETURN position (native-46's
+/// find, beside F66). `closure_body` handed the body the expectation the
+/// literal arrived under — the closure TYPE — so a variant constructor whose
+/// site recorded an open type (`|k: i32| Maybe::Just(k + 1)`, recorded
+/// `Maybe<any>`, a payload with no record of its own) had nothing to close
+/// from and was refused as "a generic type instantiated at `any`". The body
+/// now takes the position's return when it is closed, else the literal's
+/// written one. The probe: a sum, a string literal, an interpolation and a
+/// nested constructor as payloads, an `if` choosing between two constructors,
+/// a written return (also handed to a generic callee), and a literal at a
+/// narrow `u8` return.
+#[test]
+fn a_closure_body_takes_the_closures_return_as_its_position_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_closure_body_positions.vl"),
+        include_str!("native/closure_body_positions.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_closure_body_positions.vl"),
+        Verdict::Identical,
+        "a closure body must be emitted at the closure's return position"
+    );
+}
+
+/// F70: a NESTED tuple access natively. The analyzer folds `t.0.1` onto its
+/// root and records the JS layout's FLAT offset, and the emitter wrote that
+/// offset as a Rust tuple index — `t.0.1` over `((1, 2), 3)` read `t.1` and
+/// printed `3` where node prints `2` (a wrong answer with no error whenever the
+/// neighbour has the same type; rustc's E0308 otherwise), and a multi-slot
+/// element was refused by name. The recorded index chain
+/// (`tuple_index_paths`) is the Rust path. The probe: a same-typed
+/// neighbour, a write, a compound write, a `&mut` handed on, a multi-slot read,
+/// a destructure of a nested element, three levels, a `Shared` view read and
+/// write, and a generic function at an instance whose parameter is a tuple.
+#[test]
+fn a_nested_tuple_access_reads_the_nested_element_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_nested_tuple_slots.vl"),
+        include_str!("native/nested_tuple_slots.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_nested_tuple_slots.vl"),
+        Verdict::Identical,
+        "a nested tuple access must read the element its index chain names"
+    );
+}
+
+/// F67: a LOCAL closure binding called and then read. The literal's cast
+/// left its return to Rust (`as Rc<dyn Fn(i32) -> _>`), which settles it from
+/// the closure's first use — too late for `make(1).name` (E0282) and wrongly
+/// for `i"{f()}"` over `f = || row.name` (the unsized `str`, E0277). The cast
+/// writes the return the body was rendered at, else the literal's recorded
+/// one. The probe: a field read and arithmetic on a call, a `str` and an `i32`
+/// return interpolated, a method on the result, a closure returning a
+/// closure, a list and an `Option`.
+#[test]
+fn a_local_closures_result_is_read_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_local_closure_returns.vl"),
+        include_str!("native/local_closure_returns.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_local_closure_returns.vl"),
+        Verdict::Identical,
+        "a local closure's result must be readable the same way on both backends"
+    );
+}
+
+/// F69 + F77: a closure whose parameter is a VIEW, reached other than
+/// through the type written for it. The analyzer records a closure type's
+/// views beside the WRITTEN annotation, by id; a closure arriving through a
+/// match capture, a loop binding or a closure's unannotated parameter carries
+/// a type built elsewhere, with no record, so its call read `f(&mut s)` into a
+/// copy and `|f| f(&cell.write())` bound `f` as `Fn(T)` against the field's
+/// `Fn(&T)` (rustc E0308). The call keeps the `&`/`&mut` the source wrote
+/// (B464: a closure's view parameter takes a written view), and an
+/// unannotated closure parameter takes the position's written closure type.
+/// The probe: `inference::borrows`' B467 pin (a nested closure's parameter, a
+/// field, a match capture, a loop) and a generic lender over view closures.
+#[test]
+fn a_view_closure_reached_by_another_route_keeps_its_views_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_closure_view_parameters.vl"),
+        include_str!("native/closure_view_parameters.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_closure_view_parameters.vl"),
+        Verdict::Identical,
+        "a view closure reached through a capture, a loop or a parameter must keep its views"
+    );
+}
+
+/// F48 (pinned, not reproduced at the Order 46 base): a reassigned
+/// closure-typed `mut` binding and a `List` of closures build — F44's counted
+/// literal closed what was filed as rustc E0308 in Order 43.
+#[test]
+fn a_reassigned_closure_binding_and_a_list_of_closures_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_reassigned_closures.vl"),
+        include_str!("native/reassigned_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_reassigned_closures.vl"),
+        Verdict::Identical,
+        "a reassigned closure binding and a list of closures must build and run the same"
+    );
+}
+
+/// F51 (pinned, not reproduced at the Order 46 base): a captured value
+/// returned from a closure — an expression body, a `match` leg, a block tail,
+/// and `KeyedSource::or`'s own shape over a generic list — copies rather than
+/// moving out of the `Fn` closure (F63/F64 closed what was filed as rustc
+/// E0507). The base refuses this probe only for F67's `|| row.name`.
+#[test]
+fn a_capture_returned_from_a_closure_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_captured_returns.vl"),
+        include_str!("native/captured_returns.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_captured_returns.vl"),
+        Verdict::Identical,
+        "a capture handed back from a closure must be copied, not moved"
+    );
+}
+
+/// F78 (pinned, not reproduced at the Order 46 base): a trait DEFAULT calling
+/// an overridable hook reached through a BLANKET — `Flow`'s `on_change`/`sub`
+/// as defaults over `start`, with a generic cell reaching `Flow<List<E>>` only
+/// through the `Source` blanket — builds; Order 45 saw it refused as "an
+/// unbound generic type parameter … of `ListCell`". (The lane also built
+/// `delta-law.vl`, `list-cell.vl` and the reactive programs against a std copy
+/// with those defaults written and eight pipe impls' copies removed:
+/// identical.)
+#[test]
+fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_default_hook_through_blanket.vl"),
+        include_str!("native/default_hook_through_blanket.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_default_hook_through_blanket.vl"),
+        Verdict::Identical,
+        "a default calling a hook a blanket supplies must build and run the same"
+    );
+}
+
+/// F68 + B503: `print` lays a value out by ONE rule on both backends — node's
+/// `console.log`, which the JS backend binds and `vilan_rt::inspect` ports.
+/// Natively every container printed on one line, so a 22-element `List<str>`
+/// printed one line against node's nine; and a `List<dyn T>` printed each
+/// object as its `[ value, {} ]` pair on BOTH backends (B436 converted a lone
+/// object only). The JS backend now maps a list of objects at the host
+/// boundary, and the native `Js::js_hosted` renders the same split. The probe
+/// walks node's rules (grouped columns padded by kind, the 80-column break, a
+/// many-field struct, the depth cut, "... n more items", string quoting and
+/// splitting, a cell, a map, a set, a tuple, a list of `Option`s) and B503's
+/// shapes (a list and a nested list of objects; an object in an `Option` and in
+/// a struct field, which stay pairs on both).
+#[test]
+fn print_lays_values_out_by_nodes_rule_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_print_layout.vl"),
+        include_str!("native/print_layout.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_print_layout.vl"),
+        Verdict::Identical,
+        "print must lay every value out by node's console.log rule on both backends"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds
@@ -8758,10 +9007,11 @@ fn a_default_over_a_source_written_in_its_providers_binder_is_identical_on_both_
 /// Inside the struct's OWN impl a literal of ANOTHER instantiation
 /// (`Pair<V, K>` in `impl Pair<type K, type V>`) cannot take that rule — the
 /// impl's binders are the declaration's parameters, and installing the
-/// literal's bindings would retype the value's own reads — so a field that
-/// only mentions a parameter expects nothing there, and a value that needed
-/// the expectation is refused by name rather than built at the wrong
-/// instantiation (rustc E0308 before).
+/// literal's bindings would retype the value's own reads. F82: the field's
+/// type is MINTED with the literal's arguments written in there, so the
+/// swapped literal's `held = Maybe::Nothing` closes from `Maybe<str>` and the
+/// probe below is identical (it was refused by name before, and accepted here
+/// only as that refusal).
 #[test]
 fn a_struct_literals_fields_close_their_values_on_both_backends() {
     let staged = stage();
@@ -8780,16 +9030,33 @@ fn a_struct_literals_fields_close_their_values_on_both_backends() {
         SWAPPED_LITERAL_PROBE,
     )
     .expect("write the probe program");
-    match compare(&staged, "native_probe_swapped_literal.vl") {
-        Verdict::Identical => {}
-        Verdict::Refused(reason) => assert!(
-            reason.contains("instantiated at `any`"),
-            "the swapped literal's refusal moved to another construct: {reason}"
-        ),
-        Verdict::Broken(detail) => {
-            panic!("a swapped literal in its own impl was built wrong: {detail}")
-        }
-    }
+    assert_eq!(
+        compare(&staged, "native_probe_swapped_literal.vl"),
+        Verdict::Identical,
+        "a swapped literal in its own impl must close its fields from its own arguments"
+    );
+}
+
+/// F82: a struct literal of another instantiation inside the struct's own
+/// impl closes EVERY field from the field's type read under the literal's
+/// arguments — the emitter mints `Maybe<str>` from `held: Maybe<V>` where
+/// the literal's `V` is the method's `K` (`Emitter::substituted`). The probe:
+/// a nullary variant, `None`, an empty list, a cell around `None`, a tuple of
+/// both parameters, a bare parameter, a field naming no parameter and a
+/// closure field, swapped twice (so both instantiations build each way).
+#[test]
+fn a_swapped_struct_literal_closes_every_field_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_swapped_struct_literals.vl"),
+        include_str!("native/swapped_struct_literals.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_swapped_struct_literals.vl"),
+        Verdict::Identical,
+        "a swapped struct literal must close every field from its own instantiation"
+    );
 }
 
 const SWAPPED_LITERAL_PROBE: &str = concat!(

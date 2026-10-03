@@ -1,0 +1,96 @@
+// F69 + F77: a closure whose parameter is a VIEW (`|&mut str| void`) reached
+// some other way than through the type that was WRITTEN for it. The analyzer
+// records a closure type's views beside the written annotation, by its id, and
+// a closure that arrives through a match capture, a loop binding, or a
+// closure's own unannotated parameter carries a type built elsewhere, with no
+// record — so natively its call read `f(&mut s)` through into a copy, and the
+// literal bound `|f|` as `Fn(T)` against the field's `Fn(&T)` (rustc E0308
+// both ways). The call keeps the `&`/`&mut` the source wrote, and an
+// unannotated closure parameter takes the position's written closure type.
+// Each block is one route: a nested closure's parameter, a field called
+// directly (the control), a match capture out of an `Option` field, a loop
+// over a list of view closures, and a generic lender whose fields are closures
+// over view closures with their parameters unannotated (`|f| f(&cell.write())`).
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
+
+struct Holder {
+	f: |&mut str| void,
+}
+
+struct Nested {
+	g: |(|&mut str| void)| void,
+}
+
+struct Maybe {
+	f: Option<|&mut str| void>,
+}
+
+struct Lend<T> {
+	lend: |(|&T| void)| void,
+	modify: |(|&mut T| void)| void,
+}
+
+fun lender<T>(own value: T): Lend<T> {
+	let cell = Shared::new(value);
+	Lend<T> { lend = |f| f(&cell.write()), modify = |f| f(&mut cell.write()) }
+}
+
+fun main() {
+	let n = Nested {
+		g = |f| {
+			mut s = "old";
+			f(&mut s);
+			print(s);
+		},
+	};
+	(n.g)(|&mut p| {
+		p = "nested ok";
+	});
+
+	let h = Holder {
+		f = |&mut p| {
+			p = "direct ok";
+		},
+	};
+	mut s = "old";
+	(h.f)(&mut s);
+	print(s);
+
+	let m = Maybe {
+		f = Some(|&mut p| {
+			p = "option ok";
+		}),
+	};
+	match m.f {
+		Some(let f) => {
+			mut t = "old";
+			f(&mut t);
+			print(t);
+		},
+		None => {},
+	}
+
+	mut edits: List<|&mut List<i32>| void> = [];
+	edits.push(|&mut list| list.push(7));
+	edits.push(|&mut list| list.push(8));
+	mut xs: List<i32> = [];
+	for edit in edits {
+		edit(&mut xs);
+	}
+	print(xs.len());
+	print(xs[1]);
+
+	let number = lender(1);
+	(number.lend)(|v: &i32| print(*v));
+	(number.modify)(|place: &mut i32| {
+		place = 5;
+	});
+	(number.lend)(|v: &i32| print(*v));
+	let text = lender("a");
+	(text.modify)(|place: &mut str| {
+		place = i"{*place}b";
+	});
+	(text.lend)(|v: &str| print(*v));
+}

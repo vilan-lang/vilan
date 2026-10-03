@@ -8835,7 +8835,8 @@ impl<'src> Transformer<'src> {
     /// as the value it erased, not as the `[value, table]` pair — the pair is
     /// this backend's representation, and `print(object)` printed it
     /// (`[ [ 5 ], {} ]`). Native renders the object's value the same way
-    /// (`vilan-rt`'s `Js for Dyn`), so both print `[ 5 ]`.
+    /// (`vilan-rt`'s `Js for Dyn`), so both print `[ 5 ]`. B503: and so does an
+    /// object inside a `List` handed there (`[ [ 2 ], [ 3 ] ]`).
     fn host_arguments(
         &self,
         target_id: Id,
@@ -8858,26 +8859,79 @@ impl<'src> Transformer<'src> {
                         Some(Type::Any)
                     )
                 });
-            let is_object = self.expr_type_id(*argument_id).is_some_and(|type_id| {
-                matches!(
-                    self.program
-                        .type_id_to_type_map
-                        .get(&self.resolve_type_id(type_id)),
-                    Some(Type::Dyn(..))
-                )
-            });
-            if takes_any
-                && is_object
+            if let Some(type_id) = self.expr_type_id(*argument_id)
+                && takes_any
+                && self.holds_a_hosted_object(type_id)
                 && let Some(argument) = args.get_mut(index)
             {
-                let pair = std::mem::replace(argument, js::Node::Void);
-                *argument = js::Node::PropertyIndex(
-                    Box::new(pair),
-                    Box::new(js::Node::Number("0".to_string(), None)),
-                );
+                let value = std::mem::replace(argument, js::Node::Void);
+                *argument = self.hosted_value(type_id, value, 0);
             }
         }
         args
+    }
+
+    /// B503: whether a value of `type_id` reaches the host holding a trait
+    /// object where it must arrive as the value it erased — the object itself
+    /// (B436), or one inside a `List` (or fixed array), at any depth of lists.
+    /// Other containers hand their objects over as stored; the native `Js`
+    /// impls render the same split (`Js::js_hosted`).
+    fn holds_a_hosted_object(&self, type_id: TypeId) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(type_id))
+        {
+            Some(Type::Dyn(..)) => true,
+            Some(Type::Array(element, _)) => self.holds_a_hosted_object(*element),
+            Some(Type::Struct(struct_id, arguments))
+                if arguments.len() == 1
+                    && self
+                        .program
+                        .structs
+                        .get(struct_id)
+                        .is_some_and(|declaration| declaration.name == "List") =>
+            {
+                self.holds_a_hosted_object(arguments[0])
+            }
+            _ => false,
+        }
+    }
+
+    /// `value` as the host receives it: an object's `[ value, table ]` pair
+    /// replaced by its value, and a list of them mapped element-wise into a
+    /// NEW array (the program's own list is not touched). Only reached where
+    /// [`Self::holds_a_hosted_object`] said so.
+    fn hosted_value(&self, type_id: TypeId, value: js::Node<'src>, depth: usize) -> js::Node<'src> {
+        let element = match self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(type_id))
+        {
+            Some(Type::Dyn(..)) => {
+                return js::Node::PropertyIndex(
+                    Box::new(value),
+                    Box::new(js::Node::Number("0".to_string(), None)),
+                );
+            }
+            Some(Type::Array(element, _)) => *element,
+            Some(Type::Struct(_, arguments)) => arguments[0],
+            _ => return value,
+        };
+        let name = format!("__hosted{depth}");
+        let converted = self.hosted_value(element, js::Node::Local(name.clone()), depth + 1);
+        js::Node::Call(
+            Box::new(js::Node::Property(Box::new(value), "map".to_string())),
+            vec![js::Node::Closure(js::Closure {
+                parameters: vec![js::Parameter { name }],
+                body: vec![js::Node::Return(Box::new(converted))],
+                is_async: false,
+                origin: None,
+            })],
+        )
     }
 
     fn emit_extern(
