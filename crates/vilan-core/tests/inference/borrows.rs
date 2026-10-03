@@ -617,6 +617,80 @@ fn transparent_references_reject_deref_assignment() {
     );
 }
 
+/// B522: the parser takes any chain as an assignment's left side, so the
+/// analyzer is where a non-place is refused — one diagnostic per assignment,
+/// for `=` and every compound operator, on both backends (the JS module threw
+/// `Invalid left-hand side in assignment` at load).
+#[test]
+fn b522_an_assignment_to_something_that_is_not_a_place_is_refused() {
+    for (statement, what) in [
+        ("(x + 1) = 2;", "an arithmetic expression"),
+        ("-x = 1;", "a negation"),
+        ("-x += 1;", "a negation"),
+        ("!flag = true;", "a `!` expression"),
+        ("seven() = 1;", "a call"),
+        ("x.abs() = 3;", "a call"),
+        ("1 = 2;", "a literal"),
+        ("\"s\" = name;", "a literal"),
+        ("(if flag { x } else { x }) = 4;", "an `if`"),
+        ("({ x }) = 3;", "a block"),
+        ("[x] = [1];", "a list literal"),
+        ("Some(x) = Some(1);", "a variant constructor"),
+        ("(x, x + 1) = (1, 2);", "an arithmetic expression"),
+    ] {
+        let source = format!(
+            r#"
+            import std::option::Option::{{ self, Some }};
+            fun seven(): i32 {{ 7 }}
+            fun main() {{
+                mut x = 0;
+                mut flag = false;
+                mut name = "n";
+                {statement}
+                print(i"{{x}} {{flag}} {{name}}");
+            }}
+            "#
+        );
+        assert_fails_once_with(&source, "is not a place");
+        assert_fails_with(&source, what);
+    }
+}
+
+/// B522's other side: every place shape keeps assigning — a binding, a
+/// parenthesized binding, a field, an element, a tuple of bindings, a compound
+/// operator, a view parameter, and a call that returns a `&mut` view. (A tuple
+/// target holding an element, a nested tuple or a tuple-typed binding is a
+/// place too, but its JS emission is a separate defect, filed by this lane.)
+#[test]
+fn b522_every_place_shape_still_assigns() {
+    assert_compiles_and_runs(
+        r#"
+        import std::shared::Shared;
+        struct P { x: i32, pair: (i32, i32) }
+        fun bump(n: &mut i32) { n += 1; }
+        fun main() {
+            mut x = 0;
+            mut y = 10;
+            mut p = P { x = 1, pair = (2, 3) };
+            mut list = [1, 2];
+            (x) = 3;
+            p.x = 2;
+            p.pair.1 = 30;
+            list[0] = 5;
+            x += 1;
+            (x, y) = (y, x);
+            (x, y) = (1, 2);
+            p.x = 9;
+            bump(&mut x);
+            let cell = Shared::new(1);
+            cell.write() += 1;
+            print(i"{x} {y} {p.x} {p.pair.1} {list[0]} {cell.read()}");
+        }
+        "#,
+        "2 2 9 30 5 2\n",
+    );
+}
+
 #[test]
 fn transparent_references_reject_mut_view_binding() {
     // R7: a view binding cannot be `mut` — a view cannot be rebound.

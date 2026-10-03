@@ -286,6 +286,13 @@ written down.
 <!-- family: tooling -->
 **A duplicate import carries a warning — `` `Json` is already imported on line 1 — Organize Imports removes the repeat `` — and its quick fix is Organize Imports' own edit for the run (E251's merge).** E255 (filed from E251's remainder). A leaf repeats an earlier one when it reaches the same path and binds the same name: the same line twice, a name twice in one group, a member beside a group that holds it, a `self` leaf beside the module's own import. An alias binds a different name and repeats nothing; an `only` import, a `use`, a re-export and a marked or selector branch are not compared (the organizer leaves them as written). Syntactic (`formatter::duplicate_import_leaves`), so a file with errors still hears about it; published only for an open buffer, with the code `duplicate-import`. Pins: `organize_duplicate_tests::e255_each_repeat_carries_a_warning_naming_the_first_line`, `e255_an_alias_or_a_distinct_member_is_no_duplicate`, `e255_the_quick_fix_is_the_organize_edit_and_clears_the_warning`. Tracker E255.
 
+---
+
+<!-- family: miscompile -->
+**An assignment whose left side is not a place is refused, once, at the left side — `-x = 1`, `!b = true`, `(x + 1) = 2`, `seven() = 1`, `x.abs() = 3`, `1 = 2`, `[x] = [1]`, `Some(x) = Some(1)`, `(if c { x } else { x }) = 4`, and the same under every compound operator — with "the left side of this assignment is not a place: it is a negation — only a place can be assigned: a binding (`x`), a field (`p.x`), an element (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a `&mut` view".** Each passed `vilan check`, and the JS module threw `SyntaxError: Invalid left-hand side in assignment` at load (`x + 1 = 2;` in the emitted code). The parser reads any chain as the place and checks only that an assignment operator follows; the rule is the checker's because one shape of call IS a place — a call that returns a `&mut` view (`cell.write() += 1`) — and only resolution tells it from one that returns a value. A tuple target is a place when every element is (`(x, x + 1) = ..` names the `x + 1`). Every place shape keeps assigning: a binding, a parenthesized one, a field, an element, a tuple of bindings, a view parameter, `cell.write()`. Pins: `inference::borrows`' `b522_an_assignment_to_something_that_is_not_a_place_is_refused` (thirteen targets, each refused exactly once and named) and `b522_every_place_shape_still_assigns` — the first red on the 0.43.0 toolchain. Ledger: one `NEW` row. Docs: `grammar.md` §3.4. No golden moves. Tracker B522.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

@@ -28375,6 +28375,107 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B522: an assignment's left side must be a PLACE. The parser reads any
+    /// chain there and checks only that an assignment operator follows, so
+    /// `-x = 1`, `(x + 1) = 2` and `seven() = 1` reached the emitters, and the
+    /// JS module threw `Invalid left-hand side in assignment` at load. The
+    /// rule is semantic rather than syntactic because one shape of call IS a
+    /// place: a call that returns a `&mut` view (`cell.write() += 1`), which
+    /// only resolution can tell from a call that returns a value.
+    ///
+    /// One diagnostic per assignment, at the first non-place (a tuple target
+    /// is a place when every element is). A target that failed to resolve, a
+    /// `*` target and a lifted chain already carry their own refusal.
+    fn check_assignment_places(&mut self) {
+        let mut assignment_targets: Vec<Id> = self
+            .expr_id_to_expr_map
+            .values()
+            .filter_map(|expr| match expr {
+                Expr::Assignment(target_id, _) => Some(*target_id),
+                _ => None,
+            })
+            .filter(|target_id| !self.reusable_entity(*target_id))
+            .collect();
+        // Source order, so a program with several reports them in reading order.
+        assignment_targets.sort_unstable_by_key(|target_id| target_id.0);
+        for target_id in assignment_targets {
+            let Some((non_place_id, what)) = self.first_non_place(target_id) else {
+                continue;
+            };
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&non_place_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "the left side of this assignment is not a place: it is {what} — only a \
+                         place can be assigned: a binding (`x`), a field (`p.x`), an element \
+                         (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a \
+                         `&mut` view"
+                    ),
+                },
+                target_id,
+            );
+        }
+    }
+
+    /// The first sub-expression of an assignment target that is not a place,
+    /// with the words that name its kind — `None` when the whole target is a
+    /// place (or carries its own refusal elsewhere). B522.
+    fn first_non_place(&self, target_id: Id) -> Option<(Id, &'static str)> {
+        let what = match self.expr_id_to_expr_map.get(&target_id)? {
+            Expr::Local(_)
+            | Expr::Variable(_)
+            | Expr::Parameter(_)
+            | Expr::Field(..)
+            | Expr::TupleIndex(..)
+            | Expr::Index(..)
+            // Refused by the assignment's walk (`*x = v`, `p?.x = v`), or an
+            // unresolved name already reported.
+            | Expr::Dereference(_)
+            | Expr::Reference(..)
+            | Expr::Lift(..)
+            | Expr::Error => return None,
+            Expr::Tuple(elements) => {
+                return elements
+                    .iter()
+                    .find_map(|element_id| self.first_non_place(*element_id));
+            }
+            Expr::Call(call_id) => {
+                if self.call_returns_view(*call_id) {
+                    return None;
+                }
+                if self.call_is_variant_constructor(*call_id) {
+                    "a variant constructor (a pattern is matched with `let` or `is`, not assigned)"
+                } else {
+                    "a call that returns a value rather than a `&mut` view"
+                }
+            }
+            Expr::EnumVariant(..) => "a variant constructor",
+            Expr::Unary('-', _) => "a negation",
+            Expr::Unary('!', _) => "a `!` expression",
+            Expr::Unary(..) => "an operator expression",
+            Expr::Binary(..) => "an arithmetic expression",
+            Expr::Await(_) => "an `await`",
+            Expr::Async(_) => "an `async` block",
+            Expr::Bool(_)
+            | Expr::Number(..)
+            | Expr::String(_)
+            | Expr::MultilineString(_)
+            | Expr::Null
+            | Expr::Void => "a literal",
+            Expr::List(_) | Expr::Repeat(..) => "a list literal",
+            Expr::If(_) => "an `if`",
+            Expr::Match(..) => "a `match`",
+            Expr::Block(_) => "a block",
+            Expr::Is(..) => "an `is` test",
+            Expr::Closure(_) => "a closure",
+            Expr::StructInitializer(..) => "a struct literal",
+            _ => "this expression",
+        };
+        Some((target_id, what))
+    }
+
     /// proposal/lazy.md §2 — partition the `lazy let` declarations into the
     /// module-level ones (which become memo cells) and the locals (which §3
     /// excludes), and record each module one's initializer.
@@ -70846,6 +70947,7 @@ fn analyze_over_world<'src>(
         };
     }
     class_a_checks! {
+        analyzer.check_assignment_places();
         analyzer.check_readonly_mutation();
         analyzer.check_mutable_arguments();
         analyzer.check_lazy_arguments();

@@ -546,8 +546,12 @@ MODULE-LEVEL `let` binding one name to one initializer (§6.10): a `lazy
 mut`, a lazy destructure, a lazy binding with no initializer and a lazy
 local are each refused. A **place** is a chain expression
 (§3.6) denoting a location: a local, a field chain, an index, or a place
-reached through a call (`a.write().count`); the optional leading `*`
-assigns through a view. `jump break` / `jump continue` control the
+reached through a call (`a.write().count`), a call that returns a `&mut`
+view (`cell.write() += 1`), or a tuple of places (`(a, b) = (b, a)`); the
+optional leading `*` assigns through a view. The grammar reads any chain
+there, so a left side that denotes no location — `-x`, `!b`, `(x + 1)`,
+`await p`, a literal, a value-returning call, a variant constructor — is
+refused by the checker, once per assignment. `jump break` / `jump continue` control the
 innermost enclosing loop.
 
 ## 3.5 Blocks and control expressions
