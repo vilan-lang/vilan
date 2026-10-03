@@ -738,6 +738,12 @@ const DEFAULT_SUITE: &[&str] = &[
     // through a `Shared` view, refused by name until the read became a scoped
     // borrow and the place's statement settled its value first.
     "shared.vl",
+    // F83: `cell.write() += 1` — a compound write through a counted cell, as
+    // a statement, in a closure, on a field, in an effect run inline and from a
+    // turn drain, and on a captured and a module-level `mut`. Every one died
+    // natively with "a cell was read while it is being updated" until the
+    // value was settled before the cell's `set` took its borrow.
+    "shared-compound-write.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named

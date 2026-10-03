@@ -36,4 +36,5 @@ f64-print-boundary	0	0
 non-bmp-string-length	0	0
 keyword-members	1	2
 shared	0	0
+shared-compound-write	8	28
 native_probe_board	3	22

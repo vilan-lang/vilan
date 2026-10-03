@@ -4645,7 +4645,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let expecting = expecting.or_else(|| self.cell_element_type(receiver));
             let receiver_text = self.expression(receiver, depth)?;
             let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
-            return Ok(format!("({receiver_text}).set({value_text})"));
+            return Ok(settled_cell_write(
+                &format!("({receiver_text})"),
+                &value_text,
+            ));
         }
         let named = match self.program.entity_map.get(&target) {
             Some(Expr::Local(binding)) => Some(*binding),
@@ -4654,12 +4657,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(binding) = named {
             if self.boxed.contains(&binding) {
                 let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
-                return Ok(format!("{}.set({value_text})", self.binding_name(binding)));
+                return Ok(settled_cell_write(&self.binding_name(binding), &value_text));
             }
             if self.module_bindings.contains(&binding) {
                 let cell = self.ensure_module_binding(binding, span)?;
                 let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
-                return Ok(format!("{cell}.with(|cell| cell.set({value_text}))"));
+                return Ok(format!(
+                    "{{ let __assigned = {value_text}; {cell}.with(|cell| cell.set(__assigned)); }}"
+                ));
             }
             if self.binding_holds_a_view(binding) {
                 let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
@@ -11106,6 +11111,21 @@ fn object_member_declaration(
 /// `Shared`'s own intrinsics are deliberately NOT here: their receiver is a
 /// handle, and a copy of a handle is the same cell, so a `get()` of a boxed
 /// binding holding one reaches the same place either way.
+/// A write through a counted cell's own `set` — `cell.write() = v`, a boxed
+/// binding, a module-level one — with its VALUE settled in a statement of its
+/// own first (F83).
+///
+/// Rust keeps an argument's temporaries alive to the end of the enclosing
+/// statement, so `(cell).set(*(cell).borrow_mut() + 1)` — what
+/// `cell.write() += 1` desugars to — still held the value's `borrow_mut` when
+/// `set` took its own, and every compound write through a cell died with
+/// `vilan_rt::REENTRANT_READ`. A `let` drops the value's temporaries at its
+/// semicolon, which is the order the language means: the right-hand side is
+/// read, THEN the cell is written. F62's place-in-a-cell rule, at the `set`.
+fn settled_cell_write(cell: &str, value: &str) -> String {
+    format!("{{ let __assigned = {value}; {cell}.set(__assigned); }}")
+}
+
 fn mutates_its_receiver(intrinsic: Intrinsic) -> bool {
     matches!(
         intrinsic,

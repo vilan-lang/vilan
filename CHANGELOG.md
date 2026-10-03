@@ -23,6 +23,13 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: miscompile -->
+**Native: a compound write through a `Shared`'s write view — `cell.write() += 1` — no longer aborts with "a cell was read while it is being updated".** The write is the cell's own `set`, and its value read the same cell: `(cell).set(*(cell).borrow_mut() + 1)` kept the value's `borrow_mut` alive to the end of the statement (Rust's rule for an argument's temporaries), so `set` met it and the program stopped. The value is now settled in a `let` first — read, then write, the order the language means and F62's rule for a place inside a cell, at the `set`. Corrected premise: the item filed it as an effect run from a turn drain (`batch`); it was EVERY compound write through a cell, in any position — the corpus spells them `cell.write() = cell.read() + 1`, which is why nothing caught it. JS was always right. The same settling now covers the other two writes that go through a cell's `set` (a captured `mut`, a module-level `mut`), whose values read with a copying `get` and so never collided. Pin: the corpus program `shared-compound-write.vl` (a statement, a closure body, a field, an effect run inline and from a drain — aborted on 0.43.0 — and a captured and a module-level `mut` as controls), in `native_differential`'s default suite and so in the native leak census (38 minted, 0 live) and the copy censuses (one new row each). Tracker F83.
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

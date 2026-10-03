@@ -1,0 +1,65 @@
+import std::io::print;
+import std::reactive::{ Owner, Signal, SignalCell, Source, batch, run_with_owner };
+import std::shared::Shared;
+
+// F83: a COMPOUND write through a counted cell — `cell.write() += 1` — reads
+// the cell and then writes it. Natively the read's borrow outlived the read
+// and met the write's, so every one of these died with "a cell was read while
+// it is being updated" until the value was settled before the cell was
+// written. Each shape the write can stand in is one line here: a plain
+// statement, a closure body, a field, an effect run inline by a `set`, the same
+// effect run from a turn drain, a captured `mut` binding and a module-level one.
+struct Tally {
+	count: i32,
+}
+
+mut ticks = 0;
+
+fun tick() {
+	ticks += 2;
+	ticks *= 3;
+}
+
+fun main() {
+	let fired = Shared::new(0);
+	fired.write() += 1;
+	fired.write() -= 3;
+	fired.write() *= -5;
+	print(i"statement: {fired.read()}");
+
+	let bump = || fired.write() += 1;
+	bump();
+	bump();
+	print(i"closure: {fired.read()}");
+
+	let tally = Shared::new(Tally { count = 1 });
+	tally.write().count += 41;
+	print(i"field: {tally.read().count}");
+
+	let a = SignalCell::new(0);
+	let b = SignalCell::new(0);
+	let runs = Shared::new(0);
+	let watching = Owner::new();
+	run_with_owner(watching, || {
+		a.effect_on_change(|_x| runs.write() += 1);
+		b.effect_on_change(|_x| runs.write() += 10);
+	});
+	a.set(1);
+	print(i"inline: {runs.read()}");
+	batch(|| {
+		a.set(2);
+		b.set(2);
+	});
+	print(i"drained: {runs.read()}");
+	watching.dispose();
+
+	mut captured = 1;
+	let double = || captured *= 2;
+	double();
+	double();
+	print(i"captured: {captured}");
+
+	tick();
+	tick();
+	print(i"module: {ticks}");
+}
