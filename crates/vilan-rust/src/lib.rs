@@ -3857,6 +3857,33 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.parameter_parts_at(id, None, span)
     }
 
+    /// Whether a closure parameter should take the POSITION's closure type
+    /// over its own (F69, F77): `|f| f(&cell.write())` in a field typed
+    /// `|(|&T| void)| void` gives `f` a closure type the analyzer built for the
+    /// literal, which carries no record of the `&` the field's annotation
+    /// wrote (views are tracked beside a WRITTEN type, by its id), so the
+    /// literal bound `f` as `Fn(T)` against the field's `Fn(&T)` and rustc
+    /// refused it. The position's type is the same closure with its views
+    /// recorded, so it is the one to render — when the parameter's own type is
+    /// a closure of the same arity whose views are not recorded.
+    fn positioned_closure_carries_views(&self, own: TypeId, positioned: TypeId) -> bool {
+        let own = self.concrete(own);
+        let positioned = self.concrete(positioned);
+        let (
+            Some(Type::Closure(own_parameters, _, _)),
+            Some(Type::Closure(positioned_parameters, _, _)),
+        ) = (self.type_entry(&own), self.type_entry(&positioned))
+        else {
+            return false;
+        };
+        own_parameters.len() == positioned_parameters.len()
+            && !self.program.closure_type_parameter_views.contains_key(&own)
+            && self
+                .program
+                .closure_type_parameter_views
+                .contains_key(&positioned)
+    }
+
     /// [`Self::parameter_parts`], with the parameter's type taken from
     /// `positioned` where the analyzer recorded none — a closure literal's
     /// parameter that only its POSITION types (F74).
@@ -3876,10 +3903,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .cloned()
             .ok_or_else(|| unsupported("an unresolved parameter", span))?;
         if let Some(positioned) = positioned
-            && matches!(
+            && (matches!(
                 self.resolve(parameter.type_id),
                 None | Some(Type::Unresolved | Type::Unknown)
-            )
+            ) || self.positioned_closure_carries_views(parameter.type_id, positioned))
         {
             parameter.type_id = positioned;
         }
@@ -9910,6 +9937,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     }
                 }
                 Some(false) => format!("&{}", self.expression(*argument, depth)?),
+                // F69: a closure type that reached this call through a match
+                // capture, a loop binding or a closure's own parameter is not
+                // the WRITTEN type the analyzer recorded its views beside, so
+                // the record is silent here. The argument's own spelling is
+                // not: a closure's view parameter takes a view the source
+                // writes (`f(&mut s)`, B464's rule — a bare place is refused
+                // there), so a written `&`/`&mut` IS the convention, and it is
+                // passed as written rather than read through into a copy.
+                None if already_a_reference => self.expression(*argument, depth)?,
                 None => self.consumed_value_of(*argument, depth)?,
             });
         }

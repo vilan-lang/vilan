@@ -55,6 +55,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**Native: a closure whose parameter is a VIEW keeps it on every route to its call — a match capture (`Some(let f) => f(&mut t)`), a loop binding (`for edit in edits { edit(&mut xs) }`), a closure's own unannotated parameter (`Nested { g = |f| { f(&mut s); .. } }`), and a closure literal in a field typed `|(|&T| void)| void` with its parameter unannotated (`lend = |f| f(&cell.write())`) — where rustc refused each (E0308: expected `&mut Rc<str>`, found `Rc<str>`; `Fn(T)` against `Fn(&T)`).** The analyzer records a closure type's views beside the WRITTEN annotation, keyed by its type id (B495's paper is the general answer), and a closure that arrives some other way carries a type built elsewhere, with no record, so the call read `f(&mut s)` through into a copy and the literal bound its parameter by value. Two rules close the routes natively: at a closure call whose type records nothing, the argument's own spelling is the convention — a closure's view parameter takes a view the source writes (B464), so a written `&`/`&mut` is passed as written; and an unannotated closure parameter whose position is a closure type WITH recorded views takes that written type over its own unrecorded one. The JS half of F77 (an annotated `let lend: |(|&i32| void)| void = |f| ..` never types `f`) is B516, the solver's. The whole-set differential holds at 0 broken. Pin: `native_differential`'s `a_view_closure_reached_by_another_route_keeps_its_views_on_both_backends` (`native/closure_view_parameters.vl`: `inference::borrows`' B467 program built natively — a nested closure's parameter, a field, a match capture, a loop — and a generic lender over view closures at two instances; rustc refused it on 0.43.0). Tracker F69, F77 (one fix: neither route builds without both rules).
+
+---
+
 ## v0.43.0 — 2026-10-02
 
 <!-- family: breaking -->

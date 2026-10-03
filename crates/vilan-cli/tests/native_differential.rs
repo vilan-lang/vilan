@@ -8821,6 +8821,32 @@ fn a_local_closures_result_is_read_the_same_on_both_backends() {
     );
 }
 
+/// F69 + F77: a closure whose parameter is a VIEW, reached other than
+/// through the type written for it. The analyzer records a closure type's
+/// views beside the WRITTEN annotation, by id; a closure arriving through a
+/// match capture, a loop binding or a closure's unannotated parameter carries
+/// a type built elsewhere, with no record, so its call read `f(&mut s)` into a
+/// copy and `|f| f(&cell.write())` bound `f` as `Fn(T)` against the field's
+/// `Fn(&T)` (rustc E0308). The call keeps the `&`/`&mut` the source wrote
+/// (B464: a closure's view parameter takes a written view), and an
+/// unannotated closure parameter takes the position's written closure type.
+/// The probe: `inference::borrows`' B467 pin (a nested closure's parameter, a
+/// field, a match capture, a loop) and a generic lender over view closures.
+#[test]
+fn a_view_closure_reached_by_another_route_keeps_its_views_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_closure_view_parameters.vl"),
+        include_str!("native/closure_view_parameters.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_closure_view_parameters.vl"),
+        Verdict::Identical,
+        "a view closure reached through a capture, a loop or a parameter must keep its views"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds
