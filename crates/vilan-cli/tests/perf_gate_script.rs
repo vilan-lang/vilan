@@ -174,7 +174,9 @@ fn an_e121_row_reports_until_green_at_two_consecutive_seals_and_then_blocks() {
     let (ok, _) = run(&green);
     assert!(ok);
     assert!(
-        fs::read_to_string(&budgets).expect("read").contains("blocking = false"),
+        fs::read_to_string(&budgets)
+            .expect("read")
+            .contains("blocking = false"),
         "green, red, green is one consecutive green, not two"
     );
     let (ok, report) = run(&green);
