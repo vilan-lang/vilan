@@ -75,7 +75,7 @@ jobs:
           (cd target/perf-gate/genapp-profile && valgrind --tool=callgrind --callgrind-out-file=../callgrind.genapp ../../profiling/vilan check . > /dev/null 2>&1 || true)
           callgrind_annotate --inclusive=yes target/perf-gate/callgrind.genapp | head -60 > target/perf-gate/top25.txt
           cat target/perf-gate/top25.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: perf-nightly
@@ -106,7 +106,7 @@ jobs:
           cd target/perf-gate/genapp
           ../../release/vilan check . > /dev/null 2>&1 || true
           for run in 1 2 3; do /usr/bin/time -p ../../release/vilan check . > /dev/null; done 2>&1 | tee ../macos-time.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: perf-macos
