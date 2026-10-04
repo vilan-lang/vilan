@@ -12,7 +12,7 @@ use crate::node::{
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
-use crate::type_::{SubstitutionContext, Type, TypeId};
+use crate::type_::{Mode, ParameterMode, SubstitutionContext, Type, TypeId};
 use crate::util::{join_with, plural};
 
 mod hint_labels;
@@ -734,6 +734,16 @@ impl<'a, 'src> Divergence<'a, 'src> {
 /// `check_return_position` can ask the same syntactic question when the
 /// mismatch it is diagnosing is a bare `if` in tail position, without
 /// re-deriving the answer from the inferred type.
+/// The mode a parameter's convention passes it in (B495): a view for `&`, a
+/// writable view for `&mut`, a value for a bare or `own` parameter.
+pub fn convention_mode(convention: Convention) -> Mode {
+    match convention {
+        Convention::Ref => Mode::View,
+        Convention::RefMut => Mode::MutView,
+        Convention::Bare | Convention::Own => Mode::Value,
+    }
+}
+
 fn if_branch_has_final_else(branch: &ExprIfBranch) -> bool {
     match branch {
         ExprIfBranch::If(_, _, Some(next)) => if_branch_has_final_else(next),
@@ -2933,6 +2943,12 @@ pub struct Closure {
     /// reachable; before it, the annotation was parsed, re-printed by the
     /// formatter, and otherwise completely ignored by type checking.
     pub return_type_id: Option<TypeId>,
+    /// Each parameter's mode as the literal states it (B495): `Written` where
+    /// the parameter spells its type or a view (`|c: str|`, `|c: &str|`,
+    /// `|&mut list|`), `Open` where it is written bare (`|c|`) and takes the
+    /// mode of the position the literal lands in. The literal's
+    /// `Type::Closure` carries exactly this.
+    pub parameter_modes: Vec<ParameterMode>,
 }
 
 /// A constraint that a struct initializer's field value must
@@ -4655,13 +4671,15 @@ pub struct Analyzer<'src> {
     // element rather than a copy. Maps the binding id to whether the view is
     // writable (`&mut`). Drives the indexed-loop lowering + view classification.
     for_each_views: HashMap<Id, bool>,
-    // A written closure TYPE whose parameters are views (`|&mut T| void`): the
-    // closure type's id → per parameter, `Some(mutable)` for a `&`/`&mut` and
-    // `None` for a value. `walk_type_node` erases the `&` (a view is tracked
-    // beside the type, never in it), and the JS backend needs nothing more —
-    // an object is a reference there. The native backend's closure SIGNATURE
-    // does (F18 slice 3: `SignalCell::update(mutate: sync |&mut T| void)`).
-    closure_type_parameter_views: HashMap<TypeId, Vec<Option<bool>>>,
+    // B495: the mode each closure literal's BARE parameter adopted, by the
+    // parameter's id — the position it landed in decided it, where the
+    // literal's `Type::Closure` (`ParameterMode::Open`) met a written mode
+    // inside unification. A view or writable view is also written into the
+    // parameter's `convention`, which is what the emitters and the view
+    // checks read; a VALUE leaves the convention bare, so this table is what
+    // remembers that the parameter is no longer open and refuses a second,
+    // different mode.
+    adopted_parameter_modes: HashMap<Id, Mode>,
     // `match opt { Some(let v) => .. }` where `opt` is a call returning a view
     // wrapped in an enum payload (`fun get(..): Option<&mut i32> { Some(&mut
     // self.x) }`, or `Option<&mut Node>` for an aggregate). The capture `v` binds
@@ -7064,7 +7082,7 @@ impl<'src> Analyzer<'src> {
             for_each_next_providers: HashMap::default(),
             for_each_iterable_types: HashMap::default(),
             for_each_views: HashMap::default(),
-            closure_type_parameter_views: HashMap::default(),
+            adopted_parameter_modes: HashMap::default(),
             wrapped_view_captures: HashMap::default(),
             prepped_binary_ops: Vec::new(),
             binary_context_types: HashMap::default(),
@@ -7528,10 +7546,11 @@ impl<'src> Analyzer<'src> {
                     && self.same_type_structure(left_element, right_element, depth + 1)
             }
             (
-                Type::Closure(left_parameters, left_return, left_contexts, _),
-                Type::Closure(right_parameters, right_return, right_contexts, _),
+                Type::Closure(left_parameters, left_return, left_contexts, left_modes),
+                Type::Closure(right_parameters, right_return, right_contexts, right_modes),
             ) => {
                 left_contexts == right_contexts
+                    && self.parameter_modes_compatible(&left_modes, &right_modes)
                     && all(&left_parameters, &right_parameters)
                     && self.same_type_structure(left_return, right_return, depth + 1)
             }
@@ -29944,183 +29963,9 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// B465 (R-c): a closure LITERAL that lands where a closure type takes a
-    /// VIEW (`f: |&str| void`, `update(f: |&mut T| void)`) has view
-    /// parameters there, written or not. `|c|` handed to `f` receives the
-    /// view the caller passes (`f(&a.city)`), so `c` IS a `&str` and reading
-    /// its value takes `*c`, as it does for a `fun`'s `&` parameter. Its
-    /// convention was the bare one the literal was written with, so the JS
-    /// emitter read the view's `(base, key)` pair as the value (`out = *c`
-    /// stored `[ [ 'Oslo', '1' ], 0 ]`), the checker took `out = c` without
-    /// the `*`, and the native emitter passed a value where the literal's type
-    /// wanted a reference.
-    ///
-    /// The positions read are the ones a closure type is WRITTEN at, which is
-    /// where `closure_type_parameter_views` records a view: a parameter of
-    /// the callee a call resolves to (a function, an external, a method, or a
-    /// closure-typed value whose own parameter is a closure type), a field of
-    /// the struct a literal builds, and an annotated binding. A literal
-    /// reached through a `let` (`let f = |c| ..; with_city(home, f)`) adopts
-    /// at the position it is handed to. A parameter the literal spells with
-    /// `&`/`&mut` already has its convention; only a bare one adopts.
-    ///
-    /// Runs once, after inference and before every pass that reads a
-    /// parameter's convention (`infer_borrows`, the view checks, the
-    /// primitive-view classification the emitters read). Whole-program and
-    /// deterministic, so a reused module's literals adopt exactly as they did
-    /// when the module was recorded.
-    fn adopt_closure_parameter_views(&mut self) {
-        let mut adoptions: Vec<(Id, Vec<Option<bool>>)> = Vec::new();
-        let mut call_ids: Vec<Id> = self.function_calls.keys().copied().collect();
-        call_ids.sort_unstable_by_key(|call_id| call_id.0);
-        for call_id in call_ids {
-            let Some(function_call) = self.function_calls.get(&call_id) else {
-                continue;
-            };
-            let argument_ids = function_call.argument_ids.clone();
-            let subject_id = function_call.subject_id;
-            let position_type_ids = self.callee_parameter_type_ids(subject_id);
-            for (type_id, argument_id) in position_type_ids.iter().zip(&argument_ids) {
-                if let Some(views) = self.closure_type_parameter_views.get(type_id)
-                    && let Some(closure_id) = self.closure_behind_callee(*argument_id)
-                {
-                    adoptions.push((closure_id, views.clone()));
-                }
-            }
-        }
-        // B534: a literal standing in a function's RETURN position, where the
-        // return type is a written closure type with view parameters (`fun
-        // make(): |&mut List<i32>| void { |list| list.push(9) }`), takes them
-        // there too — it was refused "cannot mutate immutable 'list'".
-        let mut function_ids: Vec<Id> = self.functions.keys().copied().collect();
-        function_ids.sort_unstable_by_key(|function_id| function_id.0);
-        for function_id in function_ids {
-            let Some((return_type_id, tail_id)) = self
-                .functions
-                .get(&function_id)
-                .filter(|function| function.has_body)
-                .and_then(|function| {
-                    function
-                        .return_type_id
-                        .map(|type_id| (type_id, function.body.1))
-                })
-            else {
-                continue;
-            };
-            let Some(views) = self
-                .closure_type_parameter_views
-                .get(&return_type_id)
-                .cloned()
-            else {
-                continue;
-            };
-            let mut leaves = Vec::new();
-            self.collect_tail_leaves(tail_id, &mut leaves);
-            for leaf in leaves {
-                if let Some(closure_id) = self.closure_behind_callee(leaf) {
-                    adoptions.push((closure_id, views.clone()));
-                }
-            }
-        }
-        for (expr_id, expr) in &self.expr_id_to_expr_map {
-            match expr {
-                Expr::StructInitializer(_, fields) => {
-                    let Some(Type::Struct(struct_id, _)) = self
-                        .type_id_of_expr(*expr_id)
-                        .and_then(|type_id| self.type_id_to_type_map.get(&type_id))
-                    else {
-                        continue;
-                    };
-                    let Some(struct_) = self.structs.get(struct_id) else {
-                        continue;
-                    };
-                    for (index, value_id) in fields {
-                        if let Some(field) = struct_.fields.get(*index)
-                            && let Some(views) =
-                                self.closure_type_parameter_views.get(&field.type_id)
-                            && let Some(closure_id) = self.closure_behind_callee(*value_id)
-                        {
-                            adoptions.push((closure_id, views.clone()));
-                        }
-                    }
-                }
-                Expr::Variable(variable_id) => {
-                    if let Some(variable) = self.variables.get(variable_id)
-                        && variable.annotated
-                        && let Some(initial) = variable.initial
-                        && let Some(views) =
-                            self.closure_type_parameter_views.get(&variable.type_id)
-                        && let Some(closure_id) = self.closure_behind_callee(initial)
-                    {
-                        adoptions.push((closure_id, views.clone()));
-                    }
-                }
-                _ => {}
-            }
-        }
-        for (closure_id, views) in adoptions {
-            let Some(parameter_ids) = self
-                .closures
-                .get(&closure_id)
-                .map(|closure| closure.parameters.clone())
-            else {
-                continue;
-            };
-            if parameter_ids.len() != views.len() {
-                continue;
-            }
-            for (parameter_id, view) in parameter_ids.iter().zip(views) {
-                let Some(mutable) = view else {
-                    continue;
-                };
-                if let Some(parameter) = self.parameters.get_mut(parameter_id)
-                    && parameter.convention == Convention::Bare
-                {
-                    parameter.convention = if mutable {
-                        Convention::RefMut
-                    } else {
-                        Convention::Ref
-                    };
-                }
-            }
-        }
-    }
-
-    /// The written TYPE of each parameter position of the callee `subject_id`
-    /// names — a function's or an external's declared parameters (the receiver
-    /// first for a method), or the parameter types of a closure-typed value's
-    /// closure type. Empty when the callee is neither.
-    fn callee_parameter_type_ids(&self, subject_id: Id) -> Vec<TypeId> {
-        if let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) {
-            let parameter_ids = self
-                .functions
-                .get(callee_id)
-                .map(|function| &function.parameters)
-                .or_else(|| {
-                    self.external_functions
-                        .get(callee_id)
-                        .map(|external| &external.parameters)
-                });
-            if let Some(parameter_ids) = parameter_ids {
-                return parameter_ids
-                    .iter()
-                    .filter_map(|parameter_id| self.parameters.get(parameter_id))
-                    .map(|parameter| parameter.type_id)
-                    .collect();
-            }
-        }
-        match self
-            .closure_value_type_id(subject_id)
-            .and_then(|type_id| self.type_id_to_type_map.get(&type_id))
-        {
-            Some(Type::Closure(parameter_type_ids, _, _, _)) => parameter_type_ids.clone(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// The closure TYPE a closure-typed value carries — a parameter, a local,
-    /// or a field holding one: the type as written, which is where
-    /// `closure_type_parameter_views` keys its views.
+    /// The closure TYPE a closure-typed callee carries — a parameter, a local
+    /// (a `let`, a `match` capture, a loop binding) or any other expression's
+    /// recorded type (a field read, `(h.f)(..)`).
     fn closure_value_type_id(&self, subject_id: Id) -> Option<TypeId> {
         match self.expr_id_to_expr_map.get(&subject_id)? {
             Expr::Local(binding_id) | Expr::Parameter(binding_id) => self
@@ -30132,44 +29977,244 @@ impl<'src> Analyzer<'src> {
                         .get(binding_id)
                         .map(|variable| variable.type_id)
                 }),
-            Expr::Field(..) => self.expr_id_to_type_id_map.get(&subject_id).copied(),
-            _ => None,
+            _ => self.expr_id_to_type_id_map.get(&subject_id).copied(),
         }
     }
 
     /// B400: the per-parameter view conventions of a call whose callee is a
-    /// CLOSURE-typed value — a parameter, a local, or a field holding one —
-    /// read off the closure type as written (`|&List<T>| U`). `None` for a
-    /// named function (its parameters carry their conventions) and for a
-    /// closure type with no view parameter.
+    /// CLOSURE-typed value — `Some(mutable)` for a view parameter, `None` for
+    /// a value — read off the closure type's MODES (B495), which every route
+    /// the value took (a `let`, a capture, a loop binding, a generic's
+    /// argument, a field) carried with it. `None` for a named function (its
+    /// parameters carry their conventions) and for a closure type with no
+    /// view parameter.
     ///
-    /// B465: a callee that IS a closure literal (through `let` bindings,
-    /// `let f = |c: &str| ..; f(..)`) answers from the literal's own
-    /// parameters — written with `&`/`&mut` or adopted from where the literal
-    /// was handed — since its type was never written.
+    /// A callee that IS a closure literal (through `let` bindings, `let f =
+    /// |c: &str| ..; f(..)`) answers from the literal's own parameters —
+    /// spelled with `&`/`&mut`, or adopted from where the literal landed.
     fn closure_callee_views(&self, subject_id: Id) -> Option<Vec<Option<bool>>> {
-        if let Some(closure_id) = self.closure_behind_callee(subject_id)
+        let views: Vec<Option<bool>> = if let Some(closure_id) =
+            self.closure_behind_callee(subject_id)
             && let Some(closure) = self.closures.get(&closure_id)
         {
-            let views: Vec<Option<bool>> = closure
+            closure
                 .parameters
                 .iter()
                 .map(|parameter_id| {
-                    match self
-                        .parameters
+                    self.parameters
                         .get(parameter_id)
-                        .map(|parameter| parameter.convention)
-                    {
-                        Some(Convention::Ref) => Some(false),
-                        Some(Convention::RefMut) => Some(true),
-                        _ => None,
-                    }
+                        .and_then(|parameter| convention_mode(parameter.convention).view())
                 })
-                .collect();
-            return views.iter().any(Option::is_some).then_some(views);
+                .collect()
+        } else {
+            let type_id = self.closure_value_type_id(subject_id)?;
+            let Type::Closure(_, _, _, modes) = self.borrow_type_by_type_id(type_id) else {
+                return None;
+            };
+            modes
+                .iter()
+                .map(|mode| self.resolved_parameter_mode(*mode).view())
+                .collect()
+        };
+        views.iter().any(Option::is_some).then_some(views)
+    }
+
+    /// The mode a closure type's parameter slot passes in (B495): a written
+    /// mode is itself; an open one — a literal's bare parameter — is whatever
+    /// it adopted, and a value while it has adopted nothing.
+    fn resolved_parameter_mode(&self, mode: ParameterMode) -> Mode {
+        match mode {
+            ParameterMode::Written(mode) => mode,
+            ParameterMode::Open(parameter_id) => self
+                .adopted_parameter_modes
+                .get(&parameter_id)
+                .copied()
+                .unwrap_or(Mode::Value),
         }
-        let type_id = self.closure_value_type_id(subject_id)?;
-        self.closure_type_parameter_views.get(&type_id).cloned()
+    }
+
+    /// B495 Q3, ADOPTION: a closure literal's bare parameter takes the mode
+    /// of the written position it lands in, at the moment the two closure
+    /// types meet in unification — so every check that runs during inference
+    /// already sees it (the post-inference pass this replaces ran too late
+    /// for the mutability check, `closure-type-views.md` v7).
+    ///
+    /// `false` when the parameter already adopted a DIFFERENT mode: one
+    /// literal cannot be a value closure at one position and a view closure
+    /// at another, so the second landing is refused like any written
+    /// mismatch. Past the constraint fixpoint nothing adopts any more (a
+    /// check that reconciles must not rewrite a convention a pass before it
+    /// read), and an open parameter is then compatible with any mode.
+    fn adopt_parameter_mode(&mut self, parameter_id: Id, mode: Mode) -> bool {
+        if let Some(adopted) = self.adopted_parameter_modes.get(&parameter_id) {
+            return *adopted == mode;
+        }
+        if self.types_settled {
+            return true;
+        }
+        self.adopted_parameter_modes.insert(parameter_id, mode);
+        if let Some(parameter) = self.parameters.get_mut(&parameter_id)
+            && parameter.convention == Convention::Bare
+        {
+            parameter.convention = match mode {
+                Mode::Value => Convention::Bare,
+                Mode::View => Convention::Ref,
+                Mode::MutView => Convention::RefMut,
+            };
+        }
+        // The fixpoint's progress signal: an adoption moved the world a
+        // deferred constraint may be waiting on (it is made once per
+        // parameter, so it cannot keep the loop lit).
+        self.type_map_writes += 1;
+        true
+    }
+
+    /// B495: a closure literal's BARE parameter that nothing has typed yet
+    /// takes the parameter type of the closure type its literal's type meets
+    /// — B13's channel at a call through the binding, applied where the
+    /// binding's type is reconciled instead (`let typed: |&str| void = h`
+    /// types `h`'s `|c|` as `str`, which is what makes `*c` read a scalar
+    /// view's place). The slot is the literal's own, so the body's deferred
+    /// uses retry against it; a parameter already typed is left alone.
+    fn fill_open_parameter_type(&mut self, parameter_id: Id, parameter_type: &Type) {
+        if self.types_settled
+            || matches!(
+                parameter_type,
+                Type::Unknown | Type::Unresolved | Type::Generic(_)
+            )
+        {
+            return;
+        }
+        let Some(slot) = self
+            .parameters
+            .get(&parameter_id)
+            .map(|parameter| parameter.type_id)
+        else {
+            return;
+        };
+        if matches!(self.borrow_type_by_type_id(slot), Type::Unknown) {
+            self.write_type_slot(slot, parameter_type.clone());
+        }
+    }
+
+    /// B495: the modes of two closure types that meet in unification (Q2,
+    /// Q3). Unstated modes (an analyzer-synthesized expectation) yield the
+    /// other side's. Two written modes must agree — a value closure is not a
+    /// view closure (`None`, the refusal). An open mode adopts the other
+    /// side's written mode, or the mode its partner already adopted.
+    fn reconcile_parameter_modes(
+        &mut self,
+        left: &[ParameterMode],
+        right: &[ParameterMode],
+    ) -> Option<Vec<ParameterMode>> {
+        if left.is_empty() || left.len() != right.len() {
+            return Some(if left.is_empty() { right } else { left }.to_vec());
+        }
+        let mut modes = Vec::with_capacity(left.len());
+        for (left, right) in left.iter().zip(right) {
+            modes.push(match (*left, *right) {
+                (ParameterMode::Written(left), ParameterMode::Written(right)) => {
+                    (left == right).then_some(ParameterMode::Written(left))?
+                }
+                (ParameterMode::Open(parameter_id), ParameterMode::Written(mode))
+                | (ParameterMode::Written(mode), ParameterMode::Open(parameter_id)) => self
+                    .adopt_parameter_mode(parameter_id, mode)
+                    .then_some(ParameterMode::Written(mode))?,
+                (ParameterMode::Open(left_id), ParameterMode::Open(right_id)) => {
+                    let left_mode = self.adopted_parameter_modes.get(&left_id).copied();
+                    let right_mode = self.adopted_parameter_modes.get(&right_id).copied();
+                    match (left_mode, right_mode) {
+                        (Some(mode), _) => self
+                            .adopt_parameter_mode(right_id, mode)
+                            .then_some(ParameterMode::Written(mode))?,
+                        (None, Some(mode)) => self
+                            .adopt_parameter_mode(left_id, mode)
+                            .then_some(ParameterMode::Written(mode))?,
+                        (None, None) => ParameterMode::Open(left_id),
+                    }
+                }
+            });
+        }
+        Some(modes)
+    }
+
+    /// A closure literal's modes as its type carries them (B495): its own
+    /// (`Closure::parameter_modes`), after its bare parameters adopted the
+    /// modes of the closure type it is inferred AT — the position's
+    /// expectation, through the active substitution when that is a generic
+    /// bound to a closure type (`List<|&mut T| void>::push`'s `T`, a generic
+    /// identity's `T` bound from an annotated result). A spelled mode that
+    /// disagrees is left for the reconcile of the whole value to refuse.
+    #[inline(never)]
+    fn closure_literal_modes(
+        &mut self,
+        closure_id: Id,
+        constraint: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> Vec<ParameterMode> {
+        let modes = self
+            .closures
+            .get(&closure_id)
+            .map(|closure| closure.parameter_modes.clone())
+            .unwrap_or_default();
+        let expected_modes = match constraint {
+            Type::Closure(_, _, _, expected) => expected.clone(),
+            Type::Generic(constraint_id) => match substitution_context
+                .get(constraint_id)
+                .map(|bound| self.borrow_type_by_type_id(*bound))
+            {
+                Some(Type::Closure(_, _, _, expected)) => expected.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        if expected_modes.len() == modes.len() {
+            for (mode, expected) in modes.iter().zip(expected_modes) {
+                if let (ParameterMode::Open(parameter_id), ParameterMode::Written(expected)) =
+                    (*mode, expected)
+                {
+                    self.adopt_parameter_mode(parameter_id, expected);
+                }
+            }
+        }
+        modes
+    }
+
+    /// The read-only twin of [`Self::reconcile_parameter_modes`] for the
+    /// comparison paths (`compare_type_rigid`, `same_type_structure`):
+    /// whether the two closure types' modes can meet. An open parameter that
+    /// has adopted nothing yet meets anything.
+    fn parameter_modes_compatible(&self, left: &[ParameterMode], right: &[ParameterMode]) -> bool {
+        if left.is_empty() || right.is_empty() || left.len() != right.len() {
+            return true;
+        }
+        let settled = |mode: &ParameterMode| match mode {
+            ParameterMode::Written(mode) => Some(*mode),
+            ParameterMode::Open(parameter_id) => {
+                self.adopted_parameter_modes.get(parameter_id).copied()
+            }
+        };
+        left.iter()
+            .zip(right)
+            .all(|(left, right)| match (settled(left), settled(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            })
+    }
+
+    /// The modes of a named function's declared parameters, as the closure
+    /// type it coerces to carries them (B495): `fun bump(x: &mut i32)` is a
+    /// `|&mut i32| void`.
+    fn function_parameter_modes(&self, function_id: Id) -> Vec<ParameterMode> {
+        self.functions
+            .get(&function_id)
+            .map(|function| function.parameters.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|parameter_id| self.parameters.get(parameter_id))
+            .filter(|parameter| parameter.name != "self")
+            .map(|parameter| ParameterMode::Written(convention_mode(parameter.convention)))
+            .collect()
     }
 
     /// The text of the file `source` points at, when this analysis registered
@@ -37792,6 +37837,19 @@ impl<'src> Analyzer<'src> {
             .return_type
             .as_deref()
             .map(|node| self.walk_type_node(node, body_scope_id));
+        let parameter_modes = closure
+            .parameters
+            .0
+            .iter()
+            .zip(&parameters)
+            .map(|(parameter, parameter_id)| {
+                if parameter.declared_type.is_some() || parameter.convention != Convention::Bare {
+                    ParameterMode::Written(convention_mode(parameter.convention))
+                } else {
+                    ParameterMode::Open(*parameter_id)
+                }
+            })
+            .collect();
         self.closures.insert(
             id,
             Closure {
@@ -37801,6 +37859,7 @@ impl<'src> Analyzer<'src> {
                 return_: expr_id,
                 rets,
                 return_type_id,
+                parameter_modes,
             },
         );
         Some(Expr::Closure(id))
@@ -37846,6 +37905,7 @@ impl<'src> Analyzer<'src> {
                 // `Expr::Async`, never `Expr::Closure` — S3's
                 // return-position check (below) never sees it.
                 return_type_id: None,
+                parameter_modes: Vec::new(),
             },
         );
         self.expr_id_to_expr_map
@@ -38901,17 +38961,20 @@ impl<'src> Analyzer<'src> {
                     .collect(),
             )),
             Node::ClosureType(parameters, return_type) => {
-                let views: Vec<Option<bool>> = parameters
+                // B495: the `&`/`&mut` the parameter walk below erases is the
+                // parameter's MODE, and it stays in the type — every copy,
+                // substitution and reconcile of this type carries it.
+                let modes: Vec<ParameterMode> = parameters
                     .0
                     .iter()
-                    .map(|parameter| match &parameter.1.0 {
-                        Node::Reference(mutable, _) => Some(*mutable),
-                        _ => None,
+                    .map(|parameter| {
+                        ParameterMode::Written(match &parameter.1.0 {
+                            Node::Reference(true, _) => Mode::MutView,
+                            Node::Reference(false, _) => Mode::View,
+                            _ => Mode::Value,
+                        })
                     })
                     .collect();
-                if views.iter().any(Option::is_some) {
-                    self.closure_type_parameter_views.insert(type_id, views);
-                }
                 let t_parameter_type_ids = parameters
                     .0
                     .iter()
@@ -38927,7 +38990,7 @@ impl<'src> Analyzer<'src> {
                     t_parameter_type_ids,
                     t_return_type_id,
                     Vec::new(),
-                    Vec::new(),
+                    modes,
                 ))
             }
             // A context clause reaching the general type walk is misplaced —
@@ -40971,7 +41034,9 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         let returned = Type::Enum(enum_id, arguments).get_type_id(self);
-        Some(Type::Closure(parameters, returned, Vec::new(), Vec::new()))
+        // A variant constructor takes its payload by value (B495).
+        let modes = vec![ParameterMode::Written(Mode::Value); parameters.len()];
+        Some(Type::Closure(parameters, returned, Vec::new(), modes))
     }
 
     /// B462's other half: a TUPLE variant named as a value where no closure is
@@ -43067,6 +43132,11 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .map(|parameter_id| self.parameters.get(parameter_id).unwrap().type_id)
                     .collect::<Vec<_>>();
+                let modes = self.closure_literal_modes(
+                    closure_id,
+                    constraint.as_ref(),
+                    substitution_context,
+                );
 
                 // S3 (editing-dx.md §3.9): when the closure's return type is
                 // KNOWN and GROUND ahead of the body — either its OWN
@@ -43183,7 +43253,7 @@ impl<'src> Analyzer<'src> {
                                 parameter_type_ids,
                                 target_return_type_id,
                                 Vec::new(),
-                                Vec::new(),
+                                modes,
                             );
                         }
                         ReturnPositionCheck::Mismatched(msg) => {
@@ -43252,7 +43322,7 @@ impl<'src> Analyzer<'src> {
                                 parameter_type_ids,
                                 target_return_type_id,
                                 Vec::new(),
-                                Vec::new(),
+                                modes,
                             );
                         }
                     }
@@ -43296,7 +43366,7 @@ impl<'src> Analyzer<'src> {
                         parameter_type_ids,
                         return_type.get_type_id(self),
                         Vec::new(),
-                        Vec::new(),
+                        modes,
                     ),
                 }
             }
@@ -44307,12 +44377,14 @@ impl<'src> Analyzer<'src> {
         };
         // A named function has no `context` clause of its own (B242's clause is
         // a DECLARATION about its body, not a threading discipline on a value),
-        // so its coerced closure type carries none.
+        // so its coerced closure type carries none. Its parameters' modes are
+        // its conventions (B495).
+        let modes = self.function_parameter_modes(function_id);
         Some(Type::Closure(
             parameter_type_ids,
             return_type_id,
             Vec::new(),
-            Vec::new(),
+            modes,
         ))
     }
 
@@ -44371,12 +44443,14 @@ impl<'src> Analyzer<'src> {
     /// `function_closure_type`: a clause is a declaration about the member's
     /// body, not a threading discipline on the value.
     fn callable_closure_type(&self, subject_type: &Type) -> Option<Type> {
-        let (_, parameter_type_ids, return_type_id) = self.callable_call_signature(subject_type)?;
+        let (function_id, parameter_type_ids, return_type_id) =
+            self.callable_call_signature(subject_type)?;
         let ground = parameter_type_ids
             .iter()
             .all(|parameter_type_id| self.type_is_ground(*parameter_type_id))
             && self.type_is_ground(return_type_id);
-        ground.then(|| Type::Closure(parameter_type_ids, return_type_id, Vec::new(), Vec::new()))
+        let modes = self.function_parameter_modes(function_id);
+        ground.then(|| Type::Closure(parameter_type_ids, return_type_id, Vec::new(), modes))
     }
 
     /// `function_closure_type` for read-only paths (`compare_type`): an
@@ -44391,7 +44465,7 @@ impl<'src> Analyzer<'src> {
             parameter_type_ids,
             return_type_id,
             Vec::new(),
-            Vec::new(),
+            self.function_parameter_modes(function_id),
         ))
     }
 
@@ -45000,14 +45074,24 @@ impl<'src> Analyzer<'src> {
                 } else {
                     l_contexts.clone()
                 };
-                let modes = if l_modes.is_empty() {
-                    r_modes.clone()
-                } else {
-                    l_modes.clone()
-                };
                 if l_parameter_ids.len() != r_parameter_ids.len() {
                     return None;
                 }
+                // B495: the modes take part in compatibility, unlike the
+                // clause — two written modes must agree, and a literal's open
+                // parameter adopts the written one here (Q2, Q3).
+                let (l_modes, r_modes) = (l_modes.clone(), r_modes.clone());
+                let modes = self.reconcile_parameter_modes(&l_modes, &r_modes)?;
+                let open_parameters: Vec<Option<Id>> = (0..l_parameter_ids.len())
+                    .map(|index| {
+                        [l_modes.get(index), r_modes.get(index)]
+                            .into_iter()
+                            .find_map(|mode| match mode {
+                                Some(ParameterMode::Open(parameter_id)) => Some(*parameter_id),
+                                _ => None,
+                            })
+                    })
+                    .collect();
                 let mut result_parameter_ids = Vec::with_capacity(l_parameter_ids.len());
                 let mut all_bindings = Vec::new();
                 for (l_parameter_id, r_parameter_id) in
@@ -45018,6 +45102,9 @@ impl<'src> Analyzer<'src> {
                     let (parameter, bindings) =
                         self.reconcile_type(&l, &r, substitution_context)?;
                     all_bindings.extend(bindings);
+                    if let Some(parameter_id) = open_parameters[result_parameter_ids.len()] {
+                        self.fill_open_parameter_type(parameter_id, &parameter);
+                    }
                     result_parameter_ids.push(parameter.get_type_id(self));
                 }
                 let l_return = l_return_id.get_type(self);
@@ -45313,10 +45400,11 @@ impl<'src> Analyzer<'src> {
             }
             // B309: clauses are not compared — see `Type::Closure`'s own note.
             (
-                Type::Closure(l_parameter_ids, l_return_id, _, _),
-                Type::Closure(r_parameter_ids, r_return_id, _, _),
+                Type::Closure(l_parameter_ids, l_return_id, _, l_modes),
+                Type::Closure(r_parameter_ids, r_return_id, _, r_modes),
             ) => {
                 l_parameter_ids.len() == r_parameter_ids.len()
+                    && self.parameter_modes_compatible(l_modes, r_modes)
                     && l_parameter_ids.iter().zip(r_parameter_ids.iter()).all(
                         |(l_parameter_id, r_parameter_id)| {
                             let l = l_parameter_id.get_type(self);
@@ -47362,6 +47450,11 @@ impl<'src> Analyzer<'src> {
         got_type: &Type,
         substitution_context: &SubstitutionContext,
     ) -> String {
+        if let Some(message) =
+            self.closure_mode_mismatch_message(expected_type, got_type, substitution_context)
+        {
+            return message;
+        }
         let expected = self.pretty_print_type(expected_type, substitution_context);
         let got = self.pretty_print_type(got_type, substitution_context);
         match self.numeric_conversion_target(expected_type, got_type) {
@@ -47379,6 +47472,81 @@ impl<'src> Analyzer<'src> {
             ),
             None => format!("Expected {expected}, but got {got} instead."),
         }
+    }
+
+    /// B495 Q2: the refusal for a closure whose parameter's MODE differs
+    /// from the mode its type position wrote — a value closure where the type
+    /// takes a view, or the reverse. The two are different calling
+    /// conventions (the caller hands a view's place, or a value), so they are
+    /// different types, and no adapter is inserted: a value-into-view adapter
+    /// hides a copy, and a view closure cannot stand where a value closure
+    /// writes its own copy. `None` unless both are closure types of one arity
+    /// whose modes disagree at a parameter where both are settled.
+    fn closure_mode_mismatch_message(
+        &self,
+        expected_type: &Type,
+        got_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> Option<String> {
+        let (
+            Type::Closure(expected_parameters, _, _, expected_modes),
+            Type::Closure(got_parameters, _, _, got_modes),
+        ) = (expected_type, got_type)
+        else {
+            return None;
+        };
+        if expected_parameters.len() != got_parameters.len()
+            || expected_modes.len() != expected_parameters.len()
+            || got_modes.len() != got_parameters.len()
+        {
+            return None;
+        }
+        let settled = |mode: &ParameterMode| match mode {
+            ParameterMode::Written(mode) => Some(*mode),
+            ParameterMode::Open(parameter_id) => {
+                self.adopted_parameter_modes.get(parameter_id).copied()
+            }
+        };
+        let (index, expected_mode, got_mode) =
+            expected_modes.iter().zip(got_modes).enumerate().find_map(
+                |(index, (expected, got))| match (settled(expected), settled(got)) {
+                    (Some(expected), Some(got)) if expected != got => Some((index, expected, got)),
+                    _ => None,
+                },
+            )?;
+        let pointee = self.pretty_print_type(
+            &expected_parameters[index].get_type(self),
+            substitution_context,
+        );
+        let describe = |mode: Mode| match mode {
+            Mode::Value => format!("`{pointee}` by value"),
+            Mode::View => format!("a view `&{pointee}`"),
+            Mode::MutView => format!("a writable view `&mut {pointee}`"),
+        };
+        let which = if expected_parameters.len() == 1 {
+            "this closure takes".to_string()
+        } else {
+            format!("this closure's parameter {} takes", index + 1)
+        };
+        let adapt = match (expected_mode, got_mode) {
+            (Mode::View, Mode::Value) => {
+                "write the parameter the way the type does (`|c: &T|`, or a bare `|c|`), or adapt the value closure with one that copies the view's value out: `|c| f(*c)`"
+            }
+            (Mode::MutView, Mode::Value) => {
+                "a closure that takes a value writes only its own copy, never the caller's place: write the parameter `&mut` (`|c: &mut T|`, or a bare `|c|`)"
+            }
+            (Mode::Value, _) => {
+                "write the parameter by value (`|c: T|`, or a bare `|c|`), or adapt the view closure with one that lends it the value: `|c| f(&c)`"
+            }
+            _ => {
+                "write the parameter's view the way the type does (`&` and `&mut` are different views)"
+            }
+        };
+        Some(format!(
+            "{which} {} where its type takes {}: a value closure and a view closure are different types, and no adapter is inserted; {adapt}.",
+            describe(got_mode),
+            describe(expected_mode),
+        ))
     }
 
     /// Whether `type_` is the index type, `usize`.
@@ -48722,12 +48890,22 @@ impl<'src> Analyzer<'src> {
                                     &argument_type,
                                     &substitution_context,
                                 );
-                                self.diagnostics.push(Error {
-                                    trace: Vec::new(),
-                                    note,
-                                    span: **self.span_map.get(&argument_id).unwrap(),
-                                    msg,
-                                });
+                                let span = **self.span_map.get(&argument_id).unwrap();
+                                // A later argument may still defer the call
+                                // (B495's mode refusal stands at a closure
+                                // literal whose parameter types already
+                                // reconcile, so the call is re-attempted):
+                                // one diagnostic per root cause (B5).
+                                if !self.diagnostics.iter().any(|diagnostic| {
+                                    diagnostic.span == span && diagnostic.msg == msg
+                                }) {
+                                    self.diagnostics.push(Error {
+                                        trace: Vec::new(),
+                                        note,
+                                        span,
+                                        msg,
+                                    });
+                                }
                             }
                         }
                     }
@@ -61979,7 +62157,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
 
-            Type::Closure(parameters, return_id, contexts, _) => {
+            Type::Closure(parameters, return_id, contexts, modes) => {
                 if !contexts.is_empty() {
                     buf.push('(');
                 }
@@ -61987,6 +62165,11 @@ impl<'src> Analyzer<'src> {
                 for (i, parameter_id) in parameters.iter().enumerate() {
                     if i > 0 {
                         buf.push_str(", ");
+                    }
+                    // B495: the mode is part of the type, so it prints —
+                    // `|&str| void` is not `|str| void`.
+                    if let Some(mode) = modes.get(i) {
+                        buf.push_str(self.resolved_parameter_mode(*mode).prefix());
                     }
                     let parameter_type = parameter_id.get_type(self);
                     let rendered = self.pretty_print_type_at(
@@ -62863,13 +63046,6 @@ pub struct Program<'src> {
     pub for_each_iterable_types: HashMap<Id, TypeId>,
     // `for e in &mut list` loop bindings → whether the element view is `&mut`.
     pub for_each_views: HashMap<Id, bool>,
-    /// A written closure TYPE's view parameters (`|&mut T| void`), keyed by the
-    /// closure type's id: per parameter, `Some(mutable)` for a `&`/`&mut` view
-    /// and `None` for a value. Only closure types with at least one view are
-    /// recorded. The type itself carries the POINTEE (views are tracked beside
-    /// types), so this is where the native backend reads the `&mut` its
-    /// closure signature has to spell.
-    pub closure_type_parameter_views: HashMap<TypeId, Vec<Option<bool>>>,
     pub binary_op_dispatch: HashMap<Id, Id>,
     /// B176: `str + value` binaries whose right operand is a generic parameter
     /// whose bound provides the string form — `(the parameter's constraint, the
@@ -63836,6 +64012,36 @@ pub enum TransferForm {
 }
 
 impl<'src> Program<'src> {
+    /// The mode a closure type's parameter slot passes in (B495). A literal's
+    /// open parameter answers with the convention it adopted during
+    /// inference (a bare parameter that adopted nothing, or adopted a value,
+    /// is a value).
+    pub fn parameter_mode(&self, mode: ParameterMode) -> Mode {
+        match mode {
+            ParameterMode::Written(mode) => mode,
+            ParameterMode::Open(parameter_id) => self
+                .parameters
+                .get(&parameter_id)
+                .map_or(Mode::Value, |parameter| {
+                    convention_mode(parameter.convention)
+                }),
+        }
+    }
+
+    /// Per parameter of the closure type `type_`, `Some(mutable)` for a view
+    /// and `None` for a value — empty when `type_` is not a closure type or
+    /// states no modes. What the native backend renders a closure signature
+    /// and passes a closure call's arguments by.
+    pub fn closure_parameter_views(&self, type_: &Type) -> Vec<Option<bool>> {
+        match type_ {
+            Type::Closure(_, _, _, modes) => modes
+                .iter()
+                .map(|mode| self.parameter_mode(*mode).view())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The source file an entity originated from, by locating the walk range
     /// that produced its id. `None` for synthetic entities minted outside any
     /// file walk (e.g. during post-analysis passes).
@@ -71849,9 +72055,6 @@ fn analyze_over_world<'src>(
         // The splice (§3.2). Before every check that could add to the lists,
         // and the published order is `sort_in_step`'s either way.
         analyzer.replay_world_diagnostics(&replay_records);
-        // B465: a closure literal at a view position of a written closure type
-        // takes view parameters there — before anything reads a convention.
-        analyzer.adopt_closure_parameter_views();
         // Infer the `borrows` effect before any check reads it (readonly-mutation
         // and the scalar-view lowering both consult `Function.borrows`).
         analyzer.infer_borrows();
@@ -73173,7 +73376,6 @@ fn analyze_over_world<'src>(
         for_each_next_providers: analyzer.for_each_next_providers,
         for_each_iterable_types: analyzer.for_each_iterable_types,
         for_each_views: analyzer.for_each_views,
-        closure_type_parameter_views: analyzer.closure_type_parameter_views,
         binary_op_dispatch: analyzer.binary_op_dispatch,
         concat_render_dispatch: analyzer.concat_render_dispatch,
         own_generic_call_bindings: analyzer.own_generic_call_bindings,

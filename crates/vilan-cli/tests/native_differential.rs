@@ -9294,6 +9294,28 @@ fn a_view_closure_reached_by_another_route_keeps_its_views_on_both_backends() {
     );
 }
 
+/// B495: the closure type carries its parameters' MODES, so a literal with a
+/// bare parameter takes the view of the position it reaches by every route —
+/// an annotation re-typing a `let`, a generic identity, an `Option`/`List` of
+/// view closures, a generic struct's field, a match capture, a loop binding,
+/// `List::push` — and the call through each passes a view natively too. JS
+/// stored the `(base, key)` pair as the value at the first two on v0.43.0,
+/// refused the `Option`/`List` literal, and native passed a value to a `&mut`.
+#[test]
+fn a_closure_literal_takes_its_positions_parameter_modes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_closure_parameter_modes.vl"),
+        include_str!("native/closure_parameter_modes.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_closure_parameter_modes.vl"),
+        Verdict::Identical,
+        "a closure literal must take its position's parameter modes on both backends"
+    );
+}
+
 /// F48 (pinned, not reproduced at the Order 46 base): a reassigned
 /// closure-typed `mut` binding and a `List` of closures build — F44's counted
 /// literal closed what was filed as rustc E0308 in Order 43.

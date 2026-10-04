@@ -653,3 +653,4 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 628	-	`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell` (re-exported from `std::reactive`)
 629	-	`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell` (re-exported from `std::reactive`)
 630	-	`{part}` was renamed `{new}`: write `import std::{module}::{new};`
+NEW	-	{which} {got} where its type takes {expected}: a value closure and a view closure are different types, and no adapter is inserted; {adapt}.

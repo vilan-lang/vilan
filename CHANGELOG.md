@@ -25,6 +25,16 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**A closure literal written with a bare parameter takes the view of the closure type it lands in on every route — a `let` an annotation re-types (`let h = |c| { out = *c; }; let typed: |&str| void = h;`), a generic identity (`let f: |&str| void = hold(|c| ..)`), an `Option`/`List` of view closures, a generic struct's field (`Holder<|&mut i32| void>`) and `List<|&mut T| void>::push` — where JS stored the caller's `(base, key)` pair as the value (`out=Oslo,0`), the `Option`/`List` and `push` forms were refused "cannot mutate immutable 'x'", and natively the call through a capture or a generic field passed a value to a `&mut`.** B495 (`closure-type-views.md`, RULED Q1–Q5), closing B527, B534's third position and F69. A closure type now carries each parameter's MODE (value, view, writable view) in the type itself, where it lived in a side table keyed by the written annotation's id and was lost on every copy, substitution and reconcile. A bare literal parameter adopts the written mode where the two types meet in unification, so the mutability check during inference sees it; the post-inference adoption pass and the side table are gone, and both emitters read the mode off the type (native-46's call-site stopgap for F69/F77 is retired with it). Hover, inlay hints and mismatch messages print the mode: `|&str, &mut i32| void`.
+
+---
+
+<!-- family: breaking -->
+**BREAKING (B495 Q2/Q4): `|str| void` and `|&str| void` are different types. A closure whose parameter states one mode — written on its type, spelled on the literal (`|c: str|`, `|c: &str|`), or a named function's declared convention — is refused where the other is wanted, in both directions: "this closure takes `str` by value where its type takes a view `&str`: a value closure and a view closure are different types, and no adapter is inserted; … adapt the value closure with one that copies the view's value out: `|c| f(*c)`".** A by-value closure bound to a view type stored the place pair as the value on JS, and the reverse ran only because `*c` of a non-view read through; natively both were erased. A bare literal is unaffected (it takes its position's mode), and so is one literal reached twice at one mode; reached at two different modes it is refused at the second. The estate carries no such site (std, the corpus, the examples, the docs and kolt: 0), so the refusal ships as an error, not Q2's one-release warning.
+
+---
+
 <!-- family: fix -->
 **The book writes `[resource]` on its own line above the declaration, as `vilan fmt` has since B485 Q10, in all 20 fence lines that still put it on the declaration line.** K28: the tour's resources page (6), the persistence guide's file-API summary (3), `std::process` (4), `std::reactive`'s collection- and map-pipe traits (4), `std::misc` (1) and the memory spec (2). Where a summary aligns a trailing comment, the comment keeps its column. The docs gate compiles every rewritten fence. Tracker K28.
 

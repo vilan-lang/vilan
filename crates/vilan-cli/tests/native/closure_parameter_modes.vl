@@ -1,0 +1,81 @@
+// B495: a closure type carries each parameter's MODE (`|&str| void` is not
+// `|str| void`), so a closure literal written with a bare parameter takes the
+// view of the position it reaches by any route — a `let` re-typed by an
+// annotation, a generic identity, an `Option` or `List` of view closures, a
+// generic struct's field, a match capture, a loop binding and `List::push` —
+// and a call through any of those passes a view on both backends. On v0.43.0
+// JS stored the caller's `(base, key)` pair as the value (`Oslo,0`) at the
+// first two, refused the third ("cannot mutate immutable 'x'"), and native
+// passed a value where the type took a reference.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct City {
+	name: str,
+}
+
+struct Counter {
+	n: i32,
+}
+
+struct Holder<T> {
+	f: T,
+}
+
+fun hold<T>(x: T): T {
+	x
+}
+
+fun main() {
+	let home = City { name = "Oslo" };
+	mut out = "";
+	let h = |c| {
+		out = *c;
+	};
+	let typed: |&str| void = h;
+	typed(&home.name);
+	print(i"through a let: {out}");
+
+	let city = "Bergen";
+	let held: |&str| void = hold(|c| {
+		out = *c;
+	});
+	held(&city);
+	print(i"through hold<T>: {out}");
+
+	mut c = Counter { n = 1 };
+	let bump: Option<|&mut i32| void> = Some(|x| {
+		x += 10;
+	});
+	match bump {
+		Some(let f) => f(&mut c.n),
+		None => {},
+	}
+	print(i"through a match capture: {c.n}");
+	let all: List<|&mut i32| void> = [
+		|x| {
+			x += 100;
+		},
+	];
+	for g in all {
+		g(&mut c.n);
+	}
+	print(i"through a loop binding: {c.n}");
+
+	mut n = 1;
+	let holder: Holder<|&mut i32| void> = Holder {
+		f = |x| {
+			x += 5;
+		},
+	};
+	(holder.f)(&mut n);
+	print(i"through Holder<T>: {n}");
+
+	mut edits: List<|&mut List<i32>| void> = [];
+	edits.push(|list| list.push(7));
+	mut xs: List<i32> = [];
+	for edit in edits {
+		edit(&mut xs);
+	}
+	print(i"through List::push: {xs.len()}");
+}

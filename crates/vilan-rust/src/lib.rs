@@ -1737,8 +1737,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Type::Closure(parameters, return_type_id, _, _) => {
                 out.push_str("Fn");
                 // A view parameter is a different Rust signature, so it keys
-                // apart from the same closure type over values.
-                if let Some(views) = self.program.closure_type_parameter_views.get(&type_id) {
+                // apart from the same closure type over values (B495: the
+                // modes are the type's own).
+                let views = self.program.closure_parameter_views(type_);
+                if views.iter().any(Option::is_some) {
                     for view in views {
                         out.push_str(match view {
                             Some(true) => "M",
@@ -2251,20 +2253,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let element = self.rust_type(element, span)?;
                 Ok(format!("[{element}; {length}]"))
             }
-            Type::Closure(parameters, return_type, contexts, _) => {
+            Type::Closure(parameters, return_type, contexts, modes) => {
                 // Read and CLEAR: the flag belongs to this position's outermost
                 // closure, not to a closure nested inside its own signature.
                 let is_async = std::mem::take(&mut self.expects_async);
-                // A parameter WRITTEN as a view (`|&mut T| void`) is a reference
-                // in the signature, as the closure literal that lands here binds
-                // it (`move |list: &mut Vec<i32>|`) — the analyzer records the
-                // `&`/`&mut` the type itself erases.
-                let views = self
-                    .program
-                    .closure_type_parameter_views
-                    .get(&type_id)
-                    .cloned()
-                    .unwrap_or_default();
+                // A view parameter (`|&mut T| void`) is a reference in the
+                // signature, as the closure literal that lands here binds it
+                // (`move |list: &mut Vec<i32>|`) — the type's own modes say
+                // which (B495), on every route the type took to get here.
+                let views: Vec<Option<bool>> = modes
+                    .iter()
+                    .map(|mode| self.program.parameter_mode(*mode).view())
+                    .collect();
                 let mut parts = Vec::new();
                 for (index, parameter) in parameters.iter().enumerate() {
                     let rendered = self.rust_type(*parameter, span)?;
@@ -3862,33 +3862,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.parameter_parts_at(id, None, span)
     }
 
-    /// Whether a closure parameter should take the POSITION's closure type
-    /// over its own (F69, F77): `|f| f(&cell.write())` in a field typed
-    /// `|(|&T| void)| void` gives `f` a closure type the analyzer built for the
-    /// literal, which carries no record of the `&` the field's annotation
-    /// wrote (views are tracked beside a WRITTEN type, by its id), so the
-    /// literal bound `f` as `Fn(T)` against the field's `Fn(&T)` and rustc
-    /// refused it. The position's type is the same closure with its views
-    /// recorded, so it is the one to render — when the parameter's own type is
-    /// a closure of the same arity whose views are not recorded.
-    fn positioned_closure_carries_views(&self, own: TypeId, positioned: TypeId) -> bool {
-        let own = self.concrete(own);
-        let positioned = self.concrete(positioned);
-        let (
-            Some(Type::Closure(own_parameters, _, _, _)),
-            Some(Type::Closure(positioned_parameters, _, _, _)),
-        ) = (self.type_entry(&own), self.type_entry(&positioned))
-        else {
-            return false;
-        };
-        own_parameters.len() == positioned_parameters.len()
-            && !self.program.closure_type_parameter_views.contains_key(&own)
-            && self
-                .program
-                .closure_type_parameter_views
-                .contains_key(&positioned)
-    }
-
     /// [`Self::parameter_parts`], with the parameter's type taken from
     /// `positioned` where the analyzer recorded none — a closure literal's
     /// parameter that only its POSITION types (F74).
@@ -3908,10 +3881,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .cloned()
             .ok_or_else(|| unsupported("an unresolved parameter", span))?;
         if let Some(positioned) = positioned
-            && (matches!(
+            && matches!(
                 self.resolve(parameter.type_id),
                 None | Some(Type::Unresolved | Type::Unknown)
-            ) || self.positioned_closure_carries_views(parameter.type_id, positioned))
+            )
         {
             parameter.type_id = positioned;
         }
@@ -9805,11 +9778,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) -> Option<Span> {
         let receiver = self.canonical_place(self.place_spine(*argument_ids.first()?)?);
         for (index, parameter) in declared.iter().enumerate() {
-            let writes_a_view = self
-                .program
-                .closure_type_parameter_views
-                .get(&parameter.type_id)
-                .is_some_and(|views| views.contains(&Some(true)));
+            let writes_a_view = self.type_entry(&parameter.type_id).is_some_and(|type_| {
+                self.program
+                    .closure_parameter_views(type_)
+                    .contains(&Some(true))
+            });
             if !writes_a_view {
                 continue;
             }
@@ -9923,8 +9896,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) -> Result<Vec<String>, Error> {
         let views = callee_type
             .map(|type_id| self.concrete(type_id))
-            .and_then(|type_id| self.program.closure_type_parameter_views.get(&type_id))
-            .cloned()
+            .and_then(|type_id| self.type_entry(&type_id))
+            .map(|type_| self.program.closure_parameter_views(type_))
             .unwrap_or_default();
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
@@ -9943,15 +9916,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     }
                 }
                 Some(false) => format!("&{}", self.expression(*argument, depth)?),
-                // F69: a closure type that reached this call through a match
-                // capture, a loop binding or a closure's own parameter is not
-                // the WRITTEN type the analyzer recorded its views beside, so
-                // the record is silent here. The argument's own spelling is
-                // not: a closure's view parameter takes a view the source
-                // writes (`f(&mut s)`, B464's rule — a bare place is refused
-                // there), so a written `&`/`&mut` IS the convention, and it is
-                // passed as written rather than read through into a copy.
-                None if already_a_reference => self.expression(*argument, depth)?,
                 None => self.consumed_value_of(*argument, depth)?,
             });
         }

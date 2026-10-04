@@ -257,7 +257,13 @@ scalar view can't leak); write `*v` to copy the value out. A closure's view
 parameter is a view by the same rule, whether the literal spells it
 (`|&mut list|`) or takes it from the closure type it is handed to: `|c|`
 passed where `|&str| void` is expected receives a `&str`, and reads it as
-`*c`. Iteration by view (`for e in &mut list`) binds each
+`*c`. The `&`/`&mut` is part of the closure TYPE — `|&str| void` and
+`|str| void` are different types — so a bare `|c|` takes its position's
+mode however it reaches it (a `let` the annotation re-types, a generic's
+argument, an `Option` or `List` of view closures, a field), and a closure
+whose parameter states one mode (written on its type, or spelled on the
+literal) is refused where the other is wanted: a value-into-view adapter
+would hide a copy, so write it (`|c| f(*c)`). Iteration by view (`for e in &mut list`) binds each
 element as a view: assignment and field writes go through; `*e` reads the
 element. The parameter conventions:
 

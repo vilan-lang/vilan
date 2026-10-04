@@ -12060,7 +12060,8 @@ fn b512_the_spelled_copy_of_a_conditional_view_is_a_copy() {
 /// |list| list.push(9) }` was refused "cannot mutate immutable 'list'" — and at
 /// an annotated binding, called or never called (closed by B516's change to the
 /// binding's probe). The third position the item names, a generic parameter
-/// instantiated with the closure type (`List<|&mut ..|>::push`), is not taken.
+/// instantiated with the closure type (`List<|&mut ..|>::push`), is B495's:
+/// `b495_a_literal_nested_in_a_written_view_closure_type_adopts_its_views`.
 #[test]
 fn b534_a_closure_literal_takes_view_parameters_at_a_return_and_an_annotated_binding() {
     assert_compiles_and_runs(
@@ -12080,5 +12081,173 @@ fn b534_a_closure_literal_takes_view_parameters_at_a_return_and_an_annotated_bin
         }
         "#,
         "4\n",
+    );
+}
+
+/// B495 (`closure-type-views.md`): a closure type carries its parameters'
+/// MODES, so a literal written with a bare parameter takes the view of the
+/// written position it reaches however it gets there. Through a `let` the
+/// annotation re-types (`let typed: |&str| void = h`) and through a generic
+/// identity (`hold<T>(x: T): T`), JS stored the caller's `(base, key)` pair as
+/// the value — `out=Oslo,0` — because the views lived in a side table keyed by
+/// the written annotation's id, and every copy of the type lost them.
+#[test]
+fn b495_a_literal_adopts_its_positions_views_through_a_let_and_a_generic_identity() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct City { name: str }
+
+        fun hold<T>(x: T): T { x }
+
+        fun main() {
+            let home = City { name = "Oslo" };
+            mut out = "";
+            let h = |c| {
+                out = *c;
+            };
+            let typed: |&str| void = h;
+            typed(&home.name);
+            print(i"let {out}");
+            let city = "Bergen";
+            let held: |&str| void = hold(|c| {
+                out = *c;
+            });
+            held(&city);
+            print(i"hold {out}");
+            mut n = 1;
+            let bump = |x| {
+                x += 10;
+            };
+            let writes: |&mut i32| void = bump;
+            writes(&mut n);
+            let doubled: |&mut i32| void = hold(|x| {
+                x *= 2;
+            });
+            doubled(&mut n);
+            print(i"mut {n}");
+        }
+        "#,
+        "let Oslo\nhold Bergen\nmut 22\n",
+    );
+}
+
+/// B495: a bare literal stored INSIDE a written view closure type — an
+/// `Option<|&mut i32| void>`, a `List<..>`, a generic struct's field
+/// `Holder<|&mut i32| void>`, and `List<|&mut ..|>::push`'s `T` (B534's third
+/// position) — takes the view there. Each was refused "cannot mutate immutable
+/// 'x'": the written closure type was one constructor deep, and the
+/// adoption pass only met it at the top.
+#[test]
+fn b495_a_literal_nested_in_a_written_view_closure_type_adopts_its_views() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        struct Holder<T> { f: T }
+
+        fun main() {
+            mut n = 1;
+            let bump: Option<|&mut i32| void> = Some(|x| {
+                x += 10;
+            });
+            match bump {
+                Some(let f) => f(&mut n),
+                None => {},
+            }
+            let all: List<|&mut i32| void> = [|x| {
+                x += 100;
+            }];
+            for g in all {
+                g(&mut n);
+            }
+            let holder: Holder<|&mut i32| void> = Holder { f = |x| {
+                x += 1000;
+            } };
+            (holder.f)(&mut n);
+            print(n);
+            mut edits: List<|&mut List<i32>| void> = [];
+            edits.push(|list| list.push(7));
+            mut xs: List<i32> = [];
+            for edit in edits {
+                edit(&mut xs);
+            }
+            print(xs.len());
+        }
+        "#,
+        "1111\n1\n",
+    );
+}
+
+/// B495 Q2: a value closure and a view closure are different types, in both
+/// directions, whether the mode was written on the type or spelled on the
+/// literal — `|str| void` bound where `|&str| void` is wanted stored the place
+/// pair as the value on JS, and the reverse passed natively by luck. Refused
+/// with the parameter's two modes named, and the adapter to write.
+#[test]
+fn b495_a_value_closure_and_a_view_closure_are_different_types() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let by_value: |str| void = |c| {};
+            let as_view: |&str| void = by_value;
+        }
+        "#,
+        "this closure takes `str` by value where its type takes a view `&str`: a value closure and a view closure are different types, and no adapter is inserted",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let by_view: |&str| void = |c| {};
+            let as_value: |str| void = by_view;
+        }
+        "#,
+        "this closure takes a view `&str` where its type takes `str` by value",
+    );
+    assert_fails_with(
+        r#"
+        fun apply(f: |&mut i32| void, n: &mut i32) { f(n); }
+        fun main() {
+            mut n = 1;
+            apply(|x: i32| {}, &mut n);
+        }
+        "#,
+        "this closure takes `i32` by value where its type takes a writable view `&mut i32`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let h = |c| {};
+            let as_value: |str| void = h;
+            let as_view: |&str| void = h;
+        }
+        "#,
+        "this closure takes `str` by value where its type takes a view `&str`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let pair: |i32, &mut i32| void = |a, b| {};
+            let other: |i32, &i32| void = pair;
+        }
+        "#,
+        "this closure's parameter 2 takes a writable view `&mut i32` where its type takes a view `&i32`",
+    );
+}
+
+/// B495: the mode is part of the closure type's printed form — a mismatch,
+/// a hover and an inlay hint say `|&str| void`, not `|str| void`.
+#[test]
+fn b495_a_closure_types_modes_print_with_the_type() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let f: |&str, &mut i32, bool| void = |a, b, c| {};
+            let n: i32 = f;
+        }
+        "#,
+        "Expected i32, but got |&str, &mut i32, bool| void instead.",
     );
 }
