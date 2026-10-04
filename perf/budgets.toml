@@ -53,15 +53,15 @@ measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WS
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_539_076_957
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 1_486_101_057
+measured_at = "Order 46's seal on next @a1c1551a, one codegen unit (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:fullstack"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_348_096_002
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 3_228_172_963
+measured_at = "Order 46's seal on next @a1c1551a, one codegen unit (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:router"
@@ -88,15 +88,15 @@ measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WS
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_549_127_841
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 1_493_788_780
+measured_at = "Order 46's seal on next @a1c1551a, one codegen unit (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_160_706_643
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 2_107_172_722
+measured_at = "Order 46's seal on next @a1c1551a, one codegen unit (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
 
 [[row]]
 subject = "example:todo"
@@ -123,6 +123,27 @@ measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WS
 small = 160
 large = 320
 max_ratio = 2.3
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "reference"
+ratio = 1.07
+reason = "F78's trait defaults are instantiated per pipe stage type (+4.7% here; the browser example is 6.1% cheaper and kolt 0.3%), A152's combinators (+1.6%), and the order's other lanes (about 1.6%). Approved by the owner at Order 46's seal."
+item = "M119"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.02
+reason = "std grew: A152's combinators (+1.5%) and A150's states() (+1.4%), which this program does not call; F78 gives 0.9% back. Approved by the owner at Order 46's seal."
+item = "M120"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.03
+reason = "std grew in reactive-46 (+2.5% in all: A152, A150) plus the order's other lanes (about 1.3%). Approved by the owner at Order 46's seal."
+item = "M120"
 
 [[e121]]
 scenario = "leaf keystroke"
