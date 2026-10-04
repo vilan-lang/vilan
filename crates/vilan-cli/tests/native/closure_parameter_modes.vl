@@ -78,4 +78,21 @@ fun main() {
 		edit(&mut xs);
 	}
 	print(i"through List::push: {xs.len()}");
+	print(i"two literals as one value: {pick(true)} {pick(false)}");
+}
+
+fun pick(c: bool): i32 {
+	mut n = 1;
+	let f = if c {
+		|x| {
+			x += 10;
+		}
+	} else {
+		|y| {
+			y += 20;
+		}
+	};
+	let g: |&mut i32| void = f;
+	g(&mut n);
+	n
 }

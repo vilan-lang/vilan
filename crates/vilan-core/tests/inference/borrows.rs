@@ -12133,6 +12133,41 @@ fn b495_a_literal_adopts_its_positions_views_through_a_let_and_a_generic_identit
     );
 }
 
+/// B495: two literals that become ONE value before it meets a written
+/// position — the arms of an `if` bound to a `let` the annotation re-types —
+/// take its mode (and parameter type) together. Only the first arm's literal
+/// adopted, and the second wrote its by-value copy: `n` stayed 1.
+#[test]
+fn b495_two_literals_bound_as_one_value_adopt_its_mode_together() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun pick(c: bool) {
+            mut n = 1;
+            let f = if c {
+                |x| {
+                    x += 10;
+                }
+            } else {
+                |y| {
+                    y += 20;
+                }
+            };
+            let g: |&mut i32| void = f;
+            g(&mut n);
+            print(n);
+        }
+
+        fun main() {
+            pick(true);
+            pick(false);
+        }
+        "#,
+        "11\n21\n",
+    );
+}
+
 /// B495: a bare literal stored INSIDE a written view closure type — an
 /// `Option<|&mut i32| void>`, a `List<..>`, a generic struct's field
 /// `Holder<|&mut i32| void>`, and `List<|&mut ..|>::push`'s `T` (B534's third

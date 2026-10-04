@@ -4685,6 +4685,11 @@ pub struct Analyzer<'src> {
     // remembers that the parameter is no longer open and refuses a second,
     // different mode.
     adopted_parameter_modes: HashMap<Id, Mode>,
+    // B495: bare parameters of two DIFFERENT literals whose types met in
+    // unification before either adopted anything (`if c { |x| .. } else {
+    // |y| .. }` bound to one `let`): one value, so one mode and one type —
+    // what one of them adopts or is typed with, the other takes too.
+    open_parameter_links: HashMap<Id, Vec<Id>>,
     // `match opt { Some(let v) => .. }` where `opt` is a call returning a view
     // wrapped in an enum payload (`fun get(..): Option<&mut i32> { Some(&mut
     // self.x) }`, or `Option<&mut Node>` for an aggregate). The capture `v` binds
@@ -7088,6 +7093,7 @@ impl<'src> Analyzer<'src> {
             for_each_iterable_types: HashMap::default(),
             for_each_views: HashMap::default(),
             adopted_parameter_modes: HashMap::default(),
+            open_parameter_links: HashMap::default(),
             wrapped_view_captures: HashMap::default(),
             prepped_binary_ops: Vec::new(),
             binary_context_types: HashMap::default(),
@@ -30462,7 +30468,29 @@ impl<'src> Analyzer<'src> {
         // deferred constraint may be waiting on (it is made once per
         // parameter, so it cannot keep the loop lit).
         self.type_map_writes += 1;
-        true
+        // A linked parameter is the same value's: it adopts the same mode
+        // (each adopts once, so the walk ends).
+        let linked = self
+            .open_parameter_links
+            .get(&parameter_id)
+            .cloned()
+            .unwrap_or_default();
+        linked
+            .into_iter()
+            .all(|linked| self.adopt_parameter_mode(linked, mode))
+    }
+
+    /// B495: record that two literals' bare parameters stand for one value's
+    /// parameter (see `open_parameter_links`).
+    fn link_open_parameters(&mut self, left: Id, right: Id) {
+        let entry = self.open_parameter_links.entry(left).or_default();
+        if !entry.contains(&right) {
+            entry.push(right);
+        }
+        let entry = self.open_parameter_links.entry(right).or_default();
+        if !entry.contains(&left) {
+            entry.push(left);
+        }
     }
 
     /// B495: a closure literal's BARE parameter that nothing has typed yet
@@ -30481,15 +30509,23 @@ impl<'src> Analyzer<'src> {
         {
             return;
         }
-        let Some(slot) = self
-            .parameters
-            .get(&parameter_id)
-            .map(|parameter| parameter.type_id)
-        else {
-            return;
-        };
-        if matches!(self.borrow_type_by_type_id(slot), Type::Unknown) {
-            self.write_type_slot(slot, parameter_type.clone());
+        let mut pending = vec![parameter_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        while let Some(parameter_id) = pending.pop() {
+            if !seen.insert(parameter_id) {
+                continue;
+            }
+            if let Some(slot) = self
+                .parameters
+                .get(&parameter_id)
+                .map(|parameter| parameter.type_id)
+                && matches!(self.borrow_type_by_type_id(slot), Type::Unknown)
+            {
+                self.write_type_slot(slot, parameter_type.clone());
+            }
+            if let Some(linked) = self.open_parameter_links.get(&parameter_id) {
+                pending.extend(linked.iter().copied());
+            }
         }
     }
 
@@ -30526,7 +30562,12 @@ impl<'src> Analyzer<'src> {
                         (None, Some(mode)) => self
                             .adopt_parameter_mode(left_id, mode)
                             .then_some(ParameterMode::Written(mode))?,
-                        (None, None) => ParameterMode::Open(left_id),
+                        (None, None) => {
+                            if left_id != right_id && !self.types_settled {
+                                self.link_open_parameters(left_id, right_id);
+                            }
+                            ParameterMode::Open(left_id)
+                        }
                     }
                 }
             });
