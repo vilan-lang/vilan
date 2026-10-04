@@ -519,21 +519,22 @@ steps run once the dialog is rendered.
 
 The hook is a **microtask**, which is enough because the whole
 synchronous build — and the `mount` that finishes it — runs to
-completion before any microtask does. On the SSR twin both methods
-accept and drop, like the event binders: there is no document to be in.
+completion before any microtask does. On the SSR twin `on_mount` accepts
+and drops, like the event binders: there is no document to be in.
 
-`autofocus` also writes a **marker**, `data-autofocus`, and so does element
-syntax's bare attribute (`<input autofocus />`). The marker makes the choice
-readable: to a focus scope, to devtools, and to a test that asserts markup.
-It is std's own attribute rather than the native one because the native
-`autofocus` is not free on an element inserted after the page parsed: the
-document queues it as an autofocus candidate and refuses it once something
-has focus, which Chromium reports on the console once per page. A focus
-scope still honours a native `autofocus` written on the element itself
-(`on_mount(|element| element.set_attribute("autofocus", ""))`), which is
-also the spelling for a `<dialog>` or a popover, whose own focusing steps
-read the native attribute. The SSR twin writes neither, because a *served*
-`autofocus` is honored by the browser's own initial parse.
+`autofocus` writes **no attribute** in the browser. It registers the
+element with std (in a `WeakSet`, so nothing is kept alive), and a focus
+scope reads that registration — see below. The native `autofocus`
+attribute is not free on an element inserted after the page parsed: the
+document queues it as an autofocus candidate and refuses it once
+something has focus, which Chromium reports on the console once per page.
+So `.autofocus()` is the one spelling, and an element head's *written*
+`autofocus` attribute (`<input autofocus />`) gets a warning with a quick
+fix that rewrites it to `.autofocus()`. The native attribute is still
+yours when you mean it — `.attr("autofocus", "")` writes it as spelled,
+for a `<dialog>` or a popover, whose own focusing steps read it. On the
+SSR twin `.autofocus()` writes the native attribute: a *served* page's
+initial parse is the one place it works, and it logs nothing there.
 
 ## Focus scopes
 
@@ -570,13 +571,19 @@ let scope = focus_scope(panel, FocusContainment::Contain);
 let _took = scope.focus_initial();
 ```
 
-`focus_initial` focuses the first marked descendant (`[data-autofocus]`,
-or a native `[autofocus]` written on the element by hand), else the
-first tabbable one, else the panel itself at `tabindex="-1"` — and it
-answers whether the focus was taken, so a show that fired too early is
-simply asked again on the next pass. It is idempotent: once focus has
-been taken, a later call leaves alone whatever the user has since moved
-to.
+`focus_initial` focuses the first descendant, in tree order, that
+`.autofocus()` registered; else the first carrying a native `[autofocus]`;
+else the first tabbable one; else the panel itself at `tabindex="-1"` —
+and it answers whether the focus was taken, so a show that fired too
+early is simply asked again on the next pass. It is idempotent: once
+focus has been taken, a later call leaves alone whatever the user has
+since moved to. Inside a scope, `.autofocus()`'s own bounded clock stands
+aside and lets the show decide.
+
+The scope does not have to exist before its content is built: the walk
+happens at the show, over whatever the panel holds then, so an element
+that mounts later — a `when` that opens inside the panel — is found in its
+place, and an element removed since it registered is simply not there.
 
 Scopes NEST as a stack, not by DOM ancestry, because an overlay is a
 portal: a submenu opened from inside a menu mounts beside its parent's
