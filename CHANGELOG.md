@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**The shipped compiler and language server are built as ONE codegen unit per crate, so an unrelated change to the compiler no longer moves its measured cost.** M116 (ruled 2026-10-04). With rustc's default of 16 units, what LLVM inlines followed how a crate's code happened to split between units, and ui-46 measured kolt's `vilan check` +564M instructions (~2%) from items added to one file — noise as large as the changes the performance gates judge. `[profile.release]` now sets `codegen-units = 1` (the `profiling` profile inherits it; `wasm-release` already had it). Measured at the change: kolt's check 25,766M → 25,291M instructions (−1.8%); a clean release build of `vilan-cli` + `vilan-lsp` takes 144 s where it took 63 s. Tracker M116.
+
+---
+
+<!-- family: tooling -->
 **`vilan fmt` formats a file that leads with `[platform(..)] mod self;` and carries `export *;`, where it declined it ("the printer's output reads `[platform("browser")] mod self;` where it stops being readable").** The canonical slot for the `export *;` marker (E181, below the leading import run) was counted from the top of the file, so the marker was printed ABOVE `mod self;` — which must be a file's first statement — and the reprint did not parse. The slot now counts from below a leading `mod self;`. Found by layout-46.
 
 ---
