@@ -258,9 +258,7 @@ function $o(self, content) {
 	return __clone(self);
 }
 function $H(self, name2, value) {
-	if (name2 !== "autofocus") {
-		apply(value, self, name2);
-	}
+	apply(value, self, name2);
 	return __clone(self);
 }
 function $I(source, render2) {
@@ -307,9 +305,7 @@ function $Y(self, parent, name2) {
 	$Z(self, parent, name2);
 }
 function $X(self, name2, value) {
-	if (name2 !== "autofocus") {
-		$Y(value, self, name2);
-	}
+	$Y(value, self, name2);
 	return __clone(self);
 }
 function $aa(self, content) {

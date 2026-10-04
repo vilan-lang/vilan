@@ -163,15 +163,11 @@ export impl View {
 	/// §5): a `str` sets once; a `SignalCell<str>` is read once, exactly
 	/// `bind_attr`. Anything `AttrValue` fills the slot.
 	///
-	/// ONE NAME IS STD'S (A151): `autofocus` — element syntax's bare
-	/// `<input autofocus />` — is std's focus marker, which the browser twin writes
-	/// as `data-autofocus`; a server render DROPS it, exactly as it drops
-	/// `View::autofocus` (a served native `autofocus` would focus the element at
-	/// the browser's initial parse, before the client build ran). KEEP IN STEP.
+	/// Every name is served as it is spelled — `autofocus` included (A157): a
+	/// served page's initial parse is the one place the native attribute works.
+	/// KEEP IN STEP.
 	fun attr<V: AttrValue>(self, name: str, own value: V): View {
-		if name != "autofocus" {
-			value.apply(self, name);
-		}
+		value.apply(self, name);
 		self
 	}
 
@@ -281,22 +277,20 @@ export impl View {
 		self
 	}
 
-	/// Focus, server side: nothing to focus. Dropped like `on_mount`, whose
-	/// one-word form it is on the browser twin. KEEP IN STEP.
-	///
-	/// The browser twin also WRITES std's `data-autofocus` marker (A121 §6.1,
-	/// A151), and this deliberately does not: the marker means nothing until a
-	/// focus scope reads it, and there is no focus scope here. The client build
-	/// sets it at mount either way. (A served NATIVE `autofocus` would be honoured
-	/// by the browser's own initial parse and focus the element before the client
-	/// build ran — which is why this never wrote that either.)
+	/// Focus, server side: WRITE the native `autofocus` attribute (A157). A served
+	/// page's initial parse is the one place that attribute works — the browser
+	/// focuses the element and logs nothing — so the server says it in the
+	/// platform's own words. The browser twin writes NO attribute: an element it
+	/// inserts after the parse would only queue a candidate the document refuses
+	/// once something has focus, so there it focuses on mount and registers the
+	/// element for an enclosing focus scope instead. KEEP IN STEP.
 	fun autofocus(self): View {
-		self
+		self.attr("autofocus", "")
 	}
 
 	/// Make this element a focus scope, server side: nothing is trapped and nothing
-	/// is focused. Dropped like `autofocus` above, whose clock it shares on the
-	/// browser twin. KEEP IN STEP.
+	/// is focused, so it is dropped — there is no document to trap focus in. KEEP
+	/// IN STEP.
 	fun focus_scope(self, containment: FocusContainment): View {
 		self
 	}
@@ -945,11 +939,11 @@ export fun when_live<P, C: Slot>(
 
 // === A121: focus scopes, server side (proposal/focus-scope.md) ===============
 //
-// ACCEPTED AND DROPPED, exactly as `on_mount` and `autofocus` are: a server render
-// has no focus to trap and no document to trap it in — the request creates,
-// serializes and discards. The surface is declared name for name so the same
-// component source compiles through both layers; the browser twin (browser/ui.vl)
-// carries the mechanism and its reasoning. KEEP IN STEP.
+// ACCEPTED AND DROPPED, exactly as `on_mount` is: a server render has no focus to
+// trap and no document to trap it in — the request creates, serializes and
+// discards. The surface is declared name for name so the same component source
+// compiles through both layers; the browser twin (browser/ui.vl) carries the
+// mechanism and its reasoning. KEEP IN STEP.
 
 /// What a focus scope does with a Tab that would leave it — the browser twin's
 /// enum, declared here so a component that names an arm compiles on both legs.
