@@ -8783,3 +8783,186 @@ fn b455_a_selector_with_a_non_trait_is_refused() {
         "{diagnostics:#?}"
     );
 }
+
+// --- F28's first half: the single-platform modules leave the layer directories ---
+//
+// The three facts the layer gives and the file-level `[platform(..)] mod self;`
+// fence must give the same way before a module moves (std's manifest names the
+// layers; these pins name the MODULES, so they read the same whichever
+// mechanism serves them). layout-46 ran them over the fenced tree and STOPPED
+// the move: (a) failed for `std::web::router` — fenced `browser`, it imports the
+// `ui` TWIN, which a node build binds to the process side, and the fence walk
+// then reports six of the process twin's functions as unreachable-from-browser
+// violations inside std, on a bare import (the layer reported none); and (b)
+// failed for every browser module, `infer_platform` reading browser evidence off
+// the layer directory only. The modules stay layered under their new paths
+// (`src/browser/web/*`, `src/process/{web,rpc}/*`) until both are answered.
+
+/// One program per single-platform module: it calls one of the module's
+/// functions on the platform the module does NOT serve.
+const F28_OFF_PLATFORM_CALLS: &[(&str, &str, &str, Platform)] = &[
+    (
+        "import std::web::dom::create_element;\nfun main() {\n\tlet _ = create_element(\"div\");\n}\n",
+        "create_element",
+        "std::web::dom",
+        Platform::Node { version: 24 },
+    ),
+    (
+        "import std::web::storage::get;\nfun main() {\n\tlet _ = get(\"k\");\n}\n",
+        "get",
+        "std::web::storage",
+        Platform::Node { version: 24 },
+    ),
+    (
+        "import std::web::router::location_url;\nfun main() {\n\tlet _ = location_url();\n}\n",
+        "location_url",
+        "std::web::router",
+        Platform::Node { version: 24 },
+    ),
+    (
+        "import std::web::dev::hmr_active;\nfun main() {\n\tlet _ = hmr_active();\n}\n",
+        "hmr_active",
+        "std::web::dev",
+        Platform::Node { version: 24 },
+    ),
+    (
+        "import std::fs::read_file_to_str;\nfun main() {\n\tlet _ = read_file_to_str(\"x\");\n}\n",
+        "read_file_to_str",
+        "std::fs",
+        Platform::Browser,
+    ),
+    (
+        "import std::http::if_none_match_matches;\nfun main() {\n\tlet _ = if_none_match_matches(\"a\", \"b\");\n}\n",
+        "if_none_match_matches",
+        "std::http",
+        Platform::Browser,
+    ),
+    (
+        "import std::db::Database;\nfun main() {\n\tlet _ = Database::open(\"x\");\n}\n",
+        "open",
+        "std::db",
+        Platform::Browser,
+    ),
+    (
+        "import std::process::args;\nfun main() {\n\tlet _ = args();\n}\n",
+        "args",
+        "std::process",
+        Platform::Browser,
+    ),
+    (
+        "import std::build::require_build;\nfun main() {\n\tlet _ = require_build(\"client\");\n}\n",
+        "require_build",
+        "std::build",
+        Platform::Browser,
+    ),
+    (
+        "import std::rpc::server::ws_accept_key;\nfun main() {\n\tlet _ = ws_accept_key(\"k\");\n}\n",
+        "ws_accept_key",
+        "std::rpc::server",
+        Platform::Browser,
+    ),
+];
+
+/// F28 (a): calling a single-platform module's function off its platform is
+/// ONE colouring error, at the user's call, whose chain names the function and
+/// its module — and importing such a module without reaching it is legal.
+#[test]
+fn f28_an_off_platform_call_into_a_single_platform_module_is_one_error_at_the_call() {
+    for (entry, function, module, platform) in F28_OFF_PLATFORM_CALLS {
+        let errors = analyze_package_spanned(&[("main.vl", entry)], "main.vl", *platform);
+        let violations: Vec<_> = errors
+            .iter()
+            .filter(|(message, ..)| message.contains("cannot run on"))
+            .collect();
+        assert_eq!(violations.len(), 1, "{module} on {platform:?}: {errors:#?}");
+        let (message, file, range) = violations[0];
+        assert!(
+            message.starts_with(&format!("`{function}` requires the `")),
+            "{module}: {message}"
+        );
+        assert_eq!(file, "main.vl", "{module}: anchored in the user's file");
+        assert!(
+            entry[range.clone()].contains(function),
+            "{module}: anchored at the call, got {:?}",
+            &entry[range.clone()]
+        );
+        let import_only = entry.lines().next().unwrap().to_string() + "\nfun main() {}\n";
+        let elided = analyze_package(&[("main.vl", &import_only)], "main.vl", *platform);
+        assert!(
+            elided.is_empty(),
+            "{module}: importing without reaching is legal on {platform:?}: {elided:?}"
+        );
+    }
+}
+
+/// F28 (a), the chain: the frame names the module by its PATH.
+#[test]
+fn f28_the_off_platform_chain_names_the_module_by_its_path() {
+    for (entry, function, module, platform) in F28_OFF_PLATFORM_CALLS {
+        let raw = analyze_package_raw(&[("main.vl", entry)], "main.vl", *platform);
+        let violation = raw
+            .iter()
+            .find(|error| error.msg.contains("cannot run on"))
+            .unwrap_or_else(|| panic!("{module}: a violation"));
+        let rendered = format!(
+            "{} {}",
+            violation.msg,
+            violation
+                .note
+                .as_ref()
+                .map(|note| note.msg.clone())
+                .unwrap_or_default()
+        );
+        assert!(
+            rendered.contains(&format!("main → {function} ({module})")),
+            "{module}: {rendered}"
+        );
+    }
+}
+
+/// F28 (b): the editor's platform inference for a file that imports ONLY a
+/// single-platform module — no manifest, no `--platform` — is browser for a
+/// browser module (inferred, the reason naming the module) and the default for
+/// a process one.
+#[test]
+fn f28_a_file_importing_only_a_single_platform_module_is_analyzed_as_before() {
+    for (entry, _, module, off_platform) in F28_OFF_PLATFORM_CALLS {
+        let dir = scratch::root().join(format!(
+            "vilan_f28_infer_{}_{}",
+            std::process::id(),
+            module.replace("::", "_")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.vl");
+        std::fs::write(&path, entry).unwrap();
+        let source: &'static str = Box::leak(entry.to_string().into_boxed_str());
+        let (program, _) = analyze_source(
+            source,
+            &std_spec(),
+            &dir,
+            &path,
+            None,
+            &Workspace::default(),
+        );
+        let program = program.expect("a program");
+        let reason = program.platform_reason.clone().unwrap_or_default();
+        if *off_platform == Platform::Browser {
+            // A process module: no browser evidence, so the default.
+            assert_eq!(program.platform, Platform::default(), "{module}: {reason}");
+            assert_eq!(program.platform_kind, Some("default"), "{module}: {reason}");
+        } else {
+            assert_eq!(program.platform, Platform::Browser, "{module}: {reason}");
+            assert_eq!(
+                program.platform_kind,
+                Some("inferred"),
+                "{module}: {reason}"
+            );
+            assert!(
+                reason.contains(&format!("`{module}`")),
+                "{module}: the reason names the module: {reason}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

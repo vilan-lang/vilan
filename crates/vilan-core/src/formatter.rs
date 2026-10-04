@@ -4387,8 +4387,16 @@ impl<'src> Printer<'src> {
     /// started. The block is every leading import, comments and blank lines and
     /// all.
     fn export_all_marker_slot(&self, items: &[Spanned<Node<'src>>], marker: usize) -> usize {
-        let mut slot = 0;
-        let mut index = 0;
+        // A file's `[platform(..)] mod self;` is its FIRST statement by rule
+        // (B415) — the import run and the marker below it both come after it.
+        // Slot 0 here put `export *;` above it, and the reprint no longer
+        // parsed (layout-46's find: every fenced module with an `export *;`).
+        let first = usize::from(matches!(
+            items.first().map(|item| &item.0),
+            Some(Node::ModulePlatform(_))
+        ));
+        let mut slot = first;
+        let mut index = first;
         while index < items.len() {
             if index == marker {
                 index += 1;
@@ -14329,6 +14337,27 @@ mod export_marker_placement {
         assert_places(
             "import std::io::print;\nexport *;\nfun main() {}\n",
             "import std::io::print;\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // A file's `[platform(..)] mod self;` is its first statement (B415), so
+    // the marker's slot is below it — and below the import run after it. The
+    // slot used to count from 0, put `export *;` ABOVE `mod self;`, and the
+    // reprint no longer parsed: every fenced module carrying the marker was
+    // declined (layout-46's find, on std's F28 move).
+    #[test]
+    fn a_file_platform_declaration_stays_first_above_the_marker() {
+        assert_places(
+            "[platform(\"browser\")] mod self;\n\nexport *;\n\nfun f() {}\n",
+            "[platform(\"browser\")] mod self;\n\nexport *;\n\nfun f() {}\n",
+        );
+        assert_places(
+            "[platform(\"browser\")] mod self;\n\nexport *;\n\nimport std::io::print;\n\nfun f() {}\n",
+            "[platform(\"browser\")] mod self;\n\nimport std::io::print;\n\nexport *;\n\nfun f() {}\n",
+        );
+        assert_places(
+            "// what this module is\n\n[platform(\"@process\")] mod self;\n\nfun f() {}\n\nexport *;\n",
+            "// what this module is\n\n[platform(\"@process\")] mod self;\n\nexport *;\n\nfun f() {}\n",
         );
     }
 

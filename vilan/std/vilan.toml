@@ -44,10 +44,10 @@ prelude = false
 # The process-having runtimes (node today; deno/bun join `@process` when added).
 # Its `node:`-compat bindings are portable across them, so no per-runtime split.
 [library.layer.process]
-platform = ["@process"]    # fs, http, process
+platform = ["@process"]    # fs, http, db, process, …, web::document, rpc::server
 
 [library.layer.browser]
-platform = ["browser"]     # dom, ui, storage
+platform = ["browser"]     # web::dom, web::ui, web::storage, …
 
 # std's prose is re-filled by `vilan fmt` (E205's `wrap_comments`), to 84
 # columns rather than to the 100 the printer lays CODE out to (E215's R1/R2).
