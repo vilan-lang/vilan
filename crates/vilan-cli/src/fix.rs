@@ -322,6 +322,30 @@ fn shown(path: &Path) -> String {
         .to_string()
 }
 
+/// A generated ROOT as the report prints it: the shown file's path with the
+/// components below the root dropped. The root comes back from the manifest
+/// in its own resolved spelling, which on Windows need not share a prefix
+/// with the working directory's (a verbatim `\\?\` form against a plain one),
+/// so `shown(root)` printed it whole there; the FILE's shown path is already
+/// relative, and how deep it lies under the root is a count of components.
+fn shown_root(path: &Path, root: &Path) -> String {
+    let resolved = vilan_core::util::canonical_path_of_unwritten(path);
+    let depth = resolved
+        .strip_prefix(root)
+        .or_else(|_| path.strip_prefix(root))
+        .map(|below| below.components().count());
+    match depth {
+        Ok(depth) => {
+            let mut shown_path = PathBuf::from(shown(path));
+            for _ in 0..depth {
+                shown_path.pop();
+            }
+            shown_path.display().to_string()
+        }
+        Err(_) => shown(root),
+    }
+}
+
 fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
 }
@@ -357,7 +381,7 @@ pub(crate) fn report(fixed: &Fixed) {
                 "  {}: {} (under the package's `generated` root, {})",
                 shown(path),
                 sites.len(),
-                shown(root),
+                shown_root(path, root),
             );
         }
     }
