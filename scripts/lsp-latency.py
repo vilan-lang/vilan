@@ -46,6 +46,16 @@ every repetition starts from the same text. One document is open at a time.
   scripts/lsp-latency.py --kolt ~/code/kolt --lsp target/release/vilan-lsp
   scripts/lsp-latency.py --kolt ~/code/kolt --commit 984a1dfb --runs 7
   scripts/lsp-latency.py --kolt ~/code/kolt --callgrind out/ --scenario "parse break"
+  scripts/lsp-latency.py --source /path/to/migrated-kolt --lsp target/release/vilan-lsp
+
+`--source DIR` replays the script over a PREPARED tree used as it stands (copied
+to the scratch location; no git is run in it) instead of `--kolt` at a commit:
+across a breaking release the tip's run takes the migrated kolt while the base's
+keeps the release's commit. Every anchor of the chosen scenarios is looked up in
+the copy BEFORE the server starts, and the run refuses — naming each one — when
+an anchor is missing, or when an edit's anchor occurs more than once (the edit
+would land on the first, which may not be the place it means). `--json` records
+which source the run replayed, so the seal can say the two sides differed.
 
 `--callgrind DIR` runs the server under valgrind's callgrind with instrumentation
 OFF, switches it on for ONE scenario's measured edit only (`callgrind_control
@@ -419,6 +429,34 @@ def anchor_offset(text, anchor, scenario, what):
     return at + delta
 
 
+ANCHOR_KINDS = ("edit", "hover", "completion", "references")
+
+
+def anchor_problems(root, scenarios):
+    """Every anchor of `scenarios` checked against the tree at `root` before anything runs: a missing
+    anchor, or an EDIT anchor that occurs more than once (the edit lands on the first occurrence, which may
+    not be the place the script means). Answers the problems in words (empty: every anchor lands)."""
+    problems = []
+    for scenario in scenarios:
+        path = root / scenario["file"]
+        try:
+            text = path.read_text()
+        except OSError as error:
+            problems.append(f"{scenario['name']}: cannot read {scenario['file']} ({error.strerror})")
+            continue
+        for kind in ANCHOR_KINDS:
+            if kind not in scenario:
+                continue
+            needle = scenario[kind][0]
+            count = text.count(needle)
+            if count == 0:
+                problems.append(f"{scenario['name']}: the {kind} anchor {needle!r} is not in {scenario['file']}")
+            elif count > 1 and kind == "edit":
+                problems.append(f"{scenario['name']}: the edit anchor {needle!r} occurs {count} times in "
+                                f"{scenario['file']} - the edit would land on the first")
+    return problems
+
+
 def end_position(text):
     return position(text, len(text))
 
@@ -651,6 +689,19 @@ def prepare_copy(kolt, commit, scratch):
     return target, "(working tree)"
 
 
+def prepare_source(source, scratch):
+    """`--source`: a prepared tree (across a breaking release, the migrated kolt), copied as it stands minus
+    build output — no git is run in it, whatever it is."""
+    source = Path(source).resolve()
+    target = Path(scratch) / "kolt-source"
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(
+        source, target, ignore=shutil.ignore_patterns("dist", "worktrees", "node_modules", ".git", "*.db", "target")
+    )
+    return target
+
+
 def copy_untracked_inputs(kolt, target):
     """The gitignored inputs the const pass reads — kolt's generated
     `src/search-dict/` — copied beside the archive when the checkout has them;
@@ -746,7 +797,13 @@ def callgrind_report(directory, top):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--kolt", required=True, help="the package checkout to copy (kolt)")
+    sources = parser.add_mutually_exclusive_group(required=True)
+    sources.add_argument("--kolt", help="the package checkout to copy (kolt), at --commit")
+    sources.add_argument(
+        "--source",
+        help="a PREPARED tree to replay the script over, used as it stands (no git): the tip's migrated kolt "
+        "across a breaking release",
+    )
     parser.add_argument("--commit", default="HEAD", help="the commit to copy (git checkouts; default HEAD)")
     parser.add_argument("--lsp", default="vilan-lsp", help="the vilan-lsp binary (default: the one on PATH)")
     parser.add_argument("--scratch", default=None, help="where the copy goes (default: a temp dir)")
@@ -759,8 +816,18 @@ def main():
     arguments = parser.parse_args()
 
     scratch = Path(arguments.scratch or os.path.join(os.environ.get("TMPDIR", "/tmp"), "vilan-lsp-latency"))
-    root, sha = prepare_copy(arguments.kolt, arguments.commit, scratch)
+    if arguments.source:
+        root = prepare_source(arguments.source, scratch)
+        source = {"kind": "prepared", "path": str(Path(arguments.source).resolve())}
+        described = f"the prepared tree {source['path']}"
+    else:
+        root, sha = prepare_copy(arguments.kolt, arguments.commit, scratch)
+        source = {"kind": "commit", "sha": sha}
+        described = f"kolt @{sha[:8]}"
     lsp = shutil.which(arguments.lsp) or arguments.lsp
+    # The server runs in the copy, so a relative binary path is resolved here,
+    # first (`--lsp target/release/vilan-lsp` named nothing from inside it).
+    lsp = os.path.abspath(lsp) if os.sep in lsp else lsp
     version = subprocess.run([lsp, "--version"], capture_output=True, text=True).stdout.strip()
     env = dict(os.environ)
     if arguments.std:
@@ -774,6 +841,13 @@ def main():
     scenarios = [s for s in SCENARIOS if not arguments.scenario or s["name"] in arguments.scenario]
     if not scenarios:
         raise SystemExit(f"no scenario named {arguments.scenario}; the names: {[s['name'] for s in SCENARIOS]}")
+    problems = anchor_problems(root, scenarios)
+    if problems:
+        raise SystemExit(
+            f"the edit script does not land in {described}:\n  "
+            + "\n  ".join(problems)
+            + "\nNothing was run. Pass the commit the script names, or leave the scenario out with --scenario."
+        )
 
     command = [lsp]
     if arguments.callgrind:
@@ -826,13 +900,15 @@ def main():
     finally:
         server.stop()
     header = (
-        f"vilan-lsp latency — {version} on kolt @{sha[:8]} ({std_note}); "
+        f"vilan-lsp latency — {version} on {described} ({std_note}); "
         f"{arguments.runs} run(s) per edit; loadavg {load_before} before, {load_average()} after; "
         f"{os.cpu_count()} cores"
     )
     print_table(cold_rows, rows, header)
     if arguments.json:
-        Path(arguments.json).write_text(json.dumps({"header": header, "open": cold_rows, "edits": rows}, indent=1))
+        Path(arguments.json).write_text(
+            json.dumps({"header": header, "source": source, "open": cold_rows, "edits": rows}, indent=1)
+        )
     if arguments.callgrind:
         callgrind_report(arguments.callgrind, arguments.top)
 

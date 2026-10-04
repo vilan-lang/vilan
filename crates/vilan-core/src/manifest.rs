@@ -740,6 +740,94 @@ impl Package {
     }
 }
 
+/// A154: the path that replaced a `prelude` value naming a std module that
+/// moved under a namespace — `"std::web"` (the web prelude's old path) becomes
+/// `"std::web::prelude"`, `"std::style::prelude"` becomes
+/// `"std::web::style::prelude"` — as `(old segment, new path below std, the
+/// whole rewritten value)`. `None` for any path that did not move. `std::web`
+/// is a namespace now, so only the bare two-segment `"std::web"` is the old
+/// path; `"std::web::prelude"` is the new one. Read off the ONE table, by the
+/// manifest's refusal and by `vilan check --fix`'s rewrite
+/// ([`rewrite_moved_prelude`]).
+pub fn moved_prelude_path(path: &str) -> Option<(&'static str, &'static str, String)> {
+    let segments: Vec<&str> = path.split("::").collect();
+    if segments.len() < 2 || segments[0] != "std" {
+        return None;
+    }
+    let (old, new) = crate::parsing::MOVED_STD_MODULES
+        .iter()
+        .find(|(module, _)| *module == segments[1])?;
+    if *old == "web" && segments.len() > 2 {
+        return None;
+    }
+    let rewritten = std::iter::once("std")
+        .chain(std::iter::once(*new))
+        .chain(segments[2..].iter().copied())
+        .collect::<Vec<_>>()
+        .join("::");
+    Some((old, new, rewritten))
+}
+
+/// One `prelude` value [`rewrite_moved_prelude`] rewrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreludeRewrite {
+    /// The section it sits in: `[package]` or `[library]`.
+    pub section: &'static str,
+    /// The value as it was written (`std::web`).
+    pub old: String,
+    /// The value written in its place (`std::web::prelude`).
+    pub new: String,
+}
+
+/// `vilan check --fix`'s half of A154's manifest refusal: the manifest text
+/// `text` with every `[package]`/`[library]` `prelude` value that names a moved
+/// std module ([`moved_prelude_path`]) rewritten to its new path, and what was
+/// rewritten. `None` when nothing moved — or the text is not TOML at all, which
+/// the manifest's own read reports.
+///
+/// The edit replaces the value's own span (its quotes included) and nothing
+/// else, so the file's comments, layout and every other key stay byte for byte.
+pub fn rewrite_moved_prelude(text: &str) -> Option<(String, Vec<PreludeRewrite>)> {
+    #[derive(Deserialize)]
+    struct Sections {
+        package: Option<PreludeOnly>,
+        library: Option<PreludeOnly>,
+    }
+    #[derive(Deserialize)]
+    struct PreludeOnly {
+        prelude: Option<toml::Spanned<toml::Value>>,
+    }
+    let sections: Sections = toml::from_str(text).ok()?;
+    let mut edits = Vec::new();
+    for (section, declared) in [
+        ("[package]", sections.package),
+        ("[library]", sections.library),
+    ] {
+        let Some(value) = declared.and_then(|declared| declared.prelude) else {
+            continue;
+        };
+        let span = value.span();
+        let toml::Value::String(path) = value.into_inner() else {
+            continue;
+        };
+        if let Some((_, _, rewritten)) = moved_prelude_path(&path) {
+            edits.push((span, section, path, rewritten));
+        }
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    edits.sort_by_key(|(span, ..)| std::cmp::Reverse(span.start));
+    let mut rewritten_text = text.to_string();
+    let mut rewrites = Vec::new();
+    for (span, section, old, new) in edits {
+        rewritten_text.replace_range(span, &format!("\"{new}\""));
+        rewrites.push(PreludeRewrite { section, old, new });
+    }
+    rewrites.reverse();
+    Some((rewritten_text, rewrites))
+}
+
 /// What is wrong with a declared `prelude` value, or `None` when it is
 /// well-formed (`prelude.md` §6.2 determinations 4, 6 and 7). `section` is the
 /// manifest spelling to name in the message (`[package]` / `[library]`);
@@ -806,16 +894,7 @@ fn prelude_problem(
     // prelude's old `"std::web"`, which every web package's manifest wrote.
     // `std::web` is a namespace now, so only the bare two-segment spelling is
     // the old path; `std::web::prelude` is the new one.
-    if root == "std"
-        && let Some(new) = crate::parsing::moved_std_module(segments[1])
-        && (segments[1] != "web" || segments.len() == 2)
-    {
-        let old = segments[1];
-        let rewritten = std::iter::once("std")
-            .chain(std::iter::once(new))
-            .chain(segments[2..].iter().copied())
-            .collect::<Vec<_>>()
-            .join("::");
+    if let Some((old, new, rewritten)) = moved_prelude_path(path) {
         return Some(format!(
             "`{section} prelude = \"{path}\"` names the old path of a std module: `std::{old}` \
              moved to `std::{new}` — write `prelude = \"{rewritten}\"`"
@@ -4243,6 +4322,47 @@ mod tests {
             ))
             .validate();
             assert_eq!(errors, Vec::<String>::new(), "{path}");
+        }
+    }
+
+    /// `vilan check --fix`'s manifest rewrite: the moved `prelude` value and
+    /// nothing else — comments, layout, the other keys and a `prelude` in the
+    /// other section stay byte for byte — and the result validates.
+    #[test]
+    fn a154_the_moved_prelude_value_is_rewritten_in_place() {
+        let text = "# the app\n[package]\nname = \"app\"\n# the web set\nprelude   =   \"std::web\"  # ambient ui/style\n\n[entry.client]\ntarget = \"browser\"\n";
+        let (rewritten, rewrites) = rewrite_moved_prelude(text).expect("a rewrite");
+        assert_eq!(
+            rewritten,
+            text.replace("\"std::web\"", "\"std::web::prelude\"")
+        );
+        assert_eq!(
+            rewrites,
+            vec![PreludeRewrite {
+                section: "[package]",
+                old: "std::web".to_string(),
+                new: "std::web::prelude".to_string(),
+            }]
+        );
+        assert_eq!(parse(&rewritten).validate(), Vec::<String>::new());
+        // A literal string and a moved module's own prelude, in `[library]`.
+        let (rewritten, _) =
+            rewrite_moved_prelude("[library]\nname = \"lib\"\nprelude = 'std::style::prelude'\n")
+                .expect("a rewrite");
+        assert_eq!(
+            rewritten,
+            "[library]\nname = \"lib\"\nprelude = \"std::web::style::prelude\"\n"
+        );
+        // Nothing to rewrite: the new paths, `false`, no key, and a text that
+        // is not TOML (the manifest's own read reports that).
+        for text in [
+            "[package]\nname = \"app\"\nprelude = \"std::web::prelude\"\n",
+            "[package]\nname = \"app\"\nprelude = \"std::prelude\"\n",
+            "[package]\nname = \"app\"\nprelude = false\n",
+            "[package]\nname = \"app\"\n",
+            "[package\nprelude = \"std::web\"\n",
+        ] {
+            assert_eq!(rewrite_moved_prelude(text), None, "{text}");
         }
     }
 

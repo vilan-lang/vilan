@@ -238,19 +238,56 @@ vilan check --explain-cost 5
 ```
 
 **`--fix`** is the one exception to "writes nothing", and it is asked for
-by name. Before checking, it applies the fix every **numeric mismatch**
-carries — the `.as_*()` conversion the message names, or `: usize` on a
-counter bound by a bare literal — to the package's own files (never to
-std or a dependency), analyzes again, and repeats until a round finds
-nothing more to fix; then it checks as usual and reports what is left.
-It prints one line first, `fixed 12 numeric mismatches in 3 files`. The
-edits are the editor's quick fixes (**Convert with `.as_usize()`**,
-**Declare `at` a `usize`**), computed by the same function, so the two
-never disagree. It is the migration tool for the release that moved
-std's positions, lengths and counts to [`usize`](../std/numbers.md): what
-it cannot decide — a `-1` "not found", a `for i >= 0` loop, signed
-arithmetic that should convert once at its end — stays a diagnostic, for
-a person. It cannot be combined with `--watch`.
+by name. Before checking, it applies the fixes the diagnostics carry to
+the package's own files (never to std or a dependency), analyzes again,
+and repeats until a round finds nothing more to fix; then it checks as
+usual and reports what is left. The edits are the editor's quick fixes,
+computed by the same functions, so the two never disagree. It cannot be
+combined with `--watch`. It fixes two kinds of diagnostic, each the
+migration tool for one release:
+
+- **A moved std path** (v0.44.0, where std's modules were grouped under
+  namespaces): every `import std::dom::…` becomes `import
+  std::web::dom::…`, a brace list keeps its names (`std::{ delta::SeqOp }`
+  becomes `std::{ reactive::delta::SeqOp }`), and `prelude = "std::web"`
+  in `vilan.toml` becomes `prelude = "std::web::prelude"` — only that
+  value changes, the file's comments and layout stay. One run migrates a
+  package, even one whose old imports are its only errors. A file that
+  `vilan fmt` left canonical is kept canonical (a moved import can sort
+  to a new place). Two things are left, and named: a file under the
+  package's
+  [`generated`](../guide/dev-loop.md#when-the-hook-generates-vilan)
+  root, which the project regenerates — change what generates it — and
+  a brace list
+  under the old web-prelude path that names `self`
+  (`std::web::{ self, Signal }`), which no one edit rewrites correctly.
+
+  ```sh
+  vilan check --fix
+  ```
+
+- **A numeric mismatch** (the release that moved std's positions,
+  lengths and counts to [`usize`](../std/numbers.md)): the `.as_*()`
+  conversion the message names, or `: usize` on a counter bound by a bare
+  literal (**Convert with `.as_usize()`**, **Declare `at` a `usize`**).
+  What it cannot decide — a `-1` "not found", a `for i >= 0` loop, signed
+  arithmetic that should convert once at its end — stays a diagnostic,
+  for a person.
+
+It prints what it did before the check's own report: for moved paths, a
+total and then one line per file with its count, and a line for each
+path it left; then, always, the numeric line.
+
+```text
+fixed 4 moved std paths in 3 files
+  src/main.vl: 2
+  src/views.vl: 1
+  vilan.toml: 1
+fixed 0 numeric mismatches in 0 files
+```
+
+A second run finds nothing, writes nothing, and says
+`fixed 0 numeric mismatches in 0 files`.
 
 One thing it does that `build` does not: when the file has a **syntax
 error**, `check` reports it and then type-checks the rest of the file
