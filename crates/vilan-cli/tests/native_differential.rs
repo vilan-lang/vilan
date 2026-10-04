@@ -9336,6 +9336,25 @@ fn a_payload_view_writes_the_enum_in_place_on_both_backends() {
     );
 }
 
+/// B538: a tuple assignment target holding an element, a nested tuple, a
+/// tuple-typed binding or a tuple-typed position assigns each place on both
+/// backends (JS threw at load; natively `(p).clone()` stood in the pattern,
+/// rustc E0070).
+#[test]
+fn a_tuple_target_of_places_assigns_each_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_tuple_assignment_targets.vl"),
+        include_str!("native/tuple_assignment_targets.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_tuple_assignment_targets.vl"),
+        Verdict::Identical,
+        "a tuple target of places must assign each on both backends"
+    );
+}
+
 /// F48 (pinned, not reproduced at the Order 46 base): a reassigned
 /// closure-typed `mut` binding and a `List` of closures build — F44's counted
 /// literal closed what was filed as rustc E0308 in Order 43.

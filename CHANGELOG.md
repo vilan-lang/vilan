@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**A tuple assignment whose target holds an element (`(list[0], x) = (1, 2)`), a nested tuple (`((x, y), z) = ((4, 5), 6)`), a tuple-typed binding (`(p, z) = ((7, 8), 9)`) or a tuple-typed position (`(t.0, z) = ..`) assigns each place, where the JS module threw at load (`[ __at(list, 0), x ] = ..`, `[ ...[ x, y ], z ] = ..`) and natively rustc refused the tuple-typed binding (`(p).clone()` in the pattern, E0070).** B538 (solver-b-46's find). JS lowers such a target to the value in a temporary and one ordinary write per leaf at its flat offset (an element through `__at_put`, a tuple-typed leaf from a `slice`); a tuple of plain places keeps its destructuring (`(a, b) = (b, a)` is byte-identical). Natively each element of the target is rendered as a place.
+
+---
+
 <!-- family: fix -->
 **A write through a `Store` handle into an enum variant's single payload, or through an `Option`'s `some()`, writes the payload IN PLACE: no deep copy out and back per write (the derive's step), and no window in which the place holds `None` (the `Option` step, where a panic inside the write lost the payload).** B509 S2 and M109. The derive's single-payload write step and both `Option` steps (`Store<Option<P>>::some()`, `StoreSome<Option<P>>::some()`) are written `match &mut held { V(let p0) => f(p0), .. }`. Counted, not timed: the paper's probe — 2,000 writes of one scalar inside a payload holding a 10,000-element list — made two deep copies of the payload per write through the derive's step (`__clone` called over 20,000 times for ONE write) and makes none now. A multi-payload variant (`Away(str, i32)`) keeps its copy (Q6: a tuple of views cannot be formed), and its write-back still clones the dead payload (M109's remainder).
 

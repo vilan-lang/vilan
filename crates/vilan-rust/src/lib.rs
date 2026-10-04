@@ -11164,6 +11164,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let subject_text = self.mutable_place(subject, depth)?;
                 Ok(format!("{subject_text}{path}"))
             }
+            // B538: a tuple target is Rust's destructuring assignment, each
+            // element a PLACE — a tuple-typed binding read as a value took
+            // rule 1's `.clone()`, which is no place (rustc E0070).
+            Some(Expr::Tuple(elements)) => {
+                let mut parts = Vec::with_capacity(elements.len());
+                for element in elements {
+                    parts.push(self.mutable_place(element, depth)?);
+                }
+                Ok(format!("({},)", parts.join(", ")))
+            }
             // Everything else — the source's own `&mut` among it — is the
             // expression arm's, which reborrows a binding that is already a
             // `&mut` loan (F35) rather than taking a `&mut &mut`.
