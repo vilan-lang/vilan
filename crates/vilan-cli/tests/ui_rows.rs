@@ -612,8 +612,10 @@ fn n122_the_shared_stub_refuses_a_focus_the_platform_would() {
     );
 }
 
-/// The SSR twins accept and drop, like every event binder there: the markup is
-/// exactly what it would have been without them, and no action runs.
+/// The SSR twin of `on_mount` accepts and drops, like every event binder there:
+/// the markup is exactly what it would have been without it, and no action
+/// runs. `autofocus`'s twin WRITES the native attribute since A157 — a served
+/// page's initial parse is the one place that attribute works.
 const SSR_TWINS: &str = r#"import std::io::print;
 import std::ui::{ View, render, view };
 
@@ -650,8 +652,9 @@ fn the_ssr_twins_of_the_mount_hook_render_the_same_markup_and_run_nothing() {
         .expect("run node");
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
     assert_eq!(
-        stdout, "<input name=\"modal\">\n<input>\n",
-        "the SSR twins must render the markup unchanged and run no action"
+        stdout, "<input name=\"modal\" autofocus=\"\">\n<input>\n",
+        "the SSR twin of `on_mount` must render the markup unchanged and run \
+         no action; `autofocus`'s serves the native attribute (A157)"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4383,11 +4386,10 @@ fn a121_the_show_takes_the_focus_and_autofocus_says_where() {
     };
     assert_eq!(
         line("markup="),
-        "markup={\"name\":\"marked\",\"data-autofocus\":\"\"}",
-        "`View::autofocus` WRITES std's marker (A121 §6.1; `data-autofocus` \
-         since A151, never the native attribute) — that is how a scope, \
-         devtools and a markup assertion can see which element the author \
-         chose. It moves emitted markup, which is why it is pinned; \
+        "markup={\"name\":\"marked\"}",
+        "`View::autofocus` writes NO attribute (A157, replacing A121 §6.1's \
+         marker and A151's `data-autofocus`): it REGISTERS the element in \
+         std's `WeakSet`, which is what the scope's show reads; \
          got:\n{stdout}"
     );
     let takes: Vec<&str> = stdout
@@ -4410,8 +4412,8 @@ fn a121_the_show_takes_the_focus_and_autofocus_says_where() {
     assert_eq!(
         line("shown="),
         "shown=marked",
-        "`focus_initial` prefers the `[data-autofocus]` descendant over the \
-         first tabbable one — the author saying so beats the order; \
+        "`focus_initial` prefers the REGISTERED descendant over the first \
+         tabbable one — the author saying so beats the order (A157); \
          got:\n{stdout}"
     );
     assert_eq!(
@@ -4486,16 +4488,14 @@ fn a121_the_chained_focus_scope_installs_the_trap_and_takes_the_focus() {
     );
 }
 
-/// The SSR twins of both forms: accepted and dropped, like every event binder
-/// there — including the `data-autofocus` marker, which the browser twin
-/// writes and the server twin deliberately does not (process/ui.vl says why).
+/// The SSR twin of the focus scope: accepted and dropped, like every event
+/// binder there. (`View::autofocus`'s server half is A157's, below: it WRITES
+/// the native attribute.)
 const FOCUS_SSR_TWINS: &str = r#"import std::io::print;
 import std::ui::{ FocusContainment, View, render, view };
 
 fun main() {
 	print(render(view("div").focus_scope(FocusContainment::Contain).child(view("input"))));
-	print(render(view("input").autofocus()));
-	print(render(<input autofocus />));
 }
 
 main();
@@ -4505,26 +4505,51 @@ main();
 fn a121_the_ssr_twins_render_the_same_markup_and_trap_nothing() {
     let stdout = build_and_run_process("a121_ssr", FOCUS_SSR_TWINS);
     assert_eq!(
-        stdout, "<div><input></div>\n<input>\n<input>\n",
-        "a server render has no focus to trap: both forms serialize exactly \
-         what they would without them, and std's focus marker — written by \
-         `View::autofocus` and by element syntax's bare `autofocus` (A151) — \
-         stays a client-side write (a served native `autofocus` would focus \
-         the element at the browser's own initial parse, which is a behaviour \
-         change to every server-rendered page that writes it)"
+        stdout, "<div><input></div>\n",
+        "a server render has no focus to trap: the scope serializes exactly \
+         what it would without it"
     );
 }
 
-// --- A151: std's focus marker is `data-autofocus` ------------------------------
-//
-// RULED (R-b, 2026-10-03): `View::autofocus` and element syntax's `autofocus`
-// write `data-autofocus`, never the native attribute — an inserted element's
-// native `autofocus` queues an autofocus candidate the document refuses once
-// something has focus, and Chromium logs it once per page. `focus_initial`
-// reads the marker and still honours a native `[autofocus]` written on the
-// element by hand.
+/// A157's server half: `View::autofocus` WRITES the native `autofocus` — a
+/// served page's initial parse is the one place the native attribute works,
+/// and it logs nothing there — and the server `attr` serves a written
+/// `autofocus` as written, whether from element syntax or `.attr(..)`.
+const AUTOFOCUS_SERVED: &str = r#"import std::io::print;
+import std::ui::{ View, render, view };
 
-const AUTOFOCUS_MARKER: &str = r#"import std::dom::window;
+fun main() {
+	print(render(view("input").autofocus()));
+	print(render(view("input").attr("autofocus", "")));
+	print(render(<input name("written") autofocus />));
+}
+
+main();
+"#;
+
+#[test]
+fn a157_the_server_render_carries_the_native_autofocus() {
+    let stdout = build_and_run_process("a157_served", AUTOFOCUS_SERVED);
+    assert_eq!(
+        stdout,
+        "<input autofocus=\"\">\n<input autofocus=\"\">\n<input name=\"written\" autofocus=\"\">\n",
+        "the server twin writes the native attribute for `.autofocus()` and \
+         serves a written one as written (A157 reverses A151's drop)"
+    );
+}
+
+// --- A157: `.autofocus()` REGISTERS, and a scope starts on what it registered --
+//
+// RULED (the owner's design, 2026-10-03; replaces A151's `data-autofocus`
+// marker before it shipped): `View::autofocus` records the element in a
+// module-level `WeakSet` and leaves NO attribute in the DOM. A focus scope's
+// `focus_initial` starts on the FIRST registered descendant in tree order,
+// else a native `[autofocus]` descendant, else the first tabbable, else the
+// panel; inside a scope the bounded focus-on-mount clock defers to the scope.
+// An explicit `.attr("autofocus", "")` writes the NATIVE attribute (the
+// silent rename is gone).
+
+const AUTOFOCUS_REGISTRY: &str = r#"import std::dom::window;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell };
@@ -4533,12 +4558,14 @@ import std::ui::{ FocusContainment, FocusScope, View, focus_scope, mount_root, v
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
+	let early: SignalCell<bool> = Signal::new(false);
+	let spare: SignalCell<bool> = Signal::new(false);
 	let held: Shared<Option<FocusScope>> = Shared::new(None);
+	let spare_held: Shared<Option<FocusScope>> = Shared::new(None);
 	let root = mount_root("app", || {
 		<div>
-			<input name("method") .autofocus() />
-			<input name("element") autofocus />
-			<input name("raw") .attr("title", "plain") />
+			<input name("outside") .autofocus() />
+			<input name("raw") .attr("autofocus", "") />
 			{when(open, || {
 				<div
 					name("panel")
@@ -4547,10 +4574,22 @@ fun main() {
 					})
 				>
 					<input name("first") />
-					<input
-						name("native")
-						.on_mount(|element| element.set_attribute("autofocus", ""))
-					/>
+					<input name("hand") .attr("autofocus", "") />
+					<section>
+						{when(early, || <input name("early") .autofocus() />)}
+					</section>
+					<input name("late") .autofocus() />
+				</div>
+			})}
+			{when(spare, || {
+				<div
+					name("spare")
+					.on_mount(|element| {
+						spare_held.write() = Some(focus_scope(element, FocusContainment::Wrap));
+					})
+				>
+					<input name("plain") />
+					<input name("native") .attr("autofocus", "") />
 				</div>
 			})}
 		</div>
@@ -4558,10 +4597,22 @@ fun main() {
 	let _open = root.take(window().listen("open", |_event| {
 		open.set(true);
 	}));
+	let _early = root.take(window().listen("early", |_event| {
+		early.set(true);
+	}));
+	let _spare = root.take(window().listen("spare", |_event| {
+		spare.set(true);
+	}));
 	let _show = root.take(window().listen("show", |_event| {
 		match held.read() {
 			Some(let scope) => print(i"took={scope.focus_initial()}"),
 			None => print("no scope"),
+		}
+	}));
+	let _show_spare = root.take(window().listen("show-spare", |_event| {
+		match spare_held.read() {
+			Some(let scope) => print(i"spare took={scope.focus_initial()}"),
+			None => print("no spare scope"),
 		}
 	}));
 	print("built");
@@ -4570,22 +4621,40 @@ fun main() {
 main();
 "#;
 
+/// The browser twin, in one transcript: `.autofocus()` outside a scope
+/// focuses on its own clock and writes nothing; inside one it registers and
+/// lets the scope's show decide; the show starts on the first REGISTERED
+/// descendant in TREE order (here registered LAST, after its sibling, and
+/// ahead of an earlier native `[autofocus]`); a scope with no registered
+/// descendant falls back to a native `[autofocus]`; and `.attr("autofocus",
+/// "")` writes the native attribute as spelled.
 #[test]
-fn a151_autofocus_writes_data_autofocus_and_a_scope_honours_a_native_one() {
+fn a157_a_scope_starts_on_the_first_registered_descendant_and_the_dom_carries_no_marker() {
     let harness = format!(
         "{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n\
-         setTimeout(() => {{\n  \
-         console.log(\"method=\" + JSON.stringify(findByName(\"method\").attributes));\n  \
-         console.log(\"element=\" + JSON.stringify(findByName(\"element\").attributes));\n  \
-         console.log(\"raw=\" + JSON.stringify(findByName(\"raw\").attributes));\n  \
+         const tick = () => new Promise((resolve) => setTimeout(resolve, 0));\n\
+         const attrs = (name) => JSON.stringify(findByName(name).attributes);\n\
+         (async () => {{\n  \
+         await tick();\n  \
+         console.log(\"mounted=\" + at());\n  \
+         console.log(\"outside=\" + attrs(\"outside\"));\n  \
+         console.log(\"raw=\" + attrs(\"raw\"));\n  \
          window.fire(\"open\", {{}});\n  \
-         setTimeout(() => {{\n    \
-         window.fire(\"show\", {{}});\n    \
+         await tick();\n  \
+         console.log(\"opened=\" + at());\n  \
+         window.fire(\"early\", {{}});\n  \
+         await tick();\n  \
+         console.log(\"early=\" + attrs(\"early\"));\n  \
+         console.log(\"late=\" + attrs(\"late\"));\n  \
+         window.fire(\"show\", {{}});\n  \
          console.log(\"shown=\" + at());\n  \
-         }}, 0);\n\
-         }}, 0);\n"
+         window.fire(\"spare\", {{}});\n  \
+         await tick();\n  \
+         window.fire(\"show-spare\", {{}});\n  \
+         console.log(\"spare shown=\" + at());\n\
+         }})();\n"
     );
-    let stdout = build_and_run("a151_marker", AUTOFOCUS_MARKER, &harness);
+    let stdout = build_and_run("a157_registry", AUTOFOCUS_REGISTRY, &harness);
     let line = |key: &str| -> String {
         stdout
             .lines()
@@ -4594,27 +4663,56 @@ fn a151_autofocus_writes_data_autofocus_and_a_scope_honours_a_native_one() {
             .to_string()
     };
     assert_eq!(
-        line("method="),
-        "method={\"name\":\"method\",\"data-autofocus\":\"\"}",
-        "`View::autofocus` writes the marker and NOT the native attribute; \
-         got:\n{stdout}"
+        line("mounted="),
+        "mounted=outside",
+        "outside any scope `.autofocus()` keeps its bounded focus-on-mount \
+         (B271); got:\n{stdout}"
     );
     assert_eq!(
-        line("element="),
-        "element={\"name\":\"element\",\"data-autofocus\":\"\"}",
-        "element syntax's bare `autofocus` (`.attr(\"autofocus\", \"\")`) writes \
-         the same marker; got:\n{stdout}"
+        line("outside="),
+        "outside={\"name\":\"outside\"}",
+        "`.autofocus()` leaves NO attribute in the DOM — neither the native \
+         `autofocus` (whose processing Chromium blocks and logs on an \
+         inserted element) nor A151's `data-autofocus`; got:\n{stdout}"
     );
     assert_eq!(
         line("raw="),
-        "raw={\"name\":\"raw\",\"title\":\"plain\"}",
-        "every other attribute name is written as it is spelled; got:\n{stdout}"
+        "raw={\"name\":\"raw\",\"autofocus\":\"\"}",
+        "an explicit `.attr(\"autofocus\", \"\")` writes the NATIVE attribute \
+         as spelled (for a `<dialog>` or a popover); got:\n{stdout}"
+    );
+    assert_eq!(
+        line("opened="),
+        "opened=outside",
+        "INSIDE a scope the bounded clock defers: `late` registered and did \
+         not take focus itself — the scope's show decides; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("early="),
+        "early={\"name\":\"early\"}",
+        "no marker on a registered element inside a scope either; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("late="),
+        "late={\"name\":\"late\"}",
+        "no marker on a registered element inside a scope either; \
+         got:\n{stdout}"
     );
     assert_eq!(
         line("shown="),
-        "shown=native",
-        "`focus_initial` still honours a native `[autofocus]` written on the \
-         element by hand, ahead of the first tabbable one; got:\n{stdout}"
+        "shown=early",
+        "the show starts on the FIRST registered descendant in TREE order — \
+         `early` was registered after `late` but stands before it — and a \
+         registered descendant beats an earlier native `[autofocus]` \
+         (`hand`) and the first tabbable (`first`); got:\n{stdout}"
+    );
+    assert_eq!(
+        line("spare shown="),
+        "spare shown=native",
+        "with nothing registered under it, a scope falls back to a native \
+         `[autofocus]` descendant ahead of the first tabbable — and only its \
+         OWN descendants count (`raw` is outside it); got:\n{stdout}"
     );
 }
 

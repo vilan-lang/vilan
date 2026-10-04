@@ -653,3 +653,4 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 628	-	`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell` (re-exported from `std::reactive`)
 629	-	`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell` (re-exported from `std::reactive`)
 630	-	`{part}` was renamed `{new}`: write `import std::{module}::{new};`
+631	-	a written `autofocus` attribute is the browser's native one, which acts only while the page is first parsed: on an element inserted later the document refuses it once something has focus, and Chromium logs "Autofocus processing was blocked because a document already has a focused element". Write `.autofocus()` — it focuses the element once it is in the document, an enclosing focus scope starts on it, and a server render still writes the native attribute (for a `<dialog>` or a popover that wants the native one, write `.attr("autofocus", "")`)

@@ -7957,3 +7957,121 @@ fn a155_one_class_write_per_element_is_silent() {
         "no element here writes its class twice; got: {warnings:#?}"
     );
 }
+
+// --- A157: a WRITTEN `autofocus` in an element head is steered ---------------
+//
+// RULED (the owner's design, 2026-10-03): `<input autofocus />` lowers to
+// `.attr("autofocus", "")`, the browser's NATIVE attribute, which acts only at
+// the page's initial parse. A WARNING at the attribute's name says why and
+// steers to `.autofocus()`, with a stable code and a quick fix's data. An
+// explicit `.attr("autofocus", "")` is not steered: it is how a `<dialog>` or a
+// popover gets the native attribute.
+
+const A157_HEAD: &str = concat!(
+    "import std::io::print;\n",
+    "import std::ui::{ View, render, view };\n",
+    "\n",
+);
+
+/// The element-syntax attribute warns at its NAME, bare or with an empty
+/// value, wherever it stands in the head, on both platforms — and the fix data
+/// rewrites it to the method in place.
+#[test]
+fn a157_a_written_autofocus_in_an_element_head_warns_and_steers_to_the_method() {
+    use vilan_core::parsing::{WRITTEN_AUTOFOCUS_CODE, written_autofocus_fix};
+    let cases = [
+        ("<input autofocus />", "<input .autofocus() />"),
+        (
+            "<input name(\"n\") autofocus placeholder(\"p\") />",
+            "<input name(\"n\") .autofocus() placeholder(\"p\") />",
+        ),
+        (
+            "<input name(\"n\") autofocus(\"\") />",
+            "<input name(\"n\") .autofocus() />",
+        ),
+    ];
+    // Both platforms, so no `render` (a browser build has none): the element
+    // is bound and dropped.
+    let head = "import std::ui::View;\n\n";
+    for platform in [Platform::default(), Platform::Browser] {
+        for (element, fixed) in cases {
+            let source = format!("{head}fun main() {{\n\tlet _element: View = {element};\n}}\n");
+            let warnings = warning_diagnostics_with_std_on(&source, std_spec(), platform);
+            let matching: Vec<_> = warnings
+                .iter()
+                .filter(|(message, _)| message.contains("a written `autofocus` attribute"))
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "one steer for {element:?} on {platform:?}; got: {warnings:#?}"
+            );
+            let (message, range) = matching[0];
+            assert_eq!(
+                &source[range.clone()],
+                "autofocus",
+                "at the attribute's name"
+            );
+            assert!(
+                message.contains("Write `.autofocus()`")
+                    && message.contains("Autofocus processing was blocked"),
+                "the steer says why and what to write; got: {message}"
+            );
+            let fix = written_autofocus_fix(&source, message, range.clone().into())
+                .expect("the steer carries a quick fix");
+            assert_eq!(fix.code, WRITTEN_AUTOFOCUS_CODE);
+            let mut rewritten = source.clone();
+            rewritten.replace_range(fix.span.into_range(), fix.replacement);
+            assert_eq!(
+                rewritten,
+                format!("{head}fun main() {{\n\tlet _element: View = {fixed};\n}}\n"),
+                "the fix writes the method in place"
+            );
+            assert!(
+                warning_diagnostics_with_std_on(&rewritten, std_spec(), platform)
+                    .iter()
+                    .all(|(message, _)| !message.contains("a written `autofocus` attribute")),
+                "the fixed program is not steered again"
+            );
+        }
+    }
+}
+
+/// Silent for the explicit `.attr("autofocus", "")` — in a head or a chain —
+/// and for the method form; and a valued attribute the method has no slot for
+/// (`autofocus(flag)`) is steered without an edit.
+#[test]
+fn a157_an_explicit_attr_call_is_not_steered() {
+    use vilan_core::parsing::written_autofocus_fix;
+    let source = format!(
+        "{A157_HEAD}{}",
+        concat!(
+            "fun main() {\n",
+            "\tprint(render(<input .attr(\"autofocus\", \"\") />));\n",
+            "\tprint(render(view(\"input\").attr(\"autofocus\", \"\")));\n",
+            "\tprint(render(<input .autofocus() />));\n",
+            "\tprint(render(view(\"input\").autofocus()));\n",
+            "}\n",
+        )
+    );
+    let warnings = warning_diagnostics(&source);
+    assert!(
+        warnings
+            .iter()
+            .all(|(message, _)| !message.contains("a written `autofocus` attribute")),
+        "no element-head attribute here; got: {warnings:#?}"
+    );
+    let valued = format!(
+        "{A157_HEAD}fun main() {{\n\tlet flag = \"on\";\n\tprint(render(<input autofocus(flag) />));\n}}\n"
+    );
+    let warnings = warning_diagnostics(&valued);
+    let (message, range) = warnings
+        .iter()
+        .find(|(message, _)| message.contains("a written `autofocus` attribute"))
+        .unwrap_or_else(|| panic!("a valued attribute is steered too; got: {warnings:#?}"));
+    assert_eq!(
+        written_autofocus_fix(&valued, message, range.clone().into()),
+        None,
+        "but `autofocus(flag)` has no method spelling to rewrite to"
+    );
+}

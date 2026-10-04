@@ -7455,6 +7455,19 @@ impl Document {
                     replacement: String::new(),
                     target: None,
                 });
+            } else if let Some(fix) =
+                vilan_core::parsing::written_autofocus_fix(&self.text, &warning.msg, warning.span)
+            {
+                // A157: a written `autofocus` in an element head — the
+                // analyzer's steer, recognized by its exact message as B520's
+                // foreign spellings are, and rewritten to `.autofocus()` in
+                // place.
+                fixes.push(QuickFix {
+                    title: fix.title.to_string(),
+                    span: fix.span,
+                    replacement: fix.replacement.to_string(),
+                    target: None,
+                });
             }
         }
         fixes

@@ -192,17 +192,14 @@ export impl View {
 	/// §5): a `str` sets once; a `SignalCell<str>` re-sets whenever it changes,
 	/// exactly `bind_attr`. Anything `AttrValue` fills the slot.
 	///
-	/// ONE NAME IS STD'S (A151): `autofocus` — what element syntax's bare
-	/// `<input autofocus />` lowers to — is written as `data-autofocus`, the marker
-	/// `View::autofocus` writes and a focus scope's `focus_initial` reads. The
-	/// native attribute on an element inserted after the page parsed only queues an
-	/// autofocus candidate the document refuses once something has focus, which
-	/// Chromium reports on the console once per page. The native attribute stays
-	/// reachable on the element itself (`on_mount(|element|
-	/// element.set_attribute("autofocus", ""))`), for a `<dialog>` or a popover,
-	/// whose own focusing steps read it.
+	/// Every name is written as it is spelled — `autofocus` included (A157). An
+	/// explicit `.attr("autofocus", "")` writes the NATIVE attribute, which is what
+	/// a `<dialog>` or a popover wants: their own focusing steps read it. To focus
+	/// an element on mount, or to say where a focus scope starts, write
+	/// `.autofocus()`; the compiler steers an element head's written `autofocus`
+	/// there, because the native attribute acts only at the page's initial parse.
 	fun attr<V: AttrValue>(self, name: str, own value: V): View {
-		value.apply(self, attribute_written_for(name));
+		value.apply(self, name);
 		self
 	}
 
@@ -431,32 +428,33 @@ export impl View {
 	/// an overlay is that focus is a consequence of the SHOW — a hook the driver
 	/// runs when it flips visibility, or `<dialog>.showModal()`, whose focusing
 	/// steps run once the dialog is rendered — not a retry.
+	///
+	/// INSIDE A FOCUS SCOPE the scope decides (A157). The element is REGISTERED —
+	/// in a host `WeakSet`, so nothing is written to the DOM and nothing is held
+	/// alive — and the scope's `focus_initial` starts on the first registered
+	/// descendant in tree order when the show calls it. An attempt that finds the
+	/// element inside a live scope therefore does nothing and ends the clock; one
+	/// that runs before any scope holds it focuses as above, which the show then
+	/// settles.
 	fun autofocus(self): View {
-		// A121 §6.1, corrected by A151: WRITE A MARKER TOO, and make it std's own
-		// `data-autofocus` rather than the native attribute. The marker makes the
-		// author's choice READABLE: to an enclosing `FocusScope`, whose
-		// `focus_initial` prefers a marked descendant over the first tabbable one;
-		// to devtools; and to a test that asserts markup. §6.1 said the native
-		// `autofocus` would cost nothing at runtime on a dynamically inserted
-		// element. It does cost something: the HTML spec queues such an element as
-		// an autofocus CANDIDATE, the document flushes its candidates once and
-		// refuses when something already has focus — Chromium logs "Autofocus
-		// processing was blocked because a document already has a focused element"
-		// once per page load — and on a page with nothing focused the native
-		// processing would focus the element on its own clock. A `data-` attribute
-		// has no behaviour at all.
-		//
-		// Inside a focus scope, `autofocus` marks which element the scope should
-		// start on; outside one it focuses on its own bounded clock. It means the
-		// same thing in both places.
-		self.element.set_attribute(AUTOFOCUS_MARKER, "");
+		// A157 (replacing A121 §6.1's written marker and A151's `data-autofocus`):
+		// NO attribute. The native `autofocus` on an element inserted after the
+		// page parsed is queued as an autofocus CANDIDATE that the document refuses
+		// once something has focus — Chromium logs "Autofocus processing was blocked
+		// because a document already has a focused element" once per page load —
+		// and on a page with nothing focused the native processing would focus the
+		// element on its own clock. A `data-` marker had no behaviour, but it was
+		// still markup std left behind on an author's element. The registry is
+		// read where the answer is needed — `focus_initial` asks it per candidate,
+		// at the show — so the scope need not exist when this runs.
+		register_autofocus(autofocus_elements, self.element);
 		self.on_mount(|element| {
-			element.focus();
-			if !element.matches(":focus") {
+			if !autofocus_settled(element) {
 				request_animation_frame(|| {
-					element.focus();
-					if !element.matches(":focus") {
-						request_animation_frame(|| element.focus());
+					if !autofocus_settled(element) {
+						request_animation_frame(|| {
+							let _settled = autofocus_settled(element);
+						});
 					}
 				});
 			}
@@ -2122,20 +2120,6 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	reconcile_pass((instance.snapshot)());
 }
 
-/// std's focus marker (A151): the attribute `View::autofocus` and element syntax's
-/// `autofocus` write, and a focus scope's `focus_initial` reads.
-let AUTOFOCUS_MARKER: str = "data-autofocus";
-
-/// The attribute `View::attr(name, ..)` writes: `name`, except std's one name —
-/// `autofocus`, written as `AUTOFOCUS_MARKER` (A151).
-fun attribute_written_for(name: str): str {
-	if name == "autofocus" {
-		AUTOFOCUS_MARKER
-	} else {
-		name
-	}
-}
-
 /// Something that can fill an attribute value (proposal/element-syntax.md §5). This
 /// is what `<div name(value)>` desugars through — element syntax builds
 /// `.attr(name, value)`, never `.bind_attr` — so the arms below are exactly the
@@ -2548,31 +2532,39 @@ export impl FocusScope {
 	/// visible AT THE CALL, and an overlay panel is hidden until layout places it,
 	/// so focus is a consequence of the show and not of the mount).
 	///
-	/// The order is: the first MARKED descendant — `[data-autofocus]`, which
-	/// `View::autofocus` and element syntax's `autofocus` write, or a native
-	/// `[autofocus]` written on the element by hand (A151) — the author saying
-	/// which element the scope should start on; else the first tabbable one,
-	/// else the panel itself at `tabindex="-1"` (`focus_first`'s own
-	/// fallback).
+	/// The order is (A157): the first descendant, in TREE order, that
+	/// `View::autofocus` REGISTERED — the author saying which element the scope
+	/// should start on; else the first descendant carrying a native `[autofocus]`
+	/// (written with `.attr("autofocus", "")` or by hand); else the first tabbable
+	/// one; else the panel itself at `tabindex="-1"` (`focus_first`'s own
+	/// fallback). Tree order and not registration order: it is HTML's rule for
+	/// `autofocus`, and an element that mounts later (a `when` that opens after the
+	/// scope did) may stand earlier in the panel.
+	///
+	/// The walk runs HERE, at the show, over the descendants the root has now — so
+	/// the scope never needs to exist before its content is built, and an element
+	/// registered and since removed is simply not among them.
 	///
 	/// IDEMPOTENT, and answering `false` rather than latching when the focus did
 	/// not take: a driver whose show hook may fire before layout calls it again on
 	/// the next pass, which is what every overlay's `focused` flag was already
 	/// doing one layer up.
-	///
-	/// `View::autofocus` also WRITES the marker, so the two mechanisms may both
-	/// fire for one element and that is harmless: they focus the same element, and
-	/// focusing an already-focused element is a no-op.
 	fun focus_initial(self): bool {
 		if self.focused.read() {
 			ret true;
 		}
-		mut marked: Option<Element> = None;
+		mut registered: Option<Element> = None;
+		mut native: Option<Element> = None;
 		for candidate in self.root.query_selector_all("*") {
-			if marked.is_none() && (candidate.has_attribute(AUTOFOCUS_MARKER) || candidate.has_attribute("autofocus")) {
-				marked = Some(candidate);
+			if registered.is_none() {
+				if autofocus_registered(autofocus_elements, candidate) {
+					registered = Some(candidate);
+				} else if native.is_none() && candidate.has_attribute("autofocus") {
+					native = Some(candidate);
+				}
 			}
 		}
+		let marked = registered.or(native);
 		let took = match marked {
 			Some(let target) => {
 				target.focus();
@@ -2637,6 +2629,52 @@ let focus_scopes: Shared<List<(i32, Element, FocusContainment, Element)>> = Shar
 
 /// The id source. Ids are never reused, so a stale handle names nothing.
 let next_focus_scope: Shared<i32> = Shared::new(0);
+
+/// The host `WeakSet` that holds the elements `View::autofocus` was called on
+/// (A157). WEAK, which is the point: registering keeps nothing alive, and an
+/// element the document dropped is collected with it — nothing ever unregisters.
+/// Bound as free functions over an opaque handle rather than as an `impl`, because
+/// it is this file's private mechanism and a member of a type declared here would
+/// be twin SURFACE (std_twin_parity counts members).
+external struct AutofocusRegistry;
+
+/// `new WeakSet()`.
+[extern(new, "WeakSet")]
+external fun autofocus_registry(): AutofocusRegistry;
+
+/// `registry.add(element)`.
+[extern(method, "add")]
+external fun register_autofocus(registry: AutofocusRegistry, element: Element): void;
+
+/// `registry.has(element)`.
+[extern(method, "has")]
+external fun autofocus_registered(registry: AutofocusRegistry, element: Element): bool;
+
+/// The one registry, for the life of the page.
+let autofocus_elements: AutofocusRegistry = autofocus_registry();
+
+/// One attempt on `View::autofocus`'s bounded clock, answering whether the clock is
+/// done: the element lies inside a live focus scope, whose show decides the initial
+/// focus (A157), or the focus took.
+fun autofocus_settled(element: Element): bool {
+	if within_focus_scope(element) {
+		ret true;
+	}
+	element.focus();
+	element.matches(":focus")
+}
+
+/// Whether `element` lies inside the root of any live focus scope.
+fun within_focus_scope(element: Element): bool {
+	mut within = false;
+	for entry in focus_scopes.read() {
+		let (_id, scope_root, _containment, _restore) = entry;
+		if scope_root.contains(element) {
+			within = true;
+		}
+	}
+	within
+}
 
 /// Install `root` as a focus scope for as long as the ambient owner lives.
 ///
