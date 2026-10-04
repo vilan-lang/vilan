@@ -519,9 +519,12 @@ fn diagnostic_groups(document: &Document, owner: &Url, paint: bool) -> Vec<(Url,
             DiagnosticSeverity::ERROR
         };
         // B520: a diagnostic with a stable code publishes it — the foreign
-        // spellings, recognized by their exact message.
+        // spellings, and A157's written-`autofocus` steer, each recognized by
+        // its exact message.
         let code = vilan_core::parsing::ForeignSpelling::of_message(&item.message)
-            .map(|spelling| NumberOrString::String(spelling.code().to_string()));
+            .map(|spelling| spelling.code())
+            .or_else(|| vilan_core::elements::element_diagnostic_code(&item.message))
+            .map(|code| NumberOrString::String(code.to_string()));
         let diagnostic = |range| Diagnostic {
             range,
             severity: Some(severity),

@@ -28,6 +28,8 @@ mod import_position_tests;
 mod member_admission_tests;
 #[cfg(test)]
 mod organize_duplicate_tests;
+#[cfg(test)]
+mod written_autofocus_tests;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

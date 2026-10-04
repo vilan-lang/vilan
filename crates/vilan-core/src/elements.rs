@@ -25,6 +25,76 @@ use crate::node::{
 };
 use crate::span::{Span, Spanned};
 
+/// A157: the warning on a WRITTEN `autofocus` attribute in an element head
+/// (`<input autofocus />`, which lowers to `.attr("autofocus", "")`). Raised by
+/// the analyzer's `check_written_autofocus`, at the attribute's NAME; an
+/// explicit `.attr("autofocus", ..)` is not steered (it is how a `<dialog>` or
+/// a popover gets the native attribute). Fixed text, no slots: the editor
+/// recognizes the diagnostic by it ([`written_autofocus_fix`]).
+pub const WRITTEN_AUTOFOCUS_MESSAGE: &str = "a written `autofocus` attribute is the browser's \
+     native one, which acts only while the page is first parsed: on an element inserted later \
+     the document refuses it once something has focus, and Chromium logs \"Autofocus processing \
+     was blocked because a document already has a focused element\". Write `.autofocus()` — it \
+     focuses the element once it is in the document, an enclosing focus scope starts on it, and a \
+     server render still writes the native attribute (for a `<dialog>` or a popover that wants \
+     the native one, write `.attr(\"autofocus\", \"\")`)";
+
+/// [`WRITTEN_AUTOFOCUS_MESSAGE`]'s STABLE code. The editor publishes it as the
+/// LSP diagnostic's `code`; it never changes when the message is reworded.
+pub const WRITTEN_AUTOFOCUS_CODE: &str = "element-attribute/autofocus";
+
+/// The stable code of an element-syntax diagnostic `message`, if it is one.
+pub fn element_diagnostic_code(message: &str) -> Option<&'static str> {
+    (message == WRITTEN_AUTOFOCUS_MESSAGE).then_some(WRITTEN_AUTOFOCUS_CODE)
+}
+
+/// The quick fix for an element-syntax diagnostic: the span to replace and the
+/// text to write there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElementFix {
+    /// The diagnostic's stable code ([`WRITTEN_AUTOFOCUS_CODE`]).
+    pub code: &'static str,
+    /// The quick fix's title.
+    pub title: &'static str,
+    /// The source range the edit replaces.
+    pub span: Span,
+    /// What the edit writes there.
+    pub replacement: &'static str,
+}
+
+/// The quick fix for the diagnostic `message` anchored at `span` in `source`
+/// (A157), or `None` when it is not [`WRITTEN_AUTOFOCUS_MESSAGE`], `span` no
+/// longer covers the word `autofocus` (the buffer moved on), or the attribute
+/// carries a value other than `("")` — `autofocus(flag)` is a value the method
+/// form has no slot for, so the warning stands without an edit.
+///
+/// The edit replaces the attribute — the bare name, or the name through its
+/// `("")` — with `.autofocus()` IN PLACE: a dotted link may stand anywhere in
+/// a head, and the formatter's element-head order treats it as a barrier, so
+/// the result is already what `vilan fmt` prints.
+pub fn written_autofocus_fix(source: &str, message: &str, span: Span) -> Option<ElementFix> {
+    if message != WRITTEN_AUTOFOCUS_MESSAGE || source.get(span.into_range())? != "autofocus" {
+        return None;
+    }
+    let after = source.get(span.end..)?;
+    let rest = after.trim_start();
+    let end = if let Some(inside) = rest.strip_prefix('(') {
+        let close = inside.find(')')?;
+        if inside[..close].trim() != "\"\"" {
+            return None;
+        }
+        span.end + (after.len() - rest.len()) + 1 + close + 1
+    } else {
+        span.end
+    };
+    Some(ElementFix {
+        code: WRITTEN_AUTOFOCUS_CODE,
+        title: "Write `.autofocus()`",
+        span: Span::from(span.start..end),
+        replacement: ".autofocus()",
+    })
+}
+
 /// Rewrite every element in a parsed tree, in place. Called at each
 /// `lift::rewrite_items` site, immediately before it — which covers the entry
 /// file, every loaded module, and parsed macro-expansion output.

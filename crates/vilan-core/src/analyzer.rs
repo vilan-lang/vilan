@@ -53131,6 +53131,78 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// A157: a WRITTEN `autofocus` attribute in an element head —
+    /// `<input autofocus />`, which lowers to `.attr("autofocus", "")` — is the
+    /// browser's NATIVE attribute, which acts only at the page's initial parse:
+    /// on an element inserted later the document refuses it once something has
+    /// focus, and Chromium logs that it did. A WARNING at the attribute's name,
+    /// steering to `.autofocus()` ([`crate::elements::WRITTEN_AUTOFOCUS_MESSAGE`],
+    /// whose quick fix is [`crate::elements::written_autofocus_fix`]).
+    ///
+    /// An element head's attribute is told from a written `.attr(..)` by its
+    /// member reference: the desugar gives the generated `attr` a ZERO-WIDTH
+    /// span (`elements.rs`, the attribute name is markup), where a written call
+    /// spans its name. The explicit `.attr("autofocus", "")` is therefore not
+    /// steered — it is how a `<dialog>` or a popover gets the native attribute.
+    /// Skips std, dependencies and generated code, as A155 does.
+    fn check_written_autofocus(&mut self) {
+        let mut sites: Vec<(SourceId, Span)> = Vec::new();
+        for (call_id, function_call) in &self.function_calls {
+            let Some(member_name) = self.member_name_spans.get(call_id) else {
+                continue;
+            };
+            if member_name.start != member_name.end {
+                continue;
+            }
+            let Some(Expr::Local(member_id)) =
+                self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            if self.callable_name(*member_id) != Some("attr")
+                || !self.is_std_view_member(*member_id)
+            {
+                continue;
+            }
+            let Some(&name) = function_call.argument_ids.get(1) else {
+                continue;
+            };
+            if !matches!(
+                self.expr_id_to_expr_map.get(&name),
+                Some(Expr::String("autofocus"))
+            ) {
+                continue;
+            }
+            let Some(source) = self.source_of_id(*call_id) else {
+                continue;
+            };
+            if self.std_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+                || self.derived_origin_file(*call_id).is_some()
+            {
+                continue;
+            }
+            let Some(span) = self.span_map.get(&name) else {
+                continue;
+            };
+            sites.push((source, **span));
+        }
+        // The calls are visited in the table's order, not the file's — sorted so
+        // `vilan check` prints them stably, and one per site (an entry world per
+        // package entry resolves a shared file's calls once each).
+        sites.sort_by_key(|(source, span)| (source.0, span.start, span.end));
+        sites.dedup();
+        for (source, span) in sites {
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: crate::elements::WRITTEN_AUTOFOCUS_MESSAGE.to_string(),
+            });
+            self.warning_sources.push(source);
+        }
+    }
+
     /// Whether `member_id` is a method of std's own `View` (either ui twin).
     fn is_std_view_member(&self, member_id: Id) -> bool {
         let Some(index) = self.implementation_by_declaration.get(&member_id) else {
@@ -72136,6 +72208,9 @@ fn analyze_over_world<'src>(
         // chain. Post-build because it reads which `View` member each link
         // resolved to.
         analyzer.check_class_written_twice();
+        // A157: a written `autofocus` in an element head. Post-build for the same
+        // reason: it reads which `View` member the head's `attr` resolved to.
+        analyzer.check_written_autofocus();
         analyzer.check_plain_reaches();
         analyzer.check_duplicate_module_declarations();
         // Two impls declaring one name for one subject (B57): a coherence rule, so
