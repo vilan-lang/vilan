@@ -84,7 +84,7 @@ pub fn collect_type_generics(
                 collect_type_generics(program, argument, depth + 1, out);
             }
         }
-        Some(Type::Closure(parameters, return_type_id, _)) => {
+        Some(Type::Closure(parameters, return_type_id, _, _)) => {
             let parameters = parameters.clone();
             let return_type_id = *return_type_id;
             for parameter in parameters {

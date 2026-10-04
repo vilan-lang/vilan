@@ -371,7 +371,7 @@ fn is_context_binding(program: &Program, id: Id) -> bool {
 /// closure type written before the clause moved into the type.
 fn clause_of_type<'a>(program: &'a Program<'_>, type_id: TypeId) -> Option<&'a [Id]> {
     match program.type_id_to_type_map.get(&type_id) {
-        Some(Type::Closure(_, _, contexts)) if !contexts.is_empty() => Some(contexts),
+        Some(Type::Closure(_, _, contexts, _)) if !contexts.is_empty() => Some(contexts),
         _ => None,
     }
 }

@@ -948,7 +948,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn closure_return_position(&self, closure: &vilan_core::analyzer::Closure) -> Option<TypeId> {
         self.expected_type
             .and_then(|type_id| match self.resolve(type_id) {
-                Some(Type::Closure(_, returns, _)) => Some(*returns),
+                Some(Type::Closure(_, returns, _, _)) => Some(*returns),
                 _ => None,
             })
             .filter(|returns| self.is_grounded(*returns))
@@ -1564,10 +1564,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Type::Dyn(id, arguments) => Type::Dyn(id, self.substituted_all(&arguments, entries)),
             Type::Tuple(elements) => Type::Tuple(self.substituted_all(&elements, entries)),
             Type::Array(element, length) => Type::Array(self.substituted(element, entries), length),
-            Type::Closure(parameters, returns, contexts) => Type::Closure(
+            Type::Closure(parameters, returns, contexts, modes) => Type::Closure(
                 self.substituted_all(&parameters, entries),
                 self.substituted(returns, entries),
                 contexts,
+                modes,
             ),
             _ => return type_id,
         };
@@ -1733,7 +1734,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 out.push_str("Tup");
                 self.write_key_arguments(elements, out);
             }
-            Type::Closure(parameters, return_type_id, _) => {
+            Type::Closure(parameters, return_type_id, _, _) => {
                 out.push_str("Fn");
                 // A view parameter is a different Rust signature, so it keys
                 // apart from the same closure type over values.
@@ -1961,7 +1962,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // and its parameters against the literal's parameters.
             if let Some(Expr::Closure(closure_id)) = self.program.entity_map.get(argument)
                 && let Some(closure) = self.program.closures.get(closure_id)
-                && let Some(Type::Closure(declared_parameters, declared_return, _)) =
+                && let Some(Type::Closure(declared_parameters, declared_return, _, _)) =
                     self.type_entry(&parameter.type_id)
             {
                 for (declared, literal) in declared_parameters.iter().zip(&closure.parameters) {
@@ -2250,7 +2251,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let element = self.rust_type(element, span)?;
                 Ok(format!("[{element}; {length}]"))
             }
-            Type::Closure(parameters, return_type, contexts) => {
+            Type::Closure(parameters, return_type, contexts, _) => {
                 // Read and CLEAR: the flag belongs to this position's outermost
                 // closure, not to a closure nested inside its own signature.
                 let is_async = std::mem::take(&mut self.expects_async);
@@ -2409,7 +2410,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let element = *element;
                 self.mentions_any(element)
             }
-            Some(Type::Closure(parameters, returns, _)) => {
+            Some(Type::Closure(parameters, returns, _, _)) => {
                 let (parameters, returns) = (parameters.clone(), *returns);
                 parameters.iter().any(|inner| self.mentions_any(*inner))
                     || self.mentions_any(returns)
@@ -3422,7 +3423,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .map(|parameter| parameter.type_id)
             })?;
         match self.resolve(binding_type)? {
-            Type::Closure(_, return_type_id, _) => Some(*return_type_id),
+            Type::Closure(_, return_type_id, _, _) => Some(*return_type_id),
             _ => None,
         }
     }
@@ -3826,7 +3827,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // declared one), and without this hop the instance was emitted
             // `-> ()` over a body handing back an `i32`.
             _ => match self.resolve(self.type_of(subject_id)?)? {
-                Type::Closure(_, return_type_id, _) => Some(*return_type_id),
+                Type::Closure(_, return_type_id, _, _) => Some(*return_type_id),
                 _ => None,
             },
         }
@@ -3874,8 +3875,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let own = self.concrete(own);
         let positioned = self.concrete(positioned);
         let (
-            Some(Type::Closure(own_parameters, _, _)),
-            Some(Type::Closure(positioned_parameters, _, _)),
+            Some(Type::Closure(own_parameters, _, _, _)),
+            Some(Type::Closure(positioned_parameters, _, _, _)),
         ) = (self.type_entry(&own), self.type_entry(&positioned))
         else {
             return false;
@@ -4728,7 +4729,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         self.type_of(id)
             .and_then(|type_id| self.resolve(type_id))
-            .is_some_and(|resolved| matches!(resolved, Type::Closure(_, _, _)))
+            .is_some_and(|resolved| matches!(resolved, Type::Closure(_, _, _, _)))
     }
 
     /// Whether `id` READS a binding holding one of the executor's host handles
@@ -5226,7 +5227,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             return Err(unsupported("an unresolved variant coercion", span));
         };
-        let Some(Type::Closure(parameters, returned, _)) = self.type_entry(&closure_type).cloned()
+        let Some(Type::Closure(parameters, returned, _, _)) =
+            self.type_entry(&closure_type).cloned()
         else {
             return Err(unsupported("a variant coerced to a non-closure type", span));
         };
@@ -5266,7 +5268,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         closure_type: TypeId,
         span: Span,
     ) -> Result<Vec<String>, Error> {
-        let Some(Type::Closure(_, _, contexts)) = self.resolve(closure_type).cloned() else {
+        let Some(Type::Closure(_, _, contexts, _)) = self.resolve(closure_type).cloned() else {
             return Ok(Vec::new());
         };
         let mut parameters = Vec::with_capacity(contexts.len());
@@ -5291,7 +5293,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some(expected) = self.expected_type else {
             return Ok(None);
         };
-        let Some(Type::Closure(_, _, contexts)) = self.resolve(expected).cloned() else {
+        let Some(Type::Closure(_, _, contexts, _)) = self.resolve(expected).cloned() else {
             return Ok(None);
         };
         if contexts.is_empty() {
@@ -6808,10 +6810,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // F38: a closure type binds through its parameters and its return —
             // `and_then<U>(self, fn: |T| Result<U, E>)` learns `U` from the
             // closure it is handed.
-            Some(Type::Closure(pattern_parameters, pattern_return, _)) => {
+            Some(Type::Closure(pattern_parameters, pattern_return, _, _)) => {
                 let (pattern_parameters, pattern_return) =
                     (pattern_parameters.clone(), *pattern_return);
-                let Some(Type::Closure(concrete_parameters, concrete_return, _)) =
+                let Some(Type::Closure(concrete_parameters, concrete_return, _, _)) =
                     self.type_entry(&concrete).cloned()
                 else {
                     return;
@@ -6849,7 +6851,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .all(|inner| self.is_closed_in_itself(*inner)),
             Some(Type::Array(element, _)) => self.is_closed_in_itself(*element),
             Some(Type::Mapped(..)) => false,
-            Some(Type::Closure(parameters, returns, _)) => {
+            Some(Type::Closure(parameters, returns, _, _)) => {
                 parameters
                     .iter()
                     .all(|inner| self.is_closed_in_itself(*inner))
@@ -7247,15 +7249,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // under `Shared<|Hash| void>`, where nothing in the literal constrains
         // `_key` and the annotation reaches the call's `T` only — takes the
         // position's: the closure type the literal is rendered into.
-        let positioned: Vec<TypeId> = match self
-            .expected_type
-            .and_then(|type_id| self.resolve(type_id))
-        {
-            Some(Type::Closure(expected, _, _)) if expected.len() == closure.parameters.len() => {
-                expected.clone()
-            }
-            _ => Vec::new(),
-        };
+        let positioned: Vec<TypeId> =
+            match self.expected_type.and_then(|type_id| self.resolve(type_id)) {
+                Some(Type::Closure(expected, _, _, _))
+                    if expected.len() == closure.parameters.len() =>
+                {
+                    expected.clone()
+                }
+                _ => Vec::new(),
+            };
         let mut parameters = Vec::new();
         let mut signature = Vec::new();
         for (index, parameter_id) in closure.parameters.iter().enumerate() {
@@ -7450,7 +7452,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let recorded = self
             .type_of(closure.id)
             .and_then(|type_id| match self.resolve(type_id) {
-                Some(Type::Closure(_, returns, _)) => Some(*returns),
+                Some(Type::Closure(_, returns, _, _)) => Some(*returns),
                 _ => None,
             });
         match self

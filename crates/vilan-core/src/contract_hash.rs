@@ -208,7 +208,7 @@ impl<'program, 'src> Renderer<'program, 'src> {
             Type::Array(element, length) => {
                 format!("[{}; {length}]", self.render(*element, substitution))
             }
-            Type::Closure(parameters, returned, _) => {
+            Type::Closure(parameters, returned, _, _) => {
                 format!(
                     "|{}| {}",
                     self.list(parameters, substitution),

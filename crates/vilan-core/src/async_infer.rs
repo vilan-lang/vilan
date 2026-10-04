@@ -225,7 +225,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
             let Some(parameter_record) = program.parameters.get(parameter) else {
                 continue;
             };
-            let Some(Type::Closure(_, return_type, _)) = program
+            let Some(Type::Closure(_, return_type, _, _)) = program
                 .type_id_to_type_map
                 .get(&parameter_record.type_id)
                 .cloned()
@@ -1634,7 +1634,7 @@ fn closure_return_is_value(program: &Program, parameter_id: Id) -> bool {
     let Some(parameter) = program.parameters.get(&parameter_id) else {
         return false;
     };
-    let Some(Type::Closure(_, return_type, _)) =
+    let Some(Type::Closure(_, return_type, _, _)) =
         program.type_id_to_type_map.get(&parameter.type_id).cloned()
     else {
         return false;
@@ -1664,7 +1664,8 @@ struct FieldStore {
 /// about — i.e. NOT void (A.3: void positions keep spawn semantics) and not
 /// still unresolved.
 fn plain_closure_position(program: &Program, type_id: TypeId) -> bool {
-    let Some(Type::Closure(_, return_type, _)) = program.type_id_to_type_map.get(&type_id) else {
+    let Some(Type::Closure(_, return_type, _, _)) = program.type_id_to_type_map.get(&type_id)
+    else {
         return false;
     };
     !matches!(

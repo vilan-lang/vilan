@@ -12299,7 +12299,7 @@ impl<'src> Transformer<'src> {
             // already rewritten every threading site into ordinary parameters
             // and arguments, so two instantiations differing only in a clause
             // emit the same code.
-            Type::Closure(parameters, return_type_id, _) => {
+            Type::Closure(parameters, return_type_id, _, _) => {
                 out.push_str("Fn");
                 self.write_type_key_arguments(parameters, out);
                 out.push_str("->");

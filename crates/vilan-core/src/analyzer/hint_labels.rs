@@ -398,7 +398,7 @@ impl<'src> Analyzer<'src> {
             Type::Array(element, _) => {
                 self.mentions_a_hinted_type(element.borrow_type(self), depth + 1)
             }
-            Type::Closure(parameters, return_id, contexts) if contexts.is_empty() => parameters
+            Type::Closure(parameters, return_id, contexts, _) if contexts.is_empty() => parameters
                 .iter()
                 .chain(std::iter::once(return_id))
                 .any(|part| self.mentions_a_hinted_type(part.borrow_type(self), depth + 1)),
@@ -456,7 +456,7 @@ impl<'src> Analyzer<'src> {
                 let element = self.render_hint_label(&element, admitted, hosts, depth + 1);
                 format!("[{element}; {length}]")
             }
-            Type::Closure(parameters, return_id, _) => {
+            Type::Closure(parameters, return_id, _, _) => {
                 let (parameters, return_id) = (parameters.clone(), *return_id);
                 let parts: Vec<String> = parameters
                     .iter()

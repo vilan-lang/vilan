@@ -7528,8 +7528,8 @@ impl<'src> Analyzer<'src> {
                     && self.same_type_structure(left_element, right_element, depth + 1)
             }
             (
-                Type::Closure(left_parameters, left_return, left_contexts),
-                Type::Closure(right_parameters, right_return, right_contexts),
+                Type::Closure(left_parameters, left_return, left_contexts, _),
+                Type::Closure(right_parameters, right_return, right_contexts, _),
             ) => {
                 left_contexts == right_contexts
                     && all(&left_parameters, &right_parameters)
@@ -10516,8 +10516,8 @@ impl<'src> Analyzer<'src> {
             // type. Two closure types that differ only in their clause select
             // the same impl, exactly as they unify.
             (
-                Type::Closure(left_parameters, left_return, _),
-                Type::Closure(right_parameters, right_return, _),
+                Type::Closure(left_parameters, left_return, _, _),
+                Type::Closure(right_parameters, right_return, _, _),
             ) => {
                 self.same_impl_types(left_parameters, right_parameters, comparing)
                     && self.same_impl_type(*left_return, *right_return, comparing)
@@ -11127,7 +11127,7 @@ impl<'src> Analyzer<'src> {
             Type::Array(element, _) => {
                 self.mentions_self_trait(&element.get_type(self), self_trait, depth + 1)
             }
-            Type::Closure(parameters, return_type, _) => {
+            Type::Closure(parameters, return_type, _, _) => {
                 mentions(self, parameters)
                     || self.mentions_self_trait(&return_type.get_type(self), self_trait, depth + 1)
             }
@@ -11282,9 +11282,10 @@ impl<'src> Analyzer<'src> {
                     self.substitute_member_type(&element, self_trait, subject, context);
                 Type::Array(substituted.get_type_id(self), *length)
             }
-            Type::Closure(parameter_ids, return_type_id, contexts) => {
+            Type::Closure(parameter_ids, return_type_id, contexts, modes) => {
                 let parameter_ids = parameter_ids.clone();
                 let contexts = contexts.clone();
+                let modes = modes.clone();
                 let return_type = return_type_id.get_type(self);
                 let parameters = self.substitute_member_argument_types(
                     &parameter_ids,
@@ -11298,7 +11299,7 @@ impl<'src> Analyzer<'src> {
                 // B309: the clause rides through substitution. It names context
                 // BINDINGS, which no type substitution can rename, and losing it
                 // here would silently un-inject a trait member's declared body.
-                Type::Closure(parameters, return_type, contexts)
+                Type::Closure(parameters, return_type, contexts, modes)
             }
             _ => type_.clone(),
         }
@@ -11636,7 +11637,7 @@ impl<'src> Analyzer<'src> {
             | Type::Tuple(arguments) => arguments
                 .iter()
                 .all(|argument| self.substitution_fixed(*argument)),
-            Type::Closure(parameters, return_type, _) => {
+            Type::Closure(parameters, return_type, _, _) => {
                 parameters
                     .iter()
                     .all(|parameter| self.substitution_fixed(*parameter))
@@ -12075,7 +12076,7 @@ impl<'src> Analyzer<'src> {
             // B309: the clause is not rendered into the CANONICAL key — the
             // key is a structural identity (same shape = same entry), and the
             // clause is a discipline over the shape.
-            Type::Closure(parameters, return_id, _) => {
+            Type::Closure(parameters, return_id, _, _) => {
                 buf.push_str("fn(");
                 for (index, parameter) in parameters.iter().enumerate() {
                     if index > 0 {
@@ -13528,7 +13529,7 @@ impl<'src> Analyzer<'src> {
             Type::Trait(_, arguments) | Type::Dyn(_, arguments) => any(self, &arguments, visited),
             Type::Tuple(members) => any(self, &members, visited),
             Type::Array(element, _length) => any(self, &[element], visited),
-            Type::Closure(parameters, return_, _) => {
+            Type::Closure(parameters, return_, _, _) => {
                 any(self, &parameters, visited) || any(self, &[return_], visited)
             }
             Type::Mapped(binder, source, template) => {
@@ -22427,12 +22428,12 @@ impl<'src> Analyzer<'src> {
             if context_ids.is_empty() {
                 continue;
             }
-            if let Some(Type::Closure(parameters, return_type_id, _)) =
+            if let Some(Type::Closure(parameters, return_type_id, _, modes)) =
                 self.type_id_to_type_map.get(&type_id).cloned()
             {
                 self.write_type_slot(
                     type_id,
-                    Type::Closure(parameters, return_type_id, context_ids.clone()),
+                    Type::Closure(parameters, return_type_id, context_ids.clone(), modes),
                 );
             }
             // The entity-keyed INDEX, derived from the one record: the hover
@@ -30112,7 +30113,7 @@ impl<'src> Analyzer<'src> {
             .closure_value_type_id(subject_id)
             .and_then(|type_id| self.type_id_to_type_map.get(&type_id))
         {
-            Some(Type::Closure(parameter_type_ids, _, _)) => parameter_type_ids.clone(),
+            Some(Type::Closure(parameter_type_ids, _, _, _)) => parameter_type_ids.clone(),
             _ => Vec::new(),
         }
     }
@@ -33927,7 +33928,7 @@ impl<'src> Analyzer<'src> {
             }
             Type::Tuple(members) => any(self, &members, visited),
             Type::Array(element, _) => any(self, &[element], visited),
-            Type::Closure(parameters, return_type_id, _) => {
+            Type::Closure(parameters, return_type_id, _, _) => {
                 any(self, &parameters, visited) || any(self, &[return_type_id], visited)
             }
             Type::Mapped(binder, source, template) => {
@@ -34583,9 +34584,9 @@ impl<'src> Analyzer<'src> {
             }
         }
         let unknown = Type::Unknown.get_type_id(self);
-        let expected = Type::Closure(vec![element_template], unknown, Vec::new());
+        let expected = Type::Closure(vec![element_template], unknown, Vec::new(), Vec::new());
         let closure_type = self.infer_type(argument_id, &expected, &HashMap::default());
-        let Type::Closure(_, return_type_id, _) = closure_type else {
+        let Type::Closure(_, return_type_id, _, _) = closure_type else {
             return Resolution::Deferred;
         };
         if matches!(
@@ -38926,6 +38927,7 @@ impl<'src> Analyzer<'src> {
                     t_parameter_type_ids,
                     t_return_type_id,
                     Vec::new(),
+                    Vec::new(),
                 ))
             }
             // A context clause reaching the general type walk is misplaced —
@@ -39611,7 +39613,7 @@ impl<'src> Analyzer<'src> {
                 .iter()
                 .all(|item| self.type_is_fully_determined(&item.get_type(self))),
             Type::Array(element_id, _) => self.type_is_fully_determined(&element_id.get_type(self)),
-            Type::Closure(parameter_ids, return_id, _) => {
+            Type::Closure(parameter_ids, return_id, _, _) => {
                 parameter_ids
                     .iter()
                     .all(|parameter| self.type_is_fully_determined(&parameter.get_type(self)))
@@ -40114,7 +40116,7 @@ impl<'src> Analyzer<'src> {
                 .iter()
                 .any(|item| self.type_has_an_unknown_hole(&item.get_type(self))),
             Type::Array(element_id, _) => self.type_has_an_unknown_hole(&element_id.get_type(self)),
-            Type::Closure(parameter_ids, return_id, _) => {
+            Type::Closure(parameter_ids, return_id, _, _) => {
                 parameter_ids
                     .iter()
                     .any(|parameter| self.type_has_an_unknown_hole(&parameter.get_type(self)))
@@ -40322,7 +40324,7 @@ impl<'src> Analyzer<'src> {
             | Type::Function(_)
             | Type::Module(_)
             | Type::Void => false,
-            Type::Closure(parameter_type_ids, return_type_id, _) => {
+            Type::Closure(parameter_type_ids, return_type_id, _, _) => {
                 parameter_type_ids
                     .iter()
                     .any(|parameter_type_id| self.type_has_hole(*parameter_type_id))
@@ -40480,7 +40482,7 @@ impl<'src> Analyzer<'src> {
         parameter_type: &Type,
         substitution: &SubstitutionContext,
     ) -> bool {
-        let Type::Closure(closure_parameter_ids, _, _) = parameter_type else {
+        let Type::Closure(closure_parameter_ids, _, _, _) = parameter_type else {
             return false;
         };
         let Some((_, own_generics)) = self.method_signature_ref(member_id) else {
@@ -40885,7 +40887,7 @@ impl<'src> Analyzer<'src> {
     /// the reference (`Local`) is recorded; the variant entity itself is
     /// shared by every mention.
     fn note_variant_coercion(&mut self, expr_id: Id, inferred: &Type) {
-        let Type::Closure(parameters, _, _) = inferred else {
+        let Type::Closure(parameters, _, _, _) = inferred else {
             return;
         };
         let Some(Expr::Local(target)) = self.expr_id_to_expr_map.get(&expr_id) else {
@@ -40969,7 +40971,7 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         let returned = Type::Enum(enum_id, arguments).get_type_id(self);
-        Some(Type::Closure(parameters, returned, Vec::new()))
+        Some(Type::Closure(parameters, returned, Vec::new(), Vec::new()))
     }
 
     /// B462's other half: a TUPLE variant named as a value where no closure is
@@ -41481,8 +41483,8 @@ impl<'src> Analyzer<'src> {
             }
             (Type::Array(left, _), Type::Array(right, _)) => vec![(*left, *right)],
             (
-                Type::Closure(left_parameters, left_return, _),
-                Type::Closure(right_parameters, right_return, _),
+                Type::Closure(left_parameters, left_return, _, _),
+                Type::Closure(right_parameters, right_return, _, _),
             ) if left_parameters.len() == right_parameters.len() => left_parameters
                 .iter()
                 .copied()
@@ -41511,7 +41513,7 @@ impl<'src> Analyzer<'src> {
     /// reconcile reports, and recording it would have the emitter wrap a call
     /// the program never makes.
     fn note_callable_coercion(&mut self, expr_id: Id, constraint: &Type, inferred: &Type) {
-        let Type::Closure(expected_parameter_type_ids, _, _) = constraint else {
+        let Type::Closure(expected_parameter_type_ids, _, _, _) = constraint else {
             return;
         };
         if !self.type_is_callable(inferred) {
@@ -41542,7 +41544,7 @@ impl<'src> Analyzer<'src> {
         }
         let expected_arity = expected_parameter_type_ids.len();
         if self.callable_closure_type(inferred).is_some_and(|coerced| {
-            matches!(&coerced, Type::Closure(parameter_type_ids, _, _)
+            matches!(&coerced, Type::Closure(parameter_type_ids, _, _, _)
                     if parameter_type_ids.len() == expected_arity)
         }) {
             // The value's OWN type rides with the site: an `Expr::Local`
@@ -42239,7 +42241,7 @@ impl<'src> Analyzer<'src> {
                 // `|i32| Option<i32>`). Anywhere else a payload variant as a
                 // value is refused after the build (`refuse_bare_payload_variants`).
                 if !payload_less
-                    && let Type::Closure(expected_parameters, expected_return, _) =
+                    && let Type::Closure(expected_parameters, expected_return, _, _) =
                         constraint.as_ref()
                     && let Some(coerced) = self.variant_as_closure(
                         enum_id,
@@ -42294,7 +42296,7 @@ impl<'src> Analyzer<'src> {
                     Type::Unresolved => Type::Unresolved,
                     // Calling a closure-typed value (e.g. `(self.fn)()`)
                     // yields the closure's return type.
-                    Type::Closure(_, return_type_id, _) => {
+                    Type::Closure(_, return_type_id, _, _) => {
                         let return_type = return_type_id.get_type(self);
                         self.substitute_type(&return_type, substitution_context)
                     }
@@ -43007,7 +43009,7 @@ impl<'src> Analyzer<'src> {
                 // matching arity, fill any unannotated (`Unknown`) parameter from
                 // it — so `|res|` passed where `|Res| void` is expected types
                 // `res` as `Res`.
-                if let Type::Closure(expected_parameter_ids, _, _) = constraint.as_ref()
+                if let Type::Closure(expected_parameter_ids, _, _, _) = constraint.as_ref()
                     && expected_parameter_ids.len() == parameter_ids.len()
                 {
                     let expected = expected_parameter_ids.clone();
@@ -43094,7 +43096,7 @@ impl<'src> Analyzer<'src> {
                     None => None,
                 };
                 if target_return_type_id.is_none()
-                    && let Type::Closure(expected_parameter_ids, expected_return_type_id, _) =
+                    && let Type::Closure(expected_parameter_ids, expected_return_type_id, _, _) =
                         constraint.as_ref()
                     && expected_parameter_ids.len() == parameter_type_ids.len()
                 {
@@ -43181,6 +43183,7 @@ impl<'src> Analyzer<'src> {
                                 parameter_type_ids,
                                 target_return_type_id,
                                 Vec::new(),
+                                Vec::new(),
                             );
                         }
                         ReturnPositionCheck::Mismatched(msg) => {
@@ -43249,6 +43252,7 @@ impl<'src> Analyzer<'src> {
                                 parameter_type_ids,
                                 target_return_type_id,
                                 Vec::new(),
+                                Vec::new(),
                             );
                         }
                     }
@@ -43291,6 +43295,7 @@ impl<'src> Analyzer<'src> {
                     _ => Type::Closure(
                         parameter_type_ids,
                         return_type.get_type_id(self),
+                        Vec::new(),
                         Vec::new(),
                     ),
                 }
@@ -44307,6 +44312,7 @@ impl<'src> Analyzer<'src> {
             parameter_type_ids,
             return_type_id,
             Vec::new(),
+            Vec::new(),
         ))
     }
 
@@ -44370,7 +44376,7 @@ impl<'src> Analyzer<'src> {
             .iter()
             .all(|parameter_type_id| self.type_is_ground(*parameter_type_id))
             && self.type_is_ground(return_type_id);
-        ground.then(|| Type::Closure(parameter_type_ids, return_type_id, Vec::new()))
+        ground.then(|| Type::Closure(parameter_type_ids, return_type_id, Vec::new(), Vec::new()))
     }
 
     /// `function_closure_type` for read-only paths (`compare_type`): an
@@ -44384,6 +44390,7 @@ impl<'src> Analyzer<'src> {
         Some(Type::Closure(
             parameter_type_ids,
             return_type_id,
+            Vec::new(),
             Vec::new(),
         ))
     }
@@ -44985,13 +44992,18 @@ impl<'src> Analyzer<'src> {
             // one, so the answer written back into the slot still says the
             // value is injected.
             (
-                Type::Closure(l_parameter_ids, l_return_id, l_contexts),
-                Type::Closure(r_parameter_ids, r_return_id, r_contexts),
+                Type::Closure(l_parameter_ids, l_return_id, l_contexts, l_modes),
+                Type::Closure(r_parameter_ids, r_return_id, r_contexts, r_modes),
             ) => {
                 let contexts = if l_contexts.is_empty() {
                     r_contexts.clone()
                 } else {
                     l_contexts.clone()
+                };
+                let modes = if l_modes.is_empty() {
+                    r_modes.clone()
+                } else {
+                    l_modes.clone()
                 };
                 if l_parameter_ids.len() != r_parameter_ids.len() {
                     return None;
@@ -45015,7 +45027,7 @@ impl<'src> Analyzer<'src> {
                 all_bindings.extend(bindings);
                 let return_type_id = return_type.get_type_id(self);
                 (
-                    Type::Closure(result_parameter_ids, return_type_id, contexts),
+                    Type::Closure(result_parameter_ids, return_type_id, contexts, modes),
                     all_bindings,
                 )
             }
@@ -45301,8 +45313,8 @@ impl<'src> Analyzer<'src> {
             }
             // B309: clauses are not compared — see `Type::Closure`'s own note.
             (
-                Type::Closure(l_parameter_ids, l_return_id, _),
-                Type::Closure(r_parameter_ids, r_return_id, _),
+                Type::Closure(l_parameter_ids, l_return_id, _, _),
+                Type::Closure(r_parameter_ids, r_return_id, _, _),
             ) => {
                 l_parameter_ids.len() == r_parameter_ids.len()
                     && l_parameter_ids.iter().zip(r_parameter_ids.iter()).all(
@@ -45501,16 +45513,17 @@ impl<'src> Analyzer<'src> {
             // generic method parameter `|T| U` becomes `|i32| U` under `T = i32` —
             // without this an unannotated closure argument's parameter stays the
             // abstract `T`.
-            Type::Closure(parameters, return_type_id, contexts) => {
+            Type::Closure(parameters, return_type_id, contexts, modes) => {
                 let (parameters, return_type_id) = (parameters.clone(), *return_type_id);
                 let contexts = contexts.clone();
+                let modes = modes.clone();
                 let parameters = self.substitute_argument_types(&parameters, substitution_context);
                 let return_type = self.substitute_type_id(return_type_id, substitution_context);
                 // B309: the clause survives substitution — this is the arm that
                 // makes a GENERIC ARGUMENT able to carry one, since a field
                 // declared `held: T` reads its clause out of the argument `T`
                 // was bound to.
-                Type::Closure(parameters, return_type, contexts)
+                Type::Closure(parameters, return_type, contexts, modes)
             }
             Type::Tuple(element_ids) => {
                 let element_ids = element_ids.clone();
@@ -48184,7 +48197,7 @@ impl<'src> Analyzer<'src> {
 
         // Calling a closure-typed value, e.g. `(self.fn)()`: type-check the
         // arguments against the closure's parameter types.
-        if let Type::Closure(parameter_type_ids, _, _) = &subject_type {
+        if let Type::Closure(parameter_type_ids, _, _, _) = &subject_type {
             if argument_ids.len() != parameter_type_ids.len() {
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
@@ -51080,7 +51093,7 @@ impl<'src> Analyzer<'src> {
             self.bind_open_generics_from_expectation(call_id, callee_id, open, &mut trial);
             for (generic, arity) in closure_generics {
                 if let Some(bound) = trial.get(&generic).copied()
-                    && let Type::Closure(parameter_type_ids, _, _) = bound.get_type(self)
+                    && let Type::Closure(parameter_type_ids, _, _, _) = bound.get_type(self)
                     && parameter_type_ids.len() == arity
                     && self.type_is_fully_determined(&bound.get_type(self))
                 {
@@ -51234,7 +51247,7 @@ impl<'src> Analyzer<'src> {
         match type_id.get_type(self) {
             Type::Generic(_) | Type::Unknown | Type::Unresolved => false,
             Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
-            Type::Closure(parameter_type_ids, return_type_id, _) => {
+            Type::Closure(parameter_type_ids, return_type_id, _, _) => {
                 parameter_type_ids
                     .iter()
                     .all(|parameter_type_id| self.type_is_ground(*parameter_type_id))
@@ -52325,7 +52338,7 @@ impl<'src> Analyzer<'src> {
             Type::Tuple(elements) => (None, elements),
             Type::Array(element, _) => (None, vec![element]),
             Type::Generic(inner) => (None, vec![inner]),
-            Type::Closure(parameters, return_type, _) => {
+            Type::Closure(parameters, return_type, _, _) => {
                 let mut all = parameters;
                 all.push(return_type);
                 (None, all)
@@ -54562,7 +54575,7 @@ impl<'src> Analyzer<'src> {
                     Some(Type::Generic(at)) if at == free)
                 && self.values_never_carry_position(&[argument_id], nominal, position);
         }
-        let Type::Closure(closure_parameters, closure_return, _) = &parameter_type else {
+        let Type::Closure(closure_parameters, closure_return, _, _) = &parameter_type else {
             return false;
         };
         for closure_parameter in closure_parameters {
@@ -61727,7 +61740,7 @@ impl<'src> Analyzer<'src> {
                     self.collect_generics(&argument.get_type(self), depth + 1, out);
                 }
             }
-            Type::Closure(parameters, return_id, _) => {
+            Type::Closure(parameters, return_id, _, _) => {
                 for parameter in parameters {
                     self.collect_generics(&parameter.get_type(self), depth + 1, out);
                 }
@@ -61966,7 +61979,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
 
-            Type::Closure(parameters, return_id, contexts) => {
+            Type::Closure(parameters, return_id, contexts, _) => {
                 if !contexts.is_empty() {
                     buf.push('(');
                 }
@@ -75117,8 +75130,12 @@ mod walk_type_node_fence_tests {
         let void = analyzer.type_id_for_type(Type::Void);
         let generic = analyzer.type_id_for_type(Type::Generic(unresolved));
         let tuple = analyzer.type_id_for_type(Type::Tuple(vec![void, unresolved, generic]));
-        let closure =
-            analyzer.type_id_for_type(Type::Closure(vec![tuple, void], generic, Vec::new()));
+        let closure = analyzer.type_id_for_type(Type::Closure(
+            vec![tuple, void],
+            generic,
+            Vec::new(),
+            Vec::new(),
+        ));
         let array = analyzer.type_id_for_type(Type::Array(tuple, 3));
         let slots = [unresolved, void, generic, tuple, closure, array];
         assert!(
