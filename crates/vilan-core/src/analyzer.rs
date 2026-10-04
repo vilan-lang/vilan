@@ -67254,7 +67254,7 @@ pub fn modules_under_root(root: &Path, other_roots: &[&Path]) -> Vec<(String, Pa
     }
     let other_roots: Vec<PathBuf> = other_roots
         .iter()
-        .map(|other| crate::util::canonical_path(other))
+        .map(crate::util::canonical_path)
         .collect();
     let mut modules = modules_in_root(root);
     if let Ok(entries) = std::fs::read_dir(root) {
