@@ -1050,7 +1050,9 @@ fn contract_violations(
     let put = |dir: &std::path::Path, files: &[(&str, &str)]| {
         std::fs::create_dir_all(dir).unwrap();
         for (name, contents) in files {
-            std::fs::write(dir.join(name), contents).unwrap();
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
         }
     };
     let src = root.join("src");
@@ -1102,6 +1104,39 @@ fn a_library_contract_check_keeps_the_position_in_prose() {
         }),
         "{violations:?}"
     );
+}
+
+/// A154: std's layered modules sit under namespaces (`src/browser/web/ui.vl`
+/// is `web::ui`), and the contract walked a root's TOP level only — so a module
+/// nested in a layer was never checked at all. A nested browser module reaching
+/// a process-only module is the violation a flat one always was, and a nested
+/// one staying in its served set is clean.
+#[test]
+fn a154_a_module_nested_in_a_layer_is_held_to_the_contract() {
+    let violations = contract_violations(
+        &[("lib.vl", "")],
+        &[("net/server.vl", "fun serve(): i32 { 1 }\n")],
+        &[(
+            "web/widget.vl",
+            "import pkg::net::server::serve;\nfun widget(): i32 { serve() }\n",
+        )],
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("`web::widget` imports `pkg::net::server")),
+        "the nested browser module's reach into the process layer is a violation: \
+         {violations:#?}"
+    );
+    let clean = contract_violations(
+        &[("lib.vl", ""), ("util.vl", "fun util(): i32 { 1 }\n")],
+        &[],
+        &[(
+            "web/widget.vl",
+            "import pkg::util::util;\nfun widget(): i32 { util() }\n",
+        )],
+    );
+    assert!(clean.is_empty(), "{clean:#?}");
 }
 
 #[test]

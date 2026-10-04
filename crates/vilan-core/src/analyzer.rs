@@ -67337,8 +67337,14 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
     // (which the contract governs) from a `pkg::item` re-export or a typo (which
     // ordinary name resolution handles).
     let all_roots = spec.search_roots(Platform::None);
+    // A65/A154: a root's modules at EVERY depth — std's layered modules sit
+    // under namespaces (`browser/web/ui.vl` is `web::ui`), and a top-level walk
+    // skipped every one of them, so the contract checked nothing in a layer.
+    // A layer root nested inside the base root is its own root, not a namespace
+    // of the base (`modules_under_root`'s `other_roots`).
+    let layer_roots: Vec<&Path> = layers.iter().map(|(_, root)| *root).collect();
     for (served, root) in &layers {
-        for (importer, path) in modules_in_root(root) {
+        for (importer, path) in modules_under_root(root, &layer_roots) {
             let Some(loaded) = load_package_module(&path) else {
                 continue;
             };
