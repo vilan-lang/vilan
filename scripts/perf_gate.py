@@ -4,7 +4,7 @@
     scripts/perf_gate.py gate      --vilan target/release/vilan [--class ci] [--counter auto] [--json OUT]
     scripts/perf_gate.py measure   --vilan BIN [--json OUT]                     # the table, no verdict
     scripts/perf_gate.py ratchet   --from MEASURED.json [--release]             # the seal's ceiling ratchet
-    scripts/perf_gate.py seal      --vilan TIP --base RELEASE --kolt DIR [--lsp-json BASE.json TIP.json]
+    scripts/perf_gate.py seal      --vilan TIP --base RELEASE --kolt DIR [--tip-kolt MIGRATED] [--lsp-json BASE.json TIP.json]
     scripts/perf_gate.py calibrate --vilan BIN --kolt DIR                       # S4: genapp vs kolt phase split
     scripts/perf_gate.py report    --verdict perf-<sha>.json --out perf/report-vX.Y.Z.md
 
@@ -27,6 +27,13 @@ The three tiers (§3):
   and E121's rows (Q9: red-reporting until green at two consecutive seals, then blocking). It writes
   `perf-<sha>.json`, which `scripts/cut-release.sh` reads (S6): no green verdict at the commit to be
   tagged, no cut, unless `--allow-perf-regression "<reason>"`.
+
+Across a BREAKING release the one kolt source cannot serve both sides: the release's source no longer checks
+under the tip, and a migrated one does not check under the release. `seal --tip-kolt DIR` gives the tip its
+own source — a prepared, already-migrated tree used as-is (copied to the scratch location, no git needed in
+it) — while the base keeps `--kolt`/`--commit`. Before anything is measured, each side must check its own
+source with no errors, or the seal is refused; the verdict and its report say the two sides checked
+different sources, and why.
 
 A clock appears only in T3, which runs on the owner's quiet machine and refuses a CPU verdict under load;
 every other figure is a count, the same on any machine of a class. Linux only (perf_event_open, wait4)."""
@@ -318,6 +325,72 @@ def prepare_kolt(kolt, commit, scratch):
     return copy, sha
 
 
+def prepare_tree(tree, scratch):
+    """A prepared source (`--tip-kolt`): the directory as it stands — no git is run in it — copied to the
+    scratch location beside the base's copy, minus build output, databases and nested worktrees."""
+    copy = os.path.join(scratch, "kolt-tip")
+    shutil.copytree(tree, copy, ignore=shutil.ignore_patterns("dist", "worktrees", "node_modules", ".git", "*.db",
+                                                              "target"))
+    return copy
+
+
+def side_envs(options):
+    """The base's and the tip's environments: each side's std (`--base-std`, `--tip-std`)."""
+    env_base, env_tip = dict(os.environ), dict(os.environ)
+    if options.tip_std:
+        env_tip["VILAN_STD"] = options.tip_std
+    if options.base_std:
+        env_base["VILAN_STD"] = options.base_std
+    return env_base, env_tip
+
+
+def prepare_sources(options, scratch):
+    """The two sides' kolt copies: one copy of `--kolt` at `--commit` for both, or — across a breaking
+    release — that copy for the base and the prepared `--tip-kolt` tree for the tip."""
+    base_copy, kolt_sha = prepare_kolt(options.kolt, options.commit, scratch)
+    sources = {"base": {"copy": base_copy, "label": f"kolt@{kolt_sha}"},
+               "tip": {"copy": base_copy, "label": f"kolt@{kolt_sha}"}, "kolt": kolt_sha, "different": False}
+    if options.tip_kolt:
+        sources["tip"] = {"copy": prepare_tree(options.tip_kolt, scratch),
+                          "label": f"the prepared tree {os.path.abspath(options.tip_kolt)}"}
+        sources["different"] = True
+    if not options.base_std:
+        for side in ("base", "tip"):
+            if inside_a_checkout(sources[side]["copy"]):
+                # A binary run inside a vilan checkout reads THAT checkout's std, not its embedded one, so the
+                # release would be measured with the tip's std — a different program.
+                sys.exit(f"perf_gate: the kolt copy {sources[side]['copy']} sits inside a vilan checkout; pass "
+                         "--base-std (the release's std) or a --scratch outside it")
+    return sources
+
+
+def different_sources_note(sources):
+    """What the verdict says when the two sides checked different sources (`--tip-kolt`)."""
+    return (f"the two sides checked DIFFERENT sources: the base {sources['base']['label']}, the tip "
+            f"{sources['tip']['label']} — a breaking release, whose base source does not check under the tip "
+            "(nor the migrated tree under the base). Each side's check was clean; the ratios compare the same "
+            "app before and after its migration, not one text.")
+
+
+def refuse_unchecked_sources(options, sources):
+    """Across a breaking release each side checks its OWN source, so a ratio means something only when both
+    checks are clean: run each once, before anything is measured, and answer the refusals (empty: both
+    clean). A same-source seal keeps its old rule (a disagreement is noted, not refused)."""
+    if not sources["different"]:
+        return []
+    env_base, env_tip = side_envs(options)
+    refusals = []
+    for side, binary, env in (("base", options.base, env_base), ("tip", options.tip, env_tip)):
+        binary = os.path.abspath(binary) if os.sep in binary else binary
+        run = subprocess.run([binary, "check", "."], cwd=sources[side]["copy"], env=env, capture_output=True,
+                             text=True)
+        if run.returncode != 0:
+            first = next((line for line in (run.stderr + run.stdout).splitlines() if line.strip()), "")
+            refusals.append(f"the {side}'s source ({sources[side]['label']}) does not check under the {side} "
+                            f"compiler (exit {run.returncode}): {first}")
+    return refusals
+
+
 def inside_a_checkout(path):
     path = os.path.abspath(path)
     while True:
@@ -334,25 +407,17 @@ def loadavg():
         return float(handle.read().split()[0])
 
 
-def t3_compare(options, scratch):
-    copy, kolt_sha = prepare_kolt(options.kolt, options.commit, scratch)
-    env_base, env_tip = dict(os.environ), dict(os.environ)
-    if options.tip_std:
-        env_tip["VILAN_STD"] = options.tip_std
-    if options.base_std:
-        env_base["VILAN_STD"] = options.base_std
-    elif inside_a_checkout(copy):
-        # A binary run inside a vilan checkout reads THAT checkout's std, not its embedded one, so the
-        # release would be measured with the tip's std — a different program.
-        sys.exit(f"perf_gate: the kolt copy {copy} sits inside a vilan checkout; pass --base-std (the release's "
-                 "std) or a --scratch outside it")
+def t3_compare(options, sources):
+    env_base, env_tip = side_envs(options)
+    base_copy, tip_copy = sources["base"]["copy"], sources["tip"]["copy"]
     counter = resolve_counter("auto")
     runs = {"base": [], "tip": []}
-    for binary, env in ((options.base, env_base), (options.tip, env_tip)):
+    sides = (("base", options.base, env_base, base_copy), ("tip", options.tip, env_tip, tip_copy))
+    for _, binary, env, copy in sides:
         perf_count.measure([binary, "check", "."], cwd=copy, env=env, counter=counter)  # warm-up each
     loads = [loadavg()]
     for _ in range(options.runs):
-        for name, binary, env in (("base", options.base, env_base), ("tip", options.tip, env_tip)):
+        for name, binary, env, copy in sides:
             runs[name].append(perf_count.measure([binary, "check", "."], cwd=copy, env=env, counter=counter))
         loads.append(loadavg())
     summary = {}
@@ -372,9 +437,18 @@ def t3_compare(options, scratch):
         red.append(f"kolt check CPU x{ratio['cpu_s']:.3f}")
     if ratio["peak_rss_kb"] > options.threshold:
         red.append(f"kolt check peak RSS x{ratio['peak_rss_kb']:.3f}")
-    if summary["base"]["exit"] != summary["tip"]["exit"]:
+    if sources["different"]:
+        notes.append(different_sources_note(sources))
+        # The checks were clean before the measurement (`refuse_unchecked_sources`); a run that then fails
+        # is still a refusal, never a ratio.
+        for name in ("base", "tip"):
+            if summary[name]["exit"] != 0:
+                red.append(f"the {name}'s check of its own source exited {summary[name]['exit']} during the "
+                           "measurement")
+    elif summary["base"]["exit"] != summary["tip"]["exit"]:
         notes.append("the two compilers disagree on the program (exit codes): the comparison covers different work")
-    return {"kolt": kolt_sha, "counter": counter, "load_max": load, "runs": options.runs, "base": summary["base"],
+    return {"kolt": sources["kolt"], "sources": {side: sources[side]["label"] for side in ("base", "tip")},
+            "different_sources": sources["different"], "counter": counter, "load_max": load, "runs": options.runs, "base": summary["base"],
             "tip": summary["tip"], "ratio": ratio, "threshold": options.threshold, "red": red, "notes": notes}
 
 
@@ -438,23 +512,63 @@ def lsp_compare(base_json, tip_json, threshold):
     return rows, red
 
 
+def lsp_source_notes(base_json, tip_json):
+    """The LSP harness's two runs replayed one edit script; say so when they replayed it over different
+    sources (`scripts/lsp-latency.py --source`, across a breaking release)."""
+    with open(base_json) as handle:
+        base = json.load(handle).get("source")
+    with open(tip_json) as handle:
+        tip = json.load(handle).get("source")
+    if base == tip:
+        return []
+    return [f"the LSP harness replayed its edit script over DIFFERENT sources: the base {describe_source(base)}, "
+            f"the tip {describe_source(tip)} — a breaking release; each row compares the same edit in the same "
+            "app before and after its migration"]
+
+
+def describe_source(source):
+    if not source:
+        return "(unrecorded)"
+    if source.get("kind") == "prepared":
+        return f"the prepared tree {source.get('path')}"
+    return f"kolt@{str(source.get('sha', ''))[:8]}"
+
+
 def command_seal(options):
     data = load_budgets(options.budgets)
     sha = options.sha or subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True,
                                         text=True).stdout.strip()
+    if options.tip_kolt and not options.kolt:
+        sys.exit("perf_gate: --tip-kolt gives the TIP its own source; the base still needs --kolt (and --commit)")
     scratch = tempfile.mkdtemp(prefix="perf-seal-", dir=options.scratch)
     try:
         print(f"seal perf verdict for {sha[:10]} (load {loadavg():.1f})")
+        sources = prepare_sources(options, scratch) if options.kolt else None
+        if sources:
+            refusals = refuse_unchecked_sources(options, sources)
+            if refusals:
+                for refusal in refusals:
+                    print(f"  REFUSED  {refusal}")
+                print("PERF VERDICT: REFUSED — across a breaking release each side must check its own source "
+                      "with no errors; nothing was measured and no verdict was written")
+                return 1
+            if sources["different"]:
+                print(f"  NOTE  {different_sources_note(sources)}")
         counter, results = measure_all(options.tip, data, options.work, "auto")
         t2_lines, t2_red = judge(data, results, counter, options.klass)
         print("\n".join(t2_lines))
-        t3 = t3_compare(options, scratch) if options.kolt else None
+        t3 = t3_compare(options, sources) if sources else None
         if t3:
-            print(f"  T3 kolt @{t3['kolt']}: CPU x{t3['ratio']['cpu_s']:.3f}  RSS x{t3['ratio']['peak_rss_kb']:.3f}  "
-                  f"instructions x{t3['ratio']['instructions']:.3f}  (load max {t3['load_max']:.1f})")
-        lsp_rows, lsp_red = ([], [])
+            label = "kolt" if not t3["different_sources"] else "kolt (base and tip on different sources)"
+            print(f"  T3 {label} @{t3['kolt']}: CPU x{t3['ratio']['cpu_s']:.3f}  "
+                  f"RSS x{t3['ratio']['peak_rss_kb']:.3f}  instructions x{t3['ratio']['instructions']:.3f}  "
+                  f"(load max {t3['load_max']:.1f})")
+        lsp_rows, lsp_red, lsp_notes = ([], [], [])
         if options.lsp_json:
             lsp_rows, lsp_red = lsp_compare(options.lsp_json[0], options.lsp_json[1], options.threshold)
+            lsp_notes = lsp_source_notes(options.lsp_json[0], options.lsp_json[1])
+            for note in lsp_notes:
+                print(f"  NOTE  {note}")
         e121, e121_red = e121_rows(data, options.lsp_json[1] if options.lsp_json else None)
         # §6.4: the report's first line names the most expensive phase — a SHARE of thread CPU on the
         # generated app, which a load moves far less than it moves the absolute figures.
@@ -465,7 +579,8 @@ def command_seal(options):
         verdict = {
             "sha": sha, "date": datetime.date.today().isoformat(), "verdict": "red" if red else "green",
             "red": red, "load": loadavg(), "class": options.klass, "counter": counter,
-            "t2": {"results": results, "judged": t2_lines}, "t3": t3, "lsp": lsp_rows, "e121": e121,
+            "t2": {"results": results, "judged": t2_lines}, "t3": t3, "lsp": lsp_rows, "lsp_notes": lsp_notes,
+            "e121": e121,
             "bumps": bumps, "bumps_for_the_owner": owner_bumps, "genapp_phases_cpu_ms": phases,
         }
         os.makedirs(options.verdict_dir, exist_ok=True)
@@ -583,6 +698,10 @@ def command_report(options):
                    f"{verdict['load']:.1f}. kolt `vilan check`: CPU x{t3['ratio']['cpu_s']:.3f}, peak RSS "
                    f"x{t3['ratio']['peak_rss_kb']:.3f}, instructions x{t3['ratio']['instructions']:.3f} against "
                    f"the previous release.")
+        for note in t3.get("notes", []):
+            out += ["", f"> **Note:** {note}"]
+    for note in verdict.get("lsp_notes", []):
+        out += ["", f"> **Note:** {note}"]
     out += ["", f"## T2 — instruction counts ({verdict['counter']}, class {verdict['class']})", "",
             "| subject | count | previous | ratio |", "|---|---:|---:|---:|"]
     for subject, result in verdict["t2"]["results"].items():
@@ -658,8 +777,10 @@ def main():
     p.add_argument("--base", required=True)
     p.add_argument("--tip-std")
     p.add_argument("--base-std", help="VILAN_STD for the base (needed when the copy sits inside a checkout)")
-    p.add_argument("--kolt")
+    p.add_argument("--kolt", help="the base's source: a kolt checkout, archived at --commit")
     p.add_argument("--commit", default="HEAD")
+    p.add_argument("--tip-kolt", help="the TIP's own source across a breaking release: a prepared, already-migrated "
+                                      "kolt tree, used as it stands (no git); the base keeps --kolt/--commit")
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--threshold", type=float, default=1.10)
     p.add_argument("--max-load", type=float, default=2.0)
