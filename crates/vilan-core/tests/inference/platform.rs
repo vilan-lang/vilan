@@ -10050,30 +10050,39 @@ fn b206_an_ordinary_parameter_still_renders_as_written() {
 
 #[test]
 fn b249_a_trait_parameter_takes_the_impls_argument() {
-    // The find's own shape, against std's own reactive trait: `T` is nested
-    // inside a closure type, which is why it is a substitution and not a
-    // per-position lookup. A142 moved `on_change` off `Source` (whose required
-    // attach is now the `T`-free `on_settle`) onto `Flow<T>`, where it is still a
-    // requirement with `T` inside its observer's closure type — so the pin names
-    // `Flow<i32>`, the trait that still carries the shape.
-    let source = r#"
+    // The find's own shape, against std's own reactive traits: `T` nested inside
+    // a type, which is why it is a substitution and not a per-position lookup.
+    // `Flow<T>`'s one requirement is `start`, whose `T` sits inside the
+    // `Instance<T>` it returns (F78, Order 46, made `on_change`/`sub` defaults over
+    // it). The closure-nested case is the trait below, written as `on_change`
+    // was.
+    let flow = r#"
         import std::reactive::Flow;
         struct Counted { n: i32 }
         impl Counted with Flow<i32> { }
         fun main() {}
         "#;
-    // The substitution is the claim, so the pin reads the declaration around
-    // the receiver: the line renders `Flow`'s `own self` as a bare `self` (a
-    // separate find — copied verbatim it is refused for its receiver), and this
-    // pin must not be the one that fixes that spelling in place.
-    assert_fails_with(source, "missing 'on_change'; declare `fun on_change(");
-    // B482's std half typed the observer with its clause: `(|T| void) context
-    // tracking`, substituted the same way.
-    assert_fails_with(
-        source,
-        ", observer: (|i32| void) context tracking): Subscription`",
-    );
-    assert_fails_without(source, "|T| void");
+    // The line renders `Flow`'s `own self` as written, and the pin reads the
+    // declaration around the receiver all the same.
+    assert_fails_with(flow, "missing 'start'; declare `fun start(");
+    assert_fails_with(flow, "): Instance<i32>`");
+    assert_fails_without(flow, "Instance<T>");
+    // `T` inside a closure parameter, substituted the same way. (The clause
+    // `context tracking` on it is not rendered for a program's own trait, where
+    // std's `Flow::on_change` rendered it — filed by reactive-46; this pin holds
+    // the substitution only.)
+    let clause = r#"
+        import std::reactive::{ Subscription, tracking };
+        trait Watched<T> {
+            fun watch(own self, observer: (|T| void) context tracking): Subscription;
+        }
+        struct Counted { n: i32 }
+        impl Counted with Watched<i32> { }
+        fun main() {}
+        "#;
+    assert_fails_with(clause, "missing 'watch'; declare `fun watch(");
+    assert_fails_with(clause, "observer: |i32| void");
+    assert_fails_without(clause, "|T| void");
 }
 
 #[test]

@@ -431,6 +431,8 @@ std/reactive.md h2 writing-a-signal
 std/reactive.md h2 maybesignal
 std/reactive.md h2 combine
 std/reactive.md h2 divorce
+std/reactive.md h2 zip_some
+std/reactive.md h3 unzip--a-tuple-cell-split
 std/reactive.md h2 subscription-disposable
 std/reactive.md h2 owner
 std/reactive.md h2 turns
