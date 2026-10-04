@@ -4678,6 +4678,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.program.for_each_views.get(&binding) == Some(&true) {
             return true;
         }
+        // B509: a payload capture under `match &mut place` is a `&mut` into
+        // the payload slot (Rust's binding modes), handed on by reborrow.
+        if self.program.payload_view_captures.get(&binding) == Some(&true) {
+            return true;
+        }
         self.program
             .variables
             .get(&binding)

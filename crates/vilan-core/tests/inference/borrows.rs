@@ -12251,3 +12251,347 @@ fn b495_a_closure_types_modes_print_with_the_type() {
         "Expected i32, but got |&str, &mut i32, bool| void instead.",
     );
 }
+
+/// B509 (`payload-views.md` door A, RULED Q1–Q7): the match SUBJECT carries
+/// the mode. Under `match &mut place` every `let` payload capture is a
+/// writable view into its slot — an aggregate payload's fields, a whole
+/// payload replaced (the variant kept), a scalar payload, several payloads of
+/// one variant, a nested variant's payload, a view parameter subject — and
+/// `&mut place is V(let p)` binds the same. `match &place` binds readonly
+/// views. Every write was refused "declare it `mut`" before, and the `mut`
+/// the steer led to bound a copy whose write never landed.
+#[test]
+fn b509_a_view_subject_binds_its_payload_captures_as_views() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        struct P { x: i32, tags: List<str> }
+
+        enum E { A(P), B(i32, str), C }
+
+        enum Nest { Wrap(Option<i32>), Empty }
+
+        fun write_in(held: &mut Option<P>) {
+            match &mut held {
+                Some(let p) => {
+                    p.x += 100;
+                },
+                None => {},
+            }
+        }
+
+        fun main() {
+            mut held: Option<P> = Some(P { x = 1, tags = ["a"] });
+            match &mut held {
+                Some(let p) => {
+                    p.x = 2;
+                    p.tags.push("b");
+                },
+                None => {},
+            }
+            print(i"fields {held.map(|p| p.x).unwrap_or(0)} {held.map(|p| p.tags.len()).unwrap_or(0)}");
+            match &mut held {
+                Some(let p) => {
+                    p = P { x = 3, tags = [] };
+                },
+                None => {},
+            }
+            print(i"whole {held.map(|p| p.x).unwrap_or(0)}");
+            write_in(&mut held);
+            print(i"view parameter {held.map(|p| p.x).unwrap_or(0)}");
+            mut n: Option<i32> = Some(5);
+            match &mut n {
+                Some(let v) => {
+                    v += 1;
+                },
+                None => {},
+            }
+            if &mut n is Some(let v) {
+                v *= 10;
+            }
+            print(i"scalar and is {n.unwrap_or(0)}");
+            mut e = E::B(1, "one");
+            match &mut e {
+                E::B(let a, let b) => {
+                    a += 41;
+                    b = "forty-two";
+                },
+                _ => {},
+            }
+            match e {
+                E::B(let a, let b) => print(i"several {a} {b}"),
+                _ => {},
+            }
+            mut nest = Nest::Wrap(Some(7));
+            match &mut nest {
+                Nest::Wrap(Some(let inner)) => {
+                    inner = 8;
+                },
+                _ => {},
+            }
+            match nest {
+                Nest::Wrap(let inner) => print(i"nested {inner.unwrap_or(0)}"),
+                Nest::Empty => {},
+            }
+            mut total = 0;
+            match &held {
+                Some(let p) => {
+                    total += p.x;
+                },
+                None => {},
+            }
+            match &n {
+                Some(let v) => {
+                    total += *v;
+                },
+                None => {},
+            }
+            print(i"read views {total}");
+        }
+        "#,
+        "fields 2 2\nwhole 3\nview parameter 103\nscalar and is 60\nseveral 42 forty-two\nnested 8\nread views 163\n",
+    );
+}
+
+/// B509: a payload view in a GENERIC body is a view at every instance — the
+/// shape std's `Store<Option<P>>` write step takes, at a scalar `P` (where it
+/// is the `(enum, slot)` pair) and at an aggregate one (the slot's reference).
+#[test]
+fn b509_a_payload_view_in_a_generic_body_writes_through_at_every_instance() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        struct P { x: i32 }
+
+        fun modify<T>(held: &mut Option<T>, f: |&mut T| void) {
+            match &mut held {
+                Some(let payload) => f(payload),
+                None => {},
+            }
+        }
+
+        fun main() {
+            mut number: Option<i32> = Some(1);
+            modify(&mut number, |n| {
+                n += 1;
+            });
+            mut point: Option<P> = Some(P { x = 1 });
+            modify(&mut point, |p| {
+                p.x += 10;
+            });
+            mut text: Option<str> = Some("a");
+            modify(&mut text, |t| {
+                t = i"{*t}b";
+            });
+            print(i"{number.unwrap_or(0)} {point.map(|p| p.x).unwrap_or(0)} {text.unwrap_or("")}");
+        }
+        "#,
+        "2 11 ab\n",
+    );
+}
+
+/// B509 Q4: a `mut` capture under a view subject is refused — it would bind a
+/// COPY of the payload, a write to which looks exactly like the write the
+/// match was written to make (B528's trap).
+#[test]
+fn b509_a_mut_capture_under_a_view_subject_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        fun main() {
+            mut held: Option<P> = Some(P { x = 1 });
+            match &mut held {
+                Some(mut p) => {
+                    p.x = 2;
+                },
+                None => {},
+            }
+        }
+        "#,
+        "`mut p` would bind a COPY of the payload, but this matches a view (`&mut held`), whose captures are views into the payload: bind `let p` to write the payload in place, and write `*p` where a copy is wanted",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        fun main() {
+            mut held: Option<i32> = Some(1);
+            if &held is Some(mut v) {
+                v += 1;
+            }
+        }
+        "#,
+        "`mut v` would bind a COPY of the payload, but this matches a view (`&held`), whose captures are views into the payload: bind `let v` to read it, or match `&mut held` to write it",
+    );
+}
+
+/// B509 Q3/Q5: rule 4 guards the SUBJECT place for a payload view's live
+/// range, which runs to the capture's LAST use — a reassignment of the place
+/// or of a prefix of it, a part reassignment, and a `&mut` of it handed to a
+/// call are refused while the view is still to be used; after its last use the
+/// place may be written (`let next = ..; held = Some(next);`).
+#[test]
+fn b509_rule_4_guards_the_subject_until_the_captures_last_use() {
+    let prelude = r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        struct Outer { held: Option<P> }
+        fun reset(o: &mut Option<P>) { o = None; }
+    "#;
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut held: Option<P> = Some(P {{ x = 1 }});
+            match &mut held {{
+                Some(let p) => {{
+                    held = None;
+                    p.x = 7;
+                }},
+                None => {{}},
+            }}
+        }}"
+        ),
+        "cannot reassign 'held' while a view into it is live (rule 4",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut outer = Outer {{ held = Some(P {{ x = 1 }}) }};
+            match &mut outer.held {{
+                Some(let p) => {{
+                    outer.held = None;
+                    p.x = 7;
+                }},
+                None => {{}},
+            }}
+        }}"
+        ),
+        "cannot reassign 'outer.held' while a view into it is live: the view points into the storage this write replaces",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut outer = Outer {{ held = Some(P {{ x = 1 }}) }};
+            match &mut outer.held {{
+                Some(let p) => {{
+                    reset(&mut outer.held);
+                    p.x = 7;
+                }},
+                None => {{}},
+            }}
+        }}"
+        ),
+        "cannot pass '&mut outer' to 'reset' while a view into it is live",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut n: Option<i32> = Some(1);
+            if &mut n is Some(let v) {{
+                n = None;
+                v += 1;
+            }}
+        }}"
+        ),
+        "cannot reassign 'n' while a view into it is live (rule 4",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut held: Option<P> = Some(P {{ x = 1 }});
+            match &mut held {{
+                Some(let p) => {{
+                    for i in [1, 2] {{
+                        p.x += i;
+                        held = None;
+                    }}
+                }},
+                None => {{}},
+            }}
+        }}"
+        ),
+        "cannot reassign 'held' while a view into it is live (rule 4",
+    );
+    assert_compiles_and_runs(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut held: Option<P> = Some(P {{ x = 1 }});
+            match &mut held {{
+                Some(let p) => {{
+                    let next = P {{ x = p.x + 1 }};
+                    held = Some(next);
+                }},
+                None => {{}},
+            }}
+            print(held.map(|p| p.x).unwrap_or(0));
+        }}"
+        ),
+        "2\n",
+    );
+}
+
+/// B528: a write through a capture that is a COPY (a bare `match place`) or a
+/// READONLY view (`match &place`) says what the capture is and how to write the
+/// payload — never "declare it `mut`", which bound a copy whose write silently
+/// did not land.
+#[test]
+fn b528_a_write_to_a_copy_or_readonly_capture_steers_to_the_view_subject() {
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        fun main() {
+            mut held: Option<P> = Some(P { x = 1 });
+            match held {
+                Some(let p) => {
+                    p.x = 2;
+                },
+                None => {},
+            }
+        }
+        "#,
+        "cannot mutate 'p': it is a COPY of the payload the pattern takes out of `held`, so a write to it (or to `mut p`) would not reach `held` — to write the payload in place, match a view of it, `match &mut held` (or `&mut held is ..`), whose `let` captures are writable views",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        fun one(held: &mut Option<P>) {
+            match held {
+                Some(let p) => {
+                    p.x = 2;
+                },
+                None => {},
+            }
+        }
+        "#,
+        "cannot mutate 'p': it is a COPY of the payload the pattern takes out of `held`",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        fun main() {
+            mut held: Option<P> = Some(P { x = 1 });
+            match &held {
+                Some(let p) => {
+                    p.x = 2;
+                },
+                None => {},
+            }
+        }
+        "#,
+        "cannot write through 'p': this matches `&held`, a readonly view, so its captures are readonly views into the payload — match `&mut held` to write the payload in place",
+    );
+}

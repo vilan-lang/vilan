@@ -1334,6 +1334,11 @@ struct InvalidationScanState {
     /// Call expressions that are the DIRECT operand of an `await`. The token
     /// path already reports those, so the call-site path must not double up.
     awaited_operands: HashSet<Id>,
+    /// B509 Q3: a match capture's uses still ahead of the scan — a capture
+    /// view is live from its arm's start to its LAST use, and leaves the live
+    /// set when the scan passes it. A capture with a use inside a loop or a
+    /// closure in its arm is not counted; it stays live for the whole arm.
+    capture_uses: HashMap<Id, usize>,
 }
 
 /// A call site with a view live across it, pending the suspension verdict.
@@ -26700,6 +26705,7 @@ impl<'src> Analyzer<'src> {
                         .then_some((*capture_id, *subject_id))
                 })
             })
+            .chain(self.payload_view_capture_subjects())
             .collect();
         loop {
             let mut changed = false;
@@ -26818,6 +26824,22 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Local(binding)) => {
                     if let Some(found) = origins.get(binding) {
                         add(found.clone(), &mut roots);
+                    }
+                }
+                // B509: a view of an enum place (`match &mut held`) — the
+                // payload captures point into the place itself.
+                Some(Expr::Reference(operand, _)) => {
+                    let forwarded = match self.expr_id_to_expr_map.get(operand) {
+                        Some(Expr::Local(binding)) => origins.get(binding).cloned(),
+                        _ => None,
+                    };
+                    match forwarded {
+                        Some(found) => add(found, &mut roots),
+                        None => {
+                            if let Some(root) = self.place_root(*operand) {
+                                add(vec![root], &mut roots);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -26959,6 +26981,7 @@ impl<'src> Analyzer<'src> {
                         .then_some((*capture_id, subject_id))
                 })
             })
+            .chain(self.payload_view_capture_subjects())
             .collect();
         loop {
             let mut changed = false;
@@ -27016,6 +27039,19 @@ impl<'src> Analyzer<'src> {
                         }
                         Some(Expr::Local(binding)) => {
                             found.extend(anchors.get(binding).cloned().unwrap_or_default());
+                        }
+                        // B509: a payload view points into the enum place the
+                        // subject names — a view parameter's own anchors, or
+                        // exactly the place.
+                        Some(Expr::Reference(operand, _)) => {
+                            let forwarded = match self.expr_id_to_expr_map.get(operand) {
+                                Some(Expr::Local(binding)) => anchors.get(binding).cloned(),
+                                _ => None,
+                            };
+                            match forwarded {
+                                Some(forwarded) => found.extend(forwarded),
+                                None => found.extend(anchor_of(*operand, AnchorDepth::Exact)),
+                            }
                         }
                         _ => {}
                     }
@@ -27620,7 +27656,288 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        // B509 (`payload-views.md` door A): the third subject kind — a VIEW of
+        // an enum place, `match &mut held { V(let p) => .. }` / `&held is
+        // V(let p)`. The subject carries the mode, as `for e in &mut list`
+        // does, so every `let` capture of a payload is a view into its slot:
+        // writable under `&mut`, readonly under `&`. Scalar-ness is the
+        // capture's own type; a generic one is decided per instance by the
+        // emitters.
+        for (capture_id, mutable) in self.payload_view_capture_modes() {
+            let scalar = self.variables.get(&capture_id).is_some_and(|variable| {
+                self.is_scalar_view_pointee(&variable.type_id.get_type(self))
+            });
+            captures.insert(capture_id, (mutable, scalar));
+        }
         captures
+    }
+
+    /// B528/B509: the refusal for a write rooted in a `match`/`is` capture
+    /// that cannot carry it — a `let` capture under a bare place subject (a
+    /// COPY of the payload), or one under a `&place` subject (a READONLY
+    /// view). `None` for any other root.
+    fn capture_write_refusal(&self, target_id: Id, name: &str) -> Option<String> {
+        let mut root = target_id;
+        while let Some(
+            Expr::Field(subject_id, _, _)
+            | Expr::TupleIndex(subject_id, _, _)
+            | Expr::Index(subject_id, _)
+            | Expr::Dereference(subject_id),
+        ) = self.expr_id_to_expr_map.get(&root)
+        {
+            root = *subject_id;
+        }
+        let Some(Expr::Local(capture_id)) = self.expr_id_to_expr_map.get(&root) else {
+            return None;
+        };
+        let capture_id = *capture_id;
+        if !self.variables.contains_key(&capture_id) {
+            return None;
+        }
+        // A whole reassignment of an `is` capture (`n = 5` after a `guard`'s
+        // `if !(x is Some(let n))`) is a rebind of a local, which `mut` is the
+        // answer to; a write INTO it, or any write to a `match` leg's capture,
+        // is the payload write B528 is about.
+        let writes_into = root != target_id;
+        for expr in self.expr_id_to_expr_map.values() {
+            let (subject_id, patterns, is_test): (Id, Vec<&ExprPattern>, bool) = match expr {
+                Expr::Match(subject_id, legs) => (
+                    *subject_id,
+                    legs.iter().map(|leg| &leg.pattern).collect(),
+                    false,
+                ),
+                Expr::Is(subject_id, pattern) => (*subject_id, vec![pattern], true),
+                _ => continue,
+            };
+            let mut captures = Vec::new();
+            for pattern in patterns {
+                Self::collect_payload_captures(pattern, &mut captures);
+            }
+            if !captures.contains(&capture_id) {
+                continue;
+            }
+            return match self.reference_subject_mode(subject_id) {
+                Some(false) => {
+                    let operand = match self.expr_id_to_expr_map.get(&subject_id) {
+                        Some(Expr::Reference(operand, _)) => *operand,
+                        _ => return None,
+                    };
+                    let place = self.receiver_spelling(operand).unwrap_or("place");
+                    Some(format!(
+                        "cannot write through '{name}': this matches `&{place}`, a readonly view, so its captures are readonly views into the payload — match `&mut {place}` to write the payload in place"
+                    ))
+                }
+                Some(true) => None,
+                None if is_test && !writes_into => None,
+                None if self.place_root(subject_id).is_some() => {
+                    let place = self.receiver_spelling(subject_id).unwrap_or("place");
+                    Some(format!(
+                        "cannot mutate '{name}': it is a COPY of the payload the pattern takes out of `{place}`, so a write to it (or to `mut {name}`) would not reach `{place}` — to write the payload in place, match a view of it, `match &mut {place}` (or `&mut {place} is ..`), whose `let` captures are writable views"
+                    ))
+                }
+                None => None,
+            };
+        }
+        None
+    }
+
+    /// B509 Q4: a `mut` capture of a payload under a `match &mut place` /
+    /// `match &place` (or the `is` form) is refused. Under a view subject a
+    /// `let` capture IS a view into the payload, so `mut p` could only bind a
+    /// COPY — and a write to that copy looks exactly like the write the match
+    /// was written to make (B528's trap: the old steer led there, and the
+    /// write silently did not land).
+    fn check_mut_captures_under_view_subjects(&mut self) {
+        let mut refusals: Vec<(Id, &'src str, Option<&'src str>, bool)> = Vec::new();
+        for expr in self.expr_id_to_expr_map.values() {
+            let (subject_id, patterns): (Id, Vec<&ExprPattern>) = match expr {
+                Expr::Match(subject_id, legs) => {
+                    (*subject_id, legs.iter().map(|leg| &leg.pattern).collect())
+                }
+                Expr::Is(subject_id, pattern) => (*subject_id, vec![pattern]),
+                _ => continue,
+            };
+            let Some(mutable) = self.reference_subject_mode(subject_id) else {
+                continue;
+            };
+            if self.reusable_entity(subject_id) {
+                continue;
+            }
+            let operand = match self.expr_id_to_expr_map.get(&subject_id) {
+                Some(Expr::Reference(operand, _)) => Some(*operand),
+                _ => None,
+            };
+            let mut captures = Vec::new();
+            for pattern in patterns {
+                Self::collect_payload_captures(pattern, &mut captures);
+            }
+            for capture_id in captures {
+                if let Some(variable) = self.variables.get(&capture_id)
+                    && variable.mutable
+                {
+                    let place = operand.and_then(|operand| self.receiver_spelling(operand));
+                    refusals.push((capture_id, variable.name, place, mutable));
+                }
+            }
+        }
+        refusals.sort_unstable_by_key(|(capture_id, ..)| capture_id.0);
+        for (capture_id, name, place, mutable) in refusals {
+            let place = place.unwrap_or("place");
+            let (subject, steer) = if mutable {
+                (
+                    format!("&mut {place}"),
+                    format!("bind `let {name}` to write the payload in place"),
+                )
+            } else {
+                (
+                    format!("&{place}"),
+                    format!("bind `let {name}` to read it, or match `&mut {place}` to write it"),
+                )
+            };
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&capture_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`mut {name}` would bind a COPY of the payload, but this matches a view (`{subject}`), whose captures are views into the payload: {steer}, and write `*{name}` where a copy is wanted"
+                    ),
+                },
+                capture_id,
+            );
+        }
+    }
+
+    /// The bindings a variant pattern reaches through its payloads — the
+    /// positions a view subject binds as views (B509).
+    fn collect_payload_captures(pattern: &ExprPattern, out: &mut Vec<Id>) {
+        if let ExprPattern::Variant(_, _, sub_patterns) = pattern {
+            for sub_pattern in sub_patterns {
+                match sub_pattern {
+                    ExprPattern::Binding(capture_id) => out.push(*capture_id),
+                    ExprPattern::Variant(..) => Self::collect_payload_captures(sub_pattern, out),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// B509: each payload capture under a view subject with the SUBJECT it
+    /// views — the pair rule 4's origin and anchor maps read (the subject's
+    /// place is the capture's origin).
+    fn payload_view_capture_subjects(&self) -> Vec<(Id, Id)> {
+        let mut found = Vec::new();
+        for expr in self.expr_id_to_expr_map.values() {
+            let (subject_id, patterns): (Id, Vec<&ExprPattern>) = match expr {
+                Expr::Match(subject_id, legs) => {
+                    (*subject_id, legs.iter().map(|leg| &leg.pattern).collect())
+                }
+                Expr::Is(subject_id, pattern) => (*subject_id, vec![pattern]),
+                _ => continue,
+            };
+            if self.reference_subject_mode(subject_id).is_none() {
+                continue;
+            }
+            let mut captures = Vec::new();
+            for pattern in patterns {
+                Self::collect_payload_captures(pattern, &mut captures);
+            }
+            found.extend(
+                captures
+                    .into_iter()
+                    .filter(|capture_id| self.wrapped_view_captures.contains_key(capture_id))
+                    .map(|capture_id| (capture_id, subject_id)),
+            );
+        }
+        found
+    }
+
+    /// B509 Q3: how many times the scan of `expr_id` will meet `binding`, or
+    /// `None` when a use sits inside a loop or a closure — a loop meets it
+    /// again on its next iteration and a closure whenever it is called, so
+    /// neither has a last use the straight-line scan can see.
+    fn binding_use_count(&self, expr_id: Id, binding: Id) -> Option<usize> {
+        let mut count = 0usize;
+        let mut pending = vec![(expr_id, false)];
+        while let Some((current, deferred)) = pending.pop() {
+            let deferred = deferred
+                || matches!(
+                    self.expr_id_to_expr_map.get(&current),
+                    Some(Expr::For(..) | Expr::ForEach(..))
+                );
+            match self.expr_id_to_expr_map.get(&current) {
+                Some(Expr::Local(found)) if *found == binding => {
+                    if deferred {
+                        return None;
+                    }
+                    count += 1;
+                }
+                Some(Expr::Closure(closure_id) | Expr::Async(closure_id)) => {
+                    if let Some(closure) = self.closures.get(closure_id) {
+                        pending.push((closure.return_, true));
+                    }
+                }
+                _ => {}
+            }
+            let mut children = Vec::new();
+            self.drop_scan_children(current, &mut children);
+            pending.extend(children.into_iter().map(|child| (child, deferred)));
+        }
+        Some(count)
+    }
+
+    /// B509: the mode a `match`/`is` SUBJECT carries — `Some(true)` for
+    /// `&mut place`, `Some(false)` for `&place` — when the subject is a view of
+    /// a place (a binding, a field, an element, or a view parameter, never a
+    /// call's result, whose payload is a temporary). `None` for every other
+    /// subject, including a bare `match place`, which keeps its copy
+    /// semantics (Q2).
+    fn reference_subject_mode(&self, subject_id: Id) -> Option<bool> {
+        match self.expr_id_to_expr_map.get(&subject_id)? {
+            Expr::Reference(operand_id, mutable) if self.place_root(*operand_id).is_some() => {
+                Some(*mutable)
+            }
+            _ => None,
+        }
+    }
+
+    /// B509: every payload capture of a `match`/`is` over a view subject,
+    /// with the subject's mode — the bindings a variant pattern reaches
+    /// through its payloads (`V(let a, let b)`, `Some(Pair(let a, _))`). A
+    /// binding inside a TUPLE sub-pattern is not one: tuples store flat, so a
+    /// tuple-typed leaf is a reslice, and the capture stays a copy.
+    fn payload_view_capture_modes(&self) -> Vec<(Id, bool)> {
+        let mut found = Vec::new();
+        for expr in self.expr_id_to_expr_map.values() {
+            let (subject_id, patterns): (Id, Vec<&ExprPattern>) = match expr {
+                Expr::Match(subject_id, legs) => {
+                    (*subject_id, legs.iter().map(|leg| &leg.pattern).collect())
+                }
+                Expr::Is(subject_id, pattern) => (*subject_id, vec![pattern]),
+                _ => continue,
+            };
+            let Some(mutable) = self.reference_subject_mode(subject_id) else {
+                continue;
+            };
+            let mut captures = Vec::new();
+            for pattern in patterns {
+                Self::collect_payload_captures(pattern, &mut captures);
+            }
+            // A `mut` capture is refused under a view subject (Q4); it is not
+            // made a view as well, so the refusal stands alone.
+            found.extend(
+                captures
+                    .into_iter()
+                    .filter(|capture_id| {
+                        !self
+                            .variables
+                            .get(capture_id)
+                            .is_some_and(|variable| variable.mutable)
+                    })
+                    .map(|capture_id| (capture_id, mutable)),
+            );
+        }
+        found
     }
 
     /// Whether a call resolves to a `borrows` function returning a scalar view —
@@ -28632,26 +28949,17 @@ impl<'src> Analyzer<'src> {
                     if let Some(guard) = leg.guard {
                         self.scan_invalidation(guard, scan, live, violations, state);
                     }
-                    // A `Some(let v)` capture over a wrapped-view call is a
-                    // view for its leg's extent.
+                    // A capture over a wrapped-view call, or a payload capture
+                    // under a view subject (B509), is a view from its leg's
+                    // start to its last use (Q3).
                     let mut leg_views: Vec<Id> = Vec::new();
-                    if let ExprPattern::Variant(_, _, sub_patterns) = &leg.pattern {
-                        for sub_pattern in sub_patterns {
-                            if let ExprPattern::Binding(capture_id) = sub_pattern
-                                && scan.view_bindings.contains(capture_id)
-                            {
-                                leg_views.push(*capture_id);
-                            }
-                        }
-                    }
-                    let newly_live: Vec<Id> = leg_views
-                        .iter()
-                        .copied()
-                        .filter(|view| live.insert(*view))
-                        .collect();
+                    Self::collect_payload_captures(&leg.pattern, &mut leg_views);
+                    leg_views.retain(|capture_id| scan.view_bindings.contains(capture_id));
+                    let newly_live = self.enter_capture_views(&leg_views, leg.body, live, state);
                     self.scan_invalidation_block(&[], leg.body, scan, live, violations, state);
                     for view in newly_live {
                         live.remove(&view);
+                        state.capture_uses.remove(&view);
                     }
                 }
             }
@@ -28807,8 +29115,42 @@ impl<'src> Analyzer<'src> {
                     self.scan_invalidation(*value, scan, live, violations, state);
                 }
             }
+            // B509 Q3: passing a capture view's last use ends its live range.
+            Expr::Local(binding) => {
+                if let Some(remaining) = state.capture_uses.get_mut(&binding) {
+                    *remaining = remaining.saturating_sub(1);
+                    if *remaining == 0 {
+                        state.capture_uses.remove(&binding);
+                        live.remove(&binding);
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    /// B509 Q3: make a match (or `is`) capture's views live for `body`, each
+    /// until its last use there; answers the ones made live here, for the
+    /// caller to retire after the body.
+    fn enter_capture_views(
+        &self,
+        views: &[Id],
+        body: Id,
+        live: &mut HashSet<Id>,
+        state: &mut InvalidationScanState,
+    ) -> Vec<Id> {
+        let mut newly_live = Vec::new();
+        for view in views {
+            let uses = self.binding_use_count(body, *view);
+            if uses == Some(0) || !live.insert(*view) {
+                continue;
+            }
+            if let Some(uses) = uses {
+                state.capture_uses.insert(*view, uses);
+            }
+            newly_live.push(*view);
+        }
+        newly_live
     }
 
     fn scan_invalidation_if(
@@ -28822,7 +29164,32 @@ impl<'src> Analyzer<'src> {
         match branch {
             ExprIfBranch::If(condition, (statements, tail), else_branch) => {
                 self.scan_invalidation(*condition, scan, live, violations, state);
+                // B509 Q7: `&mut held is Some(let p)` binds the same payload
+                // views a `match &mut held` leg does, for the block the test
+                // guards — each to its last use there.
+                let mut views = Vec::new();
+                self.collect_is_capture_views(*condition, &mut views);
+                views.retain(|view| scan.view_bindings.contains(view));
+                let mut newly_live = Vec::new();
+                for view in views {
+                    let uses = statements
+                        .iter()
+                        .chain(std::iter::once(tail))
+                        .map(|id| self.binding_use_count(*id, view))
+                        .try_fold(0usize, |total, uses| uses.map(|uses| total + uses));
+                    if uses == Some(0) || !live.insert(view) {
+                        continue;
+                    }
+                    if let Some(uses) = uses {
+                        state.capture_uses.insert(view, uses);
+                    }
+                    newly_live.push(view);
+                }
                 self.scan_invalidation_block(statements, *tail, scan, live, violations, state);
+                for view in newly_live {
+                    live.remove(&view);
+                    state.capture_uses.remove(&view);
+                }
                 if let Some(else_branch) = else_branch {
                     self.scan_invalidation_if(else_branch, scan, live, violations, state);
                 }
@@ -28830,6 +29197,19 @@ impl<'src> Analyzer<'src> {
             ExprIfBranch::Else((statements, tail)) => {
                 self.scan_invalidation_block(statements, *tail, scan, live, violations, state);
             }
+        }
+    }
+
+    /// The payload captures of every `is` test a condition makes true when
+    /// it holds — the test itself, or either side of a `&&` (B509 Q7).
+    fn collect_is_capture_views(&self, condition: Id, out: &mut Vec<Id>) {
+        match self.expr_id_to_expr_map.get(&condition) {
+            Some(Expr::Is(_, pattern)) => Self::collect_payload_captures(pattern, out),
+            Some(Expr::Binary(BinaryOp::And, left, right)) => {
+                self.collect_is_capture_views(*left, out);
+                self.collect_is_capture_views(*right, out);
+            }
+            _ => {}
         }
     }
 
@@ -28851,6 +29231,22 @@ impl<'src> Analyzer<'src> {
             .collect();
         for target_id in assignment_targets {
             if let Some((name, fix)) = self.readonly_root(target_id) {
+                // B528/B509: a write through a match capture says what the
+                // capture IS — a copy, or a readonly view — and how to write
+                // the payload, never "declare it `mut`", which binds a copy
+                // whose write silently does not land.
+                if let Some(msg) = self.capture_write_refusal(target_id, name) {
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                            msg,
+                        },
+                        target_id,
+                    );
+                    continue;
+                }
                 let advice = Self::immutability_advice(name, fix);
                 self.push_anchored(
                     Error {
@@ -63938,6 +64334,12 @@ pub struct Program<'src> {
     // (`compute_transient_view_payloads`); the capture is a pair at an
     // instance exactly when its payload is.
     pub transient_view_payloads: HashMap<Id, Vec<Id>>,
+    // B509: the payload captures of a `match`/`is` over a VIEW of an enum
+    // place (`match &mut held { Some(let p) => .. }`) — each binds a view into
+    // its payload slot: the slot's own reference for an aggregate, the
+    // `(enum, slot)` pair for a scalar (decided per instance for a generic).
+    // Maps each to whether its view is writable (`&mut` subject).
+    pub payload_view_captures: HashMap<Id, bool>,
     // View bindings/params holding a scalar `(base, key)` view; `*v` lowers to
     // `v[0][v[1]]` (covers both a boxed local and a scalar field).
     pub primitive_views: HashSet<Id>,
@@ -72155,6 +72557,9 @@ fn analyze_over_world<'src>(
         // Record `Some(let v)` captures over wrapped-scalar-view calls before the
         // checks + view classification consult them.
         analyzer.wrapped_view_captures = analyzer.compute_wrapped_view_captures();
+        // B509 Q4: a `mut` capture under a view subject is a copy that looks
+        // like a write.
+        analyzer.check_mut_captures_under_view_subjects();
         // B178: the entry takes no parameters — a whole-program shape check, so it
         // rides here with the rest rather than at the declaration's walk (where
         // "which `main` is the entry" is not yet a question the walk can answer).
@@ -72742,6 +73147,8 @@ fn analyze_over_world<'src>(
     let receiver_views = analyzer.compute_receiver_views();
     let fixed_view_refs = analyzer.compute_fixed_view_refs();
     let transient_view_payloads = analyzer.compute_transient_view_payloads();
+    let payload_view_captures: HashMap<Id, bool> =
+        analyzer.payload_view_capture_modes().into_iter().collect();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals(&receiver_views);
     let primitive_views = analyzer.compute_primitive_views();
     let scalar_view_refs = analyzer.compute_scalar_view_refs();
@@ -73563,6 +73970,7 @@ fn analyze_over_world<'src>(
         receiver_views,
         fixed_view_refs,
         transient_view_payloads,
+        payload_view_captures,
         primitive_views,
         scalar_view_refs,
         scalar_view_calls,

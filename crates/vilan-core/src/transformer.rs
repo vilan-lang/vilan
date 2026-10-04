@@ -4397,10 +4397,33 @@ impl<'src> Transformer<'src> {
                         .iter()
                         .any(|payload| self.derefs_scalar_view(*payload))
                 })
-            || (self.program.for_each_views.contains_key(&binding)
+            || ((self.program.for_each_views.contains_key(&binding)
+                || self.program.payload_view_captures.contains_key(&binding))
                 && self
                     .binding_type_id(binding)
                     .is_some_and(|type_id| self.resolves_to_scalar_view_pointee(type_id)))
+    }
+
+    /// B509: what a payload capture under a view subject binds, given the
+    /// slot read `subject` the pattern walk produced (`$a[1 + i]`): the slot
+    /// itself for an aggregate payload — the payload's own reference, so a
+    /// write through the capture lands in the enum — and, for a scalar one
+    /// (at this instance), the `(enum, slot)` pair the view representation
+    /// reads and writes through. Any other capture keeps `subject`.
+    fn payload_view_capture_value(
+        &self,
+        capture_id: Id,
+        subject: js::Node<'src>,
+    ) -> js::Node<'src> {
+        if !self.program.payload_view_captures.contains_key(&capture_id)
+            || !self.binding_holds_a_scalar_view_pair(capture_id)
+        {
+            return subject;
+        }
+        match subject {
+            js::Node::PropertyIndex(container, slot) => js::Node::Array(vec![*container, *slot]),
+            other => other,
+        }
     }
 
     /// B444: per argument position of the callee `subject_id` names, whether
@@ -8293,6 +8316,7 @@ impl<'src> Transformer<'src> {
         match pattern {
             ExprPattern::Wildcard => {}
             ExprPattern::Binding(capture_id) => {
+                let subject = self.payload_view_capture_value(*capture_id, subject);
                 self.is_bindings.insert(*capture_id, subject);
             }
             ExprPattern::Variant(enum_id, variant_index, payload) => {
@@ -9861,6 +9885,7 @@ impl<'src> Transformer<'src> {
                     js::Node::Call(callee, _)
                         if matches!(callee.as_ref(), js::Node::Local(name) if name == "__clone")
                 );
+                let subject = self.payload_view_capture_value(*capture_id, subject);
                 let subject = if self.capture_copies(*capture_id) && !already_cloned {
                     self.used_helpers.insert("__clone");
                     js::Node::Call(

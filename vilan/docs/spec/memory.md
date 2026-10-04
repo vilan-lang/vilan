@@ -265,7 +265,16 @@ whose parameter states one mode (written on its type, or spelled on the
 literal) is refused where the other is wanted: a value-into-view adapter
 would hide a copy, so write it (`|c| f(*c)`). Iteration by view (`for e in &mut list`) binds each
 element as a view: assignment and field writes go through; `*e` reads the
-element. The parameter conventions:
+element. Matching by view is the same act on one value: the SUBJECT
+carries the mode, so `match &mut place { V(let p) => .. }` (and
+`&mut place is V(let p)`) binds every `let` payload capture as a writable
+view into its slot — assigning `p` replaces the payload and keeps the
+variant — and `match &place` binds readonly views, while a bare
+`match place` copies, as it always has. A `mut` capture under a view
+subject is refused (it would be a copy that looks like a write). Rule 4
+guards the subject place, and every prefix of it, from the arm's start to
+the capture's LAST use. A binding inside a tuple sub-pattern stays a copy.
+The parameter conventions:
 
 | Convention | Written | Data | Resource |
 |---|---|---|---|

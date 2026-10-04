@@ -9316,6 +9316,26 @@ fn a_closure_literal_takes_its_positions_parameter_modes_on_both_backends() {
     );
 }
 
+/// B509: `match &mut place` / `&mut place is ..` bind payload captures as
+/// writable views and `match &place` as readonly ones — natively through
+/// Rust's binding modes, a capture handed on to a `&mut` position by reborrow
+/// (`f(p0)` emitted `&mut p0` on a `&mut P` binding, rustc E0596, the first
+/// time std's derive wrote its enum step in place).
+#[test]
+fn a_payload_view_writes_the_enum_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_payload_views.vl"),
+        include_str!("native/payload_views.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_payload_views.vl"),
+        Verdict::Identical,
+        "a payload view must write the enum in place on both backends"
+    );
+}
+
 /// F48 (pinned, not reproduced at the Order 46 base): a reassigned
 /// closure-typed `mut` binding and a `List` of closures build — F44's counted
 /// literal closed what was filed as rustc E0308 in Order 43.
