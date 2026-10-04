@@ -22,7 +22,7 @@ json-roundtrip	2	12
 remainder	0	1
 numeric-types	1	6
 option-view	0	1
-dyn-objects	35	67
+dyn-objects	33	57
 usize	6	14
 usize-literals	1	6
 unsigned-saturate	0	17
