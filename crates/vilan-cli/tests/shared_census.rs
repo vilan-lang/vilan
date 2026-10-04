@@ -170,12 +170,18 @@ const CENSUS: &[(&str, usize, &str)] = &[
          draws from ONE space; it is dropped at once",
     ),
     (
-        "store.vl",
-        3,
+        "store_core.vl",
+        4,
         "E: a store's cells, all minted by the store and reached through every \
          copy of a handle (A142 S7, `proposal/store.md`) — the root's value \
          (`Store::new`), each node of its slot tree, and a slot's subscription \
-         count (read by the subscription's release, Q12)",
+         count (read by the subscription's release, Q12). The core moved out of \
+         `store.vl` at A149 S3 (so `std::ui` stops loading the collection \
+         layer); +1 there: a keyed node's table of children (a map's keys, a \
+         set's members, a keyed list's keys), made by the first subscription \
+         under a key and read by every write's diff. A collection flow's feed \
+         keeps its state in `mut` bindings its closures capture, so `store.vl` \
+         itself mints none",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
     (
@@ -297,7 +303,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 196,
+        total, 197,
         "the total number of `Shared` construction sites in std changed"
     );
 

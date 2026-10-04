@@ -9808,6 +9808,28 @@ fn a142_s7_an_enum_store_builds_and_wakes_the_same_on_both_backends() {
     );
 }
 
+/// A149 S3: collection fields as keyed and sequence nodes build and wake the
+/// same on both backends — a write to one key of a map field waking that key's
+/// readers and nobody else's (the wake counts), keyed slots living as long as
+/// their subscriptions, a map field's flow told one op per changed key (handle
+/// writes, a whole write reconciled by key, a root write), a set field's members
+/// and ops, a keyed list read by key, and a list field's flow told splices with
+/// an operator that maps only what arrived.
+#[test]
+fn a149_s3_collection_fields_build_and_wake_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_collections.vl"),
+        include_str!("native/store_collections.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_collections.vl"),
+        Verdict::Identical,
+        "collection fields of a store must build and wake the same on both backends"
+    );
+}
+
 /// B436 + B437: a trait object prints as its value, alone, and as the pair a
 /// list holds; two applications of one trait over one type dispatch through
 /// their own tables — identical on both backends (the JS leg printed the pair

@@ -1183,6 +1183,56 @@ fn derive_in_an_imported_module_resolves() {
 }
 
 #[test]
+fn a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map() {
+    // A149 S3: `[derive(Storable)]` in an imported module — the shape kolt's
+    // `account.vl` and `store.vl` are — expands there with its own imports, and
+    // its map field is a keyed node the importer writes and watches by key. Red
+    // when the derive's output named `Storable` through `std::store`, where the
+    // module's own `Storable` is the derive macro: "'Storable' is not a trait"
+    // when the derive's module is the first to load `std::store` (the entry
+    // imports none of it here, as kolt's does not).
+    let entry = concat!(
+        "import std::io::print;\n",
+        "import std::reactive::{ Owner, Signal, Source, run_with_owner };\n",
+        "import pkg::model::board;\n",
+        "fun main() {\n",
+        "    let store = board();\n",
+        "    let owner = Owner::new();\n",
+        "    run_with_owner(owner, || {\n",
+        "        store.cards().at(1).effect_on_change(|card| print(i\"1 is {card.unwrap_or(\"-\")}\"));\n",
+        "        store.cards().at(2).effect_on_change(|card| print(i\"2 is {card.unwrap_or(\"-\")}\"));\n",
+        "    });\n",
+        "    store.cards().insert(2, \"two\");\n",
+        "    store.cards().remove(1);\n",
+        "    owner.dispose();\n",
+        "}\n",
+        "main();\n",
+    );
+    let model = concat!(
+        "import std::hash_map::HashMap;\n",
+        "import std::store::{ Storable, Store };\n",
+        "\n",
+        "export *;\n",
+        "\n",
+        "[derive(Storable)]\n",
+        "struct Board {\n",
+        "    title: str,\n",
+        "    cards: HashMap<i32, str>,\n",
+        "}\n",
+        "\n",
+        "fun board(): Store<Board> {\n",
+        "    mut cards: HashMap<i32, str> = HashMap::new();\n",
+        "    cards.insert(1, \"one\");\n",
+        "    Store::new(Board { title = \"b\", cards })\n",
+        "}\n",
+    );
+    assert_eq!(
+        run_package(&[("main.vl", entry), ("model.vl", model)], "main.vl"),
+        "2 is two\n1 is -\n"
+    );
+}
+
+#[test]
 fn derive_in_a_dependency_library_resolves() {
     // The contract-library pattern: a `[derive(Json)]` type in a dependency library's
     // `lib.vl`, used by the app — the derive expands in the dependency too.

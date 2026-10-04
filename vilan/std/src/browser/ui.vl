@@ -73,7 +73,7 @@ import pkg::reactive::{
 	zip_some,
 };
 import pkg::shared::Shared;
-import pkg::store::{ Store, StoreFlag, StoreSome };
+import pkg::store_core::{ Store, StoreFlag, StoreSome };
 import pkg::style::Style;
 
 /// A binding's subscription: `observer` now and on every change, released with

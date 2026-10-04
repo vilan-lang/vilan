@@ -48,7 +48,7 @@ import pkg::reactive::{
 	zip_some,
 };
 import pkg::shared::Shared;
-import pkg::store::{ Store, StoreFlag, StoreSome };
+import pkg::store_core::{ Store, StoreFlag, StoreSome };
 import pkg::style::Style;
 
 /// One attribute in an element's ordered attribute list. Ordering is INSERTION

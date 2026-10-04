@@ -657,7 +657,8 @@ export trait Sequence<T> {
 
 /// Where a splice at `at` starts in a sequence of `held` elements: `at`, pulled
 /// into `0..=held`.
-fun splice_start(held: usize, at: usize): usize {
+[internal("the one splice's clamp, shared with a store's sequence node (A149 S3)")]
+export fun splice_start(held: usize, at: usize): usize {
 	if at > held {
 		held
 	} else {
@@ -666,7 +667,8 @@ fun splice_start(held: usize, at: usize): usize {
 }
 
 /// How many of the `removed` asked for a splice from `start` can take.
-fun splice_count(held: usize, start: usize, removed: usize): usize {
+[internal("the one splice's clamp, shared with a store's sequence node (A149 S3)")]
+export fun splice_count(held: usize, start: usize, removed: usize): usize {
 	if start + removed > held {
 		held - start
 	} else {
@@ -677,7 +679,8 @@ fun splice_count(held: usize, start: usize, removed: usize): usize {
 /// Apply an already-clamped splice to `list` and answer the op it made. The op
 /// carries what LEFT as well as what arrived — §3.1's requirement, and what makes a
 /// group fold's derivative O(1).
-fun splice_in_place<T>(
+[internal("the one splice, shared with a store's sequence node (A149 S3)")]
+export fun splice_in_place<T>(
 	list: &mut List<T>,
 	start: usize,
 	taking: usize,
