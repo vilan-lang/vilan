@@ -89,6 +89,16 @@ move an anchor, and a moved anchor is a broken link.
 | [The dev loop](guide/dev-loop.md) | `run --watch`, hot module replacement, what carries across a swap |
 
 ### std reference
+
+std's modules sit under four namespaces where a family shares a purpose: the
+web modules under `std::web::` (`dom`, `ui`, `style`, `router`, `storage`,
+`dev`, `document`, `asset`, and the web prelude `std::web::prelude`), the
+reactive family under `std::reactive::` (`store`, `transient`, `delta`, the
+hash cells), the JS-only modules under `std::js::` (`promise`, `native_map`,
+`null`) and the server half of RPC at `std::rpc::server`. Everything else —
+the collections, the traits, the codecs, the process modules — sits at
+`std::<name>`.
+
 | Page | Modules |
 |---|---|
 | [collections](std/collections.md) | List, HashMap, HashSet, Range, Iterator |
@@ -105,8 +115,8 @@ move an anchor, and a moved anchor is a broken link.
 | [rpc](std/rpc.md) | `std::rpc`: transports, clients, frames |
 | [browser](std/browser.md) | `std::web::dom`, `std::web::ui`, `std::web::router`, `std::web::storage` |
 | [dev / HMR](std/dev.md) | `std::web::dev`: `stash`/`take`, `on_teardown`, `hmr_active` |
-| [process](std/process.md) | db, http, fs, build, document, process, rpc_server, watch |
-| [misc](std/misc.md) | io, task, promise, context, crypto, jwt, asset |
+| [process](std/process.md) | db, http, fs, build, `web::document`, process, `rpc::server`, watch |
+| [misc](std/misc.md) | io, task, `js::promise`, context, crypto, jwt, `web::asset` |
 
 ### Specification
 | Chapter | Defines |

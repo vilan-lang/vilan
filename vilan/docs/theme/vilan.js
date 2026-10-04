@@ -299,7 +299,7 @@
 	// program is CHECKED (the browser has no process host to run it),
 	// everything else runs.
 	var PROCESS_HINT =
-		/\bstd::(build|db|document|fs|http|process|rpc_server|watch)\b|\bstd::ui::(?:\{[^}]*\brender\b|render\b)/;
+		/\bstd::(build|db|fs|http|process|watch|web::document|rpc::server)\b|\bstd::web::ui::(?:\{[^}]*\brender\b|render\b)/;
 
 	// --- the share codec -------------------------------------------------
 	//
