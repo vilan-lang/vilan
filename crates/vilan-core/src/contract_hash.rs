@@ -208,10 +208,22 @@ impl<'program, 'src> Renderer<'program, 'src> {
             Type::Array(element, length) => {
                 format!("[{}; {length}]", self.render(*element, substitution))
             }
-            Type::Closure(parameters, returned, _) => {
+            // B495: a closure type's parameter modes are part of the type, so
+            // they are part of its spelling (`|&str| void`).
+            Type::Closure(parameters, returned, _, modes) => {
+                let parameters: Vec<String> = parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, parameter)| {
+                        let prefix = modes
+                            .get(index)
+                            .map_or("", |mode| self.program.parameter_mode(*mode).prefix());
+                        format!("{prefix}{}", self.render(*parameter, substitution))
+                    })
+                    .collect();
                 format!(
                     "|{}| {}",
-                    self.list(parameters, substitution),
+                    parameters.join(", "),
                     self.render(*returned, substitution)
                 )
             }

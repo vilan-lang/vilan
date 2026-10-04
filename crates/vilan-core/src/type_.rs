@@ -68,7 +68,12 @@ pub enum Type {
     // `context::thread_contexts`' value-flow rule — a call, a forward to a
     // same-clause position, or `run` — and it is closed by default: a use the
     // rule does not name is refused, not threaded.
-    Closure(Vec<TypeId>, TypeId, Vec<Id>),
+    //
+    // The fourth slot is each parameter's MODE (B495, `closure-type-views.md`):
+    // see [`ParameterMode`]. Empty means the modes are UNSTATED — a type the
+    // analyzer synthesized as an expectation (`|T| U` for an element walk),
+    // which constrains no mode and passes every parameter by value.
+    Closure(Vec<TypeId>, TypeId, Vec<Id>, Vec<ParameterMode>),
     // A nominal enum/struct and its type arguments (`Option<i32>` ->
     // `Enum(option_id, [i32])`, `List<str>` -> `Struct(list_id, [str])`). The
     // arguments are empty for a non-generic type, or where they are not (yet)
@@ -120,6 +125,63 @@ pub enum Type {
     Unknown,
     Unresolved,
     Void,
+}
+
+/// How a closure type passes one parameter (B495, `closure-type-views.md`
+/// §3 (b)): by value, as a view (`&T`), or as a writable view (`&mut T`).
+///
+/// A view "is tracked beside the type, never in it" everywhere else — a view
+/// is not a generic argument, a field or an element — and a closure type's
+/// parameters are the one place it is written INTO a type, because they are
+/// positions, not values. So the mode is a property of the closure type's
+/// parameter slot and of nothing a type variable can stand for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mode {
+    Value,
+    View,
+    MutView,
+}
+
+impl Mode {
+    /// The `&`/`&mut ` a view parameter prints before its type.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Mode::Value => "",
+            Mode::View => "&",
+            Mode::MutView => "&mut ",
+        }
+    }
+
+    /// `Some(mutable)` for a view, `None` for a value — the shape the
+    /// emitters' per-parameter view tables use.
+    pub fn view(self) -> Option<bool> {
+        match self {
+            Mode::Value => None,
+            Mode::View => Some(false),
+            Mode::MutView => Some(true),
+        }
+    }
+}
+
+/// One parameter slot of a [`Type::Closure`]'s modes (B495).
+///
+/// A closure TYPE that was written (`|&str| void`), a literal's parameter
+/// that spells its type (`|c: &str|`, `|c: str|`), and a named function's
+/// declared parameter all state their mode: [`ParameterMode::Written`]. A
+/// literal's parameter written BARE (`|c|`) states none: its mode is the one
+/// of the written position the literal lands in, and it takes that mode where
+/// the two types meet — inside unification, the way a literal takes the
+/// position's `context` clause (B309) — which is why the slot names the
+/// parameter that adopts.
+///
+/// Modes take part in `Type`'s equality and hashing: `|str| void` and
+/// `|&str| void` are different calling conventions, so they are different
+/// types (Q4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ParameterMode {
+    Written(Mode),
+    /// A closure literal's bare parameter, by the parameter's id.
+    Open(Id),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

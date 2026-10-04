@@ -769,11 +769,10 @@ export impl Store<Option<type P>> {
 				None => {},
 			}
 		}, |held: &mut Option<P>, f: |&mut P| void| {
-			match held.take() {
-				Some(mut payload) => {
-					f(&mut payload);
-					held = Some(payload);
-				},
+			// In place (B509): the capture is a writable view into the payload,
+			// so there is no window in which the place holds `None`.
+			match &mut held {
+				Some(let payload) => f(payload),
 				None => {},
 			}
 		})
@@ -794,11 +793,10 @@ export impl StoreSome<Option<type P>> {
 				None => {},
 			}
 		}, |held: &mut Option<P>, f: |&mut P| void| {
-			match held.take() {
-				Some(mut payload) => {
-					f(&mut payload);
-					held = Some(payload);
-				},
+			// In place (B509): the capture is a writable view into the payload,
+			// so there is no window in which the place holds `None`.
+			match &mut held {
+				Some(let payload) => f(payload),
 				None => {},
 			}
 		})
@@ -1288,10 +1286,12 @@ export macro fun store_enum_impls(target: EnumItem): str {
 				}
 			}
 			let read = i"|held: &{subject}, f: |&{operand}| void| \{\n\tmatch held \{\n\t\t{bound} => f(&{built}),\n\t\t_ => \{" + "},\n\t}\n}";
-			// One payload binds `mut` and is written back; several are gathered
-			// into the tuple the handle lends, then spread back.
+			// One payload is lent IN PLACE: under `match &mut held` its capture is
+			// a writable view into the slot (B509), so nothing is copied out or
+			// written back. Several are gathered into the tuple the handle lends,
+			// then spread back — a tuple of views cannot be formed (Q6).
 			let write = if arity == 1 {
-				i"|held: &mut {subject}, f: |&mut {operand}| void| \{\n\tmatch held \{\n\t\t{name}::{variant.name}(mut p0) => \{\n\t\t\tf(&mut p0);\n\t\t\theld = {name}::{variant.name}(p0);\n\t\t" + "},\n\t\t_ => {},\n\t}\n}"
+				i"|held: &mut {subject}, f: |&mut {operand}| void| \{\n\tmatch &mut held \{\n\t\t{name}::{variant.name}(let p0) => f(p0),\n\t\t_ => \{" + "},\n\t}\n}"
 			} else {
 				i"|held: &mut {subject}, f: |&mut {operand}| void| \{\n\tmatch held \{\n\t\t{bound} => \{\n\t\t\tmut payload = {built};\n\t\t\tf(&mut payload);\n\t\t\theld = {name}::{variant.name}({join(unpacked, ", ")});\n\t\t" + "},\n\t\t_ => {},\n\t}\n}"
 			};

@@ -1472,7 +1472,7 @@ impl<'p, 'src> TypeParameterScan<'p, 'src> {
             // The type parameter itself, and the two "we do not know" cases —
             // conservative, since a fold under either is unverifiable.
             Some(Type::Generic(_)) | Some(Type::Unknown) | Some(Type::Unresolved) | None => true,
-            Some(Type::Closure(arguments, result, _)) => {
+            Some(Type::Closure(arguments, result, _, _)) => {
                 let result = *result;
                 arguments
                     .clone()

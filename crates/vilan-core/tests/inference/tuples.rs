@@ -8460,3 +8460,17 @@ fn a152_unzips_follow_dies_with_the_owner_that_split_it() {
         "2\n",
     );
 }
+
+/// B538: a tuple ASSIGNMENT target holding an element, a nested tuple, a
+/// tuple-typed binding or a tuple-typed position assigns each place (B522
+/// admits each as a place). JS walked the target as an array literal — the
+/// element as its `__at` READ, a tuple-typed element as a `...spread` — and
+/// the module threw `Invalid destructuring assignment target` at load. A tuple
+/// of plain bindings keeps its destructuring (the swap).
+#[test]
+fn b538_a_tuple_target_of_elements_nested_tuples_and_tuple_typed_places_assigns_each() {
+    assert_compiles_and_runs(
+        include_str!("../../../vilan-cli/tests/native/tuple_assignment_targets.vl"),
+        "element: 1 2\nnested: 4 5 6\ntuple-typed binding: 7 8 9\ntuple-typed position: 11 12 13\nfield and element: 21 22\nswap: 5 4\n",
+    );
+}

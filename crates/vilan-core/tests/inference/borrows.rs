@@ -12060,7 +12060,8 @@ fn b512_the_spelled_copy_of_a_conditional_view_is_a_copy() {
 /// |list| list.push(9) }` was refused "cannot mutate immutable 'list'" — and at
 /// an annotated binding, called or never called (closed by B516's change to the
 /// binding's probe). The third position the item names, a generic parameter
-/// instantiated with the closure type (`List<|&mut ..|>::push`), is not taken.
+/// instantiated with the closure type (`List<|&mut ..|>::push`), is B495's:
+/// `b495_a_literal_nested_in_a_written_view_closure_type_adopts_its_views`.
 #[test]
 fn b534_a_closure_literal_takes_view_parameters_at_a_return_and_an_annotated_binding() {
     assert_compiles_and_runs(
@@ -12080,5 +12081,718 @@ fn b534_a_closure_literal_takes_view_parameters_at_a_return_and_an_annotated_bin
         }
         "#,
         "4\n",
+    );
+}
+
+/// B495 (`closure-type-views.md`): a closure type carries its parameters'
+/// MODES, so a literal written with a bare parameter takes the view of the
+/// written position it reaches however it gets there. Through a `let` the
+/// annotation re-types (`let typed: |&str| void = h`) and through a generic
+/// identity (`hold<T>(x: T): T`), JS stored the caller's `(base, key)` pair as
+/// the value — `out=Oslo,0` — because the views lived in a side table keyed by
+/// the written annotation's id, and every copy of the type lost them.
+#[test]
+fn b495_a_literal_adopts_its_positions_views_through_a_let_and_a_generic_identity() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct City { name: str }
+
+        fun hold<T>(x: T): T { x }
+
+        fun main() {
+            let home = City { name = "Oslo" };
+            mut out = "";
+            let h = |c| {
+                out = *c;
+            };
+            let typed: |&str| void = h;
+            typed(&home.name);
+            print(i"let {out}");
+            let city = "Bergen";
+            let held: |&str| void = hold(|c| {
+                out = *c;
+            });
+            held(&city);
+            print(i"hold {out}");
+            mut n = 1;
+            let bump = |x| {
+                x += 10;
+            };
+            let writes: |&mut i32| void = bump;
+            writes(&mut n);
+            let doubled: |&mut i32| void = hold(|x| {
+                x *= 2;
+            });
+            doubled(&mut n);
+            print(i"mut {n}");
+        }
+        "#,
+        "let Oslo\nhold Bergen\nmut 22\n",
+    );
+}
+
+/// B495: two literals that become ONE value before it meets a written
+/// position — the arms of an `if` bound to a `let` the annotation re-types —
+/// take its mode (and parameter type) together. Only the first arm's literal
+/// adopted, and the second wrote its by-value copy: `n` stayed 1.
+#[test]
+fn b495_two_literals_bound_as_one_value_adopt_its_mode_together() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun pick(c: bool) {
+            mut n = 1;
+            let f = if c {
+                |x| {
+                    x += 10;
+                }
+            } else {
+                |y| {
+                    y += 20;
+                }
+            };
+            let g: |&mut i32| void = f;
+            g(&mut n);
+            print(n);
+        }
+
+        fun main() {
+            pick(true);
+            pick(false);
+        }
+        "#,
+        "11\n21\n",
+    );
+}
+
+/// B495: a bare literal stored INSIDE a written view closure type — an
+/// `Option<|&mut i32| void>`, a `List<..>`, a generic struct's field
+/// `Holder<|&mut i32| void>`, and `List<|&mut ..|>::push`'s `T` (B534's third
+/// position) — takes the view there. Each was refused "cannot mutate immutable
+/// 'x'": the written closure type was one constructor deep, and the
+/// adoption pass only met it at the top.
+#[test]
+fn b495_a_literal_nested_in_a_written_view_closure_type_adopts_its_views() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        struct Holder<T> { f: T }
+
+        fun main() {
+            mut n = 1;
+            let bump: Option<|&mut i32| void> = Some(|x| {
+                x += 10;
+            });
+            match bump {
+                Some(let f) => f(&mut n),
+                None => {},
+            }
+            let all: List<|&mut i32| void> = [|x| {
+                x += 100;
+            }];
+            for g in all {
+                g(&mut n);
+            }
+            let holder: Holder<|&mut i32| void> = Holder { f = |x| {
+                x += 1000;
+            } };
+            (holder.f)(&mut n);
+            print(n);
+            mut edits: List<|&mut List<i32>| void> = [];
+            edits.push(|list| list.push(7));
+            mut xs: List<i32> = [];
+            for edit in edits {
+                edit(&mut xs);
+            }
+            print(xs.len());
+        }
+        "#,
+        "1111\n1\n",
+    );
+}
+
+/// B495 Q2: a value closure and a view closure are different types, in both
+/// directions, whether the mode was written on the type or spelled on the
+/// literal — `|str| void` bound where `|&str| void` is wanted stored the place
+/// pair as the value on JS, and the reverse passed natively by luck. Refused
+/// with the parameter's two modes named, and the adapter to write.
+#[test]
+fn b495_a_value_closure_and_a_view_closure_are_different_types() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let by_value: |str| void = |c| {};
+            let as_view: |&str| void = by_value;
+        }
+        "#,
+        "this closure takes `str` by value where its type takes a view `&str`: a value closure and a view closure are different types, and no adapter is inserted",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let by_view: |&str| void = |c| {};
+            let as_value: |str| void = by_view;
+        }
+        "#,
+        "this closure takes a view `&str` where its type takes `str` by value",
+    );
+    assert_fails_with(
+        r#"
+        fun apply(f: |&mut i32| void, n: &mut i32) { f(n); }
+        fun main() {
+            mut n = 1;
+            apply(|x: i32| {}, &mut n);
+        }
+        "#,
+        "this closure takes `i32` by value where its type takes a writable view `&mut i32`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let h = |c| {};
+            let as_value: |str| void = h;
+            let as_view: |&str| void = h;
+        }
+        "#,
+        "this closure takes `str` by value where its type takes a view `&str`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let pair: |i32, &mut i32| void = |a, b| {};
+            let other: |i32, &i32| void = pair;
+        }
+        "#,
+        "this closure's parameter 2 takes a writable view `&mut i32` where its type takes a view `&i32`",
+    );
+}
+
+/// B495: the mode is part of the closure type's printed form — a mismatch,
+/// a hover and an inlay hint say `|&str| void`, not `|str| void`.
+#[test]
+fn b495_a_closure_types_modes_print_with_the_type() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let f: |&str, &mut i32, bool| void = |a, b, c| {};
+            let n: i32 = f;
+        }
+        "#,
+        "Expected i32, but got |&str, &mut i32, bool| void instead.",
+    );
+}
+
+/// B509 (`payload-views.md` door A, RULED Q1–Q7): the match SUBJECT carries
+/// the mode. Under `match &mut place` every `let` payload capture is a
+/// writable view into its slot — an aggregate payload's fields, a whole
+/// payload replaced (the variant kept), a scalar payload, several payloads of
+/// one variant, a nested variant's payload, a view parameter subject — and
+/// `&mut place is V(let p)` binds the same. `match &place` binds readonly
+/// views. Every write was refused "declare it `mut`" before, and the `mut`
+/// the steer led to bound a copy whose write never landed.
+#[test]
+fn b509_a_view_subject_binds_its_payload_captures_as_views() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        struct P { x: i32, tags: List<str> }
+
+        enum E { A(P), B(i32, str), C }
+
+        enum Nest { Wrap(Option<i32>), Empty }
+
+        fun write_in(held: &mut Option<P>) {
+            match &mut held {
+                Some(let p) => {
+                    p.x += 100;
+                },
+                None => {},
+            }
+        }
+
+        fun main() {
+            mut held: Option<P> = Some(P { x = 1, tags = ["a"] });
+            match &mut held {
+                Some(let p) => {
+                    p.x = 2;
+                    p.tags.push("b");
+                },
+                None => {},
+            }
+            print(i"fields {held.map(|p| p.x).unwrap_or(0)} {held.map(|p| p.tags.len()).unwrap_or(0)}");
+            match &mut held {
+                Some(let p) => {
+                    p = P { x = 3, tags = [] };
+                },
+                None => {},
+            }
+            print(i"whole {held.map(|p| p.x).unwrap_or(0)}");
+            write_in(&mut held);
+            print(i"view parameter {held.map(|p| p.x).unwrap_or(0)}");
+            mut n: Option<i32> = Some(5);
+            match &mut n {
+                Some(let v) => {
+                    v += 1;
+                },
+                None => {},
+            }
+            if &mut n is Some(let v) {
+                v *= 10;
+            }
+            print(i"scalar and is {n.unwrap_or(0)}");
+            mut e = E::B(1, "one");
+            match &mut e {
+                E::B(let a, let b) => {
+                    a += 41;
+                    b = "forty-two";
+                },
+                _ => {},
+            }
+            match e {
+                E::B(let a, let b) => print(i"several {a} {b}"),
+                _ => {},
+            }
+            mut nest = Nest::Wrap(Some(7));
+            match &mut nest {
+                Nest::Wrap(Some(let inner)) => {
+                    inner = 8;
+                },
+                _ => {},
+            }
+            match nest {
+                Nest::Wrap(let inner) => print(i"nested {inner.unwrap_or(0)}"),
+                Nest::Empty => {},
+            }
+            mut total = 0;
+            match &held {
+                Some(let p) => {
+                    total += p.x;
+                },
+                None => {},
+            }
+            match &n {
+                Some(let v) => {
+                    total += *v;
+                },
+                None => {},
+            }
+            print(i"read views {total}");
+        }
+        "#,
+        "fields 2 2\nwhole 3\nview parameter 103\nscalar and is 60\nseveral 42 forty-two\nnested 8\nread views 163\n",
+    );
+}
+
+/// B509: a payload view in a GENERIC body is a view at every instance — the
+/// shape std's `Store<Option<P>>` write step takes, at a scalar `P` (where it
+/// is the `(enum, slot)` pair) and at an aggregate one (the slot's reference).
+#[test]
+fn b509_a_payload_view_in_a_generic_body_writes_through_at_every_instance() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        struct P { x: i32 }
+
+        fun modify<T>(held: &mut Option<T>, f: |&mut T| void) {
+            match &mut held {
+                Some(let payload) => f(payload),
+                None => {},
+            }
+        }
+
+        fun main() {
+            mut number: Option<i32> = Some(1);
+            modify(&mut number, |n| {
+                n += 1;
+            });
+            mut point: Option<P> = Some(P { x = 1 });
+            modify(&mut point, |p| {
+                p.x += 10;
+            });
+            mut text: Option<str> = Some("a");
+            modify(&mut text, |t| {
+                t = i"{*t}b";
+            });
+            print(i"{number.unwrap_or(0)} {point.map(|p| p.x).unwrap_or(0)} {text.unwrap_or("")}");
+        }
+        "#,
+        "2 11 ab\n",
+    );
+}
+
+/// B509 Q4: a `mut` capture under a view subject is refused — it would bind a
+/// COPY of the payload, a write to which looks exactly like the write the
+/// match was written to make (B528's trap).
+#[test]
+fn b509_a_mut_capture_under_a_view_subject_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        fun main() {
+            mut held: Option<P> = Some(P { x = 1 });
+            match &mut held {
+                Some(mut p) => {
+                    p.x = 2;
+                },
+                None => {},
+            }
+        }
+        "#,
+        "`mut p` would bind a COPY of the payload, but this matches a view (`&mut held`), whose captures are views into the payload: bind `let p` to write the payload in place, and write `*p` where a copy is wanted",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        fun main() {
+            mut held: Option<i32> = Some(1);
+            if &held is Some(mut v) {
+                v += 1;
+            }
+        }
+        "#,
+        "`mut v` would bind a COPY of the payload, but this matches a view (`&held`), whose captures are views into the payload: bind `let v` to read it, or match `&mut held` to write it",
+    );
+}
+
+/// B509 Q3/Q5: rule 4 guards the SUBJECT place for a payload view's live
+/// range, which runs to the capture's LAST use — a reassignment of the place
+/// or of a prefix of it, a part reassignment, and a `&mut` of it handed to a
+/// call are refused while the view is still to be used; after its last use the
+/// place may be written (`let next = ..; held = Some(next);`).
+#[test]
+fn b509_rule_4_guards_the_subject_until_the_captures_last_use() {
+    let prelude = r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        struct Outer { held: Option<P> }
+        fun reset(o: &mut Option<P>) { o = None; }
+    "#;
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut held: Option<P> = Some(P {{ x = 1 }});
+            match &mut held {{
+                Some(let p) => {{
+                    held = None;
+                    p.x = 7;
+                }},
+                None => {{}},
+            }}
+        }}"
+        ),
+        "cannot reassign 'held' while a view into it is live (rule 4",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut outer = Outer {{ held = Some(P {{ x = 1 }}) }};
+            match &mut outer.held {{
+                Some(let p) => {{
+                    outer.held = None;
+                    p.x = 7;
+                }},
+                None => {{}},
+            }}
+        }}"
+        ),
+        "cannot reassign 'outer.held' while a view into it is live: the view points into the storage this write replaces",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut outer = Outer {{ held = Some(P {{ x = 1 }}) }};
+            match &mut outer.held {{
+                Some(let p) => {{
+                    reset(&mut outer.held);
+                    p.x = 7;
+                }},
+                None => {{}},
+            }}
+        }}"
+        ),
+        "cannot pass '&mut outer' to 'reset' while a view into it is live",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut n: Option<i32> = Some(1);
+            if &mut n is Some(let v) {{
+                n = None;
+                v += 1;
+            }}
+        }}"
+        ),
+        "cannot reassign 'n' while a view into it is live (rule 4",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut held: Option<P> = Some(P {{ x = 1 }});
+            match &mut held {{
+                Some(let p) => {{
+                    for i in [1, 2] {{
+                        p.x += i;
+                        held = None;
+                    }}
+                }},
+                None => {{}},
+            }}
+        }}"
+        ),
+        "cannot reassign 'held' while a view into it is live (rule 4",
+    );
+    assert_compiles_and_runs(
+        &format!(
+            "{prelude}
+        fun main() {{
+            mut held: Option<P> = Some(P {{ x = 1 }});
+            match &mut held {{
+                Some(let p) => {{
+                    let next = P {{ x = p.x + 1 }};
+                    held = Some(next);
+                }},
+                None => {{}},
+            }}
+            print(held.map(|p| p.x).unwrap_or(0));
+        }}"
+        ),
+        "2\n",
+    );
+}
+
+/// B528: a write through a capture that is a COPY (a bare `match place`) or a
+/// READONLY view (`match &place`) says what the capture is and how to write the
+/// payload — never "declare it `mut`", which bound a copy whose write silently
+/// did not land.
+#[test]
+fn b528_a_write_to_a_copy_or_readonly_capture_steers_to_the_view_subject() {
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        fun main() {
+            mut held: Option<P> = Some(P { x = 1 });
+            match held {
+                Some(let p) => {
+                    p.x = 2;
+                },
+                None => {},
+            }
+        }
+        "#,
+        "cannot mutate 'p': it is a COPY of the payload the pattern takes out of `held`, so a write to it (or to `mut p`) would not reach `held` — to write the payload in place, match a view of it, `match &mut held` (or `&mut held is ..`), whose `let` captures are writable views",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        fun one(held: &mut Option<P>) {
+            match held {
+                Some(let p) => {
+                    p.x = 2;
+                },
+                None => {},
+            }
+        }
+        "#,
+        "cannot mutate 'p': it is a COPY of the payload the pattern takes out of `held`",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        struct P { x: i32 }
+        fun main() {
+            mut held: Option<P> = Some(P { x = 1 });
+            match &held {
+                Some(let p) => {
+                    p.x = 2;
+                },
+                None => {},
+            }
+        }
+        "#,
+        "cannot write through 'p': this matches `&held`, a readonly view, so its captures are readonly views into the payload — match `&mut held` to write the payload in place",
+    );
+}
+
+/// B509 S2 / M109: std's through-variant write steps write IN PLACE — the
+/// `Store<Option<P>>` step and the derive's single-payload enum step — so the
+/// paper's cost probe (2,000 writes of one scalar inside a payload holding a
+/// 10,000-element list) makes NO copy, where the derive's step deep-copied the
+/// payload out and back on every write. Counted, not timed: the emitted
+/// `__clone` is instrumented and every call counted. The old shape is the
+/// control that proves the counter is live.
+#[test]
+fn b509_a_through_variant_write_copies_nothing() {
+    fn copies_made(source: &str) -> usize {
+        let js = compile(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let counted = js.replace(
+            "function __clone(value) {",
+            "function __clone(value) { globalThis.__copies = (globalThis.__copies ?? 0) + 1;",
+        );
+        let counted = format!(
+            "process.on('exit', () => console.log('copies=' + (globalThis.__copies ?? 0)));\n{counted}"
+        );
+        let stdout = run_js(&counted).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let line = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("copies="))
+            .expect("the exit hook prints the count");
+        line.parse().expect("a count")
+    }
+    let program = |step: &str| {
+        format!(
+            r#"
+        import std::io::print;
+        import std::option::Option::{{ self, None, Some }};
+
+        struct P {{ x: i32, big: List<i32> }}
+
+        enum E {{ A(P), B }}
+
+        fun payload(): P {{
+            mut big: List<i32> = [];
+            mut i = 0;
+            for i < 10000 {{
+                big.push(i);
+                i += 1;
+            }}
+            P {{ x = 0, big }}
+        }}
+
+        {step}
+
+        fun main() {{
+            mut e = E::A(payload());
+            mut held: Option<P> = Some(payload());
+            mut n = 0;
+            for n < 2000 {{
+                through_variant(&mut e, |p: &mut P| {{
+                    p.x += 1;
+                }});
+                through_option(&mut held, |p: &mut P| {{
+                    p.x += 1;
+                }});
+                n += 1;
+            }}
+            match &e {{
+                E::A(let p) => print(p.x),
+                E::B => {{}},
+            }}
+            match &held {{
+                Some(let p) => print(p.x),
+                None => {{}},
+            }}
+        }}
+        "#
+        )
+    };
+    let in_place = program(
+        r#"
+        fun through_variant(held: &mut E, f: |&mut P| void) {
+            match &mut held {
+                E::A(let p0) => f(p0),
+                _ => {},
+            }
+        }
+        fun through_option(held: &mut Option<P>, f: |&mut P| void) {
+            match &mut held {
+                Some(let payload) => f(payload),
+                None => {},
+            }
+        }
+        "#,
+    );
+    let copied = program(
+        r#"
+        fun through_variant(held: &mut E, f: |&mut P| void) {
+            match held {
+                E::A(mut p0) => {
+                    f(&mut p0);
+                    held = E::A(p0);
+                },
+                _ => {},
+            }
+        }
+        fun through_option(held: &mut Option<P>, f: |&mut P| void) {
+            match held.take() {
+                Some(mut payload) => {
+                    f(&mut payload);
+                    held = Some(payload);
+                },
+                None => {},
+            }
+        }
+        "#,
+    );
+    assert_eq!(
+        copies_made(&in_place),
+        0,
+        "an in-place write step makes no copy"
+    );
+    assert!(
+        copies_made(&copied) >= 4000,
+        "the copy-out-and-back control must count its two copies per write"
+    );
+    // std's own steps, through a derived enum's handle and an `Option`'s:
+    // the copies a write makes do not include the 10,000-element payload — a
+    // deep copy of it alone is over 10,000 `__clone` calls, and 199 more
+    // writes add a handful each (the written leaf), never that.
+    let through_std = |writes: usize| {
+        format!(
+            r#"
+        import std::io::print;
+        import std::option::Option::{{ self, None, Some }};
+        import std::store::{{ Storable, Store, StoreSome }};
+
+        [derive(Storable)]
+        struct Device {{ since: i32, big: List<i32> }}
+
+        [derive(Storable)]
+        enum Presence {{ Offline, Online(Device) }}
+
+        fun main() {{
+            mut big: List<i32> = [];
+            mut i = 0;
+            for i < 10000 {{
+                big.push(i);
+                i += 1;
+            }}
+            let presence = Store::new(Presence::Online(Device {{ since = 0, big }}));
+            let since = presence.online().since();
+            let maybe = Store::new(Some(Device {{ since = 0, big = [1, 2, 3] }}));
+            let other = maybe.some().since();
+            mut n = 0;
+            for n < {writes} {{
+                let _variant = since.patch(n);
+                let _option = other.patch(n);
+                n += 1;
+            }}
+            print(since.get().unwrap_or(0));
+        }}
+        "#
+        )
+    };
+    let once = copies_made(&through_std(1));
+    let many = copies_made(&through_std(200));
+    assert!(
+        many - once < 199 * 2 * 10,
+        "a write through std's variant and Option steps copies the payload: {once} copies for one write, {many} for 200"
     );
 }

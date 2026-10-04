@@ -4397,10 +4397,33 @@ impl<'src> Transformer<'src> {
                         .iter()
                         .any(|payload| self.derefs_scalar_view(*payload))
                 })
-            || (self.program.for_each_views.contains_key(&binding)
+            || ((self.program.for_each_views.contains_key(&binding)
+                || self.program.payload_view_captures.contains_key(&binding))
                 && self
                     .binding_type_id(binding)
                     .is_some_and(|type_id| self.resolves_to_scalar_view_pointee(type_id)))
+    }
+
+    /// B509: what a payload capture under a view subject binds, given the
+    /// slot read `subject` the pattern walk produced (`$a[1 + i]`): the slot
+    /// itself for an aggregate payload — the payload's own reference, so a
+    /// write through the capture lands in the enum — and, for a scalar one
+    /// (at this instance), the `(enum, slot)` pair the view representation
+    /// reads and writes through. Any other capture keeps `subject`.
+    fn payload_view_capture_value(
+        &self,
+        capture_id: Id,
+        subject: js::Node<'src>,
+    ) -> js::Node<'src> {
+        if !self.program.payload_view_captures.contains_key(&capture_id)
+            || !self.binding_holds_a_scalar_view_pair(capture_id)
+        {
+            return subject;
+        }
+        match subject {
+            js::Node::PropertyIndex(container, slot) => js::Node::Array(vec![*container, *slot]),
+            other => other,
+        }
     }
 
     /// B444: per argument position of the callee `subject_id` names, whether
@@ -6743,6 +6766,28 @@ impl<'src> Transformer<'src> {
                         js::Node::Local(name)
                     }
                 };
+                // B538: a tuple target a JS destructuring pattern cannot spell —
+                // an element (`(list[0], x) = ..`, whose read is `__at`), a
+                // nested tuple (`((x, y), z)`), or a tuple-typed element (`(p,
+                // z)`, a reslice) — is the value in a temporary and one
+                // ordinary write per leaf, at the leaf's flat offset. A tuple
+                // of plain places keeps the destructuring it always had.
+                if let Some(Expr::Tuple(_)) = self.program.entity_map.get(target_id)
+                    && !self.tuple_target_destructures(*target_id)
+                {
+                    let temporary = self.ng.next_name();
+                    block.push(js::Node::ConstVariable(js::Variable {
+                        name: temporary.clone(),
+                        value: Box::new(value),
+                    }));
+                    self.assign_tuple_target_leaves(
+                        *target_id,
+                        &js::Node::Local(temporary),
+                        0,
+                        block,
+                    );
+                    return None;
+                }
                 // Writing a *whole value* through a view. A `Shared` write is a
                 // single-slot view (`cell.v`): rebind the slot, so every handle to
                 // the cell sees the new value (`cell.v = value`). An ordinary
@@ -8293,6 +8338,7 @@ impl<'src> Transformer<'src> {
         match pattern {
             ExprPattern::Wildcard => {}
             ExprPattern::Binding(capture_id) => {
+                let subject = self.payload_view_capture_value(*capture_id, subject);
                 self.is_bindings.insert(*capture_id, subject);
             }
             ExprPattern::Variant(enum_id, variant_index, payload) => {
@@ -8826,6 +8872,112 @@ impl<'src> Transformer<'src> {
         let mut inner = self.current_substitution.clone();
         inner.insert(binder, element);
         std::mem::replace(&mut self.current_substitution, inner)
+    }
+
+    /// B538: whether a tuple assignment target is a JS destructuring pattern
+    /// as it stands — every element a one-slot place JS can assign through
+    /// (a binding, a field, a one-slot tuple position). An element (`__at`
+    /// is a call), a nested tuple (a spread) and a multi-slot element (a
+    /// reslice) are not.
+    fn tuple_target_destructures(&self, target_id: Id) -> bool {
+        let Some(Expr::Tuple(elements)) = self.program.entity_map.get(&target_id) else {
+            return true;
+        };
+        elements.iter().all(|element| {
+            !matches!(
+                self.program.entity_map.get(element),
+                Some(Expr::Tuple(_) | Expr::Index(..))
+            ) && self
+                .expr_type_id(*element)
+                .is_none_or(|type_id| self.flat_width(type_id) == 1)
+        })
+    }
+
+    /// B538: one write per leaf of a tuple target, reading each leaf's value
+    /// out of `value` (the flat temporary) at its flat offset — a slot for a
+    /// one-slot leaf, a `slice` for a tuple-typed one — and a nested tuple
+    /// target recursing at its own offset. Answers the slots it consumed —
+    /// a nested target's own width, which no recorded type states.
+    fn assign_tuple_target_leaves(
+        &mut self,
+        target_id: Id,
+        value: &js::Node<'src>,
+        base: usize,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> usize {
+        let Some(Expr::Tuple(elements)) = self.program.entity_map.get(&target_id).cloned() else {
+            return 1;
+        };
+        let mut offset = base;
+        for element in elements {
+            if let Some(Expr::Tuple(_)) = self.program.entity_map.get(&element) {
+                offset += self.assign_tuple_target_leaves(element, value, offset, block);
+                continue;
+            }
+            let width = self
+                .expr_type_id(element)
+                .map_or(1, |type_id| self.flat_width(type_id));
+            let slot = if width == 1 {
+                js::Node::PropertyIndex(
+                    Box::new(value.clone()),
+                    Box::new(js::Node::Number(offset.to_string(), None)),
+                )
+            } else {
+                js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(value.clone()),
+                        "slice".to_string(),
+                    )),
+                    vec![
+                        js::Node::Number(offset.to_string(), None),
+                        js::Node::Number((offset + width).to_string(), None),
+                    ],
+                )
+            };
+            match self.program.entity_map.get(&element).cloned() {
+                Some(Expr::Index(subject_id, index_id)) => {
+                    let subject = self
+                        .walk_entity(subject_id, block)
+                        .unwrap_or(js::Node::Void);
+                    let index = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+                    self.used_helpers.insert("__at_put");
+                    block.push(js::Node::Call(
+                        Box::new(js::Node::Local("__at_put".to_string())),
+                        vec![subject, index, slot],
+                    ));
+                }
+                Some(Expr::TupleIndex(subject_id, baked_offset, baked_width))
+                    if self
+                        .tuple_index_slot(element, (baked_offset, baked_width))
+                        .1
+                        > 1 =>
+                {
+                    let (into, into_width) =
+                        self.tuple_index_slot(element, (baked_offset, baked_width));
+                    let subject = self
+                        .walk_entity(subject_id, block)
+                        .unwrap_or(js::Node::Void);
+                    for position in 0..into_width {
+                        block.push(js::Node::Assignment(
+                            Box::new(js::Node::PropertyIndex(
+                                Box::new(subject.clone()),
+                                Box::new(js::Node::Number((into + position).to_string(), None)),
+                            )),
+                            Box::new(js::Node::PropertyIndex(
+                                Box::new(value.clone()),
+                                Box::new(js::Node::Number((offset + position).to_string(), None)),
+                            )),
+                        ));
+                    }
+                }
+                _ => {
+                    let place = self.walk_entity(element, block).unwrap_or(js::Node::Void);
+                    block.push(js::Node::Assignment(Box::new(place), Box::new(slot)));
+                }
+            }
+            offset += width;
+        }
+        offset - base
     }
 
     /// The number of flat slots a value of `type_id` occupies once tuples are
@@ -9861,6 +10013,7 @@ impl<'src> Transformer<'src> {
                     js::Node::Call(callee, _)
                         if matches!(callee.as_ref(), js::Node::Local(name) if name == "__clone")
                 );
+                let subject = self.payload_view_capture_value(*capture_id, subject);
                 let subject = if self.capture_copies(*capture_id) && !already_cloned {
                     self.used_helpers.insert("__clone");
                     js::Node::Call(
@@ -12299,7 +12452,7 @@ impl<'src> Transformer<'src> {
             // already rewritten every threading site into ordinary parameters
             // and arguments, so two instantiations differing only in a clause
             // emit the same code.
-            Type::Closure(parameters, return_type_id, _) => {
+            Type::Closure(parameters, return_type_id, _, _) => {
                 out.push_str("Fn");
                 self.write_type_key_arguments(parameters, out);
                 out.push_str("->");

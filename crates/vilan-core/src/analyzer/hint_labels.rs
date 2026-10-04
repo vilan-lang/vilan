@@ -398,7 +398,7 @@ impl<'src> Analyzer<'src> {
             Type::Array(element, _) => {
                 self.mentions_a_hinted_type(element.borrow_type(self), depth + 1)
             }
-            Type::Closure(parameters, return_id, contexts) if contexts.is_empty() => parameters
+            Type::Closure(parameters, return_id, contexts, _) if contexts.is_empty() => parameters
                 .iter()
                 .chain(std::iter::once(return_id))
                 .any(|part| self.mentions_a_hinted_type(part.borrow_type(self), depth + 1)),
@@ -456,13 +456,21 @@ impl<'src> Analyzer<'src> {
                 let element = self.render_hint_label(&element, admitted, hosts, depth + 1);
                 format!("[{element}; {length}]")
             }
-            Type::Closure(parameters, return_id, _) => {
-                let (parameters, return_id) = (parameters.clone(), *return_id);
+            Type::Closure(parameters, return_id, _, modes) => {
+                let (parameters, return_id, modes) =
+                    (parameters.clone(), *return_id, modes.clone());
                 let parts: Vec<String> = parameters
                     .iter()
-                    .map(|parameter| {
+                    .enumerate()
+                    .map(|(index, parameter)| {
                         let parameter = parameter.get_type(self);
-                        self.render_hint_label(&parameter, admitted, hosts, depth + 1)
+                        // B495: a view parameter's `&`/`&mut` is the type's.
+                        let prefix = modes
+                            .get(index)
+                            .map_or("", |mode| self.resolved_parameter_mode(*mode).prefix());
+                        let rendered =
+                            self.render_hint_label(&parameter, admitted, hosts, depth + 1);
+                        format!("{prefix}{rendered}")
                     })
                     .collect();
                 let return_type = return_id.get_type(self);

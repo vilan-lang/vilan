@@ -25,6 +25,36 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**A tuple assignment whose target holds an element (`(list[0], x) = (1, 2)`), a nested tuple (`((x, y), z) = ((4, 5), 6)`), a tuple-typed binding (`(p, z) = ((7, 8), 9)`) or a tuple-typed position (`(t.0, z) = ..`) assigns each place, where the JS module threw at load (`[ __at(list, 0), x ] = ..`, `[ ...[ x, y ], z ] = ..`) and natively rustc refused the tuple-typed binding (`(p).clone()` in the pattern, E0070).** B538 (solver-b-46's find). JS lowers such a target to the value in a temporary and one ordinary write per leaf at its flat offset (an element through `__at_put`, a tuple-typed leaf from a `slice`); a tuple of plain places keeps its destructuring (`(a, b) = (b, a)` is byte-identical). Natively each element of the target is rendered as a place.
+
+---
+
+<!-- family: fix -->
+**A write through a `Store` handle into an enum variant's single payload, or through an `Option`'s `some()`, writes the payload IN PLACE: no deep copy out and back per write (the derive's step), and no window in which the place holds `None` (the `Option` step, where a panic inside the write lost the payload).** B509 S2 and M109. The derive's single-payload write step and both `Option` steps (`Store<Option<P>>::some()`, `StoreSome<Option<P>>::some()`) are written `match &mut held { V(let p0) => f(p0), .. }`. Counted, not timed: the paper's probe — 2,000 writes of one scalar inside a payload holding a 10,000-element list — made two deep copies of the payload per write through the derive's step (`__clone` called over 20,000 times for ONE write) and makes none now. A multi-payload variant (`Away(str, i32)`) keeps its copy (Q6: a tuple of views cannot be formed), and its write-back still clones the dead payload (M109's remainder).
+
+---
+
+<!-- family: feature -->
+**`match &mut place { V(let p) => .. }` and `&mut place is V(let p)` bind each payload capture as a WRITABLE view into its slot — `p.x = 2` and `p = P { .. }` write the enum in place, the variant kept — and `match &place` binds readonly views; a bare `match place` copies, as it always has.** B509 (`payload-views.md` door A, RULED Q1–Q7). The subject carries the mode, as `for e in &mut list` does. On JS an aggregate payload binds the slot's own reference and a scalar one the `(enum, slot)` pair; natively Rust's binding modes give `p: &mut P`. A capture through a nested variant (`Some(Pair(let a, _))`) is a view too; one inside a tuple sub-pattern stays a copy. Rule 4 guards the subject place and every prefix of it from the arm's start to the capture's LAST use (Q3): `held = None`, `outer.held = ..` and `reset(&mut held)` are refused while the capture is still to be used, and `let next = f(*p); held = Some(next);` is legal. A wrapped-view capture (`match first(&mut bag) { Some(let p) => .. }`) takes the same last-use range (Q5). B528: a write through a capture that is a COPY (`match held { Some(let p) => p.x = 2 }`) now says so — "it is a COPY of the payload the pattern takes out of `held`, so a write to it (or to `mut p`) would not reach `held` — to write the payload in place, match a view of it, `match &mut held` …" — where it steered to `mut`, which compiled and dropped the write; a write through a readonly view says to match `&mut`.
+
+---
+
+<!-- family: breaking -->
+**BREAKING (B509 Q4, Q1): a `mut` capture under a view subject is refused — "`mut p` would bind a COPY of the payload, but this matches a view (`&mut held`), whose captures are views into the payload: bind `let p` to write the payload in place, and write `*p` where a copy is wanted" — and a capture under `match &place` is a readonly VIEW, so a scalar payload read as a value takes `*v`, as a loop view's does.** `match &mut held { Some(mut p) => p.x = 2 }` compiled and its write never reached `held`. Std, the corpus, the examples, the docs' fences and kolt carry no `match &`/`match &mut` subject (0 sites), so nothing in the estate moves.
+
+---
+
+<!-- family: miscompile -->
+**A closure literal written with a bare parameter takes the view of the closure type it lands in on every route — a `let` an annotation re-types (`let h = |c| { out = *c; }; let typed: |&str| void = h;`), a generic identity (`let f: |&str| void = hold(|c| ..)`), an `Option`/`List` of view closures, a generic struct's field (`Holder<|&mut i32| void>`), `List<|&mut T| void>::push`, and the arms of an `if` that become one value before they meet the position — where JS stored the caller's `(base, key)` pair as the value (`out=Oslo,0`), the `Option`/`List` and `push` forms were refused "cannot mutate immutable 'x'", and natively the call through a capture or a generic field passed a value to a `&mut`.** B495 (`closure-type-views.md`, RULED Q1–Q5), closing B527, B534's third position and F69. A closure type now carries each parameter's MODE (value, view, writable view) in the type itself, where it lived in a side table keyed by the written annotation's id and was lost on every copy, substitution and reconcile. A bare literal parameter adopts the written mode where the two types meet in unification, so the mutability check during inference sees it; the post-inference adoption pass and the side table are gone, and both emitters read the mode off the type (native-46's call-site stopgap for F69/F77 is retired with it). Hover, inlay hints and mismatch messages print the mode: `|&str, &mut i32| void`.
+
+---
+
+<!-- family: breaking -->
+**BREAKING (B495 Q2/Q4): `|str| void` and `|&str| void` are different types. A closure whose parameter states one mode — written on its type, spelled on the literal (`|c: str|`, `|c: &str|`), or a named function's declared convention — is refused where the other is wanted, in both directions: "this closure takes `str` by value where its type takes a view `&str`: a value closure and a view closure are different types, and no adapter is inserted; … adapt the value closure with one that copies the view's value out: `|c| f(*c)`".** A by-value closure bound to a view type stored the place pair as the value on JS, and the reverse ran only because `*c` of a non-view read through; natively both were erased. A bare literal is unaffected (it takes its position's mode), and so is one literal reached twice at one mode; reached at two different modes it is refused at the second. The estate carries no such site (std, the corpus, the examples, the docs and kolt: 0), so the refusal ships as an error, not Q2's one-release warning.
+
+---
+
 <!-- family: fix -->
 **The book writes `[resource]` on its own line above the declaration, as `vilan fmt` has since B485 Q10, in all 20 fence lines that still put it on the declaration line.** K28: the tour's resources page (6), the persistence guide's file-API summary (3), `std::process` (4), `std::reactive`'s collection- and map-pipe traits (4), `std::misc` (1) and the memory spec (2). Where a summary aligns a trailing comment, the comment keeps its column. The docs gate compiles every rewritten fence. Tracker K28.
 

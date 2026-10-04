@@ -118,6 +118,33 @@ fun main() {
 Inside the loop, `*e` reads the element and assigning to `e` writes
 through to the list.
 
+A `match` does the same for an enum's payload. A plain `match held`
+copies what it captures; `match &mut held` captures each payload as a
+writable view, so a write lands in `held` itself, and `match &held`
+captures readonly views:
+
+```vilan
+struct Point { x: i32 }
+
+fun main() {
+	mut held: Option<Point> = Some(Point { x = 1 });
+	match &mut held {
+		Some(let p) => {
+			p.x = 2;
+		},
+		None => {},
+	}
+	if &mut held is Some(let p) {
+		p.x += 40;
+	}
+	print(held.map(|p| p.x).unwrap_or(0)); // 42
+}
+```
+
+`held` is frozen while a capture is still to be used (`held = None`
+before the capture's last use is refused), and a `mut` capture there is
+refused: it would be a copy that looks like a write.
+
 > **Going deeper.** A method may return a view that projects its
 > receiver, like `fun get(&mut self, i: i32): &mut T`. The compiler
 > infers which parameter the view borrows from, and the returned view

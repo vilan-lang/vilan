@@ -9294,6 +9294,67 @@ fn a_view_closure_reached_by_another_route_keeps_its_views_on_both_backends() {
     );
 }
 
+/// B495: the closure type carries its parameters' MODES, so a literal with a
+/// bare parameter takes the view of the position it reaches by every route —
+/// an annotation re-typing a `let`, a generic identity, an `Option`/`List` of
+/// view closures, a generic struct's field, a match capture, a loop binding,
+/// `List::push` — and the call through each passes a view natively too. JS
+/// stored the `(base, key)` pair as the value at the first two on v0.43.0,
+/// refused the `Option`/`List` literal, and native passed a value to a `&mut`.
+#[test]
+fn a_closure_literal_takes_its_positions_parameter_modes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_closure_parameter_modes.vl"),
+        include_str!("native/closure_parameter_modes.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_closure_parameter_modes.vl"),
+        Verdict::Identical,
+        "a closure literal must take its position's parameter modes on both backends"
+    );
+}
+
+/// B509: `match &mut place` / `&mut place is ..` bind payload captures as
+/// writable views and `match &place` as readonly ones — natively through
+/// Rust's binding modes, a capture handed on to a `&mut` position by reborrow
+/// (`f(p0)` emitted `&mut p0` on a `&mut P` binding, rustc E0596, the first
+/// time std's derive wrote its enum step in place).
+#[test]
+fn a_payload_view_writes_the_enum_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_payload_views.vl"),
+        include_str!("native/payload_views.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_payload_views.vl"),
+        Verdict::Identical,
+        "a payload view must write the enum in place on both backends"
+    );
+}
+
+/// B538: a tuple assignment target holding an element, a nested tuple, a
+/// tuple-typed binding or a tuple-typed position assigns each place on both
+/// backends (JS threw at load; natively `(p).clone()` stood in the pattern,
+/// rustc E0070).
+#[test]
+fn a_tuple_target_of_places_assigns_each_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_tuple_assignment_targets.vl"),
+        include_str!("native/tuple_assignment_targets.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_tuple_assignment_targets.vl"),
+        Verdict::Identical,
+        "a tuple target of places must assign each on both backends"
+    );
+}
+
 /// F48 (pinned, not reproduced at the Order 46 base): a reassigned
 /// closure-typed `mut` binding and a `List` of closures build — F44's counted
 /// literal closed what was filed as rustc E0308 in Order 43.

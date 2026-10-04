@@ -1,0 +1,123 @@
+// B509 (payload-views.md door A): `match &mut place` binds every `let`
+// payload capture as a writable view into its slot, `match &place` as a
+// readonly one, and `&mut place is V(let p)` the same — natively through
+// Rust's binding modes (`match &mut held { Some(p) => .. }`, `p: &mut P`),
+// on JS as the slot's own reference (an aggregate) or the `(enum, slot)` pair
+// (a scalar). Aggregate fields, a whole payload, a scalar, several payloads,
+// a nested variant, a view parameter subject, read views, and a generic
+// write step at a scalar, an aggregate and a `str` instance.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct P {
+	x: i32,
+	tags: List<str>,
+}
+
+enum E {
+	A(P),
+	B(i32, str),
+	C,
+}
+
+enum Nest {
+	Wrap(Option<i32>),
+	Empty,
+}
+
+fun write_in(held: &mut Option<P>) {
+	match &mut held {
+		Some(let p) => {
+			p.x += 100;
+		},
+		None => {},
+	}
+}
+
+fun modify<T>(held: &mut Option<T>, f: |&mut T| void) {
+	match &mut held {
+		Some(let payload) => f(payload),
+		None => {},
+	}
+}
+
+fun main() {
+	mut held: Option<P> = Some(P { x = 1, tags = ["a"] });
+	match &mut held {
+		Some(let p) => {
+			p.x = 2;
+			p.tags.push("b");
+		},
+		None => {},
+	}
+	print(i"fields {held.map(|p| p.x).unwrap_or(0)} {held.map(|p| p.tags.len()).unwrap_or(0)}");
+	match &mut held {
+		Some(let p) => {
+			p = P { x = 3, tags = [] };
+		},
+		None => {},
+	}
+	print(i"whole {held.map(|p| p.x).unwrap_or(0)}");
+	write_in(&mut held);
+	print(i"view parameter {held.map(|p| p.x).unwrap_or(0)}");
+	mut n: Option<i32> = Some(5);
+	match &mut n {
+		Some(let v) => {
+			v += 1;
+		},
+		None => {},
+	}
+	if &mut n is Some(let v) {
+		v *= 10;
+	}
+	print(i"scalar and is {n.unwrap_or(0)}");
+	mut e = E::B(1, "one");
+	match &mut e {
+		E::B(let a, let b) => {
+			a += 41;
+			b = "forty-two";
+		},
+		_ => {},
+	}
+	match e {
+		E::B(let a, let b) => print(i"several {a} {b}"),
+		_ => {},
+	}
+	mut nest = Nest::Wrap(Some(7));
+	match &mut nest {
+		Nest::Wrap(Some(let inner)) => {
+			inner = 8;
+		},
+		_ => {},
+	}
+	match nest {
+		Nest::Wrap(let inner) => print(i"nested {inner.unwrap_or(0)}"),
+		Nest::Empty => {},
+	}
+	mut total = 0;
+	match &held {
+		Some(let p) => {
+			total += p.x;
+		},
+		None => {},
+	}
+	match &n {
+		Some(let v) => {
+			total += *v;
+		},
+		None => {},
+	}
+	print(i"read views {total}");
+	mut number: Option<i32> = Some(1);
+	modify(&mut number, |n| {
+		n += 1;
+	});
+	mut text: Option<str> = Some("a");
+	modify(&mut text, |t| {
+		t = i"{*t}b";
+	});
+	modify(&mut held, |p| {
+		p.x += 1000;
+	});
+	print(i"generic {number.unwrap_or(0)} {text.unwrap_or("")} {held.map(|p| p.x).unwrap_or(0)}");
+}
