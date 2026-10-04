@@ -209,8 +209,9 @@ name = "app"
 prelude = "std::web"    # omit the key for the default set
 ```
 
-The default set is `print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`.
-The **web** set adds `Signal`, `SignalCell`, `view`, `View`, and the
+The default set is `print`, `Iterator` (so `filter`, `map` and `to_list`
+need no import), `Option`/`Some`/`None`, `Result`/`Ok`/`Err`.
+The **web** set adds `Signal`, `SignalCell`, `CollPipe`, `SetPipe`, `view`, `View`, and the
 modules `style` and `ui` — so a UI file writes `view("div")` and
 `style::Display::Flex` with no import at all. `prelude = false` turns it
 off entirely.

@@ -757,11 +757,14 @@ request is rendered is the one served.
 - `+` is a per-property override, not CSS specificity. The right
   operand's value replaces the left's for the same property and
   condition.
-- `.class(name)`, `.styled(style)`, `.bind_class(..)` and
-  `.bind_styled(..)` all set the class attribute, so the later call
-  wins — and a reactive one keeps winning every time its signal
-  changes. Use one mechanism per element (custom classes can ride along
-  via `.raw`).
+- `.class(name)`, `.styled(style)`, `.bind_class(..)`,
+  `.bind_styled(..)` and an element head's `class(..)` all set the class
+  attribute, so the later call wins — and a reactive one keeps winning
+  every time its signal changes. Where one element's head or chain
+  writes it twice the compiler warns, naming both writers (`<div
+  class("x") .styled(card) />` keeps only `card`'s classes). Use one
+  mechanism per element: two styles compose with `+` into one
+  `.styled(a + b)`, and custom classes can ride along via `.raw`.
 - A shorthand and its own longhands (`padding` with `padding_top`,
   `border` with `border_color`) resolve by the order you wrote them, not
   by specificity: a later longhand narrows the shorthand, a later

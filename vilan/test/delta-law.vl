@@ -33,6 +33,7 @@
 // deliberate: what S1 owes is that `DeltaLog`, `DeltaCursor`, `SeqOp` and the
 // `DeltaSource` bound are enough for a cell an APPLICATION writes, with the
 // twelve collection methods falling out of one primitive as trait defaults.
+import std::compare::PartialEq;
 import std::io::{ panic, print };
 import std::option::Option::{ self, None, Some };
 import std::reactive::{

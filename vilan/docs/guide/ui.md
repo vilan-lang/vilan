@@ -522,11 +522,17 @@ synchronous build — and the `mount` that finishes it — runs to
 completion before any microtask does. On the SSR twin both methods
 accept and drop, like the event binders: there is no document to be in.
 
-`autofocus` also writes the `autofocus` **attribute**. The attribute is
-inert for an element inserted after the page parsed — that is *why* this
-method exists — so it costs nothing at runtime and makes the choice
-readable: to a focus scope, to devtools, and to a test that asserts
-markup. The SSR twin deliberately does not write it, because a *served*
+`autofocus` also writes a **marker**, `data-autofocus`, and so does element
+syntax's bare attribute (`<input autofocus />`). The marker makes the choice
+readable: to a focus scope, to devtools, and to a test that asserts markup.
+It is std's own attribute rather than the native one because the native
+`autofocus` is not free on an element inserted after the page parsed: the
+document queues it as an autofocus candidate and refuses it once something
+has focus, which Chromium reports on the console once per page. A focus
+scope still honours a native `autofocus` written on the element itself
+(`on_mount(|element| element.set_attribute("autofocus", ""))`), which is
+also the spelling for a `<dialog>` or a popover, whose own focusing steps
+read the native attribute. The SSR twin writes neither, because a *served*
 `autofocus` is honored by the browser's own initial parse.
 
 ## Focus scopes
@@ -564,7 +570,8 @@ let scope = focus_scope(panel, FocusContainment::Contain);
 let _took = scope.focus_initial();
 ```
 
-`focus_initial` focuses the first `[autofocus]` descendant, else the
+`focus_initial` focuses the first marked descendant (`[data-autofocus]`,
+or a native `[autofocus]` written on the element by hand), else the
 first tabbable one, else the panel itself at `tabindex="-1"` — and it
 answers whether the focus was taken, so a show that fired too early is
 simply asked again on the next pass. It is idempotent: once focus has
@@ -652,6 +659,21 @@ Read the cell inside a binding, exactly as an `each_by` row does:
 
 ```vilan,fragment
 {when_some(selected, |account| <p>{account.derive(|current| current.name)}</p>)}
+```
+
+When the content needs SEVERAL maybes — a message and its author — reach for
+`ui::when_all_some` rather than nesting `when_some`s. It takes a tuple of flows
+of `Option`s and builds while EVERY one is `Some`; the body takes ONE
+parameter, a tuple of cells, destructured where it is written. The cells are
+made under the body's owner, written in place while everything stays `Some`,
+and released with the body when any part goes `None` — so the negative states
+are handled once, here, and the body reads plain values:
+
+```vilan,fragment
+{ui::when_all_some((message, author), |(message, author)| <p>
+	<b>{author.derive(|user| user.name)}</b>
+	{message.derive(|current| current.content)}
+</p>)}
 ```
 
 ### Position, and placing one at the end

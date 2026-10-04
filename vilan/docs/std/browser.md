@@ -269,7 +269,7 @@ too.
 | `text` | `(content: str): View` | static text |
 | `class` | `(name: str): View` | static class |
 | `styled` | `(style: Style): View` | classes from a compiled style |
-| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, any `Source<str>` tracks; an `Option<str>` sets it or leaves it off, and a `Source<Option<str>>` tracks with `None` **removing** it (A115) — so the element-syntax form `<div data-dragging(maybe)>` takes every shape `bind_attr` does |
+| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, any `Source<str>` tracks; an `Option<str>` sets it or leaves it off, and a `Source<Option<str>>` tracks with `None` **removing** it (A115) — so the element-syntax form `<div data-dragging(maybe)>` takes every shape `bind_attr` does. One name is std's: `autofocus` writes the focus marker `data-autofocus` (A151), and the SSR twin drops it |
 | `style_var` | `(name: str, source: S): View`; `S: Source<str>` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
@@ -284,7 +284,7 @@ too.
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle — sets the `hidden` attribute AND an inline `display:none`, restoring the element's own inline `display` when it turns true |
 | `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
-| `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve; also WRITES the `autofocus` attribute, which is how a focus scope reads the author's choice (the SSR twin writes neither) |
+| `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve; also WRITES std's `data-autofocus` marker (as does element syntax's bare `autofocus`), which is how a focus scope reads the author's choice (the SSR twin writes neither) |
 | `focus_scope` | `(containment: FocusContainment): View` | make this element a focus scope and take the initial focus on `autofocus`'s clock — the sugar for the case with no show hook |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
@@ -335,12 +335,14 @@ The conditional, the dynamic subtree and the keyed run are **values**, not
 `View` methods. Each fills a child position, so it sits exactly where it is
 written — between siblings, not after them. They are bare names in the
 `std::web` prelude, and
-`std::ui::{ when, when_some, swap, each, each_values, each_by }` otherwise:
+`std::ui::{ when, when_some, swap, each, each_values, each_by }` otherwise
+(`when_all_some` is reached as `ui::when_all_some` or imported by name):
 
 | function | signature | returns |
 |---|---|---|
 | `when` | `(condition: S, body: (sync \|\| C) context owner_scope)`; `S: Source<bool>, C: Slot` | `Conditional<S, C>` |
 | `when_some` | `(source: S, render: (sync \|SignalCell<T>\| C) context owner_scope)`; `S: Source<Option<T>>, C: Slot` | `WhenSome<T, S, C>` |
+| `when_all_some` | `(flows: (U in T: dyn Flow<Option<U>>), render: (sync \|(U in T: SignalCell<U>)\| C) context owner_scope)`; `T: (2..), C: Slot` | `WhenSome<T, ZipSome<T>, C>` |
 | `swap` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<T>, C: Slot` | `Swap<T, S, C>` |
 | `each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot` | `Each<T, K, S, C>` |
 | `each_values` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq + Hashable, S: Source<List<T>>, C: Slot` | `EachValues<T, S, C>` |

@@ -58,6 +58,7 @@ import pkg::reactive::{
 	Signal,
 	SignalCell,
 	Source,
+	ZipSome,
 	also_releasing,
 	comp,
 	get_owner,
@@ -69,6 +70,7 @@ import pkg::reactive::{
 	tracking,
 	turn,
 	turn_scope,
+	zip_some,
 };
 import pkg::shared::Shared;
 import pkg::store::{ Store, StoreFlag, StoreSome };
@@ -189,8 +191,18 @@ export impl View {
 	/// An attribute. The value's TYPE decides its life (proposal/element-syntax.md
 	/// §5): a `str` sets once; a `SignalCell<str>` re-sets whenever it changes,
 	/// exactly `bind_attr`. Anything `AttrValue` fills the slot.
+	///
+	/// ONE NAME IS STD'S (A151): `autofocus` — what element syntax's bare
+	/// `<input autofocus />` lowers to — is written as `data-autofocus`, the marker
+	/// `View::autofocus` writes and a focus scope's `focus_initial` reads. The
+	/// native attribute on an element inserted after the page parsed only queues an
+	/// autofocus candidate the document refuses once something has focus, which
+	/// Chromium reports on the console once per page. The native attribute stays
+	/// reachable on the element itself (`on_mount(|element|
+	/// element.set_attribute("autofocus", ""))`), for a `<dialog>` or a popover,
+	/// whose own focusing steps read it.
 	fun attr<V: AttrValue>(self, name: str, own value: V): View {
-		value.apply(self, name);
+		value.apply(self, attribute_written_for(name));
 		self
 	}
 
@@ -420,19 +432,24 @@ export impl View {
 	/// runs when it flips visibility, or `<dialog>.showModal()`, whose focusing
 	/// steps run once the dialog is rendered — not a retry.
 	fun autofocus(self): View {
-		// A121 §6.1: WRITE THE ATTRIBUTE TOO. HTML's `autofocus` is inert for a
-		// dynamically inserted element — which is the whole reason this method
-		// exists — so setting it costs nothing at runtime and makes the author's
-		// choice READABLE: to an enclosing `FocusScope`, whose `focus_initial`
-		// prefers an `[autofocus]` descendant over the first tabbable one; to
-		// devtools; and to a test that asserts markup. Both mechanisms may then
-		// fire for one element, and that is harmless — they focus the same element,
-		// and focusing an already-focused element is a no-op.
+		// A121 §6.1, corrected by A151: WRITE A MARKER TOO, and make it std's own
+		// `data-autofocus` rather than the native attribute. The marker makes the
+		// author's choice READABLE: to an enclosing `FocusScope`, whose
+		// `focus_initial` prefers a marked descendant over the first tabbable one;
+		// to devtools; and to a test that asserts markup. §6.1 said the native
+		// `autofocus` would cost nothing at runtime on a dynamically inserted
+		// element. It does cost something: the HTML spec queues such an element as
+		// an autofocus CANDIDATE, the document flushes its candidates once and
+		// refuses when something already has focus — Chromium logs "Autofocus
+		// processing was blocked because a document already has a focused element"
+		// once per page load — and on a page with nothing focused the native
+		// processing would focus the element on its own clock. A `data-` attribute
+		// has no behaviour at all.
 		//
 		// Inside a focus scope, `autofocus` marks which element the scope should
 		// start on; outside one it focuses on its own bounded clock. It means the
 		// same thing in both places.
-		self.element.set_attribute("autofocus", "");
+		self.element.set_attribute(AUTOFOCUS_MARKER, "");
 		self.on_mount(|element| {
 			element.focus();
 			if !element.matches(":focus") {
@@ -2105,6 +2122,20 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	reconcile_pass((instance.snapshot)());
 }
 
+/// std's focus marker (A151): the attribute `View::autofocus` and element syntax's
+/// `autofocus` write, and a focus scope's `focus_initial` reads.
+let AUTOFOCUS_MARKER: str = "data-autofocus";
+
+/// The attribute `View::attr(name, ..)` writes: `name`, except std's one name —
+/// `autofocus`, written as `AUTOFOCUS_MARKER` (A151).
+fun attribute_written_for(name: str): str {
+	if name == "autofocus" {
+		AUTOFOCUS_MARKER
+	} else {
+		name
+	}
+}
+
 /// Something that can fill an attribute value (proposal/element-syntax.md §5). This
 /// is what `<div name(value)>` desugars through — element syntax builds
 /// `.attr(name, value)`, never `.bind_attr` — so the arms below are exactly the
@@ -2400,6 +2431,34 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 	});
 }
 
+// === `when_all_some`: several maybes, one body (A152) =======================
+//
+// Waiting for several maybes at once was a nest of `when_some`s, each one a region,
+// an owner and a place where the negative state is handled again. This is
+// `when_some` over `zip_some` plus the split: ONE region and ONE owner, the
+// negative states handled here, and a body that reads plain values through one cell
+// per part. KEEP IN STEP with the process twin's copy (process/ui.vl).
+
+/// Content that exists while EVERY one of `flows` is `Some`, with the parts bound —
+/// the body takes ONE parameter, a tuple of `SignalCell`s, destructured at the call
+/// site:
+///
+///     <li>{when_all_some((message, author), |(message, author)| row(message, author))}</li>
+///
+/// The cells are created under the body's owner when every input turns `Some`,
+/// written IN PLACE while all of them stay `Some` (a changed payload updates the
+/// bindings the body made, it never rebuilds the body — `when_some`'s rule), and
+/// released with the body when any input goes `None`. Each input is any flow of a
+/// maybe, as `zip_some` takes it.
+export fun when_all_some<T: (2..), C: Slot>(
+	flows: (U in T: dyn Flow<Option<U>>),
+	render: (sync |(U in T: SignalCell<U>)| C) context owner_scope,
+): WhenSome<T, ZipSome<T>, C> {
+	// The split runs INSIDE the body, under the owner `when_some` makes for it, so
+	// the parts' follow dies with the row.
+	when_some(zip_some(flows), |whole: SignalCell<T>| render(whole.unzip()))
+}
+
 // === `when_live`: a store's variant as content (A142 S7) ====================
 //
 // `when_some` hands its body a `SignalCell<T>` of the WHOLE payload, so every
@@ -2489,8 +2548,10 @@ export impl FocusScope {
 	/// visible AT THE CALL, and an overlay panel is hidden until layout places it,
 	/// so focus is a consequence of the show and not of the mount).
 	///
-	/// The order is: the first `[autofocus]` descendant — the author saying
-	/// which element the scope should start on — else the first tabbable one,
+	/// The order is: the first MARKED descendant — `[data-autofocus]`, which
+	/// `View::autofocus` and element syntax's `autofocus` write, or a native
+	/// `[autofocus]` written on the element by hand (A151) — the author saying
+	/// which element the scope should start on; else the first tabbable one,
 	/// else the panel itself at `tabindex="-1"` (`focus_first`'s own
 	/// fallback).
 	///
@@ -2499,16 +2560,16 @@ export impl FocusScope {
 	/// the next pass, which is what every overlay's `focused` flag was already
 	/// doing one layer up.
 	///
-	/// `View::autofocus` also WRITES the `autofocus` attribute, so the two
-	/// mechanisms may both fire for one element and that is harmless: they focus
-	/// the same element, and focusing an already-focused element is a no-op.
+	/// `View::autofocus` also WRITES the marker, so the two mechanisms may both
+	/// fire for one element and that is harmless: they focus the same element, and
+	/// focusing an already-focused element is a no-op.
 	fun focus_initial(self): bool {
 		if self.focused.read() {
 			ret true;
 		}
 		mut marked: Option<Element> = None;
 		for candidate in self.root.query_selector_all("*") {
-			if marked.is_none() && candidate.has_attribute("autofocus") {
+			if marked.is_none() && (candidate.has_attribute(AUTOFOCUS_MARKER) || candidate.has_attribute("autofocus")) {
 				marked = Some(candidate);
 			}
 		}

@@ -243,8 +243,9 @@ The body is built under a fresh owner when the variant goes live and disposed
 when it goes away; a write inside the payload wakes only the bindings that read
 what changed. Should a derivation in the body run in the turn that ends the
 variant — a derivation settles before the effect that tears the body down — it
-reads the payload as it was when the body was built, and a write then lands
-nowhere. On the server it renders the live payload once.
+reads the LAST payload a read through the live variant saw (a message edited
+and then deleted shows its edit, never the text the body was built over), and a
+write then lands nowhere. On the server it renders the live payload once.
 
 ## What it costs
 

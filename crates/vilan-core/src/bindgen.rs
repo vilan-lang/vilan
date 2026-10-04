@@ -244,9 +244,6 @@ pub fn generate(source: &str, options: &Options) -> Generated {
 const RESERVED_NAMES: &[&str] = &[
     "self", "any", "bool", "f32", "f64", "i8", "i16", "i32", "i53", "str", "u8", "u16", "u32",
     "u53", "usize", "void", "BigInt", "List", "HashMap", "HashSet", "Option",
-    // `Map`/`Set` are the hash collections' names before tracker I9, still
-    // published one release as `std::map`/`std::set`'s deprecated aliases.
-    "Map", "Set",
 ];
 
 /// Whether a generated name must be escaped: a keyword, or a name

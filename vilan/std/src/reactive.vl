@@ -1838,16 +1838,6 @@ export struct TrackedDerive<T> {
 }
 
 export impl TrackedDerive<type T> with Flow<T> {
-	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<T> {
 		let body = self.body;
 		let runs = Owner::new();
@@ -2041,22 +2031,29 @@ export trait Flow<T> {
 	/// immediate call IS the initial paint), which is why `sub`/`effect` exist
 	/// beside it.
 	///
-	/// A CALLBACK, not a body (A142 §7.3, B482): every impl runs `observer` under
+	/// A CALLBACK, not a body (A142 §7.3, B482): it runs `observer` under
 	/// `tracking.clear(..)`, so a `track()` in it is refused at compile time and a
 	/// `tracking.get_safe()` reads `None` — it runs after whatever body minted it.
 	///
-	/// REQUIRED rather than a default, like `sub`, so that each impl answers it
-	/// itself: a stage with `observe_flow`, and every source through the blanket
-	/// below with its own `attach_observer` (a mirror's lease, a cell's direct
-	/// attach).
+	/// A DEFAULT over `start` (F78): a stage takes it as written — start the flow,
+	/// attach one pulling subscriber — and every source overrides it through the
+	/// blanket below with its own `attach_observer` (a mirror's lease, a cell's
+	/// direct attach). Until Order 46 it was required and every stage carried the
+	/// same copy, because the native backend refused a default calling a hook it
+	/// reached through a blanket.
 	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription;
+	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
+	}
 
 	/// Subscribe: `observer` fires ONCE NOW with the current value, then once per
 	/// change. The eager form. You hold the `Subscription`; `effect` is the
-	/// owner-tied spelling. A callback, cleared as `on_change`'s is.
+	/// owner-tied spelling. A callback, cleared as `on_change`'s is; a default over
+	/// `start`, as `on_change` is.
 	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription;
+	fun sub(own self, observer: (|T| void) context tracking): Subscription {
+		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
+	}
 
 	/// `effect` WITHOUT the immediate first call: `body` runs on every CHANGE from
 	/// here on, each run under an owner of its own (`effect`'s contract otherwise).
@@ -2591,6 +2588,44 @@ export impl SignalCell<type T> {
 	}
 }
 
+/// The tuple-valued cell, split (A152).
+export impl SignalCell<type T: (2..)> {
+	/// One cell per position of this tuple-valued cell, each seeded with its part
+	/// and written IN PLACE on every change of the whole — `pair.unzip()` over a
+	/// `SignalCell<(A, B)>` is a `(SignalCell<A>, SignalCell<B>)`. A binding over a
+	/// part updates where it stands; nothing is rebuilt. `ui`'s `when_all_some`
+	/// hands its body exactly this.
+	///
+	/// A MATERIALISING node, like `.cell()`: the follow registers with the ambient
+	/// owner when there is one, so the parts stop following with the boundary that
+	/// split them, and outside every boundary they follow as long as the whole. It
+	/// is a derivation (A110 door 2): a turn settles the parts before an effect
+	/// reads them.
+	///
+	/// Every part is written on every change of the whole — a change to another
+	/// position, and a `set` that changes nothing, included — because a cell never
+	/// compares (`T` needs no `PartialEq`). The parts are copies of the whole's
+	/// payloads, so a `set` on a part does not write back.
+	fun unzip(self): (U in T: SignalCell<U>) {
+		unzip_cell(self)
+	}
+}
+
+/// `unzip`'s body, outside the impl: inside `SignalCell<type T>`'s block a part's
+/// `SignalCell::new` and `set` read the block's `T` where each position wants its
+/// own element type (a solver find of A152's, filed by reactive-46).
+fun unzip_cell<W: (2..)>(whole: SignalCell<W>): (V in W: SignalCell<V>) {
+	let parts = (part in whole.get() => SignalCell::new(part));
+	as_derivation();
+	let _owned = register_with_owner(whole.on_settle(subscriber_of(|| {
+		let current = whole.get();
+		for key in current.keys() {
+			parts.get(key).set(current.get(key));
+		}
+	}, true)));
+	parts
+}
+
 /// A SEALED derivation's read-only face — what `.memo()` and `.memo_global()` hand
 /// back (A142 R11/R20). A `Source`: read it, pass it anywhere, build any number of
 /// pipes over it. It has no `set`: a derivation is written by its upstream only.
@@ -2701,6 +2736,48 @@ export fun combine<T: (2..)>(sources: (U in T: dyn Source<U>)): Combine<T> {
 /// the caller seals).
 export fun divorce<T: (2..), S: Source<T>>(source: S): (U in T: Derive<S, T, U>) {
 	source.get().keys().map(|key| source.derive(|whole| whole.get(key)))
+}
+
+/// Wait for several maybes at once (A152): a pipe that is `Some` of the tuple of
+/// the inputs' payloads while EVERY input is `Some`, and `None` while any one is
+/// `None`. `zip_some((message, author))` over flows of `Option<Message>` and
+/// `Option<User>` is a `Pipe<Option<(Message, User)>>`, so the negative states are
+/// handled once, where the zip is read, and nothing past it re-matches them.
+///
+/// It is `combine` and `Option::zip` written once, on `combine`'s per-arity
+/// mechanism: variadic over the inputs' (distinct) payload types through a
+/// mapped-tuple parameter, VALUE level and stateless. It holds no cells and needs
+/// no owner, so it composes like any stage (`.derive`, `.distinct`, `.memo()`, a
+/// consumer). Each input is any flow of a maybe — a cell, a sealed memo, a pipe
+/// (a mirror's `.latest()`, a transient's `.derive(|state| state.ready())`) —
+/// erased to `dyn Flow<Option<U>>` at the argument; a pipe input is moved in, as
+/// any consumer takes one.
+///
+/// A dependent input needs nothing new: `let author = message.and_then(|m|
+/// m.author.user()).memo(); zip_some((message, author))`. What it does NOT do is
+/// answer a flow of flows — the parts of a zipped value are values; `ui`'s
+/// `when_all_some` is the form that hands a body one cell per part.
+export fun zip_some<T: (2..)>(flows: (U in T: dyn Flow<Option<U>>)): ZipSome<T> {
+	ZipSome<T> { flows }
+}
+
+/// `Option::zip` over a tuple of maybes of any arity: `Some` of the payloads when
+/// every position is `Some`, `None` otherwise — `zip_some`'s read, per change.
+fun zip_options<T: (2..)>(values: (U in T: Option<U>)): Option<T> {
+	// A tuple of an abstract family is walked by a comprehension (its arity is not
+	// known while the body is checked), so the test is one pass that records
+	// whether any position is empty, and the unwrap a second that cannot fail.
+	mut complete = true;
+	let _tested = (value in values => {
+		if value.is_none() {
+			complete = false;
+		}
+	});
+	if !complete {
+		ret None;
+	}
+	let payloads: T = (value in values => value.unwrap());
+	Some(payloads)
 }
 
 // === Per-key selection (backlog A44; Solid's `createSelector`) ===============
@@ -2843,16 +2920,6 @@ export struct Derive<S, T, U> {
 }
 
 export impl Derive<type S: Flow<type T>, T, type U> with Flow<U> {
-	[must_use]
-	fun on_change(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<U> {
 		let transform = self.transform;
 		let upstream = self.up.start();
@@ -2906,16 +2973,6 @@ export struct Switch<S, T, I, U> {
 }
 
 export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U> {
-	[must_use]
-	fun on_change(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|U| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<U> {
 		let select = self.select;
 		let runs = Owner::new();
@@ -2974,16 +3031,6 @@ export struct SwitchSome<S, T, I, U> {
 export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U> with Flow<
 	Option<U>,
 > {
-	[must_use]
-	fun on_change(own self, observer: (|Option<U>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|Option<U>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<Option<U>> {
 		let select = self.select;
 		let runs = Owner::new();
@@ -3071,16 +3118,6 @@ export struct AndThen<S, T, I, U> {
 export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, type U> with Flow<
 	Option<U>,
 > {
-	[must_use]
-	fun on_change(own self, observer: (|Option<U>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|Option<U>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<Option<U>> {
 		let select = self.select;
 		let runs = Owner::new();
@@ -3166,16 +3203,6 @@ export struct ThenSome<F, S, T> {
 }
 
 export impl ThenSome<type F: Flow<bool>, type S: Source<T>, type T> with Flow<Option<T>> {
-	[must_use]
-	fun on_change(own self, observer: (|Option<T>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|Option<T>| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<Option<T>> {
 		let source = self.source;
 		let outer = self.up.start();
@@ -3223,16 +3250,6 @@ export struct Combine<T: (2..)> {
 }
 
 export impl Combine<type T> with Flow<T> {
-	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<T> {
 		let sources = self.sources;
 		Instance<T> {
@@ -3250,6 +3267,36 @@ export impl Combine<type T> with Flow<T> {
 
 export impl Combine<type T> with Pipe<T> {}
 
+/// `zip_some` as a stage (A152): its inputs are FLOWS, so starting it starts each
+/// one, and the instance reads them all per change and zips what it read. The
+/// attach forwards the same subscriber to every input, as `Combine`'s does; the
+/// handle disposes every arm, and the release releases every input's instance.
+[hint(Pipe<Option<T>>)]
+[resource]
+export struct ZipSome<T: (2..)> {
+	flows: (U in T: dyn Flow<Option<U>>),
+}
+
+export impl ZipSome<type T> with Flow<Option<T>> {
+	fun start(own self): Instance<Option<T>> {
+		let instances = (flow in self.flows => flow.start());
+		Instance<Option<T>> {
+			pull = || zip_options((instance in instances => (instance.pull)())),
+			attach = |subscriber: Subscriber| {
+				let arms = (instance in instances => (instance.attach)(subscriber));
+				retiring(subscriber, || {
+					let _released = (arm in arms => detach(arm));
+				})
+			},
+			release = || {
+				let _released = (instance in instances => (instance.release)());
+			},
+		}
+	}
+}
+
+export impl ZipSome<type T> with Pipe<Option<T>> {}
+
 /// `.distinct()` as a stage (A142 R7): the upstream's value, passed on ONLY when it
 /// differs from the last one passed on. Sealing does not compare — every change
 /// above a `.memo()` is a write, and a write always notifies — so the equality is
@@ -3265,16 +3312,6 @@ export struct Distinct<S, T> {
 }
 
 export impl Distinct<type S: Flow<T>, type T: PartialEq> with Flow<T> {
-	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<T> {
 		let upstream = self.up.start();
 		let pull = upstream.pull;
@@ -3309,16 +3346,6 @@ export struct DistinctBy<S, T, K> {
 }
 
 export impl DistinctBy<type S: Flow<T>, type T, type K: PartialEq> with Flow<T> {
-	[must_use]
-	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
-	}
-
-	[must_use]
-	fun sub(own self, observer: (|T| void) context tracking): Subscription {
-		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
-	}
-
 	fun start(own self): Instance<T> {
 		let key = self.key;
 		let upstream = self.up.start();

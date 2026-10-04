@@ -1711,6 +1711,56 @@ fn b480_a_bound_through_a_trait_argument_binds_from_an_object() {
     );
 }
 
+/// B480's shape as kolt's `Channel::find` writes it (re-checked by reactive-46,
+/// Order 46): `switch` with NO type arguments over a selector whose body is a
+/// `match` on an `Option` with two arms of different stage types — a
+/// `Source::constant` and a `derive` over another pipe — erased by an annotated
+/// `dyn Flow<TransientState<..>>` binding, then sealed. kolt carried
+/// `switch<TransientState<Channel, RpcError>>` for it; it infers.
+#[test]
+fn b480_a_selector_matching_two_erased_arms_needs_no_switch_type_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source };
+        import std::transient::TransientState;
+
+        fun shown(state: TransientState<str, str>): str {
+            match state {
+                TransientState::Ready(let name) => name,
+                TransientState::Absent => "absent",
+                _ => "pending",
+            }
+        }
+
+        fun main() {
+            let client: SignalCell<Option<i32>> = Signal::new(None);
+            let names: SignalCell<Option<str>> = Signal::new(Some("general"));
+            let found = client
+                .switch(|connected| {
+                    let state: dyn Flow<TransientState<str, str>> = match connected {
+                        None => Source::constant(TransientState::Pending),
+                        Some(let _id) => names.derive(|name| match name {
+                            Some(let present) => TransientState::Ready(present),
+                            None => TransientState::Absent,
+                        }),
+                    };
+                    state
+                })
+                .memo();
+            print(shown(found.get()));
+            client.set(Some(1));
+            print(shown(found.get()));
+            names.set(None);
+            print(shown(found.get()));
+        }
+
+        main();
+        "#,
+        "pending\ngeneral\nabsent\n",
+    );
+}
+
 #[test]
 fn a142_a_source_object_stays_copyable_though_flow_is_a_resource_trait() {
     // R39 with B470's attribute on the DECLARING trait alone: `Source<T> with

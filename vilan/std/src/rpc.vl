@@ -4518,15 +4518,18 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 /// last held (a mirror has always kept it; the state now carries it).
 ///
 /// `state()` REPORTS, like `status()`: it leases nothing, so an unwatched mirror's
-/// state is `Pending` for as long as nothing watches it. `latest()` and
+/// state is `Pending` for as long as nothing watches it. `states()`, `latest()` and
 /// `is_pending()` are pipes a view BINDS in place of the mirror, so each LEASES the
-/// mirror while its consumer holds it — `latest()` is how a list keeps its old rows
-/// on screen while a re-mint is on its way (R27) — and each follows what the last
-/// mint said as well as the value.
+/// mirror while its consumer holds it — `states()` is the whole state watched
+/// (A150), `latest()` is how a list keeps its old rows on screen while a re-mint is
+/// on its way (R27) — and each follows what the last mint said as well as the
+/// value.
 ///
 /// The mirror's own `get()` is unchanged: it reads what the mirror holds, the stale
 /// value included after a failed re-mint.
 export impl RemoteSource<type T> with TransientSource<T, RpcError> {
+	/// The state as a PASSIVE report: it leases nothing, so a mirror nobody else
+	/// watches reads `Pending` here forever — bind `states()` to watch it.
 	fun state(self): MemoCell<TransientState<T, RpcError>> {
 		let derived = SignalCell::new(self.transient_state());
 		let _cached = register_with_owner(self.cache.on_change(|_value| {
@@ -4536,6 +4539,17 @@ export impl RemoteSource<type T> with TransientSource<T, RpcError> {
 			derived.set(self.transient_state());
 		}));
 		MemoCell { cell = derived }
+	}
+
+	/// The whole state, LEASED (A150): the mirror as a source (its lease) combined
+	/// with what the last mint said, read as the state — `latest()`'s own shape,
+	/// keeping every arm.
+	fun states(self): dyn Pipe<TransientState<T, RpcError>> {
+		let leased: dyn Source<Option<T>> = self;
+		let told: dyn Source<Option<Status>> = self.mint;
+		let pipe: dyn Pipe<TransientState<T, RpcError>> = combine((leased, told))
+			.derive(|_both| self.transient_state());
+		pipe
 	}
 
 	fun latest(self): dyn Pipe<Option<T>> {
@@ -6488,12 +6502,9 @@ export macro fun service(item: Item): Source {
 				match field.type_.arguments.get(0) {
 					Some(let element) => {
 						if field.keyed {
-							// `Map` is the hash map's spelling before tracker I9,
-							// kept one release as `std::map`'s deprecated alias of
-							// the same type — the annotation is read as WRITTEN, so
-							// both spellings are the map here until the alias goes
-							// (the analyzer's `is_hash_map_head` is the twin).
-							if (element.name == "HashMap" || element.name == "Map") && element.arguments.len() == 2 {
+							// The annotation is read as WRITTEN (the analyzer's
+							// `is_hash_map_head` is the twin).
+							if element.name == "HashMap" && element.arguments.len() == 2 {
 								match element.arguments.get(0) {
 									Some(let key) => match element.arguments.get(1) {
 										Some(let value) => {
@@ -6523,9 +6534,7 @@ export macro fun service(item: Item): Source {
 									},
 									None => {},
 								}
-							} else if field.key != ""
-								&& element.name == "List"
-								&& element.arguments.len() == 1 {
+							} else if field.key != "" && element.name == "List" && element.arguments.len() == 1 {
 								match element.arguments.get(0) {
 									Some(let value) => {
 										exposed_names.push(field.name);

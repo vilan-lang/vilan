@@ -202,6 +202,8 @@ floats are deliberately *not* `Ord` (NaN has no place in a total order), so
 `f64` and `f32` carry their own — same recipe, same result.
 
 ```vilan
+import std::compare::Ord;
+
 fun main() {
 	print(9.clamp(0, 5));       // 5   — i32, through Ord
 	print(9f.clamp(0f, 5f));    // 5

@@ -145,7 +145,7 @@ browser. Decides which std [layers](#layer) are importable.
 <a id="prelude"></a>**prelude**: the names available without imports. Two layers: the
 built-in set the language always has (the primitive types, `List`,
 `void`), and a per-package set named by `[package] prelude` — std's base
-one (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) by default,
+one (`print`, `Iterator`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) by default,
 `"std::web"` for applications, any module for a custom one, or `false`
 for none. A prelude is the weakest scope: declaring or importing one of
 its names shadows it silently. [Spec §4.7](../spec/names.md).

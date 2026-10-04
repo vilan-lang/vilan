@@ -22,7 +22,7 @@ quoted here.
 
 **"cannot find '…' in this scope"** · **"cannot find type '…'"**
 The name isn't visible here. Usually a missing `import` — though the
-basics (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) are in the
+basics (`print`, `Iterator`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) are in the
 prelude and need none. If you did import it, check for a typo or a
 shadowing local. One case that reads as a compiler mistake and isn't: an
 `is` capture is in scope only where its test is known to have **passed** —

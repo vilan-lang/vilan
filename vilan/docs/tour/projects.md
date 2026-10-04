@@ -37,8 +37,8 @@ prelude = "std::web"
 
 | Value | Meaning |
 |---|---|
-| *omitted* | std's base set: `print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err` |
-| `"std::web"` | the base set plus `Signal`, `SignalCell`, `view`, `View`, the five slot values (`when`, `swap`, `each`, `each_values`, `each_by`), and the modules `style` and `ui` |
+| *omitted* | std's base set: `print`, `Iterator`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err` |
+| `"std::web"` | the base set plus `Signal`, `SignalCell`, `CollPipe`, `SetPipe`, `view`, `View`, the six slot values (`when`, `when_some`, `swap`, `each`, `each_values`, `each_by`), and the modules `style` and `ui` |
 | `"pkg::my_prelude"` | your own module — its exports are the ambient names |
 | `"some_dep::their_prelude"` | a dependency's module |
 | `false` | no prelude at all |

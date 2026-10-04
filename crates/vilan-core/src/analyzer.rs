@@ -5826,6 +5826,73 @@ fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String
     })
 }
 
+/// R-e (Order 46, ruled): the collection names that had their one release and
+/// are gone — `std::map`'s `Map` and `std::set`'s `Set` (deprecated by I9 in
+/// v0.42.0), and the reactive cells' short names (renamed by A148 in v0.43.0).
+/// Each old name with the name that replaced it and the module that declares
+/// it; the import path's miss and the bare name's miss both read this one
+/// table, so a steer can never name a path the other does not.
+const RENAMED_STD_NAMES: &[(&str, &str, &str)] = &[
+    ("Map", "HashMap", "hash_map"),
+    ("Set", "HashSet", "hash_set"),
+    ("MapCell", "HashMapCell", "reactive"),
+    ("SetCell", "HashSetCell", "reactive"),
+    ("MapEntry", "HashMapEntry", "reactive"),
+    ("SetEntry", "HashSetEntry", "reactive"),
+    ("MapMemo", "HashMapMemo", "reactive"),
+    ("SetMemo", "HashSetMemo", "reactive"),
+    ("TrackedMap", "TrackedHashMap", "reactive"),
+];
+
+/// R-e's modules: `std::map` and `std::set` (I9's deprecated aliases, removed),
+/// and `std::map_cell`/`std::set_cell` (A148's renamed modules).
+const REMOVED_STD_MODULES: &[(&str, &str)] = &[
+    (
+        "map",
+        "`std::map` was removed: its `Map` is `std::hash_map::HashMap`",
+    ),
+    (
+        "set",
+        "`std::set` was removed: its `Set` is `std::hash_set::HashSet`",
+    ),
+    (
+        "map_cell",
+        "`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell` \
+         (re-exported from `std::reactive`)",
+    ),
+    (
+        "set_cell",
+        "`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell` \
+         (re-exported from `std::reactive`)",
+    ),
+];
+
+/// The steer for an import path segment that names one of R-e's removed std
+/// names: a module at std's root, or an old item name anywhere under `std`.
+fn renamed_std_segment(root: &str, part: &str, at_std_root: bool) -> Option<String> {
+    if root != "std" {
+        return None;
+    }
+    if at_std_root
+        && let Some((_, steer)) = REMOVED_STD_MODULES
+            .iter()
+            .find(|(module, _)| *module == part)
+    {
+        return Some((*steer).to_string());
+    }
+    renamed_std_name(part).map(|(new, module)| {
+        format!("`{part}` was renamed `{new}`: write `import std::{module}::{new};`")
+    })
+}
+
+/// R-e's renamed name for `old`, with the module that declares the new one.
+fn renamed_std_name(old: &str) -> Option<(&'static str, &'static str)> {
+    RENAMED_STD_NAMES
+        .iter()
+        .find(|(name, _, _)| *name == old)
+        .map(|(_, new, module)| (*new, *module))
+}
+
 /// The `export` marker on a top-level item, and the item under it (B318 §1.1).
 ///
 /// `unwrap_item` is the sibling that answers only the second half; it stays as
@@ -46229,11 +46296,12 @@ impl<'src> Analyzer<'src> {
                             });
                             return false;
                         }
-                        let msg =
-                            removed_std_alias(root, part, namespace_scope_id == root_scope_id)
-                                .unwrap_or_else(|| {
-                                    format!("cannot find '{}' in the imported path", part)
-                                });
+                        let at_std_root = namespace_scope_id == root_scope_id;
+                        let msg = removed_std_alias(root, part, at_std_root)
+                            .or_else(|| renamed_std_segment(root, part, at_std_root))
+                            .unwrap_or_else(|| {
+                                format!("cannot find '{}' in the imported path", part)
+                            });
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,
@@ -51793,6 +51861,14 @@ impl<'src> Analyzer<'src> {
     /// the SAME name (a layered std twin) keep the steer, genuinely
     /// different modules make it ambiguous and it stays silent.
     fn import_steer(&mut self, name: &str) -> Option<String> {
+        // R-e: a collection name that had its one release. A program of the
+        // program's own may still declare one (`struct Map`), and then this
+        // miss never happens.
+        if let Some((new, module)) = renamed_std_name(name) {
+            return Some(format!(
+                "; `{name}` was renamed `{new}` — `import std::{module}::{new};`"
+            ));
+        }
         // B414: `jump` is a CONTEXTUAL keyword — the jump only when its target
         // follows — so a forgotten target reads a name `jump` and misses here.
         // The miss is the old "expected a jump target" in other words.
@@ -51920,9 +51996,11 @@ impl<'src> Analyzer<'src> {
                     .map(|importable| importable.name.to_string()),
             );
         }
-        // The base seven are in both sets, so a program missing `print` must
+        // The base eight are in both sets, so a program missing `print` must
         // get the ordinary import steer, not "switch to the web set".
-        for shared in ["print", "Option", "Some", "None", "Result", "Ok", "Err"] {
+        for shared in [
+            "print", "Iterator", "Option", "Some", "None", "Result", "Ok", "Err",
+        ] {
             names.remove(shared);
         }
         // A MODULE-carried entry (`style`, `ui`) leaves the steer set too:
@@ -52934,6 +53012,168 @@ impl<'src> Analyzer<'src> {
             });
             self.warning_sources.push(source);
         }
+    }
+
+    /// A155: one element whose class is written twice in one chain — an element
+    /// head's `class("x")` and a `.styled(card)`, two `.styled`s, a `.class` and
+    /// a `.bind_styled` — keeps only the LAST write: every one of std's `View`
+    /// class writers SETS the attribute, on both ui twins, so the earlier write is
+    /// silently lost (`<div class("x") .styled(card) />` renders only `card`'s
+    /// classes, and the reverse order only `x`). A WARNING naming both writers,
+    /// at the one that wins.
+    ///
+    /// Statically visible means one receiver chain: from each writer, the walk
+    /// follows the receiver while it is a dotted call of one of std's `View`
+    /// methods (every one of which hands back the element it was called on), so
+    /// an element head — which lowers to exactly such a chain — and a written
+    /// chain over `view("..")` are both seen, and a chain broken by a function
+    /// of the program's own is not. Whether the writers should APPEND instead is
+    /// an open design question (census first); this pass does not change them.
+    fn check_class_written_twice(&mut self) {
+        // Each class writer: its call, its receiver entity, its source.
+        let mut writers: HashMap<Id, (Id, SourceId)> = HashMap::default();
+        // Every dotted call of a std `View` method, by its CALL ENTITY, with its
+        // receiver entity: the links the walk may cross.
+        let mut links: HashMap<Id, (Id, Id)> = HashMap::default();
+        let call_entities: HashMap<Id, Id> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter_map(|(entity, expr)| match expr {
+                Expr::Call(call_id) => Some((*call_id, *entity)),
+                _ => None,
+            })
+            .collect();
+        for (call_id, function_call) in &self.function_calls {
+            if !self.member_name_spans.contains_key(call_id) {
+                continue;
+            }
+            let Some(Expr::Local(member_id)) =
+                self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            if !self.is_std_view_member(*member_id) {
+                continue;
+            }
+            let Some(&receiver) = function_call.argument_ids.first() else {
+                continue;
+            };
+            if let Some(&entity) = call_entities.get(call_id) {
+                links.insert(entity, (*call_id, receiver));
+            }
+            let writes_class = match self.callable_name(*member_id) {
+                Some("class" | "styled" | "bind_class" | "bind_styled") => true,
+                Some("attr") => matches!(
+                    function_call
+                        .argument_ids
+                        .get(1)
+                        .and_then(|name| self.expr_id_to_expr_map.get(name)),
+                    Some(Expr::String("class"))
+                ),
+                _ => false,
+            };
+            if !writes_class {
+                continue;
+            }
+            let Some(source) = self.source_of_id(*call_id) else {
+                continue;
+            };
+            if self.std_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+                || self.derived_origin_file(*call_id).is_some()
+            {
+                continue;
+            }
+            writers.insert(*call_id, (receiver, source));
+        }
+        if writers.len() < 2 {
+            return;
+        }
+        // From each writer, the nearest writer BELOW it on its receiver chain:
+        // the write it overrides. Reported once per pair, at the later writer.
+        let mut pairs: Vec<(SourceId, Id, Id)> = Vec::new();
+        for (call_id, (receiver, source)) in &writers {
+            let mut current = *receiver;
+            while let Some(&(inner_call, inner_receiver)) = links.get(&current) {
+                if writers.contains_key(&inner_call) {
+                    pairs.push((*source, inner_call, *call_id));
+                    break;
+                }
+                current = inner_receiver;
+            }
+        }
+        let mut sites: Vec<(SourceId, Span, String, String, Span)> = pairs
+            .into_iter()
+            .filter_map(|(source, earlier, later)| {
+                let (earlier_text, earlier_span) = self.class_writer_text(earlier, source)?;
+                let (later_text, later_span) = self.class_writer_text(later, source)?;
+                Some((source, later_span, earlier_text, later_text, earlier_span))
+            })
+            .collect();
+        sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
+        sites.dedup_by_key(|(source, span, ..)| (source.0, span.start, span.end));
+        for (source, span, earlier, later, earlier_span) in sites {
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: Some(Note::here(
+                    earlier_span,
+                    format!("`{earlier}` writes this element's class first"),
+                )),
+                span,
+                msg: format!(
+                    "this element's class is written twice — `{earlier}` and then \
+                     `{later}` — and only the last write stays: `{later}` replaces \
+                     what `{earlier}` wrote. Compose them into one writer (two styles \
+                     add: `.styled(a + b)`), or drop one"
+                ),
+            });
+            self.warning_sources.push(source);
+        }
+    }
+
+    /// Whether `member_id` is a method of std's own `View` (either ui twin).
+    fn is_std_view_member(&self, member_id: Id) -> bool {
+        let Some(index) = self.implementation_by_declaration.get(&member_id) else {
+            return false;
+        };
+        let implementation = &self.implementations[*index];
+        let Some(Type::Struct(struct_id, _)) =
+            self.type_id_to_type_map.get(&implementation.subject)
+        else {
+            return false;
+        };
+        self.structs.get(struct_id).is_some_and(|struct_| {
+            struct_.name == "View"
+                && self
+                    .source_of_id(struct_.id)
+                    .is_some_and(|source| self.std_sources.contains(&source))
+        })
+    }
+
+    /// A class writer as its author wrote it — `.styled(card)` for a chain link,
+    /// `class("x")` for an element head's attribute — and the span to point at:
+    /// from the member's name to the end of its arguments.
+    fn class_writer_text(&self, call_id: Id, source: SourceId) -> Option<(String, Span)> {
+        let name = *self.member_name_spans.get(&call_id)?;
+        let arguments = self.function_calls.get(&call_id)?.arguments_span;
+        let text = self.source_text(source)?;
+        let start = name.start.min(arguments.start);
+        let mut end = arguments.end.max(name.end);
+        // An element head's attribute spans its name through its VALUE, and the
+        // closing parenthesis belongs to neither: take it back.
+        let rest = text.get(end..)?;
+        let blank = rest.len() - rest.trim_start().len();
+        if rest.trim_start().starts_with(')') && !text.get(start..end)?.ends_with(')') {
+            end += blank + 1;
+        }
+        let written = text.get(start..end)?;
+        let dotted = text[..start].trim_end().ends_with('.');
+        let label = if dotted {
+            format!(".{written}")
+        } else {
+            written.to_string()
+        };
+        Some((label, (start..end).into()))
     }
 
     /// B382: `export [deprecated("use …")] import a::X as Y;` deprecates the
@@ -64882,13 +65122,11 @@ fn annotation_is_keyed_cell(type_node: Option<&Node<'_>>) -> bool {
     )
 }
 
-/// Whether a WRITTEN type head names the hash map: `HashMap`, or `Map`, its
-/// spelling before tracker I9, which `std::map` keeps one release as a
-/// deprecated re-export of the same type. The `[expose]` shape checks read the
-/// annotation before any type resolves, so both spellings are the map here —
-/// drop `Map` with the alias.
+/// Whether a WRITTEN type head names the hash map. The `[expose]` shape checks
+/// read the annotation before any type resolves. (`Map`, the spelling before
+/// tracker I9, went with its alias in R-e.)
 fn is_hash_map_head(head: &str) -> bool {
-    matches!(head, "HashMap" | "Map")
+    head == "HashMap"
 }
 
 fn sole_argument_is_map(type_node: Option<&Node<'_>>) -> bool {
@@ -71039,9 +71277,7 @@ fn analyze_inner<'src>(
     // The `std::hash_set` `HashSet` struct, if `hash_set.vl` loaded. Its
     // `new`/`insert`/... method ids are captured below after `build()`. `HashSet`
     // is imported explicitly (not an always-loaded core module), so it isn't bound
-    // into the global scope. Read from the DECLARING module: `std::set`'s
-    // deprecated `Set` (I9) is a re-export of this same entity, so a program that
-    // still spells the old name lands here too.
+    // into the global scope. Read from the DECLARING module.
     let set_struct_id = module_scopes
         .get("hash_set")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
@@ -71055,8 +71291,7 @@ fn analyze_inner<'src>(
     // The `std::hash_map` `HashMap` struct, if `hash_map.vl` loaded — captured so
     // R10 (destruction.md §4) can reject a resource type argument (`HashMap<str,
     // Database>`). `HashMap` is a vilan wrapper over `NativeMap`, so its element
-    // still lands in host-opaque storage. `std::map`'s deprecated `Map` is the same
-    // entity (I9), as `HashSet` is above.
+    // still lands in host-opaque storage.
     let map_struct_id = module_scopes
         .get("hash_map")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
@@ -71897,6 +72132,10 @@ fn analyze_over_world<'src>(
         // past.
         // B515 reads the import reaches, which the plain-reach pass consumes.
         analyzer.check_trait_method_scope(global_scope_id);
+        // A155: one element's class written twice in one statically visible
+        // chain. Post-build because it reads which `View` member each link
+        // resolved to.
+        analyzer.check_class_written_twice();
         analyzer.check_plain_reaches();
         analyzer.check_duplicate_module_declarations();
         // Two impls declaring one name for one subject (B57): a coherence rule, so

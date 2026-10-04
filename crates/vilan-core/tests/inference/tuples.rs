@@ -8318,3 +8318,145 @@ fn b442_a_bare_none_in_a_mapped_argument_takes_the_bound_familys_element() {
     );
     assert_fails(&program("count((1, true), (Some(1), Some(2)))"));
 }
+
+// --- A152: `zip_some` and `SignalCell<(..)>::unzip` --------------------------
+//
+// The ruling (2026-10-03): `zip_some` takes a tuple of `Flow<Option<..>>` and
+// answers `Some` of the payloads only while every input is `Some` — value level,
+// stateless, on `combine`'s per-arity mechanism; `unzip` splits a tuple-valued
+// cell into one cell per position, written in place.
+
+/// Arity two and three, the negative state at every position, and the zip
+/// following each input's changes — read through a sealed memo, which is a
+/// consumer like any other.
+#[test]
+fn a152_zip_some_is_some_only_while_every_input_is() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Pipe, Signal, SignalCell, Source, zip_some };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet name: SignalCell<Option<str>> = Signal::new(Some(\"Ada\"));\n",
+            "\tlet age: SignalCell<Option<i32>> = Signal::new(None);\n",
+            "\tlet flag: SignalCell<Option<bool>> = Signal::new(Some(true));\n",
+            "\tlet pair = zip_some((name, age)).memo();\n",
+            "\tlet triple = zip_some((name, age, flag)).memo();\n",
+            "\tprint(i\"{pair.get().is_none()} {triple.get().is_none()}\");\n",
+            "\tage.set(Some(36));\n",
+            "\tmatch pair.get() {\n",
+            "\t\tSome((let n, let a)) => print(i\"{n} {a}\"),\n",
+            "\t\tNone => print(\"none\"),\n",
+            "\t}\n",
+            "\tmatch triple.get() {\n",
+            "\t\tSome((let n, let a, let f)) => print(i\"{n} {a} {f}\"),\n",
+            "\t\tNone => print(\"none\"),\n",
+            "\t}\n",
+            "\tflag.set(None);\n",
+            "\tprint(i\"{pair.get().is_some()} {triple.get().is_none()}\");\n",
+            "\tname.set(None);\n",
+            "\tprint(i\"{pair.get().is_none()}\");\n",
+            "}\n",
+        ),
+        "true true\nAda 36\nAda 36 true\ntrue true\ntrue\n",
+    );
+}
+
+/// Each input is any FLOW of a maybe: a pipe is moved in (here a `derive` and an
+/// `and_then` that depends on another input — the dependent case the item
+/// names), and the zip composes as a stage: `.derive` over it, then a consumer.
+/// The dependent input is a DIAMOND on `message`, so each write is a `batch`:
+/// a turn runs the consumer once, on settled values (outside one, an inline
+/// notify reaches it once per arm, as it does any `combine`).
+#[test]
+fn a152_zip_some_takes_pipes_and_composes_as_a_stage() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::display::Display;\n",
+            "import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, batch, zip_some };\n",
+            "\n",
+            "struct Message {\n",
+            "\tauthor: usize,\n",
+            "\tcontent: str,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet users: SignalCell<List<str>> = Signal::new([\"ada\", \"grace\"]);\n",
+            "\tlet message: SignalCell<Option<Message>> = Signal::new(None);\n",
+            "\tlet author = message\n",
+            "\t\t.and_then(|m| users.derive(|names| names.get(m.author)))\n",
+            "\t\t.memo();\n",
+            "\tlet line = zip_some((message, author.derive(|name| name)))\n",
+            "\t\t.derive(|both| match both {\n",
+            "\t\t\tSome((let m, let name)) => i\"{name}: {m.content}\",\n",
+            "\t\t\tNone => \"(nothing)\",\n",
+            "\t\t})\n",
+            "\t\t.memo();\n",
+            "\tmut seen: List<str> = [];\n",
+            "\tlet _watch = line.sub(|text| seen.push(text));\n",
+            "\tbatch(|| message.set(Some(Message { author = 1, content = \"hi\" })));\n",
+            "\tbatch(|| message.set(Some(Message { author = 0, content = \"yo\" })));\n",
+            "\tbatch(|| message.set(Some(Message { author = 5, content = \"lost\" })));\n",
+            "\tprint(seen.join(\" | \"));\n",
+            "}\n",
+        ),
+        "(nothing) | grace: hi | ada: yo | (nothing)\n",
+    );
+}
+
+/// `unzip` at arity two and three: the parts are seeded with the whole's
+/// payloads and written IN PLACE on every change of the whole (the SAME cells —
+/// an observer taken before the write sees it), and a part's own `set` does not
+/// write back.
+#[test]
+fn a152_unzip_splits_a_tuple_cell_into_cells_written_in_place() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::display::Display;\n",
+            "import std::reactive::{ Flow, Signal, SignalCell, Source };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet pair = Signal::new((1, \"one\"));\n",
+            "\tlet (number, word) = pair.unzip();\n",
+            "\tmut words: List<str> = [];\n",
+            "\tlet _watch = word.on_change(|w| words.push(w));\n",
+            "\tpair.set((2, \"two\"));\n",
+            "\tpair.set((3, \"two\"));\n",
+            "\tprint(i\"{number.get()} {word.get()} {words.join(\",\")}\");\n",
+            "\tnumber.set(9);\n",
+            "\tprint(i\"{pair.get().0}\");\n",
+            "\tlet triple = Signal::new((1, (2, 3), \"c\"));\n",
+            "\tlet (a, b, c) = triple.unzip();\n",
+            "\ttriple.set((4, (5, 6), \"d\"));\n",
+            "\tprint(i\"{a.get()} {b.get().1} {c.get()}\");\n",
+            "}\n",
+        ),
+        "3 two two,two\n3\n4 6 d\n",
+    );
+}
+
+/// `unzip` is a materialising node, like `.cell()`: under an owner its follow
+/// registers with the owner, so the parts stop following when the owner is
+/// disposed.
+#[test]
+fn a152_unzips_follow_dies_with_the_owner_that_split_it() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, run_with_owner };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet pair = Signal::new((1, \"one\"));\n",
+            "\tlet owner = Owner::new();\n",
+            "\tlet (number, _word) = run_with_owner(owner, || pair.unzip());\n",
+            "\tpair.set((2, \"two\"));\n",
+            "\towner.dispose();\n",
+            "\tpair.set((3, \"three\"));\n",
+            "\tprint(i\"{number.get()}\");\n",
+            "}\n",
+        ),
+        "2\n",
+    );
+}

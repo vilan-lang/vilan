@@ -25,6 +25,7 @@ Decoding untrusted input is fallible the same way `from_json` is: handle
 the `Err` with `match`, `!`, or `unwrap_or_else`.
 
 ```vilan
+import std::display::Display;
 import std::markdown::{ parse, Block, Doc, Inline, ParseError };
 import std::result::Result::{ Err, Ok };
 

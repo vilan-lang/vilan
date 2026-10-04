@@ -3058,73 +3058,15 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
     );
 }
 
-/// I9: `Map` is `HashMap`'s spelling before the rename, kept one release as
-/// `std::map`'s deprecated alias — and the keyed exposure reads its annotation
-/// AS WRITTEN, before any type resolves, in two places (the analyzer's shape
-/// check and the `[service]` expansion). Both must take the old spelling as the
-/// map: the program compiles, and the contract it states is the `HashMap`
-/// spelling's, keyed — not the whole-value channel's, which is what the
-/// expansion would fall back to if it did not recognise the element.
-#[test]
-fn i9_the_deprecated_map_spelling_is_still_a_keyed_expose_map() {
-    assert_compiles_and_runs(
-        r#"
-        import std::io::print;
-        import std::hash_map::HashMap;
-        import std::map::Map;
-        import std::reactive::{ Signal, SignalCell };
-        import std::wire::Keyed;
-        [derive(Wire, PartialEq, Debug)]
-        struct Task { id: str }
-        impl Task with Keyed<str> {
-            fun key(self): str { self.id }
-        }
-        [service(NewClient)]
-        struct NewStore {
-            [expose(keyed)] tasks: SignalCell<HashMap<str, Task>>,
-        }
-        impl NewStore {
-            [rpc]
-            fun count(self): usize { self.tasks.get().len() }
-        }
-        [service(OldClient)]
-        struct OldStore {
-            [expose(keyed)] tasks: SignalCell<Map<str, Task>>,
-        }
-        impl OldStore {
-            [rpc]
-            fun count(self): usize { self.tasks.get().len() }
-        }
-        [service(WholeClient)]
-        struct WholeStore {
-            [expose] tasks: SignalCell<HashMap<str, Task>>,
-        }
-        impl WholeStore {
-            [rpc]
-            fun count(self): usize { self.tasks.get().len() }
-        }
-        fun main() {
-            let keyed = NewStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
-            let old = OldStore { tasks = Signal::new(Map::new()) }.contract_hash();
-            let whole = WholeStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
-            print(old == keyed);
-            print(keyed == whole);
-        }
-        main();
-        "#,
-        "true\nfalse\n",
-    );
-}
-
 /// A144 (R-f): the contract hash reads the RESOLVED type, so every spelling of
-/// one wire contract hashes alike — the deprecated `Map<..>`, `HashMap<..>`, a
-/// renaming import of it, on an `[rpc]` signature and on a WHOLE-value
-/// `[expose]` (whose element the hash names). Red before A144 (the hash read
-/// the types as written): the three `[rpc]` services printed `7edcd9bc`,
-/// `966c1d7c` and `1956457c`, and the two whole exposures differed. The value
-/// itself is djb2 over the canonical surface,
+/// one wire contract hashes alike — `HashMap<..>` and a renaming import of it,
+/// on an `[rpc]` signature and on a WHOLE-value `[expose]` (whose element the
+/// hash names). Red before A144 (the hash read the types as written): the
+/// `[rpc]` services printed different hashes, and the two whole exposures
+/// differed. The value itself is djb2 over the canonical surface,
 /// `counts(HashMap<str, i32>)->HashMap<str, i32>;` — the spelling a plainly
-/// written service already had, so its hash did not move.
+/// written service already had, so its hash did not move. (The deprecated
+/// `Map<..>` spelling was the third until R-e removed it.)
 #[test]
 fn a144_an_alias_and_its_target_hash_alike() {
     assert_compiles_and_runs(
@@ -3132,7 +3074,6 @@ fn a144_an_alias_and_its_target_hash_alike() {
         import std::io::print;
         import std::hash_map::HashMap;
         import std::hash_map::HashMap as Table;
-        import std::map::Map;
         import std::reactive::{ Signal, SignalCell };
         [service(NewClient)]
         struct NewSpelling {
@@ -3141,14 +3082,6 @@ fn a144_an_alias_and_its_target_hash_alike() {
         impl NewSpelling {
             [rpc]
             fun counts(self, names: HashMap<str, i32>): HashMap<str, i32> { names }
-        }
-        [service(OldClient)]
-        struct OldSpelling {
-            unused: i32,
-        }
-        impl OldSpelling {
-            [rpc]
-            fun counts(self, names: Map<str, i32>): Map<str, i32> { names }
         }
         [service(RenamedClient)]
         struct RenamedSpelling {
@@ -3166,26 +3099,139 @@ fn a144_an_alias_and_its_target_hash_alike() {
             [rpc]
             fun size(self): usize { self.counts.get().len() }
         }
-        [service(WholeOldClient)]
-        struct WholeOld {
-            [expose] counts: SignalCell<Map<str, i32>>,
+        [service(WholeRenamedClient)]
+        struct WholeRenamed {
+            [expose] counts: SignalCell<Table<str, i32>>,
         }
-        impl WholeOld {
+        impl WholeRenamed {
             [rpc]
             fun size(self): usize { self.counts.get().len() }
         }
         fun main() {
             print(NewSpelling { unused = 0 }.contract_hash());
-            print(OldSpelling { unused = 0 }.contract_hash());
             print(RenamedSpelling { unused = 0 }.contract_hash());
             let whole_new = WholeNew { counts = Signal::new(HashMap::new()) }.contract_hash();
-            let whole_old = WholeOld { counts = Signal::new(Map::new()) }.contract_hash();
-            print(whole_new == whole_old);
+            let whole_renamed = WholeRenamed { counts = Signal::new(HashMap::new()) }.contract_hash();
+            print(whole_new == whole_renamed);
         }
         main();
         "#,
-        "7edcd9bc\n7edcd9bc\n7edcd9bc\ntrue\n",
+        "7edcd9bc\n7edcd9bc\ntrue\n",
     );
+}
+
+// --- B525: the contract hash sees a Wire type's SHAPE -------------------------
+//
+// mirrored-store.md S0 (Q14, ruled into v0.44.0): the binary codec reads by
+// position and the JSON one by name, so a type whose fields or variants moved is
+// another contract under the same name. Each pin builds the same service over
+// two declarations of its Wire type and compares the hashes.
+
+/// The service every B525 pin hashes: one `[rpc]` taking and returning the
+/// type under test, and one handle return of it.
+fn b525_hash_of(declarations: &str) -> String {
+    let source = format!(
+        "{}{declarations}{}",
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+        ),
+        concat!(
+            "[service(SvcClient)]\n",
+            "struct Svc {\n",
+            "\tlast: SignalCell<Option<Message>>,\n",
+            "}\n",
+            "impl Svc {\n",
+            "\t[rpc]\n",
+            "\tfun echo(self, message: Message): Message { message }\n",
+            "\t[rpc]\n",
+            "\tfun watch(self): SignalCell<Option<Message>> { self.last }\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(Svc { last = Signal::new(None) }.contract_hash());\n",
+            "}\n",
+        )
+    );
+    compile_and_run(&source)
+        .unwrap_or_else(|errors| panic!("expected a clean run, got: {errors:#?}"))
+        .trim()
+        .to_string()
+}
+
+/// A struct that gains a field, loses one, reorders two, renames one or
+/// changes one's type is a different contract; the same declaration hashes
+/// the same. Red on 0.43.0, where all six printed `b8fcf645`-alike.
+#[test]
+fn b525_a_wire_structs_fields_are_in_the_contract_hash() {
+    let base = "[derive(Wire)]\nstruct Message {\n\tid: u53,\n\tcontent: str,\n}\n";
+    let variants = [
+        "[derive(Wire)]\nstruct Message {\n\tid: u53,\n\tcontent: str,\n\tedited: bool,\n}\n",
+        "[derive(Wire)]\nstruct Message {\n\tid: u53,\n}\n",
+        "[derive(Wire)]\nstruct Message {\n\tcontent: str,\n\tid: u53,\n}\n",
+        "[derive(Wire)]\nstruct Message {\n\tid: u53,\n\ttext: str,\n}\n",
+        "[derive(Wire)]\nstruct Message {\n\tid: i32,\n\tcontent: str,\n}\n",
+    ];
+    let base_hash = b525_hash_of(base);
+    assert_eq!(base_hash, b525_hash_of(base), "one declaration, one hash");
+    let mut seen = vec![base_hash.clone()];
+    for variant in variants {
+        let hash = b525_hash_of(variant);
+        assert!(
+            !seen.contains(&hash),
+            "a changed shape must move the hash; {variant:?} hashed {hash}, already seen in {seen:?}"
+        );
+        seen.push(hash);
+    }
+}
+
+/// The walk is recursive: a field's own struct, an enum's variants (added,
+/// reordered, a payload changed) and a backed enum's backing values are all in
+/// the hash — and a recursive type ends the walk at its second mention.
+#[test]
+fn b525_the_shape_walk_reaches_nested_types_variants_and_instances() {
+    let pairs = [
+        (
+            "[derive(Wire)]\nstruct Author {\n\tname: str,\n}\n",
+            "[derive(Wire)]\nstruct Author {\n\tname: str,\n\tid: u53,\n}\n",
+        ),
+        (
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(str),\n}\n",
+            "[derive(Wire)]\nenum Kind {\n\tImage(str),\n\tText,\n}\n",
+        ),
+        (
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(str),\n}\n",
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(u53),\n}\n",
+        ),
+        (
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(str),\n}\n",
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(str),\n\tVideo,\n}\n",
+        ),
+        (
+            "[derive(Wire)]\nenum Level {\n\tLow = 1,\n\tHigh = 2,\n}\n",
+            "[derive(Wire)]\nenum Level {\n\tLow = 1,\n\tHigh = 3,\n}\n",
+        ),
+    ];
+    let message = |inner: &str, field: &str| {
+        format!("{inner}[derive(Wire)]\nstruct Message {{\n\tid: u53,\n\t{field},\n}}\n")
+    };
+    for (before, after) in pairs {
+        let field = if before.contains("Author") {
+            "author: Author"
+        } else if before.contains("Level") {
+            "level: Level"
+        } else {
+            "kind: Kind"
+        };
+        assert_ne!(
+            b525_hash_of(&message(before, field)),
+            b525_hash_of(&message(after, field)),
+            "a nested shape change must move the hash: {before:?} -> {after:?}"
+        );
+    }
+    // A recursive type: the second mention is the name alone, so the walk ends.
+    let recursive = "[derive(Wire)]\nstruct Reply {\n\ttext: str,\n\tquoted: List<Reply>,\n}\n\
+                     [derive(Wire)]\nstruct Message {\n\tid: u53,\n\treply: Reply,\n}\n";
+    assert_eq!(b525_hash_of(recursive).len(), 8);
 }
 
 /// A56 / R6: the field names its key TWICE — once in the attribute, once in the

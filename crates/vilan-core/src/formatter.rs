@@ -9744,7 +9744,7 @@ mod idempotency {
         result_vl => "result.vl",
         list_vl => "list.vl",
         string_vl => "string.vl",
-        set_vl => "set.vl",
+        hash_set_vl => "hash_set.vl",
         iterator_vl => "iterator.vl",
         arena_vl => "arena.vl",
         shared_vl => "shared.vl",

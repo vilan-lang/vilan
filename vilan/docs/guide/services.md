@@ -77,6 +77,7 @@ fields are typed **mirrors** (`RemoteSource<T>`, one per `[expose]`) and
 whose rpc methods are ordinary calls that return `Result`:
 
 ```vilan,browser
+import std::debug::Debug;
 import std::reactive::{ Signal, SignalCell };
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };

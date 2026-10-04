@@ -7849,3 +7849,111 @@ fn b471_a_css_call_on_a_style_names_the_rename() {
         "#;
     assert_fails_with(source, CSS_RENAME_NOTE);
 }
+
+// --- A155: one element's class written twice ----------------------------------
+//
+// RULED (2026-10-03): a WARNING naming both writers when one element sets its
+// class twice where it is statically visible in one chain. Every one of std's
+// `View` class writers SETS the attribute, so the earlier write is lost.
+
+const A155_HEAD: &str = concat!(
+    "import std::reactive::{ Signal, SignalCell };\n",
+    "import std::style::{ Length, Style };\n",
+    "import std::ui::{ View, render, view };\n",
+    "\n",
+    "let card: Style = css { padding(Length::px(4)); };\n",
+    "let other: Style = css { margin(Length::px(2)); };\n",
+    "\n",
+);
+
+/// Each writer pair, in each order, named at the writer that wins: an element
+/// head's `class(..)` and `.styled(..)`, two `.styled`s, a `.class` and a
+/// `.bind_class` across links that are not writers (`.attr("title", ..)`, a
+/// `.child`), and a hand-written `.attr("class", ..)` before a `.bind_styled`.
+#[test]
+fn a155_an_element_that_writes_its_class_twice_warns_naming_both_writers() {
+    let cases = [
+        (
+            "\tlet v = <div class(\"x\") .styled(card) />;\n",
+            "styled(card)",
+            "`class(\"x\")` and then `.styled(card)`",
+        ),
+        (
+            "\tlet v = <div .styled(card) class(\"x\") />;\n",
+            "class(\"x\")",
+            "`.styled(card)` and then `class(\"x\")`",
+        ),
+        (
+            "\tlet v = view(\"div\").styled(card).styled(other);\n",
+            "styled(other)",
+            "`.styled(card)` and then `.styled(other)`",
+        ),
+        (
+            "\tlet v = view(\"div\").class(\"a\").attr(\"title\", \"t\").child(view(\"p\")).bind_class(Signal::new(\"b\"));\n",
+            "bind_class(Signal::new(\"b\"))",
+            "`.class(\"a\")` and then `.bind_class(Signal::new(\"b\"))`",
+        ),
+        (
+            "\tlet look: SignalCell<Style> = Signal::new(card);\n\tlet v = view(\"div\").attr(\"class\", \"a\").bind_styled(look);\n",
+            "bind_styled(look)",
+            "`.attr(\"class\", \"a\")` and then `.bind_styled(look)`",
+        ),
+    ];
+    for (body, spanning, writers) in cases {
+        let source = format!("{A155_HEAD}fun main() {{\n{body}\tprint(render(v));\n}}\n");
+        let warnings = warning_diagnostics(&source);
+        let matching: Vec<_> = warnings
+            .iter()
+            .filter(|(message, _)| message.contains("this element's class is written twice"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "one warning per overridden write in {body:?}; got: {warnings:#?}"
+        );
+        let (message, range) = matching[0];
+        assert!(
+            message.contains(writers),
+            "the warning must name both writers ({writers}); got: {message}"
+        );
+        assert_eq!(
+            &source[range.clone()],
+            spanning,
+            "the warning stands at the writer that wins; got: {message}"
+        );
+    }
+}
+
+/// Silent where one element writes its class once: composed styles, a class
+/// and other attributes, a nested element writing its OWN class, two elements
+/// built apart, and a chain broken by a function of the program's own (not
+/// statically one element).
+#[test]
+fn a155_one_class_write_per_element_is_silent() {
+    let source = format!(
+        "{A155_HEAD}{}",
+        concat!(
+            "fun wrap(view: View): View {\n",
+            "\tview\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(render(<div .styled(card + other) />));\n",
+            "\tprint(render(<div class(\"a\") title(\"t\") />));\n",
+            "\tprint(render(<div class(\"a\")><p class(\"b\") /></div>));\n",
+            "\tlet first = view(\"div\").class(\"a\");\n",
+            "\tlet second = view(\"div\").styled(card);\n",
+            "\tprint(render(first));\n",
+            "\tprint(render(second));\n",
+            "\tprint(render(wrap(view(\"div\").class(\"a\")).styled(card)));\n",
+            "}\n",
+        )
+    );
+    let warnings = warning_diagnostics(&source);
+    assert!(
+        warnings
+            .iter()
+            .all(|(message, _)| !message.contains("written twice")),
+        "no element here writes its class twice; got: {warnings:#?}"
+    );
+}

@@ -647,3 +647,9 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 622	-	cannot reassign '{place}' while a view into it is live: the view points into the storage this write replaces (rule 4: no invalidating mutation under a live view).
 623	-	`{symbol}` computes on two numbers, but the right operand is `{rhs}`, which is not one: there are no implicit conversions, and the host would compute on its lowering (`2 * true` is `2`, typed `{lhs}`). Compute on the number you mean (`if flag { 1 } else { 0 }`, or a `parse` of the string)
 624	-	`[rpc]` method `{method_name}` returns `{written}`, a trait: a bare-trait return hides the body's type from the caller, and what crosses the wire for a hidden type is not designed — return {steer}
+625	-	this element's class is written twice — `{earlier}` and then `{later}` — and only the last write stays: `{later}` replaces what `{earlier}` wrote. Compose them into one writer (two styles add: `.styled(a + b)`), or drop one
+626	-	`std::map` was removed: its `Map` is `std::hash_map::HashMap`
+627	-	`std::set` was removed: its `Set` is `std::hash_set::HashSet`
+628	-	`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell` (re-exported from `std::reactive`)
+629	-	`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell` (re-exported from `std::reactive`)
+630	-	`{part}` was renamed `{new}`: write `import std::{module}::{new};`

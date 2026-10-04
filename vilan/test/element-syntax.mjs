@@ -151,11 +151,15 @@ function $d(self, parent, name2) {
 	$e(self, parent, name2);
 }
 function $c(self, name2, value) {
-	$d(value, self, name2);
+	if (name2 !== "autofocus") {
+		$d(value, self, name2);
+	}
 	return __clone(self);
 }
 function $k(self, name2, value) {
-	apply(value, self, name2);
+	if (name2 !== "autofocus") {
+		apply(value, self, name2);
+	}
 	return __clone(self);
 }
 function $l(self, content) {

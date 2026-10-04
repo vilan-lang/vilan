@@ -724,13 +724,16 @@ export impl StoreSome<type P> {
 	/// live — `when_live`'s body (§2.6). Reads and writes go through the variant as
 	/// before. Should a reader run in the turn that ENDS the variant, before the
 	/// body is released — a derivation settles ahead of the effect that tears the
-	/// body down — it reads the payload as it was when this was called, and a write
-	/// then lands nowhere. Refuses a variant that is not live now.
+	/// body down — it reads the LAST payload a read through the live variant saw
+	/// (B526, mirrored-store.md Q11: a message edited and then deleted repaints
+	/// nothing older than its edit), and a write then lands nowhere. Refuses a
+	/// variant that is not live now.
 	fun assume(self): Store<P> {
-		// A capture, not a cell: nothing writes it, and a closure captures the
-		// BINDING (spec §6.9).
-		let snapshot = self.get();
-		if snapshot.is_none() {
+		// The fallback is refreshed by every read that reaches the live payload, so
+		// it is the last value anyone read — every subscriber's wake is such a
+		// read. A binding the closure captures, not a cell (spec §6.9, M93's rule).
+		mut last = self.get();
+		if last.is_none() {
 			panic("`StoreSome::assume` on a variant that is not live");
 		}
 		let lend = self.lend;
@@ -741,11 +744,12 @@ export impl StoreSome<type P> {
 				mut reached = false;
 				lend(|payload: &P| {
 					reached = true;
+					last = Some(*payload);
 					f(&payload);
 				});
 				if !reached {
-					match snapshot {
-						Some(let last) => f(&last),
+					match last {
+						Some(let held) => f(&held),
 						None => {},
 					}
 				}

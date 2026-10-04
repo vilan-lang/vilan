@@ -7128,20 +7128,21 @@ fn n113_the_helper_the_getter_and_an_unknown_global_still_compile() {
 
 // --- B472: the import steer indexes std's deprecated ALIAS re-exports -------
 
-/// `Map` and `Set` are `export [deprecated(..)] import … as Map;` in
+/// `Map` and `Set` were `export [deprecated(..)] import … as Map;` in
 /// `std::map`/`std::set` — re-exports, which declare nothing, so the steer's
 /// index held no entry and an unimported `Map` got no hint while an unimported
-/// `HashMap` got the right one. A deprecated alias now steers to the name it
-/// stands for, with the import that name takes.
+/// `HashMap` got the right one. B472 made a deprecated alias steer to the name
+/// it stands for; R-e (Order 46) removed the two aliases, and the unimported old
+/// name now carries R-e's renamed-name steer instead.
 #[test]
 fn b472_an_unimported_deprecated_alias_steers_to_the_name_it_stands_for() {
     assert_fails_with(
         "fun main() {\n    let counts: Map<str, i32> = Map::new();\n    print(counts.len());\n}\n",
-        "did you mean `HashMap` (`import std::hash_map::HashMap;`)? `Map` is its deprecated alias",
+        "`Map` was renamed `HashMap` — `import std::hash_map::HashMap;`",
     );
     assert_fails_with(
         "fun main() {\n    let seen: Set<i32> = Set::new();\n    print(seen.len());\n}\n",
-        "did you mean `HashSet` (`import std::hash_set::HashSet;`)? `Set` is its deprecated alias",
+        "`Set` was renamed `HashSet` — `import std::hash_set::HashSet;`",
     );
     // The control: the new name's own steer is the ordinary one.
     assert_fails_with(

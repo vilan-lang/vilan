@@ -723,8 +723,9 @@ fn a142_s7_a_handle_into_a_payload_is_a_source_of_an_option_with_patch() {
 fn a142_s7_a_payload_store_assumed_reads_the_last_payload_once_the_variant_ends() {
     // `assume()` — what `when_live` hands its body — is a `Store<P>` through the
     // variant: it reads and writes the live payload, and should a reader run in
-    // the turn that ends the variant it reads the payload as it was when assumed,
-    // while a write then lands nowhere. Assuming a dead variant is refused.
+    // the turn that ends the variant it reads the LAST payload a read through the
+    // live variant saw (B526: `phone`, not the `laptop` it was assumed at), while
+    // a write then lands nowhere. Assuming a dead variant is refused.
     assert_compiles_and_runs(
         &variant_program(
             r#"
@@ -742,7 +743,49 @@ fn a142_s7_a_payload_store_assumed_reads_the_last_payload_once_the_variant_ends(
             print(i"ended: {device.name().get()} online={presence.is_online().get()}");
             "#,
         ),
-        "live: phone root=phone\nended: laptop online=false\n",
+        "live: phone root=phone\nended: phone online=false\n",
+    );
+}
+
+#[test]
+fn b526_an_assumed_handle_holds_the_last_value_its_subscribers_read() {
+    // B526 (mirrored-store.md S0, Q11): the payload is patched through ANOTHER
+    // handle and then deleted. The assumed handle's subscriber is woken by the
+    // patch and reads `edited` through the live variant; when the delete ends the
+    // variant, the same subscriber wakes again and reads the fallback — which is
+    // that last read, not the `hello` the handle was assumed at. Before the fix it
+    // repainted `hello` for the turn before teardown.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+        import std::io::print;
+        import std::reactive::{ Flow, Owner, Source, run_with_owner };
+        import std::store::{ Storable, Store, StoreSome };
+
+        [derive(Storable, PartialEq)]
+        struct Message {
+            id: u53,
+            content: str,
+        }
+
+        fun main() {
+            let slot: Store<Option<Message>> = Store::new(Some(Message { id = 7, content = "hello" }));
+            let held: Store<Message> = slot.some().assume();
+            mut seen: List<str> = [];
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                held.content().effect_on_change(|content| seen.push(content));
+            });
+            let _patched = slot.some().content().patch("edited");
+            slot.set(None);
+            print(seen.join(" "));
+            print(held.content().get());
+            owner.dispose();
+        }
+
+        main();
+        "#,
+        "edited edited\nedited\n",
     );
 }
 
@@ -852,6 +895,41 @@ fn a142_s7_when_live_compiles_on_both_ui_layers() {
              print(render(panel(Store::new(Presence::Offline))));\n}}\n\nmain();\n"
         ),
         "<aside><p>laptop</p></aside>\n<aside></aside>\n",
+    );
+}
+
+#[test]
+fn b526_the_server_twins_when_live_serves_the_payload_as_it_stands() {
+    // B526's server twin: `when_live` reads once, so its body is built over the
+    // payload as it stands at the render — a rename patched through another
+    // handle before the render is the one served.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::Source;
+        import std::store::{ Storable, Store };
+        import std::ui::{ View, render, view, when_live };
+
+        [derive(PartialEq, Storable)]
+        struct Device {
+            name: str,
+        }
+
+        [derive(PartialEq, Storable)]
+        enum Presence {
+            Offline,
+            Online(Device),
+        }
+
+        fun main() {
+            let presence = Store::new(Presence::Online(Device { name = "laptop" }));
+            let _renamed = presence.online().name().patch("phone");
+            print(render(view("aside").child(when_live(presence.online(), |device| view("p").bind_text(device.name())))));
+        }
+
+        main();
+        "#,
+        "<aside><p>phone</p></aside>\n",
     );
 }
 
