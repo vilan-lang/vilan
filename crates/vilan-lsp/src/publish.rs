@@ -523,7 +523,7 @@ fn diagnostic_groups(document: &Document, owner: &Url, paint: bool) -> Vec<(Url,
         // its exact message.
         let code = vilan_core::parsing::ForeignSpelling::of_message(&item.message)
             .map(|spelling| spelling.code())
-            .or_else(|| vilan_core::elements::element_diagnostic_code(&item.message))
+            .or_else(|| vilan_core::parsing::element_diagnostic_code(&item.message))
             .map(|code| NumberOrString::String(code.to_string()));
         let diagnostic = |range| Diagnostic {
             range,

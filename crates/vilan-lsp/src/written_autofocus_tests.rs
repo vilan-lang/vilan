@@ -2,7 +2,7 @@
 //! (`<input autofocus />`) publishes with its stable code
 //! (`element-attribute/autofocus`) and carries a quick fix that rewrites it to
 //! `.autofocus()` in place. The analyzer raises the steer and
-//! `vilan_core::elements::written_autofocus_fix` is the fix's data; this is
+//! `vilan_core::parsing::written_autofocus_fix` is the fix's data; this is
 //! the code action over it, in B520's shape (`foreign_spelling_tests.rs`).
 
 use std::path::Path;

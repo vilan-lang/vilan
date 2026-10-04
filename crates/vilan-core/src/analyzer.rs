@@ -53136,8 +53136,8 @@ impl<'src> Analyzer<'src> {
     /// browser's NATIVE attribute, which acts only at the page's initial parse:
     /// on an element inserted later the document refuses it once something has
     /// focus, and Chromium logs that it did. A WARNING at the attribute's name,
-    /// steering to `.autofocus()` ([`crate::elements::WRITTEN_AUTOFOCUS_MESSAGE`],
-    /// whose quick fix is [`crate::elements::written_autofocus_fix`]).
+    /// steering to `.autofocus()` ([`crate::parsing::WRITTEN_AUTOFOCUS_MESSAGE`],
+    /// whose quick fix is [`crate::parsing::written_autofocus_fix`]).
     ///
     /// An element head's attribute is told from a written `.attr(..)` by its
     /// member reference: the desugar gives the generated `attr` a ZERO-WIDTH
@@ -53197,7 +53197,7 @@ impl<'src> Analyzer<'src> {
                 trace: Vec::new(),
                 note: None,
                 span,
-                msg: crate::elements::WRITTEN_AUTOFOCUS_MESSAGE.to_string(),
+                msg: crate::parsing::WRITTEN_AUTOFOCUS_MESSAGE.to_string(),
             });
             self.warning_sources.push(source);
         }

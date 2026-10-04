@@ -7978,7 +7978,7 @@ const A157_HEAD: &str = concat!(
 /// rewrites it to the method in place.
 #[test]
 fn a157_a_written_autofocus_in_an_element_head_warns_and_steers_to_the_method() {
-    use vilan_core::elements::{WRITTEN_AUTOFOCUS_CODE, written_autofocus_fix};
+    use vilan_core::parsing::{WRITTEN_AUTOFOCUS_CODE, written_autofocus_fix};
     let cases = [
         ("<input autofocus />", "<input .autofocus() />"),
         (
@@ -8042,7 +8042,7 @@ fn a157_a_written_autofocus_in_an_element_head_warns_and_steers_to_the_method() 
 /// (`autofocus(flag)`) is steered without an edit.
 #[test]
 fn a157_an_explicit_attr_call_is_not_steered() {
-    use vilan_core::elements::written_autofocus_fix;
+    use vilan_core::parsing::written_autofocus_fix;
     let source = format!(
         "{A157_HEAD}{}",
         concat!(

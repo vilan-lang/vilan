@@ -7456,7 +7456,7 @@ impl Document {
                     target: None,
                 });
             } else if let Some(fix) =
-                vilan_core::elements::written_autofocus_fix(&self.text, &warning.msg, warning.span)
+                vilan_core::parsing::written_autofocus_fix(&self.text, &warning.msg, warning.span)
             {
                 // A157: a written `autofocus` in an element head — the
                 // analyzer's steer, recognized by its exact message as B520's
