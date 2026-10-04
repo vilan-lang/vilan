@@ -883,31 +883,176 @@ pub struct StdPathFix {
     pub code: &'static str,
     /// The quick fix's title: "Write `std::web::dom`".
     pub title: String,
-    /// The source range the edit replaces: the OLD module segment.
+    /// The source range the edit replaces: the OLD module segment, or, for a
+    /// brace list under the old web-prelude path that also names `std::web`'s
+    /// own children, the stretch from its first prelude name to its last.
     pub span: Span,
-    /// What the edit writes there: the new path below `std::` (`web::dom`).
-    pub replacement: &'static str,
+    /// What the edit writes there: the new path below `std::` (`web::dom`), or
+    /// that stretch with `prelude::` written before each prelude name.
+    pub replacement: String,
 }
 
 /// The quick fix for the diagnostic `message` anchored at `span` in `source`
-/// (A154), or `None` when it is not a moved-module refusal or `span` no longer
-/// covers the old segment (the buffer moved on).
+/// (A154), or `None` when it is not a moved-module refusal, `span` no longer
+/// covers the old segment (the buffer moved on), or the import is a shape no
+/// one edit rewrites correctly ([`moved_std_module_edit`] says which and why).
+pub fn moved_std_module_fix(source: &str, message: &str, span: Span) -> Option<StdPathFix> {
+    moved_std_module_edit(source, message, span)?.ok()
+}
+
+/// The edit that answers a moved-module refusal (A154) — the ONE computation the
+/// editor's quick fix and `vilan check --fix` both apply, so the two cannot
+/// write different paths for the same refusal. `None` when `message` is not a
+/// moved-module refusal or `span` no longer covers the old segment;
+/// `Some(Err(reason))` when the import is a shape the fix leaves to a person,
+/// with the reason in words.
 ///
 /// The refusal anchors at the old module's own segment — `dom` in
 /// `import std::dom::create_element;`, `web` in `std::web::Signal` — so the edit
 /// replaces exactly that segment with the new path below `std::`, and whatever
 /// the path continues with (`::create_element`, a brace list, an alias) stays.
-pub fn moved_std_module_fix(source: &str, message: &str, span: Span) -> Option<StdPathFix> {
+///
+/// One shape needs more (E268): a brace list under the old web-prelude path
+/// that also names one of `std::web`'s own children — `std::web::{ Signal,
+/// dom::create_element }`. `std::web` is that namespace now, so `dom::..`
+/// already resolves there; rewriting `web` to `web::prelude` would carry it
+/// along and break it. The edit instead writes `prelude::` before each name
+/// that is not a child: `std::web::{ prelude::Signal, dom::create_element }`.
+/// The children are read off the one table (every module that moved to
+/// `web::<child>`), so a name that is not one is a prelude name — or a typo,
+/// which stays an ordinary miss under `prelude::` exactly as it does under
+/// `std::web::prelude::{ .. }`.
+pub fn moved_std_module_edit(
+    source: &str,
+    message: &str,
+    span: Span,
+) -> Option<Result<StdPathFix, &'static str>> {
     let (old, new) = moved_std_module_of_message(message)?;
     if source.get(span.into_range())? != old {
         return None;
     }
-    Some(StdPathFix {
+    let whole = || StdPathFix {
         code: MOVED_STD_MODULE_CODE,
         title: format!("Write `std::{new}`"),
         span,
-        replacement: new,
-    })
+        replacement: new.to_string(),
+    };
+    if old != "web" {
+        return Some(Ok(whole()));
+    }
+    let (tree, _errors) = parse(source);
+    let Some(elements) = tree
+        .as_ref()
+        .and_then(|(nodes, _)| web_brace_list_at(nodes, span))
+    else {
+        // `std::web::Signal`, `std::web::{ .. }` read as no import (a parse
+        // the tree does not hold): the segment alone is the edit.
+        return Some(Ok(whole()));
+    };
+    let mut prelude_names = Vec::new();
+    let mut names_a_child = false;
+    for element in elements {
+        match element {
+            ImportBranch::Path("self", ..) => return Some(Err(MOVED_WEB_SELF_REASON)),
+            ImportBranch::Path(name, ..) if is_web_namespace_child(name) => names_a_child = true,
+            ImportBranch::Path(name, name_span, _) => prelude_names.push((*name, *name_span)),
+            ImportBranch::Reach(..) | ImportBranch::Selector(..) | ImportBranch::Set(..) => {
+                return Some(Err(MOVED_WEB_MARKED_REASON));
+            }
+        }
+    }
+    if !names_a_child || prelude_names.is_empty() {
+        return Some(Ok(whole()));
+    }
+    let first = prelude_names[0].1.start;
+    let last = prelude_names[prelude_names.len() - 1].1.start;
+    let mut replacement = String::new();
+    let mut cursor = first;
+    for (_, name_span) in &prelude_names {
+        replacement.push_str(&source[cursor..name_span.start]);
+        replacement.push_str("prelude::");
+        cursor = name_span.start;
+    }
+    let names = prelude_names
+        .iter()
+        .map(|(name, _)| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(Ok(StdPathFix {
+        code: MOVED_STD_MODULE_CODE,
+        title: format!("Write `prelude::` before {names} (the web prelude is `std::web::prelude`)"),
+        span: Span::from(first..last),
+        replacement,
+    }))
+}
+
+/// Why [`moved_std_module_edit`] leaves `std::web::{ self, .. }` to a person:
+/// `self` bound the old prelude module under the name `web`, and no path
+/// edit keeps both that binding and the list's other names.
+pub const MOVED_WEB_SELF_REASON: &str = "the brace list names `self`, which bound the old web      prelude as `web`; `std::web` is a namespace now, so write `prelude as web` (or import the      names from `std::web::prelude`) by hand";
+
+/// Why [`moved_std_module_edit`] leaves a marked brace list under the old
+/// web-prelude path to a person: a reach marker (`#name`), an impl selector
+/// (`(impl T)`) or a nested `{ .. }` group binds no plain name the edit can
+/// prefix with `prelude::`.
+pub const MOVED_WEB_MARKED_REASON: &str = "the brace list holds a reach marker, an impl selector      or a nested group, which the edit cannot prefix with `prelude::`; move those names under      `std::web::prelude` by hand";
+
+/// Whether `name` is one of `std::web`'s own children — every module the one
+/// table moved to `web::<name>`, the web prelude among them.
+fn is_web_namespace_child(name: &str) -> bool {
+    MOVED_STD_MODULES
+        .iter()
+        .filter_map(|(_, new)| new.strip_prefix("web::"))
+        .any(|child| child == name)
+}
+
+/// The elements of the brace list that follows the import segment spanning
+/// exactly `anchor` (`std::web::{ .. }`), wherever the import sits — at the
+/// top of a file or block-scoped. `None` when that segment is not followed by
+/// a brace list (or no import holds it).
+fn web_brace_list_at<'tree, 'src>(
+    nodes: &'tree NodeList<'src>,
+    anchor: Span,
+) -> Option<&'tree [ImportBranch<'src>]> {
+    fn in_branch<'tree, 'src>(
+        branch: &'tree ImportBranch<'src>,
+        anchor: Span,
+    ) -> Option<&'tree [ImportBranch<'src>]> {
+        match branch {
+            ImportBranch::Path(_, span, ImportTail::Continue(next)) if *span == anchor => {
+                match next.as_ref() {
+                    ImportBranch::Set(elements) => Some(elements),
+                    _ => None,
+                }
+            }
+            ImportBranch::Path(_, _, ImportTail::Continue(next)) => in_branch(next, anchor),
+            ImportBranch::Path(..) | ImportBranch::Selector(..) => None,
+            ImportBranch::Set(elements) => elements
+                .iter()
+                .find_map(|element| in_branch(element, anchor)),
+            ImportBranch::Reach(_, inner) => in_branch(inner, anchor),
+        }
+    }
+    fn in_node<'tree, 'src>(
+        node: &'tree Spanned<Node<'src>>,
+        anchor: Span,
+    ) -> Option<&'tree [ImportBranch<'src>]> {
+        if !(node.1.start <= anchor.start && anchor.end <= node.1.end) {
+            return None;
+        }
+        match &node.0 {
+            Node::Import(branch, _) | Node::Use(branch) => return in_branch(branch, anchor),
+            _ => {}
+        }
+        let mut found = None;
+        node.0.for_each_child(&mut |child| {
+            if found.is_none() {
+                found = in_node(child, anchor);
+            }
+        });
+        found
+    }
+    nodes.iter().find_map(|node| in_node(node, anchor))
 }
 
 /// A157: the warning on a WRITTEN `autofocus` attribute in an element head
@@ -14288,5 +14433,121 @@ mod tests {
         ] {
             program(source);
         }
+    }
+
+    /// A154 / E268: the edit for a moved-module refusal, on every import shape
+    /// it meets. `anchor` is the n-th occurrence of the old segment the
+    /// refusal anchors at (the analyzer's span, pinned in `module_resolution`).
+    fn moved_edit(
+        source: &str,
+        old: &str,
+        occurrence: usize,
+    ) -> Option<Result<String, &'static str>> {
+        let start = source
+            .match_indices(old)
+            .nth(occurrence)
+            .map(|(start, _)| start)
+            .expect("the anchor");
+        let new = moved_std_module(old).expect("a moved module");
+        let message = moved_std_module_message(old, new);
+        let edit = moved_std_module_edit(source, &message, Span::from(start..start + old.len()))?;
+        Some(edit.map(|fix| {
+            let mut text = source.to_string();
+            text.replace_range(fix.span.into_range(), &fix.replacement);
+            text
+        }))
+    }
+
+    #[test]
+    fn a154_the_moved_path_edit_replaces_the_old_segment() {
+        for (source, old, after) in [
+            (
+                "import std::dom::{ create_element, Element };",
+                "dom",
+                "import std::web::dom::{ create_element, Element };",
+            ),
+            (
+                "import std::{ rpc_server::Server, ui::View };",
+                "rpc_server",
+                "import std::{ rpc::server::Server, ui::View };",
+            ),
+            (
+                "import std::web::Signal as S;",
+                "web",
+                "import std::web::prelude::Signal as S;",
+            ),
+            // A list of prelude names only: the segment is still the edit.
+            (
+                "import std::web::{ Signal, Memo };",
+                "web",
+                "import std::web::prelude::{ Signal, Memo };",
+            ),
+        ] {
+            assert_eq!(
+                moved_edit(source, old, 0),
+                Some(Ok(after.to_string())),
+                "{source}"
+            );
+        }
+    }
+
+    /// E268: a brace list under the old web-prelude path that also names one of
+    /// `std::web`'s children keeps the child and writes `prelude::` before each
+    /// prelude name — at the top of a file, nested in an outer list, aliased,
+    /// and block-scoped.
+    #[test]
+    fn e268_a_mixed_web_list_prefixes_the_prelude_names_and_keeps_the_children() {
+        for (source, after) in [
+            (
+                "import std::web::{ Signal, dom::create_element };",
+                "import std::web::{ prelude::Signal, dom::create_element };",
+            ),
+            (
+                "import std::web::{ dom::create_element, Signal, ui, Memo as M };",
+                "import std::web::{ dom::create_element, prelude::Signal, ui, prelude::Memo as M };",
+            ),
+            (
+                "import std::{ web::{ Signal, prelude::view }, option::Option };",
+                "import std::{ web::{ prelude::Signal, prelude::view }, option::Option };",
+            ),
+            (
+                "export import std::web::{\n\tSignal,\n\tstyle,\n};",
+                "export import std::web::{\n\tprelude::Signal,\n\tstyle,\n};",
+            ),
+            (
+                "fun main() {\n\timport std::web::{ Signal, dom::x };\n}",
+                "fun main() {\n\timport std::web::{ prelude::Signal, dom::x };\n}",
+            ),
+        ] {
+            assert_eq!(
+                moved_edit(source, "web", 0),
+                Some(Ok(after.to_string())),
+                "{source}"
+            );
+        }
+    }
+
+    /// The shapes no one edit rewrites correctly are left to a person, with
+    /// the reason; a span that no longer covers the old segment is no edit.
+    #[test]
+    fn e268_a_web_list_naming_self_or_a_marker_is_left_with_its_reason() {
+        assert_eq!(
+            moved_edit("import std::web::{ self, Signal };", "web", 0),
+            Some(Err(MOVED_WEB_SELF_REASON))
+        );
+        assert_eq!(
+            moved_edit("import std::web::{ #Signal, dom::x };", "web", 0),
+            Some(Err(MOVED_WEB_MARKED_REASON))
+        );
+        let source = "import std::dom::x;";
+        let message = moved_std_module_message("dom", "web::dom");
+        assert_eq!(
+            moved_std_module_edit(source, &message, Span::from(0..3)),
+            None
+        );
+        assert_eq!(
+            moved_std_module_edit(source, "cannot find 'x'", Span::from(11..14)),
+            None
+        );
     }
 }

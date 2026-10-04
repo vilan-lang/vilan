@@ -7238,7 +7238,10 @@ impl Document {
             }
             // A154: a path through a std module that moved under a namespace —
             // the refusal anchors at the old segment, and the fix writes the
-            // new path there (`dom` → `web::dom`).
+            // new path there (`dom` → `web::dom`), or, in a brace list under
+            // the old web-prelude path that also names a child of `std::web`,
+            // `prelude::` before the prelude names (E268). The edit is the one
+            // `vilan check --fix` applies.
             if let Some(fix) = vilan_core::parsing::moved_std_module_fix(
                 &self.text,
                 &diagnostic.msg,
@@ -7247,7 +7250,7 @@ impl Document {
                 fixes.push(QuickFix {
                     title: fix.title,
                     span: fix.span,
-                    replacement: fix.replacement.to_string(),
+                    replacement: fix.replacement,
                     target: None,
                 });
                 continue;

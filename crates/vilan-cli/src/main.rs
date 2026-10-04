@@ -189,11 +189,14 @@ enum Command {
         /// Re-check whenever a watched `.vl` source file changes (Ctrl-C to stop).
         #[arg(long)]
         watch: bool,
-        /// Before checking, apply the fix every numeric mismatch carries — the
-        /// `.as_*()` conversion its message names, or a literal-bound counter
-        /// declared `usize` — to the package's own files, repeating until a
-        /// round finds nothing more to fix (the migration to `usize` indexes).
-        /// What is left is reported as usual.
+        /// Before checking, apply the fixes the diagnostics carry to the
+        /// package's own files, repeating until a round finds nothing more to
+        /// fix: every moved std path (`std::dom` → `std::web::dom`, and
+        /// `prelude = "std::web"` → `"std::web::prelude"` in `vilan.toml` — the
+        /// migration to v0.44.0's std layout), then every numeric mismatch's
+        /// (the `.as_*()` conversion its message names, or a literal-bound
+        /// counter declared `usize` — the migration to `usize` indexes). Each
+        /// file changed is named. What is left is reported as usual.
         #[arg(long, conflicts_with = "watch")]
         fix: bool,
         /// After checking, print the declarations whose type inference cost
@@ -882,11 +885,14 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> R
 }
 
 /// `vilan check --fix`'s pass over the project `check` would check, under
-/// every platform it would check it under: each unit's numeric mismatches
-/// fixed to a fixed point ([`fix::fix_unit`]). A standalone library has no
-/// program to analyze, so it has nothing to fix.
+/// every platform it would check it under: the manifests' moved `prelude`
+/// first ([`fix::fix_manifests`] — an old one stops the project resolving),
+/// then each unit's moved std paths and numeric mismatches fixed to a fixed
+/// point ([`fix::fix_unit`]). A standalone library has no program to analyze,
+/// so it has nothing to fix.
 fn fix_project(file: Option<PathBuf>, platform: Option<&str>) -> Result<fix::Fixed, String> {
     let mut fixed = fix::Fixed::default();
+    fix::fix_manifests(file.as_deref(), &mut fixed)?;
     match resolve_project(file)? {
         Project::Single {
             unit,
@@ -2360,11 +2366,7 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
         let opinions = *fmt_opinions
             .entry(directory)
             .or_insert_with_key(|directory| vilan_core::manifest::fmt_opinions_covering(directory));
-        let defaults = vilan_core::formatter::FormatOptions::default();
-        let options = vilan_core::formatter::FormatOptions {
-            wrap_comments: opinions.wrap_comments.unwrap_or(defaults.wrap_comments),
-            comment_width: opinions.comment_width.unwrap_or(defaults.comment_width),
-        };
+        let options = format_options(opinions);
         let source = match fs::read_to_string(file) {
             Ok(source) => source,
             Err(error) => {
@@ -2461,6 +2463,19 @@ fn report_decline(file: &Path, decline: &vilan_core::formatter::Decline) {
         paint::out(paint::Style::BOLD, &where_),
         decline.sentence(),
     );
+}
+
+/// The printer's options for a file whose package holds `opinions` (E205/E215's
+/// `[fmt]` knobs, each defaulted where the package says nothing) — the one
+/// translation `vilan fmt` and `vilan check --fix` both format with.
+fn format_options(
+    opinions: vilan_core::manifest::FmtOpinions,
+) -> vilan_core::formatter::FormatOptions {
+    let defaults = vilan_core::formatter::FormatOptions::default();
+    vilan_core::formatter::FormatOptions {
+        wrap_comments: opinions.wrap_comments.unwrap_or(defaults.wrap_comments),
+        comment_width: opinions.comment_width.unwrap_or(defaults.comment_width),
+    }
 }
 
 /// Drops every file that lives under a declared `generated` root, and says so

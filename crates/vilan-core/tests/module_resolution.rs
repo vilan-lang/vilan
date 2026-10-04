@@ -751,7 +751,7 @@ fn a154_the_moved_module_refusal_anchors_at_the_old_segment() {
         )
         .expect("the refusal carries its fix");
         let mut fixed = entry.to_string();
-        fixed.replace_range(fix.span.into_range(), fix.replacement);
+        fixed.replace_range(fix.span.into_range(), &fix.replacement);
         let after = analyze_package(&[("main.vl", &fixed)], "main.vl", Platform::Browser);
         assert!(
             after

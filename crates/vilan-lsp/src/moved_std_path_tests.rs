@@ -92,6 +92,50 @@ fn the_old_web_prelude_path_is_rewritten_at_web() {
     clean(&after);
 }
 
+/// E268: a brace list under the old web-prelude path that also names one of
+/// `std::web`'s children — rewriting `web` would carry `dom::..` under the
+/// prelude and break it, so the edit writes `prelude::` before the prelude
+/// name instead, and the child stays where it resolves.
+#[test]
+fn a_mixed_web_list_moves_only_the_prelude_names() {
+    let after = fixed(
+        "import std::web::{ Signal, dom::create_element };\n\nfun main() {\n\tlet _ = Signal::new(1);\n\tlet _ = create_element(\"div\");\n}\n",
+        "Write `prelude::` before `Signal` (the web prelude is `std::web::prelude`)",
+    );
+    assert_eq!(
+        after,
+        "import std::web::{ prelude::Signal, dom::create_element };\n\nfun main() {\n\tlet _ = Signal::new(1);\n\tlet _ = create_element(\"div\");\n}\n"
+    );
+    clean(&after);
+}
+
+/// A shape no one edit rewrites correctly (`self` bound the old prelude as
+/// `web`) is offered no edit at all, rather than a wrong one.
+#[test]
+fn a_web_list_naming_self_is_offered_no_edit() {
+    let source =
+        "import std::web::{ self, Signal };\n\nfun main() {\n\tlet _ = Signal::new(1);\n}\n";
+    let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+    let program = document.program.as_ref().expect("a program");
+    let moved: Vec<_> = document
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.msg.contains(" moved to `std::"))
+        .collect();
+    assert!(!moved.is_empty(), "the old path is refused");
+    for diagnostic in moved {
+        let titles: Vec<String> = document
+            .quickfixes(program, diagnostic.span)
+            .into_iter()
+            .map(|fix| fix.title)
+            .collect();
+        assert!(
+            titles.iter().all(|title| !title.starts_with("Write ")),
+            "no moved-path edit for {source:?}: {titles:?}"
+        );
+    }
+}
+
 /// The diagnostic is published with its stable code, which a client (and the
 /// fix) can key on whatever the message's wording becomes.
 #[test]
