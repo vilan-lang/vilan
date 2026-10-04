@@ -12595,3 +12595,169 @@ fn b528_a_write_to_a_copy_or_readonly_capture_steers_to_the_view_subject() {
         "cannot write through 'p': this matches `&held`, a readonly view, so its captures are readonly views into the payload — match `&mut held` to write the payload in place",
     );
 }
+
+/// B509 S2 / M109: std's through-variant write steps write IN PLACE — the
+/// `Store<Option<P>>` step and the derive's single-payload enum step — so the
+/// paper's cost probe (2,000 writes of one scalar inside a payload holding a
+/// 10,000-element list) makes NO copy, where the derive's step deep-copied the
+/// payload out and back on every write. Counted, not timed: the emitted
+/// `__clone` is instrumented and every call counted. The old shape is the
+/// control that proves the counter is live.
+#[test]
+fn b509_a_through_variant_write_copies_nothing() {
+    fn copies_made(source: &str) -> usize {
+        let js = compile(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let counted = js.replace(
+            "function __clone(value) {",
+            "function __clone(value) { globalThis.__copies = (globalThis.__copies ?? 0) + 1;",
+        );
+        let counted = format!(
+            "process.on('exit', () => console.log('copies=' + (globalThis.__copies ?? 0)));\n{counted}"
+        );
+        let stdout = run_js(&counted).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let line = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("copies="))
+            .expect("the exit hook prints the count");
+        line.parse().expect("a count")
+    }
+    let program = |step: &str| {
+        format!(
+            r#"
+        import std::io::print;
+        import std::option::Option::{{ self, None, Some }};
+
+        struct P {{ x: i32, big: List<i32> }}
+
+        enum E {{ A(P), B }}
+
+        fun payload(): P {{
+            mut big: List<i32> = [];
+            mut i = 0;
+            for i < 10000 {{
+                big.push(i);
+                i += 1;
+            }}
+            P {{ x = 0, big }}
+        }}
+
+        {step}
+
+        fun main() {{
+            mut e = E::A(payload());
+            mut held: Option<P> = Some(payload());
+            mut n = 0;
+            for n < 2000 {{
+                through_variant(&mut e, |p: &mut P| {{
+                    p.x += 1;
+                }});
+                through_option(&mut held, |p: &mut P| {{
+                    p.x += 1;
+                }});
+                n += 1;
+            }}
+            match &e {{
+                E::A(let p) => print(p.x),
+                E::B => {{}},
+            }}
+            match &held {{
+                Some(let p) => print(p.x),
+                None => {{}},
+            }}
+        }}
+        "#
+        )
+    };
+    let in_place = program(
+        r#"
+        fun through_variant(held: &mut E, f: |&mut P| void) {
+            match &mut held {
+                E::A(let p0) => f(p0),
+                _ => {},
+            }
+        }
+        fun through_option(held: &mut Option<P>, f: |&mut P| void) {
+            match &mut held {
+                Some(let payload) => f(payload),
+                None => {},
+            }
+        }
+        "#,
+    );
+    let copied = program(
+        r#"
+        fun through_variant(held: &mut E, f: |&mut P| void) {
+            match held {
+                E::A(mut p0) => {
+                    f(&mut p0);
+                    held = E::A(p0);
+                },
+                _ => {},
+            }
+        }
+        fun through_option(held: &mut Option<P>, f: |&mut P| void) {
+            match held.take() {
+                Some(mut payload) => {
+                    f(&mut payload);
+                    held = Some(payload);
+                },
+                None => {},
+            }
+        }
+        "#,
+    );
+    assert_eq!(
+        copies_made(&in_place),
+        0,
+        "an in-place write step makes no copy"
+    );
+    assert!(
+        copies_made(&copied) >= 4000,
+        "the copy-out-and-back control must count its two copies per write"
+    );
+    // std's own steps, through a derived enum's handle and an `Option`'s:
+    // the copies a write makes do not include the 10,000-element payload — a
+    // deep copy of it alone is over 10,000 `__clone` calls, and 199 more
+    // writes add a handful each (the written leaf), never that.
+    let through_std = |writes: usize| {
+        format!(
+            r#"
+        import std::io::print;
+        import std::option::Option::{{ self, None, Some }};
+        import std::store::{{ Storable, Store, StoreSome }};
+
+        [derive(Storable)]
+        struct Device {{ since: i32, big: List<i32> }}
+
+        [derive(Storable)]
+        enum Presence {{ Offline, Online(Device) }}
+
+        fun main() {{
+            mut big: List<i32> = [];
+            mut i = 0;
+            for i < 10000 {{
+                big.push(i);
+                i += 1;
+            }}
+            let presence = Store::new(Presence::Online(Device {{ since = 0, big }}));
+            let since = presence.online().since();
+            let maybe = Store::new(Some(Device {{ since = 0, big = [1, 2, 3] }}));
+            let other = maybe.some().since();
+            mut n = 0;
+            for n < {writes} {{
+                let _variant = since.patch(n);
+                let _option = other.patch(n);
+                n += 1;
+            }}
+            print(since.get().unwrap_or(0));
+        }}
+        "#
+        )
+    };
+    let once = copies_made(&through_std(1));
+    let many = copies_made(&through_std(200));
+    assert!(
+        many - once < 199 * 2 * 10,
+        "a write through std's variant and Option steps copies the payload: {once} copies for one write, {many} for 200"
+    );
+}
