@@ -579,11 +579,35 @@ mod check_cache_bound_tests {
         let path = root.join(name);
         std::fs::create_dir_all(&path).expect("create a table");
         std::fs::write(path.join("macro-expansions"), vec![b'x'; bytes]).expect("write a table");
-        let when = SystemTime::now() - age;
-        std::fs::File::open(&path)
-            .and_then(|directory| directory.set_modified(when))
-            .expect("age the table");
+        age_directory(&path, SystemTime::now() - age).expect("age the table");
         path
+    }
+
+    /// Sets a DIRECTORY's mtime, which is what the bound reads as a table's
+    /// age. Opening a directory as a file differs by platform: unix opens it
+    /// read-only and `futimens` needs only ownership, while Windows refuses to
+    /// open a directory at all without `FILE_FLAG_BACKUP_SEMANTICS`, and
+    /// refuses to stamp a time through a handle without
+    /// `FILE_WRITE_ATTRIBUTES` (the first CI run read "Access is denied." on
+    /// every one of these pins). Asking for exactly those two is the whole of
+    /// what the platform needs; the bound itself reads the mtime through
+    /// `metadata().modified()`, which works the same everywhere.
+    #[cfg(not(windows))]
+    fn age_directory(path: &Path, when: SystemTime) -> std::io::Result<()> {
+        std::fs::File::open(path)?.set_modified(when)
+    }
+
+    #[cfg(windows)]
+    fn age_directory(path: &Path, when: SystemTime) -> std::io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // winnt.h / winbase.h.
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?
+            .set_modified(when)
     }
 
     fn names(root: &Path) -> Vec<String> {
