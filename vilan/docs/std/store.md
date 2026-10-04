@@ -23,6 +23,11 @@ import std::store::{ Storable, Store, StoreSome, StoreFlag };
 | `[reactive(coarse)]` | field attribute | the field is one slot, compared whole |
 | `[reactive(name = "..")]` | field attribute | the name the field's projection is generated under |
 | `when_live(handle, body)` | `std::ui` | a variant as content: rebuilt only when the variant changes, the payload's `Store<P>` in hand |
+| `.at(key)` | on a `HashMap` field | one key's value as a `Store<Option<V>>` that wakes for that key only |
+| `.contains(x)` | on a `HashSet` field | one member's presence as a `Store<bool>` |
+| `.by_key(k)` | on a keyed `List` field | one element, found by its `Keyed` key, as a `Store<Option<T>>` |
+| `.push(x)`, `.splice(..)`, … | on a `List` field | the `SequenceCell` writes, landed in place |
+| `.keys()`, `.map(..)`, `each_by(..)` | on a collection field | the shape's operators, told per-key or per-span ops |
 
 ## A store
 
@@ -247,6 +252,67 @@ reads the LAST payload a read through the live variant saw (a message edited
 and then deleted shows its edit, never the text the body was built over), and a
 write then lands nowhere. On the server it renders the live payload once.
 
+## Collections
+
+A collection field takes its declared shape — no derive to write:
+
+- a **`HashMap<K, V>`** is a KEYED node. `at(key)` is a `Store<Option<V>>` whose
+  slot is that key's alone: a write to key 7 wakes the readers of key 7 and
+  nobody else. `at(key).set(None)` removes the key, and `.some()` reaches into
+  a present value. `insert(key, value)` and `remove(key)` are the same two
+  writes.
+- a **`HashSet<T>`** likewise: `contains(x)` is a `Store<bool>`, and
+  `set(true)`/`set(false)` (or `insert`/`remove`) add and remove `x`.
+- a **`List<T>`** is a SEQUENCE node. Every `SequenceCell` write — `push`,
+  `prepend`, `insert_at`, `remove_at`, `splice`, `clear`, … — lands in place.
+  A list of `Keyed` values reads one element with `by_key(k)`. There is no
+  `at(index)`: a position shifts under a splice, and the handle would silently
+  change which element it names.
+
+```vilan
+import std::delta::SequenceCell;
+import std::hash_map::HashMap;
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+import std::store::{ Storable, Store };
+
+[derive(PartialEq, Storable)]
+struct Channel {
+	name: str,
+	messages: List<i32>,
+}
+
+[derive(Storable)]
+struct Global {
+	channels: HashMap<i32, Channel>,
+}
+
+fun main() {
+	let global = Store::new(Global { channels = HashMap::new() });
+	global.channels().insert(1, Channel { name = "general", messages = [] });
+	global.channels().insert(2, Channel { name = "random", messages = [] });
+	let page = Owner::new();
+	run_with_owner(page, || {
+		global.channels().at(1).some().name().effect(|name| print(i"1 is {name.unwrap_or("-")}"));
+		global.channels().at(2).effect(|channel| print(i"2 has {channel.map(|held| held.messages.len()).unwrap_or(0)}"));
+	});
+	global.channels().at(2).some().messages().push(40);   // "2 has 1" — channel 1 does not wake
+	let _renamed = global.channels().at(1).some().name().patch("lobby");   // "1 is lobby"
+	global.channels().remove(2);                          // "2 has 0"
+	page.dispose();
+}
+```
+
+A whole write of a collection diffs by key — a list by its common prefix and
+suffix, as `ListCell::reconcile_to` does — and wakes only the keys whose value
+changed. A map is never compared with `==`.
+
+A collection handle is also the shape's FLOW. `global.channels().keys()`,
+`.values()`, `log.map(..)`, `each_by(log, ..)` start from it and are told OPS —
+a `MapOp` per changed key, a `SetOp` per member, a `SeqOp` per splice (`SetAt`
+for an element changed in place) — never handed a copy to diff. A push builds
+one row. Each flow keeps its own op log at the collection, recorded only while
+the flow is open.
+
 ## What it costs
 
 - **A derive line per type**, and a knob per coarse field.
@@ -255,7 +321,10 @@ write then lands nowhere. On the server it renders the live payload once.
 - **A whole write costs one comparison per live slot.** A handle write costs
   the comparisons under the handle.
 - **Projections are methods**: `user.address().city()`.
-- **A write through a variant copies the payload out and back** — a pattern
-  cannot bind a writable view into an enum's payload.
+- **A write through a variant lands in place** for a single payload and an
+  `Option`'s `Some` (a `match &mut` capture is a writable view); a variant
+  with several payloads copies its tuple out and back. A write under a map key
+  copies that key's value out and back: a map lends no value in place.
+- **A `by_key` read scans the list** for the first element under its key.
 
 On the native backend a store builds, wakes and is observed as it does on JS.
