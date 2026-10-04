@@ -1,4 +1,4 @@
-# std::store reference
+# std::reactive::store reference
 
 The fine-grained version of a type, generated from its shape. A
 `SignalCell<User>` wakes every reader on every write — a new city reruns the
@@ -8,7 +8,7 @@ Concepts: the [reactive guide](../guide/reactive.md); the traits a store
 implements: [std::reactive](reactive.md).
 
 ```vilan,fragment
-import std::store::{ Storable, Store, StoreSome, StoreFlag };
+import std::reactive::store::{ Storable, Store, StoreSome, StoreFlag };
 ```
 
 ## At a glance
@@ -22,7 +22,7 @@ import std::store::{ Storable, Store, StoreSome, StoreFlag };
 | `StoreFlag` | struct | a discriminant as a read-only `Source<bool>` (`is_some()`, `is_online()`) |
 | `[reactive(coarse)]` | field attribute | the field is one slot, compared whole |
 | `[reactive(name = "..")]` | field attribute | the name the field's projection is generated under |
-| `when_live(handle, body)` | `std::ui` | a variant as content: rebuilt only when the variant changes, the payload's `Store<P>` in hand |
+| `when_live(handle, body)` | `std::web::ui` | a variant as content: rebuilt only when the variant changes, the payload's `Store<P>` in hand |
 | `.at(key)` | on a `HashMap` field | one key's value as a `Store<Option<V>>` that wakes for that key only |
 | `.contains(x)` | on a `HashSet` field | one member's presence as a `Store<bool>` |
 | `.by_key(k)` | on a keyed `List` field | one element, found by its `Keyed` key, as a `Store<Option<T>>` |
@@ -33,7 +33,7 @@ import std::store::{ Storable, Store, StoreSome, StoreFlag };
 
 ```vilan
 import std::reactive::{ Owner, Signal, Source, run_with_owner };
-import std::store::{ Storable, Store };
+import std::reactive::store::{ Storable, Store };
 
 [derive(PartialEq, Storable)]
 struct Address {
@@ -119,7 +119,7 @@ member wins. The derive refuses it; rename the projection:
 
 ```vilan
 import std::reactive::{ Signal, Source };
-import std::store::{ Storable, Store };
+import std::reactive::store::{ Storable, Store };
 
 [derive(Storable)]
 struct Request {
@@ -152,7 +152,7 @@ struct User {
 
 ```vilan
 import std::reactive::{ Signal, Source };
-import std::store::{ Storable, Store, StoreSome };
+import std::reactive::store::{ Storable, Store, StoreSome };
 
 [derive(Storable)]
 struct Profile {
@@ -189,7 +189,7 @@ variant in snake case (`Online(Device)` gives `online()`, a `StoreSome<Device>`;
 
 ```vilan
 import std::reactive::{ Owner, Signal, Source, run_with_owner };
-import std::store::{ Storable, Store, StoreSome };
+import std::reactive::store::{ Storable, Store, StoreSome };
 
 [derive(PartialEq, Storable)]
 struct Device {
@@ -270,10 +270,10 @@ A collection field takes its declared shape — no derive to write:
   change which element it names.
 
 ```vilan
-import std::delta::SequenceCell;
+import std::reactive::delta::SequenceCell;
 import std::hash_map::HashMap;
 import std::reactive::{ Owner, Signal, Source, run_with_owner };
-import std::store::{ Storable, Store };
+import std::reactive::store::{ Storable, Store };
 
 [derive(PartialEq, Storable)]
 struct Channel {

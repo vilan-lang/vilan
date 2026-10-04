@@ -1,11 +1,11 @@
 // `std::watch` — the process layer's dev-mode surface (`dev-refresh.md` §5 item 2).
-// Named apart from the browser's `std::dev` (`std/src/browser/dev.vl`) on purpose:
-// `std_twin_parity.rs`'s `TWINNED_MODULES` documents `dev` as deliberately
+// Named apart from the browser's `std::web::dev` (`std/src/browser/web/dev.vl`) on
+// purpose: `std_twin_parity.rs`'s `TWINNED_MODULES` documents `dev` as deliberately
 // single-platform (browser-only, no counterpart to hold it against — the same
 // reasoning `db`/`fs`/`http`/`process`/`rpc_server` already get on the process
 // side), so reusing that name here would silently open a twin the parity gate was
 // never meant to cover — the two surfaces share no component source the way
-// `std::ui`'s two halves do, which is what that gate actually protects.
+// `std::web::ui`'s two halves do, which is what that gate actually protects.
 //
 // `force_refresh()` is the manual half of the ruling's composed mechanism: check
 // `is_watching()`, re-read cheaply, `force_refresh()`, and the browser re-pulls
@@ -22,10 +22,10 @@ export *;
 /// loop (`dev-refresh.md` §5, item 2).
 ///
 /// Uniform: DEFINED under every run and `false` outside a watch, so a program
-/// branches on it without knowing how it was started. `std::dev` is the browser's
-/// answer to the same question and is browser-only by construction (HMR swaps the
-/// browser leg in place; the node leg restarts), so this is the process layer's
-/// own.
+/// branches on it without knowing how it was started. `std::web::dev` is the
+/// browser's answer to the same question and is browser-only by construction (HMR
+/// swaps the browser leg in place; the node leg restarts), so this is the process
+/// layer's own.
 ///
 /// What it is for is FRESHNESS, not code: a server that restarts on every code
 /// change can still serve week-old bytes for a file it read once at the top of

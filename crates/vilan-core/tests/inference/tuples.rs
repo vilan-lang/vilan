@@ -4544,7 +4544,7 @@ fn a_task_is_not_a_promise() {
     assert_fails_with(
         r#"
         import std::task::Task;
-        import std::promise::Promise;
+        import std::js::promise::Promise;
         fun label(): str { "ready" }
         fun main() {
             let p: Promise<str> = async label();
@@ -4557,12 +4557,12 @@ fn a_task_is_not_a_promise() {
 
 #[test]
 fn spawn_typing_falls_back_to_promise_without_std_task() {
-    // Compat: a program that loads `std::promise` but never `std::task`
+    // Compat: a program that loads `std::js::promise` but never `std::task`
     // keeps the old `Promise<T>` spawn typing (an older std has no task.vl).
     assert_compiles(
         r#"
         import std::io::print;
-        import std::promise::Promise;
+        import std::js::promise::Promise;
         fun label(): str { "ready" }
         fun main() {
             let p: Promise<str> = async label();
@@ -4579,7 +4579,7 @@ fn a_raw_host_promise_still_types_and_awaits() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::promise::Promise;
+        import std::js::promise::Promise;
         import std::task::Task;
         [extern(new, "Promise")]
         external fun ticket(executor: |(|i32| void)| void): Promise<i32>;

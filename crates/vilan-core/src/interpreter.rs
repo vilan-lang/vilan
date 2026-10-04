@@ -589,7 +589,7 @@ enum EmitSpelling {
 }
 
 impl EmitSpelling {
-    /// The `std::asset` path a diagnostic names this spelling by.
+    /// The `std::web::asset` path a diagnostic names this spelling by.
     fn name(self) -> &'static str {
         match self {
             EmitSpelling::Unkeyed => "asset::emit",
@@ -679,7 +679,7 @@ fn check_emit_kind(kind: &str, spelling: EmitSpelling) -> Result<(), Failure> {
                 format!(
                     "`asset::emit_keyed` cannot order the `{kind}` kind: the style \
                      sidecar is ordered by the CSS cascade, not by a contribution's \
-                     key — write a rule with `asset::emit`, or let `std::style` own \
+                     key — write a rule with `asset::emit`, or let `std::web::style` own \
                      the sheet"
                 ),
             ));
@@ -1676,7 +1676,7 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Array(Rc::new(RefCell::new(items))))
             }
             // HMR is a `run --watch`-only concern; the native evaluator never has
-            // a shim, so the activity guard (`std::dev`, `hmr.md` §4) is always
+            // a shim, so the activity guard (`std::web::dev`, `hmr.md` §4) is always
             // false — keeping the guarded `dev::*` / std hooks inert here, so the
             // equivalence gate holds.
             "__hmr_active" => Ok(Value::Bool(false)),
@@ -2587,7 +2587,7 @@ impl<'a> Interpreter<'a> {
             "fetch" | "setTimeout" | "setInterval" | "structuredClone" | "__timer" => {
                 Err(Failure::unsupported(format!("`{name}`")))
             }
-            // The DOM helpers (`std::dom`, A121 and A59 before it). There is no
+            // The DOM helpers (`std::web::dom`, A121 and A59 before it). There is no
             // document at expansion time and there never will be — a macro body
             // runs in the compiler — so every one of them is a capability MISS
             // by design, exactly like `fetch` above, rather than the

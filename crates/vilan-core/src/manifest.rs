@@ -197,7 +197,7 @@ pub const DEFAULT_PRELUDE: &str = "std::prelude";
 
 /// std's web prelude (`prelude.md` §5.3) — named here only so the diagnostics
 /// that steer toward it cannot drift from the module that implements it.
-pub const WEB_PRELUDE: &str = "std::web";
+pub const WEB_PRELUDE: &str = "std::web::prelude";
 
 /// A package's *resolved* ambient scope, after the key's default is applied.
 /// The compiler sees this, never [`PreludeDecl`].
@@ -802,6 +802,25 @@ fn prelude_problem(
         });
     }
     let root = segments[0];
+    // A154: a std module that moved under a namespace — above all the web
+    // prelude's old `"std::web"`, which every web package's manifest wrote.
+    // `std::web` is a namespace now, so only the bare two-segment spelling is
+    // the old path; `std::web::prelude` is the new one.
+    if root == "std"
+        && let Some(new) = crate::parsing::moved_std_module(segments[1])
+        && (segments[1] != "web" || segments.len() == 2)
+    {
+        let old = segments[1];
+        let rewritten = std::iter::once("std")
+            .chain(std::iter::once(new))
+            .chain(segments[2..].iter().copied())
+            .collect::<Vec<_>>()
+            .join("::");
+        return Some(format!(
+            "`{section} prelude = \"{path}\"` names the old path of a std module: `std::{old}` \
+             moved to `std::{new}` — write `prelude = \"{rewritten}\"`"
+        ));
+    }
     if root == "pkg" || root == "std" || dependencies.contains_key(root) {
         return None;
     }
@@ -1811,8 +1830,8 @@ pub fn resolve_library(dir: &Path) -> PackageSpec {
 /// `vilan.stdPath` at the SOURCE root (`.../std/src`) instead of the package
 /// directory: when the given directory has no manifest but its parent is a
 /// `[library]`, the parent is resolved. Without this, the bare-source
-/// fallback has no platform layers, so every layered module (`std::ui`,
-/// `std::rpc_server`, ...) silently fails to resolve — a wall of import
+/// fallback has no platform layers, so every layered module (`std::web::ui`,
+/// `std::rpc::server`, ...) silently fails to resolve — a wall of import
 /// errors instead of one fixable mistake.
 pub fn resolve_std(std_dir: &Path) -> PackageSpec {
     if !std_dir.join("vilan.toml").exists()
@@ -4176,14 +4195,55 @@ mod tests {
     #[test]
     fn the_web_prelude_is_an_ordinary_module_path() {
         // §6.2 determination 2: selecting the web set is not a mode the
-        // compiler knows about — `std::web` is a module like any other, which
+        // compiler knows about — `std::web::prelude` is a module like any other, which
         // is why there is no enumerated list of set names anywhere.
-        let manifest = parse("[package]\nname = \"app\"\nprelude = \"std::web\"\n");
+        let manifest = parse("[package]\nname = \"app\"\nprelude = \"std::web::prelude\"\n");
         assert_eq!(
             manifest.package.as_ref().unwrap().prelude(),
             PreludeSpec::Module(WEB_PRELUDE.to_string())
         );
         assert_eq!(manifest.validate(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a154_the_old_web_prelude_path_is_refused_with_the_new_one() {
+        // A154: `std::web` is a namespace now; the web prelude is
+        // `std::web::prelude`, and the old spelling every web manifest wrote is
+        // refused with the line to write instead — from the ONE moved-module
+        // table, so a moved module named as a prelude is steered the same way.
+        for (written, rewritten) in [
+            ("std::web", "std::web::prelude"),
+            ("std::style::prelude", "std::web::style::prelude"),
+        ] {
+            for section in ["package", "library"] {
+                let errors = parse(&format!(
+                    "[{section}]\nname = \"app\"\nprelude = \"{written}\"\n"
+                ))
+                .validate();
+                assert_eq!(
+                    errors,
+                    vec![format!(
+                        "`[{section}] prelude = \"{written}\"` names the old path of a std \
+                         module: `std::{}` moved to `std::{}` — write `prelude = \"{rewritten}\"`",
+                        written.split("::").nth(1).unwrap(),
+                        crate::parsing::moved_std_module(written.split("::").nth(1).unwrap())
+                            .unwrap()
+                    )]
+                );
+            }
+        }
+        // The new paths, and a namespace's child that is not the prelude, pass.
+        for path in [
+            "std::web::prelude",
+            "std::web::style::prelude",
+            "std::prelude",
+        ] {
+            let errors = parse(&format!(
+                "[package]\nname = \"app\"\nprelude = \"{path}\"\n"
+            ))
+            .validate();
+            assert_eq!(errors, Vec::<String>::new(), "{path}");
+        }
     }
 
     #[test]
@@ -4228,7 +4288,7 @@ mod tests {
                 e.contains("`[package] prelude`")
                     && e.contains("package root")
                     && e.contains("std::prelude")
-                    && e.contains("std::web")
+                    && e.contains("std::web::prelude")
             }),
             "{errors:?}"
         );
@@ -4294,7 +4354,7 @@ mod tests {
         // §6.2 determination 5: a SEMANTIC key must not travel any edge, so
         // `[project]` has no `prelude` at all — an unknown key there is
         // ignored, and each member states its own.
-        let manifest = parse("[project]\npackages = [\"a\"]\nprelude = \"std::web\"\n");
+        let manifest = parse("[project]\npackages = [\"a\"]\nprelude = \"std::web::prelude\"\n");
         assert_eq!(manifest.validate(), Vec::<String>::new());
         assert!(manifest.package.is_none());
     }

@@ -1,6 +1,6 @@
 # Styling
 
-`std::style` gives you typed, checked CSS without writing a stylesheet.
+`std::web::style` gives you typed, checked CSS without writing a stylesheet.
 You build a `Style` value in code, the compiler evaluates it during the
 build and writes real CSS rules into your bundle's `.css` file, and at
 runtime the style is nothing but a set of class names on an element.
@@ -10,8 +10,8 @@ spacing scale, color ramps), except the pieces are typed function calls,
 so a typo is a compile error instead of a silently-ignored class.
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
-import std::style::{ style, space, Style, Color, Length, Display, FlexDirection };
+import std::web::ui::{ view, View, mount_root };
+import std::web::style::{ style, space, Style, Color, Length, Display, FlexDirection };
 
 let card = const style()
 	.display(Display::Flex)
@@ -58,8 +58,8 @@ Here is one style written both ways, in one program. `card` and
 beside the chain, it becomes the chain.
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
-import std::style::{ style, space, Style, Color };
+import std::web::ui::{ view, View, mount_root };
+import std::web::style::{ style, space, Style, Color };
 
 let card = css {
 	display("flex");
@@ -149,7 +149,7 @@ let themed = css {
 constructors a `.on(..)` head takes — `hover`, `focus`, `active`, `disabled`,
 `first`, `last`, `pseudo`, `element`, `attribute`, `within`, `children`,
 `divide`, `media`, `sm`, `md`, `lg`, `xl`; and `var` and `piece`. That is the
-`std::style::prelude` module, in scope inside a `css` block and nowhere else, so
+`std::web::style::prelude` module, in scope inside a `css` block and nowhere else, so
 a value reads as the CSS it stands for:
 
 ```vilan,fragment
@@ -166,10 +166,10 @@ what the name means, and the module is only asked when nothing else
 answers.
 
 **Outside a block, import the vocabulary once at the top of the file.**
-`std::style::prelude` is an ordinary module there, so
-`import std::style::prelude::{ s, space, gray, hover, Cursor };` binds
+`std::web::style::prelude` is an ordinary module there, so
+`import std::web::style::prelude::{ s, space, gray, hover, Cursor };` binds
 exactly what the file uses — bare, for the whole file — and
-`import std::style::prelude as tokens;` qualifies them through a name of
+`import std::web::style::prelude as tokens;` qualifies them through a name of
 your choosing instead. That is the form to reach for in a file whose
 `fun` bodies build chains, because a chain written outside a hole gets no
 ambient scope: one import list at the top beats an import block inside
@@ -180,7 +180,7 @@ The keyword-property TYPES are in that module too — `Length`, `Cursor`,
 chain, the tokens and the keywords:
 
 ```vilan,fragment
-import std::style::prelude::{ s, space, gray, px, hover, active, Cursor, TextAlign };
+import std::web::style::prelude::{ s, space, gray, px, hover, active, Cursor, TextAlign };
 
 fun button(): Style {
 	s()
@@ -195,12 +195,12 @@ fun button(): Style {
 
 The other keyword enums — `Display`, `Position`, `FlexDirection`,
 `JustifyContent`, `Overflow`, `WhiteSpace`, `UserSelect` — stay in
-`std::style` and are imported from there when a file wants them. The
+`std::web::style` and are imported from there when a file wants them. The
 prelude is a vocabulary, not a second spelling of the whole module.
 
 What the module publishes is exactly the names listed above — the 38
 functions and the 8 types, 46 in all. Its own machinery is not surface:
-each of these functions is one line over `std::style`'s constructor of
+each of these functions is one line over `std::web::style`'s constructor of
 the same name, and the alias it needs to call one (`hover` here is the
 condition, `style::hover` is what it calls) is imported inside that
 function's own body rather than at the top of the file, so it never
@@ -322,8 +322,8 @@ shell against its build and refuse to start over exactly that:
 let page = require_shell("src/app.html", build).html();
 ```
 
-`require_shell` (`std::document`, the
-[reference](../std/process.md#stddocument)) checks the file every boot: a
+`require_shell` (`std::web::document`, the
+[reference](../std/process.md#stdwebdocument)) checks the file every boot: a
 shell that links no stylesheet over a build that emitted one stops the
 server, naming the file and the fix. The fullstack template ships that
 line. Nothing checks a browser-only project's `index.html` — there is no
@@ -394,8 +394,8 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   `Display::parse(text)` goes the other way, `None` outside the set.
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
-import std::style::{ style, space, Style, Color, Gradient, Length, RadialExtent };
+import std::web::ui::{ view, View, mount_root };
+import std::web::style::{ style, space, Style, Color, Gradient, Length, RadialExtent };
 
 let hero = const style()
 	.padding(space(6))
@@ -649,8 +649,8 @@ properties. The style declares a variable, and the element binds the
 variable to a signal with `style_var`:
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
-import std::style::{ style, Style, Length, Color };
+import std::web::ui::{ view, View, mount_root };
+import std::web::style::{ style, Style, Length, Color };
 import std::reactive::Signal;
 
 let bar = const style()
@@ -678,8 +678,8 @@ pile as a chain — `self + delta` when the condition holds, `self`
 untouched when it doesn't:
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
-import std::style::{ style, space, Style, Color };
+import std::web::ui::{ view, View, mount_root };
+import std::web::style::{ style, space, Style, Color };
 
 let base = const style().padding(space(2)).color(Color::gray(900));
 let chosen = const style().background(Color::blue(100)).color(Color::blue(900));
@@ -714,8 +714,8 @@ the style in a signal and bind it. `bind_styled` is to `styled` what
 `bind_class` is to `class`:
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
-import std::style::{ style, space, Style, Color };
+import std::web::ui::{ view, View, mount_root };
+import std::web::style::{ style, space, Style, Color };
 import std::reactive::Signal;
 
 let idle = const style().padding(space(2)).background(Color::gray(100));

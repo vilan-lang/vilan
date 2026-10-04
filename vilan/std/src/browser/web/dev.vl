@@ -1,8 +1,8 @@
-// `std::dev` — the hot-module-replacement app surface (`hmr.md` §4). Every hook
-// here is a no-op unless a `vilan run --watch` round installed its dev shim (the
-// `window.__VILAN_HMR__` singleton), so importing this module costs nothing in a
-// production build. Browser-only: HMR swaps the browser leg in place; the Node leg
-// restarts, so its state has no swap to survive.
+// `std::web::dev` — the hot-module-replacement app surface (`hmr.md` §4). Every
+// hook here is a no-op unless a `vilan run --watch` round installed its dev shim
+// (the `window.__VILAN_HMR__` singleton), so importing this module costs nothing in
+// a production build. Browser-only: HMR swaps the browser leg in place; the Node
+// leg restarts, so its state has no swap to survive.
 //
 // `hmr_active` binds the `__hmr_active` runtime helper — a self-contained `typeof`
 // check the transformer emits (and the interpreter answers `false`), so it is safe

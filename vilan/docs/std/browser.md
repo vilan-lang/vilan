@@ -1,10 +1,10 @@
 # Browser modules reference
 
-The browser layer of std: `std::dom`, `std::ui`, `std::router`,
-`std::storage`. Available only for browser builds. Concepts:
+The browser layer of std: `std::web::dom`, `std::web::ui`, `std::web::router`,
+`std::web::storage`. Available only for browser builds. Concepts:
 [Building UI](../guide/ui.md), [Routing](../guide/routing.md).
 
-## std::dom
+## std::web::dom
 
 Opaque handles over real DOM objects.
 
@@ -230,7 +230,7 @@ if is_open {
 }
 ```
 
-## std::ui
+## std::web::ui
 
 ```vilan,fragment
 struct View { element: Element }
@@ -252,7 +252,7 @@ host's `null` typed as an `Element`, so the alternative was a
 `Cannot read properties of null` from somewhere inside the attach, with
 the one thing you got wrong appearing nowhere in the message. On the
 server side that mismatch is caught before it can happen: the id is what
-[`check_shell`](process.md#stddocument) holds the document against.
+[`check_shell`](process.md#stdwebdocument) holds the document against.
 
 `view` knows the SVG vocabulary: an SVG tag name (`svg`, `path`, `rect`,
 `clipPath`, …; exact case) creates its element in the SVG namespace, so
@@ -334,8 +334,8 @@ the handler and drops it.
 The conditional, the dynamic subtree and the keyed run are **values**, not
 `View` methods. Each fills a child position, so it sits exactly where it is
 written — between siblings, not after them. They are bare names in the
-`std::web` prelude, and
-`std::ui::{ when, when_some, swap, each, each_values, each_by }` otherwise
+`std::web::prelude`, the web prelude, and
+`std::web::ui::{ when, when_some, swap, each, each_values, each_by }` otherwise
 (`when_all_some` is reached as `ui::when_all_some` or imported by name):
 
 | function | signature | returns |
@@ -482,7 +482,7 @@ Two things deliberately still ask for the concrete type:
   `Flow` today — a source or a pipe; `AttrValue`'s `Option` arms (A115) arrived
   the same way.
 
-## std::router
+## std::web::router
 
 ```vilan,fragment
 fun current_path(): SignalCell<str>       // location.pathname, live (navigate + back/forward)
@@ -570,7 +570,7 @@ is remembered as in flight, so clicking the link again retries; there is no
 retry API because a link is one. Worked example:
 [the dev loop](../guide/dev-loop.md#shipping-routes-separately).
 
-## std::storage
+## std::web::storage
 
 `localStorage` / `sessionStorage`, string-keyed strings, in **two forms**: six
 free functions for the site that touches one key, and a `Storage` handle for
@@ -604,7 +604,7 @@ impl Storage {
 ```
 
 ```vilan,browser
-import std::storage;
+import std::web::storage;
 
 fun main() {
 	storage::set("token", "abc");
@@ -635,8 +635,8 @@ walk, since `len` and `key_at` are two host calls and another tab may remove a
 key between them.
 
 ```vilan,browser
-import std::dom::window;
-import std::storage;
+import std::web::dom::window;
+import std::web::storage;
 
 fun main() {
 	let store = window().local_storage();
@@ -649,14 +649,14 @@ fun main() {
 ```
 
 The two reader verbs live on `Window`, so a module that calls them imports
-**both** `std::dom`'s `window` and `std::storage` — the `impl Window` block is
-declared in `std::storage`, and an impl is in scope only where its module is.
+**both** `std::web::dom`'s `window` and `std::web::storage` — the `impl Window` block is
+declared in `std::web::storage`, and an impl is in scope only where its module is.
 
 ```vilan,browser
-import std::dom::window;
+import std::web::dom::window;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
-import std::storage;
+import std::web::storage;
 
 fun main() {
 	let store = window().local_storage();
@@ -683,6 +683,6 @@ fun main() {
 `window` (a crash on the server) or an in-memory map answering reads with
 values the browser never wrote — and the second turns a layer mistake into a
 silent divergence between the two renders of one component. Importing
-`std::storage` from a process module is a cross-platform error at analysis
+`std::web::storage` from a process module is a cross-platform error at analysis
 instead. Server-side persistence is [`std::db`](process.md); state that must
 reach the browser rides the render or an rpc call.

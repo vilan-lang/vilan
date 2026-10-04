@@ -7,13 +7,13 @@
 // `HashMapCell<T, void>` for the two reasons the paper gives: its op vocabulary is
 // smaller (`Add` carries no "what was there"), and its per-member read is
 // `contains(x): bool`, not `at(x): Option<void>`.
-import pkg::delta::{ DeltaCursor, DeltaLog, DeltaSource, SetOp };
 import pkg::hash::{ Hash, Hashable };
-import pkg::hash_map_cell::KeySlots;
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
-import pkg::native_map::NativeMap;
+import pkg::js::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::delta::{ DeltaCursor, DeltaLog, DeltaSource, SetOp };
+import pkg::reactive::hash_map_cell::KeySlots;
 import pkg::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
 import pkg::shared::Shared;
 

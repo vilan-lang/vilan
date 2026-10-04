@@ -1238,7 +1238,7 @@ fn a_view_annotation_is_transparent_to_the_trait_reading_at_both_positions() {
 // T-dependent body still gets one copy per type, a T-independent one still
 // gets one copy in total, and the counts match the written spelling's.
 
-/// The three estate sites the census was taken on, shaped like `std::ui`'s
+/// The three estate sites the census was taken on, shaped like `std::web::ui`'s
 /// A33-widened bindings (`fun bind_text<S: Source<str>>(self, source: S)`):
 /// a T-DEPENDENT body (the bound's member is resolved per impl), a
 /// T-INDEPENDENT one, and a two-parameter site. `{bound}` is spliced with the
@@ -1335,12 +1335,12 @@ fn b186_the_sugared_estate_runs() {
 #[test]
 fn b186_a_kolt_shaped_view_extension_takes_a_source_parameter() {
     // The exhibit the owner will write next: a `View` extension bound on
-    // `Source<i32>` without a `<S: ..>` list, against the real `std::ui` and
+    // `Source<i32>` without a `<S: ..>` list, against the real `std::web::ui` and
     // the real `std::reactive` — the shape A33 widened `bind_text` into, now
     // spelled the way §7.3 says it should be.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::web::ui::{ View, view, mount_root };
         import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         import std::display::Display;
 
@@ -6373,7 +6373,7 @@ fn b279_the_strict_body_of_the_other_trait_still_fences_when_it_is_called() {
 fn b279_the_const_only_check_still_refuses_through_a_bounded_generics_dispatch() {
     assert_fails_with(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
 
         trait Paint { fun paint(self); }
 
@@ -6403,7 +6403,7 @@ fn b279_the_const_only_check_still_refuses_through_a_bounded_generics_dispatch()
 fn b279_a_same_named_member_on_an_unrelated_trait_does_not_let_the_const_only_check_miss() {
     assert_fails_with(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
 
         trait Paint { fun paint(self); }
         trait Coat { fun paint(self); }
@@ -6439,7 +6439,7 @@ fn b279_a_clean_instantiation_of_the_same_generic_is_still_admitted() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
 
         trait Paint { fun paint(self); }
 
@@ -7487,7 +7487,7 @@ fn b391_a_services_generated_client_call_is_admitted_under_its_own_module() {
     let exported = concat!(
         "import std::io::print;\n",
         "import std::reactive::{ Signal, SignalCell };\n",
-        "import std::rpc_server::{ Connection, Service };\n",
+        "import std::rpc::server::{ Connection, Service };\n",
         "import std::json::json_codec;\n",
         "\n",
         "[client_service]\n",
@@ -8873,7 +8873,7 @@ fn b498_a_static_call_on_a_nested_binder_reached_through_a_bound_is_grounded() {
     assert_compiles_and_runs(
         r#"
         import std::default::Default;
-        import std::delta::IntoFlow;
+        import std::reactive::delta::IntoFlow;
         import std::io::print;
 
         trait Fresh<T> {

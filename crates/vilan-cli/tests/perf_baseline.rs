@@ -522,7 +522,7 @@ import std::hash_set::HashSet;
 import std::shared::Shared;
 import std::string;
 import std::time::{ Instant, now };
-import std::ui::render;
+import std::web::ui::render;
 import std::wire;
 
 fun main() {
@@ -841,7 +841,7 @@ fn run(scale: Scale) -> Vec<Row> {
 fn style_heavy_source(sites: usize) -> String {
     let mut source = String::from(
         "import std::io::print;\n\
-         import std::style::{ Color, Display, Length, space, style };\n\n",
+         import std::web::style::{ Color, Display, Length, space, style };\n\n",
     );
     for site in 0..sites {
         source.push_str(&format!(

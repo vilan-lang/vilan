@@ -22,13 +22,13 @@
 // touches `window` (a crash on the server) and an in-memory map that answers
 // every read with a value the browser never wrote — and the second is worse,
 // because it turns a layer mistake into a silent divergence between the two
-// renders of one component. Importing `std::storage` from a process module is
+// renders of one component. Importing `std::web::storage` from a process module is
 // a hard cross-platform error at analysis instead, which names the mistake at
 // the import. Persisted server state is `std::db`; state that must reach the
 // browser rides the render or an rpc call.
 
-import pkg::dom::Window;
 import pkg::option::Option::{ self, None, Some };
+import pkg::web::dom::Window;
 
 /// `localStorage.getItem(key)` — "" when absent.
 [extern("__local_get")]
@@ -65,8 +65,8 @@ export external struct Storage;
 // because that is where the host puts them and where kolt reached for them —
 // and because a free `local_storage()` would need a runtime helper to address
 // a global PROPERTY, which is the cost `__dom_window` already paid once.
-// It does mean a call site imports BOTH: `std::dom`'s `window` for the handle
-// and `std::storage` for this impl, since an impl is in scope only where its
+// It does mean a call site imports BOTH: `std::web::dom`'s `window` for the handle
+// and `std::web::storage` for this impl, since an impl is in scope only where its
 // module is.
 export impl Window {
 	/// `window.localStorage` — the origin-scoped store that outlives the tab.

@@ -68,7 +68,7 @@ impl RemoteSource<type T> {
 	fun sub(self, observer: (|T| void) context tracking): Subscription  // counted, manual: present values; dispose to release
 }
 
-// A mirror is a transient source (std::transient): Status mapped arm for arm.
+// A mirror is a transient source (std::reactive::transient): Status mapped arm for arm.
 impl RemoteSource<type T> with TransientSource<T, RpcError> {
 	fun state(self): MemoCell<TransientState<T, RpcError>>   // passive, like `status`: leases nothing
 	fun states(self): dyn Pipe<TransientState<T, RpcError>>  // leases while bound; the whole state
@@ -506,7 +506,7 @@ nothing could not tell a 401 from an outage and paid the whole backoff to learn
 nothing. `connect_socket_with` offers exactly the list it is given, which is the
 seam for a peer that speaks something else.
 
-## Server plumbing (`std::rpc_server`, process layer)
+## Server plumbing (`std::rpc::server`, process layer)
 
 ```vilan,fragment
 impl Service {
@@ -547,7 +547,7 @@ attach). The `{mount}rpc` route is the server side of `std::rpc`'s
 usually; serving the build's own artifacts is
 `ServerBuilder::serve_build`'s job, on the same builder. Details:
 [Services & RPC](../guide/services.md#growing-past-one-service) and the
-[process reference](process.md#stdrpc_server).
+[process reference](process.md#stdrpcserver).
 
 One matching rule is worth knowing: a service claims a path **segment** —
 its route exactly, or its route followed by `?` — so `/rpc` does not

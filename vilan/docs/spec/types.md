@@ -49,7 +49,7 @@ The type forms (grammar §3.9) denote:
 
 A nominal type is written as a **path** (grammar §3.9's `type-path`):
 either a bare name, or the name qualified by the modules that declare it.
-`Style`, `style::Style` and `std::style::Style` name the same type; the
+`Style`, `style::Style` and `std::web::style::Style` name the same type; the
 segments before the last select namespaces and are resolved exactly as an
 expression path's are (names §4.2), so a module in scope reaches its
 types the way it reaches its values. This holds in **every** type
@@ -59,7 +59,7 @@ form:
 
 ```vilan
 import std::reactive;
-import std::style;
+import std::web::style;
 
 struct Card {
     style: style::Style,

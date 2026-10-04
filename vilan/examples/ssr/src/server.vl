@@ -8,13 +8,13 @@
 // replaces it, and `serve_build` is what puts it there — the bundle's name comes
 // from the build, not from this file.
 //
-// This file shares the package's `prelude = "std::web"` — that is what gives
+// This file shares the package's `prelude = "std::web::prelude"` — that is what gives
 // `print` below with no import. The rest of what a server reaches is one-layer
 // and in no prelude by rule, so the process modules are imported by name.
 
 import std::build::require_build;
-import std::document::require_shell;
 import std::http::{ Request, Response, Server };
+import std::web::document::require_shell;
 import pkg::app::app;
 
 async fun main() {

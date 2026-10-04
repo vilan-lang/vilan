@@ -201,7 +201,7 @@ import std::json::Json;
 import std::json::json_codec;
 import std::rpc::HttpTransport;
 import std::http::Server;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(Client)]
 struct Counter {
@@ -368,7 +368,7 @@ import std::rpc::{
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
 };
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 // Per-connection reactive servers, so `attach` can expose the board's signal on
 // the caller's own wire.
@@ -491,7 +491,7 @@ import std::json::{ Json, FromJson, json_codec };
 import std::reactive::{ Signal, SignalCell };
 import std::rpc::{ ReactiveServer, DuplexEnd };
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
@@ -680,7 +680,7 @@ import std::rpc::{
 	HttpTransport, connect_socket, bridge, SocketDuplex,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
 };
-import std::rpc_server::{ Service, ws_accept_key };
+import std::rpc::server::{ Service, ws_accept_key };
 import std::http::{ Response, Server };
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
@@ -810,7 +810,7 @@ import std::rpc::{
 	connect_socket, bridge, SocketTransport, SocketDuplex,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
 };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::http::{ Response, Server };
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
@@ -954,7 +954,7 @@ import std::rpc::{
 	connect_socket, bridge, SocketTransport, SocketDuplex,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
 };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::http::{ Response, Server };
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
@@ -1106,7 +1106,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::rpc::{ HttpTransport, ReactiveClient, RemoteSource, duplex_pair };
 import std::http::Server;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(NotesClient)]
 struct Notes {
@@ -1239,7 +1239,7 @@ import std::option::Option::{ self, None, Some };
 import std::json::json_codec;
 import std::rpc::HttpTransport;
 import std::http::Server;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(LedgerClient)]
 struct Ledger {

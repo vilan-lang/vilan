@@ -4,13 +4,13 @@
 // closes when it unmounts, instead of living as long as the tab.
 //
 // `Signal`, `Result`/`Ok`/`Err` and `print` are ambient under the package's
-// `prelude = "std::web"`, and `mount_root` is reached through the ambient MODULE
+// `prelude = "std::web::prelude"`, and `mount_root` is reached through the ambient MODULE
 // `ui` — browser-only inside a module both layers declare, so the qualifier is
 // what keeps a platform error at the call.
 
 import std::json::json_codec;
-import std::router::current_path;
-import std::storage;
+import std::web::router::current_path;
+import std::web::storage;
 import pkg::routes::{ Route, parse };
 import pkg::store::NotesClient;
 import pkg::views::screen;

@@ -16,7 +16,7 @@ compile-time file channel, `const parse(asset::read("pages/intro.md"))`
 parses a page during compilation — within the const fuel budget even
 for the book's largest page — and ships the `Doc` as plain data in the
 output, with the read file tracked as a build input
-([std::asset](misc.md#stdasset)).
+([std::web::asset](misc.md#stdwebasset)).
 
 ## Parsing
 

@@ -34,8 +34,8 @@ mod support;
 
 /// A browser leg that compiles a `const style()`, so its build emits a sidecar
 /// and the manifest names one — two artifacts to route instead of one.
-const STYLED_CLIENT: &str = r#"import std::style::{ Display, Style, style };
-import std::ui::{ mount_root, view };
+const STYLED_CLIENT: &str = r#"import std::web::style::{ Display, Style, style };
+import std::web::ui::{ mount_root, view };
 
 fun panel(): Style {
 	style().display(Display::Flex)

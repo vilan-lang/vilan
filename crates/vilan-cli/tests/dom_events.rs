@@ -1,4 +1,4 @@
-//! The `std::dom` event surface's runtime gates (proposal/router.md §5; backlog
+//! The `std::web::dom` event surface's runtime gates (proposal/router.md §5; backlog
 //! A27, kolt.local 037).
 //!
 //! Three capabilities land together because the exhibit that named them — kolt's
@@ -121,7 +121,7 @@ fn build_and_run(tag: &str, app: &str, harness: &str) -> String {
 /// `Event` (§5.3). Two different events in one session, so a cached first read
 /// would be visible.
 const POINTER_COORDINATES: &str = r#"import std::io::print;
-import std::dom::{ Event, get_element_by_id, window };
+import std::web::dom::{ Event, get_element_by_id, window };
 
 fun main() {
 	let target = get_element_by_id("app");
@@ -164,7 +164,7 @@ done();
 /// harness between phases, so the assertions run at chosen points inside the
 /// program's own lifetime rather than after it has finished.
 const LISTEN_AND_DISPOSE: &str = r#"import std::io::print;
-import std::dom::{ Event, get_element_by_id, window };
+import std::web::dom::{ Event, get_element_by_id, window };
 import std::reactive::{ Disposable, Shared };
 
 [extern("__phase")]
@@ -289,9 +289,9 @@ done();
 /// A drag is the canonical case for why element-local `on_event` cannot carry
 /// this: the pointer leaves the element mid-drag.
 const DRAG_EXHIBIT: &str = r#"import std::io::print;
-import std::dom::{ Event, window };
+import std::web::dom::{ Event, window };
 import std::reactive::{ Disposable, Signal };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 [extern("__phase")]
 external fun phase(name: str): void;
@@ -411,15 +411,15 @@ require("./app.js");
 
 // --- The marking gate: `retains` marks registration, never removal -----------
 
-/// Every `[extern]` in `std::dom`'s event surface, as `(function name, binding
+/// Every `[extern]` in `std::web::dom`'s event surface, as `(function name, binding
 /// text, retains)`. Read off the declarations by pairing each attribute with the
 /// `external fun` it precedes, so reordering, reindenting, or moving a
 /// declaration between `impl` blocks cannot fake a pass.
 fn event_surface_externs() -> Vec<(String, String, bool)> {
     let source = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src/browser/dom.vl"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src/browser/web/dom.vl"),
     )
-    .expect("read std/src/browser/dom.vl");
+    .expect("read std/src/browser/web/dom.vl");
 
     let mut found = Vec::new();
     for (index, _) in source.match_indices("[extern(") {
@@ -457,7 +457,7 @@ fn the_event_surfaces_externs_are_marked_by_the_audit_rule() {
             .iter()
             .find(|(found, _, _)| found == name)
             .map(|(_, binding, retains)| (binding.clone(), *retains))
-            .unwrap_or_else(|| panic!("`std::dom` declares no `external fun {name}`"))
+            .unwrap_or_else(|| panic!("`std::web::dom` declares no `external fun {name}`"))
     };
 
     // Registration: the host STORES the vilan closure and calls it later, which
@@ -547,7 +547,7 @@ fn the_event_surfaces_externs_are_marked_by_the_audit_rule() {
 /// marks each element it is handed, so the negative half is an assertion too:
 /// the inner node must NOT carry the `current_target` mark.
 const EVENT_TARGETS_AND_CODE: &str = r#"import std::io::print;
-import std::dom::{ Event, get_element_by_id, window };
+import std::web::dom::{ Event, get_element_by_id, window };
 
 fun main() {
 	window().on_event("keydown", |event| {

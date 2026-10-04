@@ -1,17 +1,17 @@
-// `std::store_core` — the store's core: the handle types, the slot tree, the one
-// write and its spine (tracker A142 S7, A149 S3; `proposal/store.md`).
+// `std::reactive::store_core` — the store's core: the handle types, the slot tree,
+// the one write and its spine (tracker A142 S7, A149 S3; `proposal/store.md`).
 //
-// Reach it through `std::store`, which re-exports every public name here and adds
-// the collection nodes (`at`, `contains`, `by_key`, the sequence writes and the
-// shapes' flows) and `[derive(Storable)]`. The core is its own module so that what
-// `std::ui` needs for `when_live` — the three handle types and their reads — does
-// not bring the collection layer into every program that renders a view: a program
-// pays for the store's collections only when it imports `std::store`. The design
-// notes live at the top of `store.vl`.
+// Reach it through `std::reactive::store`, which re-exports every public name here
+// and adds the collection nodes (`at`, `contains`, `by_key`, the sequence writes
+// and the shapes' flows) and `[derive(Storable)]`. The core is its own module so
+// that what `std::web::ui` needs for `when_live` — the three handle types and their
+// reads — does not bring the collection layer into every program that renders a
+// view: a program pays for the store's collections only when it imports
+// `std::reactive::store`. The design notes live at the top of `store.vl`.
 import pkg::compare::PartialEq;
 import pkg::hash::{ Hash, canonical_hash };
 import pkg::io::panic;
-import pkg::native_map::NativeMap;
+import pkg::js::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	Signal,
@@ -144,7 +144,7 @@ export fun store_kid(node: Option<Shared<StoreNode>>, index: usize): Option<Shar
 
 /// The KEYED child of `node` for the key whose hash is `hash`, if anything watches
 /// it — a collection diff's step down.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun store_keyed(node: Option<Shared<StoreNode>>, hash: Hash): Option<Shared<StoreNode>> {
 	match node {
 		None => None,
@@ -156,7 +156,7 @@ export fun store_keyed(node: Option<Shared<StoreNode>>, hash: Hash): Option<Shar
 }
 
 /// The hashes of `node`'s live keyed children.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun keyed_hashes(node: Option<Shared<StoreNode>>): List<Hash> {
 	match node {
 		None => [],
@@ -187,7 +187,7 @@ export fun store_has_me(node: Option<Shared<StoreNode>>): bool {
 
 /// Whether an open flow's recorder stands at `node`: a collection diff must then
 /// find every changed key or span, not only the watched ones.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun has_feeds(node: Option<Shared<StoreNode>>): bool {
 	match node {
 		None => false,
@@ -211,7 +211,7 @@ export fun store_wake_me(node: Option<Shared<StoreNode>>, changed: bool, woken: 
 
 /// Tell every feed at `node` that the write touched `touch`, and enlist each once
 /// in `woken`, so it reads its part around the assignment.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun store_touch(node: Option<Shared<StoreNode>>, touch: StoreTouch, woken: &mut StoreWoken) {
 	match node {
 		None => {},
@@ -349,14 +349,14 @@ fun node_empty(node: Shared<StoreNode>): bool {
 /// ANCESTORS (woken when the subtree changed — the spine), the feeds of the
 /// collections it writes inside of with the key it writes under (touched when the
 /// subtree changed), and the node at the path itself, if one exists.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export struct Spine {
 	ancestors: List<StoreSlot>,
 	touches: List<(StoreFeed, StoreTouch)>,
 	node: Option<Shared<StoreNode>>,
 }
 
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun spine(root: Shared<StoreNode>, path: List<StoreStep>): Spine {
 	mut ancestors: List<StoreSlot> = [];
 	mut touches: List<(StoreFeed, StoreTouch)> = [];
@@ -387,7 +387,7 @@ export fun spine(root: Shared<StoreNode>, path: List<StoreStep>): Spine {
 /// only collects, and the turn delivers (§2.8). A subscriber standing on two of the
 /// slots — a `combine` of two fields, a pipe forwarded to both — is one record, so
 /// the turn's dedup runs it once, after the write has fully landed.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun deliver(woken: List<StoreSlot>) {
 	if woken.len() == 1 {
 		woken[0].signal.notify();
@@ -430,7 +430,7 @@ fun counted(root: Shared<StoreNode>, path: List<StoreStep>, slot: StoreSlot, han
 }
 
 /// Attach `subscriber` to the slot at `path`, counted.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun watch_at(
 	root: Shared<StoreNode>,
 	path: List<StoreStep>,
@@ -504,13 +504,13 @@ fun prune_empty(chain: List<Shared<StoreNode>>, path: List<StoreStep>) {
 }
 
 /// Stand `feed` on the node at `path`, made with the nodes on the way down.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun attach_feed(root: Shared<StoreNode>, path: List<StoreStep>, feed: StoreFeed) {
 	node_made(root, path).write().feeds.push(feed);
 }
 
 /// Take the feed `id` off the node at `path`, and drop every node it left empty.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun detach_feed(root: Shared<StoreNode>, path: List<StoreStep>, id: i32) {
 	let chain = node_chain(root, path);
 	if chain.len() != path.len() + 1 {
@@ -528,7 +528,7 @@ export fun detach_feed(root: Shared<StoreNode>, path: List<StoreStep>, id: i32) 
 }
 
 /// Tell the spine's feeds what the write touched, and enlist them.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun touch_spine(touches: List<(StoreFeed, StoreTouch)>, woken: &mut StoreWoken) {
 	for touched in touches {
 		(touched.0.touch)(touched.1);
@@ -1052,7 +1052,7 @@ export impl Store<type T> with Source<T> {
 }
 
 /// The value a `Store`'s lend reaches, copied out — only the value at the path.
-[internal("the store core, reached by `std::store`'s collection nodes (A149 S3)")]
+[internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun lent_value<T>(lend: |(|&T| void)| void): T {
 	mut out: Option<T> = None;
 	lend(|held: &T| {

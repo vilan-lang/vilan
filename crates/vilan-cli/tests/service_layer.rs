@@ -27,7 +27,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::hash_map::HashMap;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::wire::{ Keyed, Wire };
 
 [derive(Wire, PartialEq, Debug)]
@@ -246,7 +246,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::rpc::HttpTransport;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(Client)]
 struct Counter {
@@ -332,7 +332,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::rpc::HttpTransport;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(NotesClient)]
 struct Notes {
@@ -436,7 +436,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::rpc::connect_socket;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(NotesClient)]
 struct Notes {
@@ -648,7 +648,7 @@ const BYTE_IDENTICAL_SERVER: &str = r#"import std::io::print;
 import std::shared::Shared;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(Client)]
 struct Counter {
@@ -862,7 +862,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 
 [service(NotesClient)]
 struct Notes {
@@ -1119,7 +1119,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+import std::rpc::server::{ Connection, Handshake, Reject, Service, Session };
 
 [service(NotesClient)]
 struct Notes {
@@ -2150,7 +2150,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::{ connect_socket, connect_socket_with };
-import std::rpc_server::{ Handshake, Reject, Service, Session };
+import std::rpc::server::{ Handshake, Reject, Service, Session };
 
 [service(NotesClient)]
 struct Notes {
@@ -2261,7 +2261,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::hash_map::HashMap;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::wire::{ Keyed, Wire };
 
 [derive(Wire, PartialEq, Debug)]
@@ -2516,7 +2516,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::shared::Shared;
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 
 [service(GateClient)]
 struct Gate {
@@ -2728,7 +2728,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::RpcError;
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 import std::time::sleep;
 
 [client_service]
@@ -3187,7 +3187,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 import std::time::sleep;
 
 [service(PeerClient, client = Peer)]
@@ -3281,7 +3281,7 @@ fn a_peer_to_peer_struct_carries_both_halves_and_both_directions_work() {
 const RECEIVE_LOOP_GATE: &str = r#"import std::io::print;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -3482,7 +3482,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::wire::Wire;
 
@@ -3828,7 +3828,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::{ RemoteSource, session_of };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::wire::Wire;
 
@@ -4343,7 +4343,7 @@ import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 
 [service(StoreClient)]
 struct Store {
@@ -4469,7 +4469,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::option::Option::{ self, None, Some };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 
 [service(StoreClient)]
 struct Store {
@@ -4725,7 +4725,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 import std::time::sleep;
 
 [client_service]
@@ -5317,7 +5317,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::{ KeyedCell, KeyedSource, RemoteSource, session_of };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::wire::{ Keyed, Wire };
 
@@ -5992,7 +5992,7 @@ fn an_rpc_call_whose_argument_count_disagrees_with_the_method_is_a_decode_failur
     const ARITY_SERVER: &str = r#"import std::io::print;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(Client)]
 struct Counter {
@@ -6124,7 +6124,7 @@ import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::Server;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::wire::Wire;
 
 [derive(Wire)]
@@ -6375,7 +6375,7 @@ fn the_post_legs_status_says_what_the_envelope_says() {
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(Client)]
 struct Door {
@@ -6542,7 +6542,7 @@ import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::rpc::RpcError;
 
 [service(Client)]
@@ -6622,7 +6622,7 @@ import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Request, Response, Server };
-import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+import std::rpc::server::{ Connection, Handshake, Reject, Service, Session };
 import std::rpc::{ Dispatcher, reply };
 
 [service(Client)]
@@ -6829,7 +6829,7 @@ import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Request, Response, Server };
-import std::rpc_server::{ Reject, Service, Session };
+import std::rpc::server::{ Reject, Service, Session };
 import std::rpc::RpcError;
 
 [service(Client)]
@@ -6918,7 +6918,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::binary::binary_codec;
 import std::http::{ Request, Response, Server };
-import std::rpc_server::{ Reject, Service, Session };
+import std::rpc::server::{ Reject, Service, Session };
 import std::rpc::RpcError;
 
 [service(Client)]

@@ -1,8 +1,8 @@
 // `std::http` — a small HTTP server over `node:http`, exposed through an abstract
 // `Server`/`Response` API. The raw `node:http` calls are `[extern]` host bindings
-// used internally (and by `std::rpc_server`, which needs partial writes for SSE);
+// used internally (and by `std::rpc::server`, which needs partial writes for SSE);
 // everything else is ordinary Vilan. The routing and protocol machinery for a
-// mounted RPC service lives in `std::rpc_server` — this module only carries
+// mounted RPC service lives in `std::rpc::server` — this module only carries
 // `ServerBuilder.services` and folds it in at `build()` (`fullstack-dx.md` §4), so
 // a plain HTTP app never has to know the type exists.
 
@@ -11,7 +11,7 @@ import pkg::bytes::{ Bytes, new_text_decoder };
 import pkg::crypto::sha256;
 import pkg::json::{ JsonKind, JsonValue, coerce_str };
 import pkg::option::Option::{ self, None, Some };
-import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades };
+import pkg::rpc::server::{ Service, fold_service_requests, fold_service_upgrades };
 
 // --- Raw node:http bindings ---
 
@@ -87,7 +87,7 @@ export impl NodeSocket {
 
 	/// Emit `"timeout"` after `millis` of inactivity; `0` clears it. Node's own
 	/// `socket.setTimeout` — it does NOT close the socket, it only tells you, which
-	/// is what lets `std::rpc_server` arm a greeting bound and disarm it on the
+	/// is what lets `std::rpc::server` arm a greeting bound and disarm it on the
 	/// first byte.
 	[extern(method, "setTimeout")]
 	external fun set_timeout(self, millis: i32);
@@ -126,7 +126,7 @@ export impl NodeSocket {
 async external fun read_request_body(node: NodeRequest): str;
 
 /// The same body as raw bytes (a node `Buffer` IS a Uint8Array) — for frames that
-/// may be binary (`std::rpc_server`'s `/rpc`).
+/// may be binary (`std::rpc::server`'s `/rpc`).
 [extern("node:stream/consumers", "buffer")]
 async external fun read_request_bytes(node: NodeRequest): Bytes;
 
@@ -515,7 +515,7 @@ export struct ServerBuilder {
 	on_start: |Server| void,
 	on_stop: |Server| void,
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
-	/// Rpc services installed with `with_service` (`std::rpc_server`,
+	/// Rpc services installed with `with_service` (`std::rpc::server`,
 	/// `fullstack-dx.md` §4) — folded in front of `request_handler` and
 	/// `upgrade_handler` at `build()`. Empty for a plain HTTP app, which is
 	/// what keeps this module's own knowledge of `Service` to one field.

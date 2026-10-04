@@ -8,7 +8,7 @@ import std::json::json_codec;
 import std::process::{ env, exit };
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Err, Ok };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::wire::{ Keyed, Wire };
 
 [derive(Wire, PartialEq, Debug)]

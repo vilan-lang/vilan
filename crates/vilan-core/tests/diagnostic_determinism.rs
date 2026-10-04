@@ -463,7 +463,7 @@ fn the_overlay_cap_selects_the_same_diagnostics_every_time() {
 fn the_const_only_reports_are_one_per_site_on_every_cold_analysis() {
     let rendering = assert_cold_rendering_is_stable(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
 
         fun rule_a(): i32 { emit("css", ".a{}"); 1 }
         fun rule_b(): i32 { emit("css", ".b{}"); 2 }

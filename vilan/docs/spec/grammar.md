@@ -309,7 +309,7 @@ semantic-token modifier) and leads its hover with the steer.
 `[internal("reason")]` follows it, and answers a different question.
 Visibility says whether a module may **name** an item; this says whether
 a reader should **reach for** one that is named — an item exported on
-purpose and dangerous on purpose, like `std::ui`'s `Region.anchor`,
+purpose and dangerous on purpose, like `std::web::ui`'s `Region.anchor`,
 which `each` and a hand-written `Slot` legitimately need and which
 corrupts the reconciler's view when a row is moved through it without
 `hold_rows`. The one argument is the reason, and it is required: it is
@@ -512,7 +512,7 @@ attribute names (`derive`, `service`, `client_service`, `extern`,
 available as user macro-attribute names.
 
 `[reactive(..)]` is a field's store knobs, read by `[derive(Storable)]`
-(`std::store`) and by nothing else: `coarse` makes the field one slot,
+(`std::reactive::store`) and by nothing else: `coarse` makes the field one slot,
 compared whole, and `name = "x"` generates its projection as `x()`. The
 `name` must be an identifier. It may stand on either side of `[expose]`.
 
@@ -705,7 +705,7 @@ tag's token for token. In a head item, an undotted name is an attribute
 (a bare name is a boolean attribute) and a leading `.` is an ordinary
 chain member — the grammar never consults any method list. Text
 children are quoted strings; bare text is a parse error. An element is
-an ordinary expression: it desugars before analysis to the `std::ui`
+an ordinary expression: it desugars before analysis to the `std::web::ui`
 view chain (`view("tag")` with one method call per head item and a
 `.child(…)` per child), and postfix suffixes apply to it
 (`<div />.show(flag)`).
@@ -753,7 +753,7 @@ arguments are ordinary expressions
 (`.on(within(attribute("data-theme").eq("dark")) + hover()) { … }`).
 
 Like an element, a block is an ordinary expression that desugars before
-analysis — to the `std::style` chain: `style()`, then `.raw(property,
+analysis — to the `std::web::style` chain: `style()`, then `.raw(property,
 value)` per declaration and `.name(args…, style() … )` per condition
 rule, with the rule's own chain appended as the final argument, in
 written order. `@` does not lex at all, so there are no at-rules inside

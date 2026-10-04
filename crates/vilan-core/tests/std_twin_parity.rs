@@ -9,9 +9,9 @@
 //! process build runs over browser modules.
 //!
 //! Nothing structurally held the halves against each other, and it bit twice
-//! during the bundle-splitting arc: `std::router` re-exports `ui::chunk_pending`
+//! during the bundle-splitting arc: `std::web::router` re-exports `ui::chunk_pending`
 //! and is analyzed in process builds too, so a browser-only `chunk_pending` left
-//! `std::router` uncompilable there (`proposal/bundle-splitting.md`, closing
+//! `std::web::router` uncompilable there (`proposal/bundle-splitting.md`, closing
 //! note). The pins that caught it were incidental. This is the standing gate.
 //!
 //! # The contract: what "surface" means here (N118)
@@ -20,7 +20,7 @@
 //! private helper is that twin's implementation choice: nothing outside the
 //! file can name it, so it cannot be the thing that breaks a build on the
 //! other platform, which is the whole failure class this gate exists for
-//! (`std::router` re-exports `ui::chunk_pending`, a name a process build must
+//! (`std::web::router` re-exports `ui::chunk_pending`, a name a process build must
 //! resolve). Counting private declarations made the gate ask a second
 //! question it was never built to ask — "do the two files read alike" — and
 //! that question has a wrong answer: the browser twin does its SVG routing
@@ -51,7 +51,7 @@
 //!
 //! **What it does not compare:** signatures. `on_event` is
 //! `|Event| void` in the browser and generic `|E| void` on the process side,
-//! deliberately — a server layer cannot name the browser-only `std::dom::Event`,
+//! deliberately — a server layer cannot name the browser-only `std::web::dom::Event`,
 //! and the handler is discarded anyway (process/ui.vl documents it). Names are
 //! the surface that breaks a build at analysis; shapes are held by
 //! `ssr_differential.rs`.
@@ -99,14 +99,14 @@ impl Side {
 /// site, not a silent surface drift. `time` and every other shared module lives
 /// in the base layer, compiled once for both platforms, so it cannot diverge at
 /// all.
-const TWINNED_MODULES: &[&str] = &["ui"];
+const TWINNED_MODULES: &[&str] = &["web::ui"];
 
 /// Names one twin declares and the other deliberately does not: `(module, name,
 /// side, why)`. A member is spelled `Type.member`.
 const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     // --- browser-only ------------------------------------------------------
     (
-        "ui",
+        "web::ui",
         "mount",
         Side::BrowserOnly,
         "BY DESIGN: mounting a component into a live document is a CLIENT entry \
@@ -115,7 +115,7 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          note, proposal/ssr.md §2/§6a).",
     ),
     (
-        "ui",
+        "web::ui",
         "mount_root",
         Side::BrowserOnly,
         "BY DESIGN, with `mount`: the reactive root a mount establishes is a \
@@ -123,7 +123,7 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          no owner survives it.",
     ),
     (
-        "ui",
+        "web::ui",
         "is_null",
         Side::BrowserOnly,
         "With `mount_target`: the one host-null peek its guard needs. Same \
@@ -131,7 +131,7 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          side.",
     ),
     (
-        "ui",
+        "web::ui",
         "chunk_preload",
         Side::BrowserOnly,
         "With `chunk_arm`: the S3 initial-route preload. Emitter-planted \
@@ -139,7 +139,7 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          render has nothing to prefetch.",
     ),
     (
-        "ui",
+        "web::ui",
         "swap_split",
         Side::BrowserOnly,
         "Emitter-selected, never written: a split build retargets a splittable \
@@ -151,11 +151,11 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          third name existed only because the retired `View.swap_split` METHOD \
          shadowed this one inside its own `impl` block. CONTRAST \
          `chunk_pending`, the one chunk-machinery name user code DOES bind \
-         (through `std::router::pending`) — it is mirrored on both sides, and \
+         (through `std::web::router::pending`) — it is mirrored on both sides, and \
          its absence is exactly what E34 was filed for.",
     ),
     (
-        "ui",
+        "web::ui",
         "Region.host",
         Side::BrowserOnly,
         "A91: the element a region currently sits in, read off its ANCHOR \
@@ -167,7 +167,7 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     // --- process-only ------------------------------------------------------
     (
-        "ui",
+        "web::ui",
         "render",
         Side::ProcessOnly,
         "BY DESIGN: serializes the built tree to markup — the process layer's \
@@ -175,22 +175,22 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          there is nothing to serialize.",
     ),
     (
-        "ui",
+        "web::ui",
         "Attribute",
         Side::ProcessOnly,
         "Part of the string-tree REPRESENTATION: the process `View` is a tag plus \
          ordered attributes and children, where the browser `View` wraps a live \
-         `std::dom::Element` and stores nothing itself.",
+         `std::web::dom::Element` and stores nothing itself.",
     ),
     (
-        "ui",
+        "web::ui",
         "Child",
         Side::ProcessOnly,
         "With `Attribute`: the ordered child list (an element or a text node), \
          which the DOM holds for the browser twin.",
     ),
     (
-        "ui",
+        "web::ui",
         "set_attribute",
         Side::ProcessOnly,
         "The set-or-replace-by-name helper that makes the string tree match the \
@@ -198,14 +198,14 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          appends). The browser twin calls the DOM for this.",
     ),
     (
-        "ui",
+        "web::ui",
         "escape_text",
         Side::ProcessOnly,
         "A serialization detail behind `render`. The DOM escapes on its own — \
          setting `textContent` never needs it.",
     ),
     (
-        "ui",
+        "web::ui",
         "escape_attribute",
         Side::ProcessOnly,
         "With `escape_text`: attribute-position escaping for the serializer.",
@@ -223,20 +223,15 @@ fn std_spec() -> PackageSpec {
 /// The module stems declared by a layer directory (`src/browser` -> `dom`,
 /// `router`, `ui`, ...).
 fn layer_modules(layer: &str) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let Ok(entries) = std::fs::read_dir(std_root().join("src").join(layer)) else {
-        panic!("std has no `{layer}` layer directory");
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|extension| extension == "vl") {
-            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
-            if stem != "lib" {
-                names.insert(stem);
-            }
-        }
-    }
-    names
+    let directory = std_root().join("src").join(layer);
+    assert!(directory.is_dir(), "std has no `{layer}` layer directory");
+    // A154: at every depth, named by path — the `ui` twins are `web::ui`, and a
+    // twin nested under a namespace is still a twin.
+    vilan_core::analyzer::modules_under_root(&directory, &[])
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != "lib")
+        .collect()
 }
 
 /// Analyze a program that imports `module` on `platform` and read the surface
@@ -279,7 +274,7 @@ fn surface(module_name: &str, platform: Platform) -> BTreeSet<String> {
 /// the members of every type declared there (`View.text`, `Slot.place`, ...).
 ///
 /// The source filter is what keeps the comparison honest — a module scope also
-/// holds its `import`s, and the twins import different things (`std::dom` on one
+/// holds its `import`s, and the twins import different things (`std::web::dom` on one
 /// side, nothing like it on the other), which is not surface divergence.
 ///
 /// The EXPORT filter is N118's, and it is the contract this file's head
@@ -291,7 +286,8 @@ fn surface(module_name: &str, platform: Platform) -> BTreeSet<String> {
 /// carry explicit `export` markers, so both are curated and the filter bites
 /// on both sides.
 fn declared_surface(program: &Program<'_>, module_name: &str) -> BTreeSet<String> {
-    let file_name = format!("{module_name}.vl");
+    let leaf = module_name.rsplit("::").next().unwrap_or(module_name);
+    let file_name = format!("{leaf}.vl");
     let source_id = program
         .sources
         .iter()
@@ -310,7 +306,7 @@ fn declared_surface(program: &Program<'_>, module_name: &str) -> BTreeSet<String
     let module = program
         .modules
         .values()
-        .find(|module| module.name == module_name)
+        .find(|module| module.name == leaf)
         .unwrap_or_else(|| panic!("no module named `{module_name}` in the analyzed program"));
     let scope = program
         .scopes
@@ -493,8 +489,8 @@ fn every_allowed_divergence_states_why() {
 /// the second and third assertions red together — that is the pre-N118 gate.
 #[test]
 fn n118_the_surface_is_the_exported_one() {
-    let browser = surface("ui", Platform::Browser);
-    let process = surface("ui", Platform::default());
+    let browser = surface("web::ui", Platform::Browser);
+    let process = surface("web::ui", Platform::default());
     assert!(
         browser.contains("mount"),
         "`mount` is exported from the browser twin"

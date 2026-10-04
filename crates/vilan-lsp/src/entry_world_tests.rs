@@ -550,7 +550,7 @@ async fn m104_a_world_lives_while_a_document_it_serves_is_open() {
 /// legs; beside its browser entry, the node entry's kept world does.
 #[tokio::test]
 async fn m104_a_module_both_entries_reach_reports_both_legs() {
-    const WIDGET: &str = "import std::ui::{ View, view };\n\n\
+    const WIDGET: &str = "import std::web::ui::{ View, view };\n\n\
          export fun attach(): View {\n\tlet root = view(\"div\");\n\t\
          root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
     const REACHES: &str = "import pkg::widget::attach;\n\nfun main() {\n\tattach();\n}\n";

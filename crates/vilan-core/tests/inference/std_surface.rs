@@ -382,15 +382,65 @@ fn r_e_the_removed_collection_modules_are_refused_with_the_new_path() {
         ),
         (
             "import std::map_cell::MapCell;",
-            "`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell`",
+            "`std::map_cell` is `std::reactive::hash_map_cell` now, and its `MapCell` is `HashMapCell`",
         ),
         (
             "import std::set_cell;",
-            "`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell`",
+            "`std::set_cell` is `std::reactive::hash_set_cell` now, and its `SetCell` is `HashSetCell`",
         ),
     ] {
         assert_fails_once_with(&format!("{import}\n\nfun main() {{}}\n"), steer);
     }
+}
+
+/// A154: every module that moved under a namespace is refused at its OLD path
+/// with where it went — from the one table the editor's fix also reads — and
+/// resolves at its new one. No forwarding modules (the ruling's (2)).
+#[test]
+fn a154_every_moved_module_is_refused_at_its_old_path_and_resolves_at_its_new_one() {
+    for (old, new) in vilan_core::parsing::MOVED_STD_MODULES {
+        let steer = vilan_core::parsing::moved_std_module_message(old, new);
+        // `std::web` resolves now (the namespace), so its old spelling shows
+        // only through a name the prelude exports; its own pin is below.
+        // `null` is a keyword, so no import path can spell `std::null` or
+        // `std::js::null` — the module is reached as the primitive type.
+        if *old == "null" {
+            continue;
+        }
+        if *old != "web" {
+            assert_fails_once_with(&format!("import std::{old};\n\nfun main() {{}}\n"), &steer);
+        }
+        assert_compiles(&format!("import std::{new};\n\nfun main() {{}}\n"));
+    }
+}
+
+#[test]
+fn a154_a_moved_module_inside_a_brace_list_is_refused_where_it_is_written() {
+    assert_fails_once_with(
+        "import std::{ io::print, rpc_server::Server };\n\nfun main() {\n\tprint(\"x\");\n}\n",
+        "`std::rpc_server` moved to `std::rpc::server`",
+    );
+    assert_fails_once_with(
+        "import std::delta::{ ListCell };\n\nfun main() {}\n",
+        "`std::delta` moved to `std::reactive::delta`",
+    );
+}
+
+#[test]
+fn a154_the_old_web_prelude_path_is_refused_and_a_typo_under_the_namespace_is_not() {
+    // `std::web::Signal` was the web prelude's re-export; `web` resolves (the
+    // namespace), `Signal` misses, and the refusal names the move.
+    assert_fails_once_with(
+        "import std::web::Signal;\n\nfun main() {}\n",
+        "`std::web` moved to `std::web::prelude`",
+    );
+    assert_compiles("import std::web::prelude::Signal;\n\nfun main() {}\n");
+    // A name the prelude does NOT export is an ordinary miss under the
+    // namespace — the steer would point at a path that does not have it either.
+    assert_fails_once_with(
+        "import std::web::dmo;\n\nfun main() {}\n",
+        "cannot find 'dmo' in the imported path",
+    );
 }
 
 #[test]
@@ -5224,7 +5274,7 @@ fn b98_the_platform_twins_are_not_a_duplicate_on_either_leg() {
     // proof lives in `check_scope_differential.rs`, which force-loads every std
     // module on both legs with the skip disabled.)
     let source = r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun main() { let root: View = view("div"); }
         "#;
     assert_compiles_browser(source);
@@ -7512,7 +7562,7 @@ fn b416_a_field_named_like_the_expansions_own_bindings_round_trips() {
 
 const A150_SHOW: &str = concat!(
     "import std::io::print;\n",
-    "import std::transient::TransientState;\n",
+    "import std::reactive::transient::TransientState;\n",
     "\n",
     "fun show(state: TransientState<i32, str>): str {\n",
     "\tmatch state {\n",

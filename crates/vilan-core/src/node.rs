@@ -722,12 +722,12 @@ pub enum Node<'src> {
         body: Box<Spanned<Node<'src>>>,
     },
     // A `css { … }` block (proposal/css-block.md) — CSS-shaped sugar over the
-    // `std::style` chain. Exists only between parse and the pre-analysis
+    // `std::web::style` chain. Exists only between parse and the pre-analysis
     // desugar (`css::rewrite_items`); the formatter prints it from source
     // (S2's passthrough; S3 brings the canonical printer).
     Css(CssBody<'src>),
     // An element expression `<div …> … </div>` (proposal/element-syntax.md) —
-    // markup sugar over the `std::ui` view chain. Exists only between parse
+    // markup sugar over the `std::web::ui` view chain. Exists only between parse
     // and the pre-analysis desugar (`elements::rewrite_items`); the formatter
     // prints it from source.
     Element(Box<ElementBody<'src>>),
@@ -958,20 +958,20 @@ pub enum Node<'src> {
     ),
     // A DESUGAR's scope-independent reference to a std item (B270): the module
     // under `std` and the item's name. `css { … }` seeds its chain with
-    // `StdItem("style", "style")` and element syntax calls
-    // `StdItem("ui", "view")`, so both mean std's function whatever the site's
+    // `StdItem("web::style", "style")` and element syntax calls
+    // `StdItem("web::ui", "view")`, so both mean std's function whatever the site's
     // scope binds those names to — a `let style = 1;`, an ambient `style`
-    // MODULE from `std::web`, an `import … as s`, or nothing at all.
+    // MODULE from `std::web::prelude`, an `import … as s`, or nothing at all.
     //
     // No source spells this: it exists only in a desugared tree, which is why
-    // it is not a path (`std::style::style` written inline is refused by
+    // it is not a path (`std::web::style::style` written inline is refused by
     // design — names.md §4.7) and why the loader seeds the module it names
     // (`collect_std_item_modules`) rather than waiting for an import.
     StdItem(&'src str, &'src str),
     // A70: the desugared body of a `css { … }` block, wrapping the whole chain
     // it lowered to. It FORWARDS like `const` does — the inner expression is
     // the entity, no wrapper — and exists only to tell the analyzer which
-    // expressions were written INSIDE a block, because `std::style::prelude`
+    // expressions were written INSIDE a block, because `std::web::style::prelude`
     // is ambient exactly there: a bare name in a hole, a condition head's
     // argument or a chain link's argument resolves against the site's scope
     // first and against that module only if nothing in scope answers.

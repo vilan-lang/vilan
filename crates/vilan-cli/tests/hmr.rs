@@ -71,7 +71,7 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// changes the bundle (a swap round).
 fn client_source(code_marker: &str, css_marker: &str) -> String {
     format!(
-        "import std::io::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"css\", \".{css_marker}{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"{code_marker}\");\n}}\n"
+        "import std::io::print;\nimport std::web::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"css\", \".{css_marker}{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"{code_marker}\");\n}}\n"
     )
 }
 
@@ -660,7 +660,7 @@ fn common_source(banner: &str) -> String {
 /// leaves it untouched — the "no css either" half of the quiet assertion).
 fn shared_client_source(css_marker: &str) -> String {
     format!(
-        "import std::io::print;\nimport std::asset::emit;\nimport pkg::common::banner;\n\n\
+        "import std::io::print;\nimport std::web::asset::emit;\nimport pkg::common::banner;\n\n\
          fun styles(): i32 {{\n\temit(\"css\", \".{css_marker}{{color:red}}\");\n\t1\n}}\n\n\
          let _s = const styles();\n\nfun main() {{\n\tprint(banner());\n}}\n"
     )
@@ -1639,7 +1639,7 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
 /// first-ever stylesheet of the session.
 fn presence_client_source(asset_kind: &str) -> String {
     format!(
-        "import std::io::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"{asset_kind}\", \".added{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"a\");\n}}\n"
+        "import std::io::print;\nimport std::web::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"{asset_kind}\", \".added{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"a\");\n}}\n"
     )
 }
 

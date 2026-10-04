@@ -10,6 +10,7 @@ import std::io::print;
 import std::json::{ Json, json_codec };
 import std::option::Option::{ None, Some };
 import std::result::Result::{ self, Err, Ok };
+import std::rpc::server::Service;
 import std::rpc::{
 	Dispatcher,
 	HttpTransport,
@@ -25,7 +26,6 @@ import std::rpc::{
 	local_rpc,
 	reply,
 };
-import std::rpc_server::Service;
 import std::shared::Shared;
 import std::time::now_millis;
 import std::wire::{ Codec, Serializer };

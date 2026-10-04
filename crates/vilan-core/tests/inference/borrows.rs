@@ -52,7 +52,7 @@ fn owner_disposes_subscriptions_across_re_renders() {
     // under a FRESH owner. After several renders only the *current* rows fire,
     // so the count stays bounded (a leak would give 6, not 2).
     //
-    // The fresh owner per render is `std::ui`'s own discipline — every
+    // The fresh owner per render is `std::web::ui`'s own discipline — every
     // boundary in `browser/ui.vl` (`each`'s rows, `when`, `swap`) disposes
     // the old owner and mints a new one, never refilling the disposed one — and
     // since B291 it is the only shape that works: an `Owner` has a disposed
@@ -10527,7 +10527,7 @@ fn b433_well_typed_writes_at_every_place_compile_and_run() {
 // passed the cell's live list uncopied, so a write to the cell inside the
 // closure showed through the parameter (`seen=3`; natively `seen=2`). The
 // closure type carries its parameters' conventions, and the view-argument
-// check now reads them. `std::delta`'s `ListCell::peek` was written this way
+// check now reads them. `std::reactive::delta`'s `ListCell::peek` was written this way
 // and re-spells through `Weak::get` (collections-42's patch, in this change).
 
 const B400_HOLDER: &str = concat!(
@@ -10961,7 +10961,7 @@ fn b483_a_storing_constructor_copies_an_argument_the_caller_still_reads() {
     let source = r#"
         import std::io::print;
         import std::shared::Shared;
-        import std::delta::ListCell;
+        import std::reactive::delta::ListCell;
 
         struct P { x: i32, tags: List<i32> }
 
@@ -12759,7 +12759,7 @@ fn b509_a_through_variant_write_copies_nothing() {
             r#"
         import std::io::print;
         import std::option::Option::{{ self, None, Some }};
-        import std::store::{{ Storable, Store, StoreSome }};
+        import std::reactive::store::{{ Storable, Store, StoreSome }};
 
         [derive(Storable)]
         struct Device {{ since: i32, big: List<i32> }}

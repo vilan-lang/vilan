@@ -3043,7 +3043,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// This used to read one identifier, so `style::FlexDirection::` looked up
     /// `FlexDirection` in scope — where it is not, and never was: it is a
     /// MEMBER of `style` — and answered nothing, while the import spelling of
-    /// the same path (`import std::style::FlexDirection::`) descended fine.
+    /// the same path (`import std::web::style::FlexDirection::`) descended fine.
     /// Each further segment is one step through
     /// [`Self::namespace_member`], the same single-step descent
     /// [`Self::namespace_completions`] offers the last one's items from; a
@@ -4542,10 +4542,40 @@ impl AutoImportOrder {
                 continue;
             };
             let tier = import_origin_tier(root);
-            for &child_id in root_scope.name_to_id_map.values() {
+            // A154: std's modules sit under namespaces (`std::web::dom`), so
+            // under `std` the walk descends each module's CHILDREN too,
+            // breadth-first: the top level in the order it always took, then
+            // each level below it. A package's own nested modules (A65) are
+            // not walked — that is a separate question, filed by layout-46.
+            let mut pending: std::collections::VecDeque<(Id, Vec<String>)> = root_scope
+                .name_to_id_map
+                .values()
+                .filter_map(|&child_id| {
+                    let child = program.modules.get(&child_id)?;
+                    Some((child_id, vec![root.to_string(), child.name.to_string()]))
+                })
+                .collect();
+            while let Some((child_id, path)) = pending.pop_front() {
                 let Some(child_module) = program.modules.get(&child_id) else {
                     continue;
                 };
+                if let Some(children) = (root == "std")
+                    .then(|| program.module_children_scopes.get(&child_id))
+                    .flatten()
+                    .and_then(|scope_id| program.scopes.get(scope_id))
+                {
+                    for &grandchild_id in children.name_to_id_map.values() {
+                        // A nested prelude is never a name's home (the
+                        // analyzer's B4 index skips it for the same reason).
+                        if let Some(grandchild) = program.modules.get(&grandchild_id)
+                            && grandchild.name != "prelude"
+                        {
+                            let mut below = path.clone();
+                            below.push(grandchild.name.to_string());
+                            pending.push_back((grandchild_id, below));
+                        }
+                    }
+                }
                 let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
                     continue;
                 };
@@ -4573,9 +4603,7 @@ impl AutoImportOrder {
                 // are in hand, so the keystroke path parses nothing at all.
                 let curated = program.curated_modules.contains(&child_module.body.1);
                 let module = modules.len() as u32;
-                modules.push(AutoImportModule {
-                    path: vec![root.to_string(), child_module.name.to_string()],
-                });
+                modules.push(AutoImportModule { path });
                 for (&name, &entity_id) in &child_scope.name_to_id_map {
                     // Only a name this module DECLARES is an add-import target;
                     // a re-export names an item that lives somewhere else.

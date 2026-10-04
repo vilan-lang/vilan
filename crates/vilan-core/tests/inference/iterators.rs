@@ -2234,7 +2234,7 @@ fn an_annotated_non_option_next_keeps_its_own_diagnostic() {
 // written over its own `T` matched `Colour::Red` against a `Fruit::Apple(9)`.
 //
 // Whether it is fixable AT the pattern turns on WHICH parameter it is, and the
-// evidence for the split is `std::ui::View::swap` — see the `#[ignore]`d pin at
+// evidence for the split is `std::web::ui::View::swap` — see the `#[ignore]`d pin at
 // the end of this block. A parameter declared by a scope ENCLOSING the pattern
 // is abstract by construction (the declaration is checked once for all of its
 // instantiations), so it is an error. One that arrived from elsewhere means
@@ -2500,7 +2500,7 @@ fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
 // differing only by whether the parameter list starts with `self`.
 
 /// B90's headline case, `#[ignore]`d until the fix: the wrong enum inside a
-/// closure passed to a METHOD's own generic. `std::ui::View::swap` is exactly
+/// closure passed to a METHOD's own generic. `std::web::ui::View::swap` is exactly
 /// this shape, and the routing guide's `swap(route, |current| match current {
 /// .. })` is the documented, shipped use — which is why B82 refused to make a
 /// `Type::Generic` scrutinee a blanket error (probed then: 3 diagnostics in
@@ -3110,7 +3110,7 @@ fn a_custom_conformer_gets_every_termination_for_free() {
 // does not carry its trait, so it falls back to every member with the call's
 // name. Statics were in that set, and they cannot be: `receiver.name()` never
 // selects a member with no receiver. Leaving them in was not merely imprecise.
-// `std::promise::Promise::all` is an `async external` STATIC and `promise` is a
+// `std::js::promise::Promise::all` is an `async external` STATIC and `promise` is a
 // force-loaded core module, so the moment std grew an `Iterator::all` trait
 // default, every `xs.iter().all(p)` colored its whole caller async — down to an
 // `async` `main`, which the const-eval interpreter then refuses outright
@@ -4361,7 +4361,7 @@ fn b102_a_different_instantiation_through_a_forwarder_still_splits() {
 fn b102_a_self_recursive_call_keeps_its_own_generic_bound() {
     compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         fun wrap<T: Slot>(content: T, depth: i32): View {
             if depth > 0 {
                 wrap(content, depth - 1)

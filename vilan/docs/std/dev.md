@@ -1,6 +1,6 @@
 # Dev / HMR reference
 
-`std::dev` is the app-facing surface of **hot module replacement**: the
+`std::web::dev` is the app-facing surface of **hot module replacement**: the
 live-update loop `vilan run --watch` runs for a full-stack project (see
 [The dev loop](../guide/dev-loop.md) for the whole picture). Browser-only,
 and every hook here is a **no-op outside a hot reload**: importing it costs
@@ -23,7 +23,7 @@ it, so you rarely call it directly. Reach for it when you want a whole block
 to exist only during development.
 
 ```vilan,browser
-import std::dev;
+import std::web::dev;
 
 fun main() {
 	if dev::hmr_active() {
@@ -42,7 +42,7 @@ something outside the reactive system. Without it, that stray keeps running
 after the swap: harmless (it writes into disposed cells) but wasteful.
 
 ```vilan,browser
-import std::dev;
+import std::web::dev;
 import std::shared::Shared;
 
 let connection: Shared<bool> = Shared::new(true);
@@ -67,7 +67,7 @@ Module-level bindings carry across a swap automatically (see
 value minted inside a function that you want to survive one edit.
 
 ```vilan,browser
-import std::dev;
+import std::web::dev;
 import std::option::Option::{ self, Some, None };
 
 fun main() {

@@ -269,7 +269,7 @@ fn manifest_string_field<'manifest>(
 /// at boot, never to disk, so no `.html` can vouch for it (§16.2, E65).
 ///
 /// Read from every `.vl` in the tree rather than from the entries alone:
-/// `std::document` is process-coloured, so a browser leg cannot carry the
+/// `std::web::document` is process-coloured, so a browser leg cannot carry the
 /// call, and a server may build its page in a module the entry imports. A call
 /// in a module no entry reaches is the one blind spot, accepted over restating
 /// the module loader in a gate.
@@ -423,7 +423,7 @@ fn manifest(leg: &str, styles: Option<&str>) -> String {
 }
 
 const RUNG_2_SERVER: &str = "import std::build::require_build;\n\
-     import std::document::Document;\n\
+     import std::web::document::Document;\n\
      import std::http::{ Response, Server };\n\n\
      async fun main() {\n\
      \tlet build = require_build(\"client\");\n\

@@ -1,6 +1,6 @@
 // The shared component: ONE `fun app(): View` that both entries build
 // (proposal/ssr.md §1, §3). It sits in the same source tree as `client.vl` and
-// `server.vl`, and `import std::ui` resolves per entry — the browser layer in
+// `server.vl`, and `import std::web::ui` resolves per entry — the browser layer in
 // the client leg, the process layer in the server leg. The client mounts it
 // into live DOM; the server renders it to an HTML string. Its data is
 // self-contained (signals seeded in code), so the two legs produce the same
@@ -9,13 +9,13 @@
 //
 // Build pure, bind reactive (proposal/ssr.md §5): the bindings below all READ
 // ONCE on the server (the value at render time is the value served) and stay live
-// on the client. Nothing here reaches for `std::dom`, so the same source compiles
+// on the client. Nothing here reaches for `std::web::dom`, so the same source compiles
 // on both platforms. Components are just functions returning a `View`, so the app
 // is composition.
 //
 // This file imports NOTHING, and that is the prelude rather than a small file:
 // `Signal`, `SignalCell`, `view` and `View` are all ambient under
-// `prelude = "std::web"` (vilan.toml), and every one of them is base-layer or
+// `prelude = "std::web::prelude"` (vilan.toml), and every one of them is base-layer or
 // declared by both platform layers — so the empty import block means the same
 // thing in the browser leg and in the node leg, which is what a shared component
 // needs.

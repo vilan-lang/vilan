@@ -25,6 +25,16 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**`vilan fmt` formats a file that leads with `[platform(..)] mod self;` and carries `export *;`, where it declined it ("the printer's output reads `[platform("browser")] mod self;` where it stops being readable").** The canonical slot for the `export *;` marker (E181, below the leading import run) was counted from the top of the file, so the marker was printed ABOVE `mod self;` — which must be a file's first statement — and the reprint did not parse. The slot now counts from below a leading `mod self;`. Found by layout-46.
+
+---
+
+<!-- family: breaking -->
+**std's modules are grouped under namespaces: the web modules under `std::web::`, the reactive family under `std::reactive::`, the JS-interop modules under `std::js::`, and `rpc_server` under `std::rpc::`. The old paths are gone (no forwarding modules) and each is refused with where it went — "`std::dom` moved to `std::web::dom`" — with a quick fix in the editor; `prelude = "std::web"` in a `vilan.toml` is refused the same way.** A154 (ruled 2026-10-03). The moves, old → new: `std::dom` → `std::web::dom`, `std::ui` → `std::web::ui`, `std::style` → `std::web::style` (and `std::style::prelude` → `std::web::style::prelude`), `std::dev` → `std::web::dev`, `std::router` → `std::web::router`, `std::storage` → `std::web::storage`, `std::document` → `std::web::document`, `std::asset` → `std::web::asset`, the web prelude `std::web` → `std::web::prelude` (write `prelude = "std::web::prelude"`); `std::hash_map_cell` → `std::reactive::hash_map_cell`, `std::hash_set_cell` → `std::reactive::hash_set_cell`, `std::transient` → `std::reactive::transient`, `std::store` → `std::reactive::store`, `std::store_core` → `std::reactive::store_core`, `std::delta` → `std::reactive::delta`; `std::null` → `std::js::null`, `std::promise` → `std::js::promise`, `std::native_map` → `std::js::native_map`; `std::rpc_server` → `std::rpc::server`. Nothing else moved: the collections, the trait modules, the codecs, the server modules (`fs`, `http`, `db`, `process`, `watch`, `build`), `context`, `memo`, `shared`, `task`, `wire`, `ws` and `fetch` keep their paths. Under the web prelude `ui::` and `style::` stay ambient, element syntax and `css { }` mean what they meant, and names re-exported from `std::reactive` (`HashMapCell`, `HashSetCell`, the delta operators) are still imported from there — only an explicit `import std::<old>::…` line changes. The refusal's stable code is `std-path/moved`; the edit replaces the old module segment with the new path.
+
+---
+
 <!-- family: miscompile -->
 **A tuple assignment whose target holds an element (`(list[0], x) = (1, 2)`), a nested tuple (`((x, y), z) = ((4, 5), 6)`), a tuple-typed binding (`(p, z) = ((7, 8), 9)`) or a tuple-typed position (`(t.0, z) = ..`) assigns each place, where the JS module threw at load (`[ __at(list, 0), x ] = ..`, `[ ...[ x, y ], z ] = ..`) and natively rustc refused the tuple-typed binding (`(p).clone()` in the pattern, E0070).** B538 (solver-b-46's find). JS lowers such a target to the value in a temporary and one ordinary write per leaf at its flat offset (an element through `__at_put`, a tuple-typed leaf from a `slice`); a tuple of plain places keeps its destructuring (`(a, b) = (b, a)` is byte-identical). Natively each element of the target is rendered as a place.
 

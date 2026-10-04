@@ -9,11 +9,9 @@
 // a node:crypto `pbkdf2Sync` the program binds itself, read back through the
 // `Buffer`'s `toString("hex")` under a host-struct name of the program's own,
 // with the salt and the session token drawn from `std::crypto::random_bytes`.
-import std::asset;
 import std::build::require_build;
 import std::crypto::random_bytes;
 import std::db::Database;
-import std::document::Document;
 import std::hash_map::HashMap;
 import std::http::{ CachePolicy, Request, Response, Server };
 import std::io::print;
@@ -22,7 +20,9 @@ import std::option::Option::{ self, None, Some };
 import std::range::Range;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Err, Ok };
-import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+import std::rpc::server::{ Connection, Handshake, Reject, Service, Session };
+import std::web::asset;
+import std::web::document::Document;
 import std::wire::{ Keyed, Wire };
 
 [derive(Wire, PartialEq, Debug)]

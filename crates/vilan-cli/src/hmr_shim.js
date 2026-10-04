@@ -4,7 +4,7 @@
 // name are template-substituted at write time. It installs a
 // `window.__VILAN_HMR__` singleton (a re-evaluated
 // bundle reuses it), defines the instrumentation globals the compiled bundle
-// calls (`__hmr_adopt*`/`__hmr_expose`/`__hmr_lazy_value`, hmr.md §5) plus the `std::dev` host
+// calls (`__hmr_adopt*`/`__hmr_expose`/`__hmr_lazy_value`, hmr.md §5) plus the `std::web::dev` host
 // globals (`__hmr_register_teardown`/`__hmr_stash`/`__hmr_take`), and reacts to
 // the dev channel: live-reload, CSS hot-swap, an error overlay, and the
 // state-preserving `swap` (hmr.md §3/§4).
@@ -36,7 +36,7 @@
     var exposed = {}; // key -> { fp, getter } — the live bindings to capture.
     var seed = {}; // key -> { fp, value } — last capture, consulted on adopt.
     var teardowns = []; // cleanups run once, before the next bundle evaluates.
-    var userStash = {}; // "user:"-prefixed app carryover (std::dev stash/take).
+    var userStash = {}; // "user:"-prefixed app carryover (std::web::dev stash/take).
 
     var singleton = {
         port: PORT,
@@ -140,7 +140,7 @@
     globalThis.__hmr_expose = function (key, fp, getter) {
         exposed[key] = { fp: fp, getter: getter };
     };
-    // std::dev host globals — only reached behind an `hmr_active()` guard.
+    // std::web::dev host globals — only reached behind an `hmr_active()` guard.
     globalThis.__hmr_register_teardown = function (cleanup) {
         teardowns.push(cleanup);
     };

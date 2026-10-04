@@ -17,7 +17,7 @@ const TITLE: &str = "Write `.autofocus()`";
 
 #[test]
 fn a_written_autofocus_becomes_the_method() {
-    let source = "import std::ui::View;\n\nfun main() {\n\tlet _element: View = <input name(\"n\") autofocus />;\n}\n";
+    let source = "import std::web::ui::View;\n\nfun main() {\n\tlet _element: View = <input name(\"n\") autofocus />;\n}\n";
     let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
     let program = document.program.as_ref().expect("a program");
     // A warning is not in `diagnostics` (document.rs says why): the fix is
@@ -33,7 +33,7 @@ fn a_written_autofocus_becomes_the_method() {
     text.replace_range(fixes[0].span.into_range(), &fixes[0].replacement);
     assert_eq!(
         text,
-        "import std::ui::View;\n\nfun main() {\n\tlet _element: View = <input name(\"n\") .autofocus() />;\n}\n"
+        "import std::web::ui::View;\n\nfun main() {\n\tlet _element: View = <input name(\"n\") .autofocus() />;\n}\n"
     );
     let fixed = Document::analyze(&text, &std_root(), Path::new("test.vl"));
     assert!(
@@ -54,7 +54,7 @@ fn a_written_autofocus_becomes_the_method() {
 fn the_steer_is_published_with_its_code() {
     let path = std::env::temp_dir().join(format!("vilan-a157-code-{}.vl", std::process::id()));
     let document = Document::analyze(
-        "import std::ui::View;\n\nfun main() {\n\tlet _element: View = <input autofocus />;\n}\n",
+        "import std::web::ui::View;\n\nfun main() {\n\tlet _element: View = <input autofocus />;\n}\n",
         &std_root(),
         &path,
     );

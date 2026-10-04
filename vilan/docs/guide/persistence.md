@@ -211,7 +211,7 @@ every path they do not claim and deep links keep working (see
 
 ```vilan,norun
 import std::build::require_build;
-import std::document::require_shell;
+import std::web::document::require_shell;
 import std::http::{ Response, Server };
 
 async fun main() {

@@ -8,7 +8,7 @@ a page that exists. Every page receives exactly the parameters it declares.
 When you add a page, the compiler points at every `match` that now needs to
 handle it. A pattern-string router can't promise any of that.
 
-`std::router` supplies the primitives: the live path signal, `navigate`,
+`std::web::router` supplies the primitives: the live path signal, `navigate`,
 the `link` helper, and `parse_path` / `FromPath` for reading a URL back.
 
 ## The route model
@@ -17,8 +17,8 @@ Here's a small two-level app: a home page, and workspace pages that have
 their own sub-pages.
 
 ```vilan,browser
-import std::ui::{ swap, view, View, mount_root };
-import std::router::{ current_path, navigate, segments, link, Routable };
+import std::web::ui::{ swap, view, View, mount_root };
+import std::web::router::{ current_path, navigate, segments, link, Routable };
 import std::reactive::{ Signal, SignalCell };
 import std::option::Option::{ self, Some, None };
 
@@ -100,7 +100,7 @@ Now the pieces one at a time.
 ## Reading the URL back
 
 `parse` above is one half of a pair the compiler cannot hold together, so
-`std::router` gives it a shape: `Routable` writes a route to a URL,
+`std::web::router` gives it a shape: `Routable` writes a route to a URL,
 `FromPath` reads one back, and a type implementing both states its wire
 format once in each direction.
 
@@ -114,7 +114,7 @@ compiler says so if you try.
 
 ```vilan,browser
 import std::io::print;
-import std::router::{ FromPath, PathParts, Routable, from_path, parse_path };
+import std::web::router::{ FromPath, PathParts, Routable, from_path, parse_path };
 
 [derive(PartialEq)]
 enum Route {
@@ -262,7 +262,7 @@ on your server's builder chain does it:
 
 ```vilan,norun
 import std::build::require_build;
-import std::document::require_shell;
+import std::web::document::require_shell;
 import std::http::{ Response, Server };
 
 async fun main() {

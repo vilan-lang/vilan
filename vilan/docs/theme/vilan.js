@@ -292,14 +292,14 @@
 	// The docs harness compiles untagged fences on the process leg, but most
 	// are platform-neutral and RUN in the browser; only these imports mark a
 	// program as genuinely process-bound: the std modules of the process layer
-	// (`std/vilan.toml`, `[library.layer.process]`) and `std::ui`'s `render`,
+	// (`std/vilan.toml`, `[library.layer.process]`) and `std::web::ui`'s `render`,
 	// the SSR twin's one process-only export. A wrong guess is self-correcting:
 	// the reader lands on a diagnostic, and in the playground the mode select
 	// is right there. The run button makes the same guess: a process-bound
 	// program is CHECKED (the browser has no process host to run it),
 	// everything else runs.
 	var PROCESS_HINT =
-		/\bstd::(build|db|document|fs|http|process|rpc_server|watch)\b|\bstd::ui::(?:\{[^}]*\brender\b|render\b)/;
+		/\bstd::(build|db|fs|http|process|watch|web::document|rpc::server)\b|\bstd::web::ui::(?:\{[^}]*\brender\b|render\b)/;
 
 	// --- the share codec -------------------------------------------------
 	//

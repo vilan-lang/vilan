@@ -23,7 +23,7 @@ import std::compare::PartialEq;
 import std::io::print;
 import std::reactive::{ Owner, Signal, SignalCell, Source, batch, derive, run_with_owner };
 import std::shared::Shared;
-import std::store::{ Storable, Store, StoreFlag, StoreSome, store_census };
+import std::reactive::store::{ Storable, Store, StoreFlag, StoreSome, store_census };
 
 let compares = Shared::new(0);
 let woke = Shared::new([""]);
@@ -317,7 +317,7 @@ fn a142_s7_a_coarse_field_is_one_slot_compared_whole() {
         import std::io::print;
         import std::reactive::{ Owner, Signal, Source, run_with_owner };
         import std::shared::Shared;
-        import std::store::{ Storable, Store };
+        import std::reactive::store::{ Storable, Store };
 
         let compares = Shared::new(0);
 
@@ -370,7 +370,7 @@ fn a142_s7_a_renamed_projection_takes_the_name_the_attribute_gives() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, Source };
-        import std::store::{ Storable, Store };
+        import std::reactive::store::{ Storable, Store };
 
         [derive(Storable)]
         struct Request {
@@ -402,7 +402,7 @@ fn a142_s7_the_derive_refuses_a_field_named_like_a_handle_member() {
         assert_fails_with(
             &format!(
                 r#"
-                import std::store::Storable;
+                import std::reactive::store::Storable;
 
                 [derive(Storable)]
                 struct Clash {{
@@ -447,7 +447,7 @@ fn a142_s7_a_leaf_with_no_equality_changes_on_every_covering_write() {
         r#"
         import std::io::print;
         import std::reactive::{ Owner, Signal, Source, run_with_owner };
-        import std::store::{ Storable, Store };
+        import std::reactive::store::{ Storable, Store };
 
         [derive(Storable)]
         struct Button {
@@ -514,7 +514,7 @@ fn a142_s7_a_generic_struct_derives_and_projects_its_parameters() {
         r#"
         import std::io::print;
         import std::reactive::{ Owner, Signal, Source, run_with_owner };
-        import std::store::{ Storable, Store };
+        import std::reactive::store::{ Storable, Store };
 
         [derive(Storable)]
         struct Pair<T> {
@@ -553,7 +553,7 @@ fn a142_s7_a_handle_reads_one_leaf_without_copying_the_root() {
         import std::hash_map::HashMap;
         import std::io::print;
         import std::reactive::Source;
-        import std::store::{ Storable, Store, store_census };
+        import std::reactive::store::{ Storable, Store, store_census };
 
         [derive(Storable)]
         struct Root {
@@ -760,7 +760,7 @@ fn b526_an_assumed_handle_holds_the_last_value_its_subscribers_read() {
         import std::display::Display;
         import std::io::print;
         import std::reactive::{ Flow, Owner, Source, run_with_owner };
-        import std::store::{ Storable, Store, StoreSome };
+        import std::reactive::store::{ Storable, Store, StoreSome };
 
         [derive(Storable, PartialEq)]
         struct Message {
@@ -798,7 +798,7 @@ fn a142_s7_an_enum_derive_refuses_a_variant_named_like_a_handle_member() {
         assert_fails_with(
             &format!(
                 r#"
-                import std::store::Storable;
+                import std::reactive::store::Storable;
 
                 [derive(Storable)]
                 enum Clash {{
@@ -814,7 +814,7 @@ fn a142_s7_an_enum_derive_refuses_a_variant_named_like_a_handle_member() {
     }
     assert_compiles(
         r#"
-        import std::store::Storable;
+        import std::reactive::store::Storable;
 
         [derive(Storable)]
         enum Fine {
@@ -836,7 +836,7 @@ fn a142_s7_a_generic_enum_derives_with_a_scalar_payload() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, Source };
-        import std::store::{ Storable, Store };
+        import std::reactive::store::{ Storable, Store };
 
         [derive(Storable)]
         enum Maybe<T> {
@@ -869,8 +869,8 @@ fn a142_s7_when_live_compiles_on_both_ui_layers() {
     let component = r#"
         import std::io::print;
         import std::reactive::Source;
-        import std::store::{ Storable, Store };
-        import std::ui::{ View, view, when_live };
+        import std::reactive::store::{ Storable, Store };
+        import std::web::ui::{ View, view, when_live };
 
         [derive(PartialEq, Storable)]
         struct Device {
@@ -890,7 +890,7 @@ fn a142_s7_when_live_compiles_on_both_ui_layers() {
     assert_compiles_browser(&format!("{component}\nfun main() {{}}\n"));
     assert_compiles_and_runs(
         &format!(
-            "{component}\nimport std::ui::render;\n\nfun main() {{\n    \
+            "{component}\nimport std::web::ui::render;\n\nfun main() {{\n    \
              print(render(panel(Store::new(Presence::Online(Device {{ name = \"laptop\" }})))));\n    \
              print(render(panel(Store::new(Presence::Offline))));\n}}\n\nmain();\n"
         ),
@@ -907,8 +907,8 @@ fn b526_the_server_twins_when_live_serves_the_payload_as_it_stands() {
         r#"
         import std::io::print;
         import std::reactive::Source;
-        import std::store::{ Storable, Store };
-        import std::ui::{ View, render, view, when_live };
+        import std::reactive::store::{ Storable, Store };
+        import std::web::ui::{ View, render, view, when_live };
 
         [derive(PartialEq, Storable)]
         struct Device {
@@ -1028,7 +1028,7 @@ fun main() {"#,
 /// woke for one write.
 const COLLECTIONS: &str = r#"
 import std::compare::PartialEq;
-import std::delta::{ CollFlow, MapFlow, MapOp, SeqOp, SequenceCell, SetFlow, SetOp };
+import std::reactive::delta::{ CollFlow, MapFlow, MapOp, SeqOp, SequenceCell, SetFlow, SetOp };
 import std::display::Display;
 import std::hash_map::HashMap;
 import std::hash_set::HashSet;
@@ -1036,7 +1036,7 @@ import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Owner, Signal, Source, run_with_owner };
 import std::shared::Shared;
-import std::store::{ Storable, Store, StoreSome, store_census, store_feed_census };
+import std::reactive::store::{ Storable, Store, StoreSome, store_census, store_feed_census };
 import std::wire::Keyed;
 
 [derive(PartialEq, Storable)]

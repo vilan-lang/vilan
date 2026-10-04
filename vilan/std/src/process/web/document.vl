@@ -1,5 +1,5 @@
-// `std::document` — the HTML document a browser leg is loaded by, held against what
-// that leg's build emitted (`fullstack-dx.md` §5.5–§5.6, RATIFIED 2026-08-11).
+// `std::web::document` — the HTML document a browser leg is loaded by, held against
+// what that leg's build emitted (`fullstack-dx.md` §5.5–§5.6, RATIFIED 2026-08-11).
 //
 // The founding bug: a shell that linked no stylesheet, over a build that emitted
 // one. Nothing failed. The page rendered — unstyled, and correct-looking — and
@@ -38,8 +38,8 @@ import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
 import pkg::path;
 import pkg::result::Result::{ self, Err, Ok };
-import pkg::ui;
-import pkg::ui::{ View, escape_attribute, escape_text };
+import pkg::web::ui;
+import pkg::web::ui::{ View, escape_attribute, escape_text };
 
 /// The mount element's id when nothing says otherwise — what every shell in this
 /// tree uses, and the other end of `mount_root("app", …)`.

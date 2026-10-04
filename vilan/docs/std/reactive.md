@@ -31,7 +31,7 @@ import std::reactive::{
 | `Constant<T>` | struct | `Source::constant(v)`: a source that never changes |
 | `Derive`, `Switch`, `SwitchSome`, `AndThen`, `ThenSome`, `Combine`, `ZipSome`, `Distinct`, `DistinctBy` | `[resource]` structs | the pipe stages: hold their upstream until a consumer starts them; what the combinators return |
 | `Instance<T>` | struct | a started flow — the one consumer's `pull`/`attach`/`release` (for stage authors) |
-| `TransientState`, `TransientSource`, `.transient()` | `std::transient` | values that come and go — pending, ready, refreshing, failed with the stale value, absent; a flow of tasks sealed so the latest task wins ([std::transient](transient.md)) |
+| `TransientState`, `TransientSource`, `.transient()` | `std::reactive::transient` | values that come and go — pending, ready, refreshing, failed with the stale value, absent; a flow of tasks sealed so the latest task wins ([std::reactive::transient](transient.md)) |
 | `track` | method (every `Source`) | read AND make the source a dependency of the body that is running — tracked reads (A142 §7) |
 | `derive` (free), `TrackedDerive<T>` | fn / `[resource]` struct | a pipe whose only dependencies are the ones its body tracks |
 | `tracking`, `TrackScope`, `Tracker` | context / structs | the tracking scope a body's run establishes; `tracking.clear(..)` is `untrack` |
@@ -401,7 +401,7 @@ directly) or to keep a contract of its own — a mirror's seeding frame arrives
 and makes the one immediate call itself.
 
 **Anything that only reads takes a `Flow`, not a `Signal`.** Every read-only
-binding in [`std::ui`](browser.md#view-methods) — `bind_text`, `bind_class`,
+binding in [`std::web::ui`](browser.md#view-methods) — `bind_text`, `bind_class`,
 `bind_attr`, `bind_styled`, `style_var`, `toggle_attr`, `when`, `when_some`,
 `show` and `swap` — is generic over `Flow<T>` and consumes it (`own`), so
 `Stored<str>` above, a cell and a pipe all drive them, on the browser layer and
@@ -590,7 +590,7 @@ run's first registration — a body that registers nothing costs a read and a
 write, and allocates no owner. A run's nursery has to exist before the body
 runs (the spawn machinery registers a task at the `async` expression), but a
 run that started no task hands its nursery on to the next run: a stage makes a
-nursery at its first run, and again only after a run that spawned. The bindings in `std::ui` do not pay even that:
+nursery at its first run, and again only after a run that spawned. The bindings in `std::web::ui` do not pay even that:
 their bodies write the DOM and register nothing, so they attach plainly.
 
 ```vilan
@@ -733,7 +733,7 @@ impl Selector<type T: Hashable + PartialEq> {
 
 ```vilan,browser
 import std::reactive::{ Signal, SignalCell, selector };
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 fun main() {
 	let rows: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
@@ -949,7 +949,7 @@ the zip once per arm outside a turn, as any `combine` does; inside a `batch`
 or a turn it runs once, on settled values.
 
 What it does not do is hand back a flow per part: the parts of a zipped value
-are values. For a body that wants one live cell per part, `std::ui`'s
+are values. For a body that wants one live cell per part, `std::web::ui`'s
 `when_all_some((a, b), |(a, b)| ..)` is `when_some` over `zip_some` plus the
 split below.
 
@@ -996,7 +996,7 @@ the snapshot an inline notify is walking. (Until A110 a delivery queued in the
 currently-draining turn could still land once. It cannot now.)
 
 `Subscription::teardown` is the registration shape for a source **outside** the
-signal graph: `dispose` runs the hook once and does nothing else. `std::dom`'s
+signal graph: `dispose` runs the hook once and does nothing else. `std::web::dom`'s
 `listen` is built on it — a DOM listener's whole teardown is the call that
 unhooks it. The hook is one-shot, so disposing twice is safe.
 

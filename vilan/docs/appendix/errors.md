@@ -41,10 +41,10 @@ test that captured it"): a plain `bool` does not carry the payload, so
 the capture reaches the rest of that expression and nothing after it.
 → [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md), [spec §5.7](../spec/types.md)
 
-**"… is in the prelude of the web set — set `prelude = \"std::web\"`"**
+**"… is in the prelude of the web set — set `prelude = \"std::web::prelude\"`"**
 The name (`Signal`, `SignalCell`, `view`, `View`) is one std's **web**
 prelude makes ambient, and this package is on the base one. Either set
-`prelude = "std::web"` in `vilan.toml`, or import the name explicitly —
+`prelude = "std::web::prelude"` in `vilan.toml`, or import the name explicitly —
 both work; the steer only means the manifest line is usually what you
 wanted. It fires only for names the web set carries as bare members,
 never for its module-carried names (`style`, `ui`): switching preludes
@@ -63,7 +63,7 @@ name: `import std::math;` and `math::min(1, 2)`.
 
 **"`…` requires the `…` layer of `std` and cannot run on `…`"**
 Code reachable from this build's entry calls into a module the platform
-doesn't have: `std::fs` from a browser build, `std::dom` from a Node
+doesn't have: `std::fs` from a browser build, `std::web::dom` from a Node
 build. The error lists the call chain from `main` to the crossing.
 Importing the module is not the problem (imports are free); reaching it
 is. Move the call behind the right entry, or check the package's
@@ -461,7 +461,7 @@ none. **An interpolated string is this same concatenation** (`i"a{x}b"`
 *is* `("" + "a" + x + "b")`), so a hole gets the identical error and the
 identical fix. A `css` block's hole is the one that is NOT this
 concatenation any more (A34): a mixed value passes each hole through
-`std::style::piece`, so `border: 1px solid {Color::gray(500)};` keeps
+`std::web::style::piece`, so `border: 1px solid {Color::gray(500)};` keeps
 the value typed and puts its `:root` line on the sheet — which is why
 the message steers a style token into a block rather than into
 `.to_string()`, whose text would name a custom property nothing
@@ -973,7 +973,7 @@ ordered by the CSS cascade, not by a contribution's key"**
 The stylesheet's order is decided by the cascade — base rules before
 `@media` blocks, media blocks by ascending min-width — so a sort key
 handed to it would have nowhere to apply. Write the rule with
-`asset::emit("css", …)`, or let [`std::style`](../std/style.md) own the
+`asset::emit("css", …)`, or let [`std::web::style`](../std/style.md) own the
 sheet. `emit_keyed` is for a kind of the program's own.
 
 **"… is compile-time-only; evaluate this call inside a `const` expression"**
@@ -1078,7 +1078,7 @@ space, the way CSS's own value lists do — `margin(px(4), px(8))`,
 `border("1px solid", gray(300))`. And a `css` block has no at-rules of
 any kind: a media query is spelled as a breakpoint combinator
 (`.md { … }`), and a declaration block under a selector of your own is
-`std::style::declare`. `@` lexes as nothing at all, anywhere, which is
+`std::web::style::declare`. `@` lexes as nothing at all, anywhere, which is
 why that one is the lexer's refusal and not the block's.
 → [Styling](../guide/styling.md)
 

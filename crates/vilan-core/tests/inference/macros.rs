@@ -5111,7 +5111,7 @@ fn run_with_owner_yields_the_body_value() {
     );
 }
 
-// The clause may name an IMPORTED context (the `std::ui` shape) — resolution
+// The clause may name an IMPORTED context (the `std::web::ui` shape) — resolution
 // runs after the import fixpoint, following the import alias to the defining
 // binding so identity agrees with the threading pass.
 #[test]
@@ -5403,7 +5403,7 @@ fn e191_an_arity_error_in_an_element_head_reports_alone() {
     let source = r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, mount_root, view };
+        import std::web::ui::{ View, mount_root, view };
 
         fun target(name: str): str {
             "/" + name

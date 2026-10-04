@@ -77,7 +77,7 @@ for the explicit keywords when you *don't* want to wait. The
 | CSS: `gap: 1rem;` (hard-coded)  | `gap(space(4));` (a scale token)                |
 
 The CSS rows are a real block, not a template string: `css { … }` is
-core syntax that lowers to a `std::style` chain, so the property names
+core syntax that lowers to a `std::web::style` chain, so the property names
 are tokens the compiler sees, every value is an ordinary vilan
 expression the type system checks, and `vilan fmt` orders them for you. The
 [styling guide](../guide/styling.md#the-css-block) has the whole shape.

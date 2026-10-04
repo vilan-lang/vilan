@@ -26,12 +26,12 @@
 // positional face — `values()`, `entries()` — derives its positions from the ops
 // (`delta.vl`'s map operators, S2).
 import pkg::compare::PartialEq;
-import pkg::delta::{ DeltaCursor, DeltaLog, DeltaSource, MapOp };
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::io::panic;
-import pkg::native_map::NativeMap;
+import pkg::js::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::delta::{ DeltaCursor, DeltaLog, DeltaSource, MapOp };
 import pkg::reactive::{
 	Signal,
 	SignalCell,

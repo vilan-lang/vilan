@@ -32,7 +32,7 @@ follows keystroke by keystroke.
 ```toml
 [package]
 name = "notes"
-prelude = "std::web"
+prelude = "std::web::prelude"
 
 [entry.client]
 target = "browser"
@@ -54,7 +54,7 @@ walkthrough/
 ```
 
 One package, two entries ([Platforms](../tour/platforms.md) introduced
-this layout). `prelude = "std::web"` is the other line worth reading: it
+this layout). `prelude = "std::web::prelude"` is the other line worth reading: it
 puts `Signal`, `SignalCell`, `view`, `View` and the modules `style` and
 `ui` in scope in every file below with no `import`, which is why the
 snippets that follow have such short import blocks (see [the prelude

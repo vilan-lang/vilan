@@ -394,7 +394,7 @@ fn formattable_files() -> Vec<PathBuf> {
 }
 
 /// A repo-relative label for a file in [`formattable_files`]. Base names are not
-/// unique across the roots (`std/src/browser/ui.vl` and `std/src/process/ui.vl`
+/// unique across the roots (`std/src/browser/web/ui.vl` and `std/src/process/web/ui.vl`
 /// are both `ui.vl`), so a failure has to say which one.
 fn label(path: &Path) -> String {
     let full = path.to_string_lossy().replace('\\', "/");

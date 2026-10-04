@@ -15,7 +15,7 @@ ssr/
 
 ## What it demonstrates
 
-- **One component, two rendered forms.** `src/app.vl` imports `std::ui`, which
+- **One component, two rendered forms.** `src/app.vl` imports `std::web::ui`, which
   resolves per *entry*: the browser layer (live DOM) in the client leg, the
   process layer (an HTML string) in the server leg. Same source, no annotation,
   no conditional compilation. That per-entry shadow is the whole SSR mechanism.

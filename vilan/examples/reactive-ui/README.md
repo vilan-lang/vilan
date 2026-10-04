@@ -1,4 +1,4 @@
-# Reactive UI: `std::reactive` + `std::ui`
+# Reactive UI: `std::reactive` + `std::web::ui`
 
 Two browser components built on Vilan's state and view layers, with no server
 involved. The guides ([Reactive state](../../docs/guide/reactive.md),

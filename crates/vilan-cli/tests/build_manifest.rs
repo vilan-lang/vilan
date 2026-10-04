@@ -66,8 +66,8 @@ fn two_leg_project(tag: &str, styles: bool) -> PathBuf {
         "[package]\nname = \"legs\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
     );
     let client = if styles {
-        r#"import std::style::{ Display, Style, style };
-import std::ui::{ mount_root, view };
+        r#"import std::web::style::{ Display, Style, style };
+import std::web::ui::{ mount_root, view };
 
 fun panel(): Style {
 	style().display(Display::Flex)
@@ -79,7 +79,7 @@ fun main() {
 }
 "#
     } else {
-        r#"import std::ui::{ mount_root, view };
+        r#"import std::web::ui::{ mount_root, view };
 
 fun main() {
 	let _root = mount_root("app", || view("main").text("plain"));

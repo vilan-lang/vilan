@@ -19,7 +19,7 @@
 //!
 //!   2. **Nothing was added or dropped.** (1) compares what the program PRINTS,
 //!      and a SERVER-rendered element carries no handler wiring at all
-//!      (`std::ui`'s `on` accepts and discards), so an `on:` handler is
+//!      (`std::web::ui`'s `on` accepts and discards), so an `on:` handler is
 //!      invisible to it. The emitted JavaScript is therefore compared as two
 //!      multisets — every string literal it carries, and every character — so
 //!      an item that was dropped, duplicated, or had its name or value altered
@@ -90,7 +90,7 @@ const ELEMENT_SOURCES: &[&str] = &["vilan/test/element-syntax.vl"];
 ///     slot.
 const ORDER_SENSITIVE: &str = concat!(
     "import std::io::print;\n",
-    "import std::ui::{ View, render, view };\n",
+    "import std::web::ui::{ View, render, view };\n",
     "\n",
     "fun main() {\n",
     // The barrier, both ways round. As written the attribute wins the first and
@@ -120,7 +120,7 @@ const ORDER_SENSITIVE: &str = concat!(
 /// sort moves them past each other and the two `print`s swap.
 const EVALUATION_ORDER: &str = concat!(
     "import std::io::print;\n",
-    "import std::ui::{ View, render, view };\n",
+    "import std::web::ui::{ View, render, view };\n",
     "\n",
     "fun note(name: str): str {\n",
     "\tprint(name);\n",

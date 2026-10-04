@@ -2,7 +2,7 @@ import pkg::compare::PartialEq;
 import pkg::context::Context;
 import pkg::hash::Hashable;
 import pkg::io::panic;
-import pkg::native_map::NativeMap;
+import pkg::js::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::{ Shared, Weak };
@@ -21,7 +21,7 @@ import pkg::tuple::Tuple;
 //
 // `proposal/incremental-collections.md` §4 is the design; `std::rpc`'s `KeyedCell`
 // is the first consumer (A54's machinery, lifted).
-export import pkg::delta::{
+export import pkg::reactive::delta::{
 	Coll,
 	CollBy,
 	CollFilter,
@@ -70,7 +70,7 @@ export import pkg::delta::{
 	element_holds_allocated,
 	map_each,
 };
-export import pkg::hash_map_cell::{
+export import pkg::reactive::hash_map_cell::{
 	HashMapCell,
 	HashMapEntry,
 	KeySlots,
@@ -78,10 +78,11 @@ export import pkg::hash_map_cell::{
 	MapSource,
 	TrackedHashMap,
 };
-export import pkg::hash_set_cell::{ HashSetCell, HashSetEntry, SetSignal, SetSource };
+export import pkg::reactive::hash_set_cell::{ HashSetCell, HashSetEntry, SetSignal, SetSource };
 
 /// A resource that can be released. An `Owner` collects `Disposable`s and releases
-/// them as a group; `Subscription`, `Owner`, and `std::ui`'s `View` are disposable.
+/// them as a group; `Subscription`, `Owner`, and `std::web::ui`'s `View` are
+/// disposable.
 export trait Disposable {
 	fun dispose(self);
 }
@@ -334,7 +335,7 @@ export impl Turn {
 }
 
 /// The ambient transaction. Established by `turn`/`batch` (and, at the framework
-/// boundaries, `std::ui` event dispatch and the RPC server's per-message dispatch);
+/// boundaries, `std::web::ui` event dispatch and the RPC server's per-message dispatch);
 /// read by `set` via `get_safe`, so unscoped code pays nothing.
 export let turn_scope: Context<Turn> = Context::new();
 
@@ -741,8 +742,8 @@ export struct Subscription {
 export impl Subscription {
 	/// A subscription over NO signal: `dispose` runs `release` once and does
 	/// nothing else. The registration shape for a source outside the signal graph —
-	/// `std::dom`'s `listen`, whose whole teardown is the call that unhooks the DOM
-	/// listener (`proposal/router.md` §5.2).
+	/// `std::web::dom`'s `listen`, whose whole teardown is the call that unhooks
+	/// the DOM listener (`proposal/router.md` §5.2).
 	///
 	/// The one-shot is the `release` cell's, so an owner releasing a handle the app
 	/// already disposed by hand cannot unhook twice.

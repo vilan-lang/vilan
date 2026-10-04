@@ -9,6 +9,7 @@ import std::json::{ FromJson, Json, json_codec };
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell, Subscription };
 import std::result::Result::{ self, Err, Ok };
+import std::rpc::server::Service;
 import std::rpc::{
 	DuplexEnd,
 	DuplexTransport,
@@ -20,7 +21,6 @@ import std::rpc::{
 	bridge,
 	connect_split,
 };
-import std::rpc_server::Service;
 import std::shared::Shared;
 import std::time::{ now_millis, sleep };
 import std::wire::Frame;

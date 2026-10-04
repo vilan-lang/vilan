@@ -71,7 +71,7 @@ has it with no prelude at all.
 | `PartialEq`, `PartialOrd` | `std::compare` | `==`/ordering (§5.7) | — |
 | `Iterator`/`Iterable` | `std::iterator` | `for … in` | — |
 | `Task<T>` | `std::task` | `async`/`await` (§7.3) | — |
-| `Promise<T>` | `std::promise` | host-interop promises (§7.3) | — |
+| `Promise<T>` | `std::js::promise` | host-interop promises (§7.3) | — |
 | `Context<T>` | `std::context` | contexts (§8) | — |
 | `panic`, `assert` | `std::io` | divergence, `vilan test` | — |
 

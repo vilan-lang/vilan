@@ -724,6 +724,44 @@ fn cross_platform_transitive_import_not_reported() {
     assert!(errors.iter().any(|e| e.contains("main → builder")));
 }
 
+/// A154: the moved-module refusal anchors at the OLD module's own segment —
+/// `dom`, `rpc_server`, or the `web` of `std::web::Signal` — which is exactly
+/// the span the editor's fix (`moved_std_module_fix`) replaces.
+#[test]
+fn a154_the_moved_module_refusal_anchors_at_the_old_segment() {
+    for (entry, segment) in [
+        ("import std::dom::create_element;\nfun main() {}\n", "dom"),
+        (
+            "import std::{ rpc_server::Server };\nfun main() {}\n",
+            "rpc_server",
+        ),
+        ("import std::web::Signal;\nfun main() {}\n", "web"),
+    ] {
+        let errors = analyze_package_spanned(&[("main.vl", entry)], "main.vl", Platform::Browser);
+        let (message, file, range) = errors
+            .iter()
+            .find(|(message, ..)| message.contains(" moved to `std::"))
+            .unwrap_or_else(|| panic!("a moved-module refusal for {entry:?}: {errors:?}"));
+        assert_eq!(file, "main.vl");
+        assert_eq!(&entry[range.clone()], segment, "{message}");
+        let fix = vilan_core::parsing::moved_std_module_fix(
+            entry,
+            message,
+            vilan_core::Span::from(range.clone()),
+        )
+        .expect("the refusal carries its fix");
+        let mut fixed = entry.to_string();
+        fixed.replace_range(fix.span.into_range(), fix.replacement);
+        let after = analyze_package(&[("main.vl", &fixed)], "main.vl", Platform::Browser);
+        assert!(
+            after
+                .iter()
+                .all(|message| !message.contains(" moved to `std::")),
+            "the fixed import resolves: {fixed:?} {after:?}"
+        );
+    }
+}
+
 #[test]
 fn platform_modules_load_for_typing_under_opposite_platform() {
     // Loading a cross-platform std module purely to type-check it must not introduce
@@ -732,8 +770,8 @@ fn platform_modules_load_for_typing_under_opposite_platform() {
         ("http", Platform::Browser),
         ("fs", Platform::Browser),
         ("process", Platform::Browser),
-        ("dom", Platform::default()),
-        ("ui", Platform::default()),
+        ("web::dom", Platform::default()),
+        ("web::ui", Platform::default()),
     ] {
         let entry = format!("import std::{module};\nfun main() {{}}\n");
         let errors = analyze_package(&[("main.vl", &entry)], "main.vl", platform);
@@ -960,7 +998,7 @@ fn process_layer_std_is_reachable_for_deno() {
 fn browser_layer_std_is_cross_platform_for_deno() {
     // The browser layer doesn't serve deno: reaching a browser-layer function
     // from a deno build is a coloring violation (pattern matching, not names).
-    let entry = "import std::router::navigate;\nfun main() { navigate(\"/x\"); }\n";
+    let entry = "import std::web::router::navigate;\nfun main() { navigate(\"/x\"); }\n";
     let errors = analyze_package(&[("main.vl", entry)], "main.vl", deno());
     assert!(
         errors
@@ -1012,7 +1050,9 @@ fn contract_violations(
     let put = |dir: &std::path::Path, files: &[(&str, &str)]| {
         std::fs::create_dir_all(dir).unwrap();
         for (name, contents) in files {
-            std::fs::write(dir.join(name), contents).unwrap();
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
         }
     };
     let src = root.join("src");
@@ -1064,6 +1104,39 @@ fn a_library_contract_check_keeps_the_position_in_prose() {
         }),
         "{violations:?}"
     );
+}
+
+/// A154: std's layered modules sit under namespaces (`src/browser/web/ui.vl`
+/// is `web::ui`), and the contract walked a root's TOP level only — so a module
+/// nested in a layer was never checked at all. A nested browser module reaching
+/// a process-only module is the violation a flat one always was, and a nested
+/// one staying in its served set is clean.
+#[test]
+fn a154_a_module_nested_in_a_layer_is_held_to_the_contract() {
+    let violations = contract_violations(
+        &[("lib.vl", "")],
+        &[("net/server.vl", "fun serve(): i32 { 1 }\n")],
+        &[(
+            "web/widget.vl",
+            "import pkg::net::server::serve;\nfun widget(): i32 { serve() }\n",
+        )],
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("`web::widget` imports `pkg::net::server")),
+        "the nested browser module's reach into the process layer is a violation: \
+         {violations:#?}"
+    );
+    let clean = contract_violations(
+        &[("lib.vl", ""), ("util.vl", "fun util(): i32 { 1 }\n")],
+        &[],
+        &[(
+            "web/widget.vl",
+            "import pkg::util::util;\nfun widget(): i32 { util() }\n",
+        )],
+    );
+    assert!(clean.is_empty(), "{clean:#?}");
 }
 
 #[test]
@@ -1187,9 +1260,9 @@ fn a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map() {
     // A149 S3: `[derive(Storable)]` in an imported module — the shape kolt's
     // `account.vl` and `store.vl` are — expands there with its own imports, and
     // its map field is a keyed node the importer writes and watches by key. Red
-    // when the derive's output named `Storable` through `std::store`, where the
+    // when the derive's output named `Storable` through `std::reactive::store`, where the
     // module's own `Storable` is the derive macro: "'Storable' is not a trait"
-    // when the derive's module is the first to load `std::store` (the entry
+    // when the derive's module is the first to load `std::reactive::store` (the entry
     // imports none of it here, as kolt's does not).
     let entry = concat!(
         "import std::io::print;\n",
@@ -1210,7 +1283,7 @@ fn a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map() {
     );
     let model = concat!(
         "import std::hash_map::HashMap;\n",
-        "import std::store::{ Storable, Store };\n",
+        "import std::reactive::store::{ Storable, Store };\n",
         "\n",
         "export *;\n",
         "\n",
@@ -1999,9 +2072,9 @@ fn local_module_sharing_a_std_name_resolves_for_both_roots() {
 
 #[test]
 fn local_module_sharing_a_layered_std_name_resolves_for_both_roots() {
-    // The original E.10 report: a local `ui.vl` alongside `std::ui` (which lives
+    // The original E.10 report: a local `ui.vl` alongside `std::web::ui` (which lives
     // in std's browser layer), both imported by the same program.
-    let entry = "import std::ui::view;\nimport pkg::ui::screen;\n\nfun main() { screen(); }\n";
+    let entry = "import std::web::ui::view;\nimport pkg::ui::screen;\n\nfun main() { screen(); }\n";
     let errors = analyze_package(
         &[
             ("main.vl", entry),
@@ -3173,10 +3246,11 @@ fn stds_package_root_publishes_nothing_after_the_alias_sweep() {
 #[test]
 fn the_web_preludes_surface_is_its_members_and_its_ambient_modules() {
     // §5.2/§5.3: three members and two MODULES, published by the one
-    // mechanism — `export import pkg::style;` publishes the module `style`
+    // mechanism — `export import pkg::web::style;` publishes the module `style`
     // exactly as `export import pkg::reactive::Signal;` publishes a member.
     let spec = std_spec();
-    let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("web.vl"));
+    let importables =
+        vilan_core::analyzer::module_importables(&spec.base_root.join("web").join("prelude.vl"));
     let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
     for expected in [
         "print",
@@ -3556,14 +3630,14 @@ fn the_web_prelude_binds_signal_view_and_the_ambient_modules() {
 // package reported "`style` is a module, not a value; qualify through it" —
 // the form was unusable in the packages it was designed for. The seed is a
 // `Node::StdItem`, resolved through `std`'s own namespace, and the loader
-// seeds `std::style` off the reference itself.
+// seeds `std::web::style` off the reference itself.
 
 #[test]
 fn b270_a_css_block_compiles_under_the_web_preludes_ambient_style_module() {
     // The owner's repro (kolt channel.vl:71), reduced. `style::Length::rem` in
     // the same file is the control: the ambient MODULE is untouched and still
     // qualifies, which the interim workaround (a per-file
-    // `import std::style::{ Length, style };`) cost the file.
+    // `import std::web::style::{ Length, style };`) cost the file.
     let entry = "let card = const css { display(\"flex\"); };\n\
         fun main() {\n\
         \tlet gap = style::Length::rem(1);\n\
@@ -3606,11 +3680,11 @@ fn b270_a_local_style_binding_does_not_capture_a_block_under_a_prelude() {
 #[test]
 fn an_ambient_module_is_beaten_by_an_explicit_member_import() {
     // §4.1/§13.11, and the reason the `style` module costs the estate nothing:
-    // `std::style::style` is a FUNCTION whose name equals its module's, and 60
+    // `std::web::style::style` is a FUNCTION whose name equals its module's, and 60
     // call sites write it bare. Each carries this import, which outranks the
     // ambient module — so `style()` keeps meaning the builder.
-    let entry = "import std::style::style;\n\
-import std::style::Style;\n\
+    let entry = "import std::web::style::style;\n\
+import std::web::style::Style;\n\
 fun styled(): Style { style() }\n\
 fun main() { print(\"styled\"); }\n";
     let errors = analyze_under_prelude(
@@ -3634,7 +3708,7 @@ fn shadowing_an_ambient_module_costs_that_files_qualified_spelling() {
     // call sites import the enums they use explicitly and never write
     // `style::…`), and it is the ordinary shadowing rule rather than anything
     // the prelude adds. Recorded in prelude.md §4.1.
-    let entry = "import std::style::style;\n\
+    let entry = "import std::web::style::style;\n\
 fun main() {\n\
 \tlet shown = style::Display::Flex;\n\
 \tprint(\"styled\");\n\
@@ -3839,7 +3913,8 @@ fn a_web_set_name_steers_to_the_manifest_key_not_to_an_import() {
     );
     assert!(
         errors.iter().any(|e| {
-            e.contains("in the prelude of the web set") && e.contains("prelude = \"std::web\"")
+            e.contains("in the prelude of the web set")
+                && e.contains("prelude = \"std::web::prelude\"")
         }),
         "{errors:#?}"
     );
@@ -3902,7 +3977,7 @@ fn a_name_in_neither_std_prelude_keeps_the_ordinary_import_steer() {
 
 #[test]
 fn a_package_already_on_the_web_set_never_gets_the_web_steer() {
-    // "You are not on the web set" is only true when it is true. On `std::web`
+    // "You are not on the web set" is only true when it is true. On `std::web::prelude`
     // a genuinely missing name gets the ordinary steer.
     let errors = analyze_under_prelude(
         web_prelude(),
@@ -3927,7 +4002,7 @@ fn a_module_carried_web_name_gets_no_web_steer() {
     // does not make the bare name a value — the "both work" promise fails
     // exactly there (audit run 6, F2). A value-position miss on `style` must
     // fall through to the ordinary machinery (the css note beside the css
-    // desugar names the import that actually compiles: `std::style::style`).
+    // desugar names the import that actually compiles: `std::web::style::style`).
     let errors = analyze_under_prelude(
         base_prelude(),
         &[("main.vl", "fun main() { let s = style(); }\n")],
@@ -3950,9 +4025,9 @@ fn a_module_carried_web_name_gets_no_web_steer() {
 fn a_module_carried_web_name_reaches_its_types_by_qualifying() {
     // B172, and the reason it was load-bearing rather than cosmetic. The web
     // set carries `style` as a MODULE, so a web-set user reached every VALUE in
-    // `std::style` (`style::style()`, `style::Display::Flex`) and no TYPE in
+    // `std::web::style` (`style::style()`, `style::Display::Flex`) and no TYPE in
     // it: `style::Style` was a PARSE error in every type position, and both web
-    // templates carried a forced `import std::style::Style;` to get around it.
+    // templates carried a forced `import std::web::style::Style;` to get around it.
     // A qualified path is a type now, so the prelude's module name is enough.
     let errors = analyze_under_prelude(
         web_prelude(),
@@ -8742,4 +8817,187 @@ fn b455_a_selector_with_a_non_trait_is_refused() {
         )),
         "{diagnostics:#?}"
     );
+}
+
+// --- F28's first half: the single-platform modules leave the layer directories ---
+//
+// The three facts the layer gives and the file-level `[platform(..)] mod self;`
+// fence must give the same way before a module moves (std's manifest names the
+// layers; these pins name the MODULES, so they read the same whichever
+// mechanism serves them). layout-46 ran them over the fenced tree and STOPPED
+// the move: (a) failed for `std::web::router` — fenced `browser`, it imports the
+// `ui` TWIN, which a node build binds to the process side, and the fence walk
+// then reports six of the process twin's functions as unreachable-from-browser
+// violations inside std, on a bare import (the layer reported none); and (b)
+// failed for every browser module, `infer_platform` reading browser evidence off
+// the layer directory only. The modules stay layered under their new paths
+// (`src/browser/web/*`, `src/process/{web,rpc}/*`) until both are answered.
+
+/// One program per single-platform module: it calls one of the module's
+/// functions on the platform the module does NOT serve.
+const F28_OFF_PLATFORM_CALLS: &[(&str, &str, &str, Platform)] = &[
+    (
+        "import std::web::dom::create_element;\nfun main() {\n\tlet _ = create_element(\"div\");\n}\n",
+        "create_element",
+        "std::web::dom",
+        Platform::Node { version: 24 },
+    ),
+    (
+        "import std::web::storage::get;\nfun main() {\n\tlet _ = get(\"k\");\n}\n",
+        "get",
+        "std::web::storage",
+        Platform::Node { version: 24 },
+    ),
+    (
+        "import std::web::router::location_url;\nfun main() {\n\tlet _ = location_url();\n}\n",
+        "location_url",
+        "std::web::router",
+        Platform::Node { version: 24 },
+    ),
+    (
+        "import std::web::dev::hmr_active;\nfun main() {\n\tlet _ = hmr_active();\n}\n",
+        "hmr_active",
+        "std::web::dev",
+        Platform::Node { version: 24 },
+    ),
+    (
+        "import std::fs::read_file_to_str;\nfun main() {\n\tlet _ = read_file_to_str(\"x\");\n}\n",
+        "read_file_to_str",
+        "std::fs",
+        Platform::Browser,
+    ),
+    (
+        "import std::http::if_none_match_matches;\nfun main() {\n\tlet _ = if_none_match_matches(\"a\", \"b\");\n}\n",
+        "if_none_match_matches",
+        "std::http",
+        Platform::Browser,
+    ),
+    (
+        "import std::db::Database;\nfun main() {\n\tlet _ = Database::open(\"x\");\n}\n",
+        "open",
+        "std::db",
+        Platform::Browser,
+    ),
+    (
+        "import std::process::args;\nfun main() {\n\tlet _ = args();\n}\n",
+        "args",
+        "std::process",
+        Platform::Browser,
+    ),
+    (
+        "import std::build::require_build;\nfun main() {\n\tlet _ = require_build(\"client\");\n}\n",
+        "require_build",
+        "std::build",
+        Platform::Browser,
+    ),
+    (
+        "import std::rpc::server::ws_accept_key;\nfun main() {\n\tlet _ = ws_accept_key(\"k\");\n}\n",
+        "ws_accept_key",
+        "std::rpc::server",
+        Platform::Browser,
+    ),
+];
+
+/// F28 (a): calling a single-platform module's function off its platform is
+/// ONE colouring error, at the user's call, whose chain names the function and
+/// its module — and importing such a module without reaching it is legal.
+#[test]
+fn f28_an_off_platform_call_into_a_single_platform_module_is_one_error_at_the_call() {
+    for (entry, function, module, platform) in F28_OFF_PLATFORM_CALLS {
+        let errors = analyze_package_spanned(&[("main.vl", entry)], "main.vl", *platform);
+        let violations: Vec<_> = errors
+            .iter()
+            .filter(|(message, ..)| message.contains("cannot run on"))
+            .collect();
+        assert_eq!(violations.len(), 1, "{module} on {platform:?}: {errors:#?}");
+        let (message, file, range) = violations[0];
+        assert!(
+            message.starts_with(&format!("`{function}` requires the `")),
+            "{module}: {message}"
+        );
+        assert_eq!(file, "main.vl", "{module}: anchored in the user's file");
+        assert!(
+            entry[range.clone()].contains(function),
+            "{module}: anchored at the call, got {:?}",
+            &entry[range.clone()]
+        );
+        let import_only = entry.lines().next().unwrap().to_string() + "\nfun main() {}\n";
+        let elided = analyze_package(&[("main.vl", &import_only)], "main.vl", *platform);
+        assert!(
+            elided.is_empty(),
+            "{module}: importing without reaching is legal on {platform:?}: {elided:?}"
+        );
+    }
+}
+
+/// F28 (a), the chain: the frame names the module by its PATH.
+#[test]
+fn f28_the_off_platform_chain_names_the_module_by_its_path() {
+    for (entry, function, module, platform) in F28_OFF_PLATFORM_CALLS {
+        let raw = analyze_package_raw(&[("main.vl", entry)], "main.vl", *platform);
+        let violation = raw
+            .iter()
+            .find(|error| error.msg.contains("cannot run on"))
+            .unwrap_or_else(|| panic!("{module}: a violation"));
+        let rendered = format!(
+            "{} {}",
+            violation.msg,
+            violation
+                .note
+                .as_ref()
+                .map(|note| note.msg.clone())
+                .unwrap_or_default()
+        );
+        assert!(
+            rendered.contains(&format!("main → {function} ({module})")),
+            "{module}: {rendered}"
+        );
+    }
+}
+
+/// F28 (b): the editor's platform inference for a file that imports ONLY a
+/// single-platform module — no manifest, no `--platform` — is browser for a
+/// browser module (inferred, the reason naming the module) and the default for
+/// a process one.
+#[test]
+fn f28_a_file_importing_only_a_single_platform_module_is_analyzed_as_before() {
+    for (entry, _, module, off_platform) in F28_OFF_PLATFORM_CALLS {
+        let dir = scratch::root().join(format!(
+            "vilan_f28_infer_{}_{}",
+            std::process::id(),
+            module.replace("::", "_")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.vl");
+        std::fs::write(&path, entry).unwrap();
+        let source: &'static str = Box::leak(entry.to_string().into_boxed_str());
+        let (program, _) = analyze_source(
+            source,
+            &std_spec(),
+            &dir,
+            &path,
+            None,
+            &Workspace::default(),
+        );
+        let program = program.expect("a program");
+        let reason = program.platform_reason.clone().unwrap_or_default();
+        if *off_platform == Platform::Browser {
+            // A process module: no browser evidence, so the default.
+            assert_eq!(program.platform, Platform::default(), "{module}: {reason}");
+            assert_eq!(program.platform_kind, Some("default"), "{module}: {reason}");
+        } else {
+            assert_eq!(program.platform, Platform::Browser, "{module}: {reason}");
+            assert_eq!(
+                program.platform_kind,
+                Some("inferred"),
+                "{module}: {reason}"
+            );
+            assert!(
+                reason.contains(&format!("`{module}`")),
+                "{module}: the reason names the module: {reason}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

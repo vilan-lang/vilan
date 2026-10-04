@@ -6,7 +6,7 @@
 // closure, so there is nothing to re-discover and an `await` can never hide a
 // dependency.
 //
-// `Signal`, `view` and `View` are ambient: `prelude = "std::web"` in vilan.toml
+// `Signal`, `view` and `View` are ambient: `prelude = "std::web::prelude"` in vilan.toml
 // puts them in scope with no import, along with the MODULES `style` and `ui` —
 // which is why the chain below writes `style::Display::Flex` and imports nothing
 // for it. The prelude carries the module, not its members, so you

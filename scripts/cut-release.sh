@@ -64,7 +64,7 @@
 # Lifetime markers (proposal/deprecation.md §3): `<!-- deprecates: KEY -->` /
 # `<!-- removes: KEY -->` above an entry's head - one KEY per line, one or
 # more per entry (unlike `family:`/`commit:`, repetition is legal). KEY is
-# the fully qualified path (`std::rpc_server::serve_service`) or the CLI
+# the fully qualified path (`std::rpc::server::serve_service`) or the CLI
 # spelling (`vilan build --target`). A `removes:` under Unreleased is REFUSED
 # unless a RELEASED section carries the matching `deprecates:`; a patch cut
 # refuses either marker outright; shipped deprecations not yet removed are

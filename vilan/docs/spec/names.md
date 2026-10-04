@@ -77,7 +77,7 @@ Within std itself, sibling modules are referenced as `pkg::…` (std is its
 own package). The namespaces are disjoint: resolution is scoped by the
 root segment, so a package is free to name a module `ui` or `json` even
 though std has one: `pkg::ui` is always the package's own module,
-`std::ui` always std's, and neither shadows the other. (Conversely,
+`std::web::ui` always std's, and neither shadows the other. (Conversely,
 `pkg::` never reaches a std module.) The root names themselves are
 **reserved**: a manifest may not declare a dependency — or a
 `[package] name` — as `std`, `pkg`, or `macro_std` (§11.4), so no
@@ -121,7 +121,7 @@ importing module's scope:
 - `import std::option::Option::{ self, Some, None };` is a path into a
   TYPE: `self` binds the type itself; variant names bind the variants for
   unqualified use.
-- `import std::style::Length::rem;` is the same path into a type, reaching
+- `import std::web::style::Length::rem;` is the same path into a type, reaching
   its **statics** — the functions its `impl` blocks declare that take no
   `self` (§4.6). A static is reached through the module whose file writes
   the block, which is the type's own module for a type whose impls sit
@@ -129,7 +129,7 @@ importing module's scope:
   method is not importable under either form, and says so. The set and
   `as` forms reach statics like any other leaf, which is what lets an
   app's own prelude module re-export one bare
-  (`export import std::style::Length::rem as rem;`).
+  (`export import std::web::style::Length::rem as rem;`).
 - A **type segment replaces** the path's namespace. What follows
   `Length` is resolved in `Length`'s namespace and nowhere else — its
   variants, then its statics — so a module-level `rem` declared beside
@@ -175,7 +175,7 @@ before a leaf is the **reach** marker, `import pkg::a::{ #hidden };`,
 which takes an item the module does not export and says so.
 
 Platform gating is not checked at the import: a module outside the
-current platform's layers (e.g. `std::ui` in a Node build) still loads,
+current platform's layers (e.g. `std::web::ui` in a Node build) still loads,
 so its items type-check. The error is reported where platform-colored
 code becomes **reachable** from the build's entry (§11).
 
@@ -380,7 +380,7 @@ exports. `[package] prelude` (and `[library] prelude`) names it:
 | Value | Ambient names |
 |---|---|
 | *omitted* — the default | std's base set: `print`, `Iterator`, `Option`, `Some`, `None`, `Result`, `Ok`, `Err` |
-| `"std::web"` | the base set, plus `Signal`, `SignalCell`, the collection pipes' sealers `CollPipe` and `SetPipe`, `view`, `View`, the six slot values (`when`, `when_some`, `swap`, `each`, `each_values`, `each_by`), and the **modules** `style` and `ui` |
+| `"std::web::prelude"` | the base set, plus `Signal`, `SignalCell`, the collection pipes' sealers `CollPipe` and `SetPipe`, `view`, `View`, the six slot values (`when`, `when_some`, `swap`, `each`, `each_values`, `each_by`), and the **modules** `style` and `ui` |
 | any module path (`pkg::…`, `std::…`, a dependency) | that module's exports |
 | `false` | none — only the built-in set above |
 

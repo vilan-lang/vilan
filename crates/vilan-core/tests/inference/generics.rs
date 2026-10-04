@@ -2434,7 +2434,7 @@ fn generic_call_over_a_bounded_transport_decodes() {
         import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result::{ self, Ok, Err };
-        import std::promise::Promise;
+        import std::js::promise::Promise;
         trait Wire { fun send(self, msg: str): Promise<str>; }
         struct Echo {}
         impl Echo with Wire {
@@ -4447,7 +4447,7 @@ import std::io::print;
         import std::json::{ Json, FromJson, json_codec };
         import std::reactive::{ Signal, SignalCell };
         import std::shared::Shared;
-        import std::rpc_server::Service;
+        import std::rpc::server::Service;
         import std::http::{ Response, Server };
 
         // The whole paradigm, zero manual wiring: [expose]d state + [rpc] methods,
@@ -4540,7 +4540,7 @@ import std::io::print;
 
 // --- B168: a trait bound over a BARE parameter, resolved in a generic body ---
 //
-// A33 widened `std::ui`'s read-only bindings from `SignalCell<T>` to a `Source<T>`
+// A33 widened `std::web::ui`'s read-only bindings from `SignalCell<T>` to a `Source<T>`
 // bound, and `View::swap` — read-only like every other, no write anywhere in
 // it — was the one site that could NOT come along. The gap the widening walked
 // into was narrow and exact:

@@ -118,15 +118,15 @@ fn build_chain<'src>(
     // view underlines the element head itself, which is what the user wrote.
     //
     // It is a `StdItem` (B270), not a bare accessor: `<div />` means
-    // `std::ui::view` whatever `view` names at the site, so a local `view`
+    // `std::web::ui::view` whatever `view` names at the site, so a local `view`
     // binding — a `let`, a `fun`, an icon set's generated `view` (A35's find)
     // — no longer captures the desugar's callee, and the loader seeds
-    // `std::ui` off the reference rather than off an import the author must
+    // `std::web::ui` off the reference rather than off an import the author must
     // remember.
     let head_span: Span = (span.start..tag.end).into();
     let mut chain: Spanned<Node<'src>> = (
         Node::Call(
-            Box::new((Node::StdItem("ui", "view"), head_span)),
+            Box::new((Node::StdItem("web::ui", "view"), head_span)),
             None,
             (vec![(Node::String(tag_text), tag)], tag),
         ),

@@ -15,8 +15,8 @@
 // answers, so an explicit local binding always wins and no file can be broken by a
 // name added here. Outside a block it is an ordinary module, and there is no
 // wildcard import in vilan: the two idioms are the brace list
-// (`import std::style::prelude::{ rem, gray };`) and the qualifying alias
-// (`import std::style::prelude as tokens;`), ONE statement at the top of a file
+// (`import std::web::style::prelude::{ rem, gray };`) and the qualifying alias
+// (`import std::web::style::prelude as tokens;`), ONE statement at the top of a file
 // whose `fun` bodies build chains — a chain written outside a hole gets no ambient
 // scope, so before A106 such a file imported one name per token it used (kolt's
 // `styles.vl:54/103` imported nine, per function).
@@ -38,7 +38,7 @@
 // `TextAlign` and `AlignItems` belong to the same vocabulary as `rem` and
 // `hover` (`Length` was already here, as `piece`'s and the constructors'
 // currency). The set is deliberately the FOUR the vocabulary needs and not
-// every keyword enum in `std::style`: `Display`, `Position`, `FlexDirection`,
+// every keyword enum in `std::web::style`: `Display`, `Position`, `FlexDirection`,
 // `JustifyContent`, `Overflow`, `WhiteSpace` and `UserSelect` stay qualified
 // until a file asks for them, because a prelude is a vocabulary rather than a
 // re-export of a module.
@@ -46,7 +46,16 @@
 // `s()` is `style()` under the one-letter name a chain written inside a
 // `const { … }` wants; the builder itself is untouched.
 
-import pkg::style::{ AlignItems, Color, Condition, CssPiece, Cursor, Length, Style, TextAlign };
+import pkg::web::style::{
+	AlignItems,
+	Color,
+	Condition,
+	CssPiece,
+	Cursor,
+	Length,
+	Style,
+	TextAlign,
+};
 
 export *;
 
@@ -83,7 +92,7 @@ fun auto(): Length {
 /// The spacing scale, by step — `{space(4)}` is the token, not a copied `1rem`, and
 /// it carries its own `:root` line onto the sheet.
 fun space(step: i32): Length {
-	import pkg::style::space as scale_step;
+	import pkg::web::style::space as scale_step;
 	scale_step(step)
 }
 
@@ -134,7 +143,7 @@ fun oklch(lightness: f64, chroma: f64, hue: f64): Color {
 /// as a string; the dashes are checked, because a name without them is not a
 /// reference at all.
 fun var(name: str): str {
-	import pkg::style::var as custom_property;
+	import pkg::web::style::var as custom_property;
 	custom_property(name)
 }
 
@@ -147,7 +156,7 @@ fun var(name: str): str {
 /// this so a `Length` or a `Color` inside it puts its `:root` line on the sheet
 /// rather than emitting a `var()` nothing declares.
 fun piece<V: CssPiece>(value: V): str {
-	import pkg::style::piece as value_piece;
+	import pkg::web::style::piece as value_piece;
 	value_piece(value)
 }
 
@@ -155,7 +164,7 @@ fun piece<V: CssPiece>(value: V): str {
 
 /// `style()` under the name a chain written inline wants.
 fun s(): Style {
-	import pkg::style::style as open_style;
+	import pkg::web::style::style as open_style;
 	open_style()
 }
 
@@ -166,8 +175,8 @@ fun s(): Style {
 /// ambient inside a block and a head is an ordinary expression list the lowering
 /// passes through.
 ///
-/// Each is one line over `std::style`'s own constructor, aliased because the free
-/// name and the `Style` METHOD of the same name coexist (`hover()` is the
+/// Each is one line over `std::web::style`'s own constructor, aliased because the
+/// free name and the `Style` METHOD of the same name coexist (`hover()` is the
 /// condition, `style().hover(inner)` is the sugar that puts a style under it) and a
 /// file declaring `fun hover()` cannot also call the import of that name. The alias
 /// is imported INSIDE the body (A117): at file level `export *;` would publish the
@@ -175,97 +184,97 @@ fun s(): Style {
 /// function-scoped import is reachable from nowhere else.
 
 fun hover(): Condition {
-	import pkg::style::hover as hover_condition;
+	import pkg::web::style::hover as hover_condition;
 	hover_condition()
 }
 
 fun focus(): Condition {
-	import pkg::style::focus as focus_condition;
+	import pkg::web::style::focus as focus_condition;
 	focus_condition()
 }
 
 fun active(): Condition {
-	import pkg::style::active as active_condition;
+	import pkg::web::style::active as active_condition;
 	active_condition()
 }
 
 fun disabled(): Condition {
-	import pkg::style::disabled as disabled_condition;
+	import pkg::web::style::disabled as disabled_condition;
 	disabled_condition()
 }
 
 fun first(): Condition {
-	import pkg::style::first as first_condition;
+	import pkg::web::style::first as first_condition;
 	first_condition()
 }
 
 fun last(): Condition {
-	import pkg::style::last as last_condition;
+	import pkg::web::style::last as last_condition;
 	last_condition()
 }
 
 /// Any pseudo-class by name — `pseudo("focus-visible")`. One value is ONE
 /// pseudo-class: a `:` in the name is refused, because two are two values.
 fun pseudo(name: str): Condition {
-	import pkg::style::pseudo as pseudo_condition;
+	import pkg::web::style::pseudo as pseudo_condition;
 	pseudo_condition(name)
 }
 
 /// A pseudo-ELEMENT — `element("selection")` is `::selection`, and it comes last in
 /// the compound with nothing after it.
 fun element(name: str): Condition {
-	import pkg::style::element as element_condition;
+	import pkg::web::style::element as element_condition;
 	element_condition(name)
 }
 
 /// An attribute on the element itself — PRESENCE (`[name]`); `.eq(value)`
 /// narrows it to the exact form.
 fun attribute(name: str): Condition {
-	import pkg::style::attribute as attribute_condition;
+	import pkg::web::style::attribute as attribute_condition;
 	attribute_condition(name)
 }
 
 /// The ancestor GUARD: the element's own rule, conditioned on an ANCESTOR matching
 /// `condition` — `within(attribute("data-theme").eq("dark"))`.
 fun within(condition: Condition): Condition {
-	import pkg::style::within as within_condition;
+	import pkg::web::style::within as within_condition;
 	within_condition(condition)
 }
 
 /// Every direct CHILD of the element — `.sX > *`.
 fun children(): Condition {
-	import pkg::style::children as children_condition;
+	import pkg::web::style::children as children_condition;
 	children_condition()
 }
 
 /// Every direct child BUT THE FIRST — `> :not(:first-child)`.
 fun divide(): Condition {
-	import pkg::style::divide as divide_condition;
+	import pkg::web::style::divide as divide_condition;
 	divide_condition()
 }
 
 /// An arbitrary min-width breakpoint; `sm`/`md`/`lg`/`xl` are the named ones.
 fun media(min_width: str): Condition {
-	import pkg::style::media as media_condition;
+	import pkg::web::style::media as media_condition;
 	media_condition(min_width)
 }
 
 fun sm(): Condition {
-	import pkg::style::sm as sm_condition;
+	import pkg::web::style::sm as sm_condition;
 	sm_condition()
 }
 
 fun md(): Condition {
-	import pkg::style::md as md_condition;
+	import pkg::web::style::md as md_condition;
 	md_condition()
 }
 
 fun lg(): Condition {
-	import pkg::style::lg as lg_condition;
+	import pkg::web::style::lg as lg_condition;
 	lg_condition()
 }
 
 fun xl(): Condition {
-	import pkg::style::xl as xl_condition;
+	import pkg::web::style::xl as xl_condition;
 	xl_condition()
 }

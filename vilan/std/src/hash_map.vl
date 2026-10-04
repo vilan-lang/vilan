@@ -13,7 +13,7 @@
 import pkg::compare::PartialEq;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
-import pkg::native_map::NativeMap;
+import pkg::js::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 
 export *;

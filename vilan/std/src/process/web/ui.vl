@@ -1,5 +1,5 @@
-// `std::ui` for `@process` — the server (SSR) view layer (proposal/ssr.md, A7). The
-// exact public surface of the browser `std::ui`, but building an HTML STRING TREE
+// `std::web::ui` for `@process` — the server (SSR) view layer (proposal/ssr.md, A7). The
+// exact public surface of the browser `std::web::ui`, but building an HTML STRING TREE
 // instead of live DOM. A route handler calls the app's own view-building code — the
 // same component functions the client runs — against this layer, `render(view)`
 // serializes the tree to markup, and the handler splices it into its HTML shell.
@@ -22,15 +22,16 @@
 //
 // OMITTED (proposal/ssr.md §2, §6a): `mount`/`mount_root` do not exist here — a
 // component that mounts is a client entry, not a renderable view; the natural
-// factoring is a shared `fun app(): View` and a per-leg `main`. `std::dom` stays
-// browser-only; a component importing it fails a process build at the `import` with
-// the standard cross-platform error — the correct boundary.
+// factoring is a shared `fun app(): View` and a per-leg `main`. `std::web::dom`
+// stays browser-only; a component importing it fails a process build at the
+// `import` with the standard cross-platform error — the correct boundary.
 //
 // Only available when building for a process platform (node).
 
 import pkg::compare::PartialEq;
 import pkg::hash::Hashable;
 import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::store_core::{ Store, StoreFlag, StoreSome };
 import pkg::reactive::{
 	Draft,
 	Flow,
@@ -48,8 +49,7 @@ import pkg::reactive::{
 	zip_some,
 };
 import pkg::shared::Shared;
-import pkg::store_core::{ Store, StoreFlag, StoreSome };
-import pkg::style::Style;
+import pkg::web::style::Style;
 
 /// One attribute in an element's ordered attribute list. Ordering is INSERTION
 /// ORDER — the component wrote them in code order — so serialization is
@@ -180,11 +180,12 @@ export impl View {
 
 	/// Like `on`, but the handler receives the event. Accepted and discarded the
 	/// same way. The event type is GENERIC (`E`) rather than the browser's
-	/// `std::dom::Event`: a server layer cannot name that browser-only type, and a
-	/// discarded handler never touches the event anyway — so any handler shape is
-	/// accepted. (This is what lets a browser module like `std::router`, whose
-	/// `link` binds an `on_event`, still resolve `std::ui` when the analyzer loads
-	/// it to compute a process build's cross-platform requirements.)
+	/// `std::web::dom::Event`: a server layer cannot name that browser-only type,
+	/// and a discarded handler never touches the event anyway — so any handler
+	/// shape is accepted. (This is what lets a browser module like
+	/// `std::web::router`, whose `link` binds an `on_event`, still resolve
+	/// `std::web::ui` when the analyzer loads it to compute a process build's
+	/// cross-platform requirements.)
 	fun on_event<E>(self, event: str, handler: (|E| void) context (turn_scope, tracking)): View {
 		self
 	}
@@ -271,7 +272,7 @@ export impl View {
 	/// creates, serializes and discards — so this returns `self` unchanged,
 	/// exactly as the event binders do with their handlers. The parameter is
 	/// generic for the same reason `on_event`'s is: a server layer cannot name
-	/// the browser-only `std::dom::Element`. KEEP IN STEP with the browser
+	/// the browser-only `std::web::dom::Element`. KEEP IN STEP with the browser
 	/// twin (browser/ui.vl).
 	fun on_mount<E>(self, action: sync |E| void): View {
 		self
@@ -833,7 +834,7 @@ export fun render(view: View): str {
 /// (proposal/bundle-splitting.md §2/§S3). A server render is one pass over code
 /// that is already loaded, so nothing is ever in flight and nothing can fail to
 /// arrive: these are always `false` and `None`. They exist because
-/// `std::router::pending`/`chunk_error` re-export them, and the two `ui` layers
+/// `std::web::router::pending`/`chunk_error` re-export them, and the two `ui` layers
 /// declare the same surface — a component that binds one renders on both sides.
 /// KEEP IN STEP with the browser twin (browser/ui.vl).
 let chunk_pending_signal: SignalCell<bool> = SignalCell::new(false);
@@ -974,8 +975,8 @@ export impl FocusScope {
 
 	/// Hear focus leave the scope, server side: ACCEPTED AND DROPPED — there is no
 	/// focus to leave. The handler is generic for `on_mount`'s reason: a server
-	/// layer cannot name the browser-only `std::dom::Element` it would be handed.
-	/// KEEP IN STEP.
+	/// layer cannot name the browser-only `std::web::dom::Element` it would be
+	/// handed. KEEP IN STEP.
 	fun on_leave<E>(self, handler: |E| void) {}
 }
 
@@ -999,9 +1000,9 @@ fun topmost_contain_scope(): Option<i32> {
 
 /// Install a focus scope, server side: nothing is installed and nothing is focused.
 /// The root is GENERIC for `on_mount`'s reason — a server layer cannot name the
-/// browser-only `std::dom::Element` — and the handle it hands back answers `false`
-/// from `focus_initial`, which is the same answer the browser gives for a scope
-/// whose subtree holds nothing focusable.
+/// browser-only `std::web::dom::Element` — and the handle it hands back answers
+/// `false` from `focus_initial`, which is the same answer the browser gives for a
+/// scope whose subtree holds nothing focusable.
 export fun focus_scope<E>(root: E, containment: FocusContainment): FocusScope {
 	let id = next_focus_scope.read() + 1;
 	next_focus_scope.write() = id;

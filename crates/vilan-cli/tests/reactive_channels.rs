@@ -3149,7 +3149,7 @@ import std::process::exit;
 import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ RemoteSource, SocketTransport };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -3398,7 +3398,7 @@ import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ KeyedCell, KeyedSource, RemoteSource };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 import std::wire::{ Keyed, Wire };
@@ -3655,7 +3655,7 @@ import std::http::{ Response, Server };
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ KeyedCell, KeyedSource };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 import std::wire::{ Keyed, Wire };
@@ -3943,7 +3943,7 @@ import std::http::{ Response, Server };
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ KeyedCell, KeyedSource };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 import std::wire::{ Keyed, Wire };
@@ -4358,7 +4358,7 @@ import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -4524,7 +4524,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::shared::Shared;
 import std::task::Task;
 import std::time::sleep;
-import std::transient::{ TaskSource, Transient, TransientSource, TransientState };
+import std::reactive::transient::{ TaskSource, Transient, TransientSource, TransientState };
 
 fun show<E>(state: TransientState<i32, E>, error: |E| str): str {
 	match state {
@@ -4682,10 +4682,10 @@ import std::process::exit;
 import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, Owner, owner_scope };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ RemoteSource, RpcError };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
-import std::transient::{ TransientSource, TransientState };
+import std::reactive::transient::{ TransientSource, TransientState };
 
 [service(BoardClient)]
 struct Board {
@@ -4797,10 +4797,10 @@ import std::process::exit;
 import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, Owner, owner_scope };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ RemoteSource, RpcError };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
-import std::transient::{ TransientSource, TransientState };
+import std::reactive::transient::{ TransientSource, TransientState };
 
 [service(BoardClient)]
 struct Board {
@@ -4919,7 +4919,7 @@ import std::process::exit;
 import std::reactive::{ MemoCell, Pipe, Signal, SignalCell, Source };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -5027,7 +5027,7 @@ import std::process::exit;
 import std::reactive::{ HashMapCell, HashMapEntry, Source };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -5218,7 +5218,7 @@ import std::process::exit;
 import std::reactive::{ Signal, SignalCell, Source };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -5336,7 +5336,7 @@ import std::process::exit;
 import std::reactive::{ Signal, SignalCell, Source };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 

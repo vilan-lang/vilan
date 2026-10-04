@@ -452,7 +452,7 @@ impl Socket {
 
     /// `socket.setTimeout(millis)` — fire `"timeout"` after that much
     /// inactivity; `0` clears it. It does NOT close the socket, which is the
-    /// property `std::rpc_server` arms a greeting bound with.
+    /// property `std::rpc::server` arms a greeting bound with.
     pub fn set_timeout(&self, millis: i32) {
         self.0.touch();
         self.0.idle_limit.set(if millis <= 0 {

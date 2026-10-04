@@ -375,13 +375,13 @@ fn a_never_instantiated_impls_globals_leave_no_residue() {
 
 #[test]
 fn the_router_is_browser_only() {
-    // `std::router` lives in the browser layer. Under platform coloring the
+    // `std::web::router` lives in the browser layer. Under platform coloring the
     // import is fine — REACHING `navigate` from a node build's entry is the
     // violation, anchored at the user call site with the chain
     // (proposal/platform-coloring.md §3.6).
     assert_fails_spanning(
         r#"
-        import std::router::navigate;
+        import std::web::router::navigate;
 
         fun main() {
             navigate("/home");
@@ -411,8 +411,8 @@ fn the_router_is_browser_only() {
 /// only under the platform its fence admits.
 const SLOT_TWINS: &str = r#"
 import std::io::print;
-import std::ui;
-import std::ui::{ Slot, View, view };
+import std::web::ui;
+import std::web::ui::{ Slot, View, view };
 
 struct Badge {
     label: str,
@@ -675,7 +675,7 @@ fn a_family_fence_draws_one_diagnostic_not_one_per_host() {
     // first host that rejects it; the fence itself is quoted, so the family is
     // not lost.
     let source = r#"
-        import std::router::navigate;
+        import std::web::router::navigate;
 
         [platform("@process")]
         fun go() {
@@ -706,7 +706,7 @@ fn two_fences_broken_the_same_way_each_report() {
     // The negative for the fence half: the origin is part of the cause, so two
     // distinct promises are two distinct mistakes even reaching the same callee.
     let source = r#"
-        import std::router::navigate;
+        import std::web::router::navigate;
 
         [platform("@process")]
         fun go_home() {
@@ -1101,7 +1101,7 @@ fn an_initializer_violation_anchors_at_the_initializer_call() {
     // `navigate` precedent.)
     assert_fails_spanning(
         r#"
-        import std::storage::get;
+        import std::web::storage::get;
 
         let token = get("notes-token");
 
@@ -1441,7 +1441,7 @@ fn a_function_requiring_two_layers_renders_one_line_each_in_label_order() {
     let line = requirement_line_of(
         r#"
         import std::fs;
-        import std::router::navigate;
+        import std::web::router::navigate;
 
         fun torn() {
             fs::write_file("state", "data");
@@ -1455,7 +1455,7 @@ fn a_function_requiring_two_layers_renders_one_line_each_in_label_order() {
     .expect("`torn` requires both layers");
     assert_eq!(
         line,
-        "requires the `browser` layer of `std` (via `navigate (std::router)`)\n\
+        "requires the `browser` layer of `std` (via `navigate (std::web::router)`)\n\
          requires the `process` layer of `std` (via `write_file (std::fs)`)"
     );
 }
@@ -1909,11 +1909,11 @@ fn a_context_reading_function_still_cannot_be_a_value() {
 #[test]
 fn an_imported_function_coerces_across_modules() {
     // The reference resolves through an import binding (browser layer:
-    // `std::router::segments` is a plain vilan fn) — the coercion and the
+    // `std::web::router::segments` is a plain vilan fn) — the coercion and the
     // emitted value must both follow the alias to the defining function.
     assert_compiles_browser(
         r#"
-        import std::router::segments;
+        import std::web::router::segments;
 
         fun apply(path: str, transform: |str| List<str>): List<str> {
             transform(path)
@@ -3720,7 +3720,7 @@ fn bind_draft_compiles_for_the_browser() {
     // adoption writes `local` and bypasses the push path).
     assert_compiles_browser(
         r#"
-        import std::ui::{ view, View, mount_root };
+        import std::web::ui::{ view, View, mount_root };
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
 
@@ -10556,7 +10556,7 @@ fn b290_an_annotated_closure_parameter_stays_the_control() {
 // method" and is really "was the receiver's type known on the first attempt":
 // a receiver whose type had not landed made the call DEFER, the body typed the
 // parameter itself, and the retry bound `E` from the finished closure.
-// `std::router::link_to`'s `|event: Event|` was the workaround.
+// `std::web::router::link_to`'s `|event: Event|` was the workaround.
 
 #[test]
 fn b304_a_closure_parameter_is_not_frozen_at_the_callees_unbound_generic() {
