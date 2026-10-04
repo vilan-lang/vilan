@@ -724,6 +724,12 @@ function also_releasing(handle, release) {
 		return $bj;
 	} ];
 }
+function has_spawned(self) {
+	return __nursery_has_spawned(self);
+}
+function detached_nursery() {
+	return __nursery_new_detached();
+}
 function ensure_wired($e) {
 	if (!(wired.v)) {
 		wired.v = true;
@@ -763,12 +769,6 @@ function pending() {
 }
 function chunk_error() {
 	return chunk_failure();
-}
-function has_spawned(self) {
-	return __nursery_has_spawned(self);
-}
-function detached_nursery() {
-	return __nursery_new_detached();
 }
 function view(tag) {
 	let $bz = null;

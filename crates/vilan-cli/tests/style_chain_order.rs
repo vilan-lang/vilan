@@ -484,7 +484,7 @@ fn every_tracked_fixture_is_already_in_canonical_order() {
 /// project templates' card.
 const ORDER_SENSITIVE: &str = concat!(
     "import std::io::print;\n",
-    "import std::style::{ AlignItems, Color, Cursor, Display, FlexDirection, Length, space, style };\n",
+    "import std::web::style::{ AlignItems, Color, Cursor, Display, FlexDirection, Length, space, style };\n",
     "\n",
     "fun main() {\n",
     // --- the adversarial half ---
@@ -595,7 +595,7 @@ fn an_order_sensitive_fixture_resolves_the_same_slots() {
 /// the entangled-pair cases below load-bearing here in a way they are not there.
 const CSS_ORDER_SENSITIVE: &str = concat!(
     "import std::io::print;\n",
-    "import std::style::{ Color, Length, space, style };\n",
+    "import std::web::style::{ Color, Length, space, style };\n",
     "\n",
     "fun main() {\n",
     // The shorthand LAST wins the whole box; the longhand last wins one edge.
@@ -684,7 +684,7 @@ fn an_order_sensitive_css_block_resolves_the_same_slots() {
 /// the new text has to be proved equivalent.
 const E167_TYPED_CHAIN: &str = concat!(
     "import std::io::print;\n",
-    "import std::style::{ Color, Length, Style, space, style };\n",
+    "import std::web::style::{ Color, Length, Style, space, style };\n",
     "\n",
     "fun main() {\n",
     "\tlet chain = const style()\n",
@@ -700,7 +700,7 @@ const E167_TYPED_CHAIN: &str = concat!(
 
 const E167_CONVERTED_BLOCK: &str = concat!(
     "import std::io::print;\n",
-    "import std::style::{ Color, Length, Style, space, style };\n",
+    "import std::web::style::{ Color, Length, Style, space, style };\n",
     "\n",
     "fun main() {\n",
     "\tlet chain = const css {\n",
@@ -770,7 +770,7 @@ fn the_css_block_refactor_renders_the_typed_chain_it_converted() {
 /// `refactor_inlines_an_impl_style_extension_declared_in_the_current_file`.
 const E172_EXTENSION_CHAIN: &str = concat!(
     "import std::io::print;\n",
-    "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n",
+    "import std::web::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n",
     "\n",
     "impl Style {\n",
     "\tfun flex_row(self): Style {\n",
@@ -792,7 +792,7 @@ const E172_EXTENSION_CHAIN: &str = concat!(
 
 const E172_CONVERTED_BLOCK: &str = concat!(
     "import std::io::print;\n",
-    "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n",
+    "import std::web::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n",
     "\n",
     "impl Style {\n",
     "\tfun flex_row(self): Style {\n",

@@ -6232,7 +6232,7 @@ mod snapshot_consistency_tests {
     async fn the_css_spelling_refactor_is_offered_through_the_real_handler() {
         let (service, _socket) = backend();
         let backend = service.inner();
-        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay(\"flex\");\n\t}\n}\n";
+        let source = "import std::web::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay(\"flex\");\n\t}\n}\n";
         let (_dir, document) = crate::document::tests::analyze_workspace(&[("main.vl", source)]);
         let cursor = document
             .line_index
@@ -7222,7 +7222,7 @@ mod snapshot_consistency_tests {
     // while the `View` methods themselves come from the analyzed program.
     #[tokio::test]
     async fn completion_after_a_dot_in_an_element_head_offers_the_view_methods() {
-        const BASE: &str = "import std::ui::view;\n\nfun main() {\n\t<div></div>\n}\n";
+        const BASE: &str = "import std::web::ui::view;\n\nfun main() {\n\t<div></div>\n}\n";
         let live = BASE.replacen("\t<div></div>\n", "\t<div .></div>\n", 1);
         let (service, _socket) = backend();
         let backend = service.inner();
@@ -9863,7 +9863,7 @@ mod package_recolor_tests {
          [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
     /// A module using the BROWSER `View`'s `element` field: clean under
     /// `browser`, "no field 'element'" under any process target.
-    const WIDGET: &str = "import std::ui::{ View, view };\n\n\
+    const WIDGET: &str = "import std::web::ui::{ View, view };\n\n\
          fun attach(): View {\n\tlet root = view(\"div\");\n\t\
          root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
     const CLIENT_WITHOUT_IMPORT: &str =
@@ -10157,7 +10157,7 @@ mod linked_editing_range_tests {
 
     /// An element with a real statement line available to insert above it, so
     /// the stale answer has live CODE to land on rather than blank space.
-    const VIEW: &str = "import std::ui::{ view, View };\n\nfun page(): View {\n\t<div>\n\t\t\"hello world\"\n\t</div>\n}\n";
+    const VIEW: &str = "import std::web::ui::{ view, View };\n\nfun page(): View {\n\t<div>\n\t\t\"hello world\"\n\t</div>\n}\n";
 
     fn open(backend: &Backend, text: &str) -> Url {
         let uri = Url::parse("file:///linked/page.vl").expect("a url");

@@ -422,7 +422,7 @@ struct Emitter<'a, 'src> {
     ///
     /// [`Emitter::expects_async`] is the same fact on the TYPE side and was
     /// already read; the value side was not, so `fold_service_requests` —
-    /// `std::rpc_server`'s fold, which every `Server::builder()` reaches —
+    /// `std::rpc::server`'s fold, which every `Server::builder()` reaches —
     /// returned a closure whose body calls an `async` one and was refused as an
     /// adapted instance. It is not one: the position DECLARES the asyncness,
     /// which is precisely the case F20 lifted the refusal for at a field and at
@@ -2563,7 +2563,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `remoteAddress`) ANSWER one — the dependency runs this way and
             // not the other.
             "JsonValue" => Ok("vilan_rt::json::JsonValue".to_string()),
-            // F18 slice 3: node:crypto's `Hash`, which `std::rpc_server`'s
+            // F18 slice 3: node:crypto's `Hash`, which `std::rpc::server`'s
             // WebSocket handshake chains through (`create_hash` → `update` →
             // `digest`). std names it `NodeHash` so it cannot be read as
             // `std::hash::Hash`, the `"Hash"` arm above.
@@ -7998,7 +7998,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "({}).is_directory()",
                 self.place_argument(argument_ids, 0, depth)?
             ),
-            // --- NodeHash (node:crypto, `std::rpc_server`'s handshake) ---
+            // --- NodeHash (node:crypto, `std::rpc::server`'s handshake) ---
             ("NodeHash", "update") => format!(
                 "({}).update(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
@@ -8591,7 +8591,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         match (*module, *symbol, name) {
             (None, "__sha256", _) => one(self, "crypto::sha256_bytes"),
-            // F18 slice 3: the two seams `std::rpc_server` reaches beyond
+            // F18 slice 3: the two seams `std::rpc::server` reaches beyond
             // `Bytes` — `std::time`'s host clock (the handshake rate limit
             // stamps each attempt) and node:crypto's `createHash`, whose SHA-1
             // is the WebSocket accept key. The hash's two methods are

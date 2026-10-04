@@ -2475,7 +2475,7 @@ pub struct Implementation<'src> {
 /// the subject's written head name, and the scope the block was written in.
 ///
 /// A type's namespace holds its impls' self-less functions, and an import that
-/// spells `std::style::Length::rem` has to find them before types resolve: the
+/// spells `std::web::style::Length::rem` has to find them before types resolve: the
 /// impl's `subject` is a bare [`TypeId`] until `prepped_type_locals` drains,
 /// which is two drains AFTER the import fixpoint. So the association is kept by
 /// NAME and SCOPE, both of which the walk has in hand, and the import path
@@ -4059,7 +4059,7 @@ pub struct Analyzer<'src> {
     /// type from one twin asks these whether another twin declares a member by
     /// that name, which is the fact that turns "struct 'Region' has no field
     /// 'anchor'" from a contradiction into an answer ("the `browser` twin of
-    /// `std::ui` declares it"). Recorded at load time, where the layer roots
+    /// `std::web::ui` declares it"). Recorded at load time, where the layer roots
     /// and the module's path are both in hand; read only at a diagnostic.
     std_layer_twin_files: HashMap<SourceId, Vec<(String, String, PathBuf, Vec<String>)>>,
     // E200: the lazy ARGUMENTS `check_lazy_arguments` refused in its own words
@@ -4639,7 +4639,7 @@ pub struct Analyzer<'src> {
     // binds those names to.
     prepped_std_items: Vec<(Id, &'src str, &'src str)>,
     // A70: how deep the walk is inside a `css` block's desugared body, and the
-    // bare names minted while it was — the ones `std::style::prelude` answers
+    // bare names minted while it was — the ones `std::web::style::prelude` answers
     // when the site's own scope does not.
     css_scope_depth: usize,
     css_scope_locals: HashSet<Id>,
@@ -4740,7 +4740,7 @@ pub struct Analyzer<'src> {
     /// name's module). Built in the same lazy pass as the export index; an
     /// alias that is NOT deprecated joins the export index itself.
     std_deprecated_alias_index: Option<HashMap<String, (String, String)>>,
-    /// The names `std::web` makes ambient, read lazily off disk on the first
+    /// The names `std::web::prelude` makes ambient, read lazily off disk on the first
     /// failed resolution (`prelude.md` §11.4). A package on the base prelude
     /// reaching for `Signal`, `view`, `View`, `style` or `ui` is the one new
     /// class of confusion the two-set design creates, and the fix is one
@@ -5481,7 +5481,7 @@ pub struct Analyzer<'src> {
     // `satisfies_trait_bound` about this trait once its fast paths miss.
     hashable_trait_id: Option<Id>,
     print_fn_id: Option<Id>,
-    // `std::asset`'s const-only channel, in the order a diagnostic names its
+    // `std::web::asset`'s const-only channel, in the order a diagnostic names its
     // members. One list rather than one field per verb: the channel grows
     // (four verbs in 2026-08, eight after kolt.local 035), and the const
     // pass's three consumers — the R-fixpoint's seed set, the callee's own
@@ -5529,10 +5529,10 @@ pub struct Analyzer<'src> {
     /// makes a value callable.
     callable_trait_id: Option<Id>,
     // The std `dev::stash`/`dev::take` functions (`hmr.md` §4), resolved by
-    // identity from `std::dev` after loading. Their generic `T` carries a value
+    // identity from `std::web::dev` after loading. Their generic `T` carries a value
     // across a hot swap, so the call site is checked against the transfer bound
     // (`transferable_as_value`) — keyed on the real std fns, never a user's
-    // same-named function. `None` until `std::dev` is reachable (import-only).
+    // same-named function. `None` until `std::web::dev` is reachable (import-only).
     hmr_stash_fn_id: Option<Id>,
     hmr_take_fn_id: Option<Id>,
     // The std `Drop` trait (destruction.md §5), resolved by identity from
@@ -5564,7 +5564,7 @@ pub struct Analyzer<'src> {
     try_dispatch: HashMap<Id, TryDispatch>,
     // Per `?.` site: the lowering (std pair inline; flatten or map).
     lift_dispatch: HashMap<Id, LiftDispatch>,
-    // The `std::promise` `Promise<T>` struct, if loaded: the raw host-interop
+    // The `std::js::promise` `Promise<T>` struct, if loaded: the raw host-interop
     // promise type. `await p` unwraps a `Promise<T>` to `T`.
     promise_struct_id: Option<Id>,
     // The `std::task` `Task<T>` struct, if loaded. `async e` types as
@@ -5885,12 +5885,12 @@ const REMOVED_STD_MODULES: &[(&str, &str)] = &[
     ),
     (
         "map_cell",
-        "`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell` \
+        "`std::map_cell` is `std::reactive::hash_map_cell` now, and its `MapCell` is `HashMapCell` \
          (re-exported from `std::reactive`)",
     ),
     (
         "set_cell",
-        "`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell` \
+        "`std::set_cell` is `std::reactive::hash_set_cell` now, and its `SetCell` is `HashSetCell` \
          (re-exported from `std::reactive`)",
     ),
 ];
@@ -12394,7 +12394,7 @@ impl<'src> Analyzer<'src> {
     /// sanctioned resource container (a vilan enum, checkable under R11), so it
     /// is deliberately absent.
     ///
-    /// `NativeMap` — the raw `std::native_map` layer the public `HashMap`/`HashSet` are
+    /// `NativeMap` — the raw `std::js::native_map` layer the public `HashMap`/`HashSet` are
     /// built on — belongs in the set for the same reason its wrappers do, and
     /// omitting it was B154: its `insert(&mut self, key: Hash, value: V)`
     /// declares `value` bare, so the widened temporary predicate destroys a
@@ -12915,7 +12915,7 @@ impl<'src> Analyzer<'src> {
     /// transfer form draws. The concrete `T` is known only at the call site, so
     /// the check lives here: a `stash` argument's type, and a `take` call's
     /// `Option<T>` element, are each classified, and a closure / view / resource /
-    /// reactive cell is rejected. Inert unless `std::dev` is loaded (the ids are
+    /// reactive cell is rejected. Inert unless `std::web::dev` is loaded (the ids are
     /// `None`), so a program that never touches HMR pays nothing.
     fn check_hmr_transfer_bounds(&mut self) {
         if self.hmr_stash_fn_id.is_none() && self.hmr_take_fn_id.is_none() {
@@ -20547,7 +20547,7 @@ impl<'src> Analyzer<'src> {
     /// trait id alone: `impl type S: Source<str>` is not applicable to a
     /// `SignalCell<View>`. Reading the id only made every blanket over a
     /// parameterized trait match every instantiation of it, which is how a
-    /// `Signal<View>` in child position reached `std::ui`'s `Source<str>` text
+    /// `Signal<View>` in child position reached `std::web::ui`'s `Source<str>` text
     /// arm and stringified the view.
     fn impl_bounds_hold(&mut self, impl_subject: TypeId, subject_type: &Type) -> bool {
         let impl_subject_type = impl_subject.get_type(self);
@@ -30944,7 +30944,7 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// std's pipe traits (F60): `std::reactive`'s `Pipe` and `std::delta`'s
+    /// std's pipe traits (F60): `std::reactive`'s `Pipe` and `std::reactive::delta`'s
     /// `CollPipe`, by declaration — std declares each name once, and an
     /// application's own trait of the same name is not std's.
     fn std_pipe_traits(&self) -> Vec<Id> {
@@ -32852,8 +32852,8 @@ impl<'src> Analyzer<'src> {
     /// bare `TypeId` until `prepped_type_locals` drains, two drains after the
     /// import fixpoint that asks this.
     ///
-    /// The scope is the rule and not just the mechanism: `std::style::Length`'s
-    /// statics are reached through `std::style`, whose file holds the block,
+    /// The scope is the rule and not just the mechanism: `std::web::style::Length`'s
+    /// statics are reached through `std::web::style`, whose file holds the block,
     /// and an EXTENSION impl's statics through the module that writes the
     /// extension. Both are one question — does this block's subject name
     /// resolve, in this block's own scope, to the type the path walked to —
@@ -38936,7 +38936,7 @@ impl<'src> Analyzer<'src> {
                     // - One that arrived from elsewhere means only "not
                     //   substituted yet". A closure argument to a METHOD's own
                     //   generic reaches its body with the parameter still
-                    //   abstract, which is `std::ui::View::swap`'s shape and
+                    //   abstract, which is `std::web::ui::View::swap`'s shape and
                     //   the routing guide's `swap(route, |current| match current
                     //   { .. })` — a match that IS concrete at the call. Left
                     //   lenient here, and pinned `#[ignore]`d: the fix is to
@@ -46467,11 +46467,16 @@ impl<'src> Analyzer<'src> {
         let root = segments.next()?;
         let mut target_id = self.resolve_import_root(root, source)?;
         let mut namespace_scope_id = self.modules.get(&target_id)?.body.1;
+        // A154: the walk also descends a module's directory CHILDREN (A65), as
+        // the import walk does — `std::web::prelude` is the namespace `web`'s
+        // child, which `web`'s own (empty) scope does not hold.
+        let mut namespace_module_id: Option<Id> = None;
         for part in segments {
-            target_id = self.member_in_namespace(part, namespace_scope_id)?;
+            target_id = self.member_or_submodule(part, namespace_scope_id, namespace_module_id)?;
             let Some(Expr::Module(sub_module_id)) = self.expr_id_to_expr_map.get(&target_id) else {
                 return None;
             };
+            namespace_module_id = Some(*sub_module_id);
             namespace_scope_id = self.modules.get(sub_module_id)?.body.1;
         }
         Some(namespace_scope_id)
@@ -46739,7 +46744,7 @@ impl<'src> Analyzer<'src> {
                             variants
                         }
                         // B317: a struct namespaces the functions of its impl
-                        // blocks — `std::style::Length::rem`, the shape
+                        // blocks — `std::web::style::Length::rem`, the shape
                         // `names.md` §4.3 has promised since it was written
                         // ("variants, statics"). It is not a SCOPE: the blocks
                         // are found through the scope the walk was standing in,
@@ -52524,7 +52529,7 @@ impl<'src> Analyzer<'src> {
     }
 
     /// The web-set arm of the unresolved-name diagnostic (`prelude.md` §11.4
-    /// determination 1). Fires when the name is one `std::web` would have made
+    /// determination 1). Fires when the name is one `std::web::prelude` would have made
     /// ambient and this package is not on it — the misdirection the two-set
     /// design creates, whose fix is a manifest line, not an import.
     ///
@@ -52592,38 +52597,18 @@ impl<'src> Analyzer<'src> {
         })
     }
 
-    /// Reads `std::web`'s importable names off disk, once, on the first failed
+    /// Reads `std::web::prelude`'s importable names off disk, once, on the first failed
     /// resolution. A cold path by construction, and the same shape
     /// [`Analyzer::build_std_indexes_if_needed`] uses — deliberately reading
     /// the MODULE rather than carrying a second copy of the web set in Rust,
-    /// so the steer can never drift from what `std/src/web.vl` actually
+    /// so the steer can never drift from what `std/src/web/prelude.vl` actually
     /// exports. Answers empty when the file is unreadable: a steer degrades,
     /// it never fails.
     fn build_web_prelude_index_if_needed(&mut self) {
         if self.web_prelude_index.is_some() {
             return;
         }
-        let module = crate::manifest::WEB_PRELUDE
-            .rsplit("::")
-            .next()
-            .unwrap_or_default();
-        let path = self
-            .std_module_files
-            .iter()
-            .find(|(name, _)| name == module)
-            .map(|(_, path)| path.clone());
-        let mut names = HashSet::default();
-        if let Some(path) = path
-            && let Some(loaded) = load_package_module(&path)
-        {
-            let mut importables = Vec::new();
-            collect_importables(&loaded.ast.0, &mut importables);
-            names.extend(
-                importables
-                    .into_iter()
-                    .map(|importable| importable.name.to_string()),
-            );
-        }
+        let mut names: HashSet<String> = self.web_prelude_names().into_iter().collect();
         // The base eight are in both sets, so a program missing `print` must
         // get the ordinary import steer, not "switch to the web set".
         for shared in [
@@ -52635,18 +52620,45 @@ impl<'src> Analyzer<'src> {
         // under the web set the bare name becomes a module, so a VALUE-position
         // miss on it is not fixed by switching preludes — the steer's "both
         // work" promise fails exactly there (audit run 6, F2: the css desugar
-        // needs the bare function `std::style::style`, and the css note beside
+        // needs the bare function `std::web::style::style`, and the css note beside
         // it names the import that actually compiles). Removed dynamically by
         // the std module list, never a Rust-side name copy.
+        // A154: a module's NAME is its last segment (`web::ui` binds `ui`).
         let module_names: Vec<String> = self
             .std_module_files
             .iter()
-            .map(|(module_name, _)| module_name.clone())
+            .map(|(module_name, _)| module_leaf_name(module_name).to_string())
             .collect();
         for module_name in module_names {
             names.remove(module_name.as_str());
         }
         self.web_prelude_index = Some(names);
+    }
+
+    /// Every name `std::web::prelude` makes importable, read off disk (a cold
+    /// path: only a failed resolution asks). Empty when the file is unreadable —
+    /// a steer degrades, it never fails.
+    fn web_prelude_names(&self) -> Vec<String> {
+        let module = crate::manifest::WEB_PRELUDE
+            .strip_prefix("std::")
+            .unwrap_or_default();
+        let Some(path) = self
+            .std_module_files
+            .iter()
+            .find(|(name, _)| name == module)
+            .map(|(_, path)| path.clone())
+        else {
+            return Vec::new();
+        };
+        let Some(loaded) = load_package_module(&path) else {
+            return Vec::new();
+        };
+        let mut importables = Vec::new();
+        collect_importables(&loaded.ast.0, &mut importables);
+        importables
+            .into_iter()
+            .map(|importable| importable.name.to_string())
+            .collect()
     }
 
     /// The B4 import steer for a PATH whose resolution missed in scope (E103) —
@@ -52693,6 +52705,15 @@ impl<'src> Analyzer<'src> {
         let mut deprecated_aliases: HashMap<String, (String, String)> = HashMap::default();
         let files = self.std_module_files.clone();
         for (module_name, path) in &files {
+            // A154: a NESTED prelude (`web::prelude`, `web::style::prelude`) is
+            // a surface of re-exports and token wrappers, never the home of a
+            // name — the index of the flat tree never held one (`std::web` and
+            // `std::style::prelude` were not listed then), and holding one now
+            // would make every `style` builder it wraps ambiguous and silence
+            // the steer. Its parent module is the name's home.
+            if module_name.contains("::") && module_leaf_name(module_name) == "prelude" {
+                continue;
+            }
             let Some(loaded) = load_package_module(path) else {
                 continue;
             };
@@ -53071,7 +53092,7 @@ impl<'src> Analyzer<'src> {
     ///
     /// An UNCURATED module's types count as exported (§8, the rollout's tooling
     /// half): until a module has written its first marker it has made no claim
-    /// about its surface, and warning that `std::ui::View` is unexported would
+    /// about its surface, and warning that `std::web::ui::View` is unexported would
     /// be a warning about work that is scheduled rather than about the signature
     /// in front of the reader. The plain-reach warning beside this one is what
     /// tells an author to curate.
@@ -53421,7 +53442,7 @@ impl<'src> Analyzer<'src> {
 
     /// The import path that names `entity` from the module DECLARING it —
     /// `std::display::Display` — found by the entity rather than by its name,
-    /// so a name two modules declare (`std::style`'s `Display` beside
+    /// so a name two modules declare (`std::web::style`'s `Display` beside
     /// `std::display`'s) still answers. `None` for an entity no top-level
     /// module of `std` or of the package declares.
     fn import_path_of(&self, entity: Id) -> Option<String> {
@@ -56908,12 +56929,12 @@ impl<'src> Analyzer<'src> {
     /// run, and every other name — the call subjects the divergence leaves are
     /// read from among them — must resolve before it.
     /// B270: resolve one desugar-minted std reference through `std`'s OWN
-    /// namespace, exactly as `resolve_import` walks `import std::style::style`
+    /// namespace, exactly as `resolve_import` walks `import std::web::style::style`
     /// — the root module, then the submodule, then the item — and never
     /// through the entity's scope.
     ///
     /// The walk is the import machinery's because the answer must be the
-    /// import's answer: whatever `import std::ui::view` would have bound is
+    /// import's answer: whatever `import std::web::ui::view` would have bound is
     /// what `<div />` means, layer overlays and all.
     ///
     /// A miss DEGRADES to the site's scope (`resolve_prepped_local`) instead of
@@ -56923,7 +56944,10 @@ impl<'src> Analyzer<'src> {
     /// the pre-B270 diagnostics ("cannot find 'view'", A35's shadow steer) are
     /// exactly the right ones to fall back on.
     fn resolve_prepped_std_item(&mut self, id: Id, module: &'src str, item: &'src str) {
-        let Some(subject_id) = self.std_item_id(&[module], item) else {
+        // A154: the module is a PATH under `std` (`web::ui`), walked segment by
+        // segment as the import that spells it would be.
+        let modules: Vec<&str> = module.split("::").collect();
+        let Some(subject_id) = self.std_item_id(&modules, item) else {
             self.resolve_prepped_local(id, item);
             return;
         };
@@ -56934,7 +56958,7 @@ impl<'src> Analyzer<'src> {
 
     /// `std::<module…>::<item>`'s entity, or `None` when std does not have it.
     /// The modules are walked in order, so `["style", "prelude"]` descends
-    /// `std::style` and then its `style/prelude.vl` child — the same walk
+    /// `std::web::style` and then its `style/prelude.vl` child — the same walk
     /// `resolve_import` makes for the import that spells it.
     fn std_item_id(&self, modules: &[&str], item: &str) -> Option<Id> {
         let std_module_id = *self.module_id_by_name.get("std")?;
@@ -57026,7 +57050,7 @@ impl<'src> Analyzer<'src> {
             .or_else(|| {
                 self.css_scope_locals
                     .contains(&id)
-                    .then(|| self.std_item_id(&["style", "prelude"], name))
+                    .then(|| self.std_item_id(&["web", "style", "prelude"], name))
                     .flatten()
             });
         match resolved {
@@ -57124,11 +57148,11 @@ impl<'src> Analyzer<'src> {
                 );
                 // N69/N74: the two desugars' import steers are both gone, for
                 // one reason. B270 made an element's callee a scope-independent
-                // `std::ui::view` and a `css` block's seed a scope-independent
-                // `std::style::style`, so neither name can be unresolved while
+                // `std::web::ui::view` and a `css` block's seed a scope-independent
+                // `std::web::style::style`, so neither name can be unresolved while
                 // std has the item — and in the one state that could still miss
                 // it, a std lacking the item altogether, "add `import
-                // std::ui::{ view, View };`" / "add `import std::style::style;`"
+                // std::web::ui::{ view, View };`" / "add `import std::web::style::style;`"
                 // steered at an import that would miss exactly the same way. A
                 // note that can only fire where its own advice is wrong is worse
                 // than no note. The reachability claims stay where they belong,
@@ -61111,7 +61135,7 @@ impl<'src> Analyzer<'src> {
                             // A34 edits the tail (ledger row 355 keeps its id).
                             // A `css` block's hole is the ONE hole that is not
                             // this concatenation any more: it goes through
-                            // `std::style::piece`, which carries the value's
+                            // `std::web::style::piece`, which carries the value's
                             // `:root` line onto the sheet — so a reader who
                             // met this message while assembling a CSS value by
                             // hand needs to know that the block has a spelling
@@ -61886,7 +61910,7 @@ impl<'src> Analyzer<'src> {
         // --- B426: a CONSTANT that folds negative at an unsigned type ---
         // B407 refuses a negative LITERAL (`-1`); a literal-only expression
         // that FOLDS negative (`let end: usize = 0 - 1;`, the spelling
-        // `std::ui`'s focus wrap used) passed and printed `-1` on JS. The
+        // `std::web::ui`'s focus wrap used) passed and printed `-1` on JS. The
         // maximal literal-only `+`/`-`/`*` trees are folded exactly (i128), at
         // the type their literals settled at, and a negative result at an
         // unsigned type is refused where it is written. A tree with any
@@ -63755,8 +63779,8 @@ pub struct Program<'src> {
     // the site by the argument's concrete type — a resource lowers to its `__drop`
     // helper, data is a no-op consume (destruction.md §6).
     pub drop_fn_id: Option<Id>,
-    /// `std::asset`'s const-only channel — every verb no RUNTIME call path may
-    /// reach — paired with the `std::asset` path a diagnostic names it by, in
+    /// `std::web::asset`'s const-only channel — every verb no RUNTIME call path may
+    /// reach — paired with the `std::web::asset` path a diagnostic names it by, in
     /// a fixed order so a member reaching more than one is NAMED for the same
     /// one every run.
     ///
@@ -66823,8 +66847,8 @@ fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
 /// world's maps (M21/S3c — the same rule the entry's own std refs follow).
 ///
 /// A hygienic reference is not an import, so nothing else would tell the loader
-/// that a file holding one `css { … }` block needs `std::style`, or that one
-/// `<div />` needs `std::ui`. This is that seed, and it is what lets the block
+/// that a file holding one `css { … }` block needs `std::web::style`, or that one
+/// `<div />` needs `std::web::ui`. This is that seed, and it is what lets the block
 /// and the element compile with no import written at all. The set is small and
 /// closed — two names today — and empty for the overwhelming majority of files,
 /// which pay one `for_each_child` walk that stops at the first miss.
@@ -66836,11 +66860,11 @@ fn collect_std_item_modules(nodes: &NodeList) -> Vec<&'static str> {
                     found.push((*module).to_string());
                 }
             }
-            // A70: a `css` block makes `std::style::prelude` ambient inside
+            // A70: a `css` block makes `std::web::style::prelude` ambient inside
             // itself, so the module has to be loaded for a hole to be able to
             // reach it — the same seed, for the same reason.
-            Node::CssScope(_) if !found.iter().any(|seen| seen == "style::prelude") => {
-                found.push("style::prelude".to_string());
+            Node::CssScope(_) if !found.iter().any(|seen| seen == "web::style::prelude") => {
+                found.push("web::style::prelude".to_string());
             }
             _ => {}
         }
@@ -67119,6 +67143,108 @@ pub fn modules_in_root(root: &Path) -> Vec<(String, PathBuf)> {
         modules.push((name.to_string(), path));
     }
     modules.sort();
+    modules
+}
+
+/// Every module under `root` at ANY depth (A65's nested modules), each named by
+/// its path below the root — `web::dom` for `web/dom.vl`, `web::style` for
+/// `web/style.vl` or `web/style/lib.vl` — with its file. [`modules_in_root`]'s
+/// top level is included as it lists it (the root's own `lib.vl` under `lib`).
+///
+/// A154 is why it exists: std's modules moved under namespaces, and every
+/// consumer that inventoried std through the top-level listing — the B4 import
+/// steer's index, the editor's add-import candidates and auto-import index, the
+/// layer contract — would have stopped seeing `std::web::dom` at all. A pure
+/// namespace directory (no `lib.vl`) contributes no row of its own; its children
+/// do. The document overlay is read beside the disk at every depth, for the
+/// reason [`modules_in_root`] gives (the playground's std is overlay-only).
+/// Sorted, and a name present on disk and in the overlay is listed once.
+///
+/// `other_roots` are the package's OTHER source roots: a layered library keeps
+/// its layers INSIDE its base root (std's `src/browser/`, `src/process/`), and a
+/// layer directory is a root of its own, not a namespace of the base — so the
+/// walk never descends into one (it would list `browser::web::ui`).
+pub fn modules_under_root(root: &Path, other_roots: &[&Path]) -> Vec<(String, PathBuf)> {
+    fn walk(
+        directory: &Path,
+        prefix: &str,
+        other_roots: &[PathBuf],
+        into: &mut Vec<(String, PathBuf)>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if path.is_dir() {
+                if other_roots.contains(&crate::util::canonical_path(&path)) {
+                    continue;
+                }
+                let module = format!("{prefix}::{name}");
+                let lib = path.join("lib.vl");
+                if lib.is_file() {
+                    into.push((module.clone(), lib));
+                }
+                walk(&path, &module, other_roots, into);
+            } else if let Some(stem) = name.strip_suffix(".vl")
+                && stem != "lib"
+            {
+                into.push((format!("{prefix}::{stem}"), path.clone()));
+            }
+        }
+    }
+    let other_roots: Vec<PathBuf> = other_roots
+        .iter()
+        .map(|other| crate::util::canonical_path(other))
+        .collect();
+    let mut modules = modules_in_root(root);
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && !other_roots.contains(&crate::util::canonical_path(&path))
+                && let Some(name) = path.file_name().and_then(|name| name.to_str())
+            {
+                walk(&path, name, &other_roots, &mut modules);
+            }
+        }
+    }
+    // The overlay below the top level (`modules_in_root` listed the top).
+    let canonical_root = crate::util::canonical_path(root);
+    for path in document_overlay_paths() {
+        let Ok(relative) = path.strip_prefix(&canonical_root) else {
+            continue;
+        };
+        if other_roots
+            .iter()
+            .any(|other| other != &canonical_root && path.starts_with(other))
+        {
+            continue;
+        }
+        let segments: Vec<&str> = relative
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect();
+        let Some((file, directories)) = segments.split_last() else {
+            continue;
+        };
+        if directories.is_empty() {
+            continue;
+        }
+        let module = match file.strip_suffix(".vl") {
+            Some("lib") => directories.join("::"),
+            Some(stem) => format!("{}::{stem}", directories.join("::")),
+            None => continue,
+        };
+        if !modules.iter().any(|(known, _)| *known == module) {
+            modules.push((module, path));
+        }
+    }
+    modules.sort();
+    modules.dedup_by(|later, earlier| later.0 == earlier.0);
     modules
 }
 
@@ -67703,7 +67829,7 @@ pub struct Workspace {
     /// project to answer from (a bare file, a `[library]` module, a test
     /// harness), the INFERENCE that chose the platform fills it instead (F27
     /// R6, `crate::infer_platform`) — "it reads `.anchor`, which only the
-    /// browser twin of `std::ui` declares". `None` only where neither spoke,
+    /// browser twin of `std::web::ui` declares". `None` only where neither spoke,
     /// and the diagnostic that reads it then says only which platform it is
     /// under.
     ///
@@ -67924,7 +68050,7 @@ struct BaseCacheKey {
     /// modules' scopes already seeded with their ambient set, and the entry
     /// package's own modules take the entry prelude — so two preludes resolve
     /// two different worlds from identical sources, exactly as two macro
-    /// budgets do. Omitting this served a `std::web` world to a base-prelude
+    /// budgets do. Omitting this served a `std::web::prelude` world to a base-prelude
     /// program, which is how it was found.
     ///
     /// The dependency packages' preludes ride in `workspace` below, since
@@ -69946,8 +70072,8 @@ fn analyze_inner<'src>(
             .into_iter()
             .map(|(name, _)| seed_module(&std_roots, name))
             // B341: and the modules the entry's own SYNTAX seeds, which no
-            // `std::` path in the text names — `std::ui` for an element,
-            // `std::style::prelude` for a `css` block. They are pushed into
+            // `std::` path in the text names — `std::web::ui` for an element,
+            // `std::web::style::prelude` for a `css` block. They are pushed into
             // `to_load` beside the written imports below and they load into the
             // world exactly as those do, so a key that omitted them said two
             // entries built one world when they build two. `vilan build`
@@ -70168,16 +70294,21 @@ fn analyze_inner<'src>(
     // loader can RESOLVE in a root is what the steer can NAME — including the
     // `windows-support.md` §5 rule this loop used to restate for itself (path a
     // `PathBuf`, name a `str`), which is `modules_in_root`'s own contract now.
-    for root in std::iter::once(&std.base_root).chain(std.layers.iter().map(|layer| &layer.root)) {
+    let std_roots: Vec<&Path> = std::iter::once(std.base_root.as_path())
+        .chain(std.layers.iter().map(|layer| layer.root.as_path()))
+        .collect();
+    for root in &std_roots {
+        // A154: at every depth — std's modules sit under namespaces
+        // (`web::dom`), and a steer that cannot see them cannot name them.
         analyzer.std_module_files.extend(
-            modules_in_root(root)
+            modules_under_root(root, &std_roots)
                 .into_iter()
                 .filter(|(name, _)| name != "lib"),
         );
     }
     analyzer.std_module_files.sort();
     // What the ENTRY package resolves under, for the web-set steer arm
-    // (prelude.md §11.4): a package already on `std::web` must not be told to
+    // (prelude.md §11.4): a package already on `std::web::prelude` must not be told to
     // switch to it.
     analyzer.entry_prelude_path = workspace
         .entry_prelude
@@ -70479,13 +70610,22 @@ fn analyze_inner<'src>(
     // (macro-engine.md §10 — the ambient derive vocabulary), so they must be
     // loaded before the registry builds, derives or not.
     for core in [
-        "boolean", "list", "null", "promise", "compare", "default", "debug", "json", "hash",
+        "boolean",
+        "list",
+        "js::null",
+        "js::promise",
+        "compare",
+        "default",
+        "debug",
+        "json",
+        "hash",
         // `number` and `string` host the numeric and `str` primitives. They
         // used to load only as a side effect of `std/src/lib.vl` re-exporting
         // their members for the `std::number::i32` / `std::string::str` short names; the alias
         // sweep (prelude.md §10.2) deleted those, so the lang items say so
         // themselves instead of riding on an alias.
-        "number", "string",
+        "number",
+        "string",
     ] {
         to_load.push((Origin::Std, core));
     }
@@ -70694,7 +70834,7 @@ fn analyze_inner<'src>(
     // `std` is itself a package (E.10): its modules register under the `std`
     // namespace only, and every std source maps here so std's *internal* `pkg::`
     // imports resolve within std — never through the entry's `pkg`, where a
-    // same-named local module would collide (a local `ui.vl` vs `std::ui`).
+    // same-named local module would collide (a local `ui.vl` vs `std::web::ui`).
     // Pushed after the dependency packages so the entry-at-0 / deps-at-1.. index
     // convention above is undisturbed.
     let std_package_index = analyzer.packages.len();
@@ -70764,9 +70904,11 @@ fn analyze_inner<'src>(
         let Some(path) = prelude.module_path() else {
             return;
         };
-        let mut segments = path.split("::");
-        let (Some(root), Some(module), None) = (segments.next(), segments.next(), segments.next())
-        else {
+        // A154: the module is the whole path below the root — `web::prelude`
+        // for `std::web::prelude` — which the loader resolves as A65's nested
+        // module. (This took exactly two segments before, so a prelude in a
+        // module directory was never loaded and seeded nothing.)
+        let Some((root, module)) = path.split_once("::") else {
             return;
         };
         let module = interned_display_name(module.to_string());
@@ -71277,7 +71419,7 @@ fn analyze_inner<'src>(
             // Register the module under its package's namespace: entry modules in
             // `pkg`, `std` modules in `std`, a dependency's in its own — so no
             // package's modules collide with or shadow another's (E.10: a local
-            // `ui.vl` and `std::ui` coexist, each reachable through its root).
+            // `ui.vl` and `std::web::ui` coexist, each reachable through its root).
             //
             // A65: "its package's namespace" is the origin's root scope for a
             // top-level module and its PARENT module's submodule scope for a
@@ -71713,7 +71855,7 @@ fn analyze_inner<'src>(
     // Every loaded module's importable names, read syntactically before any
     // walk. A prelude module publishes exactly these (prelude.md §8), and
     // reading them here is what lets `seed_preludes` answer "what does
-    // `std::web` make ambient" without re-parsing anything.
+    // `std::web::prelude` make ambient" without re-parsing anything.
     for (_name, ast, _text, module_scope_id, _source_id, _origin) in &loaded {
         let mut importables = Vec::new();
         collect_importables(&ast.0, &mut importables);
@@ -71837,14 +71979,14 @@ fn analyze_inner<'src>(
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("print").copied());
     }
-    // Remember `std::asset`'s const-only compile-time channel — lines out (in
+    // Remember `std::web::asset`'s const-only compile-time channel — lines out (in
     // both spellings), the end-of-evaluation hook, text in, whole files out
     // (in both spellings), a directory listing in, a digest in (const-eval.md
     // §2-3 and §3.1, docs-port.md §3.3, build-hooks.md §5.3, G23,
     // kolt.local 029/035); the const pass enforces that no runtime call path
     // reaches any of them. Order is the diagnostic's, so it is fixed here and
     // read nowhere else.
-    if let Some(asset_scope_id) = module_scopes.get("asset") {
+    if let Some(asset_scope_id) = module_scopes.get("web::asset") {
         analyzer.asset_channel_fns = [
             ("emit", "asset::emit"),
             ("emit_keyed", "asset::emit_keyed"),
@@ -71914,15 +72056,15 @@ fn analyze_inner<'src>(
             .and_then(|scope| scope.name_to_id_map.get("Callable").copied())
     });
     // The std `dev::stash`/`dev::take` functions, by identity (`hmr.md` §4) — set
-    // only when `std::dev` is reachable, so the transfer-bound check at their call
+    // only when `std::web::dev` is reachable, so the transfer-bound check at their call
     // sites keys on the real hooks rather than a user's same-named function.
-    analyzer.hmr_stash_fn_id = module_scopes.get("dev").and_then(|scope_id| {
+    analyzer.hmr_stash_fn_id = module_scopes.get("web::dev").and_then(|scope_id| {
         analyzer
             .scopes
             .get(scope_id)
             .and_then(|scope| scope.name_to_id_map.get("stash").copied())
     });
-    analyzer.hmr_take_fn_id = module_scopes.get("dev").and_then(|scope_id| {
+    analyzer.hmr_take_fn_id = module_scopes.get("web::dev").and_then(|scope_id| {
         analyzer
             .scopes
             .get(scope_id)
@@ -71956,7 +72098,7 @@ fn analyze_inner<'src>(
         ("u32", "number"),
         ("f64", "number"),
         ("BigInt", "number"),
-        ("null", "null"),
+        ("null", "js::null"),
         ("i8", "number"),
         ("u8", "number"),
         ("i16", "number"),
@@ -72036,11 +72178,11 @@ fn analyze_inner<'src>(
             .insert("HashMap", map_struct_id);
     }
 
-    // The raw `std::native_map` `NativeMap` struct, if loaded (imported by the
+    // The raw `std::js::native_map` `NativeMap` struct, if loaded (imported by the
     // public `HashMap`/`HashSet` wrappers). It carries the map intrinsics; the public
     // `HashMap`/`HashSet` are ordinary vilan structs over it (I1).
     let native_map_struct_id = module_scopes
-        .get("native_map")
+        .get("js::native_map")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
         .and_then(|scope| scope.name_to_id_map.get("NativeMap").copied());
     if let Some(native_map_struct_id) = native_map_struct_id {
@@ -72138,13 +72280,13 @@ fn analyze_inner<'src>(
             .insert("Context", context_struct_id);
     }
 
-    // The `std::promise` `Promise<T>` struct, so `async`/`await` type precisely.
+    // The `std::js::promise` `Promise<T>` struct, so `async`/`await` type precisely.
     analyzer.promise_struct_id = module_scopes
-        .get("promise")
+        .get("js::promise")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
         .and_then(|scope| scope.name_to_id_map.get("Promise").copied());
     // Bind `Promise` into the global scope so a bare `Promise<T>` annotation
-    // resolves (alongside `std::promise::Promise` by path).
+    // resolves (alongside `std::js::promise::Promise` by path).
     if let Some(promise_struct_id) = analyzer.promise_struct_id {
         analyzer
             .mut_scope_for_scope_id(global_scope_id)
@@ -72755,7 +72897,7 @@ fn analyze_over_world<'src>(
     }
     unless_cancelled! {
         // The HMR transfer bound at `dev::stash`/`dev::take` call sites (`hmr.md` §4);
-        // inert unless `std::dev` is loaded. Runs inside `analyze()` (like the S2a
+        // inert unless `std::web::dev` is loaded. Runs inside `analyze()` (like the S2a
         // classification) so both the CLI and the LSP/test pipelines get it.
         //
         // NOT in M19 T1's Class A window, though §3.3 files it there. It
@@ -72772,7 +72914,7 @@ fn analyze_over_world<'src>(
         // (`editor-latency.md` §3.6). What that buys is 100–165 ms of a 5.7 s
         // debug checks phase on kolt's client leg, ~2%, against the drop
         // planner's gate at 950–1230 ms in the same phase. The pass is also
-        // INERT unless `std::dev` is loaded, so most programs pay nothing for
+        // INERT unless `std::web::dev` is loaded, so most programs pay nothing for
         // it at all. It stays live and stays honest.
         analyzer.check_hmr_transfer_bounds();
     }
@@ -73224,7 +73366,7 @@ fn analyze_over_world<'src>(
     if let Some(env_id) = module_member("process", "env") {
         intrinsics.insert(env_id, Intrinsic::Env);
     }
-    if let Some(id) = module_member("dom", "query_selector_all") {
+    if let Some(id) = module_member("web::dom", "query_selector_all") {
         intrinsics.insert(id, Intrinsic::QuerySelectorAll);
     }
 
@@ -76136,7 +76278,7 @@ pub fn check_global_property_externs(program: &mut Program) {
                 "`{symbol}` is a host PROPERTY, not a function: the function form of \
                  `[extern]` emits a CALL, so this binding reaches the host as \
                  `{symbol}()` and fails there. Read it through a runtime helper \
-                 (`std::dom`'s `__dom_active_element` and `__dom_window` are that \
+                 (`std::web::dom`'s `__dom_active_element` and `__dom_window` are that \
                  shape), or, if the property hangs off a value the program holds \
                  rather than off a global, bind it with `[extern(get, \"..\")]` on a \
                  receiver"

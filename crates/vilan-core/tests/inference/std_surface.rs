@@ -382,11 +382,11 @@ fn r_e_the_removed_collection_modules_are_refused_with_the_new_path() {
         ),
         (
             "import std::map_cell::MapCell;",
-            "`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell`",
+            "`std::map_cell` is `std::reactive::hash_map_cell` now, and its `MapCell` is `HashMapCell`",
         ),
         (
             "import std::set_cell;",
-            "`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell`",
+            "`std::set_cell` is `std::reactive::hash_set_cell` now, and its `SetCell` is `HashSetCell`",
         ),
     ] {
         assert_fails_once_with(&format!("{import}\n\nfun main() {{}}\n"), steer);
@@ -5224,7 +5224,7 @@ fn b98_the_platform_twins_are_not_a_duplicate_on_either_leg() {
     // proof lives in `check_scope_differential.rs`, which force-loads every std
     // module on both legs with the skip disabled.)
     let source = r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun main() { let root: View = view("div"); }
         "#;
     assert_compiles_browser(source);
@@ -7512,7 +7512,7 @@ fn b416_a_field_named_like_the_expansions_own_bindings_round_trips() {
 
 const A150_SHOW: &str = concat!(
     "import std::io::print;\n",
-    "import std::transient::TransientState;\n",
+    "import std::reactive::transient::TransientState;\n",
     "\n",
     "fun show(state: TransientState<i32, str>): str {\n",
     "\tmatch state {\n",

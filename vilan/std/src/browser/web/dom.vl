@@ -1,4 +1,4 @@
-// `std::dom` — the browser (DOM) platform layer: a minimal binding to the host
+// `std::web::dom` — the browser (DOM) platform layer: a minimal binding to the host
 // document, elements, and events. Only available when building for the browser
 // (`vilan build --target browser`).
 //
@@ -26,19 +26,19 @@ external fun create_element(tag: str): Element;
 /// `document.createElementNS(namespace, tag)` — a fresh element in an explicit
 /// namespace. SVG elements must be created this way: `createElement` produces an
 /// HTML-namespace node whatever the tag says, and an HTML-namespace `<svg>` renders
-/// nothing. `std::ui::view` routes SVG tag names here by itself.
+/// nothing. `std::web::ui::view` routes SVG tag names here by itself.
 [extern("document.createElementNS")]
 external fun create_element_ns(namespace: str, tag: str): Element;
 
 /// `document.createTextNode(content)` — a fresh, unattached text node. Text
-/// CHILDREN ride this (`std::ui`'s `child` on a `str` or `SignalCell<str>`): mixed
+/// CHILDREN ride this (`std::web::ui`'s `child` on a `str` or `SignalCell<str>`): mixed
 /// content interleaves text nodes between element children as real siblings,
 /// never wrapper spans.
 [extern("document.createTextNode")]
 external fun create_text_node(content: str): Text;
 
 /// `document.createDocumentFragment()` — an empty, unattached container whose
-/// CHILDREN move when it is inserted, leaving it empty. `std::ui` builds a row in
+/// CHILDREN move when it is inserted, leaving it empty. `std::web::ui` builds a row in
 /// one of these and then plants the whole thing with a single `insert_before`,
 /// which is how content of an unknown shape (A91: a row may be any `Slot`) reaches
 /// a position that is not the parent's end.
@@ -55,7 +55,7 @@ external fun create_document_fragment(): Element;
 /// for exactly one job: taking a RUN of sibling nodes out of the document in one
 /// call (`extract_contents`).
 ///
-/// A `std::ui` run's rows are delimited by empty text markers, and since A91 a
+/// A `std::web::ui` run's rows are delimited by empty text markers, and since A91 a
 /// row's node set is not fixed — a row that is itself a `when` or an `each` grows
 /// and shrinks after it was placed. So "move this row" cannot be a list of
 /// remembered nodes; it is "everything between these two markers", which is what a
@@ -195,7 +195,7 @@ impl Element {
 
 	/// Inserts `child` immediately BEFORE `anchor`, which must be a child of this
 	/// element (`element.insertBefore(child, anchor)`) — the positional counterpart
-	/// to `append`, and what `std::ui`'s `Region` is built on.
+	/// to `append`, and what `std::web::ui`'s `Region` is built on.
 	///
 	/// Like `append`, this MOVES a node that is already in the document rather than
 	/// copying it, so re-inserting a live element is how a run of children is
@@ -594,7 +594,7 @@ impl Element {
 external struct Window;
 
 /// The one `window` object (via a helper — a global property has no function form,
-/// the same reason `std::router`'s `location.pathname` needs one).
+/// the same reason `std::web::router`'s `location.pathname` needs one).
 [extern("__dom_window")]
 external fun window(): Window;
 
@@ -683,14 +683,14 @@ impl Text {
 	external fun set_text(self, text: str): void;
 
 	/// Removes the node from the document (`node.remove()`) — `Element`'s `remove`
-	/// for a text node, which is what a `std::ui` `Region` does with its anchor
-	/// when the boundary holding it is disposed.
+	/// for a text node, which is what a `std::web::ui` `Region` does with its
+	/// anchor when the boundary holding it is disposed.
 	[extern(method, "remove")]
 	external fun remove(self): void;
 
 	/// The node's current parent (`node.parentNode`).
 	///
-	/// A `std::ui` `Region` reads its host through this rather than
+	/// A `std::web::ui` `Region` reads its host through this rather than
 	/// remembering one, because since A91 an anchor MOVES: a region opened
 	/// inside a row is built in a detached staging parent and then planted,
 	/// and the row itself is re-inserted on every order pass. The anchor is
@@ -701,7 +701,7 @@ impl Text {
 }
 
 /// A DOM range — two boundary points in one document, and the one operation
-/// `std::ui` needs from them: cut everything between them out as a fragment.
+/// `std::web::ui` needs from them: cut everything between them out as a fragment.
 ///
 /// Both boundaries are `Text` because both are markers std planted: a row's own
 /// leading marker and whatever bounds it on the right (the next row's marker, or

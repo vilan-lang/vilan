@@ -34,13 +34,13 @@ import pkg::compare::PartialEq;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
-import pkg::hash_map_cell::{ HashMapCell, HashMapEntry, MapSource, apply_map_ops };
 import pkg::hash_set::HashSet;
-import pkg::hash_set_cell::{ HashSetCell, HashSetEntry, SetSource, apply_set_ops };
 import pkg::io::panic;
-import pkg::native_map::NativeMap;
+import pkg::js::native_map::NativeMap;
 import pkg::operators::{ Add, Sub };
 import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::hash_map_cell::{ HashMapCell, HashMapEntry, MapSource, apply_map_ops };
+import pkg::reactive::hash_set_cell::{ HashSetCell, HashSetEntry, SetSource, apply_set_ops };
 import pkg::reactive::{
 	Flow,
 	Instance,

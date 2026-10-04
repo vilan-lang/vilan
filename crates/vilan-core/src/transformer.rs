@@ -1244,7 +1244,7 @@ fn helper_source(name: &str) -> &'static str {
         // A failed fetch reports and does NOT continue: the route signal never
         // advances, so the previous view stays and the navigation simply did not
         // happen (`bundle-splitting.md` §2). `failed` carries the reason to
-        // `std::router::chunk_error` (§S3) — without it a failure left
+        // `std::web::router::chunk_error` (§S3) — without it a failure left
         // `pending()` stuck true forever, since only the success path cleared
         // it. The in-flight promise is dropped on failure so the next attempt
         // refetches.
@@ -1275,7 +1275,7 @@ fn helper_source(name: &str) -> &'static str {
              }"
         }
         // The boot preload's fire-and-forget half (`bundle-splitting.md` §S3);
-        // `std::ui::chunk_preload` computes the arm and calls this. Failure is
+        // `std::web::ui::chunk_preload` computes the arm and calls this. Failure is
         // silent — `__chunk_load` has already reported it, and the gate's own
         // load surfaces it on `chunk_error()`.
         "__chunk_preload" => {
@@ -1283,7 +1283,7 @@ fn helper_source(name: &str) -> &'static str {
              \t__chunk_load(arm, () => {}, () => {});\n\
              }"
         }
-        // `std::ui::mount_target` (A24, fullstack-dx.md §9.5): the one peek at
+        // `std::web::ui::mount_target` (A24, fullstack-dx.md §9.5): the one peek at
         // whether a host value is JS `null`/`undefined` — `Element` (and any
         // other opaque `external struct` handle) has no vilan-visible way to
         // ask this itself.
@@ -1375,7 +1375,7 @@ fn helper_source(name: &str) -> &'static str {
         "__sha512" => {
             "async function __sha512(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-512\", data));\n}"
         }
-        // Web Storage glue (std::storage): a missing key reads null; flatten to "".
+        // Web Storage glue (std::web::storage): a missing key reads null; flatten to "".
         // A120 S3: one header off a host `fetch` Response. `Headers` is not a
         // plain object — its entries are not own properties, so the `JsonValue`
         // reading `std::http::Request::header` uses on node's request object
@@ -1395,12 +1395,12 @@ fn helper_source(name: &str) -> &'static str {
         "__session_get" => {
             "function __session_get(key) {\n\treturn sessionStorage.getItem(key) ?? \"\";\n}"
         }
-        // DOM glue (std::dom): `window` is a global property, and the
+        // DOM glue (std::web::dom): `window` is a global property, and the
         // function-extern form addresses only callables — the same reason
         // `__router_path` exists. This is what makes `window` a listen TARGET
         // with the same verbs `Element` carries (`proposal/router.md` §5.1).
         "__dom_window" => "function __dom_window() {\n\treturn window;\n}",
-        // `std::dom::active_element`: the SAME reason `__dom_window` exists —
+        // `std::web::dom::active_element`: the SAME reason `__dom_window` exists —
         // `document.activeElement` is a global PROPERTY, and the
         // function-extern form addresses only callables, so
         // `[extern("document.activeElement")]` emits a CALL to it (A121; the
@@ -1418,11 +1418,11 @@ fn helper_source(name: &str) -> &'static str {
              }"
         }
         // `Element::bounding_rect`: ONE `getBoundingClientRect()` (which forces
-        // layout) read into the four numbers `std::dom`'s `DomRect` carries.
+        // layout) read into the four numbers `std::web::dom`'s `DomRect` carries.
         // The array IS the struct's runtime form — a struct is an array in
         // FIELD ORDER — so this builds a `DomRect` the same way `__parse_i32`
         // builds an `Option`. Its order is `left, top, width, height`, and
-        // `DomRect`'s field order in `vilan/std/src/browser/dom.vl` must match;
+        // `DomRect`'s field order in `vilan/std/src/browser/web/dom.vl` must match;
         // `ui_rows.rs`'s `a59_bounding_rect_reads_the_host_box` asserts the
         // four values by name, so a reorder is a red test rather than silence.
         "__dom_bounding_rect" => {
@@ -1439,7 +1439,7 @@ fn helper_source(name: &str) -> &'static str {
              \treturn Array.from(element.querySelectorAll(selector));\n\
              }"
         }
-        // Router glue (std::router): `location.pathname` is a global property,
+        // Router glue (std::web::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
         // The whole relative URL, for the query and fragment `location.pathname`
@@ -1464,7 +1464,7 @@ fn helper_source(name: &str) -> &'static str {
              \t}\n\
              }"
         }
-        // HMR activity guard (std::dev, `hmr.md` §4/§5): true only when a `run
+        // HMR activity guard (std::web::dev, `hmr.md` §4/§5): true only when a `run
         // --watch` shim installed its `window.__VILAN_HMR__` singleton. A
         // self-contained `typeof` test (safe with no shim, in any host), so the
         // std hooks and `dev::*` calls that guard on it are inert in production
@@ -2891,7 +2891,7 @@ type FrameSets = (
 
 /// What a split build's route gate rewires: a recognized `swap` call becomes
 /// its `swap_split` twin — the `View` METHOD or, since A85, the free VALUE form
-/// — and `std::ui::chunk_preload` is planted ahead of the statement that mounts
+/// — and `std::web::ui::chunk_preload` is planted ahead of the statement that mounts
 /// each one. `retarget`'s third element is the emitted call's route-source
 /// argument index, which differs between the two shapes (the method carries its
 /// receiver first).

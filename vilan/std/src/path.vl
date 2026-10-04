@@ -40,8 +40,8 @@
 // a file rule and `.js` under a URL rule, `%2F` is not a separator, and a URL's
 // root is an origin rather than a filesystem root. So the split is that a URL
 // parser owns scheme/authority/query/fragment and hands its PATH COMPONENT to the
-// functions here — which is precisely what `std::document`'s `file_name_of` does
-// today, and why it can be two lines.
+// functions here — which is precisely what `std::web::document`'s `file_name_of`
+// does today, and why it can be two lines.
 //
 // **Color: none.** This module is in std's base `root` layer, not
 // `src/process`, so it is seeded no platform (`std/vilan.toml`); every

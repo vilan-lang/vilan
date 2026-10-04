@@ -1,8 +1,8 @@
 // The WEB prelude — the ambient scope for applications, selected with
-// `prelude = "std::web"` (`prelude.md` §5.3). The census that drew it is blunt:
-// `print` is not the most-imported name in real vilan code, `Signal` is, and nine
-// of the top sixteen application names are the style/UI cluster. No single fixed
-// set serves both a test corpus and an application, so std ships both and the
+// `prelude = "std::web::prelude"` (`prelude.md` §5.3). The census that drew it is
+// blunt: `print` is not the most-imported name in real vilan code, `Signal` is, and
+// nine of the top sixteen application names are the style/UI cluster. No single
+// fixed set serves both a test corpus and an application, so std ships both and the
 // manifest picks.
 //
 // The base eight are re-stated rather than derived. That is the override rule (§8)
@@ -34,8 +34,8 @@ export import pkg::reactive::{ CollPipe, SetPipe };
 
 // `view` and `View` — ranks 3 and 4, the builder and its type, one idea. A view
 // tree is dense with `view("div")` calls, which is why these are bare members and
-// not left to `ui::`. `std::ui` is declared by BOTH platform layers, so neither
-// name colors this prelude to one target.
+// not left to `ui::`. `std::web::ui` is declared by BOTH platform layers, so
+// neither name colors this prelude to one target.
 //
 // The SLOT functions travel with them (A99, and `when_some` with A119). They
 // are the whole conditional/dynamic/keyed surface now that the `View` methods
@@ -44,9 +44,9 @@ export import pkg::reactive::{ CollPipe, SetPipe };
 // leaving them behind `ui::` would put back the import this set exists to
 // delete. Both platform layers declare every one of them, so none of them
 // colors this prelude either. E145's rule 0 then FADES an explicit
-// `import std::ui::{ when };` in a `std::web` file, which is the intended
+// `import std::web::ui::{ when };` in a `std::web::prelude` file, which is the intended
 // reading: the prelude already binds it.
-export import pkg::ui::{ View, each, each_by, each_values, swap, view, when, when_some };
+export import pkg::web::ui::{ View, each, each_by, each_values, swap, view, when, when_some };
 
 // Ambient MODULES (§5.2). A module entry costs one name in the bare namespace — its
 // own — and buys a whole namespace behind one qualifying segment.
@@ -54,12 +54,12 @@ export import pkg::ui::{ View, each, each_by, each_values, swap, view, when, whe
 // `style` is the move that dissolves the `Display` collision: the CSS enum is
 // `style::Display` and the `to_string` trait keeps bare `Display` to itself, so
 // neither has to rename. It carries eleven enums for one name. A file that
-// wants the builder bare still writes `import std::style::style;` — an explicit
+// wants the builder bare still writes `import std::web::style::style;` — an explicit
 // import beats an ambient module, so all 60 existing `style()` call sites are
 // untouched.
 //
 // `ui` carries `mount_root` and the rest of the UI surface without putting a
 // once-per-app name into the bare namespace. `ui::mount_root` on a node build is an
 // error at the call, which is where a platform error reads.
-export import pkg::style;
-export import pkg::ui;
+export import pkg::web::style;
+export import pkg::web::ui;

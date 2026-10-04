@@ -197,7 +197,7 @@ pub const DEFAULT_PRELUDE: &str = "std::prelude";
 
 /// std's web prelude (`prelude.md` §5.3) — named here only so the diagnostics
 /// that steer toward it cannot drift from the module that implements it.
-pub const WEB_PRELUDE: &str = "std::web";
+pub const WEB_PRELUDE: &str = "std::web::prelude";
 
 /// A package's *resolved* ambient scope, after the key's default is applied.
 /// The compiler sees this, never [`PreludeDecl`].
@@ -1811,8 +1811,8 @@ pub fn resolve_library(dir: &Path) -> PackageSpec {
 /// `vilan.stdPath` at the SOURCE root (`.../std/src`) instead of the package
 /// directory: when the given directory has no manifest but its parent is a
 /// `[library]`, the parent is resolved. Without this, the bare-source
-/// fallback has no platform layers, so every layered module (`std::ui`,
-/// `std::rpc_server`, ...) silently fails to resolve — a wall of import
+/// fallback has no platform layers, so every layered module (`std::web::ui`,
+/// `std::rpc::server`, ...) silently fails to resolve — a wall of import
 /// errors instead of one fixable mistake.
 pub fn resolve_std(std_dir: &Path) -> PackageSpec {
     if !std_dir.join("vilan.toml").exists()
@@ -4176,9 +4176,9 @@ mod tests {
     #[test]
     fn the_web_prelude_is_an_ordinary_module_path() {
         // §6.2 determination 2: selecting the web set is not a mode the
-        // compiler knows about — `std::web` is a module like any other, which
+        // compiler knows about — `std::web::prelude` is a module like any other, which
         // is why there is no enumerated list of set names anywhere.
-        let manifest = parse("[package]\nname = \"app\"\nprelude = \"std::web\"\n");
+        let manifest = parse("[package]\nname = \"app\"\nprelude = \"std::web::prelude\"\n");
         assert_eq!(
             manifest.package.as_ref().unwrap().prelude(),
             PreludeSpec::Module(WEB_PRELUDE.to_string())
@@ -4228,7 +4228,7 @@ mod tests {
                 e.contains("`[package] prelude`")
                     && e.contains("package root")
                     && e.contains("std::prelude")
-                    && e.contains("std::web")
+                    && e.contains("std::web::prelude")
             }),
             "{errors:?}"
         );
@@ -4294,7 +4294,7 @@ mod tests {
         // §6.2 determination 5: a SEMANTIC key must not travel any edge, so
         // `[project]` has no `prelude` at all — an unknown key there is
         // ignored, and each member states its own.
-        let manifest = parse("[project]\npackages = [\"a\"]\nprelude = \"std::web\"\n");
+        let manifest = parse("[project]\npackages = [\"a\"]\nprelude = \"std::web::prelude\"\n");
         assert_eq!(manifest.validate(), Vec::<String>::new());
         assert!(manifest.package.is_none());
     }

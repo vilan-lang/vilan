@@ -720,7 +720,7 @@ fn n110_a_generated_name_in_a_witness_is_a_hole_and_nothing_wider() {
 /// instrumentation (`__hmr_adopt*` / `__hmr_expose`). The runtime *guard*
 /// (`__hmr_active`) and the guarded std hooks (`__hmr_register_teardown` &c.)
 /// are deliberately NOT swept: they appear in plain builds of programs using
-/// `mount_root`/`connect_socket`/`std::dev` and no-op without a shim — a
+/// `mount_root`/`connect_socket`/`std::web::dev` and no-op without a shim — a
 /// future corpus golden may legitimately carry them.
 #[test]
 fn no_corpus_golden_carries_hmr_instrumentation() {
@@ -1090,7 +1090,7 @@ fn eight_concurrent_runs_of_the_filesystem_program_agree_byte_for_byte() {
 /// `--test corpus` never dirties the tree. The regeneration RITUAL does not:
 /// rebuilding a golden is `vilan build vilan/test/<program>.vl` **in place**
 /// (`AGENTS.md` §2, and the reason is that a stale binary writes wrong
-/// goldens). The three programs that reach `std::asset` write four files
+/// goldens). The three programs that reach `std::web::asset` write four files
 /// beside the corpus when they are built there — `.vilan-bundled`,
 /// `icons/close.svg`, `logo.<hash>.svg` and `robots.txt` — and none of them
 /// was ignored, so `git add -A` after a regeneration swept all four into the
@@ -1134,7 +1134,7 @@ fn every_asset_a_corpus_build_emits_beside_the_sources_is_gitignored() {
         }
         std::fs::copy(&path, work.join(name)).expect("stage a corpus file");
         if extension == "vl"
-            && std::fs::read_to_string(&path).is_ok_and(|text| text.contains("std::asset"))
+            && std::fs::read_to_string(&path).is_ok_and(|text| text.contains("std::web::asset"))
         {
             asset_programs.push(name.to_string());
         }
@@ -1142,7 +1142,7 @@ fn every_asset_a_corpus_build_emits_beside_the_sources_is_gitignored() {
     asset_programs.sort();
     assert!(
         !asset_programs.is_empty(),
-        "no corpus program reaches `std::asset`, so this pin measures nothing"
+        "no corpus program reaches `std::web::asset`, so this pin measures nothing"
     );
 
     let staged = files_under(&work);

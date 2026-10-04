@@ -653,7 +653,7 @@ fn a146_a_tracked_list_keyed_or_mirror_read_keeps_one_edge_across_runs() {
         import std::io::print;
         import std::option::Option::{ self, None, Some };
         import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, derive };
-        import std::delta::ListCell;
+        import std::reactive::delta::ListCell;
         import std::rpc::{ KeyedCell, Keyed, KeyedSource, ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::json::json_codec;
         import std::shared::Shared;
@@ -893,7 +893,7 @@ fn b482_a_track_in_a_ui_event_handler_is_refused() {
     // handler minted inside a body runs CLEARED in the browser.
     let source = r#"
         import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
 
         fun main() {
             let count: SignalCell<i32> = Signal::new(1);
@@ -912,7 +912,7 @@ fn b482_a_track_in_a_ui_event_handler_is_refused() {
         "#;
     let message = "this closure is called with `tracking` CLEARED: it lands at the parameter `handler` of `on`";
     assert_fails_browser_with(source, message);
-    // The server's `std::ui` DISCARDS a handler (it is never called), so its
+    // The server's `std::web::ui` DISCARDS a handler (it is never called), so its
     // clause is only the signature's: the process leg compiles, and a fullstack
     // build is refused by its browser leg.
     assert_compiles(source);

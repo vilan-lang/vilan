@@ -1,4 +1,5 @@
-// `std::ui` — a declarative, fine-grained reactive view layer over `std::dom`.
+// `std::web::ui` — a declarative, fine-grained reactive view layer over
+// `std::web::dom`.
 //
 // A `View` describes a DOM element; methods chain to build it. Plain setters
 // (`text`/`class`/`attr`) set static content; the `bind_*` setters take a `Source`
@@ -28,24 +29,10 @@
 // Only available when building for the browser (`vilan build --target browser`).
 
 import pkg::compare::PartialEq;
-import pkg::dev::{ hmr_active, on_teardown };
-import pkg::dom::{
-	Element,
-	Event,
-	Text,
-	active_element,
-	create_document_fragment,
-	create_element,
-	create_element_ns,
-	create_range,
-	create_text_node,
-	get_element_by_id,
-	request_animation_frame,
-	window,
-};
 import pkg::hash::Hashable;
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::store_core::{ Store, StoreFlag, StoreSome };
 import pkg::reactive::{
 	Disposable,
 	Draft,
@@ -73,8 +60,22 @@ import pkg::reactive::{
 	zip_some,
 };
 import pkg::shared::Shared;
-import pkg::store_core::{ Store, StoreFlag, StoreSome };
-import pkg::style::Style;
+import pkg::web::dev::{ hmr_active, on_teardown };
+import pkg::web::dom::{
+	Element,
+	Event,
+	Text,
+	active_element,
+	create_document_fragment,
+	create_element,
+	create_element_ns,
+	create_range,
+	create_text_node,
+	get_element_by_id,
+	request_animation_frame,
+	window,
+};
+import pkg::web::style::Style;
 
 /// A binding's subscription: `observer` now and on every change, released with
 /// the nearest boundary. `effect` without the per-run owner (A142 §4): every body
@@ -392,7 +393,7 @@ export impl View {
 	/// "rendered" or "visible" — `focus()`, a measurement, a scroll into view —
 	/// must ask again on an animation frame if the first attempt does not take.
 	/// `View::autofocus` is that pattern written once;
-	/// `std::dom::request_animation_frame` is the clock.
+	/// `std::web::dom::request_animation_frame` is the clock.
 	fun on_mount(self, action: sync |Element| void): View {
 		// Capture the ELEMENT, not the view: the closure the host holds must reach
 		// exactly what the callback needs and nothing more (`proposal/lifetimes.md`
@@ -568,13 +569,13 @@ fun write_back_draft(element: Element, draft: Draft<str>) {
 }
 
 /// True while a route chunk is in flight (proposal/bundle-splitting.md §2) — the
-/// one hook a loading indicator needs. Re-exported as `std::router::pending`, which
-/// is where an app reads it.
+/// one hook a loading indicator needs. Re-exported as `std::web::router::pending`,
+/// which is where an app reads it.
 let chunk_pending_signal: SignalCell<bool> = SignalCell::new(false);
 
 /// Why the last route chunk fetch failed, or `None` (§S3). Re-exported as
-/// `std::router::chunk_error`. Cleared when the next navigation starts, so a view
-/// bound to it shows the failure exactly until something is retried.
+/// `std::web::router::chunk_error`. Cleared when the next navigation starts, so a
+/// view bound to it shows the failure exactly until something is retried.
 let chunk_error_signal: SignalCell<Option<str>> = SignalCell::new(None);
 
 /// The route arm a value selects. See `swap_split`.

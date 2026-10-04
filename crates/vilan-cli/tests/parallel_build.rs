@@ -112,7 +112,11 @@ fn three_leg_workspace(dir: &Path, bundled: bool) {
             String::new()
         }
     };
-    let import_asset = if bundled { "import std::asset;\n" } else { "" };
+    let import_asset = if bundled {
+        "import std::web::asset;\n"
+    } else {
+        ""
+    };
     if bundled {
         for leg in ["client", "probe", "server"] {
             write(
@@ -127,7 +131,7 @@ fn three_leg_workspace(dir: &Path, bundled: bool) {
         "src/client.vl",
         &format!(
             "{import_asset}\
-             import std::ui::{{ mount_root, view }};\n\
+             import std::web::ui::{{ mount_root, view }};\n\
              import pkg::shared::greeting;\n\
              \n\
              {}\
@@ -230,7 +234,7 @@ fn a_three_leg_workspace_writes_the_same_dist_either_way() {
 ///
 /// The plant is the fixture's own shape rather than a contrivance: `client`
 /// comes first in the schedule and is by far the slower leg (a browser bundle
-/// over `std::ui` against a node leg that imports `std::io`), so a round that
+/// over `std::web::ui` against a node leg that imports `std::io`), so a round that
 /// blamed in completion order would name the two files the other way round
 /// essentially every time.
 #[test]
@@ -246,8 +250,8 @@ fn a_bundled_name_collision_names_the_same_leg_either_way() {
     write(
         &dir,
         "src/client.vl",
-        "import std::asset;\n\
-         import std::ui::{ mount_root, view };\n\
+        "import std::web::asset;\n\
+         import std::web::ui::{ mount_root, view };\n\
          \n\
          let ONE = const asset::bundle_as(\"first.txt\", \"/pinned.txt\");\n\
          \n\
@@ -258,7 +262,7 @@ fn a_bundled_name_collision_names_the_same_leg_either_way() {
     write(
         &dir,
         "src/server.vl",
-        "import std::asset;\n\
+        "import std::web::asset;\n\
          import std::io::print;\n\
          \n\
          let TWO = const asset::bundle_as(\"second.txt\", \"/pinned.txt\");\n\
@@ -314,7 +318,7 @@ fn an_aborting_round_names_the_same_leg_either_way() {
     write(
         &dir,
         "src/client.vl",
-        "import std::ui::{ mount_root, view };\n\n\
+        "import std::web::ui::{ mount_root, view };\n\n\
          fun main() {\n\tlet _root = mount_root(\"app\", || view(\"a\"));\n}\n",
     );
     // `probe` fails, and `server` — after it in the schedule — fails too. A
@@ -389,7 +393,7 @@ fn a_leg_that_reads_another_legs_artifact_gets_this_rounds_bytes() {
     write(
         &dir,
         "server.vl",
-        "import std::asset;\nimport std::io::print;\n\n\
+        "import std::web::asset;\nimport std::io::print;\n\n\
          let BUNDLE = const asset::read(\"dist/client.js\");\n\n\
          fun main() {\n\tprint(BUNDLE);\n}\n",
     );
@@ -510,7 +514,7 @@ fn a_watch_round_reuses_the_same_legs_either_way() {
             write(
                 &dir,
                 "src/client.vl",
-                "import std::ui::{ mount_root, view };\n\
+                "import std::web::ui::{ mount_root, view };\n\
                  import pkg::only_client::tint;\n\
                  \n\
                  fun main() {\n\

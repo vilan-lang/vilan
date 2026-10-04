@@ -1,7 +1,7 @@
 # Process modules reference
 
 The process layer (Node/Deno/Bun builds): `std::db`, `std::http`,
-`std::fs`, `std::process`, `std::rpc_server`, `std::watch`. Task-oriented
+`std::fs`, `std::process`, `std::rpc::server`, `std::watch`. Task-oriented
 usage: [Persistence and the server](../guide/persistence.md).
 
 ## std::db: SQLite
@@ -207,12 +207,12 @@ content-type table a full-stack server used to write by hand. It takes a
 [`LegBuild`](#stdbuild) and installs one route per artifact at
 `/<name>` — the bundle, the style sidecar if the leg emitted one, every
 route chunk, and every resource the leg bundled with
-[`const asset::bundle`](misc.md#stdasset) — in front of `on_request`,
+[`const asset::bundle`](misc.md#stdwebasset) — in front of `on_request`,
 whatever order the chain was written in. So the app's catch-all still answers every path the build does
 not claim, and a leg that gains `split = true` gains its chunk routes with
 no server edit. It is the one way a server serves its build: an rpc app
 that wants it puts its service on the same chain with `with_service`
-([below](#stdrpc_server)) rather than reaching for a `serve_*` boot
+([below](#stdrpcserver)) rather than reaching for a `serve_*` boot
 function, which hands you only a fallback and no builder to install on.
 
 Three details are decisions, not defaults. The route shape is `/<name>`,
@@ -303,7 +303,7 @@ somewhere reachable, e.g. behind a signal handler or a `/shutdown`
 route) or from inside a request handler. Stopping a `Server` value
 `start()` never populated (built but never started) is a no-op.
 
-## std::rpc_server
+## std::rpc::server
 
 ```vilan,fragment
 impl Service {
@@ -768,7 +768,7 @@ serve, so it stops with the error's message instead of starting.
 
 `assets` is what makes a built app need nothing but `dist/`: every
 non-code resource the leg named with
-[`const asset::bundle`](misc.md#stdasset), by its package-relative path, so
+[`const asset::bundle`](misc.md#stdwebasset), by its package-relative path, so
 `static/icon.svg` is served at `/static/icon.svg` from
 `dist/static/icon.svg`. A row placed by `bundle_as` carries the TARGET
 instead — the url spelled at the call, minus its leading `/` — and is served
@@ -776,7 +776,7 @@ and read exactly the same way, which is why a fingerprinted or path-pinned
 name needs nothing here. A build written before bundling existed carries no
 `assets` field and reads as a build with none, which is what it was.
 
-## std::document
+## std::web::document
 
 The HTML document a browser leg is loaded by, held against what that leg's
 build emitted — so the `<script>`, the `<link>` and the mount element
@@ -832,7 +832,7 @@ start.
 
 ```vilan,norun
 import std::build::require_build;
-import std::document::require_shell;
+import std::web::document::require_shell;
 import std::http::{ Response, Server };
 
 async fun main() {
@@ -882,7 +882,7 @@ resolution reads `document.currentScript`):
 
 ```vilan,norun
 import std::build::require_build;
-import std::document::Document;
+import std::web::document::Document;
 import std::http::{ Response, Server };
 
 async fun main() {
@@ -1007,8 +1007,8 @@ changed on disk yourself, then call `force_refresh()` so every browser
 connected to the dev channel reloads once and re-pulls it.
 `force_refresh()` is a **no-op outside `vilan run --watch`** — it costs
 nothing to leave the call in a shipped build. (Named apart from the
-browser's [`std::dev`](dev.md) on purpose — the two share no component
-source the way, say, `std::ui`'s browser and process halves do, so they
+browser's [`std::web::dev`](dev.md) on purpose — the two share no component
+source the way, say, `std::web::ui`'s browser and process halves do, so they
 are not the same surface under two names.)
 
 ```vilan,norun

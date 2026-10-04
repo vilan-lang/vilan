@@ -1,4 +1,4 @@
-/// `std::transient` — values that come and go (tracker A142 S3,
+/// `std::reactive::transient` — values that come and go (tracker A142 S3,
 /// `proposal/reactive-layers.md` §5).
 ///
 /// A `Source` has a value. A TRANSIENT has a value only sometimes: a fetch in

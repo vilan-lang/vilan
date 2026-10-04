@@ -1723,7 +1723,7 @@ fn b480_a_selector_matching_two_erased_arms_needs_no_switch_type_arguments() {
         r#"
         import std::io::print;
         import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source };
-        import std::transient::TransientState;
+        import std::reactive::transient::TransientState;
 
         fun shown(state: TransientState<str, str>): str {
             match state {

@@ -12007,7 +12007,7 @@ mod tests {
     fn a_file_leading_mod_self_hosts_the_files_platform() {
         // B415: `[platform("…")] mod self;` as the file's first statement is
         // the host for the file's own attributes (F27 R1's platform).
-        let items = program("[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n");
+        let items = program("[platform(\"browser\")] mod self;\n\nimport std::web::ui::Region;\n");
         match &items.0[0].0 {
             Node::ModulePlatform(patterns) => {
                 assert_eq!(
@@ -12053,8 +12053,8 @@ mod tests {
     #[test]
     fn mod_self_anywhere_but_the_files_head_is_refused() {
         for source in [
-            "import std::ui::Region;\n[platform(\"browser\")] mod self;\n",
-            "import std::ui::Region;\nmod self;\n",
+            "import std::web::ui::Region;\n[platform(\"browser\")] mod self;\n",
+            "import std::web::ui::Region;\nmod self;\n",
             "fun f() {\n\t[platform(\"browser\")] mod self;\n}\n",
             "mod inner {\n\t[platform(\"browser\")] mod self;\n}\n",
         ] {

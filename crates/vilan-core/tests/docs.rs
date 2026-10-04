@@ -627,17 +627,17 @@ const RETIRED_STD_NAMES: &[&str] = &[
 /// never breaks, so a run anchored on one survives a reflow.
 const RETIREMENT_NOTES: &[(&str, &str)] = &[
     (
-        "browser/ui.vl",
+        "browser/web/ui.vl",
         "one-line sugar over them — `when`, `swap`, `swap_split`, `bind_each`,",
     ),
     (
-        "browser/ui.vl",
+        "browser/web/ui.vl",
         "`bind_each_values`, `bind_each_by` — are retired",
     ),
-    ("browser/ui.vl", "Named `each` and not `bind_each`"),
-    ("browser/ui.vl", "`{bind_each(..)}` read as a setter"),
+    ("browser/web/ui.vl", "Named `each` and not `bind_each`"),
+    ("browser/web/ui.vl", "`{bind_each(..)}` read as a setter"),
     (
-        "style.vl",
+        "web/style.vl",
         "all and pushed authors onto the deleted `child_relation` as a",
     ),
 ];

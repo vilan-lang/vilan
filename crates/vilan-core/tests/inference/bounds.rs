@@ -4743,7 +4743,7 @@ fn const_chains_through_computed_bindings() {
 }
 
 // --- G2 slice 5: the asset channel + the const-only bit -----------------------
-// `std::asset::emit(kind, line)` accumulates build assets during const
+// `std::web::asset::emit(kind, line)` accumulates build assets during const
 // evaluation (const-eval.md §3); the channel dedups by line and orders
 // lexically. `emit` is const-ONLY (§2): a runtime call path errors at the
 // boundary call site — the crossing from runtime code into emit-reaching
@@ -4753,7 +4753,7 @@ fn const_chains_through_computed_bindings() {
 fn a_const_emit_collects_assets() {
     let assets = collected_assets(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun rule(): i32 {
             emit("css", ".a{color:red}");
             emit("css", ".b{color:blue}");
@@ -4781,7 +4781,7 @@ fn assets_deduplicate_and_sort_in_cascade_order() {
     // position they need (the CSS-soundness argument in assemble_assets).
     let assembled = assembled_assets(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun base(): i32 {
             emit("css", ".pA3{padding:1rem}");
             emit("css", "@media (min-width: 768px){.mX{padding:2rem}}");
@@ -4814,7 +4814,7 @@ fn media_rules_sort_by_ascending_min_width() {
     // the collection order, decides.
     let assembled = assembled_assets(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun wide(): i32 {
             emit("css", "@media (min-width: 1280px){.d{width:4rem}}");
             emit("css", "@media (min-width: 1024px){.c{width:3rem}}");
@@ -4850,7 +4850,7 @@ fn a_sm_lg_pair_renders_the_lg_value_on_a_wide_viewport() {
     // matching breakpoint wins the cascade tie.
     let assembled = assembled_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().sm(style().padding(space(2))).lg(style().padding(space(3)))
         }
@@ -4876,7 +4876,7 @@ fn a_sm_lg_pair_renders_the_lg_value_on_a_wide_viewport() {
 fn asset_kinds_stay_separate() {
     let assembled = assembled_assets(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun both(): i32 {
             emit("css", ".a{}");
             emit("txt", "hello");
@@ -4899,7 +4899,7 @@ fn a_non_css_kind_keeps_lexical_order_for_media_looking_lines() {
     // puts '@' (0x40) before 'z' (0x7A).
     let assembled = assembled_assets(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun entries(): i32 {
             emit("manifest", "zebra: last by bytes");
             emit("manifest", "@media (min-width: 768px){.mX{padding:2rem}}");
@@ -4925,7 +4925,7 @@ fn non_css_media_looking_lines_sort_by_bytes_not_by_width() {
     // sort 640px first.
     let assembled = assembled_assets(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun entries(): i32 {
             emit("manifest", "@media (min-width: 640px){.a{width:1rem}}");
             emit("manifest", "@media (min-width: 1024px){.c{width:3rem}}");
@@ -4951,7 +4951,7 @@ fn the_cascade_comparator_stays_css_scoped_in_a_mixed_flush() {
     // lexically. Pins that the rule is per kind, not per flush.
     let assembled = assembled_assets(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun both(): i32 {
             emit("css", "zx{color:red}");
             emit("css", "@media (min-width: 1024px){.c{width:3rem}}");
@@ -4984,7 +4984,7 @@ fn the_cascade_comparator_stays_css_scoped_in_a_mixed_flush() {
 fn a_runtime_emit_is_rejected() {
     assert_fails_spanning(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun main() {
             emit("css", ".a{}");
         }
@@ -5001,7 +5001,7 @@ fn a_runtime_call_reaching_emit_is_rejected_at_the_boundary() {
     // outermost runtime crossing — not at the emit inside `rule`. (rfind:
     // the declaration `fun rule():` also contains the snippet.)
     let source = r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun rule(): i32 {
             emit("css", ".a{}");
             1
@@ -5025,7 +5025,7 @@ fn a_runtime_call_reaching_emit_is_rejected_at_the_boundary() {
 #[test]
 fn a_top_level_runtime_call_reaching_emit_is_rejected() {
     let source = r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun rule(): i32 {
             emit("css", ".a{}");
             1
@@ -5052,7 +5052,7 @@ fn reaching_functions_inside_const_are_fine() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun padding(): i32 {
             emit("css", ".pA3{padding:1rem}");
             4
@@ -5206,7 +5206,7 @@ fn a_const_depth_miss_reports_a_budget_and_elides_the_repeated_frames() {
 #[test]
 fn a_function_reaching_emit_cannot_escape_as_a_value() {
     let source = r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun styled(): i32 {
             emit("css", ".a{}");
             1
@@ -5233,7 +5233,7 @@ fn a_function_reaching_emit_cannot_escape_as_a_value() {
 #[test]
 fn a_module_level_value_reference_to_an_emit_reaching_function_is_rejected() {
     let source = r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun styled(): i32 {
             emit("css", ".a{}");
             1
@@ -5257,7 +5257,7 @@ fn a_module_level_value_reference_to_an_emit_reaching_function_is_rejected() {
 fn a_closure_reaching_emit_cannot_escape_as_a_value() {
     assert_fails_with(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun apply(f: || i32): i32 {
             f()
         }
@@ -5277,7 +5277,7 @@ fn a_closure_reaching_emit_cannot_escape_as_a_value() {
 fn a_closure_wrapping_an_emit_reaching_call_cannot_escape_as_a_value() {
     assert_fails_with(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun styled(): i32 {
             emit("css", ".a{}");
             1
@@ -5301,7 +5301,7 @@ fn an_indirect_call_rooted_in_const_stays_legal() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun styled(): i32 {
             emit("css", ".a{}");
             1
@@ -5319,7 +5319,7 @@ fn an_indirect_call_rooted_in_const_stays_legal() {
     let assets = collected_assets(
         r#"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun styled(): i32 {
             emit("css", ".a{}");
             1
@@ -5393,7 +5393,7 @@ fn a_const_read_parses_the_books_largest_page_within_budget() {
     let book_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
     let (values, inputs) = const_reads(
         r#"
-        import std::asset;
+        import std::web::asset;
         import std::markdown;
         import std::result::Result::{ Err, Ok };
         fun block_count(): i32 {
@@ -5425,7 +5425,7 @@ fn a_const_read_parses_the_books_largest_page_within_budget() {
 fn a_missing_read_is_a_clean_diagnostic_at_the_read_site() {
     assert_fails_spanning(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _text = const asset::read("vilan-k13-definitely-missing.md");
         }
@@ -5457,7 +5457,7 @@ fn an_absolute_read_path_is_refused() {
     assert_fails_with(
         &format!(
             r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {{
             let _text = const asset::read("{}");
         }}
@@ -5479,7 +5479,7 @@ fn a_posix_absolute_path_is_refused_on_every_platform() {
     // this true on both without asserting either arm's wording.
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _text = const asset::read("/etc/hostname");
         }
@@ -5493,7 +5493,7 @@ fn a_posix_absolute_path_is_refused_on_every_platform() {
 fn a_read_path_escaping_the_package_root_is_refused() {
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _text = const asset::read("../outside.md");
         }
@@ -5522,7 +5522,7 @@ const EMIT_KIND_REFUSAL: &str = "`asset::emit` kinds name one file beside the bu
 fn an_emit_kind_escaping_the_output_directory_is_refused() {
     assert_fails_with(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun rule(): i32 {
             emit("../evil", "x");
             1
@@ -5541,7 +5541,7 @@ fn an_emit_kind_carrying_a_separator_is_refused() {
     // file in a directory the build never made. Refused by the same rule.
     assert_fails_with(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun rule(): i32 {
             emit("a/b", "x");
             1
@@ -5561,7 +5561,7 @@ fn a_legitimate_emit_kind_is_untouched() {
     // rule that refused it would be worse than the hole it closes.
     assert_compiles(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun rule(): i32 {
             emit("css", ".a{color:red}");
             1
@@ -5605,7 +5605,7 @@ fn owned_refusal(kind: &str, collides_with: &str) -> String {
 fn emitting_program(kind: &str) -> String {
     format!(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun rule(): i32 {{
             emit("{kind}", "x");
             1
@@ -5672,7 +5672,7 @@ fn a_computed_emit_kind_is_fenced_like_a_literal_one() {
     // the kind is always known where the fence runs.
     assert_fails_with(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun kind_name(): str {
             "v" + "l"
         }
@@ -5737,7 +5737,7 @@ fn keyed_program(kind: &str, contributions: &[(&str, &str)]) -> String {
         .collect::<String>();
     format!(
         r#"
-        import std::asset::emit_keyed;
+        import std::web::asset::emit_keyed;
         fun contribute(): i32 {{
 {calls}            1
         }}
@@ -5814,7 +5814,7 @@ fn a_key_computed_at_const_time_orders_the_flush() {
     // the paper's own example, and it is computed here rather than written.
     let assembled = assembled_assets(
         r#"
-        import std::asset::emit_keyed;
+        import std::web::asset::emit_keyed;
         fun rank(index: i32): str {
             if index < 10 { i"0{index}" } else { i"{index}" }
         }
@@ -5858,7 +5858,7 @@ fn an_unkeyed_emit_records_the_line_as_its_own_key() {
     // pinned on the contribution rather than inferred from the file.
     let contributions = collected_keyed_assets(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
         fun contribute(): i32 {
             emit("routes", "a line");
             1
@@ -5904,7 +5904,7 @@ fn the_two_spellings_of_one_line_set_assemble_to_the_same_bytes() {
     let program = |import: &str, calls: &str| {
         format!(
             r#"
-        import std::asset::{import};
+        import std::web::asset::{import};
         fun contribute(): i32 {{
 {calls}            1
         }}
@@ -5941,7 +5941,7 @@ fn the_two_spellings_interleave_within_one_kind() {
     // `"z…"` behind it, with no rule of its own for the mixture.
     let assembled = assembled_assets(
         r#"
-        import std::asset::{ emit, emit_keyed };
+        import std::web::asset::{ emit, emit_keyed };
         fun contribute(): i32 {
             emit("routes", "apple");
             emit_keyed("routes", "0", "keyed-first");
@@ -6024,7 +6024,7 @@ fn a_runtime_emit_keyed_is_rejected() {
     // runtime binding (B143's shape).
     assert_fails_spanning(
         r#"
-        import std::asset::emit_keyed;
+        import std::web::asset::emit_keyed;
         fun main() {
             emit_keyed("routes", "0", "x");
         }
@@ -6042,7 +6042,7 @@ fn a_runtime_call_reaching_emit_keyed_is_named_for_the_spelling() {
     // looking for a call that isn't in the file.
     assert_fails_with(
         r#"
-        import std::asset::emit_keyed;
+        import std::web::asset::emit_keyed;
         fun contribute(): i32 {
             emit_keyed("routes", "0", "x");
             1
@@ -6062,7 +6062,7 @@ fn a_function_reaching_emit_keyed_cannot_escape_as_a_value() {
     // callee, so the refusal sits where the value is made.
     assert_fails_with(
         r#"
-        import std::asset::emit_keyed;
+        import std::web::asset::emit_keyed;
         fun contribute(): i32 {
             emit_keyed("routes", "0", "x");
             1
@@ -6087,7 +6087,7 @@ fn emit_keyed_inside_a_const_stays_legal_through_a_value() {
     let assembled = assembled_assets(
         r#"
         import std::io::print;
-        import std::asset::emit_keyed;
+        import std::web::asset::emit_keyed;
         fun contribute(): i32 {
             emit_keyed("routes", "0", "x");
             1
@@ -6109,7 +6109,7 @@ fn a_runtime_read_is_rejected() {
     // The const-only bit, same machinery as `emit`'s (const-eval.md §2).
     assert_fails_spanning(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _text = asset::read("page.md");
         }
@@ -6126,7 +6126,7 @@ fn a_runtime_call_reaching_read_is_rejected_at_the_boundary() {
     // function says `asset::read`, not `asset::emit`.
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun page(): str {
             asset::read("page.md")
         }
@@ -6143,7 +6143,7 @@ fn a_runtime_call_reaching_read_is_rejected_at_the_boundary() {
 fn a_function_reaching_read_cannot_escape_as_a_value() {
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun page(): str {
             asset::read("page.md")
         }
@@ -6169,7 +6169,7 @@ fn a_changed_input_is_seen_by_the_next_analysis() {
     let dir = scratch_dir(&format!("vilan-const-read-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _text = const asset::read("note.txt");
         }
@@ -6205,7 +6205,7 @@ fn a_read_bigger_than_the_fuel_budget_is_a_budget_miss() {
     // Comfortably past the explicit fuel budget in bytes.
     std::fs::write(dir.join("huge.txt"), "a".repeat(17_000_000)).unwrap();
     let source = r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _text = const asset::read("huge.txt");
         }
@@ -6781,7 +6781,7 @@ fn a_supertrait_member_under_a_sub_bound_resolves_and_runs() {
 
 // ── A33: a read-only binding demands `Source`, not `Signal` ───────────────────
 //
-// Every `bind_*` in `std::ui` took the CONCRETE `Signal`, so a user type that
+// Every `bind_*` in `std::web::ui` took the CONCRETE `Signal`, so a user type that
 // implements `Source<T>` — kolt's `StorageSignal`, a `RemoteSource`, any custom
 // mirror — could not drive a binding it only ever reads from. A33 swept std,
 // classified each site READ-ONLY or WRITE-BACK, and widened the read-only ones
@@ -6898,8 +6898,8 @@ fn a_user_source_drives_every_read_only_browser_binding() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-        import std::style::{{ Color, Style, style }};
-        import std::ui::{{ View, each, mount_root, view, when }};
+        import std::web::style::{{ Color, Style, style }};
+        import std::web::ui::{{ View, each, mount_root, view, when }};
         {A_USER_SOURCE}
         fun main() {{
             let label: Stored<str> = Stored::new("alpha");
@@ -6930,7 +6930,7 @@ fn a_user_source_drives_the_process_twin_and_renders() {
         &format!(
             r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-        import std::ui::{{ View, each, render, view, when }};
+        import std::web::ui::{{ View, each, render, view, when }};
         {A_USER_SOURCE}
         fun main() {{
             let label: Stored<str> = Stored::new("alpha");
@@ -6967,7 +6967,7 @@ fn a_source_alone_still_cannot_drive_bind_value() {
         &format!(
             r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::web::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
             let typed: Stored<str> = Stored::new("");
@@ -6987,7 +6987,7 @@ fn bind_draft_still_demands_a_draft() {
         &format!(
             r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::web::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
             let typed: Stored<str> = Stored::new("");
@@ -7012,7 +7012,7 @@ fn a_user_source_fills_an_attribute_and_places_a_slot() {
         format!(
             r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::web::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
             let label: Stored<str> = Stored::new("alpha");
@@ -7033,7 +7033,7 @@ fn a_user_source_fills_an_attribute_and_places_a_slot() {
 fn a_plain_string_still_takes_the_static_attr_and_slot_arms() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             print(render(view("a").attr("href", "/home").child("label")));
         }
@@ -7052,7 +7052,7 @@ fn element_syntax_still_routes_attributes_through_attr_value() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, mount_root, view };
+        import std::web::ui::{ View, mount_root, view };
 
         fun main() {
             let label = Signal::new("alpha");
@@ -7084,7 +7084,7 @@ fn a_user_source_drives_the_browser_swap() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-        import std::ui::{{ View, mount_root, swap, view }};
+        import std::web::ui::{{ View, mount_root, swap, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("home");
@@ -7105,7 +7105,7 @@ fn a_user_source_drives_the_split_gate() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-        import std::ui::{{ View, mount_root, swap_split, view }};
+        import std::web::ui::{{ View, mount_root, swap_split, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("home");
@@ -7125,7 +7125,7 @@ fn a_user_source_drives_the_boot_preload() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-        import std::ui::{{ chunk_preload, View, mount_root, view }};
+        import std::web::ui::{{ chunk_preload, View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("home");
@@ -7146,7 +7146,7 @@ fn a_user_source_drives_the_process_swap_and_renders() {
         &format!(
             r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-        import std::ui::{{ View, render, swap, view }};
+        import std::web::ui::{{ View, render, swap, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("docs");
@@ -7162,14 +7162,14 @@ fn a_user_source_drives_the_process_swap_and_renders() {
 
 /// The no-regression half: a concrete `Signal` still drives all three. `Signal`
 /// implements `Source`, so the widening must have kept every existing call site
-/// — `std::router`'s `swap(route, ..)` is one, and the split fixture's gate is
+/// — `std::web::router`'s `swap(route, ..)` is one, and the split fixture's gate is
 /// another.
 #[test]
 fn a_concrete_signal_still_drives_the_swap_family() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, chunk_preload, mount_root, swap, swap_split, view };
+        import std::web::ui::{ View, chunk_preload, mount_root, swap, swap_split, view };
 
         fun main() {
             let route = Signal::new("home");
@@ -7653,7 +7653,7 @@ fn a32_a_custom_signal_impl_drives_bind_value() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
-        import std::ui::{ View, mount_root, view };
+        import std::web::ui::{ View, mount_root, view };
 
         struct Shouted { inner: SignalCell<str> }
 
@@ -7687,7 +7687,7 @@ fn a32_a_custom_signal_impl_drives_the_process_bind_value() {
     assert_compiles_and_runs(
         r#"
         import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
 
         struct Upper { inner: SignalCell<str> }
 
@@ -9633,7 +9633,7 @@ fn b275_a_bool_signal_is_not_an_attribute_value() {
     assert_fails_browser_with(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::view;
+        import std::web::ui::view;
 
         fun main() {
             let flag: SignalCell<bool> = Signal::new(true);
@@ -9656,7 +9656,7 @@ fn b275_a_str_signal_is_still_an_attribute_value() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell, Owner, run_with_owner };
-        import std::ui::view;
+        import std::web::ui::view;
 
         fun main() {
             let text: SignalCell<str> = Signal::new("on");
@@ -9701,7 +9701,7 @@ fn a85_a_context_clause_is_legal_off_a_parameter() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Source, owner_scope };
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         struct Conditional<S: Source<bool>> {
             condition: S,
             body: (|| View) context owner_scope,
@@ -9731,7 +9731,7 @@ fn a85_a_sync_marker_on_a_context_typed_field_is_still_refused() {
     assert_fails_with(
         r#"
         import std::reactive::{ Source, owner_scope };
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         struct Conditional<S: Source<bool>> {
             condition: S,
             body: (sync || View) context owner_scope,
@@ -9750,7 +9750,7 @@ fn a85_a_value_form_holds_its_body_as_a_context_carrying_field() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Source, owner_scope };
-        import std::ui::{ Region, Slot, View, view };
+        import std::web::ui::{ Region, Slot, View, view };
         struct Conditional<S: Source<bool>> {
             condition: S,
             body: (|| View) context owner_scope,
@@ -9781,7 +9781,7 @@ fn a85_an_injected_body_reaches_the_value_form_that_stores_it() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Source, owner_scope };
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         struct Conditional<S: Source<bool>> {
             condition: S,
             body: (|| View) context owner_scope,
@@ -10237,7 +10237,7 @@ fn a85_a_helper_returns_a_value_form_by_name() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell, owner_scope };
-        import std::ui::{ Conditional, Each, View, each, mount_root, view, when };
+        import std::web::ui::{ Conditional, Each, View, each, mount_root, view, when };
         fun account(flag: SignalCell<bool>): Conditional<SignalCell<bool>, View> {
             when(flag, || view("nav"))
         }
@@ -10271,7 +10271,7 @@ fn a85_a_helper_returns_a_value_form_by_name() {
 fn a85_child_inherits_the_owner_requirement_per_instantiation() {
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun shell(): View {
             view("div").child("hello").child(view("span")).child([view("i")])
         }
@@ -10281,7 +10281,7 @@ fn a85_child_inherits_the_owner_requirement_per_instantiation() {
     assert_fails_browser_with(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, view, when };
+        import std::web::ui::{ View, view, when };
         fun unrooted(flag: SignalCell<bool>): View {
             view("div").child(when(flag, || view("span")))
         }
@@ -10304,7 +10304,7 @@ fn a85_a_generic_slot_helper_keeps_the_requirement_per_instantiation() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell, owner_scope };
-        import std::ui::{ Slot, View, mount_root, view, when };
+        import std::web::ui::{ Slot, View, mount_root, view, when };
         fun put<C: Slot>(parent: View, content: C): View {
             parent.child(content)
         }
@@ -10321,7 +10321,7 @@ fn a85_a_generic_slot_helper_keeps_the_requirement_per_instantiation() {
     assert_fails_browser_with(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ Slot, View, view, when };
+        import std::web::ui::{ Slot, View, view, when };
         fun put<C: Slot>(parent: View, content: C): View {
             parent.child(content)
         }
@@ -10345,7 +10345,7 @@ fn a91_a_render_closure_may_yield_any_slot() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, each, each_by, each_values, mount_root, swap, view, when };
+        import std::web::ui::{ View, each, each_by, each_values, mount_root, swap, view, when };
         fun main() {
             let rows: SignalCell<List<str>> = Signal::new(["a"]);
             let flag: SignalCell<bool> = Signal::new(true);
@@ -10389,7 +10389,7 @@ fn a99_the_retired_browser_methods_are_refused_with_the_slot_steer() {
             &format!(
                 r#"
         import std::reactive::{{ Signal, SignalCell }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::web::ui::{{ View, mount_root, view }};
         fun main() {{
             let rows: SignalCell<List<str>> = Signal::new(["a"]);
             let _root = mount_root("app", || view("ul")
@@ -10403,7 +10403,7 @@ fn a99_the_retired_browser_methods_are_refused_with_the_slot_steer() {
             &format!(
                 r#"
         import std::reactive::{{ Signal, SignalCell }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::web::ui::{{ View, mount_root, view }};
         fun main() {{
             let rows: SignalCell<List<str>> = Signal::new(["a"]);
             let _root = mount_root("app", || view("ul")
@@ -10424,7 +10424,7 @@ fn a99_the_retired_when_and_swap_methods_are_refused_with_the_slot_steer() {
     assert_fails_browser_with(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, mount_root, view };
+        import std::web::ui::{ View, mount_root, view };
         fun main() {
             let flag: SignalCell<bool> = Signal::new(true);
             let _root = mount_root("app", || view("div")
@@ -10436,7 +10436,7 @@ fn a99_the_retired_when_and_swap_methods_are_refused_with_the_slot_steer() {
     assert_fails_browser_with(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, mount_root, view };
+        import std::web::ui::{ View, mount_root, view };
         fun main() {
             let tab: SignalCell<i32> = Signal::new(1);
             let _root = mount_root("app", || view("div")
@@ -10456,7 +10456,7 @@ fn a99_the_retired_process_methods_are_refused_with_the_slot_steer() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             let rows: SignalCell<List<str>> = Signal::new(["a"]);
             print(render(view("ul")
@@ -10510,7 +10510,7 @@ fn a99_the_child_rewrite_renders_what_the_method_did() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, each, render, view, when };
+        import std::web::ui::{ View, each, render, view, when };
         fun main() {
             let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
             let flag: SignalCell<bool> = Signal::new(true);
@@ -10534,7 +10534,7 @@ fn a99_the_split_gate_lives_under_the_free_swap_split() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, mount_root, swap_split, view };
+        import std::web::ui::{ View, mount_root, swap_split, view };
         fun main() {
             let route: SignalCell<str> = Signal::new("home");
             let _root = mount_root("app", || view("main")
@@ -10544,7 +10544,7 @@ fn a99_the_split_gate_lives_under_the_free_swap_split() {
     );
     let errors = compile_browser(
         r#"
-        import std::ui::{ View, mount_root, split_route, view };
+        import std::web::ui::{ View, mount_root, split_route, view };
         fun main() {
             let _root = mount_root("app", || view("main"));
         }
@@ -10566,7 +10566,7 @@ fn a91_a_value_form_names_the_row_shape_it_yields() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ Conditional, EachValues, View, each_values, mount_root, view, when };
+        import std::web::ui::{ Conditional, EachValues, View, each_values, mount_root, view, when };
         fun banner(flag: SignalCell<bool>): Conditional<SignalCell<bool>, List<View>> {
             when(flag, || [view("i"), view("b")])
         }
@@ -10974,7 +10974,7 @@ fn b347_each_by_types_an_unannotated_render_closure_from_its_source() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell }};
-        import std::ui::{{ View, each_by, mount_root, view }};
+        import std::web::ui::{{ View, each_by, mount_root, view }};
         {A_KEYED_ROW}
         fun main() {{
             let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
@@ -10994,7 +10994,7 @@ fn b347_the_each_by_row_cell_reads_its_own_field() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell }};
-        import std::ui::{{ View, each_by, mount_root, view }};
+        import std::web::ui::{{ View, each_by, mount_root, view }};
         {A_KEYED_ROW}
         fun main() {{
             let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
@@ -11016,7 +11016,7 @@ fn b347_a_wrong_render_body_reports_once_with_no_owner_scope_cascade() {
     let errors = compile_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell }};
-        import std::ui::{{ View, each_by, mount_root, view }};
+        import std::web::ui::{{ View, each_by, mount_root, view }};
         {A_KEYED_ROW}
         fun main() {{
             let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
@@ -11061,7 +11061,7 @@ fn b347_a_wrong_render_body_reports_once_with_no_owner_scope_cascade() {
 const A_NESTED_SWAP_WORLD: &str = r#"
         import std::context::Context;
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, mount_root, swap, view };
+        import std::web::ui::{ View, mount_root, swap, view };
 
         [derive(PartialEq)]
         enum Tab { A, B }
@@ -11235,7 +11235,7 @@ fn b352_an_explicit_type_argument_outlives_a_less_resolved_argument() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, mount_root, view };
+        import std::web::ui::{ View, mount_root, view };
 
         fun main() {
             let error_text = Signal<Option<str>>::new(None);
@@ -12588,7 +12588,7 @@ fn a_type_without_the_bound_does_not_reach_the_blanket_through_the_cycle() {
     );
 }
 
-/// A112 S3's whole shape, std-free of `std::ui`: the supertrait form of the
+/// A112 S3's whole shape, std-free of `std::web::ui`: the supertrait form of the
 /// optional capability, a "no feed" blanket over `Source` and a real one over
 /// `DeltaSource` (B378 ranks the second), reached through ONE bound.
 #[test]
@@ -14039,7 +14039,7 @@ const FLOW_THROUGH_A_BLANKET: &str = concat!(
     "impl Cell<type T> with Src<T> { fun get(self): T { self.v } }\n",
 );
 
-/// B476: two trait arms over `Fl<str>` and `Fl<i32>` (std::ui's `Slot` shape)
+/// B476: two trait arms over `Fl<str>` and `Fl<i32>` (std::web::ui's `Slot` shape)
 /// each answer their own receivers — directly and through a `Slot` bound. Both
 /// were candidates for every `Cell`, and every call was ambiguous.
 #[test]

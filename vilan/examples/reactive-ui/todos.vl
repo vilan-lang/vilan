@@ -2,7 +2,7 @@
 // (`derive`), a two-input dependency (`combine`), a reactive keyed list, and
 // conditional rendering. The dependency graph is literally the combinator tree.
 //
-// `Signal`, `SignalCell`, `view` and `View` are ambient (`prelude = "std::web"`),
+// `Signal`, `SignalCell`, `view` and `View` are ambient (`prelude = "std::web::prelude"`),
 // so nothing below imports them — `SignalCell` travels with `Signal` precisely
 // for the annotations and parameter types this file is full of. `format` and
 // `combine` are NOT in the set and are imported by name: the prelude is a floor,

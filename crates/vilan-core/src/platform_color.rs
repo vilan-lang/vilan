@@ -993,24 +993,30 @@ fn frame_label(program: &Program, id: Id) -> String {
     if is_user_code(program, id) {
         return name;
     }
-    let module = program
-        .source_of(id)
-        .and_then(|source| {
-            // The STEM comes from the spelling the user gave; the containment
-            // test from the canonical form, resolved per source (M53).
-            let path = program.sources.get(source.0 as usize)?;
-            let containing = program.source_layers.get(source.0 as usize)?.containing?;
-            Some((path, containing as usize))
+    let module = program.source_of(id).and_then(|source| {
+        // The containment test reads the canonical form, resolved per source
+        // (M53); the module PATH is the file's place under that root — A154:
+        // `web/dom.vl` is `std::web::dom`, not its stem `dom` — read off the
+        // same canonical pair, so it holds for a `\\?\`-prefixed root too.
+        let canonical = program.canonical_sources.get(source.0 as usize)?;
+        let containing = program.source_layers.get(source.0 as usize)?.containing? as usize;
+        let (root, library, ..) = program.layer_platforms.get(containing)?;
+        let relative = canonical.strip_prefix(root).ok()?;
+        let mut segments: Vec<String> = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let file = segments.pop()?;
+        let stem = file.strip_suffix(".vl").unwrap_or(&file);
+        if stem != "lib" {
+            segments.push(stem.to_string());
+        }
+        Some(if segments.is_empty() {
+            library.clone()
+        } else {
+            format!("{library}::{}", segments.join("::"))
         })
-        .and_then(|(path, containing)| {
-            let stem = path.file_stem()?.to_string_lossy().into_owned();
-            let library = program.layer_platforms.get(containing)?.1.clone();
-            Some(if stem == "lib" {
-                library
-            } else {
-                format!("{library}::{stem}")
-            })
-        });
+    });
     match module {
         Some(module) => format!("{name} ({module})"),
         None => name,

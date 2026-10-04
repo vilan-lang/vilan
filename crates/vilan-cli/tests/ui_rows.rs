@@ -92,7 +92,7 @@ fn build_and_run(tag: &str, app: &str, harness: &str) -> String {
 /// derive it — the case that has no spelling without `each_by`.
 const THREE_FORMS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each, each_by, each_values, mount_root, view };
+import std::web::ui::{ View, each, each_by, each_values, mount_root, view };
 
 [derive(PartialEq)]
 struct Task {
@@ -205,7 +205,7 @@ fn the_three_list_forms_differ_only_in_what_a_changed_row_costs() {
 /// content — and the item it now holds reached the row through its own cell.
 const KEPT_IDENTITY: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each_by, mount_root, view };
+import std::web::ui::{ View, each_by, mount_root, view };
 
 struct Handle {
 	id: i32,
@@ -274,10 +274,10 @@ fn the_index_form_keeps_the_rows_element_and_updates_through_its_cell() {
 /// `on_mount` at every attachment site the module has: a statically appended
 /// child, a `when` instantiation that appears in a LATER drain wave, and
 /// `each` rows — the initial one and one appended after the fact.
-const MOUNT_HOOK: &str = r#"import std::dom::Element;
+const MOUNT_HOOK: &str = r#"import std::web::dom::Element;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each_values, mount_root, view, when };
+import std::web::ui::{ View, each_values, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
@@ -338,7 +338,7 @@ fn on_mount_hands_over_an_element_that_is_already_in_the_document() {
 
 const AUTOFOCUS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view, when };
+import std::web::ui::{ View, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
@@ -433,7 +433,7 @@ global.findByName = (name) => {
 /// point of the one-word form.
 const HIDDEN_AUTOFOCUS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view, when };
+import std::web::ui::{ View, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
@@ -533,7 +533,7 @@ fn b271_autofocus_is_refused_in_the_microtask_and_taken_on_the_first_frame() {
 /// (inherited) — so they are pinned through a program: a refused focus leaves
 /// `document.activeElement` where it was, reads `false` from
 /// `matches(":focus")`, dispatches no `focusin`, and logs its reason.
-const FOCUS_REFUSALS: &str = r#"import std::dom::{ active_element, create_element, get_element_by_id, is_null, window };
+const FOCUS_REFUSALS: &str = r#"import std::web::dom::{ active_element, create_element, get_element_by_id, is_null, window };
 import std::io::print;
 
 fun main() {
@@ -617,7 +617,7 @@ fn n122_the_shared_stub_refuses_a_focus_the_platform_would() {
 /// runs. `autofocus`'s twin WRITES the native attribute since A157 — a served
 /// page's initial parse is the one place that attribute works.
 const SSR_TWINS: &str = r#"import std::io::print;
-import std::ui::{ View, render, view };
+import std::web::ui::{ View, render, view };
 
 fun main() {
 	print(render(view("input").attr("name", "modal").autofocus()));
@@ -673,7 +673,7 @@ const IN_PLACE_REMOVE: &str = r#"import std::compare::PartialEq;
 import std::hash::{ Hash, Hashable };
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 struct Row {
 	id: i32,
@@ -787,7 +787,7 @@ fn b255_an_in_place_remove_under_each_keeps_the_surviving_rows() {
 const IN_PLACE_EDIT: &str = r#"import std::compare::PartialEq;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 struct Row {
 	id: i32,
@@ -866,7 +866,7 @@ fn b255_an_in_place_element_write_under_each_refreshes_that_row() {
 /// at all, which is the shape this form exists for.
 const IN_PLACE_REMOVE_BY: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each_by, mount_root, view };
+import std::web::ui::{ View, each_by, mount_root, view };
 
 struct Handle {
 	id: i32,
@@ -950,9 +950,9 @@ fn b255_an_in_place_remove_under_each_by_keeps_the_surviving_rows() {
 /// `bounding_rect` (and its derived edges), the rounded `offset_*` pair,
 /// `is_connected`, `contains`, the element-scoped `query_selector_all`, and
 /// `remove_attribute` — every binding kolt's overlay hand-declared.
-const MEASURE: &str = r#"import std::dom::{ create_element, get_element_by_id };
+const MEASURE: &str = r#"import std::web::dom::{ create_element, get_element_by_id };
 import std::io::print;
-import std::ui::{ mount_root, view };
+import std::web::ui::{ mount_root, view };
 
 fun main() {
 	let _root = mount_root("app", || {
@@ -1040,9 +1040,9 @@ fn a59_measurement_reads_the_host_box_and_a_detached_element_reads_zero() {
 /// The capture phase: a listener registered with `listen_capture` runs on the
 /// way DOWN — before the target's own — and a disposed one is gone from the
 /// capture table rather than from the bubble table it never joined.
-const CAPTURE: &str = r#"import std::dom::{ get_element_by_id, window };
+const CAPTURE: &str = r#"import std::web::dom::{ get_element_by_id, window };
 import std::io::print;
-import std::ui::{ mount_root, view };
+import std::web::ui::{ mount_root, view };
 
 fun main() {
 	let _root = mount_root("app", || {
@@ -1125,9 +1125,9 @@ fn a59_capture_listeners_run_before_the_target_and_dispose_by_phase() {
 /// Resize observation: `observe_resize` fires ONCE when observation starts (the
 /// first-layout hook), fires again on a size change, and its `Subscription`
 /// disconnects the observer.
-const RESIZE: &str = r#"import std::dom::get_element_by_id;
+const RESIZE: &str = r#"import std::web::dom::get_element_by_id;
 import std::io::print;
-import std::ui::{ mount_root, view };
+import std::web::ui::{ mount_root, view };
 
 fun main() {
 	let _root = mount_root("app", || view("section"));
@@ -1174,7 +1174,7 @@ fn a59_observe_resize_fires_on_first_layout_and_stops_with_its_subscription() {
 /// no spelling but a `swap(signal, |x| view)` over it.
 const CHILD_CONTRACT: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun main() {
 	let label: SignalCell<str> = Signal::new("one");
@@ -1211,7 +1211,7 @@ main();
 /// being the value served — no subscription, no later change to follow.
 const CHILD_CONTRACT_SSR: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, render, view };
+import std::web::ui::{ View, render, view };
 
 fun main() {
 	let label: SignalCell<str> = Signal::new("one");
@@ -1235,7 +1235,7 @@ main();
 /// written once more.
 const TOGGLE_ATTR: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun main() {
 	let modal: SignalCell<bool> = Signal::new(false);
@@ -1265,7 +1265,7 @@ main();
 /// source has nothing to serialize.
 const TOGGLE_ATTR_SSR: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, render, view };
+import std::web::ui::{ View, render, view };
 
 fun main() {
 	let modal: SignalCell<bool> = Signal::new(true);
@@ -1282,8 +1282,8 @@ main();
 /// through `.alpha()`.
 const SHOW_OVER_A_FLEX_ROW: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::style::{ Color, Display, preflight, style };
-import std::ui::{ View, mount_root, view };
+import std::web::style::{ Color, Display, preflight, style };
+import std::web::ui::{ View, mount_root, view };
 
 fun main() {
 	let _reset = const preflight();
@@ -1315,7 +1315,7 @@ main();
 /// toggle takes it away.
 const SHOW_SSR: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, render, view };
+import std::web::ui::{ View, render, view };
 
 fun main() {
 	let visible: SignalCell<bool> = Signal::new(true);
@@ -1739,7 +1739,7 @@ const POSITION_HARNESS_TAIL: &str =
 /// A `{signal}` carrying a `View`, between two static siblings.
 const A71_ELEMENT_CHILD: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun main() {
 	let mark: SignalCell<i32> = Signal::new(1);
@@ -1836,7 +1836,7 @@ fn a71_the_anchor_is_an_empty_text_node() {
 /// `when` between two static siblings.
 const A71_WHEN: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view, when };
+import std::web::ui::{ View, mount_root, view, when };
 
 fun main() {
 	let show: SignalCell<bool> = Signal::new(false);
@@ -1898,7 +1898,7 @@ fn a71_when_toggles_on_between_the_siblings_it_sits_between() {
 /// reconciler distinguishes.
 const A71_ROWS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 [derive(PartialEq)]
 struct Row {
@@ -1973,7 +1973,7 @@ fn a71_each_rows_stay_between_the_header_and_the_footer() {
 const A71_RUN_AND_SWAP: &str = r#"import std::io::print;
 import std::range::Range;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, swap, view };
+import std::web::ui::{ View, mount_root, swap, view };
 
 fun main() {
 	let count: SignalCell<i32> = Signal::new(1);
@@ -2051,7 +2051,7 @@ fn a71_a_reactive_run_and_a_swap_each_keep_their_own_place() {
 /// place instead of re-appended behind whatever the chain added after it.
 const A46_FRAGMENT: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun pair(): List<View> {
 	<>
@@ -2133,7 +2133,7 @@ fn a46_a_fragment_places_its_run_in_position_statically_and_reactively() {
 /// served markup comparable (`ssr_differential`'s rule, asserted here on the
 /// static half, which is the only half a server render has).
 const A46_FRAGMENT_SSR: &str = r#"import std::io::print;
-import std::ui::{ View, render, view };
+import std::web::ui::{ View, render, view };
 
 fun pair(): List<View> {
 	<><i>"a"</i><b>"b"</b></>
@@ -2173,7 +2173,7 @@ fn a46_the_ssr_twin_serializes_a_fragment_as_its_run() {
 /// boundary is the thing that goes.
 const A88_PORTAL: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell, comp };
-import std::ui::{ View, each, mount, swap, view, when };
+import std::web::ui::{ View, each, mount, swap, view, when };
 
 [derive(PartialEq)]
 struct Row {
@@ -2310,7 +2310,7 @@ fn a88_the_anchors_go_with_the_content() {
 /// append.
 const A85_VALUE_FORMS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each, each_by, each_values, mount_root, swap, view, when };
+import std::web::ui::{ View, each, each_by, each_values, mount_root, swap, view, when };
 
 fun main() {
 	let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
@@ -2403,7 +2403,7 @@ fn a85_the_five_value_forms_place_where_their_hole_is() {
 /// control in `inference/bounds.rs`).
 const A85_OWNERSHIP: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell, Source };
-import std::ui::{ View, mount_root, view, when };
+import std::web::ui::{ View, mount_root, view, when };
 
 fun main() {
 	let label: SignalCell<str> = Signal::new("one");
@@ -2452,7 +2452,7 @@ fn a85_a_toggled_off_when_value_disposes_the_body_it_built() {
 /// than `.each_values(..)`/`.when(..)`/`.swap(..)`.
 const A85_VALUE_FORMS_SSR: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each_values, render, swap, view, when };
+import std::web::ui::{ View, each_values, render, swap, view, when };
 
 fun main() {
 	let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
@@ -2499,7 +2499,7 @@ fn a85_the_ssr_twins_of_the_value_forms_render_what_the_methods_do() {
 /// follow) — driven through a reorder-with-insert, a toggle and a removal.
 const A91_ROW_SHAPES: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each_values, mount_root, view, when };
+import std::web::ui::{ View, each_values, mount_root, view, when };
 
 fun main() {
 	let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
@@ -2613,7 +2613,7 @@ fn a91_a_row_costs_one_empty_text_marker() {
 /// retired the `each_values` method the second half used to write).
 const A91_ROWS_SSR: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each_values, render, view, when };
+import std::web::ui::{ View, each_values, render, view, when };
 
 fun main() {
 	let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
@@ -2664,7 +2664,7 @@ require("./app.js");
 /// what is being measured is the edit, not the round trip.
 const A98_ORDER_PASS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 [derive(PartialEq)]
 struct Row {
@@ -2840,7 +2840,7 @@ fn a91_the_ssr_twin_renders_what_each_row_shape_renders() {
 /// asks to be equal.
 const NESTED_SWAP_ON_ONE_SOURCE: &str = r#"import std::io::print;
 import std::reactive::{ Disposable, FlushPolicy, Signal, SignalCell, Source, get_owner, turn };
-import std::ui::{ View, mount_root, swap, view };
+import std::web::ui::{ View, mount_root, swap, view };
 
 [derive(PartialEq)]
 enum Shell {
@@ -2975,7 +2975,7 @@ fn a110_nested_swaps_on_one_source_build_no_orphan_subtree_on_sign_out() {
 const BIND_ATTR_OPTION: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Disposable, Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun main() {
 	let dragging: SignalCell<Option<str>> = Signal::new(None);
@@ -3092,7 +3092,7 @@ fn a105_bind_attr_over_an_option_source_sets_and_removes_the_attribute() {
 /// attribute is written and the `None` one is not there at all.
 const ELEMENT_OPTION_ATTRIBUTE: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun main() {
 	let held: Option<str> = Some("row");
@@ -3139,7 +3139,7 @@ fn a115_element_syntax_takes_a_static_option_attribute() {
 const ELEMENT_OPTION_SOURCE_ATTRIBUTE: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun main() {
 	let dragging: SignalCell<Option<str>> = Signal::new(None);
@@ -3214,7 +3214,7 @@ fn a115_element_syntax_tracks_an_option_source_attribute() {
 const ELEMENT_OPTION_ATTRIBUTE_SSR: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, render, view };
+import std::web::ui::{ View, render, view };
 
 fun main() {
 	let held: Option<str> = Some("row");
@@ -3248,7 +3248,7 @@ fn a115_the_ssr_twin_renders_an_option_attribute_from_element_syntax() {
 const BIND_ATTR_OPTION_SSR: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, render, view };
+import std::web::ui::{ View, render, view };
 
 fun main() {
 	let held: SignalCell<Option<str>> = Signal::new(Some("row"));
@@ -3288,7 +3288,7 @@ fn a105_the_ssr_twin_renders_a_some_attribute_and_omits_a_none() {
 const WHEN_SOME: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view, when_some };
+import std::web::ui::{ View, mount_root, view, when_some };
 
 struct Account {
 	id: i32,
@@ -3342,7 +3342,7 @@ main();
 /// the `<span>` the body builds is actually PLACED, between its two static
 /// siblings.
 const B369_INFERRED_CONSTRUCTOR: &str = r#"import std::io::print;
-import std::ui::{ Region, Slot, View, mount_root, view };
+import std::web::ui::{ Region, Slot, View, mount_root, view };
 
 struct Holder<C: Slot> {
 	body: || C,
@@ -3463,7 +3463,7 @@ fn a119_when_some_keeps_its_row_across_a_payload_change() {
 const WHEN_SOME_SSR: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, render, view, when_some };
+import std::web::ui::{ View, render, view, when_some };
 
 struct Account {
 	id: i32,
@@ -3506,7 +3506,7 @@ fn a119_the_ssr_twin_renders_a_some_body_and_omits_a_none() {
 const WHEN_ALL_SOME: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Flow, Signal, SignalCell, on_cleanup };
-import std::ui::{ View, mount_root, view, when_all_some };
+import std::web::ui::{ View, mount_root, view, when_all_some };
 
 fun main() {
 	let name: SignalCell<Option<str>> = Signal::new(Some("Ada"));
@@ -3638,7 +3638,7 @@ fn a152_when_all_some_updates_its_cells_in_place_and_releases_on_none() {
 const WHEN_ALL_SOME_SSR: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, render, view, when_all_some };
+import std::web::ui::{ View, render, view, when_all_some };
 
 fun main() {
 	let name: SignalCell<Option<str>> = Signal::new(Some("Ada"));
@@ -3696,7 +3696,7 @@ fn b369_an_inferred_generic_constructor_places_its_slot_in_the_live_tree() {
 
 // --- A121: the DOM reads a focus scope is written on -------------------------
 //
-// `proposal/focus-scope.md` §7 named the reads `std::dom` did not have, and §8
+// `proposal/focus-scope.md` §7 named the reads `std::web::dom` did not have, and §8
 // named what the test harness would need before any of them could be pinned.
 // Both landed together, and this is the pin that the HARNESS half is not
 // silently load-bearing: every addition is asserted here through a program
@@ -3709,7 +3709,7 @@ fn b369_an_inferred_generic_constructor_places_its_slot_in_the_live_tree() {
 /// `visibility: hidden`, the parent link and its null at the root,
 /// `document.activeElement` before and after a focus, and the `focusin` that
 /// focus dispatches — carrying `related_target`, where focus came FROM.
-const FOCUS_READS: &str = r#"import std::dom::{ active_element, create_element, get_element_by_id, is_null, window };
+const FOCUS_READS: &str = r#"import std::web::dom::{ active_element, create_element, get_element_by_id, is_null, window };
 import std::io::print;
 
 fun main() {
@@ -3846,10 +3846,10 @@ fn a121_the_dom_reads_a_focus_scope_needs_answer_off_the_host() {
 // --- A121 S1: the tabbable walk, and a scope that traps without `inert` ------
 
 /// The walk, with one element per reason it can be dropped and one per
-/// position in the order. The tree is built through `std::dom` directly: this
-/// is a `std::dom` claim, and going through `std::ui` would only put a view
+/// position in the order. The tree is built through `std::web::dom` directly: this
+/// is a `std::web::dom` claim, and going through `std::web::ui` would only put a view
 /// layer between the assertion and the thing asserted.
-const TABBABLE_WALK: &str = r#"import std::dom::{ create_element, get_element_by_id };
+const TABBABLE_WALK: &str = r#"import std::web::dom::{ create_element, get_element_by_id };
 import std::io::print;
 
 fun main() {
@@ -3981,10 +3981,10 @@ fn a121_the_tabbable_walk_implements_the_selectors_definition() {
 /// A `Wrap` scope — a menu. The panel is a portal-shaped sibling of the rest
 /// of the page, and the page stays live: a Tab pressed outside the scope is
 /// not touched, which is A121's "without `inert`" stated as a test.
-const WRAP_SCOPE: &str = r#"import std::dom::window;
+const WRAP_SCOPE: &str = r#"import std::web::dom::window;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
+import std::web::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
@@ -4099,10 +4099,10 @@ fn a121_wrap_cycles_at_the_ends_and_leaves_the_rest_of_the_page_alone() {
 /// driver's container, not into its parent's panel), so
 /// `menu.contains(submenu)` is false and a containment test written on DOM
 /// ancestry would yank focus out of the submenu the moment it opened.
-const CONTAIN_SCOPE: &str = r#"import std::dom::window;
+const CONTAIN_SCOPE: &str = r#"import std::web::dom::window;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
+import std::web::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
 
 fun main() {
 	let menu: SignalCell<bool> = Signal::new(false);
@@ -4229,10 +4229,10 @@ fn a121_contain_pulls_focus_back_and_the_nested_scope_takes_over() {
 /// The restore, and both of its guards. A scope remembers what held focus at
 /// INSTALL and gives it back at disposal — unless the app moved focus
 /// deliberately in the meantime, in which case the app's choice stands.
-const RESTORE_SCOPE: &str = r#"import std::dom::window;
+const RESTORE_SCOPE: &str = r#"import std::web::dom::window;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
+import std::web::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
@@ -4320,12 +4320,12 @@ fn a121_a_scope_restores_the_focus_it_took_and_not_the_focus_it_was_given() {
 /// hidden until something places it, and the DRIVER calls `focus_initial`
 /// when it flips visibility — the `Shared<Option<FocusScope>>` here is the
 /// per-open handle every driver already keeps beside its `focused` flag.
-const SHOW_TAKES_FOCUS: &str = r#"import std::dom::window;
+const SHOW_TAKES_FOCUS: &str = r#"import std::web::dom::window;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell };
 import std::shared::Shared;
-import std::ui::{ FocusContainment, FocusScope, View, focus_scope, mount_root, view, when };
+import std::web::ui::{ FocusContainment, FocusScope, View, focus_scope, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
@@ -4426,10 +4426,10 @@ fn a121_the_show_takes_the_focus_and_autofocus_says_where() {
 
 /// The chained sugar: no show hook, no driver, no handle — the scope installs
 /// itself and takes the focus on `autofocus`'s bounded clock.
-const FOCUS_SCOPE_SUGAR: &str = r#"import std::dom::window;
+const FOCUS_SCOPE_SUGAR: &str = r#"import std::web::dom::window;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ FocusContainment, View, mount_root, view, when };
+import std::web::ui::{ FocusContainment, View, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
@@ -4492,7 +4492,7 @@ fn a121_the_chained_focus_scope_installs_the_trap_and_takes_the_focus() {
 /// binder there. (`View::autofocus`'s server half is A157's, below: it WRITES
 /// the native attribute.)
 const FOCUS_SSR_TWINS: &str = r#"import std::io::print;
-import std::ui::{ FocusContainment, View, render, view };
+import std::web::ui::{ FocusContainment, View, render, view };
 
 fun main() {
 	print(render(view("div").focus_scope(FocusContainment::Contain).child(view("input"))));
@@ -4516,7 +4516,7 @@ fn a121_the_ssr_twins_render_the_same_markup_and_trap_nothing() {
 /// and it logs nothing there — and the server `attr` serves a written
 /// `autofocus` as written, whether from element syntax or `.attr(..)`.
 const AUTOFOCUS_SERVED: &str = r#"import std::io::print;
-import std::ui::{ View, render, view };
+import std::web::ui::{ View, render, view };
 
 fun main() {
 	print(render(view("input").autofocus()));
@@ -4549,12 +4549,12 @@ fn a157_the_server_render_carries_the_native_autofocus() {
 // An explicit `.attr("autofocus", "")` writes the NATIVE attribute (the
 // silent rename is gone).
 
-const AUTOFOCUS_REGISTRY: &str = r#"import std::dom::window;
+const AUTOFOCUS_REGISTRY: &str = r#"import std::web::dom::window;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell };
 import std::shared::Shared;
-import std::ui::{ FocusContainment, FocusScope, View, focus_scope, mount_root, view, when };
+import std::web::ui::{ FocusContainment, FocusScope, View, focus_scope, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
@@ -4730,10 +4730,10 @@ fn a157_a_scope_starts_on_the_first_registered_descendant_and_the_dom_carries_no
 /// Every handler prints which scope heard the leave and whether `to` is the
 /// element focus went to; the harness interleaves step markers, so the pin
 /// reads one ordered transcript and silence is as visible as a fire.
-const ON_LEAVE_SCOPES: &str = r#"import std::dom::window;
+const ON_LEAVE_SCOPES: &str = r#"import std::web::dom::window;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
+import std::web::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
 
 fun main() {
 	let menu: SignalCell<bool> = Signal::new(false);
@@ -4912,7 +4912,7 @@ fn a128_on_leave_fires_where_focus_went_and_only_when_it_left_every_scope() {
 const A112_S3_OPS: &str = r#"import std::io::print;
 import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source };
 import std::shared::Shared;
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 [derive(PartialEq, Hashable)]
 struct Row {
@@ -5126,7 +5126,7 @@ fn a112_s3_a_list_cell_under_each_builds_only_the_rows_its_ops_name() {
 const A112_S3_WALK: &str = r#"import std::io::{ panic, print };
 import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source, batch, map_each };
 import std::shared::Shared;
-import std::ui::{ View, each, each_by, each_values, mount_root, view };
+import std::web::ui::{ View, each, each_by, each_values, mount_root, view };
 
 [derive(PartialEq, Hashable)]
 struct Row {
@@ -5370,7 +5370,7 @@ fn a112_s3_the_random_walk_holds_through_each() {
 const A112_S3B_OPS: &str = r#"import std::io::print;
 import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source };
 import std::shared::Shared;
-import std::ui::{ View, each_by, mount_root, view };
+import std::web::ui::{ View, each_by, mount_root, view };
 
 struct Row {
 	id: i32,
@@ -5612,7 +5612,7 @@ fn a112_s3b_a_list_cell_under_each_by_builds_only_the_rows_its_ops_name() {
 /// afterwards.
 const A129_SPAN: &str = r#"import std::io::print;
 import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source, batch };
-import std::ui::{ View, each, each_by, mount_root, view };
+import std::web::ui::{ View, each, each_by, mount_root, view };
 
 [derive(PartialEq, Hashable)]
 struct Row {
@@ -5825,7 +5825,7 @@ fn a129_a_splice_keeps_the_rows_whose_keys_survive_it() {
 const M86_COPIES: &str = r#"import std::io::print;
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source, map_each };
-import std::ui::{ View, each, each_by, mount_root, view };
+import std::web::ui::{ View, each, each_by, mount_root, view };
 
 [derive(PartialEq, Hashable)]
 struct Row {
@@ -6067,7 +6067,7 @@ fn m87_keyed_cell_locate_copies_no_whole_list() {
 /// push builds one row in each run.
 const PIPE_RUNS: &str = r#"import std::io::print;
 import std::reactive::{ ListCell, Signal, SignalCell };
-import std::ui::{ View, each, each_by, mount_root, view };
+import std::web::ui::{ View, each, each_by, mount_root, view };
 
 [derive(PartialEq)]
 struct Task {

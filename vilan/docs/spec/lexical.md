@@ -319,7 +319,7 @@ because lexing finishes before any parser exists (§2.5). The consequence
 is stated rather than worked around and the diagnostic names the
 spelling: a block has no at-rules, so a media query is a breakpoint
 condition rule (`.md { … }`) and a declaration block under a selector of
-your own is `std::style::declare`.
+your own is `std::web::style::declare`.
 
 **`#` lexes, and a `css` block refuses it.** The byte is a token — the
 import reach marker — so the lexer has nothing to say about it, and the

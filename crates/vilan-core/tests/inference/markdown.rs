@@ -4621,7 +4621,7 @@ fn bundle_root() -> PathBuf {
 fn a_const_bundle_registers_the_file_and_folds_to_its_url() {
     let (values, inputs, bundled) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = const asset::bundle("docs/SUMMARY.md");
         }
@@ -4661,7 +4661,7 @@ fn a_file_bundled_twice_is_registered_once() {
     // make `serve_build` install two identical routes).
     let (_, _, bundled) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _one = const asset::bundle("docs/SUMMARY.md");
             let _two = const asset::bundle("./docs/SUMMARY.md");
@@ -4682,7 +4682,7 @@ fn a_file_bundled_twice_is_registered_once() {
 fn a_missing_bundle_is_a_clean_diagnostic_at_the_call_site() {
     assert_fails_spanning(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = const asset::bundle("vilan-029-definitely-missing.png");
         }
@@ -4701,7 +4701,7 @@ fn a_missing_bundle_is_still_a_tracked_build_input() {
     // program the failing analysis left rather than through `const_bundles`.
     let root = bundle_root();
     let source = r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = const asset::bundle("vilan-029-definitely-missing.png");
         }
@@ -4759,7 +4759,7 @@ fn an_absolute_bundle_path_is_refused() {
     assert_fails_with(
         &format!(
             r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {{
             let _url = const asset::bundle("{absolute}");
         }}
@@ -4776,7 +4776,7 @@ fn an_absolute_bundle_path_is_refused() {
 fn a_bundle_path_escaping_the_package_root_is_refused() {
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = const asset::bundle("../outside.png");
         }
@@ -4795,7 +4795,7 @@ fn a_backslash_in_a_bundle_path_is_refused() {
     // nothing on either.
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = const asset::bundle("static\\logo.png");
         }
@@ -4812,7 +4812,7 @@ fn a_bundle_path_naming_no_file_is_refused() {
     // the message says what is wrong instead of reporting an OS error.
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = const asset::bundle(".");
         }
@@ -4826,7 +4826,7 @@ fn a_bundle_path_naming_no_file_is_refused() {
 fn a_runtime_bundle_is_rejected() {
     assert_fails_spanning(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = asset::bundle("logo.png");
         }
@@ -4843,7 +4843,7 @@ fn a_runtime_call_reaching_bundle_is_rejected_at_the_boundary() {
     // function says `asset::bundle`, not `asset::emit`.
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun icon(): str {
             asset::bundle("logo.png")
         }
@@ -4860,7 +4860,7 @@ fn a_runtime_call_reaching_bundle_is_rejected_at_the_boundary() {
 fn a_function_reaching_bundle_cannot_escape_as_a_value() {
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun icon(): str {
             asset::bundle("logo.png")
         }
@@ -4886,7 +4886,7 @@ fn a_changed_bundled_file_is_seen_by_the_next_analysis() {
     let dir = scratch_dir(&format!("vilan-const-bundle-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("static")).unwrap();
     let source = r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = const asset::bundle("static/note.txt");
         }
@@ -4923,7 +4923,7 @@ fn a_bundled_file_is_not_charged_by_its_size() {
     std::fs::write(dir.join("huge.bin"), "a".repeat(17_000_000)).unwrap();
     let (values, _, bundled) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = const asset::bundle("huge.bin");
         }
@@ -5027,7 +5027,7 @@ fn a_recursive_listing_is_byte_sorted_over_files_only() {
     let root = estate_root("listing");
     let (values, _, _) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _entries = const asset::read_dir_all("static");
         }
@@ -5058,7 +5058,7 @@ fn an_immediate_listing_names_bare_entries_and_stops_there() {
     let root = estate_root("immediate");
     let (values, _, _) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _entries = const asset::read_dir("static");
         }
@@ -5086,7 +5086,7 @@ fn every_listed_directory_is_a_tracked_build_input() {
     let root = estate_root("tracked");
     let (_, inputs, _) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _entries = const asset::read_dir_all("static");
         }
@@ -5116,7 +5116,7 @@ fn a_new_file_moves_the_listed_directorys_input_key() {
     // because the leg's inputs would re-hash equal and the leg would skip.
     let root = estate_root("membership");
     let source = r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _entries = const asset::read_dir_all("static");
         }
@@ -5166,7 +5166,7 @@ fn a_listing_that_names_no_directory_is_refused() {
             Box::leak(
                 format!(
                     r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {{
             let _entries = const asset::read_dir("{path}");
         }}
@@ -5192,7 +5192,7 @@ fn a_listing_path_outside_the_package_root_is_refused() {
         Box::leak(
             format!(
                 r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {{
             let _entries = const asset::read_dir("{absolute}");
         }}
@@ -5207,7 +5207,7 @@ fn a_listing_path_outside_the_package_root_is_refused() {
     );
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _entries = const asset::read_dir_all("../outside");
         }
@@ -5224,7 +5224,7 @@ fn a_runtime_listing_is_rejected() {
     // not `asset::emit`.
     assert_fails_spanning(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _entries = asset::read_dir("static");
         }
@@ -5235,7 +5235,7 @@ fn a_runtime_listing_is_rejected() {
     );
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun estate(): List<str> {
             asset::read_dir_all("static")
         }
@@ -5257,7 +5257,7 @@ fn a_bundle_as_target_is_the_url_and_the_output_name() {
     let root = estate_root("target");
     let (values, _, bundled) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _url = const asset::bundle_as("static/robots.txt", "/robots.txt");
         }
@@ -5306,7 +5306,7 @@ fn a_bundle_as_url_shape_is_refused() {
             Box::leak(
                 format!(
                     r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {{
             let _url = const asset::bundle_as("static/robots.txt", "{url}");
         }}
@@ -5331,7 +5331,7 @@ fn two_sources_claiming_one_target_name_both() {
     let root = estate_root("collision");
     let errors = const_errors(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _one = const asset::bundle_as("static/robots.txt", "/pinned.txt");
             let _two = const asset::bundle_as("static/logo.png", "/pinned.txt");
@@ -5356,7 +5356,7 @@ fn the_same_source_and_target_twice_registers_once() {
     let root = estate_root("dedup");
     let (_, _, bundled) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _one = const asset::bundle_as("static/robots.txt", "/robots.txt");
             let _two = const asset::bundle_as("./static/robots.txt", "/robots.txt");
@@ -5381,7 +5381,7 @@ fn a_digest_is_the_sha256_of_the_files_bytes() {
     let root = estate_root("digest");
     let (values, _, _) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _hex = const asset::digest("static/logo.png");
         }
@@ -5407,7 +5407,7 @@ fn a_digested_file_is_a_tracked_build_input() {
     // single worst failure the cache tier this exists for can have.
     let root = estate_root("digesttrack");
     let source = r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _hex = const asset::digest("static/logo.png");
         }
@@ -5436,7 +5436,7 @@ fn a_digested_file_is_a_tracked_build_input() {
 fn a_runtime_digest_is_rejected() {
     assert_fails_spanning(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun main() {
             let _hex = asset::digest("logo.png");
         }
@@ -5447,7 +5447,7 @@ fn a_runtime_digest_is_rejected() {
     );
     assert_fails_with(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun fingerprint(): str {
             asset::digest("logo.png")
         }
@@ -5470,7 +5470,7 @@ fn the_estate_recipe_folds_to_one_url_per_file() {
     let root = estate_root("recipe");
     let (values, _, bundled) = const_bundles(
         r#"
-        import std::asset;
+        import std::web::asset;
         fun estate(): List<str> {
             mut urls: List<str> = [];
             for file in asset::read_dir_all("static") {
@@ -5729,7 +5729,7 @@ fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
         import std::json::json_codec;
         import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
-        import std::ui::{ each, mount_root, view };
+        import std::web::ui::{ each, mount_root, view };
 
         [derive(Wire, PartialEq, Debug)]
         struct Todo { id: i32, label: str }
@@ -5754,7 +5754,7 @@ fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
         import std::json::json_codec;
         import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
-        import std::ui::{ each, mount_root, view };
+        import std::web::ui::{ each, mount_root, view };
 
         [derive(Wire, PartialEq, Debug)]
         struct Todo { id: i32, label: str }

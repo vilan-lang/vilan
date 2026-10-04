@@ -295,7 +295,7 @@ Where the cursor is decides what is offered.
   (Imports are read as single-line items; a braced group's later lines are
   not recognized.) Inside an impl SELECTOR the answer is not a name the
   module offers but a block it writes: after `impl ` the module's impl
-  subjects (`import std::style::{ (impl ` offers `Length`, `Color`, …), and
+  subjects (`import std::web::style::{ (impl ` offers `Length`, `Color`, …), and
   after `)::` that block's members (`(impl Length)::` offers `rem`). Both
   come from the module's parsed text, like every other answer here.
 - **A name you have not imported** is offered too, labeled with the module
@@ -378,7 +378,7 @@ construct stops the conversion, because its attachment is not recoverable
 across the reshape — the same refusal `vilan fmt` makes when it declines to
 reorder a commented block. So does a declaration with **several
 arguments** (`margin(px(4), px(8))`): its chain twin needs
-`std::style::piece`, which is ambient inside a block and nowhere else, so
+`std::web::style::piece`, which is ambient inside a block and nowhere else, so
 the chain written out would name something the file does not import. The
 two directions are inverses on everything they accept.
 

@@ -5539,8 +5539,8 @@ fn b369_the_kolt_shape_a_context_carrying_closure_parameter_and_a_slot_impl() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Source, SignalCell, owner_scope };
-        import std::ui::{ Region, Slot, View };
-        import std::ui;
+        import std::web::ui::{ Region, Slot, View };
+        import std::web::ui;
 
         struct Conditional<T, S: Source<Option<T>>, C: Slot> {
         	condition: S,

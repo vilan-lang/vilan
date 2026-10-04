@@ -134,8 +134,8 @@ pub fn compile(source: &str) -> Result<String, Vec<String>> {
     compile_on(source, Platform::default())
 }
 
-/// `compile` for a browser build — the platform whose layer holds `std::ui` /
-/// `std::dom` / `std::router`, none of which the default (node) platform can
+/// `compile` for a browser build — the platform whose layer holds `std::web::ui` /
+/// `std::web::dom` / `std::web::router`, none of which the default (node) platform can
 /// import.
 pub fn compile_browser(source: &str) -> Result<String, Vec<String>> {
     compile_on(source, Platform::Browser)

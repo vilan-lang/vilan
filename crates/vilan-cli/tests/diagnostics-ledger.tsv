@@ -366,7 +366,7 @@ row	flagship	key
 332	flagship	`std::{name}` was removed: `{name}` is a primitive and is always in scope — delete the import (its module path, if you need it, is `std::{home}::{name}`)
 333	flagship	`std::{name}` was removed: `{name}` is in the default prelude (no import needed), and its module path is `std::{home}::{name}`
 334	flagship	`std::{name}` was removed: its module path is `std::{home}::{name}`
-336	flagship	`@` is not a vilan token; a `css` block has no at-rules — a media query is a breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is `std::style::declare`
+336	flagship	`@` is not a vilan token; a `css` block has no at-rules — a media query is a breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is `std::web::style::declare`
 337	-	std::db migrate: could not begin a transaction for migration '{step.name}': {message}
 338	-	std::db migrate: migration '{step.name}' failed and was not applied: {message}
 339	-	std::db migrate: migration '{step.name}' applied but could not be recorded: {message}
@@ -493,7 +493,7 @@ row	flagship	key
 469	-	`asset::schedule_at_end` outside a `const` expression
 470	-	`{function}` kinds name one file beside the build output; `{kind}` is not one path segment — pass a bare kind like `css`
 471	-	`{function}` kinds name one file beside the build output, and `{kind}` collides with {collision} — pass a kind of the program's own, like `routes`
-472	-	`asset::emit_keyed` cannot order the `{kind}` kind: the style sidecar is ordered by the CSS cascade, not by a contribution's key — write a rule with `asset::emit`, or let `std::style` own the sheet
+472	-	`asset::emit_keyed` cannot order the `{kind}` kind: the style sidecar is ordered by the CSS cascade, not by a contribution's key — write a rule with `asset::emit`, or let `std::web::style` own the sheet
 473	-	parameter {position} of `{subject}`'s `{member}` is {form}, but `{trait}` declares {declared}; match the declared laziness
 474	-	`{name}` is a `lazy` parameter of the resource type `{type}`: a lazy argument is carried by a thunk, and a thunk owning a resource is what R9 forbids
 475	-	this argument is the resource `{type}`, and it stands in the `lazy` parameter `{name}`: the thunk that carries it would own the resource
@@ -571,7 +571,7 @@ row	flagship	key
 547	-	`[derive({name})]` expanded before std's `{module}` declared its `{name}` macro: a compiler load-ordering bug (B21's class); please report how this module is reached
 548	-	{count} `context` {checks} did not run: this program does not type, so the call graph it would be checked over has holes in it — fix the errors above and check again
 549	-	`external fun {name}` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
-550	-	`{symbol}` is a host PROPERTY, not a function: the function form of `[extern]` emits a CALL, so this binding reaches the host as `{symbol}()` and fails there. Read it through a runtime helper (`std::dom`'s `__dom_active_element` and `__dom_window` are that shape), or, if the property hangs off a value the program holds rather than off a global, bind it with `[extern(get, "..")]` on a receiver
+550	-	`{symbol}` is a host PROPERTY, not a function: the function form of `[extern]` emits a CALL, so this binding reaches the host as `{symbol}()` and fails there. Read it through a runtime helper (`std::web::dom`'s `__dom_active_element` and `__dom_window` are that shape), or, if the property hangs off a value the program holds rather than off a global, bind it with `[extern(get, "..")]` on a receiver
 551	-	`{}` is not a derivable trait: nothing declares a `{}` macro — not std, not this file, and nothing it imports. std derives {}; a derive of your own is a `macro fun {}` in this file or imported by name
 552	-	`guarded_async`
 553	-	`[service]` on `{name}` has an empty contract surface: it declares no `[rpc]` method, no `[expose]`d field and no `client = ..` handler, so the client it generates can call nothing and every call answers `unknown method` at runtime
@@ -650,8 +650,8 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 625	-	this element's class is written twice — `{earlier}` and then `{later}` — and only the last write stays: `{later}` replaces what `{earlier}` wrote. Compose them into one writer (two styles add: `.styled(a + b)`), or drop one
 626	-	`std::map` was removed: its `Map` is `std::hash_map::HashMap`
 627	-	`std::set` was removed: its `Set` is `std::hash_set::HashSet`
-628	-	`std::map_cell` is `std::hash_map_cell` now, and its `MapCell` is `HashMapCell` (re-exported from `std::reactive`)
-629	-	`std::set_cell` is `std::hash_set_cell` now, and its `SetCell` is `HashSetCell` (re-exported from `std::reactive`)
+628	-	`std::map_cell` is `std::reactive::hash_map_cell` now, and its `MapCell` is `HashMapCell` (re-exported from `std::reactive`)
+629	-	`std::set_cell` is `std::reactive::hash_set_cell` now, and its `SetCell` is `HashSetCell` (re-exported from `std::reactive`)
 630	-	`{part}` was renamed `{new}`: write `import std::{module}::{new};`
 631	-	a written `autofocus` attribute is the browser's native one, which acts only while the page is first parsed: on an element inserted later the document refuses it once something has focus, and Chromium logs "Autofocus processing was blocked because a document already has a focused element". Write `.autofocus()` — it focuses the element once it is in the document, an enclosing focus scope starts on it, and a server render still writes the native attribute (for a `<dialog>` or a popover that wants the native one, write `.attr("autofocus", "")`)
 632	-	{which} {got} where its type takes {expected}: a value closure and a view closure are different types, and no adapter is inserted; {adapt}.

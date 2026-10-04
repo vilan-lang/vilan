@@ -79,7 +79,7 @@ fn combined(output: &Output) -> String {
     )
 }
 
-/// Run a one-file node program against the real `std::document` and hand back
+/// Run a one-file node program against the real `std::web::document` and hand back
 /// what it printed. The probes below build `LegBuild` values directly, so they
 /// ask about the document and nothing else — no build, no server, no port.
 fn run_probe(tag: &str, source: &str) -> String {
@@ -130,11 +130,11 @@ fn refused_probe(tag: &str, source: &str) -> String {
 /// and `body` value here is markup a real page carries (a favicon, an `og:`
 /// tag, a page-frame `<style>`, a `<noscript>`).
 const PROPERTY: &str = r#"import std::build::LegBuild;
-import std::document::{ Document, ShellFault, check_shell };
+import std::web::document::{ Document, ShellFault, check_shell };
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };
-import std::ui::{ View, view };
+import std::web::ui::{ View, view };
 
 fun app(): View {
 	view("main").class("app").text("rendered")
@@ -232,11 +232,11 @@ fn every_document_of_can_produce_passes_check_shell() {
 
 /// `render` at both rungs, and what it does to the value it was called on.
 const RENDER: &str = r#"import std::build::LegBuild;
-import std::document::{ Document, ShellFault, check_shell };
+import std::web::document::{ Document, ShellFault, check_shell };
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };
-import std::ui::{ View, view };
+import std::web::ui::{ View, view };
 
 fun app(): View {
 	view("main").class("app").text("rendered")
@@ -307,8 +307,8 @@ fn render_splices_inside_the_mount_element_at_both_rungs() {
 
 /// A browser leg with styles, so the generated document has a `<link>` to be
 /// right or wrong about.
-const STYLED_CLIENT: &str = r#"import std::style::{ Display, Style, style };
-import std::ui::{ mount_root, view };
+const STYLED_CLIENT: &str = r#"import std::web::style::{ Display, Style, style };
+import std::web::ui::{ mount_root, view };
 
 fun panel(): Style {
 	style().display(Display::Flex)
@@ -324,7 +324,7 @@ fun main() {
 fn generated_server(port: u16) -> String {
     format!(
         "import std::build::require_build;\n\
-         import std::document::Document;\n\
+         import std::web::document::Document;\n\
          import std::http::{{ Request, Response, Server }};\n\
          import std::io::print;\n\
          import std::process;\n\
@@ -485,7 +485,7 @@ const HATCH_ENVELOPE: &str =
 /// `ScriptNotEmitted`. Probed on 2026-08-19 this page built, booted, and was
 /// served; it is the finding E70 was filed on, and this pin is the ruling.
 const HATCHED_SERVER: &str = r#"import std::build::require_build;
-import std::document::Document;
+import std::web::document::Document;
 import std::http::{ Request, Response, Server };
 import std::io::print;
 
@@ -542,7 +542,7 @@ fn a_hatch_loading_a_script_the_build_did_not_emit_refuses_the_boot() {
 /// `check_shell` CAUGHT it when called by hand — `html()` now refuses to hand
 /// it back at all.
 const STYLE_HATCH: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::option::Option::{ None, Some, self };
 
 fun main() {
@@ -580,7 +580,7 @@ fn a_hatch_linking_a_stylesheet_the_build_did_not_emit_refuses() {
 /// script. Both faults are expected, because a check that reported one costs a
 /// restart per problem (§5.6).
 const MOUNT_HATCH: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::option::Option::{ None, Some, self };
 
 fun main() {
@@ -617,7 +617,7 @@ fn a_hatch_that_hides_the_mount_element_refuses() {
 /// the generated tag is classic precisely because chunk resolution reads
 /// `document.currentScript`, and the hatch's module copy would race it.
 const MODULE_HATCH: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::option::Option::{ None, Some, self };
 
 fun main() {
@@ -652,7 +652,7 @@ fn a_module_script_hatch_over_a_splitting_leg_refuses() {
 /// and rides the page. (The property probe passes 1056 hatched documents
 /// through the same internal check; this pin is the named, minimal case.)
 const VALID_HATCH: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 
@@ -690,7 +690,7 @@ fn a_valid_hatch_passes_the_check_and_rides_the_page() {
 /// with a pre-joined string. Each call now lands on its own line at the
 /// hatch's indent, so the hatch is usable per item.
 const REPEATED_HATCH: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 
@@ -738,7 +738,7 @@ fn consecutive_hatch_calls_land_one_per_line() {
 /// shell's closing tags (E77), and consecutive calls arrive there one per
 /// line too — the join happens where the calls append, so both arms share it.
 const REPEATED_HATCH_SUPPLIED: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };
@@ -790,7 +790,7 @@ fn consecutive_head_calls_compose_one_per_line_into_a_supplied_shell() {
 // at all. Like `title`, it shapes the generated document only — a supplied
 // shell's identity lines are the shell's own.
 const DESCRIPTION: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 
@@ -861,7 +861,7 @@ fn a_hostile_description_is_escaped_like_the_title() {
 /// element can carry — is still handed back, which is the absence of the
 /// check, observed. (`.mount("")` is not endorsed; it is the observable.)
 const HATCHLESS: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 
@@ -943,7 +943,7 @@ const SHELL: &str = "<!doctype html>\n<html lang=\"en\">\n\t<head>\n\t\t<meta ch
 fn supplied_hatch_server(port: u16) -> String {
     format!(
         "import std::build::require_build;\n\
-         import std::document::require_shell;\n\
+         import std::web::document::require_shell;\n\
          import std::http::{{ Request, Response, Server }};\n\
          import std::io::print;\n\
          import std::process;\n\
@@ -1046,7 +1046,7 @@ fn a_head_hatch_on_a_supplied_shell_now_rides_the_served_page() {
 /// supplied shell. Port 0 like every refusal pin: no assertion expects a bound
 /// socket.
 const BAD_SUPPLIED_HATCH_SERVER: &str = r#"import std::build::require_build;
-import std::document::require_shell;
+import std::web::document::require_shell;
 import std::http::{ Request, Response, Server };
 import std::io::print;
 
@@ -1086,7 +1086,7 @@ fn a_bad_hatch_on_a_supplied_shell_refuses_the_boot() {
 /// into the leg's namespace over a build that emitted no styles — so a second
 /// fault family is pinned at the supplied site too.
 const FROM_SHELL_BAD_HATCH: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };
@@ -1134,11 +1134,11 @@ fn a_bad_hatch_through_from_shell_names_the_supplied_shell() {
 /// mount element — three insertions in one page, each at the position the
 /// ruling defines, and the composed page passes the check.
 const COMPOSED_HATCHES: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };
-import std::ui::{ View, view };
+import std::web::ui::{ View, view };
 
 fun app(): View {
 	view("main").class("app").text("rendered")
@@ -1197,11 +1197,11 @@ fn a_valid_hatch_composes_at_every_splice_point_and_passes() {
 /// emitted, via `attr`) still riding the page: the check keys on the hatches
 /// alone, exactly as it does on the generated arm.
 const HATCHLESS_SUPPLIED: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };
-import std::ui::{ View, view };
+import std::web::ui::{ View, view };
 
 fun main() {
 	let build = LegBuild {
@@ -1271,7 +1271,7 @@ fn a_hatchless_supplied_shell_is_byte_identical_and_runs_no_check() {
 /// Composing would have to guess a position the author cannot see; it refuses
 /// instead, naming every missing tag (not the first) and both fixes.
 const NO_CLOSING_TAGS: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };
@@ -1318,7 +1318,7 @@ fn a_used_hatch_with_no_closing_tag_to_splice_before_refuses() {
 /// is no refusal — the same tag-less-`<head>` shell composes fine when only
 /// `body()` is used, because the splice points are demanded per hatch.
 const UNUSED_HATCH: &str = r#"import std::build::LegBuild;
-import std::document::Document;
+import std::web::document::Document;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };
@@ -1368,7 +1368,7 @@ fn a_closing_tag_only_an_unused_hatch_would_need_is_not_required() {
 // old figure is dominated by the fold, which is why it scales with the DOCUMENT
 // where the new one scales with the element's body.
 const RAW_TEXT: &str = r#"import std::build::LegBuild;
-import std::document::check_shell;
+import std::web::document::check_shell;
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };

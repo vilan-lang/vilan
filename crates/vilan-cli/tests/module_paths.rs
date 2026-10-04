@@ -653,7 +653,7 @@ fn a65_a_directory_carries_no_platform_coloring_of_its_own() {
         ),
         (
             "src/lib/painted.vl",
-            "import std::dom::get_element_by_id;\n\nfun paint() {\n\tlet _ = \
+            "import std::web::dom::get_element_by_id;\n\nfun paint() {\n\tlet _ = \
              get_element_by_id(\"app\");\n}\n",
         ),
         (

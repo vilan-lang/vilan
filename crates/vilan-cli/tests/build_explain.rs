@@ -101,7 +101,7 @@ fn stage(tag: &str) -> PathBuf {
     write(
         &dir,
         "src/client.vl",
-        "import std::asset::{ bundle, bundle_as, digest, emit };\n\
+        "import std::web::asset::{ bundle, bundle_as, digest, emit };\n\
          import std::io::print;\n\
          \n\
          fun base(): i32 {\n\
@@ -312,7 +312,7 @@ fn a_lone_package_explains_the_outputs_beside_its_entry() {
     write(
         &dir,
         "app.vl",
-        "import std::asset::emit;\n\
+        "import std::web::asset::emit;\n\
          import std::io::print;\n\
          \n\
          fun routes(): i32 {\n\

@@ -94,13 +94,13 @@ struct InferredPlatform {
 /// Infers a build platform for editor analysis (which has no `--platform`) from
 /// a file's own text. Evidence, per `import std::<module>` reference:
 ///
-/// - a module served ONLY by a browser layer (`std::dom`) is browser evidence —
+/// - a module served ONLY by a browser layer (`std::web::dom`) is browser evidence —
 ///   the file cannot mean anything else;
 /// - a module served by a browser layer AND another root — a platform TWIN,
-///   like `std::ui` — is evidence through the NAMES imported from it: a
+///   like `std::web::ui` — is evidence through the NAMES imported from it: a
 ///   name declared by just the browser twin (`mount`) says browser, one
 ///   declared by just the other side (`render`) says process, and a name both
-///   declare says nothing. B36: the old rule read *any* `std::ui` import as
+///   declare says nothing. B36: the old rule read *any* `std::web::ui` import as
 ///   browser evidence, so a two-entry package's shared file importing the
 ///   process twin's `render` analyzed as browser in the editor and its import
 ///   red-flagged, while `vilan build` was clean on every entry.
@@ -142,14 +142,38 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         .map(|layer| layer.root.as_path())
         .chain(std::iter::once(std.base_root.as_path()))
         .collect();
-    // The module file `name` resolves to under `root` (`name.vl` or `name/lib.vl`).
+    // The module file `name` resolves to under `root` (`name.vl` or
+    // `name/lib.vl`). A154: `name` is a PATH below `std` (`web::dom` is
+    // `web/dom.vl`), since std's modules sit under namespaces.
     fn module_file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
-        let file = root.join(format!("{name}.vl"));
-        if file.exists() {
-            return Some(file);
+        let mut directory = root.to_path_buf();
+        let mut segments = name.split("::").peekable();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                let file = directory.join(format!("{segment}.vl"));
+                if file.exists() {
+                    return Some(file);
+                }
+                let lib = directory.join(segment).join("lib.vl");
+                return lib.exists().then_some(lib);
+            }
+            directory.push(segment);
         }
-        let lib = root.join(name).join("lib.vl");
-        lib.exists().then_some(lib)
+        None
+    }
+    // Whether `name` is a module in any of `roots` — the question that tells a
+    // namespace segment the walk descends through (`web` of `std::web::dom`)
+    // from a module whose items follow (`option` of `std::option::Option`).
+    fn is_module_in(roots: &[&Path], name: &str) -> bool {
+        roots.iter().any(|root| module_file(root, name).is_some())
+    }
+    // The path a segment names below the walk's prefix (`web` + `dom`).
+    fn joined(prefix: &str, segment: &str) -> String {
+        if prefix.is_empty() {
+            segment.to_string()
+        } else {
+            format!("{prefix}::{segment}")
+        }
     }
     // Whether the module at `path` declares `name` at its top level (through
     // the item wrappers). A file that fails to read or parse declares nothing —
@@ -253,12 +277,23 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     // it justifies (see the doc comment).
     fn child_is_browser_evidence(
         branch: &ImportBranch,
+        prefix: &str,
         browser_root: &Path,
         other_roots: &[&Path],
     ) -> Option<String> {
         match branch {
-            ImportBranch::Path(module, _, sub) => {
-                let browser_file = module_file(browser_root, module)?;
+            ImportBranch::Path(segment, _, sub) => {
+                let module = &joined(prefix, segment);
+                let Some(browser_file) = module_file(browser_root, module) else {
+                    // A154: not a browser module, and not a module anywhere —
+                    // a namespace (`web`), so the evidence is below it.
+                    if let ImportTail::Continue(sub) = sub
+                        && !is_module_in(other_roots, module)
+                    {
+                        return child_is_browser_evidence(sub, module, browser_root, other_roots);
+                    }
+                    return None;
+                };
                 let twin_files: Vec<std::path::PathBuf> = other_roots
                     .iter()
                     .filter_map(|root| module_file(root, module))
@@ -270,8 +305,8 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                     ));
                 }
                 // A twin: only a name the browser side alone declares says
-                // browser. A bare `import std::ui;` names nothing — neutral,
-                // and so is an aliased one (`import std::ui as u;`), which
+                // browser. A bare `import std::web::ui;` names nothing — neutral,
+                // and so is an aliased one (`import std::web::ui as u;`), which
                 // takes the module and no name out of it.
                 let ImportTail::Continue(sub) = sub else {
                     return None;
@@ -292,12 +327,12 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                     })
             }
             ImportBranch::Reach(_, inner) => {
-                child_is_browser_evidence(inner, browser_root, other_roots)
+                child_is_browser_evidence(inner, prefix, browser_root, other_roots)
             }
             ImportBranch::Selector(_) => None,
-            ImportBranch::Set(branches) => branches
-                .iter()
-                .find_map(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
+            ImportBranch::Set(branches) => branches.iter().find_map(|branch| {
+                child_is_browser_evidence(branch, prefix, browser_root, other_roots)
+            }),
         }
     }
     // The TWIN `std` modules one `std::<module>` reference names — each with
@@ -305,13 +340,21 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     // subjects: a module with no twin is already decided by the rule above.
     fn twin_modules(
         branch: &ImportBranch,
+        prefix: &str,
         browser_root: &Path,
         other_roots: &[&Path],
         into: &mut Vec<(String, std::path::PathBuf, Vec<std::path::PathBuf>)>,
     ) {
         match branch {
-            ImportBranch::Path(module, _, _) => {
+            ImportBranch::Path(segment, _, sub) => {
+                let module = &joined(prefix, segment);
                 let Some(browser_file) = module_file(browser_root, module) else {
+                    // A154: a namespace segment — the twin is below it.
+                    if let ImportTail::Continue(sub) = sub
+                        && !is_module_in(other_roots, module)
+                    {
+                        twin_modules(sub, module, browser_root, other_roots, into);
+                    }
                     return;
                 };
                 let twin_files: Vec<std::path::PathBuf> = other_roots
@@ -321,13 +364,15 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                 if twin_files.is_empty() || into.iter().any(|(name, _, _)| name == module) {
                     return;
                 }
-                into.push(((*module).to_string(), browser_file, twin_files));
+                into.push((module.to_string(), browser_file, twin_files));
             }
-            ImportBranch::Reach(_, inner) => twin_modules(inner, browser_root, other_roots, into),
+            ImportBranch::Reach(_, inner) => {
+                twin_modules(inner, prefix, browser_root, other_roots, into)
+            }
             ImportBranch::Selector(_) => {}
             ImportBranch::Set(branches) => {
                 for branch in branches {
-                    twin_modules(branch, browser_root, other_roots, into);
+                    twin_modules(branch, prefix, browser_root, other_roots, into);
                 }
             }
         }
@@ -355,7 +400,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch else {
             return false;
         };
-        import_reason = child_is_browser_evidence(child, browser_root, &other_roots);
+        import_reason = child_is_browser_evidence(child, "", browser_root, &other_roots);
         import_reason.is_some()
     });
     if let Some(reason) = import_reason {
@@ -373,7 +418,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         if let Node::Import(branch, ..) | Node::Use(branch) = node
             && let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch
         {
-            twin_modules(child, browser_root, &other_roots, &mut twins);
+            twin_modules(child, "", browser_root, &other_roots, &mut twins);
         }
         false
     });
@@ -934,9 +979,9 @@ fn analyze_source_unfenced(
     // Use the front-end's resolved platform (e.g. from `vilan.toml`), else infer
     // one from the file's own imports: a file importing the browser DOM layer is a
     // browser file, otherwise Node. This keeps the platform gate from
-    // false-flagging valid `std::dom` usage while still catching a genuine
+    // false-flagging valid `std::web::dom` usage while still catching a genuine
     // cross-platform import (e.g. `std::http` in a file that also reaches for
-    // `std::dom`).
+    // `std::web::dom`).
     // F27 R6: an inferred platform carries its own reason, so the overlay note
     // can say why this file is under this twin even where no front end resolved
     // the colour (a bare file, a `[library]` module, a test harness). The

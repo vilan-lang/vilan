@@ -1,4 +1,4 @@
-# Router: `std::router`
+# Router: `std::web::router`
 
 A client-side routed app. The model in one sentence: **routes are enums**. The URL is a
 wire format for a typed value, so layouts, params, guards, and links are
@@ -10,7 +10,7 @@ What to look at in [`app.vl`](app.vl):
 - **The route space**: `Route` with a nested `ItemsRoute`. Nested enums
   mirror nested layouts; `/items/{id}`'s param is an `i32` payload.
 - **`parse`/`href`**: a hand-written inverse pair over
-  `std::router::segments`. Total (unknown paths → `NotFound`), and testable
+  `std::web::router::segments`. Total (unknown paths → `NotFound`), and testable
   like any function.
 - **The shell**: `app` swaps the page on the derived route signal
   (`View.swap`: an unchanged route is a no-op; a swapped-out page's

@@ -1455,7 +1455,7 @@ fn collect_markup_spans(
 /// property-name span, and each generated accessor takes a zero-width anchor so
 /// that no analyzed token ever lands on CSS-side syntax. The single exception is
 /// the outer `style()`, which keeps the `css` keyword's own span so a missing
-/// `import std::style::style` underlines the word that asked for a `Style` — and
+/// `import std::web::style::style` underlines the word that asked for a `Style` — and
 /// that one accessor is what `scaffolding` suppresses here, exactly as the
 /// element desugar's `<tag` accessor is suppressed.
 #[derive(Default)]
@@ -6675,13 +6675,13 @@ impl Document {
             return false;
         }
         // E180's THIRD subtraction (R9, RULED 2026-09-14). A module the PRELUDE
-        // module itself re-exports — `std/src/web.vl` lines 47-48, `export
+        // module itself re-exports — `std/src/web/prelude.vl` lines 47-48, `export
         // import pkg::style;` and `export import pkg::ui;` — is loaded for
         // every file of the package whatever that file imports, so an import
         // reaching it carries no `impl` the file would otherwise lack. Rescuing
         // it is not wrong, it is REDUNDANT, and the redundant statement is one
         // the organizer would then write into every file of an application:
-        // kolt's `import std::ui::{ (impl View) };`.
+        // kolt's `import std::web::ui::{ (impl View) };`.
         if program.prelude_bindings.contains(&module_id) {
             return false;
         }
@@ -6905,7 +6905,20 @@ impl Document {
             }
             let mut seen_modules: HashSet<String> = HashSet::new();
             for root in &module_roots {
-                for (module_name, module_path) in vilan_core::analyzer::modules_in_root(root) {
+                // A154: std's modules sit under namespaces (`std::web::dom`),
+                // so std is listed at every depth; another origin keeps the top
+                // level it always offered.
+                // A NESTED prelude (`web::prelude`, `web::style::prelude`) is
+                // never a name's home — the analyzer's B4 index skips it too.
+                let listed = if origin == "std" {
+                    vilan_core::analyzer::modules_under_root(root, &module_roots)
+                        .into_iter()
+                        .filter(|(module_name, _)| !module_name.ends_with("::prelude"))
+                        .collect()
+                } else {
+                    vilan_core::analyzer::modules_in_root(root)
+                };
+                for (module_name, module_path) in listed {
                     if module_name == "lib" || !seen_modules.insert(module_name.clone()) {
                         continue;
                     }
@@ -6916,8 +6929,8 @@ impl Document {
                     // quickfix path had drifted from it — harmlessly until std
                     // gained the prelude modules, whose whole content is
                     // re-exports, at which point `view` started offering both
-                    // `std::ui` and `std::web` and the menu went ambiguous.
-                    // Nobody should ever be told to `import std::web::view`.
+                    // `std::web::ui` and `std::web::prelude` and the menu went ambiguous.
+                    // Nobody should ever be told to `import std::web::prelude::view`.
                     let importables = vilan_core::analyzer::module_importables(&module_path);
                     let curated = vilan_core::analyzer::module_is_curated(&importables);
                     if importables.iter().any(|importable| {
@@ -6925,7 +6938,11 @@ impl Document {
                             && importable.kind != vilan_core::analyzer::ImportableKind::Reexport
                             && (!curated || importable.exported.is_exported())
                     }) {
-                        candidates.push(vec![origin.clone(), module_name]);
+                        candidates.push(
+                            std::iter::once(origin.clone())
+                                .chain(module_name.split("::").map(str::to_string))
+                                .collect(),
+                        );
                     }
                 }
             }
@@ -9061,14 +9078,14 @@ enum CssValuePiece {
     Hole(std::ops::Range<usize>),
 }
 
-/// The `std::style::prelude` constructor for a whole text value, or `None` when
+/// The `std::web::style::prelude` constructor for a whole text value, or `None` when
 /// it has none and the value stays a string literal.
 ///
 /// The table is deliberately SMALL, exactly as the codemod's is: the css
 /// lowering makes a typed value and its string spelling byte-identical, so the
 /// choice is readability only, and a rewrite that guessed wrong would be worse
 /// than one that did not guess. Every name is a free function of
-/// `std::style::prelude`, which is ambient inside a `css` block, so a typed
+/// `std::web::style::prelude`, which is ambient inside a `css` block, so a typed
 /// rewrite needs no import.
 fn css_typed_constructor(value: &str) -> Option<String> {
     let value = value.trim();
@@ -10238,7 +10255,7 @@ pub(crate) mod tests {
     #[test]
     fn quickfix_rewrites_a_retired_slot_method_to_the_value_form() {
         let source = "import std::reactive::{ Signal, SignalCell };\n\
-                      import std::ui::{ View, each, mount_root, view };\n\
+                      import std::web::ui::{ View, each, mount_root, view };\n\
                       \n\
                       fun main() {\n\
                       \tlet rows: SignalCell<List<str>> = Signal::new([\"a\"]);\n\
@@ -10581,13 +10598,13 @@ pub(crate) mod tests {
 
     // The ratified first target (E54) was element syntax with no `view` in
     // scope: `<div/>` desugared to an unresolved `view` accessor. B270 (Order
-    // 30) made the element HYGIENIC — `<tag />` means `std::ui::view` whatever
+    // 30) made the element HYGIENIC — `<tag />` means `std::web::ui::view` whatever
     // the site's scope holds, and needs no import — so the element itself no
     // longer raises anything. The `View` TYPE written beside it still does,
     // and it takes the SAME general unresolved-name path as any other name,
-    // reaching `std::ui` in real std via `import_candidates`' disk scan (the
-    // `std::web` re-export is skipped: nobody is told to `import
-    // std::web::View`). Applied, the file is CLEAN — which is the element's
+    // reaching `std::web::ui` in real std via `import_candidates`' disk scan (the
+    // `std::web::prelude` re-export is skipped: nobody is told to `import
+    // std::web::prelude::View`). Applied, the file is CLEAN — which is the element's
     // hygiene pinned from the editor's side too.
     #[test]
     fn quickfix_offers_the_add_import_fix_for_the_view_type_beside_a_hygienic_element() {
@@ -10627,11 +10644,11 @@ pub(crate) mod tests {
             fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
         );
         assert!(
-            view_fixes[0].title.contains("std::ui"),
+            view_fixes[0].title.contains("std::web::ui"),
             "{}",
             view_fixes[0].title
         );
-        assert_eq!(view_fixes[0].replacement, "import std::ui::View;\n");
+        assert_eq!(view_fixes[0].replacement, "import std::web::ui::View;\n");
         // Applied and re-analyzed: the type resolves through the import and
         // the element head through its own seed — nothing is left.
         let mut applied = text.to_string();
@@ -10648,7 +10665,7 @@ pub(crate) mod tests {
     }
 
     // E110 (audit run 6, F22): a name the WEB set would have made ambient
-    // carries the manifest steer analyzer-side (`prelude = "std::web"`), and
+    // carries the manifest steer analyzer-side (`prelude = "std::web::prelude"`), and
     // the add-import quickfix is offered beside it. `web_prelude_steer`'s
     // comment used to claim the opposite — that the arm's different suffix
     // steered the LSP's `unresolved_name` parser off — which was never true:
@@ -10885,7 +10902,7 @@ pub(crate) mod tests {
     /// `(title, replaced text, replacement)` — the shape every §7.2 pin reads.
     fn css_block_fixes(body: &str) -> Vec<(String, String, String)> {
         let source = format!(
-            "import std::style::{{ Color, Style, style }};\n\nfun card(): Style {{\n{body}}}\n"
+            "import std::web::style::{{ Color, Style, style }};\n\nfun card(): Style {{\n{body}}}\n"
         );
         let (directory, document) = analyze_workspace(&[("main.vl", &source)]);
         let program = document
@@ -11101,7 +11118,7 @@ pub(crate) mod tests {
     /// the parser wanted.
     #[test]
     fn the_applied_css_call_fix_leaves_the_file_analyzing() {
-        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tpadding: 4px;\n\t\tdisplay: flex;\n\t}\n}\n";
+        let source = "import std::web::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tpadding: 4px;\n\t\tdisplay: flex;\n\t}\n}\n";
         let (directory, document) = analyze_workspace(&[("main.vl", source)]);
         let program = document.program.as_ref().expect("a css fixture analyzes");
         let text = document.line_index.text().to_string();
@@ -11931,7 +11948,7 @@ pub(crate) mod tests {
     // classes, breakpoints, `within` and `divide`.
     #[test]
     fn a_css_pseudo_class_selector_is_steered_to_the_dotted_rule() {
-        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\t:hover {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n";
+        let source = "import std::web::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\t:hover {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n";
         let (directory, document) = analyze_workspace(&[("main.vl", source)]);
         let published = document.published_diagnostics();
         let messages = messages(&published);
@@ -11964,7 +11981,7 @@ pub(crate) mod tests {
     /// `(to_chain, replaced text, replacement)`.
     fn css_conversion(body: &str) -> Option<(bool, String, String)> {
         css_conversion_of(&format!(
-            "import std::style::{{ Color, Length, Style, space, style }};\n\nfun card(): Style {{\n{body}}}\n"
+            "import std::web::style::{{ Color, Length, Style, space, style }};\n\nfun card(): Style {{\n{body}}}\n"
         ))
     }
 
@@ -12079,7 +12096,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_reads_a_path_spelled_style_seed() {
         let conversion = css_conversion_of(
-            "import std::style;\n\nfun card(): style::Style {\n\tsty~le::style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.padding(style::space(4))\n}\n",
+            "import std::web::style;\n\nfun card(): style::Style {\n\tsty~le::style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.padding(style::space(4))\n}\n",
         )
         .expect("a `style::style()` chain converts");
         assert_eq!(
@@ -12111,7 +12128,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_splits_a_chain_at_a_link_with_no_block_spelling() {
         let conversion = css_conversion_of(
-            "import std::style::{ Color, Length, Style, space, style };\n\nimpl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\nfun icon_button(): Style {\n\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"outline\", \"none\")\n\t\t.radius(Length::px(4))\n\t\t.attribute(\"disabled\", None, style().color(Color::gray(300)))\n\t\t.select_off()\n\t\t.hover(style().background(Color::gray(100)))\n}\n",
+            "import std::web::style::{ Color, Length, Style, space, style };\n\nimpl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\nfun icon_button(): Style {\n\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"outline\", \"none\")\n\t\t.radius(Length::px(4))\n\t\t.attribute(\"disabled\", None, style().color(Color::gray(300)))\n\t\t.select_off()\n\t\t.hover(style().background(Color::gray(100)))\n}\n",
         )
         .expect("a kolt-shaped chain converts");
         assert_eq!(
@@ -12131,7 +12148,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_inlines_an_impl_style_extension_declared_in_the_current_file() {
         let conversion = css_conversion_of(
-            "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\nfun button_style(color: Color): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.gap(space(2))\n\t\t.align_items(AlignItems::Center)\n\t\t.radius(Length::px(4))\n\t\t.color(color)\n}\n",
+            "import std::web::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\nfun button_style(color: Color): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.gap(space(2))\n\t\t.align_items(AlignItems::Center)\n\t\t.radius(Length::px(4))\n\t\t.color(color)\n}\n",
         )
         .expect("kolt's `button_style` shape converts");
         assert!(!conversion.0, "chain -> block");
@@ -12150,7 +12167,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_follows_one_current_file_extension_into_another_and_stops_at_a_statement() {
         let conversion = css_conversion_of(
-            "import std::style::{ Color, Display, FlexDirection, Length, Style, style };\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n\n\tfun ghost(self): Style {\n\t\tself.raw(\"pointer-events\", \"none\").flex_row()\n\t}\n\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n\nfun card(): Style {\n\tsty~le()\n\t\t.ghost()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            "import std::web::style::{ Color, Display, FlexDirection, Length, Style, style };\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n\n\tfun ghost(self): Style {\n\t\tself.raw(\"pointer-events\", \"none\").flex_row()\n\t}\n\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n\nfun card(): Style {\n\tsty~le()\n\t\t.ghost()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
         )
         .expect("a delegating extension converts");
         assert_eq!(
@@ -12173,10 +12190,10 @@ pub(crate) mod tests {
     #[test]
     fn refactor_inlines_an_impl_style_extension_from_a_sibling_file() {
         let conversion = css_conversion_across(
-            "import std::style::{ Display, FlexDirection, Length, Style, style };\nimport pkg::theme;\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\nfun button_style(): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            "import std::web::style::{ Display, FlexDirection, Length, Style, style };\nimport pkg::theme;\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\nfun button_style(): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n\t\t.raw(\"outline\", \"none\")\n}\n",
             &[(
                 "theme.vl",
-                "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n",
+                "import std::web::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n",
             )],
         )
         .expect("a chain reaching a sibling's extension converts");
@@ -12194,9 +12211,9 @@ pub(crate) mod tests {
     // `word-spacing` in the buffer; the conversion must write the buffer's.
     #[test]
     fn refactor_inlines_a_siblings_unsaved_impl_style_body() {
-        const SAVED: &str = "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n";
-        const UNSAVED: &str = "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"word-spacing\", Length::px(2))\n\t}\n}\n";
-        let source = "import std::style::{ Length, Style, style };\nimport pkg::theme;\n\n\
+        const SAVED: &str = "import std::web::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n";
+        const UNSAVED: &str = "import std::web::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"word-spacing\", Length::px(2))\n\t}\n}\n";
+        let source = "import std::web::style::{ Length, Style, style };\nimport pkg::theme;\n\n\
              fun button_style(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n}\n";
         let offset = source.find('~').expect("fixture needs a `~` cursor");
         let text = source.replace('~', "");
@@ -12227,10 +12244,10 @@ pub(crate) mod tests {
     #[test]
     fn refactor_splits_at_a_sibling_extension_whose_body_is_not_a_chain() {
         let conversion = css_conversion_across(
-            "import std::style::{ Color, Length, Style, style };\nimport pkg::theme;\n\nfun card(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            "import std::web::style::{ Color, Length, Style, style };\nimport pkg::theme;\n\nfun card(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
             &[(
                 "theme.vl",
-                "import std::style::{ Color, Style };\n\nimpl Style {\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n",
+                "import std::web::style::{ Color, Style };\n\nimpl Style {\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n",
             )],
         )
         .expect("the convertible prefix converts");
@@ -12267,7 +12284,7 @@ pub(crate) mod tests {
         assert_eq!(css_conversion("\tsty~le()\n\t\t.class_list()\n"), None);
         assert_eq!(
             css_conversion_of(
-                "import std::style::{ Style, style };\n\nimpl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\nfun card(): Style {\n\tsty~le()\n\t\t.select_off()\n}\n",
+                "import std::web::style::{ Style, style };\n\nimpl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\nfun card(): Style {\n\tsty~le()\n\t\t.select_off()\n}\n",
             ),
             None
         );
@@ -12294,7 +12311,7 @@ pub(crate) mod tests {
     // The refusals, each about meaning rather than shape. A comment's
     // attachment is not recoverable across the reshape (the S3 printer refuses
     // to reorder a commented block for the same reason), and a declaration with
-    // SEVERAL arguments has a chain twin that names `std::style::piece` — a
+    // SEVERAL arguments has a chain twin that names `std::web::style::piece` — a
     // name ambient inside a block and nowhere else, so the chain this wrote
     // would not resolve in the file it landed in.
     //
@@ -12645,8 +12662,7 @@ pub(crate) mod tests {
         ])
     }
 
-    const F27_UNDECLARED: &str =
-        "import std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+    const F27_UNDECLARED: &str = "import std::web::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
 
     #[test]
     fn f27_a_declared_module_is_analyzed_as_declared_over_the_default_entry() {
@@ -14153,11 +14169,11 @@ pub(crate) mod tests {
     }
 
     // A manifest-less scratch file gets its platform INFERRED from its imports:
-    // `std::dom` marks it a browser file, so reaching `std::fs` colors.
+    // `std::web::dom` marks it a browser file, so reaching `std::fs` colors.
     #[test]
     fn an_inferred_browser_file_colors_without_a_manifest() {
         let document = Document::analyze(
-            "import std::dom;\nimport std::fs;\n\nfun main() {\n\tlet present = fs::stat(\"marker\");\n}\n",
+            "import std::web::dom;\nimport std::fs;\n\nfun main() {\n\tlet present = fs::stat(\"marker\");\n}\n",
             &std_root(),
             Path::new("scratch.vl"),
         );
@@ -14239,15 +14255,15 @@ pub(crate) mod tests {
     }
 
     // B36: a shared (non-entry) file in a two-entry package importing a name
-    // only the PROCESS twin of `std::ui` declares (`render`). The old
-    // inference read any `std::ui` import as browser evidence, analyzed the
+    // only the PROCESS twin of `std::web::ui` declares (`render`). The old
+    // inference read any `std::web::ui` import as browser evidence, analyzed the
     // file as browser, and red-flagged the import — while `vilan build` was
     // clean on every entry. Name-level evidence infers Node here.
     #[test]
     fn a_shared_file_importing_the_process_twins_name_is_not_red_flagged() {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
-        let shared = "import std::ui::{ view, View, render };\n\nfun page_markup(): str {\n\trender(view(\"main\").text(\"hi\"))\n}\n";
+        let shared = "import std::web::ui::{ view, View, render };\n\nfun page_markup(): str {\n\trender(view(\"main\").text(\"hi\"))\n}\n";
         let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
         let (dir, _client) = analyze_workspace(&[
             ("src/client.vl", entry),
@@ -14277,7 +14293,7 @@ pub(crate) mod tests {
     fn a_shared_file_importing_the_browser_twins_name_still_infers_browser() {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
-        let shared = "import std::ui::{ view, View, mount };\n\nfun attach() {\n\tmount(\"app\", view(\"main\").text(\"hi\"));\n}\n";
+        let shared = "import std::web::ui::{ view, View, mount };\n\nfun attach() {\n\tmount(\"app\", view(\"main\").text(\"hi\"));\n}\n";
         let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
         let (dir, _client) = analyze_workspace(&[
             ("src/client.vl", entry),
@@ -14302,7 +14318,7 @@ pub(crate) mod tests {
 
     // F27 R2: MEMBER evidence, for the file B36's name rule cannot decide. The
     // owner's `lib/conditional_value.vl` imports `Region`, `Row` and `Slot` —
-    // every one of them declared by BOTH `std::ui` twins — so there is no name
+    // every one of them declared by BOTH `std::web::ui` twins — so there is no name
     // to weigh, and the file went to the process twin, where `region.anchor` is
     // not a field. What it DOES with those names is the evidence: `anchor` is
     // declared by the browser twin and by nothing on the process side.
@@ -14310,8 +14326,7 @@ pub(crate) mod tests {
     fn a_shared_file_reading_a_browser_only_member_infers_browser() {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
-        let shared =
-            "import std::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+        let shared = "import std::web::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
         let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
         let (dir, _client) = analyze_workspace(&[
             ("src/client.vl", entry),
@@ -14342,8 +14357,7 @@ pub(crate) mod tests {
     fn a_shared_file_reading_a_process_only_member_stays_on_the_process_twin() {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
-        let shared =
-            "import std::ui::Region;\n\nfun parent_of(region: Region) {\n\tregion.parent;\n}\n";
+        let shared = "import std::web::ui::Region;\n\nfun parent_of(region: Region) {\n\tregion.parent;\n}\n";
         let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
         let (dir, _client) = analyze_workspace(&[
             ("src/client.vl", entry),
@@ -14367,7 +14381,7 @@ pub(crate) mod tests {
     }
 
     // And member evidence is weighed only for a TWIN module the file imports:
-    // a file that imports no `std::ui` at all, and reads `.anchor` off its own
+    // a file that imports no `std::web::ui` at all, and reads `.anchor` off its own
     // struct, is not browser-coloured by the name of a field.
     #[test]
     fn a_member_name_off_a_users_own_type_is_not_platform_evidence() {
@@ -14424,13 +14438,13 @@ pub(crate) mod tests {
 
     /// A module using the BROWSER `View`'s `element` field: clean under
     /// `browser`, "no field 'element'" under any process target.
-    const BROWSER_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
+    const BROWSER_ONLY_MODULE: &str = "import std::web::ui::{ View, view };\n\n\
          fun attach(): View {\n\tlet root = view(\"div\");\n\t\
          root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
 
     /// The mirror: the PROCESS `View`'s `tag`. Clean under node, red under
     /// `browser`.
-    const PROCESS_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
+    const PROCESS_ONLY_MODULE: &str = "import std::web::ui::{ View, view };\n\n\
          fun markup(): str {\n\tlet root = view(\"div\");\n\troot.tag\n}\n";
 
     #[test]
@@ -14494,7 +14508,7 @@ pub(crate) mod tests {
         let (dir, shared) = analyze_workspace(&[
             (
                 "src/shared.vl",
-                "import std::ui::{ View, view };\n\n\
+                "import std::web::ui::{ View, view };\n\n\
                  fun labelled(text: str): str {\n\tlet root = view(text);\n\troot.tag\n}\n",
             ),
             ("vilan.toml", &fullstack_package("server")),
@@ -15204,7 +15218,7 @@ pub(crate) mod tests {
         // is suppressed. The fixture builds UI outside a boundary, so analysis
         // reports the owner fence — tokens are computed regardless, which is
         // itself the salvage property the markup pass relies on.
-        let text = "import std::ui::{ view, View };\n\nfun page(): View {\n\t<div aria-label(\"x\")>\"hi\" <span/></div>\n}\n";
+        let text = "import std::web::ui::{ view, View };\n\nfun page(): View {\n\t<div aria-label(\"x\")>\"hi\" <span/></div>\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let tokens = document.semantic_tokens();
         let kind_of = |snippet: &str, occurrence: usize| -> Option<TokenKind> {
@@ -15262,7 +15276,7 @@ pub(crate) mod tests {
     // time, so the `>` is out of its reach the moment it leaves the tag's line.
     #[test]
     fn a_multi_line_element_head_paints_what_a_one_line_head_paints() {
-        let prelude = "import std::ui::{ view, View };\n\nfun page(): View {\n";
+        let prelude = "import std::web::ui::{ view, View };\n\nfun page(): View {\n";
         let one_line =
             format!("{prelude}\t<div aria-label(\"x\") on:click(handle)>\"hi\"</div>\n}}\n");
         let multi_line = format!(
@@ -15302,7 +15316,7 @@ pub(crate) mod tests {
         // outer `style()`, at the `css` keyword, so the missing-import note can
         // underline the word that asked for a `Style` — is suppressed here,
         // exactly as `<div`'s Function token is.
-        let text = "import std::style::{ Color, Style, space, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tflex-direction(\"column\");\n\t\tgap(space(4));\n\t\t--brand-ink(Color::gray(900));\n\t\t.md {\n\t\t\tcolor(Color::gray(50));\n\t\t}\n\t}\n}\n";
+        let text = "import std::web::style::{ Color, Style, space, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tflex-direction(\"column\");\n\t\tgap(space(4));\n\t\t--brand-ink(Color::gray(900));\n\t\t.md {\n\t\t\tcolor(Color::gray(50));\n\t\t}\n\t}\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let tokens = document.semantic_tokens();
         let kind_of = |snippet: &str, occurrence: usize| -> Option<TokenKind> {
@@ -15367,7 +15381,7 @@ pub(crate) mod tests {
     #[test]
     fn linked_tag_ranges_pair_open_and_close() {
         let text =
-            "import std::ui::{ view, View };\n\nfun page(): View {\n\t<div>\"hi\"</div>\n}\n";
+            "import std::web::ui::{ view, View };\n\nfun page(): View {\n\t<div>\"hi\"</div>\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let open_at = text.find("<div").expect("fixture") + 1;
         let (open, close) = document.linked_tag_ranges(open_at).expect("a pair");
@@ -15378,7 +15392,7 @@ pub(crate) mod tests {
         let close_at = close.start + 1;
         assert_eq!(document.linked_tag_ranges(close_at), Some((open, close)));
         // A self-closing element has no pair; elsewhere in the file, none.
-        let solo = "import std::ui::{ view, View };\n\nfun page(): View {\n\t<div />\n}\n";
+        let solo = "import std::web::ui::{ view, View };\n\nfun page(): View {\n\t<div />\n}\n";
         let document = Document::analyze(solo, &std_root(), Path::new("test.vl"));
         let at = solo.find("<div").expect("fixture") + 1;
         assert_eq!(document.linked_tag_ranges(at), None);
@@ -17982,7 +17996,7 @@ pub(crate) mod tests {
             (
                 "src/main.vl",
                 "import pkg::marks;\n\
-                 import std::style::{ Style, style };\n\
+                 import std::web::style::{ Style, style };\n\
                  fun card(): Style {\n\tcss {\n\t\t.|\n\t}\n}\n",
             ),
             (
@@ -18246,7 +18260,7 @@ pub(crate) mod tests {
             "import std::io::print;\n\
              import std::reactive::{ Signal, SignalCell };\n\
              import std::result::Result;\n\
-             import std::ui::view;\n\
+             import std::web::ui::view;\n\
              struct Note { id: i32, text: str }\n\
              struct NotesClient { }\n\
              impl NotesClient {\n\
@@ -18594,7 +18608,7 @@ pub(crate) mod tests {
     // --- E67: an element's opening tag (editing-dx.md §18) ------------------
 
     /// The prelude the element-head pins share.
-    const ELEMENT_HEAD_PRELUDE: &str = "import std::ui::view;\nimport std::reactive::{ Signal, SignalCell };\nimport std::io::print;\n";
+    const ELEMENT_HEAD_PRELUDE: &str = "import std::web::ui::view;\nimport std::reactive::{ Signal, SignalCell };\nimport std::io::print;\n";
 
     fn element_head_completions(body: &str) -> Vec<String> {
         completions_at_marker(
@@ -18877,7 +18891,7 @@ pub(crate) mod tests {
     // E69's ruling that says what did NOT change.
     #[test]
     fn an_unknown_attribute_name_is_never_refused() {
-        let source = "import std::ui::view;\nimport std::io::print;\n\
+        let source = "import std::web::ui::view;\nimport std::io::print;\n\
              fun main() {\n\t\
              let card = <div data-tip(\"hello\") aria-nonesuch(\"x\") wibble(\"y\")></div>;\n\t\
              print(\"built\");\n\t\
@@ -18899,7 +18913,7 @@ pub(crate) mod tests {
 
     /// The prelude the `css`-block pins share.
     const CSS_BLOCK_PRELUDE: &str =
-        "import std::style::{ Color, Length, Style, space, style };\nimport std::io::print;\n";
+        "import std::web::style::{ Color, Length, Style, space, style };\nimport std::io::print;\n";
 
     fn css_block_completions(body: &str) -> Vec<String> {
         completions_at_marker(
@@ -19064,8 +19078,8 @@ pub(crate) mod tests {
     // same analyzed impl table, so the popup finds it with no extra reading.
     #[test]
     fn e183_the_dotted_head_reaches_a_sibling_files_impl_style() {
-        let source = "import std::style::{ Style, style };\nimport pkg::theme;\n\nfun card() {\n\tlet card = css {\n\t\t.~\n\t};\n}\n";
-        let sibling = "import std::style::{ Style, style };\n\nexport impl Style {\n\tfun themed(self): Style {\n\t\tself.raw(\"color\", \"red\")\n\t}\n}\n";
+        let source = "import std::web::style::{ Style, style };\nimport pkg::theme;\n\nfun card() {\n\tlet card = css {\n\t\t.~\n\t};\n}\n";
+        let sibling = "import std::web::style::{ Style, style };\n\nexport impl Style {\n\tfun themed(self): Style {\n\t\tself.raw(\"color\", \"red\")\n\t}\n}\n";
         let offset = source.find('~').expect("a cursor");
         let text = source.replace('~', "");
         let (directory, document) = analyze_workspace(&[("main.vl", &text), ("theme.vl", sibling)]);
@@ -19371,7 +19385,7 @@ pub(crate) mod tests {
     #[test]
     fn css_completion_fires_inside_an_element_head_argument() {
         let source = format!(
-            "{CSS_BLOCK_PRELUDE}import std::ui::view;\n\nfun main() {{\n\t<div .styled(css {{ disp~ }})></div>;\n}}\n"
+            "{CSS_BLOCK_PRELUDE}import std::web::ui::view;\n\nfun main() {{\n\t<div .styled(css {{ disp~ }})></div>;\n}}\n"
         );
         let labels = completions_at_marker(&source, '~');
         assert!(
@@ -20255,12 +20269,12 @@ pub(crate) mod tests {
     // `code_path_completions` used to read only the identifier ending at the
     // `::`, so `style::FlexDirection::` saw `FlexDirection` — a MEMBER of
     // `style`, never a binding — and answered nothing. The import arm has
-    // always descended (`import std::style::FlexDirection::` → four variants);
+    // always descended (`import std::web::style::FlexDirection::` → four variants);
     // these hold the code arm to the same reach, with E53's in-scope rooting
     // still deciding the HEAD.
 
     // The owner's own case, spelled the way kolt spells it: a `prelude`
-    // manifest puts `std::web`'s names in scope, so `style` is a module
+    // manifest puts `std::web::prelude`'s names in scope, so `style` is a module
     // reachable with no import — and the path descends into the enum from
     // there.
     #[test]
@@ -20272,7 +20286,7 @@ pub(crate) mod tests {
             ),
             (
                 "vilan.toml",
-                "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n[entry.main]\ntarget = \"browser\"\n",
+                "[package]\nname = \"probe\"\nprelude = \"std::web::prelude\"\n\n[entry.main]\ntarget = \"browser\"\n",
             ),
         ]);
         assert!(
@@ -20290,7 +20304,7 @@ pub(crate) mod tests {
     #[test]
     fn an_import_selector_completes_subjects_then_the_blocks_members() {
         let subjects = completions_at_cursor(
-            "import std::style::{ (impl |
+            "import std::web::style::{ (impl |
 ",
         );
         assert!(
@@ -20302,7 +20316,7 @@ pub(crate) mod tests {
             "and not a member of one, which is a level deeper: {subjects:?}"
         );
         let members = completions_at_cursor(
-            "import std::style::{ (impl Length)::|
+            "import std::web::style::{ (impl Length)::|
 ",
         );
         assert!(
@@ -20320,7 +20334,7 @@ pub(crate) mod tests {
     #[test]
     fn nested_code_path_completion_descends_an_imported_std_module() {
         let labels = completions_at_cursor(
-            "import std::style;\n\nfun main() {\n\tlet d = style::FlexDirection::|\n}\n",
+            "import std::web::style;\n\nfun main() {\n\tlet d = style::FlexDirection::|\n}\n",
         );
         assert!(
             labels.contains(&"Row".to_string()) && labels.contains(&"ColumnReverse".to_string()),
@@ -20502,7 +20516,7 @@ pub(crate) mod tests {
     // the set an import through this module can bind.
     #[test]
     fn import_descends_into_a_structs_statics() {
-        let labels = completions_at_cursor("import std::style::Length::|\nfun main() {}\n");
+        let labels = completions_at_cursor("import std::web::style::Length::|\nfun main() {}\n");
         assert!(
             labels.contains(&"rem".to_string()) && labels.contains(&"px".to_string()),
             "a struct's statics are importable: {labels:?}"
@@ -22065,7 +22079,7 @@ pub(crate) mod tests {
     fn organize_keeps_a_view_import_used_only_by_markup() {
         let (dir, document) = analyze_workspace(&[(
             "main.vl",
-            "import std::ui::view;\nfun page() {\n\t<div>\"hi\"</div>\n}\n",
+            "import std::web::ui::view;\nfun page() {\n\t<div>\"hi\"</div>\n}\n",
         )]);
         assert!(
             document.diagnostics.is_empty(),
@@ -22099,7 +22113,7 @@ pub(crate) mod tests {
 
     // --- E180: the organizer broke kolt's generated `src/lucide/lib.vl` -----
     //
-    // Under `prelude = "std::web"` the file's two imports are both redundant
+    // Under `prelude = "std::web::prelude"` the file's two imports are both redundant
     // with the prelude (rule (0), and correct — the file checks clean with both
     // deleted), but E168's rescue then rewrote them, and `import std::option;`
     // bound the module name `option` over the file's own `fun option()` icon:
@@ -22111,7 +22125,7 @@ pub(crate) mod tests {
     /// The web prelude, which is what kolt's own manifest declares: it is the
     /// prelude that binds `Option`/`Some`/`None`, `View`/`view`, and the two
     /// ambient MODULES (`style`, `ui`) R9's third subtraction is about.
-    const WEB_PRELUDE_MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n[entry.main]\ntarget = \"browser\"\n";
+    const WEB_PRELUDE_MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web::prelude\"\n\n[entry.main]\ntarget = \"browser\"\n";
 
     // E180 pin (a). The kolt shape at its smallest: the prelude binds `Option`,
     // so the import is redundant and rule (0) prunes the leaf — and the module
@@ -22182,19 +22196,19 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // E180 pin (c) — R9's third subtraction, RULED 2026-09-14. `std::web` says
-    // `export import pkg::ui;`, so `std::ui` is loaded for EVERY file of the
+    // E180 pin (c) — R9's third subtraction, RULED 2026-09-14. `std::web::prelude` says
+    // `export import pkg::ui;`, so `std::web::ui` is loaded for EVERY file of the
     // package and its impls are there whatever this file imports. `view("div")
     // .child(..)` is a receiver-syntax use of a member declared in `ui.vl`, so
     // without the subtraction the rescue fires and writes
-    // `import std::ui::{ (impl View) };` into the file — redundant, and (kolt's
+    // `import std::web::ui::{ (impl View) };` into the file — redundant, and (kolt's
     // estate) into every file of an application. With it the statement goes.
     #[test]
     fn organize_strips_a_ui_import_the_prelude_module_itself_reexports() {
         let (dir, document) = analyze_workspace(&[
             (
                 "main.vl",
-                "import std::ui::{ View, view };\n\nfun page(): View {\n\tview(\"div\").child(view(\"p\"))\n}\n",
+                "import std::web::ui::{ View, view };\n\nfun page(): View {\n\tview(\"div\").child(view(\"p\"))\n}\n",
             ),
             ("vilan.toml", WEB_PRELUDE_MANIFEST),
         ]);
@@ -22211,7 +22225,7 @@ pub(crate) mod tests {
             organized(&document).expect("both leaves are prelude-redundant"),
             // E186: the opening paragraph's separator goes with it.
             "fun page(): View {\n\tview(\"div\").child(view(\"p\"))\n}\n",
-            "`std::ui` is ambient under this prelude — rescuing it as a \
+            "`std::web::ui` is ambient under this prelude — rescuing it as a \
              selector is redundant, not protective",
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -23392,14 +23406,19 @@ fun main() {
         let single = analyze_workspace(&[("main.vl", "fun main() {}\n")]);
         let nested = e152_workspace();
         for (label, (dir, document), expected) in [
-            ("a single-file package", single, Vec::new()),
+            // A154: std's own bodiless namespace `js` — every program loads
+            // `std::js::null` and `std::js::promise` (core primitives), so its
+            // directory node exists. It is the same kind (a namespace node a
+            // child path minted, attributed to the entry because a directory
+            // has no file), not a second one.
+            ("a single-file package", single, vec!["js"]),
             // B335: `lib` is NOT one of these — it has a body file
             // (`lib/lib.vl`) and reports it. It used to appear here because a
             // module reached first as the parent NAMESPACE of `lib::ui` kept
             // the entry-attributed placeholder range its namespace node was
             // minted with, even after its body loaded and adopted the node. The
             // set is now exactly what the name says: directories with no body.
-            ("nested bodiless directories", nested, vec!["ui"]),
+            ("nested bodiless directories", nested, vec!["js", "ui"]),
         ] {
             let program = document.program.as_ref().expect("program");
             let mut namespaces: Vec<&str> = Vec::new();
@@ -29342,7 +29361,7 @@ mod builder_chain_member_completion {
     fn a_builder_chain_inside_an_element_head_argument_offers_the_receivers_members() {
         for (spelling, prelude) in [("unannotated", UNANNOTATED), ("annotated", ANNOTATED)] {
             let source = format!(
-                "import std::ui::view;\n{prelude}fun main() {{\n\
+                "import std::web::ui::view;\n{prelude}fun main() {{\n\
                  \t<div\n\
                  \t\t.on(Handler::new()\n\
                  \t\t\t.on_drag(|| {{}})\n\
@@ -29544,7 +29563,7 @@ mod stale_receiver_member_completion {
     /// kolt's own manifest shape: the web prelude puts `style`, `View` and the
     /// element vocabulary in scope with no import, which is what makes the
     /// reported buffer the buffer it is.
-    const MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n\
+    const MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web::prelude\"\n\n\
          [entry.main]\ntarget = \"browser\"\n";
 
     /// The LANDED text: the attribute holds a plain binding.
@@ -30054,7 +30073,7 @@ mod dead_item_paint_tests {
                 ),
                 (
                     "src/ui.vl",
-                    "import std::ui::{ View, view };\n\n\
+                    "import std::web::ui::{ View, view };\n\n\
                      [platform(\"browser\")]\n\
                      fun mount(): View {\n\tview(\"div\")\n}\n\n\
                      [platform(\"browser\")]\n\
@@ -30853,7 +30872,7 @@ mod hint_abbreviation_tests {
     #[test]
     fn inlay_hint_abbreviates_a_transient_seal_as_its_transient_source() {
         let text = "import std::reactive::{ Flow, Pipe, SignalCell, Source };\n\
-             import std::transient::{ Transient, TransientSource };\n\n\
+             import std::reactive::transient::{ Transient, TransientSource };\n\n\
              async fun double(x: i32): i32 {\n\tx * 2\n}\n\n\
              fun main() {\n\tlet id = SignalCell::new(1);\n\
              \tlet loaded = id.derive(|x: i32| async double(x)).transient();\n\

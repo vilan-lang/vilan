@@ -3821,7 +3821,7 @@ fn owning_package(file: &Path) -> Result<Option<(PathBuf, Manifest)>, String> {
 /// Before this, an explicit file built a `Unit` with **no** `package_dir`, so the
 /// manifest was never read in file mode — and every answer that depends on it
 /// was a lie the user could not see. Three, measured: a package already on
-/// `prelude = "std::web"` was steered to "set `prelude = \"std::web\"`", the edit
+/// `prelude = "std::web::prelude"` was steered to "set `prelude = \"std::web::prelude\"`", the edit
 /// it had already made; `prelude = false` was silently ineffective, so a name the
 /// package removed still resolved; and a manifest the validator refuses passed
 /// file-mode check wordlessly while directory mode failed the build on it.

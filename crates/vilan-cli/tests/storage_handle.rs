@@ -1,6 +1,6 @@
-//! The `std::storage` handle's runtime gate (tracker A57).
+//! The `std::web::storage` handle's runtime gate (tracker A57).
 //!
-//! `std::storage` shipped as six free functions over the two host stores, with
+//! `std::web::storage` shipped as six free functions over the two host stores, with
 //! a missing key flattened to `""`. That is right for a one-key read and wrong
 //! for the three things an app doing anything larger needs: counting the store,
 //! walking its keys, and asking whether a key is present at all — the last of
@@ -114,10 +114,10 @@ fn build_and_run(tag: &str, app: &str, harness: &str) -> String {
 /// is `empty` — a key stored as `""` — because it is the one case where `has`
 /// and `get` disagree with the six free functions, and the reason the handle
 /// exists at all.
-const EVERY_METHOD: &str = r#"import std::dom::window;
+const EVERY_METHOD: &str = r#"import std::web::dom::window;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
-import std::storage;
+import std::web::storage;
 
 fun main() {
 	let store = window().local_storage();
@@ -253,10 +253,10 @@ done();
 /// one — and the six free functions still address `localStorage` /
 /// `sessionStorage` exactly as they did, flattening a missing key to `""`. The
 /// handle is an addition, not a replacement.
-const TWO_STORES: &str = r#"import std::dom::window;
+const TWO_STORES: &str = r#"import std::web::dom::window;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
-import std::storage;
+import std::web::storage;
 
 fun main() {
 	let local = window().local_storage();
@@ -355,10 +355,10 @@ done();
 /// mishandles: an empty store answers `[]`, and `keys()` is a SNAPSHOT, so a
 /// removal after the call does not change the list already in hand.
 const KEYS_ENUMERATION: &str = r#"import std::display::Display;
-import std::dom::window;
+import std::web::dom::window;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
-import std::storage;
+import std::web::storage;
 
 fun main() {
 	let store = window().local_storage();

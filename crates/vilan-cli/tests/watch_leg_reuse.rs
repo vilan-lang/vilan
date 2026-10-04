@@ -223,7 +223,7 @@ fn build_artifact_dependent_fixture(dir: &Path) {
     write(
         dir,
         "server.vl",
-        "import std::asset;\nimport std::io::print;\n\n\
+        "import std::web::asset;\nimport std::io::print;\n\n\
          let BUNDLE = const asset::read(\"dist/client.js\");\n\n\
          fun main() {\n\tprint(BUNDLE);\n}\n",
     );
@@ -428,7 +428,7 @@ fn build_bundling_fixture(dir: &Path) {
     write(
         dir,
         "src/client.vl",
-        "import std::asset::bundle;\nimport std::io::print;\n\n\
+        "import std::web::asset::bundle;\nimport std::io::print;\n\n\
          const {\n\tbundle(\"static/font/body.woff2\");\n\tbundle(\"static/robots.txt\");\n};\n\n\
          fun main() {\n\tprint(\"client\");\n}\n",
     );

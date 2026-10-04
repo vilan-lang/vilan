@@ -4,7 +4,7 @@
 //!
 //! # Why this is the right gate
 //!
-//! It needs no new oracle. `ssr_differential` proves a second `std::ui`
+//! It needs no new oracle. `ssr_differential` proves a second `std::web::ui`
 //! implementation by compiling one program two ways and comparing bytes; this
 //! is the same shape applied to a BACKEND rather than to a platform, and the
 //! corpus it runs over is the one the whole project already trusts to say what
@@ -333,7 +333,7 @@ const B510_PROBE: &str = concat!(
 
 const B498_PROBE: &str = concat!(
     "import std::default::Default;\n",
-    "import std::delta::IntoFlow;\n",
+    "import std::reactive::delta::IntoFlow;\n",
     "import std::io::print;\n",
     "\n",
     "trait Fresh<T> {\n",
@@ -467,7 +467,7 @@ const B467_PROBE: &str = concat!(
 const RC_PROBE: &str = concat!(
     "import std::io::print;\n",
     "import std::shared::Shared;\n",
-    "import std::delta::ListCell;\n",
+    "import std::reactive::delta::ListCell;\n",
     "\n",
     "struct P { x: i32, tags: List<i32> }\n",
     "\n",
@@ -1112,20 +1112,20 @@ const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[];
 /// surface S1a has none of. Written as a support list so Order 38 widens the
 /// corpus by deleting rows rather than by rewriting the walk.
 const PLATFORM_MODULES: &[&str] = &[
-    "std::dom",
+    "std::web::dom",
     "std::fetch",
     "std::fs",
     "std::http",
     "std::db",
     "std::rpc",
-    "std::ui",
-    "std::web",
-    "std::storage",
-    "std::router",
-    "std::dev",
+    "std::web::ui",
+    "std::web::prelude",
+    "std::web::storage",
+    "std::web::router",
+    "std::web::dev",
     "std::canvas",
     "std::process",
-    "std::asset",
+    "std::web::asset",
     "std::build",
     "std::task",
     "std::time",
@@ -3313,7 +3313,7 @@ const A146_PROBE: &str = concat!(
     "import std::io::print;\n",
     "import std::option::Option::{ self, None, Some };\n",
     "import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, derive };\n",
-    "import std::delta::ListCell;\n",
+    "import std::reactive::delta::ListCell;\n",
     "import std::rpc::{ KeyedCell, Keyed };\n",
     "import std::shared::Shared;\n",
     "\n",
@@ -4472,7 +4472,7 @@ fn the_kolt_shapes_lowering_gaps_build_the_same_on_both_backends() {
 }
 
 const KOLT_LOWERING_PROBE: &str = concat!(
-    "import std::asset;\n",
+    "import std::web::asset;\n",
     "import std::io::print;\n",
     "import std::option::Option::{ self, None, Some };\n",
     "\n",
@@ -5630,7 +5630,7 @@ const BIGINT_TRAP_PROBE: &str = concat!(
     "}\n",
 );
 
-/// **F18 slice 3's two seams**: node:crypto's SHA-1 behind `std::rpc_server`'s
+/// **F18 slice 3's two seams**: node:crypto's SHA-1 behind `std::rpc::server`'s
 /// `ws_accept_key`, and `std::time`'s host clock — the two host bindings, beside
 /// F33's `Bytes`, that stood between `Server::builder()` and the native backend.
 ///
@@ -5667,7 +5667,7 @@ fn the_websocket_accept_key_and_the_host_clock_agree_on_both_backends() {
 
 const SEAMS_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::rpc_server::ws_accept_key;\n",
+    "import std::rpc::server::ws_accept_key;\n",
     "import std::time::{ now, now_millis };\n",
     "\n",
     "fun main() {\n",
@@ -8234,7 +8234,7 @@ const F58_TOY_PROBE: &str = concat!(
 
 const F58_LIST_CELL_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::delta::ListCell;\n",
+    "import std::reactive::delta::ListCell;\n",
     "import std::reactive::{ Disposable, Source };\n",
     "\n",
     "fun watch<S: Source<List<str>>>(source: S) {\n",

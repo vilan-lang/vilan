@@ -139,7 +139,7 @@ class StubElement {
         notifyMutation();
         return child;
     }
-    // A71: `appendChild`'s positional counterpart. `std::ui`'s `Region`
+    // A71: `appendChild`'s positional counterpart. `std::web::ui`'s `Region`
     // plants an empty text node and inserts its content BEFORE it, so a
     // reactive run keeps its place among static siblings.
     insertBefore(child, anchor) {
@@ -323,7 +323,7 @@ class StubElement {
 }
 
 /// A text node — a real sibling of the element children: what a `str` or a
-/// `Source<str>` child rides, and what `std::ui`'s `Region` plants (empty) as
+/// `Source<str>` child rides, and what `std::web::ui`'s `Region` plants (empty) as
 /// the anchor it inserts before (A71).
 class StubText {
     constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
@@ -343,7 +343,7 @@ class StubText {
 }
 
 /// A document fragment — a staging container whose CHILDREN move when it is
-/// inserted (A91). `std::ui` builds a row in one of these and plants the whole
+/// inserted (A91). `std::web::ui` builds a row in one of these and plants the whole
 /// thing with a single `insertBefore`, which is how content of an unknown
 /// shape reaches a position that is not the parent's end.
 class StubFragment {
@@ -379,7 +379,7 @@ class StubFragment {
     render() { return this.children.map(c => c.render()).join(""); }
 }
 
-/// A DOM range, reduced to the one thing `std::ui` asks of it: cut every node
+/// A DOM range, reduced to the one thing `std::web::ui` asks of it: cut every node
 /// between two sibling markers out of the document in one call (A91). A row's
 /// node set is not fixed — a row that is itself a `when` or an `each` grows
 /// after it was placed — so "move this row" is a span between markers rather

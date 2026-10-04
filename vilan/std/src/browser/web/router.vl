@@ -1,4 +1,4 @@
-// `std::router` — history-API routing (proposal/router.md, backlog A10).
+// `std::web::router` — history-API routing (proposal/router.md, backlog A10).
 //
 // The model: routes are an ENUM, not pattern strings — the URL is a wire format for
 // a typed value. An app declares its route space as (nested) enums, writes an
@@ -12,12 +12,12 @@
 // VALUE (`Routable`), so every link's path comes from the enum. Only available when
 // building for the browser.
 
-import pkg::dom::{ Event, window };
 import pkg::hash_map::HashMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{ FlushPolicy, SignalCell, turn };
 import pkg::shared::Shared;
-import pkg::ui::{ View, chunk_failure, chunk_pending, view };
+import pkg::web::dom::{ Event, window };
+import pkg::web::ui::{ View, chunk_failure, chunk_pending, view };
 
 /// `history.pushState(state, title, path)` — state and title are unused ("").
 [extern("history.pushState")]
@@ -59,7 +59,7 @@ export let wired: Shared<bool> = Shared::new(false);
 
 /// Wire the singleton once: read the current location and subscribe
 /// back/forward. A `popstate` is a DOM event, so it dispatches inside a fresh
-/// turn exactly as `View.on` does — `std::dom`'s window verbs are raw, like
+/// turn exactly as `View.on` does — `std::web::dom`'s window verbs are raw, like
 /// `element.on`, so the turn wrapper is the caller's (`proposal/router.md`
 /// §5.1). The subscription is deliberately never removed: the path singleton
 /// lives as long as the program.
@@ -304,15 +304,15 @@ export impl View {
 	/// Sets the `href`, clears the drag arming (B293 — see `link`), and
 	/// intercepts exactly the plain left-click.
 	///
-	/// It lives here rather than in `std::ui` because it is routing, not view
-	/// building: it needs `Routable` and `navigate`, and `std::ui` knows
+	/// It lives here rather than in `std::web::ui` because it is routing, not view
+	/// building: it needs `Routable` and `navigate`, and `std::web::ui` knows
 	/// nothing about either. `link` IS this method plus an anchor, which is
 	/// the honest relation between the two.
 	///
 	/// `|event|` is UNANNOTATED, and the annotation it used to carry was a
 	/// workaround: a process build analyzes this browser module to color the
 	/// program, and the process `View::on_event` takes a generic `|E| void` (a
-	/// server layer cannot name `std::dom::Event`), which the call froze into
+	/// server layer cannot name `std::web::dom::Event`), which the call froze into
 	/// the closure parameter before `plain_left_click(event)` below could pin
 	/// it. B304 closed that (the slot is left open when the expectation is the
 	/// callee's own unbound generic), so the body says what it means.

@@ -50,7 +50,7 @@ fn build_writes_assets_beside_the_output() {
         &dir,
         "app.vl",
         r#"import std::io::print;
-import std::asset::emit;
+import std::web::asset::emit;
 
 fun base(): i32 {
 	emit("css", ".pA3{padding:1rem}");
@@ -106,7 +106,7 @@ fn a_kind_colliding_with_the_build_namespace_never_reaches_the_filesystem() {
     // which is the part that cannot be inferred from a green analyzer — the
     // fence has to bite before the flush, not merely before the exit code.
     let dir = temp_project("owned_kind");
-    let source = "import std::io::print;\nimport std::asset::emit;\n\nfun clobber(): i32 {\n\temit(\"vl\", \"CLOBBERED\");\n\t1\n}\n\nlet _c = const clobber();\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    let source = "import std::io::print;\nimport std::web::asset::emit;\n\nfun clobber(): i32 {\n\temit(\"vl\", \"CLOBBERED\");\n\t1\n}\n\nlet _c = const clobber();\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
     write(&dir, "app.vl", source);
     let entry = dir.join("app.vl");
     let output = vilan(&["build", entry.to_str().unwrap()]);
@@ -144,7 +144,7 @@ fn routes_program(spelling: &str, contributions: &[(&str, &str)]) -> String {
         })
         .collect::<String>();
     format!(
-        "import std::io::print;\nimport std::asset::{spelling};\n\nfun outputs(): i32 {{\n{calls}\t1\n}}\n\nlet _o = const outputs();\n\nfun main() {{\n\tprint(\"routes\");\n}}\nmain();\n"
+        "import std::io::print;\nimport std::web::asset::{spelling};\n\nfun outputs(): i32 {{\n{calls}\t1\n}}\n\nlet _o = const outputs();\n\nfun main() {{\n\tprint(\"routes\");\n}}\nmain();\n"
     )
 }
 
@@ -214,7 +214,7 @@ fn kind_program(kinds: &[(&str, &str)]) -> String {
         .map(|(kind, line)| format!("\temit(\"{kind}\", \"{line}\");\n"))
         .collect::<String>();
     format!(
-        "import std::io::print;\nimport std::asset::emit;\n\nfun outputs(): i32 {{\n\temit(\"css\", \".k{{color:red}}\");\n{extra}\t1\n}}\n\nlet _o = const outputs();\n\nfun main() {{\n\tprint(\"kinds\");\n}}\nmain();\n"
+        "import std::io::print;\nimport std::web::asset::emit;\n\nfun outputs(): i32 {{\n\temit(\"css\", \".k{{color:red}}\");\n{extra}\t1\n}}\n\nlet _o = const outputs();\n\nfun main() {{\n\tprint(\"kinds\");\n}}\nmain();\n"
     )
 }
 
@@ -387,7 +387,7 @@ fn a_workspace_node_leg_kind_that_stops_emitting_is_pruned_from_dist() {
         "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
     );
     write(&dir, "src/client.vl", "fun main() {}\n");
-    let with_routes = "import std::asset::emit;\n\nfun routes(): i32 {\n\temit(\"routes\", \"GET /health\");\n\t1\n}\n\nlet _r = const routes();\n\nfun main() {}\n";
+    let with_routes = "import std::web::asset::emit;\n\nfun routes(): i32 {\n\temit(\"routes\", \"GET /health\");\n\t1\n}\n\nlet _r = const routes();\n\nfun main() {}\n";
     write(&dir, "src/server.vl", with_routes);
     let output = vilan(&["build", dir.to_str().unwrap()]);
     assert!(
@@ -449,7 +449,7 @@ fn a_watch_round_prunes_a_kind_that_stopped_emitting_from_dist() {
     write(
         &dir,
         "src/server.vl",
-        "import std::io::print;\nimport std::asset::emit;\n\nfun routes(): i32 {\n\temit(\"routes\", \"GET /health\");\n\t1\n}\n\nlet _r = const routes();\n\nfun main() {\n\tprint(\"srv\");\n}\n",
+        "import std::io::print;\nimport std::web::asset::emit;\n\nfun routes(): i32 {\n\temit(\"routes\", \"GET /health\");\n\t1\n}\n\nlet _r = const routes();\n\nfun main() {\n\tprint(\"srv\");\n}\n",
     );
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
@@ -496,11 +496,11 @@ fn a_watch_round_reruns_the_finalisers_of_what_it_recompiled_and_retains_the_res
     write(
         &dir,
         "src/client.vl",
-        "import std::asset::{ emit, schedule_at_end };\n\nfun flush_client() {\n\temit(\"probe\", \"client-flush\");\n}\n\nfun register(): i32 {\n\tschedule_at_end(flush_client);\n\t1\n}\n\nlet _r = const register();\n\nfun main() {}\n",
+        "import std::web::asset::{ emit, schedule_at_end };\n\nfun flush_client() {\n\temit(\"probe\", \"client-flush\");\n}\n\nfun register(): i32 {\n\tschedule_at_end(flush_client);\n\t1\n}\n\nlet _r = const register();\n\nfun main() {}\n",
     );
     let server = |line: &str| {
         format!(
-            "import std::io::print;\nimport std::asset::{{ emit, schedule_at_end }};\n\nfun flush_server() {{\n\temit(\"probe\", \"{line}\");\n}}\n\nfun register(): i32 {{\n\tschedule_at_end(flush_server);\n\t1\n}}\n\nlet _r = const register();\n\nfun main() {{\n\tprint(\"srv\");\n}}\n"
+            "import std::io::print;\nimport std::web::asset::{{ emit, schedule_at_end }};\n\nfun flush_server() {{\n\temit(\"probe\", \"{line}\");\n}}\n\nfun register(): i32 {{\n\tschedule_at_end(flush_server);\n\t1\n}}\n\nlet _r = const register();\n\nfun main() {{\n\tprint(\"srv\");\n}}\n"
         )
     };
     write(&dir, "src/server.vl", &server("server-flush-one"));
@@ -540,7 +540,7 @@ fn a_watch_round_reruns_the_finalisers_of_what_it_recompiled_and_retains_the_res
 /// spawn under `--watch` and kill).
 fn quick_exit_program(marker: &str) -> String {
     format!(
-        "import std::io::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"css\", \".{marker}{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\nmain();\n"
+        "import std::io::print;\nimport std::web::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"css\", \".{marker}{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\nmain();\n"
     )
 }
 
@@ -582,7 +582,7 @@ fn workspace_run_writes_fresh_dist_css() {
     write(
         &dir,
         "src/client.vl",
-        "import std::io::print;\nimport std::asset::emit;\n\nfun styles(): i32 {\n\temit(\"css\", \".ws{margin:0}\");\n\t1\n}\n\nlet _s = const styles();\n\nfun main() {\n\tprint(\"ui\");\n}\n",
+        "import std::io::print;\nimport std::web::asset::emit;\n\nfun styles(): i32 {\n\temit(\"css\", \".ws{margin:0}\");\n\t1\n}\n\nlet _s = const styles();\n\nfun main() {\n\tprint(\"ui\");\n}\n",
     );
     write(
         &dir,

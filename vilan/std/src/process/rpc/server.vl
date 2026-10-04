@@ -1,4 +1,4 @@
-// `std::rpc_server` — the server half of `std::rpc`, mounted on `std::http`:
+// `std::rpc::server` — the server half of `std::rpc`, mounted on `std::http`:
 // where a protocol (a frame handler) meets a real listening socket. The client
 // halves live in platform-neutral `std::rpc` (`HttpTransport`, `connect_split`);
 // this module is their process-layer counterpart, and the two must agree on the

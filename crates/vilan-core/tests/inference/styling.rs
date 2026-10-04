@@ -1,4 +1,4 @@
-//! `std::style` and the styling arc (A8/A22/A23/W11, the relation axis, the
+//! `std::web::style` and the styling arc (A8/A22/A23/W11, the relation axis, the
 //! declaration block, typed `raw`), plus the Kolt-migration std packages
 //! (`crypto`, `db`, storage, `router`).
 //!
@@ -7,7 +7,7 @@
 
 use crate::support::*;
 
-// --- A8: std::style — typed atomic styles, compiled ---------------------------
+// --- A8: std::web::style — typed atomic styles, compiled ---------------------------
 // The styling system riding const evaluation and the asset channel
 // (proposal/ui-styling.md): builder-chain construction inside `const`, atomic
 // rules with content-hashed class names, per-property last-wins merge,
@@ -17,7 +17,7 @@ use crate::support::*;
 fn a_style_emits_atomic_rules_and_theme_vars() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun card(): Style {
             style().padding(space(4))
         }
@@ -50,7 +50,7 @@ fn last_wins_within_a_chain() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun padded(): Style {
             style().padding(space(4)).padding(space(6))
         }
@@ -72,7 +72,7 @@ fn add_merges_per_property_right_wins() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space, Style, Color };
+        import std::web::style::{ style, space, Style, Color };
         fun base(): Style {
             style().padding(space(4)).background(Color::gray(50))
         }
@@ -96,7 +96,7 @@ fn extend_with_override_is_a_property_method_on_a_style() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun main() {
             let base = const style().padding(space(4));
             let bigger = const base.padding(space(6));
@@ -113,7 +113,7 @@ fn extend_with_override_is_a_property_method_on_a_style() {
 fn hover_emits_a_pseudo_rule() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().hover(style().background(Color::gray(100)))
         }
@@ -134,7 +134,7 @@ fn hover_emits_a_pseudo_rule() {
 fn breakpoints_wrap_media_and_stack_with_pseudo() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().md(style().hover(style().padding(space(6))))
         }
@@ -164,7 +164,7 @@ fn breakpoints_wrap_media_and_stack_with_pseudo() {
 fn within_prefixes_the_ancestor_guard() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().within("data-theme", Some("dark"), style().background(Color::gray(900)))
         }
@@ -188,7 +188,7 @@ fn within_prefixes_the_ancestor_guard() {
 fn within_stacks_over_a_pseudo_class() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().within("data-theme", Some("dark"), style().hover(style().background(Color::gray(700))))
         }
@@ -212,7 +212,7 @@ fn within_stacks_over_a_pseudo_class() {
 fn a_breakpoint_wraps_within_over_a_pseudo_class() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().md(style().within("data-theme", Some("dark"), style().hover(style().padding(space(6)))))
         }
@@ -237,7 +237,7 @@ fn a_breakpoint_wraps_within_over_a_pseudo_class() {
 fn a_pseudo_class_cannot_wrap_within() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().hover(style().within("data-theme", Some("dark"), style().background(Color::gray(700))))
         }
@@ -258,7 +258,7 @@ fn a_pseudo_class_cannot_wrap_within() {
 fn within_cannot_wrap_within() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().within("data-theme", Some("dark"), style().within("data-theme", Some("dim"), style().background(Color::gray(700))))
         }
@@ -279,7 +279,7 @@ fn within_cannot_wrap_within() {
 fn within_cannot_wrap_a_breakpoint() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().within("data-theme", Some("dark"), style().md(style().padding(space(6))))
         }
@@ -302,7 +302,7 @@ fn within_cannot_wrap_a_breakpoint() {
 fn within_validates_its_name_and_value() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().within("data theme", Some("dark"), style().background(Color::gray(700)))
         }
@@ -325,7 +325,7 @@ fn within_validates_its_name_and_value() {
 fn a_pseudo_class_cannot_wrap_a_pseudo_class() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().hover(style().focus(style().background(Color::gray(700))))
         }
@@ -346,7 +346,7 @@ fn a_pseudo_class_cannot_wrap_a_pseudo_class() {
 fn a_breakpoint_cannot_wrap_a_breakpoint() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().md(style().lg(style().padding(space(6))))
         }
@@ -372,7 +372,7 @@ fn a_breakpoint_cannot_wrap_a_breakpoint() {
 fn composing_conditions_leaves_the_uncomposed_class_names_untouched() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().background(Color::gray(50)).hover(style().background(Color::gray(100)))
         }
@@ -393,7 +393,7 @@ fn composing_conditions_leaves_the_uncomposed_class_names_untouched() {
 fn an_unknown_scale_step_fails_the_build() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().padding(space(37))
         }
@@ -414,7 +414,7 @@ fn an_unknown_scale_step_fails_the_build() {
 fn an_unknown_ramp_step_fails_the_build() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().background(Color::gray(55))
         }
@@ -435,7 +435,7 @@ fn an_unknown_ramp_step_fails_the_build() {
 fn runtime_style_construction_is_rejected() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun main() {
             let card = style().padding(space(4));
         }
@@ -454,7 +454,7 @@ fn runtime_style_construction_is_rejected() {
 fn length_units_render_their_css() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         fun s(): Style {
             style()
                 .width(Length::px(37))
@@ -500,7 +500,7 @@ fn length_units_render_their_css() {
 fn the_demanded_properties_emit_their_declarations() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style, Color, Length, Position, UserSelect, WhiteSpace };
+        import std::web::style::{ style, space, Style, Color, Length, Position, UserSelect, WhiteSpace };
         fun s(): Style {
             style()
                 .position(Position::Absolute)
@@ -557,7 +557,7 @@ fn the_demanded_properties_emit_their_declarations() {
 fn the_new_keyword_enums_cover_every_variant() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, UserSelect, WhiteSpace };
+        import std::web::style::{ style, Style, UserSelect, WhiteSpace };
         fun space_variants(): Style {
             style()
                 .white_space(WhiteSpace::Normal)
@@ -607,7 +607,7 @@ fn the_new_keyword_enums_cover_every_variant() {
 fn border_color_is_its_own_slot_so_a_hover_can_recolour_a_border() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun s(): Style {
             style()
                 .border(Length::px(1), Color::gray(300))
@@ -643,7 +643,7 @@ fn border_color_is_its_own_slot_so_a_hover_can_recolour_a_border() {
 fn alpha_colours_render_their_css() {
     let assets = collected_assets(
         r##"
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun s(): Style {
             style()
                 .background(Color::rgba(27, 6, 13, 0.9))
@@ -682,7 +682,7 @@ fn alpha_colours_render_their_css() {
 fn gradients_paint_the_background_image_slot() {
     let assets = collected_assets(
         r##"
-        import std::style::{ style, Style, Color, Gradient, RadialExtent };
+        import std::web::style::{ style, Style, Color, Gradient, RadialExtent };
         fun linear(): Style {
             style()
                 .background(Color::gray(50))
@@ -750,7 +750,7 @@ fn gradients_paint_the_background_image_slot() {
 fn the_border_family_emits_one_declaration_per_edge() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun s(): Style {
             style()
                 .border_top(Length::px(1), Color::gray(300))
@@ -790,7 +790,7 @@ fn the_border_family_emits_one_declaration_per_edge() {
 fn border_none_replaces_the_border_slot_rather_than_racing_it() {
     let program = r#"
         import std::io::print;
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun cleared(): Style {
             style().border(Length::px(1), Color::gray(300)).border_none()
         }
@@ -818,7 +818,7 @@ fn border_none_replaces_the_border_slot_rather_than_racing_it() {
 fn the_typed_methods_mint_the_rules_their_raw_sites_did() {
     let source = r#"
         import std::io::print;
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         fun escaped(): Style {
             style()
                 .raw("border", "none")
@@ -867,7 +867,7 @@ fn the_typed_methods_mint_the_rules_their_raw_sites_did() {
 fn the_box_edges_emit_their_longhands() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style, Length };
+        import std::web::style::{ style, space, Style, Length };
         fun s(): Style {
             style()
                 .padding_top(space(2))
@@ -910,7 +910,7 @@ fn the_box_edges_emit_their_longhands() {
 fn the_display_enum_covers_every_variant() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Display };
+        import std::web::style::{ style, Style, Display };
         fun s(): Style {
             style()
                 .display(Display::Flex)
@@ -953,7 +953,7 @@ fn out_of_range_colour_values_fail_the_build() {
     for (source, expected) in [
         (
             r#"
-            import std::style::{ style, Style, Color };
+            import std::web::style::{ style, Style, Color };
             fun s(): Style { style().background(Color::rgba(300, 0, 0, 0.5)) }
             let _s = const s();
             fun main() {}
@@ -963,7 +963,7 @@ fn out_of_range_colour_values_fail_the_build() {
         ),
         (
             r#"
-            import std::style::{ style, Style, Color };
+            import std::web::style::{ style, Style, Color };
             fun s(): Style { style().background(Color::rgba(0, 0, 0, 1.5)) }
             let _s = const s();
             fun main() {}
@@ -973,7 +973,7 @@ fn out_of_range_colour_values_fail_the_build() {
         ),
         (
             r#"
-            import std::style::{ style, Style, Color };
+            import std::web::style::{ style, Style, Color };
             fun s(): Style { style().color(Color::gray(500).alpha(-0.2)) }
             let _s = const s();
             fun main() {}
@@ -983,7 +983,7 @@ fn out_of_range_colour_values_fail_the_build() {
         ),
         (
             r#"
-            import std::style::{ style, Style, Color, Gradient };
+            import std::web::style::{ style, Style, Color, Gradient };
             fun s(): Style {
                 style().background_gradient(Gradient::linear(90.0).stop(Color::black(), 0.0))
             }
@@ -1008,7 +1008,7 @@ fn out_of_range_colour_values_fail_the_build() {
 fn identical_rules_deduplicate_across_styles() {
     let assembled = assembled_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun a(): Style {
             style().padding(space(4))
         }
@@ -1074,7 +1074,7 @@ fn a_longhand_after_a_shorthand_wins_by_emission_order() {
     // '*' (0x2A) sorting before '.' (0x2E).
     let css = style_css(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().padding(space(4)).padding_top(space(0))
         }
@@ -1106,7 +1106,7 @@ fn a_longhand_after_a_shorthand_keeps_both_classes() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun main() {
             let boxed = const style().padding(space(4)).padding_top(space(0));
             print(boxed.class_list().split(" ").len());
@@ -1125,7 +1125,7 @@ fn a_shorthand_after_a_longhand_clears_the_whole_family() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun main() {
             let boxed = const style().padding_top(space(0)).padding(space(4));
             let plain = const style().padding(space(4));
@@ -1144,7 +1144,7 @@ fn the_axis_methods_resolve_against_the_shorthand_too() {
     // slots the edge methods do, so it resolves identically.
     let css = style_css(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().padding(space(4)).padding_x(space(6))
         }
@@ -1168,7 +1168,7 @@ fn border_and_border_colour_resolve_by_authoring_order() {
     // set after it wins on order, and a `border` set after a colour clears it.
     let css = style_css(
         r#"
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun s(): Style {
             style().border(Length::px(1), Color::gray(300)).border_color(Color::blue(600))
         }
@@ -1191,7 +1191,7 @@ fn border_and_border_colour_resolve_by_authoring_order() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun main() {
             let framed = const style()
                 .border_color(Color::blue(600))
@@ -1213,7 +1213,7 @@ fn a_merge_resolves_a_family_the_way_a_chain_does() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun main() {
             let base = const style().border(Length::px(1), Color::gray(300));
             // Right side narrows the family: both survive, the colour outranks.
@@ -1238,7 +1238,7 @@ fn a_condition_never_clears_the_base_family() {
     // either way round).
     let css = style_css(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun shorthand_under_within(): Style {
             style().padding_top(space(0)).within("data-theme", Some("dark"), style().padding(space(4)))
         }
@@ -1283,7 +1283,7 @@ fn a_condition_never_clears_the_base_family() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun main() {
             let themed = const style().padding_top(space(0)).within("data-theme", Some("dark"), style().padding(space(4)));
             print(themed.class_list().split(" ").len());
@@ -1300,7 +1300,7 @@ fn the_marker_keeps_the_media_bands_intact() {
     // marker never appears in, and the marker orders rules INSIDE a block.
     let css = style_css(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().sm(style().padding(space(2))).lg(style().padding(space(3)))
         }
@@ -1336,7 +1336,7 @@ fn raw_belongs_to_its_property_s_family() {
     // `status_line`: a zeroed box with one edge pushed to `auto`.
     let css = style_css(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().margin(space(0)).raw("margin-left", "auto")
         }
@@ -1361,7 +1361,7 @@ fn raw_belongs_to_its_property_s_family() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun main() {
             let pushed = const style().raw("margin-left", "auto").raw("margin", "0");
             print(pushed.class_list().contains(" "));
@@ -1380,7 +1380,7 @@ fn every_family_in_the_table_is_marked_and_its_longhands_are_not() {
     // note had missed.
     let css = style_css(
         r##"
-        import std::style::{ style, space, Style, Color, Length };
+        import std::web::style::{ style, space, Style, Color, Length };
         fun boxes(): Style {
             style().padding(space(4)).margin(space(6)).inset(space(0))
         }
@@ -1435,7 +1435,7 @@ fn a_border_edge_survives_the_family_it_narrows() {
     // a `border` set after it clears it — the same pair of rules one level in.
     let css = style_css(
         r#"
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun s(): Style {
             style().border(Length::px(1), Color::gray(300)).border_top(Length::px(2), Color::blue(600))
         }
@@ -1455,7 +1455,7 @@ fn a_border_edge_survives_the_family_it_narrows() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun main() {
             let framed = const style()
                 .border_top(Length::px(2), Color::blue(600))
@@ -1483,7 +1483,7 @@ fn a_border_edge_survives_the_family_it_narrows() {
 fn the_a23_value_surfaces_emit_their_declarations() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         fun s(): Style {
             style()
                 .inset(Length::zero())
@@ -1525,7 +1525,7 @@ fn the_a23_value_surfaces_emit_their_declarations() {
 fn calc_still_wraps_and_raw_does_not() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         fun s(): Style {
             style()
                 .width(Length::calc("100% - 2rem"))
@@ -1560,7 +1560,7 @@ fn line_height_length_shares_the_line_height_slot() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         fun main() {
             let unitless_last = const style().line_height_length(Length::px(24)).line_height(1.5);
             let length_last = const style().line_height(1.5).line_height_length(Length::px(24));
@@ -1581,7 +1581,7 @@ fn background_image_and_background_gradient_share_one_slot() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, Color, Gradient, RadialExtent };
+        import std::web::style::{ style, Style, Color, Gradient, RadialExtent };
         fun main() {
             let painted = const style()
                 .background_gradient(
@@ -1607,7 +1607,7 @@ fn background_image_and_background_gradient_share_one_slot() {
 fn the_new_background_slots_are_longhands_of_their_family() {
     let css = style_css(
         r##"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().raw("background", "#180509").background_image("url(a.png)").background_size("cover")
         }
@@ -1636,7 +1636,7 @@ fn the_new_background_slots_are_longhands_of_their_family() {
     assert_compiles_and_runs(
         r##"
         import std::io::print;
-        import std::style::{ style };
+        import std::web::style::{ style };
         fun main() {
             let reset = const style()
                 .background_image("url(a.png)")
@@ -1659,7 +1659,7 @@ fn a_blank_css_escape_fails_the_build() {
     for (source, expected) in [
         (
             r#"
-            import std::style::{ style, Style, Length };
+            import std::web::style::{ style, Style, Length };
             fun s(): Style { style().width(Length::raw("")) }
             let _s = const s();
             fun main() {}
@@ -1669,7 +1669,7 @@ fn a_blank_css_escape_fails_the_build() {
         ),
         (
             r#"
-            import std::style::{ style, Style, Length };
+            import std::web::style::{ style, Style, Length };
             fun s(): Style { style().width(Length::calc("   ")) }
             let _s = const s();
             fun main() {}
@@ -1679,7 +1679,7 @@ fn a_blank_css_escape_fails_the_build() {
         ),
         (
             r#"
-            import std::style::{ style, Style };
+            import std::web::style::{ style, Style };
             fun s(): Style { style().background_image("") }
             let _s = const s();
             fun main() {}
@@ -1689,7 +1689,7 @@ fn a_blank_css_escape_fails_the_build() {
         ),
         (
             r#"
-            import std::style::{ style, Style };
+            import std::web::style::{ style, Style };
             fun s(): Style { style().background_size("") }
             let _s = const s();
             fun main() {}
@@ -1715,7 +1715,7 @@ fn a_blank_css_escape_fails_the_build() {
 fn the_website_background_sites_convert_with_the_shipped_value_types() {
     let assets = collected_assets(
         r##"
-        import std::style::{ style, Style, Color, Gradient, RadialExtent };
+        import std::web::style::{ style, Style, Color, Gradient, RadialExtent };
         // art.vl:92 — `background: #EB682E`, 8 of the 20 solid sites.
         fun literal_hex(): Style { style().background(Color::hex("#EB682E")) }
         // art.vl:55 — `background: rgba(27, 6, 13, 0.88)`, the other 12.
@@ -1783,7 +1783,7 @@ fn the_website_background_sites_convert_with_the_shipped_value_types() {
 fn converting_a_background_shorthand_to_a_longhand_keeps_authoring_order() {
     let css = style_css(
         r##"
-        import std::style::{ style, Style, Color, Gradient, RadialExtent };
+        import std::web::style::{ style, Style, Color, Gradient, RadialExtent };
         // An UNconverted base under a converted override: the raw shorthand is
         // marked and sorts first, so the gradient still wins.
         fun half_converted(): Style {
@@ -1814,7 +1814,7 @@ fn converting_a_background_shorthand_to_a_longhand_keeps_authoring_order() {
     assert_compiles_and_runs(
         r##"
         import std::io::print;
-        import std::style::{ style, Color, Gradient, RadialExtent };
+        import std::web::style::{ style, Color, Gradient, RadialExtent };
         fun main() {
             let converted = const style()
                 .background(Color::hex("#180509"))
@@ -1840,7 +1840,7 @@ fn converting_a_background_shorthand_to_a_longhand_keeps_authoring_order() {
 fn the_two_value_padding_sites_compose_from_the_axis_methods() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         // playground_page.vl:147 — `padding: 8px 20px`.
         fun s(): Style {
             style().padding_y(Length::px(8)).padding_x(Length::px(20))
@@ -1868,7 +1868,7 @@ fn the_two_value_padding_sites_compose_from_the_axis_methods() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space, Length };
+        import std::web::style::{ style, space, Length };
         fun main() {
             let boxed = const style()
                 .padding_y(Length::px(8))
@@ -1895,7 +1895,7 @@ fn the_two_value_padding_sites_compose_from_the_axis_methods() {
 fn size_writes_the_width_and_height_slots() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         fun s(): Style {
             style().size(Length::rem(1.0))
         }
@@ -1920,7 +1920,7 @@ fn a_height_after_size_narrows_by_last_wins() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         fun main() {
             let squared = const style().size(Length::rem(1.0)).height(Length::rem(2.0));
             print(squared.class_list().split(" ").len());
@@ -1939,7 +1939,7 @@ fn a_height_after_size_narrows_by_last_wins() {
 fn color_var_references_without_declaring() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style()
                 .background(Color::var("--accent"))
@@ -1974,7 +1974,7 @@ fn color_var_references_without_declaring() {
 fn a_custom_property_reference_without_its_dashes_fails_the_build() {
     for program in [
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().background(Color::var("button-color"))
         }
@@ -1983,7 +1983,7 @@ fn a_custom_property_reference_without_its_dashes_fails_the_build() {
         main();
         "#,
         r#"
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         fun s(): Style {
             style().width(Length::var("w"))
         }
@@ -2007,7 +2007,7 @@ fn a_custom_property_reference_without_its_dashes_fails_the_build() {
 fn a_custom_property_named_only_dashes_fails_the_build() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().background(Color::var("--"))
         }
@@ -2030,7 +2030,7 @@ fn a_custom_property_named_only_dashes_fails_the_build() {
 fn a_custom_property_name_with_a_delimiter_fails_the_build() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().background(Color::var("--button color"))
         }
@@ -2053,7 +2053,7 @@ fn a_custom_property_name_with_a_delimiter_fails_the_build() {
 fn a_dashed_custom_property_reference_still_renders() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Color, Length };
+        import std::web::style::{ style, Style, Color, Length };
         fun s(): Style {
             style()
                 .background(Color::var("--button-color"))
@@ -2080,7 +2080,7 @@ fn a_dashed_custom_property_reference_still_renders() {
 fn oklch_emits_the_number_form() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style()
                 .background(Color::oklch(0.62, 0.19, 313.0))
@@ -2109,7 +2109,7 @@ fn oklch_emits_the_number_form() {
 fn an_oklch_lightness_outside_the_unit_range_fails_the_build() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().background(Color::oklch(62.0, 0.19, 313.0))
         }
@@ -2130,7 +2130,7 @@ fn an_oklch_lightness_outside_the_unit_range_fails_the_build() {
 fn an_oklch_chroma_outside_its_range_fails_the_build() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().background(Color::oklch(0.62, 0.7, 313.0))
         }
@@ -2153,7 +2153,7 @@ fn an_oklch_chroma_outside_its_range_fails_the_build() {
 fn an_oklch_hue_outside_the_canonical_turn_fails_the_build() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().background(Color::oklch(0.62, 0.19, 700.0))
         }
@@ -2182,7 +2182,7 @@ fn an_oklch_hue_outside_the_canonical_turn_fails_the_build() {
 fn an_attribute_condition_selects_on_the_element_itself() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().attribute("data-open", Some("true"), style().opacity(0.5))
         }
@@ -2206,7 +2206,7 @@ fn an_attribute_condition_selects_on_the_element_itself() {
 fn an_attribute_condition_wraps_a_pseudo_class() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().attribute("data-open", Some("true"), style().hover(style().opacity(0.8)))
         }
@@ -2229,7 +2229,7 @@ fn an_attribute_condition_wraps_a_pseudo_class() {
 fn within_wraps_an_attribute_condition() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().within("data-theme", Some("dark"), style().attribute("data-open", Some("true"), style().opacity(0.8)))
         }
@@ -2253,7 +2253,7 @@ fn within_wraps_an_attribute_condition() {
 fn all_four_condition_axes_compose_outside_in() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().md(style().within("data-theme", Some("dark"), style().attribute(
                 "data-open",
@@ -2281,7 +2281,7 @@ fn all_four_condition_axes_compose_outside_in() {
 fn an_attribute_cannot_wrap_a_media_conditioned_style() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().attribute("data-open", Some("true"), style().md(style().padding(space(6))))
         }
@@ -2302,7 +2302,7 @@ fn an_attribute_cannot_wrap_a_media_conditioned_style() {
 fn an_attribute_cannot_wrap_within() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().attribute("data-open", Some("true"), style().within("data-theme", Some("dark"), style().background(Color::gray(700))))
         }
@@ -2324,7 +2324,7 @@ fn an_attribute_cannot_wrap_within() {
 fn a_pseudo_class_cannot_wrap_an_attribute_condition() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().hover(style().attribute("data-open", Some("true"), style().background(Color::gray(700))))
         }
@@ -2346,7 +2346,7 @@ fn a_pseudo_class_cannot_wrap_an_attribute_condition() {
 fn an_attribute_cannot_wrap_an_attribute_condition() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().attribute(
                 "data-open",
@@ -2374,7 +2374,7 @@ fn an_attribute_cannot_wrap_an_attribute_condition() {
 fn an_attribute_name_with_a_delimiter_fails_the_build() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().attribute("data open", Some("true"), style().opacity(0.5))
         }
@@ -2395,7 +2395,7 @@ fn an_attribute_name_with_a_delimiter_fails_the_build() {
 fn an_attribute_value_with_a_quote_fails_the_build() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().attribute("data-open", Some("tr\"ue"), style().opacity(0.5))
         }
@@ -2420,7 +2420,7 @@ fn attribute_slots_merge_per_condition_and_property() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun main() {
             let togged = const style()
                 .attribute("data-open", Some("true"), style().opacity(0.5))
@@ -2445,8 +2445,8 @@ fn ssr_renders_attribute_conditioned_classes() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, Color };
-        import std::ui::{ view, render };
+        import std::web::style::{ style, Style, Color };
+        import std::web::ui::{ view, render };
         fun main() {
             let disclosure = const style()
                 .color(Color::gray(700))
@@ -2478,7 +2478,7 @@ fn ssr_renders_attribute_conditioned_classes() {
 fn an_attribute_condition_with_no_value_selects_on_presence() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().attribute("data-selected", None, style().opacity(0.5))
         }
@@ -2498,7 +2498,7 @@ fn an_attribute_condition_with_no_value_selects_on_presence() {
     // form is a second condition rather than a reinterpretation of the first.
     let exact = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().attribute("data-selected", Some("true"), style().opacity(0.5))
         }
@@ -2522,7 +2522,7 @@ fn an_attribute_condition_with_no_value_selects_on_presence() {
 fn an_ancestor_guard_with_no_value_selects_on_presence() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().within("data-print", None, style().opacity(0.5))
         }
@@ -2548,7 +2548,7 @@ fn a_negated_attribute_condition_composes_with_a_pseudo_class() {
     // hovered AND not disabled, with the negation on the condition it negates.
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, attribute, hover };
+        import std::web::style::{ style, Style, attribute, hover };
         fun s(): Style {
             style().on(attribute("disabled").not() + hover(), style().opacity(0.8))
         }
@@ -2569,7 +2569,7 @@ fn a_negated_attribute_condition_composes_with_a_pseudo_class() {
 fn a_negated_pseudo_class_renders_as_not() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, hover };
+        import std::web::style::{ style, Style, hover };
         fun s(): Style {
             style().on(hover().not(), style().opacity(0.8))
         }
@@ -2593,7 +2593,7 @@ fn a_negated_ancestor_guard_opens_the_line_with_a_colon() {
     // rules instead of after them (A89's one recorded band move, unchanged).
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, attribute, within };
+        import std::web::style::{ style, Style, attribute, within };
         fun s(): Style {
             style().on(within(attribute("data-theme").eq("dark")).not(), style().opacity(0.8))
         }
@@ -2618,7 +2618,7 @@ fn a_negated_ancestor_guard_opens_the_line_with_a_colon() {
 fn a_negated_attribute_rule_outranks_the_plain_pseudo_rule() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, attribute, hover };
+        import std::web::style::{ style, Style, attribute, hover };
         fun s(): Style {
             style()
                 .on(hover(), style().opacity(0.9))
@@ -2658,7 +2658,7 @@ fn a_css_block_head_takes_a_condition_set() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, attribute, hover };
+        import std::web::style::{ style, Style, attribute, hover };
         fun main() {
             let chain = const style()
                 .on(attribute("disabled").not() + hover(), style().raw("color", "red"));
@@ -2682,7 +2682,7 @@ fn a_css_block_head_takes_a_condition_set() {
 fn the_not_marker_is_retired() {
     assert_fails(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().not(style().opacity(0.5))
         }
@@ -2709,7 +2709,7 @@ fn a_double_negation_on_a_condition_fails_the_build() {
 fn a_pseudo_class_name_cannot_forge_the_negation_marker() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().pseudo("!hover", style().opacity(0.5))
         }
@@ -2734,7 +2734,7 @@ fn a_negated_condition_is_its_own_slot() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, attribute };
+        import std::web::style::{ style, Style, attribute };
         fun main() {
             let both = const style()
                 .on(attribute("disabled"), style().opacity(0.5))
@@ -2755,7 +2755,7 @@ fn a_negated_condition_is_its_own_slot() {
 fn a_child_relation_steers_a_conditioned_inner_to_attribute_and_to_the_set() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().children(style().hover(style().opacity(0.5)))
         }
@@ -2797,7 +2797,7 @@ fn a_child_relation_steers_a_conditioned_inner_to_attribute_and_to_the_set() {
 fn children_emits_a_layered_child_combinator() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().children(style().margin_top(space(2)))
         }
@@ -2818,7 +2818,7 @@ fn children_emits_a_layered_child_combinator() {
 fn divide_emits_the_layered_not_first_child_refinement() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().divide(style().margin_top(space(4)))
         }
@@ -2845,7 +2845,7 @@ fn relation_slots_merge_per_relation_and_property() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun main() {
             // same relation, same property, twice: ONE slot, last wins —
             // byte-identical to writing only the last call
@@ -2883,7 +2883,7 @@ fn relation_slots_merge_per_relation_and_property() {
 fn a_breakpoint_wraps_a_child_relation() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().md(style().children(style().gap(space(2))))
         }
@@ -2908,7 +2908,7 @@ fn a_breakpoint_wraps_a_child_relation() {
 fn the_family_marker_orders_a_shorthand_inside_the_layer() {
     let css = style_css(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().children(style().padding(space(4)).padding_top(space(0)))
         }
@@ -2939,7 +2939,7 @@ fn the_family_marker_orders_a_shorthand_inside_the_layer() {
 fn a_within_rule_sorts_after_the_pseudo_band() {
     let css = style_css(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style()
                 .hover(style().background(Color::gray(100)))
@@ -2987,7 +2987,7 @@ fn a_within_rule_sorts_after_the_pseudo_band() {
 fn a_child_relation_takes_an_unconditioned_style() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().children(style().hover(style().background(Color::gray(700))))
         }
@@ -3008,7 +3008,7 @@ fn a_child_relation_takes_an_unconditioned_style() {
 fn divide_takes_an_unconditioned_style() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().divide(style().attribute("data-open", Some("true"), style().opacity(0.5)))
         }
@@ -3029,7 +3029,7 @@ fn divide_takes_an_unconditioned_style() {
 fn a_child_relation_cannot_wrap_a_breakpoint() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().children(style().md(style().padding(space(6))))
         }
@@ -3050,7 +3050,7 @@ fn a_child_relation_cannot_wrap_a_breakpoint() {
 fn within_cannot_wrap_a_child_relation() {
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().within("data-theme", Some("dark"), style().children(style().margin_top(space(2))))
         }
@@ -3067,7 +3067,7 @@ fn within_cannot_wrap_a_child_relation() {
     );
 }
 
-// --- kolt.local 032: the declaration block (std::style::declare) ---------------
+// --- kolt.local 032: the declaration block (std::web::style::declare) ---------------
 // The generic form of the escape hatch apps were hand-rolling: a set of
 // declarations under an author-chosen selector, straight into the const-only
 // CSS channel. It mints NO class, produces no `Style`, touches no slot key and
@@ -3094,7 +3094,7 @@ fn a_declaration_block_emits_its_selector_and_declarations() {
     // the one line, so the surgery has nothing left to do.
     let assets = collected_assets(
         r##"
-        import std::style::{ declare, declarations, Color };
+        import std::web::style::{ declare, declarations, Color };
         fun theme(id: str) {
             declare(
                 i"[data-theme=\"{id}\"]",
@@ -3125,7 +3125,7 @@ fn a_declaration_block_mints_no_class() {
     // nothing for a slot key or a class name to be.
     let css = style_css(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun reset() {
             declare("*", declarations().raw("box-sizing", "border-box"));
         }
@@ -3144,7 +3144,7 @@ fn a_declaration_block_leaves_the_atomic_sheet_byte_identical() {
     // stylesheets are equal BYTE FOR BYTE — same class names, same rules, same
     // order. A declaration block adds; it never moves anything.
     const STYLED: &str = r##"
-        import std::style::{ style, space, Color, Style };
+        import std::web::style::{ style, space, Color, Style };
         fun card(): Style {
             style().padding(space(4)).color(Color::gray(700)).hover(style().color(Color::gray(900)))
         }
@@ -3153,7 +3153,7 @@ fn a_declaration_block_leaves_the_atomic_sheet_byte_identical() {
     let without = style_css(&format!("{STYLED}\nfun main() {{}}\nmain();\n"));
     let with = style_css(&format!(
         r##"{STYLED}
-        import std::style::{{ declare, declarations }};
+        import std::web::style::{{ declare, declarations }};
         fun theme() {{
             declare(":root", declarations().raw("--color-ink", "#fafafa"));
         }}
@@ -3180,7 +3180,7 @@ fn preflight_emits_its_reset_only_when_the_program_asks_for_it() {
     // EMITS, so the request is a call and the opt-out is its absence — there is
     // no build flag, no `Document` option, and nothing to switch off.
     const STYLED: &str = r##"
-        import std::style::{ style, space, Color, Style };
+        import std::web::style::{ style, space, Color, Style };
         fun card(): Style {
             style().padding(space(4)).color(Color::gray(700))
         }
@@ -3194,7 +3194,7 @@ fn preflight_emits_its_reset_only_when_the_program_asks_for_it() {
 
     let with = style_css(&format!(
         r##"{STYLED}
-        import std::style::preflight;
+        import std::web::style::preflight;
         let _reset = const preflight();
         fun main() {{}}
         main();
@@ -3256,7 +3256,7 @@ fn a_reset_rule_loses_to_a_style_and_to_a_declaration_block() {
     // declare-beats-its-sublayer. One rule, twice, in the same direction.
     let css = style_css(
         r##"
-        import std::style::{ style, declare, declarations, preflight, Display, Style };
+        import std::web::style::{ style, declare, declarations, preflight, Display, Style };
         fun s(): Style {
             style().display(Display::Flex)
         }
@@ -3305,7 +3305,7 @@ fn a_declaration_block_is_layered_and_a_style_rule_is_not() {
     // chosen selector can never out-specify a view's own style.
     let css = style_css(
         r##"
-        import std::style::{ style, declare, declarations, Color, Style };
+        import std::web::style::{ style, declare, declarations, Color, Style };
         fun s(): Style {
             style().color(Color::hex("#111111"))
         }
@@ -3339,7 +3339,7 @@ fn the_declaration_layer_does_not_disturb_the_media_sort() {
     // still lands after it in ascending min-width order.
     let css = style_css(
         r##"
-        import std::style::{ style, space, declare, declarations, Style };
+        import std::web::style::{ style, space, declare, declarations, Style };
         fun s(): Style {
             style().sm(style().padding(space(2))).lg(style().padding(space(3)))
         }
@@ -3374,7 +3374,7 @@ fn a_token_spent_in_a_declaration_block_declares_itself() {
     // other.
     let assets = collected_assets(
         r##"
-        import std::style::{ declare, declarations, space, Color };
+        import std::web::style::{ declare, declarations, space, Color };
         fun tokens() {
             declare(
                 ":root",
@@ -3410,7 +3410,7 @@ fn declarations_keep_their_authoring_order() {
     // (`starts_style_builder`), pinned in `vilan-cli/tests/style_chain_order.rs`.
     let css = style_css(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun block() {
             declare(
                 "body",
@@ -3438,7 +3438,7 @@ fn declarations_keep_their_authoring_order() {
 fn a_data_uri_value_keeps_its_semicolon() {
     let css = style_css(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun block() {
             declare(
                 "body",
@@ -3460,7 +3460,7 @@ fn a_data_uri_value_keeps_its_semicolon() {
 fn a_declaration_block_selector_cannot_contain_a_newline() {
     let diagnostics = failure_diagnostics(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun block() {
             declare(":root\n:host", declarations().raw("--color-ink", "#fafafa"));
         }
@@ -3481,7 +3481,7 @@ fn a_declaration_block_selector_cannot_contain_a_newline() {
 fn a_declaration_block_selector_cannot_contain_a_brace() {
     let diagnostics = failure_diagnostics(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun block() {
             declare(":root{color:red}", declarations().raw("--color-ink", "#fafafa"));
         }
@@ -3506,7 +3506,7 @@ fn a_declaration_block_selector_cannot_contain_a_brace() {
 fn a_declaration_block_selector_cannot_be_an_at_rule() {
     let diagnostics = failure_diagnostics(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun block() {
             declare("@media (prefers-color-scheme: light)", declarations().raw("--color-ink", "#111111"));
         }
@@ -3527,7 +3527,7 @@ fn a_declaration_block_selector_cannot_be_an_at_rule() {
 fn a_declaration_block_with_no_declarations_is_rejected() {
     let diagnostics = failure_diagnostics(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun block() {
             declare(":root", declarations());
         }
@@ -3550,7 +3550,7 @@ fn a_declaration_block_with_no_declarations_is_rejected() {
 fn a_declaration_property_cannot_carry_its_own_separator() {
     let diagnostics = failure_diagnostics(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun block() {
             declare(":root", declarations().raw("color:red", "1"));
         }
@@ -3572,7 +3572,7 @@ fn a_declaration_property_cannot_carry_its_own_separator() {
 fn a_blank_declaration_value_is_rejected() {
     let diagnostics = failure_diagnostics(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun block() {
             declare(":root", declarations().raw("--color-ink", ""));
         }
@@ -3595,7 +3595,7 @@ fn a_blank_declaration_value_is_rejected() {
 fn a_runtime_declare_is_rejected() {
     assert_fails_spanning(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun main() {
             declare(":root", declarations().raw("--color-ink", "#fafafa"));
         }
@@ -3620,7 +3620,7 @@ fn raw_carries_a_length_tokens_root_line() {
     // the declaration of `--space-4` lands beside it.
     let assets = collected_assets(
         r##"
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         let _padded = const style().raw("padding", space(4));
         fun main() {}
         main();
@@ -3643,7 +3643,7 @@ fn raw_carries_a_color_tokens_root_line() {
     // The same, for a ramp step — the other half of `CssValue`'s token arm.
     let assets = collected_assets(
         r##"
-        import std::style::{ style, Color };
+        import std::web::style::{ style, Color };
         let _outlined = const style().raw("outline-color", Color::gray(50));
         fun main() {}
         main();
@@ -3670,7 +3670,7 @@ fn the_text_field_route_declares_no_token() {
     // why `raw` had to grow the typed spelling above.
     let css = style_css(
         r##"
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         let _padded = const style().raw("padding", space(4).text);
         fun main() {}
         main();
@@ -3690,7 +3690,7 @@ fn raw_and_with_length_mint_the_same_rule() {
     // one class name and one token line — byte for byte.
     let through_raw = style_css(
         r##"
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         let _padded = const style().raw("scroll-margin-top", space(4));
         fun main() {}
         main();
@@ -3698,7 +3698,7 @@ fn raw_and_with_length_mint_the_same_rule() {
     );
     let through_with_length = style_css(
         r##"
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         let _padded = const style().with_length("scroll-margin-top", space(4));
         fun main() {}
         main();
@@ -3714,7 +3714,7 @@ fn raw_with_a_str_declares_nothing() {
     // unguarded emit.
     let css = style_css(
         r##"
-        import std::style::{ style };
+        import std::web::style::{ style };
         let _flex = const style().raw("display", "flex");
         fun main() {}
         main();
@@ -3729,7 +3729,7 @@ fn raw_with_an_untokened_length_declares_nothing() {
     // root must not reach the channel as a blank line.
     let css = style_css(
         r##"
-        import std::style::{ style, Length };
+        import std::web::style::{ style, Length };
         let _wide = const style().raw("scroll-padding", Length::px(37.0));
         fun main() {}
         main();
@@ -3747,7 +3747,7 @@ fn a_typed_raw_keeps_its_conditions_and_its_family() {
     // slot.
     let css = style_css(
         r##"
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         let _card = const style()
             .padding_left(space(2))
             .raw("padding", space(4))
@@ -3772,7 +3772,7 @@ fn a_non_css_value_in_raw_names_the_trait() {
     // the trait, and a secondary span at the declaration.
     assert_fails_with(
         r##"
-        import std::style::{ style };
+        import std::web::style::{ style };
         let _bad = const style().raw("z-index", 3);
         fun main() {}
         main();
@@ -3787,7 +3787,7 @@ fn a_declaration_blocks_raw_carries_a_length_token() {
     // custom properties, where a dangling `var()` is likeliest.
     let css = style_css(
         r##"
-        import std::style::{ declare, declarations, space };
+        import std::web::style::{ declare, declarations, space };
         fun tokens() {
             declare(":root", declarations().raw("--pad", space(6)));
         }
@@ -3807,7 +3807,7 @@ fn a_declaration_blocks_raw_carries_a_length_token() {
 fn a_declaration_blocks_raw_carries_a_color_token() {
     let css = style_css(
         r##"
-        import std::style::{ declare, declarations, Color };
+        import std::web::style::{ declare, declarations, Color };
         fun tokens() {
             declare(":root", declarations().raw("--brand", Color::gray(50)));
         }
@@ -3828,7 +3828,7 @@ fn a_declaration_blocks_str_raw_declares_nothing() {
     // The instantiation the existing call sites use: the block's line alone.
     let css = style_css(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun reset() {
             declare("*", declarations().raw("box-sizing", "border-box"));
         }
@@ -3849,7 +3849,7 @@ fn a_declaration_chain_carries_its_tokens_rather_than_emitting_them() {
     let assets = collected_assets(
         r##"
         import std::io::print;
-        import std::style::{ declarations, space };
+        import std::web::style::{ declarations, space };
         fun main() {
             let dropped = declarations().raw("--pad", space(6));
             print(dropped.text);
@@ -3872,7 +3872,7 @@ fn a_declaration_chain_builds_outside_a_const_expression() {
     assert_compiles_and_runs(
         r##"
         import std::io::print;
-        import std::style::{ declarations, space, Color };
+        import std::web::style::{ declarations, space, Color };
         fun main() {
             let block = declarations()
                 .raw("box-sizing", "border-box")
@@ -3890,7 +3890,7 @@ fn a_declaration_chain_builds_outside_a_const_expression() {
 fn a_non_css_value_in_a_declaration_names_the_trait() {
     assert_fails_with(
         r##"
-        import std::style::{ declare, declarations };
+        import std::web::style::{ declare, declarations };
         fun tokens() {
             declare(":root", declarations().raw("--z", 3));
         }
@@ -3909,7 +3909,7 @@ fn a_typed_declaration_value_is_checked_like_a_str_one() {
     // newline is refused exactly as the `str` spelling is.
     assert_run_panics(
         r##"
-        import std::style::{ declare, declarations, Length };
+        import std::web::style::{ declare, declarations, Length };
         fun tokens() {
             declare(":root", declarations().raw("--pad", Length::raw("1rem\n2rem")));
         }
@@ -3938,7 +3938,7 @@ fn emit_reached_through_a_bounded_generic_is_const_only() {
     assert_fails_with(
         r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -3972,7 +3972,7 @@ fn a_clean_impl_through_the_same_bounded_generic_stays_admitted() {
     assert_compiles_and_runs(
         r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -4012,7 +4012,7 @@ fn a_bounded_generic_is_charged_per_call_site_not_per_function() {
     // separates the refinement from putting `render` itself in R.
     let source = r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -4068,7 +4068,7 @@ fn a_forwarding_wrapper_charges_the_entry_that_resolves_it() {
     // the concrete spelling anchors.
     let source = r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -4110,7 +4110,7 @@ fn a_second_generic_parameter_still_charges_its_entry() {
     assert_fails_with(
         r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -4148,7 +4148,7 @@ fn a_clean_two_parameter_generic_dispatch_stays_admitted() {
     assert_compiles_and_runs(
         r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -4189,7 +4189,7 @@ fn a_generic_dispatch_reaching_emit_inside_const_stays_legal() {
     assert_compiles_and_runs(
         r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -4224,7 +4224,7 @@ fn an_inherited_trait_default_reaching_emit_is_refused_on_a_concrete_receiver() 
     assert_fails_with(
         r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -4252,7 +4252,7 @@ fn a_module_level_initializer_entry_is_a_boundary_for_generic_dispatch() {
     assert_fails_with(
         r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -4291,7 +4291,7 @@ fn a_shared_default_self_call_refuses_conservatively_even_for_a_clean_receiver()
     // ships, this pin is the one to revisit.
     let source = r##"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
         struct Token {
             value: str,
         }
@@ -4842,7 +4842,7 @@ fn calling_a_method_call_result_directly_parses() {
     );
 }
 
-// --- A10: `std::router` + `View.swap` (proposal/router.md) -------------------
+// --- A10: `std::web::router` + `View.swap` (proposal/router.md) -------------------
 //
 // The runtime semantics (interception, pushState/popstate, dedupe, disposal)
 // are pinned end-to-end in `crates/vilan-cli/tests/router.rs` under a DOM
@@ -4857,9 +4857,9 @@ fn swap_renders_a_dynamic_subtree_per_route_value() {
     // with `.memo()` — the route source the view reads.)
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, mount_root, swap, view };
+        import std::web::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
-        import std::router::{ current_path, navigate, segments, link, Routable };
+        import std::web::router::{ current_path, navigate, segments, link, Routable };
 
         [derive(PartialEq)]
         enum Route {
@@ -5073,9 +5073,9 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
     // inside the view closure and the pipe itself goes to `swap`.)
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, mount_root, swap, view };
+        import std::web::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
-        import std::router::{ current_path, segments };
+        import std::web::router::{ current_path, segments };
 
         [derive(PartialEq)]
         enum Route {
@@ -5107,7 +5107,7 @@ fn swap_requires_a_comparable_value() {
     // without the impl is rejected at the call.
     assert_fails_browser_with(
         r#"
-        import std::ui::{ View, mount_root, swap, view };
+        import std::web::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
 
         struct Opaque {
@@ -5131,7 +5131,7 @@ fn swap_boundaries_nest() {
     // resolve under the outer's injected extent.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, mount_root, swap, view };
+        import std::web::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
 
         fun main() {
@@ -5152,7 +5152,7 @@ fn swap_composes_with_sibling_bindings() {
     // form: three boundary kinds registering into the same enclosing owner.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, each, mount_root, swap, view };
+        import std::web::ui::{ View, each, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
 
         fun main() {
@@ -5174,8 +5174,8 @@ fn on_event_hands_the_handler_the_dom_event() {
     // modifier/key state and cancel the default action.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
-        import std::dom::Event;
+        import std::web::ui::{ View, view, mount_root };
+        import std::web::dom::Event;
 
         fun main() {
             let _root = mount_root("app", || view("input")
@@ -5197,7 +5197,7 @@ fn the_window_is_a_listen_target_with_the_elements_verbs() {
     // if either surface were spelled differently.
     assert_compiles_browser(
         r#"
-        import std::dom::{ Event, get_element_by_id, window };
+        import std::web::dom::{ Event, get_element_by_id, window };
         import std::reactive::{ Disposable, Owner };
 
         fun main() {
@@ -5230,7 +5230,7 @@ fn pointer_coordinates_are_f64_accessors_on_the_event() {
     // does it: `f64` in, `f64` out, no conversion at the boundary.
     assert_compiles_browser(
         r#"
-        import std::dom::{ Event, get_element_by_id, window };
+        import std::web::dom::{ Event, get_element_by_id, window };
 
         fun main() {
             let element = get_element_by_id("app");
@@ -5253,8 +5253,8 @@ fn link_accepts_any_routable_and_chains() {
     // returned `View` chains like any other.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
-        import std::router::{ link, Routable };
+        import std::web::ui::{ View, view, mount_root };
+        import std::web::router::{ link, Routable };
 
         [derive(PartialEq)]
         enum Route {
@@ -5380,7 +5380,7 @@ fn a_neutral_instantiation_is_admitted_despite_a_colored_impl() {
 // --- K2c: `css` is a hard keyword (proposal/css-block.md §5.4, Q3) -------------
 // The word was promoted so the block — and, later, the headed form, which needs
 // a token two-token lookahead cannot give — has a grammar seat. The promotion
-// took three names out of `std::style`: `Length::css(…)` became `Length::raw(…)`
+// took three names out of `std::web::style`: `Length::css(…)` became `Length::raw(…)`
 // and the `css` field of a `Length` and a `Color` became `text`. Every position
 // that used to spell the word refused, and the refusal NAMED both renames —
 // a bare "found `css`, expected an identifier" would leave the reader to guess
@@ -5404,7 +5404,7 @@ fn a_css_member_access_is_a_member_lookup_after_the_member_tier() {
     assert_fails_once_with(
         r#"
         import std::io::print;
-        import std::style::space;
+        import std::web::style::space;
         fun main() {
             print(space(4).css);
         }
@@ -5418,7 +5418,7 @@ fn a_css_member_access_is_a_member_lookup_after_the_member_tier() {
 fn a_css_path_segment_is_a_member_lookup_after_the_member_tier() {
     assert_fails_once_with(
         r#"
-        import std::style::{ Length, style };
+        import std::web::style::{ Length, style };
         let _x = const style().left(Length::css("1px"));
         fun main() {}
         main();
@@ -5482,7 +5482,7 @@ fn the_renamed_length_surface_is_what_compiles_instead() {
     // `raw` is the same verbatim value `css` was — no wrapper, unlike `calc`.
     let css = style_css(
         r#"
-        import std::style::{ style, space, Length };
+        import std::web::style::{ style, space, Length };
         let _s = const style()
             .left(Length::raw("clamp(120px, 30%, 185px)"))
             .width(Length::raw(space(4).text));
@@ -5508,7 +5508,7 @@ fn the_renamed_length_surface_is_what_compiles_instead() {
 /// elsewhere would make the byte comparison pass for the wrong reason.
 const TWIN_PROGRAM: &str = r#"
     import std::io::print;
-    import std::style::{ Color, Length, Style, space, style };
+    import std::web::style::{ Color, Length, Style, space, style };
     fun card(): Style {
         {TWIN}
     }
@@ -5600,7 +5600,7 @@ fn a101_several_arguments_join_with_one_space() {
     // `:root` line on the sheet, and the two spellings emit the same bytes.
     let block = style_css(
         r#"
-        import std::style::{ style, space, Color };
+        import std::web::style::{ style, space, Color };
         let _s = const css { margin(space(4), space(8)); border("1px solid", Color::gray(500)); };
         fun main() {}
         main();
@@ -5623,11 +5623,11 @@ fn a101_a_custom_property_is_a_call_head_and_var_reads_one() {
     // R12, both sides. `--brand-ink(..)` is admitted on the PROPERTY side by the
     // production that already read leading hyphens (element attributes do the
     // same); on the VALUE side `--x` is not an expression at all, so CSS's
-    // `var(--x)` is spelled `var("--x")` — a `std::style` value function,
+    // `var(--x)` is spelled `var("--x")` — a `std::web::style` value function,
     // ambient inside a block through the style prelude.
     let block = style_css(
         r#"
-        import std::style::{ style, Color };
+        import std::web::style::{ style, Color };
         let _s = const css { --brand-ink(Color::gray(900)); color(var("--brand-ink")); };
         fun main() {}
         main();
@@ -5639,7 +5639,7 @@ fn a101_a_custom_property_is_a_call_head_and_var_reads_one() {
     // and the check reaches the free function too.
     assert_run_panics(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         let _s = const css { color(var("brand-ink")); };
         fun main() {}
         main();
@@ -5655,7 +5655,7 @@ fn a101_a_declaration_argument_is_typed_at_the_argument() {
     // named at the same trait, in the same words.
     assert_fails_with(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         let _s = const css { padding(4); };
         fun main() {}
         main();
@@ -5672,7 +5672,7 @@ fn a_css_block_is_an_ordinary_expression() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         fun main() {
             let base = const css { padding(space(4)); };
             let wider = const css { padding(space(6)); };
@@ -5691,7 +5691,7 @@ fn a_one_hole_value_carries_its_tokens_root_line() {
     // closed, restated for the block.
     let css = style_css(
         r#"
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         let _s = const css { gap(space(4)); };
         fun main() {}
         main();
@@ -5710,7 +5710,7 @@ fn a_one_hole_value_carries_its_tokens_root_line() {
 // `.text` reaches the var reference and DROPS the `:root` line the one-hole
 // path carries, which is the exact hazard the block was built to close.
 //
-// Each hole of a mixed value now goes through `std::style::piece`, which
+// Each hole of a mixed value now goes through `std::web::style::piece`, which
 // returns the text and puts the `:root` line on the sheet. This replaces
 // `a_mixed_css_value_refuses_a_struct_hole`, which pinned the gap.
 
@@ -5720,7 +5720,7 @@ fn a_mid_value_token_carries_its_root_line() {
     // var reference AND the token that declares it.
     let css = style_css(
         r#"
-        import std::style::{ style, Color };
+        import std::web::style::{ style, Color };
         let _s = const css { border("1px solid", Color::gray(500)); };
         fun main() {}
         main();
@@ -5736,7 +5736,7 @@ fn a_mid_value_length_carries_its_root_line_too() {
     // shape that forced the mixed path in the first place.
     let css = style_css(
         r#"
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         let _s = const css { padding(i"calc({piece(space(4))} + 2px)"); };
         fun main() {}
         main();
@@ -5757,7 +5757,7 @@ fn the_single_hole_path_is_unchanged_by_the_mid_value_one() {
     // than a rendered string, and what the emitted-bytes gate compares.
     let block = style_css(
         r#"
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         let _s = const css { gap(space(4)); };
         fun main() {}
         main();
@@ -5765,7 +5765,7 @@ fn the_single_hole_path_is_unchanged_by_the_mid_value_one() {
     );
     let chain = style_css(
         r#"
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         let _s = const style().raw("gap", space(4));
         fun main() {}
         main();
@@ -5781,7 +5781,7 @@ fn a_piece_of_a_type_with_no_piece_is_still_refused() {
     // would let it.
     assert_fails_with(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         struct Point { x: i32, y: i32 }
         let _s = const css { border("1px solid", Point { x = 1, y = 2 }); };
         fun main() {}
@@ -5799,7 +5799,7 @@ fn a_whole_value_still_demands_a_css_value_and_its_unit() {
     // text that supplies the unit, which is why a bare number is legal there.
     assert_fails_with(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style { style().raw("padding", 4) }
         let _s = const s();
         fun main() {}
@@ -5815,7 +5815,7 @@ fn a_mixed_css_value_still_admits_a_string_hole() {
     // mixed value, so the form itself is untouched.
     let css = style_css(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         fun main() {}
         let width = "100%";
         let inset = 2;
@@ -5833,7 +5833,7 @@ fn a_hole_free_value_is_its_own_source_slice() {
     // the emitted stylesheet.
     let css = style_css(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         let _s = const css {
             grid-template-columns("repeat(3, 1fr)");
             background-image("url(\"tile.png\")");
@@ -5860,7 +5860,7 @@ fn a_hole_free_value_is_its_own_source_slice() {
 fn a_custom_property_is_span_adjacency_and_nothing_new() {
     let css = style_css(
         r#"
-        import std::style::{ style, Color };
+        import std::web::style::{ style, Color };
         let _s = const css { --brand-ink(Color::gray(900)); };
         fun main() {}
         main();
@@ -5877,7 +5877,7 @@ fn nested_rules_lower_to_the_shipped_relation_combinators() {
     // day it ships and the grammar never consults `Style`'s method list.
     let css = style_css(
         r#"
-        import std::style::{ style, space, Color };
+        import std::web::style::{ style, space, Color };
         let _s = const css {
             .within("data-theme", Some("dark")) {
                 color(Color::gray(50));
@@ -5908,7 +5908,7 @@ fn nesting_order_is_combinator_order() {
     // so the shape that is legal is the shape that reads correctly.
     let css = style_css(
         r#"
-        import std::style::{ style, Color };
+        import std::web::style::{ style, Color };
         let _s = const css {
             .md {
                 .within("data-theme", Some("dark")) {
@@ -5937,7 +5937,7 @@ fn a_misnested_condition_still_refuses_by_name() {
     // chain's own, reached through the same calls.
     assert_run_panics(
         r#"
-        import std::style::{ style, Color };
+        import std::web::style::{ style, Color };
         let _s = const css {
             .hover {
                 .md {
@@ -5960,7 +5960,7 @@ fn a_macro_generated_css_block_desugars() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, space };
+        import std::web::style::{ style, space };
         fun main() {
             let made = macro {
                 import macro_std::source;
@@ -5981,8 +5981,8 @@ fn a_css_block_inside_markup_desugars() {
     // there would reach the analyzer as a `Node::Css`.
     assert_compiles(
         r#"
-        import std::ui::{ View, view };
-        import std::style::{ style, space };
+        import std::web::ui::{ View, view };
+        import std::web::style::{ style, space };
         fun main() {
             let _card = <div .styled(const css { padding(space(4)); }) />;
         }
@@ -6002,8 +6002,8 @@ fn a101_a_hex_colour_is_a_typed_value_and_the_colour_rule_is_retired() {
     // (`r##"…"##`: the spelling contains `"#`, which closes an `r#"`.)
     assert_compiles(
         r##"
-        import std::style::style;
-        import std::style::Color;
+        import std::web::style::style;
+        import std::web::style::Color;
         let _s = const css { color(Color::hex("#333")); };
         fun main() {}
         main();
@@ -6012,7 +6012,7 @@ fn a101_a_hex_colour_is_a_typed_value_and_the_colour_rule_is_retired() {
     // The prelude's own spelling, ambient inside a block.
     assert_compiles(
         r##"
-        import std::style::style;
+        import std::web::style::style;
         let _s = const css { color(hex("#333")); };
         fun main() {}
         main();
@@ -6024,7 +6024,7 @@ fn a101_a_hex_colour_is_a_typed_value_and_the_colour_rule_is_retired() {
 fn an_at_rule_refuses_naming_the_breakpoint_combinator() {
     assert_fails_with(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         let _s = const css { @media (min-width: 768px) { color: red; } };
         fun main() {}
         main();
@@ -6041,7 +6041,7 @@ fn important_refuses_permanently_and_says_why() {
     // seen.
     assert_fails_with(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         let _s = const css { color(red !important); };
         fun main() {}
         main();
@@ -6057,7 +6057,7 @@ fn a_missing_terminator_asks_for_the_semicolon() {
     // item decidable in one pass.
     assert_fails_with(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         let _s = const css { color("red") };
         fun main() {}
         main();
@@ -6075,7 +6075,7 @@ fn a101_the_css_spelling_of_a_declaration_names_the_call_form() {
     // exactly what the codemod migrates.
     assert_fails_with(
         concat!(
-            "\n        import std::style::style;\n        let _s = const css { padding",
+            "\n        import std::web::style::style;\n        let _s = const css { padding",
             ": 1rem; };\n        fun main() {}\n        main();\n        "
         ),
         "a `css` declaration is a CALL",
@@ -6105,7 +6105,7 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::style::style;
+        import std::web::style::style;
         fun main() {
             if (const css { color("red"); }).class_list() != "" {
                 print("styled");
@@ -6128,7 +6128,7 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
 fn a_chain_link_calls_an_apps_own_style_helper() {
     let css = style_css(
         r#"
-        import std::style::{ style, Style, Display, FlexDirection, UserSelect };
+        import std::web::style::{ style, Style, Display, FlexDirection, UserSelect };
         impl Style {
             fun flex_row(self): Style {
                 self.display(Display::Flex).flex_direction(FlexDirection::Row)
@@ -6162,7 +6162,7 @@ fn a_chain_link_takes_arguments_and_a_block_still_equals_its_chain() {
     // same sheet, link arguments included.
     let block = style_css(
         r#"
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         impl Style {
             fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
         }
@@ -6173,7 +6173,7 @@ fn a_chain_link_takes_arguments_and_a_block_still_equals_its_chain() {
     );
     let chain = style_css(
         r#"
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         impl Style {
             fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
         }
@@ -6191,7 +6191,7 @@ fn a_dotted_item_with_no_body_and_no_terminator_is_refused() {
     // formatter may never invent a token.
     assert_fails_with(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         let a = css { .ghost() };
         fun main() {}
         main();
@@ -6200,7 +6200,7 @@ fn a_dotted_item_with_no_body_and_no_terminator_is_refused() {
     );
 }
 
-// --- A70: `std::style::prelude`, ambient inside a block ----------------------
+// --- A70: `std::web::style::prelude`, ambient inside a block ----------------------
 
 #[test]
 fn a_hole_reaches_the_style_prelude_with_no_import() {
@@ -6231,7 +6231,7 @@ fn a_local_binding_beats_the_ambient_style_prelude() {
     // asked first, always, so no file can be broken by a name added to it.
     let css = style_css(
         r#"
-        import std::style::Length;
+        import std::web::style::Length;
         fun main() {}
         fun rem(value: f64): Length { Length::px(value) }
         let card = css { padding(rem(4)); };
@@ -6247,7 +6247,7 @@ fn a_chain_links_arguments_see_the_prelude_too() {
     // a condition head's argument, and a link's argument alike.
     let css = style_css(
         r#"
-        import std::style::{ style, Style, Length };
+        import std::web::style::{ style, Style, Length };
         impl Style {
             fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
         }
@@ -6266,10 +6266,10 @@ fn the_style_prelude_is_importable_in_any_block() {
     // block-scoped, so a `const { … }` can carry its own.
     assert_compiles(
         r#"
-        import std::style::Style;
+        import std::web::style::Style;
         fun palette(): Style {
             const {
-                import std::style::prelude::{ rem, s };
+                import std::web::style::prelude::{ rem, s };
                 s().raw("padding", rem(1))
             }
         }
@@ -6279,10 +6279,10 @@ fn the_style_prelude_is_importable_in_any_block() {
     );
     assert_compiles(
         r#"
-        import std::style::Style;
+        import std::web::style::Style;
         fun palette(): Style {
             const {
-                import std::style::prelude;
+                import std::web::style::prelude;
                 prelude::s().raw("padding", prelude::rem(1))
             }
         }
@@ -6298,7 +6298,7 @@ fn the_style_prelude_is_not_ambient_outside_a_block() {
     // anywhere else, so the module costs the bare namespace nothing.
     assert_fails_with(
         r#"
-        import std::style::style;
+        import std::web::style::style;
         let a = const style().raw("padding", rem(1));
         fun main() {}
         main();
@@ -6311,7 +6311,7 @@ fn the_style_prelude_is_not_ambient_outside_a_block() {
 //
 // A70 made the prelude ambient inside a css HOLE, which is one syntactic
 // position. A `fun` body that builds a chain is not that position, so before
-// A106 such a file imported one name per token it used — and from `std::style`
+// A106 such a file imported one name per token it used — and from `std::web::style`
 // rather than the prelude, because the prelude carried the free functions and
 // the conditions but NOT the keyword-property types, and because the builder
 // there is named `style` and wants aliasing. kolt's `styles.vl:54/103` is the
@@ -6319,12 +6319,12 @@ fn the_style_prelude_is_not_ambient_outside_a_block() {
 // under a `// FIXME: Add a prelude to std.`.
 //
 // Door 1 (R7 at Order 38's GO): the four TYPES the vocabulary needs join the
-// module, and one file-level import list is the idiom. Door 2 — the `std::web`
+// module, and one file-level import list is the idiom. Door 2 — the `std::web::prelude`
 // prelude re-exporting this module, ambient in every web file — is gated on a
 // zero-collision census, and the census this lane ran is NOT zero, so it is
 // not taken.
 
-/// The four keyword-property types resolve through `std::style::prelude`, so
+/// The four keyword-property types resolve through `std::web::style::prelude`, so
 /// ONE import list answers both halves of a chain — the tokens and the
 /// keywords. This is kolt's `button_style` shape, with the nine-name block
 /// replaced by one statement at the top.
@@ -6332,7 +6332,7 @@ fn the_style_prelude_is_not_ambient_outside_a_block() {
 fn a106_one_prelude_import_answers_a_whole_chain_outside_a_hole() {
     let css = style_css(
         r#"
-        import std::style::prelude::{
+        import std::web::style::prelude::{
             AlignItems,
             Cursor,
             Length,
@@ -6346,7 +6346,7 @@ fn a106_one_prelude_import_answers_a_whole_chain_outside_a_hole() {
             s,
             space,
         };
-        import std::style::Style;
+        import std::web::style::Style;
         fun button(): Style {
             s()
                 .padding(space(2))
@@ -6379,8 +6379,8 @@ fn a106_one_prelude_import_answers_a_whole_chain_outside_a_hole() {
 fn a106_the_four_types_qualify_through_the_module_name() {
     assert_compiles(
         r#"
-        import std::style::prelude as tokens;
-        import std::style::Style;
+        import std::web::style::prelude as tokens;
+        import std::web::style::Style;
         fun button(): Style {
             tokens::s()
                 .cursor(tokens::Cursor::Pointer)
@@ -6395,14 +6395,14 @@ fn a106_the_four_types_qualify_through_the_module_name() {
 }
 
 /// The set is the FOUR the vocabulary needs, not every keyword enum in
-/// `std::style`. A prelude is a vocabulary rather than a second spelling of a
+/// `std::web::style`. A prelude is a vocabulary rather than a second spelling of a
 /// module, so the rest stay where they are and the refusal says so.
 #[test]
 fn a106_the_other_keyword_enums_stay_out_of_the_prelude() {
     for absent in ["Display", "Position", "FlexDirection", "JustifyContent"] {
         let source = format!(
             r#"
-            import std::style::prelude::{{ {absent} }};
+            import std::web::style::prelude::{{ {absent} }};
             fun main() {{}}
             main();
             "#
@@ -6550,7 +6550,7 @@ fn a117_the_designed_surface_is_forty_six_names() {
 fn a117_every_designed_name_still_imports_from_the_prelude() {
     let names = A117_PRELUDE_SURFACE.join(", ");
     assert_compiles(&format!(
-        "import std::style::prelude::{{ {names} }};\nfun main() {{}}\nmain();\n"
+        "import std::web::style::prelude::{{ {names} }};\nfun main() {{}}\nmain();\n"
     ));
 }
 
@@ -6561,13 +6561,13 @@ fn a117_every_designed_name_still_imports_from_the_prelude() {
 fn a117_no_alias_spelling_resolves_from_outside_the_prelude() {
     for alias in A117_RETIRED_ALIAS_SPELLINGS {
         let source =
-            format!("import std::style::prelude::{{ {alias} }};\nfun main() {{}}\nmain();\n");
+            format!("import std::web::style::prelude::{{ {alias} }};\nfun main() {{}}\nmain();\n");
         let diagnostics = failure_diagnostics(&source);
         assert!(
             diagnostics
                 .iter()
                 .any(|(message, _)| message.contains("in the imported path")),
-            "`{alias}` still resolves out of std::style::prelude: {diagnostics:#?}"
+            "`{alias}` still resolves out of std::web::style::prelude: {diagnostics:#?}"
         );
     }
 }
@@ -6580,15 +6580,15 @@ fn a117_no_alias_spelling_resolves_from_outside_the_prelude() {
 fn a117_the_preludes_source_binds_exactly_the_designed_surface() {
     let source = std::fs::read_to_string(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../vilan/std/src/style/prelude.vl"),
+            .join("../../vilan/std/src/web/style/prelude.vl"),
     )
-    .expect("read std::style::prelude");
+    .expect("read std::web::style::prelude");
     let mut bound: Vec<String> = Vec::new();
     let mut inside_file_level_import = false;
     for line in source.lines() {
         // A function-scoped import is indented; the file-level one is not, and
         // it is the only import whose names `export *;` publishes.
-        if let Some(rest) = line.strip_prefix("import pkg::style::{") {
+        if let Some(rest) = line.strip_prefix("import pkg::web::style::{") {
             inside_file_level_import = !rest.contains('}');
             for name in rest.trim_end_matches(&['}', ';'][..]).split(',') {
                 let name = name.trim();
@@ -6625,7 +6625,7 @@ fn a117_the_preludes_source_binds_exactly_the_designed_surface() {
     designed.sort();
     assert_eq!(
         bound, designed,
-        "std::style::prelude binds a different set than the designed surface"
+        "std::web::style::prelude binds a different set than the designed surface"
     );
     for alias in A117_RETIRED_ALIAS_SPELLINGS {
         assert!(
@@ -6687,7 +6687,7 @@ fn a_block_in_an_element_head_needs_no_const_either() {
     assert!(
         compile_browser(
             r#"
-        import std::ui::mount_root;
+        import std::web::ui::mount_root;
         fun main() {
             mount_root("app", || <div .styled(css { display("flex"); })>"hi"</div>);
         }
@@ -6725,10 +6725,10 @@ fn a_runtime_hole_is_refused_at_the_hole() {
 //
 // The block's seed used to be a bare `style` accessor resolved at the SITE,
 // which made the whole form unusable in the packages it was built for: under
-// `prelude = "std::web"` the ambient `style` is a MODULE, so every block failed
+// `prelude = "std::web::prelude"` the ambient `style` is a MODULE, so every block failed
 // with "`style` is a module, not a value" (kolt channel.vl:71). It also let any
 // local `style` capture a call nobody had written. The seed is now
-// `std::style::style` whatever the site says, and the loader pulls `std::style`
+// `std::web::style::style` whatever the site says, and the loader pulls `std::web::style`
 // in off the reference, so a block needs no import at all.
 //
 // This replaces `a_block_without_style_in_scope_fails_at_the_css_keyword`,
@@ -6769,12 +6769,12 @@ fn a_local_style_binding_does_not_capture_the_blocks_seed() {
 
 #[test]
 fn an_aliased_style_import_leaves_the_blocks_seed_alone() {
-    // `import std::style::style as s;` binds `s` and nothing called `style`.
+    // `import std::web::style::style as s;` binds `s` and nothing called `style`.
     // The block is unaffected either way — the alias is for the CHAIN, and the
     // two spellings sit side by side.
     let css = style_css(
         r#"
-        import std::style::style as s;
+        import std::web::style::style as s;
         let _a = const s().raw("color", "red");
         let _b = const css { display("flex"); };
         fun main() {}
@@ -6788,9 +6788,9 @@ fn an_aliased_style_import_leaves_the_blocks_seed_alone() {
 #[test]
 fn n74_an_unresolved_style_is_reported_without_an_import_steer() {
     // N74, N69's twin. `css_style_import_note` attached "a `css { … }` block
-    // lowers to a std::style::style chain; add `import std::style::style;`" to
+    // lowers to a std::web::style::style chain; add `import std::web::style::style;`" to
     // an unresolved `style` whose span read `css`, and after B270 the block's
-    // seed is a scope-independent reference to `std::style::style` — so the
+    // seed is a scope-independent reference to `std::web::style::style` — so the
     // note could only fire for a std with no `style` item at all, where the
     // import it steers at would miss exactly the same way. A note that can
     // only fire where its own advice is false is worse than no note; the
@@ -6835,7 +6835,7 @@ fn b227_a_printed_event_parameter_is_still_an_event() {
     assert_fails_browser_with(
         r#"
         import std::io::print;
-        import std::ui::{ View, view, mount_root };
+        import std::web::ui::{ View, view, mount_root };
 
         fun main() {
             let _root = mount_root("app", || <div on:keydown(|event| {
@@ -6856,7 +6856,7 @@ fn b227_a_printed_event_parameter_still_reads_its_key() {
     assert_compiles_browser(
         r#"
         import std::io::print;
-        import std::ui::{ View, view, mount_root };
+        import std::web::ui::{ View, view, mount_root };
 
         fun main() {
             let _root = mount_root("app", || <div on:keydown(|event| {
@@ -6901,7 +6901,7 @@ fn b311_a_pseudo_name_carrying_the_key_separator_is_refused_at_the_name() {
     ] {
         let program = format!(
             r#"
-            import std::style::{{ style, Style }};
+            import std::web::style::{{ style, Style }};
             fun s(): Style {{
                 {written}
             }}
@@ -6927,7 +6927,7 @@ fn b311_the_refusal_names_both_values_the_string_form_was_reached_for() {
     // free-form name was carrying.
     let diagnostics = failure_diagnostics(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().pseudo("hover:not(:active)", style().opacity(0.5))
         }
@@ -6956,7 +6956,7 @@ fn b311_the_miscompiles_own_exhibit_is_spelled_as_two_condition_values() {
     // now the one that reaches the sheet, with the `:not(:active)` in it.
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style, hover, active, attribute };
+        import std::web::style::{ style, Style, hover, active, attribute };
         fun s(): Style {
             style().on(
                 attribute("data-open").eq("true") + hover() + active().not(),
@@ -6987,7 +6987,7 @@ fn b322_add_merges_a_conditioned_style_through_the_slot_reader() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style, hover, active, pseudo, element };
+        import std::web::style::{ style, Style, hover, active, pseudo, element };
         fun main() {
             let base = const style()
                 .on(hover() + active().not(), style().opacity(0.5))
@@ -7019,7 +7019,7 @@ fn b322_a_breakpoint_width_and_a_written_property_are_fenced_against_the_separat
     ] {
         let program = format!(
             r#"
-            import std::style::{{ style, Style }};
+            import std::web::style::{{ style, Style }};
             fun s(): Style {{
                 {written}
             }}
@@ -7060,7 +7060,7 @@ fn a95_the_option_taking_sugar_warns_with_the_condition_value_as_the_steer() {
     ] {
         let program = format!(
             r#"
-            import std::style::{{ style, Style }};
+            import std::web::style::{{ style, Style }};
             fun s(): Style {{
                 {call}
             }}
@@ -7092,7 +7092,7 @@ fn a95_the_deprecated_sugar_still_emits_exactly_what_it_always_did() {
     // that has not migrated yet must keep producing the same stylesheet.
     let sugar = style_rules(
         r#"
-        import std::style::{ style, Style, Color };
+        import std::web::style::{ style, Style, Color };
         fun s(): Style {
             style().attribute("data-open", Some("true"), style().color(Color::gray(50)))
         }
@@ -7138,7 +7138,7 @@ fn a93_the_child_relation_hatch_is_gone() {
     // a method, so the hatch cannot be reached to be fenced.
     assert_fails(
         r#"
-        import std::style::{ style, Style };
+        import std::web::style::{ style, Style };
         fun s(): Style {
             style().child_relation("not([hidden])", "display", style().opacity(0.5))
         }
@@ -7157,7 +7157,7 @@ fn a93_the_two_shipped_relations_are_the_controls() {
     // replaced the token.
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style()
                 .children(style().margin_top(space(2)))
@@ -7197,7 +7197,7 @@ fn three_requests_for_one_finaliser_run_it_once() {
     // in contribution order, where a second run IS a second entry.
     let assets = collected_assets(
         r#"
-        import std::asset::{ emit, schedule_at_end };
+        import std::web::asset::{ emit, schedule_at_end };
         fun flush() {
             emit("probe", "flushed");
         }
@@ -7227,7 +7227,7 @@ fn a_finaliser_runs_after_every_const_expression_including_later_ones() {
     // is the observable — the raw vector is in contribution order.
     let assets = collected_assets(
         r#"
-        import std::asset::{ emit, schedule_at_end };
+        import std::web::asset::{ emit, schedule_at_end };
         fun flush() {
             emit("probe", "zzz-the-end");
         }
@@ -7262,7 +7262,7 @@ fn a_finaliser_runs_after_every_const_expression_including_later_ones() {
 fn a_panicking_finaliser_fails_the_build_naming_the_function() {
     assert_fails_with(
         r#"
-        import std::asset::{ emit, schedule_at_end };
+        import std::web::asset::{ emit, schedule_at_end };
         import std::io::panic;
         fun flush() {
             emit("probe", "never");
@@ -7287,7 +7287,7 @@ fn scheduling_a_finaliser_outside_a_const_expression_is_refused() {
     // carries a live `__schedule_at_end` with no runtime binding.
     assert_fails_with(
         r#"
-        import std::asset::schedule_at_end;
+        import std::web::asset::schedule_at_end;
         fun flush() {}
         fun main() {
             schedule_at_end(flush);
@@ -7310,7 +7310,7 @@ fn a_nested_condition_emits_the_composed_rule_and_not_its_scaffolding() {
     // the first two as it goes, so only the third can ever be on an element.
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Color, Style };
+        import std::web::style::{ style, Color, Style };
         import std::option::Option::Some;
         fun s(): Style {
             style().attribute(
@@ -7349,7 +7349,7 @@ fn a_standalone_condition_style_still_emits_when_it_is_itself_applied() {
     // element, and it ships.
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Color, Style };
+        import std::web::style::{ style, Color, Style };
         fun s(): Style {
             style().hover(style().color(Color::gray(50)))
         }
@@ -7377,7 +7377,7 @@ fn a_slot_a_shorthand_covered_never_reaches_the_sheet() {
     // its rule is dropped with it. The shorthand's rule is what ships.
     let assets = collected_assets(
         r#"
-        import std::style::{ style, space, Style };
+        import std::web::style::{ style, space, Style };
         fun s(): Style {
             style().padding_top(space(2)).padding(space(4))
         }
@@ -7405,7 +7405,7 @@ fn the_registry_cannot_be_read_before_evaluation_has_finished() {
     // yet a fact. Refused, naming the hook that IS the right place to ask.
     assert_fails_with(
         r#"
-        import std::asset::{ stage, staged };
+        import std::web::asset::{ stage, staged };
         fun contribute(): usize {
             stage("probe", "token", "line");
             staged("probe").len()
@@ -7425,7 +7425,7 @@ fn a_staged_contribution_survives_when_the_build_still_names_its_token() {
     // string nothing names.
     let assets = collected_assets(
         r#"
-        import std::asset::{ emit, schedule_at_end, stage, staged };
+        import std::web::asset::{ emit, schedule_at_end, stage, staged };
         fun flush() {
             for line in staged("probe") {
                 emit("probe", line);
@@ -7467,7 +7467,7 @@ fn style_rules(source: &str) -> Vec<String> {
 }
 
 const CONDITION_PROGRAM: &str = r#"
-    import std::style::{ style, Color, Style, hover, active, attribute, md, within, element, pseudo, children, divide, sm };
+    import std::web::style::{ style, Color, Style, hover, active, attribute, md, within, element, pseudo, children, divide, sm };
     fun s(): Style {
         {SET}
     }
@@ -7784,7 +7784,7 @@ const CSS_FIELD_RENAME_NOTE: &str = "the `.css` field of a `Length` or a `Color`
 fn b471_a_css_field_read_on_a_length_names_the_rename() {
     let source = r#"
         import std::io::print;
-        import std::style::space;
+        import std::web::style::space;
         fun main() {
             print(space(4).css);
         }
@@ -7797,7 +7797,7 @@ fn b471_a_css_field_read_on_a_length_names_the_rename() {
 #[test]
 fn b471_a_css_static_on_length_names_the_rename() {
     let source = r#"
-        import std::style::{ Length, style };
+        import std::web::style::{ Length, style };
         let _x = const style().left(Length::css("1px"));
         fun main() {}
         main();
@@ -7841,7 +7841,7 @@ fn b471_a_user_types_css_miss_stays_the_ordinary_error() {
 #[test]
 fn b471_a_css_call_on_a_style_names_the_rename() {
     let source = r#"
-        import std::style::style;
+        import std::web::style::style;
         fun main() {
             let _s = style().css("color", "red");
         }
@@ -7858,8 +7858,8 @@ fn b471_a_css_call_on_a_style_names_the_rename() {
 
 const A155_HEAD: &str = concat!(
     "import std::reactive::{ Signal, SignalCell };\n",
-    "import std::style::{ Length, Style };\n",
-    "import std::ui::{ View, render, view };\n",
+    "import std::web::style::{ Length, Style };\n",
+    "import std::web::ui::{ View, render, view };\n",
     "\n",
     "let card: Style = css { padding(Length::px(4)); };\n",
     "let other: Style = css { margin(Length::px(2)); };\n",
@@ -7969,7 +7969,7 @@ fn a155_one_class_write_per_element_is_silent() {
 
 const A157_HEAD: &str = concat!(
     "import std::io::print;\n",
-    "import std::ui::{ View, render, view };\n",
+    "import std::web::ui::{ View, render, view };\n",
     "\n",
 );
 
@@ -7992,7 +7992,7 @@ fn a157_a_written_autofocus_in_an_element_head_warns_and_steers_to_the_method() 
     ];
     // Both platforms, so no `render` (a browser build has none): the element
     // is bound and dropped.
-    let head = "import std::ui::View;\n\n";
+    let head = "import std::web::ui::View;\n\n";
     for platform in [Platform::default(), Platform::Browser] {
         for (element, fixed) in cases {
             let source = format!("{head}fun main() {{\n\tlet _element: View = {element};\n}}\n");

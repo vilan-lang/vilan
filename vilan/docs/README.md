@@ -101,10 +101,10 @@ move an anchor, and a moved anchor is a broken link.
 | [encoding](std/encoding.md) | json, wire, binary, bytes, base64 |
 | [net](std/net.md) | fetch, ws |
 | [reactive](std/reactive.md) | the full `std::reactive` API |
-| [style](std/style.md) | the full `std::style` API |
+| [style](std/style.md) | the full `std::web::style` API |
 | [rpc](std/rpc.md) | `std::rpc`: transports, clients, frames |
-| [browser](std/browser.md) | `std::dom`, `std::ui`, `std::router`, `std::storage` |
-| [dev / HMR](std/dev.md) | `std::dev`: `stash`/`take`, `on_teardown`, `hmr_active` |
+| [browser](std/browser.md) | `std::web::dom`, `std::web::ui`, `std::web::router`, `std::web::storage` |
+| [dev / HMR](std/dev.md) | `std::web::dev`: `stash`/`take`, `on_teardown`, `hmr_active` |
 | [process](std/process.md) | db, http, fs, build, document, process, rpc_server, watch |
 | [misc](std/misc.md) | io, task, promise, context, crypto, jwt, asset |
 

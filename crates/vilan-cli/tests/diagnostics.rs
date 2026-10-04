@@ -1653,7 +1653,7 @@ fn primary_label_file(stderr: &str) -> String {
         .to_string()
 }
 
-/// The browser fixture the zero-argument pins share: a `std::ui` method that
+/// The browser fixture the zero-argument pins share: a `std::web::ui` method that
 /// takes an argument, called with none.
 const BROWSER_MANIFEST: &str = "[package]\nname = \"app\"\ntarget = \"browser\"\n";
 
@@ -1663,7 +1663,7 @@ fn a_zero_argument_std_method_call_reports_in_the_callers_file() {
     // and fell back to the declaration when there was none — so with zero
     // arguments the diagnostic's source became std's file while its span still
     // held the caller's byte offsets. The whole thing rendered against
-    // `std/src/browser/ui.vl`, at offsets belonging to another file, and the
+    // `std/src/browser/web/ui.vl`, at offsets belonging to another file, and the
     // user's own file was never named: it read as no diagnostic at all.
     let dir = temp_files(
         "zero_arg_std_method",
@@ -1671,7 +1671,7 @@ fn a_zero_argument_std_method_call_reports_in_the_callers_file() {
             ("vilan.toml", BROWSER_MANIFEST),
             (
                 "src/main.vl",
-                "import std::ui::{ View, view, mount_root };\n\n\
+                "import std::web::ui::{ View, view, mount_root };\n\n\
                  fun broken(): View {\n\tview(\"div\").styled()\n}\n\n\
                  fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
             ),
@@ -1712,7 +1712,7 @@ fn a_zero_argument_std_method_in_an_element_head_reports_in_the_callers_file() {
             ("vilan.toml", BROWSER_MANIFEST),
             (
                 "src/main.vl",
-                "import std::ui::{ View, view, mount_root };\n\n\
+                "import std::web::ui::{ View, view, mount_root };\n\n\
                  fun broken(): View {\n\t<div .styled() />\n}\n\n\
                  fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
             ),
@@ -1744,8 +1744,8 @@ fn a_too_many_arguments_std_method_call_still_reports_in_the_callers_file() {
             ("vilan.toml", BROWSER_MANIFEST),
             (
                 "src/main.vl",
-                "import std::ui::{ View, view, mount_root };\n\
-                 import std::style::style;\n\n\
+                "import std::web::ui::{ View, view, mount_root };\n\
+                 import std::web::style::style;\n\n\
                  fun broken(): View {\n\tview(\"div\").styled(style(), 1, 2)\n}\n\n\
                  fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
             ),

@@ -24,7 +24,7 @@ external fun emit(kind: str, line: str): void;
 //
 // The `css` kind is refused here: the style sidecar is ordered by the CSS cascade
 // rather than by a contribution's key, so a key passed for it would have no
-// meaning. Write CSS with `emit`, or with `std::style`.
+// meaning. Write CSS with `emit`, or with `std::web::style`.
 //
 // Compile-time-only, exactly like `emit`.
 
@@ -44,7 +44,7 @@ external fun emit_keyed(kind: str, key: str, line: str): void;
 // in a const context of its own — so a module can accumulate into a registry
 // while the program evaluates and process + emit the result in one go at the
 // end, instead of emitting each piece at the moment it is minted and being
-// unable to take any of it back. `std::style` is the first consumer: a style
+// unable to take any of it back. `std::web::style` is the first consumer: a style
 // rule is recorded when it is built and the sheet is written here, once, from
 // the rules that survived.
 //
@@ -91,7 +91,7 @@ external fun schedule_at_end(finaliser: || void): void;
 // saying so. That pairing is the mechanism: a module stages while the program
 // evaluates, and its finaliser emits what survived.
 //
-// This is how `std::style` writes a stylesheet. Every rule is staged under its
+// This is how `std::web::style` writes a stylesheet. Every rule is staged under its
 // class; a condition combinator that re-mints an inner style's rules under a
 // composed condition drops the inner, so the inner's class is in no surviving style
 // and its rule never reaches the sheet.

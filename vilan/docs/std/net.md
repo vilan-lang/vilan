@@ -58,7 +58,7 @@ hand-rolled fetch calls.
 ## std::ws
 
 Websocket **framing**: building and parsing raw frames. This is
-server-side plumbing (`std::rpc_server` uses it to speak websocket on a
+server-side plumbing (`std::rpc::server` uses it to speak websocket on a
 plain TCP socket); browser clients get sockets from the host via the rpc
 transport instead.
 

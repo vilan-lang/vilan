@@ -1,4 +1,4 @@
-# std::transient reference
+# std::reactive::transient reference
 
 Values that come and go: a fetch in flight, a refresh on its way, a failure
 that still remembers the last good value, a remote source that says there is
@@ -6,7 +6,7 @@ no such thing. Concepts: the [reactive guide](../guide/reactive.md); the pipe
 model this builds on: [std::reactive](reactive.md).
 
 ```vilan,fragment
-import std::transient::{ TransientState, TransientSource, Transient, TaskSource };
+import std::reactive::transient::{ TransientState, TransientSource, Transient, TaskSource };
 ```
 
 ## At a glance
@@ -53,7 +53,7 @@ Three combinators change what a state carries without re-matching its arms:
   `Pending`, `Refreshing((a, b))`.
 
 ```vilan
-import std::transient::TransientState;
+import std::reactive::transient::TransientState;
 
 fun found(maybe: Option<str>): TransientState<str, str> {
 	match maybe {

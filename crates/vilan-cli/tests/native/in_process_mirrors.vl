@@ -6,10 +6,10 @@
 // the cause: the program reaches `std::rpc`'s `keyed_mirror_of`, whose
 // `Shared::new(|_key| {})` left the closure's parameter untyped and whose
 // `Shared::new([])` gave rustc a `Vec<_>` read before it was settled.
-import std::delta::ListCell;
 import std::io::print;
 import std::json::json_codec;
 import std::option::Option::{ self, None, Some };
+import std::reactive::delta::ListCell;
 import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, derive };
 import std::rpc::{
 	Keyed,

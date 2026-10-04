@@ -1108,7 +1108,7 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
 // pseudo): the same shape as Tailwind's plugin putting variant groups last.
 //
 // Two rules keep the reorder SEMANTICS-preserving, which is not optional: a
-// chain merges last-wins per property slot (`vilan/std/src/style.vl`).
+// chain merges last-wins per property slot (`vilan/std/src/web/style.vl`).
 //
 //   * A method the table does not know is a BARRIER — a user `impl Style`
 //     extension (kolt's `paint_primary` writes colour AND background), or one
@@ -1165,7 +1165,7 @@ pub enum StyleCategory {
 /// The condition axes, in the order a selector writes them — which is both the
 /// order the nesting SUGAR requires at the call site and the canonical order the
 /// canonicaliser sorts a condition SET into (`token_axis` and `render_rule` in
-/// `vilan/std/src/style.vl`, style-conditions.md §2.1).
+/// `vilan/std/src/web/style.vl`, style-conditions.md §2.1).
 ///
 /// `Guard` and `Child` were one `Relation` axis while a relation was one slot.
 /// A95 splits them, because they are not the same position: an ancestor guard
@@ -1624,7 +1624,7 @@ pub fn sort_style_chains<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
 // --- Canonical `on` head order ------------------------------------------------
 //
 // A95 S3. `Style::on(conditions, inner)` takes a condition SET, and a set has no
-// order — `canonical_condition` in `vilan/std/src/style.vl` sorts the tokens
+// order — `canonical_condition` in `vilan/std/src/web/style.vl` sorts the tokens
 // itself before the slot key is built, so `md() + hover()` and `hover() + md()`
 // already mint one class. That is what lets the formatter put the SOURCE in the
 // order the selector reads in: the reorder cannot change the emitted stylesheet,
@@ -6418,7 +6418,7 @@ impl<'src> Printer<'src> {
     // lines; the prefix is a line like any other and breaks like one, while the
     // construct's own body lines are its business and are measured where they
     // are printed. (This used to refuse to measure such a rendering at all,
-    // which exempted the whole statement from the budget: a `std::ui` tree
+    // which exempted the whole statement from the budget: a `std::web::ui` tree
     // ending in `.when(cond, || { … })` stayed inline at any width — one
     // hand-split example collapsed to 707 columns.)
     //
@@ -6825,7 +6825,7 @@ impl<'src> Printer<'src> {
     /// Prints a list literal in split form: `[` closes the line that opened it,
     /// every element takes its own line one indentation level in with a trailing
     /// comma — the last one included, so adding an element is a one-line diff and
-    /// the shape matches what the `std::ui` idiom is already hand-written as —
+    /// the shape matches what the `std::web::ui` idiom is already hand-written as —
     /// and `]` returns to the opening line's indent, where the caller's closing
     /// parens and terminator glue after it.
     ///
@@ -9369,7 +9369,7 @@ mod reformats {
             "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
             "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
         );
-        // The shape `std::dom`'s listen surface is declared in (`router.md`
+        // The shape `std::web::dom`'s listen surface is declared in (`router.md`
         // §5.2): a MARKED registration and an UNMARKED removal, adjacent, on
         // the same host object. The audit rule draws its line between these two
         // lines — `addEventListener` stores the closure, `removeEventListener`
@@ -9645,11 +9645,11 @@ mod reformats {
     /// formatted rather than a failure anyone sees.
     #[test]
     fn a_module_qualified_type_path_round_trips() {
-        let source = "import std::reactive;\nimport std::style;\n\n\
+        let source = "import std::reactive;\nimport std::web::style;\n\n\
              struct Card {\n\
              \tstyle: style::Style,\n\
              \thits: reactive::SignalCell<i32>,\n\
-             \tdeep: List<std::style::Style>,\n\
+             \tdeep: List<std::web::style::Style>,\n\
              }\n\n\
              impl style::Style {\n\
              \tfun tag(&self): str {\n\
@@ -9738,7 +9738,7 @@ mod idempotency {
     // bailed on all three; this is the pin the item asked for, and with
     // `assert_fixed_point` reading `reprint` it can no longer pass by bailing.
     fixed_point_tests! {
-        null_vl => "null.vl",
+        null_vl => "js/null.vl",
         boolean_vl => "boolean.vl",
         option_vl => "option.vl",
         result_vl => "result.vl",
@@ -9951,7 +9951,7 @@ mod idempotency {
         // F27 R1: the file's own line, an impl's label and a nominal's.
         let source = concat!(
             "[platform(\"browser\")] mod self;\n\n",
-            "import std::ui::Region;\n\n",
+            "import std::web::ui::Region;\n\n",
             "[platform(\"browser\")]\n",
             "struct Slot {}\n\n",
             "[platform(\"browser\", \"@process\")]\n",
@@ -11543,7 +11543,7 @@ mod nested_layout {
     // --- R1: a link's own line is measured, and its argument splits ----------
 
     /// The motivating shape, from the website's `art.vl` `diagram()`: a
-    /// hand-nested `std::ui` view tree flattened onto one line. The statement's
+    /// hand-nested `std::web::ui` view tree flattened onto one line. The statement's
     /// chain splits, then each `.child(…)` link whose OWN line overflows splits
     /// its argument tree one level deeper — its subject staying on the link's
     /// line after `.child(`, its links one level in, and the enclosing call's
@@ -12235,7 +12235,7 @@ mod spanning_renderings {
     //!
     //! This used to be the opposite: a rendering containing any newline was
     //! refused a measurement, which exempted the ENTIRE statement from the
-    //! budget. One block-bodied closure at the tail of a `std::ui` tree kept the
+    //! budget. One block-bodied closure at the tail of a `std::web::ui` tree kept the
     //! whole chain inline at any width — `examples/reactive-ui/todos.vl`, hand
     //! split by its author, reformatted into a single 707-column line, and the
     //! formatter had no way back out of it.
@@ -13076,7 +13076,7 @@ mod signature_layout {
     use super::chain_splitting::{assert_over_budget, columns};
 
     /// The motivating signature — `serve_connected` as it stood in
-    /// `std/src/process/rpc_server.vl` (since retired, E71): 172 columns of
+    /// `std/src/process/rpc/server.vl` (since retired, E71): 172 columns of
     /// closure-typed parameters, wide by construction.
     #[test]
     fn an_over_budget_signature_splits_one_parameter_per_line() {
@@ -15209,7 +15209,7 @@ mod style_chain_order {
     //! slots are entangled share a FAMILY and never move relative to each
     //! other. Everything below either pins the ruling or pins one of those two
     //! rules. `crates/vilan-core/tests/style_table_sync.rs` holds the table to
-    //! `vilan/std/src/style.vl`; `crates/vilan-cli/tests/style_chain_order.rs`
+    //! `vilan/std/src/web/style.vl`; `crates/vilan-cli/tests/style_chain_order.rs`
     //! proves the reorder leaves the emitted CSS byte-identical.
     use super::bailing_constructs::assert_construct;
     use super::{
@@ -15698,7 +15698,7 @@ mod on_head_order {
     //!
     //! The reorder is safe for a reason the model gives rather than a bet a test
     //! has to make: a condition SET has no order. `canonical_condition` in
-    //! `vilan/std/src/style.vl` sorts the tokens before the slot key is built,
+    //! `vilan/std/src/web/style.vl` sorts the tokens before the slot key is built,
     //! so `md() + hover()` and `hover() + md()` already mint one class, and the
     //! formatter is putting the SOURCE in the order the selector reads in.
     //! `crates/vilan-core/tests/style_table_sync.rs` gate 6 holds the axis

@@ -28,7 +28,7 @@ fn the_table_carries_the_expected_packages() {
         "std/vilan.toml",
         "std/src/lib.vl",
         "std/src/reactive.vl",
-        "std/src/browser/dom.vl",
+        "std/src/browser/web/dom.vl",
         "std/src/process/fs.vl",
         "macro_std/vilan.toml",
         "macro_std/src/lib.vl",

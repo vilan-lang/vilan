@@ -5,7 +5,7 @@ pub enum Token<'src> {
     Bool(bool),
     Ctrl(char),
     // `css` — the head of a `css { … }` block (proposal/css-block.md), CSS
-    // declarations that lower to a `std::style` chain before analysis. A HARD
+    // declarations that lower to a `std::web::style` chain before analysis. A HARD
     // keyword rather than a contextual gate (§5.4, Q3 ruled 2026-08-28): the
     // headed form `css [attr="v"] { … }` needs a token the two-token lookahead
     // cannot give, and taking the word is cheap in alpha and impossible after

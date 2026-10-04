@@ -7,7 +7,7 @@
 // and the whole boot/persist lifecycle is the store's own business instead of
 // wiring injected from `main`.
 //
-// The package's `prelude = "std::web"` reaches this server-colored module too —
+// The package's `prelude = "std::web::prelude"` reaches this server-colored module too —
 // `SignalCell` for the `[expose]`d field's type, and `Result`/`Ok`/`Err` for
 // `load`'s decode — which is the case for the web set restating the base seven
 // rather than replacing them. `std::fs` and `std::shared` are one-layer or

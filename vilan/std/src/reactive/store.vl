@@ -1,5 +1,5 @@
-// `std::store` — the fine-grained version of a type, generated from its shape
-// (tracker A142 S7, `proposal/store.md`).
+// `std::reactive::store` — the fine-grained version of a type, generated from its
+// shape (tracker A142 S7, `proposal/store.md`).
 //
 // A `SignalCell<User>` wakes every reader on every write: a write to the user's
 // city reruns the binding that shows their name. A STORE wakes exactly the readers
@@ -69,7 +69,11 @@
 // (`MapOp`, `SetOp`, `SeqOp`), not handed a copy to diff. Each flow started from a
 // handle keeps its own op log at the collection's node, recorded only while it is
 // open — a per-subscription FEED, as a slot is per path.
-import pkg::delta::{
+import pkg::hash::{ Hash, Hashable };
+import pkg::hash_map::HashMap;
+import pkg::hash_set::HashSet;
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::delta::{
 	CollFlow,
 	CollInstance,
 	DeltaLog,
@@ -86,13 +90,7 @@ import pkg::delta::{
 	splice_in_place,
 	splice_start,
 };
-import pkg::hash::{ Hash, Hashable };
-import pkg::hash_map::HashMap;
-import pkg::hash_set::HashSet;
-import pkg::option::Option::{ self, None, Some };
-import pkg::reactive::{ Signal, Source, Subscriber };
-import pkg::shared::{ Shared, fresh_identity };
-import pkg::store_core::{
+import pkg::reactive::store_core::{
 	Spine,
 	attach_feed,
 	deliver,
@@ -106,11 +104,13 @@ import pkg::store_core::{
 	touch_spine,
 	watch_at,
 };
+import pkg::reactive::{ Signal, Source, Subscriber };
+import pkg::shared::{ Shared, fresh_identity };
 import pkg::wire::Keyed;
 
 // The core — the handle types, the slot tree, the write — is `store_core.vl`,
-// re-exported here whole: `std::store` is the one module a program imports.
-export import pkg::store_core::{
+// re-exported here whole: `std::reactive::store` is the one module a program imports.
+export import pkg::reactive::store_core::{
 	Storable,
 	Store,
 	StoreFeed,
@@ -1339,15 +1339,16 @@ export macro fun store_enum_impls(target: EnumItem): str {
 }
 
 /// `[derive(Storable)]`: the struct's or enum's store surface (§3.1). Its output
-/// carries its own imports, from `std::store_core` where the names are declared: a
-/// module's own `Storable` here is this macro, and the re-exported trait of the
-/// same name is not reached through `std::store` from generated code (N?3).
+/// carries its own imports, from `std::reactive::store_core` where the names are
+/// declared: a module's own `Storable` here is this macro, and the re-exported
+/// trait of the same name is not reached through `std::reactive::store` from
+/// generated code (N?3).
 export macro fun Storable(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 
 	let header = "import std::option::Option;\n"
 		+ "import std::shared::Shared;\n"
-		+ "import std::store_core::{ Storable, StoreFlag, StoreLeaf, StoreNode, StoreSlot, StoreWoken, Store, StoreSome, store_has_me, store_kid, store_opaque, store_switch, store_wake_me };\n";
+		+ "import std::reactive::store_core::{ Storable, StoreFlag, StoreLeaf, StoreNode, StoreSlot, StoreWoken, Store, StoreSome, store_has_me, store_kid, store_opaque, store_switch, store_wake_me };\n";
 	if item.as_struct() is Some(let target) {
 		ret source(header + store_struct_impls(target));
 	}

@@ -1,6 +1,6 @@
 //! The cross-implementation differential for A7 SSR (proposal/ssr.md §2, §4 S1,
 //! §5's drift gate): ONE shared component module, compiled twice, must produce
-//! the same tree from `std::ui`'s two layers — the browser layer building a live
+//! the same tree from `std::web::ui`'s two layers — the browser layer building a live
 //! DOM and the process layer building an HTML string.
 //!
 //! - The BROWSER leg builds `component.vl` + a `mount_root` client, runs it under
@@ -25,7 +25,7 @@
 //!
 //! Not exercised by THIS differential (all covered by the inference snapshot
 //! pins instead): `on_event` — present in both layers, but a handler that touches
-//! the event needs the browser-only `std::dom::Event`, so it is not part of a
+//! the event needs the browser-only `std::web::dom::Event`, so it is not part of a
 //! shared component; `mount` — a client entry, not a view.
 //!
 //! `style_var` USED to be on that list, on the recorded ground that "the stub
@@ -64,9 +64,9 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// value branch), `bind_value`, a discarded `on` handler, and nested
 /// composition — with `&`/`<`/`>`/`"` in the data to drive escaping on both
 /// sides.
-const COMPONENT: &str = r#"import std::ui::{ View, each, each_values, swap, view, when, when_some };
+const COMPONENT: &str = r#"import std::web::ui::{ View, each, each_values, swap, view, when, when_some };
 import std::reactive::{ Signal, SignalCell };
-import std::style::{ style, space, Style };
+import std::web::style::{ style, space, Style };
 
 [derive(PartialEq)]
 enum Tab {
@@ -146,7 +146,7 @@ fun app(): View {
 }
 "#;
 
-const CLIENT: &str = r#"import std::ui::mount_root;
+const CLIENT: &str = r#"import std::web::ui::mount_root;
 import pkg::component::app;
 
 fun main() {
@@ -155,7 +155,7 @@ fun main() {
 main();
 "#;
 
-const SERVER: &str = r#"import std::ui::render;
+const SERVER: &str = r#"import std::web::ui::render;
 import std::io::print;
 import pkg::component::app;
 

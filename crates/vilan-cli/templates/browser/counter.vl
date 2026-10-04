@@ -8,12 +8,12 @@
 // `bind_text` consumes it, so the text updates itself.
 // (The i-string renders the number directly, by host coercion.)
 //
-// Styling is `std::style`: a `Style` is built inside `const`, so the compiler
+// Styling is `std::web::style`: a `Style` is built inside `const`, so the compiler
 // evaluates the chain at build time and writes real CSS into `app.css` beside
 // the bundle. `.styled(..)` only puts the generated class names on the element
 // — `index.html` links the sidecar.
 //
-// `Signal`, `SignalCell`, `view` and `View` are ambient: `prelude = "std::web"` in
+// `Signal`, `SignalCell`, `view` and `View` are ambient: `prelude = "std::web::prelude"` in
 // vilan.toml puts them in scope with no import, along with the MODULES `style`
 // and `ui` — which is why the chain below writes `style::Display::Flex` and
 // imports nothing for it. The prelude carries the module, not its members, so

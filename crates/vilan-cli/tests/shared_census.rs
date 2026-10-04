@@ -35,9 +35,13 @@ use std::path::{Path, PathBuf};
 /// belong to. The count is of OCCURRENCES, not lines — `reactive.vl` and
 /// `rpc.vl` each construct two cells on one line in places.
 const CENSUS: &[(&str, usize, &str)] = &[
-    ("browser/router.vl", 1, "R: the module-level `wired` latch"),
     (
-        "browser/ui.vl",
+        "browser/web/router.vl",
+        1,
+        "R: the module-level `wired` latch",
+    ),
+    (
+        "browser/web/ui.vl",
         25,
         "O + R: per-boundary row/owner bookkeeping (+3 at Order 39: `when_some`'s \
          row, owner and payload cell — A119), plus A121's focus scopes at Order \
@@ -50,49 +54,6 @@ const CENSUS: &[(&str, usize, &str)] = &[
          same way",
     ),
     (
-        "delta.vl",
-        33,
-        "E: the delta log's ops/version/base/cursors (twice — `new` and \
-         `with_limit`) plus a cursor's own sequence. Every one of them is \
-         minted by the CELL that holds the log and read by the CONSUMERS that \
-         hold cursors into it, which is the E class exactly; they are A54's \
-         five cells, lifted out of `rpc.vl` and spelled once per constructor \
-         (A112 S1). +1 at M86: a `ListCell`'s own list, held in a cell of its \
-         own rather than inside a `SignalCell` so a write can read its length \
-         in place — E for the same reason (minted by the cell, read and \
-         written through every copy of the handle). +12 at A142 S4, the \
-         collection pipes' INSTANCE state (O, per instance: minted by `open`, \
-         released with the consumer's handle): an element core's seven \
-         (slot ids, inputs, values, the followed elements' holds, the dirty \
-         slots, the next slot id, the consumer's subscriber), the kept mirror \
-         of `filter`, `filter_map` and the tally (one each) and the Fenwick \
-         index's tree; plus `element_holds_allocated_count`, the module-level \
-         counter the per-element allocation pin reads (R). +2 at A142 S5: \
-         `.coll()`'s and `.coll_by()`'s last list, the one each diffs the next \
-         against (O, per instance). +9 at A138 S2, the map operators' INSTANCE \
-         state (O, per instance, as the collection stages'): the rank index's \
-         five (slots, live flags, a live key's slot, the Fenwick tree, the live \
-         count) behind `values()`/`entries()`, the keyed core's two (rows by key, \
-         a run's slot id to its key) behind `map_values`/`filter`/`sum_by`, and \
-         `count()`'s counter and `sum_by`'s accumulator.",
-    ),
-    (
-        "hash_map_cell.vl",
-        4,
-        "E (A138 S1): a `HashMapCell`'s own map, a `KeySlots` table, and each \
-         watched key's subscription count; +1 at A138's wire reply, the table of \
-         each asked key's identity (`HashMapEntry::identity`). Each is minted by the cell (or the \
-         first subscription on a key) and read and written through every copy \
-         of the handle and by the slot's release, which a disposal elsewhere \
-         runs: the E class, as `ListCell`'s list is",
-    ),
-    (
-        "hash_set_cell.vl",
-        1,
-        "E (A138 S1): a `HashSetCell`'s own set, as `HashMapCell`'s map (its slots are \
-         a `KeySlots`, counted in `hash_map_cell.vl`)",
-    ),
-    (
         "memo.vl",
         1,
         "E: the memo cache outlives every maker's scope",
@@ -103,12 +64,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
         "F (blocked: `Reader::next` awaits, so no `&mut self`)",
     ),
     (
-        "process/rpc_server.vl",
+        "process/rpc/server.vl",
         6,
         "R + O: the registry, the server's stats",
     ),
     (
-        "process/ui.vl",
+        "process/web/ui.vl",
         6,
         "O: the SSR request's view tree, plus A121's three inert focus-scope \
          twins at Order 40 (R by shape, never written): the twin surfaces are \
@@ -143,6 +104,69 @@ const CENSUS: &[(&str, usize, &str)] = &[
          (R: the lazy-nursery pin's instrument, beside `owner_lists_allocated_count`). −3 at M93: a `Tracker` is ONE cell made at `start` (where its runs stand, the target and, once something is tracked, its lists' cell) and the lists' ONE cell is made at the stage's first `track()` (O, per tracking stage) — where it was five cells per stage instance whether or not the body tracked; an `effect`'s latest input is a binding its two closures capture, not a cell; `trackers_allocated_count` is the lazy-tracker pin's instrument (R).",
     ),
     (
+        "reactive/delta.vl",
+        33,
+        "E: the delta log's ops/version/base/cursors (twice — `new` and \
+         `with_limit`) plus a cursor's own sequence. Every one of them is \
+         minted by the CELL that holds the log and read by the CONSUMERS that \
+         hold cursors into it, which is the E class exactly; they are A54's \
+         five cells, lifted out of `rpc.vl` and spelled once per constructor \
+         (A112 S1). +1 at M86: a `ListCell`'s own list, held in a cell of its \
+         own rather than inside a `SignalCell` so a write can read its length \
+         in place — E for the same reason (minted by the cell, read and \
+         written through every copy of the handle). +12 at A142 S4, the \
+         collection pipes' INSTANCE state (O, per instance: minted by `open`, \
+         released with the consumer's handle): an element core's seven \
+         (slot ids, inputs, values, the followed elements' holds, the dirty \
+         slots, the next slot id, the consumer's subscriber), the kept mirror \
+         of `filter`, `filter_map` and the tally (one each) and the Fenwick \
+         index's tree; plus `element_holds_allocated_count`, the module-level \
+         counter the per-element allocation pin reads (R). +2 at A142 S5: \
+         `.coll()`'s and `.coll_by()`'s last list, the one each diffs the next \
+         against (O, per instance). +9 at A138 S2, the map operators' INSTANCE \
+         state (O, per instance, as the collection stages'): the rank index's \
+         five (slots, live flags, a live key's slot, the Fenwick tree, the live \
+         count) behind `values()`/`entries()`, the keyed core's two (rows by key, \
+         a run's slot id to its key) behind `map_values`/`filter`/`sum_by`, and \
+         `count()`'s counter and `sum_by`'s accumulator.",
+    ),
+    (
+        "reactive/hash_map_cell.vl",
+        4,
+        "E (A138 S1): a `HashMapCell`'s own map, a `KeySlots` table, and each \
+         watched key's subscription count; +1 at A138's wire reply, the table of \
+         each asked key's identity (`HashMapEntry::identity`). Each is minted by the cell (or the \
+         first subscription on a key) and read and written through every copy \
+         of the handle and by the slot's release, which a disposal elsewhere \
+         runs: the E class, as `ListCell`'s list is",
+    ),
+    (
+        "reactive/hash_set_cell.vl",
+        1,
+        "E (A138 S1): a `HashSetCell`'s own set, as `HashMapCell`'s map (its slots are \
+         a `KeySlots`, counted in `hash_map_cell.vl`)",
+    ),
+    (
+        "reactive/store_core.vl",
+        4,
+        "E: a store's cells, all minted by the store and reached through every \
+         copy of a handle (A142 S7, `proposal/store.md`) — the root's value \
+         (`Store::new`), each node of its slot tree, and a slot's subscription \
+         count (read by the subscription's release, Q12). The core moved out of \
+         `store.vl` at A149 S3 (so `std::web::ui` stops loading the collection \
+         layer); +1 there: a keyed node's table of children (a map's keys, a \
+         set's members, a keyed list's keys), made by the first subscription \
+         under a key and read by every write's diff. A collection flow's feed \
+         keeps its state in `mut` bindings its closures capture, so `store.vl` \
+         itself mints none",
+    ),
+    (
+        "reactive/transient.vl",
+        1,
+        "E: a `Transient`'s generation claim (A142 S3) — made by `.transient()`, \
+         read by each settling task to drop a superseded reply",
+    ),
+    (
         "rpc.vl",
         56,
         "R + O + E: sessions, wiring, the mirrors' leases. FIVE fewer since \
@@ -169,27 +193,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
          `Shared::identity` gives it, which is how every `identity()` in std \
          draws from ONE space; it is dropped at once",
     ),
-    (
-        "store_core.vl",
-        4,
-        "E: a store's cells, all minted by the store and reached through every \
-         copy of a handle (A142 S7, `proposal/store.md`) — the root's value \
-         (`Store::new`), each node of its slot tree, and a slot's subscription \
-         count (read by the subscription's release, Q12). The core moved out of \
-         `store.vl` at A149 S3 (so `std::ui` stops loading the collection \
-         layer); +1 there: a keyed node's table of children (a map's keys, a \
-         set's members, a keyed list's keys), made by the first subscription \
-         under a key and read by every write's diff. A collection flow's feed \
-         keeps its state in `mut` bindings its closures capture, so `store.vl` \
-         itself mints none",
-    ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
-    (
-        "transient.vl",
-        1,
-        "E: a `Transient`'s generation claim (A142 S3) — made by `.transient()`, \
-         read by each settling task to drop a superseded reply",
-    ),
     ("ws.vl", 4, "O: the frame decoder's state"),
 ];
 
@@ -197,10 +201,10 @@ const CENSUS: &[(&str, usize, &str)] = &[
 /// `mut` local captured by the closures of its own frame IS the shared
 /// storage, so each of these is the cell deleted and nothing put in its place.
 const FRAME_SCOPED_RETIRED: &[(&str, &str)] = &[
-    ("process/rpc_server.vl", "mut settled = false;"),
-    ("process/rpc_server.vl", "mut expired = false;"),
-    ("process/rpc_server.vl", "mut closed = false;"),
-    ("process/rpc_server.vl", "mut greeted = false;"),
+    ("process/rpc/server.vl", "mut settled = false;"),
+    ("process/rpc/server.vl", "mut expired = false;"),
+    ("process/rpc/server.vl", "mut closed = false;"),
+    ("process/rpc/server.vl", "mut greeted = false;"),
     ("rpc.vl", "mut connection = \"\";"),
     ("rpc.vl", "mut refused = \"\";"),
     ("rpc.vl", "mut fault: Option<str> = None;"),

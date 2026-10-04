@@ -206,7 +206,7 @@ gets one, chosen in `vilan.toml`:
 ```toml
 [package]
 name = "app"
-prelude = "std::web"    # omit the key for the default set
+prelude = "std::web::prelude"    # omit the key for the default set
 ```
 
 The default set is `print`, `Iterator` (so `filter`, `map` and `to_list`

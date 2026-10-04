@@ -61,7 +61,7 @@ fn router_example() -> &'static str {
 
 #[test]
 fn the_router_example_splits_into_its_three_routes() {
-    // `vilan/examples/router/vilan.toml` declares `prelude = "std::web"`, so
+    // `vilan/examples/router/vilan.toml` declares `prelude = "std::web::prelude"`, so
     // `view`, `View`, `SignalCell` and the `ui` module are ambient there and the
     // file imports none of them. Analyzing it under the base prelude instead
     // would fail to resolve them — the probe has to read the example the way its
@@ -144,9 +144,9 @@ fn the_router_example_splits_into_its_three_routes() {
 fn a_wildcard_arm_keeps_its_code_eager() {
     let plan = plan_for(
         r#"
-import std::ui::{View, view, mount_root, swap};
+import std::web::ui::{View, view, mount_root, swap};
 import std::reactive::Signal;
-import std::router::{current_path, segments};
+import std::web::router::{current_path, segments};
 
 [derive(PartialEq)]
 enum Route {
@@ -195,9 +195,9 @@ fun main() {
 fn a_second_route_match_declines_the_split() {
     let plan = plan_for(
         r#"
-import std::ui::{View, view, mount_root, swap};
+import std::web::ui::{View, view, mount_root, swap};
 import std::reactive::Signal;
-import std::router::{current_path, segments};
+import std::web::router::{current_path, segments};
 
 [derive(PartialEq)]
 enum Route {
@@ -271,7 +271,7 @@ fn a_chunk_file_name_is_its_arm_reduced_to_a_file_name() {
 fn a_swap_without_a_route_match_is_not_splittable() {
     let plan = plan_for(
         r#"
-import std::ui::{View, view, mount_root, swap};
+import std::web::ui::{View, view, mount_root, swap};
 import std::reactive::Signal;
 
 fun label(on: bool): View {
@@ -319,8 +319,8 @@ fn a_node_program_plans_nothing() {
 /// eager name is what lets the pin below CALL one under node with an empty
 /// registry.
 const CROSSING_SOURCE: &str = r#"
-import std::ui::{View, view, mount_root, swap};
-import std::router::{current_path, segments};
+import std::web::ui::{View, view, mount_root, swap};
+import std::web::router::{current_path, segments};
 
 [derive(PartialEq)]
 enum Route {

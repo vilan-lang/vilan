@@ -732,8 +732,8 @@ fn platform_modules_load_for_typing_under_opposite_platform() {
         ("http", Platform::Browser),
         ("fs", Platform::Browser),
         ("process", Platform::Browser),
-        ("dom", Platform::default()),
-        ("ui", Platform::default()),
+        ("web::dom", Platform::default()),
+        ("web::ui", Platform::default()),
     ] {
         let entry = format!("import std::{module};\nfun main() {{}}\n");
         let errors = analyze_package(&[("main.vl", &entry)], "main.vl", platform);
@@ -960,7 +960,7 @@ fn process_layer_std_is_reachable_for_deno() {
 fn browser_layer_std_is_cross_platform_for_deno() {
     // The browser layer doesn't serve deno: reaching a browser-layer function
     // from a deno build is a coloring violation (pattern matching, not names).
-    let entry = "import std::router::navigate;\nfun main() { navigate(\"/x\"); }\n";
+    let entry = "import std::web::router::navigate;\nfun main() { navigate(\"/x\"); }\n";
     let errors = analyze_package(&[("main.vl", entry)], "main.vl", deno());
     assert!(
         errors
@@ -1187,9 +1187,9 @@ fn a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map() {
     // A149 S3: `[derive(Storable)]` in an imported module — the shape kolt's
     // `account.vl` and `store.vl` are — expands there with its own imports, and
     // its map field is a keyed node the importer writes and watches by key. Red
-    // when the derive's output named `Storable` through `std::store`, where the
+    // when the derive's output named `Storable` through `std::reactive::store`, where the
     // module's own `Storable` is the derive macro: "'Storable' is not a trait"
-    // when the derive's module is the first to load `std::store` (the entry
+    // when the derive's module is the first to load `std::reactive::store` (the entry
     // imports none of it here, as kolt's does not).
     let entry = concat!(
         "import std::io::print;\n",
@@ -1210,7 +1210,7 @@ fn a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map() {
     );
     let model = concat!(
         "import std::hash_map::HashMap;\n",
-        "import std::store::{ Storable, Store };\n",
+        "import std::reactive::store::{ Storable, Store };\n",
         "\n",
         "export *;\n",
         "\n",
@@ -1999,9 +1999,9 @@ fn local_module_sharing_a_std_name_resolves_for_both_roots() {
 
 #[test]
 fn local_module_sharing_a_layered_std_name_resolves_for_both_roots() {
-    // The original E.10 report: a local `ui.vl` alongside `std::ui` (which lives
+    // The original E.10 report: a local `ui.vl` alongside `std::web::ui` (which lives
     // in std's browser layer), both imported by the same program.
-    let entry = "import std::ui::view;\nimport pkg::ui::screen;\n\nfun main() { screen(); }\n";
+    let entry = "import std::web::ui::view;\nimport pkg::ui::screen;\n\nfun main() { screen(); }\n";
     let errors = analyze_package(
         &[
             ("main.vl", entry),
@@ -3173,10 +3173,11 @@ fn stds_package_root_publishes_nothing_after_the_alias_sweep() {
 #[test]
 fn the_web_preludes_surface_is_its_members_and_its_ambient_modules() {
     // §5.2/§5.3: three members and two MODULES, published by the one
-    // mechanism — `export import pkg::style;` publishes the module `style`
+    // mechanism — `export import pkg::web::style;` publishes the module `style`
     // exactly as `export import pkg::reactive::Signal;` publishes a member.
     let spec = std_spec();
-    let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("web.vl"));
+    let importables =
+        vilan_core::analyzer::module_importables(&spec.base_root.join("web").join("prelude.vl"));
     let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
     for expected in [
         "print",
@@ -3556,14 +3557,14 @@ fn the_web_prelude_binds_signal_view_and_the_ambient_modules() {
 // package reported "`style` is a module, not a value; qualify through it" —
 // the form was unusable in the packages it was designed for. The seed is a
 // `Node::StdItem`, resolved through `std`'s own namespace, and the loader
-// seeds `std::style` off the reference itself.
+// seeds `std::web::style` off the reference itself.
 
 #[test]
 fn b270_a_css_block_compiles_under_the_web_preludes_ambient_style_module() {
     // The owner's repro (kolt channel.vl:71), reduced. `style::Length::rem` in
     // the same file is the control: the ambient MODULE is untouched and still
     // qualifies, which the interim workaround (a per-file
-    // `import std::style::{ Length, style };`) cost the file.
+    // `import std::web::style::{ Length, style };`) cost the file.
     let entry = "let card = const css { display(\"flex\"); };\n\
         fun main() {\n\
         \tlet gap = style::Length::rem(1);\n\
@@ -3606,11 +3607,11 @@ fn b270_a_local_style_binding_does_not_capture_a_block_under_a_prelude() {
 #[test]
 fn an_ambient_module_is_beaten_by_an_explicit_member_import() {
     // §4.1/§13.11, and the reason the `style` module costs the estate nothing:
-    // `std::style::style` is a FUNCTION whose name equals its module's, and 60
+    // `std::web::style::style` is a FUNCTION whose name equals its module's, and 60
     // call sites write it bare. Each carries this import, which outranks the
     // ambient module — so `style()` keeps meaning the builder.
-    let entry = "import std::style::style;\n\
-import std::style::Style;\n\
+    let entry = "import std::web::style::style;\n\
+import std::web::style::Style;\n\
 fun styled(): Style { style() }\n\
 fun main() { print(\"styled\"); }\n";
     let errors = analyze_under_prelude(
@@ -3634,7 +3635,7 @@ fn shadowing_an_ambient_module_costs_that_files_qualified_spelling() {
     // call sites import the enums they use explicitly and never write
     // `style::…`), and it is the ordinary shadowing rule rather than anything
     // the prelude adds. Recorded in prelude.md §4.1.
-    let entry = "import std::style::style;\n\
+    let entry = "import std::web::style::style;\n\
 fun main() {\n\
 \tlet shown = style::Display::Flex;\n\
 \tprint(\"styled\");\n\
@@ -3839,7 +3840,8 @@ fn a_web_set_name_steers_to_the_manifest_key_not_to_an_import() {
     );
     assert!(
         errors.iter().any(|e| {
-            e.contains("in the prelude of the web set") && e.contains("prelude = \"std::web\"")
+            e.contains("in the prelude of the web set")
+                && e.contains("prelude = \"std::web::prelude\"")
         }),
         "{errors:#?}"
     );
@@ -3902,7 +3904,7 @@ fn a_name_in_neither_std_prelude_keeps_the_ordinary_import_steer() {
 
 #[test]
 fn a_package_already_on_the_web_set_never_gets_the_web_steer() {
-    // "You are not on the web set" is only true when it is true. On `std::web`
+    // "You are not on the web set" is only true when it is true. On `std::web::prelude`
     // a genuinely missing name gets the ordinary steer.
     let errors = analyze_under_prelude(
         web_prelude(),
@@ -3927,7 +3929,7 @@ fn a_module_carried_web_name_gets_no_web_steer() {
     // does not make the bare name a value — the "both work" promise fails
     // exactly there (audit run 6, F2). A value-position miss on `style` must
     // fall through to the ordinary machinery (the css note beside the css
-    // desugar names the import that actually compiles: `std::style::style`).
+    // desugar names the import that actually compiles: `std::web::style::style`).
     let errors = analyze_under_prelude(
         base_prelude(),
         &[("main.vl", "fun main() { let s = style(); }\n")],
@@ -3950,9 +3952,9 @@ fn a_module_carried_web_name_gets_no_web_steer() {
 fn a_module_carried_web_name_reaches_its_types_by_qualifying() {
     // B172, and the reason it was load-bearing rather than cosmetic. The web
     // set carries `style` as a MODULE, so a web-set user reached every VALUE in
-    // `std::style` (`style::style()`, `style::Display::Flex`) and no TYPE in
+    // `std::web::style` (`style::style()`, `style::Display::Flex`) and no TYPE in
     // it: `style::Style` was a PARSE error in every type position, and both web
-    // templates carried a forced `import std::style::Style;` to get around it.
+    // templates carried a forced `import std::web::style::Style;` to get around it.
     // A qualified path is a type now, so the prelude's module name is enough.
     let errors = analyze_under_prelude(
         web_prelude(),

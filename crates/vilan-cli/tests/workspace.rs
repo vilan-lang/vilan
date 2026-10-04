@@ -1480,14 +1480,14 @@ fn cross_package_emission_is_byte_identical_under_import_permutation() {
 
 #[test]
 fn file_mode_honors_the_packages_declared_prelude() {
-    // Lie 1, the web set. A package on `prelude = "std::web"` has `view`
+    // Lie 1, the web set. A package on `prelude = "std::web::prelude"` has `view`
     // ambient; file mode had no manifest, so the name failed to resolve and the
     // steer told the author to make the edit their manifest already carries.
     let dir = temp_project("file_prelude_web");
     write(
         &dir,
         "vilan.toml",
-        "[package]\nname = \"app\"\ntarget = \"browser\"\nprelude = \"std::web\"\n",
+        "[package]\nname = \"app\"\ntarget = \"browser\"\nprelude = \"std::web::prelude\"\n",
     );
     write(
         &dir,
@@ -1650,11 +1650,11 @@ fn write_fullstack_package(dir: &Path, default_entry: &str, modules: &[(&str, &s
 
 /// A module using the BROWSER `View`'s `element` field — clean under `browser`,
 /// "no field 'element'" under any process target.
-const BROWSER_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
+const BROWSER_ONLY_MODULE: &str = "import std::web::ui::{ View, view };\n\n\
      export fun attach(): View {\n\tlet root = view(\"div\");\n\t\
      root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
 
-/// F27: a module over `std::ui`'s `Region` — every name it imports exists in
+/// F27: a module over `std::web::ui`'s `Region` — every name it imports exists in
 /// BOTH twins, so it has no import evidence at all and takes the process one,
 /// where `anchor` is a field the browser twin alone declares.
 ///
@@ -1663,19 +1663,18 @@ const BROWSER_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
 /// pushed seventeen columns inward (`diagnostics_ledger.rs`'s
 /// `no_prose_literal_swallows_a_line_continuation`).
 const REGION_FIELD_MODULE: &str =
-    "import std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+    "import std::web::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
 
 /// The same over a METHOD the browser twin alone declares.
 const REGION_METHOD_MODULE: &str =
-    "import std::ui::Region;\n\nexport fun host_of(region: Region) {\n\tregion.host();\n}\n";
+    "import std::web::ui::Region;\n\nexport fun host_of(region: Region) {\n\tregion.host();\n}\n";
 
 /// And the control: a member NO twin declares.
-const REGION_TYPO_MODULE: &str =
-    "import std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchorr;\n}\n";
+const REGION_TYPO_MODULE: &str = "import std::web::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchorr;\n}\n";
 
 /// The mirror: the PROCESS `View`'s `tag` field — clean under node, "no field
 /// 'tag'" under `browser`.
-const PROCESS_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
+const PROCESS_ONLY_MODULE: &str = "import std::web::ui::{ View, view };\n\n\
      export fun markup(): str {\n\tlet root = view(\"div\");\n\troot.tag\n}\n";
 
 #[test]
@@ -1781,7 +1780,7 @@ fn file_mode_checks_a_shared_module_under_every_leg_that_reaches_it() {
             // single-color answer would have picked.
             (
                 "src/shared.vl",
-                "import std::ui::{ View, view };\n\n\
+                "import std::web::ui::{ View, view };\n\n\
                  export fun labelled(text: str): str {\n\tlet root = view(text);\n\t\
                  root.tag\n}\n",
             ),
@@ -1859,7 +1858,7 @@ fn an_unreached_module_names_the_default_entry_fallback_it_took() {
     // The E119 report itself: nothing loads `orphan.vl`, so the designated
     // `default-entry` colours it — and the process twin's `View` has no
     // `element`. The refusal is correct; without the reason it reads as a
-    // compiler mistake, because the file imports `std::ui` and uses it exactly
+    // compiler mistake, because the file imports `std::web::ui` and uses it exactly
     // as the browser leg would.
     let dir = temp_project("e119_unreached_reason");
     let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
@@ -1906,7 +1905,7 @@ fn a_reached_module_names_the_leg_that_reaches_it() {
         &[
             (
                 "src/shared.vl",
-                "import std::ui::{ View, view };\n\n\
+                "import std::web::ui::{ View, view };\n\n\
                  export fun labelled(text: str): str {\n\tlet root = view(text);\n\t\
                  root.tag\n}\n",
             ),
@@ -2020,7 +2019,7 @@ fn a_field_the_other_twin_declares_is_named_as_such() {
         "E119's two facts are unchanged:\n{text}"
     );
     assert!(
-        text.contains("The `browser` twin of `std::ui` declares `anchor`"),
+        text.contains("The `browser` twin of `std::web::ui` declares `anchor`"),
         "and the third one answers the question the reader actually asked:\n{text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -2050,7 +2049,7 @@ fn a_method_the_other_twin_declares_is_named_too() {
     );
     assert!(
         text.contains("`Region` here is std's process twin")
-            && text.contains("The `browser` twin of `std::ui` declares `host`"),
+            && text.contains("The `browser` twin of `std::web::ui` declares `host`"),
         "the method miss gets the same three facts:\n{text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -2083,7 +2082,7 @@ fn a_member_neither_twin_declares_is_still_just_a_miss() {
         "the overlay is still named:\n{text}"
     );
     assert!(
-        !text.contains("twin of `std::ui` declares"),
+        !text.contains("twin of `std::web::ui` declares"),
         "but no twin is claimed to have it:\n{text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -2159,7 +2158,7 @@ fn package_mode_still_checks_every_leg() {
     write(
         &dir,
         "src/widget.vl",
-        "import std::ui::{ View, view };\n\n\
+        "import std::web::ui::{ View, view };\n\n\
          export fun attach(): View {\n\tlet root = view(\"div\");\n\troot.tag;\n\troot\n}\n",
     );
     let broken = vilan_plain(&["check", dir.to_str().unwrap()]);
@@ -2225,11 +2224,11 @@ fn file_mode_does_not_ask_a_module_for_a_main() {
 // reach it. A declaration outranks both.
 
 /// The owner's shape, declared.
-const DECLARED_REGION_MODULE: &str = "[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+const DECLARED_REGION_MODULE: &str = "[platform(\"browser\")] mod self;\n\nimport std::web::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
 
 /// The same body under a function FENCE — which, before R1, changed nothing
 /// about how its body resolved.
-const FENCED_REGION_MODULE: &str = "import std::ui::Region;\n\n[platform(\"browser\")]\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+const FENCED_REGION_MODULE: &str = "import std::web::ui::Region;\n\n[platform(\"browser\")]\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
 
 fn f27_package(tag: &str, slot: &str, server: &str) -> PathBuf {
     let dir = temp_project(tag);
@@ -2299,7 +2298,7 @@ fn f27_a_bare_files_declaration_is_its_platform_on_the_terminal_too() {
     write(
         &dir,
         "slot.vl",
-        "[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n\nfun main() {}\n",
+        "[platform(\"browser\")] mod self;\n\nimport std::web::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n\nfun main() {}\n",
     );
     let output = vilan_plain(&["check", dir.join("slot.vl").to_str().unwrap()]);
     let text = combined(&output);
@@ -2322,7 +2321,7 @@ fn f27_a_bare_files_declaration_is_its_platform_on_the_terminal_too() {
 /// browser twin writes, so a pin can break THAT twin alone.
 fn slot_twins_module(browser_value: &str) -> String {
     format!(
-        "import std::ui;\nimport std::ui::{{ Slot, View }};\n\nexport struct Badge {{\n\tlabel: str,\n}}\n\n\
+        "import std::web::ui;\nimport std::web::ui::{{ Slot, View }};\n\nexport struct Badge {{\n\tlabel: str,\n}}\n\n\
          [platform(\"browser\")]\nexport impl Badge with Slot {{\n\tfun place(own self, parent: View) {{\n\t\tparent.element.set_attribute(\"data-badge\", {browser_value});\n\t}}\n}}\n\n\
          [platform(\"@process\")]\nexport impl Badge with Slot {{\n\tfun place(own self, parent: View) {{\n\t\tui::set_attribute(parent.attributes, \"data-badge\", self.label);\n\t}}\n}}\n"
     )

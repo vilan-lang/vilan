@@ -28,7 +28,7 @@ Here's a complete little server:
 import std::reactive::{ Signal, SignalCell };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 
 [derive(Wire, PartialEq, Debug)]
@@ -341,7 +341,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::SocketTransport;
 import std::shared::Shared;
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 [derive(Wire, PartialEq, Debug)]
 struct Note {
@@ -1390,7 +1390,7 @@ other:
 import std::shared::Shared;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(TodosClient)]
 struct Todos {

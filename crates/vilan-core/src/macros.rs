@@ -64,7 +64,7 @@ const STD_DERIVE_MACROS: &[(&str, &str)] = &[
     ("Json", "json.vl"),
     ("Wire", "json.vl"),
     ("Hashable", "hash.vl"),
-    ("Storable", "store.vl"),
+    ("Storable", "reactive/store.vl"),
 ];
 
 /// B376: what to say about `[derive(Name)]` where nothing declares a `Name`

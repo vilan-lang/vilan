@@ -32,7 +32,7 @@ use crate::line_index::LineIndex;
 
 /// The std PACKAGE directory (holding `vilan.toml`), like the language
 /// server's `discover_std_dir` — the bare source root would drop the
-/// manifest's platform layers (no `std::ui`, no `std::style`).
+/// manifest's platform layers (no `std::web::ui`, no `std::web::style`).
 fn std_root() -> PathBuf {
     std::env::var_os("VILAN_STD")
         .map(PathBuf::from)
@@ -119,9 +119,9 @@ fn completions(src: &str) -> (String, Vec<Completion>) {
     (text, items)
 }
 
-const ELEMENT_HEAD_PRELUDE: &str = "import std::ui::view;\nimport std::reactive::{ Signal, SignalCell };\nimport std::io::print;\n";
+const ELEMENT_HEAD_PRELUDE: &str = "import std::web::ui::view;\nimport std::reactive::{ Signal, SignalCell };\nimport std::io::print;\n";
 const CSS_BLOCK_PRELUDE: &str =
-    "import std::style::{ Color, Length, Style, space, style };\nimport std::io::print;\n";
+    "import std::web::style::{ Color, Length, Style, space, style };\nimport std::io::print;\n";
 
 /// The harness itself, before anything is claimed over it: the engine answers,
 /// and it answers over the analyzed program rather than out of a table of

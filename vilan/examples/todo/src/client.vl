@@ -8,7 +8,7 @@
 // change (this tab's included) arrives over the wire.
 //
 // `Result`/`Ok`/`Err` and `print` are ambient under the package's
-// `prelude = "std::web"`, and `mount_root` is reached through the ambient MODULE
+// `prelude = "std::web::prelude"`, and `mount_root` is reached through the ambient MODULE
 // `ui` — so what is left below is the codec and this package's own modules,
 // none of which any prelude carries.
 

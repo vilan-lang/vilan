@@ -1,8 +1,8 @@
 # Misc reference
 
 The small modules that don't need a page of their own: `std::io`,
-`std::task`, `std::promise`, `std::context`, `std::crypto`, `std::jwt`,
-`std::asset`, `std::tuple`.
+`std::task`, `std::js::promise`, `std::context`, `std::crypto`, `std::jwt`,
+`std::web::asset`, `std::tuple`.
 
 ## std::io
 
@@ -88,7 +88,7 @@ absorbed for a join, and children do not cancel their siblings
 (ownership is lifetime, not fate-sharing). Cancellation echoes, from the
 owner's `cancel` or drop, stay silent.
 
-## std::promise
+## std::js::promise
 
 ```vilan,fragment
 external struct Promise<T>;
@@ -186,7 +186,7 @@ fun decode_claims<C: Wire>(segment: str): Option<C>   // decode WITHOUT verifyin
 `verify_hs512` checks the signature (constant-time) before yielding claims;
 `decode_claims` is for non-security introspection only.
 
-## std::asset
+## std::web::asset
 
 ```vilan,fragment
 fun emit(kind: str, line: str)               // compile-time only: append to a build asset
@@ -203,10 +203,10 @@ fun digest(path: str): str                   // compile-time only: a file's sha-
 ```
 
 All eleven callable only from `const` evaluation — a runtime call path
-to any of them is a compile error. `emit` is how `std::style` writes the CSS
+to any of them is a compile error. `emit` is how `std::web::style` writes the CSS
 file (`emit("css", rule)`). Reach for it directly only for a shape std
 has no spelling for: a whole declaration block under a selector you
-choose is `std::style::declare`, which builds the line — and the layer
+choose is `std::web::style::declare`, which builds the line — and the layer
 around it — for you. A browser build with emissions produces
 `<entry>.css` beside `<entry>.js` (beside `<entry>.mjs` on a process
 target).
@@ -251,7 +251,7 @@ line, it postpones one. `schedule_at_end(f)` asks the build to call the
 named function `f` once, after every const evaluation of this compile
 has finished and in a const context of its own, so a module can gather
 contributions while the program evaluates and emit the finished result
-in one go — which is how `std::style` puts the rules that survived on
+in one go — which is how `std::web::style` puts the rules that survived on
 the sheet instead of every rule ever constructed:
 
 ```vilan,fragment
@@ -286,7 +286,7 @@ names nothing, so nothing can stop naming it.
 `staged` answers only after evaluation has finished — until the last
 `const` expression has run, a token may still be about to be named — so
 it is read from a finaliser, and reading it anywhere else is a compile
-error saying so. That pairing is how `std::style` writes a stylesheet:
+error saying so. That pairing is how `std::web::style` writes a stylesheet:
 every rule is staged under its class, and a condition combinator that
 re-mints an inner style's rules under a composed condition drops the
 inner, so the inner's class is in no surviving style and its rule never
@@ -295,7 +295,7 @@ reaches the sheet.
 The `css` kind is the one `emit_keyed` refuses: the stylesheet is
 ordered by the cascade rather than by a contribution's key, so a key
 passed for it would have no meaning. Write CSS with `emit`, or leave it
-to `std::style`.
+to `std::web::style`.
 
 Because the kind becomes a filename, it must **be** a filename: one path
 segment, so a kind carrying `/`, `\`, or `..` is refused — for either

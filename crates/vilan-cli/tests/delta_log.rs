@@ -412,7 +412,7 @@ fn a_list_cell_runs_its_derivation_once_per_arriving_element() {
 /// where `KeyedCell` lives).
 #[test]
 fn std_reactive_imports_nothing_from_std_wire() {
-    for file in ["reactive.vl", "delta.vl"] {
+    for file in ["reactive.vl", "reactive/delta.vl"] {
         let source = std_source(file);
         for line in source.lines() {
             let trimmed = line.trim_start();

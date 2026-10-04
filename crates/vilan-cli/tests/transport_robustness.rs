@@ -178,7 +178,7 @@ import std::json::json_codec;
 import std::option::Option::{ self, Some, None };
 import std::process::args;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import common::StatusBoard;
 
 // A second service with a DIFFERENT contract surface — the redeployed server.
@@ -888,7 +888,7 @@ import std::option::Option::{ self, Some, None };
 import std::process::args;
 import std::http::{ Response, Server };
 import std::rpc::session_of;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(BoardClient)]
 struct Board {

@@ -1117,7 +1117,7 @@ enum IStringEnd {
 /// exactly why the fix offers nothing for the other three at-rules.
 pub const AT_IS_NOT_A_TOKEN: &str = "`@` is not a vilan token; a `css` block has no at-rules — a media query is a \
      breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is \
-     `std::style::declare`";
+     `std::web::style::declare`";
 
 /// The rule a hole whose text is not an expression breaks (B247). A hole holds
 /// an EXPRESSION and `{` / `}` DELIMIT it (`lexical.md` §3.4), so a nested brace

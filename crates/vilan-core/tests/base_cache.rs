@@ -1215,13 +1215,13 @@ fn a_pkg_importing_entry_hits_the_cache_on_its_second_analysis() {
 /// B341: the key carries the modules the entry's own SYNTAX seeds, not only the
 /// ones a `std::` path names.
 ///
-/// An element desugars to `std::ui`'s `view`, and a `css` block makes
-/// `std::style::prelude` ambient inside itself — both are pushed into `to_load`
+/// An element desugars to `std::web::ui`'s `view`, and a `css` block makes
+/// `std::web::style::prelude` ambient inside itself — both are pushed into `to_load`
 /// beside the written imports, both load into the world, and neither is named
 /// by any `std::` path in the text. The key was `collect_module_paths(.., "std")`
 /// alone, so a plain entry and an element entry with the same import line minted
 /// the SAME key and the second was served the first's world: a world with no
-/// `std::ui` in it, in which `<div/>` fails with "cannot find 'view' in this
+/// `std::web::ui` in it, in which `<div/>` fails with "cannot find 'view' in this
 /// scope". Not a cache curiosity — `vilan build` analyzes a package's entries in
 /// ONE process, so a two-entry package where one entry uses element syntax
 /// failed to build, and WHICH entry failed depended on the order the entries
@@ -1259,7 +1259,7 @@ fn an_entrys_desugar_seeds_are_part_of_its_world_key() {
     assert_eq!(
         element.0, "[]",
         "an element entry analyzed after a plain one must analyze clean — it \
-         was served a world with no `std::ui` in it: {}",
+         was served a world with no `std::web::ui` in it: {}",
         element.0
     );
     assert!(
@@ -1279,7 +1279,7 @@ fn an_entrys_desugar_seeds_are_part_of_its_world_key() {
     let plain = observe(PLAIN);
     assert_eq!(plain.0, "[]", "the plain entry must analyze clean second");
 
-    // The `css` twin, whose seed is `std::style::prelude` and whose failure
+    // The `css` twin, whose seed is `std::web::style::prelude` and whose failure
     // said "cannot find 'style' in this scope".
     vilan_core::analyzer::base_cache_clear();
     let plain = observe(PLAIN);
@@ -2822,11 +2822,11 @@ fn checked_cache_bytes_per_world() {
         ("math", RECORD_C),
         (
             "router",
-            "import std::router::current_path;\nfun main() { }\n",
+            "import std::web::router::current_path;\nfun main() { }\n",
         ),
         (
             "web_wide",
-            "import std::io::print;\nimport std::router::current_path;\n\
+            "import std::io::print;\nimport std::web::router::current_path;\n\
              import std::time::sleep;\nimport std::math::PI;\nfun main() { print(PI); }\n",
         ),
     ] {

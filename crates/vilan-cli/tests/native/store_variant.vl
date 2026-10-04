@@ -7,9 +7,9 @@
 import std::compare::PartialEq;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ Storable, Store, StoreSome };
 import std::reactive::{ Owner, Signal, Source, run_with_owner };
 import std::shared::Shared;
-import std::store::{ Storable, Store, StoreSome };
 
 [derive(PartialEq, Storable)]
 struct Device {

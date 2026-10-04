@@ -1,6 +1,6 @@
 //! A33: a read-only binding takes a `Source`, and it is a LIVE one.
 //!
-//! `std::ui`'s read-only binders were widened from the concrete `SignalCell<T>` to a
+//! `std::web::ui`'s read-only binders were widened from the concrete `SignalCell<T>` to a
 //! `Source<T>` bound, so a user's own reactive type can drive them. That the
 //! widened signatures ACCEPT such a type is a compile fact, pinned in
 //! `vilan-core`'s inference suite. What only a running program can show is that
@@ -128,7 +128,7 @@ fn build_and_run(tag: &str, app: &str) -> String {
 fn app_source() -> String {
     format!(
         r#"import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-import std::ui::{{ View, each, mount_root, view, when }};
+import std::web::ui::{{ View, each, mount_root, view, when }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]
@@ -250,7 +250,7 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
 fn a_user_source_drives_swap_and_keeps_driving_it() {
     let app = format!(
         r#"import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-import std::ui::{{ View, mount_root, swap, view }};
+import std::web::ui::{{ View, mount_root, swap, view }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]
@@ -313,8 +313,8 @@ fun main() {{
 fn b526_a_when_live_body_reads_the_last_payload_as_its_variant_ends() {
     let app = r#"import std::io::print;
 import std::reactive::{ Flow, Pipe, Signal, Source, batch };
-import std::store::{ Storable, Store };
-import std::ui::{ View, mount_root, view, when_live };
+import std::reactive::store::{ Storable, Store };
+import std::web::ui::{ View, mount_root, view, when_live };
 
 [derive(PartialEq, Storable)]
 struct Device {
@@ -368,8 +368,8 @@ fun main() {
 fn a142_s7_when_live_rebuilds_only_when_the_variant_changes() {
     let app = r#"import std::io::print;
 import std::reactive::{ Signal, Source };
-import std::store::{ Storable, Store };
-import std::ui::{ View, mount_root, view, when_live };
+import std::reactive::store::{ Storable, Store };
+import std::web::ui::{ View, mount_root, view, when_live };
 
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]

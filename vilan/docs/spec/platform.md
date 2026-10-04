@@ -11,10 +11,10 @@ capability its platform lacks.
 The standard library is layered:
 
 - the **base** layer: platform-neutral, available everywhere;
-- the **browser** layer (`std::dom`, `std::ui`, `std::router`,
-  `std::storage`): browser builds only;
+- the **browser** layer (`std::web::dom`, `std::web::ui`, `std::web::router`,
+  `std::web::storage`): browser builds only;
 - the **process** layer (`std::fs`, `std::http`, `std::db`,
-  `std::process`, `std::rpc_server`): `@process` builds only.
+  `std::process`, `std::rpc::server`): `@process` builds only.
 
 A library may declare the same shape for itself (`[library.layer]`,
 §11.4): a neutral root plus per-platform overlay roots.
@@ -50,7 +50,7 @@ Fences add no runtime behavior; they are checked declarations.
 
 A fence is also the platform its body is **analyzed under**. One
 analysis types a file under one platform — and so under one `std`
-twin, which is what a body over `std::ui`'s `Region` reads its fields
+twin, which is what a body over `std::web::ui`'s `Region` reads its fields
 from — so a file is analyzed under a platform every fence and label in
 it admits, whenever the colour its package gives it (§11.2, the
 `default-entry`'s, inference's) admits none of them. Declarations that

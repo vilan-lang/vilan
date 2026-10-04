@@ -1123,7 +1123,7 @@ fn trait_method_candidates(program: &Program, trait_id: Id, member: &str) -> Vec
 /// A dispatched `receiver.name()` can only ever select a member with a
 /// receiver, so a same-named STATIC is not a candidate for it however sound the
 /// rest of the over-approximation is. Leaving statics in is not merely
-/// imprecise, it is wrong in a way users feel: `std::promise::Promise::all` is
+/// imprecise, it is wrong in a way users feel: `std::js::promise::Promise::all` is
 /// an `async external` static, `promise` is a force-loaded core module, and so
 /// every `xs.iter().all(p)` — an `OnType` re-dispatch, which cannot pin its
 /// trait and falls back to this scan — used to color its whole caller async,

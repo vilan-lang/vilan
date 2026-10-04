@@ -40,13 +40,13 @@
 // so a family resolves by AUTHORING order, the way every other merge here
 // does, and never by the class-name sort.
 
-import pkg::asset::{ emit, schedule_at_end, stage, staged };
 import pkg::compare::{ Ord, Ordering };
 import pkg::hash_map::HashMap;
 import pkg::io::panic;
 import pkg::operators::Add;
 import pkg::option::Option::{ self, None, Some };
 import pkg::range::Range;
+import pkg::web::asset::{ emit, schedule_at_end, stage, staged };
 
 // --- values -------------------------------------------------------------------
 
