@@ -46673,7 +46673,13 @@ impl<'src> Analyzer<'src> {
         // nothing but its statics, and neither leaves the module scope behind
         // to answer.
         let mut type_segment: Option<ImportTypeSegment> = None;
+        // A154: the segment the walk resolved last, with whether it stood at
+        // std's root — so `std::web::Signal`, whose `web` resolves (it is the
+        // namespace now) and whose `Signal` then misses, can be told the web
+        // prelude moved, at the `web` that names the old path.
+        let mut previous_segment: Option<(&str, Span, bool)> = None;
         for (depth, (part, part_span)) in segments.enumerate() {
+            let segment_at_root = namespace_scope_id == root_scope_id;
             // B332: a type that brought no scope of its own leaves the walk
             // with nothing to read here. Reading the scope the walk came FROM
             // is the order this replaced — it is what made a module-level `rem`
@@ -46769,6 +46775,7 @@ impl<'src> Analyzer<'src> {
                     if let Some(sub_scope_id) = sub_scope_id {
                         namespace_scope_id = sub_scope_id;
                     }
+                    previous_segment = Some((part, part_span, segment_at_root));
                 }
                 None => {
                     // B236: the first thing B226's entry-cycle refusal covers.
@@ -46840,6 +46847,25 @@ impl<'src> Analyzer<'src> {
                             return false;
                         }
                         let at_std_root = namespace_scope_id == root_scope_id;
+                        // A154: a path through a module that moved under a
+                        // namespace is refused with where it went, at the old
+                        // segment — the span the editor's fix replaces.
+                        if let Some((old, old_span)) = self.moved_std_segment(
+                            root,
+                            part,
+                            part_span,
+                            at_std_root,
+                            previous_segment,
+                        ) {
+                            let new = crate::parsing::moved_std_module(old).unwrap_or_default();
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: old_span,
+                                msg: crate::parsing::moved_std_module_message(old, new),
+                            });
+                            return false;
+                        }
                         let msg = removed_std_alias(root, part, at_std_root)
                             .or_else(|| renamed_std_segment(root, part, at_std_root))
                             .unwrap_or_else(|| {
@@ -52659,6 +52685,36 @@ impl<'src> Analyzer<'src> {
             .into_iter()
             .map(|importable| importable.name.to_string())
             .collect()
+    }
+
+    /// A154: the moved std module a missed import segment names, with the span
+    /// the refusal anchors at — the OLD module's own segment. `std::dom` misses
+    /// AT `dom`; `std::web` resolves (it is the namespace now), so the old web
+    /// prelude path shows only as a miss one segment deeper, and only for a
+    /// name the prelude exports (`std::web::Signal`) — a typo under the
+    /// namespace (`std::web::dmo`) is an ordinary miss.
+    fn moved_std_segment(
+        &self,
+        root: &str,
+        part: &str,
+        part_span: Span,
+        at_std_root: bool,
+        previous: Option<(&str, Span, bool)>,
+    ) -> Option<(&'static str, Span)> {
+        if root != "std" {
+            return None;
+        }
+        if at_std_root {
+            return crate::parsing::MOVED_STD_MODULES
+                .iter()
+                .find(|(module, _)| *module == part)
+                .map(|(module, _)| (*module, part_span));
+        }
+        let (previous, previous_span, previous_at_root) = previous?;
+        (previous == "web"
+            && previous_at_root
+            && self.web_prelude_names().iter().any(|name| name == part))
+        .then_some(("web", previous_span))
     }
 
     /// The B4 import steer for a PATH whose resolution missed in scope (E103) —

@@ -724,6 +724,44 @@ fn cross_platform_transitive_import_not_reported() {
     assert!(errors.iter().any(|e| e.contains("main → builder")));
 }
 
+/// A154: the moved-module refusal anchors at the OLD module's own segment —
+/// `dom`, `rpc_server`, or the `web` of `std::web::Signal` — which is exactly
+/// the span the editor's fix (`moved_std_module_fix`) replaces.
+#[test]
+fn a154_the_moved_module_refusal_anchors_at_the_old_segment() {
+    for (entry, segment) in [
+        ("import std::dom::create_element;\nfun main() {}\n", "dom"),
+        (
+            "import std::{ rpc_server::Server };\nfun main() {}\n",
+            "rpc_server",
+        ),
+        ("import std::web::Signal;\nfun main() {}\n", "web"),
+    ] {
+        let errors = analyze_package_spanned(&[("main.vl", entry)], "main.vl", Platform::Browser);
+        let (message, file, range) = errors
+            .iter()
+            .find(|(message, ..)| message.contains(" moved to `std::"))
+            .unwrap_or_else(|| panic!("a moved-module refusal for {entry:?}: {errors:?}"));
+        assert_eq!(file, "main.vl");
+        assert_eq!(&entry[range.clone()], segment, "{message}");
+        let fix = vilan_core::parsing::moved_std_module_fix(
+            entry,
+            message,
+            vilan_core::Span::from(range.clone()),
+        )
+        .expect("the refusal carries its fix");
+        let mut fixed = entry.to_string();
+        fixed.replace_range(fix.span.into_range(), fix.replacement);
+        let after = analyze_package(&[("main.vl", &fixed)], "main.vl", Platform::Browser);
+        assert!(
+            after
+                .iter()
+                .all(|message| !message.contains(" moved to `std::")),
+            "the fixed import resolves: {fixed:?} {after:?}"
+        );
+    }
+}
+
 #[test]
 fn platform_modules_load_for_typing_under_opposite_platform() {
     // Loading a cross-platform std module purely to type-check it must not introduce

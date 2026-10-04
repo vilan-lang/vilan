@@ -802,6 +802,25 @@ fn prelude_problem(
         });
     }
     let root = segments[0];
+    // A154: a std module that moved under a namespace — above all the web
+    // prelude's old `"std::web"`, which every web package's manifest wrote.
+    // `std::web` is a namespace now, so only the bare two-segment spelling is
+    // the old path; `std::web::prelude` is the new one.
+    if root == "std"
+        && let Some(new) = crate::parsing::moved_std_module(segments[1])
+        && (segments[1] != "web" || segments.len() == 2)
+    {
+        let old = segments[1];
+        let rewritten = std::iter::once("std")
+            .chain(std::iter::once(new))
+            .chain(segments[2..].iter().copied())
+            .collect::<Vec<_>>()
+            .join("::");
+        return Some(format!(
+            "`{section} prelude = \"{path}\"` names the old path of a std module: `std::{old}` \
+             moved to `std::{new}` — write `prelude = \"{rewritten}\"`"
+        ));
+    }
     if root == "pkg" || root == "std" || dependencies.contains_key(root) {
         return None;
     }
@@ -4184,6 +4203,47 @@ mod tests {
             PreludeSpec::Module(WEB_PRELUDE.to_string())
         );
         assert_eq!(manifest.validate(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a154_the_old_web_prelude_path_is_refused_with_the_new_one() {
+        // A154: `std::web` is a namespace now; the web prelude is
+        // `std::web::prelude`, and the old spelling every web manifest wrote is
+        // refused with the line to write instead — from the ONE moved-module
+        // table, so a moved module named as a prelude is steered the same way.
+        for (written, rewritten) in [
+            ("std::web", "std::web::prelude"),
+            ("std::style::prelude", "std::web::style::prelude"),
+        ] {
+            for section in ["package", "library"] {
+                let errors = parse(&format!(
+                    "[{section}]\nname = \"app\"\nprelude = \"{written}\"\n"
+                ))
+                .validate();
+                assert_eq!(
+                    errors,
+                    vec![format!(
+                        "`[{section}] prelude = \"{written}\"` names the old path of a std \
+                         module: `std::{}` moved to `std::{}` — write `prelude = \"{rewritten}\"`",
+                        written.split("::").nth(1).unwrap(),
+                        crate::parsing::moved_std_module(written.split("::").nth(1).unwrap())
+                            .unwrap()
+                    )]
+                );
+            }
+        }
+        // The new paths, and a namespace's child that is not the prelude, pass.
+        for path in [
+            "std::web::prelude",
+            "std::web::style::prelude",
+            "std::prelude",
+        ] {
+            let errors = parse(&format!(
+                "[package]\nname = \"app\"\nprelude = \"{path}\"\n"
+            ))
+            .validate();
+            assert_eq!(errors, Vec::<String>::new(), "{path}");
+        }
     }
 
     #[test]

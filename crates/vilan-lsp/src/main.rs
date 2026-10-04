@@ -27,6 +27,8 @@ mod import_position_tests;
 #[cfg(test)]
 mod member_admission_tests;
 #[cfg(test)]
+mod moved_std_path_tests;
+#[cfg(test)]
 mod organize_duplicate_tests;
 #[cfg(test)]
 mod written_autofocus_tests;

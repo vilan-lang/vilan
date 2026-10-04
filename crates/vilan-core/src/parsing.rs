@@ -803,6 +803,113 @@ pub fn foreign_spelling_fix(source: &str, message: &str, span: Span) -> Option<S
     })
 }
 
+/// A154 (ruled 2026-10-03): the std modules that moved under a namespace, each
+/// old path (under `std::`) with the path that replaced it. The ONE table: the
+/// analyzer's refusal of an old import or qualified path, the manifest's refusal
+/// of an old `prelude` value and the editor's quick fix all read it, so no two of
+/// them can disagree about where a module went. There are no forwarding modules
+/// (the ruling's (2)): an old path resolves to nothing and is refused with this.
+///
+/// `web` is the web PRELUDE's old path — `std::web` itself is a namespace now,
+/// so its row is consulted only where a path stops AT `web` or reaches a name
+/// the namespace does not hold (see the analyzer's import walk).
+pub const MOVED_STD_MODULES: &[(&str, &str)] = &[
+    ("dom", "web::dom"),
+    ("ui", "web::ui"),
+    ("style", "web::style"),
+    ("dev", "web::dev"),
+    ("router", "web::router"),
+    ("storage", "web::storage"),
+    ("document", "web::document"),
+    ("asset", "web::asset"),
+    ("web", "web::prelude"),
+    ("hash_map_cell", "reactive::hash_map_cell"),
+    ("hash_set_cell", "reactive::hash_set_cell"),
+    ("transient", "reactive::transient"),
+    ("store", "reactive::store"),
+    ("store_core", "reactive::store_core"),
+    ("delta", "reactive::delta"),
+    ("null", "js::null"),
+    ("promise", "js::promise"),
+    ("native_map", "js::native_map"),
+    ("rpc_server", "rpc::server"),
+];
+
+/// The path [`MOVED_STD_MODULES`] gives the old std module `old` (the segment
+/// after `std::`), or `None` when `old` did not move.
+pub fn moved_std_module(old: &str) -> Option<&'static str> {
+    MOVED_STD_MODULES
+        .iter()
+        .find(|(module, _)| *module == old)
+        .map(|(_, new)| *new)
+}
+
+/// The stable code of the moved-module refusal ([`moved_std_module_message`]).
+/// The editor publishes it as the LSP diagnostic's `code`.
+pub const MOVED_STD_MODULE_CODE: &str = "std-path/moved";
+
+/// The refusal for a path through the moved std module `old` (A154). The text
+/// is its whole contract: [`moved_std_module_fix`] reads the two paths back out
+/// of it, so its head is fixed.
+pub fn moved_std_module_message(old: &str, new: &str) -> String {
+    format!(
+        "`std::{old}` moved to `std::{new}`: std's modules are grouped under namespaces since \
+         v0.44.0, and the old path is gone — write `std::{new}`"
+    )
+}
+
+/// The `(old, new)` pair a moved-module refusal names, when `message` is one.
+pub fn moved_std_module_of_message(message: &str) -> Option<(&'static str, &'static str)> {
+    let rest = message.strip_prefix("`std::")?;
+    let (old, rest) = rest.split_once('`')?;
+    let rest = rest.strip_prefix(" moved to `std::")?;
+    let (new, _) = rest.split_once('`')?;
+    MOVED_STD_MODULES
+        .iter()
+        .find(|(module, moved)| *module == old && *moved == new)
+        .map(|(module, moved)| (*module, *moved))
+}
+
+/// The stable code of a std-path diagnostic `message`, if it is one.
+pub fn std_path_diagnostic_code(message: &str) -> Option<&'static str> {
+    moved_std_module_of_message(message).map(|_| MOVED_STD_MODULE_CODE)
+}
+
+/// The quick fix for a moved-module refusal: the span to replace and the text
+/// to write there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StdPathFix {
+    /// The diagnostic's stable code ([`MOVED_STD_MODULE_CODE`]).
+    pub code: &'static str,
+    /// The quick fix's title: "Write `std::web::dom`".
+    pub title: String,
+    /// The source range the edit replaces: the OLD module segment.
+    pub span: Span,
+    /// What the edit writes there: the new path below `std::` (`web::dom`).
+    pub replacement: &'static str,
+}
+
+/// The quick fix for the diagnostic `message` anchored at `span` in `source`
+/// (A154), or `None` when it is not a moved-module refusal or `span` no longer
+/// covers the old segment (the buffer moved on).
+///
+/// The refusal anchors at the old module's own segment — `dom` in
+/// `import std::dom::create_element;`, `web` in `std::web::Signal` — so the edit
+/// replaces exactly that segment with the new path below `std::`, and whatever
+/// the path continues with (`::create_element`, a brace list, an alias) stays.
+pub fn moved_std_module_fix(source: &str, message: &str, span: Span) -> Option<StdPathFix> {
+    let (old, new) = moved_std_module_of_message(message)?;
+    if source.get(span.into_range())? != old {
+        return None;
+    }
+    Some(StdPathFix {
+        code: MOVED_STD_MODULE_CODE,
+        title: format!("Write `std::{new}`"),
+        span,
+        replacement: new,
+    })
+}
+
 /// A157: the warning on a WRITTEN `autofocus` attribute in an element head
 /// (`<input autofocus />`, which lowers to `.attr("autofocus", "")`). Raised by
 /// the analyzer's `check_written_autofocus`, at the attribute's NAME; an
