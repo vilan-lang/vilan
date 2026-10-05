@@ -9003,9 +9003,25 @@ mod reformats {
     use super::format;
 
     fn assert_formats(source: &str, expected: &str) {
+        // N141: `format` hands the source back when the reprint is DECLINED, so
+        // an identity expectation (`expected == source`) cannot tell a decline
+        // from a clean reprint. The reprint must succeed first.
+        if let Err(decline) = super::reprint(source) {
+            panic!("the reprint was declined ({decline:?}) for {source:?}");
+        }
         assert_eq!(format(source), expected);
         // The output must be a fixed point — formatting it again is a no-op.
         assert_eq!(format(expected), expected, "output is not idempotent");
+    }
+
+    /// N141: an identity expectation over a source the formatter DECLINES is
+    /// a failure, not a pass — `format` hands the declined source back
+    /// unchanged, which is exactly what an identity pin expects.
+    #[test]
+    #[should_panic(expected = "the reprint was declined")]
+    fn an_identity_pin_over_a_declined_source_fails() {
+        let source = "fun main() {\n\tlet x = (;\n}\n";
+        assert_formats(source, source);
     }
 
     // B414: the six demoted keywords reprint as NAMES where they are names and

@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**The formatter's identity pins can no longer pass on a decline.** `format` hands the source back unchanged when the reprint is declined, so `assert_formats(source, source)` read a decline as a clean reprint: E252's first pin stayed green with its bug planted back. The helper now asserts the reprint succeeded before it compares, which covers every caller at once (the literal identity calls and the loops that pass one variable twice). All ten literal identity pins, and every other caller, still pass: none of them was standing on a decline. Pin: `formatter::reformats::an_identity_pin_over_a_declined_source_fails` (the helper over a source that does not parse panics). Tracker N141.
+
+---
+
+<!-- family: tooling -->
 **A `then` that leads its line is highlighted as the keyword.** The formatter breaks a long conditional before its `then` (`ready` ⏎ `then go() else wait()`), and on that line VS Code painted `then` as a plain name: B459's TextMate rule found the keyword by the operand that ends just before it, and TextMate matches one line at a time, so the operand on the line above was never behind it. A `then` with only indentation before it is now the keyword too, on the same right-hand guard, which keeps a name that starts a line (`then = 1;`, `then.x`, `then(f)`, `then: i32`) plain. The book's highlighter reads the whole fence and already saw the line above; an `else` leading its line was never affected (an ordinary keyword in both grammars); and the language server sends no semantic token for `then` either way, so the grammar's colour is the one that shows. Pins: `grammar_sync::e270_then_leading_its_line_is_coloured_in_both_grammars` (four line-leading keywords, six line-leading names, two fences, `else`) and `vilan-lsp`'s `e270_a_line_leading_then_carries_no_semantic_token` (and hovers as the keyword). Tracker E270.
 
 ---
