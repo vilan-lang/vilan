@@ -109,31 +109,29 @@ fn a_mixed_web_list_moves_only_the_prelude_names() {
     clean(&after);
 }
 
-/// A shape no one edit rewrites correctly (`self` bound the old prelude as
-/// `web`) is offered no edit at all, rather than a wrong one.
+/// E269: the old prelude imported AS A MODULE — a bare `import std::web;`
+/// and a `self` in a brace list under the old path — is the moved-path
+/// refusal, with the fix that keeps the binding's name.
 #[test]
-fn a_web_list_naming_self_is_offered_no_edit() {
-    let source =
-        "import std::web::{ self, Signal };\n\nfun main() {\n\tlet _ = Signal::new(1);\n}\n";
-    let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
-    let program = document.program.as_ref().expect("a program");
-    let moved: Vec<_> = document
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.msg.contains(" moved to `std::"))
-        .collect();
-    assert!(!moved.is_empty(), "the old path is refused");
-    for diagnostic in moved {
-        let titles: Vec<String> = document
-            .quickfixes(program, diagnostic.span)
-            .into_iter()
-            .map(|fix| fix.title)
-            .collect();
-        assert!(
-            titles.iter().all(|title| !title.starts_with("Write ")),
-            "no moved-path edit for {source:?}: {titles:?}"
-        );
-    }
+fn the_old_web_prelude_as_a_module_keeps_its_name() {
+    let after = fixed(
+        "import std::web;\n\nfun main() {\n\tlet _ = web::Signal::new(1);\n}\n",
+        "Write `std::web::prelude as web`",
+    );
+    assert_eq!(
+        after,
+        "import std::web::prelude as web;\n\nfun main() {\n\tlet _ = web::Signal::new(1);\n}\n"
+    );
+    clean(&after);
+    let after = fixed(
+        "import std::web::{ self, Signal };\n\nfun main() {\n\tlet _ = web::Signal::new(1);\n\tlet _ = Signal::new(2);\n}\n",
+        "Write `prelude as web` for `self` and `prelude::` before the prelude's names (the web prelude is `std::web::prelude`)",
+    );
+    assert_eq!(
+        after,
+        "import std::web::{ prelude as web, prelude::Signal };\n\nfun main() {\n\tlet _ = web::Signal::new(1);\n\tlet _ = Signal::new(2);\n}\n"
+    );
+    clean(&after);
 }
 
 /// The diagnostic is published with its stable code, which a client (and the

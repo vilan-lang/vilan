@@ -48009,6 +48009,30 @@ impl<'src> Analyzer<'src> {
         // name in scope that reaches nothing; refuse, and name the children,
         // because "write the child's own path" is the whole of the fix.
         if let Some(children) = self.namespace_only_modules.get(&target_id) {
+            // E269: `std::web` was the web PRELUDE until v0.44.0, and a bare
+            // `import std::web;` (read as `web::Signal`) is the one old
+            // spelling of it that RESOLVES — to the namespace — so it never
+            // reached the moved-path refusal above. It is that refusal, at the
+            // `web` segment, so the editor's fix and `vilan check --fix` write
+            // `std::web::prelude as web`.
+            let web_segment = match (path, name) {
+                ([("std", _)], "web") => Some(leaf_span),
+                ([("std", _), ("web", web_span)], "self") => Some(*web_span),
+                _ => None,
+            };
+            if let Some(web_span) = web_segment
+                && let Some(new) = crate::parsing::moved_std_module("web")
+            {
+                if report {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: web_span,
+                        msg: crate::parsing::moved_std_module_message("web", new),
+                    });
+                }
+                return false;
+            }
             if report {
                 let mut spelled: Vec<&str> = path.iter().map(|(segment, _)| *segment).collect();
                 if name != "self" {
