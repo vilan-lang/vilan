@@ -89,7 +89,7 @@ export trait TransientSource<T, E> with Source<Option<T>> {
   reloads:
 
   ```vilan,fragment
-  view("ul").each(results.latest().derive(|rows| rows.unwrap_or([])).memo(), |row| row_view(row))
+  <ul>{each_values(results.latest().derive(|rows| rows.unwrap_or([])).memo(), |row| row_view(row))}</ul>
   ```
 
 - **`is_pending()`** is a fresh pipe per call: the spinner.

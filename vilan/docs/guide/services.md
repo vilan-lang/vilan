@@ -341,7 +341,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::SocketTransport;
 import std::shared::Shared;
-import std::web::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root };
 
 [derive(Wire, PartialEq, Debug)]
 struct Note {
@@ -360,7 +360,7 @@ fun notes_panel(client: NotesClient<SocketTransport>): View {
 	// open while — and only while — the panel is showing. `[]` until the
 	// first sync; the empty list takes its element type from the mirror.
 	let entries = client.entries.or([]).memo();
-	view("ul").child(each(entries, |note| note.id, |note| view("li").text(note.text)))
+	<ul>{each(entries, |note| note.id, |note| <li>{note.text}</li>)}</ul>
 }
 
 async fun main() {
@@ -459,10 +459,12 @@ impl Chat {
 // At the client — no await, one mirror, read like any other:
 let ids = client.get_messages("general", 100)!;
 let body = client.get_message(ids[3]);
-view("p").bind_text(body.derive(|value| match value {
-	Some(let message) => message.body,
-	None => "loading…",
-}))
+<p>
+	{body.derive(|value| match value {
+		Some(let message) => message.body,
+		None => "loading…",
+	})}
+</p>
 ```
 
 Everything you already know about a mirror applies to this one: it is a
@@ -759,7 +761,7 @@ impl Board {
 
 // At the client — sync and unleased, exactly like a plain handle:
 let tasks: KeyedSource<i32, Task> = client.tasks_in("alpha");
-view("ul").child(each(tasks.or([]), |task| task.id, |task| view("li").text(task.title)))
+<ul>{each(tasks.or([]), |task| task.id, |task| <li>{task.title}</li>)}</ul>
 ```
 
 Everything a plain handle does, this one does at the keyed type: no call
@@ -784,7 +786,7 @@ client subscribed to**, in the server's order. It reads two ways.
 ```vilan,fragment
 fun feed(client: ChatClient<SocketTransport>): View {
 	let messages = client.messages.or([]);
-	view("ul").child(each(messages, |message| message.id, |message| view("li").text(message.body)))
+	<ul>{each(messages, |message| message.id, |message| <li>{message.body}</li>)}</ul>
 }
 ```
 
@@ -796,10 +798,12 @@ fun message_row(client: ChatClient<SocketTransport>, id: str): View {
 	// server forwards that message's changes and nothing else. Released
 	// when the row unmounts, like any other lease.
 	let message = client.messages.of(id);
-	view("li").bind_text(message.derive(|held| match held {
-		Some(let found) => found.body,
-		None => "…",
-	}))
+	<li>
+		{message.derive(|held| match held {
+			Some(let found) => found.body,
+			None => "…",
+		})}
+	</li>
 }
 ```
 
@@ -884,8 +888,7 @@ First, a signal you can bind a banner to:
 
 ```vilan,fragment
 let state = client.transport.connection_state();
-view("p").text("reconnecting…")
-	.show(state.derive(|current| current == ConnectionState::Reconnecting))
+<p .show(state.derive(|current| current == ConnectionState::Reconnecting))>"reconnecting…"</p>
 ```
 
 Second, explicit call failures. A call in flight when the connection drops

@@ -13,14 +13,14 @@ What to look at in [`app.vl`](app.vl):
   `std::web::router::segments`. Total (unknown paths → `NotFound`), and testable
   like any function.
 - **The shell**: `app` swaps the page on the derived route signal
-  (`View.swap`: an unchanged route is a no-op; a swapped-out page's
-  bindings are disposed). The nested `items_layout` repeats the same shape
+  (`{swap(route, ..)}` in a child hole: an unchanged route is a no-op; a
+  swapped-out page's bindings are disposed). The nested `items_layout` repeats the same shape
   one level down.
 - **Links**: `link("Items", Route::Items(ItemsRoute::List))` renders a real
   `<a href>` (middle-click and copy-link behave natively) and intercepts only
   plain left-clicks. `item_detail`'s Previous/Next links are arithmetic on
   the payload, not string splicing.
-- **The live path**: `bind_text(current_path())`, the same signal that
+- **The live path**: `<p>{current_path()}</p>`, the same signal that
   `navigate`, link clicks, and the back button all drive.
 
 ## Build & run

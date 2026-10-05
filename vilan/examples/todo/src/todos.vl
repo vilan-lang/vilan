@@ -105,29 +105,24 @@ fun todos(client: TodoClient<SocketTransport>): View {
 		}
 	};
 
-	view("section")
-		.styled(shell)
-		.child(view("h2").text("Todos"))
-		.child(view("div")
-			.styled(row)
+	<section .styled(shell)>
+		<h2>"Todos"</h2>
+		<div .styled(row)>
 			// `bind_value` is two-way: the input shows `draft` and writes it on input.
-			.child(view("input").attr("placeholder", "What needs doing?").bind_value(draft))
-			.child(view("button").styled(button).text("Add").on("click", add)))
-		.child(view("p").bind_text(remaining.derive(|n| format(n) + " remaining")))
-		.child(view("div")
-			.styled(row)
-			.child(filter_button(filter, "all", "All"))
-			.child(filter_button(filter, "active", "Active"))
-			.child(filter_button(filter, "done", "Done")))
+			<input placeholder("What needs doing?") .bind_value(draft) />
+			<button .styled(button) .on("click", add)>"Add"</button>
+		</div>
+		<p>{remaining.derive(|n| format(n) + " remaining")}</p>
+		<div .styled(row)>
+			{filter_button(filter, "all", "All")}
+			{filter_button(filter, "active", "Active")}
+			{filter_button(filter, "done", "Done")}
+		</div>
 		// `each` renders one row per element and re-renders as `visible`
 		// changes — whether this tab caused the change or another one did.
-		.child(view("ul")
-			.styled(list)
-			.child(each(visible, |todo| todo.id, |todo| todo_row(client, todo))))
-		.child(view("p")
-			.styled(empty_note)
-			.text("Nothing here 🎉")
-			.show(visible.derive(|list| list.len() == 0)))
+		<ul .styled(list)>{each(visible, |todo| todo.id, |todo| todo_row(client, todo))}</ul>
+		<p .styled(empty_note) .show(visible.derive(|list| list.len() == 0))>"Nothing here 🎉"</p>
+	</section>
 }
 
 // A filter button highlights itself when its value is the active filter —
@@ -139,35 +134,33 @@ fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
 		.border(style::Length::px(1), style::Color::gray(700));
 	let base_classes = button.class_list();
 	let active_classes = active.class_list();
-	view("button")
-		.text(label)
+	<button
 		.bind_class(filter.derive(|current| if current == value {
 			active_classes
 		} else {
 			base_classes
 		}))
-		.on("click", || filter.set(value))
+		on:click(|| filter.set(value))
+	>
+		{label}
+	</button>
 }
 
 // One row — a snapshot from `each`; any change to the list re-renders it.
 // The checkbox reflects `done` and its edits go through the client stub.
 fun todo_row(client: TodoClient<SocketTransport>, todo: Todo): View {
-	// The done state is a VARIANT: plain `if` over const styles (CVA-free).
-	let label = view("span").text(todo.label);
-	view("li")
-		.styled(item)
-		.child(checkbox(client, todo))
-		.child(if todo.done { label.styled(done_label) } else { label })
-		.child(view("button")
-			.styled(remove_button)
-			.text("✕")
-			.on("click", || report(client.remove(todo.id))))
+	// The done state is a VARIANT: plain `if` over const styles (CVA-free) —
+	// the label is a value here, extended by the chain when the row is done.
+	let label = <span>{todo.label}</span>;
+	<li .styled(item)>
+		{checkbox(client, todo)}
+		{if todo.done { label.styled(done_label) } else { label }}
+		<button .styled(remove_button) on:click(|| report(client.remove(todo.id)))>"✕"</button>
+	</li>
 }
 
 fun checkbox(client: TodoClient<SocketTransport>, todo: Todo): View {
-	let box = view("input")
-		.attr("type", "checkbox")
-		.on("change", || report(client.toggle(todo.id)));
+	let box = <input type("checkbox") on:change(|| report(client.toggle(todo.id))) />;
 	if todo.done {
 		box.attr("checked", "checked")
 	} else {

@@ -31,15 +31,16 @@ entries: the [full-stack shape](../tour/platforms.md)); in a workspace, put it
 in a `common` library both packages depend on instead.
 
 ```vilan
-import std::web::ui::{ each, view, View, render };
+import std::web::ui::{ each, View, render };
 import std::reactive::{ Signal, SignalCell };
 
 // The one component both legs build.
 fun app(): View {
 	let tasks: SignalCell<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
-	view("main")
-		.child(view("h1").text("Tasks"))
-		.child(view("ul").child(each(tasks, |task| task, |task| view("li").text(task))))
+	<main>
+		<h1>"Tasks"</h1>
+		<ul>{each(tasks, |task| task, |task| <li>{task}</li>)}</ul>
+	</main>
 }
 
 // On the server, `render` turns the view into markup.
@@ -60,10 +61,12 @@ reference](../std/process.md#stdwebdocument)); `render(view)` puts the markup
 import std::build::require_build;
 import std::web::document::require_shell;
 import std::http::{ Server, Request, Response };
-import std::web::ui::{ view, View };
+import std::web::ui::View;
 
 fun app(): View {
-	view("main").child(view("h1").text("Tasks"))
+	<main>
+		<h1>"Tasks"</h1>
+	</main>
 }
 
 async fun main() {
@@ -112,14 +115,15 @@ mount: mounting is a client entry, not a renderable view, which is why
 the natural factoring is a shared `fun app(): View` with a per-leg `main`.
 
 ```vilan,browser
-import std::web::ui::{ each, view, View, mount_root };
+import std::web::ui::{ each, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 fun app(): View {
 	let tasks: SignalCell<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
-	view("main")
-		.child(view("h1").text("Tasks"))
-		.child(view("ul").child(each(tasks, |task| task, |task| view("li").text(task))))
+	<main>
+		<h1>"Tasks"</h1>
+		<ul>{each(tasks, |task| task, |task| <li>{task}</li>)}</ul>
+	</main>
 }
 
 fun main() {
