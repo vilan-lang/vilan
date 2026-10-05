@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**`vilan fmt` formats `a + match x { .. }` and `10 - if c { 1 } else { 0 } * 3` instead of declining the file, and a decline names the line it is about.** An `if` or a `match` that follows a binary operator is an atom to the parser (`10 - match x { .. } - 2` is `(10 - m) - 2`), and only one that BEGINS an expression is complete at its closing brace. The printer ranked both forms as statements in every operand position and wrapped them in parentheses, and the safety net threw the whole file away over the added tokens (store-46's `out = out + match x { .. };`). A right operand, and the left-most leaf of a right operand, now prints bare as written; a block-like form that begins an expression keeps its parentheses (`(if c { 1 } else { 2 }) + 1`). Separately, the net's line: a struct's trailing comma, which the comparison deletes, sat between the file's first line and the divergence, and the net named the comma's line (line 25 for a decline at line 127). Where what the comparison changed was only deletions, the two streams are now matched token by token and the decline names the line the reprint parted at. Pins: `formatter::block_like_operands` (the find's two shapes, left association past the operand, a tighter right operand's leading `if`, a comparison, four forms that keep their parentheses, and the line across deletions above and below). Tracker E265.
+
+---
+
 <!-- family: tooling -->
 **The formatter's identity pins can no longer pass on a decline.** `format` hands the source back unchanged when the reprint is declined, so `assert_formats(source, source)` read a decline as a clean reprint: E252's first pin stayed green with its bug planted back. The helper now asserts the reprint succeeded before it compares, which covers every caller at once (the literal identity calls and the loops that pass one variable twice). All ten literal identity pins, and every other caller, still pass: none of them was standing on a decline. Pin: `formatter::reformats::an_identity_pin_over_a_declined_source_fails` (the helper over a source that does not parse panics). Tracker N141.
 

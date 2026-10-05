@@ -3734,7 +3734,69 @@ fn diverging_span(
     {
         return span_of(index);
     }
+    // E265: the commonest canonicalizations are DELETIONS (a trailing comma,
+    // a redundant alias or view prefix), and one deletion on each side of the
+    // divergence defeats both alignments above — a struct's trailing comma at
+    // line 25 named line 25 for a reprint that parted company at line 127.
+    // Where the canonicalized stream past the aligned prefix is still a
+    // SUBSEQUENCE of the file's own, the canonicalization there deleted and
+    // did not move, and matching the two token by token maps the divergence
+    // exactly; the whole remainder must match, which is what tells a deletion
+    // from a reordering. Failing that, the same match from the END down to the
+    // divergence, for a reordering that happened before it.
+    if let Some(index) = deletion_aligned_index(original, canonical_source, aligned_prefix, at)
+        .or_else(|| deletion_aligned_index_from_the_end(original, canonical_source, at))
+    {
+        return span_of(index);
+    }
     span_of(aligned_prefix).or_else(|| original.last().map(|(_, span)| *span))
+}
+
+/// The written index of canonical token `at`, matching `canonical[from..]`
+/// token by token as a subsequence of `original[from..]` (the two agree before
+/// `from`). `None` unless the WHOLE remainder matches — a reordering leaves
+/// tokens the match can never find, a deletion only tokens it skips.
+fn deletion_aligned_index(
+    original: &[Spanned<Token<'_>>],
+    canonical: &[Token<'_>],
+    from: usize,
+    at: usize,
+) -> Option<usize> {
+    let mut written = from;
+    let mut found = None;
+    for (index, token) in canonical.iter().enumerate().skip(from) {
+        let offset = original
+            .get(written..)?
+            .iter()
+            .position(|(candidate, _)| candidate == token)?;
+        written += offset;
+        if index == at {
+            found = Some(written);
+        }
+        written += 1;
+    }
+    found
+}
+
+/// [`deletion_aligned_index`] from the end of both streams down to `at`: the
+/// written index of canonical token `at` when `canonical[at..]` matches as a
+/// subsequence of the file's own tail.
+fn deletion_aligned_index_from_the_end(
+    original: &[Spanned<Token<'_>>],
+    canonical: &[Token<'_>],
+    at: usize,
+) -> Option<usize> {
+    if at >= canonical.len() {
+        return None;
+    }
+    let mut written = original.len();
+    for token in canonical.get(at..)?.iter().rev() {
+        written = original
+            .get(..written)?
+            .iter()
+            .rposition(|(candidate, _)| candidate == token)?;
+    }
+    Some(written)
 }
 
 /// The [`Decline`] for a net anchored at a TOKEN rather than at a node: the
@@ -3960,6 +4022,12 @@ struct Printer<'src> {
     /// True while a seam probe is rendering a chain link to see whether it spans
     /// lines ([`Printer::link_spans_lines`]). Probes do not nest.
     probing: bool,
+    /// E265: set just before a binary expression that FOLLOWS an operator is
+    /// printed (one unwrapped, on the left spine of a right operand), and
+    /// taken by that binary's own arm first thing: its left-most operand does
+    /// not begin an expression, so an `if` or a `match` there is an atom
+    /// ([`Printer::print_bare_block_like`]).
+    operand_follows_operator: bool,
     /// True while E155's probe is rendering a chain with its ELEMENTS treated as
     /// atomic: an element that would break only because its line is too wide
     /// stays inline, so the probe measures the chain's own width rather than the
@@ -4014,6 +4082,7 @@ impl<'src> Printer<'src> {
             declined: None,
             split: Split::Off,
             probing: false,
+            operand_follows_operator: false,
             atomic_elements: false,
             options,
             head_start: None,
@@ -7766,6 +7835,7 @@ impl<'src> Printer<'src> {
         &mut self,
         operands: &[(Option<BinaryOp>, &Spanned<Node<'src>>)],
         precedence: u8,
+        follows: bool,
     ) {
         self.indent += 1;
         for (index, (operator, operand)) in operands.iter().enumerate() {
@@ -7779,13 +7849,26 @@ impl<'src> Printer<'src> {
             } else {
                 precedence + 1
             };
+            // E265: every operand after an operator follows it; the head
+            // follows one only where the whole chain does.
+            let follows_here = index > 0 || follows;
+            if follows_here && self.print_bare_block_like(operand) {
+                continue;
+            }
+            let spine_follows = follows_here
+                && matches!(operand.0, Node::Binary(..))
+                && Self::expression_precedence(&operand.0) >= minimum;
             let operand_start = self.out.len();
             let comment_cursor = self.cursor;
+            self.operand_follows_operator = spine_follows;
             self.print_operand(operand, minimum);
+            self.operand_follows_operator = false;
             if self.current_line_over_budget() {
                 self.out.truncate(operand_start);
                 self.cursor = comment_cursor;
+                self.operand_follows_operator = spine_follows;
                 self.print_split_operand(operand, minimum, Split::Tail);
+                self.operand_follows_operator = false;
             }
         }
         self.indent -= 1;
@@ -7820,6 +7903,26 @@ impl<'src> Printer<'src> {
         }
     }
 
+    /// E265: an `if` or a `match` that FOLLOWS a binary operator — the right
+    /// operand, or the left-most leaf of a right operand (`10 - if c { 1 }
+    /// else { 0 } * 3`) — is an ATOM to the parser, exactly as after a prefix
+    /// operator ([`Self::print_prefix_operand`]): it binds like any primary
+    /// (`10 - match x { .. } - 2` is `(10 - m) - 2`). Only where it BEGINS an
+    /// expression (a statement, a `let`'s value, an argument, an element, the
+    /// inside of a group) is it complete at its closing brace, and there the
+    /// operand rule's parentheses stay. So it prints bare, as written, and
+    /// answers whether it did; the operand rule wrapped it (both rank 0), and
+    /// the added parentheses were token drift the net declined the whole file
+    /// for.
+    fn print_bare_block_like(&mut self, operand: &Spanned<Node<'src>>) -> bool {
+        if !matches!(operand.0, Node::If(_) | Node::Match(_, _)) {
+            return false;
+        }
+        self.split = Split::Off;
+        self.print_expr(operand);
+        true
+    }
+
     fn print_split_operand(&mut self, expr: &Spanned<Node<'src>>, minimum: u8, split: Split) {
         self.split = if Self::expression_precedence(&expr.0) >= minimum {
             split
@@ -7848,18 +7951,52 @@ impl<'src> Printer<'src> {
     /// — belongs to a construct that has not printed yet and is the caller's,
     /// exactly as for a chain link.
     fn print_split_right(&mut self, right: &Spanned<Node<'src>>, minimum: u8, split: Split) {
+        if self.print_bare_block_like(right) {
+            return;
+        }
+        // A binary right operand printed without parentheses follows this
+        // operator, and so does its own left-most leaf.
+        let follows =
+            matches!(right.0, Node::Binary(..)) && Self::expression_precedence(&right.0) >= minimum;
         if split == Split::Off {
+            self.operand_follows_operator = follows;
             self.print_operand(right, minimum);
+            self.operand_follows_operator = false;
             return;
         }
         let right_start = self.out.len();
         let comment_cursor = self.cursor;
+        self.operand_follows_operator = follows;
         self.print_operand(right, minimum);
+        self.operand_follows_operator = false;
         if self.current_line_over_budget() {
             self.out.truncate(right_start);
             self.cursor = comment_cursor;
+            self.operand_follows_operator = follows;
             self.print_split_operand(right, minimum, split);
+            self.operand_follows_operator = false;
         }
+    }
+
+    /// A binary's LEFT operand: under the operand rule, except where the binary
+    /// itself follows an operator ([`Self::operand_follows_operator`]) — then
+    /// its left operand does too, so an `if`/`match` there prints bare and an
+    /// unwrapped binary there passes the fact on down the spine.
+    fn print_left_operand(
+        &mut self,
+        left: &Spanned<Node<'src>>,
+        minimum: u8,
+        split: Split,
+        follows: bool,
+    ) {
+        if follows && self.print_bare_block_like(left) {
+            return;
+        }
+        self.operand_follows_operator = follows
+            && matches!(left.0, Node::Binary(..))
+            && Self::expression_precedence(&left.0) >= minimum;
+        self.print_split_operand(left, minimum, split);
+        self.operand_follows_operator = false;
     }
 
     /// Prints a comma-separated list of macro arguments, each reprinted VERBATIM
@@ -8157,11 +8294,12 @@ impl<'src> Printer<'src> {
                 self.out.push(')');
             }
             Node::Binary(operator, left, right) => {
+                let follows = std::mem::take(&mut self.operand_follows_operator);
                 let precedence = Self::binary_precedence(*operator);
                 let chain_start = self.out.len();
                 let chain_cursor = self.cursor;
                 let left_start = self.out.len();
-                self.print_split_operand(left, precedence, split);
+                self.print_left_operand(left, precedence, split, follows);
                 // A split that broke the left operand across lines continues
                 // here: the operator and the right operand take their own line
                 // at the links' indentation (`…margin(space(0))` ⏎ `+ reveal`).
@@ -8200,7 +8338,7 @@ impl<'src> Printer<'src> {
                     if operands.len() >= 3 {
                         self.out.truncate(chain_start);
                         self.cursor = chain_cursor;
-                        self.print_split_binary_chain(&operands, precedence);
+                        self.print_split_binary_chain(&operands, precedence, follows);
                     }
                 }
             }
@@ -9715,6 +9853,95 @@ mod reformats {
              \tprint(i\"{d.x}{r.r}\");\n\
              }\n";
         assert_formats(source, source);
+    }
+}
+
+/// E265: an `if` or a `match` that FOLLOWS a binary operator is an atom to
+/// the parser, so the reprint writes it bare as the source did — the operand
+/// rule's parentheses were token drift, and the net declined the whole file.
+/// Where one BEGINS an expression it is complete at its brace, and the
+/// source's parentheses stay.
+#[cfg(test)]
+mod block_like_operands {
+    use super::{DeclineReason, code_tokens_spanned, reprint, verify_reprint};
+
+    fn assert_reprints(source: &str, expected: &str) {
+        let printed = reprint(source).unwrap_or_else(|decline| {
+            panic!("the reprint was declined ({decline:?}) for {source:?}")
+        });
+        assert_eq!(printed, expected, "{source:?}");
+        assert_eq!(
+            reprint(expected).as_deref(),
+            Ok(expected),
+            "output is not idempotent"
+        );
+    }
+
+    fn body(lines: &str) -> String {
+        format!("fun main() {{\n{lines}}}\n")
+    }
+
+    #[test]
+    fn a_match_or_an_if_after_an_operator_prints_bare() {
+        // The find's own two shapes: an assignment and a `let`.
+        assert_reprints(
+            &body("\tout = out + match x { 1 => \"a\", _ => \"b\" };\n"),
+            &body("\tout = out + match x {\n\t\t1 => \"a\",\n\t\t_ => \"b\"\n\t};\n"),
+        );
+        let let_form =
+            body("\tlet q = \"q\" + match x {\n\t\t1 => \"a\",\n\t\t_ => \"b\",\n\t};\n");
+        assert_reprints(&let_form, &let_form);
+        // Left-associative past it: `(10 - m) - 2`.
+        assert_reprints(
+            &body("\tlet s = 10 - match x { _ => 1 } - 2;\n"),
+            &body("\tlet s = 10 - match x {\n\t\t_ => 1\n\t} - 2;\n"),
+        );
+        // The LEFT-most leaf of a tighter right operand follows the operator
+        // too: `10 - (if .. * 3)`.
+        let spine = body("\tlet r = 10 - if c { 1 } else { 0 } * 3;\n");
+        assert_reprints(&spine, &spine);
+        let comparison = body("\tlet ok = a == if c { 1 } else { 2 } && b;\n");
+        assert_reprints(&comparison, &comparison);
+    }
+
+    #[test]
+    fn one_that_begins_an_expression_keeps_its_parentheses() {
+        for source in [
+            body("\tlet u = (if c { 1 } else { 2 }) + 1;\n"),
+            body("\tlet v = 2 * ((if c { 1 } else { 2 }) + 1);\n"),
+            body("\tlet t = (1 + if c { 1 } else { 2 }) * 2;\n"),
+            body("\tprint((if c { 1 } else { 2 }) + 1);\n"),
+        ] {
+            assert_reprints(&source, &source);
+        }
+    }
+
+    /// The net's line: a reprint that parts company with the source FAR from
+    /// a canonicalized deletion (a struct's trailing comma above it, another
+    /// below) names the line it parted at, not the deletion's.
+    #[test]
+    fn a_decline_names_the_line_it_parted_at_across_deletions() {
+        let source = concat!(
+            "struct S {\n",
+            "\ta: i32,\n",
+            "\tb: i32,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet x = 1;\n",
+            "\tlet y = 2;\n",
+            "}\n",
+            "\n",
+            "struct T {\n",
+            "\tc: i32,\n",
+            "}\n",
+        );
+        let reprinted = source.replace("let y = 2;", "let y = 3;");
+        let tokens = code_tokens_spanned(source).expect("it lexes");
+        let decline = verify_reprint(source, &tokens, &reprinted).expect_err("a drift");
+        assert_eq!(decline.reason, DeclineReason::WouldChangeTheCode);
+        assert_eq!(decline.line, Some(8), "{decline:?}");
+        assert_eq!(decline.construct, "let y = 2;");
     }
 }
 
