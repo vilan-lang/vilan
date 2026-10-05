@@ -221,6 +221,11 @@ written down.
 ---
 
 <!-- family: feature -->
+**`Debug` covers lists, options and results, and a float keeps its `.0` (debugging.md S4, E260).** `[derive(Debug)]` on a struct with a `List` or `Option` field compiles (it failed inside the generated code), `fun show<T: Debug>` takes a `List`, an `Option` or a `Result` of `Debug` elements, and `3.0.debug()` is `"3.0"` where it was `"3"`: the same spellings `dbg` prints. A tuple is not covered yet.
+
+---
+
+<!-- family: feature -->
 **`dbg` prints std's handles as themselves (debugging.md S1b).** `HashMap { "ada" => 36, "alan" => 41 }` and `HashSet { "a", "b" }` by their members in insertion order (not the hashed table inside), `Shared(Point { x = 7, y = 8 })`, `SignalCell(3)` by its current value read without tracking, a pipe by its type alone (`<pipe Derive<SignalCell<i32>, i32, i32>>`, since sampling it would run it), and a cycle through a `Shared` cut at `<cycle>`. Both backends print the same bytes. A trait object still prints as `<dyn Area>`.
 
 ---

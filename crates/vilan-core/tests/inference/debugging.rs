@@ -261,3 +261,52 @@ fn s1_a_programs_own_dbg_shadows_the_intrinsic() {
         "40\n",
     );
 }
+
+// --- S4: `Debug` through the printer (E260) -----------------------------
+
+/// E260: `[derive(Debug)]` on a struct with a `List` and an `Option` field
+/// compiles and renders them; `T: Debug` takes a list, an option and a result;
+/// a float keeps its `.0` (`3.0.debug()` is `"3.0"`) — the printer's
+/// spellings, on one line.
+#[test]
+fn s4_debug_covers_every_container_the_printer_prints() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "[derive(Debug)]\n",
+            "struct Bag { items: List<i32>, maybe: Option<f64> }\n",
+            "fun show<T: Debug>(value: T): str { value.debug() }\n",
+            "fun main() {\n",
+            "\tprint(Bag { items = [1, 2], maybe = Some(3.0) }.debug());\n",
+            "\tprint(show([1, 2]));\n",
+            "\tprint(show(Some([Some(1)])));\n",
+            "\tlet failed: Result<i32, str> = Err(\"no\");\n",
+            "\tprint(show(failed));\n",
+            "\tprint(3.0.debug());\n",
+            "\tprint((0.0 * -1.0).debug());\n",
+            "\tprint(1.5f.debug());\n",
+            "}\n",
+        ),
+        concat!(
+            "Bag { items = [1, 2], maybe = Some(3.0) }\n",
+            "[1, 2]\n",
+            "Some([Some(1)])\n",
+            "Err(\"no\")\n",
+            "3.0\n",
+            "0.0\n",
+            "1.5\n",
+        ),
+    );
+}
+
+/// E260's tuple case waits on the lane's find B?4: a blanket over the tuple
+/// family is admitted for a non-tuple at the bound check, so std cannot ship
+/// `impl type T: (2..: Debug) with Debug` without making every type `Debug`.
+#[test]
+#[ignore = "E260: the tuple case waits on the lane's find B?4 (a tuple-family blanket impl admitted for a non-tuple subject)"]
+fn s4_debug_covers_a_tuple() {
+    assert_compiles_and_runs(
+        "import std::debug::Debug;\nfun show<T: Debug>(value: T): str { value.debug() }\nfun main() { print(show((1, \"two\", 2.5))); }\n",
+        "(1, \"two\", 2.5)\n",
+    );
+}

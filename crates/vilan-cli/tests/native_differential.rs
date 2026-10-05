@@ -10446,3 +10446,39 @@ fn s1b_std_handles_print_as_themselves_on_both_backends() {
     assert_eq!(javascript.stderr, expected, "the JS leg's dbg lines");
     assert_eq!(native.stderr, expected, "the native leg's dbg lines");
 }
+
+/// debugging.md S4 (E260): `Debug` over a list, an option and a result, a
+/// derived struct holding them, and a float's `.0` render the same on both
+/// backends.
+#[test]
+fn s4_debug_over_containers_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_debug_containers.vl"),
+        concat!(
+            "import std::debug::Debug;\n",
+            "\n",
+            "[derive(Debug)]\n",
+            "struct Bag { items: List<i32>, maybe: Option<f64> }\n",
+            "\n",
+            "fun show<T: Debug>(value: T): str {\n",
+            "\tvalue.debug()\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(Bag { items = [1, 2], maybe = Some(3.0) }.debug());\n",
+            "\tprint(show([Some([2.5])]));\n",
+            "\tlet failed: Result<i32, str> = Err(\"no\");\n",
+            "\tprint(show(failed));\n",
+            "\tprint(3.0.debug());\n",
+            "\tprint((0.0 * -1.0).debug());\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_debug_containers.vl"),
+        Verdict::Identical,
+        "Debug over containers must render the same on both backends"
+    );
+}
