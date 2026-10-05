@@ -542,3 +542,43 @@ fn the_lsp_harness_refuses_a_source_its_edit_script_does_not_land_in() {
     );
     assert!(text.contains("Nothing was run."), "{text}");
 }
+
+/// M112: `calibrate --kolt-tree` compares the generated app's phase split with
+/// a PREPARED kolt tree, running no git in it — what a lane that may read kolt
+/// only through a scratch copy can calibrate against. The fake compiler prints
+/// the same `VILAN_PHASE_TIMING` line in both packages, so the split agrees.
+#[cfg(target_os = "linux")]
+#[test]
+fn calibrate_takes_a_prepared_kolt_tree_and_runs_no_git_in_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = Scratch::new("calibrate-tree");
+    let budgets = scratch.path("budgets.toml");
+    fs::write(&budgets, HEADER).expect("write the fixture budgets");
+    let vilan = scratch.path("fake-vilan");
+    fs::write(
+        &vilan,
+        "#!/bin/sh\necho '[vilan phase] base 30.0ms/30.0cpu checks 50.0ms/50.0cpu emission-walk 20.0ms/20.0cpu' >&2\nexit 0\n",
+    )
+    .expect("write the fake compiler");
+    fs::set_permissions(&vilan, fs::Permissions::from_mode(0o755)).expect("make it executable");
+    // A tree that is not a repository: an archive of it would fail.
+    let tree = tip_kolt(&scratch, "kolt-tree", false);
+    let (ok, report) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &[
+            "--scratch",
+            scratch.0.to_str().expect("utf-8"),
+            "calibrate",
+            "--vilan",
+            vilan.to_str().expect("utf-8"),
+            "--kolt-tree",
+            tree.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(ok, "calibrate against a prepared tree failed:\n{report}");
+    assert!(
+        report.contains("kolt@tree") && report.contains("calibrated"),
+        "the split names the prepared tree and agrees:\n{report}"
+    );
+}

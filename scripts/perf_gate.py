@@ -652,7 +652,12 @@ def command_calibrate(options):
     genapp = subject_dir("genapp:46", work)
     scratch = tempfile.mkdtemp(prefix="perf-calibrate-", dir=options.scratch)
     try:
-        copy, sha = prepare_kolt(options.kolt, options.commit, scratch)
+        if options.kolt_tree:
+            # A prepared tree, as `seal --tip-kolt` takes one: no git is run in it, which is what a lane
+            # that may only read kolt through a scratch copy needs (M112).
+            copy, sha = prepare_tree(options.kolt_tree, scratch), "tree"
+        else:
+            copy, sha = prepare_kolt(options.kolt, options.commit, scratch)
         splits = {}
         for name, directory in (("genapp", genapp), (f"kolt@{sha}", copy)):
             phase_split(options.vilan, directory)  # warm-up
@@ -798,7 +803,9 @@ def main():
 
     p = sub.add_parser("calibrate")
     p.add_argument("--vilan", required=True)
-    p.add_argument("--kolt", required=True)
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--kolt", help="a kolt checkout, archived at --commit")
+    source.add_argument("--kolt-tree", help="a prepared kolt tree, used as it stands (no git)")
     p.add_argument("--commit", default="HEAD")
     p.set_defaults(run=command_calibrate)
 
