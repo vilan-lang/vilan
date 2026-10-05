@@ -8567,6 +8567,29 @@ fn a_closure_handed_to_a_generic_callee_builds_at_the_calls_position_on_both_bac
     );
 }
 
+/// F86: a variant constructor as a METHOD RECEIVER with a literal payload —
+/// `Maybe::Just(3).and_then(big)` — was refused as instantiated at `any`; the
+/// receiver is the call's first argument and takes F85's position. Behind it a
+/// second cause: `nest(self): Maybe<Maybe<T>>` was refused even on a bound
+/// receiver, because a nested enum's instance re-bound `T` to `Maybe<T>` (its
+/// arguments were resolved at the head only). The probe: a trait method, a
+/// chain, a `str`, an `f64` and a list payload, a nested constructor receiver,
+/// `Option`'s own method, a generic struct literal receiver, `nest` bound.
+#[test]
+fn a_variant_constructor_as_a_receiver_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_variant_receivers.vl"),
+        include_str!("native/variant_receivers.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_variant_receivers.vl"),
+        Verdict::Identical,
+        "a variant constructor as a method receiver must build at its `self` position"
+    );
+}
+
 /// F57: every platform-bound corpus program the backend ACCEPTS prints what
 /// node prints, the ones it refuses say which construct stopped them, and the
 /// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is

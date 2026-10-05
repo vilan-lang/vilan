@@ -1577,6 +1577,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.type_entry(&type_id) == Some(&rebuilt) {
             return type_id;
         }
+        self.mint(rebuilt)
+    }
+
+    /// A type the program's table does not hold, in the minted-type overlay
+    /// ([`Self::type_entry`] reads it).
+    fn mint(&mut self, rebuilt: Type) -> TypeId {
         let minted = TypeId(u32::MAX - self.minted_types.len() as u32);
         self.minted_types.insert(minted, rebuilt);
         minted
@@ -2638,16 +2644,62 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ///
     /// The arguments are resolved through the substitution in force FIRST, so a
     /// `Pair<T>` reached from inside a `T = i32` instance instantiates
-    /// `Pair<i32>` rather than re-binding `T` to itself.
+    /// `Pair<i32>` rather than re-binding `T` to itself — and resolved WHOLE
+    /// ([`Self::deeply_resolved`]), not only at the head: inside `impl
+    /// Maybe<type T>`'s `nest(self): Maybe<Maybe<T>>` the return's argument is
+    /// `Maybe<T>`, and an entry `T -> Maybe<T>` re-bound `T` to a type that
+    /// names it, so rendering the payload recursed until the guard gave up and
+    /// the instance was refused as "an unbound generic type parameter" (F86).
     fn nominal_entries(
-        &self,
+        &mut self,
         parameters: &[TypeId],
         arguments: &[TypeId],
     ) -> Vec<(TypeId, TypeId)> {
         parameters
             .iter()
             .zip(arguments.iter())
-            .map(|(parameter, argument)| (*parameter, self.concrete(*argument)))
+            .map(|(parameter, argument)| (*parameter, self.deeply_resolved(*argument)))
+            .collect()
+    }
+
+    /// A type under the substitution in force at EVERY level: the head through
+    /// [`Self::concrete`], then each argument, element, parameter and return
+    /// the same way, rebuilt in the minted-type overlay where anything moved.
+    fn deeply_resolved(&mut self, type_id: TypeId) -> TypeId {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return type_id;
+        };
+        let head = self.concrete(type_id);
+        let Some(entry) = self.type_entry(&head).cloned() else {
+            return head;
+        };
+        let rebuilt = match entry {
+            Type::Struct(id, ref arguments) => {
+                Type::Struct(id, self.deeply_resolved_all(arguments))
+            }
+            Type::Enum(id, ref arguments) => Type::Enum(id, self.deeply_resolved_all(arguments)),
+            Type::Trait(id, ref arguments) => Type::Trait(id, self.deeply_resolved_all(arguments)),
+            Type::Dyn(id, ref arguments) => Type::Dyn(id, self.deeply_resolved_all(arguments)),
+            Type::Tuple(ref elements) => Type::Tuple(self.deeply_resolved_all(elements)),
+            Type::Array(element, length) => Type::Array(self.deeply_resolved(element), length),
+            Type::Closure(ref parameters, returns, ref contexts, ref modes) => Type::Closure(
+                self.deeply_resolved_all(parameters),
+                self.deeply_resolved(returns),
+                contexts.clone(),
+                modes.clone(),
+            ),
+            _ => return head,
+        };
+        if rebuilt == entry {
+            return head;
+        }
+        self.mint(rebuilt)
+    }
+
+    fn deeply_resolved_all(&mut self, type_ids: &[TypeId]) -> Vec<TypeId> {
+        type_ids
+            .iter()
+            .map(|type_id| self.deeply_resolved(*type_id))
             .collect()
     }
 
