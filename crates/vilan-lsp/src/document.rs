@@ -7036,18 +7036,16 @@ impl Document {
             let mut seen_modules: HashSet<String> = HashSet::new();
             for root in &module_roots {
                 // A154: std's modules sit under namespaces (`std::web::dom`),
-                // so std is listed at every depth; another origin keeps the top
-                // level it always offered.
+                // so std is listed at every depth — and so is every other
+                // origin (E267): a package's nested module (A65's
+                // `pkg::lib::ui::widget`) is a name's home at its full path.
                 // A NESTED prelude (`web::prelude`, `web::style::prelude`) is
                 // never a name's home — the analyzer's B4 index skips it too.
-                let listed = if origin == "std" {
+                let listed: Vec<(String, PathBuf)> =
                     vilan_core::analyzer::modules_under_root(root, &module_roots)
                         .into_iter()
                         .filter(|(module_name, _)| !module_name.ends_with("::prelude"))
-                        .collect()
-                } else {
-                    vilan_core::analyzer::modules_in_root(root)
-                };
+                        .collect();
                 for (module_name, module_path) in listed {
                     if module_name == "lib" || !seen_modules.insert(module_name.clone()) {
                         continue;
@@ -13493,6 +13491,69 @@ pub(crate) mod tests {
         assert!(
             !labels.contains(&"machinery".to_string()),
             "a curated module's private item is not an add-import target: {labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E267: a package's NESTED module (A65's `pkg::lib::ui::widget`) is a
+    // name's home at its full path, for the auto-import table and the
+    // add-import quick fix alike — both walked a package's top level only,
+    // so neither ever offered a name declared one directory down.
+    #[test]
+    fn a_nested_package_modules_item_is_an_auto_import_candidate_at_its_full_path() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::lib::ui::widget::greet;\n\nfun main() {\n\tgreet();\n\t\n}\n",
+            ),
+            (
+                "lib/ui/widget.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n",
+            ),
+        ]);
+        let marker = "greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let offered: Vec<(String, Vec<String>)> = document
+            .completion(offset)
+            .into_iter()
+            .filter_map(|candidate| {
+                let import = candidate.needs_import?;
+                Some((candidate.label, import.module_path))
+            })
+            .filter(|(label, _)| label == "farewell")
+            .collect();
+        assert_eq!(
+            offered,
+            vec![(
+                "farewell".to_string(),
+                ["pkg", "lib", "ui", "widget"].map(str::to_string).to_vec()
+            )],
+            "offered once, at the module's full path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nested_package_modules_item_is_an_add_import_target() {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\tfarewell();\n}\n"),
+            (
+                "lib/ui/widget.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let titles: Vec<String> = document
+            .diagnostics
+            .iter()
+            .flat_map(|diagnostic| document.quickfixes(program, diagnostic.span))
+            .map(|fix| fix.title)
+            .filter(|title| title.starts_with("Import `farewell`"))
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Import `farewell` from pkg::lib::ui::widget".to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

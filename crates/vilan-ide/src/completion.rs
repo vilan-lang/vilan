@@ -4609,10 +4609,11 @@ impl AutoImportOrder {
             };
             let tier = import_origin_tier(root);
             // A154: std's modules sit under namespaces (`std::web::dom`), so
-            // under `std` the walk descends each module's CHILDREN too,
-            // breadth-first: the top level in the order it always took, then
-            // each level below it. A package's own nested modules (A65) are
-            // not walked — that is a separate question, filed by layout-46.
+            // the walk descends each module's CHILDREN too, breadth-first: the
+            // top level in the order it always took, then each level below it.
+            // E267: a package's own nested modules (A65's `pkg::lib::ui::widget`)
+            // are walked the same way — a name declared there is importable at
+            // its full path exactly as a std one is.
             let mut pending: std::collections::VecDeque<(Id, Vec<String>)> = root_scope
                 .name_to_id_map
                 .values()
@@ -4625,9 +4626,9 @@ impl AutoImportOrder {
                 let Some(child_module) = program.modules.get(&child_id) else {
                     continue;
                 };
-                if let Some(children) = (root == "std")
-                    .then(|| program.module_children_scopes.get(&child_id))
-                    .flatten()
+                if let Some(children) = program
+                    .module_children_scopes
+                    .get(&child_id)
                     .and_then(|scope_id| program.scopes.get(scope_id))
                 {
                     for &grandchild_id in children.name_to_id_map.values() {

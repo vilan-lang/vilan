@@ -292,3 +292,50 @@ fn a_nested_std_trait_is_imported_from_where_it_is_declared() {
             .collect::<Vec<_>>()
     );
 }
+
+/// The same for a trait in a NESTED module of the package (E267's walk): the
+/// warning's statement names `pkg::shapes::Area`, the fix writes the path
+/// that resolves.
+#[test]
+fn a_nested_package_trait_is_imported_from_where_it_is_declared() {
+    let package = Package::new(
+        "nested-pkg",
+        &[
+            (
+                "geo/shapes.vl",
+                "export trait Area {\n\tfun area(self): i32;\n}\n\nexport impl i32 with Area {\n\tfun area(self): i32 {\n\t\tself * self\n\t}\n}\n",
+            ),
+            (
+                "helper.vl",
+                "import pkg::geo::shapes::Area;\n\nexport fun twice(x: i32): i32 {\n\tx.area() * 2\n}\n",
+            ),
+        ],
+    );
+    let source = "import pkg::helper::twice;\n\nfun main() {\n\tprint(twice(2) + 3.area());\n}\n";
+    let path = package.path("main.vl");
+    let document = Document::analyze(source, &std_root(), &path);
+    let fixes: Vec<QuickFix> = offered(&document)
+        .into_iter()
+        .filter(|fix| fix.title.starts_with("Import `Area` from "))
+        .collect();
+    assert_eq!(
+        fixes
+            .iter()
+            .map(|fix| fix.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Import `Area` from pkg::geo::shapes"]
+    );
+    let mut after = source.to_string();
+    after.replace_range(fixes[0].span.into_range(), &fixes[0].replacement);
+    let fixed = Document::analyze(&after, &std_root(), &path);
+    assert!(
+        fixed.diagnostics.is_empty() && fixed.warnings.is_empty(),
+        "{after}: {:?}",
+        fixed
+            .diagnostics
+            .iter()
+            .chain(&fixed.warnings)
+            .map(|diagnostic| diagnostic.msg.clone())
+            .collect::<Vec<_>>()
+    );
+}
