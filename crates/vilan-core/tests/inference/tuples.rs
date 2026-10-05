@@ -8474,3 +8474,37 @@ fn b538_a_tuple_target_of_elements_nested_tuples_and_tuple_typed_places_assigns_
         "element: 1 2\nnested: 4 5 6\ntuple-typed binding: 7 8 9\ntuple-typed position: 11 12 13\nfield and element: 21 22\nswap: 5 4\n",
     );
 }
+
+/// B541: a mapped-tuple argument whose element gives the family NO evidence,
+/// with the family bound nowhere else, is underdetermined — refused, and now
+/// said so at the element instead of as a mismatch ("Expected (U in T:
+/// Option<U>), but got (Option<i32>, Option<unknown>, Option<str>)"). With
+/// another parameter binding `T`, the same call compiles (B442's pin).
+#[test]
+fn b541_an_underdetermined_mapped_element_is_named_not_reported_as_a_mismatch() {
+    let program = |call: &str| {
+        format!(
+            r#"
+            import std::option::Option::{{ self, Some, None }};
+            fun count<T: (2..)>(items: (U in T: Option<U>)): i32 {{ 3 }}
+            fun main() {{
+                print({call});
+            }}
+            "#
+        )
+    };
+    assert_fails_once_with(
+        &program("count((Some(1), None, Some(\"two\")))"),
+        "cannot infer `T`'s element 2: `None` is `Option<unknown>` and names no type for it, \
+         and nothing else at this call binds `T`",
+    );
+    assert_fails_once_with(
+        &program("count((None, Some(1)))"),
+        "cannot infer `T`'s element 1: `None`",
+    );
+    assert_fails_without(
+        &program("count((Some(1), None, Some(\"two\")))"),
+        "Expected (U in T: Option<U>)",
+    );
+    assert_compiles_and_runs(&program("count((Some(1), Some(\"two\")))"), "3\n");
+}

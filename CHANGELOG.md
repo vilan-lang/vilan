@@ -40,6 +40,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**B541: a mapped-tuple argument whose element gives the family no evidence is refused at that element, as the underdetermined family it is: `count((Some(1), None, Some("two")))` at `(U in T: Option<U>)`, `T` bound nowhere else, reads "cannot infer `T`'s element 2: `None` is `Option<unknown>` and names no type for it, and nothing else at this call binds `T` — annotate the argument, or bind `T` through another parameter", where it read "Expected (U in T: Option<U>), but got (Option<i32>, Option<unknown>, Option<str>)".** With `T` bound by another parameter the call compiles, as B442's pin has it. **Pins:** `inference::tuples::b541_an_underdetermined_mapped_element_is_named_not_reported_as_a_mismatch` (the middle element, the first, the old wording gone once, a determined call running). One `NEW` ledger row. Tracker B541.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

@@ -48127,6 +48127,63 @@ impl<'src> Analyzer<'src> {
         (target != source).then_some(target)
     }
 
+    /// B541: an argument at a MAPPED parameter (`(U in T: Option<U>)`) whose
+    /// family `T` nothing else binds, and one of whose elements gives the
+    /// family no evidence — `None` names no payload type, so `T`'s element
+    /// there is underdetermined. The refusal is right; the mismatch wording
+    /// ("Expected (U in T: Option<U>), but got (Option<i32>, Option<unknown>,
+    /// Option<str>)") is not. `None` when the parameter is not a mapped tuple
+    /// over an unbound family, the argument is not a tuple of the parameter's
+    /// arity-free shape, or no element has a hole.
+    fn underdetermined_mapped_argument(
+        &self,
+        parameter_type: &Type,
+        argument_type: &Type,
+        argument_id: Id,
+        substitution_context: &SubstitutionContext,
+    ) -> Option<String> {
+        let Type::Mapped(_, source, _) = parameter_type else {
+            return None;
+        };
+        let Type::Generic(family) = source.get_type(self) else {
+            return None;
+        };
+        if substitution_context.contains_key(&family) {
+            return None;
+        }
+        let Type::Tuple(elements) = argument_type else {
+            return None;
+        };
+        let position = elements
+            .iter()
+            .position(|element| self.type_has_hole(*element))?;
+        let family_label = self.pretty_print_type(&Type::Generic(family), &HashMap::default());
+        let written = match self.expr_id_to_expr_map.get(&argument_id) {
+            Some(Expr::Tuple(items)) => items
+                .get(position)
+                .and_then(|item| self.written_text_of(*item))
+                .map(|text| format!("`{text}`"))
+                .unwrap_or_else(|| "this element".to_string()),
+            _ => "this element".to_string(),
+        };
+        let element =
+            self.pretty_print_type(&elements[position].get_type(self), substitution_context);
+        Some(format!(
+            "cannot infer `{family_label}`'s element {}: {written} is `{element}` and names no \
+             type for it, and nothing else at this call binds `{family_label}` — annotate the \
+             argument, or bind `{family_label}` through another parameter",
+            position + 1
+        ))
+    }
+
+    /// The source text an expression was written as, when its file is
+    /// registered with this analysis.
+    fn written_text_of(&self, id: Id) -> Option<&'src str> {
+        let span = **self.span_map.get(&id)?;
+        let text = self.source_text(self.source_of_id(id)?)?;
+        text.get(span.start..span.end)
+    }
+
     /// Records a resolved call: a `FunctionCall` plus the `Expr::Call` entity.
     /// The diagnostic for an argument that does not fit its declared parameter
     /// — with the BARE TRAIT case steered (B72).
@@ -49435,13 +49492,21 @@ impl<'src> Analyzer<'src> {
                                 }
                             }
                             None => {
-                                let (msg, note) = self.argument_mismatch(
-                                    parameter_name,
-                                    *parameter_id,
+                                let (msg, note) = match self.underdetermined_mapped_argument(
                                     &parameter_type,
                                     &argument_type,
+                                    argument_id,
                                     &substitution_context,
-                                );
+                                ) {
+                                    Some(msg) => (msg, None),
+                                    None => self.argument_mismatch(
+                                        parameter_name,
+                                        *parameter_id,
+                                        &parameter_type,
+                                        &argument_type,
+                                        &substitution_context,
+                                    ),
+                                };
                                 let span = **self.span_map.get(&argument_id).unwrap();
                                 // A later argument may still defer the call
                                 // (B495's mode refusal stands at a closure
