@@ -54503,14 +54503,51 @@ impl<'src> Analyzer<'src> {
     }
 
     fn import_steer_inner(&self, name: &str) -> Option<String> {
-        let std_members: HashSet<Id> = self
-            .module_id_by_name
-            .get("std")
-            .and_then(|std_id| self.modules.get(std_id))
-            .and_then(|module| self.scopes.get(&module.body.1))
-            .map(|scope| scope.name_to_id_map.values().copied().collect())
-            .unwrap_or_default();
-        let mut hit: Option<(&str, bool)> = None;
+        // B560: every loaded module's FULL path from its root — `std`'s and
+        // `pkg`'s scopes, then each module's children (A65/A154 namespaces),
+        // breadth-first — because the import the steer writes must be one the
+        // loader accepts. The module's own `name` is its LEAF, which spelled
+        // `pkg::lib::thing` as `pkg::thing` and `std::reactive::delta` as
+        // `pkg::delta`, imports that resolve nowhere.
+        let mut paths: HashMap<Id, String> = HashMap::default();
+        let mut pending: std::collections::VecDeque<(Id, String)> =
+            std::collections::VecDeque::new();
+        for root in ["std", "pkg"] {
+            let Some(scope) = self
+                .module_id_by_name
+                .get(root)
+                .and_then(|root_id| self.modules.get(root_id))
+                .and_then(|module| self.scopes.get(&module.body.1))
+            else {
+                continue;
+            };
+            for child_id in scope.name_to_id_map.values() {
+                if let Some(child) = self.modules.get(child_id) {
+                    pending.push_back((*child_id, format!("{root}::{}", child.name)));
+                }
+            }
+        }
+        while let Some((module_id, path)) = pending.pop_front() {
+            if paths.contains_key(&module_id) {
+                continue;
+            }
+            if let Some(children) = self
+                .module_children_scopes
+                .get(&module_id)
+                .and_then(|scope_id| self.scopes.get(scope_id))
+            {
+                for child_id in children.name_to_id_map.values() {
+                    if let Some(child) = self.modules.get(child_id) {
+                        pending.push_back((*child_id, format!("{path}::{}", child.name)));
+                    }
+                }
+            }
+            paths.insert(module_id, path);
+        }
+        // Hits are compared by that PATH, not by leaf name: two modules sharing
+        // a leaf in different directories are two homes (ambiguous, no steer),
+        // while one path loaded twice — a module's platform twins — is one.
+        let mut hit: Option<&str> = None;
         for module in self.modules.values() {
             if module.name == "pkg" || module.name == "std" {
                 continue;
@@ -54534,18 +54571,18 @@ impl<'src> Analyzer<'src> {
             if !self.is_exported_in(entity, module.body.1) {
                 continue;
             }
-            let is_std = std_members.contains(&module.id);
-            match &hit {
-                None => hit = Some((module.name, is_std)),
-                Some((existing, _)) if *existing == module.name => {}
+            // A module no root reaches (the entry itself) has no import path.
+            let Some(path) = paths.get(&module.id) else {
+                continue;
+            };
+            match hit {
+                None => hit = Some(path),
+                Some(existing) if existing == path => {}
                 Some(_) => return None,
             }
         }
-        if let Some((module, is_std)) = hit {
-            let root = if is_std { "std" } else { "pkg" };
-            return Some(format!(
-                "; import it first (`import {root}::{module}::{name};`)"
-            ));
+        if let Some(path) = hit {
+            return Some(format!("; import it first (`import {path}::{name};`)"));
         }
         if let Some(module) = self
             .std_export_index

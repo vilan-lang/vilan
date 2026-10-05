@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**The "import it first" steer names a nested module by its full path, so the import it suggests compiles.** On a name some loaded module declares, the steer printed `import {root}::{module}::{name};` with the module's LEAF name: kolt's `ProxySignal` in `src/lib/proxy_signal.vl` was steered to `import pkg::proxy_signal::ProxySignal;`, and a type in a nested std module to `pkg::` (`std::reactive::delta`'s `ListCell` as `import pkg::delta::ListCell;`). Each module's path is now built from its root through the namespaces that hold it (`pkg::lib::proxy_signal`, `std::reactive::delta`), and two declaring modules are compared by that path rather than by leaf, so two `thing.vl`s in different directories are an ambiguity (no steer) rather than one wrong path, while one module loaded twice (its platform twins) is still one home. Auto-import and the add-import fix read nested modules since E267. Pins: `module_resolution`'s `b560_the_import_steer_spells_a_nested_modules_full_path` (the steer's import pasted in compiles), `b560_two_modules_sharing_a_leaf_name_are_ambiguous`, `b560_the_import_steer_spells_a_nested_std_modules_full_path`. Tracker B560.
+
+---
+
 <!-- family: tooling -->
 **Auto-import and the add-import quick fix offer a name declared in a package's NESTED module, at its full path.** Both walked a package's top level only (A154 taught them std's namespaces and left `pkg` as it was), so a name in A65's `pkg::lib::ui::widget` was never offered by either. The auto-import table now descends a package's modules exactly as it descends std's, and the quick fix's candidate scan lists every module under the package's roots (a nested `prelude` still excepted, as for std). The import-this-trait fix (B515) reads the same scan, so a trait in `pkg::geo::shapes` is imported from there, where B515's own message names `pkg::shapes`. Pins: `vilan-lsp`'s `a_nested_package_modules_item_is_an_auto_import_candidate_at_its_full_path`, `a_nested_package_modules_item_is_an_add_import_target` and `trait_import_tests::a_nested_package_trait_is_imported_from_where_it_is_declared`. Tracker E267.
 
