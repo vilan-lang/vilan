@@ -61017,6 +61017,14 @@ impl<'src> Analyzer<'src> {
             split.push(("types", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
+        // --- Resolve `context` clauses (ambient-owner.md §5, B242, B309) ---
+        // after the import fixpoint (a clause may name an imported context),
+        // BEFORE conformance (E262: a trait member's clause is part of its
+        // parameter's TYPE, which conformance compares and its "declare `fun
+        // ..`" steer prints), and before the fixpoint, so the clause a
+        // closure type carries is part of that type for every substitution and
+        // reconcile the solver performs.
+        self.resolve_context_clauses();
         // --- Check trait conformance for `impl Subject with Trait` ---
         for check in std::mem::take(&mut self.prepped_trait_impls) {
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
@@ -61559,12 +61567,6 @@ impl<'src> Analyzer<'src> {
             split.push(("divergence+guards", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
-        // --- Resolve `context` clauses (ambient-owner.md §5, B242, B309) ---
-        // after the import fixpoint (a clause may name an imported context) and
-        // BEFORE the fixpoint below, so the clause a closure type carries is
-        // part of that type for every substitution and reconcile the solver
-        // performs.
-        self.resolve_context_clauses();
         // B401: the admission the lookups below read — after the import drain
         // (which recorded each statement's path segments) and the type drain
         // (which typed each selector's subject), before the first lookup.
