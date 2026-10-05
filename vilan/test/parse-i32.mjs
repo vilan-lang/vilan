@@ -28,42 +28,42 @@ function __parse_i32(text) {
 	const value = Number(trimmed);
 	return /^[+-]?[0-9]+$/.test(trimmed) && value >= -2147483648 && value <= 2147483647 ? [ 0, value ] : [ 1 ];
 }
-function $a(self, fallback) {
-	const $b = self;
-	let $c = null;
-	if ($b[0] === 0) {
-		const x = __clone($b[1]);
-		$c = x;
+function unwrap_or(self, fallback) {
+	const $a = self;
+	let $b = null;
+	if ($a[0] === 0) {
+		const x = __clone($a[1]);
+		$b = x;
 	} else {
-		$c = __clone(__force(fallback));
+		$b = __clone(__force(fallback));
 	}
-	return $c;
+	return $b;
 }
-function $d(self) {
-	const $e = self;
-	return $e[0] === 0;
+function is_some(self) {
+	const $c = self;
+	return $c[0] === 0;
 }
-console.log($a(__parse_i32("42"), __lazy("fallback", () => {
+console.log(unwrap_or(__parse_i32("42"), __lazy("fallback", () => {
 	return 0 - 1;
 })));
-console.log($a(__parse_i32("-7"), __lazy("fallback", () => {
+console.log(unwrap_or(__parse_i32("-7"), __lazy("fallback", () => {
 	return 0;
 })));
-console.log($a(__parse_i32("+9"), __lazy("fallback", () => {
+console.log(unwrap_or(__parse_i32("+9"), __lazy("fallback", () => {
 	return 0;
 })));
-console.log($a(__parse_i32(" 42 "), __lazy("fallback", () => {
+console.log(unwrap_or(__parse_i32(" 42 "), __lazy("fallback", () => {
 	return 0 - 1;
 })));
-console.log($d(__parse_i32("")));
-console.log($d(__parse_i32("abc")));
-console.log($d(__parse_i32("1.5")));
-console.log($d(__parse_i32("12x")));
-console.log($a(__parse_i32("2147483647"), __lazy("fallback", () => {
+console.log(is_some(__parse_i32("")));
+console.log(is_some(__parse_i32("abc")));
+console.log(is_some(__parse_i32("1.5")));
+console.log(is_some(__parse_i32("12x")));
+console.log(unwrap_or(__parse_i32("2147483647"), __lazy("fallback", () => {
 	return 0;
 })));
-console.log($d(__parse_i32("2147483648")));
-console.log($a(__parse_i32("-2147483648"), __lazy("fallback", () => {
+console.log(is_some(__parse_i32("2147483648")));
+console.log(unwrap_or(__parse_i32("-2147483648"), __lazy("fallback", () => {
 	return 0;
 })));
-console.log($d(__parse_i32("-2147483649")));
+console.log(is_some(__parse_i32("-2147483649")));

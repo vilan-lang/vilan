@@ -22,21 +22,56 @@ function hash2(self) {
 function eq(self, b) {
 	return self === b;
 }
-function $a() {
+function new2() {
 	const table = new Map();
 	return [ table ];
 }
-function $b(self, key2, value2) {
+function insert(self, key2, value2) {
 	self[0].set(hash(key2), [ __clone(key2), __clone(value2) ]);
 }
-function $c(self) {
+function len(self) {
 	return self[0].size;
 }
-function $d(self, key2) {
+function contains_key(self, key2) {
 	return self[0].has(hash(key2));
 }
-function $e(self, key2) {
-	const $f = __map_get(self[0], hash(key2));
+function get(self, key2) {
+	const $a = __map_get(self[0], hash(key2));
+	let $b = null;
+	if ($a[0] === 0) {
+		const entry2 = $a[1];
+		$b = [ 0, __clone(entry2[1]) ];
+	} else {
+		$b = [ 1 ];
+	}
+	return $b;
+}
+function unwrap_or(self, fallback) {
+	const $c = self;
+	let $d = null;
+	if ($c[0] === 0) {
+		const x = __clone($c[1]);
+		$d = x;
+	} else {
+		$d = __clone(fallback);
+	}
+	return $d;
+}
+function is_some(self) {
+	const $e = self;
+	return $e[0] === 0;
+}
+function remove(self, key2) {
+	self[0].delete(hash(key2));
+}
+function is_empty(self) {
+	return len(self) === 0;
+}
+function insert2(self, key2, value2) {
+	self[0].set(hash2(key2), [ __clone(key2), __clone(value2) ]);
+}
+function get2(self, key2) {
+	const $f = __map_get(self[0], hash2(key2));
 	let $g = null;
 	if ($f[0] === 0) {
 		const entry2 = $f[1];
@@ -46,59 +81,24 @@ function $e(self, key2) {
 	}
 	return $g;
 }
-function $h(self, fallback) {
-	const $i = self;
-	let $j = null;
-	if ($i[0] === 0) {
-		const x = __clone($i[1]);
-		$j = x;
-	} else {
-		$j = __clone(fallback);
-	}
-	return $j;
-}
-function $k(self) {
-	const $l = self;
-	return $l[0] === 0;
-}
-function $m(self, key2) {
-	self[0].delete(hash(key2));
-}
-function $n(self) {
-	return $c(self) === 0;
-}
-function $p(self, key2, value2) {
-	self[0].set(hash2(key2), [ __clone(key2), __clone(value2) ]);
-}
-function $q(self, key2) {
-	const $r = __map_get(self[0], hash2(key2));
-	let $s = null;
-	if ($r[0] === 0) {
-		const entry2 = $r[1];
-		$s = [ 0, __clone(entry2[1]) ];
-	} else {
-		$s = [ 1 ];
-	}
-	return $s;
-}
-function $w(self) {
+function keys(self) {
 	let result = [  ];
 	for (const entry2 of __map_values(self[0])) {
 		result.push(__clone(entry2[0]));
 	}
 	return result;
 }
-function $x(self) {
+function values(self) {
 	let result = [  ];
 	for (const entry2 of __map_values(self[0])) {
 		result.push(__clone(entry2[1]));
 	}
 	return result;
 }
-function $y(self) {
+function entries(self) {
 	return __map_values(self[0]);
 }
-function $z(self, value2) {
+function contains_value(self, value2) {
 	for (const entry2 of __map_values(self[0])) {
 		if (eq(entry2[1], value2)) {
 			return true;
@@ -106,59 +106,59 @@ function $z(self, value2) {
 	}
 	return false;
 }
-let scores = $a();
-$b(scores, "alice", 1);
-$b(scores, "bob", 2);
-$b(scores, "carol", 3);
-console.log($c(scores));
-console.log($d(scores, "bob"));
-console.log($d(scores, "dave"));
-console.log($h($e(scores, "bob"), 0));
-console.log($h($e(scores, "dave"), -(1)));
-console.log($k($e(scores, "alice")));
-$b(scores, "bob", 22);
-console.log($h($e(scores, "bob"), 0));
-console.log($c(scores));
-$m(scores, "bob");
-console.log($d(scores, "bob"));
-console.log($c(scores));
-console.log($n(scores));
+let scores = new2();
+insert(scores, "alice", 1);
+insert(scores, "bob", 2);
+insert(scores, "carol", 3);
+console.log(len(scores));
+console.log(contains_key(scores, "bob"));
+console.log(contains_key(scores, "dave"));
+console.log(unwrap_or(get(scores, "bob"), 0));
+console.log(unwrap_or(get(scores, "dave"), -(1)));
+console.log(is_some(get(scores, "alice")));
+insert(scores, "bob", 22);
+console.log(unwrap_or(get(scores, "bob"), 0));
+console.log(len(scores));
+remove(scores, "bob");
+console.log(contains_key(scores, "bob"));
+console.log(len(scores));
+console.log(is_empty(scores));
 let copy = __clone(scores);
-$b(copy, "dave", 4);
-console.log($d(scores, "dave"));
-console.log($d(copy, "dave"));
-let names = $a();
-$p(names, 1, "one");
-$p(names, 2, "two");
-console.log($h($q(names, 1), "?"));
-console.log($h($q(names, 9), "?"));
-let letters = $a();
-$b(letters, "a", 10);
-$b(letters, "b", 20);
-$b(letters, "c", 30);
+insert(copy, "dave", 4);
+console.log(contains_key(scores, "dave"));
+console.log(contains_key(copy, "dave"));
+let names = new2();
+insert2(names, 1, "one");
+insert2(names, 2, "two");
+console.log(unwrap_or(get2(names, 1), "?"));
+console.log(unwrap_or(get2(names, 9), "?"));
+let letters = new2();
+insert(letters, "a", 10);
+insert(letters, "b", 20);
+insert(letters, "c", 30);
 let key_count = 0;
-for (const key of $w(letters)) {
+for (const key of keys(letters)) {
 	key_count = key_count + 1;
 }
 console.log(key_count);
 let sum = 0;
-for (const value of $x(letters)) {
+for (const value of values(letters)) {
 	sum = sum + value;
 }
 console.log(sum);
-console.log($w(letters).length);
+console.log(keys(letters).length);
 let entry_order = "";
 let entry_total = 0;
-for (const entry of $y(letters)) {
+for (const entry of entries(letters)) {
 	entry_order = entry_order + entry[0];
 	entry_total = entry_total + entry[1];
 }
 console.log(entry_order);
 console.log(entry_total);
-console.log($y(letters).length);
-console.log($z(letters, 20));
-console.log($z(letters, 99));
-let empty = $a();
-console.log($n(empty));
-console.log($y(empty).length);
-console.log($z(empty, 0));
+console.log(entries(letters).length);
+console.log(contains_value(letters, 20));
+console.log(contains_value(letters, 99));
+let empty = new2();
+console.log(is_empty(empty));
+console.log(entries(empty).length);
+console.log(contains_value(empty, 0));

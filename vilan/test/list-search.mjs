@@ -32,7 +32,7 @@ function eq2(self, b) {
 function max_value() {
 	return 9007199254740992;
 }
-function $a(self, predicate) {
+function find(self, predicate) {
 	for (const item of self) {
 		if (predicate(item)) {
 			return [ 0, item ];
@@ -40,22 +40,22 @@ function $a(self, predicate) {
 	}
 	return [ 1 ];
 }
-function $b(self, fallback) {
-	const $c = self;
-	let $d = null;
-	if ($c[0] === 0) {
-		const x = __clone($c[1]);
-		$d = x;
+function unwrap_or(self, fallback) {
+	const $a = self;
+	let $b = null;
+	if ($a[0] === 0) {
+		const x = __clone($a[1]);
+		$b = x;
 	} else {
-		$d = __clone(__force(fallback));
+		$b = __clone(__force(fallback));
 	}
-	return $d;
+	return $b;
 }
-function $e(self) {
-	const $f = self;
-	return $f[0] === 1;
+function is_none(self) {
+	const $c = self;
+	return $c[0] === 1;
 }
-function $g(self, value) {
+function contains(self, value) {
 	for (const item of self) {
 		if (eq2(item, value)) {
 			return true;
@@ -63,7 +63,7 @@ function $g(self, value) {
 	}
 	return false;
 }
-function $h(self, value) {
+function index_of(self, value) {
 	let index = 0;
 	for (const item of self) {
 		if (eq2(item, value)) {
@@ -73,7 +73,7 @@ function $h(self, value) {
 	}
 	return [ 1 ];
 }
-function $n(self, value) {
+function contains2(self, value) {
 	for (const item of self) {
 		if (eq(item, value)) {
 			return true;
@@ -81,7 +81,7 @@ function $n(self, value) {
 	}
 	return false;
 }
-function $o(self, value) {
+function index_of2(self, value) {
 	let index = 0;
 	for (const item of self) {
 		if (eq(item, value)) {
@@ -92,28 +92,28 @@ function $o(self, value) {
 	return [ 1 ];
 }
 const xs = [ 10, 20, 30, 20 ];
-console.log($b($a(xs, (n) => {
+console.log(unwrap_or(find(xs, (n) => {
 	return n > 15;
 }), __lazy("fallback", () => {
 	return 0;
 })));
-console.log($e($a(xs, (n) => {
+console.log(is_none(find(xs, (n) => {
 	return n > 90;
 })));
-console.log($g(xs, 20));
-console.log($g(xs, 25));
-console.log($b($h(xs, 20), __lazy("fallback", () => {
+console.log(contains(xs, 20));
+console.log(contains(xs, 25));
+console.log(unwrap_or(index_of(xs, 20), __lazy("fallback", () => {
 	return max_value();
 })));
-console.log($e($h(xs, 99)));
+console.log(is_none(index_of(xs, 99)));
 const words = [ "alpha", "beta" ];
-console.log($n(words, "beta"));
-console.log($b($o(words, "alpha"), __lazy("fallback", () => {
+console.log(contains2(words, "beta"));
+console.log(unwrap_or(index_of2(words, "alpha"), __lazy("fallback", () => {
 	return max_value();
 })));
 let empty = [  ];
-console.log($e($a(empty, (n) => {
+console.log(is_none(find(empty, (n) => {
 	return n > 0;
 })));
-console.log($g(empty, 1));
-console.log($e($h(empty, 1)));
+console.log(contains(empty, 1));
+console.log(is_none(index_of(empty, 1)));

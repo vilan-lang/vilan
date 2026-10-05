@@ -10,7 +10,7 @@ function default2() {
 function sum(self) {
 	return self[0] + self[1];
 }
-function $a(self) {
+function sum2(self) {
 	let total = default2();
 	let seeded = false;
 	for (const item of self) {
@@ -33,4 +33,4 @@ let numbers = [  ];
 numbers.push(10);
 numbers.push(20);
 numbers.push(30);
-console.log($a(numbers));
+console.log(sum2(numbers));

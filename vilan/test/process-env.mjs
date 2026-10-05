@@ -11,16 +11,16 @@ function __env(key) {
 	const value = process.env[key];
 	return value === undefined ? [ 1 ] : [ 0, value ];
 }
-function $c(self, fallback) {
-	const $d = self;
-	let $e = null;
-	if ($d[0] === 0) {
-		const x = __clone($d[1]);
-		$e = x;
+function unwrap_or(self, fallback) {
+	const $c = self;
+	let $d = null;
+	if ($c[0] === 0) {
+		const x = __clone($c[1]);
+		$d = x;
 	} else {
-		$e = __clone(fallback);
+		$d = __clone(fallback);
 	}
-	return $e;
+	return $d;
 }
 const arguments2 = __args();
 console.log(arguments2.length);
@@ -33,4 +33,4 @@ if ($a[0] === 0) {
 	$b = console.log("unset");
 }
 $b;
-console.log($c(__env("DEFINITELY_NOT_SET_XYZ"), "unset"));
+console.log(unwrap_or(__env("DEFINITELY_NOT_SET_XYZ"), "unset"));

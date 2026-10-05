@@ -7,210 +7,210 @@ function __clone(value) {
 function default2() {
 	return 0;
 }
-function $a(self, fn) {
-	const $b = self;
-	let $c = null;
-	if ($b[0] === 0) {
-		const x = $b[1];
-		$c = [ 0, fn(x) ];
+function map(self, fn) {
+	const $a = self;
+	let $b = null;
+	if ($a[0] === 0) {
+		const x = $a[1];
+		$b = [ 0, fn(x) ];
 	} else {
-		const e = $b[1];
-		$c = [ 1, __clone(e) ];
+		const e = $a[1];
+		$b = [ 1, __clone(e) ];
 	}
-	return $c;
+	return $b;
 }
-function $d(self, fallback) {
+function unwrap_or(self, fallback) {
+	const $c = self;
+	let $d = null;
+	if ($c[0] === 0) {
+		const x = __clone($c[1]);
+		$d = x;
+	} else {
+		$d = __clone(fallback);
+	}
+	return $d;
+}
+function map_err(self, fn) {
 	const $e = self;
 	let $f = null;
 	if ($e[0] === 0) {
-		const x = __clone($e[1]);
-		$f = x;
+		const x = $e[1];
+		$f = [ 0, __clone(x) ];
 	} else {
-		$f = __clone(fallback);
+		const e = $e[1];
+		$f = [ 1, fn(e) ];
 	}
 	return $f;
 }
-function $g(self, fn) {
-	const $h = self;
-	let $i = null;
-	if ($h[0] === 0) {
-		const x = $h[1];
-		$i = [ 0, __clone(x) ];
+function is_ok_and(self, fn) {
+	const $g = self;
+	let $h = null;
+	if ($g[0] === 0) {
+		const x = $g[1];
+		$h = fn(x);
 	} else {
-		const e = $h[1];
-		$i = [ 1, fn(e) ];
+		$h = false;
 	}
-	return $i;
+	return $h;
 }
-function $j(self, fn) {
+function is_err_and(self, fn) {
+	const $i = self;
+	let $j = null;
+	if ($i[0] === 1) {
+		const e = $i[1];
+		$j = fn(e);
+	} else {
+		$j = false;
+	}
+	return $j;
+}
+function and_then(self, fn) {
 	const $k = self;
 	let $l = null;
 	if ($k[0] === 0) {
 		const x = $k[1];
 		$l = fn(x);
 	} else {
-		$l = false;
+		const e = $k[1];
+		$l = [ 1, __clone(e) ];
 	}
 	return $l;
 }
-function $m(self, fn) {
-	const $n = self;
-	let $o = null;
-	if ($n[0] === 1) {
-		const e = $n[1];
-		$o = fn(e);
+function or_else(self, fn) {
+	const $m = self;
+	let $n = null;
+	if ($m[0] === 0) {
+		const x = $m[1];
+		$n = [ 0, __clone(x) ];
 	} else {
-		$o = false;
+		const e = $m[1];
+		$n = fn(e);
 	}
-	return $o;
+	return $n;
 }
-function $p(self, fn) {
+function unwrap_or_else(self, fn) {
+	const $o = self;
+	let $p = null;
+	if ($o[0] === 0) {
+		const x = __clone($o[1]);
+		$p = x;
+	} else {
+		const e = $o[1];
+		$p = fn(e);
+	}
+	return $p;
+}
+function ok(self) {
 	const $q = self;
 	let $r = null;
 	if ($q[0] === 0) {
 		const x = $q[1];
-		$r = fn(x);
+		$r = [ 0, __clone(x) ];
 	} else {
-		const e = $q[1];
-		$r = [ 1, __clone(e) ];
+		$r = [ 1 ];
 	}
 	return $r;
 }
-function $s(self, fn) {
+function is_some(self) {
+	const $s = self;
+	return $s[0] === 0;
+}
+function err(self) {
 	const $t = self;
 	let $u = null;
-	if ($t[0] === 0) {
-		const x = $t[1];
-		$u = [ 0, __clone(x) ];
-	} else {
+	if ($t[0] === 1) {
 		const e = $t[1];
-		$u = fn(e);
+		$u = [ 0, __clone(e) ];
+	} else {
+		$u = [ 1 ];
 	}
 	return $u;
 }
-function $v(self, fn) {
-	const $w = self;
-	let $x = null;
-	if ($w[0] === 0) {
-		const x = __clone($w[1]);
-		$x = x;
+function unwrap_or2(self, fallback) {
+	const $v = self;
+	let $w = null;
+	if ($v[0] === 0) {
+		const x = __clone($v[1]);
+		$w = x;
 	} else {
-		const e = $w[1];
-		$x = fn(e);
+		$w = __clone(fallback);
 	}
-	return $x;
+	return $w;
 }
-function $y(self) {
+function unwrap_or_default(self) {
+	const $x = self;
+	let $y = null;
+	if ($x[0] === 0) {
+		const x = __clone($x[1]);
+		$y = x;
+	} else {
+		$y = default2();
+	}
+	return $y;
+}
+function and(self, b) {
 	const $z = self;
 	let $A = null;
 	if ($z[0] === 0) {
-		const x = $z[1];
-		$A = [ 0, __clone(x) ];
+		$A = b;
 	} else {
-		$A = [ 1 ];
+		const e = $z[1];
+		$A = [ 1, __clone(e) ];
 	}
 	return $A;
 }
-function $B(self) {
-	const $C = self;
-	return $C[0] === 0;
-}
-function $D(self) {
-	const $E = self;
-	let $F = null;
-	if ($E[0] === 1) {
-		const e = $E[1];
-		$F = [ 0, __clone(e) ];
+function or(self, b) {
+	const $B = self;
+	let $C = null;
+	if ($B[0] === 0) {
+		const x = $B[1];
+		$C = [ 0, __clone(x) ];
 	} else {
-		$F = [ 1 ];
+		$C = b;
 	}
-	return $F;
+	return $C;
 }
-function $G(self, fallback) {
-	const $H = self;
-	let $I = null;
-	if ($H[0] === 0) {
-		const x = __clone($H[1]);
-		$I = x;
+function transpose(self) {
+	const $D = self;
+	let $E = null;
+	if ($D[0] === 0 && $D[1][0] === 0) {
+		const x = $D[1][1];
+		$E = [ 0, [ 0, __clone(x) ] ];
+	} else if ($D[0] === 0 && $D[1][0] === 1) {
+		$E = [ 1 ];
 	} else {
-		$I = __clone(fallback);
+		const e = $D[1];
+		$E = [ 0, [ 1, __clone(e) ] ];
 	}
-	return $I;
+	return $E;
 }
-function $J(self) {
-	const $K = self;
-	let $L = null;
-	if ($K[0] === 0) {
-		const x = __clone($K[1]);
-		$L = x;
-	} else {
-		$L = default2();
-	}
-	return $L;
-}
-function $M(self, b) {
-	const $N = self;
-	let $O = null;
-	if ($N[0] === 0) {
-		$O = b;
-	} else {
-		const e = $N[1];
-		$O = [ 1, __clone(e) ];
-	}
-	return $O;
-}
-function $P(self, b) {
-	const $Q = self;
-	let $R = null;
-	if ($Q[0] === 0) {
-		const x = $Q[1];
-		$R = [ 0, __clone(x) ];
-	} else {
-		$R = b;
-	}
-	return $R;
-}
-function $S(self) {
-	const $T = self;
-	let $U = null;
-	if ($T[0] === 0 && $T[1][0] === 0) {
-		const x = $T[1][1];
-		$U = [ 0, [ 0, __clone(x) ] ];
-	} else if ($T[0] === 0 && $T[1][0] === 1) {
-		$U = [ 1 ];
-	} else {
-		const e = $T[1];
-		$U = [ 0, [ 1, __clone(e) ] ];
-	}
-	return $U;
-}
-const ok = [ 0, 10 ];
-const err = [ 1, "boom" ];
-console.log($d($a(ok, (n) => {
+const ok2 = [ 0, 10 ];
+const err2 = [ 1, "boom" ];
+console.log(unwrap_or(map(ok2, (n) => {
 	return n + 1;
 }), 0));
-console.log($d($g(err, (e) => {
+console.log(unwrap_or(map_err(err2, (e) => {
 	return e;
 }), 0));
-console.log($j(ok, (n) => {
+console.log(is_ok_and(ok2, (n) => {
 	return n > 5;
 }));
-console.log($m(err, (e) => {
+console.log(is_err_and(err2, (e) => {
 	return true;
 }));
-console.log($d($p(ok, (n) => {
+console.log(unwrap_or(and_then(ok2, (n) => {
 	return [ 0, n * 2 ];
 }), 0));
-console.log($d($s(err, (e) => {
+console.log(unwrap_or(or_else(err2, (e) => {
 	return [ 0, 7 ];
 }), 0));
-console.log($v(err, (e) => {
+console.log(unwrap_or_else(err2, (e) => {
 	return 99;
 }));
-console.log($B($y(ok)));
-console.log($G($D(err), "none"));
-console.log($J(err));
-console.log($d($M(ok, [ 0, 5 ]), 0));
-console.log($d($P(err, [ 0, 3 ]), 0));
+console.log(is_some(ok(ok2)));
+console.log(unwrap_or2(err(err2), "none"));
+console.log(unwrap_or_default(err2));
+console.log(unwrap_or(and(ok2, [ 0, 5 ]), 0));
+console.log(unwrap_or(or(err2, [ 0, 3 ]), 0));
 const ro = [ 0, [ 0, 42 ] ];
-console.log($B($S(ro)));
+console.log(is_some(transpose(ro)));

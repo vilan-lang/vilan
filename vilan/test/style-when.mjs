@@ -37,24 +37,24 @@ function slot_of(key) {
 	return [ __at(parts, 0, "std/src/web/style.vl:875:17"), __at(parts, 1, "std/src/web/style.vl:875:39"), __at(parts, 2, "std/src/web/style.vl:875:60") ];
 }
 function family_longhands(property) {
-	const $g = property;
-	let $h = null;
-	if ($g === "padding") {
-		$h = ";padding-top;padding-right;padding-bottom;padding-left;";
-	} else if ($g === "margin") {
-		$h = ";margin-top;margin-right;margin-bottom;margin-left;";
-	} else if ($g === "inset") {
-		$h = ";top;right;bottom;left;";
-	} else if ($g === "flex") {
-		$h = ";flex-grow;flex-shrink;flex-basis;";
-	} else if ($g === "background") {
-		$h = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
-	} else if ($g === "border") {
-		$h = border_longhands();
+	const $e = property;
+	let $f = null;
+	if ($e === "padding") {
+		$f = ";padding-top;padding-right;padding-bottom;padding-left;";
+	} else if ($e === "margin") {
+		$f = ";margin-top;margin-right;margin-bottom;margin-left;";
+	} else if ($e === "inset") {
+		$f = ";top;right;bottom;left;";
+	} else if ($e === "flex") {
+		$f = ";flex-grow;flex-shrink;flex-basis;";
+	} else if ($e === "background") {
+		$f = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
+	} else if ($e === "border") {
+		$f = border_longhands();
 	} else {
-		$h = "";
+		$f = "";
 	}
-	return $h;
+	return $f;
 }
 function border_longhands() {
 	let out = ";border-width;border-style;border-color;";
@@ -72,29 +72,29 @@ function without_covered(rules, media, condition, property) {
 		return __clone(rules);
 	}
 	let out = __clone(rules);
-	for (const key of $a(rules)) {
+	for (const key of keys(rules)) {
 		const slot = slot_of(key);
 		if (slot[0] === media && slot[1] === condition && longhands.includes(";" + slot[2] + ";")) {
-			$i(out, key);
+			remove(out, key);
 		}
 	}
 	return out;
 }
 function when(self, condition, delta) {
-	let $k = null;
+	let $g = null;
 	if (condition) {
-		$k = add(self, delta);
+		$g = add(self, delta);
 	} else {
-		$k = __clone(self);
+		$g = __clone(self);
 	}
-	return $k;
+	return $g;
 }
 function class_list(self) {
 	let out = "";
-	for (const entry of $l(self[0])) {
-		const $m = entry;
-		const class2 = $m[0];
-		const _declaration = $m[1];
+	for (const entry of values(self[0])) {
+		const $h = entry;
+		const class2 = $h[0];
+		const _declaration = $h[1];
 		if (out === "") {
 			out = class2;
 		} else {
@@ -105,19 +105,19 @@ function class_list(self) {
 }
 function add(self, b) {
 	let rules = __clone(self[0]);
-	for (const key of $a(b[0])) {
-		const $e = $b(b[0], key);
-		let $f = null;
-		if ($e[0] === 0) {
-			const entry = $e[1];
+	for (const key of keys(b[0])) {
+		const $c = get(b[0], key);
+		let $d = null;
+		if ($c[0] === 0) {
+			const entry = $c[1];
 			const slot = slot_of(key);
 			rules = without_covered(rules, slot[0], slot[1], slot[2]);
-			$j(rules, key, entry);
-			$f = undefined;
+			insert(rules, key, entry);
+			$d = undefined;
 		} else {
-			$f = undefined;
+			$d = undefined;
 		}
-		$f;
+		$d;
 	}
 	return [ rules ];
 }
@@ -134,31 +134,31 @@ function built(is_chosen2, is_muted2) {
 	}
 	return class_list(out);
 }
-function $a(self) {
+function keys(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
 		result.push(__clone(entry[0]));
 	}
 	return result;
 }
-function $b(self, key) {
-	const $c = __map_get(self[0], hash(key));
-	let $d = null;
-	if ($c[0] === 0) {
-		const entry = $c[1];
-		$d = [ 0, __clone(entry.slice(1, 3)) ];
+function get(self, key) {
+	const $a = __map_get(self[0], hash(key));
+	let $b = null;
+	if ($a[0] === 0) {
+		const entry = $a[1];
+		$b = [ 0, __clone(entry.slice(1, 3)) ];
 	} else {
-		$d = [ 1 ];
+		$b = [ 1 ];
 	}
-	return $d;
+	return $b;
 }
-function $i(self, key) {
+function remove(self, key) {
 	self[0].delete(hash(key));
 }
-function $j(self, key, value) {
+function insert(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), ...__clone(value) ]);
 }
-function $l(self) {
+function values(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
 		result.push(__clone(entry.slice(1, 3)));

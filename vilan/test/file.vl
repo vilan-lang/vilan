@@ -66,7 +66,7 @@ fun main() {
 	print(size);
 
 	// S5: the writing scoped form — the same awaited close over a `create`.
-	// witness: return await ($g(await (create(path)), body));
+	// witness: return await (scoped_file(await (create(path)), body));
 	with_file_create(scratch, |f| {
 		f.write_at(encode_utf8("0123456789"), 0i53);
 	});

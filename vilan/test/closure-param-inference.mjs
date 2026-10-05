@@ -4,54 +4,54 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-function $a(self, fn) {
-	const $b = self;
-	let $c = null;
-	if ($b[0] === 0) {
-		const x = $b[1];
-		$c = [ 0, fn(x) ];
+function map(self, fn) {
+	const $a = self;
+	let $b = null;
+	if ($a[0] === 0) {
+		const x = $a[1];
+		$b = [ 0, fn(x) ];
 	} else {
-		$c = [ 1 ];
+		$b = [ 1 ];
 	}
-	return $c;
+	return $b;
 }
-function $d(self, fallback) {
+function unwrap_or(self, fallback) {
+	const $c = self;
+	let $d = null;
+	if ($c[0] === 0) {
+		const x = __clone($c[1]);
+		$d = x;
+	} else {
+		$d = __clone(fallback);
+	}
+	return $d;
+}
+function is_some_and(self, fn) {
 	const $e = self;
 	let $f = null;
 	if ($e[0] === 0) {
-		const x = __clone($e[1]);
-		$f = x;
+		const x = $e[1];
+		$f = fn(x);
 	} else {
-		$f = __clone(fallback);
+		$f = false;
 	}
 	return $f;
 }
-function $g(self, fn) {
-	const $h = self;
-	let $i = null;
-	if ($h[0] === 0) {
-		const x = $h[1];
-		$i = fn(x);
-	} else {
-		$i = false;
-	}
-	return $i;
-}
-function $j(self, fn) {
+function map2(self, fn) {
 	let result = [  ];
 	for (const item of self) {
 		result.push(fn(item));
 	}
 	return result;
 }
-function $k(self, init, fn) {
+function fold(self, init, fn) {
 	let accumulator = __clone(init);
 	for (const item of self) {
 		accumulator = fn(accumulator, item);
 	}
 	return accumulator;
 }
-function $l(self, predicate) {
+function filter(self, predicate) {
 	let result = [  ];
 	for (const item of self) {
 		if (predicate(item)) {
@@ -61,20 +61,20 @@ function $l(self, predicate) {
 	return result;
 }
 const p = [ 0, [ 3, 4 ] ];
-console.log($d($a(p, (q) => {
+console.log(unwrap_or(map(p, (q) => {
 	return q[0] + q[1];
 }), 0));
-console.log($g(p, (q) => {
+console.log(is_some_and(p, (q) => {
 	return q[0] === 3;
 }));
 let pts = [  ];
 pts.push([ 1, 10 ]);
 pts.push([ 2, 20 ]);
-console.log($k($j(pts, (pt) => {
+console.log(fold(map2(pts, (pt) => {
 	return pt[0];
 }), 0, (a, b) => {
 	return a + b;
 }));
-console.log($l(pts, (pt) => {
+console.log(filter(pts, (pt) => {
 	return pt[1] > 15;
 }).length);

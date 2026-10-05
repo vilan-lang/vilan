@@ -7,26 +7,26 @@ function __clone(value) {
 function __shared_new(value) {
 	return { v: value };
 }
-function $a(value) {
+function new2(value) {
 	return [ __shared_new(__clone(value)) ];
 }
-function $c(self) {
+function get(self) {
 	return __clone(self[0].v);
 }
-function $d(self, value) {
+function set(self, value) {
 	self[0].v = __clone(value);
 }
-function $b(self, transform) {
-	$d(self, transform($c(self)));
+function update(self, transform) {
+	set(self, transform(get(self)));
 }
-const counter = $a(0);
-$b(counter, (n) => {
+const counter = new2(0);
+update(counter, (n) => {
 	return n + 1;
 });
-$b(counter, (n) => {
+update(counter, (n) => {
 	return n * 10;
 });
-console.log($c(counter));
-const label = $a("a");
-$d(label, "hello");
-console.log($c(label));
+console.log(get(counter));
+const label = new2("a");
+set(label, "hello");
+console.log(get(label));

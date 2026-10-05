@@ -37,24 +37,24 @@ function slot_of(key) {
 	return [ __at(parts, 0, "std/src/web/style.vl:875:17"), __at(parts, 1, "std/src/web/style.vl:875:39"), __at(parts, 2, "std/src/web/style.vl:875:60") ];
 }
 function family_longhands(property) {
-	const $i = property;
-	let $j = null;
-	if ($i === "padding") {
-		$j = ";padding-top;padding-right;padding-bottom;padding-left;";
-	} else if ($i === "margin") {
-		$j = ";margin-top;margin-right;margin-bottom;margin-left;";
-	} else if ($i === "inset") {
-		$j = ";top;right;bottom;left;";
-	} else if ($i === "flex") {
-		$j = ";flex-grow;flex-shrink;flex-basis;";
-	} else if ($i === "background") {
-		$j = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
-	} else if ($i === "border") {
-		$j = border_longhands();
+	const $f = property;
+	let $g = null;
+	if ($f === "padding") {
+		$g = ";padding-top;padding-right;padding-bottom;padding-left;";
+	} else if ($f === "margin") {
+		$g = ";margin-top;margin-right;margin-bottom;margin-left;";
+	} else if ($f === "inset") {
+		$g = ";top;right;bottom;left;";
+	} else if ($f === "flex") {
+		$g = ";flex-grow;flex-shrink;flex-basis;";
+	} else if ($f === "background") {
+		$g = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
+	} else if ($f === "border") {
+		$g = border_longhands();
 	} else {
-		$j = "";
+		$g = "";
 	}
-	return $j;
+	return $g;
 }
 function border_longhands() {
 	let out = ";border-width;border-style;border-color;";
@@ -72,20 +72,20 @@ function without_covered(rules, media, condition, property) {
 		return __clone(rules);
 	}
 	let out = __clone(rules);
-	for (const key of $c(rules)) {
+	for (const key of keys(rules)) {
 		const slot = slot_of(key);
 		if (slot[0] === media && slot[1] === condition && longhands.includes(";" + slot[2] + ";")) {
-			$k(out, key);
+			remove(out, key);
 		}
 	}
 	return out;
 }
 function class_list(self) {
 	let out = "";
-	for (const entry of $a(self[0])) {
-		const $b = entry;
-		const class2 = $b[0];
-		const _declaration = $b[1];
+	for (const entry of values(self[0])) {
+		const $a = entry;
+		const class2 = $a[0];
+		const _declaration = $a[1];
 		if (out === "") {
 			out = class2;
 		} else {
@@ -96,51 +96,51 @@ function class_list(self) {
 }
 function add(self, b) {
 	let rules = __clone(self[0]);
-	for (const key of $c(b[0])) {
-		const $g = $d(b[0], key);
-		let $h = null;
-		if ($g[0] === 0) {
-			const entry = $g[1];
+	for (const key of keys(b[0])) {
+		const $d = get(b[0], key);
+		let $e = null;
+		if ($d[0] === 0) {
+			const entry = $d[1];
 			const slot = slot_of(key);
 			rules = without_covered(rules, slot[0], slot[1], slot[2]);
-			$l(rules, key, entry);
-			$h = undefined;
+			insert(rules, key, entry);
+			$e = undefined;
 		} else {
-			$h = undefined;
+			$e = undefined;
 		}
-		$h;
+		$e;
 	}
 	return [ rules ];
 }
-function $a(self) {
+function values(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
 		result.push(__clone(entry.slice(1, 3)));
 	}
 	return result;
 }
-function $c(self) {
+function keys(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
 		result.push(__clone(entry[0]));
 	}
 	return result;
 }
-function $d(self, key) {
-	const $e = __map_get(self[0], hash(key));
-	let $f = null;
-	if ($e[0] === 0) {
-		const entry = $e[1];
-		$f = [ 0, __clone(entry.slice(1, 3)) ];
+function get(self, key) {
+	const $b = __map_get(self[0], hash(key));
+	let $c = null;
+	if ($b[0] === 0) {
+		const entry = $b[1];
+		$c = [ 0, __clone(entry.slice(1, 3)) ];
 	} else {
-		$f = [ 1 ];
+		$c = [ 1 ];
 	}
-	return $f;
+	return $c;
 }
-function $k(self, key) {
+function remove(self, key) {
 	self[0].delete(hash(key));
 }
-function $l(self, key, value) {
+function insert(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), ...__clone(value) ]);
 }
 const card = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ], [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "::background-color", "siolu0w", "background-color:var(--gray-50)" ] ], [ ":hover:background-color", [ ":hover:background-color", "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];

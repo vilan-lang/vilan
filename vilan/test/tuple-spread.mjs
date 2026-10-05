@@ -7,17 +7,17 @@ function __clone(value) {
 function make() {
 	return [ 4, 5 ];
 }
-function $a(items) {
+function pack(items) {
 	return __clone(items);
 }
-function $b(items) {
+function need2(items) {
 	return 1;
 }
-function $e(xs) {
+function width(xs) {
 	return 1;
 }
-function $d(items) {
-	return $e([ ...__clone(items) ]);
+function forward(items) {
+	return width([ ...__clone(items) ]);
 }
 const pair = [ 1, 2 ];
 const lead = [ ...__clone(pair), 3 ];
@@ -34,9 +34,9 @@ const outer = [ ...__clone(pair), 3 ];
 const kept = [ ...outer, 4 ];
 console.log(kept[1]);
 console.log(kept[3]);
-const none = $a([  ]);
+const none = pack([  ]);
 console.log([ ...none, 7 ][0]);
 console.log([ ...make(), 6 ][2]);
-console.log($b([ ...__clone(pair) ]));
-console.log($b([ ...pair, 7 ]));
-console.log($d([ 1, 2, 3 ]));
+console.log(need2([ ...__clone(pair) ]));
+console.log(need2([ ...pair, 7 ]));
+console.log(forward([ 1, 2, 3 ]));

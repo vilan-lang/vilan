@@ -4,24 +4,24 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-function $a(self) {
+function is_empty(self) {
 	return self.length === 0;
 }
-function $b(self, fn) {
+function map(self, fn) {
 	let result = [  ];
 	for (const item of self) {
 		result.push(fn(item));
 	}
 	return result;
 }
-function $c(self, init, fn) {
+function fold(self, init, fn) {
 	let accumulator = __clone(init);
 	for (const item of self) {
 		accumulator = fn(accumulator, item);
 	}
 	return accumulator;
 }
-function $d(self, predicate) {
+function filter(self, predicate) {
 	let result = [  ];
 	for (const item of self) {
 		if (predicate(item)) {
@@ -30,7 +30,7 @@ function $d(self, predicate) {
 	}
 	return result;
 }
-function $e(self, fn) {
+function for_each(self, fn) {
 	for (const item of self) {
 		fn(item);
 	}
@@ -41,18 +41,18 @@ xs.push(2);
 xs.push(3);
 xs.push(4);
 console.log(xs.length);
-console.log($a(xs));
-console.log($c($b(xs, (n) => {
+console.log(is_empty(xs));
+console.log(fold(map(xs, (n) => {
 	return n * 10;
 }), 0, (a, b) => {
 	return a + b;
 }));
-console.log($d(xs, (n) => {
+console.log(filter(xs, (n) => {
 	return n > 2;
 }).length);
-console.log($d(xs, (n) => {
+console.log(filter(xs, (n) => {
 	return n > 5;
 }).length);
-$e(xs, (n) => {
+for_each(xs, (n) => {
 	return console.log(n);
 });

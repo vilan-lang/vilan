@@ -4,19 +4,19 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-function $a(self) {
-	const $b = self;
-	let $c = null;
-	if ($b[0] === 0) {
-		const x = $b[1][0];
-		const y = $b[1][1];
-		$c = [ [ 0, __clone(x) ], [ 0, __clone(y) ] ];
+function unzip_pair(self) {
+	const $a = self;
+	let $b = null;
+	if ($a[0] === 0) {
+		const x = $a[1][0];
+		const y = $a[1][1];
+		$b = [ [ 0, __clone(x) ], [ 0, __clone(y) ] ];
 	} else {
-		$c = [ [ 1 ], [ 1 ] ];
+		$b = [ [ 1 ], [ 1 ] ];
 	}
-	return $c;
+	return $b;
 }
 const pair = [ 0, [ 3, 7 ] ];
-console.log($a(pair));
+console.log(unzip_pair(pair));
 const empty = [ 1 ];
-console.log($a(empty));
+console.log(unzip_pair(empty));

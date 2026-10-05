@@ -138,16 +138,16 @@ function spawn_step(label, ms, $b) {
 		return;
 	}, "spawn_step", __nursery_of($b));
 }
-async function $g(body, $h) {
-	const n = __nursery_new($h);
-	return await ((async ($i) => {
+async function nursery(body, $g) {
+	const n = __nursery_new($g);
+	return await ((async ($h) => {
 		return await (__nursery_run(n, () => {
-			return body(n, $i);
+			return body(n, $h);
 		}));
 	})(n));
 }
 (async () => {
-	const value = await ($g((n, $a) => {
+	const value = await (nursery((n, $a) => {
 		spawn_step("helper", 15, [ 0, $a ]);
 		__task(async () => {
 			await (sleep(5, [ 0, $a ]));
@@ -159,7 +159,7 @@ async function $g(body, $h) {
 		return 7;
 	}, [ 1 ]));
 	console.log(value);
-})().catch(($j) => {
-	console.error(String($j));
+})().catch(($i) => {
+	console.error(String($i));
 	process.exit(1);
 });

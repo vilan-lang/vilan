@@ -19,19 +19,19 @@ function __panic(message, location) {
 	return error;
 }
 function compare(self, b) {
-	let $g = null;
+	let $d = null;
 	if (self < b) {
-		$g = -1;
+		$d = -1;
 	} else {
-		let $h = null;
+		let $e = null;
 		if (self > b) {
-			$h = 1;
+			$e = 1;
 		} else {
-			$h = 0;
+			$e = 0;
 		}
-		$g = $h;
+		$d = $e;
 	}
-	return $g;
+	return $d;
 }
 function hold_in_list(items) {
 	return [ __clone(items) ];
@@ -92,15 +92,15 @@ function scalar_forward(value) {
 function elements_are_independent() {
 	let rows = [  ];
 	rows.push([ 1, 2 ]);
-	let kept = $d(rows, (row) => {
+	let kept = filter(rows, (row) => {
 		return true;
 	});
 	__at(kept, 0, "element-clones.vl:130:2").push(9);
 	console.log(__at(rows, 0, "element-clones.vl:131:8").length);
-	let flipped = $e(rows);
+	let flipped = reverse(rows);
 	__at(flipped, 0, "element-clones.vl:133:2").push(9);
 	console.log(__at(rows, 0, "element-clones.vl:134:8").length);
-	let mapped = $f(rows, (row) => {
+	let mapped = map(rows, (row) => {
 		return __clone(row);
 	});
 	__at(mapped, 0, "element-clones.vl:136:2").push(9);
@@ -113,7 +113,7 @@ function elements_are_independent() {
 	__at(sorted, 0, "element-clones.vl:141:2")[0] = 99;
 	console.log(__at(cells, 0, "element-clones.vl:142:8")[0]);
 }
-function $d(self, predicate) {
+function filter(self, predicate) {
 	let result = [  ];
 	for (const item of self) {
 		if (predicate(item)) {
@@ -122,7 +122,7 @@ function $d(self, predicate) {
 	}
 	return result;
 }
-function $e(self) {
+function reverse(self) {
 	let result = [  ];
 	let index = self.length;
 	while (index > 0) {
@@ -131,7 +131,7 @@ function $e(self) {
 	}
 	return result;
 }
-function $f(self, fn) {
+function map(self, fn) {
 	let result = [  ];
 	for (const item of self) {
 		result.push(fn(item));

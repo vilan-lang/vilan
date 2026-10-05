@@ -19,99 +19,99 @@ function hash(self) {
 function hash2(self) {
 	return __hash(self);
 }
-function $a() {
+function new2() {
 	const table = new Map();
 	return [ table ];
 }
-function $b(self, value2) {
+function insert(self, value2) {
 	self[0].set(hash2(value2), value2);
 }
-function $c(self) {
+function len(self) {
 	return self[0].size;
 }
-function $d(self, value2) {
+function contains(self, value2) {
 	return self[0].has(hash2(value2));
 }
-function $e(self, value2) {
+function remove(self, value2) {
 	self[0].delete(hash2(value2));
 }
-function $f(self) {
-	return $c(self) === 0;
+function is_empty(self) {
+	return len(self) === 0;
 }
-function $h(self, value2) {
+function insert2(self, value2) {
 	self[0].set(hash(value2), value2);
 }
-function $j(self, value2) {
+function contains2(self, value2) {
 	return self[0].has(hash(value2));
 }
-function $k(self, other) {
-	let result = $a();
+function union(self, other) {
+	let result = new2();
 	for (const value2 of __map_values(self[0])) {
-		$b(result, value2);
+		insert(result, value2);
 	}
 	for (const value3 of __map_values(other[0])) {
-		$b(result, value3);
+		insert(result, value3);
 	}
 	return result;
 }
-function $l(self, other) {
-	let result = $a();
+function intersection(self, other) {
+	let result = new2();
 	for (const value2 of __map_values(self[0])) {
-		if ($d(other, value2)) {
-			$b(result, value2);
+		if (contains(other, value2)) {
+			insert(result, value2);
 		}
 	}
 	return result;
 }
-function $m(self, other) {
-	let result = $a();
+function difference(self, other) {
+	let result = new2();
 	for (const value2 of __map_values(self[0])) {
-		if (!($d(other, value2))) {
-			$b(result, value2);
+		if (!(contains(other, value2))) {
+			insert(result, value2);
 		}
 	}
 	return result;
 }
-let numbers = $a();
-$b(numbers, 1);
-$b(numbers, 2);
-$b(numbers, 2);
-$b(numbers, 3);
-console.log($c(numbers));
-console.log($d(numbers, 2));
-console.log($d(numbers, 9));
-$e(numbers, 2);
-console.log($d(numbers, 2));
-console.log($c(numbers));
-console.log($f(numbers));
+let numbers = new2();
+insert(numbers, 1);
+insert(numbers, 2);
+insert(numbers, 2);
+insert(numbers, 3);
+console.log(len(numbers));
+console.log(contains(numbers, 2));
+console.log(contains(numbers, 9));
+remove(numbers, 2);
+console.log(contains(numbers, 2));
+console.log(len(numbers));
+console.log(is_empty(numbers));
 let total = 0;
 for (const value of __set_iter(numbers)) {
 	total = total + value;
 }
 console.log(total);
 let copy = __clone(numbers);
-$b(copy, 100);
-console.log($d(numbers, 100));
-console.log($d(copy, 100));
-let words = $a();
-$h(words, "hi");
-$h(words, "hi");
-$h(words, "bye");
-console.log($c(words));
-console.log($j(words, "hi"));
-let empty = $a();
-console.log($f(empty));
-let left = $a();
-$b(left, 1);
-$b(left, 2);
-$b(left, 3);
-let right = $a();
-$b(right, 2);
-$b(right, 3);
-$b(right, 4);
-console.log($c($k(left, right)));
-console.log($c($l(left, right)));
-console.log($c($m(left, right)));
-console.log($c($k(left, empty)));
-console.log($c($l(left, empty)));
-console.log($c($m(left, empty)));
+insert(copy, 100);
+console.log(contains(numbers, 100));
+console.log(contains(copy, 100));
+let words = new2();
+insert2(words, "hi");
+insert2(words, "hi");
+insert2(words, "bye");
+console.log(len(words));
+console.log(contains2(words, "hi"));
+let empty = new2();
+console.log(is_empty(empty));
+let left = new2();
+insert(left, 1);
+insert(left, 2);
+insert(left, 3);
+let right = new2();
+insert(right, 2);
+insert(right, 3);
+insert(right, 4);
+console.log(len(union(left, right)));
+console.log(len(intersection(left, right)));
+console.log(len(difference(left, right)));
+console.log(len(union(left, empty)));
+console.log(len(intersection(left, empty)));
+console.log(len(difference(left, empty)));

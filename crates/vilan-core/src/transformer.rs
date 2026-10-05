@@ -11403,7 +11403,12 @@ impl<'src> Transformer<'src> {
             self.record_hit(|recorder| recorder.defaults.get(&key).copied());
             return name;
         }
-        let name = self.ng.next_name();
+        let source_name = self
+            .program
+            .functions
+            .get(&default_id)
+            .map(|function| function.name);
+        let name = self.ng.instance_name(source_name);
         self.default_instances.insert(key.clone(), name.clone());
         if let Some(function) = self.program.functions.get(&default_id) {
             let emission = self.record_keyed(|recorder, id| {
@@ -12275,7 +12280,12 @@ impl<'src> Transformer<'src> {
             let logged = function.name.to_string();
             INSTANCE_LOG.with(|log| log.borrow_mut().push(logged));
         }
-        let name = self.ng.next_name();
+        let source_name = self
+            .program
+            .functions
+            .get(&function_id)
+            .map(|function| function.name);
+        let name = self.ng.instance_name(source_name);
         self.instances.insert(key.clone(), name.clone());
         if let Some(function) = self.program.functions.get(&function_id) {
             let emission = self.record_keyed(|recorder, id| {
@@ -14342,6 +14352,9 @@ struct NameGenerator {
     /// a base shared by thousands of locals (`item`, `found`, `i`) costs one
     /// probe a name instead of one per earlier namesake.
     next_suffix: HashMap<String, u64>,
+    /// E259: each readable monomorphized-instance name and the source name it
+    /// was minted from — renameable alongside the entities' own.
+    instance_sources: Vec<(String, String)>,
 }
 
 impl NameGenerator {
@@ -14355,6 +14368,7 @@ impl NameGenerator {
             seed,
             minted: HashSet::default(),
             next_suffix: HashMap::default(),
+            instance_sources: Vec::new(),
         }
     }
 
@@ -14394,6 +14408,29 @@ impl NameGenerator {
         };
         self.names.insert(id, name.clone());
         name
+    }
+
+    /// The name of one monomorphized instance of the function called `source`
+    /// (E259): in the readable build its source name, suffixed past the
+    /// first (`first`, `first2`), so a stack trace and a debugger read the
+    /// function they are in instead of `$a`; annotated as an entity is in the
+    /// annotated build; a plain generated name in release.
+    fn instance_name(&mut self, source: Option<&str>) -> String {
+        match (&self.seed.style, source) {
+            (NameStyle::Readable, Some(source)) => {
+                let name = self.unique_readable(source);
+                // Renameable like the entity it is named after: the scope
+                // re-allocation must not hand the same name to another
+                // declaration (E259).
+                self.instance_sources
+                    .push((name.clone(), source.to_string()));
+                name
+            }
+            (NameStyle::Annotated, Some(source)) => {
+                format!("{}/*{}*/", self.next_name(), source)
+            }
+            _ => self.next_name(),
+        }
     }
 
     /// A readable identifier from `source`, suffixed (`greet2`, `greet3`, ...) until
@@ -14867,6 +14904,9 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
         if let Some(source) = ng.seed.source_names.get(id) {
             source_of.insert(name.clone(), source.clone());
         }
+    }
+    for (name, source) in &ng.instance_sources {
+        source_of.insert(name.clone(), source.clone());
     }
     // Release re-allocates EVERY name the generator minted — including the
     // anonymous temps (`ng.names` holds only the id-keyed ones), whose names come

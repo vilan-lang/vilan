@@ -22,20 +22,20 @@ function __try_parse_json(text) {
 	}
 }
 function from_json_value(value) {
-	let $m = null;
+	let $l = null;
 	if (__json_kind(value) !== "number") {
 		return [ 1, "expected a number" ];
 	}
-	$m;
-	const $n = integer_lane_failure(value, true);
-	let $o = null;
-	if ($n[0] === 0) {
-		const reason = $n[1];
-		$o = [ 1, reason ];
+	$l;
+	const $m = integer_lane_failure(value, true);
+	let $n = null;
+	if ($m[0] === 0) {
+		const reason = $m[1];
+		$n = [ 1, reason ];
 	} else {
-		$o = [ 0, Number(value) ];
+		$n = [ 0, Number(value) ];
 	}
-	return $o;
+	return $n;
 }
 function integer_lane_failure(value, signed) {
 	const number = Number(value);
@@ -98,48 +98,48 @@ function to_json(self) {
 	return $f;
 }
 function from_json(text) {
-	const $j = $g(__try_parse_json(text), "not valid JSON");
-	if ($j[0] === 1) {
-		return $j;
+	const $i = ok_or(__try_parse_json(text), "not valid JSON");
+	if ($i[0] === 1) {
+		return $i;
 	}
-	return from_json_value2($j[1]);
+	return from_json_value2($i[1]);
 }
 function from_json_value2(value) {
-	const $k = __json_tag(value);
-	let $l = null;
-	if ($k === "Circle") {
-		const $p = from_json_value(value["Circle"]);
+	const $j = __json_tag(value);
+	let $k = null;
+	if ($j === "Circle") {
+		const $o = from_json_value(value["Circle"]);
+		if ($o[0] === 1) {
+			return $o;
+		}
+		$k = [ 0, [ 0, $o[1] ] ];
+	} else if ($j === "Rect") {
+		const $p = from_json_value(value["Rect"]["0"]);
 		if ($p[0] === 1) {
 			return $p;
 		}
-		$l = [ 0, [ 0, $p[1] ] ];
-	} else if ($k === "Rect") {
-		const $q = from_json_value(value["Rect"]["0"]);
+		const $q = from_json_value(value["Rect"]["1"]);
 		if ($q[0] === 1) {
 			return $q;
 		}
-		const $r = from_json_value(value["Rect"]["1"]);
-		if ($r[0] === 1) {
-			return $r;
-		}
-		$l = [ 0, [ 1, $q[1], $r[1] ] ];
-	} else if ($k === "Empty") {
-		$l = [ 0, [ 2 ] ];
+		$k = [ 0, [ 1, $p[1], $q[1] ] ];
+	} else if ($j === "Empty") {
+		$k = [ 0, [ 2 ] ];
 	} else {
-		$l = [ 1, "unknown variant in JSON for enum Shape" ];
+		$k = [ 1, "unknown variant in JSON for enum Shape" ];
 	}
-	return $l;
+	return $k;
 }
-function $g(self, err) {
-	const $h = self;
-	let $i = null;
-	if ($h[0] === 0) {
-		const x = $h[1];
-		$i = [ 0, __clone(x) ];
+function ok_or(self, err) {
+	const $g = self;
+	let $h = null;
+	if ($g[0] === 0) {
+		const x = $g[1];
+		$h = [ 0, __clone(x) ];
 	} else {
-		$i = [ 1, __clone(err) ];
+		$h = [ 1, __clone(err) ];
 	}
-	return $i;
+	return $h;
 }
 const c = [ 0, 3 ];
 const r = [ 1, 4, 5 ];
@@ -154,14 +154,14 @@ console.log(debug(e));
 console.log(to_json(c));
 console.log(to_json(r));
 console.log(to_json(e));
-const $s = from_json(to_json(c));
-console.log($s[0] === 0 && eq($s[1], c));
-const $t = from_json(to_json(r));
-console.log($t[0] === 0 && eq($t[1], r));
-const $u = from_json(to_json(e));
-console.log($u[0] === 0 && eq($u[1], e));
-const $v = from_json("\"Hexagon\"");
-if ($v[0] === 1) {
+const $r = from_json(to_json(c));
+console.log($r[0] === 0 && eq($r[1], c));
+const $s = from_json(to_json(r));
+console.log($s[0] === 0 && eq($s[1], r));
+const $t = from_json(to_json(e));
+console.log($t[0] === 0 && eq($t[1], e));
+const $u = from_json("\"Hexagon\"");
+if ($u[0] === 1) {
 	console.log(true);
-	console.log($v[1]);
+	console.log($u[1]);
 }

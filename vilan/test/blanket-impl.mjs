@@ -47,27 +47,27 @@ function fresh_id() {
 	next_subscriber_id.v = id + 1;
 	return id;
 }
-function mint_subscriber(notify) {
+function mint_subscriber(notify2) {
 	const derived = minting_derivation.v;
 	minting_derivation.v = false;
-	return subscriber_of(notify, derived);
+	return subscriber_of(notify2, derived);
 }
-function subscriber_of(notify, derived) {
-	return [ fresh_id(), notify, __shared_new(true), derived ];
+function subscriber_of(notify2, derived) {
+	return [ fresh_id(), notify2, __shared_new(true), derived ];
 }
 function is_quiescent(self) {
-	return $v(self[0].v) && $v(self[1].v);
+	return is_empty(self[0].v) && is_empty(self[1].v);
 }
 function enqueue(turn, subscribers) {
 	for (const subscriber of subscribers) {
 		const key = hash(subscriber[0]);
-		let $u = null;
+		let $h = null;
 		if (subscriber[3]) {
 			if (!(turn[3].v.has(key))) {
 				turn[3].v.set(key, true);
 				turn[1].v.push(__clone(subscriber));
 			}
-			$u = undefined;
+			$h = undefined;
 		} else if (!(turn[2].v.has(key))) {
 			turn[2].v.set(key, true);
 			let index = turn[0].v.length;
@@ -76,7 +76,7 @@ function enqueue(turn, subscribers) {
 			}
 			__insert_at(turn[0].v, index, __clone(subscriber), "std/src/reactive.vl:417:25");
 		}
-		$u;
+		$h;
 	}
 	if (turn[5].v && !(turn[6].v) && !(turn[4].v)) {
 		turn[6].v = true;
@@ -94,7 +94,7 @@ function drain(turn) {
 		__with_finally(() => {
 			let budget = 100000;
 			while (!(is_quiescent(turn)) && budget > 0) {
-				while (!($v(turn[1].v)) && budget > 0) {
+				while (!(is_empty(turn[1].v)) && budget > 0) {
 					const derivations = turn[1].v;
 					turn[1].v = [  ];
 					turn[3].v = new Map();
@@ -126,131 +126,131 @@ function drain(turn) {
 function reissued(subscriber) {
 	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
 }
-function $b(self, react) {
+function bind(self, react) {
 	react(self);
 }
-function $a(label) {
-	$b(label, (text) => {
+function badge(label) {
+	bind(label, (text) => {
 		return console.log("[" + text + "]");
 	});
 }
-function $d(value) {
+function new2(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
-function $c(value) {
-	return $d(value);
+function new3(value) {
+	return new2(value);
 }
-function $m(signal, subscriber) {
+function attach(signal, subscriber) {
 	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 	signal[1].v.push(reissued(subscriber));
 	return handle;
 }
-function $j(signal, observer) {
+function observe(signal, observer) {
 	const cell = signal[0];
-	return $m(signal, mint_subscriber(() => {
-		const $k = [ 0, cell ];
-		let $l = null;
-		if ($k[0] === 0) {
-			const live2 = $k[1];
-			$l = observer(live2.v);
+	return attach(signal, mint_subscriber(() => {
+		const $b = [ 0, cell ];
+		let $c = null;
+		if ($b[0] === 0) {
+			const live2 = $b[1];
+			$c = observer(live2.v);
 		} else {
-			$l = undefined;
+			$c = undefined;
 		}
-		return $l;
+		return $c;
 	}));
 }
-function $n(self) {
+function get(self) {
 	return __clone(self[0].v);
 }
-function $i(self, observer, immediately) {
-	const subscription = $j(self, observer);
+function attach_observer(self, observer, immediately) {
+	const subscription = observe(self, observer);
 	if (immediately) {
-		observer($n(self));
+		observer(get(self));
 	}
 	return subscription;
 }
-function $h(self, observer) {
-	return $i(self, (value) => {
+function sub(self, observer) {
+	return attach_observer(self, (value) => {
 		return (() => {
 			return observer(value, [ 1 ]);
 		})();
 	}, true);
 }
-function $f(self, react) {
-	$h(__clone(self), (value, $g) => {
+function bind2(self, react) {
+	sub(__clone(self), (value, $a) => {
 		return react(value);
 	});
 }
-function $e(label) {
-	$f(label, (text) => {
+function badge2(label) {
+	bind2(label, (text) => {
 		return console.log("[" + text + "]");
 	});
 }
-function $v(self) {
+function is_empty(self) {
 	return self.length === 0;
 }
-function $w(self) {
-	let $y = null;
-	if ($v(self)) {
-		$y = [ 1 ];
+function last(self) {
+	let $i = null;
+	if (is_empty(self)) {
+		$i = [ 1 ];
 	} else {
-		$y = __list_get(self, self.length - 1);
+		$i = __list_get(self, self.length - 1);
 	}
-	return $y;
+	return $i;
 }
-function $q(self, $r) {
-	const $s = $r;
-	let $t = null;
-	if ($s[0] === 0) {
-		const turn = $s[1];
-		$t = enqueue(turn, __clone(self[1].v));
+function notify(self, $e) {
+	const $f = $e;
+	let $g = null;
+	if ($f[0] === 0) {
+		const turn = $f[1];
+		$g = enqueue(turn, __clone(self[1].v));
 	} else {
-		const $z = $w(draining_turns.v);
-		let $A = null;
-		if ($z[0] === 0) {
-			const draining = $z[1];
-			$A = enqueue(draining, __clone(self[1].v));
+		const $j = last(draining_turns.v);
+		let $k = null;
+		if ($j[0] === 0) {
+			const draining = $j[1];
+			$k = enqueue(draining, __clone(self[1].v));
 		} else {
 			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$A = undefined;
+			$k = undefined;
 		}
-		$t = $A;
+		$g = $k;
 	}
-	return $t;
+	return $g;
 }
-function $o(self, value, $p) {
+function set(self, value, $d) {
 	self[0].v = __clone(value);
-	$q(self, $p);
+	notify(self, $d);
 }
-function $B(slot) {
-	$b(slot, (inner) => {
-		return console.log("holder " + $n(inner));
+function holder(slot) {
+	bind(slot, (inner) => {
+		return console.log("holder " + get(inner));
 	});
 }
-function $E(self) {
+function show(self) {
 	return "plain box";
 }
-function $D(box) {
-	console.log($E(box));
+function describe(box) {
+	console.log(show(box));
 }
-function $G(self) {
+function show2(self) {
 	return "marked box";
 }
-function $F(box) {
-	console.log($G(box));
+function describe2(box) {
+	console.log(show2(box));
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
-$a("static");
-const live = $c("first");
-$e(live);
-$o(live, "second", [ 1 ]);
-$B(live);
-$D([ [  ] ]);
-$F([ [  ] ]);
+badge("static");
+const live = new3("first");
+badge2(live);
+set(live, "second", [ 1 ]);
+holder(live);
+describe([ [  ] ]);
+describe2([ [  ] ]);

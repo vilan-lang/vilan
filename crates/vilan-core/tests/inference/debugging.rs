@@ -310,3 +310,50 @@ fn s4_debug_covers_a_tuple() {
         "(1, \"two\", 2.5)\n",
     );
 }
+
+// --- E259: readable instance names --------------------------------------
+
+/// E259: a generic function's emitted instance is named after its source in
+/// the readable build — `first`, and `describe` then `describe2` for a second
+/// instance whose body differs — where every one used to be `$a`, which is
+/// what a stack trace and a debugger showed.
+#[test]
+fn e259_a_generic_instance_is_named_after_its_function() {
+    let source = concat!(
+        "trait Named {\n",
+        "\tfun name(self): str;\n",
+        "}\n",
+        "struct Ada {}\n",
+        "struct Alan {}\n",
+        "impl Ada with Named {\n",
+        "\tfun name(self): str { \"ada\" }\n",
+        "}\n",
+        "impl Alan with Named {\n",
+        "\tfun name(self): str { \"alan\" }\n",
+        "}\n",
+        "fun describe<T: Named>(value: T): str { value.name() }\n",
+        "fun first<T>(items: List<T>): T { items[0] }\n",
+        "fun main() {\n",
+        "\tprint(describe(Ada {}));\n",
+        "\tprint(describe(Alan {}));\n",
+        "\tprint(first([1, 2]));\n",
+        "\tprint(first([\"a\"]));\n",
+        "}\n",
+    );
+    let javascript = compile(source).expect("a clean compile");
+    for declared in [
+        "function describe(",
+        "function describe2(",
+        "function first(",
+    ] {
+        assert!(
+            javascript.contains(declared),
+            "missing {declared}:\n{javascript}"
+        );
+    }
+    assert!(
+        !javascript.contains("function $"),
+        "an instance kept a generated name:\n{javascript}"
+    );
+    assert_compiles_and_runs(source, "ada\nalan\n1\na\n");
+}

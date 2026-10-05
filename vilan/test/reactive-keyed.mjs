@@ -31,18 +31,18 @@ function hash(self) {
 function show(plan) {
 	let out = "";
 	for (const step of plan[0]) {
-		const $j = step;
-		let $k = null;
-		if ($j[0] === 0) {
-			const index = $j[1];
-			$k = "K" + index + " ";
-		} else if ($j[0] === 1) {
-			const index2 = $j[1];
-			$k = "R" + index2 + " ";
+		const $i = step;
+		let $j = null;
+		if ($i[0] === 0) {
+			const index = $i[1];
+			$j = "K" + index + " ";
+		} else if ($i[0] === 1) {
+			const index2 = $i[1];
+			$j = "R" + index2 + " ";
 		} else {
-			$k = "F ";
+			$j = "F ";
 		}
-		const rendered = $k;
+		const rendered = $j;
 		out = out + rendered;
 	}
 	out = out + "| removed:";
@@ -51,7 +51,7 @@ function show(plan) {
 	}
 	console.log(out);
 }
-function $a(old_keys, old_items, items, key_of, same) {
+function reconcile(old_keys, old_items, items, key_of, same) {
 	let claimed = [  ];
 	for (const _ of old_keys) {
 		claimed.push(false);
@@ -76,61 +76,61 @@ function $a(old_keys, old_items, items, key_of, same) {
 		let head = __map_get(first, canonical2);
 		let advancing = true;
 		while (advancing) {
-			const $b = head;
-			let $c = null;
-			if ($b[0] === 0) {
-				const at = $b[1];
+			const $a = head;
+			let $b = null;
+			if ($a[0] === 0) {
+				const at = $a[1];
 				if (__at(claimed, at, "std/src/reactive.vl:3700:9")) {
 					head = __at(next_same, at, "std/src/reactive.vl:3701:14");
 				} else {
 					advancing = false;
 				}
-				$c = undefined;
+				$b = undefined;
 			} else {
-				$c = advancing = false;
+				$b = advancing = false;
 			}
-			$c;
+			$b;
 		}
-		const $d = head;
-		let $e = null;
-		if ($d[0] === 0) {
-			const at2 = $d[1];
-			$e = first.set(canonical2, at2);
+		const $c = head;
+		let $d = null;
+		if ($c[0] === 0) {
+			const at2 = $c[1];
+			$d = first.set(canonical2, at2);
 		} else {
-			$e = first.delete(canonical2);
+			$d = first.delete(canonical2);
 		}
-		$e;
+		$d;
 		let found = [ 1 ];
 		let walk = head;
 		let walking = true;
 		while (walking) {
-			const $f = walk;
-			let $g = null;
-			if ($f[0] === 0) {
-				const at3 = $f[1];
+			const $e = walk;
+			let $f = null;
+			if ($e[0] === 0) {
+				const at3 = $e[1];
 				if (!(__at(claimed, at3, "std/src/reactive.vl:3719:10")) && __at(old_keys, at3, "std/src/reactive.vl:3719:25") === item_key) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
 					walk = __at(next_same, at3, "std/src/reactive.vl:3726:14");
 				}
-				$g = undefined;
+				$f = undefined;
 			} else {
-				$g = walking = false;
+				$f = walking = false;
 			}
-			$g;
+			$f;
 		}
 		let step = [ 2 ];
-		const $h = found;
-		if ($h[0] === 0) {
-			__at_put(claimed, $h[1], true, "std/src/reactive.vl:3734:4");
-			let $i = null;
-			if (same(__at(old_items, $h[1], "std/src/reactive.vl:3735:19"), item)) {
-				$i = [ 0, $h[1] ];
+		const $g = found;
+		if ($g[0] === 0) {
+			__at_put(claimed, $g[1], true, "std/src/reactive.vl:3734:4");
+			let $h = null;
+			if (same(__at(old_items, $g[1], "std/src/reactive.vl:3735:19"), item)) {
+				$h = [ 0, $g[1] ];
 			} else {
-				$i = [ 1, $h[1] ];
+				$h = [ 1, $g[1] ];
 			}
-			step = $i;
+			step = $h;
 		}
 		steps.push(step);
 	}
@@ -144,37 +144,37 @@ function $a(old_keys, old_items, items, key_of, same) {
 	}
 	return [ steps, removed ];
 }
-show($a([ 1, 2, 3 ], [ 10, 20, 30 ], [ 30, 10, 20 ], (item) => {
+show(reconcile([ 1, 2, 3 ], [ 10, 20, 30 ], [ 30, 10, 20 ], (item) => {
 	return Math.trunc(item / 10);
 }, (a, b) => {
 	return a === b;
 }));
-show($a([ 1, 2 ], [ 10, 20 ], [ 10, 21, 35 ], (item) => {
+show(reconcile([ 1, 2 ], [ 10, 20 ], [ 10, 21, 35 ], (item) => {
 	return Math.trunc(item / 10);
 }, (a, b) => {
 	return a === b;
 }));
-show($a([ 1, 2, 3 ], [ 10, 20, 30 ], [ 30 ], (item) => {
+show(reconcile([ 1, 2, 3 ], [ 10, 20, 30 ], [ 30 ], (item) => {
 	return Math.trunc(item / 10);
 }, (a, b) => {
 	return a === b;
 }));
-show($a([ 1 ], [ 10 ], [ 10, 10 ], (item) => {
+show(reconcile([ 1 ], [ 10 ], [ 10, 10 ], (item) => {
 	return Math.trunc(item / 10);
 }, (a, b) => {
 	return a === b;
 }));
-show($a([  ], [  ], [ 10 ], (item) => {
+show(reconcile([  ], [  ], [ 10 ], (item) => {
 	return Math.trunc(item / 10);
 }, (a, b) => {
 	return a === b;
 }));
-show($a([ 1 ], [ 10 ], [  ], (item) => {
+show(reconcile([ 1 ], [ 10 ], [  ], (item) => {
 	return Math.trunc(item / 10);
 }, (a, b) => {
 	return a === b;
 }));
-show($a([ 1, 2 ], [ 10, 20 ], [ 10, 21, 35 ], (item) => {
+show(reconcile([ 1, 2 ], [ 10, 20 ], [ 10, 21, 35 ], (item) => {
 	return Math.trunc(item / 10);
 }, (_a, _b) => {
 	return true;

@@ -5,19 +5,19 @@ function __clone(value) {
 	return value;
 }
 function compare(self, b) {
-	let $d = null;
+	let $a = null;
 	if (self < b) {
-		$d = -1;
+		$a = -1;
 	} else {
-		let $e = null;
+		let $b = null;
 		if (self > b) {
-			$e = 1;
+			$b = 1;
 		} else {
-			$e = 0;
+			$b = 0;
 		}
-		$d = $e;
+		$a = $b;
 	}
-	return $d;
+	return $a;
 }
 function rem(self, m) {
 	return self - Math.trunc(self / m) * m;
@@ -52,29 +52,29 @@ function rem4(self, m) {
 function rem5(self, m) {
 	return self - Math.trunc(self / m) * m;
 }
-function $a(a, b) {
+function min(a, b) {
 	return Math.min(a, b);
 }
-function $c(self, b) {
-	let $f = null;
+function max(self, b) {
+	let $c = null;
 	if (compare(self, b) >= 0) {
-		$f = self;
+		$c = self;
 	} else {
-		$f = b;
+		$c = b;
 	}
-	return $f;
+	return $c;
 }
-function $b(a, b) {
-	return $c(a, b);
+function max2(a, b) {
+	return max(a, b);
 }
-function $g(a, b) {
-	let $h = null;
+function minmax(a, b) {
+	let $d = null;
 	if (a <= b) {
-		$h = [ __clone(a), __clone(b) ];
+		$d = [ __clone(a), __clone(b) ];
 	} else {
-		$h = [ __clone(b), __clone(a) ];
+		$d = [ __clone(b), __clone(a) ];
 	}
-	return $h;
+	return $d;
 }
 const PI = 3.141592653589793;
 const TAU = 6.283185307179586;
@@ -88,11 +88,11 @@ console.log(E > 2.718 && E < 2.719);
 console.log(EPSILON === Math.pow(2, 0 - 52));
 console.log(INFINITY > 0 && is_infinite(INFINITY));
 console.log(is_nan(NAN));
-console.log($a(3, 9));
-console.log($b("ant", "bee"));
-const $i = $g(9, 3);
-const low = $i[0];
-const high = $i[1];
+console.log(min(3, 9));
+console.log(max2("ant", "bee"));
+const $e = minmax(9, 3);
+const low = $e[0];
+const high = $e[1];
 console.log("" + low + " " + high);
 console.log(Math.sin(0));
 console.log(Math.cos(0));

@@ -34,23 +34,23 @@ function hash(self) {
 function fold_unsigned(value, modulus) {
 	const truncated = Math.trunc(value);
 	const wrapped = truncated % modulus;
-	let $n = null;
+	let $l = null;
 	if (wrapped < 0) {
-		$n = wrapped + modulus;
+		$l = wrapped + modulus;
 	} else {
-		$n = wrapped;
+		$l = wrapped;
 	}
-	return $n;
+	return $l;
 }
 function fold_signed(value, modulus, half) {
 	const wrapped = fold_unsigned(value, modulus);
-	let $o = null;
+	let $m = null;
 	if (wrapped >= half) {
-		$o = wrapped - modulus;
+		$m = wrapped - modulus;
 	} else {
-		$o = wrapped;
+		$m = wrapped;
 	}
-	return $o;
+	return $m;
 }
 function as_i53(self) {
 	const widened = Number(self);
@@ -66,18 +66,18 @@ function next_random(bound) {
 	return as_i32(state % as_i53(bound));
 }
 function render_step(step) {
-	const $l = step;
-	let $m = null;
-	if ($l[0] === 0) {
-		const index = $l[1];
-		$m = "K" + index + " ";
-	} else if ($l[0] === 1) {
-		const index2 = $l[1];
-		$m = "R" + index2 + " ";
+	const $j = step;
+	let $k = null;
+	if ($j[0] === 0) {
+		const index = $j[1];
+		$k = "K" + index + " ";
+	} else if ($j[0] === 1) {
+		const index2 = $j[1];
+		$k = "R" + index2 + " ";
 	} else {
-		$m = "F ";
+		$k = "F ";
 	}
-	return $m;
+	return $k;
 }
 function render(plan) {
 	let out = "";
@@ -91,12 +91,12 @@ function render(plan) {
 	return out;
 }
 function compare_int(label, old4, new_items) {
-	const indexed = $a(old4, old4, new_items, (item) => {
+	const indexed = reconcile(old4, old4, new_items, (item) => {
 		return item;
 	}, (before, after) => {
 		return before === after;
 	});
-	const scanned = $j(old4, old4, new_items, (item) => {
+	const scanned = scan_reconcile(old4, old4, new_items, (item) => {
 		return item;
 	}, (before, after) => {
 		return before === after;
@@ -121,12 +121,12 @@ function hash3(self) {
 	return hash(self[0]);
 }
 function compare_tags(label, old4, new_items) {
-	const indexed = $p(old4, old4, new_items, (item) => {
+	const indexed = reconcile2(old4, old4, new_items, (item) => {
 		return __clone(item);
 	}, (_before, _after) => {
 		return true;
 	});
-	const scanned = $y(old4, old4, new_items, (item) => {
+	const scanned = scan_reconcile2(old4, old4, new_items, (item) => {
 		return __clone(item);
 	}, (_before, _after) => {
 		return true;
@@ -139,12 +139,12 @@ function compare_tags(label, old4, new_items) {
 	}
 }
 function compare_pairs(label, old4, new_items) {
-	const indexed = $A(old4, old4, new_items, (item) => {
+	const indexed = reconcile3(old4, old4, new_items, (item) => {
 		return __clone(item);
 	}, (_before, _after) => {
 		return true;
 	});
-	const scanned = $J(old4, old4, new_items, (item) => {
+	const scanned = scan_reconcile3(old4, old4, new_items, (item) => {
 		return __clone(item);
 	}, (_before, _after) => {
 		return true;
@@ -156,7 +156,7 @@ function compare_pairs(label, old4, new_items) {
 		})();
 	}
 }
-function $a(old_keys, old_items, items, key_of, same) {
+function reconcile(old_keys, old_items, items, key_of, same) {
 	let claimed = [  ];
 	for (const _ of old_keys) {
 		claimed.push(false);
@@ -181,61 +181,61 @@ function $a(old_keys, old_items, items, key_of, same) {
 		let head = __map_get(first, canonical2);
 		let advancing = true;
 		while (advancing) {
-			const $b = head;
-			let $c = null;
-			if ($b[0] === 0) {
-				const at = $b[1];
+			const $a = head;
+			let $b = null;
+			if ($a[0] === 0) {
+				const at = $a[1];
 				if (__at(claimed, at, "std/src/reactive.vl:3700:9")) {
 					head = __at(next_same, at, "std/src/reactive.vl:3701:14");
 				} else {
 					advancing = false;
 				}
-				$c = undefined;
+				$b = undefined;
 			} else {
-				$c = advancing = false;
+				$b = advancing = false;
 			}
-			$c;
+			$b;
 		}
-		const $d = head;
-		let $e = null;
-		if ($d[0] === 0) {
-			const at2 = $d[1];
-			$e = first.set(canonical2, at2);
+		const $c = head;
+		let $d = null;
+		if ($c[0] === 0) {
+			const at2 = $c[1];
+			$d = first.set(canonical2, at2);
 		} else {
-			$e = first.delete(canonical2);
+			$d = first.delete(canonical2);
 		}
-		$e;
+		$d;
 		let found = [ 1 ];
 		let walk = head;
 		let walking = true;
 		while (walking) {
-			const $f = walk;
-			let $g = null;
-			if ($f[0] === 0) {
-				const at3 = $f[1];
+			const $e = walk;
+			let $f = null;
+			if ($e[0] === 0) {
+				const at3 = $e[1];
 				if (!(__at(claimed, at3, "std/src/reactive.vl:3719:10")) && __at(old_keys, at3, "std/src/reactive.vl:3719:25") === item_key) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
 					walk = __at(next_same, at3, "std/src/reactive.vl:3726:14");
 				}
-				$g = undefined;
+				$f = undefined;
 			} else {
-				$g = walking = false;
+				$f = walking = false;
 			}
-			$g;
+			$f;
 		}
 		let step = [ 2 ];
-		const $h = found;
-		if ($h[0] === 0) {
-			__at_put(claimed, $h[1], true, "std/src/reactive.vl:3734:4");
-			let $i = null;
-			if (same(__at(old_items, $h[1], "std/src/reactive.vl:3735:19"), item)) {
-				$i = [ 0, $h[1] ];
+		const $g = found;
+		if ($g[0] === 0) {
+			__at_put(claimed, $g[1], true, "std/src/reactive.vl:3734:4");
+			let $h = null;
+			if (same(__at(old_items, $g[1], "std/src/reactive.vl:3735:19"), item)) {
+				$h = [ 0, $g[1] ];
 			} else {
-				$i = [ 1, $h[1] ];
+				$h = [ 1, $g[1] ];
 			}
-			step = $i;
+			step = $h;
 		}
 		steps.push(step);
 	}
@@ -249,7 +249,7 @@ function $a(old_keys, old_items, items, key_of, same) {
 	}
 	return [ steps, removed ];
 }
-function $j(old_keys, old_items, items, key_of, same) {
+function scan_reconcile(old_keys, old_items, items, key_of, same) {
 	let claimed = [  ];
 	for (const _ of old_keys) {
 		claimed.push(false);
@@ -262,13 +262,13 @@ function $j(old_keys, old_items, items, key_of, same) {
 		while (index < old_keys.length) {
 			if (!(__at(claimed, index, "reconcile-index.vl:54:8")) && __at(old_keys, index, "reconcile-index.vl:54:26") === item_key) {
 				__at_put(claimed, index, true, "reconcile-index.vl:55:5");
-				let $k = null;
+				let $i = null;
 				if (same(__at(old_items, index, "reconcile-index.vl:56:20"), item)) {
-					$k = [ 0, index ];
+					$i = [ 0, index ];
 				} else {
-					$k = [ 1, index ];
+					$i = [ 1, index ];
 				}
-				step = $k;
+				step = $i;
 				break;
 			}
 			index = index + 1;
@@ -285,7 +285,7 @@ function $j(old_keys, old_items, items, key_of, same) {
 	}
 	return [ steps, removed ];
 }
-function $p(old_keys, old_items, items, key_of, same) {
+function reconcile2(old_keys, old_items, items, key_of, same) {
 	let claimed = [  ];
 	for (const _ of old_keys) {
 		claimed.push(false);
@@ -310,61 +310,61 @@ function $p(old_keys, old_items, items, key_of, same) {
 		let head = __map_get(first, canonical2);
 		let advancing = true;
 		while (advancing) {
-			const $q = head;
-			let $r = null;
-			if ($q[0] === 0) {
-				const at = $q[1];
+			const $n = head;
+			let $o = null;
+			if ($n[0] === 0) {
+				const at = $n[1];
 				if (__at(claimed, at, "std/src/reactive.vl:3700:9")) {
 					head = __at(next_same, at, "std/src/reactive.vl:3701:14");
 				} else {
 					advancing = false;
 				}
-				$r = undefined;
+				$o = undefined;
 			} else {
-				$r = advancing = false;
+				$o = advancing = false;
 			}
-			$r;
+			$o;
 		}
-		const $s = head;
-		let $t = null;
-		if ($s[0] === 0) {
-			const at2 = $s[1];
-			$t = first.set(canonical2, at2);
+		const $p = head;
+		let $q = null;
+		if ($p[0] === 0) {
+			const at2 = $p[1];
+			$q = first.set(canonical2, at2);
 		} else {
-			$t = first.delete(canonical2);
+			$q = first.delete(canonical2);
 		}
-		$t;
+		$q;
 		let found = [ 1 ];
 		let walk = head;
 		let walking = true;
 		while (walking) {
-			const $u = walk;
-			let $v = null;
-			if ($u[0] === 0) {
-				const at3 = $u[1];
+			const $r = walk;
+			let $s = null;
+			if ($r[0] === 0) {
+				const at3 = $r[1];
 				if (!(__at(claimed, at3, "std/src/reactive.vl:3719:10")) && eq(__at(old_keys, at3, "std/src/reactive.vl:3719:25"), item_key)) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
 					walk = __at(next_same, at3, "std/src/reactive.vl:3726:14");
 				}
-				$v = undefined;
+				$s = undefined;
 			} else {
-				$v = walking = false;
+				$s = walking = false;
 			}
-			$v;
+			$s;
 		}
 		let step = [ 2 ];
-		const $w = found;
-		if ($w[0] === 0) {
-			__at_put(claimed, $w[1], true, "std/src/reactive.vl:3734:4");
-			let $x = null;
-			if (same(__at(old_items, $w[1], "std/src/reactive.vl:3735:19"), item)) {
-				$x = [ 0, $w[1] ];
+		const $t = found;
+		if ($t[0] === 0) {
+			__at_put(claimed, $t[1], true, "std/src/reactive.vl:3734:4");
+			let $u = null;
+			if (same(__at(old_items, $t[1], "std/src/reactive.vl:3735:19"), item)) {
+				$u = [ 0, $t[1] ];
 			} else {
-				$x = [ 1, $w[1] ];
+				$u = [ 1, $t[1] ];
 			}
-			step = $x;
+			step = $u;
 		}
 		steps.push(step);
 	}
@@ -378,7 +378,7 @@ function $p(old_keys, old_items, items, key_of, same) {
 	}
 	return [ steps, removed ];
 }
-function $y(old_keys, old_items, items, key_of, same) {
+function scan_reconcile2(old_keys, old_items, items, key_of, same) {
 	let claimed = [  ];
 	for (const _ of old_keys) {
 		claimed.push(false);
@@ -391,13 +391,13 @@ function $y(old_keys, old_items, items, key_of, same) {
 		while (index < old_keys.length) {
 			if (!(__at(claimed, index, "reconcile-index.vl:54:8")) && eq(__at(old_keys, index, "reconcile-index.vl:54:26"), item_key)) {
 				__at_put(claimed, index, true, "reconcile-index.vl:55:5");
-				let $z = null;
+				let $v = null;
 				if (same(__at(old_items, index, "reconcile-index.vl:56:20"), item)) {
-					$z = [ 0, index ];
+					$v = [ 0, index ];
 				} else {
-					$z = [ 1, index ];
+					$v = [ 1, index ];
 				}
-				step = $z;
+				step = $v;
 				break;
 			}
 			index = index + 1;
@@ -414,7 +414,7 @@ function $y(old_keys, old_items, items, key_of, same) {
 	}
 	return [ steps, removed ];
 }
-function $A(old_keys, old_items, items, key_of, same) {
+function reconcile3(old_keys, old_items, items, key_of, same) {
 	let claimed = [  ];
 	for (const _ of old_keys) {
 		claimed.push(false);
@@ -439,61 +439,61 @@ function $A(old_keys, old_items, items, key_of, same) {
 		let head = __map_get(first, canonical2);
 		let advancing = true;
 		while (advancing) {
-			const $B = head;
-			let $C = null;
-			if ($B[0] === 0) {
-				const at = $B[1];
+			const $w = head;
+			let $x = null;
+			if ($w[0] === 0) {
+				const at = $w[1];
 				if (__at(claimed, at, "std/src/reactive.vl:3700:9")) {
 					head = __at(next_same, at, "std/src/reactive.vl:3701:14");
 				} else {
 					advancing = false;
 				}
-				$C = undefined;
+				$x = undefined;
 			} else {
-				$C = advancing = false;
+				$x = advancing = false;
 			}
-			$C;
+			$x;
 		}
-		const $D = head;
-		let $E = null;
-		if ($D[0] === 0) {
-			const at2 = $D[1];
-			$E = first.set(canonical2, at2);
+		const $y = head;
+		let $z = null;
+		if ($y[0] === 0) {
+			const at2 = $y[1];
+			$z = first.set(canonical2, at2);
 		} else {
-			$E = first.delete(canonical2);
+			$z = first.delete(canonical2);
 		}
-		$E;
+		$z;
 		let found = [ 1 ];
 		let walk = head;
 		let walking = true;
 		while (walking) {
-			const $F = walk;
-			let $G = null;
-			if ($F[0] === 0) {
-				const at3 = $F[1];
+			const $A = walk;
+			let $B = null;
+			if ($A[0] === 0) {
+				const at3 = $A[1];
 				if (!(__at(claimed, at3, "std/src/reactive.vl:3719:10")) && eq2(__at(old_keys, at3, "std/src/reactive.vl:3719:25"), item_key)) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
 					walk = __at(next_same, at3, "std/src/reactive.vl:3726:14");
 				}
-				$G = undefined;
+				$B = undefined;
 			} else {
-				$G = walking = false;
+				$B = walking = false;
 			}
-			$G;
+			$B;
 		}
 		let step = [ 2 ];
-		const $H = found;
-		if ($H[0] === 0) {
-			__at_put(claimed, $H[1], true, "std/src/reactive.vl:3734:4");
-			let $I = null;
-			if (same(__at(old_items, $H[1], "std/src/reactive.vl:3735:19"), item)) {
-				$I = [ 0, $H[1] ];
+		const $C = found;
+		if ($C[0] === 0) {
+			__at_put(claimed, $C[1], true, "std/src/reactive.vl:3734:4");
+			let $D = null;
+			if (same(__at(old_items, $C[1], "std/src/reactive.vl:3735:19"), item)) {
+				$D = [ 0, $C[1] ];
 			} else {
-				$I = [ 1, $H[1] ];
+				$D = [ 1, $C[1] ];
 			}
-			step = $I;
+			step = $D;
 		}
 		steps.push(step);
 	}
@@ -507,7 +507,7 @@ function $A(old_keys, old_items, items, key_of, same) {
 	}
 	return [ steps, removed ];
 }
-function $J(old_keys, old_items, items, key_of, same) {
+function scan_reconcile3(old_keys, old_items, items, key_of, same) {
 	let claimed = [  ];
 	for (const _ of old_keys) {
 		claimed.push(false);
@@ -520,13 +520,13 @@ function $J(old_keys, old_items, items, key_of, same) {
 		while (index < old_keys.length) {
 			if (!(__at(claimed, index, "reconcile-index.vl:54:8")) && eq2(__at(old_keys, index, "reconcile-index.vl:54:26"), item_key)) {
 				__at_put(claimed, index, true, "reconcile-index.vl:55:5");
-				let $K = null;
+				let $E = null;
 				if (same(__at(old_items, index, "reconcile-index.vl:56:20"), item)) {
-					$K = [ 0, index ];
+					$E = [ 0, index ];
 				} else {
-					$K = [ 1, index ];
+					$E = [ 1, index ];
 				}
-				step = $K;
+				step = $E;
 				break;
 			}
 			index = index + 1;

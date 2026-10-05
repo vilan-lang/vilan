@@ -37,7 +37,7 @@ function parity() {
 	console.log(is_even2(8));
 	console.log(is_odd2(9));
 }
-function $b(self, min, max) {
+function clamp3(self, min, max) {
 	return Math.max(Math.min(self, max), min);
 }
 parity();
@@ -56,7 +56,7 @@ console.log(Math.ceil(y));
 console.log(Math.round(y));
 console.log(Math.min(y, 2));
 console.log(Math.max(y, 10));
-console.log($b(b, 3, 7));
+console.log(clamp3(b, 3, 7));
 console.log(clamp(y, 0, 3));
 console.log(clamp(y, 4, 10));
 console.log(clamp(y, 0, 10));

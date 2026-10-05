@@ -9,10 +9,10 @@ function __map_values(map) {
 }
 function class_list(self) {
 	let out = "";
-	for (const entry of $a(self[0])) {
-		const $b = entry;
-		const class2 = $b[0];
-		const _declaration = $b[1];
+	for (const entry of values(self[0])) {
+		const $a = entry;
+		const class2 = $a[0];
+		const _declaration = $a[1];
 		if (out === "") {
 			out = class2;
 		} else {
@@ -21,7 +21,7 @@ function class_list(self) {
 	}
 	return out;
 }
-function $a(self) {
+function values(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
 		result.push(__clone(entry.slice(1, 3)));

@@ -10,13 +10,13 @@ function __parse_i32(text) {
 	return /^[+-]?[0-9]+$/.test(trimmed) && value >= -2147483648 && value <= 2147483647 ? [ 0, value ] : [ 1 ];
 }
 function shelf(self) {
-	let $p = null;
+	let $n = null;
 	if (self[0] === "dune") {
-		$p = [ 0, "sci-fi" ];
+		$n = [ 0, "sci-fi" ];
 	} else {
-		$p = [ 1 ];
+		$n = [ 1 ];
 	}
-	return $p;
+	return $n;
 }
 function find(key) {
 	let $a = null;
@@ -28,41 +28,41 @@ function find(key) {
 	return $a;
 }
 function to_number(text) {
-	const $s = __parse_i32(text);
-	let $t = null;
-	if ($s[0] === 0) {
-		const value = $s[1];
-		$t = [ 0, value ];
+	const $q = __parse_i32(text);
+	let $r = null;
+	if ($q[0] === 0) {
+		const value = $q[1];
+		$r = [ 0, value ];
 	} else {
-		$t = [ 1, text ];
+		$r = [ 1, text ];
 	}
-	return $t;
+	return $r;
 }
 function headline(key) {
-	const $C = find(key);
-	let $D = null;
-	if ($C[0] === 1) {
-		$D = $C;
+	const $A = find(key);
+	let $B = null;
+	if ($A[0] === 1) {
+		$B = $A;
 	} else {
-		$D = [ 0, $C[1][0] ];
+		$B = [ 0, $A[1][0] ];
 	}
-	const $E = $D;
-	if ($E[0] === 1) {
-		return $E;
+	const $C = $B;
+	if ($C[0] === 1) {
+		return $C;
 	}
-	const title = $E[1];
+	const title = $C[1];
 	return [ 0, title.toUpperCase() ];
 }
-function $d(self, fallback) {
-	const $e = self;
-	let $f = null;
-	if ($e[0] === 0) {
-		const x = __clone($e[1]);
-		$f = x;
+function unwrap_or(self, fallback) {
+	const $d = self;
+	let $e = null;
+	if ($d[0] === 0) {
+		const x = __clone($d[1]);
+		$e = x;
 	} else {
-		$f = __clone(fallback);
+		$e = __clone(fallback);
 	}
-	return $f;
+	return $e;
 }
 const $b = find("hit");
 let $c = null;
@@ -71,72 +71,72 @@ if ($b[0] === 1) {
 } else {
 	$c = [ 0, $b[1][0] ];
 }
-console.log($d($c, "?"));
-const $g = find("hit");
-let $h = null;
-if ($g[0] === 1) {
-	$h = $g;
+console.log(unwrap_or($c, "?"));
+const $f = find("hit");
+let $g = null;
+if ($f[0] === 1) {
+	$g = $f;
 } else {
-	$h = [ 0, $g[1][1].length ];
+	$g = [ 0, $f[1][1].length ];
 }
-console.log($d($h, 0));
-const $l = find("miss");
+console.log(unwrap_or($g, 0));
+const $j = find("miss");
+let $k = null;
+if ($j[0] === 1) {
+	$k = $j;
+} else {
+	$k = [ 0, $j[1][0] ];
+}
+console.log(unwrap_or($k, "?"));
+const $l = find("hit");
 let $m = null;
 if ($l[0] === 1) {
 	$m = $l;
 } else {
-	$m = [ 0, $l[1][0] ];
+	$m = shelf($l[1]);
 }
-console.log($d($m, "?"));
-const $n = find("hit");
-let $o = null;
-if ($n[0] === 1) {
-	$o = $n;
+console.log(unwrap_or($m, "?"));
+const $o = find("miss");
+let $p = null;
+if ($o[0] === 1) {
+	$p = $o;
 } else {
-	$o = shelf($n[1]);
+	$p = shelf($o[1]);
 }
-console.log($d($o, "?"));
-const $q = find("miss");
-let $r = null;
-if ($q[0] === 1) {
-	$r = $q;
+console.log(unwrap_or($p, "?"));
+const $s = to_number("40");
+let $t = null;
+if ($s[0] === 1) {
+	$t = $s;
 } else {
-	$r = shelf($q[1]);
+	$t = [ 0, Math.max($s[1], 2) ];
 }
-console.log($d($r, "?"));
-const $u = to_number("40");
+const $u = $t;
 let $v = null;
-if ($u[0] === 1) {
-	$v = $u;
+if ($u[0] === 0) {
+	const v = $u[1];
+	$v = console.log(v);
 } else {
-	$v = [ 0, Math.max($u[1], 2) ];
+	const e = $u[1];
+	$v = console.log(e);
 }
-const $w = $v;
+$v;
+const $w = to_number("nope");
 let $x = null;
-if ($w[0] === 0) {
-	const v = $w[1];
-	$x = console.log(v);
+if ($w[0] === 1) {
+	$x = $w;
 } else {
-	const e = $w[1];
-	$x = console.log(e);
+	$x = [ 0, Math.max($w[1], 2) ];
 }
-$x;
-const $y = to_number("nope");
+const $y = $x;
 let $z = null;
-if ($y[0] === 1) {
-	$z = $y;
+if ($y[0] === 0) {
+	const v2 = $y[1];
+	$z = console.log(v2);
 } else {
-	$z = [ 0, Math.max($y[1], 2) ];
+	const e2 = $y[1];
+	$z = console.log(e2);
 }
-const $A = $z;
-let $B = null;
-if ($A[0] === 0) {
-	const v2 = $A[1];
-	$B = console.log(v2);
-} else {
-	const e2 = $A[1];
-	$B = console.log(e2);
-}
-$B;
-console.log($d(headline("hit"), "?"));
-console.log($d(headline("miss"), "?"));
+$z;
+console.log(unwrap_or(headline("hit"), "?"));
+console.log(unwrap_or(headline("miss"), "?"));

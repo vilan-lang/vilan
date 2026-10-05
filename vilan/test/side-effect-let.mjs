@@ -34,48 +34,48 @@ function note(value) {
 	tally.v = tally.v + value;
 	return value;
 }
-function $f(values) {
+function over_a_call(values) {
 	values.map((value) => {
 		return note(1);
 	});
 	return tally.v;
 }
-function $g(values) {
+function over_a_block(values) {
 	values.map((value) => {
 		note(10);
 		return value;
 	});
 	return tally.v;
 }
-function $h(values) {
+function over_an_if(values) {
 	values.map((value) => {
-		let $i = null;
+		let $f = null;
 		if (tally.v < 100000) {
-			$i = note(100);
+			$f = note(100);
 		} else {
-			$i = 0;
+			$f = 0;
 		}
-		return $i;
+		return $f;
 	});
 	return tally.v;
 }
-function $j(values) {
+function over_a_match(values) {
 	values.map((value) => {
-		const $k = tally.v < 100000;
-		let $l = null;
-		if ($k === true) {
-			$l = note(1000);
+		const $g = tally.v < 100000;
+		let $h = null;
+		if ($g === true) {
+			$h = note(1000);
 		} else {
-			$l = 0;
+			$h = 0;
 		}
-		return $l;
+		return $h;
 	});
 	return tally.v;
 }
-function $m(values) {
+function over_a_literal(values) {
 	return tally.v;
 }
-function $n(values) {
+function chained(values) {
 	const mapped = values.map((value) => {
 		note(1);
 		return 2;
@@ -110,14 +110,14 @@ if ($d === true) {
 $e;
 console.log(tally.v);
 tally.v = 0;
-console.log($f([ 1, 2, 3 ]));
+console.log(over_a_call([ 1, 2, 3 ]));
 tally.v = 0;
-console.log($g([ 1, 2, 3 ]));
+console.log(over_a_block([ 1, 2, 3 ]));
 tally.v = 0;
-console.log($h([ 1, 2, 3 ]));
+console.log(over_an_if([ 1, 2, 3 ]));
 tally.v = 0;
-console.log($j([ 1, 2, 3 ]));
+console.log(over_a_match([ 1, 2, 3 ]));
 tally.v = 0;
-console.log($m([ 1, 2, 3 ]));
+console.log(over_a_literal([ 1, 2, 3 ]));
 tally.v = 0;
-console.log($n([ 4, 5, 6 ]));
+console.log(chained([ 4, 5, 6 ]));

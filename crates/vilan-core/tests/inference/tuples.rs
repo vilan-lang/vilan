@@ -7072,7 +7072,8 @@ fn b377_a_pure_element_in_a_discarded_comprehension_is_still_elided() {
             print(over_a_literal((1, 2, 3)));
         }
         "#,
-        "function $a(values) {\n\treturn 0;\n}",
+        // E259: the instance carries its function's name.
+        "function over_a_literal(values) {\n\treturn 0;\n}",
     );
 }
 

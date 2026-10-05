@@ -7,7 +7,7 @@ function __clone(value) {
 function default2() {
 	return 0;
 }
-function $a(self) {
+function sum(self) {
 	let total = default2();
 	let seeded = false;
 	for (const item of self) {
@@ -20,7 +20,7 @@ function $a(self) {
 	}
 	return total;
 }
-function $b(self) {
+function product(self) {
 	let total = default2();
 	let seeded = false;
 	for (const item of self) {
@@ -37,10 +37,10 @@ let numbers = [  ];
 numbers.push(2);
 numbers.push(3);
 numbers.push(4);
-console.log($a(numbers));
-console.log($b(numbers));
+console.log(sum(numbers));
+console.log(product(numbers));
 const empty = [  ];
-console.log($a(empty));
+console.log(sum(empty));
 for (const n of numbers) {
 	console.log(n);
 }

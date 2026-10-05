@@ -1,23 +1,23 @@
 function fold_unsigned(value, modulus) {
 	const truncated = Math.trunc(value);
 	const wrapped = truncated % modulus;
-	let $d = null;
+	let $a = null;
 	if (wrapped < 0) {
-		$d = wrapped + modulus;
+		$a = wrapped + modulus;
 	} else {
-		$d = wrapped;
+		$a = wrapped;
 	}
-	return $d;
+	return $a;
 }
 function fold_signed(value, modulus, half) {
 	const wrapped = fold_unsigned(value, modulus);
-	let $e = null;
+	let $b = null;
 	if (wrapped >= half) {
-		$e = wrapped - modulus;
+		$b = wrapped - modulus;
 	} else {
-		$e = wrapped;
+		$b = wrapped;
 	}
-	return $e;
+	return $b;
 }
 function max_value() {
 	return 127;
@@ -91,10 +91,10 @@ function div(self, b) {
 function to_json(self) {
 	return "{\"kind\":" + JSON.stringify(self[0]) + "," + "\"sequence\":" + JSON.stringify(self[1]) + "," + "\"stamp\":" + JSON.stringify(self[2]) + "}";
 }
-function $a(value, divisor) {
+function halve(value, divisor) {
 	return div(value, divisor);
 }
-function $b(value, divisor) {
+function halve2(value, divisor) {
 	return Math.trunc(value / divisor);
 }
 const byte = 0xFF;
@@ -114,9 +114,9 @@ console.log(7n / 2n);
 let counter = 9;
 counter = Math.trunc(counter / 2);
 console.log(counter);
-console.log($a(100, 8));
-console.log($b(7, 2));
-console.log($b(9, 4));
+console.log(halve(100, 8));
+console.log(halve2(7, 2));
+console.log(halve2(9, 4));
 console.log(as_u8(300));
 console.log(as_u8(-(1)));
 console.log(as_i8(130));

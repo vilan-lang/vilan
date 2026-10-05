@@ -1,58 +1,58 @@
 function next(self) {
-	let $c = null;
+	let $a = null;
 	if (self[0] < self[1]) {
 		self[0] = self[0] + 1;
-		$c = [ 0, self[0] ];
+		$a = [ 0, self[0] ];
 	} else {
-		$c = [ 1 ];
+		$a = [ 1 ];
 	}
-	return $c;
+	return $a;
 }
-function $a(self, count) {
+function taken(self, count) {
 	return [ self, count ];
 }
-function $b(self) {
+function next2(self) {
 	if (self[1] <= 0) {
 		return [ 1 ];
 	}
 	self[1] = self[1] - 1;
 	return next(self[0]);
 }
-function $f(it) {
+function sum_of(it) {
 	let total = 0;
-	const $g = it;
+	const $d = it;
 	while (true) {
-		const $h = $b($g);
-		if ($h[0] !== 0) {
+		const $e = next2($d);
+		if ($e[0] !== 0) {
 			break;
 		}
-		const v2 = $h[1];
+		const v2 = $e[1];
 		total = total + v2;
 	}
 	return total;
 }
-function $i(self) {
+function count_them(self) {
 	let n = 0;
-	const $j = self;
+	const $f = self;
 	while (true) {
-		const $k = $b($j);
-		if ($k[0] !== 0) {
+		const $g = next2($f);
+		if ($g[0] !== 0) {
 			break;
 		}
-		const _v = $k[1];
+		const _v = $g[1];
 		n = n + 1;
 	}
 	return n;
 }
-let taken = $a([ 0, 5 ], 3);
-const $d = taken;
+let taken2 = taken([ 0, 5 ], 3);
+const $b = taken2;
 while (true) {
-	const $e = $b($d);
-	if ($e[0] !== 0) {
+	const $c = next2($b);
+	if ($c[0] !== 0) {
 		break;
 	}
-	const v = $e[1];
+	const v = $c[1];
 	console.log(v);
 }
-console.log($f($a([ 0, 5 ], 3)));
-console.log($i($a([ 0, 9 ], 4)));
+console.log(sum_of(taken([ 0, 5 ], 3)));
+console.log(count_them(taken([ 0, 9 ], 4)));

@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**A generic function's emitted instance is named after the function in the readable (debug) build (E259).** `fun first<T>` emits `function first(items)`, and a second instance whose body differs `first2`, where every instance used to be `$a`, which is what a stack trace and a debugger showed; std's generic methods read the same way (`unwrap`, `is_some`, not `$f`). Release builds keep their short names. Corpus goldens moved by name only.
+
+---
+
 <!-- family: perf -->
 **A focus scope's autofocus scan stops at the first registered element.** `FocusScope` walks its content for the element `.autofocus()` registered (falling back to a native `autofocus` attribute); once it had found the registered one it kept visiting every remaining descendant and did nothing with them. The loop now leaves there (`registered.is_none() else jump break;`). No behaviour changes: the same element is chosen. (The owner's edit.)
 
