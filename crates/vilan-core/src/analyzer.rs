@@ -4974,6 +4974,10 @@ pub struct Analyzer<'src> {
     // — without it they were silently discarded (the empty-inner-function /
     // cross-call-collision class).
     static_subject_bindings: HashMap<Id, SubstitutionContext>,
+    // B542: B403's `Self` reading of a bare `Type::f()` inside `Type`'s own
+    // impl, for the impl parameters the static's own parameters mention — an
+    // argument may decide those instead (`self_reading_bindings`).
+    static_subject_self_bindings: HashMap<Id, SubstitutionContext>,
     /// B403: the subjects of `Type::f(..)` paths written with a BARE nominal
     /// (no type arguments) that resolved to an impl member — the calls whose
     /// impl parameters only the arguments or the return can bind, which the
@@ -7166,6 +7170,7 @@ impl<'src> Analyzer<'src> {
             dyn_refusals_reported: HashSet::default(),
             prepped_static_accessors: Vec::new(),
             static_subject_bindings: HashMap::default(),
+            static_subject_self_bindings: HashMap::default(),
             bare_static_path_subjects: HashSet::default(),
             impl_body_subjects: HashMap::default(),
             impl_head_type_ids: HashSet::default(),
@@ -48127,6 +48132,66 @@ impl<'src> Analyzer<'src> {
         (target != source).then_some(target)
     }
 
+    /// B542: which of B403's provisional `Self` bindings a bare `Type::f(..)`
+    /// inside `Type`'s own impl keeps. B403 (ruled 2026-09-26) reads the bare
+    /// path as `Self::f(..)`, which is what a parameter NOTHING at the call
+    /// binds needs (`Option::from_json_value(value)` in `impl Option<type
+    /// T>`). But inside `impl SignalCell<type T: (2..)>`, `SignalCell::new(part)`
+    /// over a part of type `U` read the block's `T` and was refused "Expected
+    /// T, but got U": the argument decides that parameter, and the `Self`
+    /// reading only contradicted it. So a binding is dropped exactly when an
+    /// argument at a parameter mentioning it has a settled type the `Self`
+    /// reading REFUSES — every call the reading accepted keeps it, so no
+    /// program that compiled changes meaning. `None` while such an argument
+    /// has not typed yet (the call defers, as its positional loop would).
+    fn self_reading_bindings(
+        &mut self,
+        subject_id: Id,
+        parameters: &[Id],
+        argument_ids: &[Id],
+    ) -> Option<SubstitutionContext> {
+        let Some(provisional) = self.static_subject_self_bindings.get(&subject_id).cloned() else {
+            return Some(SubstitutionContext::default());
+        };
+        let mut kept = SubstitutionContext::default();
+        'binding: for (generic, self_value) in provisional {
+            let mut reading = SubstitutionContext::default();
+            reading.insert(generic, self_value);
+            for (parameter_id, argument_id) in parameters.iter().zip(argument_ids) {
+                let Some(parameter_type) = self
+                    .parameters
+                    .get(parameter_id)
+                    .map(|parameter| parameter.type_id.get_type(self))
+                else {
+                    continue;
+                };
+                let mut mentioned = Vec::new();
+                self.collect_generics(&parameter_type, 0, &mut mentioned);
+                if !mentioned.contains(&generic) {
+                    continue;
+                }
+                let argument_type =
+                    self.infer_type(*argument_id, &Type::Unknown, &HashMap::default());
+                if matches!(argument_type, Type::Unresolved) {
+                    return None;
+                }
+                let argument_type_id = argument_type.clone().get_type_id(self);
+                if self.type_has_hole(argument_type_id) {
+                    continue;
+                }
+                let read = self.substitute_type(&parameter_type, &reading);
+                if self
+                    .reconcile_type(&read, &argument_type, &HashMap::default())
+                    .is_none()
+                {
+                    continue 'binding;
+                }
+            }
+            kept.insert(generic, self_value);
+        }
+        Some(kept)
+    }
+
     /// B541: an argument at a MAPPED parameter (`(U in T: Option<U>)`) whose
     /// family `T` nothing else binds, and one of whose elements gives the
     /// family no evidence — `None` names no payload type, so `T`'s element
@@ -49296,6 +49361,10 @@ impl<'src> Analyzer<'src> {
                         for (constraint_id, type_id) in bindings.clone() {
                             substitution_context.insert(constraint_id, type_id);
                         }
+                    }
+                    match self.self_reading_bindings(subject_id, &parameters, argument_ids) {
+                        Some(bindings) => substitution_context.extend(bindings),
+                        None => return Resolution::Deferred,
                     }
                     for (index, generic_argument_id) in generic_argument_ids.iter().enumerate() {
                         if let Some(generic_constraint) =
@@ -59137,10 +59206,14 @@ impl<'src> Analyzer<'src> {
                             // Option<type T>`) have always read it. Unbound, the
                             // call's impl parameters named nothing and the native
                             // build emitted ONE instance for every `Holder<X>`.
+                            let mut read_as_self = false;
                             let subject_type = match &subject_type {
                                 Type::Struct(_, args) | Type::Enum(_, args) if args.is_empty() => {
                                     match self.enclosing_self_of_same_nominal(id, &subject_type) {
-                                        Some(self_type) => self_type,
+                                        Some(self_type) => {
+                                            read_as_self = true;
+                                            self_type
+                                        }
                                         None => {
                                             if impl_subject.is_some() {
                                                 self.bare_static_path_subjects.insert(id);
@@ -59163,8 +59236,37 @@ impl<'src> Analyzer<'src> {
                                     &HashMap::default(),
                                 ) && !bindings.is_empty()
                                 {
-                                    self.static_subject_bindings
-                                        .insert(id, bindings.into_iter().collect());
+                                    // B542: B403's `Self` reading binds the
+                                    // parameters the call's ARGUMENTS also
+                                    // reach only provisionally — the call
+                                    // decides at resolution
+                                    // (`self_reading_bindings`).
+                                    // A binder of the ENCLOSING block itself
+                                    // (`Cell::new(..)` inside the same `impl
+                                    // Cell<type T>` that declares `new`) is
+                                    // rigid in the body and stays `Self`'s.
+                                    let argument_generics: Vec<TypeId> = match read_as_self {
+                                        true => self
+                                            .member_parameter_generics(member_id)
+                                            .into_iter()
+                                            .filter(|generic| {
+                                                !self.generic_is_enclosing_binder(*generic, id)
+                                            })
+                                            .collect(),
+                                        false => Vec::new(),
+                                    };
+                                    let (provisional, fixed): (Vec<_>, Vec<_>) =
+                                        bindings.into_iter().partition(|(generic, _)| {
+                                            argument_generics.contains(generic)
+                                        });
+                                    if !fixed.is_empty() {
+                                        self.static_subject_bindings
+                                            .insert(id, fixed.into_iter().collect());
+                                    }
+                                    if !provisional.is_empty() {
+                                        self.static_subject_self_bindings
+                                            .insert(id, provisional.into_iter().collect());
+                                    }
                                 }
                             }
                         }

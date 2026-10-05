@@ -9588,3 +9588,51 @@ fn b540_a_nullary_variant_binding_grounds_from_its_reassignment() {
         "but got Maybe<str>",
     );
 }
+
+/// B542: inside `impl Cell<type W: (2..)>`, a bare `Cell::new(part)` over a part
+/// of another type read the block's `W` — B403's ruled `Self` reading — and was
+/// refused "Expected W, but got U". The reading stands for every parameter the
+/// call's arguments do not decide (`Holder::tag()`, B403's own pins), and for an
+/// argument that agrees with it; an argument it would refuse decides instead.
+/// std's `SignalCell<(..)>::unzip` is written in its impl again (it was moved
+/// out to `unzip_cell` for this), and `a152_*` runs it.
+#[test]
+fn b542_a_bare_static_in_its_own_impl_takes_an_argument_the_self_reading_refuses() {
+    assert_compiles_and_runs(
+        r#"
+        struct Cell<T> { value: T }
+        impl Cell<type T> {
+            fun new(value: T): Cell<T> { Cell { value = value } }
+            fun get(self): T { self.value }
+            fun twin(self): Cell<T> { Cell::new(self.value) }
+        }
+        impl Cell<type W: (2..)> {
+            fun split(self): (U in W: Cell<U>) {
+                let parts = (part in self.get() => Cell::new(part));
+                parts
+            }
+        }
+        fun main() {
+            let whole = Cell::new((1, "x"));
+            let (a, b) = whole.split();
+            print(a.get());
+            print(b.get());
+            print(Cell::new(5).twin().get());
+        }
+        "#,
+        "1\nx\n5\n",
+    );
+    // The block that DECLARES `new` holds its `T` rigid: `Self` there, as B403
+    // ruled, so another type is still refused (its wording, "Expected str, but
+    // got str", is a solver-47 find, filed).
+    assert_fails(
+        r#"
+        struct Cell<T> { value: T }
+        impl Cell<type T> {
+            fun new(value: T): Cell<T> { Cell { value = value } }
+            fun relabel(self, label: str): Cell<str> { Cell::new(label) }
+        }
+        fun main() {}
+        "#,
+    );
+}

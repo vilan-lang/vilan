@@ -45,6 +45,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**B542: inside `impl Cell<type W: (2..)>`, a bare `Cell::new(part)` over a part of another type compiles: B403's ruled reading of a bare `Type::f()` inside `Type`'s own impl as `Self::f()` now gives way where an argument decides the parameter and the `Self` reading would refuse it ("Expected W, but got U").** Every call the reading accepted keeps it, so no program that compiled changes meaning; a parameter nothing at the call binds (`Option::from_json_value(value)`, B403's case) and a binder of the very block that declares the static stay `Self`'s. std's `SignalCell<(..)>::unzip` is written in its impl again: the `unzip_cell` workaround is gone. **Pins:** `inference::generics::b542_a_bare_static_in_its_own_impl_takes_an_argument_the_self_reading_refuses` (a comprehension of statics at each element type, an agreeing argument kept as `Self`, the declaring block's refusal kept); `a152_unzip_*` run std's method from its impl; B403's three pins unchanged. Tracker B542.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.
