@@ -22,7 +22,6 @@ fun main() {
 	}
 	mut adders = [|n: i32| n + 1, |n: i32| n * 2];
 	adders.push(|n: i32| n - base);
-	let third = adders[2];
-	print(third(30));
+	print(adders[2](30));
 	print(adders.len());
 }

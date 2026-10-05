@@ -595,7 +595,6 @@ row	flagship	key
 571	-	`resource` is an attribute, not a keyword: write `[resource]` before the declaration (`[resource] struct`, `[resource] external struct`, `[resource] enum`)
 572	-	Expected usize (an index: a position, a length or a count), but got {got} instead. There are no implicit numeric conversions; convert with `.as_usize()`
 573	-	Expected {expected}, but got usize (an index: a position, a length or a count) instead. There are no implicit numeric conversions; convert with `.as_{target}()`
-NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
 574	-	the literal `{literal}` is fractional, and the other operand of `{symbol}` is `{integer}`: an integer has no fractional part, so the literal would be typed `{integer}` and the arithmetic done in integers. Convert the integer first — `{peer}.as_f64()` — or write an integer literal
 575	-	`.{seal}()` in the initializer of the module binding `{name}` ties the cell to an owner, and a module binding has none: its subscription would stay on the upstream for the life of the program. Build it under the owner that reads it (inside the view, or an `owner_scope.run`), or write `.{seal}_global()`, which says that lifetime
 576	-	`{name}` returns a signal handle it builds with `.{seal}()` on every call: each call mints a fresh cell, so the reply never matches a channel this connection already carries (a capability and a forward per call), and the cell's subscription lives as long as the handler's owner (the connection under `Service::factory`, the service under `Service::new`). Return a cell that outlives the call — keep it on the service, keyed by the arguments (a `Memo` whose maker writes `.{seal}_global()`)
@@ -660,3 +659,22 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 635	-	cannot mutate '{name}': it is a COPY of the payload the pattern takes out of `{place}`, so a write to it (or to `mut {name}`) would not reach `{place}` — to write the payload in place, match a view of it, `match &mut {place}` (or `&mut {place} is ..`), whose `let` captures are writable views
 636	-	`std::{old}` moved to `std::{new}`: std's modules are grouped under namespaces since v0.44.0, and the old path is gone — write `std::{new}`
 637	-	`{section} prelude = "{path}"` names the old path of a std module: `std::{old}` moved to `std::{new}` — write `prelude = "{rewritten}"`
+638	-	an image (![alt](destination)) — images are outside the census grammar
+639	-	a footnote ([^label]) — footnotes are outside the census grammar
+640	-	a reference-style link ([text][label]) — only inline [text](destination) links are in the census grammar
+641	-	strikethrough (~~text~~) — outside the census grammar
+642	-	a backslash escape (\{escaped}) — the census grammar's only escape is \| inside a table cell
+643	-	a raw HTML tag (<{inner}>) — the census grammar's only HTML passthrough is <a id="…"></a>; wrap literal <…> text (a generic like List<T>) in backticks
+644	-	an indented code block (four or more leading spaces) — the census grammar's only code blocks are backtick fences
+645	-	a tilde fence (~~~) — the census grammar's fences use backticks
+646	-	an unclosed code fence — no closing ``` at the opening fence's indent
+647	-	a custom heading id ({{#…}}) — census-grammar heading ids are computed, mdBook's algorithm
+648	-	a setext heading underline or thematic break (---, ===, ***) — both outside the census grammar; headings are ATX (# Title)
+649	-	a lazy blockquote continuation — prefix the line with > or separate it from the quote with a blank line
+650	-	an indented list item — the census grammar's lists are flat, at the left margin
+651	-	a nested list item — the census grammar's lists are flat
+652	-	a lazy list continuation — indent the line under its item (two spaces) or separate it from the list with a blank line
+653	-	a table alignment colon (:---) — the census grammar's tables carry no alignment
+654	-	a reference link definition ([label]: destination) — only inline [text](destination) links are in the census grammar
+655	-	a hard line break (two trailing spaces) — outside the census grammar
+656	-	a backslash line break — outside the census grammar

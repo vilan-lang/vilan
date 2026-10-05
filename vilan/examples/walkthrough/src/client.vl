@@ -8,6 +8,7 @@
 // `ui` — browser-only inside a module both layers declare, so the qualifier is
 // what keeps a platform error at the call.
 
+import std::debug::Debug;
 import std::json::json_codec;
 import std::web::router::current_path;
 import std::web::storage;

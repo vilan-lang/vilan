@@ -66,21 +66,20 @@ fun screen(
 	// and only while, the screen is showing. The empty `[]` takes its element
 	// type from the mirror.
 	let notes = client.notes.or([]).cell();
-	view("div")
-		.styled(shell)
-		.child(connection_banner(client))
-		.child(sign_in_panel(client, token))
-		.child(authed_panel(client, notes, token, route))
+	<div .styled(shell)>
+		{connection_banner(client)}
+		{sign_in_panel(client, token)}
+		{authed_panel(client, notes, token, route)}
+	</div>
 }
 
 // Visible only while reconnecting: the transport exposes its state as a
 // signal, so a banner is one `show`.
 fun connection_banner(client: NotesClient<SocketTransport>): View {
 	let state = client.transport.connection_state();
-	view("p")
-		.styled(muted)
-		.text("reconnecting…")
-		.show(state.derive(|current| current == ConnectionState::Reconnecting))
+	<p .styled(muted) .show(state.derive(|current| current == ConnectionState::Reconnecting))>
+		"reconnecting…"
+	</p>
 }
 
 // Username + password + one button. Register-or-login keeps the surface
@@ -104,18 +103,13 @@ fun sign_in_panel(client: NotesClient<SocketTransport>, token: SignalCell<str>):
 		}
 	};
 
-	view("div")
-		.styled(shell)
-		.child(view("h2").text("Notes"))
-		.child(view("input").styled(field).attr("placeholder", "username").bind_value(username))
-		.child(view("input")
-			.styled(field)
-			.attr("placeholder", "password")
-			.attr("type", "password")
-			.bind_value(password))
-		.child(view("button").styled(button).text("Sign in").on("click", submit))
-		.child(view("p").styled(muted).bind_text(status))
-		.show(token.derive(|current| current == ""))
+	<div .styled(shell) .show(token.derive(|current| current == ""))>
+		<h2>"Notes"</h2>
+		<input .styled(field) placeholder("username") .bind_value(username) />
+		<input .styled(field) type("password") placeholder("password") .bind_value(password) />
+		<button .styled(button) .on("click", submit)>"Sign in"</button>
+		<p .styled(muted)>{status}</p>
+	</div>
 }
 
 // The routed app, visible once signed in. Pages swap on the route.
@@ -125,14 +119,13 @@ fun authed_panel(
 	token: SignalCell<str>,
 	route: SignalCell<Route>,
 ): View {
-	view("div")
-		.styled(shell)
-		.child(swap(route, |current| match current {
+	<div .styled(shell) .show(token.derive(|current| current != ""))>
+		{swap(route, |current| match current {
 			Route::Home => home_page(client, notes, token),
 			Route::Note(let id) => note_page(client, id, notes, token),
 			Route::NotFound => not_found_page(),
-		}))
-		.show(token.derive(|current| current != ""))
+		})}
+	</div>
 }
 
 // "/" — the live list plus an add form. Rows are keyed by note id.
@@ -156,30 +149,26 @@ fun home_page(
 		navigate(href(Route::Home));
 	};
 
-	view("div")
-		.styled(shell)
-		.child(view("div")
-			.styled(row)
-			.child(view("h2").text("Notes"))
-			.child(view("button").styled(button).text("Sign out").on("click", sign_out)))
-		.child(view("div")
-			.styled(row)
-			.child(view("input")
-				.styled(field)
-				.attr("placeholder", "New note")
-				.bind_value(composing))
-			.child(view("button").styled(button).text("Add").on("click", add)))
-		.child(view("ul").child(each(notes, |note| note.id, |note| note_row(client, note, token))))
+	<div .styled(shell)>
+		<div .styled(row)>
+			<h2>"Notes"</h2>
+			<button .styled(button) .on("click", sign_out)>"Sign out"</button>
+		</div>
+		<div .styled(row)>
+			<input .styled(field) placeholder("New note") .bind_value(composing) />
+			<button .styled(button) .on("click", add)>"Add"</button>
+		</div>
+		<ul>{each(notes, |note| note.id, |note| note_row(client, note, token))}</ul>
+	</div>
 }
 
 fun note_row(client: NotesClient<SocketTransport>, note: Note, token: SignalCell<str>): View {
-	view("li")
-		.styled(row)
-		.child(link(note.title, Route::Note(note.id)))
-		.child(view("button")
-			.styled(button)
-			.text("Delete")
-			.on("click", || report(client.delete_note(token.get(), note.id))))
+	<li .styled(row)>
+		{link(note.title, Route::Note(note.id))}
+		<button .styled(button) on:click(|| report(client.delete_note(token.get(), note.id)))>
+			"Delete"
+		</button>
+	</li>
 }
 
 // "/note/{id}" — the editor. It mounts under `when` so a deep link waits
@@ -203,11 +192,11 @@ fun note_page(
 		.cell();
 	let present = entry.derive(|current| current is Some(let _note)).memo();
 
-	view("div")
-		.styled(shell)
-		.child(view("p").child(link("← All notes", Route::Home)))
-		.child(view("p").styled(muted).text("loading…").show(present.derive(|has| !has)))
-		.child(when(present, || note_editor(client, note_id, entry, token)))
+	<div .styled(shell)>
+		<p>{link("← All notes", Route::Home)}</p>
+		<p .styled(muted) .show(present.derive(|has| !has))>"loading…"</p>
+		{when(present, || note_editor(client, note_id, entry, token))}
+	</div>
 }
 
 // LOCAL-FIRST: each field commits through its own rpc as the user types.
@@ -237,22 +226,19 @@ fun note_editor(
 		}
 	});
 
-	view("div")
-		.styled(shell)
-		.child(view("input").styled(field).attr("placeholder", "Title…").bind_draft(title))
-		.child(view("span").styled(muted).bind_text(title.state.derive(state_text)))
-		.child(view("textarea")
-			.styled(field)
-			.attr("placeholder", "Write…")
-			.attr("rows", "8")
-			.bind_draft(body))
-		.child(view("span").styled(muted).bind_text(body.state.derive(state_text)))
+	<div .styled(shell)>
+		<input .styled(field) placeholder("Title…") .bind_draft(title) />
+		<span .styled(muted)>{title.state.derive(state_text)}</span>
+		<textarea .styled(field) placeholder("Write…") rows("8") .bind_draft(body) />
+		<span .styled(muted)>{body.state.derive(state_text)}</span>
+	</div>
 }
 
 fun not_found_page(): View {
-	view("div")
-		.child(view("h2").text("Nothing here"))
-		.child(view("p").child(link("← All notes", Route::Home)))
+	<div>
+		<h2>"Nothing here"</h2>
+		<p>{link("← All notes", Route::Home)}</p>
+	</div>
 }
 
 // An rpc save outcome as a draft commit outcome (`None` = success).

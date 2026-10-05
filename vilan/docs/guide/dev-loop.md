@@ -508,7 +508,7 @@ takes:
 import std::option::Option::{ None, Some, self };
 import std::reactive::{ Signal, SignalCell };
 import std::web::router::{ chunk_error, current_path, pending, segments };
-import std::web::ui::{ View, mount_root, swap, view };
+import std::web::ui::{ View, mount_root, swap };
 
 [derive(PartialEq)]
 enum Route {
@@ -521,29 +521,32 @@ fun parse(path: str): Route {
 }
 
 fun home_page(): View {
-	view("h1").text("Home")
+	<h1>"Home"</h1>
 }
 
 fun missing_page(): View {
-	view("h1").text("Nothing here")
+	<h1>"Nothing here"</h1>
 }
 
 fun main() {
 	let _root = mount_root("app", || {
 		let route = current_path().derive(parse);
-		view("main")
+		<main>
 			// Visible only while a route chunk is in flight; the page behind
 			// it is the one you were already on.
-			.child(view("div").class("spinner").text("Loading…").show(pending()))
+			<div class("spinner") .show(pending())>"Loading…"</div>
 			// …and if it never arrives, say so. The next click retries.
-			.child(view("div").class("error").bind_text(chunk_error().derive(|failure| match failure {
-				Some(let reason) => "Could not load that page: " + reason,
-				None => "",
-			})))
-			.child(swap(route, |current| match current {
+			<div class("error")>
+				{chunk_error().derive(|failure| match failure {
+					Some(let reason) => "Could not load that page: " + reason,
+					None => "",
+				})}
+			</div>
+			{swap(route, |current| match current {
 				Route::Home => home_page(),
 				Route::NotFound => missing_page(),
-			}))
+			})}
+		</main>
 	});
 }
 ```

@@ -11,7 +11,9 @@ function serialize(node) {
     for (const [name, value] of Object.entries(node.attributes)) out += ` ${name}="${value}"`;
     for (const [name, value] of Object.entries(node.styleProperties)) out += ` ${name}="${value}"`;
     if (node.hidden) out += " hidden";
-    out += ">" + node.textContent;
+    // The element's OWN text (what `.text(..)` wrote), not `textContent`,
+    // which reads every descendant: the children serialize themselves below.
+    out += ">" + node._text;
     for (const child of node.children) out += serialize(child);
     return out + "</" + node.tagName + ">";
 }

@@ -212,8 +212,9 @@ prelude = "std::web::prelude"    # omit the key for the default set
 The default set is `print`, `Iterator` (so `filter`, `map` and `to_list`
 need no import), `Option`/`Some`/`None`, `Result`/`Ok`/`Err`.
 The **web** set adds `Signal`, `SignalCell`, `CollPipe`, `SetPipe`, `view`, `View`, and the
-modules `style` and `ui` — so a UI file writes `view("div")` and
-`style::Display::Flex` with no import at all. `prelude = false` turns it
+modules `style` and `ui` — so a UI file writes `<div>…</div>` (or the
+chain it lowers to, `view("div")`), `View` and `style::Display::Flex`
+with no import at all. `prelude = false` turns it
 off entirely.
 
 Two rules worth knowing:

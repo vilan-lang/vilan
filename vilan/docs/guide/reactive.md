@@ -857,7 +857,7 @@ with `.memo()` where two things read it, or hand it straight to `each`:
 
 ```vilan,browser
 import std::reactive::{ ListCell, Signal, SignalCell };
-import std::web::ui::{ each, mount_root, view };
+import std::web::ui::{ each, mount_root };
 
 [derive(PartialEq)]
 struct Task {
@@ -871,11 +871,15 @@ fun main() {
 		Task { id = 0, title = "write" },
 		Task { id = 1, title = "ship" },
 	]);
-	let _root = mount_root("app", || view("ul").child(each(
-		tasks.filter(|task| finished[task.id].derive(|done| !done)),
-		|task| task.id,
-		|task| view("li").text(task.title),
-	)));
+	let _root = mount_root("app", || {
+		<ul>
+			{each(
+				tasks.filter(|task| finished[task.id].derive(|done| !done)),
+				|task| task.id,
+				|task| <li>{task.title}</li>,
+			)}
+		</ul>
+	});
 }
 ```
 

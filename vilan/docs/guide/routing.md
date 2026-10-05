@@ -17,7 +17,7 @@ Here's a small two-level app: a home page, and workspace pages that have
 their own sub-pages.
 
 ```vilan,browser
-import std::web::ui::{ swap, view, View, mount_root };
+import std::web::ui::{ swap, View, mount_root };
 import std::web::router::{ current_path, navigate, segments, link, Routable };
 import std::reactive::{ Signal, SignalCell };
 import std::option::Option::{ self, Some, None };
@@ -83,11 +83,13 @@ fun main() {
 		// Built where it is consumed: the route is a pipe, and `swap` is its one
 		// consumer.
 		let route = current_path().derive(parse);
-		view("div").child(swap(route, |current| match current {
-			Route::Home => view("h1").text("Home"),
-			Route::Workspace(let id, let _inner) => view("h1").text(i"Workspace {id}"),
-			Route::NotFound => view("h1").text("Nothing here"),
-		}))
+		<div>
+			{swap(route, |current| match current {
+				Route::Home => <h1>"Home"</h1>,
+				Route::Workspace(let id, let _inner) => <h1>i"Workspace {id}"</h1>,
+				Route::NotFound => <h1>"Nothing here"</h1>,
+			})}
+		</div>
 	});
 }
 ```
@@ -241,7 +243,7 @@ so nothing native is lost. If you build and style your own anchor, put
 `link_to` on it and you get the same three things:
 
 ```vilan,fragment
-view("a").class("nav-item").link_to(Route::Home).text("Home")
+<a class("nav-item") .link_to(Route::Home)>"Home"</a>
 ```
 
 For programmatic navigation (after a sign-out, after creating a thing):

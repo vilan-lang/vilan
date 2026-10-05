@@ -91,7 +91,14 @@ class StubElement {
     /// The declarations written through `element.style`, by name.
     get styleProperties() { return this.style.properties; }
     set textContent(text) { this._text = text; this.children = []; notifyMutation(); }
-    get textContent() { return this._text; }
+    // The DOM's reading: every descendant text node's text, in tree order.
+    // `_text` is the one node the setter leaves (it clears the children, so
+    // it always leads), and a child — an element, or the `StubText` a `str`
+    // or a `Source<str>` child rides, `Region` anchors included — adds its
+    // own. Reading `_text` alone made `<li>{task}</li>` read "" where a
+    // browser reads the task (K26 moved the SSR example to element syntax);
+    // `render()` below has always concatenated the same way.
+    get textContent() { return this._text + this.children.map(c => c.textContent).join(""); }
     set value(value) { this._value = value; }
     get value() { return this._value; }
     set className(value) { this._className = value; }

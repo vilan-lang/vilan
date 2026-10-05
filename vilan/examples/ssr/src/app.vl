@@ -28,31 +28,31 @@ fun app(): View {
 	let tasks: SignalCell<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
 	let show_note = Signal::new(true);
 	let label = Signal::new("idle");
-	view("main")
-		.class("app")
-		.child(heading())
-		.child(task_list(tasks))
-		.child(note(show_note))
-		.child(action(label))
+	<main .class("app")>
+		{heading()}
+		{task_list(tasks)}
+		{note(show_note)}
+		{action(label)}
+	</main>
 }
 
 // The `&`, `<`, `>` are escaped by `render` — a hostile string renders inert.
 fun heading(): View {
-	view("h1").text("Tasks & <notes>")
+	<h1>"Tasks & <notes>"</h1>
 }
 
 // The signal-fed list: one `<li>` per task, read once on the server.
 fun task_list(tasks: SignalCell<List<str>>): View {
-	view("ul").child(each(tasks, |task| task, |task| view("li").text(task)))
+	<ul>{each(tasks, |task| task, |task| <li>{task}</li>)}</ul>
 }
 
 // A conditional note — `when` renders the taken branch on the server.
 fun note(show: SignalCell<bool>): View {
-	view("section").child(when(show, || view("p").text("server-rendered, then replaced")))
+	<section>{when(show, || <p>"server-rendered, then replaced"</p>)}</section>
 }
 
 // A button whose click writes `label`, which is bound to its own text: inert on
 // the server (the handler is discarded), live on the client after the replace.
 fun action(label: SignalCell<str>): View {
-	view("button").bind_text(label).on("click", || label.set("clicked"))
+	<button on:click(|| label.set("clicked"))>{label}</button>
 }

@@ -733,18 +733,20 @@ impl Selector<type T: Hashable + PartialEq> {
 
 ```vilan,browser
 import std::reactive::{ Signal, SignalCell, selector };
-import std::web::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root };
 
 fun main() {
 	let rows: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
 	let current: SignalCell<i32> = Signal::new(1);
 	let selected = selector(current);
 	let _root = mount_root("app", || {
-		view("ul").child(each(rows, |id| id, |id| {
-			view("li").text(i"row {id}").bind_class(selected.of(id).derive(|on| {
-				if on { "row current" } else { "row" }
-			}))
-		}))
+		<ul>
+			{each(rows, |id| id, |id| {
+				<li .bind_class(selected.of(id).derive(|on| if on { "row current" } else { "row" }))>
+					i"row {id}"
+				</li>
+			})}
+		</ul>
 	});
 }
 ```

@@ -836,7 +836,7 @@ pub enum Node<'src> {
     // import. The first field is the optional `(in PATH)` narrowing (B318 §2.2).
     //
     // The third field is the re-export's `[deprecated("use …")]` (B382):
-    // `export [deprecated(..)] import …;` deprecates the NAME the re-export
+    // `[deprecated(..)] export import …;` deprecates the NAME the re-export
     // publishes, so the steer belongs to the export and not to the import —
     // which also keeps `Import`'s already-wide payload out of `node_size`'s way.
     Export(
