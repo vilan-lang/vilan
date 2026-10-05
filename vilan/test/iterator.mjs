@@ -9,6 +9,6 @@ const naturals = from_fn(() => {
 	i = i + 1;
 	return i;
 });
-console.log(next(naturals));
-console.log(next(naturals));
-console.log(next(naturals));
+console.log(String(next(naturals)));
+console.log(String(next(naturals)));
+console.log(String(next(naturals)));

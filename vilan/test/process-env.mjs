@@ -23,7 +23,7 @@ function unwrap_or(self, fallback) {
 	return $d;
 }
 const arguments2 = __args();
-console.log(arguments2.length);
+console.log(String(arguments2.length));
 const $a = __env("VILAN_TEST_VAR");
 let $b = null;
 if ($a[0] === 0) {

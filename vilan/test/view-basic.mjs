@@ -7,8 +7,8 @@ function __clone(value) {
 let c = [ 10 ];
 const v = c;
 v[0] = 99;
-console.log(c[0]);
+console.log(String(c[0]));
 let e = [ 10 ];
 let d = __clone(e);
 d[0] = 1;
-console.log(e[0]);
+console.log(String(e[0]));

@@ -406,7 +406,7 @@ while (true) {
 	const pair = $s[1];
 	console.log("" + pair[0] + pair[1]);
 }
-console.log(count(chain(iter([ 1, 2 ]), iter([ 3 ]))));
+console.log(String(count(chain(iter([ 1, 2 ]), iter([ 3 ])))));
 let numbered = enumerate(iter([ "x", "y" ]));
 const $x = numbered;
 while (true) {
@@ -417,25 +417,25 @@ while (true) {
 	const entry = $y[1];
 	console.log("" + entry[0] + "=" + entry[1]);
 }
-console.log(fold(iter([ 1, 2, 3 ]), 0, (total, n) => {
+console.log(String(fold(iter([ 1, 2, 3 ]), 0, (total, n) => {
 	return total + n;
-}));
+})));
 console.log(all(iter([ 1, 2, 3 ]), (n) => {
 	return n > 0;
 }));
 console.log(to_list3(rev(iter([ 1, 2, 3 ]))));
 for_each(iter([ 1, 2 ]), (n) => {
-	return console.log(n);
+	return console.log(String(n));
 });
-console.log(len(to_set(to_list4(filter(iter([ 1, 2, 2, 3 ]), (n) => {
+console.log(String(len(to_set(to_list4(filter(iter([ 1, 2, 2, 3 ]), (n) => {
 	return n > 1;
-})))));
+}))))));
 const lengths = to_map(to_list5(map(iter([ "alpha", "hi" ]), (word) => {
 	return [ word, word.length ];
 })));
-console.log(unwrap_or(get(lengths, "hi"), 0));
+console.log(String(unwrap_or(get(lengths, "hi"), 0)));
 let live = [ 1, 2 ];
 let cursor = iter(live);
 live.push(3);
-console.log(count2(cursor));
-console.log(live.length);
+console.log(String(count2(cursor)));
+console.log(String(live.length));

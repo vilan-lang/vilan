@@ -79,7 +79,7 @@ if ($f[0] === 1) {
 } else {
 	$g = [ 0, $f[1][1].length ];
 }
-console.log(unwrap_or($g, 0));
+console.log(String(unwrap_or($g, 0)));
 const $j = find("miss");
 let $k = null;
 if ($j[0] === 1) {
@@ -115,7 +115,7 @@ const $u = $t;
 let $v = null;
 if ($u[0] === 0) {
 	const v = $u[1];
-	$v = console.log(v);
+	$v = console.log(String(v));
 } else {
 	const e = $u[1];
 	$v = console.log(e);
@@ -132,7 +132,7 @@ const $y = $x;
 let $z = null;
 if ($y[0] === 0) {
 	const v2 = $y[1];
-	$z = console.log(v2);
+	$z = console.log(String(v2));
 } else {
 	const e2 = $y[1];
 	$z = console.log(e2);

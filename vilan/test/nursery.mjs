@@ -158,7 +158,7 @@ async function nursery(body, $g) {
 		console.log("body");
 		return 7;
 	}, [ 1 ]));
-	console.log(value);
+	console.log(String(value));
 })().catch(($i) => {
 	console.error(String($i));
 	process.exit(1);

@@ -10,5 +10,5 @@ function pick3(a, b) {
 function pick4(a, b) {
 	return pick2(a, b);
 }
-console.log(pick3(2, 3));
+console.log(String(pick3(2, 3)));
 console.log(pick4([ 10 ], [ 20 ]));

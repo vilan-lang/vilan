@@ -52,11 +52,11 @@ while (true) {
 		break;
 	}
 	const n = $c[1];
-	console.log(n);
+	console.log(String(n));
 }
 let numbers = [  ];
 numbers.push(2);
 numbers.push(3);
 numbers.push(4);
-console.log(sum(numbers));
-console.log(product(numbers));
+console.log(String(sum(numbers)));
+console.log(String(product(numbers)));

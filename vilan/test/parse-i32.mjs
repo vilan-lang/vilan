@@ -43,27 +43,27 @@ function is_some(self) {
 	const $c = self;
 	return $c[0] === 0;
 }
-console.log(unwrap_or(__parse_i32("42"), __lazy("fallback", () => {
+console.log(String(unwrap_or(__parse_i32("42"), __lazy("fallback", () => {
 	return 0 - 1;
-})));
-console.log(unwrap_or(__parse_i32("-7"), __lazy("fallback", () => {
+}))));
+console.log(String(unwrap_or(__parse_i32("-7"), __lazy("fallback", () => {
 	return 0;
-})));
-console.log(unwrap_or(__parse_i32("+9"), __lazy("fallback", () => {
+}))));
+console.log(String(unwrap_or(__parse_i32("+9"), __lazy("fallback", () => {
 	return 0;
-})));
-console.log(unwrap_or(__parse_i32(" 42 "), __lazy("fallback", () => {
+}))));
+console.log(String(unwrap_or(__parse_i32(" 42 "), __lazy("fallback", () => {
 	return 0 - 1;
-})));
+}))));
 console.log(is_some(__parse_i32("")));
 console.log(is_some(__parse_i32("abc")));
 console.log(is_some(__parse_i32("1.5")));
 console.log(is_some(__parse_i32("12x")));
-console.log(unwrap_or(__parse_i32("2147483647"), __lazy("fallback", () => {
+console.log(String(unwrap_or(__parse_i32("2147483647"), __lazy("fallback", () => {
 	return 0;
-})));
+}))));
 console.log(is_some(__parse_i32("2147483648")));
-console.log(unwrap_or(__parse_i32("-2147483648"), __lazy("fallback", () => {
+console.log(String(unwrap_or(__parse_i32("-2147483648"), __lazy("fallback", () => {
 	return 0;
-})));
+}))));
 console.log(is_some(__parse_i32("-2147483649")));

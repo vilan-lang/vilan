@@ -61,20 +61,20 @@ function filter(self, predicate) {
 	return result;
 }
 const p = [ 0, [ 3, 4 ] ];
-console.log(unwrap_or(map(p, (q) => {
+console.log(String(unwrap_or(map(p, (q) => {
 	return q[0] + q[1];
-}), 0));
+}), 0)));
 console.log(is_some_and(p, (q) => {
 	return q[0] === 3;
 }));
 let pts = [  ];
 pts.push([ 1, 10 ]);
 pts.push([ 2, 20 ]);
-console.log(fold(map2(pts, (pt) => {
+console.log(String(fold(map2(pts, (pt) => {
 	return pt[0];
 }), 0, (a, b) => {
 	return a + b;
-}));
-console.log(filter(pts, (pt) => {
+})));
+console.log(String(filter(pts, (pt) => {
 	return pt[1] > 15;
-}).length);
+}).length));

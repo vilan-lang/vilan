@@ -888,7 +888,7 @@ set(count, 1, [ 1 ]);
 set_with(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
-console.log(get2(doubled));
+console.log(String(get2(doubled)));
 take(owner, sub2(__clone(count), (n, $aN) => {
 	return console.log(n);
 }), [ 1 ]);

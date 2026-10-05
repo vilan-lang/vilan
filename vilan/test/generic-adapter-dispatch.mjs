@@ -52,7 +52,7 @@ while (true) {
 		break;
 	}
 	const v = $c[1];
-	console.log(v);
+	console.log(String(v));
 }
-console.log(sum_of(taken([ 0, 5 ], 3)));
-console.log(count_them(taken([ 0, 9 ], 4)));
+console.log(String(sum_of(taken([ 0, 5 ], 3))));
+console.log(String(count_them(taken([ 0, 9 ], 4))));

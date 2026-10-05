@@ -23,12 +23,12 @@ function sum(self) {
 let a = [ 1, 2 ];
 let b = __clone(a);
 b[0] = 99;
-console.log(a[0]);
-console.log(b[0]);
+console.log(String(a[0]));
+console.log(String(b[0]));
 let xs = [  ];
 xs.push(1);
 xs.push(2);
 let ys = __clone(xs);
 ys.push(99);
-console.log(sum(xs));
-console.log(sum(ys));
+console.log(String(sum(xs)));
+console.log(String(sum(ys)));

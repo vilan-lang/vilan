@@ -27,10 +27,10 @@ let points = [  ];
 points.push([ 1, 2 ]);
 points.push([ 3, 4 ]);
 for (const point of points) {
-	console.log(sum(point));
+	console.log(String(sum(point)));
 }
 let numbers = [  ];
 numbers.push(10);
 numbers.push(20);
 numbers.push(30);
-console.log(sum2(numbers));
+console.log(String(sum2(numbers)));

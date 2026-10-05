@@ -85,13 +85,13 @@ async function helper(urls, f) {
 	console.log(map2(urls, (url) => {
 		return url.length;
 	}));
-	console.log(await (run2(async () => {
+	console.log(String(await (run2(async () => {
 		await (sleep(1, [ 1 ]));
 		return 7;
-	})));
-	console.log(run(() => {
+	}))));
+	console.log(String(run(() => {
 		return 1;
-	}));
+	})));
 	console.log(await (helper(urls, async (url) => {
 		await (sleep(1, [ 1 ]));
 		return as_i32(url.length) + 10;

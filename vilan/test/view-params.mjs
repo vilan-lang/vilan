@@ -7,4 +7,4 @@ function bump(c2) {
 let c = [ 10 ];
 increment(c);
 bump(c);
-console.log(c[0]);
+console.log(String(c[0]));

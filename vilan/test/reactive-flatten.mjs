@@ -1004,15 +1004,15 @@ const $aP = comp(($a) => {
 });
 const joined = $aP[0];
 const scope = $aP[1];
-console.log(get3(joined));
+console.log(String(get3(joined)));
 set(first, 2, [ 1 ]);
-console.log(get3(joined));
+console.log(String(get3(joined)));
 set2(outer, second, [ 1 ]);
-console.log(get3(joined));
+console.log(String(get3(joined)));
 set(first, 99, [ 1 ]);
-console.log(get3(joined));
+console.log(String(get3(joined)));
 set(second, 11, [ 1 ]);
-console.log(get3(joined));
+console.log(String(get3(joined)));
 const $bd = comp(($aU) => {
 	return memo2(derive(__clone(joined), (value, $aV, $aW, $aX) => {
 		return value * 2;
@@ -1021,6 +1021,6 @@ const $bd = comp(($aU) => {
 const doubled = $bd[0];
 const stacked = $bd[1];
 set(second, 21, [ 1 ]);
-console.log(get3(doubled));
+console.log(String(get3(doubled)));
 dispose2(stacked);
 dispose2(scope);

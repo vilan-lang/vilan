@@ -12,7 +12,9 @@ fun panic(message: str)                     // abort with a message
 fun assert(condition: bool, message: str)   // panic when false
 ```
 
-`print` lays a value out as node's `console.log` does, under either
+`print` writes a number by the language's own conversion, the one an
+i-string uses, so `print(0.0 * -1.0)` prints `0` on both backends. It lays
+any other value out as node's `console.log` does, under either
 backend: a string at the top level is written bare and quoted inside a
 container, a struct or a tuple prints as the array it is at run time
 (`[ 1, 'two' ]`), a list of more than six entries is grouped into

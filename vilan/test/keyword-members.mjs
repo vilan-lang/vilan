@@ -128,7 +128,7 @@ function in2(self) {
 }
 const event = [ "click", 1, true ];
 console.log(event[0]);
-console.log(event[1] + 1);
+console.log(String(event[1] + 1));
 console.log(to_json(event));
 const $o = from_json("{\"type\":\"key\",\"if\":2,\"match\":false}");
 let $p = null;
@@ -143,7 +143,7 @@ $p;
 const square = ret();
 console.log(type(square));
 console.log(in2(square));
-console.log(for2(square, 2));
+console.log(String(for2(square, 2)));
 const found = [ 0, square ];
 const $q = found;
 let $r = null;

@@ -1091,9 +1091,11 @@ const DEFAULT_SUITE: &[&str] = &[
     // N106: `vilan_rt::js_number`'s four documented departures from Rust's
     // own `{}` — 1e21's exponential switch, the 1e-6 linear floor, and the
     // two infinities — pinned identical on a corpus program rather than left
-    // unrecorded (negative zero is the one departure that is NOT identical;
-    // it is `f64-print-negative-zero.vl`, outside this differential by name).
+    // unrecorded.
     "f64-print-boundary.vl",
+    // N136: negative zero prints `0` on both backends since `print` formats a
+    // number by `String(x)` on JS.
+    "f64-print-negative-zero.vl",
     // N106: `str::len` counts UTF-16 code units to match JavaScript's
     // `.length`; a character outside the BMP is a surrogate pair on JS and
     // `char::len_utf16` counts it the same way natively — verified here
@@ -1127,18 +1129,10 @@ const DEFAULT_SUITE: &[&str] = &[
 /// corpus keeps its JS golden, and
 /// [`an_underflowing_usize_is_outside_the_differential_by_name`] pins the
 /// native half.
-const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[
-    (
-        "usize-underflow.vl",
-        "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
-    ),
-    (
-        "f64-print-negative-zero.vl",
-        "negative zero prints \"-0\" through node's `console.log` (a `util.inspect` \
-         special case) but \"0\" through every JS stringification `vilan_rt::js_number` \
-         implements instead (`String(x)`, a template literal, `JSON.stringify`) — N106",
-    ),
-];
+const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[(
+    "usize-underflow.vl",
+    "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
+)];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
 ///
@@ -1489,50 +1483,22 @@ fn an_underflowing_usize_is_outside_the_differential_by_name() {
     );
 }
 
-/// N106: the other [`OUTSIDE_THE_DIFFERENTIAL`] program — negative zero is
-/// the one `vilan_rt::js_number` departure from `console.log` that is NOT
-/// identical: node's `console.log` special-cases it to `"-0"` (`util.inspect`),
-/// while every JS *stringification* (`String(x)`, a template literal,
-/// `JSON.stringify`) answers `"0"`, which is what `js_number` — and so the
-/// native backend's `print` — implements. Both backends do what the book
-/// says; the sweep leaves the program out so it is not called broken.
+/// N136 (R-g door (a)): negative zero prints `0` on BOTH backends — `print`
+/// formats a number by the language's own conversion (`String(x)` on JS, the
+/// one an i-string and `vilan_rt::js_number` use) where node's `console.log`
+/// wrote `-0`. The program left `OUTSIDE_THE_DIFFERENTIAL` with the fix.
 #[test]
-fn negative_zero_prints_differently_on_each_backend_by_name() {
-    for (program, _) in OUTSIDE_THE_DIFFERENTIAL {
-        assert!(
-            corpus_dir().join(program).is_file(),
-            "{program} is named outside the differential but is not a corpus program"
-        );
-        assert!(
-            !platform_free_programs().contains(&program.to_string()),
-            "{program} is named outside the differential but the sweep still enumerates it"
-        );
-        assert!(
-            !DEFAULT_SUITE.contains(program),
-            "{program} is outside the differential and cannot be in its default suite"
-        );
-    }
+fn negative_zero_prints_zero_on_both_backends() {
     let staged = stage();
-    let javascript = vilan(&staged)
-        .args(["run", "f64-print-negative-zero.vl"])
-        .output()
-        .expect("run the JS backend");
-    assert!(
-        javascript.status.success(),
-        "the JS leg runs clean: {}",
-        String::from_utf8_lossy(&javascript.stderr)
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, "f64-print-negative-zero.vl");
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "0\n0\n0\n", "{backend:?}");
+    }
+    assert_eq!(
+        compare(&staged, "f64-print-negative-zero.vl"),
+        Verdict::Identical
     );
-    assert_eq!(String::from_utf8_lossy(&javascript.stdout), "-0\n");
-    let native = vilan(&staged)
-        .args(["run", "--backend", "rust", "f64-print-negative-zero.vl"])
-        .output()
-        .expect("run the native backend");
-    assert!(
-        native.status.success(),
-        "the native leg runs clean: {}",
-        String::from_utf8_lossy(&native.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&native.stdout), "0\n");
 }
 
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.

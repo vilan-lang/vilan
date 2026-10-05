@@ -26,7 +26,7 @@ update(counter, (n) => {
 update(counter, (n) => {
 	return n * 10;
 });
-console.log(get(counter));
+console.log(String(get(counter)));
 const label = new2("a");
 set(label, "hello");
 console.log(get(label));

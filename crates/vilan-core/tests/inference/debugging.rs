@@ -357,3 +357,33 @@ fn e259_a_generic_instance_is_named_after_its_function() {
     );
     assert_compiles_and_runs(source, "ada\nalan\n1\na\n");
 }
+
+// --- N136: `print` of a number -------------------------------------------
+
+/// N136 (R-g door (a)): a number prints by the language's own conversion —
+/// negative zero is `0`, a float and an integer alike, as on the native
+/// backend — and only numbers are wrapped: a list still prints by node's
+/// layout.
+#[test]
+fn n136_print_writes_negative_zero_as_zero() {
+    let source = concat!(
+        "fun main() {\n",
+        "\tprint(0.0 * -1.0);\n",
+        "\tlet zero = 0;\n",
+        "\tprint(zero * -1);\n",
+        "\tprint(-zero);\n",
+        "\tprint(2.5);\n",
+        "\tprint([1, 2]);\n",
+        "}\n",
+    );
+    let javascript = compile(source).expect("a clean compile");
+    assert!(
+        javascript.contains("console.log(String(0.0 * -(1.0)));"),
+        "{javascript}"
+    );
+    assert!(
+        javascript.contains("console.log([ 1, 2 ]);"),
+        "{javascript}"
+    );
+    assert_compiles_and_runs(source, "0\n0\n0\n2.5\n[ 1, 2 ]\n");
+}

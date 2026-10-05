@@ -96,22 +96,22 @@ function elements_are_independent() {
 		return true;
 	});
 	__at(kept, 0, "element-clones.vl:130:2").push(9);
-	console.log(__at(rows, 0, "element-clones.vl:131:8").length);
+	console.log(String(__at(rows, 0, "element-clones.vl:131:8").length));
 	let flipped = reverse(rows);
 	__at(flipped, 0, "element-clones.vl:133:2").push(9);
-	console.log(__at(rows, 0, "element-clones.vl:134:8").length);
+	console.log(String(__at(rows, 0, "element-clones.vl:134:8").length));
 	let mapped = map(rows, (row) => {
 		return __clone(row);
 	});
 	__at(mapped, 0, "element-clones.vl:136:2").push(9);
-	console.log(__at(rows, 0, "element-clones.vl:137:8").length);
+	console.log(String(__at(rows, 0, "element-clones.vl:137:8").length));
 	let cells = [  ];
 	cells.push([ 5 ]);
 	let sorted = __list_sort_by(__clone(cells), (a, b) => {
 		return compare(a[0], b[0]);
 	});
 	__at(sorted, 0, "element-clones.vl:141:2")[0] = 99;
-	console.log(__at(cells, 0, "element-clones.vl:142:8")[0]);
+	console.log(String(__at(cells, 0, "element-clones.vl:142:8")[0]));
 }
 function filter(self, predicate) {
 	let result = [  ];
@@ -141,47 +141,47 @@ function map(self, fn) {
 let source = [ 1, 2 ];
 let listed = hold_in_list(source);
 __at(listed, 0, "element-clones.vl:148:2").push(9);
-console.log(source.length);
+console.log(String(source.length));
 let tupled = hold_in_tuple(source);
 tupled[0].push(9);
-console.log(source.length);
+console.log(String(source.length));
 let held = hold_in_struct(source);
 held[0].push(9);
-console.log(source.length);
+console.log(String(source.length));
 let wrapped = hold_in_variant(source);
 source.push(9);
 const $a = wrapped;
 let $b = null;
 if ($a[0] === 0) {
 	const inner = $a[1];
-	$b = console.log(inner.length);
+	$b = console.log(String(inner.length));
 } else {
-	$b = console.log(0);
+	$b = console.log(String(0));
 }
 $b;
-console.log(donate().length);
-console.log(keep_scalars(4, 6)[0]);
+console.log(String(donate().length));
+console.log(String(keep_scalars(4, 6)[0]));
 let chosen = first_of(source, [ 7 ]);
 chosen.push(9);
-console.log(source.length);
+console.log(String(source.length));
 let owned = own_through([ 1, 2 ]);
 owned.push(9);
-console.log(owned.length);
+console.log(String(owned.length));
 let viewer = [ [ 1, 2 ] ];
 let lifted = viewed_of(viewer);
 lifted.push(9);
-console.log(viewer[0].length);
+console.log(String(viewer[0].length));
 viewed_projection(viewer)[0].push(9);
-console.log(viewer[0].length);
+console.log(String(viewer[0].length));
 const referenced = reference_of(viewer);
-console.log(referenced.length);
+console.log(String(referenced.length));
 const called = called_of(viewer);
-console.log(called.length);
+console.log(String(called.length));
 let cell = [ 5 ];
-console.log(scalar_of(cell));
+console.log(String(scalar_of(cell)));
 const slot = scalar_projection(cell);
 slot[0][slot[1]] = 7;
-console.log(cell[0]);
+console.log(String(cell[0]));
 let counter = [ 3 ];
-console.log(scalar_forward([ counter, 0 ]));
+console.log(String(scalar_forward([ counter, 0 ])));
 elements_are_independent();

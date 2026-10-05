@@ -5533,6 +5533,8 @@ pub struct Analyzer<'src> {
     dbg_statement_calls: HashSet<Id>,
     // Each `dbg(..)` argument's settled type, for the emitters' printers.
     dbg_argument_types: HashMap<Id, TypeId>,
+    // N136: the `print` arguments typed as a number.
+    number_print_arguments: HashSet<Id>,
     panic_fn_id: Option<Id>,
     // Every call's `(call id, subject id)` pair, banked at WALK time (B204).
     // `function_calls` holds the same pair, but only once the call's own
@@ -7340,6 +7342,7 @@ impl<'src> Analyzer<'src> {
             dbg_calls: IndexMap::default(),
             dbg_statement_calls: HashSet::default(),
             dbg_argument_types: HashMap::default(),
+            number_print_arguments: HashSet::default(),
             call_subjects: Vec::new(),
             call_subject_ids: HashSet::default(),
             divergence_leaves: DivergenceLeaves::default(),
@@ -16236,6 +16239,29 @@ impl<'src> Analyzer<'src> {
             return false;
         };
         self.functions.contains_key(callee_id) || self.external_functions.contains_key(callee_id)
+    }
+
+    /// N136: whether `type_` is a number of the language's own — an integer of
+    /// any width, `f32` or `f64` (`BigInt` prints its `n` and is not one).
+    fn is_a_number_type(&self, type_: &Type) -> bool {
+        let Type::Struct(struct_id, _) = type_ else {
+            return false;
+        };
+        self.structs.get(struct_id).is_some_and(|declaration| {
+            matches!(
+                declaration.name,
+                "i8" | "u8"
+                    | "i16"
+                    | "u16"
+                    | "i32"
+                    | "u32"
+                    | "i53"
+                    | "u53"
+                    | "usize"
+                    | "f32"
+                    | "f64"
+            )
+        })
     }
 
     /// debugging.md S1: a `dbg(..)` call. The intrinsic is the one call that
@@ -50486,6 +50512,14 @@ impl<'src> Analyzer<'src> {
                         if matches!(argument_type, Type::Unresolved) {
                             return Resolution::Deferred;
                         }
+                        // N136: a NUMBER handed to `print` prints by the
+                        // language's own conversion on JS, which needs to
+                        // know it is one.
+                        if Some(function_id) == self.print_fn_id
+                            && self.is_a_number_type(&argument_type)
+                        {
+                            self.number_print_arguments.insert(argument_id);
+                        }
                         // B372: an argument BUILT FROM a closure parameter that
                         // is still awaiting its fill — `wrap(m * 2)` inside
                         // `|m| ..` — types as `Unknown` on this attempt, and
@@ -65680,6 +65714,10 @@ pub struct Program<'src> {
     /// name the enclosing function's generics; an emitter resolves it under
     /// the instance it is emitting.
     pub dbg_argument_types: HashMap<Id, TypeId>,
+    /// N136: the `print` arguments the analysis typed as a number of the
+    /// language's own (every integer width, `f32`, `f64`) — the JS backend
+    /// prints them through `String(x)`.
+    pub number_print_arguments: HashSet<Id>,
     /// `[track_caller]` (debugging.md S0): each tracking function's hidden
     /// trailing `Location` parameter, minted by
     /// [`crate::track_caller::thread_locations`].
@@ -75922,6 +75960,7 @@ fn analyze_over_world<'src>(
             .collect(),
         dbg_statement_calls: analyzer.dbg_statement_calls.clone(),
         dbg_argument_types: analyzer.dbg_argument_types.clone(),
+        number_print_arguments: std::mem::take(&mut analyzer.number_print_arguments),
         track_caller_parameters: HashMap::default(),
         index_location_arguments: HashMap::default(),
         std_sources: std::mem::take(&mut analyzer.std_sources),

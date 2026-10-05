@@ -11,4 +11,4 @@ for (const n of [ 1, 2, 3 ]) {
 	b[0] = b[0] + 1;
 	total = total + b[0];
 }
-console.log(total);
+console.log(String(total));

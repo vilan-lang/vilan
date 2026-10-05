@@ -4,6 +4,6 @@ function sum(self) {
 function shifted(self) {
 	return [ self[0] + 1, self[1] + 1 ];
 }
-console.log(sum([ 3, 4 ]));
-console.log([ 3, 4 ][0]);
-console.log(sum(shifted([ 10, 20 ])));
+console.log(String(sum([ 3, 4 ])));
+console.log(String([ 3, 4 ][0]));
+console.log(String(sum(shifted([ 10, 20 ]))));

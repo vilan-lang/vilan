@@ -40,19 +40,19 @@ xs.push(1);
 xs.push(2);
 xs.push(3);
 xs.push(4);
-console.log(xs.length);
+console.log(String(xs.length));
 console.log(is_empty(xs));
-console.log(fold(map(xs, (n) => {
+console.log(String(fold(map(xs, (n) => {
 	return n * 10;
 }), 0, (a, b) => {
 	return a + b;
-}));
-console.log(filter(xs, (n) => {
+})));
+console.log(String(filter(xs, (n) => {
 	return n > 2;
-}).length);
-console.log(filter(xs, (n) => {
+}).length));
+console.log(String(filter(xs, (n) => {
 	return n > 5;
-}).length);
+}).length));
 for_each(xs, (n) => {
 	return console.log(n);
 });

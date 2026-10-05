@@ -116,14 +116,14 @@ function $e($f) {
 	let file = await (open2(scratch));
 	try {
 		const buffer = new Uint8Array(4);
-		console.log(await (read_at(file, buffer, 3)));
+		console.log(String(await (read_at(file, buffer, 3))));
 		console.log(decode_utf8(buffer.slice(0, 4)));
-		console.log((await (stat(file)))[0]);
+		console.log(String((await (stat(file)))[0]));
 		$a(file);
 		file = null;
 		const $c = await (open2(scratch));
 		try {
-			console.log(await (read_at($c, buffer, 0)));
+			console.log(String(await (read_at($c, buffer, 0))));
 		} finally {
 			$a($c);
 		}
@@ -134,14 +134,14 @@ function $e($f) {
 	}
 	const $d = await (open2(scratch));
 	try {
-		console.log((await (stat($d)))[0]);
+		console.log(String((await (stat($d)))[0]));
 	} finally {
 		$a($d);
 	}
 	const size = await (with_file(scratch, async (f) => {
 		return (await (stat(f)))[0];
 	}));
-	console.log(size);
+	console.log(String(size));
 	await (with_file_create(scratch, async (f) => {
 		await (write_at(f, encode_utf8("0123456789"), 0));
 		return;
@@ -157,7 +157,7 @@ function $e($f) {
 			whole = whole + decode_utf8(chunk);
 		}
 		console.log(whole);
-		console.log(position(reader));
+		console.log(String(position(reader)));
 		$e(reader);
 		reader = null;
 	} finally {

@@ -80,7 +80,7 @@ if ($b[0] === 1) {
 } else {
 	$a = [ 0, $b[1] * 2 ];
 }
-console.log(unwrap_or($a, -(1)));
+console.log(String(unwrap_or($a, -(1))));
 let $e = null;
 const $f = count;
 if ($f[0] === 1) {
@@ -88,7 +88,7 @@ if ($f[0] === 1) {
 } else {
 	$e = [ 0, 2 * $f[1] ];
 }
-console.log(unwrap_or($e, -(1)));
+console.log(String(unwrap_or($e, -(1))));
 let log = [  ];
 let $g = null;
 const $h = fetch2(log, [ 0, 40 ]);
@@ -103,8 +103,8 @@ if ($h[0] === 1) {
 	}
 }
 const both = $g;
-console.log(unwrap_or(both, -(1)));
-console.log(log.length);
+console.log(String(unwrap_or(both, -(1))));
+console.log(String(log.length));
 let log2 = [  ];
 let $j = null;
 const $k = fetch2(log2, [ 1 ]);
@@ -119,8 +119,8 @@ if ($k[0] === 1) {
 	}
 }
 const bad = $j;
-console.log(unwrap_or(bad, -(1)));
-console.log(log2.length);
+console.log(String(unwrap_or(bad, -(1))));
+console.log(String(log2.length));
 let $m = null;
 const $o = parse("good");
 if ($o[0] === 1) {
@@ -138,7 +138,7 @@ const $q = sum;
 let $r = null;
 if ($q[0] === 0) {
 	const n = $q[1];
-	$r = console.log(n);
+	$r = console.log(String(n));
 } else {
 	const e = $q[1];
 	$r = console.log(e);
@@ -160,7 +160,7 @@ const $v = $s;
 let $w = null;
 if ($v[0] === 0) {
 	const n2 = $v[1];
-	$w = console.log(n2);
+	$w = console.log(String(n2));
 } else {
 	const e2 = $v[1];
 	$w = console.log(e2);
@@ -175,9 +175,9 @@ if ($y[0] === 1) {
 	$x = __at($y[1], 0, "expression-lift.vl:77:27");
 }
 const first = $x;
-console.log(unwrap_or(first, -(1)));
-console.log(unwrap_or(total([ 0, 4 ], [ 0, 2 ]), -(1)));
-console.log(unwrap_or(total([ 0, 4 ], [ 1 ]), -(1)));
+console.log(String(unwrap_or(first, -(1))));
+console.log(String(unwrap_or(total([ 0, 4 ], [ 0, 2 ]), -(1))));
+console.log(String(unwrap_or(total([ 0, 4 ], [ 1 ]), -(1))));
 const size = [ 0, 4 ];
 let $D = null;
 const $E = size;
@@ -191,7 +191,7 @@ if ($E[0] === 1) {
 		$D = [ 0, $E[1] * $F[1] ];
 	}
 }
-console.log(unwrap_or($D, -(1)));
+console.log(String(unwrap_or($D, -(1))));
 const boxed = [ 20, "a" ];
 const doubled = map(boxed, ($G) => {
 	return $G * 2;

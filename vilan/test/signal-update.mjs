@@ -394,20 +394,20 @@ update(todos, (list) => {
 	list.push(5);
 	return;
 }, [ 1 ]);
-console.log(get(todos).length);
+console.log(String(get(todos).length));
 const scores = new10(new2());
 update2(scores, (entries) => {
 	insert(entries, "a", 1);
 	insert(entries, "b", 2);
 	return;
 }, [ 1 ]);
-console.log(len(get(scores)));
+console.log(String(len(get(scores))));
 const count = new10(1);
 update3(count, (value) => {
 	value[0][value[1]] = value[0][value[1]] + 10;
 	return;
 }, [ 1 ]);
-console.log(get(count));
+console.log(String(get(count)));
 const watched = new6([ 0 ]);
 take(owner, sub(__clone(watched), (list, $q) => {
 	return console.log("len " + list.length);
@@ -441,4 +441,4 @@ update(todos, (list) => {
 set_with(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
-console.log(get(count));
+console.log(String(get(count)));

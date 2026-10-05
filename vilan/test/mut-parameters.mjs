@@ -49,17 +49,17 @@ function with_x(self, value) {
 	self[0] = value;
 	return __clone(self);
 }
-console.log(bump(1));
+console.log(String(bump(1)));
 let list = [ 1, 2 ];
-console.log(grow(list));
-console.log(list.length);
-console.log(poke(1));
+console.log(String(grow(list)));
+console.log(String(list.length));
+console.log(String(poke(1)));
 const original = [ 0 ];
 const moved = with_x(original, 9);
-console.log(moved[0]);
-console.log(original[0]);
+console.log(String(moved[0]));
+console.log(String(original[0]));
 const shrink = (v) => {
 	v = v - 1;
 	return v;
 };
-console.log(shrink(3));
+console.log(String(shrink(3)));

@@ -88,19 +88,19 @@ async function fetch_maker($g) {
 	};
 }
 (async () => {
-	console.log((await (fetch_row([ 1 ])))[0]);
-	console.log((await (fetch_list([ 1 ]))).length);
-	console.log((await (fetch_maker([ 1 ])))());
-	console.log((await (fetch_row([ 1 ])))[1].length);
+	console.log(String((await (fetch_row([ 1 ])))[0]));
+	console.log(String((await (fetch_list([ 1 ]))).length));
+	console.log(String((await (fetch_maker([ 1 ])))()));
+	console.log(String((await (fetch_row([ 1 ])))[1].length));
 	const pending = __task(async () => {
 		return await (fetch_row([ 1 ]));
 	}, "main");
-	console.log((await (pending))[0]);
-	console.log(__at(await (fetch_list([ 1 ])), 0, "await-postfix.vl:67:8"));
-	console.log(doubled([ 21 ]));
-	console.log(await (fetch_num([ 1 ])) + 1);
+	console.log(String((await (pending))[0]));
+	console.log(String(__at(await (fetch_list([ 1 ])), 0, "await-postfix.vl:67:8")));
+	console.log(String(doubled([ 21 ])));
+	console.log(String(await (fetch_num([ 1 ])) + 1));
 	const row = await (fetch_row([ 1 ]));
-	console.log(row[0]);
+	console.log(String(row[0]));
 })().catch(($i) => {
 	console.error(String($i));
 	process.exit(1);

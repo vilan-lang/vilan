@@ -1010,8 +1010,8 @@ for (const slot of slots) {
 	console.log("" + slot[0][1].name(slot[0][0]) + " " + slot[0][1].area(slot[0][0]) + " " + doubled_area(slot[0]));
 }
 const shapes = [ [ [ 4, 4 ], $b ], [ [ 2 ], $a ] ];
-console.log(total(shapes));
-console.log(largest(shapes));
+console.log(String(total(shapes)));
+console.log(String(largest(shapes)));
 console.log(__at(slots, 0, "dyn-objects.vl:111:8"));
 const root = new3(1);
 const sources = [ __clone([ root, $c ]), [ [ __clone([ root, $c ]), 100 ], $aM ] ];
@@ -1022,6 +1022,6 @@ const watch = (($aT) => {
 })(__clone(__at(sources, 1, "dyn-objects.vl:115:14")));
 set(root, 5, [ 1 ]);
 for (const source of sources) {
-	console.log(source[1].get(source[0]));
+	console.log(String(source[1].get(source[0])));
 }
 dispose(watch, [ 1 ]);

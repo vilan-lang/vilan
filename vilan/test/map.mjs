@@ -110,18 +110,18 @@ let scores = new2();
 insert(scores, "alice", 1);
 insert(scores, "bob", 2);
 insert(scores, "carol", 3);
-console.log(len(scores));
+console.log(String(len(scores)));
 console.log(contains_key(scores, "bob"));
 console.log(contains_key(scores, "dave"));
-console.log(unwrap_or(get(scores, "bob"), 0));
-console.log(unwrap_or(get(scores, "dave"), -(1)));
+console.log(String(unwrap_or(get(scores, "bob"), 0)));
+console.log(String(unwrap_or(get(scores, "dave"), -(1))));
 console.log(is_some(get(scores, "alice")));
 insert(scores, "bob", 22);
-console.log(unwrap_or(get(scores, "bob"), 0));
-console.log(len(scores));
+console.log(String(unwrap_or(get(scores, "bob"), 0)));
+console.log(String(len(scores)));
 remove(scores, "bob");
 console.log(contains_key(scores, "bob"));
-console.log(len(scores));
+console.log(String(len(scores)));
 console.log(is_empty(scores));
 let copy = __clone(scores);
 insert(copy, "dave", 4);
@@ -140,13 +140,13 @@ let key_count = 0;
 for (const key of keys(letters)) {
 	key_count = key_count + 1;
 }
-console.log(key_count);
+console.log(String(key_count));
 let sum = 0;
 for (const value of values(letters)) {
 	sum = sum + value;
 }
-console.log(sum);
-console.log(keys(letters).length);
+console.log(String(sum));
+console.log(String(keys(letters).length));
 let entry_order = "";
 let entry_total = 0;
 for (const entry of entries(letters)) {
@@ -154,11 +154,11 @@ for (const entry of entries(letters)) {
 	entry_total = entry_total + entry[1];
 }
 console.log(entry_order);
-console.log(entry_total);
-console.log(entries(letters).length);
+console.log(String(entry_total));
+console.log(String(entries(letters).length));
 console.log(contains_value(letters, 20));
 console.log(contains_value(letters, 99));
 let empty = new2();
 console.log(is_empty(empty));
-console.log(entries(empty).length);
+console.log(String(entries(empty).length));
 console.log(contains_value(empty, 0));

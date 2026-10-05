@@ -5254,6 +5254,33 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// N136 (R-g door (a)): `print` of a NUMBER formats it by the language's
+    /// own conversion, `String(x)` — the one an i-string and the native
+    /// backend use — so negative zero prints `0`, where `console.log`'s
+    /// inspect wrote `-0`. Every other `print` is untouched.
+    fn number_print_arguments(
+        &self,
+        target_id: Id,
+        argument_ids: &[Id],
+        args: Vec<js::Node<'src>>,
+    ) -> Vec<js::Node<'src>> {
+        if target_id != self.print_fn_id
+            || !argument_ids
+                .first()
+                .is_some_and(|argument| self.program.number_print_arguments.contains(argument))
+        {
+            return args;
+        }
+        args.into_iter()
+            .map(|argument| {
+                js::Node::Call(
+                    Box::new(js::Node::Local("String".to_string())),
+                    vec![argument],
+                )
+            })
+            .collect()
+    }
+
     /// The location a checked subscript's bounds panic reports (debugging.md
     /// S0): its own site, or — inside a `[track_caller]` function's own body —
     /// the caller's, through the hidden parameter.
@@ -5947,6 +5974,11 @@ impl<'src> Transformer<'src> {
                         {
                             let args =
                                 self.host_arguments(target_id, &function_call.argument_ids, args);
+                            let args = self.number_print_arguments(
+                                target_id,
+                                &function_call.argument_ids,
+                                args,
+                            );
                             let call = self.emit_extern(target_id, binding, args);
                             return Some(self.maybe_await(target_id, call));
                         }

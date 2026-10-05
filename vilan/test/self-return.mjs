@@ -5,4 +5,4 @@ function combine_twice(self) {
 	return combine(combine(self, self), self);
 }
 const c = [ 5 ];
-console.log(combine_twice(c)[0]);
+console.log(String(combine_twice(c)[0]));

@@ -15,6 +15,6 @@ function classify(p2) {
 const x = 2;
 const y = 5;
 const p = [ x, y ];
-console.log(classify(p));
-console.log(classify([ 0, 9 ]));
-console.log(classify([ 1, 4 ]));
+console.log(String(classify(p)));
+console.log(String(classify([ 0, 9 ])));
+console.log(String(classify([ 1, 4 ])));

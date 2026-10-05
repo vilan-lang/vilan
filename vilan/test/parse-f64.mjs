@@ -24,9 +24,9 @@ function is_some(self) {
 	const $c = self;
 	return $c[0] === 0;
 }
-console.log(unwrap_or(__parse_f64("3.14"), 0));
-console.log(unwrap_or(__parse_f64("42"), 0));
-console.log(unwrap_or(__parse_f64("-2.5"), 0));
-console.log(unwrap_or(__parse_f64("nope"), -(1)));
+console.log(String(unwrap_or(__parse_f64("3.14"), 0)));
+console.log(String(unwrap_or(__parse_f64("42"), 0)));
+console.log(String(unwrap_or(__parse_f64("-2.5"), 0)));
+console.log(String(unwrap_or(__parse_f64("nope"), -(1))));
 console.log(is_some(__parse_f64("3.14")));
 console.log(is_some(__parse_f64("abc")));

@@ -40,7 +40,7 @@ if ($c[0] === 0) {
 	$d = undefined;
 }
 $d;
-console.log(cell[0]);
+console.log(String(cell[0]));
 let n = [ 1 ];
 const $e = [ 0, [ n, 0 ] ];
 let $f = null;
@@ -52,7 +52,7 @@ if ($e[0] === 0) {
 	$f = undefined;
 }
 $f;
-console.log(n[0]);
+console.log(String(n[0]));
 const live = false;
 let $g = null;
 if (live) {
@@ -70,14 +70,14 @@ if ($h[0] === 0) {
 	$i = undefined;
 }
 $i;
-console.log(n[0]);
+console.log(String(n[0]));
 let flag = [ true ];
 const toggle = [ flag, 0 ];
 toggle[0][toggle[1]] = !(toggle[0][toggle[1]]);
 console.log(flag[0]);
 let count = [ 1 ];
 set([ count, 0 ], 42);
-console.log(count[0]);
+console.log(String(count[0]));
 let ready = [ false ];
 set([ ready, 0 ], true);
 console.log(ready[0]);

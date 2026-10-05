@@ -186,31 +186,31 @@ function transpose(self) {
 }
 const ok2 = [ 0, 10 ];
 const err2 = [ 1, "boom" ];
-console.log(unwrap_or(map(ok2, (n) => {
+console.log(String(unwrap_or(map(ok2, (n) => {
 	return n + 1;
-}), 0));
-console.log(unwrap_or(map_err(err2, (e) => {
+}), 0)));
+console.log(String(unwrap_or(map_err(err2, (e) => {
 	return e;
-}), 0));
+}), 0)));
 console.log(is_ok_and(ok2, (n) => {
 	return n > 5;
 }));
 console.log(is_err_and(err2, (e) => {
 	return true;
 }));
-console.log(unwrap_or(and_then(ok2, (n) => {
+console.log(String(unwrap_or(and_then(ok2, (n) => {
 	return [ 0, n * 2 ];
-}), 0));
-console.log(unwrap_or(or_else(err2, (e) => {
+}), 0)));
+console.log(String(unwrap_or(or_else(err2, (e) => {
 	return [ 0, 7 ];
-}), 0));
-console.log(unwrap_or_else(err2, (e) => {
+}), 0)));
+console.log(String(unwrap_or_else(err2, (e) => {
 	return 99;
-}));
+})));
 console.log(is_some(ok(ok2)));
 console.log(unwrap_or2(err(err2), "none"));
-console.log(unwrap_or_default(err2));
-console.log(unwrap_or(and(ok2, [ 0, 5 ]), 0));
-console.log(unwrap_or(or(err2, [ 0, 3 ]), 0));
+console.log(String(unwrap_or_default(err2)));
+console.log(String(unwrap_or(and(ok2, [ 0, 5 ]), 0)));
+console.log(String(unwrap_or(or(err2, [ 0, 3 ]), 0)));
 const ro = [ 0, [ 0, 42 ] ];
 console.log(is_some(transpose(ro)));

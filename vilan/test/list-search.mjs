@@ -92,25 +92,25 @@ function index_of2(self, value) {
 	return [ 1 ];
 }
 const xs = [ 10, 20, 30, 20 ];
-console.log(unwrap_or(find(xs, (n) => {
+console.log(String(unwrap_or(find(xs, (n) => {
 	return n > 15;
 }), __lazy("fallback", () => {
 	return 0;
-})));
+}))));
 console.log(is_none(find(xs, (n) => {
 	return n > 90;
 })));
 console.log(contains(xs, 20));
 console.log(contains(xs, 25));
-console.log(unwrap_or(index_of(xs, 20), __lazy("fallback", () => {
+console.log(String(unwrap_or(index_of(xs, 20), __lazy("fallback", () => {
 	return max_value();
-})));
+}))));
 console.log(is_none(index_of(xs, 99)));
 const words = [ "alpha", "beta" ];
 console.log(contains2(words, "beta"));
-console.log(unwrap_or(index_of2(words, "alpha"), __lazy("fallback", () => {
+console.log(String(unwrap_or(index_of2(words, "alpha"), __lazy("fallback", () => {
 	return max_value();
-})));
+}))));
 let empty = [  ];
 console.log(is_none(find(empty, (n) => {
 	return n > 0;

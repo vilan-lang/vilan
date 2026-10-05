@@ -68,14 +68,14 @@ function sort2(self) {
 	});
 }
 const xs = [ 3, 1, 2 ];
-console.log(__at(reverse(xs), 0, "list-sort.vl:11:8"));
-console.log(__at(reverse(xs), 2, "list-sort.vl:12:8"));
-console.log(__at(sort(xs), 0, "list-sort.vl:13:8"));
-console.log(__at(sort(xs), 2, "list-sort.vl:14:8"));
-console.log(__at(xs, 0, "list-sort.vl:15:8"));
+console.log(String(__at(reverse(xs), 0, "list-sort.vl:11:8")));
+console.log(String(__at(reverse(xs), 2, "list-sort.vl:12:8")));
+console.log(String(__at(sort(xs), 0, "list-sort.vl:13:8")));
+console.log(String(__at(sort(xs), 2, "list-sort.vl:14:8")));
+console.log(String(__at(xs, 0, "list-sort.vl:15:8")));
 const numeric = sort([ 10, 2, 1 ]);
-console.log(__at(numeric, 0, "list-sort.vl:20:8"));
-console.log(__at(numeric, 2, "list-sort.vl:21:8"));
+console.log(String(__at(numeric, 0, "list-sort.vl:20:8")));
+console.log(String(__at(numeric, 2, "list-sort.vl:21:8")));
 const words = sort2([ "pear", "apple", "fig" ]);
 console.log(__at(words, 0, "list-sort.vl:24:8"));
 const descending = __list_sort_by(xs, (a, b) => {
@@ -93,7 +93,7 @@ const descending = __list_sort_by(xs, (a, b) => {
 	}
 	return $e;
 });
-console.log(__at(descending, 0, "list-sort.vl:37:8"));
+console.log(String(__at(descending, 0, "list-sort.vl:37:8")));
 let entries = [  ];
 entries.push([ 1, "a" ]);
 entries.push([ 0, "b" ]);

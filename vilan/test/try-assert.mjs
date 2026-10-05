@@ -111,17 +111,17 @@ function unwrap_or(self, fallback) {
 	}
 	return $d;
 }
-console.log(unwrap_or(doubled("hit"), __lazy("fallback", () => {
+console.log(String(unwrap_or(doubled("hit"), __lazy("fallback", () => {
 	return 0 - 1;
-})));
-console.log(unwrap_or(doubled("miss"), __lazy("fallback", () => {
+}))));
+console.log(String(unwrap_or(doubled("miss"), __lazy("fallback", () => {
 	return 0 - 1;
-})));
+}))));
 const $i = sum("40", "2");
 let $j = null;
 if ($i[0] === 0) {
 	const v = $i[1];
-	$j = console.log(v);
+	$j = console.log(String(v));
 } else {
 	const e = $i[1];
 	$j = console.log(e);
@@ -131,7 +131,7 @@ const $k = sum("40", "two");
 let $l = null;
 if ($k[0] === 0) {
 	const v2 = $k[1];
-	$l = console.log(v2);
+	$l = console.log(String(v2));
 } else {
 	const e2 = $k[1];
 	$l = console.log(e2);
@@ -141,7 +141,7 @@ const $q = pass([ 0, 6 ]);
 let $r = null;
 if ($q[0] === 0) {
 	const lane = $q[1];
-	$r = console.log(lane);
+	$r = console.log(String(lane));
 } else {
 	const why = $q[1];
 	$r = console.log(why);
@@ -151,7 +151,7 @@ const $s = pass([ 1, "closed" ]);
 let $t = null;
 if ($s[0] === 0) {
 	const lane2 = $s[1];
-	$t = console.log(lane2);
+	$t = console.log(String(lane2));
 } else {
 	const why2 = $s[1];
 	$t = console.log(why2);

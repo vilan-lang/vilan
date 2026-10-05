@@ -6,7 +6,7 @@ function is_empty(self) {
 	return self.length === 0;
 }
 const s = "Hello, World";
-console.log(s.length);
+console.log(String(s.length));
 console.log(s.includes("World"));
 console.log(s.startsWith("Hello"));
 console.log(s.endsWith("!"));

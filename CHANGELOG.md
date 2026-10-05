@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**`print` writes a number by the language's own conversion on both backends, so negative zero prints `0` (N136, R-g door (a)).** `print(0.0 * -1.0)` printed `-0` on the JS backend (node's `console.log` special-cases it) and `0` natively; a number now goes through `String(x)`, the conversion an i-string and the native backend already use, and both print `0`. Integers counted too (`print(zero * -1)` was `-0` on JS). Nothing else `print` shows moved. `f64-print-negative-zero.vl` left the differential's exclusions and joined its default suite; corpus goldens gained the `String(..)` wrap on numeric prints.
+
+---
+
 <!-- family: tooling -->
 **A generic function's emitted instance is named after the function in the readable (debug) build (E259).** `fun first<T>` emits `function first(items)`, and a second instance whose body differs `first2`, where every instance used to be `$a`, which is what a stack trace and a debugger showed; std's generic methods read the same way (`unwrap`, `is_some`, not `$f`). Release builds keep their short names. Corpus goldens moved by name only.
 
