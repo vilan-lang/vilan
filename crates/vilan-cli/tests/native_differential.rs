@@ -10426,3 +10426,23 @@ fn s1_dbg_writes_the_same_bytes_on_both_backends() {
     assert_eq!(javascript.stdout, expected_stdout);
     assert_eq!(native.stdout, expected_stdout);
 }
+
+/// debugging.md S1b: std's handles print as themselves, the same bytes on
+/// both backends (`native/dbg_handles.stderr`): a `HashMap` and a `HashSet`
+/// by their members in insertion order, a `Shared` and a `SignalCell` by their
+/// value (the cell read without tracking), a pipe by its type alone (sampling
+/// it would run it), and a `Shared` cycle cut at `<cycle>`.
+#[test]
+fn s1b_std_handles_print_as_themselves_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_dbg_handles.vl";
+    std::fs::write(staged.join(file), include_str!("native/dbg_handles.vl"))
+        .expect("write the probe program");
+    let expected = include_str!("native/dbg_handles.stderr");
+    let javascript = run_on(&staged, None, file);
+    let native = run_on(&staged, Some("rust"), file);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(javascript.stderr, expected, "the JS leg's dbg lines");
+    assert_eq!(native.stderr, expected, "the native leg's dbg lines");
+}

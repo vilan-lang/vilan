@@ -39,7 +39,10 @@ fun main() {
 - **The format is vilan's.** A struct prints its fields, an enum variant its
   qualified name (`Some`, `None`, `Ok` and `Err` bare), a float keeps its `.0`,
   a string is quoted and escaped, a closure prints its type
-  (`<closure |i32| -> i32>`). A value that fits in 80 columns stays on one line;
+  (`<closure |i32| -> i32>`). std's handles print as themselves: `HashMap {
+  "ada" => 36 }`, `HashSet { 1, 2 }`, `Shared(..)`, `SignalCell(3)` (read
+  without subscribing), a pipe by its type (sampling it would run it), and a
+  cycle through a `Shared` as `<cycle>`. A value that fits in 80 columns stays on one line;
   a longer one breaks one entry per line, two spaces deeper, with a trailing
   comma. A list shows its first 100 entries and then `… N more`.
 - **Generic code prints the real type.** In `fun show<T>(value: T)`, `dbg(value)`

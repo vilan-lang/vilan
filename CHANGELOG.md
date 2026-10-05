@@ -221,6 +221,11 @@ written down.
 ---
 
 <!-- family: feature -->
+**`dbg` prints std's handles as themselves (debugging.md S1b).** `HashMap { "ada" => 36, "alan" => 41 }` and `HashSet { "a", "b" }` by their members in insertion order (not the hashed table inside), `Shared(Point { x = 7, y = 8 })`, `SignalCell(3)` by its current value read without tracking, a pipe by its type alone (`<pipe Derive<SignalCell<i32>, i32, i32>>`, since sampling it would run it), and a cycle through a `Shared` cut at `<cycle>`. Both backends print the same bytes. A trait object still prints as `<dyn Area>`.
+
+---
+
+<!-- family: feature -->
 **`dbg(..)`: print any values with the expression and the line that produced them, in vilan's own syntax, the same bytes on both backends (debugging.md S1, E257).** `dbg(point, rows.len())` writes `[src/main.vl:12:5] point = Point { x = 1, y = 2 }` and `[src/main.vl:12:5] rows.len() = 3` to stderr (`console.log` in the browser), where `print` shows a struct as the array it is at run time. It takes any number of arguments of any types and answers its argument (a tuple of them for several, `()` for none), so `let total = dbg(price * qty) + tax;` wraps an expression in place. Written as a statement it reads its arguments in place, so `dbg(guard);` moves nothing; in expression position the value moves through, and a list or struct comes back as a copy. The compiler generates a printer per type a `dbg` reaches: structs by their fields, enum variants qualified (the prelude's four bare), tuples, lists, quoted strings, floats that keep their `.0`, closures by their type; a value past 80 columns breaks one entry per line with trailing commas, and a list stops after 100 entries. In a generic function each instantiation prints its own type. A `release` build refuses a `dbg` (at the call) unless `vilan.toml` sets `[build] dbg = "strip"` (the call is its argument) or `"keep"`. `dbg` is in the prelude; a program's own `dbg` still wins.
 
 ---

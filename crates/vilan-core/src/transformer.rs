@@ -1926,6 +1926,38 @@ fn helper_source(name: &str) -> &'static str {
              \tif (items.length > shown) entries.push([ \"\", \"\u{2026} \" + (items.length - shown) + \" more\" ]);\n\
              \treturn __dbg_group(\"[\", \"]\", false, entries);\n\
              }\n\
+             const __dbg_seen = [];\n\
+             function __dbg_shared(cell, show) {\n\
+             \tif (__dbg_seen.includes(cell)) return \"<cycle>\";\n\
+             \t__dbg_seen.push(cell);\n\
+             \ttry {\n\
+             \t\treturn __dbg_group(\"Shared(\", \")\", false, [ [ \"\", show(cell.v) ] ]);\n\
+             \t} finally {\n\
+             \t\t__dbg_seen.pop();\n\
+             \t}\n\
+             }\n\
+             function __dbg_members(open, items, show) {\n\
+             \tconst entries = [];\n\
+             \tfor (const item of items) {\n\
+             \t\tif (entries.length === 100) {\n\
+             \t\t\tentries.push([ \"\", \"\u{2026} \" + (items.length - 100) + \" more\" ]);\n\
+             \t\t\tbreak;\n\
+             \t\t}\n\
+             \t\tentries.push(show(item));\n\
+             \t}\n\
+             \treturn __dbg_group(open, \"}\", true, entries);\n\
+             }\n\
+             function __dbg_map(open, table, showKey, showValue, keyWidth, valueWidth) {\n\
+             \tconst items = Array.from(table.values());\n\
+             \treturn __dbg_members(open, items, (pair) => {\n\
+             \t\tconst key = keyWidth === 1 ? pair[0] : pair.slice(0, keyWidth);\n\
+             \t\tconst value = valueWidth === 1 ? pair[keyWidth] : pair.slice(keyWidth, keyWidth + valueWidth);\n\
+             \t\treturn [ __dbg_flat(showKey(key)) + \" => \", showValue(value) ];\n\
+             \t});\n\
+             }\n\
+             function __dbg_set(open, table, show) {\n\
+             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ]);\n\
+             }\n\
              function __dbg_str(text) {\n\
              \tlet out = \"\\\"\";\n\
              \tfor (const character of text) {\n\
@@ -14089,6 +14121,11 @@ const RESERVED_NAMES: &[&str] = &[
     "__dbg_width",
     "__dbg_flat",
     "__dbg_layout",
+    "__dbg_seen",
+    "__dbg_shared",
+    "__dbg_members",
+    "__dbg_map",
+    "__dbg_set",
     "__scan",
     "__parse_i32",
     "__parse_f64",

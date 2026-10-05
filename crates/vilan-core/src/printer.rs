@@ -59,9 +59,34 @@ pub enum Shape {
     Tuple(Vec<TypeId>),
     /// `List<T>` and `[T; n]`.
     List(TypeId),
-    /// A value that prints as fixed text: a closure by its type, an opaque
-    /// host handle by its name, a generic the build never grounded.
+    /// A value that prints as fixed text: a closure by its type, a pipe by
+    /// its type (sampling one would run it), an opaque host handle by its
+    /// name, a generic the build never grounded.
     Text(String),
+    /// S1b: `Shared<T>` — `Shared(<value>)`, and `<cycle>` for a cell the
+    /// print is already inside (only a `Shared` can close a cycle).
+    Shared(TypeId),
+    /// S1b: std's `SignalCell<T>` — `SignalCell(<value>)`, its current value
+    /// read through the field at `field` (a `Shared<T>`) WITHOUT tracking.
+    Cell {
+        label: String,
+        field: (usize, String),
+        value: TypeId,
+    },
+    /// S1b: std's `HashMap<K, V>` — `HashMap { k => v, .. }`, its entries
+    /// the `(K, V)` pairs of the table at `field`, in insertion order.
+    Map {
+        label: String,
+        field: (usize, String),
+        key: TypeId,
+        value: TypeId,
+    },
+    /// S1b: std's `HashSet<T>` — `HashSet { a, b }`.
+    Set {
+        label: String,
+        field: (usize, String),
+        element: TypeId,
+    },
 }
 
 /// The numeric scalars, by the name std declares them under.
@@ -90,6 +115,9 @@ pub fn shape_of(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> 
             "<closure {}>",
             closure_text(program, type_id, resolve)
         )),
+        Type::Struct(struct_id, _) if is_a_pipe(program, *struct_id) => {
+            Shape::Text(format!("<pipe {}>", type_text(program, type_id, resolve)))
+        }
         Type::Struct(struct_id, arguments) => struct_shape(program, *struct_id, arguments),
         Type::Enum(enum_id, arguments) => enum_shape(program, *enum_id, arguments),
         Type::Dyn(trait_id, _) => Shape::Text(format!(
@@ -110,6 +138,11 @@ fn struct_shape(program: &Program, struct_id: Id, arguments: &[TypeId]) -> Shape
         return Shape::Text("<struct>".to_string());
     };
     if declaration.external {
+        if declaration.name == "Shared"
+            && let Some(inner) = arguments.first()
+        {
+            return Shape::Shared(*inner);
+        }
         return match declaration.name {
             name if is_integer_name(name) => Shape::Integer,
             "f32" | "f64" => Shape::Float,
@@ -121,6 +154,9 @@ fn struct_shape(program: &Program, struct_id: Id, arguments: &[TypeId]) -> Shape
             },
             name => Shape::Text(format!("<{name}>")),
         };
+    }
+    if let Some(shape) = std_handle_shape(program, struct_id, arguments) {
+        return shape;
     }
     let bindings = declaration
         .generic_parameter_constraint_ids
@@ -137,6 +173,75 @@ fn struct_shape(program: &Program, struct_id: Id, arguments: &[TypeId]) -> Shape
             .collect(),
         bindings,
     }
+}
+
+/// S1b: std's handles print as themselves (§2.2) rather than as their
+/// internals: a cell by its value, a map and a set by their members, a pipe
+/// by its type. Recognized by the declaration's NAME and its residence in std,
+/// so a program's own `HashMap` is an ordinary struct.
+fn std_handle_shape(program: &Program, struct_id: Id, arguments: &[TypeId]) -> Option<Shape> {
+    let declaration = program.structs.get(&struct_id)?;
+    let in_std = program
+        .source_of(struct_id)
+        .is_some_and(|source| program.std_sources.contains(&source));
+    if !in_std {
+        return None;
+    }
+    let field = |name: &str| {
+        declaration
+            .fields
+            .iter()
+            .position(|field| field.name == name)
+            .map(|index| (index, name.to_string()))
+    };
+    match declaration.name {
+        "SignalCell" => Some(Shape::Cell {
+            label: "SignalCell".to_string(),
+            field: field("value")?,
+            value: *arguments.first()?,
+        }),
+        "HashMap" => Some(Shape::Map {
+            label: "HashMap".to_string(),
+            field: field("table")?,
+            key: *arguments.first()?,
+            value: *arguments.get(1)?,
+        }),
+        "HashSet" => Some(Shape::Set {
+            label: "HashSet".to_string(),
+            field: field("table")?,
+            element: *arguments.first()?,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether std's `Pipe`/`CollPipe` is implemented for the struct — a pipe
+/// prints by its type alone, because sampling it would run its bodies.
+fn is_a_pipe(program: &Program, struct_id: Id) -> bool {
+    let pipe_traits: Vec<Id> = program
+        .traits
+        .values()
+        .filter(|declared| matches!(declared.name, "Pipe" | "CollPipe"))
+        .filter(|declared| {
+            program
+                .source_of(declared.id)
+                .is_some_and(|source| program.std_sources.contains(&source))
+        })
+        .map(|declared| declared.id)
+        .collect();
+    if pipe_traits.is_empty() {
+        return false;
+    }
+    program.implementations.iter().any(|implementation| {
+        implementation
+            .trait_ids
+            .iter()
+            .any(|trait_id| pipe_traits.contains(trait_id))
+            && matches!(
+                program.type_id_to_type_map.get(&implementation.subject),
+                Some(Type::Struct(subject, _)) if *subject == struct_id
+            )
+    })
 }
 
 fn enum_shape(program: &Program, enum_id: Id, arguments: &[TypeId]) -> Shape {

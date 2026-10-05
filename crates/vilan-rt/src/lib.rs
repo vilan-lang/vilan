@@ -611,6 +611,12 @@ impl<T> Clone for Shared<T> {
 }
 
 impl<T> Shared<T> {
+    /// The cell's identity: the same for every handle to one cell — what
+    /// `show::shared` cuts a cycle by (debugging.md S1b).
+    pub fn address(&self) -> usize {
+        Rc::as_ptr(&self.inner) as *const () as usize
+    }
+
     pub fn new(value: T) -> Self {
         Shared {
             inner: {

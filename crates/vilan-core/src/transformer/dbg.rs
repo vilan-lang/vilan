@@ -270,6 +270,74 @@ impl<'src> Transformer<'src> {
                     ],
                 )
             }
+            Shape::Shared(inner) => {
+                let printer = self.printer_for(inner);
+                call(
+                    "__dbg_shared",
+                    vec![
+                        js::Node::Local("value".to_string()),
+                        js::Node::Local(printer),
+                    ],
+                )
+            }
+            Shape::Cell {
+                label,
+                field: (index, _),
+                value: inner,
+            } => {
+                // The cell's `Shared` holds the value as `.v`; reading it is
+                // the plain read — nothing subscribes.
+                let printer = self.printer_for(inner);
+                group(
+                    &format!("{label}("),
+                    ")",
+                    false,
+                    vec![(
+                        String::new(),
+                        call(
+                            &printer,
+                            vec![js::Node::Property(Box::new(slot(index)), "v".to_string())],
+                        ),
+                    )],
+                )
+            }
+            Shape::Map {
+                label,
+                field: (index, _),
+                key,
+                value: entry_value,
+            } => {
+                let key_width = self.flat_width(key);
+                let value_width = self.flat_width(entry_value);
+                let key_printer = self.printer_for(key);
+                let value_printer = self.printer_for(entry_value);
+                call(
+                    "__dbg_map",
+                    vec![
+                        text(format!("{label} {{")),
+                        slot(index),
+                        js::Node::Local(key_printer),
+                        js::Node::Local(value_printer),
+                        js::Node::Number(key_width.to_string(), None),
+                        js::Node::Number(value_width.to_string(), None),
+                    ],
+                )
+            }
+            Shape::Set {
+                label,
+                field: (index, _),
+                element,
+            } => {
+                let printer = self.printer_for(element);
+                call(
+                    "__dbg_set",
+                    vec![
+                        text(format!("{label} {{")),
+                        slot(index),
+                        js::Node::Local(printer),
+                    ],
+                )
+            }
             Shape::Enum { variants, bindings } => {
                 let saved = self.current_substitution.clone();
                 self.current_substitution.extend(bindings);

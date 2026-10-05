@@ -25,6 +25,11 @@ generates for each type a `dbg` reaches, the same on both backends:
 | a string | `"a \"quoted\" line\n"` |
 | a float, an integer | `3.0`, `0.25`, `1e+21`; `7`, `-3` |
 | a closure | `<closure |i32, i32| -> i32>` |
+| a `HashMap`, a `HashSet` | `HashMap { "ada" => 36 }`, `HashSet { "a", "b" }`, in insertion order |
+| a `Shared`, a `SignalCell` | `Shared(Point { x = 7, y = 8 })`, `SignalCell(3)` (read without tracking) |
+| a pipe | `<pipe Derive<SignalCell<i32>, i32, i32>>`: sampling one would run it |
+| a cycle | `Shared(Link { next = Some(<cycle>) })`: a cell met again is not entered |
+| a trait object, a host handle | `<dyn Area>`, `<Task>` |
 
 A value that fits in 80 columns from where it starts stays on one line;
 otherwise each entry takes a line of its own, two spaces deeper, with a

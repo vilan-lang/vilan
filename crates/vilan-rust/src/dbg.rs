@@ -188,6 +188,49 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let printer = self.native_printer_for(element, span)?;
                 format!("vilan_rt::show::list(&value[..], |item| {printer}(item))")
             }
+            Shape::Shared(inner) => {
+                let printer = self.native_printer_for(inner, span)?;
+                format!("vilan_rt::show::shared(value, |inner| {printer}(inner))")
+            }
+            Shape::Cell {
+                label,
+                field: (_, field),
+                value: inner,
+            } => {
+                // `get()` is the cell's plain read: nothing subscribes.
+                let printer = self.native_printer_for(inner, span)?;
+                format!(
+                    "vilan_rt::show::Doc::group({}, \")\", false, vec![(String::new(), {printer}(&value.{}.get()))])",
+                    rust_literal(&format!("{label}(")),
+                    sanitize(&field)
+                )
+            }
+            Shape::Map {
+                label,
+                field: (_, field),
+                key,
+                value: entry_value,
+            } => {
+                let key_printer = self.native_printer_for(key, span)?;
+                let value_printer = self.native_printer_for(entry_value, span)?;
+                format!(
+                    "vilan_rt::show::members({}, &value.{}.values(), |entry| (format!(\"{{}} => \", {key_printer}(&entry.0).flat()), {value_printer}(&entry.1)))",
+                    rust_literal(&format!("{label} {{")),
+                    sanitize(&field)
+                )
+            }
+            Shape::Set {
+                label,
+                field: (_, field),
+                element,
+            } => {
+                let printer = self.native_printer_for(element, span)?;
+                format!(
+                    "vilan_rt::show::members({}, &value.{}.values(), |item| (String::new(), {printer}(item)))",
+                    rust_literal(&format!("{label} {{")),
+                    sanitize(&field)
+                )
+            }
             Shape::Enum { variants, bindings } => {
                 let Some(Type::Enum(enum_id, arguments)) = self.resolve(type_id).cloned() else {
                     return Err(unsupported("printing an enum that did not resolve", span));

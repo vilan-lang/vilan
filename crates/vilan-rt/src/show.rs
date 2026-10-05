@@ -129,6 +129,38 @@ pub fn list<T>(items: &[T], show: impl Fn(&T) -> Doc) -> Doc {
     Doc::group("[", "]", false, entries)
 }
 
+/// A map's or a set's document (S1b): a padded group of the members, in the
+/// table's order, at most 100 of them and then `… N more`.
+pub fn members<T>(open: &str, items: &[T], show: impl Fn(&T) -> (String, Doc)) -> Doc {
+    let shown = items.len().min(100);
+    let mut entries: Vec<(String, Doc)> = items[..shown].iter().map(show).collect();
+    if items.len() > shown {
+        entries.push((
+            String::new(),
+            Doc::text(format!("\u{2026} {} more", items.len() - shown)),
+        ));
+    }
+    Doc::group(open, "}", true, entries)
+}
+
+thread_local! {
+    /// The cells the current print is inside, by address — a `Shared` met
+    /// again on the way down closes a cycle (S1b).
+    static SEEN: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `Shared(<value>)`, or `<cycle>` for a cell this print is already inside.
+pub fn shared<T: Clone>(cell: &crate::Shared<T>, show: impl Fn(&T) -> Doc) -> Doc {
+    let address = cell.address();
+    if SEEN.with(|seen| seen.borrow().contains(&address)) {
+        return Doc::text("<cycle>");
+    }
+    SEEN.with(|seen| seen.borrow_mut().push(address));
+    let inner = show(&cell.get());
+    SEEN.with(|seen| seen.borrow_mut().pop());
+    Doc::group("Shared(", ")", false, vec![(String::new(), inner)])
+}
+
 /// A string as vilan writes it: quoted, with `\\`, `\"`, `\n`, `\t`, `\r`
 /// and `\0` escaped.
 pub fn string(text: &str) -> Doc {
