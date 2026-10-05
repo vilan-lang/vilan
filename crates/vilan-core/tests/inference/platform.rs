@@ -10817,12 +10817,13 @@ fn a_supertrait_member_called_through_a_bound_reaches_only_its_implementors() {
     );
 }
 
-/// B536: attributes out of THE order are a WARNING of the analysis the
+/// B536: attributes out of THE order are refused by the analysis the
 /// language server and the harnesses run (`analyze_source`), spanning the
-/// head's run — and only a warning: the analysis is otherwise clean.
+/// head's run — since v0.45.0; a WARNING for one release.
 #[test]
-fn b536_an_attribute_order_warning_rides_the_analysis() {
-    assert_warns_spanning(
+fn b536_an_attribute_order_refusal_rides_the_analysis() {
+    // Refused since v0.45.0 (B536's flip, R-c); a warning for one release.
+    assert_fails_spanning(
         "[must_use] [deprecated(\"use b\")]\nfun answer(): i32 {\n\t42\n}\n\nfun main() {\n\tif answer() > 0 {}\n}\n",
         "[must_use] [deprecated(\"use b\")]",
         "a declaration's attributes are written in one order",

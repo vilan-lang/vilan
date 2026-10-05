@@ -100,6 +100,11 @@ written down.
 
 ---
 
+<!-- family: breaking -->
+**BREAKING (B536's v0.45.0 half, R-c): a declaration's attributes written out of THE order are REFUSED — "a declaration's attributes are written in one order — `[derive]` and the other generators, `[deprecated]`, … `[resource]`: write `[deprecated(..)] [internal(..)] fun`" — where v0.44.0 warned.** The head is still read as if written in the order (the analysis goes on, one diagnostic per head), and `vilan fmt` still formats a file whose only errors are marker-order refusals, now including this one: it is the migration. **The editor's half** is unchanged: `parsing::MarkerOrderDiagnostic::Attributes` keeps its code `marker-order/attributes` (`is_warning()` is now false for both), `of_message` recognizes it, and `parsing::marker_order_fix(source, message, span)` is the quick fix's edit. **Migration:** `vilan fmt`. The estate before the flip: std 0, the corpus 0, the examples 0, the docs' fences 0 and kolt 0 (`vilan fmt` wrote every head in the order in v0.44.0). **Pins:** `parsing::tests::b536_every_adjacent_marker_swap_is_canonical_warned_or_refused` (the 18 attribute swaps now refused, spanned on the run, formatted to the stack), `b536_attributes_out_of_rank_are_refused_and_read_in_it`, `b536_the_marker_order_fix_writes_the_head_in_the_order`, `b486_a_reordered_head_still_begins_where_it_was_written`, `inference::platform::b536_an_attribute_order_refusal_rides_the_analysis`, and through the binary `diagnostics::b536_an_attribute_order_refusal_renders_in_its_file` (an entry and a module, `build` and `check`). The marker census moves (the attribute swaps are refused). Docs: `grammar.md` §3.2. Tracker B536.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

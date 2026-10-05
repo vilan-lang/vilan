@@ -133,9 +133,9 @@ fun` (B524). A head written in another order is read exactly as if written
 in this one, and reported:
 
 - **attributes out of rank**, and nothing else out of order —
-  `[internal("why")]` ⏎ `[deprecated("use g")]` ⏎ `fun` — a **warning**
-  that names the head in the order (`` write `[deprecated(..)] [internal(..)]
-  fun` ``);
+  `[internal("why")]` ⏎ `[deprecated("use g")]` ⏎ `fun` — an **error** that
+  names the head in the order (`` write `[deprecated(..)] [internal(..)]
+  fun` ``): a warning in v0.44.0, refused from v0.45.0 (B536);
 - **a keyword ahead of an attribute, or two keywords inverted** — `async
   [platform("node")] fun`, `external async fun`, `lazy export let`, `macro
   async fun` — an **error**, with the head respelled in the order. That

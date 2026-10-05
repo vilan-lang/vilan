@@ -3418,6 +3418,7 @@ fn parse(source: &str) -> Option<NodeList<'_>> {
             matches!(
                 error.reason,
                 crate::parsing::ParseErrorReason::MarkerOrder { .. }
+                    | crate::parsing::ParseErrorReason::AttributeOrder { .. }
             )
         })
     })
