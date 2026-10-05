@@ -9001,3 +9001,60 @@ fn f28_a_file_importing_only_a_single_platform_module_is_analyzed_as_before() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn b547_a_with_clause_names_a_reexported_trait_beside_a_same_named_derive() {
+    // B547: `std::reactive::store` RE-EXPORTS the `Storable` trait from
+    // `store_core` and DECLARES the `Storable` derive macro. A module that was
+    // the first to load `store` bound the macro marker (its re-export had not
+    // resolved yet) and its `impl Note with Storable` was refused "'Storable'
+    // is not a trait", spanned inside std's `lib.vl`. In the entry, or once the
+    // entry imported `store`, it compiled. A bound (`T: Storable`) and the
+    // derive in the same module are pinned beside it.
+    let entry = concat!(
+        "import pkg::model::{ Note, keep };\n",
+        "fun main() {\n",
+        "    print(keep(Note { text = \"x\" }).text);\n",
+        "}\n",
+        "main();\n",
+    );
+    let model = concat!(
+        "import std::option::Option;\n",
+        "import std::reactive::store::{ Storable, StoreNode, StoreWoken };\n",
+        "import std::shared::Shared;\n",
+        "\n",
+        "export *;\n",
+        "\n",
+        "struct Note {\n",
+        "    text: str,\n",
+        "}\n",
+        "\n",
+        "impl Note with Storable {\n",
+        "    fun store_diff(\n",
+        "        &self,\n",
+        "        other: &Note,\n",
+        "        node: Option<Shared<StoreNode>>,\n",
+        "        need: bool,\n",
+        "        woken: &mut StoreWoken,\n",
+        "    ): bool {\n",
+        "        self.text != other.text\n",
+        "    }\n",
+        "}\n",
+        "\n",
+        "fun keep<T: Storable>(value: T): T {\n",
+        "    value\n",
+        "}\n",
+    );
+    assert_eq!(
+        analyze_package(
+            &[("main.vl", entry), ("model.vl", model)],
+            "main.vl",
+            Platform::Browser
+        ),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        run_package(&[("main.vl", entry), ("model.vl", model)], "main.vl"),
+        "x\n"
+    );
+}

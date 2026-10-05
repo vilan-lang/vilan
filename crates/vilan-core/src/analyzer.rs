@@ -47117,6 +47117,21 @@ impl<'src> Analyzer<'src> {
         // import does, and the reach closure must not mistake it for no
         // dependency at all. A `self` leaf is covered here too, which the
         // `import_reaches` record below deliberately is not.
+        // B547: a macro MARKER answers a name only while no item does (items
+        // win the collision, `walk_macro_fun`), and an item can still arrive by
+        // a re-export the target module has not resolved yet: `std::reactive::
+        // store` re-exports the `Storable` TRAIT from `store_core` and declares
+        // the `Storable` derive. Bound now, the marker stood where the trait
+        // belongs in a module that was the first to load `store` ("'Storable'
+        // is not a trait" at its `with` clause). So a marker binds only on the
+        // reporting pass, once every re-export that could shadow it has bound.
+        if !report
+            && bind
+            && name != "self"
+            && matches!(self.expr_id_to_expr_map.get(&target_id), Some(Expr::Macro))
+        {
+            return false;
+        }
         self.import_targets.push((source_id, target_id));
         // A `self` leaf's own span points at the namespace it re-binds.
         if name == "self" {

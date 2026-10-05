@@ -70,6 +70,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**B547: `impl Note with Storable` in a module that is not the entry — naming the trait through `std::reactive::store`, which re-exports the `Storable` trait from `store_core` and declares the `Storable` derive macro — compiles when that module is the first to load `store`. It was refused "'Storable' is not a trait", spanned inside std's `lib.vl`.** The importer's `Storable` bound the derive's MARKER: the macro answers a name only while no item does, and the trait's re-export had not resolved when the import was first tried. A macro marker now binds an import only on the import fixpoint's reporting pass, once every re-export that could shadow it has bound; a macro imported by name still binds there. **Pins:** `module_resolution::b547_a_with_clause_names_a_reexported_trait_beside_a_same_named_derive` (the `with` clause, a bound and a run; red on the base). Tracker B547.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.
