@@ -21,7 +21,8 @@
 //!   (no base-cache lookup or store, no checks record, no hot set), which is
 //!   the "clean analysis" the differential and `VILAN_INCREMENTAL=verify`
 //!   compare an incremental one against; [`render_observation`] is the
-//!   id-free rendering they compare.
+//!   id-free rendering they compare; [`Plant`] is the per-slice planted bug
+//!   that proves the differential can go red.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -95,8 +96,24 @@ pub fn fingerprinting() -> bool {
 
 // --- Q3: the clean analysis -------------------------------------------------
 
+/// What a clean analysis on this thread keeps of the incremental machinery.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Clean {
+    /// Not a clean analysis.
+    No,
+    /// The canonical analysis: nothing reused, no hot set.
+    Canonical,
+    /// Nothing reused, but the world built in the hot-set SHAPE the seeds ask
+    /// for — what the differential compares emitted JS against (S1 walks the
+    /// hot set after the prefix, so its declarations number, and emit, in a
+    /// different order from the canonical world's; a hot-set program is never
+    /// emitted, but its JS is still the sharpest check that nothing it reused
+    /// was stale).
+    KeepingHotShape,
+}
+
 thread_local! {
-    static CLEAN: Cell<bool> = const { Cell::new(false) };
+    static CLEAN: Cell<Clean> = const { Cell::new(Clean::No) };
 }
 
 /// Runs `body` with every incremental mechanism off for the analyses it makes
@@ -110,19 +127,87 @@ thread_local! {
 /// thread must not switch reuse off for a neighbour, and must leave the cache
 /// exactly as it found it.
 pub fn clean_analysis<R>(body: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
+    with_clean(Clean::Canonical, body)
+}
+
+/// [`clean_analysis`], keeping the hot-set SHAPE the analysis's seeds ask for:
+/// nothing is reused, and the world is built the way an incremental analysis
+/// with the same seeds builds it. The differential's JS comparison runs against
+/// this (see [`Clean::KeepingHotShape`]).
+pub fn clean_analysis_keeping_hot_shape<R>(body: impl FnOnce() -> R) -> R {
+    with_clean(Clean::KeepingHotShape, body)
+}
+
+fn with_clean<R>(mode: Clean, body: impl FnOnce() -> R) -> R {
+    struct Restore(Clean);
     impl Drop for Restore {
         fn drop(&mut self) {
             CLEAN.with(|clean| clean.set(self.0));
         }
     }
-    let _restore = Restore(CLEAN.with(|clean| clean.replace(true)));
+    let _restore = Restore(CLEAN.with(|clean| clean.replace(mode)));
     body()
 }
 
-/// Whether the analysis on this thread is a [`clean_analysis`].
+/// Whether the analysis on this thread is a clean one (either kind).
 pub fn clean_requested() -> bool {
-    CLEAN.with(Cell::get)
+    CLEAN.with(Cell::get) != Clean::No
+}
+
+/// Whether this thread's clean analysis keeps the hot-set shape.
+pub(crate) fn clean_keeps_hot_shape() -> bool {
+    CLEAN.with(Cell::get) == Clean::KeepingHotShape
+}
+
+// --- the planted bugs (Q3's non-vacuity) ------------------------------------
+
+/// A bug a slice plants so its differential can be watched going red
+/// (`incremental-analysis.md` §6.2; M57's lesson — a differential whose corpus
+/// never exercised the seam stayed green over a planted bug).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plant {
+    /// S1: treat the HOT modules as reusable — replay their remembered checks
+    /// as if they were part of the stored prefix. A hot module's text moves
+    /// every keystroke, so a diagnostic its edit adds or removes is served
+    /// stale.
+    HotSetReplay,
+    /// S1: skip the content validation of the stored PREFIX on a hit — serve
+    /// the world whatever its modules now say.
+    PrefixUnvalidated,
+    /// S1: drop the impl guard — defer a hot set whose impls the prefix can
+    /// reach, so the prefix resolves without them.
+    ImplGuardOff,
+    /// S1: the hot set is the WHOLE package — every module re-walked per
+    /// keystroke. Not wrong, just S1 undone; the re-walk counter pins must see
+    /// it.
+    WholePackageHot,
+    /// S1: drop the use-inferred-binding guard — defer a hot module that
+    /// imports a prefix binding whose type the first use decides.
+    UseInferredGuardOff,
+}
+
+impl Plant {
+    fn code(self) -> u8 {
+        match self {
+            Plant::HotSetReplay => 1,
+            Plant::PrefixUnvalidated => 2,
+            Plant::ImplGuardOff => 3,
+            Plant::WholePackageHot => 5,
+            Plant::UseInferredGuardOff => 6,
+        }
+    }
+}
+
+static PLANTED: AtomicU8 = AtomicU8::new(0);
+
+#[doc(hidden)]
+pub fn set_plant(plant: Option<Plant>) {
+    PLANTED.store(plant.map_or(0, Plant::code), Ordering::Relaxed);
+}
+
+pub(crate) fn planted(plant: Plant) -> bool {
+    PLANTED.load(Ordering::Relaxed) == plant.code()
 }
 
 // --- S0: the per-analysis census (Q9's counters) ----------------------------
@@ -142,8 +227,9 @@ pub struct Census {
     /// prefix from the base cache or stored under the hot-set key, the hot set
     /// walked over it.
     pub hot_world: bool,
-    /// Why a hot set this analysis measured could NOT be built as one — the
-    /// guard that refuses it (`impl`, a macro, an import of the entry).
+    /// Why a hot set this analysis measured was NOT built as one — the guard
+    /// that refused it (`impl`, `use-inferred-binding`, `refused-before`, a
+    /// macro, an import of the entry, a module the shape cannot load).
     pub hot_refusal: Option<&'static str>,
     /// Base-cache lookups this analysis made that HIT, MISSED, and the worlds
     /// it STORED.

@@ -28,10 +28,10 @@
 //! derive, an import, a `const` callee, an import cycle, a prefix module
 //! changing under a seed elsewhere, a browser entry reaching a node-only call),
 //! and the CORPUS, every program re-hosted as a package module with an
-//! importer and a bystander. From S1 on, each slice's planted bug must turn
-//! the classes leg red — the M57 lesson.
+//! importer and a bystander. Each slice's planted bug (`incremental::Plant`)
+//! must turn the classes leg red — the M57 lesson.
 //!
-//! The overlay is process-global, so the tests serialize on
+//! The overlay and the plant are process-global, so the tests serialize on
 //! [`SWITCH_LOCK`] (plain `cargo test` runs them as threads of one process).
 
 mod replay_harness;
@@ -41,7 +41,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use replay_harness::std_spec;
-use vilan_core::incremental::{Census, clean_analysis, render_observation};
+use vilan_core::incremental::{
+    Census, Plant, clean_analysis, clean_analysis_keeping_hot_shape, render_observation, set_plant,
+};
 use vilan_core::{BuildOptions, Platform, Workspace, analyze_source, transform};
 
 static SWITCH_LOCK: Mutex<()> = Mutex::new(());
@@ -127,6 +129,13 @@ enum Leg {
     /// The canonical clean one: nothing reused, no hot set — what everything
     /// an editor reads is compared against.
     Clean,
+    /// Clean, but built in the hot-set shape the seeds ask for — what the
+    /// emitted JS is compared against (a hot-set world numbers its hot
+    /// modules' declarations after the prefix's, so its JS orders them
+    /// differently from the canonical world's; a hot-set program is never
+    /// emitted, and its JS is still the sharpest check that nothing reused was
+    /// stale).
+    CleanSameShape,
 }
 
 /// One analysis of `package`'s entry, on a big-stack worker like every real
@@ -157,6 +166,7 @@ fn observe(package: &Package, seeds: Vec<PathBuf>, leg: Leg) -> Observation {
             let (program, errors) = match leg {
                 Leg::Incremental => analyze(),
                 Leg::Clean => clean_analysis(analyze),
+                Leg::CleanSameShape => clean_analysis_keeping_hot_shape(analyze),
             };
             let census = vilan_core::incremental::census();
             let rendering = program
@@ -229,6 +239,7 @@ fn replay(package: &mut Package, edit: &Edit, divergences: &mut Vec<String>) -> 
         package.set(edit.file, text);
         let incremental = observe(package, vec![seed.clone()], Leg::Incremental);
         let clean = observe(package, Vec::new(), Leg::Clean);
+        let same_shape = observe(package, vec![seed.clone()], Leg::CleanSameShape);
         if incremental.rendering != clean.rendering {
             divergences.push(format!(
                 "{} ({phase}): the incremental analysis differs from the clean one at {}",
@@ -236,12 +247,21 @@ fn replay(package: &mut Package, edit: &Edit, divergences: &mut Vec<String>) -> 
                 first_difference(&incremental.rendering, &clean.rendering)
             ));
         }
-        if incremental.javascript != clean.javascript {
+        if incremental.javascript != same_shape.javascript {
             divergences.push(format!(
-                "{} ({phase}): the emitted JS differs (incremental {} bytes, clean {} bytes)",
+                "{} ({phase}): the emitted JS differs from a clean analysis of the same \
+                 shape (incremental {} bytes, clean {} bytes)",
                 edit.label,
                 incremental.javascript.as_ref().map_or(0, String::len),
-                clean.javascript.as_ref().map_or(0, String::len),
+                same_shape.javascript.as_ref().map_or(0, String::len),
+            ));
+        }
+        // Whether the program emits at all is a user-visible answer, so it
+        // has to agree with the canonical world too.
+        if incremental.javascript.is_some() != clean.javascript.is_some() {
+            divergences.push(format!(
+                "{} ({phase}): one analysis emits and the other does not",
+                edit.label
             ));
         }
         censuses.push(incremental.census);
@@ -461,8 +481,60 @@ const PLATFORM_EDITS: &[Edit] = &[Edit {
     )],
 }];
 
-/// Runs every class edit over a fresh package, then the platform edit over its
-/// own, answering the divergences and every incremental census.
+/// The package the re-walk pins measure, with nothing a guard refuses: the
+/// hot-set world is built for every module of it, so the edits below run
+/// through S1's reuse and nothing else.
+fn leaf_package() -> Package {
+    Package::write(
+        "leaf",
+        Platform::default(),
+        &[
+            ("main.vl", PINS_MAIN),
+            ("views.vl", PINS_VIEWS),
+            ("cycle_a.vl", PINS_CYCLE_A),
+            ("cycle_b.vl", PINS_CYCLE_B),
+            ("hub.vl", PINS_HUB),
+        ],
+    )
+}
+
+/// Edits over [`leaf_package`], each served from a hot-set world: a Class A
+/// refusal typed into the hot leaf (whose remembered checks must never be
+/// replayed), and the PREFIX moving under the leaf's seed (which must never be
+/// served unvalidated).
+const LEAF_EDITS: &[Edit] = &[
+    Edit {
+        label: "a statement typed into the hot leaf",
+        file: "views.vl",
+        seed: None,
+        replacements: &[("\tbase() + 1\n", "\tlet extra = 1;\n\tbase() + extra\n")],
+    },
+    Edit {
+        label: "a Class A refusal typed into the hot leaf",
+        file: "views.vl",
+        seed: None,
+        replacements: &[(
+            "\tbase() + 1\n",
+            "\tlet frozen = 1;\n\tfrozen = 2;\n\tbase() + frozen\n",
+        )],
+    },
+    Edit {
+        label: "the PREFIX module the leaf imports changes under the leaf's seed",
+        file: "hub.vl",
+        seed: Some("views.vl"),
+        replacements: &[("\t2\n", "\t3\n")],
+    },
+    Edit {
+        label: "a body edit inside the hot cycle",
+        file: "cycle_b.vl",
+        seed: None,
+        replacements: &[("\tring(n + 1)", "\tring(n + 2)")],
+    },
+];
+
+/// Runs every class edit over a fresh package, then the platform edit and the
+/// leaf edits over their own, answering the divergences and every incremental
+/// census.
 fn replay_the_classes() -> (Vec<String>, Vec<Census>) {
     let mut divergences = Vec::new();
     let mut censuses = Vec::new();
@@ -490,6 +562,11 @@ fn replay_the_classes() -> (Vec<String>, Vec<Census>) {
         censuses.extend(replay(&mut package, edit, &mut divergences));
     }
     package.remove();
+    let mut package = leaf_package();
+    for edit in LEAF_EDITS {
+        censuses.extend(replay(&mut package, edit, &mut divergences));
+    }
+    package.remove();
     vilan_core::analyzer::base_cache_clear();
     (divergences, censuses)
 }
@@ -502,6 +579,7 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
     let _switch = SWITCH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
     let (divergences, censuses) = replay_the_classes();
     assert!(
         divergences.is_empty(),
@@ -509,15 +587,27 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
         divergences.len(),
         divergences.join("\n")
     );
-    // The harness green on ITSELF is S0's gate (`incremental-analysis.md`
-    // §11): before S1 no edit outside the entry reuses anything, so the
-    // incremental leg is the base cache's miss-and-store path against a clean
-    // analysis. S1 raises this floor to the hot-set world it builds.
+    // Non-vacuity: the script has to have exercised the hot-set world, hit and
+    // miss, or the comparison above says nothing about S1. Every edit here is
+    // outside the entry, so without S1 nothing would be reused at all.
+    let hot_worlds = censuses.iter().filter(|census| census.hot_world).count();
+    let hot_hits = censuses
+        .iter()
+        .filter(|census| census.hot_world && census.base_hits > 0)
+        .count();
+    let replayed = censuses
+        .iter()
+        .filter(|census| census.records_replayed > 0)
+        .count();
+    eprintln!(
+        "{} incremental analyses: {hot_worlds} hot-set worlds, {hot_hits} of them served \
+         from the base cache, {replayed} replaying module records",
+        censuses.len()
+    );
     assert!(
-        censuses
-            .iter()
-            .all(|census| census.base_misses + census.base_hits == 1),
-        "every incremental analysis consults the base cache exactly once"
+        hot_hits >= 8 && replayed >= 8,
+        "the script must exercise the hot-set world from the cache (served {hot_hits}, \
+         replaying {replayed}); the differential above is otherwise vacuous about S1"
     );
 }
 
@@ -564,6 +654,7 @@ fn the_corpus_as_modules_answers_what_a_clean_analysis_answers() {
     let _switch = SWITCH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
     let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test");
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&corpus)
         .expect("corpus directory")
@@ -628,5 +719,206 @@ fn the_corpus_as_modules_answers_what_a_clean_analysis_answers() {
         "{} corpus step(s) observe incremental analysis:\n{}",
         divergences.len(),
         divergences.join("\n")
+    );
+    // Non-vacuity: the corpus has to have run through the hot-set world, from
+    // the cache, often enough to say something about it. Many corpus programs
+    // are refused one (an impl on a std type, a use-inferred binding), which is
+    // the guards working; the floor is on the ones that were not.
+    let censuses: Vec<&Census> = results
+        .iter()
+        .flat_map(|(_, _, censuses)| censuses)
+        .collect();
+    let hot_hits = censuses
+        .iter()
+        .filter(|census| census.hot_world && census.base_hits > 0)
+        .count();
+    let hot_worlds = censuses.iter().filter(|census| census.hot_world).count();
+    eprintln!(
+        "{} incremental corpus analyses: {hot_worlds} hot-set worlds, {hot_hits} served from the base cache",
+        censuses.len()
+    );
+    assert!(
+        hot_hits >= 20,
+        "only {hot_hits} corpus analyses were hot-set worlds served from the cache — the leg \
+         says too little about S1"
+    );
+}
+
+// --- the planted bugs (Q3's non-vacuity) -----------------------------------------
+
+/// The classes leg with `plant` planted: answers the divergences it found.
+fn replay_with_plant(plant: Plant) -> Vec<String> {
+    set_plant(Some(plant));
+    let replayed = std::panic::catch_unwind(replay_the_classes);
+    set_plant(None);
+    replayed.expect("the classes leg panicked under a plant").0
+}
+
+/// S1's plant: the hot modules' remembered checks replayed as if they were the
+/// stored prefix's. A Class A refusal typed into a hot module is then served
+/// stale — the gate must see it.
+#[test]
+fn the_differential_sees_a_hot_module_replayed_from_a_record() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::HotSetReplay);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("Class A refusal")),
+        "the hot-set replay plant must turn the Class A refusal edit red; it found: {divergences:#?}"
+    );
+}
+
+/// S1's plant: the stored prefix served without its content check. A prefix
+/// module edited under a seed elsewhere is then served stale.
+#[test]
+fn the_differential_sees_a_prefix_served_unvalidated() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::PrefixUnvalidated);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("PREFIX module the leaf imports")),
+        "the unvalidated-prefix plant must turn the prefix edit red; it found: {divergences:#?}"
+    );
+}
+
+/// S1's plant: the impl guard dropped. A hot module's inherent impl on a
+/// prefix type is then invisible to the prefix caller that uses it.
+#[test]
+fn the_differential_sees_a_hot_impl_the_prefix_needed() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::ImplGuardOff);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("inherent impl the prefix calls")),
+        "the impl-guard plant must turn the hot impl edit red; it found: {divergences:#?}"
+    );
+}
+
+/// S1's plant: the use-inferred-binding guard dropped. A hot module that
+/// decides a prefix binding's type by its first use — a context's `run`, a
+/// push into a module's empty list — is then walked after the prefix decided
+/// it, where the canonical world walks it first.
+#[test]
+fn the_differential_sees_a_binding_the_hot_set_should_have_decided() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::UseInferredGuardOff);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("grounds a prefix context")),
+        "the use-inferred plant must turn the context edit red; it found: {divergences:#?}"
+    );
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("from the module loaded first")),
+        "the use-inferred plant must turn the module-binding push red; it found: {divergences:#?}"
+    );
+}
+
+// --- the re-walk counter pins (Q9) ------------------------------------------------
+
+const PINS_MAIN: &str = "import pkg::views::render;\nimport pkg::cycle_a::ring;\nimport pkg::hub::base;\n\nfun main() {\n\tprint(render());\n\tprint(ring(1));\n\tprint(base());\n}\n";
+
+const PINS_VIEWS: &str = "import pkg::hub::base;\n\nexport fun render(): i32 {\n\tbase() + 1\n}\n";
+
+const PINS_CYCLE_A: &str = "import pkg::cycle_b::bounce;\n\nexport fun ring(n: i32): i32 {\n\tif n > 3 {\n\t\tn\n\t} else {\n\t\tbounce(n + 1)\n\t}\n}\n";
+
+const PINS_CYCLE_B: &str =
+    "import pkg::cycle_a::ring;\n\nexport fun bounce(n: i32): i32 {\n\tring(n + 1)\n}\n";
+
+const PINS_HUB: &str = "export fun base(): i32 {\n\t2\n}\n";
+
+/// What a keystroke in `file` re-walks once the hot-set world is warm: the
+/// census of the SECOND of two analyses seeded there (the first stores the
+/// prefix).
+fn rewalked_on_a_warm_keystroke(package: &mut Package, file: &str) -> Census {
+    let original = package.text(file).to_string();
+    let seed = vec![package.path(file)];
+    package.set(file, format!("{original}\n"));
+    let _ = observe(package, seed.clone(), Leg::Incremental);
+    package.set(file, original);
+    observe(package, seed, Leg::Incremental).census
+}
+
+/// The re-walk counts the paper's §4.4 names, pinned on counts rather than
+/// clocks (Q9): a leaf importer's keystroke re-walks the leaf and the entry; a
+/// cycle member's re-walks the cycle and the entry; the entry's own re-walks
+/// the entry alone — each served from the base cache. Run twice: as built,
+/// and with the hot set planted as the WHOLE package, which must move every
+/// count (the pins' non-vacuity).
+#[test]
+fn a_keystroke_rewalks_its_hot_set_and_nothing_else() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let measure = || {
+        vilan_core::analyzer::base_cache_clear();
+        let mut package = leaf_package();
+        let leaf = rewalked_on_a_warm_keystroke(&mut package, "views.vl");
+        let cycle = rewalked_on_a_warm_keystroke(&mut package, "cycle_b.vl");
+        let entry = rewalked_on_a_warm_keystroke(&mut package, "main.vl");
+        let hub = rewalked_on_a_warm_keystroke(&mut package, "hub.vl");
+        package.remove();
+        vilan_core::analyzer::base_cache_clear();
+        (leaf, cycle, entry, hub)
+    };
+    set_plant(None);
+    let (leaf, cycle, entry, hub) = measure();
+    assert!(
+        leaf.hot_world && leaf.base_hits == 1,
+        "a leaf keystroke is a hot-set hit: {leaf:?}"
+    );
+    assert_eq!(
+        (leaf.hot_modules, leaf.sources_walked),
+        (2, 2),
+        "a keystroke in a leaf importer re-walks the leaf and the entry: {leaf:?}"
+    );
+    assert!(
+        cycle.hot_world && cycle.base_hits == 1,
+        "a cycle keystroke is a hot-set hit: {cycle:?}"
+    );
+    assert_eq!(
+        (cycle.hot_modules, cycle.sources_walked),
+        (3, 3),
+        "a keystroke in a cycle member re-walks the cycle and the entry: {cycle:?}"
+    );
+    assert!(
+        !entry.hot_world && entry.base_hits == 1,
+        "the entry's keystroke hits the ordinary world: {entry:?}"
+    );
+    assert_eq!(
+        entry.sources_walked, 1,
+        "the entry's keystroke re-walks the entry: {entry:?}"
+    );
+    // `hub` is imported by `views` and by the entry: its hot set is all three.
+    assert_eq!(
+        (hub.hot_modules, hub.sources_walked),
+        (3, 3),
+        "a shared module's keystroke re-walks it and its importers: {hub:?}"
+    );
+    assert!(
+        leaf.package_modules == 5 && leaf.records_replayed > 0,
+        "the census reads the whole package and the replayed prefix: {leaf:?}"
+    );
+
+    set_plant(Some(Plant::WholePackageHot));
+    let (leaf, cycle, _, hub) = measure();
+    set_plant(None);
+    assert!(
+        leaf.sources_walked > 2 && cycle.sources_walked > 3 && hub.sources_walked > 3,
+        "with the hot set planted as the whole package every count must move, or the \
+         pins above are vacuous: leaf {leaf:?}, cycle {cycle:?}, hub {hub:?}"
     );
 }
