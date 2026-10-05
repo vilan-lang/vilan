@@ -1945,9 +1945,11 @@ pub struct Field<'src> {
     pub type_id: TypeId,
     /// Declared `[internal("reason")]` (E213). A field is the case declaration
     /// visibility cannot serve at all — vilan has no per-field visibility — and
-    /// it is the motivating one: `Region.anchor` is exported because `each` and
-    /// a user-written `Slot` need it, and moving a row through it without
-    /// `hold_rows` corrupts the reconciler's view.
+    /// it is the motivating one: `Region.anchor` is a region's end marker, and
+    /// moving a row through it without `hold_rows` corrupts the reconciler's
+    /// view. A149 S4: a field STD labels is no member outside std
+    /// (`labels::internal_field_out_of_reach`) — a hand-written `Slot` reads
+    /// the anchor through `Region::end`.
     pub internal: Option<&'src str>,
 }
 
@@ -4610,6 +4612,13 @@ pub struct Analyzer<'src> {
     // The built-in `std` structs that back scalar primitives, keyed by name
     // (`i32`, `str`, ...). Used to type literals and resolve primitive names.
     primitive_struct_ids: HashMap<&'static str, Id>,
+    // A149 S4: std's store handles (`Store`, `StoreSome`), when
+    // `std::reactive::store_core` loaded — the receivers field syntax reads
+    // through (`crate::field_syntax`).
+    field_syntax_handles: Vec<Id>,
+    // A149 S4: the member reads field syntax turned into projection calls
+    // (`app.user`), so an assignment to one is told how a handle is written.
+    field_syntax_reads: HashSet<Id>,
     // The source-defined `enum bool` (from `std/boolean.vl`), captured after the
     // module loads. `bool` literals, comparisons, and `is` tests all type as
     // this enum; the transformer lowers it to a native JS boolean.
@@ -7122,6 +7131,8 @@ impl<'src> Analyzer<'src> {
             modules: IndexMap::default(),
             parameters: IndexMap::default(),
             primitive_struct_ids: HashMap::default(),
+            field_syntax_handles: Vec::new(),
+            field_syntax_reads: HashSet::default(),
             bool_enum_id: None,
             list_element_slots: HashMap::default(),
             prepped_assignments: Vec::new(),
@@ -22118,17 +22129,32 @@ impl<'src> Analyzer<'src> {
     /// method lookup does not fall back to fields, so a closure-holding field
     /// needs the parenthesized call form, and a non-closure field was probably
     /// meant as a plain access.
-    fn same_named_field_steer(&mut self, subject_type: &Type, member_name: &str) -> Option<String> {
+    ///
+    /// A149 S4: std's `[internal]` field is no member outside std, so a call
+    /// there (`store.lend(..)`) is not steered toward reading it.
+    fn same_named_field_steer(
+        &mut self,
+        call_id: Id,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> Option<String> {
         let Type::Struct(struct_def_id, _) = subject_type else {
             return None;
         };
-        let field_type_id = self.structs.get(struct_def_id).and_then(|struct_| {
+        let (index, field_type_id) = self.structs.get(struct_def_id).and_then(|struct_| {
             struct_
                 .fields
                 .iter()
-                .find(|field| field.name == member_name)
-                .map(|field| field.type_id)
+                .enumerate()
+                .find(|(_, field)| field.name == member_name)
+                .map(|(index, field)| (index, field.type_id))
         })?;
+        if self
+            .internal_field_hidden(*struct_def_id, index, call_id)
+            .is_some()
+        {
+            return None;
+        }
         match field_type_id.get_type(self) {
             // B340 Q2: a field holding a `Callable` is called exactly as a
             // field holding a closure is — `(a.b)(c)` — because `a.b(c)` is
@@ -29502,7 +29528,12 @@ impl<'src> Analyzer<'src> {
                 if self.call_returns_view(*call_id) {
                     return None;
                 }
-                if self.call_is_variant_constructor(*call_id) {
+                // A149 S4: `app.user.name = v` reads like a field and is a
+                // projection — a handle, which is written through, not over.
+                if self.field_syntax_reads.contains(&target_id) {
+                    "a store handle's field, which field syntax reads as its projection (a \
+                     handle, not the value): write through it with `.set(..)`"
+                } else if self.call_is_variant_constructor(*call_id) {
                     "a variant constructor (a pattern is matched with `let` or `is`, not assigned)"
                 } else {
                     "a call that returns a value rather than a `&mut` view"
@@ -51040,7 +51071,7 @@ impl<'src> Analyzer<'src> {
                 // missing method — method lookup does not fall back to fields
                 // (B4: steer to the one edit that resolves it).
                 let field_steer = self
-                    .same_named_field_steer(&subject_type, member_name)
+                    .same_named_field_steer(id, &subject_type, member_name)
                     .unwrap_or_default();
                 // If an UNLOADED std module implements it for this type, the fix
                 // is an import, not a definition (std-surface.md §5 — the
@@ -56744,6 +56775,12 @@ impl<'src> Analyzer<'src> {
         value_span: Span,
     ) -> Resolution {
         match self.expr_id_to_expr_map.get(&target_id) {
+            // A149 S4: a field-syntax read is never a place, and the place
+            // check says so with the steer; its handle type is no slot type to
+            // check the value against.
+            Some(Expr::Call(_)) if self.field_syntax_reads.contains(&target_id) => {
+                return Resolution::Resolved;
+            }
             Some(Expr::Field(..) | Expr::TupleIndex(..) | Expr::Index(..) | Expr::Call(_)) => {}
             Some(Expr::Local(binding_id)) => {
                 if !self.local_place_is_checked_at_its_assignment(*binding_id) {
@@ -57303,6 +57340,13 @@ impl<'src> Analyzer<'src> {
                     .find_map(|(index, field)| {
                         (field.name == member_name).then_some((index, field.type_id))
                     });
+                // A149 S4 (R-e): std's `[internal]` field is no member outside
+                // std. It is read as if it were not there — so the tier below
+                // (a handle's `path` is `T`'s `path`) and the refusal both see
+                // past it.
+                let hidden =
+                    field.and_then(|(index, _)| self.internal_field_hidden(struct_id, index, id));
+                let field = field.filter(|_| hidden.is_none());
                 match field {
                     Some((field_index, field_type)) => {
                         // The field's declared type is written in the struct's own
@@ -57337,6 +57381,54 @@ impl<'src> Analyzer<'src> {
                         Resolution::Resolved
                     }
                     None => {
+                        // A149 S4: on a store handle, a field of the struct it
+                        // handles reads through its projection —
+                        // `app.user.name` is `app.user().name()`.
+                        match self
+                            .field_syntax()
+                            .read(&Type::Struct(struct_id, arguments.clone()), member_name)
+                        {
+                            crate::field_syntax::Reading::Projection(_) => {
+                                self.read_field_through_projection(id, subject_id, member_name);
+                                return Resolution::Resolved;
+                            }
+                            crate::field_syntax::Reading::Unprojected(subject) => {
+                                let subject_name = self
+                                    .structs
+                                    .get(&subject)
+                                    .map_or("", |subject| subject.name);
+                                self.diagnostics.push(Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "`{member_name}` is a field of `{subject_name}`, and this \
+                                         `{struct_name}<{subject_name}>` has no projection named \
+                                         `{member_name}` to read it through: `{subject_name}` does \
+                                         not `[derive(Storable)]`, or the field's projection is \
+                                         renamed with `[reactive(name = \"..\")]` — call the \
+                                         projection by its own name"
+                                    ),
+                                });
+                                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                                return Resolution::Failed;
+                            }
+                            crate::field_syntax::Reading::Inapplicable => {}
+                        }
+                        if let Some(reason) = hidden {
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{member_name}` is an `[internal]` field of std's \
+                                     `{struct_name}`, and an internal std field is not a member \
+                                     outside std: {reason}"
+                                ),
+                            });
+                            self.expr_id_to_expr_map.insert(id, Expr::Error);
+                            return Resolution::Failed;
+                        }
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             // E119: when the struct came from an overlaid std
@@ -57409,6 +57501,64 @@ impl<'src> Analyzer<'src> {
                 Resolution::Failed
             }
         }
+    }
+
+    /// A149 S4 (R-e): the `[internal("reason")]` label of field `index` of the
+    /// struct `struct_id` when that field is out of reach at the access
+    /// `access` — an internal field std DECLARES, read from code std does not.
+    /// `None` when the field is a member there, which is every field but these.
+    ///
+    /// The ruled door is the cause, not a reserved-name list: a store handle's
+    /// own fields (`root`, `path`, `lend`, `modify`) are its machinery, and as
+    /// members they would shadow the field syntax a handle reads `T`'s fields
+    /// with. An internal field a PACKAGE declares stays a member everywhere,
+    /// with `[lints] internal_use` to warn at it, as before.
+    fn internal_field_hidden(&self, struct_id: Id, index: usize, access: Id) -> Option<&'src str> {
+        let internal = self.structs.get(&struct_id)?.fields.get(index)?.internal;
+        internal?;
+        crate::labels::internal_field_out_of_reach(
+            internal,
+            self.source_of_id(struct_id),
+            self.source_of_id(access),
+            &self.std_sources,
+        )
+    }
+
+    /// The field-syntax tier's reader over this analysis (`crate::field_syntax`).
+    fn field_syntax(&self) -> crate::field_syntax::Surface<'_, 'src> {
+        crate::field_syntax::Surface {
+            structs: &self.structs,
+            implementations: &self.implementations,
+            types: &self.type_id_to_type_map,
+            entities: &self.expr_id_to_expr_map,
+            functions: &self.functions,
+            parameters: &self.parameters,
+            handles: &self.field_syntax_handles,
+        }
+    }
+
+    /// A149 S4: the member read `subject.member` (entity `id`) becomes the call
+    /// `subject.member()` — the method call the walk would have queued had the
+    /// parentheses been written, under the SAME entity, so everything keyed by
+    /// the access (its type, its member span, the editor's hover) reads the
+    /// call. Its argument list is empty and sits just past the member's name.
+    fn read_field_through_projection(&mut self, id: Id, subject_id: Id, member_name: &'src str) {
+        let end = self
+            .member_name_spans
+            .get(&id)
+            .map_or(EMPTY_SPAN, |span| Span {
+                start: span.end,
+                end: span.end,
+            });
+        self.field_syntax_reads.insert(id);
+        self.constraints.push(Constraint::MethodCall {
+            id,
+            subject_id,
+            member_name,
+            generic_argument_ids: Vec::new(),
+            argument_ids: Vec::new(),
+            arguments_span: end,
+        });
     }
 
     /// `subject is Pattern`: once the subject type is known, resolve the pattern
@@ -64556,6 +64706,9 @@ pub struct Program<'src> {
     /// Nothing new may be keyed this way: a compiler-lowered external is a row.
     pub list_new_fn_id: Option<Id>,
     pub list_push_fn_id: Option<Id>,
+    /// A149 S4: std's store handles (`Store`, `StoreSome`) — the receivers
+    /// field syntax reads through. Read with [`Program::field_syntax`].
+    pub field_syntax_handles: Vec<Id>,
     // The `std` `panic` intrinsic (if loaded); its calls lower to a `throw`.
     pub panic_fn_id: Option<Id>,
     /// [`Divergence`]'s two resolved leaves, computed once by the analysis and
@@ -73081,6 +73234,19 @@ fn analyze_inner<'src>(
             .insert("Context", context_struct_id);
     }
 
+    // A149 S4: std's store handles, out of the module that DECLARES them — the
+    // receivers `app.user.name` reads through (`crate::field_syntax`). Keyed on
+    // std's own structs, so a user type named `Store` is never one.
+    if let Some(store_core) = module_scopes
+        .get("reactive::store_core")
+        .and_then(|scope_id| analyzer.scopes.get(scope_id))
+    {
+        analyzer.field_syntax_handles = ["Store", "StoreSome"]
+            .iter()
+            .filter_map(|name| store_core.name_to_id_map.get(name).copied())
+            .collect();
+    }
+
     // The `std::js::promise` `Promise<T>` struct, so `async`/`await` type precisely.
     analyzer.promise_struct_id = module_scopes
         .get("js::promise")
@@ -74883,6 +75049,7 @@ fn analyze_over_world<'src>(
             .collect(),
         backed_value_members,
         list_new_fn_id,
+        field_syntax_handles: analyzer.field_syntax_handles,
         list_push_fn_id,
         panic_fn_id: analyzer.panic_fn_id,
         divergence_leaves: analyzer.divergence_leaves.clone(),

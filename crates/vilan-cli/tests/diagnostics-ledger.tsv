@@ -681,3 +681,5 @@ row	flagship	key
 657	-	cannot infer `{family_label}`'s element {}: {written} is `{element}` and names no type for it, and nothing else at this call binds `{family_label}` — annotate the argument, or bind `{family_label}` through another parameter
 658	-	`mut {name}` would bind a COPY of a tuple element, and its write would not reach `{place}`: a capture inside a tuple pattern is a copy even under a view subject (tuples store flat) — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
 659	-	cannot mutate '{name}': a capture inside a tuple pattern is a COPY of its element even under a view subject (tuples store flat), so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
+NEW	-	`{member_name}` is an `[internal]` field of std's `{struct_name}`, and an internal std field is not a member outside std: {reason}
+NEW	-	`{member_name}` is a field of `{subject_name}`, and this `{struct_name}<{subject_name}>` has no projection named `{member_name}` to read it through: `{subject_name}` does not `[derive(Storable)]`, or the field's projection is renamed

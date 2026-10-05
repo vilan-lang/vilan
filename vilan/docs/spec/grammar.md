@@ -309,7 +309,7 @@ semantic-token modifier) and leads its hover with the steer.
 `[internal("reason")]` follows it, and answers a different question.
 Visibility says whether a module may **name** an item; this says whether
 a reader should **reach for** one that is named — an item exported on
-purpose and dangerous on purpose, like `std::web::ui`'s `Region.anchor`,
+purpose and dangerous on purpose, like `std::web::ui`'s `Region::cut_row`,
 which `each` and a hand-written `Slot` legitimately need and which
 corrupts the reconciler's view when a row is moved through it without
 `hold_rows`. The one argument is the reason, and it is required: it is
@@ -324,6 +324,16 @@ declaration itself, carries a semantic-token `internal` modifier that a
 theme dims; hover leads with the reason. A **field** is the case
 declaration visibility cannot serve at all, since vilan has no per-field
 visibility, and it is the case the attribute was asked for.
+
+One reach is refused, and it is std's: a field **std** labels
+`[internal(..)]` is not a member outside std (A149 S4). It is std's
+machinery — a store handle's slot tree and path, a region's end marker —
+and as a member it would shadow what a reader writes: field syntax on a
+store handle reads the handled struct's fields (`app.user.name`), and a
+`path` there must be the struct's `path`, not the handle's. Reading one is
+refused with the reason; what a program legitimately needs is a method
+(`Region::end`). A field a package labels in its own code stays a member
+everywhere, as above.
 
 The same label rides every other declaration a reader may be steered
 away from: a **struct**, an **enum**, one enum **variant**, a **trait**

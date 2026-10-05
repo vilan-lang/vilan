@@ -21,6 +21,7 @@ pub mod dispatch_refine;
 pub mod drop_plan_stats;
 pub mod elements;
 pub mod error;
+pub mod field_syntax;
 pub mod formatter;
 pub mod fx;
 pub mod git_dep;

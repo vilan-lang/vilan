@@ -754,6 +754,15 @@ export impl Region {
 		Row { marker }
 	}
 
+	/// The region's END — its anchor, the bound `cut_row` and `open_row_before`
+	/// take for the last row. A hand-written `Slot` reads it here: the anchor
+	/// FIELD is std's `[internal]` machinery and is no member outside std (A149
+	/// S4). KEEP IN STEP with the process twin's copy (process/ui.vl).
+	[internal("the region's end marker: place against it, never through it")]
+	fun end(self): Text {
+		self.anchor
+	}
+
 	/// Takes the row's CURRENT nodes out of the document, as a fragment.
 	///
 	/// `end` is whatever bounds the row on the right in the document order being

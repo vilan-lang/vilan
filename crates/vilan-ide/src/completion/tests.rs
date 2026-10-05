@@ -256,3 +256,118 @@ fn n115_a_construct_snippet_ranks_below_every_entity() {
         labels(&items)
     );
 }
+
+// --- A149 S4: field syntax on store handles --------------------------------
+
+const STORE_PRELUDE: &str = "import std::reactive::{ Signal, Source };\nimport std::reactive::store::{ Storable, Store };\n\n[derive(Storable)]\nstruct Address {\n\tcity: str,\n\tpath: str,\n}\n\n[derive(Storable)]\nstruct App {\n\tname: str,\n\taddress: Address,\n}\n\n";
+
+#[test]
+fn a149_s4_a_store_handle_offers_its_structs_fields_as_fields() {
+    // After `store.` the handled struct's fields are offered as FIELDS (field
+    // syntax), each replacing its projection's method candidate, and the
+    // handle's own `[internal]` fields (`root`, `path`, `lend`, `modify`) are
+    // not offered at all outside std — the analysis refuses them.
+    let source = format!(
+        "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.¦\n}}\n"
+    );
+    let (_, items) = completions(&source);
+    for name in ["name", "address"] {
+        let offered: Vec<CompletionKind> = items
+            .iter()
+            .filter(|item| item.label == name)
+            .map(|item| item.kind)
+            .collect();
+        assert_eq!(
+            offered,
+            vec![CompletionKind::Field],
+            "`{name}` is offered once, as a field: {:?}",
+            labels(&items)
+        );
+    }
+    // E213 offered an internal name once three characters of it were typed;
+    // std's internal FIELD is no member here at all, typed or not.
+    for (typed, internal) in [("roo", "root"), ("len", "lend"), ("modi", "modify")] {
+        let source = format!(
+            "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.{typed}¦\n}}\n"
+        );
+        let (_, items) = completions(&source);
+        assert!(
+            !items.iter().any(|item| item.label == internal),
+            "std's internal `{internal}` is no member here: {:?}",
+            labels(&items)
+        );
+    }
+}
+
+#[test]
+fn a149_s4_a_field_syntax_receiver_types_through_its_projection() {
+    // `store.address.` — a receiver that IS field syntax — offers `Address`'s
+    // fields through `Store<Address>`, `path` among them: the struct's field,
+    // not the handle's internal path.
+    let source = format!(
+        "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.address.¦\n}}\n"
+    );
+    let (_, items) = completions(&source);
+    for name in ["city", "path"] {
+        assert!(
+            items
+                .iter()
+                .any(|item| item.label == name && item.kind == CompletionKind::Field),
+            "`{name}` is offered as a field of `Store<Address>`: {:?}",
+            labels(&items)
+        );
+    }
+}
+
+#[test]
+fn a149_s4_a_field_syntax_read_hovers_as_its_projections_handle() {
+    // Hover on `city` in `store.address.city` reads the access, which IS the
+    // projection call: a `Store<str>`, and the declaration it reaches is the
+    // derive's `city()`.
+    let text = format!(
+        "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.address.city;\n}}\n"
+    );
+    let engine = Engine::new(&text);
+    let analysis = engine.analysis();
+    let offset = text.rfind(".city").expect("the read") + ".ci".len();
+    let entity = analysis.entity_at(offset).expect("an entity at the member");
+    let label = analysis.hover_label(entity).unwrap_or_default();
+    assert!(
+        label.contains("Store<str>"),
+        "hover reads the handle: {label:?}"
+    );
+    let target = analysis
+        .function_target(entity)
+        .expect("the access reaches a declaration");
+    assert_eq!(
+        engine
+            .program
+            .functions
+            .get(&target)
+            .map(|function| function.name),
+        Some("city"),
+        "and the declaration is the projection"
+    );
+}
+
+#[test]
+fn a149_s4_a_field_named_like_a_handle_internal_types_as_the_projection() {
+    // `store.address.path.` — `Address`'s `path`, read through field syntax, is
+    // a `Store<str>`. The live receiver walk must not stop at the HANDLE's
+    // internal `path` (a `List<StoreStep>`) on the way: that offered a list's
+    // members (`iter`) and none of the handle's (`on_change`).
+    let source = format!(
+        "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.address.path.¦\n}}\n"
+    );
+    let (_, items) = completions(&source);
+    assert!(
+        items.iter().any(|item| item.label == "on_change"),
+        "a handle's member is offered: {:?}",
+        labels(&items)
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "iter"),
+        "a list's is not: {:?}",
+        labels(&items)
+    );
+}

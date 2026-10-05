@@ -12681,7 +12681,10 @@ pub(crate) mod tests {
         ])
     }
 
-    const F27_UNDECLARED: &str = "import std::web::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+    // `live`, the browser twin's own field: `anchor` is std's `[internal]` end
+    // marker, which is no member outside std under either twin (A149 S4).
+    const F27_UNDECLARED: &str =
+        "import std::web::ui::Region;\n\nexport fun live_of(region: Region) {\n\tregion.live;\n}\n";
 
     #[test]
     fn f27_a_declared_module_is_analyzed_as_declared_over_the_default_entry() {
@@ -12741,8 +12744,8 @@ pub(crate) mod tests {
     fn f27_the_twin_note_offers_the_attribute_as_a_quick_fix() {
         let (dir, document) = f27_workspace(F27_UNDECLARED);
         let program = document.program.as_ref().expect("a program");
-        let at = F27_UNDECLARED.find("region.anchor").expect("the read");
-        let fixes = document.quickfixes(program, Span::from(at..at + 13));
+        let at = F27_UNDECLARED.find("region.live").expect("the read");
+        let fixes = document.quickfixes(program, Span::from(at..at + 11));
         let fix = fixes
             .iter()
             .find(|fix| {
@@ -14339,13 +14342,16 @@ pub(crate) mod tests {
     // owner's `lib/conditional_value.vl` imports `Region`, `Row` and `Slot` —
     // every one of them declared by BOTH `std::web::ui` twins — so there is no name
     // to weigh, and the file went to the process twin, where `region.anchor` is
-    // not a field. What it DOES with those names is the evidence: `anchor` is
-    // declared by the browser twin and by nothing on the process side.
+    // not a field. What it DOES with those names is the evidence: a member
+    // declared by the browser twin and by nothing on the process side. The pin
+    // reads `live`: `anchor` is std's `[internal]` end marker, no member outside
+    // std (A149 S4).
     #[test]
     fn a_shared_file_reading_a_browser_only_member_infers_browser() {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
-        let shared = "import std::web::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+        let shared =
+            "import std::web::ui::Region;\n\nfun live_of(region: Region) {\n\tregion.live;\n}\n";
         let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
         let (dir, _client) = analyze_workspace(&[
             ("src/client.vl", entry),

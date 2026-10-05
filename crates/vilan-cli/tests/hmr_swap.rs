@@ -921,7 +921,7 @@ impl ConditionalValue<type T, type S: Source<Option<T>>, type C: Slot> with Slot
 		self.condition.effect(|on| {
 			if live_row.read() is Some(let row) {
 				live_owner.read()?.dispose();
-				let _cut = region.cut_row(row, region.anchor);
+				let _cut = region.cut_row(row, region.end());
 				region.drop_row(row);
 				region.hold_rows([]);
 				live_row.write() = None;
