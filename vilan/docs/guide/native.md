@@ -37,14 +37,14 @@ What the backend reaches today:
   dependency
 - **servers**: `std::http` — `Server::builder()` with `serve_build`,
   `cache_build` and its conditional GET, `on_request`, `on_start` — and
-  `std::rpc_server`: a `[service]` mounted with `Service::new` or
+  `std::rpc::server`: a `[service]` mounted with `Service::new` or
   `Service::factory`, the WebSocket upgrade with its handshake gate
   (`authorize`), and `[expose]`/`[expose(keyed)]` mirrors a vilan client
   subscribes to, byte-for-byte on the wire with the node build
 
 What it does **not** reach yet — each refused by name, with the construct in the
-message, rather than silently mis-compiled: the browser platform (`std::dom`,
-`std::ui`, `std::web`, `std::router`), a `resource` type with a `Drop` impl
+message, rather than silently mis-compiled: the browser platform (`std::web::dom`,
+`std::web::ui`, `std::web::prelude`, `std::web::router`), a `resource` type with a `Drop` impl
 (deterministic teardown natively is its own slice; a resource with no `Drop`,
 such as a pipe node, builds as an ordinary move-only type), a handful of host bindings (the `fs`
 calls that take an options object), and

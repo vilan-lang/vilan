@@ -93,7 +93,7 @@ use std::time::{Duration, Instant};
 ///
 /// E39: it used to be 20 s, which under a loaded suite is not too large for a
 /// healthy round. `run --watch`'s first round is a full compile of every leg —
-/// a browser bundle over `std::ui` plus a server — and on a contended box that
+/// a browser bundle over `std::web::ui` plus a server — and on a contended box that
 /// alone runs past 20 s, so `hmr_swap` failed on the *machine's* speed while
 /// asserting nothing about it. Same disease as E32's cancellation family
 /// (compile inside the timed window), and the same cure: stop letting a slow

@@ -1711,6 +1711,56 @@ fn b480_a_bound_through_a_trait_argument_binds_from_an_object() {
     );
 }
 
+/// B480's shape as kolt's `Channel::find` writes it (re-checked by reactive-46,
+/// Order 46): `switch` with NO type arguments over a selector whose body is a
+/// `match` on an `Option` with two arms of different stage types — a
+/// `Source::constant` and a `derive` over another pipe — erased by an annotated
+/// `dyn Flow<TransientState<..>>` binding, then sealed. kolt carried
+/// `switch<TransientState<Channel, RpcError>>` for it; it infers.
+#[test]
+fn b480_a_selector_matching_two_erased_arms_needs_no_switch_type_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source };
+        import std::reactive::transient::TransientState;
+
+        fun shown(state: TransientState<str, str>): str {
+            match state {
+                TransientState::Ready(let name) => name,
+                TransientState::Absent => "absent",
+                _ => "pending",
+            }
+        }
+
+        fun main() {
+            let client: SignalCell<Option<i32>> = Signal::new(None);
+            let names: SignalCell<Option<str>> = Signal::new(Some("general"));
+            let found = client
+                .switch(|connected| {
+                    let state: dyn Flow<TransientState<str, str>> = match connected {
+                        None => Source::constant(TransientState::Pending),
+                        Some(let _id) => names.derive(|name| match name {
+                            Some(let present) => TransientState::Ready(present),
+                            None => TransientState::Absent,
+                        }),
+                    };
+                    state
+                })
+                .memo();
+            print(shown(found.get()));
+            client.set(Some(1));
+            print(shown(found.get()));
+            names.set(None);
+            print(shown(found.get()));
+        }
+
+        main();
+        "#,
+        "pending\ngeneral\nabsent\n",
+    );
+}
+
 #[test]
 fn a142_a_source_object_stays_copyable_though_flow_is_a_resource_trait() {
     // R39 with B470's attribute on the DECLARING trait alone: `Source<T> with
@@ -1742,8 +1792,8 @@ fn a142_a_source_object_stays_copyable_though_flow_is_a_resource_trait() {
 /// B436: `print` of a trait OBJECT prints the value it erased — `[ 5 ]`, the
 /// `Square` — not the backend's `[ value, table ]` pair (`[ [ 5 ], {} ]`). The
 /// pair is how the JS backend carries an object; at the host boundary (an
-/// `any` parameter) the value crosses. Nested in a list the pair is still the
-/// list's element, and prints as one — the native twin reproduces both.
+/// `any` parameter) the value crosses — and, since B503, inside a list handed
+/// there too (`b503_printing_a_list_of_trait_objects_prints_their_values`).
 #[test]
 fn b436_printing_a_trait_object_prints_its_value() {
     assert_compiles_and_runs(
@@ -1771,6 +1821,48 @@ fn b436_printing_a_trait_object_prints_its_value() {
         main();
         "#,
         "[ 5 ]\n25\n",
+    );
+}
+
+/// B503: a LIST of trait objects handed to `print` prints each object's value
+/// — the JS backend maps the list at the host boundary into a new array, as
+/// B436 converts a lone object — and so does a list of such lists. The
+/// program's own list is untouched (its objects still dispatch afterwards).
+/// An object inside any other container (an `Option`) still crosses as the
+/// stored pair; `native_differential`'s `print_layout` probe holds the native
+/// twin to the same split.
+#[test]
+fn b503_printing_a_list_of_trait_objects_prints_their_values() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Shape {
+            fun area(self): i32;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape {
+            fun area(self): i32 { self.side * self.side }
+        }
+
+        fun main() {
+            let shapes: List<dyn Shape> = [Square { side = 2 }, Square { side = 3 }];
+            print(shapes);
+            let rows: List<List<dyn Shape>> = [shapes, [Square { side = 4 }]];
+            print(rows);
+            print(shapes[1].area());
+            let maybe: Option<dyn Shape> = Some(Square { side = 5 });
+            print(maybe);
+        }
+
+        main();
+        "#,
+        "[ [ 2 ], [ 3 ] ]\n[ [ [ 2 ], [ 3 ] ], [ [ 4 ] ] ]\n9\n[ 0, [ [ 5 ], {} ] ]\n",
     );
 }
 
@@ -1851,4 +1943,129 @@ fn b437_two_positions_of_one_application_share_one_table_and_one_instance() {
     assert_eq!(js.matches("Object.create(").count(), 1, "one table:\n{js}");
     assert_eq!(js.matches("(shape) {").count(), 1, "one instance:\n{js}");
     assert_compiles_and_runs(source, "[ 4 ]\n[ 9 ]\n");
+}
+
+// --- B502: a trait object binds a bound's arguments from what it CARRIES ------
+
+/// B502: `measure<T, S: Shape<T>>(shape: S)` called with a `dyn Shape<str>`
+/// whose type behind it implements `Shape` twice bound `T` from the first impl
+/// (`i32`) and refused: "'dyn Shape<str>' does not implement trait
+/// 'Shape<i32>'". The object's own arguments answer — both objects of one type,
+/// in either call order, and a list of objects. (A `dyn Named<str>` over the
+/// supertrait `Shape<str>` binds `T` too; its table's answer is B532's pin,
+/// below.)
+#[test]
+fn b502_a_trait_object_binds_a_bounds_arguments_from_its_own() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Shape<T> {
+            fun area(self): T;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape<i32> {
+            fun area(self): i32 {
+                self.side * self.side
+            }
+        }
+
+        impl Square with Shape<str> {
+            fun area(self): str {
+                "big"
+            }
+        }
+
+        fun measure<T, S: Shape<T>>(shape: S): T {
+            shape.area()
+        }
+
+        fun main() {
+            let named: dyn Shape<str> = Square { side = 4 };
+            let counted: dyn Shape<i32> = Square { side = 5 };
+            print(measure(named));
+            print(measure(counted));
+            let again: dyn Shape<str> = Square { side = 1 };
+            print(measure(again));
+            let shapes: List<dyn Shape<i32>> = [Square { side = 3 }];
+            for shape in shapes {
+                print(measure(shape));
+            }
+        }
+        "#,
+        "big\n25\nbig\n9\n",
+    );
+}
+
+/// The program both B532 pins run: one type implementing `Shape` at two
+/// instantiations, reached through objects of SUB-traits — one level up
+/// (`Named<T> with Shape<T>`), two levels up (`Titled<T> with Named<T>`), a
+/// clause that writes a concrete argument (`Big with Shape<str>`), and the
+/// same sub-trait at the other instantiation — plus a call through a bound.
+const B532_PROGRAM: &str = r#"
+import std::io::print;
+
+trait Shape<T> {
+    fun area(self): T;
+}
+
+trait Named<T> with Shape<T> {}
+
+trait Titled<T> with Named<T> {}
+
+trait Big with Shape<str> {}
+
+struct Square {
+    side: i32,
+}
+
+impl Square with Shape<i32> {
+    fun area(self): i32 {
+        self.side * self.side
+    }
+}
+
+impl Square with Shape<str> {
+    fun area(self): str {
+        "big"
+    }
+}
+
+impl Square with Named<str> {}
+
+impl Square with Named<i32> {}
+
+impl Square with Titled<str> {}
+
+impl Square with Big {}
+
+fun through_bound<S: Named<str>>(shape: S): str {
+    shape.area()
+}
+
+fun main() {
+    let titled: dyn Named<str> = Square { side = 2 };
+    print(titled.area());
+    let counted: dyn Named<i32> = Square { side = 3 };
+    print(counted.area());
+    let deeper: dyn Titled<str> = Square { side = 4 };
+    print(deeper.area());
+    let big: dyn Big = Square { side = 5 };
+    print(big.area());
+    print(through_bound(Square { side = 6 }));
+}
+"#;
+
+/// B532: an object over a SUB-trait answers a supertrait's member from the
+/// supertrait's instantiation the clause chain passes — `dyn Named<str>` over
+/// `Named<T> with Shape<T>` answers `area` from `Shape<str>` (JS answered from
+/// `Shape<i32>`, printing `4` for `big`; natively rustc refused the emitted
+/// table, E0308). `native_differential` runs the same program on both backends.
+#[test]
+fn b532_an_object_over_a_subtrait_answers_from_the_supertraits_instantiation() {
+    assert_compiles_and_runs(B532_PROGRAM, "big\n9\nbig\nbig\nbig\n");
 }

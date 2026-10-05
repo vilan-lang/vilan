@@ -419,7 +419,7 @@ fn a_printing_initializer_falls_back() {
 fn an_emit_reaching_initializer_falls_back_without_erroring() {
     let program = analyze(
         "import std::io::print;\n\
-         import std::asset;\n\
+         import std::web::asset;\n\
          fun styled(): i32 {\n\
          \tasset::emit(\"css\", \".x{color:red}\");\n\
          \t1\n\

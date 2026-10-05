@@ -1,9 +1,9 @@
-# A client-side routed app on `std::router` (proposal/router.md). As a
+# A client-side routed app on `std::web::router` (proposal/router.md). As a
 # `browser`-target package, `vilan build .` emits `app.js` next to the entry;
 # serve `index.html` from this directory.
 #
 # `prelude` names the ambient scope every file here resolves under — the names in
-# scope with no import (`proposal/prelude.md` §5). `std::web` is the set for
+# scope with no import (`proposal/prelude.md` §5). `std::web::prelude` is the set for
 # applications: the base seven (`print`, `Option`/`Some`/`None`,
 # `Result`/`Ok`/`Err`) plus `Signal`, `SignalCell`, `view` and `View`, plus the
 # MODULES `style` and `ui`. `app.vl` leans on the base half as hard as the web
@@ -14,4 +14,4 @@ name = "router_demo"
 root = "."
 entry = "app.vl"
 target = "browser"
-prelude = "std::web"
+prelude = "std::web::prelude"

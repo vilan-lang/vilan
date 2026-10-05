@@ -16,8 +16,21 @@
 //! so the call (and its closure) never reaches either emitter. Every site of one
 //! expansion — the service's `contract_hash`, the client's, the reconnect hook's
 //! and the connect check — carries the same template and slots, so they agree.
+//!
+//! B525 (mirrored-store.md S0, Q14; ruled into v0.44.0): a slot renders a
+//! type's SHAPE, not only its name. A Wire codec is the type itself — the binary
+//! reader advances by position and ignores names, the JSON one reads by name —
+//! so a struct that gained, lost, renamed or reordered a field, or an enum whose
+//! variants moved, is a different contract under the same name. Every struct and
+//! enum declared OUTSIDE std is therefore written, the first time one surface
+//! reaches it, as its name followed by its fields in declaration order (name and
+//! resolved type, recursively) or its variants in order (payload types, and the
+//! backing value of a backed enum). std's types stand for themselves: they change
+//! only with the toolchain both sides are built by, and the handle types among
+//! them (`SignalCell`, `MemoCell`, …) are not encoded by their fields at all.
 
-use crate::analyzer::{Expr, Program};
+use crate::analyzer::{BackingValue, Expr, Program};
+use crate::fx::FxHashSet as HashSet;
 use crate::id::Id;
 use crate::interpreter::ConstValue;
 use crate::type_::{Type, TypeId};
@@ -47,11 +60,14 @@ pub fn resolve_contract_hashes(program: &mut Program) {
         let Some(closure) = program.closures.get(closure_id) else {
             continue;
         };
+        // One renderer per surface: a shape is written where the surface first
+        // reaches its type, and by name after that.
+        let mut renderer = Renderer::new(program);
         let slots: Vec<String> = closure
             .parameters
             .iter()
             .map(|parameter| match program.parameters.get(parameter) {
-                Some(parameter) => render(program, parameter.type_id),
+                Some(parameter) => renderer.render(parameter.type_id, &[]),
                 None => "_".to_string(),
             })
             .collect();
@@ -130,71 +146,216 @@ fn hash_hex(surface: &str) -> String {
     format!("{hash:08x}")
 }
 
-/// A resolved type's canonical spelling: each nominal type by its DECLARED name
-/// (an alias, a renaming import or a module path all name the declaration), its
-/// arguments in order, `, `-separated — the spelling a type written plainly
-/// already has, so a service that writes its types plainly hashes as it did.
-fn render(program: &Program, type_id: TypeId) -> String {
-    let Some(type_) = program.type_id_to_type_map.get(&type_id) else {
-        return "_".to_string();
-    };
-    match type_ {
-        Type::Struct(id, arguments) => nominal(
+/// A resolved type's canonical spelling, rendered for one surface.
+struct Renderer<'program, 'src> {
+    program: &'program Program<'src>,
+    /// The instances whose shape this surface has written already, by their
+    /// rendered name (`Page<i32>`): a second mention is the name alone, which is
+    /// also what ends the walk through a recursive type.
+    expanded: HashSet<String>,
+}
+
+impl<'program, 'src> Renderer<'program, 'src> {
+    fn new(program: &'program Program<'src>) -> Self {
+        Renderer {
             program,
-            program.structs.get(id).map(|declared| declared.name),
-            arguments,
-        ),
-        Type::Enum(id, arguments) => nominal(
-            program,
-            program.enums.get(id).map(|declared| declared.name),
-            arguments,
-        ),
-        Type::Trait(id, arguments) => nominal(
-            program,
-            program.traits.get(id).map(|declared| declared.name),
-            arguments,
-        ),
-        Type::Dyn(id, arguments) => format!(
-            "dyn {}",
-            nominal(
-                program,
-                program.traits.get(id).map(|declared| declared.name),
-                arguments
-            )
-        ),
-        Type::Tuple(elements) => format!("({})", list(program, elements)),
-        Type::Array(element, length) => format!("[{}; {length}]", render(program, *element)),
-        Type::Closure(parameters, returned, _) => {
-            format!(
-                "|{}| {}",
-                list(program, parameters),
-                render(program, *returned)
-            )
+            expanded: HashSet::default(),
         }
-        Type::Void => "void".to_string(),
-        Type::Never => "never".to_string(),
-        // A generic parameter, a module, a function and the solver's holes do
-        // not reach a service surface: services are not generic (B266), and a
-        // type that did not resolve is already a diagnostic.
-        _ => "_".to_string(),
     }
-}
 
-fn nominal(program: &Program, name: Option<&str>, arguments: &[TypeId]) -> String {
-    let name = name.unwrap_or("_");
-    if arguments.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name}<{}>", list(program, arguments))
+    /// Each nominal type by its DECLARED name (an alias, a renaming import or a
+    /// module path all name the declaration), its arguments in order,
+    /// `, `-separated — the spelling a type written plainly already has — and,
+    /// for a struct or enum declared outside std, its shape after the name the
+    /// first time (B525). `substitution` maps the enclosing declaration's
+    /// generic parameters (by constraint id) to their rendered arguments.
+    fn render(&mut self, type_id: TypeId, substitution: &[(TypeId, String)]) -> String {
+        let program = self.program;
+        let Some(type_) = program.type_id_to_type_map.get(&type_id) else {
+            return "_".to_string();
+        };
+        match type_ {
+            Type::Struct(id, arguments) => {
+                let name = self.nominal(
+                    program.structs.get(id).map(|declared| declared.name),
+                    arguments,
+                    substitution,
+                );
+                self.with_struct_shape(*id, name, arguments, substitution)
+            }
+            Type::Enum(id, arguments) => {
+                let name = self.nominal(
+                    program.enums.get(id).map(|declared| declared.name),
+                    arguments,
+                    substitution,
+                );
+                self.with_enum_shape(*id, name, arguments, substitution)
+            }
+            Type::Trait(id, arguments) => self.nominal(
+                program.traits.get(id).map(|declared| declared.name),
+                arguments,
+                substitution,
+            ),
+            Type::Dyn(id, arguments) => format!(
+                "dyn {}",
+                self.nominal(
+                    program.traits.get(id).map(|declared| declared.name),
+                    arguments,
+                    substitution,
+                )
+            ),
+            Type::Tuple(elements) => format!("({})", self.list(elements, substitution)),
+            Type::Array(element, length) => {
+                format!("[{}; {length}]", self.render(*element, substitution))
+            }
+            // B495: a closure type's parameter modes are part of the type, so
+            // they are part of its spelling (`|&str| void`).
+            Type::Closure(parameters, returned, _, modes) => {
+                let parameters: Vec<String> = parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, parameter)| {
+                        let prefix = modes
+                            .get(index)
+                            .map_or("", |mode| self.program.parameter_mode(*mode).prefix());
+                        format!("{prefix}{}", self.render(*parameter, substitution))
+                    })
+                    .collect();
+                format!(
+                    "|{}| {}",
+                    parameters.join(", "),
+                    self.render(*returned, substitution)
+                )
+            }
+            Type::Void => "void".to_string(),
+            Type::Never => "never".to_string(),
+            // A parameter of the declaration whose shape is being written: the
+            // argument this instance gives it.
+            Type::Generic(constraint) => substitution
+                .iter()
+                .find(|(parameter, _)| parameter == constraint)
+                .map_or_else(|| "_".to_string(), |(_, argument)| argument.clone()),
+            // A module, a function and the solver's holes do not reach a service
+            // surface: services are not generic (B266), and a type that did not
+            // resolve is already a diagnostic.
+            _ => "_".to_string(),
+        }
     }
-}
 
-fn list(program: &Program, types: &[TypeId]) -> String {
-    types
-        .iter()
-        .map(|&type_id| render(program, type_id))
-        .collect::<Vec<_>>()
-        .join(", ")
+    /// The declaration's parameters, each paired with its argument's rendering —
+    /// the substitution its fields and payloads are written under.
+    fn bind(
+        &mut self,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+        substitution: &[(TypeId, String)],
+    ) -> Vec<(TypeId, String)> {
+        parameters
+            .iter()
+            .zip(arguments)
+            .map(|(&parameter, &argument)| (parameter, self.render(argument, substitution)))
+            .collect()
+    }
+
+    /// Whether `id`'s shape is written: a declaration outside std, written once
+    /// per surface and instance.
+    fn first_user_mention(&mut self, id: Id, name: &str) -> bool {
+        let program = self.program;
+        let in_std = program
+            .source_of(id)
+            .is_some_and(|source| program.std_sources.contains(&source));
+        !in_std && self.expanded.insert(name.to_string())
+    }
+
+    fn with_struct_shape(
+        &mut self,
+        id: Id,
+        name: String,
+        arguments: &[TypeId],
+        substitution: &[(TypeId, String)],
+    ) -> String {
+        let program = self.program;
+        let Some(declared) = program.structs.get(&id) else {
+            return name;
+        };
+        // An `external` struct is a host type with no fields to write.
+        if declared.external || !self.first_user_mention(id, &name) {
+            return name;
+        }
+        let inner = self.bind(
+            &declared.generic_parameter_constraint_ids,
+            arguments,
+            substitution,
+        );
+        let fields: Vec<String> = declared
+            .fields
+            .iter()
+            .map(|field| format!("{}: {}", field.name, self.render(field.type_id, &inner)))
+            .collect();
+        format!("{name}{{{}}}", fields.join(", "))
+    }
+
+    fn with_enum_shape(
+        &mut self,
+        id: Id,
+        name: String,
+        arguments: &[TypeId],
+        substitution: &[(TypeId, String)],
+    ) -> String {
+        let program = self.program;
+        let Some(declared) = program.enums.get(&id) else {
+            return name;
+        };
+        if !self.first_user_mention(id, &name) {
+            return name;
+        }
+        let inner = self.bind(
+            &declared.generic_parameter_constraint_ids,
+            arguments,
+            substitution,
+        );
+        let backed = declared.backing.is_some();
+        let variants: Vec<String> = declared
+            .variants
+            .iter()
+            .map(|variant| {
+                let mut written = variant.name.to_string();
+                if !variant.data_type_ids.is_empty() {
+                    written.push_str(&format!("({})", self.list(&variant.data_type_ids, &inner)));
+                }
+                if backed {
+                    match &variant.backing_value {
+                        BackingValue::Int(value) => written.push_str(&format!(" = {value}")),
+                        BackingValue::Str(value) => written.push_str(&format!(" = \"{value}\"")),
+                    }
+                }
+                written
+            })
+            .collect();
+        format!("{name}{{{}}}", variants.join(", "))
+    }
+
+    fn nominal(
+        &mut self,
+        name: Option<&str>,
+        arguments: &[TypeId],
+        substitution: &[(TypeId, String)],
+    ) -> String {
+        let name = name.unwrap_or("_");
+        if arguments.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}<{}>", self.list(arguments, substitution))
+        }
+    }
+
+    fn list(&mut self, types: &[TypeId], substitution: &[(TypeId, String)]) -> String {
+        types
+            .iter()
+            .map(|&type_id| self.render(type_id, substitution))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 #[cfg(test)]

@@ -33,7 +33,7 @@ build emitted — `Document::of(build).title("Vilan todos")` — so the
 `<link>`, the `<script>` and the mount `<div id>` are derived from the
 artifacts they name and cannot disagree with them. That is the top rung of
 the full-stack ladder ([Services & RPC](../../docs/guide/services.md),
-[`std::document`](../../docs/std/process.md)); the
+[`std::web::document`](../../docs/std/process.md)); the
 [walkthrough](../walkthrough/) and the `vilan init` scaffold stand one rung
 below, with a hand-written `src/app.html` that `require_shell` checks against
 the build at every boot.

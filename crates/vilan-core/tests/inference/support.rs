@@ -134,8 +134,8 @@ pub fn compile(source: &str) -> Result<String, Vec<String>> {
     compile_on(source, Platform::default())
 }
 
-/// `compile` for a browser build — the platform whose layer holds `std::ui` /
-/// `std::dom` / `std::router`, none of which the default (node) platform can
+/// `compile` for a browser build — the platform whose layer holds `std::web::ui` /
+/// `std::web::dom` / `std::web::router`, none of which the default (node) platform can
 /// import.
 pub fn compile_browser(source: &str) -> Result<String, Vec<String>> {
     compile_on(source, Platform::Browser)
@@ -752,6 +752,15 @@ pub fn warning_diagnostics_with_std(
     source: &str,
     std: PackageSpec,
 ) -> Vec<(String, std::ops::Range<usize>)> {
+    warning_diagnostics_with_std_on(source, std, Platform::default())
+}
+
+/// [`warning_diagnostics_with_std`] analyzed for `platform`.
+pub fn warning_diagnostics_with_std_on(
+    source: &str,
+    std: PackageSpec,
+    platform: Platform,
+) -> Vec<(String, std::ops::Range<usize>)> {
     let source = source.to_string();
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -762,7 +771,7 @@ pub fn warning_diagnostics_with_std(
                 &std,
                 Path::new("."),
                 Path::new("test.vl"),
-                Some(Platform::default()),
+                Some(platform),
                 &Workspace::default(),
             );
             let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();

@@ -357,43 +357,142 @@ fn the_std_surface_batch_needs_no_import() {
     );
 }
 
-// --- I9: `HashMap`/`HashSet`, and the old names as deprecated aliases ---------
+// --- I9: `HashMap`/`HashSet`; R-e: the old names are gone ---------------------
 //
 // The hash collections are `std::hash_map::HashMap` and `std::hash_set::HashSet`.
-// `std::map::Map` and `std::set::Set` stay one release as `[deprecated]`
-// re-exports of the SAME types: a program that still spells them compiles,
-// warns at the name with the steer, and its values pass for the new type's in
-// both directions (a second spelling of one item, not a second type).
+// `std::map::Map` and `std::set::Set` had their one release as `[deprecated]`
+// re-exports (v0.42.0) and R-e (Order 46, ruled) removed them, with the reactive
+// cells' short names A148 renamed in v0.43.0: a use of an old name is refused,
+// and the refusal names the new one.
 
 #[test]
-fn i9_std_map_map_is_a_deprecated_alias_that_warns_with_the_steer() {
-    assert_warns_spanning(
-        r#"
-        import std::map::Map;
+fn r_e_the_removed_collection_modules_are_refused_with_the_new_path() {
+    for (import, steer) in [
+        (
+            "import std::map::Map;",
+            "`std::map` was removed: its `Map` is `std::hash_map::HashMap`",
+        ),
+        (
+            "import std::set::Set;",
+            "`std::set` was removed: its `Set` is `std::hash_set::HashSet`",
+        ),
+        (
+            "import std::map;",
+            "`std::map` was removed: its `Map` is `std::hash_map::HashMap`",
+        ),
+        (
+            "import std::map_cell::MapCell;",
+            "`std::map_cell` is `std::reactive::hash_map_cell` now, and its `MapCell` is `HashMapCell`",
+        ),
+        (
+            "import std::set_cell;",
+            "`std::set_cell` is `std::reactive::hash_set_cell` now, and its `SetCell` is `HashSetCell`",
+        ),
+    ] {
+        assert_fails_once_with(&format!("{import}\n\nfun main() {{}}\n"), steer);
+    }
+}
 
-        fun main() {
-            mut scores: Map<str, i32> = Map::new();
-            scores.insert("a", 1);
+/// A154: every module that moved under a namespace is refused at its OLD path
+/// with where it went — from the one table the editor's fix also reads — and
+/// resolves at its new one. No forwarding modules (the ruling's (2)).
+#[test]
+fn a154_every_moved_module_is_refused_at_its_old_path_and_resolves_at_its_new_one() {
+    for (old, new) in vilan_core::parsing::MOVED_STD_MODULES {
+        let steer = vilan_core::parsing::moved_std_module_message(old, new);
+        // `std::web` resolves now (the namespace), so its old spelling shows
+        // only through a name the prelude exports; its own pin is below.
+        // `null` is a keyword, so no import path can spell `std::null` or
+        // `std::js::null` — the module is reached as the primitive type.
+        if *old == "null" {
+            continue;
         }
-        "#,
-        "Map",
-        "`Map` is deprecated; use std::hash_map::HashMap",
+        if *old != "web" {
+            assert_fails_once_with(&format!("import std::{old};\n\nfun main() {{}}\n"), &steer);
+        }
+        assert_compiles(&format!("import std::{new};\n\nfun main() {{}}\n"));
+    }
+}
+
+#[test]
+fn a154_a_moved_module_inside_a_brace_list_is_refused_where_it_is_written() {
+    assert_fails_once_with(
+        "import std::{ io::print, rpc_server::Server };\n\nfun main() {\n\tprint(\"x\");\n}\n",
+        "`std::rpc_server` moved to `std::rpc::server`",
+    );
+    assert_fails_once_with(
+        "import std::delta::{ ListCell };\n\nfun main() {}\n",
+        "`std::delta` moved to `std::reactive::delta`",
     );
 }
 
 #[test]
-fn i9_std_set_set_is_a_deprecated_alias_that_warns_with_the_steer() {
-    assert_warns_spanning(
+fn a154_the_old_web_prelude_path_is_refused_and_a_typo_under_the_namespace_is_not() {
+    // `std::web::Signal` was the web prelude's re-export; `web` resolves (the
+    // namespace), `Signal` misses, and the refusal names the move.
+    assert_fails_once_with(
+        "import std::web::Signal;\n\nfun main() {}\n",
+        "`std::web` moved to `std::web::prelude`",
+    );
+    assert_compiles("import std::web::prelude::Signal;\n\nfun main() {}\n");
+    // A name the prelude does NOT export is an ordinary miss under the
+    // namespace — the steer would point at a path that does not have it either.
+    assert_fails_once_with(
+        "import std::web::dmo;\n\nfun main() {}\n",
+        "cannot find 'dmo' in the imported path",
+    );
+}
+
+#[test]
+fn r_e_every_renamed_collection_name_is_refused_with_its_new_name() {
+    for (old, new, module) in [
+        ("Map", "HashMap", "hash_map"),
+        ("Set", "HashSet", "hash_set"),
+        ("MapCell", "HashMapCell", "reactive"),
+        ("SetCell", "HashSetCell", "reactive"),
+        ("MapEntry", "HashMapEntry", "reactive"),
+        ("SetEntry", "HashSetEntry", "reactive"),
+        ("MapMemo", "HashMapMemo", "reactive"),
+        ("SetMemo", "HashSetMemo", "reactive"),
+        ("TrackedMap", "TrackedHashMap", "reactive"),
+    ] {
+        // Imported from the module that declares the new name: the old one is
+        // refused there, naming the new.
+        assert_fails_once_with(
+            &format!("import std::{module}::{old};\n\nfun main() {{}}\n"),
+            &format!("`{old}` was renamed `{new}`: write `import std::{module}::{new};`"),
+        );
+    }
+    // Written with no import at all, in a type and in a value position: the
+    // ordinary miss, carrying the same steer.
+    assert_fails_with(
+        "fun main() {\n\tlet table: Map<str, i32> = HashMap::new();\n}\n",
+        "cannot find type 'Map'; `Map` was renamed `HashMap` — `import std::hash_map::HashMap;`",
+    );
+    assert_fails_with(
+        "fun main() {\n\tlet cell = MapCell::new();\n}\n",
+        "`MapCell` was renamed `HashMapCell` — `import std::reactive::HashMapCell;`",
+    );
+}
+
+/// A program's own `Map` is its own: the steer is a miss's, so a declaration
+/// of the name never meets it.
+#[test]
+fn r_e_a_programs_own_map_is_untouched() {
+    assert_compiles_and_runs(
         r#"
-        import std::set::Set;
+        import std::io::print;
+
+        struct Map {
+            size: i32,
+        }
 
         fun main() {
-            mut seen: Set<i32> = Set::new();
-            seen.insert(1);
+            let map = Map { size = 3 };
+            print(map.size);
         }
         "#,
-        "Set",
-        "`Set` is deprecated; use std::hash_set::HashSet",
+        "3\n",
     );
 }
 
@@ -521,41 +620,6 @@ fn i9_a_map_of_incomparable_values_has_no_equality() {
         }
         "#,
         "PartialEq",
-    );
-}
-
-/// The alias IS the type: an old-spelled value goes where the new type is
-/// declared and back, the old import still reaches the `List` terminators
-/// (`to_map`/`to_set`, extension impls declared in the new modules), and a
-/// `for` over an old-spelled set still takes the set's native lowering (it is
-/// keyed on the declaring struct, which the alias shares).
-#[test]
-fn i9_the_old_names_are_the_same_types_as_the_new() {
-    assert_compiles_and_runs(
-        r#"
-        import std::io::print;
-        import std::hash_map::HashMap;
-        import std::hash_set::HashSet;
-        import std::map::Map;
-        import std::set::Set;
-
-        fun size_new(table: HashMap<str, i32>): usize { table.len() }
-        fun size_old(table: Map<str, i32>): usize { table.len() }
-        fun make_old(): Set<i32> { [3, 1, 3].to_set() }
-
-        fun main() {
-            let old: Map<str, i32> = [("a", 1), ("b", 2)].to_map();
-            let new: HashMap<str, i32> = old;
-            print(size_new(old));
-            print(size_old(new));
-            let seen: HashSet<i32> = make_old();
-            for value in make_old() {
-                print(value);
-            }
-            print(seen.contains(1));
-        }
-        "#,
-        "2\n2\n3\n1\ntrue\n",
     );
 }
 
@@ -5210,7 +5274,7 @@ fn b98_the_platform_twins_are_not_a_duplicate_on_either_leg() {
     // proof lives in `check_scope_differential.rs`, which force-loads every std
     // module on both legs with the skip disabled.)
     let source = r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun main() { let root: View = view("div"); }
         "#;
     assert_compiles_browser(source);
@@ -5281,6 +5345,173 @@ fn m107_impls_of_one_trait_over_distinct_types_are_never_compared() {
         "120 more impls of `Tag` over 120 more types took the duplicate-impl \
          check from {small} comparisons to {large}: an impl must be compared only with \
          the earlier impls of its own trait and subject head (M107)"
+    );
+}
+
+/// M107: the member and trait lookups read only the impls whose subject head
+/// can admit the receiver — a package of N types with derived impls costs each
+/// `==` the impls of ITS type and the blankets, not every derived `eq` in the
+/// program. Before, every lookup scanned the member's (or trait's, or every)
+/// impl row, so the rows examined grew with the square of the package: the
+/// margin of a doubling reads x2.00 here, and x3.47 with the head index
+/// planted out (8,374 / 23,104 / 74,164 rows at 30 / 60 / 120). Measured by the row
+/// counter at two sizes in one process; the generated plain package of
+/// `performance-gates.md` §6.2 (24k -> 49k lines) went from x2.80 to x1.94 in
+/// instructions with this and the other M107 indices.
+#[test]
+fn m107_impl_lookups_examine_rows_linear_in_the_package() {
+    fn rows(types: usize) -> (usize, bool) {
+        // `performance-gates.md` §6.2's plain module, one per type, in one
+        // file: derived `PartialEq` and `Debug`, a list built and walked, an
+        // `Option` matched — the lookups (`push`, the iterator protocol,
+        // `==`) whose candidate rows every derived impl used to join.
+        let mut source =
+            String::from("import std::compare::PartialEq;\nimport std::range::Range;\n");
+        for index in 0..types {
+            source.push_str(&format!(
+                "[derive(PartialEq, Debug)]\n\
+                 struct Row{index} {{ id: i32, weight: i32 }}\n\
+                 fun pick{index}(rows: List<Row{index}>, wanted: i32): Option<i32> {{\n\
+                 \tmut found = None;\n\
+                 \tfor row in rows {{ if row.id == wanted {{ found = Some(row.weight); }} }}\n\
+                 \tfound\n}}\n\
+                 fun score{index}(n: i32): i32 {{\n\
+                 \tmut rows: List<Row{index}> = [];\n\
+                 \tfor i in Range::new(0, n) {{ rows.push(Row{index} {{ id = i, weight = i * 2 }}); }}\n\
+                 \tmatch pick{index}(rows, n / 2) {{ Some(let w) => w + 1, None => 0 }}\n}}\n"
+            ));
+        }
+        source.push_str("fun main() { print(score0(3)); }\nmain();\n");
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                vilan_core::analyzer::reset_impl_rows_examined();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                assert!(program.is_some(), "analysis should produce a program");
+                (
+                    vilan_core::analyzer::impl_rows_examined(),
+                    vilan_core::analyzer::served_from_base_cache(),
+                )
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    // Both measured analyses are served std's world from the base cache, so
+    // each counts the same std share (`m107_impls_of_one_trait_…`'s reason).
+    let served = |types: usize| {
+        (0..4)
+            .map(|_| rows(types))
+            .find(|(_, served)| *served)
+            .map(|(count, _)| count)
+            .expect("the base cache serves a repeated analysis of the same world")
+    };
+    // The MARGINAL rows of each doubling, so std's own share (every lookup
+    // reads std's impls of the member too) cancels: linear growth doubles the
+    // margin per doubling, quadratic growth quadruples it.
+    let (quarter, half, whole) = (served(30), served(60), served(120));
+    let first = half.saturating_sub(quarter) as f64;
+    let second = whole.saturating_sub(half) as f64;
+    let ratio = second / first.max(1.0);
+    assert!(
+        ratio < 2.6,
+        "doubling the package's types and derived impls grew the impl lookups' rows examined \
+         by {second} where the doubling before grew them by {first} (x{ratio:.2}; {quarter}, \
+         {half}, {whole}): a lookup is scanning impls whose subject head cannot admit its \
+         receiver, which is quadratic in the package (M107)"
+    );
+}
+
+/// M106's first slice: per-declaration cost attribution in WORK COUNTS. With
+/// attribution on, every constraint the fixpoint attempts charges its work —
+/// attempts, inferences, slots, impl rows — to the function whose body its
+/// anchor sits in, and the program ranks the declarations costliest first.
+/// The ranking is a count, so it is the same on every run; a function whose
+/// body asks the solver for a long chain of generic calls outranks one that
+/// asks for nothing. (The attribution switch is process-wide, which is safe
+/// here: it only adds the table, and no other pin reads it.)
+#[test]
+fn m106_cost_attribution_ranks_declarations_by_solver_work_and_repeats_exactly() {
+    vilan_core::counters::set_cost_attribution(20);
+    let source = r#"
+        import std::io::print;
+        fun wrap<T>(value: T): Option<T> { Some(value) }
+        fun heavy(): i32 {
+            let a = wrap(wrap(wrap(wrap(wrap(1)))));
+            let b = wrap(wrap(wrap(wrap(wrap("x")))));
+            let c = [wrap(1), wrap(2), wrap(3), wrap(4), wrap(5), wrap(6)];
+            let d = c.map(|item| item.unwrap_or(0)).fold(0, |sum, value| sum + value);
+            match a { Some(_) => d, None => 0 }
+        }
+        fun light(): i32 { 1 }
+        fun main() { print(heavy() + light()); }
+    "#;
+    let costs = || {
+        let source = source.to_string();
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                program
+                    .expect("analysis should produce a program")
+                    .item_costs
+                    .into_iter()
+                    .filter(|cost| ["heavy", "light", "main"].contains(&cost.name.as_str()))
+                    .map(|cost| (cost.name, cost.work))
+                    .collect::<Vec<_>>()
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    };
+    let first = costs();
+    let names: Vec<&str> = first.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names.first(),
+        Some(&"heavy"),
+        "the function that asks the solver for the most work must rank first: {first:#?}"
+    );
+    let heavy = first[0].1;
+    assert!(
+        heavy.attempts > 0 && heavy.inferences > 0,
+        "`heavy`'s constraints were charged no attempts or inferences: {heavy:?}"
+    );
+    if let Some((_, light)) = first.iter().find(|(name, _)| name == "light") {
+        assert!(
+            light.total() < heavy.total(),
+            "`light` outranks or ties `heavy`: {first:#?}"
+        );
+    }
+    assert_eq!(
+        costs(),
+        first,
+        "the same program must cost the same work, declaration by declaration"
     );
 }
 
@@ -7320,5 +7551,134 @@ fn b416_a_field_named_like_the_expansions_own_bindings_round_trips() {
             "}\n",
         ),
         "1 s 2 2\n",
+    );
+}
+
+// --- A150: `TransientState::map`, `and_then`, `zip` -----------------------------
+//
+// Every consumer of a transient re-matched its five arms to change the value it
+// carries (kolt wrote a `map_state` of its own). The three combinators keep the
+// arm and move the value; each arm is pinned.
+
+const A150_SHOW: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::transient::TransientState;\n",
+    "\n",
+    "fun show(state: TransientState<i32, str>): str {\n",
+    "\tmatch state {\n",
+    "\t\tTransientState::Pending => \"Pending\",\n",
+    "\t\tTransientState::Ready(let v) => i\"Ready({v})\",\n",
+    "\t\tTransientState::Refreshing(let v) => i\"Refreshing({v})\",\n",
+    "\t\tTransientState::Failed(let e, let stale) => match stale {\n",
+    "\t\t\tSome(let v) => i\"Failed({e}, {v})\",\n",
+    "\t\t\tNone => i\"Failed({e})\",\n",
+    "\t\t},\n",
+    "\t\tTransientState::Absent => \"Absent\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+);
+
+/// `map` transforms every value the state holds — a `Refreshing`'s and a
+/// `Failed`'s stale one included — and keeps the arm.
+#[test]
+fn a150_transient_state_map_keeps_the_arm_and_moves_every_value() {
+    let source = format!(
+        "{A150_SHOW}{}",
+        concat!(
+            "fun main() {\n",
+            "\tlet states: List<TransientState<i32, str>> = [\n",
+            "\t\tTransientState::Pending,\n",
+            "\t\tTransientState::Ready(1),\n",
+            "\t\tTransientState::Refreshing(2),\n",
+            "\t\tTransientState::Failed(\"x\", Some(3)),\n",
+            "\t\tTransientState::Failed(\"y\", None),\n",
+            "\t\tTransientState::Absent,\n",
+            "\t];\n",
+            "\tfor state in states {\n",
+            "\t\tprint(show(state.map(|v| v * 10)));\n",
+            "\t}\n",
+            "}\n",
+        )
+    );
+    assert_compiles_and_runs(
+        &source,
+        "Pending\nReady(10)\nRefreshing(20)\nFailed(x, 30)\nFailed(y)\nAbsent\n",
+    );
+}
+
+/// `and_then` lets the value decide the state: the transient-of-a-maybe read as
+/// a transient that can be absent (kolt's `Channel::find`), with a refresh's
+/// `Ready`/`Absent` read as `Refreshing`/`Pending`, a failure's stale value
+/// passed through `next`, and an inner failure standing.
+#[test]
+fn a150_transient_state_and_then_lets_the_value_decide_the_state() {
+    let source = format!(
+        "{A150_SHOW}{}",
+        concat!(
+            "fun found(maybe: Option<i32>): TransientState<i32, str> {\n",
+            "\tmatch maybe {\n",
+            "\t\tSome(let v) => if v < 0 { TransientState::Failed(\"neg\", None) } else { TransientState::Ready(v) },\n",
+            "\t\tNone => TransientState::Absent,\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet states: List<TransientState<Option<i32>, str>> = [\n",
+            "\t\tTransientState::Pending,\n",
+            "\t\tTransientState::Ready(Some(1)),\n",
+            "\t\tTransientState::Ready(None),\n",
+            "\t\tTransientState::Refreshing(Some(2)),\n",
+            "\t\tTransientState::Refreshing(None),\n",
+            "\t\tTransientState::Refreshing(Some(-1)),\n",
+            "\t\tTransientState::Failed(\"x\", Some(Some(3))),\n",
+            "\t\tTransientState::Failed(\"y\", Some(None)),\n",
+            "\t\tTransientState::Absent,\n",
+            "\t];\n",
+            "\tfor state in states {\n",
+            "\t\tprint(show(state.and_then(|maybe| found(maybe))));\n",
+            "\t}\n",
+            "}\n",
+        )
+    );
+    assert_compiles_and_runs(
+        &source,
+        concat!(
+            "Pending\nReady(1)\nAbsent\nRefreshing(2)\nPending\nFailed(neg)\n",
+            "Failed(x, 3)\nFailed(y)\nAbsent\n",
+        ),
+    );
+}
+
+/// `zip` is the pair while both hold a value, and otherwise the arm that says
+/// the most about why not: `Failed` (this one's error first, with the pair of
+/// latest values — none when a side is absent), then `Absent`, then `Pending`,
+/// then `Refreshing`.
+#[test]
+fn a150_transient_state_zip_pairs_two_states_by_precedence() {
+    let source = format!(
+        "{A150_SHOW}{}",
+        concat!(
+            "fun pair(a: TransientState<i32, str>, b: TransientState<i32, str>): str {\n",
+            "\tshow(a.zip(b).map(|(x, y)| x * 10 + y))\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(pair(TransientState::Ready(1), TransientState::Ready(2)));\n",
+            "\tprint(pair(TransientState::Ready(1), TransientState::Refreshing(2)));\n",
+            "\tprint(pair(TransientState::Refreshing(1), TransientState::Pending));\n",
+            "\tprint(pair(TransientState::Pending, TransientState::Absent));\n",
+            "\tprint(pair(TransientState::Absent, TransientState::Failed(\"b\", Some(2))));\n",
+            "\tprint(pair(TransientState::Failed(\"a\", Some(1)), TransientState::Failed(\"b\", Some(2))));\n",
+            "\tprint(pair(TransientState::Ready(1), TransientState::Failed(\"b\", None)));\n",
+            "}\n",
+        )
+    );
+    assert_compiles_and_runs(
+        &source,
+        concat!(
+            "Ready(12)\nRefreshing(12)\nPending\nAbsent\nFailed(b)\n",
+            "Failed(a, 12)\nFailed(b)\n",
+        ),
     );
 }

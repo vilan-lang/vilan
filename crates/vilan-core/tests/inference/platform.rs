@@ -92,10 +92,11 @@ fn an_impl_declared_browser_requires_it_of_its_members_alone() {
     assert_fails_without(source, "`plain` requires");
 }
 
-/// B445: the attribute may stand AHEAD of `export` as well as after it — the
-/// issue's own `[platform("browser")] export impl` — and it is the impl's
-/// declaration either way: the members require the platform, the browser
-/// build is clean, and both spellings emit the same program.
+/// B445: the attribute stands AHEAD of `export` — the issue's own
+/// `[platform("browser")] export impl` — and it is the impl's declaration:
+/// the members require the platform and the browser build is clean. The
+/// other side of the marker, which B445 also read, is refused since B485 S3
+/// (v0.44.0), steered to this order, and still read as it.
 #[test]
 fn b445_an_impl_platform_written_ahead_of_export_is_the_impls() {
     let program = |head: &str| {
@@ -114,23 +115,21 @@ fn b445_an_impl_platform_written_ahead_of_export_is_the_impls() {
             "`show` requires the `browser` platform its `impl` declares",
         );
     }
-    let emitted_ahead = compile_browser(&ahead).expect("the browser build is clean");
-    let emitted_after = compile_browser(&after).expect("the browser build is clean");
-    assert_eq!(emitted_ahead, emitted_after);
+    compile_browser(&ahead).expect("the browser build is clean");
+    assert_fails_with(
+        &after,
+        "a declaration's markers are written in one order — its attributes, then the keywords \
+         `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration word: \
+         write `[platform(..)] export impl`",
+    );
     // A function's whole prefix, with a scope, ahead of the marker.
     let function = |head: &str| {
         format!("{head} fun answer(): i32 {{\n\t42\n}}\n\nfun main() {{\n\tprint(answer());\n}}\n")
     };
-    assert_eq!(
-        compile(&function(
-            "[deprecated(\"use other()\")] [must_use] export(in pkg)"
-        ))
-        .expect("the attributed, scoped export compiles"),
-        compile(&function(
-            "export(in pkg) [deprecated(\"use other()\")] [must_use]"
-        ))
-        .expect("the attributed, scoped export compiles"),
-    );
+    compile(&function(
+        "[deprecated(\"use other()\")] [must_use] export(in pkg)",
+    ))
+    .expect("the attributed, scoped export compiles");
 }
 
 /// A pattern no platform answers to is reported ONCE, where it is written —
@@ -376,13 +375,13 @@ fn a_never_instantiated_impls_globals_leave_no_residue() {
 
 #[test]
 fn the_router_is_browser_only() {
-    // `std::router` lives in the browser layer. Under platform coloring the
+    // `std::web::router` lives in the browser layer. Under platform coloring the
     // import is fine — REACHING `navigate` from a node build's entry is the
     // violation, anchored at the user call site with the chain
     // (proposal/platform-coloring.md §3.6).
     assert_fails_spanning(
         r#"
-        import std::router::navigate;
+        import std::web::router::navigate;
 
         fun main() {
             navigate("/home");
@@ -412,8 +411,8 @@ fn the_router_is_browser_only() {
 /// only under the platform its fence admits.
 const SLOT_TWINS: &str = r#"
 import std::io::print;
-import std::ui;
-import std::ui::{ Slot, View, view };
+import std::web::ui;
+import std::web::ui::{ Slot, View, view };
 
 struct Badge {
     label: str,
@@ -676,7 +675,7 @@ fn a_family_fence_draws_one_diagnostic_not_one_per_host() {
     // first host that rejects it; the fence itself is quoted, so the family is
     // not lost.
     let source = r#"
-        import std::router::navigate;
+        import std::web::router::navigate;
 
         [platform("@process")]
         fun go() {
@@ -707,7 +706,7 @@ fn two_fences_broken_the_same_way_each_report() {
     // The negative for the fence half: the origin is part of the cause, so two
     // distinct promises are two distinct mistakes even reaching the same callee.
     let source = r#"
-        import std::router::navigate;
+        import std::web::router::navigate;
 
         [platform("@process")]
         fun go_home() {
@@ -1102,7 +1101,7 @@ fn an_initializer_violation_anchors_at_the_initializer_call() {
     // `navigate` precedent.)
     assert_fails_spanning(
         r#"
-        import std::storage::get;
+        import std::web::storage::get;
 
         let token = get("notes-token");
 
@@ -1442,7 +1441,7 @@ fn a_function_requiring_two_layers_renders_one_line_each_in_label_order() {
     let line = requirement_line_of(
         r#"
         import std::fs;
-        import std::router::navigate;
+        import std::web::router::navigate;
 
         fun torn() {
             fs::write_file("state", "data");
@@ -1456,7 +1455,7 @@ fn a_function_requiring_two_layers_renders_one_line_each_in_label_order() {
     .expect("`torn` requires both layers");
     assert_eq!(
         line,
-        "requires the `browser` layer of `std` (via `navigate (std::router)`)\n\
+        "requires the `browser` layer of `std` (via `navigate (std::web::router)`)\n\
          requires the `process` layer of `std` (via `write_file (std::fs)`)"
     );
 }
@@ -1910,11 +1909,11 @@ fn a_context_reading_function_still_cannot_be_a_value() {
 #[test]
 fn an_imported_function_coerces_across_modules() {
     // The reference resolves through an import binding (browser layer:
-    // `std::router::segments` is a plain vilan fn) — the coercion and the
+    // `std::web::router::segments` is a plain vilan fn) — the coercion and the
     // emitted value must both follow the alias to the defining function.
     assert_compiles_browser(
         r#"
-        import std::router::segments;
+        import std::web::router::segments;
 
         fun apply(path: str, transform: |str| List<str>): List<str> {
             transform(path)
@@ -3721,7 +3720,7 @@ fn bind_draft_compiles_for_the_browser() {
     // adoption writes `local` and bypasses the push path).
     assert_compiles_browser(
         r#"
-        import std::ui::{ view, View, mount_root };
+        import std::web::ui::{ view, View, mount_root };
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
 
@@ -4390,6 +4389,21 @@ fn an_unannotated_map_new_requires_an_annotation() {
         "#,
         "never fully determined",
     );
+}
+
+/// B497: the steer's example annotation spells the type by its current
+/// name — `: HashMap<str, i32>`, not the deprecated `Map` (removed by R-e).
+#[test]
+fn b497_the_never_determined_steer_spells_hash_map() {
+    let source = r#"
+        import std::hash_map::HashMap;
+        fun main() {
+            mut table = HashMap::new();
+            table.insert("k", 1);
+        }
+        "#;
+    assert_fails_with(source, "annotate the binding (e.g. `: HashMap<str, i32>`)");
+    assert_fails_without(source, "`: Map<");
 }
 
 #[test]
@@ -9588,6 +9602,38 @@ fn b196_the_numeric_carve_out_is_untouched() {
     );
 }
 
+/// B531: the right operand of a native number's `-` `*` `/` `%` and bitwise
+/// family must be a number too. `let x: i32 = 2 * true;` checked clean and
+/// printed `2` (the host coerces `true` to `1`); a `str`, a struct and an
+/// enum on the right were as quiet. The numeric carve-out above stands.
+#[test]
+fn b531_a_non_numeric_right_operand_of_a_numbers_arithmetic_is_refused() {
+    for (expression, right) in [
+        ("2 * true", "bool"),
+        ("count * false", "bool"),
+        ("2.5 * true", "bool"),
+        ("count - true", "bool"),
+        ("count / \"2\"", "str"),
+        ("count % true", "bool"),
+        ("count & true", "bool"),
+        ("count << true", "bool"),
+        ("count * Point { x = 1 }", "Point"),
+    ] {
+        let source = format!(
+            r#"
+            struct Point {{ x: i32 }}
+            fun main() {{
+                let count: i32 = 3;
+                let x = {expression};
+                print(x);
+            }}
+            "#
+        );
+        assert_fails_once_with(&source, "computes on two numbers");
+        assert_fails_with(&source, &format!("the right operand is `{right}`"));
+    }
+}
+
 #[test]
 fn b196_the_admitted_operators_of_each_left_type_still_run() {
     // The controls. Every operator each refusal NAMES as admitted has to keep
@@ -10051,30 +10097,39 @@ fn b206_an_ordinary_parameter_still_renders_as_written() {
 
 #[test]
 fn b249_a_trait_parameter_takes_the_impls_argument() {
-    // The find's own shape, against std's own reactive trait: `T` is nested
-    // inside a closure type, which is why it is a substitution and not a
-    // per-position lookup. A142 moved `on_change` off `Source` (whose required
-    // attach is now the `T`-free `on_settle`) onto `Flow<T>`, where it is still a
-    // requirement with `T` inside its observer's closure type — so the pin names
-    // `Flow<i32>`, the trait that still carries the shape.
-    let source = r#"
+    // The find's own shape, against std's own reactive traits: `T` nested inside
+    // a type, which is why it is a substitution and not a per-position lookup.
+    // `Flow<T>`'s one requirement is `start`, whose `T` sits inside the
+    // `Instance<T>` it returns (F78, Order 46, made `on_change`/`sub` defaults over
+    // it). The closure-nested case is the trait below, written as `on_change`
+    // was.
+    let flow = r#"
         import std::reactive::Flow;
         struct Counted { n: i32 }
         impl Counted with Flow<i32> { }
         fun main() {}
         "#;
-    // The substitution is the claim, so the pin reads the declaration around
-    // the receiver: the line renders `Flow`'s `own self` as a bare `self` (a
-    // separate find — copied verbatim it is refused for its receiver), and this
-    // pin must not be the one that fixes that spelling in place.
-    assert_fails_with(source, "missing 'on_change'; declare `fun on_change(");
-    // B482's std half typed the observer with its clause: `(|T| void) context
-    // tracking`, substituted the same way.
-    assert_fails_with(
-        source,
-        ", observer: (|i32| void) context tracking): Subscription`",
-    );
-    assert_fails_without(source, "|T| void");
+    // The line renders `Flow`'s `own self` as written, and the pin reads the
+    // declaration around the receiver all the same.
+    assert_fails_with(flow, "missing 'start'; declare `fun start(");
+    assert_fails_with(flow, "): Instance<i32>`");
+    assert_fails_without(flow, "Instance<T>");
+    // `T` inside a closure parameter, substituted the same way. (The clause
+    // `context tracking` on it is not rendered for a program's own trait, where
+    // std's `Flow::on_change` rendered it — filed by reactive-46; this pin holds
+    // the substitution only.)
+    let clause = r#"
+        import std::reactive::{ Subscription, tracking };
+        trait Watched<T> {
+            fun watch(own self, observer: (|T| void) context tracking): Subscription;
+        }
+        struct Counted { n: i32 }
+        impl Counted with Watched<i32> { }
+        fun main() {}
+        "#;
+    assert_fails_with(clause, "missing 'watch'; declare `fun watch(");
+    assert_fails_with(clause, "observer: |i32| void");
+    assert_fails_without(clause, "|T| void");
 }
 
 #[test]
@@ -10501,7 +10556,7 @@ fn b290_an_annotated_closure_parameter_stays_the_control() {
 // method" and is really "was the receiver's type known on the first attempt":
 // a receiver whose type had not landed made the call DEFER, the body typed the
 // parameter itself, and the retry bound `E` from the finished closure.
-// `std::router::link_to`'s `|event: Event|` was the workaround.
+// `std::web::router::link_to`'s `|event: Event|` was the workaround.
 
 #[test]
 fn b304_a_closure_parameter_is_not_frozen_at_the_callees_unbound_generic() {
@@ -10759,5 +10814,17 @@ fn a_supertrait_member_called_through_a_bound_reaches_only_its_implementors() {
             print(next.get());
         }
         "#,
+    );
+}
+
+/// B536: attributes out of THE order are a WARNING of the analysis the
+/// language server and the harnesses run (`analyze_source`), spanning the
+/// head's run — and only a warning: the analysis is otherwise clean.
+#[test]
+fn b536_an_attribute_order_warning_rides_the_analysis() {
+    assert_warns_spanning(
+        "[must_use] [deprecated(\"use b\")]\nfun answer(): i32 {\n\t42\n}\n\nfun main() {\n\tif answer() > 0 {}\n}\n",
+        "[must_use] [deprecated(\"use b\")]",
+        "a declaration's attributes are written in one order",
     );
 }

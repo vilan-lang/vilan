@@ -419,7 +419,7 @@ fn an_observer_fires_with_the_current_value_through_the_weak_capture() {
 #[test]
 fn a_teardown_subscription_over_no_signal_still_releases_exactly_once() {
     // `Subscription::teardown` is the registration shape for a source outside
-    // the signal graph (`std::dom`'s `listen`): there is no signal, so there is
+    // the signal graph (`std::web::dom`'s `listen`): there is no signal, so there is
     // no subscriber list to alias, and the cell it mints dies with the call.
     // Under counting its weak alias answers `None` — which is the right answer,
     // because the whole of this shape's teardown is the `release` one-shot, and

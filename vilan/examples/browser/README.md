@@ -1,9 +1,9 @@
-# Browser example: raw `std::dom`
+# Browser example: raw `std::web::dom`
 
-A Vilan client that runs in the browser, built directly on the `std::dom`
+A Vilan client that runs in the browser, built directly on the `std::web::dom`
 platform layer, with no reactive layer, components, or framework. This is
 the floor everything else stands on. See [`../reactive-ui/`](../reactive-ui/)
-for the same ideas expressed through `std::ui`.
+for the same ideas expressed through `std::web::ui`.
 
 ## Build
 
@@ -29,7 +29,7 @@ whose paragraphs remove themselves when clicked (`remove`).
 
 ## Notes
 
-- `client.vl` only imports `std::dom` and other universal (core) modules, so it
+- `client.vl` only imports `std::web::dom` and other universal (core) modules, so it
   compiles for `--target browser`. Importing a Node-layer module (`std::http`,
   `std::fs`, `std::process`) here is a compile error.
 - The full-stack flow (a Vilan `std::http` server that serves this bundle

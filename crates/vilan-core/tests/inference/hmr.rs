@@ -302,7 +302,7 @@ fn hmr_disabled_is_byte_identical_and_has_no_instrumentation() {
 fn hmr_stash_rejects_a_closure_argument() {
     assert_fails_browser_with(
         r#"
-        import std::dev;
+        import std::web::dev;
 
         fun main() {
             dev::stash("handler", || 0);
@@ -318,7 +318,7 @@ fn hmr_stash_rejects_a_closure_argument() {
 fn hmr_stash_rejects_a_shared_argument() {
     assert_fails_browser_with(
         r#"
-        import std::dev;
+        import std::web::dev;
         import std::shared::Shared;
 
         fun main() {
@@ -335,7 +335,7 @@ fn hmr_stash_rejects_a_shared_argument() {
 fn hmr_stash_rejects_a_struct_that_holds_a_closure() {
     assert_fails_browser_with(
         r#"
-        import std::dev;
+        import std::web::dev;
 
         struct Handlers { on_click: || void }
 
@@ -353,7 +353,7 @@ fn hmr_stash_rejects_a_struct_that_holds_a_closure() {
 fn hmr_stash_accepts_a_plain_struct() {
     assert_compiles_browser(
         r#"
-        import std::dev;
+        import std::web::dev;
 
         struct Session { id: i32, name: str }
 
@@ -370,7 +370,7 @@ fn hmr_stash_accepts_a_plain_struct() {
 fn hmr_take_rejects_a_non_transferable_element() {
     assert_fails_browser_with(
         r#"
-        import std::dev;
+        import std::web::dev;
         import std::shared::Shared;
         import std::option::Option::{ self, Some, None };
 
@@ -392,7 +392,7 @@ fn hmr_take_rejects_a_non_transferable_element() {
 fn hmr_take_and_on_teardown_accept_plain_usage() {
     assert_compiles_browser(
         r#"
-        import std::dev;
+        import std::web::dev;
         import std::option::Option::{ self, Some, None };
 
         fun main() {

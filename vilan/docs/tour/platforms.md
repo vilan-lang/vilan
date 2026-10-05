@@ -15,10 +15,10 @@ runtime crash. That's the whole idea of this chapter.
   `Option`/`Result`, strings, numbers, `reactive`, `shared`, `time`,
   json/wire/binary, the rpc client machinery, `style`, `fetch`,
   `crypto`, and friends).
-- **Browser layer**: `std::dom`, `std::ui`, `std::router`,
-  `std::storage`. Browser builds only.
+- **Browser layer**: `std::web::dom`, `std::web::ui`, `std::web::router`,
+  `std::web::storage`. Browser builds only.
 - **Process layer** (Node/Deno/Bun): `std::db`, `std::http`, `std::fs`,
-  `std::process`, `std::rpc_server`. Server builds only.
+  `std::process`, `std::rpc::server`. Server builds only.
 
 > **Going deeper.** The check is on *reachable code*, not on imports. A
 > file may import `std::fs` and compile for the browser, as long as no
@@ -153,8 +153,8 @@ property on a RECEIVER with `[extern(get, "activeElement")]` when the
 program holds the object it hangs off, or — for a true global, which has no
 receiver — wrap it in a one-line host function of your own and bind that.
 std does the second for `window`, `location.pathname` and
-`document.activeElement`, which is why `std::dom::window()` and
-`std::dom::active_element()` exist.
+`document.activeElement`, which is why `std::web::dom::window()` and
+`std::web::dom::active_element()` exist.
 
 Any of them takes a trailing `retains` —
 `[extern(method, "addEventListener", retains)]` — and you need it whenever
@@ -177,11 +177,11 @@ were emitted. Your server serves those two files and an HTML shell; the
 [services guide](../guide/services.md) shows the standard fallback
 shape.
 
-> **Going deeper.** Build assets come from `std::asset::emit(kind,
+> **Going deeper.** Build assets come from `std::web::asset::emit(kind,
 > content)` — or `emit_keyed(kind, key, content)`, where the
 > contribution carries its own sort key — callable only during `const`
 > evaluation; the input sibling
-> `std::asset::read(path)` pulls a project file in at compile time the
+> `std::web::asset::read(path)` pulls a project file in at compile time the
 > same way. The styling
 > system's `const style()` chains call it to write CSS rules. Libraries
 > can also declare platform overlays of their own (a base root plus

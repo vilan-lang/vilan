@@ -25,13 +25,9 @@ export import std::debug;
 export import std::display;
 export import std::hash_map;
 export import std::hash_set;
-// `map` and `set` are the hash collections' modules before tracker I9, each a
-// deprecated alias now (`Map` IS `HashMap`); they leave with std's.
-export import std::map;
 export import std::operators;
 export import std::option;
 export import std::result;
-export import std::set;
 // `panic` throws — the macro's error channel: a throw surfaces as a spanned
 // "failed at expansion time" diagnostic at the invocation.
 export import std::io::panic;

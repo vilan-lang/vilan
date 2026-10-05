@@ -30,9 +30,10 @@ import pkg::fetch::{
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::io::panic;
+import pkg::js::promise::Promise;
 import pkg::json::JsonValue;
 import pkg::option::Option::{ self, None, Some };
-import pkg::promise::Promise;
+import pkg::reactive::transient::{ TransientSource, TransientState };
 import pkg::reactive::{
 	DeltaCursor,
 	DeltaLog,
@@ -69,7 +70,6 @@ import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::{ Shared, fresh_identity };
 import pkg::task::Task;
 import pkg::time::{ Duration, sleep_for };
-import pkg::transient::{ TransientSource, TransientState };
 import pkg::wire::{ Codec, Delta, Deserializer, Frame, Keyed, Serializer, Wire };
 
 // === Transport: request/response ============================================
@@ -111,7 +111,7 @@ export impl LocalTransport with Transport {
 /// the endpoint URL (`HttpTransport { url = "http://localhost:4000/rpc" }`);
 /// where the string comes from — hardcoded, env, config — is the app's choice.
 /// The server side is a mounted `Service`'s `{mount}rpc` route
-/// (`std::rpc_server`, installed with `ServerBuilder::with_service`).
+/// (`std::rpc::server`, installed with `ServerBuilder::with_service`).
 export struct HttpTransport {
 	url: str,
 }
@@ -351,7 +351,7 @@ export fun bridge<Tx: DuplexTransport>(wire: Tx): DuplexEnd {
 /// The real duplex transport over plain HTTP (§5's fallback, no WebSocket needed):
 /// server→client frames arrive on a long-lived SSE stream (`GET {base}/events`),
 /// and client→server frames POST to `{base}/send?c=<connection>`. The server side
-/// is a mounted `Service` (`std::rpc_server`); open one with `connect_split(base_url)`.
+/// is a mounted `Service` (`std::rpc::server`); open one with `connect_split(base_url)`.
 /// A true WebSocket transport becomes a drop-in sibling once it lands.
 export struct SplitDuplex {
 	// The connection id the server announced — apps use it to correlate this duplex
@@ -511,8 +511,8 @@ export fun rpc_protocols(credential: str): List<str> {
 	[rpc_subprotocol(), "token." + credential]
 }
 
-// The HMR hooks, declared here rather than imported from `std::dev` (`hmr.md`
-// §5): `std::dev` is a browser-layer module and this base module serves every
+// The HMR hooks, declared here rather than imported from `std::web::dev` (`hmr.md`
+// §5): `std::web::dev` is a browser-layer module and this base module serves every
 // platform, so it may not depend on it. `hmr_active` binds the `__hmr_active`
 // runtime helper (a `typeof` check, safe in any build); `hmr_register_teardown`
 // is a shim global, only ever reached behind the `hmr_active()` guard — inert
@@ -599,7 +599,7 @@ export struct PendingCall {
 /// The socket's binary channel tags (§5's multiplex, byte form): a binary WS
 /// message is `0x64` ('d') + a duplex frame, or `0x72` ('r') + a 4-byte LE request
 /// id + an RPC frame — the byte mirror of the `d:`/`r:<id>:` text prefixes, shared
-/// verbatim with the service upgrade path (`std::rpc_server`).
+/// verbatim with the service upgrade path (`std::rpc::server`).
 export fun tag_duplex_bytes(payload: Bytes): Bytes {
 	let tag = Bytes::alloc(1);
 	tag.set(0, 0x64);
@@ -935,7 +935,7 @@ fun route_socket_bytes(
 
 /// The announcement a server sends a vilan client it has REFUSED (A47), the
 /// `__conn:<id>` handshake's negative twin: `__reject:401` / `__reject:403`. Named
-/// here and in `std::rpc_server` at the one shape.
+/// here and in `std::rpc::server` at the one shape.
 fun reject_announcement_prefix(): str {
 	"__reject:"
 }
@@ -1250,9 +1250,9 @@ export fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, Dia
 /// `Session::anonymous()`; the app decides what more an identity means by looking
 /// `identity` up in its own state.
 ///
-/// It lives here rather than in `std::rpc_server` because `RpcRequest` carries it
-/// and `RpcRequest` is platform-neutral; `std::rpc_server` re-exports it, so
-/// `import std::rpc_server::Session` still names it.
+/// It lives here rather than in `std::rpc::server` because `RpcRequest` carries it
+/// and `RpcRequest` is platform-neutral; `std::rpc::server` re-exports it, so
+/// `import std::rpc::server::Session` still names it.
 export struct Session {
 	/// The app's name for whoever is on the other end — a user id, a subject claim.
 	/// Empty when nothing authorized this caller.
@@ -4518,15 +4518,18 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 /// last held (a mirror has always kept it; the state now carries it).
 ///
 /// `state()` REPORTS, like `status()`: it leases nothing, so an unwatched mirror's
-/// state is `Pending` for as long as nothing watches it. `latest()` and
+/// state is `Pending` for as long as nothing watches it. `states()`, `latest()` and
 /// `is_pending()` are pipes a view BINDS in place of the mirror, so each LEASES the
-/// mirror while its consumer holds it — `latest()` is how a list keeps its old rows
-/// on screen while a re-mint is on its way (R27) — and each follows what the last
-/// mint said as well as the value.
+/// mirror while its consumer holds it — `states()` is the whole state watched
+/// (A150), `latest()` is how a list keeps its old rows on screen while a re-mint is
+/// on its way (R27) — and each follows what the last mint said as well as the
+/// value.
 ///
 /// The mirror's own `get()` is unchanged: it reads what the mirror holds, the stale
 /// value included after a failed re-mint.
 export impl RemoteSource<type T> with TransientSource<T, RpcError> {
+	/// The state as a PASSIVE report: it leases nothing, so a mirror nobody else
+	/// watches reads `Pending` here forever — bind `states()` to watch it.
 	fun state(self): MemoCell<TransientState<T, RpcError>> {
 		let derived = SignalCell::new(self.transient_state());
 		let _cached = register_with_owner(self.cache.on_change(|_value| {
@@ -4536,6 +4539,17 @@ export impl RemoteSource<type T> with TransientSource<T, RpcError> {
 			derived.set(self.transient_state());
 		}));
 		MemoCell { cell = derived }
+	}
+
+	/// The whole state, LEASED (A150): the mirror as a source (its lease) combined
+	/// with what the last mint said, read as the state — `latest()`'s own shape,
+	/// keeping every arm.
+	fun states(self): dyn Pipe<TransientState<T, RpcError>> {
+		let leased: dyn Source<Option<T>> = self;
+		let told: dyn Source<Option<Status>> = self.mint;
+		let pipe: dyn Pipe<TransientState<T, RpcError>> = combine((leased, told))
+			.derive(|_both| self.transient_state());
+		pipe
 	}
 
 	fun latest(self): dyn Pipe<Option<T>> {
@@ -6488,12 +6502,9 @@ export macro fun service(item: Item): Source {
 				match field.type_.arguments.get(0) {
 					Some(let element) => {
 						if field.keyed {
-							// `Map` is the hash map's spelling before tracker I9,
-							// kept one release as `std::map`'s deprecated alias of
-							// the same type — the annotation is read as WRITTEN, so
-							// both spellings are the map here until the alias goes
-							// (the analyzer's `is_hash_map_head` is the twin).
-							if (element.name == "HashMap" || element.name == "Map") && element.arguments.len() == 2 {
+							// The annotation is read as WRITTEN (the analyzer's
+							// `is_hash_map_head` is the twin).
+							if element.name == "HashMap" && element.arguments.len() == 2 {
 								match element.arguments.get(0) {
 									Some(let key) => match element.arguments.get(1) {
 										Some(let value) => {
@@ -6523,9 +6534,7 @@ export macro fun service(item: Item): Source {
 									},
 									None => {},
 								}
-							} else if field.key != ""
-								&& element.name == "List"
-								&& element.arguments.len() == 1 {
+							} else if field.key != "" && element.name == "List" && element.arguments.len() == 1 {
 								match element.arguments.get(0) {
 									Some(let value) => {
 										exposed_names.push(field.name);

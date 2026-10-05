@@ -1,5 +1,5 @@
 // The BASE prelude — the ambient scope every vilan package resolves under unless
-// its manifest says otherwise (`prelude.md` §5.1). Seven names, each admitted by a
+// its manifest says otherwise (`prelude.md` §5.1). Eight names, each admitted by a
 // rule and not by rank alone: universal (base layer, reachable on every target),
 // language-level (the language itself produces it, or every program uses it
 // whatever its domain), unambiguous (exactly one std definition claims the name),
@@ -11,6 +11,13 @@
 // travels with it as the `!` operator's canonical type. `print` is the one name a
 // program needs before it can be observed at all.
 //
+// `Iterator` joined in Order 46 (B535, ruled): a trait's methods resolve only
+// where the trait is in scope (B515), and every iterator chain — `filter`, `map`,
+// `fold`, `to_list` — is `Iterator`'s defaults, so leaving it out would have put
+// `import std::iterator::Iterator;` at the head of nearly every program once
+// B515's warning becomes an error. It is language-level by the rule above: `for`
+// and every collection's `iter()` hand one over.
+//
 // This module is nothing but re-exports, and that is the rule rather than an
 // accident: a prelude's ambient names are exactly the names it publishes, so a
 // reader answers "what is in scope here" by reading this file.
@@ -18,5 +25,6 @@
 // Selected as `prelude = "std::prelude"`, which is also what omitting the key
 // means. The web set is next door in `web.vl`.
 export import pkg::io::print;
+export import pkg::iterator::Iterator;
 export import pkg::option::Option::{ self, None, Some };
 export import pkg::result::Result::{ self, Err, Ok };

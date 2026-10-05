@@ -1,6 +1,6 @@
 import std::io::print;
 import std::reactive::Signal;
-import std::ui::{ View, render, view };
+import std::web::ui::{ View, render, view };
 
 // Element syntax (proposal/element-syntax.md, S2): markup sugar lowering to
 // the view chain in the pre-analysis desugar. This program and its golden pin

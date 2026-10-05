@@ -1244,7 +1244,7 @@ fn helper_source(name: &str) -> &'static str {
         // A failed fetch reports and does NOT continue: the route signal never
         // advances, so the previous view stays and the navigation simply did not
         // happen (`bundle-splitting.md` §2). `failed` carries the reason to
-        // `std::router::chunk_error` (§S3) — without it a failure left
+        // `std::web::router::chunk_error` (§S3) — without it a failure left
         // `pending()` stuck true forever, since only the success path cleared
         // it. The in-flight promise is dropped on failure so the next attempt
         // refetches.
@@ -1275,7 +1275,7 @@ fn helper_source(name: &str) -> &'static str {
              }"
         }
         // The boot preload's fire-and-forget half (`bundle-splitting.md` §S3);
-        // `std::ui::chunk_preload` computes the arm and calls this. Failure is
+        // `std::web::ui::chunk_preload` computes the arm and calls this. Failure is
         // silent — `__chunk_load` has already reported it, and the gate's own
         // load surfaces it on `chunk_error()`.
         "__chunk_preload" => {
@@ -1283,7 +1283,7 @@ fn helper_source(name: &str) -> &'static str {
              \t__chunk_load(arm, () => {}, () => {});\n\
              }"
         }
-        // `std::ui::mount_target` (A24, fullstack-dx.md §9.5): the one peek at
+        // `std::web::ui::mount_target` (A24, fullstack-dx.md §9.5): the one peek at
         // whether a host value is JS `null`/`undefined` — `Element` (and any
         // other opaque `external struct` handle) has no vilan-visible way to
         // ask this itself.
@@ -1375,7 +1375,7 @@ fn helper_source(name: &str) -> &'static str {
         "__sha512" => {
             "async function __sha512(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-512\", data));\n}"
         }
-        // Web Storage glue (std::storage): a missing key reads null; flatten to "".
+        // Web Storage glue (std::web::storage): a missing key reads null; flatten to "".
         // A120 S3: one header off a host `fetch` Response. `Headers` is not a
         // plain object — its entries are not own properties, so the `JsonValue`
         // reading `std::http::Request::header` uses on node's request object
@@ -1395,12 +1395,12 @@ fn helper_source(name: &str) -> &'static str {
         "__session_get" => {
             "function __session_get(key) {\n\treturn sessionStorage.getItem(key) ?? \"\";\n}"
         }
-        // DOM glue (std::dom): `window` is a global property, and the
+        // DOM glue (std::web::dom): `window` is a global property, and the
         // function-extern form addresses only callables — the same reason
         // `__router_path` exists. This is what makes `window` a listen TARGET
         // with the same verbs `Element` carries (`proposal/router.md` §5.1).
         "__dom_window" => "function __dom_window() {\n\treturn window;\n}",
-        // `std::dom::active_element`: the SAME reason `__dom_window` exists —
+        // `std::web::dom::active_element`: the SAME reason `__dom_window` exists —
         // `document.activeElement` is a global PROPERTY, and the
         // function-extern form addresses only callables, so
         // `[extern("document.activeElement")]` emits a CALL to it (A121; the
@@ -1418,11 +1418,11 @@ fn helper_source(name: &str) -> &'static str {
              }"
         }
         // `Element::bounding_rect`: ONE `getBoundingClientRect()` (which forces
-        // layout) read into the four numbers `std::dom`'s `DomRect` carries.
+        // layout) read into the four numbers `std::web::dom`'s `DomRect` carries.
         // The array IS the struct's runtime form — a struct is an array in
         // FIELD ORDER — so this builds a `DomRect` the same way `__parse_i32`
         // builds an `Option`. Its order is `left, top, width, height`, and
-        // `DomRect`'s field order in `vilan/std/src/browser/dom.vl` must match;
+        // `DomRect`'s field order in `vilan/std/src/browser/web/dom.vl` must match;
         // `ui_rows.rs`'s `a59_bounding_rect_reads_the_host_box` asserts the
         // four values by name, so a reorder is a red test rather than silence.
         "__dom_bounding_rect" => {
@@ -1439,7 +1439,7 @@ fn helper_source(name: &str) -> &'static str {
              \treturn Array.from(element.querySelectorAll(selector));\n\
              }"
         }
-        // Router glue (std::router): `location.pathname` is a global property,
+        // Router glue (std::web::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
         // The whole relative URL, for the query and fragment `location.pathname`
@@ -1464,7 +1464,7 @@ fn helper_source(name: &str) -> &'static str {
              \t}\n\
              }"
         }
-        // HMR activity guard (std::dev, `hmr.md` §4/§5): true only when a `run
+        // HMR activity guard (std::web::dev, `hmr.md` §4/§5): true only when a `run
         // --watch` shim installed its `window.__VILAN_HMR__` singleton. A
         // self-contained `typeof` test (safe with no shim, in any host), so the
         // std hooks and `dev::*` calls that guard on it are inert in production
@@ -2891,7 +2891,7 @@ type FrameSets = (
 
 /// What a split build's route gate rewires: a recognized `swap` call becomes
 /// its `swap_split` twin — the `View` METHOD or, since A85, the free VALUE form
-/// — and `std::ui::chunk_preload` is planted ahead of the statement that mounts
+/// — and `std::web::ui::chunk_preload` is planted ahead of the statement that mounts
 /// each one. `retarget`'s third element is the emitted call's route-source
 /// argument index, which differs between the two shapes (the method carries its
 /// receiver first).
@@ -4324,7 +4324,52 @@ impl<'src> Transformer<'src> {
             Some(Expr::Call(..)) => {
                 self.program.scalar_view_calls.contains(&id) || self.call_is_scalar_shared_write(id)
             }
+            // B514: a value `if`/`match`/block evaluates to whatever its tail
+            // leaves emit, so it IS a pair when they are — `*if c { &a } else {
+            // &b }` over a scalar binds the chosen `[base, key]` and must read
+            // through it like `*v` does. Each leaf is asked the full question
+            // (a `&place` leaf included): under a value conditional a `&place`
+            // emits its pair, since B108's return seam collects its leaves from
+            // the RETURNED expression and never from beneath a `*`.
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..)) => {
+                let mut leaves = Vec::new();
+                self.collect_value_tail_leaves(id, &mut leaves);
+                leaves.iter().any(|leaf| self.derefs_scalar_view(*leaf))
+            }
             _ => false,
+        }
+    }
+
+    /// The tail leaves a value expression evaluates to: an `if`, a `match` and
+    /// a block contribute each branch's tail, anything else is itself — the
+    /// analyzer's `collect_tail_leaves`, asked at emission.
+    fn collect_value_tail_leaves(&self, id: Id, leaves: &mut Vec<Id>) {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::If(branch)) => {
+                let mut branch = branch;
+                loop {
+                    match branch {
+                        ExprIfBranch::If(_, (_, tail), else_branch) => {
+                            self.collect_value_tail_leaves(*tail, leaves);
+                            match else_branch {
+                                Some(else_branch) => branch = else_branch,
+                                None => break,
+                            }
+                        }
+                        ExprIfBranch::Else((_, tail)) => {
+                            self.collect_value_tail_leaves(*tail, leaves);
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(Expr::Match(_, legs)) => {
+                for leg in legs {
+                    self.collect_value_tail_leaves(leg.body, leaves);
+                }
+            }
+            Some(Expr::Block((_, tail))) => self.collect_value_tail_leaves(*tail, leaves),
+            _ => leaves.push(id),
         }
     }
 
@@ -4352,10 +4397,33 @@ impl<'src> Transformer<'src> {
                         .iter()
                         .any(|payload| self.derefs_scalar_view(*payload))
                 })
-            || (self.program.for_each_views.contains_key(&binding)
+            || ((self.program.for_each_views.contains_key(&binding)
+                || self.program.payload_view_captures.contains_key(&binding))
                 && self
                     .binding_type_id(binding)
                     .is_some_and(|type_id| self.resolves_to_scalar_view_pointee(type_id)))
+    }
+
+    /// B509: what a payload capture under a view subject binds, given the
+    /// slot read `subject` the pattern walk produced (`$a[1 + i]`): the slot
+    /// itself for an aggregate payload — the payload's own reference, so a
+    /// write through the capture lands in the enum — and, for a scalar one
+    /// (at this instance), the `(enum, slot)` pair the view representation
+    /// reads and writes through. Any other capture keeps `subject`.
+    fn payload_view_capture_value(
+        &self,
+        capture_id: Id,
+        subject: js::Node<'src>,
+    ) -> js::Node<'src> {
+        if !self.program.payload_view_captures.contains_key(&capture_id)
+            || !self.binding_holds_a_scalar_view_pair(capture_id)
+        {
+            return subject;
+        }
+        match subject {
+            js::Node::PropertyIndex(container, slot) => js::Node::Array(vec![*container, *slot]),
+            other => other,
+        }
     }
 
     /// B444: per argument position of the callee `subject_id` names, whether
@@ -4420,7 +4488,17 @@ impl<'src> Transformer<'src> {
         block: &mut Vec<js::Node<'src>>,
     ) -> js::Node<'src> {
         let mut view = view;
-        if matches!(self.program.entity_map.get(&view_id), Some(Expr::Call(..))) {
+        // The pair is read twice (`base[key]`), so an expression that computes
+        // it — a call, or a value block / conditional whose tail emitted inline
+        // (B514) — is evaluated once into a temporary first.
+        let computed = match self.program.entity_map.get(&view_id) {
+            Some(Expr::Call(..)) => true,
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..)) => {
+                !matches!(view, js::Node::Local(_))
+            }
+            _ => false,
+        };
+        if computed {
             let name = self.ng.next_name();
             block.push(js::Node::ConstVariable(js::Variable {
                 name: name.clone(),
@@ -6688,6 +6766,28 @@ impl<'src> Transformer<'src> {
                         js::Node::Local(name)
                     }
                 };
+                // B538: a tuple target a JS destructuring pattern cannot spell —
+                // an element (`(list[0], x) = ..`, whose read is `__at`), a
+                // nested tuple (`((x, y), z)`), or a tuple-typed element (`(p,
+                // z)`, a reslice) — is the value in a temporary and one
+                // ordinary write per leaf, at the leaf's flat offset. A tuple
+                // of plain places keeps the destructuring it always had.
+                if let Some(Expr::Tuple(_)) = self.program.entity_map.get(target_id)
+                    && !self.tuple_target_destructures(*target_id)
+                {
+                    let temporary = self.ng.next_name();
+                    block.push(js::Node::ConstVariable(js::Variable {
+                        name: temporary.clone(),
+                        value: Box::new(value),
+                    }));
+                    self.assign_tuple_target_leaves(
+                        *target_id,
+                        &js::Node::Local(temporary),
+                        0,
+                        block,
+                    );
+                    return None;
+                }
                 // Writing a *whole value* through a view. A `Shared` write is a
                 // single-slot view (`cell.v`): rebind the slot, so every handle to
                 // the cell sees the new value (`cell.v = value`). An ordinary
@@ -8238,6 +8338,7 @@ impl<'src> Transformer<'src> {
         match pattern {
             ExprPattern::Wildcard => {}
             ExprPattern::Binding(capture_id) => {
+                let subject = self.payload_view_capture_value(*capture_id, subject);
                 self.is_bindings.insert(*capture_id, subject);
             }
             ExprPattern::Variant(enum_id, variant_index, payload) => {
@@ -8773,6 +8874,112 @@ impl<'src> Transformer<'src> {
         std::mem::replace(&mut self.current_substitution, inner)
     }
 
+    /// B538: whether a tuple assignment target is a JS destructuring pattern
+    /// as it stands — every element a one-slot place JS can assign through
+    /// (a binding, a field, a one-slot tuple position). An element (`__at`
+    /// is a call), a nested tuple (a spread) and a multi-slot element (a
+    /// reslice) are not.
+    fn tuple_target_destructures(&self, target_id: Id) -> bool {
+        let Some(Expr::Tuple(elements)) = self.program.entity_map.get(&target_id) else {
+            return true;
+        };
+        elements.iter().all(|element| {
+            !matches!(
+                self.program.entity_map.get(element),
+                Some(Expr::Tuple(_) | Expr::Index(..))
+            ) && self
+                .expr_type_id(*element)
+                .is_none_or(|type_id| self.flat_width(type_id) == 1)
+        })
+    }
+
+    /// B538: one write per leaf of a tuple target, reading each leaf's value
+    /// out of `value` (the flat temporary) at its flat offset — a slot for a
+    /// one-slot leaf, a `slice` for a tuple-typed one — and a nested tuple
+    /// target recursing at its own offset. Answers the slots it consumed —
+    /// a nested target's own width, which no recorded type states.
+    fn assign_tuple_target_leaves(
+        &mut self,
+        target_id: Id,
+        value: &js::Node<'src>,
+        base: usize,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> usize {
+        let Some(Expr::Tuple(elements)) = self.program.entity_map.get(&target_id).cloned() else {
+            return 1;
+        };
+        let mut offset = base;
+        for element in elements {
+            if let Some(Expr::Tuple(_)) = self.program.entity_map.get(&element) {
+                offset += self.assign_tuple_target_leaves(element, value, offset, block);
+                continue;
+            }
+            let width = self
+                .expr_type_id(element)
+                .map_or(1, |type_id| self.flat_width(type_id));
+            let slot = if width == 1 {
+                js::Node::PropertyIndex(
+                    Box::new(value.clone()),
+                    Box::new(js::Node::Number(offset.to_string(), None)),
+                )
+            } else {
+                js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(value.clone()),
+                        "slice".to_string(),
+                    )),
+                    vec![
+                        js::Node::Number(offset.to_string(), None),
+                        js::Node::Number((offset + width).to_string(), None),
+                    ],
+                )
+            };
+            match self.program.entity_map.get(&element).cloned() {
+                Some(Expr::Index(subject_id, index_id)) => {
+                    let subject = self
+                        .walk_entity(subject_id, block)
+                        .unwrap_or(js::Node::Void);
+                    let index = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+                    self.used_helpers.insert("__at_put");
+                    block.push(js::Node::Call(
+                        Box::new(js::Node::Local("__at_put".to_string())),
+                        vec![subject, index, slot],
+                    ));
+                }
+                Some(Expr::TupleIndex(subject_id, baked_offset, baked_width))
+                    if self
+                        .tuple_index_slot(element, (baked_offset, baked_width))
+                        .1
+                        > 1 =>
+                {
+                    let (into, into_width) =
+                        self.tuple_index_slot(element, (baked_offset, baked_width));
+                    let subject = self
+                        .walk_entity(subject_id, block)
+                        .unwrap_or(js::Node::Void);
+                    for position in 0..into_width {
+                        block.push(js::Node::Assignment(
+                            Box::new(js::Node::PropertyIndex(
+                                Box::new(subject.clone()),
+                                Box::new(js::Node::Number((into + position).to_string(), None)),
+                            )),
+                            Box::new(js::Node::PropertyIndex(
+                                Box::new(value.clone()),
+                                Box::new(js::Node::Number((offset + position).to_string(), None)),
+                            )),
+                        ));
+                    }
+                }
+                _ => {
+                    let place = self.walk_entity(element, block).unwrap_or(js::Node::Void);
+                    block.push(js::Node::Assignment(Box::new(place), Box::new(slot)));
+                }
+            }
+            offset += width;
+        }
+        offset - base
+    }
+
     /// The number of flat slots a value of `type_id` occupies once tuples are
     /// flattened, under the substitution in force: a tuple is the sum of its
     /// elements', anything else (including a generic this instance does not
@@ -8835,7 +9042,8 @@ impl<'src> Transformer<'src> {
     /// as the value it erased, not as the `[value, table]` pair — the pair is
     /// this backend's representation, and `print(object)` printed it
     /// (`[ [ 5 ], {} ]`). Native renders the object's value the same way
-    /// (`vilan-rt`'s `Js for Dyn`), so both print `[ 5 ]`.
+    /// (`vilan-rt`'s `Js for Dyn`), so both print `[ 5 ]`. B503: and so does an
+    /// object inside a `List` handed there (`[ [ 2 ], [ 3 ] ]`).
     fn host_arguments(
         &self,
         target_id: Id,
@@ -8858,26 +9066,79 @@ impl<'src> Transformer<'src> {
                         Some(Type::Any)
                     )
                 });
-            let is_object = self.expr_type_id(*argument_id).is_some_and(|type_id| {
-                matches!(
-                    self.program
-                        .type_id_to_type_map
-                        .get(&self.resolve_type_id(type_id)),
-                    Some(Type::Dyn(..))
-                )
-            });
-            if takes_any
-                && is_object
+            if let Some(type_id) = self.expr_type_id(*argument_id)
+                && takes_any
+                && self.holds_a_hosted_object(type_id)
                 && let Some(argument) = args.get_mut(index)
             {
-                let pair = std::mem::replace(argument, js::Node::Void);
-                *argument = js::Node::PropertyIndex(
-                    Box::new(pair),
-                    Box::new(js::Node::Number("0".to_string(), None)),
-                );
+                let value = std::mem::replace(argument, js::Node::Void);
+                *argument = self.hosted_value(type_id, value, 0);
             }
         }
         args
+    }
+
+    /// B503: whether a value of `type_id` reaches the host holding a trait
+    /// object where it must arrive as the value it erased — the object itself
+    /// (B436), or one inside a `List` (or fixed array), at any depth of lists.
+    /// Other containers hand their objects over as stored; the native `Js`
+    /// impls render the same split (`Js::js_hosted`).
+    fn holds_a_hosted_object(&self, type_id: TypeId) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(type_id))
+        {
+            Some(Type::Dyn(..)) => true,
+            Some(Type::Array(element, _)) => self.holds_a_hosted_object(*element),
+            Some(Type::Struct(struct_id, arguments))
+                if arguments.len() == 1
+                    && self
+                        .program
+                        .structs
+                        .get(struct_id)
+                        .is_some_and(|declaration| declaration.name == "List") =>
+            {
+                self.holds_a_hosted_object(arguments[0])
+            }
+            _ => false,
+        }
+    }
+
+    /// `value` as the host receives it: an object's `[ value, table ]` pair
+    /// replaced by its value, and a list of them mapped element-wise into a
+    /// NEW array (the program's own list is not touched). Only reached where
+    /// [`Self::holds_a_hosted_object`] said so.
+    fn hosted_value(&self, type_id: TypeId, value: js::Node<'src>, depth: usize) -> js::Node<'src> {
+        let element = match self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(type_id))
+        {
+            Some(Type::Dyn(..)) => {
+                return js::Node::PropertyIndex(
+                    Box::new(value),
+                    Box::new(js::Node::Number("0".to_string(), None)),
+                );
+            }
+            Some(Type::Array(element, _)) => *element,
+            Some(Type::Struct(_, arguments)) => arguments[0],
+            _ => return value,
+        };
+        let name = format!("__hosted{depth}");
+        let converted = self.hosted_value(element, js::Node::Local(name.clone()), depth + 1);
+        js::Node::Call(
+            Box::new(js::Node::Property(Box::new(value), "map".to_string())),
+            vec![js::Node::Closure(js::Closure {
+                parameters: vec![js::Parameter { name }],
+                body: vec![js::Node::Return(Box::new(converted))],
+                is_async: false,
+                origin: None,
+            })],
+        )
     }
 
     fn emit_extern(
@@ -9752,6 +10013,7 @@ impl<'src> Transformer<'src> {
                     js::Node::Call(callee, _)
                         if matches!(callee.as_ref(), js::Node::Local(name) if name == "__clone")
                 );
+                let subject = self.payload_view_capture_value(*capture_id, subject);
                 let subject = if self.capture_copies(*capture_id) && !already_cloned {
                     self.used_helpers.insert("__clone");
                     js::Node::Call(
@@ -10441,8 +10703,21 @@ impl<'src> Transformer<'src> {
         // in `intrinsics` now, so every external a dispatch can land on has a
         // lowering keyed by member id and this function cannot be incomplete
         // again for the same reason.
+        // The impl's binders bind from the receiver's SHAPE and then from its
+        // BOUNDS: in `impl Stage<type S, type R: IntoFlow<type N: Default>>`
+        // the body's `N::default()` names `N`, which only `R`'s own `IntoFlow`
+        // impl grounds. Reached through a bound (`f.fresh()` with `F:
+        // Fresh<T>`), the shape alone left `N` open and the static call landed
+        // on `Default`'s bodiless requirement — B498's internal error. The
+        // analyzer's direct call records the same binders, and the native
+        // emitter has always bound both halves.
         let mut substitution = HashMap::default();
-        self.bind_generics(impl_subject, type_id, &mut substitution);
+        impl_select::bind_subject_and_bounds(
+            self.program,
+            impl_subject,
+            type_id,
+            &mut substitution,
+        );
         if !own_generic_values.is_empty()
             && let Some(function) = self.program.functions.get(&member_id)
         {
@@ -10580,7 +10855,15 @@ impl<'src> Transformer<'src> {
         let members = self.object_dispatchable_members(trait_id);
         let mut entries: Vec<(String, js::Node<'src>)> = Vec::with_capacity(members.len());
         for member_name in members {
-            let preferred = Some((trait_id, trait_arguments.to_vec()));
+            // B532: a supertrait's member is selected at the SUPERTRAIT's
+            // instantiation, which the clause chain passes down.
+            let preferred = crate::mono::object_member_preference(
+                self.program,
+                trait_id,
+                trait_arguments,
+                member_name,
+            )
+            .or_else(|| Some((trait_id, trait_arguments.to_vec())));
             let Some(dispatch) = self.resolve_dispatch_with(type_id, member_name, &[], preferred)
             else {
                 continue;
@@ -11664,7 +11947,9 @@ impl<'src> Transformer<'src> {
         // instantiation composes) and order by constraint id for a stable key.
         let mut entries: Vec<(TypeId, TypeId)> = substitution
             .iter()
-            .map(|(constraint_id, type_id)| (*constraint_id, self.resolve_type_id(*type_id)))
+            .map(|(constraint_id, type_id)| {
+                (*constraint_id, self.resolve_binding_type_id(*type_id))
+            })
             .collect();
         entries.sort_by_key(|(constraint_id, _)| constraint_id.0);
         let key = (
@@ -11927,6 +12212,25 @@ impl<'src> Transformer<'src> {
             })
     }
 
+    /// [`Self::resolve_type_id`] for a type a call BINDS a callee's parameter
+    /// to. Inside a trait default's instance the receiver's `Self` is typed as
+    /// the bare trait (`Obs<T>`), the one place a trait type is a value's type;
+    /// a call that hands `self` on (`observe_flow(self)`, B510) binds its `F`
+    /// to that trait type, and the callee's `flow.start()` then dispatched on
+    /// a type no impl provides — the trait's bodyless requirement, the
+    /// never-silent internal error. The default's instance knows what `Self`
+    /// is (`current_self_type`), and that is what the binding means.
+    fn resolve_binding_type_id(&self, type_id: TypeId) -> TypeId {
+        let resolved = self.resolve_type_id(type_id);
+        match (
+            self.program.type_id_to_type_map.get(&resolved),
+            self.current_self_type,
+        ) {
+            (Some(Type::Trait(..)), Some(self_type)) => self_type,
+            _ => resolved,
+        }
+    }
+
     fn resolve_type_id(&self, type_id: TypeId) -> TypeId {
         let Some(_guard) = crate::util::RecursionGuard::enter() else {
             return type_id;
@@ -12148,7 +12452,7 @@ impl<'src> Transformer<'src> {
             // already rewritten every threading site into ordinary parameters
             // and arguments, so two instantiations differing only in a clause
             // emit the same code.
-            Type::Closure(parameters, return_type_id, _) => {
+            Type::Closure(parameters, return_type_id, _, _) => {
                 out.push_str("Fn");
                 self.write_type_key_arguments(parameters, out);
                 out.push_str("->");
@@ -12284,15 +12588,6 @@ impl<'src> Transformer<'src> {
             declared_in,
         });
         None
-    }
-
-    /// Binds the generic parameters in `pattern` (an impl subject in its own
-    /// generic terms, `List<Generic(T)>`) from the matching positions of the
-    /// concrete `type_id` (`List<i32>`), accumulating `{T -> i32}` — the
-    /// shared walk [`crate::impl_select`] owns, since selecting an impl and
-    /// monomorphizing the member it declares must recover the same bindings.
-    fn bind_generics(&self, pattern: TypeId, type_id: TypeId, out: &mut HashMap<TypeId, TypeId>) {
-        impl_select::bind_subject(self.program, pattern, type_id, out);
     }
 }
 

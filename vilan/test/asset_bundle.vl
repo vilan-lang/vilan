@@ -2,8 +2,8 @@
 // (kolt.local 029). The call tells the build to carry `asset_bundle_note.txt`
 // into the output directory and folds to the url the copy answers on, so the
 // emitted JS holds a plain string and no runtime call survives.
-import std::asset::bundle;
 import std::io::print;
+import std::web::asset::bundle;
 
 let note = const bundle("asset_bundle_note.txt");
 

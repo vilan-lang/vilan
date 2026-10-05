@@ -13,14 +13,14 @@
 #
 # `prelude` names the ambient scope every file in the package resolves under —
 # the names in scope with no import. It is a PACKAGE key, so both entries share
-# it: `std::web` is the application set (the base seven — `print`,
+# it: `std::web::prelude` is the application set (the base seven — `print`,
 # `Option`/`Some`/`None`, `Result`/`Ok`/`Err` — plus `Signal`, `view`, `View`,
 # and the MODULES `style` and `ui`), and every one of those names exists on
 # node too, so the server leg loses nothing by sharing the client's prelude.
 # Omit the key for the base set; `false` turns it off.
 [package]
 name = "{{name}}"
-prelude = "std::web"
+prelude = "std::web::prelude"
 
 [entry.client]
 target = "browser"

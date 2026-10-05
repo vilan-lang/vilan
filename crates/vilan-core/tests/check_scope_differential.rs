@@ -75,7 +75,7 @@ fn std_modules_for(layer_directory: Option<&str>) -> Vec<String> {
             if path.extension().is_some_and(|extension| extension == "vl") {
                 let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
                 // `lib` is the package surface, not a module. `null` is a
-                // literal keyword — a bare `import std::null;` cannot parse —
+                // literal keyword — a bare `import std::js::null;` cannot parse —
                 // and it sits in the analyzer's always-loaded core set, so
                 // every leg still loads and checks it without the import.
                 if stem != "lib" && stem != "null" {

@@ -39,8 +39,8 @@ use support::boot::{assert_refused, boot};
 
 /// A browser leg that compiles a `const style()`, so its build emits a sidecar
 /// and the manifest names one — the shape the template's own client has.
-const STYLED_CLIENT: &str = r#"import std::style::{ Display, Style, style };
-import std::ui::{ mount_root, view };
+const STYLED_CLIENT: &str = r#"import std::web::style::{ Display, Style, style };
+import std::web::ui::{ mount_root, view };
 
 fun panel(): Style {
 	style().display(Display::Flex)
@@ -54,7 +54,7 @@ fun main() {
 
 /// The same leg with its styles deleted — the F2 plant, and the one edit a user
 /// makes that silently unlinks their stylesheet.
-const PLAIN_CLIENT: &str = r#"import std::ui::{ mount_root, view };
+const PLAIN_CLIENT: &str = r#"import std::web::ui::{ mount_root, view };
 
 fun main() {
 	let _root = mount_root("app", || view("main").text("served"));
@@ -140,7 +140,7 @@ fn stage(tag: &str, client: Client, split: bool, shell: &str) -> PathBuf {
 /// regression that let one of these servers start must not also collide with
 /// another test's port on its way to failing.
 const SERVER: &str = r#"import std::build::require_build;
-import std::document::require_shell;
+import std::web::document::require_shell;
 import std::http::{ Request, Response, Server };
 import std::io::print;
 
@@ -353,7 +353,7 @@ fn a_shell_with_two_faults_reports_both() {
 /// a substring search cannot see. It builds `LegBuild` values directly, so it
 /// asks about the CHECK and nothing else — no server, no port, no teardown.
 const PROBE: &str = r#"import std::build::LegBuild;
-import std::document::{ ShellFault, check_shell };
+import std::web::document::{ ShellFault, check_shell };
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::result::Result::{ Err, Ok, self };

@@ -190,9 +190,9 @@ overwrite keeps its key's place, and a key removed and inserted again goes to
 the end. The name says how it keys — by `Hashable` value — not that its order
 is arbitrary. Equality follows the same line: two maps are `==` when they hold the same keys
 with equal values, whatever order either was built in, so a struct holding a
-map can `[derive(PartialEq)]`. Before v0.42 the type was `std::map::Map`; that name is
-kept one release as a deprecated alias of the same type (`Map` *is* `HashMap`),
-and a use of it warns with the new spelling.
+map can `[derive(PartialEq)]`. Before v0.42 the type was `std::map::Map`; that name
+had one release as a deprecated alias and is gone since v0.44, and a use of it is
+refused with the new spelling.
 
 Keys compare **by value**. Scalars work directly, and so does a **backed enum**
 — one with explicit backing values, which *is* that value at runtime, so the
@@ -299,8 +299,8 @@ impl HashSet<type T: Hashable> with PartialEq                             // sam
 
 Value-keyed like `HashMap` (element `T` must be `Hashable`); `for x in set`
 iterates the elements in insertion order (a duplicate insert keeps its value's
-place; a value removed and inserted again goes to the end). `std::set::Set` is its deprecated
-name, kept one release as an alias, as `Map` is.
+place; a value removed and inserted again goes to the end). `std::set::Set` was its
+name before v0.42, removed in v0.44 as `Map` was.
 
 `union`/`intersection`/`difference` are the standard set operations, each
 returning a new `HashSet` and leaving both receivers untouched:

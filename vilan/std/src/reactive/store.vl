@@ -1,0 +1,1359 @@
+// `std::reactive::store` — the fine-grained version of a type, generated from its
+// shape (tracker A142 S7, `proposal/store.md`).
+//
+// A `SignalCell<User>` wakes every reader on every write: a write to the user's
+// city reruns the binding that shows their name. A STORE wakes exactly the readers
+// whose value changed, and nobody writes a twin type to get that:
+//
+//     [derive(Storable)]
+//     struct User { name: str, address: Address }
+//
+//     let user = Store::new(alice());
+//     let city: Store<str> = user.address().city();   // a handle, not a value
+//     city.set("Bergen");                              // wakes `city`, `address`, `user`
+//
+// **The handle (§2.1).** `Store<T>` is a root plus a static path. The root's value
+// lives in ONE `Shared`, in place; a projection is another `Store` cut from its
+// parent, and its `set` writes back through the root. It is a `Source<T>` and a
+// `Signal<T>`, so every pipe, effect and binding takes one unchanged. Copying a
+// handle allocates nothing.
+//
+// **Slots (§2.2, Q12).** A slot is one path's subscriber list: a notification-only
+// cell. It is made by the FIRST subscription at its path, together with the nodes
+// on the way down to it, counts its subscriptions, and goes with the last one —
+// taking every node it leaves empty. A read allocates nothing, and the store's
+// memory follows what is watched, not what is held.
+//
+// **The write rule (§2.3, Q7).** A write wakes exactly the live slots whose value
+// changed. Unlike `SignalCell::set`, which never compares, a store write always
+// does: that is the layer's whole job. It compares only where a slot is live,
+// unless a whole-value slot above needs the answer, so a write into an unwatched
+// store compares nothing. `notify()` is the escape hatch that wakes without
+// comparing.
+//
+// **The spine (§2.5).** A write through a handle diffs that handle's subtree and,
+// if anything changed, wakes each ancestor's whole-value slot. Siblings are never
+// looked at, because the path is static. The diff collects what changed and the
+// TURN delivers it (§2.8): every write's wakes are notified inside one `batch`, so
+// an observer of two changed slots runs once, on the settled value.
+//
+// **Shapes (§3.1, §4).** `[derive(Storable)]` is the opt-in, and the encapsulation
+// boundary (vilan has no private fields): a derived struct diffs field by field and
+// projects one handle per field; a derived enum diffs its discriminant, then the
+// live variant's payload. Every other type is a LEAF — compared with `==` when it
+// has `PartialEq`, and changed on every covering write when it has not — through
+// the two blanket tiers below. `Option` is structural without a derive.
+//
+// **Through a variant (§2.6, Q6).** A handle into an enum payload, or into an
+// `Option`'s `Some`, is a `StoreSome<P>`: a `Source<Option<P>>` that reads `None`
+// while the variant is not live, plus `patch(value: P): bool`, which writes only
+// while it is. It is not a `Signal`: `set(None)` would have no meaning there.
+// Switching the variant is a write to the enum's own handle.
+//
+// **Collections (§2.7, A149 S3).** A collection takes its DECLARED SHAPE, with no
+// derive to write:
+//
+//   - a `HashMap<K, V>` is a KEYED node: `at(key)` is a `Store<Option<V>>` whose
+//     slot hangs off the map's node by the key's hash, so a write to key 7 wakes
+//     the readers of key 7 and nobody else, and `at(key).set(None)` removes the key;
+//   - a `HashSet<T>` likewise, with `contains(x)`, a `Store<bool>`;
+//   - a `List<T>` is a SEQUENCE node: the sequence writes (`push`, `splice`, ...)
+//     land in place, and a keyed list (`T: Keyed<K>`) reads one element by its key
+//     with `by_key(k)`. There is no `at(index)` (Q11): a position shifts under a
+//     splice, and the handle would silently change which element it names.
+//
+// A whole write of a collection diffs by key — or, for a list, by its common prefix
+// and suffix, `reconcile_to`'s diff — and wakes only the changed keys. A collection
+// handle is the shape's FLOW: `app.channels().keys()` and
+// `each_by(app.messages(), ..)` start from it and are told per-key or per-span OPS
+// (`MapOp`, `SetOp`, `SeqOp`), not handed a copy to diff. Each flow started from a
+// handle keeps its own op log at the collection's node, recorded only while it is
+// open — a per-subscription FEED, as a slot is per path.
+import pkg::hash::{ Hash, Hashable };
+import pkg::hash_map::HashMap;
+import pkg::hash_set::HashSet;
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::delta::{
+	CollFlow,
+	CollInstance,
+	DeltaLog,
+	MapFlow,
+	MapInstance,
+	MapOp,
+	RowFeed,
+	SeqOp,
+	SequenceCell,
+	SetFlow,
+	SetInstance,
+	SetOp,
+	splice_count,
+	splice_in_place,
+	splice_start,
+};
+import pkg::reactive::store_core::{
+	Spine,
+	attach_feed,
+	deliver,
+	detach_feed,
+	has_feeds,
+	keyed_hashes,
+	lent_value,
+	spine,
+	store_keyed,
+	store_touch,
+	touch_spine,
+	watch_at,
+};
+import pkg::reactive::{ Signal, Source, Subscriber };
+import pkg::shared::{ Shared, fresh_identity };
+import pkg::wire::Keyed;
+
+// The core — the handle types, the slot tree, the write — is `store_core.vl`,
+// re-exported here whole: `std::reactive::store` is the one module a program imports.
+export import pkg::reactive::store_core::{
+	Storable,
+	Store,
+	StoreFeed,
+	StoreFlag,
+	StoreLeaf,
+	StoreNode,
+	StoreSlot,
+	StoreSome,
+	StoreStep,
+	StoreTouch,
+	StoreWoken,
+	store_census,
+	store_feed_census,
+	store_has_me,
+	store_kid,
+	store_opaque,
+	store_switch,
+	store_wake_all,
+	store_wake_me,
+};
+
+// === The declared shapes (§2.7, A149 S3) =====================================
+
+/// What `map` holds under the key whose hash is `hash` — one value, copied.
+fun value_at<K: Hashable, V>(map: &HashMap<K, V>, hash: Hash): Option<V> {
+	match map.table.get(hash) {
+		Some(let entry) => Some(entry.1),
+		None => None,
+	}
+}
+
+/// Whether two values differ, exactly, waking nothing.
+fun differs<T: Storable>(a: &T, b: &T, woken: &mut StoreWoken): bool {
+	a.store_diff(b, None, true, woken)
+}
+
+/// A map is a KEYED node: each watched key's child is the `Option<V>` that key
+/// holds, diffed against what the written map holds there, so a change to one key
+/// wakes that key's slots and nobody else's. Every OTHER key is compared only when
+/// someone needs the answer — the map's own slot or an ancestor's (settled with the
+/// first difference), or an open flow's feed (every key, each changed one told). It
+/// never compares the maps with `==` (§1.3).
+export impl HashMap<type K: Hashable, type V: Storable> with Storable {
+	fun store_diff(
+		&self,
+		other: &HashMap<K, V>,
+		node: Option<Shared<StoreNode>>,
+		need: bool,
+		woken: &mut StoreWoken,
+	): bool {
+		if !need && node.is_none() {
+			ret false;
+		}
+		let here = need || store_has_me(node);
+		let fed = has_feeds(node);
+		mut changed = false;
+		let watched = keyed_hashes(node);
+		for hash in watched {
+			let mine = value_at(self, hash);
+			let theirs = value_at(other, hash);
+			if mine.store_diff(&theirs, store_keyed(node, hash), fed || (here && !changed), woken) {
+				changed = true;
+				store_touch(node, StoreTouch::Key(hash), woken);
+			}
+		}
+		if fed || (here && !changed) {
+			for hash in self.table.keys() {
+				if fed || !changed {
+					if store_keyed(node, hash).is_none() {
+						let moved = match self.table.get(hash) {
+							Some(let mine) => match other.table.get(hash) {
+								Some(let theirs) => differs(&mine.1, &theirs.1, woken),
+								None => true,
+							},
+							None => false,
+						};
+						if moved {
+							changed = true;
+							store_touch(node, StoreTouch::Key(hash), woken);
+						}
+					}
+				}
+			}
+			for hash in other.table.keys() {
+				if (fed || !changed)
+					&& !self.table.contains_key(hash)
+					&& store_keyed(node, hash).is_none() {
+					changed = true;
+					store_touch(node, StoreTouch::Key(hash), woken);
+				}
+			}
+		}
+		store_wake_me(node, changed, woken);
+		changed
+	}
+}
+
+/// A set is a keyed node of flags: each watched member's child is whether the set
+/// holds it, so adding or removing one member wakes that member's slots only.
+export impl HashSet<type T: Hashable> with Storable {
+	fun store_diff(
+		&self,
+		other: &HashSet<T>,
+		node: Option<Shared<StoreNode>>,
+		need: bool,
+		woken: &mut StoreWoken,
+	): bool {
+		if !need && node.is_none() {
+			ret false;
+		}
+		let here = need || store_has_me(node);
+		let fed = has_feeds(node);
+		mut changed = false;
+		for hash in keyed_hashes(node) {
+			if self.table.contains_key(hash) != other.table.contains_key(hash) {
+				changed = true;
+				store_wake_all(store_keyed(node, hash), woken);
+				store_touch(node, StoreTouch::Key(hash), woken);
+			}
+		}
+		if fed || (here && !changed) {
+			for hash in self.table.keys() {
+				if (fed || !changed)
+					&& !other.table.contains_key(hash)
+					&& store_keyed(node, hash).is_none() {
+					changed = true;
+					store_touch(node, StoreTouch::Key(hash), woken);
+				}
+			}
+			for hash in other.table.keys() {
+				if (fed || !changed)
+					&& !self.table.contains_key(hash)
+					&& store_keyed(node, hash).is_none() {
+					changed = true;
+					store_touch(node, StoreTouch::Key(hash), woken);
+				}
+			}
+		}
+		store_wake_me(node, changed, woken);
+		changed
+	}
+}
+
+/// A value's KEY in a keyed list, as a store reads it (A149 S3): the hash of its
+/// `Keyed` key, or `None` for a type with no key. Two tiers, like `StoreLeaf`'s:
+/// every type answers, and a keyed one answers with its key.
+export trait StoreKey {
+	fun store_key(&self): Option<Hash>;
+}
+
+/// A type with no key.
+export impl type T with StoreKey {
+	fun store_key(&self): Option<Hash> {
+		None
+	}
+}
+
+/// A keyed type: its key's hash.
+export impl type T: Keyed<type K: Hashable> with StoreKey {
+	fun store_key(&self): Option<Hash> {
+		Some(self.key().hash())
+	}
+}
+
+/// The position of the first element of `list` whose key hashes to `hash`.
+fun keyed_position<T: StoreKey>(list: &List<T>, hash: Hash): Option<usize> {
+	mut index: usize = 0;
+	let length = list.len();
+	for index < length {
+		match list[index].store_key() {
+			Some(let key) => {
+				if key == hash {
+					ret Some(index);
+				}
+			},
+			None => {},
+		}
+		index += 1;
+	}
+	None
+}
+
+/// The first element of `list` whose key hashes to `hash` — `by_key`'s read.
+fun keyed_element<T: StoreKey>(list: &List<T>, hash: Hash): Option<T> {
+	match keyed_position(list, hash) {
+		Some(let index) => Some(list[index]),
+		None => None,
+	}
+}
+
+/// The keyed children of a list's `node` whose key is carried by an element of
+/// `list` in `start .. start + count` — the by-key handles a splice of that span
+/// may have moved.
+fun keys_in_span<T: StoreKey>(
+	node: Option<Shared<StoreNode>>,
+	list: &List<T>,
+	start: usize,
+	count: usize,
+	into: &mut List<Hash>,
+) {
+	mut index = start;
+	for index < start + count {
+		match list[index].store_key() {
+			Some(let key) => {
+				if store_keyed(node, key).is_some() && !into.contains(key) {
+					into.push(key);
+				}
+			},
+			None => {},
+		}
+		index += 1;
+	}
+}
+
+/// A list is a SEQUENCE node. A whole write is `reconcile_to`'s diff — the common
+/// prefix, the common suffix, and one span between them — so the list's slot wakes,
+/// an open flow is told one splice, and a `by_key` handle wakes only when the
+/// element under its key changed. Elements compare exactly, by their own `Storable`
+/// diff.
+export impl List<type T: Storable + StoreKey> with Storable {
+	fun store_diff(
+		&self,
+		other: &List<T>,
+		node: Option<Shared<StoreNode>>,
+		need: bool,
+		woken: &mut StoreWoken,
+	): bool {
+		if !need && node.is_none() {
+			ret false;
+		}
+		let old_length = self.len();
+		let new_length = other.len();
+		mut prefix: usize = 0;
+		for prefix < old_length && prefix < new_length {
+			if differs(&self[prefix], &other[prefix], woken) {
+				jump break;
+			}
+			prefix += 1;
+		}
+		mut suffix: usize = 0;
+		for prefix + suffix < old_length && prefix + suffix < new_length {
+			if differs(&self[old_length - 1 - suffix], &other[new_length - 1 - suffix], woken) {
+				jump break;
+			}
+			suffix += 1;
+		}
+		let removed = old_length - prefix - suffix;
+		let inserted = new_length - prefix - suffix;
+		let changed = removed > 0 || inserted > 0;
+		if changed {
+			store_touch(node, StoreTouch::Span(prefix, removed, inserted), woken);
+			mut moved: List<Hash> = [];
+			keys_in_span(node, self, prefix, removed, &mut moved);
+			keys_in_span(node, other, prefix, inserted, &mut moved);
+			for hash in moved {
+				let mine = keyed_element(self, hash);
+				let theirs = keyed_element(other, hash);
+				let _moved = mine.store_diff(&theirs, store_keyed(node, hash), false, woken);
+			}
+		}
+		store_wake_me(node, changed, woken);
+		changed
+	}
+}
+
+/// A splice at `path` — `removed` elements leave at `at` and `inserted` arrive —
+/// landed IN PLACE through `modify`: no copy of the list. Wakes the list's slot and
+/// every ancestor's, the `by_key` handles whose element the splice moved, and tells
+/// the list's open flows the span. A splice that changes nothing (clamped to
+/// nothing, or the same elements back) wakes nothing.
+fun splice_at<T: Storable + StoreKey>(
+	root: Shared<StoreNode>,
+	path: List<StoreStep>,
+	lend: |(|&List<T>| void)| void,
+	modify: |(|&mut List<T>| void)| void,
+	at: usize,
+	removed: usize,
+	inserted: List<T>,
+) {
+	let found = spine(root, path);
+	let node = found.node;
+	mut woken = StoreWoken { slots = [], feeds = [] };
+	mut reached = false;
+	mut start: usize = 0;
+	mut taking: usize = 0;
+	mut changed = false;
+	mut moved: List<Hash> = [];
+	mut olds: List<Option<T>> = [];
+	lend(|list: &List<T>| {
+		reached = true;
+		start = splice_start(list.len(), at);
+		taking = splice_count(list.len(), start, removed);
+		changed = taking != inserted.len();
+		mut index: usize = 0;
+		for !changed && index < taking {
+			changed = differs(&list[start + index], &inserted[index], &mut woken);
+			index += 1;
+		}
+		if changed {
+			keys_in_span(node, list, start, taking, &mut moved);
+			keys_in_span(node, &inserted, 0, inserted.len(), &mut moved);
+			for hash in moved {
+				olds.push(keyed_element(list, hash));
+			}
+		}
+	});
+	if !reached || !changed {
+		ret;
+	}
+	store_touch(node, StoreTouch::Span(start, taking, inserted.len()), &mut woken);
+	touch_spine(found.touches, &mut woken);
+	for feed in woken.feeds {
+		(feed.before)();
+	}
+	modify(|list: &mut List<T>| {
+		let _op = splice_in_place(list, start, taking, inserted);
+	});
+	for feed in woken.feeds {
+		(feed.after)();
+	}
+	if !moved.is_empty() {
+		lend(|list: &List<T>| {
+			mut index: usize = 0;
+			for index < moved.len() {
+				let now = keyed_element(list, moved[index]);
+				let _moved = olds[index].store_diff(&now, store_keyed(node, moved[index]), false, &mut woken);
+				index += 1;
+			}
+		});
+	}
+	store_wake_me(node, true, &mut woken);
+	for slot in found.ancestors {
+		woken.slots.push(slot);
+	}
+	deliver(woken.slots);
+}
+
+// === The feeds (A149 S3) ======================================================
+//
+// A collection handle's flow keeps its own op log, recorded by a feed standing on
+// the collection's node for as long as the flow is open. The write tells the feed
+// WHICH part moved — a key, a span — and the feed reads that part through the
+// handle's in-place lend before the assignment and after it, so its ops carry what
+// left as well as what arrived (`delta.vl`'s requirement) at the cost of the parts
+// that moved, never a copy of the collection. A change the store did not take apart
+// (`StoreTouch::Whole`) is recorded as the shape's `Reset`.
+
+/// The touches one write left a feed, and whether one of them was `Whole`.
+struct Pending {
+	keys: List<Hash>,
+	spans: List<(usize, usize, usize)>,
+	whole: bool,
+}
+
+fun pending_none(): Pending {
+	Pending { keys = [], spans = [], whole = false }
+}
+
+/// `pending` with `touch` noted.
+fun pending_with(pending: Pending, touch: StoreTouch): Pending {
+	mut noted = pending;
+	match touch {
+		StoreTouch::Key(let hash) => noted.keys.push(hash),
+		StoreTouch::Span(let at, let removed, let inserted) => noted.spans.push((at, removed, inserted)),
+		StoreTouch::Whole => {
+			noted.whole = true;
+		},
+	}
+	noted
+}
+
+// Each feed's state is `mut` bindings its three closures capture: a binding the
+// closures of one frame capture IS their shared storage (spec §6.9, M93's rule),
+// so a feed mints no cell of its own.
+
+/// A map flow's feed: a `Put` or `Delete` per touched key, read around the write.
+fun map_feed<K: Hashable, V>(
+	lend: |(|&HashMap<K, V>| void)| void,
+	log: DeltaLog<MapOp<K, V>>,
+): StoreFeed {
+	mut pending = pending_none();
+	mut olds: List<Option<(K, V)>> = [];
+	StoreFeed {
+		id = fresh_identity(),
+		touch = |touch: StoreTouch| {
+			pending = pending_with(pending, touch);
+		},
+		before = || {
+			olds = [];
+			lend(|map: &HashMap<K, V>| {
+				for hash in pending.keys {
+					olds.push(map.table.get(hash));
+				}
+			});
+		},
+		after = || {
+			let keys = pending.keys;
+			mut reached = false;
+			lend(|map: &HashMap<K, V>| {
+				reached = true;
+				if pending.whole || olds.len() != keys.len() {
+					log.record(MapOp::Reset(*map));
+					ret;
+				}
+				mut index: usize = 0;
+				for index < keys.len() {
+					// Bound first: a `match` on an indexed element whose payload is
+					// not `Copy` moves out of the list in the native emit (N?1).
+					let held = olds[index];
+					match held {
+						Some(let was) => match map.table.get(keys[index]) {
+							Some(let now) => log.record(MapOp::Put(now.0, Some(was.1), now.1)),
+							None => log.record(MapOp::Delete(was.0, was.1)),
+						},
+						None => match map.table.get(keys[index]) {
+							Some(let now) => log.record(MapOp::Put(now.0, None, now.1)),
+							None => {},
+						},
+					}
+					index += 1;
+				}
+			});
+			if !reached {
+				log.record(MapOp::Reset(HashMap::new()));
+			}
+			pending = pending_none();
+		},
+	}
+}
+
+/// A set flow's feed: an `Add` or `Remove` per touched member.
+fun set_feed<T: Hashable>(lend: |(|&HashSet<T>| void)| void, log: DeltaLog<SetOp<T>>): StoreFeed {
+	mut pending = pending_none();
+	mut olds: List<Option<T>> = [];
+	StoreFeed {
+		id = fresh_identity(),
+		touch = |touch: StoreTouch| {
+			pending = pending_with(pending, touch);
+		},
+		before = || {
+			olds = [];
+			lend(|set: &HashSet<T>| {
+				for hash in pending.keys {
+					olds.push(set.table.get(hash));
+				}
+			});
+		},
+		after = || {
+			let keys = pending.keys;
+			mut reached = false;
+			lend(|set: &HashSet<T>| {
+				reached = true;
+				if pending.whole || olds.len() != keys.len() {
+					log.record(SetOp::Reset(*set));
+					ret;
+				}
+				mut index: usize = 0;
+				for index < keys.len() {
+					let held = olds[index];
+					match held {
+						Some(let was) => {
+							if !set.table.contains_key(keys[index]) {
+								log.record(SetOp::Remove(was));
+							}
+						},
+						None => match set.table.get(keys[index]) {
+							Some(let now) => log.record(SetOp::Add(now)),
+							None => {},
+						},
+					}
+					index += 1;
+				}
+			});
+			if !reached {
+				log.record(SetOp::Reset(HashSet::new()));
+			}
+			pending = pending_none();
+		},
+	}
+}
+
+/// The elements of `list` in `start .. start + count`.
+fun span_of<T>(list: &List<T>, start: usize, count: usize): List<T> {
+	mut out: List<T> = [];
+	mut index = start;
+	for index < start + count {
+		out.push(list[index]);
+		index += 1;
+	}
+	out
+}
+
+/// What a list feed read of one touched part before the write: a span's elements,
+/// or the position and element under a key.
+enum SeqBefore<T> {
+	Span(usize, List<T>, usize),
+	Keyed(Hash, Option<(usize, T)>),
+}
+
+/// The position and element under the key whose hash is `hash`.
+fun keyed_place<T: StoreKey>(list: &List<T>, hash: Hash): Option<(usize, T)> {
+	match keyed_position(list, hash) {
+		Some(let index) => Some((index, list[index])),
+		None => None,
+	}
+}
+
+/// A list flow's feed: one `Splice` per touched span (`SetAt` for one element
+/// changed in place), read around the write. A write that touched the list in more
+/// than one place is recorded as a `Reset`.
+fun list_feed<T: StoreKey>(lend: |(|&List<T>| void)| void, log: DeltaLog<SeqOp<T>>): StoreFeed {
+	mut pending = pending_none();
+	mut olds: List<SeqBefore<T>> = [];
+	StoreFeed {
+		id = fresh_identity(),
+		touch = |touch: StoreTouch| {
+			pending = pending_with(pending, touch);
+		},
+		before = || {
+			olds = [];
+			lend(|list: &List<T>| {
+				for span in pending.spans {
+					olds.push(SeqBefore::Span(span.0, span_of(list, span.0, span.1), span.2));
+				}
+				for hash in pending.keys {
+					olds.push(SeqBefore::Keyed(hash, keyed_place(list, hash)));
+				}
+			});
+		},
+		after = || {
+			let touched = pending.spans.len() + pending.keys.len();
+			mut reached = false;
+			lend(|list: &List<T>| {
+				reached = true;
+				if pending.whole || olds.len() != touched || touched > 1 {
+					log.record(SeqOp::Reset(*list));
+					ret;
+				}
+				for before in olds {
+					match before {
+						SeqBefore::Span(let at, let left, let arriving) => {
+							let arrived = span_of(list, at, arriving);
+							if left.len() == 1 && arrived.len() == 1 {
+								log.record(SeqOp::SetAt(at, left[0], arrived[0]));
+							} else {
+								log.record(SeqOp::Splice(at, left, arrived));
+							}
+						},
+						SeqBefore::Keyed(let hash, let was) => record_keyed(log, was, keyed_place(list, hash)),
+					}
+				}
+			});
+			if !reached {
+				log.record(SeqOp::Reset([]));
+			}
+			pending = pending_none();
+		},
+	}
+}
+
+/// The op a write under one key made, from where the key's element stood before and
+/// after: an edit in place, a removal, an arrival, or a move.
+fun record_keyed<T>(log: DeltaLog<SeqOp<T>>, was: Option<(usize, T)>, now: Option<(usize, T)>) {
+	match was {
+		Some(let old) => match now {
+			Some(let new) => {
+				if old.0 == new.0 {
+					log.record(SeqOp::SetAt(old.0, old.1, new.1));
+				} else {
+					log.record(SeqOp::Splice(old.0, [old.1], []));
+					log.record(SeqOp::Splice(new.0, [], [new.1]));
+				}
+			},
+			None => log.record(SeqOp::Splice(old.0, [old.1], [])),
+		},
+		None => match now {
+			Some(let new) => log.record(SeqOp::Splice(new.0, [], [new.1])),
+			None => {},
+		},
+	}
+}
+
+// === Collection handles (§2.7, A149 S3) =======================================
+
+/// `by_key(k)`'s write: the first element under the key whose hash is `hash`, as an
+/// `Option` handed to `f`, written back in place (`Some`), removed (`None`), or
+/// appended (`Some` for a key the list did not hold).
+fun keyed_write<T: StoreKey>(held: &mut List<T>, hash: Hash, f: |&mut Option<T>| void) {
+	match keyed_position(held, hash) {
+		Some(let index) => {
+			mut found = Some(held[index]);
+			f(&mut found);
+			match found {
+				Some(let now) => {
+					held[index] = now;
+				},
+				None => {
+					let _gone = held.remove(index);
+				},
+			}
+		},
+		None => {
+			mut found: Option<T> = None;
+			f(&mut found);
+			match found {
+				Some(let now) => held.push(now),
+				None => {},
+			}
+		},
+	}
+}
+
+/// A map field is a KEYED node.
+export impl Store<HashMap<type K: Hashable, type V>> {
+	/// How many keys the map holds — read in place, copying nothing.
+	fun len(self): usize {
+		mut length: usize = 0;
+		(self.lend)(|map: &HashMap<K, V>| {
+			length = map.len();
+		});
+		length
+	}
+
+	/// The value under `key`, as a handle that depends on that key only: a write to
+	/// another key never wakes it. A `Store<Option<V>>`, so `set(None)` removes the
+	/// key, `.some()` reaches into a present value, and its subscription's slot
+	/// lives as long as its subscriptions do (Q12).
+	fun at(self, key: K): Store<Option<V>> {
+		self.descend(StoreStep::Key(key.hash()), |held: &HashMap<K, V>, f: |&Option<V>| void| {
+			let value = held.get(key);
+			f(&value);
+		}, |held: &mut HashMap<K, V>, f: |&mut Option<V>| void| {
+			mut value = held.get(key);
+			f(&mut value);
+			match value {
+				Some(let now) => held.insert(key, now),
+				None => held.remove(key),
+			}
+		})
+	}
+}
+
+export impl Store<HashMap<type K: Hashable, type V: Storable>> {
+	/// `key` holds `value` now — `at(key).set(Some(value))`.
+	fun insert(self, key: K, value: V) {
+		self.at(key).set(Some(value));
+	}
+
+	/// `key` leaves — `at(key).set(None)`.
+	fun remove(self, key: K) {
+		self.at(key).set(None);
+	}
+}
+
+/// A map field inside a variant: the same keyed step, through the variant.
+export impl StoreSome<HashMap<type K: Hashable, type V>> {
+	fun at(self, key: K): StoreSome<Option<V>> {
+		self.descend(StoreStep::Key(key.hash()), |held: &HashMap<K, V>, f: |&Option<V>| void| {
+			let value = held.get(key);
+			f(&value);
+		}, |held: &mut HashMap<K, V>, f: |&mut Option<V>| void| {
+			mut value = held.get(key);
+			f(&mut value);
+			match value {
+				Some(let now) => held.insert(key, now),
+				None => held.remove(key),
+			}
+		})
+	}
+}
+
+/// A set field is a keyed node of flags.
+export impl Store<HashSet<type T: Hashable>> {
+	/// How many members the set holds — read in place, copying nothing.
+	fun len(self): usize {
+		mut length: usize = 0;
+		(self.lend)(|set: &HashSet<T>| {
+			length = set.len();
+		});
+		length
+	}
+
+	/// Whether the set holds `member`, as a handle that depends on that member
+	/// only. A `Store<bool>`: `set(true)` adds it and `set(false)` removes it.
+	fun contains(self, member: T): Store<bool> {
+		self.descend(StoreStep::Key(member.hash()), |held: &HashSet<T>, f: |&bool| void| {
+			let present = held.contains(member);
+			f(&present);
+		}, |held: &mut HashSet<T>, f: |&mut bool| void| {
+			mut present = held.contains(member);
+			f(&mut present);
+			if present {
+				held.insert(member);
+			} else {
+				held.remove(member);
+			}
+		})
+	}
+
+	/// `member` joins the set — `contains(member).set(true)`.
+	fun insert(self, member: T) {
+		self.contains(member).set(true);
+	}
+
+	/// `member` leaves the set — `contains(member).set(false)`.
+	fun remove(self, member: T) {
+		self.contains(member).set(false);
+	}
+}
+
+export impl StoreSome<HashSet<type T: Hashable>> {
+	fun contains(self, member: T): StoreSome<bool> {
+		self.descend(StoreStep::Key(member.hash()), |held: &HashSet<T>, f: |&bool| void| {
+			let present = held.contains(member);
+			f(&present);
+		}, |held: &mut HashSet<T>, f: |&mut bool| void| {
+			mut present = held.contains(member);
+			f(&mut present);
+			if present {
+				held.insert(member);
+			} else {
+				held.remove(member);
+			}
+		})
+	}
+}
+
+/// A keyed list reads one element by its key (Q11: no `at(index)`).
+export impl Store<List<type T: StoreKey + Keyed<type K: Hashable>>> {
+	/// The first element whose key is `key`, as a handle that depends on that
+	/// element only: a splice elsewhere in the list never wakes it, and a write
+	/// that moves no element under `key` wakes nothing. `set(None)` removes the
+	/// element; `set(Some(v))` replaces it in place, or appends `v` when the list
+	/// holds no element under `key`.
+	fun by_key(self, key: K): Store<Option<T>> {
+		let hash = key.hash();
+		self.descend(StoreStep::Key(hash), |held: &List<T>, f: |&Option<T>| void| {
+			let found = keyed_element(held, hash);
+			f(&found);
+		}, |held: &mut List<T>, f: |&mut Option<T>| void| keyed_write(held, hash, f))
+	}
+}
+
+export impl StoreSome<List<type T: StoreKey + Keyed<type K: Hashable>>> {
+	fun by_key(self, key: K): StoreSome<Option<T>> {
+		let hash = key.hash();
+		self.descend(StoreStep::Key(hash), |held: &List<T>, f: |&Option<T>| void| {
+			let found = keyed_element(held, hash);
+			f(&found);
+		}, |held: &mut List<T>, f: |&mut Option<T>| void| keyed_write(held, hash, f))
+	}
+}
+
+/// A list field is a SEQUENCE node: every `SequenceCell` write — `push`, `prepend`,
+/// `insert_at`, `remove_at`, `extend`, `clear`, `truncate`, ... — is one splice,
+/// landed in place.
+export impl Store<List<type T: Storable + StoreKey>> with SequenceCell<T> {
+	/// How many elements the list holds — read in place.
+	fun size(self): usize {
+		mut length: usize = 0;
+		(self.lend)(|list: &List<T>| {
+			length = list.len();
+		});
+		length
+	}
+
+	fun splice(self, at: usize, removed: usize, inserted: List<T>) {
+		splice_at(self.root, self.path, self.lend, self.modify, at, removed, inserted);
+	}
+}
+
+/// A list field inside a variant: the same writes, landing only while the variant
+/// is live (`patch`'s rule).
+export impl StoreSome<List<type T: Storable + StoreKey>> with SequenceCell<T> {
+	fun size(self): usize {
+		mut length: usize = 0;
+		(self.lend)(|list: &List<T>| {
+			length = list.len();
+		});
+		length
+	}
+
+	fun splice(self, at: usize, removed: usize, inserted: List<T>) {
+		splice_at(self.root, self.path, self.lend, self.modify, at, removed, inserted);
+	}
+}
+
+/// A map field is a map FLOW: every map operator (`keys`, `values`, `filter`, ...)
+/// starts from it and is told `MapOp`s.
+export impl Store<HashMap<type K: Hashable, type V>> with MapFlow<K, V> {
+	fun open(own self): MapInstance<K, V> {
+		let lend = self.lend;
+		let root = self.root;
+		let path = self.path;
+		let log = DeltaLog<MapOp<K, V>>::new();
+		let cursor = log.cursor();
+		let feed = map_feed(lend, log);
+		attach_feed(root, path, feed);
+		MapInstance<K, V> {
+			snapshot = || lent_value(lend),
+			attach = |subscriber: Subscriber| watch_at(root, path, subscriber),
+			drain = || match log.since(cursor) {
+				Some(let ops) => ops,
+				None => [MapOp::Reset(lent_value(lend))],
+			},
+			release = || {
+				log.drop_cursor(cursor);
+				detach_feed(root, path, feed.id);
+			},
+		}
+	}
+}
+
+/// A set field is a set flow, told `SetOp`s.
+export impl Store<HashSet<type T: Hashable>> with SetFlow<T> {
+	fun open(own self): SetInstance<T> {
+		let lend = self.lend;
+		let root = self.root;
+		let path = self.path;
+		let log = DeltaLog<SetOp<T>>::new();
+		let cursor = log.cursor();
+		let feed = set_feed(lend, log);
+		attach_feed(root, path, feed);
+		SetInstance<T> {
+			snapshot = || lent_value(lend),
+			attach = |subscriber: Subscriber| watch_at(root, path, subscriber),
+			drain = || match log.since(cursor) {
+				Some(let ops) => ops,
+				None => [SetOp::Reset(lent_value(lend))],
+			},
+			release = || {
+				log.drop_cursor(cursor);
+				detach_feed(root, path, feed.id);
+			},
+		}
+	}
+}
+
+/// A list field is a collection flow, told `SeqOp`s — and what `each`/`each_by`
+/// read their rows from, so a `push` builds one row.
+export impl Store<List<type T: StoreKey>> with CollFlow<T> {
+	fun open(own self): CollInstance<T> {
+		let lend = self.lend;
+		let root = self.root;
+		let path = self.path;
+		let log = DeltaLog<SeqOp<T>>::new();
+		let cursor = log.cursor();
+		let feed = list_feed(lend, log);
+		attach_feed(root, path, feed);
+		CollInstance<T> {
+			snapshot = || lent_value(lend),
+			attach = |subscriber: Subscriber| watch_at(root, path, subscriber),
+			drain = || match log.since(cursor) {
+				Some(let ops) => ops,
+				None => [SeqOp::Reset(lent_value(lend))],
+			},
+			release = || {
+				log.drop_cursor(cursor);
+				detach_feed(root, path, feed.id);
+			},
+		}
+	}
+}
+
+export impl Store<List<type T: StoreKey>> with RowFeed<T> {
+	fun open_rows(own self): CollInstance<T> {
+		self.open()
+	}
+}
+
+// === `[derive(Storable)]` (§3.1, Q3, Q4, Q9, Q10) =============================
+//
+// Everything per type is emitted here — the macro door. A derive sees one item at a
+// time, so the slot tree is one uniform node type and a field's type is reached
+// only through the `Storable` bound: a field whose type nothing derives is a leaf,
+// by the tiers above. Per struct it writes:
+//
+//   - `impl T with Storable`: one diff line per field, in declaration order, each
+//     handed the field's child node and whether an answer is still needed;
+//   - `impl Store<T>` and `impl StoreSome<T>`: one projection per field, each one
+//     in-place step (`|held, f| f(&held.field)`) onto its parent's handle.
+//
+// Per enum: the diff (the discriminant, then the live payload), and on both handle
+// types the discriminant projection per variant (`is_online()`) and, per payload
+// variant, the through-variant handle (`online()`, a `StoreSome`).
+//
+// Every closure the output writes carries its parameter types. The native backend
+// types an unannotated closure parameter from the value it is matched against and,
+// for a closure-typed one, drops the view on ITS parameter (`|&F| void` arrives as
+// `|F| void`), which rustc refuses.
+
+/// The members of the handle surface — `Store`'s, `StoreSome`'s and every `Source`,
+/// `Signal` and `Flow` member a handle reaches. An inherent member wins over a
+/// generated projection of the same name (spec `names.md` §4.6), so a field
+/// spelled like one could never be reached; the derive refuses it (Q9).
+macro fun store_reserved(name: str): bool {
+	let reserved = [
+		"get",
+		"set",
+		"set_with",
+		"notify",
+		"new",
+		"on_settle",
+		"attach_observer",
+		"identity",
+		"constant",
+		"start",
+		"on_change",
+		"sub",
+		"effect",
+		"effect_on_change",
+		"scoped_effect",
+		"scoped_effect_on_change",
+		"derive",
+		"switch",
+		"distinct",
+		"distinct_by",
+		"switch_some",
+		"and_then",
+		"then_some",
+		"flatten",
+		"track",
+		"load",
+		"bind",
+		"delta_cursor",
+		"delta_since",
+		"drop_delta_cursor",
+		"start_element",
+		"start_element_value",
+		"coll",
+		"coll_by",
+		"place",
+		"apply",
+		"bind_attribute",
+		"project",
+		"descend",
+		"variant",
+		"tag",
+		"some",
+		"is_some",
+		"assume",
+		"patch",
+		"live",
+	];
+	for word in reserved {
+		if word == name {
+			ret true;
+		}
+	}
+	false
+}
+
+/// `Online` -> `online`, `HttpError` -> `http_error`: a variant's projection names.
+macro fun store_snake(name: str): str {
+	mut out = "";
+	mut index: usize = 0;
+	for index < name.len() {
+		let letter = name.substring(index, index + 1);
+		let lower = letter.to_lowercase();
+		if lower != letter && index > 0 {
+			out = out + "_";
+		}
+		out = out + lower;
+		index = index + 1;
+	}
+	out
+}
+
+/// A written type as it stands inside a closure type's parameter list: a closure
+/// type is parenthesized, so `|&F| void` over `F = || void` stays one type.
+macro fun store_operand(type_: TypeExpr): str {
+	let written = type_.render();
+	if written.contains("|") {
+		ret i"({written})";
+	}
+	written
+}
+
+/// The `<type A, type B>` an inherent impl on `Store<Subject<A, B>>` binds, bare.
+macro fun store_bare_binders(generics: List<GenericParameter>): str {
+	import macro_std::build::join;
+
+	if generics.len() == 0 {
+		ret "";
+	}
+	mut parts: List<str> = [];
+	for parameter in generics {
+		parts.push(i"type {parameter.name}");
+	}
+	"<" + join(parts, ", ") + ">"
+}
+
+/// One field projection on a handle type (`Store` or `StoreSome`): the in-place
+/// read and write of `held.{field}`, one step below the handle's own.
+macro fun store_projection(
+	handle: str,
+	subject: str,
+	method: str,
+	field: str,
+	index: usize,
+	type_: TypeExpr,
+): str {
+	let operand = store_operand(type_);
+	let written = type_.render();
+	let read = i"|held: &{subject}, f: |&{operand}| void| f(&held.{field})";
+	let write = i"|held: &mut {subject}, f: |&mut {operand}| void| f(&mut held.{field})";
+	i"fun {method}(self): {handle}<{written}> \{\n\tself.project({index}, {read}, {write})\n" + "}"
+}
+
+export macro fun store_struct_impls(target: StructItem): str {
+	import macro_std::build::{ impl_of, fun_of };
+	import macro_std::panic;
+
+	let subject = target.subject();
+	mut diff = fun_of("store_diff")
+		.parameter("&self")
+		.parameter(i"other: &{subject}")
+		.parameter("node: Option<Shared<StoreNode>>")
+		.parameter("need: bool")
+		.parameter("woken: &mut StoreWoken")
+		.returns("bool")
+		.line("if !need && node.is_none() {\n\tret false;\n}")
+		.line("let here = need || store_has_me(node);")
+		.line("mut changed = false;");
+	mut store_impl = impl_of(i"Store<{target.name}{store_bare_binders(target.generics)}>");
+	mut some_impl = impl_of(i"StoreSome<{target.name}{store_bare_binders(target.generics)}>");
+	mut index: usize = 0;
+	for field in target.fields {
+		let method = if field.reactive_name != "" { field.reactive_name } else { field.name };
+		if store_reserved(method) {
+			panic(i"`[derive(Storable)]` on `{target.name}`: the field `{field.name}` would project as `{method}()`, which a store handle already has (`{method}` is a handle member, and an inherent member wins over a projection) — rename the projection with `[reactive(name = \"..\")]` on the field");
+		}
+		// A closure-typed field takes no method at all, so the leaf tiers cannot
+		// reach it: it is the bare tier's answer, written out.
+		if field.type_.render().contains("|") {
+			diff = diff.line(i"changed = store_opaque(store_kid(node, {index}), woken) || changed;");
+		} else {
+			let step = if field.reactive_coarse { "store_leaf_diff" } else { "store_diff" };
+			diff = diff.line(i"changed = self.{field.name}.{step}(&other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
+		}
+		store_impl = store_impl.member(store_projection("Store", subject, method, field.name, index, field.type_));
+		some_impl = some_impl.member(store_projection("StoreSome", subject, method, field.name, index, field.type_));
+		index = index + 1;
+	}
+	diff = diff.line("store_wake_me(node, changed, woken);").expr("changed");
+	mut out = impl_of(target.name)
+		.generics(target.binders("Storable"))
+		.implements("Storable")
+		.method(diff)
+		.render();
+	if target.fields.len() > 0 {
+		out = out + store_impl.render() + some_impl.render();
+	}
+	out
+}
+
+export macro fun store_enum_impls(target: EnumItem): str {
+	import macro_std::option::Option::{ self, Some, None };
+	import macro_std::build::{ impl_of, fun_of, match_of, join };
+	import macro_std::panic;
+
+	let subject = target.subject();
+	let name = target.name;
+	// Which payload child the WRITTEN value's variant owns: child `1 + i` for
+	// variant `i`, child 0 being the discriminant.
+	mut to_arms = match_of("other");
+	mut index: usize = 0;
+	for variant in target.variants {
+		let pattern = if variant.payload.len() == 0 {
+			i"{name}::{variant.name}"
+		} else {
+			mut blanks: List<str> = [];
+			for _type in variant.payload {
+				blanks.push("_");
+			}
+			i"{name}::{variant.name}({join(blanks, ", ")})"
+		};
+		to_arms = to_arms.arm(pattern, i"{index + 1}");
+		index = index + 1;
+	}
+	mut self_arms = match_of("self");
+	mut store_impl = impl_of(i"Store<{name}{store_bare_binders(target.generics)}>");
+	mut some_impl = impl_of(i"StoreSome<{name}{store_bare_binders(target.generics)}>");
+	mut seen: List<str> = [];
+	index = 0;
+	for variant in target.variants {
+		let child = index + 1;
+		let arity = variant.payload.len();
+		let snake = store_snake(variant.name);
+		let flag = i"is_{snake}";
+		for taken in seen {
+			if taken == snake {
+				panic(i"`[derive(Storable)]` on `{name}`: two variants project as `{snake}()`");
+			}
+		}
+		seen.push(snake);
+		if store_reserved(flag) || (arity > 0 && store_reserved(snake)) {
+			panic(i"`[derive(Storable)]` on `{name}`: the variant `{variant.name}` would project as `{snake}()`/`{flag}()`, which a store handle already has — rename the variant");
+		}
+		mut blanks: List<str> = [];
+		mut mine: List<str> = [];
+		mut theirs: List<str> = [];
+		mut position: usize = 0;
+		for _type in variant.payload {
+			blanks.push("_");
+			mine.push(i"let a{position}");
+			theirs.push(i"let b{position}");
+			position = position + 1;
+		}
+		let bare = if arity == 0 {
+			i"{name}::{variant.name}"
+		} else {
+			i"{name}::{variant.name}({join(blanks, ", ")})"
+		};
+		let test = i"|held: &{subject}| match held \{\n\t{bare} => true,\n\t_ => false,\n" + "}";
+		let flag_method = i"fun {flag}(self): StoreFlag \{\n\tself.tag({child}, {test})\n" + "}";
+		store_impl = store_impl.member(flag_method);
+		some_impl = some_impl.member(flag_method);
+		if arity == 0 {
+			self_arms = self_arms.arm(bare, match_of("other")
+				.arm(bare, "false")
+				.arm("_", i"store_switch(node, {child}, to, woken)")
+				.render());
+		} else {
+			let mine_pattern = i"{name}::{variant.name}({join(mine, ", ")})";
+			let theirs_pattern = i"{name}::{variant.name}({join(theirs, ", ")})";
+			// The payload diff: one position is the payload node itself; several
+			// are its children, by position.
+			mut same: List<str> = [];
+			if arity == 1 {
+				if variant.payload[0].render().contains("|") {
+					same.push(i"store_opaque(store_kid(node, {child}), woken)");
+				} else {
+					same.push(i"a0.store_diff(&b0, store_kid(node, {child}), here, woken)");
+				}
+			} else {
+				same.push(i"let payload = store_kid(node, {child});");
+				same.push("let deep = here || store_has_me(payload);");
+				same.push("mut moved = false;");
+				position = 0;
+				for type_ in variant.payload {
+					if type_.render().contains("|") {
+						same.push(i"moved = store_opaque(store_kid(payload, {position}), woken) || moved;");
+					} else {
+						same.push(i"moved = a{position}.store_diff(&b{position}, store_kid(payload, {position}), deep && !moved, woken) || moved;");
+					}
+					position = position + 1;
+				}
+				same.push("store_wake_me(payload, moved, woken);");
+				same.push("moved");
+			}
+			let same_body = if arity == 1 { same[0] } else { "{\n" + join(same, "\n") + "\n}" };
+			self_arms = self_arms.arm(mine_pattern, match_of("other")
+				.arm(theirs_pattern, same_body)
+				.arm("_", i"store_switch(node, {child}, to, woken)")
+				.render());
+			// The through-variant handle: the payload type, a tuple for several.
+			mut payload_types: List<str> = [];
+			mut operands: List<str> = [];
+			for type_ in variant.payload {
+				payload_types.push(type_.render());
+				operands.push(store_operand(type_));
+			}
+			let payload = if arity == 1 {
+				payload_types[0]
+			} else {
+				"(" + join(payload_types, ", ") + ")"
+			};
+			let operand = if arity == 1 { operands[0] } else { payload };
+			mut binds: List<str> = [];
+			mut parts: List<str> = [];
+			position = 0;
+			for _type in variant.payload {
+				binds.push(i"let p{position}");
+				parts.push(i"p{position}");
+				position = position + 1;
+			}
+			let bound = i"{name}::{variant.name}({join(binds, ", ")})";
+			let built = if arity == 1 { "p0" } else { "(" + join(parts, ", ") + ")" };
+			mut unpacked: List<str> = [];
+			if arity == 1 {
+				unpacked.push("payload");
+			} else {
+				position = 0;
+				for _type in variant.payload {
+					unpacked.push(i"payload.{position}");
+					position = position + 1;
+				}
+			}
+			let read = i"|held: &{subject}, f: |&{operand}| void| \{\n\tmatch held \{\n\t\t{bound} => f(&{built}),\n\t\t_ => \{" + "},\n\t}\n}";
+			// One payload is lent IN PLACE: under `match &mut held` its capture is
+			// a writable view into the slot (B509), so nothing is copied out or
+			// written back. Several are gathered into the tuple the handle lends,
+			// then spread back — a tuple of views cannot be formed (Q6).
+			let write = if arity == 1 {
+				i"|held: &mut {subject}, f: |&mut {operand}| void| \{\n\tmatch &mut held \{\n\t\t{name}::{variant.name}(let p0) => f(p0),\n\t\t_ => \{" + "},\n\t}\n}"
+			} else {
+				i"|held: &mut {subject}, f: |&mut {operand}| void| \{\n\tmatch held \{\n\t\t{bound} => \{\n\t\t\tmut payload = {built};\n\t\t\tf(&mut payload);\n\t\t\theld = {name}::{variant.name}({join(unpacked, ", ")});\n\t\t" + "},\n\t\t_ => {},\n\t}\n}"
+			};
+			let through = i"fun {snake}(self): StoreSome<{payload}> \{\n\tself.variant({child}, {read}, {write})\n" + "}";
+			store_impl = store_impl.member(through);
+			some_impl = some_impl.member(through);
+		}
+		index = index + 1;
+	}
+	let diff = fun_of("store_diff")
+		.parameter("&self")
+		.parameter(i"other: &{subject}")
+		.parameter("node: Option<Shared<StoreNode>>")
+		.parameter("need: bool")
+		.parameter("woken: &mut StoreWoken")
+		.returns("bool")
+		.line("if !need && node.is_none() {\n\tret false;\n}")
+		.line("let here = need || store_has_me(node);")
+		.line(i"let to: usize = {to_arms.render()};")
+		.line(i"let changed = {self_arms.render()};")
+		.line("store_wake_me(node, changed, woken);")
+		.expr("changed");
+	impl_of(name)
+		.generics(target.binders("Storable"))
+		.implements("Storable")
+		.method(diff)
+		.render()
+		+ store_impl.render()
+		+ some_impl.render()
+}
+
+/// `[derive(Storable)]`: the struct's or enum's store surface (§3.1). Its output
+/// carries its own imports, from `std::reactive::store_core` where the names are
+/// declared: a module's own `Storable` here is this macro, and the re-exported
+/// trait of the same name is not reached through `std::reactive::store` from
+/// generated code (N?3).
+export macro fun Storable(item: Item): Source {
+	import macro_std::option::Option::{ self, Some, None };
+
+	let header = "import std::option::Option;\n"
+		+ "import std::shared::Shared;\n"
+		+ "import std::reactive::store_core::{ Storable, StoreFlag, StoreLeaf, StoreNode, StoreSlot, StoreWoken, Store, StoreSome, store_has_me, store_kid, store_opaque, store_switch, store_wake_me };\n";
+	if item.as_struct() is Some(let target) {
+		ret source(header + store_struct_impls(target));
+	}
+	if item.as_enum() is Some(let target) {
+		ret source(header + store_enum_impls(target));
+	}
+	source("")
+}

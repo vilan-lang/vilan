@@ -16,7 +16,7 @@ compile-time file channel, `const parse(asset::read("pages/intro.md"))`
 parses a page during compilation — within the const fuel budget even
 for the book's largest page — and ships the `Doc` as plain data in the
 output, with the read file tracked as a build input
-([std::asset](misc.md#stdasset)).
+([std::web::asset](misc.md#stdwebasset)).
 
 ## Parsing
 
@@ -25,6 +25,7 @@ Decoding untrusted input is fallible the same way `from_json` is: handle
 the `Err` with `match`, `!`, or `unwrap_or_else`.
 
 ```vilan
+import std::display::Display;
 import std::markdown::{ parse, Block, Doc, Inline, ParseError };
 import std::result::Result::{ Err, Ok };
 

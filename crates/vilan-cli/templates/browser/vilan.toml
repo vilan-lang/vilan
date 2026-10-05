@@ -1,4 +1,4 @@
-# A browser app on `std::reactive` + `std::ui`. The package's `target` is
+# A browser app on `std::reactive` + `std::web::ui`. The package's `target` is
 # `browser`, so a plain `vilan build .` emits `app.js` beside `index.html` —
 # no `--target` flag. Sources sit beside this manifest, so `root` is `.`.
 #
@@ -9,7 +9,7 @@
 # your browser refuses ES modules on `file://`.
 #
 # `prelude` names the ambient scope every file here resolves under — the names
-# in scope with no import. `std::web` is the set for applications: the base
+# in scope with no import. `std::web::prelude` is the set for applications: the base
 # seven (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) plus `Signal`,
 # `view` and `View`, plus the MODULES `style` and `ui`, which is why the
 # sources beside this file write `style::Display` and `ui::mount_root` with no
@@ -19,4 +19,4 @@ name = "{{name}}"
 root = "."
 entry = "app.vl"
 target = "browser"
-prelude = "std::web"
+prelude = "std::web::prelude"

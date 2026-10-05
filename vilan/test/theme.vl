@@ -1,5 +1,5 @@
 import std::io::print;
-import std::style::{
+import std::web::style::{
 	Color,
 	Length,
 	Style,

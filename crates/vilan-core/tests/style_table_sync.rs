@@ -1,4 +1,4 @@
-//! The canonical-order table, held to `vilan/std/src/style.vl`.
+//! The canonical-order table, held to `vilan/std/src/web/style.vl`.
 //!
 //! `vilan fmt` sorts a `style()` builder chain by a table of method names
 //! (`formatter::STYLE_PROPERTY_METHODS` and friends). A table that drifts from
@@ -49,7 +49,7 @@ use vilan_core::formatter::{
 };
 
 /// The std style surface this table describes.
-const STYLE_SOURCE: &str = "vilan/std/src/style.vl";
+const STYLE_SOURCE: &str = "vilan/std/src/web/style.vl";
 
 /// Condition rows with a free constructor and no `Style` METHOD of the same
 /// name — the value reading's rows, exempt from the completeness gate's method

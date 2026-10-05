@@ -10,3 +10,10 @@
 # the shell still wins (no `force`).
 [env]
 RUST_MIN_STACK = "8388608"
+# N137: every test process — and every `vilan` a test spawns — keeps its
+# `vilan check` macro-expansion tables under `target/`, not in the developer's
+# `~/.vilan/check-cache`: the suite checks thousands of temp packages, each a
+# table keyed by its path, and they had grown that root to 19,000 directories.
+# A `cargo run` of the CLI from this workspace lands there too; an installed
+# `vilan` never reads this file.
+VILAN_CHECK_CACHE = { value = "target/test-check-cache", relative = true }

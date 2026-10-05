@@ -4544,7 +4544,7 @@ fn a_task_is_not_a_promise() {
     assert_fails_with(
         r#"
         import std::task::Task;
-        import std::promise::Promise;
+        import std::js::promise::Promise;
         fun label(): str { "ready" }
         fun main() {
             let p: Promise<str> = async label();
@@ -4557,12 +4557,12 @@ fn a_task_is_not_a_promise() {
 
 #[test]
 fn spawn_typing_falls_back_to_promise_without_std_task() {
-    // Compat: a program that loads `std::promise` but never `std::task`
+    // Compat: a program that loads `std::js::promise` but never `std::task`
     // keeps the old `Promise<T>` spawn typing (an older std has no task.vl).
     assert_compiles(
         r#"
         import std::io::print;
-        import std::promise::Promise;
+        import std::js::promise::Promise;
         fun label(): str { "ready" }
         fun main() {
             let p: Promise<str> = async label();
@@ -4579,7 +4579,7 @@ fn a_raw_host_promise_still_types_and_awaits() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::promise::Promise;
+        import std::js::promise::Promise;
         import std::task::Task;
         [extern(new, "Promise")]
         external fun ticket(executor: |(|i32| void)| void): Promise<i32>;
@@ -8099,5 +8099,378 @@ fn b453_a_view_of_a_tuple_position_writes_and_reads_through() {
         }
         "#,
         "3\n2\n11\n3\na 6 true\n",
+    );
+}
+
+// --- B441: a tuple pattern matches the value's SHAPE ---------------------------
+//
+// A pattern of another arity than the tuple it destructures — or a tuple pattern
+// over a value that is no tuple — was let through with every element `Unknown`,
+// and emission read whatever slots the flat layout held at those positions:
+// `let (a, b, c, d, e, f) = ((1, 2), (3, 4), (5, 6))` bound 1 through 6.
+
+/// B441: every position a tuple pattern stands in refuses the arity the value
+/// does not have — `let`, a `for` binding, a closure parameter, a `match` arm —
+/// and a tuple pattern over an `i32` or a struct says it is not a tuple.
+#[test]
+fn b441_a_tuple_pattern_of_another_arity_is_refused() {
+    for (setup, binding, message) in [
+        (
+            "let t = ((1, 2), (3, 4), (5, 6));",
+            "let (a, b, c, d, e, f) = t;",
+            "this pattern binds 6 elements, but the value is a 3-tuple",
+        ),
+        (
+            "",
+            "let (a, b, c, d, e, f) = ((1, 2), (3, 4), (5, 6));",
+            "this pattern binds 6 elements, but the value is a 3-tuple",
+        ),
+        (
+            "let t = (1, 2, 3);",
+            "let (a, b) = t;",
+            "this pattern binds 2 elements, but the value is a 3-tuple",
+        ),
+        (
+            "",
+            "let (a, b, c) = ((1, 2), 3);",
+            "this pattern binds 3 elements, but the value is a 2-tuple",
+        ),
+        (
+            "",
+            "let ((a, b), (c, d, e)) = ((1, 2), (3, 4));",
+            "this pattern binds 3 elements, but the value is a 2-tuple",
+        ),
+        (
+            "",
+            "for (x, y) in [(1, 2, 3)] { print(y); }",
+            "this pattern binds 2 elements, but the value is a 3-tuple",
+        ),
+        (
+            "",
+            "let add = |(p, q)| p + q; print(add((1, 2, 3)));",
+            "this pattern binds 2 elements, but the value is a 3-tuple",
+        ),
+        (
+            "let t = (1, (2, 3));",
+            "match t { (let a, let b, let c) => print(a), }",
+            "this pattern binds 3 elements, but the value is a 2-tuple",
+        ),
+        (
+            "",
+            "let (a, b) = 5;",
+            "this pattern binds 2 elements, but the value is a `i32`, not a tuple",
+        ),
+        (
+            "",
+            "let (a, b) = Point { x = 1, y = 2 };",
+            "this pattern binds 2 elements, but the value is a `Point`, not a tuple",
+        ),
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct Point {{ x: i32, y: i32 }}
+
+                fun main() {{
+                    {setup}
+                    {binding}
+                }}
+                "#
+            ),
+            message,
+        );
+    }
+}
+
+/// B441: the nested forms that match the value's shape keep working — a
+/// pattern per element at every depth, a pattern that stops at an element and
+/// binds the whole inner tuple, a `for` and a closure parameter of the right
+/// arity, and `match`/`is` arms.
+#[test]
+fn b441_a_tuple_pattern_of_the_values_shape_destructures_at_every_depth() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let t = ((1, 2), (3, 4), (5, 6));
+            let ((a, b), (c, d), (e, f)) = t;
+            print(i"{a} {b} {c} {d} {e} {f}");
+            let (x, y, z) = t;
+            print(i"{x.0} {y.1} {z.0}");
+            let (p, q) = (1, (2, 3));
+            print(i"{p} {q.1}");
+            let (u, (v, w)) = (1, (2, 3));
+            print(i"{u} {v} {w}");
+            for (key, (low, high)) in [("a", (1, 2))] {
+                print(i"{key} {low} {high}");
+            }
+            let add = |(left, right)| left + right;
+            print(add((20, 22)));
+            match (1, (2, 3)) {
+                (let first, (let second, let third)) => print(first + second + third),
+            }
+            if (7, 8) is (let g, let h) {
+                print(g + h);
+            }
+        }
+        "#,
+        "1 2 3 4 5 6\n1 4 5\n1 3\n1 2 3\na 1 2\n42\n6\n15\n",
+    );
+}
+
+/// B447: integer literals inside TUPLES inside a LIST literal type from the
+/// expected element type — `total([(0, 3), (7, 11)])` against `total(ranges:
+/// List<(usize, usize)>)` was refused "Expected List<(usize, usize)>, but got
+/// List<(i32, i32)>", while `let one: (usize, usize) = (0, 3)` typed. At an
+/// argument, at an annotated binding, nested a level deeper, beside a
+/// non-literal element, and with an explicit suffix that still wins.
+#[test]
+fn b447_integer_literals_in_tuples_in_a_list_take_the_expected_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        fun total(ranges: List<(usize, usize)>): usize {
+            mut sum = 0usize;
+            for range in ranges {
+                sum += range.1 - range.0;
+            }
+            sum
+        }
+        fun labelled(pairs: List<((u32, u32), str)>): u32 {
+            mut sum = 0u32;
+            for pair in pairs {
+                sum += pair.0.0 + pair.0.1;
+            }
+            sum
+        }
+        fun main() {
+            print(i"{total([(0, 3), (7, 11)])}");
+            let spans: List<(usize, usize)> = [(1, 2), (5, 9)];
+            print(i"{total(spans)}");
+            print(i"{labelled([((1, 2), "a"), ((3, 4), "b")])}");
+            let start: usize = 4;
+            print(i"{total([(start, 6), (0, 1)])}");
+            print(i"{total([(0usize, 2usize)])}");
+        }
+        "#,
+        "7\n5\n10\n3\n2\n",
+    );
+}
+
+/// B440: a MAPPED parameter with a CONSTANT template, `(U in T: str)`, takes its
+/// matching concrete argument when `T` is bound by ANOTHER parameter — in
+/// either parameter order — and still refuses a mis-sized or mis-typed one.
+#[test]
+fn b440_a_constant_mapped_template_takes_its_argument_when_another_parameter_binds_the_family() {
+    let program = |call: &str| {
+        format!(
+            r#"
+            import std::reactive::SignalCell;
+            fun first_label<T: (2..)>(labels: (U in T: str), cells: (U in T: SignalCell<U>)): i32 {{
+                0
+            }}
+            fun cells_first<T: (2..)>(cells: (U in T: SignalCell<U>), labels: (U in T: str)): i32 {{
+                1
+            }}
+            fun main() {{
+                let cells = (SignalCell::new((1, 2)), SignalCell::new("b"));
+                print({call});
+            }}
+            "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program("first_label((\"first\", \"second\"), cells)"),
+        "0\n",
+    );
+    assert_compiles_and_runs(
+        &program("cells_first(cells, (\"first\", \"second\"))"),
+        "1\n",
+    );
+    assert_fails(&program("cells_first(cells, (\"a\", \"b\", \"c\"))"));
+    assert_fails(&program("cells_first(cells, (\"a\", 2))"));
+}
+
+/// B442 (with B440's change): a bare `None` in a MAPPED-tuple argument takes
+/// the element type the mapped position names once ANOTHER parameter binds the
+/// family — `(Some(1), None, Some("two"))` at `(U in T: Option<U>)` beside
+/// `seeds: T` — where it stayed `Option<unknown>` and the argument was refused.
+/// (Alone, as in the item's repro, `T`'s middle element has no evidence at all,
+/// and the call is still refused.)
+#[test]
+fn b442_a_bare_none_in_a_mapped_argument_takes_the_bound_familys_element() {
+    let program = |call: &str| {
+        format!(
+            r#"
+            import std::option::Option::{{ self, Some, None }};
+            fun count<T: (2..)>(seeds: T, items: (U in T: Option<U>)): i32 {{
+                3
+            }}
+            fun main() {{
+                print({call});
+            }}
+            "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program("count((1, true, \"x\"), (Some(1), None, Some(\"two\")))"),
+        "3\n",
+    );
+    assert_fails(&program("count((1, true), (Some(1), Some(2)))"));
+}
+
+// --- A152: `zip_some` and `SignalCell<(..)>::unzip` --------------------------
+//
+// The ruling (2026-10-03): `zip_some` takes a tuple of `Flow<Option<..>>` and
+// answers `Some` of the payloads only while every input is `Some` — value level,
+// stateless, on `combine`'s per-arity mechanism; `unzip` splits a tuple-valued
+// cell into one cell per position, written in place.
+
+/// Arity two and three, the negative state at every position, and the zip
+/// following each input's changes — read through a sealed memo, which is a
+/// consumer like any other.
+#[test]
+fn a152_zip_some_is_some_only_while_every_input_is() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Pipe, Signal, SignalCell, Source, zip_some };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet name: SignalCell<Option<str>> = Signal::new(Some(\"Ada\"));\n",
+            "\tlet age: SignalCell<Option<i32>> = Signal::new(None);\n",
+            "\tlet flag: SignalCell<Option<bool>> = Signal::new(Some(true));\n",
+            "\tlet pair = zip_some((name, age)).memo();\n",
+            "\tlet triple = zip_some((name, age, flag)).memo();\n",
+            "\tprint(i\"{pair.get().is_none()} {triple.get().is_none()}\");\n",
+            "\tage.set(Some(36));\n",
+            "\tmatch pair.get() {\n",
+            "\t\tSome((let n, let a)) => print(i\"{n} {a}\"),\n",
+            "\t\tNone => print(\"none\"),\n",
+            "\t}\n",
+            "\tmatch triple.get() {\n",
+            "\t\tSome((let n, let a, let f)) => print(i\"{n} {a} {f}\"),\n",
+            "\t\tNone => print(\"none\"),\n",
+            "\t}\n",
+            "\tflag.set(None);\n",
+            "\tprint(i\"{pair.get().is_some()} {triple.get().is_none()}\");\n",
+            "\tname.set(None);\n",
+            "\tprint(i\"{pair.get().is_none()}\");\n",
+            "}\n",
+        ),
+        "true true\nAda 36\nAda 36 true\ntrue true\ntrue\n",
+    );
+}
+
+/// Each input is any FLOW of a maybe: a pipe is moved in (here a `derive` and an
+/// `and_then` that depends on another input — the dependent case the item
+/// names), and the zip composes as a stage: `.derive` over it, then a consumer.
+/// The dependent input is a DIAMOND on `message`, so each write is a `batch`:
+/// a turn runs the consumer once, on settled values (outside one, an inline
+/// notify reaches it once per arm, as it does any `combine`).
+#[test]
+fn a152_zip_some_takes_pipes_and_composes_as_a_stage() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::display::Display;\n",
+            "import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, batch, zip_some };\n",
+            "\n",
+            "struct Message {\n",
+            "\tauthor: usize,\n",
+            "\tcontent: str,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet users: SignalCell<List<str>> = Signal::new([\"ada\", \"grace\"]);\n",
+            "\tlet message: SignalCell<Option<Message>> = Signal::new(None);\n",
+            "\tlet author = message\n",
+            "\t\t.and_then(|m| users.derive(|names| names.get(m.author)))\n",
+            "\t\t.memo();\n",
+            "\tlet line = zip_some((message, author.derive(|name| name)))\n",
+            "\t\t.derive(|both| match both {\n",
+            "\t\t\tSome((let m, let name)) => i\"{name}: {m.content}\",\n",
+            "\t\t\tNone => \"(nothing)\",\n",
+            "\t\t})\n",
+            "\t\t.memo();\n",
+            "\tmut seen: List<str> = [];\n",
+            "\tlet _watch = line.sub(|text| seen.push(text));\n",
+            "\tbatch(|| message.set(Some(Message { author = 1, content = \"hi\" })));\n",
+            "\tbatch(|| message.set(Some(Message { author = 0, content = \"yo\" })));\n",
+            "\tbatch(|| message.set(Some(Message { author = 5, content = \"lost\" })));\n",
+            "\tprint(seen.join(\" | \"));\n",
+            "}\n",
+        ),
+        "(nothing) | grace: hi | ada: yo | (nothing)\n",
+    );
+}
+
+/// `unzip` at arity two and three: the parts are seeded with the whole's
+/// payloads and written IN PLACE on every change of the whole (the SAME cells —
+/// an observer taken before the write sees it), and a part's own `set` does not
+/// write back.
+#[test]
+fn a152_unzip_splits_a_tuple_cell_into_cells_written_in_place() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::display::Display;\n",
+            "import std::reactive::{ Flow, Signal, SignalCell, Source };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet pair = Signal::new((1, \"one\"));\n",
+            "\tlet (number, word) = pair.unzip();\n",
+            "\tmut words: List<str> = [];\n",
+            "\tlet _watch = word.on_change(|w| words.push(w));\n",
+            "\tpair.set((2, \"two\"));\n",
+            "\tpair.set((3, \"two\"));\n",
+            "\tprint(i\"{number.get()} {word.get()} {words.join(\",\")}\");\n",
+            "\tnumber.set(9);\n",
+            "\tprint(i\"{pair.get().0}\");\n",
+            "\tlet triple = Signal::new((1, (2, 3), \"c\"));\n",
+            "\tlet (a, b, c) = triple.unzip();\n",
+            "\ttriple.set((4, (5, 6), \"d\"));\n",
+            "\tprint(i\"{a.get()} {b.get().1} {c.get()}\");\n",
+            "}\n",
+        ),
+        "3 two two,two\n3\n4 6 d\n",
+    );
+}
+
+/// `unzip` is a materialising node, like `.cell()`: under an owner its follow
+/// registers with the owner, so the parts stop following when the owner is
+/// disposed.
+#[test]
+fn a152_unzips_follow_dies_with_the_owner_that_split_it() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, run_with_owner };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet pair = Signal::new((1, \"one\"));\n",
+            "\tlet owner = Owner::new();\n",
+            "\tlet (number, _word) = run_with_owner(owner, || pair.unzip());\n",
+            "\tpair.set((2, \"two\"));\n",
+            "\towner.dispose();\n",
+            "\tpair.set((3, \"three\"));\n",
+            "\tprint(i\"{number.get()}\");\n",
+            "}\n",
+        ),
+        "2\n",
+    );
+}
+
+/// B538: a tuple ASSIGNMENT target holding an element, a nested tuple, a
+/// tuple-typed binding or a tuple-typed position assigns each place (B522
+/// admits each as a place). JS walked the target as an array literal — the
+/// element as its `__at` READ, a tuple-typed element as a `...spread` — and
+/// the module threw `Invalid destructuring assignment target` at load. A tuple
+/// of plain bindings keeps its destructuring (the swap).
+#[test]
+fn b538_a_tuple_target_of_elements_nested_tuples_and_tuple_typed_places_assigns_each() {
+    assert_compiles_and_runs(
+        include_str!("../../../vilan-cli/tests/native/tuple_assignment_targets.vl"),
+        "element: 1 2\nnested: 4 5 6\ntuple-typed binding: 7 8 9\ntuple-typed position: 11 12 13\nfield and element: 21 22\nswap: 5 4\n",
     );
 }

@@ -993,24 +993,30 @@ fn frame_label(program: &Program, id: Id) -> String {
     if is_user_code(program, id) {
         return name;
     }
-    let module = program
-        .source_of(id)
-        .and_then(|source| {
-            // The STEM comes from the spelling the user gave; the containment
-            // test from the canonical form, resolved per source (M53).
-            let path = program.sources.get(source.0 as usize)?;
-            let containing = program.source_layers.get(source.0 as usize)?.containing?;
-            Some((path, containing as usize))
+    let module = program.source_of(id).and_then(|source| {
+        // The containment test reads the canonical form, resolved per source
+        // (M53); the module PATH is the file's place under that root — A154:
+        // `web/dom.vl` is `std::web::dom`, not its stem `dom` — read off the
+        // same canonical pair, so it holds for a `\\?\`-prefixed root too.
+        let canonical = program.canonical_sources.get(source.0 as usize)?;
+        let containing = program.source_layers.get(source.0 as usize)?.containing? as usize;
+        let (root, library, ..) = program.layer_platforms.get(containing)?;
+        let relative = canonical.strip_prefix(root).ok()?;
+        let mut segments: Vec<String> = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let file = segments.pop()?;
+        let stem = file.strip_suffix(".vl").unwrap_or(&file);
+        if stem != "lib" {
+            segments.push(stem.to_string());
+        }
+        Some(if segments.is_empty() {
+            library.clone()
+        } else {
+            format!("{library}::{}", segments.join("::"))
         })
-        .and_then(|(path, containing)| {
-            let stem = path.file_stem()?.to_string_lossy().into_owned();
-            let library = program.layer_platforms.get(containing)?.1.clone();
-            Some(if stem == "lib" {
-                library
-            } else {
-                format!("{library}::{stem}")
-            })
-        });
+    });
     match module {
         Some(module) => format!("{name} ({module})"),
         None => name,
@@ -2132,7 +2138,7 @@ mod declared_tests {
     #[test]
     fn a_fence_or_a_label_is_declared_at_item_level() {
         for source in [
-            "export [platform(\"browser\")]\nfun f() {}\n",
+            "[platform(\"browser\")]\nexport fun f() {}\n",
             "[platform(\"browser\")]\nimpl X {\n\tfun f(self) {}\n}\n",
             "impl X {\n\t[platform(\"browser\")]\n\tfun f(self) {}\n}\n",
             "[platform(\"browser\")]\nstruct X {}\n",
@@ -2193,7 +2199,7 @@ mod declared_tests {
     #[test]
     fn an_item_declaration_decides_only_where_no_colour_admits_it() {
         let declared =
-            declared_platform("export [platform(\"browser\")]\nfun f() {}\n").expect("declares");
+            declared_platform("[platform(\"browser\")]\nexport fun f() {}\n").expect("declares");
         let shared = vec![
             choice(
                 Platform::Browser,
@@ -2228,7 +2234,7 @@ mod declared_tests {
     fn a_leg_skips_exactly_the_twins_its_platform_excludes() {
         let source = concat!(
             "[platform(\"browser\")]\nfun f(): i32 { 1 }\n",
-            "export [platform(\"@process\")]\nfun f(): i32 { 2 }\n",
+            "[platform(\"@process\")]\nexport fun f(): i32 { 2 }\n",
             "[platform(\"browser\")]\nimpl T with Show { fun show(self): str { \"b\" } }\n",
             "[platform(\"@process\")]\nimpl T with Show { fun show(self): str { \"p\" } }\n",
             "fun main() {}\n",
@@ -2251,7 +2257,7 @@ mod declared_tests {
         assert_eq!(
             text_of(&browser),
             vec![
-                "fun f(): i32 { 2 }",
+                "export fun f(): i32 { 2 }",
                 "impl T with Show { fun show(self): str { \"p\" } }"
             ]
         );

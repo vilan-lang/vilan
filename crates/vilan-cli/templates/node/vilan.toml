@@ -10,7 +10,7 @@
 # in scope with no import. `std::prelude` is the base set (`print`, `Option`
 # with `Some`/`None`, `Result` with `Ok`/`Err`), and it is also what omitting
 # the key means; it is written out so you can see the knob. An app that lives
-# in the browser wants `"std::web"` instead, and `false` turns it off.
+# in the browser wants `"std::web::prelude"` instead, and `false` turns it off.
 [package]
 name = "{{name}}"
 root = "."

@@ -32,13 +32,13 @@ this package's files with no `import`. It sits on `[package]` and on
 ```toml
 [package]
 name = "app"
-prelude = "std::web"
+prelude = "std::web::prelude"
 ```
 
 | Value | Meaning |
 |---|---|
-| *omitted* | std's base set: `print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err` |
-| `"std::web"` | the base set plus `Signal`, `SignalCell`, `view`, `View`, the five slot values (`when`, `swap`, `each`, `each_values`, `each_by`), and the modules `style` and `ui` |
+| *omitted* | std's base set: `print`, `Iterator`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err` |
+| `"std::web::prelude"` | the base set plus `Signal`, `SignalCell`, `CollPipe`, `SetPipe`, `view`, `View`, the six slot values (`when`, `when_some`, `swap`, `each`, `each_values`, `each_by`), and the modules `style` and `ui` |
 | `"pkg::my_prelude"` | your own module — its exports are the ambient names |
 | `"some_dep::their_prelude"` | a dependency's module |
 | `false` | no prelude at all |
@@ -51,8 +51,8 @@ what you want to keep:
 export import std::io::print;
 export import std::option::Option::{ self, Some, None };
 export import std::reactive::Signal;
-export import std::style;                 // a whole MODULE, as `style::…`
-export import std::style::Length::rem as rem;   // a type's STATIC, bare
+export import std::web::style;                 // a whole MODULE, as `style::…`
+export import std::web::style::Length::rem as rem;   // a type's STATIC, bare
 ```
 
 Three rules make the key safe to use:
@@ -67,7 +67,7 @@ Three rules make the key safe to use:
   compiles today.
 - **`"std"` is not a value.** It names the package root, not a prelude
   module; the manifest refuses it and points at `"std::prelude"` (the
-  default) or `"std::web"`.
+  default) or `"std::web::prelude"`.
 
 A prelude that re-exports a platform-layered name makes your package's
 ambient scope platform-dependent. Nothing special happens — platform

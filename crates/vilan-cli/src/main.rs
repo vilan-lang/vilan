@@ -26,6 +26,64 @@ use vilan_core::manifest::Package;
 use vilan_core::transformer::{EmittedChunk, transform};
 use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
 
+/// `vilan check --explain-cost`'s report (M106's first slice): the package's
+/// own declarations ranked by the solver work their constraints cost. Counts,
+/// never time, by the owner's ruling — so the same program ranks the same on
+/// every machine. std's declarations are left out: the report is about what
+/// the author can change. The suggestion to annotate is a later slice; this
+/// one is the numbers.
+fn print_cost_report(program: &Program, platform: Platform, limit: usize) {
+    let own: Vec<&vilan_core::analyzer::ItemCost> = program
+        .item_costs
+        .iter()
+        .filter(|cost| {
+            cost.source
+                .is_none_or(|source| !program.std_sources.contains(&source))
+        })
+        .collect();
+    let total: u64 = own.iter().map(|cost| cost.work.total()).sum();
+    println!(
+        "cost ({platform:?}): the {} costliest of {} declarations, {total} work units in all \
+         (attempts + inferences + selections + slots + impl rows)",
+        limit.min(own.len()),
+        own.len()
+    );
+    println!(
+        "{:>10} {:>8} {:>10} {:>10} {:>8} {:>9}  declaration",
+        "work", "attempts", "inferences", "selections", "slots", "impl rows"
+    );
+    for cost in own.iter().take(limit) {
+        let place = cost
+            .source
+            .and_then(|source| program.source_path(source))
+            .map(|path| {
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                let line = text[..cost.span.start.min(text.len())]
+                    .matches('\n')
+                    .count()
+                    + 1;
+                format!("{}:{line}", path.display())
+            })
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:>10} {:>8} {:>10} {:>10} {:>8} {:>9}  {} ({place})",
+            cost.work.total(),
+            cost.work.attempts,
+            cost.work.inferences,
+            cost.work.selections,
+            cost.work.slots,
+            cost.work.impl_rows,
+            cost.name,
+        );
+    }
+}
+
+/// The system allocator, counting heap bytes when `VILAN_COUNTERS` arms it
+/// (M105 S5, M108): the live heap and its peak per pass, beside RSS.
+/// Disarmed it is one relaxed load per allocation.
+#[global_allocator]
+static ALLOCATOR: vilan_core::counters::CountingAllocator = vilan_core::counters::CountingAllocator;
+
 /// The vilan language toolchain.
 #[derive(clap::Parser)]
 #[command(
@@ -131,13 +189,23 @@ enum Command {
         /// Re-check whenever a watched `.vl` source file changes (Ctrl-C to stop).
         #[arg(long)]
         watch: bool,
-        /// Before checking, apply the fix every numeric mismatch carries — the
-        /// `.as_*()` conversion its message names, or a literal-bound counter
-        /// declared `usize` — to the package's own files, repeating until a
-        /// round finds nothing more to fix (the migration to `usize` indexes).
-        /// What is left is reported as usual.
+        /// Before checking, apply the fixes the diagnostics carry to the
+        /// package's own files, repeating until a round finds nothing more to
+        /// fix: every moved std path (`std::dom` → `std::web::dom`, and
+        /// `prelude = "std::web"` → `"std::web::prelude"` in `vilan.toml` — the
+        /// migration to v0.44.0's std layout), then every numeric mismatch's
+        /// (the `.as_*()` conversion its message names, or a literal-bound
+        /// counter declared `usize` — the migration to `usize` indexes). Each
+        /// file changed is named. What is left is reported as usual.
         #[arg(long, conflicts_with = "watch")]
         fix: bool,
+        /// After checking, print the declarations whose type inference cost
+        /// the solver the most work (the top N, default 20) — constraint
+        /// attempts, inferences, impl selections, type slots and impl rows,
+        /// all COUNTS, so the ranking is the same on every machine. Your own
+        /// package's declarations only; std's are left out.
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "20")]
+        explain_cost: Option<usize>,
     },
     /// Build and run a source file, forwarding any trailing arguments to the
     /// program (reach them with `import std::process;` and `process::args()`).
@@ -252,6 +320,17 @@ enum CacheCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Delete every `vilan check` macro-expansion table (`~/.vilan/check-cache`).
+    ///
+    /// Each package `vilan check` has warmed keeps one table there, keyed by
+    /// its path; a check holds the root to a bound by itself (thirty days, 256
+    /// tables, 256 MiB, oldest first), and this is the gesture for emptying it
+    /// outright. Every table is re-created by the next check of its package.
+    Clean {
+        /// Print what would be deleted, with sizes, and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// The stack every compile runs on — the one this process's whole CLI runs on,
@@ -290,6 +369,7 @@ fn spawn_scoped_compiler_thread<'scope, 'env, T: Send + 'scope>(
 }
 
 fn main() -> ExitCode {
+    vilan_core::counters::arm_from_env();
     // Compilation recurses over deeply-nested ASTs and type graphs, which can
     // run past the default main-thread stack on otherwise-valid programs. Do the
     // work on a worker with a generous stack, as rustc and other compilers do;
@@ -407,7 +487,11 @@ fn run_cli() -> ExitCode {
             debug,
             watch,
             fix,
+            explain_cost,
         } => match effective_backend(backend.as_deref()) {
+            _ if explain_cost == Some(0) => {
+                report_error("--explain-cost takes a count of at least 1")
+            }
             Err(message) => report_error(&message),
             Ok(_backend) if fix => match fix_project(file.clone(), platform.as_deref()) {
                 Err(message) => report_error(&message),
@@ -417,6 +501,10 @@ fn run_cli() -> ExitCode {
                 }
             },
             Ok(_backend) => {
+                if let Some(limit) = explain_cost {
+                    vilan_core::counters::set_cost_attribution(limit);
+                }
+                ONE_SHOT_CHECK.store(!watch, std::sync::atomic::Ordering::Relaxed);
                 let roots = watch.then(|| watch_roots(&file));
                 run_or_watch(roots, move || {
                     check_once(file.clone(), platform.clone(), debug)
@@ -469,6 +557,7 @@ fn run_cli() -> ExitCode {
         Command::Upgrade { check, no_vscode } => upgrade::upgrade(check, no_vscode),
         Command::Cache { command } => match command {
             CacheCommand::Prune { all, dry_run } => cache_prune(all, dry_run),
+            CacheCommand::Clean { dry_run } => cache_clean(dry_run),
         },
     }
 }
@@ -515,6 +604,14 @@ fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
         }
     }
     outcome
+}
+
+/// `vilan cache clean` (N137): every check-cache table, whatever its age.
+/// They are caches in the strict sense — a check re-creates its package's
+/// table — so nothing in that root is protected.
+fn cache_clean(dry_run: bool) -> ExitCode {
+    let root = vilan_embedded::default_check_cache_root();
+    prune_one_cache_root(&root, None, dry_run, true, None)
 }
 
 /// One cache root pruned and reported. Split out when the check tables became a
@@ -788,11 +885,14 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> R
 }
 
 /// `vilan check --fix`'s pass over the project `check` would check, under
-/// every platform it would check it under: each unit's numeric mismatches
-/// fixed to a fixed point ([`fix::fix_unit`]). A standalone library has no
-/// program to analyze, so it has nothing to fix.
+/// every platform it would check it under: the manifests' moved `prelude`
+/// first ([`fix::fix_manifests`] — an old one stops the project resolving),
+/// then each unit's moved std paths and numeric mismatches fixed to a fixed
+/// point ([`fix::fix_unit`]). A standalone library has no program to analyze,
+/// so it has nothing to fix.
 fn fix_project(file: Option<PathBuf>, platform: Option<&str>) -> Result<fix::Fixed, String> {
     let mut fixed = fix::Fixed::default();
+    fix::fix_manifests(file.as_deref(), &mut fixed)?;
     match resolve_project(file)? {
         Project::Single {
             unit,
@@ -1827,6 +1927,7 @@ fn hmr_round(
             &leg.name,
             &reserved,
             &mut bundled_names,
+            BuildReport::Stderr,
         )
         .unwrap_or_default();
         let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
@@ -2061,6 +2162,7 @@ fn build_and_spawn_run(
                 &leg_name(&output_path),
                 &[],
                 &mut BTreeMap::new(),
+                BuildReport::Stderr,
             )
             .ok()?;
             let script = watch_script_path();
@@ -2264,11 +2366,7 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
         let opinions = *fmt_opinions
             .entry(directory)
             .or_insert_with_key(|directory| vilan_core::manifest::fmt_opinions_covering(directory));
-        let defaults = vilan_core::formatter::FormatOptions::default();
-        let options = vilan_core::formatter::FormatOptions {
-            wrap_comments: opinions.wrap_comments.unwrap_or(defaults.wrap_comments),
-            comment_width: opinions.comment_width.unwrap_or(defaults.comment_width),
-        };
+        let options = format_options(opinions);
         let source = match fs::read_to_string(file) {
             Ok(source) => source,
             Err(error) => {
@@ -2365,6 +2463,19 @@ fn report_decline(file: &Path, decline: &vilan_core::formatter::Decline) {
         paint::out(paint::Style::BOLD, &where_),
         decline.sentence(),
     );
+}
+
+/// The printer's options for a file whose package holds `opinions` (E205/E215's
+/// `[fmt]` knobs, each defaulted where the package says nothing) — the one
+/// translation `vilan fmt` and `vilan check --fix` both format with.
+fn format_options(
+    opinions: vilan_core::manifest::FmtOpinions,
+) -> vilan_core::formatter::FormatOptions {
+    let defaults = vilan_core::formatter::FormatOptions::default();
+    vilan_core::formatter::FormatOptions {
+        wrap_comments: opinions.wrap_comments.unwrap_or(defaults.wrap_comments),
+        comment_width: opinions.comment_width.unwrap_or(defaults.comment_width),
+    }
 }
 
 /// Drops every file that lives under a declared `generated` root, and says so
@@ -2602,6 +2713,25 @@ fn is_build_cache_dir(directory: &Path) -> bool {
         .is_ok_and(|contents| contents.starts_with(CACHEDIR_TAG_SIGNATURE))
 }
 
+/// Whether `directory` is a cargo workspace's DEFAULT target directory: named
+/// `target`, beside a `Cargo.toml`. [`is_build_cache_dir`]'s tag is the general
+/// rule, and this is the one case it misses: cargo writes `CACHEDIR.TAG` only
+/// into a target directory IT creates, so a `target/` that already existed —
+/// a lane's `target/<lane>-scratch/` made before the first build, a restored
+/// cache — carries none.
+///
+/// N138: the `vilan-fmt` leg (`vilan fmt --check .` at the repository root)
+/// walked such a `target/` after any local full suite, and the scratch
+/// projects the tests leave under `target/tmp` turned it red. A vilan package
+/// may still name a module directory `target`: without a `Cargo.toml` beside
+/// it, it is walked like any other.
+fn is_cargo_target_dir(directory: &Path) -> bool {
+    directory.file_name().is_some_and(|name| name == "target")
+        && directory
+            .parent()
+            .is_some_and(|parent| parent.join("Cargo.toml").is_file())
+}
+
 impl TreeWalk {
     fn rooted_at(root: &Path) -> TreeWalk {
         TreeWalk {
@@ -2703,7 +2833,7 @@ impl TreeWalk {
         if !self.visited.insert(identity) {
             return;
         }
-        if is_build_cache_dir(path) {
+        if is_build_cache_dir(path) || is_cargo_target_dir(path) {
             return;
         }
         let Ok(entries) = fs::read_dir(path) else {
@@ -3706,7 +3836,7 @@ fn owning_package(file: &Path) -> Result<Option<(PathBuf, Manifest)>, String> {
 /// Before this, an explicit file built a `Unit` with **no** `package_dir`, so the
 /// manifest was never read in file mode — and every answer that depends on it
 /// was a lie the user could not see. Three, measured: a package already on
-/// `prelude = "std::web"` was steered to "set `prelude = \"std::web\"`", the edit
+/// `prelude = "std::web::prelude"` was steered to "set `prelude = \"std::web::prelude\"`", the edit
 /// it had already made; `prelude = false` was silently ineffective, so a name the
 /// package removed still resolved; and a manifest the validator refuses passed
 /// file-mode check wordlessly while directory mode failed the build on it.
@@ -4442,8 +4572,16 @@ fn expansion_cache_root(package_dir: &Path, goal: CompileGoal) -> PathBuf {
     let canonical = vilan_core::util::canonical_path(package_dir);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&canonical, &mut hasher);
-    vilan_embedded::default_check_cache_root()
-        .join(format!("{:016x}", std::hash::Hasher::finish(&hasher)))
+    let root = vilan_embedded::default_check_cache_root();
+    let table = root.join(format!("{:016x}", std::hash::Hasher::finish(&hasher)));
+    // N137: the root holds itself to a bound — thirty days, 256 tables, 256
+    // MiB, oldest first — checked at most once a day and once per process, and
+    // never at the cost of this package's own table.
+    static BOUNDED: std::sync::Once = std::sync::Once::new();
+    BOUNDED.call_once(|| {
+        vilan_embedded::bound_check_cache(&root, Some(&table));
+    });
+    table
 }
 
 /// Builds a lone package / bare file, writing `<entry>.mjs` on a process leg
@@ -4500,6 +4638,7 @@ fn build_single(
         &leg,
         &[LegNamespace::of(&leg, platform)],
         &mut BTreeMap::new(),
+        BuildReport::Stdout,
     ) {
         Ok(assets) => assets,
         Err(_) => return RoundOutcome::Failed,
@@ -4640,6 +4779,7 @@ fn run_single(unit: &Unit, args: &[String], backend: Backend) -> ExitCode {
         &leg_name(&output_path),
         &[],
         &mut BTreeMap::new(),
+        BuildReport::Stderr,
     )
     .is_err()
     {
@@ -4981,6 +5121,10 @@ fn build_workspace_artifacts(
                 &unit.name,
                 &reserved,
                 &mut bundled_names,
+                // `vilan build`'s report, and a workspace `vilan run`'s, whose
+                // `Compiled` lines go to stdout beside it; a workspace has no
+                // native leg for that stdout to disagree with.
+                BuildReport::Stdout,
             )?;
             // Unconditional: this is also where a previous build's chunks are swept
             // when this one wrote none, and where a browser leg's build manifest is
@@ -5403,30 +5547,45 @@ fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
         .is_ok()
     };
 
-    // The FIRST member runs alone, on this thread, writing its diagnostics
-    // straight out (M35). It is what fills the process-global caches — the
-    // clean-parse cache, the base world, the macro worlds — and starting every
-    // member cold at once would have each of them analyze `std` from scratch:
-    // N times the CPU for one world, and N threads queued on the one mutex that
-    // hands it out. Every member after it meets those caches warm, which is
-    // where the parallelism is actually free. The caches themselves need
-    // nothing: each is a content-keyed `Mutex`, M23's claims are taken under
-    // the lookup's own lock, and every counter and scope inside an analysis
-    // (`cancel`, `owned_modules`, `leak_tally`, `depth_stats`, the analyzer's
-    // own probes) is already thread-local, because an analysis has run on a
-    // thread of its own since the language server's first one.
-    let mut ok = check(first_unit, *first_platform);
-    if rest.is_empty() || sequential_check() {
+    // M100: every member starts at once, one thread each, capturing its
+    // diagnostics. M35 ran the FIRST member alone to warm the process-global
+    // caches — the clean-parse cache, the base world, the macro worlds — so
+    // the rest would meet them warm. That made a two-entry package (a client
+    // and a server, the commonest shape there is) fully serial: the second
+    // entry had nothing to overlap with, and wall equalled CPU. What the warm-up
+    // protected against does not happen any more: a base world two members
+    // share is built ONCE whoever misses first (M44: the second waits on the
+    // first's claim rather than recomputing), and members with different
+    // keys — a browser leg and a node leg — never shared one. What is left to
+    // race is std's clean parse, which costs a few percent of one analysis.
+    // The caches are content-keyed mutexes and every per-analysis scope is
+    // thread-local (M35's reasoning, unchanged), so nothing else is shared.
+    // A one-shot round whose members all key distinct worlds (a client and
+    // a server do: the platform is in the key) can never hit a world one of
+    // them stores, so none is stored (M100/M108: the clones were the largest
+    // thing left alive once the members overlap).
+    if ONE_SHOT_CHECK.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut platforms: Vec<String> = members
+            .iter()
+            .map(|(_, platform)| format!("{platform:?}"))
+            .collect();
+        platforms.sort();
+        platforms.dedup();
+        if platforms.len() == members.len() {
+            vilan_core::analyzer::set_base_cache_store(false);
+        }
+    }
+    if members.len() == 1 || sequential_check() {
+        let mut ok = check(first_unit, *first_platform);
         for (unit, platform) in rest {
             ok &= check(unit, *platform);
         }
         return outcome(ok);
     }
+    let mut ok = true;
 
-    // The rest, one thread each, each capturing its diagnostics rather than
-    // racing to stderr with them.
     let captured: Vec<(bool, Vec<CapturedReport>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = rest
+        let workers: Vec<_> = members
             .iter()
             .map(|(unit, platform)| {
                 spawn_scoped_compiler_thread(scope, || {
@@ -6167,6 +6326,20 @@ fn prune_and_record_bundled(directory: &std::path::Path, leg: &str, bundled: &BT
     write_leg_record(&record, next, "bundled-asset record");
 }
 
+/// Where a build's own report lines (`Bundled  robots.txt`) go.
+///
+/// `vilan build`'s report is its OUTPUT, so it is stdout. `vilan run`'s is
+/// chatter in front of the program's own output, and stdout there belongs to
+/// the program: the JS `run` printed its asset report ahead of the program's
+/// first line while the native `run` printed nothing, so a program that
+/// bundles a resource disagreed between the two backends on bytes it never
+/// wrote (E243; `estate.vl` sat outside the native differential for it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildReport {
+    Stdout,
+    Stderr,
+}
+
 /// Copies every file `const asset::bundle` registered into the build's output
 /// directory, and returns their names — the `assets` array of the leg's build
 /// manifest ([`write_chunks`]), in the order the program asked for them.
@@ -6217,6 +6390,7 @@ fn write_bundled(
     leg: &str,
     reserved: &[LegNamespace],
     written_names: &mut BTreeMap<String, PathBuf>,
+    report: BuildReport,
 ) -> Result<Vec<String>, ExitCode> {
     let mut written = Vec::new();
     // What the record will say. Not the same list as `written`: a resource that
@@ -6284,11 +6458,18 @@ fn write_bundled(
             );
             return Err(ExitCode::FAILURE);
         }
-        println!(
-            "{}  {}",
-            paint::out(paint::Style::GREEN, "Bundled"),
-            paint::out(paint::Style::BOLD, &destination.display().to_string())
-        );
+        match report {
+            BuildReport::Stdout => println!(
+                "{}  {}",
+                paint::out(paint::Style::GREEN, "Bundled"),
+                paint::out(paint::Style::BOLD, &destination.display().to_string())
+            ),
+            BuildReport::Stderr => eprintln!(
+                "{}  {}",
+                paint::err(paint::Style::GREEN, "Bundled"),
+                paint::err(paint::Style::BOLD, &destination.display().to_string())
+            ),
+        }
         explain::bundled(destination, leg, source.clone(), name);
         written.push(name.clone());
         recorded.insert(name.clone());
@@ -6648,6 +6829,10 @@ fn json_string(text: &str) -> String {
 /// `--watch` the flag stays set, so every rebuild re-reports — intended.
 static PRINT_CHUNKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `vilan check` without `--watch`: one round, then the process exits — so
+/// a world stored for a later round has no later round (M100).
+static ONE_SHOT_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn compile_to_js(
     file: &Path,
     pkg_root: &Path,
@@ -6725,7 +6910,15 @@ fn compile_to_js(
     // clean-parse cache below — rather than anything inside `analyze` (B139
     // added the parser to the instrument, and it is the family with no bound).
     vilan_core::begin_depth_stats();
-    let cached = vilan_core::parse_clean_cached(&src);
+    let cached = vilan_core::parse_clean_cached_with_warnings(&src)
+        .map(|parsed| ((parsed.ast, parsed.text), parsed.warnings));
+    // The entry's parse WARNINGS (B536), from whichever parse served it: the
+    // cache's, or the fresh one below. They join the program's warnings
+    // before the post-passes order them.
+    let mut entry_parse_warnings: Vec<vilan_core::ParseWarning> = cached
+        .map(|(_, warnings)| warnings.to_vec())
+        .unwrap_or_default();
+    let cached = cached.map(|(clean, _)| clean);
 
     // Analyzer and codegen diagnostics, collected as `(source, span, message)`
     // for ariadne — the source being the file the span indexes into, so each one
@@ -6757,9 +6950,13 @@ fn compile_to_js(
     let mut parse_errors: Vec<vilan_core::parsing::ParseError> = Vec::new();
     let fresh_root: Option<vilan_core::Spanned<vilan_core::node::NodeList>> = match &cached {
         None => {
-            let (tree, errors) = vilan_core::parsing::parse(src.as_str());
+            let (tree, errors, warnings) = vilan_core::parsing::parse_with_warnings(src.as_str());
             let analyzable = errors.is_empty() || goal.analyzes_recovered_trees();
             parse_errors = errors;
+            entry_parse_warnings = warnings
+                .iter()
+                .map(|warning| (warning.span, vilan_core::parsing::render(warning)))
+                .collect();
             tree.filter(|_| analyzable).map(|(mut items, span)| {
                 // Elements desugar, then bare-`?` marks become lift regions,
                 // before analysis (element-syntax.md §4, expression-lifting.md);
@@ -6814,6 +7011,7 @@ fn compile_to_js(
         }
 
         let mut program = analyze(root, source_ref, &std, pkg_root, file, platform, workspace);
+        vilan_core::add_entry_parse_warnings(&mut program, entry_parse_warnings);
 
         // The whole-program passes that follow analysis — context threading,
         // async inference, the drop checks, platform coloring, const
@@ -7141,8 +7339,13 @@ fn compile_to_js(
         }
         // And the program's drop, timed by making it explicit: a whole-world
         // analysis frees its tables here, ~0.3 s on kolt's client (M98).
+        vilan_core::counters::checkpoint("emission");
+        if let Some(limit) = vilan_core::counters::cost_report_limit() {
+            print_cost_report(&program, platform, limit);
+        }
         let drop_clock = vilan_core::PhaseClock::now();
         drop(program);
+        vilan_core::counters::checkpoint("program-drop");
         if vilan_core::phase_timing_enabled() {
             eprintln!(
                 "[vilan phase] emission-walk {phase_emission} program-drop {}",

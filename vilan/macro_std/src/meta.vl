@@ -47,7 +47,7 @@ export impl TypeExpr {
 //
 // `key` is the KEY TYPE the attribute named, as written — `[expose(keyed = str)]`
 // (A51) — or `""` when the field is not keyed or its key is to be read off a
-// `Map<K, V>` element. A keyed mirror is a `KeyedSource<K, T>` and vilan has no
+// `HashMap<K, V>` element. A keyed mirror is a `KeyedSource<K, T>` and vilan has no
 // associated types, so a collection that does not name its key in its own type
 // (a `List<T>`) has nowhere else to get one; this is the one attribute argument
 // in the language that is a type rather than a word.
@@ -155,7 +155,7 @@ fun derive_binders(generics: List<GenericParameter>, reached: List<str>, trait_n
 }
 
 // Whether a written type MENTIONS a parameter, at any depth: `T` does,
-// `List<T>` does, `Option<Map<str, T>>` does, `i32` does not. A parameter no
+// `List<T>` does, `Option<HashMap<str, T>>` does, `i32` does not. A parameter no
 // member type mentions is PHANTOM — the generated body never has a value of it
 // to call anything on — and takes a bare binder.
 fun mentions(type_: TypeExpr, parameter: str): bool {

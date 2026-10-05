@@ -1,0 +1,393 @@
+// A149 S3 on both backends: collection fields of a derived struct as keyed and
+// sequence nodes (`proposal/store.md` §2.7) — a write to one key of a map field
+// waking that key's readers and nobody else's, keyed slots living as long as their
+// subscriptions, a map field's flow told one op per changed key (handle writes, a
+// whole write reconciled by key, a root write), a set field's members and ops, a
+// keyed list read by key, and a list field's flow told splices with an operator
+// that maps only what arrived.
+
+import std::compare::PartialEq;
+import std::display::Display;
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::delta::{ CollFlow, MapFlow, MapOp, SeqOp, SequenceCell, SetFlow, SetOp };
+import std::reactive::store::{ Storable, Store, StoreSome, store_census, store_feed_census };
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+import std::shared::Shared;
+import std::wire::Keyed;
+
+[derive(PartialEq, Storable)]
+struct Channel {
+	id: i32,
+	name: str,
+	messages: List<i32>,
+}
+
+[derive(PartialEq, Storable)]
+struct Message {
+	id: i32,
+	text: str,
+}
+
+impl Message with Keyed<i32> {
+	fun key(self): i32 {
+		self.id
+	}
+}
+
+[derive(Storable)]
+struct Global {
+	channels: HashMap<i32, Channel>,
+	tags: HashSet<str>,
+	log: List<Message>,
+}
+
+let names = Shared::new([""]);
+let counts = Shared::new([0]);
+
+fun bump(name: str) {
+	mut held = names.read();
+	mut tally = counts.read();
+	mut index: usize = 0;
+	for index < held.len() {
+		if held[index] == name {
+			tally[index] = tally[index] + 1;
+			counts.write() = tally;
+			ret;
+		}
+		index += 1;
+	}
+	held.push(name);
+	tally.push(1);
+	names.write() = held;
+	counts.write() = tally;
+}
+
+/// The readers that woke since the last call, each with its count, in name
+/// order (the order a turn delivers wakes in is not a contract, §3.3); `-` for
+/// none.
+fun tally(): str {
+	mut out = "";
+	let held = names.read();
+	let tally = counts.read();
+	mut printed: List<str> = [];
+	mut round: usize = 0;
+	for round < held.len() {
+		mut best: Option<usize> = None;
+		mut index: usize = 0;
+		for index < held.len() {
+			if tally[index] > 0 && !printed.contains(held[index]) {
+				best = match best {
+					Some(let at) => if held[index] < held[at] { Some(index) } else { Some(at) },
+					None => Some(index),
+				};
+			}
+			index += 1;
+		}
+		match best {
+			Some(let at) => {
+				printed.push(held[at]);
+				out = out + i" {held[at]}={tally[at]}";
+			},
+			None => {},
+		}
+		round += 1;
+	}
+	mut cleared: List<i32> = [];
+	for _name in held {
+		cleared.push(0);
+	}
+	counts.write() = cleared;
+	if out == "" {
+		" -"
+	} else {
+		out
+	}
+}
+
+fun channel(id: i32, name: str): Channel {
+	Channel { id, name, messages = [] }
+}
+
+fun global(): Global {
+	mut channels: HashMap<i32, Channel> = HashMap::new();
+	mut id = 1;
+	for id <= 6 {
+		channels.insert(id, channel(id, i"c{id}"));
+		id += 1;
+	}
+	Global { channels, tags = HashSet::new(), log = [] }
+}
+
+fun census<T>(store: Store<T>): str {
+	let (slots, nodes) = store_census(store);
+	i"slots={slots} nodes={nodes} feeds={store_feed_census(store)}"
+}
+
+fun map_ops(ops: List<MapOp<i32, Channel>>): str {
+	mut out = "";
+	for op in ops {
+		let piece = match op {
+			MapOp::Put(let key, let was, let now) => i" Put({key}, {was.map(|held| held.name).unwrap_or("-")}, {now.name})",
+			MapOp::Delete(let key, let gone) => i" Delete({key}, {gone.name})",
+			MapOp::Reset(let map) => i" Reset({map.len()})",
+		};
+		out = out + piece;
+	}
+	if out == "" {
+		" -"
+	} else {
+		out
+	}
+}
+
+fun set_ops(ops: List<SetOp<str>>): str {
+	mut out = "";
+	for op in ops {
+		let piece = match op {
+			SetOp::Add(let member) => i" Add({member})",
+			SetOp::Remove(let member) => i" Remove({member})",
+			SetOp::Reset(let set) => i" Reset({set.len()})",
+		};
+		out = out + piece;
+	}
+	if out == "" {
+		" -"
+	} else {
+		out
+	}
+}
+
+fun texts(list: List<Message>): str {
+	mut out = "[";
+	for message in list {
+		if out != "[" {
+			out = out + " ";
+		}
+		out = out + i"{message.id}:{message.text}";
+	}
+	out + "]"
+}
+
+fun seq_ops(ops: List<SeqOp<Message>>): str {
+	mut out = "";
+	for op in ops {
+		let piece = match op {
+			SeqOp::Splice(let at, let removed, let inserted) => i" Splice({at}, {texts(removed)}, {texts(inserted)})",
+			SeqOp::SetAt(let at, let was, let now) => i" SetAt({at}, {was.text}, {now.text})",
+			SeqOp::Reset(let list) => i" Reset({texts(list)})",
+			SeqOp::Move(let from, let count, let to) => i" Move({from}, {count}, {to})",
+		};
+		out = out + piece;
+	}
+	if out == "" {
+		" -"
+	} else {
+		out
+	}
+}
+
+fun a_write_to_one_key_wakes_that_keys_readers_and_nobody_elses() {
+	print("-- a write to one key wakes that keys readers and nobody elses");
+
+	let store = Store::new(global());
+	let owner = Owner::new();
+	run_with_owner(owner, || {
+		mut id = 1;
+		for id <= 6 {
+			let name = i"k{id}";
+			store.channels().at(id).effect_on_change(|_held| bump(name));
+			id += 1;
+		}
+		store.channels().effect_on_change(|_map| bump("map"));
+		store.channels().at(3).some().name().effect_on_change(|_name| bump("name3"));
+		store.tags().effect_on_change(|_tags| bump("tags"));
+	});
+	print(i"subscribed:{tally()}");
+	let _renamed = store.channels().at(3).some().name().patch("three");
+	print(i"key 3's name patched:{tally()}");
+	let _pushed = store.channels().at(3).some().messages().push(30);
+	print(i"key 3's list pushed:{tally()}");
+	store.channels().at(3).set(store.channels().at(3).get());
+	print(i"key 3 set to what it holds:{tally()}");
+	store.channels().insert(4, channel(4, "four"));
+	print(i"key 4 replaced:{tally()}");
+	store.channels().insert(9, channel(9, "nine"));
+	print(i"key 9 arrived:{tally()}");
+	store.channels().remove(5);
+	print(i"key 5 removed:{tally()}");
+	store.channels().remove(5);
+	print(i"key 5 removed again:{tally()}");
+	mut whole = store.channels().get();
+	whole.insert(2, channel(2, "two"));
+	store.channels().set(whole);
+	print(i"whole map, key 2 changed:{tally()}");
+	store.channels().set(store.channels().get());
+	print(i"whole map unchanged:{tally()}");
+	mut root = store.get();
+	root.tags.insert("new");
+	store.set(root);
+	print(i"root written, only the set changed:{tally()}");
+	print(store.channels().at(3).get().map(|held| held.name).unwrap_or("-"));
+	print(store.channels().at(5).get().is_none());
+	owner.dispose();
+	print(census(store));
+}
+
+fun a_keyed_slot_lives_as_long_as_its_subscriptions() {
+	print("-- a keyed slot lives as long as its subscriptions");
+
+	let store = Store::new(global());
+	let _read = store.channels().at(2).get();
+	print(i"one read: {census(store)}");
+	let first = store.channels().at(2).on_change(|_held| bump("a"));
+	let second = store.channels().at(2).on_change(|_held| bump("b"));
+	print(i"two on key 2: {census(store)}");
+	let third = store.channels().at(4).some().name().on_change(|_name| bump("c"));
+	print(i"and key 4's name: {census(store)}");
+	first.dispose();
+	second.dispose();
+	print(i"key 2 released: {census(store)}");
+	third.dispose();
+	print(i"nothing watched: {census(store)}");
+}
+
+fun a_map_field_is_a_map_flow_told_one_op_per_changed_key() {
+	print("-- a map field is a map flow told one op per changed key");
+
+	let store = Store::new(global());
+	let flow = store.channels().open();
+	print(i"open: {census(store)}");
+	store.channels().insert(7, channel(7, "seven"));
+	store.channels().at(1).set(Some(channel(1, "one")));
+	let _renamed = store.channels().at(2).some().name().patch("two");
+	store.channels().remove(3);
+	store.channels().remove(3);
+	store.channels().at(4).set(store.channels().at(4).get());
+	print(i"handle writes:{map_ops((flow.drain)())}");
+	mut whole = store.channels().get();
+	whole.remove(4);
+	whole.insert(5, channel(5, "five"));
+	whole.insert(8, channel(8, "eight"));
+	store.channels().set(whole);
+	print(i"whole write:{map_ops((flow.drain)())}");
+	mut root = store.get();
+	root.channels.remove(8);
+	store.set(root);
+	print(i"root write:{map_ops((flow.drain)())}");
+	store.channels().set(store.channels().get());
+	print(i"unchanged:{map_ops((flow.drain)())}");
+	(flow.release)();
+	print(i"released: {census(store)}");
+	let keys = store.channels().keys().memo_global();
+	store.channels().insert(10, channel(10, "ten"));
+	store.channels().remove(1);
+	print(i"keys: {keys.len()} {keys.contains(10).get()} {keys.contains(1).get()}");
+}
+
+fun a_set_field_wakes_one_member_and_is_told_set_ops() {
+	print("-- a set field wakes one member and is told set ops");
+
+	let store = Store::new(global());
+	let flow = store.tags().open();
+	let owner = Owner::new();
+	run_with_owner(owner, || {
+		store.tags().contains("red").effect_on_change(|held| bump(i"red:{held}"));
+		store.tags().contains("blue").effect_on_change(|held| bump(i"blue:{held}"));
+	});
+	store.tags().insert("red");
+	print(i"red added:{tally()}");
+	store.tags().insert("green");
+	print(i"green added:{tally()}");
+	store.tags().contains("red").set(true);
+	print(i"red added again:{tally()}");
+	store.tags().remove("red");
+	store.tags().contains("blue").set(true);
+	print(i"red removed, blue added:{tally()}");
+	mut whole: HashSet<str> = HashSet::new();
+	whole.insert("blue");
+	whole.insert("pink");
+	store.tags().set(whole);
+	print(i"whole write:{tally()}");
+	print(i"ops:{set_ops((flow.drain)())}");
+	owner.dispose();
+	(flow.release)();
+	print(census(store));
+}
+
+fun a_keyed_list_reads_by_key_and_wakes_only_the_element_that_moved() {
+	print("-- a keyed list reads by key and wakes only the element that moved");
+
+	let store = Store::new(global());
+	store.log().push(Message { id = 1, text = "hi" });
+	store.log().push(Message { id = 2, text = "yo" });
+	let owner = Owner::new();
+	run_with_owner(owner, || {
+		store.log().by_key(1).effect_on_change(|_held| bump("m1"));
+		store.log().by_key(2).effect_on_change(|_held| bump("m2"));
+		store.log().by_key(2).some().text().effect_on_change(|_text| bump("text2"));
+		store.log().effect_on_change(|_list| bump("log"));
+	});
+	store.log().push(Message { id = 3, text = "hey" });
+	print(i"another pushed:{tally()}");
+	let _edited = store.log().by_key(1).some().text().patch("HI");
+	print(i"1 edited by key:{tally()}");
+	store
+		.log()
+		.set([
+			Message { id = 1, text = "HI" },
+			Message { id = 2, text = "YO" },
+			Message { id = 3, text = "hey" },
+		]);
+	print(i"whole list, 2 changed:{tally()}");
+	store.log().remove_at(0);
+	print(i"1 spliced out:{tally()}");
+	store.log().splice(0, 1, [Message { id = 2, text = "YO" }]);
+	print(i"the same element spliced back:{tally()}");
+	store.log().by_key(4).set(Some(Message { id = 4, text = "four" }));
+	store.log().by_key(3).set(None);
+	print(i"4 appended, 3 removed by key:{tally()} {texts(store.log().get())}");
+	owner.dispose();
+	print(census(store));
+}
+
+fun a_list_field_is_a_collection_flow_told_splices() {
+	print("-- a list field is a collection flow told splices");
+
+	let store = Store::new(global());
+	let flow = store.log().open();
+	store.log().push(Message { id = 1, text = "hi" });
+	store.log().push(Message { id = 2, text = "yo" });
+	let _edited = store.log().by_key(1).some().text().patch("HI");
+	store.log().by_key(2).set(None);
+	print(i"writes:{seq_ops((flow.drain)())}");
+	store.log().set([Message { id = 0, text = "zero" }, Message { id = 1, text = "HI" }]);
+	print(i"whole write:{seq_ops((flow.drain)())}");
+	store.log().set(store.log().get());
+	print(i"unchanged:{seq_ops((flow.drain)())}");
+	(flow.release)();
+	let mapped = Shared::new(0);
+	let lengths = store
+		.log()
+		.map(|message: Message| {
+			mapped.write() = mapped.read() + 1;
+			message.text.len()
+		})
+		.memo_global();
+	print(i"sealed: mapped={mapped.read()} {lengths.get().len()}");
+	store.log().push(Message { id = 6, text = "six" });
+	print(i"one pushed: mapped={mapped.read()} {lengths.get().len()}");
+}
+
+fun main() {
+	a_write_to_one_key_wakes_that_keys_readers_and_nobody_elses();
+	a_keyed_slot_lives_as_long_as_its_subscriptions();
+	a_map_field_is_a_map_flow_told_one_op_per_changed_key();
+	a_set_field_wakes_one_member_and_is_told_set_ops();
+	a_keyed_list_reads_by_key_and_wakes_only_the_element_that_moved();
+	a_list_field_is_a_collection_flow_told_splices();
+}
+
+main();

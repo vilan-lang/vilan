@@ -786,11 +786,22 @@ impl ReferenceIndex {
         //    as by span — the (template, expansion) key, since a definition
         //    belongs to exactly one expansion — and never carry a
         //    co-reference: a template's bytes are nobody's identifier.
-        rows.sort_by(|left, right| {
-            (left.source.0, left.span.start, left.span.end)
-                .cmp(&(right.source.0, right.span.start, right.span.end))
-                .then(left.definition.sort_key().cmp(&right.definition.sort_key()))
-                .then(right.is_declaration.cmp(&left.is_declaration))
+        //
+        // M101: UNSTABLE, by a key. The key is a total order over everything
+        // that tells two rows apart at this point (no row carries a
+        // co-reference yet), so rows the unstable sort may swap are equal in
+        // every field and the result is the stable sort's, without its scratch
+        // buffer or its comparator re-deriving the tuple per comparison — the
+        // sort was most of this build's cost on kolt's client (0.29 G of 0.33 G
+        // instructions under callgrind).
+        rows.sort_unstable_by_key(|row| {
+            (
+                row.source.0,
+                row.span.start,
+                row.span.end,
+                row.definition.sort_key(),
+                std::cmp::Reverse(row.is_declaration),
+            )
         });
         let mut collapsed: Vec<Occurrence> = Vec::with_capacity(rows.len());
         // The index in `collapsed` where the current `(source, span)` group

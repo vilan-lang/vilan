@@ -13,7 +13,7 @@
 // holds with a runtime flag in the middle. The `.css` golden beside this file
 // carries exactly three atomic sets and no fourth — nothing is minted here.
 import std::io::print;
-import std::style::{ Color, Style, space, style };
+import std::web::style::{ Color, Style, space, style };
 
 let base: Style = const style()
 	.padding(space(2))

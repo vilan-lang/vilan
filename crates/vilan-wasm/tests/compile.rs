@@ -91,7 +91,7 @@ fn a_std_import_resolves_from_the_embedded_toolchain() {
 /// compiles for, and it resolves through a LAYER root rather than the base.
 #[test]
 fn a_browser_layer_import_resolves() {
-    let output = compile("import std::ui::view;\nfun main() { let v = view(\"div\"); }\n");
+    let output = compile("import std::web::ui::view;\nfun main() { let v = view(\"div\"); }\n");
     assert!(
         output.diagnostics.is_empty(),
         "expected the browser layer to resolve, got: {:#?}",
@@ -119,7 +119,7 @@ fn a_browser_layer_import_resolves() {
 fn a_splittable_route_match_still_compiles_to_one_playground_bundle() {
     let output = compile(
         "import std::reactive::{ Signal, SignalCell };\n\
-         import std::ui::{ View, mount_root, swap, view };\n\
+         import std::web::ui::{ View, mount_root, swap, view };\n\
          \n\
          [derive(PartialEq)]\n\
          enum Route {\n\
@@ -205,7 +205,7 @@ fn the_playground_compile_path_never_calls_the_split_emitter() {
 fn a_retired_view_method_carries_the_a99_steer_in_the_playground() {
     let output = compile(
         "import std::reactive::{ Signal, SignalCell };\n\
-         import std::ui::{ View, mount_root, view };\n\
+         import std::web::ui::{ View, mount_root, view };\n\
          \n\
          fun main() {\n\
          \tlet tab: SignalCell<i32> = Signal::new(1);\n\
@@ -376,7 +376,7 @@ fn a_syntax_error_degrades_to_a_diagnostic() {
 #[test]
 fn compile_time_styles_come_back_as_css() {
     let output = compile(
-        "import std::style::style;\n\
+        "import std::web::style::style;\n\
          let card = const style().raw(\"color\", \"red\");\n\
          fun main() { let classes = card.class_list(); }\n",
     );
@@ -653,10 +653,10 @@ fn a_server_program_is_rejected_for_the_browser() {
 #[test]
 fn a_browser_program_is_rejected_for_node() {
     // The rejection comes from NAME resolution, not platform coloring:
-    // std::ui resolves to its process twin under node, and that twin never
+    // std::web::ui resolves to its process twin under node, and that twin never
     // declares `mount` — the name is absent rather than fenced.
     let output = compile_for_node(
-        "import std::ui::{ mount, view };\n\nfun main() {\n\tmount(\"app\", view(\"p\").text(\"hi\"));\n}\n",
+        "import std::web::ui::{ mount, view };\n\nfun main() {\n\tmount(\"app\", view(\"p\").text(\"hi\"));\n}\n",
     );
     assert!(
         output
@@ -842,9 +842,9 @@ fn struct_initializer_completion_offers_the_remaining_fields() {
 #[test]
 fn element_head_completion_offers_the_attribute_table() {
     let compiled =
-        "import std::ui::view;\n\nfun main() {\n\tlet card = <input/>;\n\tlet _ = card;\n}\n";
+        "import std::web::ui::view;\n\nfun main() {\n\tlet card = <input/>;\n\tlet _ = card;\n}\n";
     let live =
-        "import std::ui::view;\n\nfun main() {\n\tlet card = <input />;\n\tlet _ = card;\n}\n";
+        "import std::web::ui::view;\n\nfun main() {\n\tlet card = <input />;\n\tlet _ = card;\n}\n";
     let items = complete_after(compiled, live, 3, 19);
     let offered = labels(&items);
     for expected in ["type", "disabled", "value", "class", "id"] {
@@ -875,8 +875,8 @@ fn element_head_completion_offers_the_attribute_table() {
 #[test]
 fn element_head_completion_offers_a_hyphenated_attribute_under_its_own_prefix() {
     let compiled =
-        "import std::ui::view;\n\nfun main() {\n\tlet icon = <svg/>;\n\tlet _ = icon;\n}\n";
-    let live = "import std::ui::view;\n\nfun main() {\n\tlet icon = <svg stroke-w/>;\n\tlet _ = icon;\n}\n";
+        "import std::web::ui::view;\n\nfun main() {\n\tlet icon = <svg/>;\n\tlet _ = icon;\n}\n";
+    let live = "import std::web::ui::view;\n\nfun main() {\n\tlet icon = <svg stroke-w/>;\n\tlet _ = icon;\n}\n";
     let items = complete_after(compiled, live, 3, 25);
     let offered = labels(&items);
     assert!(
@@ -1165,7 +1165,7 @@ fn browser_mode_seeds_the_web_set() {
 ///
 /// The second half is the honesty half, and it is a pin rather than an
 /// observation: `web_prelude_steer` (`prelude.md` §11.4) must not answer "set
-/// `prelude = \"std::web\"` in vilan.toml" here, because a pasted buffer has no
+/// `prelude = \"std::web::prelude\"` in vilan.toml" here, because a pasted buffer has no
 /// manifest to edit.
 ///
 /// It used to hold for the wrong reason — the steer was SILENT, its std module
@@ -1303,13 +1303,13 @@ fn an_explicit_import_beats_the_ambient_name() {
 
     // Imported: the FUNCTION wins the name, silently…
     assert_clean(
-        &compile("import std::style::style;\n\nfun main() {\n\tlet _builder = style();\n}\n"),
+        &compile("import std::web::style::style;\n\nfun main() {\n\tlet _builder = style();\n}\n"),
         "the imported function `style`",
     );
     // …and the qualified spelling that ambient module bought is gone with it.
     assert_reports(
         &compile(
-            "import std::style::style;\n\nfun main() {\n\tlet _display = style::Display::Flex;\n}\n",
+            "import std::web::style::style;\n\nfun main() {\n\tlet _display = style::Display::Flex;\n}\n",
         ),
         "is not a module",
         "an imported member costs the file its ambient module",
@@ -1361,7 +1361,7 @@ fn the_prelude_wire_maps_absent_off_and_a_module_path() {
     );
     assert_eq!(
         PlaygroundPrelude::recommended_for(vilan_core::Platform::Browser),
-        vilan_core::manifest::PreludeSpec::Module("std::web".to_string()),
+        vilan_core::manifest::PreludeSpec::Module("std::web::prelude".to_string()),
         "the playground's browser mode IS a web app"
     );
     assert_eq!(
@@ -1389,7 +1389,7 @@ fn the_prelude_wire_maps_absent_off_and_a_module_path() {
 /// last compile retained.
 #[test]
 fn css_dotted_head_completion_reaches_the_playground() {
-    let compiled = "import std::style::{ Style, style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.raw(\"font-family\", \"monospace\")\n\t}\n}\n\nfun main() {\n\tlet card = css {\n\t};\n}\n";
+    let compiled = "import std::web::style::{ Style, style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.raw(\"font-family\", \"monospace\")\n\t}\n}\n\nfun main() {\n\tlet card = css {\n\t};\n}\n";
     let live = compiled.replace(
         "\tlet card = css {\n\t};",
         "\tlet card = css {\n\t\t.\n\t};",

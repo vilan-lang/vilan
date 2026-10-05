@@ -192,7 +192,7 @@ nothing else: `extname("/app.js?v=2")` is `.js?v=2` under a file rule and
 `.js` under a URL rule, `%2F` is not a separator, and a URL's root is an
 origin rather than a filesystem root. The split is that a URL's own grammar —
 scheme, authority, query, fragment — is cut first, and what is left is an
-ordinary path these functions read. `std::document`'s internal `file_name_of`
+ordinary path these functions read. `std::web::document`'s internal `file_name_of`
 is exactly that, in two lines:
 
 ```vilan,fragment

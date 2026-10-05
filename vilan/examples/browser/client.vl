@@ -2,12 +2,12 @@
 //   vilan build --target browser client.vl
 // then open index.html (which mounts `<div id="app">` and loads the bundle).
 //
-// Demonstrates the `std::dom` layer: looking up the mount point, building
+// Demonstrates the `std::web::dom` layer: looking up the mount point, building
 // elements, setting text, wiring event handlers (closures), and a live form —
 // reading an `<input>`'s value and reflecting it on each keystroke — all lowered
 // to DOM globals, with no Node host imports.
 
-import std::dom::{ Element, create_element, get_element_by_id, query_selector };
+import std::web::dom::{ Element, create_element, get_element_by_id, query_selector };
 
 fun main() {
 	let app = get_element_by_id("app");

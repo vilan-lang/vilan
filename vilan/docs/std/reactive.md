@@ -10,7 +10,7 @@ Import what you use:
 ```vilan,fragment
 import std::reactive::{
 	Signal, SignalCell, Source, Flow, Pipe, MemoCell, MaybeSignal, Subscriber, Subscription,
-	Disposable, combine, divorce, selector, Selector, derive, tracking,
+	Disposable, combine, divorce, zip_some, selector, Selector, derive, tracking,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
 	Turn, FlushPolicy, turn_scope, turn, batch, flush, at_settle,
 	optimistic, Optimistic, WriteState,
@@ -29,9 +29,9 @@ import std::reactive::{
 | `Subscriber` | struct | one observer's record — its id (a turn's dedup key), `notify`, liveness and class; what `on_settle` carries |
 | `MemoCell<T>` | struct | a sealed derivation's read-only face — what `.memo()` returns |
 | `Constant<T>` | struct | `Source::constant(v)`: a source that never changes |
-| `Derive`, `Switch`, `SwitchSome`, `AndThen`, `ThenSome`, `Combine`, `Distinct`, `DistinctBy` | `[resource]` structs | the pipe stages: hold their upstream until a consumer starts them; what the combinators return |
+| `Derive`, `Switch`, `SwitchSome`, `AndThen`, `ThenSome`, `Combine`, `ZipSome`, `Distinct`, `DistinctBy` | `[resource]` structs | the pipe stages: hold their upstream until a consumer starts them; what the combinators return |
 | `Instance<T>` | struct | a started flow — the one consumer's `pull`/`attach`/`release` (for stage authors) |
-| `TransientState`, `TransientSource`, `.transient()` | `std::transient` | values that come and go — pending, ready, refreshing, failed with the stale value, absent; a flow of tasks sealed so the latest task wins ([std::transient](transient.md)) |
+| `TransientState`, `TransientSource`, `.transient()` | `std::reactive::transient` | values that come and go — pending, ready, refreshing, failed with the stale value, absent; a flow of tasks sealed so the latest task wins ([std::reactive::transient](transient.md)) |
 | `track` | method (every `Source`) | read AND make the source a dependency of the body that is running — tracked reads (A142 §7) |
 | `derive` (free), `TrackedDerive<T>` | fn / `[resource]` struct | a pipe whose only dependencies are the ones its body tracks |
 | `tracking`, `TrackScope`, `Tracker` | context / structs | the tracking scope a body's run establishes; `tracking.clear(..)` is `untrack` |
@@ -42,6 +42,8 @@ import std::reactive::{
 | `Subscription` | struct | an explicit subscription; `Disposable` |
 | `combine` | fn | a pipe of the tuple of 2+ sources |
 | `divorce` | fn | the reverse: one derived pipe per position of a tuple-valued source |
+| `zip_some` | fn | wait for several maybes: `Some` of the tuple of payloads while every input is `Some` |
+| `unzip` | method (`SignalCell<T: (2..)>`) | one cell per position of a tuple-valued cell, written in place |
 | `selector`, `Selector<T>` | fn/struct | per-key selection: one subscription, two writes per change |
 | `Owner` | struct | disposal bag; the lifetime unit |
 | `on_cleanup` | fn | run a cleanup when the ambient owner is released |
@@ -271,16 +273,14 @@ trait Source<T> with Flow<T> {
 [resource]
 trait Flow<T> {
 	[must_use]
-	fun start(own self): Instance<T>                                  // the stage author's member
-	[must_use]
-	fun observe(own self, observer: |T| void, immediately: bool): Subscription
-	                                                                  // the stage author's attach (required)
+	fun start(own self): Instance<T>                                  // the stage author's member (required)
 	[must_use]
 	fun on_change(own self, observer: (|T| void) context tracking): Subscription
-	                                                                  // no first call; a callback (cleared)
+	                                                                  // no first call; a callback (cleared);
+	                                                                  // a default over `start`, a source's own
 	[must_use]
 	fun sub(own self, observer: (|T| void) context tracking): Subscription
-	                                                                  // + one immediate call; cleared
+	                                                                  // + one immediate call; cleared; likewise
 	fun effect_on_change(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
 	                                                                  // owner-registered; an owner per run; cleared
 	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
@@ -401,7 +401,7 @@ directly) or to keep a contract of its own — a mirror's seeding frame arrives
 and makes the one immediate call itself.
 
 **Anything that only reads takes a `Flow`, not a `Signal`.** Every read-only
-binding in [`std::ui`](browser.md#view-methods) — `bind_text`, `bind_class`,
+binding in [`std::web::ui`](browser.md#view-methods) — `bind_text`, `bind_class`,
 `bind_attr`, `bind_styled`, `style_var`, `toggle_attr`, `when`, `when_some`,
 `show` and `swap` — is generic over `Flow<T>` and consumes it (`own`), so
 `Stored<str>` above, a cell and a pipe all drive them, on the browser layer and
@@ -590,7 +590,7 @@ run's first registration — a body that registers nothing costs a read and a
 write, and allocates no owner. A run's nursery has to exist before the body
 runs (the spawn machinery registers a task at the `async` expression), but a
 run that started no task hands its nursery on to the next run: a stage makes a
-nursery at its first run, and again only after a run that spawned. The bindings in `std::ui` do not pay even that:
+nursery at its first run, and again only after a run that spawned. The bindings in `std::web::ui` do not pay even that:
 their bodies write the DOM and register nothing, so they attach plainly.
 
 ```vilan
@@ -733,7 +733,7 @@ impl Selector<type T: Hashable + PartialEq> {
 
 ```vilan,browser
 import std::reactive::{ Signal, SignalCell, selector };
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 fun main() {
 	let rows: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
@@ -911,6 +911,72 @@ included. A consumer that wants its output to fire only when that position
 moved gates it: `divorce(pair).0.distinct()`, which asks `PartialEq` of that
 one element. `.memo()` an output where it is shared or read.
 
+## zip_some
+
+```vilan,fragment
+fun zip_some<T: (2..)>(flows: (U in T: dyn Flow<Option<U>>)): ZipSome<T>
+```
+
+Wait for several maybes at once: a pipe that is `Some` of the tuple of the
+inputs' payloads while EVERY input is `Some`, and `None` while any one is
+`None`. Over flows of `Option<Message>` and `Option<User>` it is a
+`Pipe<Option<(Message, User)>>`, so the negative states are handled in one
+place — where the zip is read — and nothing past it re-matches them. It is
+`combine` and `Option::zip` written once: variadic over the payload types,
+stateless, and needing no owner, so it composes like any stage. Each input is
+any flow of a maybe — a cell, a sealed memo, a pipe such as a mirror's
+`.latest()` or a transient's `.derive(|state| state.ready())` — and a pipe input
+is moved in:
+
+```vilan
+import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, zip_some };
+
+fun main() {
+	let name: SignalCell<Option<str>> = Signal::new(Some("Ada"));
+	let age: SignalCell<Option<i32>> = Signal::new(None);
+	let both = zip_some((name, age.derive(|value| value))).memo();
+	print(both.get().is_none());
+	age.set(Some(36));
+	if both.get() is Some((let who, let years)) {
+		print(i"{who} {years}");
+	}
+}
+```
+
+A dependent input needs nothing new — `message.and_then(|m| m.author.user())`
+sealed with `.memo()` beside `message` itself. A diamond like that one notifies
+the zip once per arm outside a turn, as any `combine` does; inside a `batch`
+or a turn it runs once, on settled values.
+
+What it does not do is hand back a flow per part: the parts of a zipped value
+are values. For a body that wants one live cell per part, `std::web::ui`'s
+`when_all_some((a, b), |(a, b)| ..)` is `when_some` over `zip_some` plus the
+split below.
+
+### unzip — a tuple cell, split
+
+```vilan,fragment
+impl SignalCell<type T: (2..)> { fun unzip(self): (U in T: SignalCell<U>) }
+```
+
+One cell per position of a tuple-valued cell, each seeded with its part and
+written IN PLACE on every change of the whole, so a binding over a part updates
+where it stands. It is a materialising node, like `.cell()`: the follow
+registers with the ambient owner when there is one, and dies with it. Every
+part is written on every change of the whole (a cell never compares, so `T`
+needs no `PartialEq`), and a part's own `set` does not write back:
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source };
+
+fun main() {
+	let pair = Signal::new((1, "one"));
+	let (number, word) = pair.unzip();
+	pair.set((2, "two"));
+	print(i"{number.get()} {word.get()}");
+}
+```
+
 ## Subscription, Disposable
 
 ```vilan,fragment
@@ -930,7 +996,7 @@ the snapshot an inline notify is walking. (Until A110 a delivery queued in the
 currently-draining turn could still land once. It cannot now.)
 
 `Subscription::teardown` is the registration shape for a source **outside** the
-signal graph: `dispose` runs the hook once and does nothing else. `std::dom`'s
+signal graph: `dispose` runs the hook once and does nothing else. `std::web::dom`'s
 `listen` is built on it — a DOM listener's whole teardown is the call that
 unhooks it. The hook is one-shot, so disposing twice is safe.
 
@@ -1426,11 +1492,13 @@ re-runs it at all, which makes the contract sharper rather than different.
 ## Collection pipes — operators per shape
 
 ```vilan,fragment
-[resource] trait CollFlow<T> {                 // anything a collection pipeline starts from
+[resource]
+trait CollFlow<T> {                            // anything a collection pipeline starts from
 	fun open(own self): CollInstance<T>;       // the node author's member
 }
 trait CollSource<T> with DeltaSource<List<T>, SeqOp<T>> {}   // ListCell, ListMemo
-[resource] trait CollPipe<T> with CollFlow<T> {
+[resource]
+trait CollPipe<T> with CollFlow<T> {
 	fun memo(own self): ListMemo<T>            // seal: a read-only CollSource
 	fun memo_global(own self): ListMemo<T>     // ... for the program (A130)
 	fun sample(own self): List<T>              // one read: start, take, release
@@ -1547,7 +1615,7 @@ collection pipe.
 
 ```vilan
 import std::option::Option::{ self, None, Some };
-import std::reactive::{ Signal, SignalCell, comp };
+import std::reactive::{ CollPipe, Signal, SignalCell, comp };
 
 fun main() {
 	let fetched: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
@@ -1689,7 +1757,7 @@ changed the set and record only when they did.
 
 ```vilan
 import std::hash_set::HashSet;
-import std::reactive::{ HashSetCell };
+import std::reactive::{ Disposable, Flow, HashSetCell };
 
 fun main() {
 	let online: HashSetCell<str> = HashSetCell::new();
@@ -1710,8 +1778,10 @@ collection as one `Reset`.
 ## Map pipes — operators for maps and sets
 
 ```vilan,fragment
-[resource] trait MapFlow<K: Hashable, V> { fun open(own self): MapInstance<K, V>; }   // MapSource, every map pipe
-[resource] trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
+[resource]
+trait MapFlow<K: Hashable, V> { fun open(own self): MapInstance<K, V>; }              // MapSource, every map pipe
+[resource]
+trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
 	fun memo(own self): HashMapMemo<K, V>          // seal: a read-only MapSource with get(key)/at(key)
 	fun memo_global(own self): HashMapMemo<K, V>
 	fun sample(own self): HashMap<K, V>
@@ -1738,7 +1808,7 @@ subtract what left.
 
 ```vilan
 import std::hash_map::HashMap;
-import std::reactive::{ HashMapCell, comp };
+import std::reactive::{ CollPipe, HashMapCell, SetPipe, comp };
 
 fun main() {
 	let stock: HashMapCell<str, i32> = HashMapCell::of([("pens", 3), ("ink", 0)].to_map());

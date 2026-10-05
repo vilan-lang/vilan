@@ -1238,7 +1238,7 @@ pub fn assemble_assets(assets: &[EmittedAsset]) -> BTreeMap<String, String> {
 ///   styling system reaches `<leg>.css` through `emit("css", …)`, and
 ///   `write_assets` recognizes that kind by name. It is reserved *against a
 ///   build hook* (build-hooks.md §5.6, where a manifest declaring
-///   `[build.asset.css]` is an error naming `std::style`), never against the
+///   `[build.asset.css]` is an error naming `std::web::style`), never against the
 ///   const channel that produces it.
 ///
 /// `chunks.json` is matched before the `.js` family so the manifest keeps its
@@ -1472,7 +1472,7 @@ impl<'p, 'src> TypeParameterScan<'p, 'src> {
             // The type parameter itself, and the two "we do not know" cases —
             // conservative, since a fold under either is unverifiable.
             Some(Type::Generic(_)) | Some(Type::Unknown) | Some(Type::Unresolved) | None => true,
-            Some(Type::Closure(arguments, result, _)) => {
+            Some(Type::Closure(arguments, result, _, _)) => {
                 let result = *result;
                 arguments
                     .clone()
@@ -2555,7 +2555,7 @@ impl<'p, 'src> State<'p, 'src> {
     }
 
     /// How a const-only callee names itself in a diagnostic: the channel verb
-    /// itself, by its `std::asset` path, or the R-member that reaches one —
+    /// itself, by its `std::web::asset` path, or the R-member that reaches one —
     /// named for the verb `reaches` recorded for it.
     fn const_only_name(&self, callee: Id, reaches: &HashMap<Id, Id>) -> String {
         if let Some((_, path)) = self

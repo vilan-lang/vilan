@@ -30,7 +30,7 @@ fn write(dir: &Path, relative: &str, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-const CLIENT: &str = r#"import std::ui::{ mount_root, view };
+const CLIENT: &str = r#"import std::web::ui::{ mount_root, view };
 
 fun main() {
 	let _root = mount_root("app", || view("div").text("hi"));

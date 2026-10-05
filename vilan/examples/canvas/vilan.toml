@@ -5,7 +5,7 @@
 # no `--target` flag needed. Sources sit at the package root, so `root` is `.`.
 #
 # `prelude` names the ambient scope every file here resolves under — the names in
-# scope with no import (`proposal/prelude.md` §5). `std::web`, the application
+# scope with no import (`proposal/prelude.md` §5). `std::web::prelude`, the application
 # set, for the same reason `../browser` takes it: this is a browser app. It
 # deletes nothing here — `board.vl`'s whole surface comes from the generated
 # `pkg::canvas`, and `canvas.vl` imports nothing at all — and that is worth
@@ -17,4 +17,4 @@ name = "canvas_demo"
 root = "."
 entry = "board.vl"
 target = "browser"
-prelude = "std::web"
+prelude = "std::web::prelude"

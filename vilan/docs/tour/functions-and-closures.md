@@ -25,7 +25,10 @@ fun main() {
 
 Notice there is no `return` on the last line. A bare expression at the
 end of a block is the block's value. You'll see this everywhere in Vilan.
-`if`, `match`, and plain blocks all work the same way.
+`if`, `match`, and plain blocks all work the same way. An early exit is
+`ret`, and the compiler says so if you write `return`, `fn` or `-> i32`
+out of habit: each is refused with the vilan spelling, and the editor
+offers the rewrite.
 
 The `: i32` is optional. Leave it off and the return type is inferred
 from the body — from the final expression and from every `ret`, which

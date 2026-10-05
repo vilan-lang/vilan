@@ -249,15 +249,32 @@ requires an explicit `*`. A view in **value position** (passed where a
 value is expected, used as an operator's operand, or bound or ASSIGNED to a
 value type — `out = v` as much as `let out: T = v`, and a view EXPRESSION
 alike: `out = &a`, `out = inner(&holder)` of a `borrows` function, or a
-branch of a value `if` handing either back) is a compile error, never
+branch of a value `if` handing either back — at a binding as at an
+assignment, so `let v = if c { &a } else { &b }` initializes no view
+binding, and as an argument or operand) is a compile error, never
 a silent coercion to the pointee (so the `(base, key)` representation of a
 scalar view can't leak); write `*v` to copy the value out. A closure's view
 parameter is a view by the same rule, whether the literal spells it
 (`|&mut list|`) or takes it from the closure type it is handed to: `|c|`
 passed where `|&str| void` is expected receives a `&str`, and reads it as
-`*c`. Iteration by view (`for e in &mut list`) binds each
+`*c`. The `&`/`&mut` is part of the closure TYPE — `|&str| void` and
+`|str| void` are different types — so a bare `|c|` takes its position's
+mode however it reaches it (a `let` the annotation re-types, a generic's
+argument, an `Option` or `List` of view closures, a field), and a closure
+whose parameter states one mode (written on its type, or spelled on the
+literal) is refused where the other is wanted: a value-into-view adapter
+would hide a copy, so write it (`|c| f(*c)`). Iteration by view (`for e in &mut list`) binds each
 element as a view: assignment and field writes go through; `*e` reads the
-element. The parameter conventions:
+element. Matching by view is the same act on one value: the SUBJECT
+carries the mode, so `match &mut place { V(let p) => .. }` (and
+`&mut place is V(let p)`) binds every `let` payload capture as a writable
+view into its slot — assigning `p` replaces the payload and keeps the
+variant — and `match &place` binds readonly views, while a bare
+`match place` copies, as it always has. A `mut` capture under a view
+subject is refused (it would be a copy that looks like a write). Rule 4
+guards the subject place, and every prefix of it, from the arm's start to
+the capture's LAST use. A binding inside a tuple sub-pattern stays a copy.
+The parameter conventions:
 
 | Convention | Written | Data | Resource |
 |---|---|---|---|
@@ -302,7 +319,14 @@ through the parameter) passes freely. Views anchor at their origin roots
 wherever they arise: a direct `&place`, a view-returning call (the
 callee's `borrows` positions mapped through the arguments), or a
 wrapped-view `match` capture. A projection returned through a call is
-policed exactly like the `&place` it came from.
+policed exactly like the `&place` it came from. An enclosing place is any
+prefix of the viewed path (`bag.items` under a view of `bag.items[0]`, an
+aggregate element at any index); a view a call hands back may point anywhere
+under the place the call was lent, so writing any AGGREGATE at or under that
+place is an event while it is live (`match first(&mut bag) { Some(let p) =>
+.. }` forbids `bag.items = []`). A write beside the viewed path (`bag.items`
+under a view of `bag.label`), and a write of a scalar (`bag.count = 3`, a
+content write the view reads through), are not.
 
 *Implementation note: the dynamic remainder (aliasing reached through
 calls, container-internal invalidation) is tracked future work. When it
@@ -470,7 +494,8 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   ```vilan
   import std::drop::Drop;
 
-  [resource] struct Guard { label: str }
+  [resource]
+  struct Guard { label: str }
   impl Guard with Drop {
       fun drop(&mut self) { print(self.label); }
   }
@@ -511,7 +536,8 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   ```vilan
   import std::drop::Drop;
 
-  [resource] struct Guard { label: str }
+  [resource]
+  struct Guard { label: str }
   impl Guard with Drop {
       fun drop(&mut self) { print(self.label); }
   }

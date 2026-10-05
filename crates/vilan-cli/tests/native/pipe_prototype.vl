@@ -60,7 +60,8 @@ impl type S: Src<type T> with Up<T> {
 }
 
 // ---- A transformation: a description. NOT a Src: no get().
-[resource] struct Map<S, T, U> {
+[resource]
+struct Map<S, T, U> {
 	up: S,
 	f: |T| U,
 }
@@ -94,7 +95,8 @@ trait Pipe<T> with Up<T> {
 impl Map<type S: Up<type T>, T, type U> with Pipe<U> {}
 
 // A stateful stage: its state (the generation) lives in the INSTANTIATION.
-[resource] struct Switch<S, T, I, U> {
+[resource]
+struct Switch<S, T, I, U> {
 	up: S,
 	select: |T| I,
 }

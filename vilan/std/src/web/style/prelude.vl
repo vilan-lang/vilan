@@ -1,0 +1,280 @@
+// The css block's hole vocabulary (tracker A70): free-function aliases of the typed
+// style tokens, so a hole reads as the CSS it stands for.
+//
+// A block's holes are where the type system lives (css-block.md §10), and the price
+// of that was `{Length::rem(4.0)}` and `{Color::gray(500)}` inside a value that is
+// otherwise plain CSS: the qualifying segment is noise at every hole, and under the
+// web prelude — where `style` is an ambient MODULE — it is
+// `{style::Length::rem(4.0)}`. These are the same values under the names CSS itself
+// uses, and nothing else: every function here is one line, and the `Length`/`Color`
+// constructors stay exactly where they are.
+//
+// The module is AMBIENT INSIDE A CSS HOLE (names.md §4.7's ambient-module rule,
+// applied to one syntactic position): the lowering resolves a hole's bare names
+// against the site's scope FIRST and against this module only if nothing there
+// answers, so an explicit local binding always wins and no file can be broken by a
+// name added here. Outside a block it is an ordinary module, and there is no
+// wildcard import in vilan: the two idioms are the brace list
+// (`import std::web::style::prelude::{ rem, gray };`) and the qualifying alias
+// (`import std::web::style::prelude as tokens;`), ONE statement at the top of a file
+// whose `fun` bodies build chains — a chain written outside a hole gets no ambient
+// scope, so before A106 such a file imported one name per token it used (kolt's
+// `styles.vl:54/103` imported nine, per function).
+//
+// THE SURFACE IS THE 46 NAMES BELOW (A117): the 38 one-line functions and the 8
+// types the import above brings in. `export *;` re-exports what a module BINDS, an
+// aliased import included, so the aliases this file needs on the way in —
+// `open_style`, `scale_step`, `value_piece`, `custom_property` and seventeen
+// `*_condition` spellings — used to resolve from outside as 21 more exports nobody
+// designed, which is a vocabulary with two spellings for everything and A106 door
+// 2's largest objection. They now live INSIDE the one body each is for: a
+// function-scoped import binds in the function's scope and nothing reaches it from
+// another module, which is the whole mechanism. The aliases exist at all because
+// the free name and the local one collide — `hover()` here is the condition and
+// `style::hover` is what it calls — and that is why they cannot simply be dropped.
+//
+// The keyword-property TYPES ride along for that reason (A106): a chain reads
+// `.cursor(Cursor::Pointer)` whether it is inside a hole or not, so `Cursor`,
+// `TextAlign` and `AlignItems` belong to the same vocabulary as `rem` and
+// `hover` (`Length` was already here, as `piece`'s and the constructors'
+// currency). The set is deliberately the FOUR the vocabulary needs and not
+// every keyword enum in `std::web::style`: `Display`, `Position`, `FlexDirection`,
+// `JustifyContent`, `Overflow`, `WhiteSpace` and `UserSelect` stay qualified
+// until a file asks for them, because a prelude is a vocabulary rather than a
+// re-export of a module.
+//
+// `s()` is `style()` under the one-letter name a chain written inside a
+// `const { … }` wants; the builder itself is untouched.
+
+import pkg::web::style::{
+	AlignItems,
+	Color,
+	Condition,
+	CssPiece,
+	Cursor,
+	Length,
+	Style,
+	TextAlign,
+};
+
+export *;
+
+// --- lengths ------------------------------------------------------------------
+
+fun rem(value: f64): Length {
+	Length::rem(value)
+}
+
+fun px(value: f64): Length {
+	Length::px(value)
+}
+
+fun em(value: f64): Length {
+	Length::em(value)
+}
+
+fun pct(value: f64): Length {
+	Length::pct(value)
+}
+
+fun vh(value: f64): Length {
+	Length::vh(value)
+}
+
+fun vw(value: f64): Length {
+	Length::vw(value)
+}
+
+fun auto(): Length {
+	Length::auto()
+}
+
+/// The spacing scale, by step — `{space(4)}` is the token, not a copied `1rem`, and
+/// it carries its own `:root` line onto the sheet.
+fun space(step: i32): Length {
+	import pkg::web::style::space as scale_step;
+	scale_step(step)
+}
+
+// --- colors -------------------------------------------------------------------
+
+fun black(): Color {
+	Color::black()
+}
+
+fun white(): Color {
+	Color::white()
+}
+
+fun transparent(): Color {
+	Color::transparent()
+}
+
+fun hex(value: str): Color {
+	Color::hex(value)
+}
+
+fun gray(step: i32): Color {
+	Color::gray(step)
+}
+
+fun blue(step: i32): Color {
+	Color::blue(step)
+}
+
+fun red(step: i32): Color {
+	Color::red(step)
+}
+
+fun green(step: i32): Color {
+	Color::green(step)
+}
+
+fun rgba(red: i32, green: i32, blue: i32, alpha: f64): Color {
+	Color::rgba(red, green, blue, alpha)
+}
+
+fun oklch(lightness: f64, chroma: f64, hue: f64): Color {
+	Color::oklch(lightness, chroma, hue)
+}
+
+/// A CUSTOM PROPERTY as a value — `color(var("--brand-ink"));` (A101 R12).
+/// `--brand-ink` is not an expression, so CSS's `var(--x)` is spelled with the name
+/// as a string; the dashes are checked, because a name without them is not a
+/// reference at all.
+fun var(name: str): str {
+	import pkg::web::style::var as custom_property;
+	custom_property(name)
+}
+
+/// One PIECE of a value assembled from text and expressions —
+/// `padding(i"calc({piece(space(4))} + 2px)");`.
+///
+/// A declaration's arguments are whole values, joined by a space when there are
+/// several (A101 R10); a value whose parts are GLUED (`calc(… + 2px)`,
+/// `{150}ms`) is one argument built here instead, and each part goes through
+/// this so a `Length` or a `Color` inside it puts its `:root` line on the sheet
+/// rather than emitting a `var()` nothing declares.
+fun piece<V: CssPiece>(value: V): str {
+	import pkg::web::style::piece as value_piece;
+	value_piece(value)
+}
+
+// --- the builder --------------------------------------------------------------
+
+/// `style()` under the name a chain written inline wants.
+fun s(): Style {
+	import pkg::web::style::style as open_style;
+	open_style()
+}
+
+// --- the conditions ------------------------------------------------------------
+
+/// The condition VALUES (A95), under the names a `css` block head wants:
+/// `.on(hover() + active().not()) { … }` needs no import, because this module is
+/// ambient inside a block and a head is an ordinary expression list the lowering
+/// passes through.
+///
+/// Each is one line over `std::web::style`'s own constructor, aliased because the
+/// free name and the `Style` METHOD of the same name coexist (`hover()` is the
+/// condition, `style().hover(inner)` is the sugar that puts a style under it) and a
+/// file declaring `fun hover()` cannot also call the import of that name. The alias
+/// is imported INSIDE the body (A117): at file level `export *;` would publish the
+/// alias spelling as a second surface name for the same value, and a
+/// function-scoped import is reachable from nowhere else.
+
+fun hover(): Condition {
+	import pkg::web::style::hover as hover_condition;
+	hover_condition()
+}
+
+fun focus(): Condition {
+	import pkg::web::style::focus as focus_condition;
+	focus_condition()
+}
+
+fun active(): Condition {
+	import pkg::web::style::active as active_condition;
+	active_condition()
+}
+
+fun disabled(): Condition {
+	import pkg::web::style::disabled as disabled_condition;
+	disabled_condition()
+}
+
+fun first(): Condition {
+	import pkg::web::style::first as first_condition;
+	first_condition()
+}
+
+fun last(): Condition {
+	import pkg::web::style::last as last_condition;
+	last_condition()
+}
+
+/// Any pseudo-class by name — `pseudo("focus-visible")`. One value is ONE
+/// pseudo-class: a `:` in the name is refused, because two are two values.
+fun pseudo(name: str): Condition {
+	import pkg::web::style::pseudo as pseudo_condition;
+	pseudo_condition(name)
+}
+
+/// A pseudo-ELEMENT — `element("selection")` is `::selection`, and it comes last in
+/// the compound with nothing after it.
+fun element(name: str): Condition {
+	import pkg::web::style::element as element_condition;
+	element_condition(name)
+}
+
+/// An attribute on the element itself — PRESENCE (`[name]`); `.eq(value)`
+/// narrows it to the exact form.
+fun attribute(name: str): Condition {
+	import pkg::web::style::attribute as attribute_condition;
+	attribute_condition(name)
+}
+
+/// The ancestor GUARD: the element's own rule, conditioned on an ANCESTOR matching
+/// `condition` — `within(attribute("data-theme").eq("dark"))`.
+fun within(condition: Condition): Condition {
+	import pkg::web::style::within as within_condition;
+	within_condition(condition)
+}
+
+/// Every direct CHILD of the element — `.sX > *`.
+fun children(): Condition {
+	import pkg::web::style::children as children_condition;
+	children_condition()
+}
+
+/// Every direct child BUT THE FIRST — `> :not(:first-child)`.
+fun divide(): Condition {
+	import pkg::web::style::divide as divide_condition;
+	divide_condition()
+}
+
+/// An arbitrary min-width breakpoint; `sm`/`md`/`lg`/`xl` are the named ones.
+fun media(min_width: str): Condition {
+	import pkg::web::style::media as media_condition;
+	media_condition(min_width)
+}
+
+fun sm(): Condition {
+	import pkg::web::style::sm as sm_condition;
+	sm_condition()
+}
+
+fun md(): Condition {
+	import pkg::web::style::md as md_condition;
+	md_condition()
+}
+
+fun lg(): Condition {
+	import pkg::web::style::lg as lg_condition;
+	lg_condition()
+}
+
+fun xl(): Condition {
+	import pkg::web::style::xl as xl_condition;
+	xl_condition()
+}

@@ -52,6 +52,7 @@ for the explicit keywords when you *don't* want to wait. The
 | You write in JS/TS              | You write in Vilan                              |
 | ------------------------------- | ----------------------------------------------- |
 | `function f(x) { … }`           | `fun f(x: i32): i32 { … }`                      |
+| `return x;`                     | `ret x;` — the compiler steers `return` here    |
 | `const x = …` / `let x = …`     | `let x = …` / `mut x = …`                       |
 | `x === y`                       | `x == y` (type-checked equality)                |
 | `` `Hello ${name}` ``           | `i"Hello {name}"`                               |
@@ -76,7 +77,7 @@ for the explicit keywords when you *don't* want to wait. The
 | CSS: `gap: 1rem;` (hard-coded)  | `gap(space(4));` (a scale token)                |
 
 The CSS rows are a real block, not a template string: `css { … }` is
-core syntax that lowers to a `std::style` chain, so the property names
+core syntax that lowers to a `std::web::style` chain, so the property names
 are tokens the compiler sees, every value is an ordinary vilan
 expression the type system checks, and `vilan fmt` orders them for you. The
 [styling guide](../guide/styling.md#the-css-block) has the whole shape.

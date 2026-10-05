@@ -84,7 +84,7 @@ pub fn collect_type_generics(
                 collect_type_generics(program, argument, depth + 1, out);
             }
         }
-        Some(Type::Closure(parameters, return_type_id, _)) => {
+        Some(Type::Closure(parameters, return_type_id, _, _)) => {
             let parameters = parameters.clone();
             let return_type_id = *return_type_id;
             for parameter in parameters {
@@ -156,6 +156,110 @@ pub fn trait_reaches_supertrait(program: &Program<'_>, trait_id: Id, supertrait_
         }
     }
     false
+}
+
+/// The trait in `trait_id`'s supertrait closure that DECLARES `member`: the
+/// member's declaration, the declaring trait, and the substitution the `with`
+/// clauses on the way imply — each supertrait's own parameters bound to the
+/// arguments its clause wrote, in the sub-trait's terms (`trait Named<T> with
+/// Shape<T>` reached for `area` binds `Shape`'s `T` to `Named`'s `T`).
+///
+/// One walk for both emitters' object tables (A124 R3): the slot's signature
+/// is written in the declaring trait's terms, and the slot's IMPL is selected
+/// at the declaring trait's instantiation ([`object_member_preference`]).
+pub fn object_member_declaration(
+    program: &Program<'_>,
+    trait_id: Id,
+    member: &str,
+) -> Option<(Id, Id, Vec<(TypeId, TypeId)>)> {
+    let mut stack: Vec<(Id, Vec<(TypeId, TypeId)>)> = vec![(trait_id, Vec::new())];
+    let mut seen: HashSet<Id> = HashSet::default();
+    while let Some((id, chain)) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let trait_ = program.traits.get(&id)?;
+        if let Some(declaration) = trait_.declarations.get(member) {
+            return Some((*declaration, id, chain));
+        }
+        for supertrait_type_id in &trait_.supertraits {
+            if let Some(Type::Trait(super_id, super_arguments)) =
+                program.type_id_to_type_map.get(supertrait_type_id)
+            {
+                let mut extended = chain.clone();
+                if let Some(supertrait) = program.traits.get(super_id) {
+                    extended.extend(
+                        supertrait
+                            .generic_parameter_constraint_ids
+                            .iter()
+                            .copied()
+                            .zip(super_arguments.iter().copied()),
+                    );
+                }
+                stack.push((*super_id, extended));
+            }
+        }
+    }
+    None
+}
+
+/// The trait application an object over `trait_id<arguments>` dispatches
+/// `member` on: the DECLARING trait, at the arguments the clause chain passes
+/// it (B532). A member a supertrait declares is that supertrait's, so a table
+/// for `dyn Named<str>` over `trait Named<T> with Shape<T>` takes `area` from
+/// the impl of `Shape<str>` — asking for `Named<str>`'s instead matched no
+/// impl providing `area`, and the by-name fallback answered from whichever
+/// impl of `Shape` came first (`Shape<i32>`'s `4` where `"big"` is right).
+///
+/// The arguments are substituted at the top of each position (a clause
+/// argument that IS a parameter of a trait on the way); one written in a
+/// nested form (`with Shape<Option<T>>`) keeps its written id, which the
+/// caller resolves under its own substitution as it resolves any argument.
+pub fn object_member_preference(
+    program: &Program<'_>,
+    trait_id: Id,
+    arguments: &[TypeId],
+    member: &str,
+) -> Option<(Id, Vec<TypeId>)> {
+    let (_, declaring, chain) = object_member_declaration(program, trait_id, member)?;
+    if declaring == trait_id {
+        return Some((trait_id, arguments.to_vec()));
+    }
+    let mut map: HashMap<TypeId, TypeId> = HashMap::default();
+    if let Some(trait_) = program.traits.get(&trait_id) {
+        map.extend(
+            trait_
+                .generic_parameter_constraint_ids
+                .iter()
+                .copied()
+                .zip(arguments.iter().copied()),
+        );
+    }
+    map.extend(chain);
+    let through = |mut type_id: TypeId| {
+        // Bounded by the map's size: each hop follows one entry, and a chain
+        // longer than that is a cycle.
+        for _ in 0..=map.len() {
+            let next = map.get(&type_id).copied().or_else(|| {
+                match program.type_id_to_type_map.get(&type_id) {
+                    Some(Type::Generic(constraint_id)) => map.get(constraint_id).copied(),
+                    _ => None,
+                }
+            });
+            match next {
+                Some(next) if next != type_id => type_id = next,
+                _ => break,
+            }
+        }
+        type_id
+    };
+    let declared = program.traits.get(&declaring)?;
+    let resolved = declared
+        .generic_parameter_constraint_ids
+        .iter()
+        .map(|parameter| through(*parameter))
+        .collect();
+    Some((declaring, resolved))
 }
 
 /// The member a call dispatched on `trait_id`'s surface takes from an impl of

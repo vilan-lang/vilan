@@ -12,6 +12,7 @@ pub mod closest_name;
 pub mod const_eval;
 pub mod context;
 pub mod contract_hash;
+pub mod counters;
 pub mod css;
 pub mod css_properties;
 pub mod dead_items;
@@ -93,13 +94,13 @@ struct InferredPlatform {
 /// Infers a build platform for editor analysis (which has no `--platform`) from
 /// a file's own text. Evidence, per `import std::<module>` reference:
 ///
-/// - a module served ONLY by a browser layer (`std::dom`) is browser evidence —
+/// - a module served ONLY by a browser layer (`std::web::dom`) is browser evidence —
 ///   the file cannot mean anything else;
 /// - a module served by a browser layer AND another root — a platform TWIN,
-///   like `std::ui` — is evidence through the NAMES imported from it: a
+///   like `std::web::ui` — is evidence through the NAMES imported from it: a
 ///   name declared by just the browser twin (`mount`) says browser, one
 ///   declared by just the other side (`render`) says process, and a name both
-///   declare says nothing. B36: the old rule read *any* `std::ui` import as
+///   declare says nothing. B36: the old rule read *any* `std::web::ui` import as
 ///   browser evidence, so a two-entry package's shared file importing the
 ///   process twin's `render` analyzed as browser in the editor and its import
 ///   red-flagged, while `vilan build` was clean on every entry.
@@ -141,14 +142,38 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         .map(|layer| layer.root.as_path())
         .chain(std::iter::once(std.base_root.as_path()))
         .collect();
-    // The module file `name` resolves to under `root` (`name.vl` or `name/lib.vl`).
+    // The module file `name` resolves to under `root` (`name.vl` or
+    // `name/lib.vl`). A154: `name` is a PATH below `std` (`web::dom` is
+    // `web/dom.vl`), since std's modules sit under namespaces.
     fn module_file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
-        let file = root.join(format!("{name}.vl"));
-        if file.exists() {
-            return Some(file);
+        let mut directory = root.to_path_buf();
+        let mut segments = name.split("::").peekable();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                let file = directory.join(format!("{segment}.vl"));
+                if file.exists() {
+                    return Some(file);
+                }
+                let lib = directory.join(segment).join("lib.vl");
+                return lib.exists().then_some(lib);
+            }
+            directory.push(segment);
         }
-        let lib = root.join(name).join("lib.vl");
-        lib.exists().then_some(lib)
+        None
+    }
+    // Whether `name` is a module in any of `roots` — the question that tells a
+    // namespace segment the walk descends through (`web` of `std::web::dom`)
+    // from a module whose items follow (`option` of `std::option::Option`).
+    fn is_module_in(roots: &[&Path], name: &str) -> bool {
+        roots.iter().any(|root| module_file(root, name).is_some())
+    }
+    // The path a segment names below the walk's prefix (`web` + `dom`).
+    fn joined(prefix: &str, segment: &str) -> String {
+        if prefix.is_empty() {
+            segment.to_string()
+        } else {
+            format!("{prefix}::{segment}")
+        }
     }
     // Whether the module at `path` declares `name` at its top level (through
     // the item wrappers). A file that fails to read or parse declares nothing —
@@ -252,12 +277,23 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     // it justifies (see the doc comment).
     fn child_is_browser_evidence(
         branch: &ImportBranch,
+        prefix: &str,
         browser_root: &Path,
         other_roots: &[&Path],
     ) -> Option<String> {
         match branch {
-            ImportBranch::Path(module, _, sub) => {
-                let browser_file = module_file(browser_root, module)?;
+            ImportBranch::Path(segment, _, sub) => {
+                let module = &joined(prefix, segment);
+                let Some(browser_file) = module_file(browser_root, module) else {
+                    // A154: not a browser module, and not a module anywhere —
+                    // a namespace (`web`), so the evidence is below it.
+                    if let ImportTail::Continue(sub) = sub
+                        && !is_module_in(other_roots, module)
+                    {
+                        return child_is_browser_evidence(sub, module, browser_root, other_roots);
+                    }
+                    return None;
+                };
                 let twin_files: Vec<std::path::PathBuf> = other_roots
                     .iter()
                     .filter_map(|root| module_file(root, module))
@@ -269,8 +305,8 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                     ));
                 }
                 // A twin: only a name the browser side alone declares says
-                // browser. A bare `import std::ui;` names nothing — neutral,
-                // and so is an aliased one (`import std::ui as u;`), which
+                // browser. A bare `import std::web::ui;` names nothing — neutral,
+                // and so is an aliased one (`import std::web::ui as u;`), which
                 // takes the module and no name out of it.
                 let ImportTail::Continue(sub) = sub else {
                     return None;
@@ -291,12 +327,12 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                     })
             }
             ImportBranch::Reach(_, inner) => {
-                child_is_browser_evidence(inner, browser_root, other_roots)
+                child_is_browser_evidence(inner, prefix, browser_root, other_roots)
             }
             ImportBranch::Selector(_) => None,
-            ImportBranch::Set(branches) => branches
-                .iter()
-                .find_map(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
+            ImportBranch::Set(branches) => branches.iter().find_map(|branch| {
+                child_is_browser_evidence(branch, prefix, browser_root, other_roots)
+            }),
         }
     }
     // The TWIN `std` modules one `std::<module>` reference names — each with
@@ -304,13 +340,21 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     // subjects: a module with no twin is already decided by the rule above.
     fn twin_modules(
         branch: &ImportBranch,
+        prefix: &str,
         browser_root: &Path,
         other_roots: &[&Path],
         into: &mut Vec<(String, std::path::PathBuf, Vec<std::path::PathBuf>)>,
     ) {
         match branch {
-            ImportBranch::Path(module, _, _) => {
+            ImportBranch::Path(segment, _, sub) => {
+                let module = &joined(prefix, segment);
                 let Some(browser_file) = module_file(browser_root, module) else {
+                    // A154: a namespace segment — the twin is below it.
+                    if let ImportTail::Continue(sub) = sub
+                        && !is_module_in(other_roots, module)
+                    {
+                        twin_modules(sub, module, browser_root, other_roots, into);
+                    }
                     return;
                 };
                 let twin_files: Vec<std::path::PathBuf> = other_roots
@@ -320,13 +364,15 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                 if twin_files.is_empty() || into.iter().any(|(name, _, _)| name == module) {
                     return;
                 }
-                into.push(((*module).to_string(), browser_file, twin_files));
+                into.push((module.to_string(), browser_file, twin_files));
             }
-            ImportBranch::Reach(_, inner) => twin_modules(inner, browser_root, other_roots, into),
+            ImportBranch::Reach(_, inner) => {
+                twin_modules(inner, prefix, browser_root, other_roots, into)
+            }
             ImportBranch::Selector(_) => {}
             ImportBranch::Set(branches) => {
                 for branch in branches {
-                    twin_modules(branch, browser_root, other_roots, into);
+                    twin_modules(branch, prefix, browser_root, other_roots, into);
                 }
             }
         }
@@ -354,7 +400,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch else {
             return false;
         };
-        import_reason = child_is_browser_evidence(child, browser_root, &other_roots);
+        import_reason = child_is_browser_evidence(child, "", browser_root, &other_roots);
         import_reason.is_some()
     });
     if let Some(reason) = import_reason {
@@ -372,7 +418,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         if let Node::Import(branch, ..) | Node::Use(branch) = node
             && let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch
         {
-            twin_modules(child, browser_root, &other_roots, &mut twins);
+            twin_modules(child, "", browser_root, &other_roots, &mut twins);
         }
         false
     });
@@ -425,9 +471,24 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
 /// [`parse_clean_cached`]'s store: clean parses by content hash. At module
 /// scope (rather than local to the function, as it began) only so
 /// [`parse_clean_cache_clear`] can reach it.
-static PARSE_CLEAN_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<u64, (&'static Spanned<node::NodeList<'static>>, &'static str)>>,
-> = std::sync::OnceLock::new();
+static PARSE_CLEAN_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, CleanParse>>> =
+    std::sync::OnceLock::new();
+
+/// One parse WARNING as the pipeline reports it (B536): its span into its own
+/// file's text, and its rendered message
+/// ([`parsing::parse_with_warnings`]).
+pub type ParseWarning = (span::Span, String);
+
+/// A clean parse ([`parse_clean_cached_with_warnings`]): the leaked tree, its
+/// leaked text, and the parse's warnings — empty for nearly every source. A
+/// warning does not make a source unclean (B536): the head it reports parses
+/// to the tree its canonical spelling does.
+#[derive(Clone, Copy)]
+pub struct CleanParse {
+    pub ast: &'static Spanned<node::NodeList<'static>>,
+    pub text: &'static str,
+    pub warnings: &'static [ParseWarning],
+}
 /// Content hashes known NOT to parse clean — so a broken file (an entry
 /// mid-edit under `--watch`, say) is leaked and re-parsed once per distinct
 /// content, not once per round.
@@ -481,6 +542,12 @@ pub fn parse_clean_cache_clear() {
 pub fn parse_clean_cached(
     source: &str,
 ) -> Option<(&'static Spanned<node::NodeList<'static>>, &'static str)> {
+    parse_clean_cached_with_warnings(source).map(|parsed| (parsed.ast, parsed.text))
+}
+
+/// [`parse_clean_cached`], with the parse's warnings (B536) — what a pipeline
+/// that REPORTS diagnostics reads (the CLI's entry, the module loader).
+pub fn parse_clean_cached_with_warnings(source: &str) -> Option<CleanParse> {
     let cache = PARSE_CLEAN_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let broken = PARSE_CLEAN_BROKEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
 
@@ -517,7 +584,7 @@ pub fn parse_clean_cached(
     leak_tally::record(leak_tally::LeakSite::ParseCleanCacheText, leaked.len());
     // The handwritten frontend always returns a (possibly recovered) tree; a
     // source is "clean" — and cacheable — exactly when it produced no diagnostics.
-    let (tree, errors) = parsing::parse(leaked);
+    let (tree, errors, warnings) = parsing::parse_with_warnings(leaked);
     let Some(mut root) = tree.filter(|_| errors.is_empty()) else {
         // Recovering (E97): the insert is one step over a `Copy` key, so a
         // recovered guard sees a well-formed set either way.
@@ -535,13 +602,57 @@ pub fn parse_clean_cached(
         leak_tally::LeakSite::ParseCleanCacheAst,
         std::mem::size_of_val(leaked_root),
     );
+    let warnings: &'static [ParseWarning] = if warnings.is_empty() {
+        &[]
+    } else {
+        let rendered: Box<[ParseWarning]> = warnings
+            .iter()
+            .map(|warning| (warning.span, parsing::render(warning)))
+            .collect();
+        let leaked_warnings: &'static [ParseWarning] = Box::leak(rendered);
+        leak_tally::record(
+            leak_tally::LeakSite::ParseCleanCacheAst,
+            std::mem::size_of_val(leaked_warnings),
+        );
+        leaked_warnings
+    };
+    let parsed = CleanParse {
+        ast: leaked_root,
+        text: leaked,
+        warnings,
+    };
     // Recovering (E97): the tree and its text are both leaked and complete
     // BEFORE the lock is taken, so the entry is whole or absent, never torn.
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, (leaked_root, leaked));
-    Some((leaked_root, leaked))
+        .insert(key, parsed);
+    Some(parsed)
+}
+
+/// Adds the ENTRY file's parse warnings (B536) to an analyzed program's
+/// warnings, as the entry's ([`analyzer::SourceId`] 0) — before the
+/// post-passes, whose last step orders every diagnostic. Both pipelines call
+/// it: [`analyze_source`]'s and the CLI's, which parse the entry themselves;
+/// a module's warnings ride its load instead.
+pub fn add_entry_parse_warnings(
+    program: &mut analyzer::Program<'_>,
+    warnings: impl IntoIterator<Item = ParseWarning>,
+) {
+    for (span, msg) in warnings {
+        // `warning_sources` is padded lazily: materialize the implicit tail
+        // first, or this pair would land on an earlier warning's index.
+        program
+            .warning_sources
+            .resize(program.warnings.len(), analyzer::SourceId(0));
+        program.warnings.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg,
+        });
+        program.warning_sources.push(analyzer::SourceId(0));
+    }
 }
 
 /// The content hash the compiler keys its caches and source fingerprints on —
@@ -741,7 +852,7 @@ fn analyze_source_unfenced(
     if !macros::in_macro_world() {
         depth_stats::begin();
     }
-    let (tree, parse_errors) = parsing::parse(source);
+    let (tree, parse_errors, parse_warnings) = parsing::parse_with_warnings(source);
     let mut diagnostics: Vec<Error> = parse_errors
         .iter()
         .map(|error| Error {
@@ -868,9 +979,9 @@ fn analyze_source_unfenced(
     // Use the front-end's resolved platform (e.g. from `vilan.toml`), else infer
     // one from the file's own imports: a file importing the browser DOM layer is a
     // browser file, otherwise Node. This keeps the platform gate from
-    // false-flagging valid `std::dom` usage while still catching a genuine
+    // false-flagging valid `std::web::dom` usage while still catching a genuine
     // cross-platform import (e.g. `std::http` in a file that also reaches for
-    // `std::dom`).
+    // `std::web::dom`).
     // F27 R6: an inferred platform carries its own reason, so the overlay note
     // can say why this file is under this twin even where no front end resolved
     // the colour (a bare file, a `[library]` module, a test harness). The
@@ -924,6 +1035,12 @@ fn analyze_source_unfenced(
         let mut program = analyzer::analyze_cancellable(
             root, source, std, pkg_root, entry_path, platform, workspace,
         )?;
+        add_entry_parse_warnings(
+            &mut program,
+            parse_warnings
+                .iter()
+                .map(|warning| (warning.span, parsing::render(warning))),
+        );
         // The post-pass half of the `VILAN_PHASE_TIMING` split prints inside
         // `post_analysis_passes` itself (backlog M5), so BOTH pipelines —
         // this one (LSP, wasm, the test harnesses) and the CLI's — show it.
@@ -1216,6 +1333,7 @@ pub fn post_analysis_passes(
     if !macros::in_macro_world() {
         depth_stats::report();
     }
+    counters::checkpoint("post-passes");
 }
 
 /// Anchor the `VILAN_DEPTH_STATS` instrument for an analysis a front end is
@@ -1493,12 +1611,18 @@ thread_local! {
     /// The thread CPU reading at the previous [`phase_pass_mark`].
     static PHASE_PASS_LAST: std::cell::Cell<std::time::Duration> =
         const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    /// [`counters::type_slots_minted`] at the previous [`phase_pass_mark`].
+    static PHASE_PASS_SLOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Starts a per-pass split: the next [`phase_pass_mark`] measures from here.
 pub fn phase_pass_mark_start() {
     if phase_pass_split_enabled() {
         PHASE_PASS_LAST.with(|last| last.set(thread_cpu_now().unwrap_or_default()));
+        PHASE_PASS_SLOTS.with(|last| last.set(counters::type_slots_minted()));
+        if counters::heap_armed() {
+            counters::reset_heap_peak();
+        }
     }
 }
 
@@ -1510,7 +1634,11 @@ pub fn phase_pass_mark(pass: &str) {
     }
     let now = thread_cpu_now().unwrap_or_default();
     let spent = now.saturating_sub(PHASE_PASS_LAST.with(|last| last.replace(now)));
-    if spent < std::time::Duration::from_millis(1) {
+    let slots_now = counters::type_slots_minted();
+    let slots = slots_now.saturating_sub(PHASE_PASS_SLOTS.with(|last| last.replace(slots_now)));
+    // A pass that minted type slots prints however little CPU it took: the
+    // slots are held until the program drops, so they are M108's measure.
+    if spent < std::time::Duration::from_millis(1) && slots < 1000 {
         return;
     }
     let world = if macros::in_macro_world() {
@@ -1518,16 +1646,17 @@ pub fn phase_pass_mark(pass: &str) {
     } else {
         ""
     };
-    match resident_megabytes() {
-        Some(megabytes) => eprintln!(
-            "[vilan pass]{world} {:.1}cpu rss={megabytes}MB {pass}",
-            spent.as_secs_f64() * 1000.0
-        ),
-        None => eprintln!(
-            "[vilan pass]{world} {:.1}cpu {pass}",
-            spent.as_secs_f64() * 1000.0
-        ),
-    }
+    // The live heap and the pass's own peak when `VILAN_COUNTERS` armed the
+    // counting allocator (M108's heap profile by pass): RSS alone cannot say
+    // which pass held the bytes, because the allocator keeps pages it freed.
+    let heap = counters::heap_fragment();
+    let rss = resident_megabytes()
+        .map(|megabytes| format!(" rss={megabytes}MB"))
+        .unwrap_or_default();
+    eprintln!(
+        "[vilan pass]{world} {:.1}cpu{rss}{heap} slots+{slots} {pass}",
+        spent.as_secs_f64() * 1000.0
+    );
 }
 
 /// The process's resident set in megabytes, where the host says (`VmRSS`).

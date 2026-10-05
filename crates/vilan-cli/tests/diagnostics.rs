@@ -406,6 +406,58 @@ fn a_module_warning_renders_in_the_module_file() {
     );
 }
 
+/// B536: a declaration whose attributes are out of THE order is a parse
+/// WARNING, reported for the entry (served by the clean-parse cache, which
+/// carries a clean source's warnings) and for an imported module (the
+/// loader's), under `build` and `check`, in the file that holds it, once per
+/// head, and never fatal.
+#[test]
+fn b536_an_attribute_order_warning_renders_in_its_file_and_is_not_fatal() {
+    let dir = temp_files(
+        "attribute_order_warning",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import std::io::print;\nimport pkg::alpha::value;\n\n[must_use] [deprecated(\"use value\")]\nfun old(): i32 {\n\t1\n}\n\nfun main() {\n\tprint(value());\n}\n",
+            ),
+            (
+                "src/alpha.vl",
+                "[platform(\"node\")] [must_use]\nexport fun value(): i32 {\n\t2\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let checked = vilan(&dir, &["check", "."], true);
+    let check_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(output.status.success(), "a warning is not fatal: {stderr}");
+    assert!(checked.status.success(), "nor under check: {check_stderr}");
+    for stderr in [&stderr, &check_stderr] {
+        let warnings: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.starts_with("Warning: a declaration's attributes"))
+            .collect();
+        assert_eq!(warnings.len(), 2, "one per head: {stderr}");
+        assert!(
+            warnings[0].ends_with("write `[deprecated(..)] [must_use] fun`")
+                || warnings[1].ends_with("write `[deprecated(..)] [must_use] fun`"),
+            "the entry's head, in THE order: {stderr}"
+        );
+        assert!(
+            renders_in(stderr, "main.vl", "[must_use] [deprecated(\"use value\")]"),
+            "the entry's warning renders in the entry: {stderr}"
+        );
+        assert!(
+            renders_in(stderr, "alpha.vl", "[platform(\"node\")] [must_use]")
+                && stderr.contains("write `[must_use] [platform(..)] export fun`"),
+            "the module's renders in the module: {stderr}"
+        );
+        assert!(!stderr.contains("Error:"), "{stderr}");
+    }
+}
+
 #[test]
 fn a_macro_registration_diagnostic_renders_once_at_the_entry_and_leads() {
     // E16's original repro (`macros.rs`): a std file that defines a macro, with
@@ -602,8 +654,73 @@ fn phase_timing_env_var_prints_the_phase_split() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M106: `vilan check --explain-cost N` prints the package's own declarations
+/// ranked by the solver work their constraints cost — counts, never time —
+/// and leaves std's out. The default (no flag) prints nothing of it.
+#[test]
+fn explain_cost_ranks_the_packages_own_declarations_by_work() {
+    let dir = temp_package(
+        "explaincost",
+        "import std::io::print;\n\
+         fun wrap<T>(value: T): Option<T> { Some(value) }\n\
+         fun heavy(): i32 {\n\
+         \tlet a = wrap(wrap(wrap(wrap(wrap(1)))));\n\
+         \tlet c = [wrap(1), wrap(2), wrap(3), wrap(4)];\n\
+         \tlet d = c.map(|item| item.unwrap_or(0)).fold(0, |sum, value| sum + value);\n\
+         \tmatch a { Some(_) => d, None => 0 }\n\
+         }\n\
+         fun light(): i32 { 1 }\n\
+         fun main() { print(heavy() + light()); }\n",
+    );
+    let run = |arguments: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .current_dir(&dir)
+            .arg("check")
+            .args(arguments)
+            .arg(".")
+            .output()
+            .expect("run vilan");
+        assert!(
+            output.status.success(),
+            "the fixture must check cleanly; stderr was: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let report = run(&["--explain-cost", "3"]);
+    let rows: Vec<&str> = report
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with("work"))
+        .skip(1)
+        .take_while(|line| {
+            line.trim_start()
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit())
+        })
+        .collect();
+    assert!(
+        report.starts_with("cost (") && rows.len() <= 3 && !rows.is_empty(),
+        "the report must have its header and at most three rows:\n{report}"
+    );
+    assert!(
+        rows[0].contains(" heavy ("),
+        "`heavy` must rank first:\n{report}"
+    );
+    assert!(
+        !report.contains("std/"),
+        "std's declarations are left out:\n{report}"
+    );
+    assert!(
+        !run(&[]).contains("cost ("),
+        "without the flag there is no report"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// M98: `VILAN_PHASE_TIMING=passes` adds the checks phase's per-pass split —
-/// one `[vilan pass]` line per pass that cost a millisecond, its own prefix so
+/// one `[vilan pass]` line per pass that cost a millisecond (or minted a
+/// thousand type slots, M108), its own prefix so
 /// the positional `[vilan phase]` readers never see it — and every value of
 /// the switch prints the `emission-walk … program-drop …` row, the two costs
 /// after the post-passes that no phase line used to name.
@@ -650,9 +767,17 @@ fn phase_timing_passes_prints_the_per_pass_split_and_the_emission_row() {
             .trim_end_matches("cpu")
             .parse()
             .unwrap_or_else(|_| panic!("`{line}`'s cpu figure must be a number"));
+        // M108: a pass that minted a thousand type slots prints however
+        // little CPU it took — the slots are held until the program drops.
+        let slots: u64 = line
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("slots+"))
+            .unwrap_or_else(|| panic!("`{line}` carries no `slots+<n>` figure"))
+            .parse()
+            .unwrap_or_else(|_| panic!("`{line}`'s slots figure must be a number"));
         assert!(
-            milliseconds >= 1.0,
-            "`{line}` is under the one-millisecond floor the split prints at"
+            milliseconds >= 1.0 || slots >= 1000,
+            "`{line}` is under both floors the split prints at (a millisecond, a thousand slots)"
         );
     }
     assert!(
@@ -1528,7 +1653,7 @@ fn primary_label_file(stderr: &str) -> String {
         .to_string()
 }
 
-/// The browser fixture the zero-argument pins share: a `std::ui` method that
+/// The browser fixture the zero-argument pins share: a `std::web::ui` method that
 /// takes an argument, called with none.
 const BROWSER_MANIFEST: &str = "[package]\nname = \"app\"\ntarget = \"browser\"\n";
 
@@ -1538,7 +1663,7 @@ fn a_zero_argument_std_method_call_reports_in_the_callers_file() {
     // and fell back to the declaration when there was none — so with zero
     // arguments the diagnostic's source became std's file while its span still
     // held the caller's byte offsets. The whole thing rendered against
-    // `std/src/browser/ui.vl`, at offsets belonging to another file, and the
+    // `std/src/browser/web/ui.vl`, at offsets belonging to another file, and the
     // user's own file was never named: it read as no diagnostic at all.
     let dir = temp_files(
         "zero_arg_std_method",
@@ -1546,7 +1671,7 @@ fn a_zero_argument_std_method_call_reports_in_the_callers_file() {
             ("vilan.toml", BROWSER_MANIFEST),
             (
                 "src/main.vl",
-                "import std::ui::{ View, view, mount_root };\n\n\
+                "import std::web::ui::{ View, view, mount_root };\n\n\
                  fun broken(): View {\n\tview(\"div\").styled()\n}\n\n\
                  fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
             ),
@@ -1587,7 +1712,7 @@ fn a_zero_argument_std_method_in_an_element_head_reports_in_the_callers_file() {
             ("vilan.toml", BROWSER_MANIFEST),
             (
                 "src/main.vl",
-                "import std::ui::{ View, view, mount_root };\n\n\
+                "import std::web::ui::{ View, view, mount_root };\n\n\
                  fun broken(): View {\n\t<div .styled() />\n}\n\n\
                  fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
             ),
@@ -1619,8 +1744,8 @@ fn a_too_many_arguments_std_method_call_still_reports_in_the_callers_file() {
             ("vilan.toml", BROWSER_MANIFEST),
             (
                 "src/main.vl",
-                "import std::ui::{ View, view, mount_root };\n\
-                 import std::style::style;\n\n\
+                "import std::web::ui::{ View, view, mount_root };\n\
+                 import std::web::style::style;\n\n\
                  fun broken(): View {\n\tview(\"div\").styled(style(), 1, 2)\n}\n\n\
                  fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
             ),
@@ -1832,12 +1957,64 @@ fn check_of_a_sound_entry_is_green_and_writes_nothing() {
 // --- M35: a multi-entry check compiles its entries in parallel -------------
 //
 // The members of a workspace are independent analyses that shared one thread.
-// They now share a process instead: the first runs alone (it fills the
-// process-global caches every later one hits), and the rest run one thread
-// each. Their diagnostics are captured rather than raced to stderr, and
+// They now share a process instead, one thread each, all started at once
+// (M100: M35 ran the first alone to warm the caches, which left a client and
+// a server fully serial). Their diagnostics are captured rather than raced to stderr, and
 // replayed in MEMBER order with the B182 ledger applied there — so what a
 // reader sees is what a sequential round wrote, and nothing about the
 // scheduler reaches the terminal.
+
+/// M100/M108: a one-shot `vilan check` whose members key distinct worlds
+/// (here a browser and a node entry: the platform is in the key) stores no
+/// base world — no later round and no other member can hit one, and the clones
+/// were the largest thing left alive once the members overlap. Two members on
+/// one platform (the three-entry package's server and probe) may share a world,
+/// so that round stores. Read off `VILAN_COUNTERS`' `world-stored` line.
+#[test]
+fn a_one_shot_check_stores_a_base_world_only_when_two_members_could_share_it() {
+    let stored = |manifest: &'static str, entries: &[&'static str]| {
+        let mut files = vec![
+            ("vilan.toml", manifest),
+            ("src/store.vl", "struct Store {\n\tname: str,\n}\n"),
+        ];
+        files.extend(
+            three_entries()
+                .into_iter()
+                .filter(|(path, _)| entries.iter().any(|entry| path.ends_with(entry))),
+        );
+        let dir = temp_files("store_policy", &files);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .current_dir(&dir)
+            .args(["check", "."])
+            .env("VILAN_COUNTERS", "1")
+            .output()
+            .expect("run vilan");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "the fixture must check cleanly: {stderr}"
+        );
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("[vilan counters] world-stored"))
+            .count()
+    };
+    let two = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\
+               \n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+    assert_eq!(
+        stored(two, &["client.vl", "server.vl"]),
+        0,
+        "a client and a server key distinct worlds, so a one-shot check stores neither"
+    );
+    assert!(
+        stored(
+            THREE_ENTRY_MANIFEST,
+            &["client.vl", "server.vl", "probe.vl"]
+        ) > 0,
+        "two node members may share a world, so the round stores"
+    );
+}
 
 /// A three-entry package with a mistake in the module all three reach AND one
 /// mistake of its own per entry — the shape that makes both halves of the
@@ -1991,13 +2168,13 @@ fn a_parallel_check_reports_in_member_order() {
 
 /// `helper.vl`: one of each labelled position, and a use of its own label.
 const LABELLED_HELPER: &str = concat!(
-    "export [internal(\"a struct\")]\n",
-    "struct Region {\n\t[internal(\"a field\")] anchor: str,\n\tlabel: str,\n}\n\n",
+    "[internal(\"a struct\")]\n",
+    "export struct Region {\n\t[internal(\"a field\")] anchor: str,\n\tlabel: str,\n}\n\n",
     "export enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
-    "export [internal(\"a binding\")]\n",
-    "let cache = 3;\n\n",
-    "export [internal(\"a function\")]\n",
-    "fun seam(): i32 {\n\tcache\n}\n",
+    "[internal(\"a binding\")]\n",
+    "export let cache = 3;\n\n",
+    "[internal(\"a function\")]\n",
+    "export fun seam(): i32 {\n\tcache\n}\n",
 );
 
 /// `main.vl`: a use of each, from outside the declaring module.
@@ -2079,10 +2256,10 @@ fn e224_an_import_line_alone_never_warns() {
     std::fs::write(
         dir.join("src/stale.vl"),
         concat!(
-            "export [deprecated(\"use Fresh\")]\n",
-            "struct Stale {\n\tat: i32,\n}\n\n",
-            "export [deprecated(\"use fresh()\")]\n",
-            "fun stale(): i32 {\n\t1\n}\n",
+            "[deprecated(\"use Fresh\")]\n",
+            "export struct Stale {\n\tat: i32,\n}\n\n",
+            "[deprecated(\"use fresh()\")]\n",
+            "export fun stale(): i32 {\n\t1\n}\n",
         ),
     )
     .unwrap();
@@ -2141,15 +2318,15 @@ fn internal_use_is_silent_unless_the_package_asks() {
 /// module; `re.vl`: a deprecated renaming re-export, and a deprecated
 /// NON-renaming one.
 const DEPRECATED_INNER: &str = concat!(
-    "export [deprecated(\"use DeltaCursor\")]\n",
-    "struct KeyedThing {\n\tat: i32,\n}\n\n",
+    "[deprecated(\"use DeltaCursor\")]\n",
+    "export struct KeyedThing {\n\tat: i32,\n}\n\n",
     "export struct DeltaCursor {\n\tat: i32,\n}\n\n",
     "export struct Kept {\n\tat: i32,\n}\n\n",
     "export fun own_use(): KeyedThing {\n\tKeyedThing { at = 1 }\n}\n",
 );
 const DEPRECATED_RE: &str = concat!(
-    "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n",
-    "export [deprecated(\"import it from pkg::inner\")] import pkg::inner::Kept;\n",
+    "[deprecated(\"use pkg::inner::DeltaCursor\")] export import pkg::inner::DeltaCursor as KeyedCursor;\n",
+    "[deprecated(\"import it from pkg::inner\")] export import pkg::inner::Kept;\n",
 );
 
 fn deprecated_package(tag: &str, main: &str) -> PathBuf {

@@ -2434,7 +2434,7 @@ fn generic_call_over_a_bounded_transport_decodes() {
         import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result::{ self, Ok, Err };
-        import std::promise::Promise;
+        import std::js::promise::Promise;
         trait Wire { fun send(self, msg: str): Promise<str>; }
         struct Echo {}
         impl Echo with Wire {
@@ -2584,6 +2584,49 @@ fn rpc_rejects_a_non_wire_return() {
         }
         fun main() {}
         "#,
+    );
+}
+
+/// B490 (opaque-returns.md Q9): an `[rpc]` method returning a bare trait is
+/// refused ONCE, at the method, with the concrete type the body builds as the
+/// steer. It used to fail inside the `[service]` expansion three times over —
+/// a non-Wire `MemoCell<i32>`, B253's stale "a generic for a return" steer
+/// for `Source`, and an uninferrable `call<T: Wire>` — at the attribute, with
+/// nothing pointing at the method.
+#[test]
+fn b490_an_rpc_method_returning_a_bare_trait_is_refused_once_at_the_method() {
+    let errors = compile(
+        r#"
+        import std::reactive::{ Source, SignalCell, Pipe, Flow };
+
+        [service(CounterClient)]
+        struct Counter {
+            count: SignalCell<i32>,
+        }
+
+        impl Counter {
+            [rpc]
+            fun doubled(self): Source<i32> {
+                self.count.derive(|x| x * 2).memo()
+            }
+        }
+
+        fun main() {
+            let c = Counter { count = SignalCell::new(2) };
+            print(c.doubled().get());
+        }
+        "#,
+    )
+    .expect_err("a bare-trait `[rpc]` return must be refused");
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one diagnostic, at the method; got: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("`[rpc]` method `doubled` returns `Source<i32>`, a trait")
+            && errors[0].contains("return `MemoCell<i32>`, the type the body builds"),
+        "got: {errors:#?}"
     );
 }
 
@@ -3447,6 +3490,36 @@ fn an_internal_label_on_a_local_binding_is_refused() {
         ),
         "1\n",
     );
+}
+
+/// B493: the refusal names the label WRITTEN. It said `[internal(..)]`
+/// whatever the label was, so a `[platform(..)]` or `[deprecated(..)]` on a
+/// local was refused for a label nobody wrote.
+#[test]
+fn b493_a_local_label_refusal_names_the_label_written() {
+    for (labels, named) in [
+        (
+            "[platform(\"node\")]",
+            "`[platform(..)]` labels an item on a module's surface: nothing outside this body \
+             can name it, so the label has no reader — delete it",
+        ),
+        (
+            "[deprecated(\"use y\")]",
+            "`[deprecated(..)]` labels an item on a module's surface",
+        ),
+        (
+            "[deprecated(\"use y\")] [internal(\"why\")]",
+            "`[deprecated(..)]` and `[internal(..)]` label an item on a module's surface: \
+             nothing outside this body can name it, so the labels have no reader — delete them",
+        ),
+    ] {
+        let source = format!("fun main() {{\n\t{labels}\n\tlet local = 1;\n\tprint(local);\n}}\n");
+        assert_fails_spanning(
+            &source,
+            "local",
+            &format!("`local` is a local binding, and {named}"),
+        );
+    }
 }
 
 /// Nothing warns by default: the lint is opt-in (`[lints] internal_use`), and
@@ -4374,7 +4447,7 @@ import std::io::print;
         import std::json::{ Json, FromJson, json_codec };
         import std::reactive::{ Signal, SignalCell };
         import std::shared::Shared;
-        import std::rpc_server::Service;
+        import std::rpc::server::Service;
         import std::http::{ Response, Server };
 
         // The whole paradigm, zero manual wiring: [expose]d state + [rpc] methods,
@@ -4467,7 +4540,7 @@ import std::io::print;
 
 // --- B168: a trait bound over a BARE parameter, resolved in a generic body ---
 //
-// A33 widened `std::ui`'s read-only bindings from `SignalCell<T>` to a `Source<T>`
+// A33 widened `std::web::ui`'s read-only bindings from `SignalCell<T>` to a `Source<T>`
 // bound, and `View::swap` — read-only like every other, no write anywhere in
 // it — was the one site that could NOT come along. The gap the widening walked
 // into was narrow and exact:
@@ -5280,6 +5353,52 @@ fn b185_a_never_called_closure_still_names_its_starved_parameter() {
         main();
         "#,
         "`values` is never given a type",
+    );
+}
+
+/// B516: a closure literal whose parameters ONLY its binding's annotation
+/// types, and whose body needs one of them, takes the annotation — `let lend:
+/// |(|&i32| void)| void = |f| f(&n);` was refused "`f` is never given a
+/// type": the binding's readiness probe was undirected, and the body waits on
+/// `f` while `f` waits on the direction. A block body, a nested closure-typed
+/// parameter and a two-parameter literal are pinned beside it; B400's refusal
+/// of a value at the annotation's `&` parameter now stands ALONE (it carried a
+/// spurious "never given a type" beside it).
+#[test]
+fn b516_an_annotated_bindings_closure_types_a_parameter_its_body_needs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(1);
+            let lend: |(|&i32| void)| void = |f| f(&cell.write());
+            lend(|v: &i32| print(*v));
+            let three: |(|&i32| void)| void = |f| f(&3);
+            three(|v: &i32| print(*v));
+            let block: |(|i32| str)| str = |f| { f(4) };
+            print(block(|n: i32| i"n={n}"));
+            let pair: |(|i32| i32), i32| i32 = |f, x| f(x);
+            print(pair(|n: i32| n * 10, 5));
+        }
+        "#,
+        "1\n3\nn=4\n50\n",
+    );
+    let refused = compile(
+        r#"
+        import std::shared::Shared;
+        struct Holder { items: Shared<List<i32>> }
+        fun main() {
+            let holder = Holder { items = Shared::new([1, 2]) };
+            let count: |&List<i32>| usize = |list| list.len();
+            print(count(holder.items.read()));
+        }
+        "#,
+    )
+    .expect_err("a value at the annotation's `&` parameter is refused");
+    assert_eq!(refused.len(), 1, "B400's refusal alone; got: {refused:#?}");
+    assert!(
+        refused[0].contains("a `&` parameter takes a view"),
+        "got: {refused:#?}"
     );
 }
 
@@ -9350,5 +9469,44 @@ fn b454_an_argument_constructor_takes_the_receivers_error_type() {
             "}\n",
         ),
         "Result<i32, str>",
+    );
+}
+
+/// B513: a closure literal's unannotated parameters take their types from a
+/// generic call's ANNOTATED result — `let shown: Shared<|str| void> =
+/// Shared::new(|key| ..)` left `key` untyped (natively refused, "unresolved
+/// type"), and a body that needs it (`key.len()`) could not check at all.
+/// `native_differential` runs the program on both backends.
+#[test]
+fn b513_a_generic_calls_annotated_result_types_a_closure_arguments_parameters() {
+    assert_compiles_and_runs(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let shown: Shared<|str| void> = Shared::new(|key| print(i"key={key}"));
+            (shown.read())("k");
+            let measured: Shared<|str| usize> = Shared::new(|key| key.len());
+            print((measured.read())("abc"));
+            let summed: Shared<|i32, i32| i32> = Shared::new(|a, b| a + b);
+            print((summed.read())(2, 3));
+        }
+        "#,
+        "key=k\n3\n5\n",
+    );
+}
+
+/// B518: a closure type whose PARAMETER is itself a closure prints with the
+/// parameter parenthesized, as it is written — `|(|i32| void)| void` — in
+/// diagnostics and hover alike; it printed `||i32| void| void`.
+#[test]
+fn b518_a_closure_typed_parameter_prints_parenthesized() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let lend: |(|i32| void)| void = |f: (|i32| void)| f(1);
+            let wrong: i32 = lend;
+        }
+        "#,
+        "but got |(|i32| void)| void",
     );
 }

@@ -857,7 +857,7 @@ with `.memo()` where two things read it, or hand it straight to `each`:
 
 ```vilan,browser
 import std::reactive::{ ListCell, Signal, SignalCell };
-import std::ui::{ each, mount_root, view };
+import std::web::ui::{ each, mount_root, view };
 
 [derive(PartialEq)]
 struct Task {

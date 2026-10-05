@@ -95,7 +95,11 @@ uses that working tree instead; **`vilan.stdPath`** overrides both.
 Every setting applies live, with no window reload: the feature toggles are
 pushed to the running server, and a changed `vilan.server.path` / `vilan.stdPath`
 restarts it for you. (There is also a **Vilan: Restart Language Server**
-command, for when you have rebuilt the binary underneath it.)
+command, for when you have rebuilt the binary underneath it, and **Vilan: Stop
+Language Server** / **Vilan: Start Language Server** to silence it and bring it
+back.) The `vilan 0.43.0` item in the status bar opens a menu with the file's
+platform and entry, the last analysis' size, a switch per feature, and those
+commands.
 
 `vilan.organizeImports.onSave` is handled by the extension's own on-save hook,
 so it leaves your `editor.codeActionsOnSave` untouched. If you would rather

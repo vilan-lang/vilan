@@ -10,8 +10,8 @@
 // in `items` like anyone else's would.
 //
 // `Signal`, `SignalCell`, `view`, `View` and `Result`/`Ok`/`Err` are ambient
-// under `prelude = "std::web"` (vilan.toml), and the style chains below reach
-// `std::style` through the ambient MODULE — one ambient name for the whole
+// under `prelude = "std::web::prelude"` (vilan.toml), and the style chains below reach
+// `std::web::style` through the ambient MODULE — one ambient name for the whole
 // namespace, which is why every spelling is `style::…` and nothing imports it.
 // Importing the member `style` would shadow that module and take `style::Color`
 // down with it, so even the builder stays qualified. `format`, `combine` and

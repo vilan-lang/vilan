@@ -1,5 +1,5 @@
 import std::io::print;
-import std::style::{ Display, Style, declarations, declare, preflight, style };
+import std::web::style::{ Display, Style, declarations, declare, preflight, style };
 
 // The opt-in base stylesheet (kolt.local 008): one `const preflight()` and the
 // build's sheet gains a reset — Tailwind's preflight scope adapted, plus the

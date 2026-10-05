@@ -2,18 +2,18 @@
 // one note's editor at "/note/{id}". Lists render live off the mirror;
 // the editor commits per keystroke through drafts.
 //
-// The import block below is what the `std::web` prelude (vilan.toml) leaves:
+// The import block below is what the web prelude (`std::web::prelude`) (vilan.toml) leaves:
 // `Option`/`Some`/`None`, `Result`/`Ok`/`Err`, `Signal`, `SignalCell`, `view` and
-// `View` are ambient members, and the whole nine-name `std::style` block is gone
+// `View` are ambient members, and the whole nine-name `std::web::style` block is gone
 // because `style` is an ambient MODULE — one ambient name for the namespace, so
 // every spelling below is `style::…`. Note what would break it: importing the
 // member `style` to write the builder bare would SHADOW that module, and
 // `style::Color` in the same file would stop resolving.
 
 import std::reactive::{ Draft, DraftState, draft };
-import std::router::{ link, navigate };
 import std::rpc::{ ConnectionState, RpcError, SocketTransport };
-import std::storage;
+import std::web::router::{ link, navigate };
+import std::web::storage;
 import pkg::notes::{ AuthOutcome, Note };
 import pkg::routes::{ Route, href };
 import pkg::store::NotesClient;

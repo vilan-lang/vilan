@@ -37,7 +37,7 @@ error inside `const` ("`now()` is not const-evaluable"), not a deferred
 runtime call: the answer would not be a constant.
 
 The deliberate exception is the **compile-time file channel**,
-`std::asset`, callable **only** during const evaluation, in three
+`std::web::asset`, callable **only** during const evaluation, in three
 directions. `emit(kind, content)` is the output direction for lines: it
 declares a build asset (the styling system's CSS, for example) that the
 build writes beside the output; its ordered spelling
@@ -111,7 +111,7 @@ once, after every const evaluation of this compile has finished, in a
 const context of its own. A module can then accumulate while the
 program evaluates and process and emit the whole result in one go at
 the end, instead of emitting each piece the moment it is minted and
-being unable to take any of it back — which is how `std::style` writes
+being unable to take any of it back — which is how `std::web::style` writes
 a stylesheet holding the rules that survived rather than every rule
 ever built.
 
@@ -137,7 +137,7 @@ token the build still **names** — the token appears in a value some
 `const` expression evaluated to — in `(token, line)` order and
 deduplicated on that pair. `staged` answers only after evaluation has
 finished, so it is read from a finaliser and refuses anywhere else.
-That is how `std::style` puts the rules that survived on the sheet
+That is how `std::web::style` puts the rules that survived on the sheet
 instead of every rule ever constructed: a condition combinator re-mints
 an inner style's rules under the composed condition and drops the
 inner, so the inner's class is in no surviving style and its rule never
@@ -269,5 +269,23 @@ export const let space = scale_step(0.25);
 
 fun main() {
 	print(space(8f));
+}
+```
+
+Both take the label prefix a plain declaration takes, written ahead of
+the keywords (§3.2's one order), so the deprecation policy reaches a
+compile-time helper too:
+
+```vilan
+[deprecated("use scale_step")]
+export const fun step(rem: f64): |f64| f64 {
+	|n: f64| rem * n
+}
+
+[internal("tuning, not a contract")]
+const let base = 0.25;
+
+fun main() {
+	print(base);
 }
 ```

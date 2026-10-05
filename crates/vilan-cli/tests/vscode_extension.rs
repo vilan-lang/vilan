@@ -638,26 +638,64 @@ fn e214_the_setting_off_leaves_on_type_formatting_in_charge() {
     );
 }
 
-// --- F27 R1/R6: the platform status line --------------------------------------
+// --- F27 R1/R6, E247: the status bar item and its menu --------------------------
 
-/// The status bar says which platform the active vilan file is analyzed under
-/// and which kind of fact chose it — `analyzed as: browser — declared` — with
-/// the whole reason as its tooltip, and it follows the file as it is edited.
+/// The status bar item reads the server's version (`vilan 0.43.0`, E247's
+/// R-a) and keeps the platform and its whole reason in its tooltip — the text
+/// and the menu rows are `menu.ts`'s decisions, which `npm test` pins — and it
+/// follows the file as it is edited, shown for a vilan file.
 #[test]
-fn f27_the_status_line_names_the_platform_and_the_kind_of_fact() {
+fn f27_e247_the_status_item_reads_the_version_and_opens_the_menu() {
     let source = extension_source();
     assert!(source.contains("window.createStatusBarItem(StatusBarAlignment.Right, 100)"));
+    assert!(source.contains(
+        "platformStatus.text = statusText(running, client?.initializeResult?.serverInfo?.version);"
+    ));
+    assert!(source.contains("platformStatus.tooltip = statusTooltip(running, fileStatus);"));
+    assert!(source.contains("platformStatus.command = 'vilan.showMenu';"));
+    let menu = std::fs::read_to_string(extension_dir().join("src/menu.ts")).expect("menu.ts");
     assert!(
-        source.contains("`analyzed as: ${answer.platform} — ${answer.kind}`"),
-        "the line's text"
+        menu.contains("`analyzed as: ${file.platform} — ${file.kind}`"),
+        "the platform row keeps F27's text"
     );
-    assert!(source.contains("platformStatus.tooltip = answer.reason"));
     // Shown for a vilan file only, and re-asked after edits settle.
     assert!(source.contains("editor.document.languageId !== 'vilan'"));
     assert!(
         source.contains("window.onDidChangeActiveTextEditor(() => void refreshPlatformStatus())")
     );
     assert!(source.contains("schedulePlatformRefresh();"));
+}
+
+/// E248: stop and start beside restart, each declared in `package.json`; a
+/// stopped server is not restarted by a settings change.
+#[test]
+fn e248_stop_and_start_are_commands_and_a_stop_holds() {
+    let source = extension_source();
+    for command in [
+        "vilan.stopServer",
+        "vilan.startServer",
+        "vilan.showMenu",
+        "vilan.showOutput",
+    ] {
+        assert!(
+            source.contains(&format!("commands.registerCommand('{command}'")),
+            "{command} is registered"
+        );
+        assert!(
+            manifest_field(&format!(
+                "contributes.commands.some(c => c.command === '{command}')"
+            )) == "true",
+            "{command} is declared in package.json"
+        );
+    }
+    assert!(
+        source.contains("stopping.diagnostics?.clear();"),
+        "a stop clears its squiggles"
+    );
+    assert!(
+        source.contains("if (!stopped) {\n                    await startClient(context);"),
+        "a settings change does not restart a stopped server"
+    );
 }
 
 // --- The extension's own tests (`npm test`) ----------------------------------

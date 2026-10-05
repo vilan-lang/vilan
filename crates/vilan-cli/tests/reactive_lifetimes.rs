@@ -113,12 +113,12 @@ fn build_and_run(tag: &str, app: &str, harness: &str, support: &[(&str, &str)]) 
 
 // --- A28: the derivation combinators are detachable --------------------------
 
-/// The idiom `std::router` documents, run 25 times: derive the typed route from
+/// The idiom `std::web::router` documents, run 25 times: derive the typed route from
 /// the module-level path signal inside a `mount_root` body, then dispose.
 const ROUTER_IDIOM: &str = r#"import std::io::print;
 import std::reactive::{ Disposable, Signal, SignalCell };
-import std::router::{ current_path, segments };
-import std::ui::{ View, mount_root, view };
+import std::web::router::{ current_path, segments };
+import std::web::ui::{ View, mount_root, view };
 
 [derive(PartialEq)]
 enum Route {
@@ -168,7 +168,7 @@ fn derivations_detach_from_their_source_with_their_boundary() {
 const TWO_WAY_BINDINGS: &str = r#"import std::io::print;
 import std::option::Option::{ None, self };
 import std::reactive::{ Signal, SignalCell, draft };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun main() {
 	let typed = Signal::new("");
@@ -227,7 +227,7 @@ require("./app.js");
 const CYCLE_EXEMPLAR: &str = r#"import std::json::json_codec;
 import std::reactive::{ Disposable, Signal, SignalCell };
 import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 let path: SignalCell<str> = Signal::new("/");
 let depth: SignalCell<usize> = path.derive(|value| value.len()).cell_global();

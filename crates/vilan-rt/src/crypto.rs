@@ -1,4 +1,4 @@
-//! `vilan-rt::crypto` — the digests `std::crypto` and `std::rpc_server` bind
+//! `vilan-rt::crypto` — the digests `std::crypto` and `std::rpc::server` bind
 //! (tracker F18 slices 2 and 3).
 //!
 //! # What this is a twin OF
@@ -12,7 +12,7 @@
 //! standing preference over a wrong answer — and adding them is the SHA-512
 //! block function and nothing else.
 //!
-//! Slice 3 adds the one other digest std reaches: `std::rpc_server`'s
+//! Slice 3 adds the one other digest std reaches: `std::rpc::server`'s
 //! WebSocket handshake binds node:crypto's `createHash("sha1")` →
 //! `update(text)` → `digest("base64")` for RFC 6455's `Sec-WebSocket-Accept`
 //! proof. [`NodeHash`] is that host object; [`sha1`] and [`base64`] are the
@@ -244,7 +244,7 @@ struct HashState {
     finalized: bool,
 }
 
-/// node:crypto's `Hash` — `std::rpc_server`'s `external struct NodeHash`, the
+/// node:crypto's `Hash` — `std::rpc::server`'s `external struct NodeHash`, the
 /// object `createHash(algorithm)` answers (F18 slice 3).
 ///
 /// A handle, because the host object is one: `update` answers `this` and the
@@ -452,7 +452,7 @@ mod tests {
 
     /// **The seam's pin: RFC 6455 §1.3's own handshake.** A client key of
     /// `dGhlIHNhbXBsZSBub25jZQ==` is answered with `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`,
-    /// computed exactly as `std::rpc_server`'s `ws_accept_key` spells it:
+    /// computed exactly as `std::rpc::server`'s `ws_accept_key` spells it:
     /// `createHash("sha1").update(key + GUID).digest("base64")`.
     #[test]
     fn the_rfc_6455_accept_key_is_the_rfcs_own_answer() {

@@ -367,6 +367,7 @@ mod tests {
                 ast,
                 text,
                 parse_errors: &[],
+                parse_warnings: &[],
             },
         )
     }

@@ -4,7 +4,7 @@
 //!
 //! # Why this is the right gate
 //!
-//! It needs no new oracle. `ssr_differential` proves a second `std::ui`
+//! It needs no new oracle. `ssr_differential` proves a second `std::web::ui`
 //! implementation by compiling one program two ways and comparing bytes; this
 //! is the same shape applied to a BACKEND rather than to a platform, and the
 //! corpus it runs over is the one the whole project already trusts to say what
@@ -146,6 +146,305 @@ const B473_PROBE: &str = concat!(
     "\tprint(walk(Count { n = 0 }));\n",
     "}\n",
 );
+
+/// B532's program, `inference::dyn_objects`' `B532_PROGRAM`: objects over
+/// SUB-traits of a trait implemented at two instantiations.
+/// B489 + opaque-returns.md find 2: a bare-trait return's arguments reach the
+/// body, and a generic one instantiated twice returns each instantiation's type.
+const B489_PROBE: &str = concat!(
+    "import std::reactive::{ Source, SignalCell };\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "\n",
+    "fun nothing(): Source<Option<i32>> { SignalCell::new(None) }\n",
+    "\n",
+    "fun chosen(flag: bool): Source<Option<str>> {\n",
+    "    if flag { SignalCell::new(None) } else { SignalCell::new(Some(\"x\")) }\n",
+    "}\n",
+    "\n",
+    "fun wrap<T>(value: T): Source<T> { SignalCell::new(value) }\n",
+    "\n",
+    "fun main() {\n",
+    "    print(nothing().get().is_none());\n",
+    "    print(chosen(false).get().is_none());\n",
+    "    print(wrap(1).get());\n",
+    "    print(wrap(\"s\").get());\n",
+    "}\n",
+);
+
+const B532_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Shape<T> {\n",
+    "    fun area(self): T;\n",
+    "}\n",
+    "\n",
+    "trait Named<T> with Shape<T> {}\n",
+    "\n",
+    "trait Titled<T> with Named<T> {}\n",
+    "\n",
+    "trait Big with Shape<str> {}\n",
+    "\n",
+    "struct Square {\n",
+    "    side: i32,\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<i32> {\n",
+    "    fun area(self): i32 {\n",
+    "        self.side * self.side\n",
+    "    }\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<str> {\n",
+    "    fun area(self): str {\n",
+    "        \"big\"\n",
+    "    }\n",
+    "}\n",
+    "\n",
+    "impl Square with Named<str> {}\n",
+    "\n",
+    "impl Square with Named<i32> {}\n",
+    "\n",
+    "impl Square with Titled<str> {}\n",
+    "\n",
+    "impl Square with Big {}\n",
+    "\n",
+    "fun through_bound<S: Named<str>>(shape: S): str {\n",
+    "    shape.area()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "    let titled: dyn Named<str> = Square { side = 2 };\n",
+    "    print(titled.area());\n",
+    "    let counted: dyn Named<i32> = Square { side = 3 };\n",
+    "    print(counted.area());\n",
+    "    let deeper: dyn Titled<str> = Square { side = 4 };\n",
+    "    print(deeper.area());\n",
+    "    let big: dyn Big = Square { side = 5 };\n",
+    "    print(big.area());\n",
+    "    print(through_bound(Square { side = 6 }));\n",
+    "}\n",
+);
+
+const B502_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Shape<T> {\n",
+    "\tfun area(self): T;\n",
+    "}\n",
+    "\n",
+    "struct Square {\n",
+    "\tside: i32,\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<i32> {\n",
+    "\tfun area(self): i32 {\n",
+    "\t\tself.side * self.side\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape<str> {\n",
+    "\tfun area(self): str {\n",
+    "\t\t\"big\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun measure<T, S: Shape<T>>(shape: S): T {\n",
+    "\tshape.area()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet named: dyn Shape<str> = Square { side = 4 };\n",
+    "\tlet counted: dyn Shape<i32> = Square { side = 5 };\n",
+    "\tprint(measure(named));\n",
+    "\tprint(measure(counted));\n",
+    "\tlet again: dyn Shape<str> = Square { side = 1 };\n",
+    "\tprint(measure(again));\n",
+    "\tlet shapes: List<dyn Shape<i32>> = [Square { side = 3 }];\n",
+    "\tfor shape in shapes {\n",
+    "\t\tprint(measure(shape));\n",
+    "\t}\n",
+    "}\n",
+);
+
+const B510_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Obs<T> {\n",
+    "\tfun start(own self): T;\n",
+    "\tfun observe(own self, observer: |T| void) {\n",
+    "\t\tobserve_flow(self, |value| observer(value), true)\n",
+    "\t}\n",
+    "\tfun first(own self): T {\n",
+    "\t\tfirst_of(self)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun observe_flow<U, F: Obs<U>>(own flow: F, observer: |U| void, immediately: bool) {\n",
+    "\tlet value = flow.start();\n",
+    "\tif immediately {\n",
+    "\t\tobserver(value);\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun first_of<U, F: Obs<U>>(own flow: F): U {\n",
+    "\tflow.start()\n",
+    "}\n",
+    "\n",
+    "trait Wrap<T> with Obs<T> {\n",
+    "\tfun wrapped(own self): T {\n",
+    "\t\tthrough_sub(self)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun through_sub<U, W: Wrap<U>>(own wrap: W): U {\n",
+    "\twrap.start()\n",
+    "}\n",
+    "\n",
+    "struct Thing {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Thing with Obs<i32> {\n",
+    "\tfun start(own self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Thing with Wrap<i32> {}\n",
+    "\n",
+    "struct Word {\n",
+    "\ts: str,\n",
+    "}\n",
+    "\n",
+    "impl Word with Obs<str> {\n",
+    "\tfun start(own self): str {\n",
+    "\t\tself.s\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tThing { n = 5 }.observe(|n| print(n + 1));\n",
+    "\tWord { s = \"w\" }.observe(|s| print(s));\n",
+    "\tprint(Thing { n = 6 }.first());\n",
+    "\tprint(Word { s = \"v\" }.first());\n",
+    "\tprint(Thing { n = 7 }.wrapped());\n",
+    "}\n",
+);
+
+const B498_PROBE: &str = concat!(
+    "import std::default::Default;\n",
+    "import std::reactive::delta::IntoFlow;\n",
+    "import std::io::print;\n",
+    "\n",
+    "trait Fresh<T> {\n",
+    "\tfun fresh(self): T;\n",
+    "}\n",
+    "\n",
+    "struct Stage<S, R> {\n",
+    "\ts: S,\n",
+    "\tr: R,\n",
+    "}\n",
+    "\n",
+    "impl Stage<type S, type R: IntoFlow<type N: Default>> with Fresh<N> {\n",
+    "\tfun fresh(self): N {\n",
+    "\t\tN::default()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun through<F: Fresh<T>, T>(f: F): T {\n",
+    "\tf.fresh()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(Stage { s = \"x\", r = 1 }.fresh());\n",
+    "\tprint(through(Stage { s = \"x\", r = \"y\" }) == \"\");\n",
+    "\tprint(through(Stage { s = 1, r = 5 }) + 1);\n",
+    "\tprint(Fresh::fresh(Stage { s = 1, r = true }));\n",
+    "}\n",
+);
+
+const B514_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct P {\n",
+    "\tx: i32,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet n = 4;\n",
+    "\tlet m = 5;\n",
+    "\tprint(*if n < m { &n } else { &m });\n",
+    "\tlet s = \"a\";\n",
+    "\tlet t = \"b\";\n",
+    "\tprint(*if n > m { &s } else { &t });\n",
+    "\tlet picked = *if n < m { &n } else { &m };\n",
+    "\tprint(picked + 1);\n",
+    "\tprint(*match n {\n",
+    "\t\t4 => &m,\n",
+    "\t\t_ => &n,\n",
+    "\t});\n",
+    "\tprint(*if n > m { &n } else if n == 4 { &m } else { &n });\n",
+    "\tlet flag = n < m;\n",
+    "\tprint(*if flag { &true } else { &false });\n",
+    "\tlet p = P { x = 1 };\n",
+    "\tlet q = P { x = 2 };\n",
+    "\tlet r = *if n < m { &q } else { &p };\n",
+    "\tprint(r.x);\n",
+    "}\n",
+);
+
+const B511_PROBE: &str = concat!(
+    "import std::compare::PartialEq;\n",
+    "import std::io::print;\n",
+    "\n",
+    "trait Same {\n",
+    "\tfun same(&self, other: &Self): bool;\n",
+    "\tfun differs(&self, other: &Self): bool {\n",
+    "\t\t!self.same(other)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl type T: PartialEq with Same {\n",
+    "\tfun same(&self, other: &T): bool {\n",
+    "\t\t*self == *other\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "trait Swap {\n",
+    "\tfun swapped(self): Self;\n",
+    "}\n",
+    "\n",
+    "impl (type A, type B) with Swap {\n",
+    "\tfun swapped(self): (A, B) {\n",
+    "\t\tself\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "[derive(PartialEq)]\n",
+    "struct Pair {\n",
+    "\ta: i32,\n",
+    "\tb: i32,\n",
+    "}\n",
+    "\n",
+    "fun through<T: PartialEq>(a: T, b: T): bool {\n",
+    "\tSame::same(&a, &b)\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet x = Pair { a = 1, b = 2 };\n",
+    "\tlet y = Pair { a = 1, b = 2 };\n",
+    "\tlet z = Pair { a = 1, b = 3 };\n",
+    "\tprint(Same::same(&x, &y));\n",
+    "\tprint(Same::same(x, &z));\n",
+    "\tprint(Same::same(&1, &1));\n",
+    "\tprint(Same::same(&\"x\", &\"y\"));\n",
+    "\tprint(Same::differs(&x, &z));\n",
+    "\tprint(through(x, z));\n",
+    "\tprint(through(\"a\", \"a\"));\n",
+    "\tlet pair = Swap::swapped((1, \"one\"));\n",
+    "\tprint(pair.1);\n",
+    "}\n",
+);
 const B467_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -168,7 +467,7 @@ const B467_PROBE: &str = concat!(
 const RC_PROBE: &str = concat!(
     "import std::io::print;\n",
     "import std::shared::Shared;\n",
-    "import std::delta::ListCell;\n",
+    "import std::reactive::delta::ListCell;\n",
     "\n",
     "struct P { x: i32, tags: List<i32> }\n",
     "\n",
@@ -738,6 +1037,12 @@ const DEFAULT_SUITE: &[&str] = &[
     // through a `Shared` view, refused by name until the read became a scoped
     // borrow and the place's statement settled its value first.
     "shared.vl",
+    // F83: `cell.write() += 1` — a compound write through a counted cell, as
+    // a statement, in a closure, on a field, in an effect run inline and from a
+    // turn drain, and on a captured and a module-level `mut`. Every one died
+    // natively with "a cell was read while it is being updated" until the
+    // value was settled before the cell's `set` took its borrow.
+    "shared-compound-write.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -788,37 +1093,39 @@ const ASYNC_SUITE: &[&str] = &[
 /// Order 44 seal (a host binding's by-value argument moved its `salt`) behind
 /// an E0308 (a `match` literal pattern written at the arms' width over a
 /// `usize`), and nothing ran it. [`every_platform_bound_program_is_identical_or_named`]
-/// requires these four and classifies the rest.
-const PLATFORM_BOUND_REQUIRED: &[&str] =
-    &["crypto.vl", "db.vl", "asset_bundle.vl", "element-syntax.vl"];
+/// requires these and classifies the rest. `estate.vl` joined them with E243:
+/// the JS `vilan run` printed its asset report on stdout ahead of the
+/// program's output, and reports on stderr now.
+const PLATFORM_BOUND_REQUIRED: &[&str] = &[
+    "crypto.vl",
+    "db.vl",
+    "asset_bundle.vl",
+    "element-syntax.vl",
+    "estate.vl",
+];
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
 /// agree on for a reason that is not the program's, named with the reason.
-const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[(
-    "estate.vl",
-    "the JS `vilan run` prints its build's asset report (`Bundled  robots.txt`, ...) on \
-     STDOUT ahead of the program's output, and the native run reports nothing; the \
-     program's own three lines are identical",
-)];
+const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[];
 
 /// Modules whose presence in an `import` means the program reaches a platform
 /// surface S1a has none of. Written as a support list so Order 38 widens the
 /// corpus by deleting rows rather than by rewriting the walk.
 const PLATFORM_MODULES: &[&str] = &[
-    "std::dom",
+    "std::web::dom",
     "std::fetch",
     "std::fs",
     "std::http",
     "std::db",
     "std::rpc",
-    "std::ui",
-    "std::web",
-    "std::storage",
-    "std::router",
-    "std::dev",
+    "std::web::ui",
+    "std::web::prelude",
+    "std::web::storage",
+    "std::web::router",
+    "std::web::dev",
     "std::canvas",
     "std::process",
-    "std::asset",
+    "std::web::asset",
     "std::build",
     "std::task",
     "std::time",
@@ -3006,7 +3313,7 @@ const A146_PROBE: &str = concat!(
     "import std::io::print;\n",
     "import std::option::Option::{ self, None, Some };\n",
     "import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, derive };\n",
-    "import std::delta::ListCell;\n",
+    "import std::reactive::delta::ListCell;\n",
     "import std::rpc::{ KeyedCell, Keyed };\n",
     "import std::shared::Shared;\n",
     "\n",
@@ -4165,7 +4472,7 @@ fn the_kolt_shapes_lowering_gaps_build_the_same_on_both_backends() {
 }
 
 const KOLT_LOWERING_PROBE: &str = concat!(
-    "import std::asset;\n",
+    "import std::web::asset;\n",
     "import std::io::print;\n",
     "import std::option::Option::{ self, None, Some };\n",
     "\n",
@@ -5323,7 +5630,7 @@ const BIGINT_TRAP_PROBE: &str = concat!(
     "}\n",
 );
 
-/// **F18 slice 3's two seams**: node:crypto's SHA-1 behind `std::rpc_server`'s
+/// **F18 slice 3's two seams**: node:crypto's SHA-1 behind `std::rpc::server`'s
 /// `ws_accept_key`, and `std::time`'s host clock — the two host bindings, beside
 /// F33's `Bytes`, that stood between `Server::builder()` and the native backend.
 ///
@@ -5360,7 +5667,7 @@ fn the_websocket_accept_key_and_the_host_clock_agree_on_both_backends() {
 
 const SEAMS_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::rpc_server::ws_accept_key;\n",
+    "import std::rpc::server::ws_accept_key;\n",
     "import std::time::{ now, now_millis };\n",
     "\n",
     "fun main() {\n",
@@ -7927,7 +8234,7 @@ const F58_TOY_PROBE: &str = concat!(
 
 const F58_LIST_CELL_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::delta::ListCell;\n",
+    "import std::reactive::delta::ListCell;\n",
     "import std::reactive::{ Disposable, Source };\n",
     "\n",
     "fun watch<S: Source<List<str>>>(source: S) {\n",
@@ -8239,6 +8546,32 @@ fn every_platform_bound_program_is_identical_or_named() {
     }
 }
 
+/// E243: the JS `vilan run` reports the resources its build bundled on
+/// STDERR, so stdout is the program's alone — it printed `Bundled  …` lines on
+/// stdout ahead of the program's first line while the native run printed
+/// nothing, and `estate.vl` sat outside the platform-bound differential for
+/// it. The assertion reads only the word `Bundled` on each stream, never a
+/// path, so it holds on Windows, where the destination prints with `\`.
+#[test]
+fn the_js_run_reports_its_bundled_resources_on_stderr() {
+    let staged = stage();
+    let run = vilan(&staged)
+        .args(["run", "estate.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert!(run.status.success(), "estate.vl runs: {run:?}");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !stdout.contains("Bundled"),
+        "stdout is the program's alone:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("Bundled"),
+        "the build's report still says what it bundled, on stderr:\n{stderr}"
+    );
+}
+
 /// F57's second defect: a `match` literal pattern takes the SUBJECT's width,
 /// never the expectation around the `match` (the arms' type). It stood behind
 /// `crypto.vl`'s E0382 in `std::base64::decode_url`, so the platform-bound pin
@@ -8491,6 +8824,126 @@ fn a_supertrait_override_is_dispatched_through_a_subtrait_on_both_backends() {
     );
 }
 
+/// B511: a qualified call to a blanket impl's member is monomorphized on both
+/// backends — a struct by view and bare, a scalar, a `str`, the blanket's trait
+/// default, a caller's parameter whose bound reaches the blanket, and a tuple
+/// subject. JS emitted the blanket's body un-instanced (`self === other`) and the
+/// native backend refused "a value of an unbound generic type parameter";
+/// `inference::traits`' `b511_*` pins hold the JS values.
+#[test]
+fn a_qualified_call_to_a_blankets_member_is_monomorphized_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b511.vl"), B511_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b511.vl"),
+        Verdict::Identical,
+        "a qualified call to a blanket's member must answer as the method form does on both backends"
+    );
+}
+
+/// B514: `*` over a value `if`/`match` of scalar views reads the value on both
+/// backends — a scalar, a `str`, a `bool`, an `else if` chain, a bound result,
+/// and an aggregate beside them. JS printed the chosen place's `(base, key)`
+/// pair. (`*{ &m }`, a block tail, is held out: the native backend refuses it at
+/// rustc, E0614, on 0.43.0 as well — a native find; `inference::borrows`' `b514_*`
+/// pin holds the JS value.)
+#[test]
+fn a_dereferenced_conditional_of_scalar_views_reads_the_value_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b514.vl"), B514_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b514.vl"),
+        Verdict::Identical,
+        "a dereferenced conditional of scalar views must read the value on both backends"
+    );
+}
+
+/// B498: a static call on an impl's NESTED binder (`N::default()` under `type R:
+/// IntoFlow<type N: Default>`) is grounded when the member is reached through a
+/// generic bound, on both backends. The JS emitter bound the impl's binders from
+/// the receiver's shape alone and raised "internal: a call resolved to
+/// `Default`'s requirement `default`"; native printed the values.
+#[test]
+fn a_static_call_on_a_nested_binder_reached_through_a_bound_is_grounded_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b498.vl"), B498_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b498.vl"),
+        Verdict::Identical,
+        "a nested binder must be grounded through a bound on both backends"
+    );
+}
+
+/// B510: a trait default handing `self` to a generic over its own trait runs on
+/// both backends — the observer passed on, wrapped in a closure literal, and
+/// through a sub-trait's default. Both refused "Expected T, but got i32" (the
+/// first implementor answered for `Self`); past that, JS raised "internal: a call
+/// resolved to `Obs`'s requirement `start`".
+#[test]
+fn a_trait_default_passing_self_to_a_generic_over_its_trait_runs_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b510.vl"), B510_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b510.vl"),
+        Verdict::Identical,
+        "a trait default passing self to a generic over its trait must run on both backends"
+    );
+}
+
+/// B502: a trait object binds a bound's arguments from what it carries — a
+/// `dyn Shape<str>` whose type implements `Shape` twice, both objects in one
+/// program, and a list of objects — on both backends. Both refused "'dyn
+/// Shape<str>' does not implement trait 'Shape<i32>'" (the first impl answered
+/// for the object).
+#[test]
+fn a_trait_object_binds_a_bounds_arguments_from_its_own_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b502.vl"), B502_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b502.vl"),
+        Verdict::Identical,
+        "a trait object must bind a bound's arguments from its own on both backends"
+    );
+}
+
+/// B489: `SignalCell::new(None)` under a `Source<Option<i32>>` return types
+/// from the annotation's arguments — natively it was refused "an unresolved
+/// type". With it, opaque-returns.md's find 2 (a generic bare-trait return
+/// instantiated twice, which JS's pin cannot see): already right on this base,
+/// pinned so it stays so.
+#[test]
+fn a_bare_trait_returns_arguments_reach_the_body_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b489.vl"), B489_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b489.vl"),
+        Verdict::Identical,
+        "a bare-trait return's arguments must reach the body on both backends"
+    );
+}
+
+/// B532: an object over a SUB-trait answers a supertrait's member from the
+/// supertrait's instantiation the clause chain passes (`dyn Named<str>` over
+/// `Named<T> with Shape<T>` answers `area` from `Shape<str>`). JS answered from
+/// `Shape<i32>`; natively rustc refused the emitted table (E0308).
+#[test]
+fn an_object_over_a_subtrait_answers_from_the_supertraits_instantiation_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b532.vl"), B532_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b532.vl"),
+        Verdict::Identical,
+        "an object over a sub-trait must answer from the supertrait's instantiation on both backends"
+    );
+}
+
 /// B467: a closure whose `&mut` is its own PARAMETER is stored in a struct
 /// field and called through it on both backends — the analyzer refused it as a
 /// view escape before. (`inference::borrows`' `b467_*` pin covers the other
@@ -8714,6 +9167,310 @@ fn a_bare_variant_of_a_generic_enum_is_identical_on_both_backends() {
     );
 }
 
+/// F66: a variant constructor INSIDE a generic body closes its enum's
+/// arguments per instance. The analyzer records one type per SITE, and
+/// `variant_arguments` read that record first: inside `Maybe<T>::map<U>` the
+/// site of `Maybe::Just(f(x))` recorded the receiver's `Maybe<T>`, so the
+/// `(str, i32)` instance minted `Maybe<(str, i32)>` for a `Maybe<i32>` value
+/// and rustc refused the emission (E0308 four times on 0.43.0). The position
+/// and the payload are read under the instance and come first; a record closed
+/// in itself (no parameter in it) still wins, being the same in every
+/// instance. The probe: a payload of the method's own parameter, a nullary
+/// variant at a generic return, a two-parameter enum built swapped (two
+/// instances each way), a nested payload, a binding annotated in the
+/// instance's parameter, and `Option`'s constructors inside a generic body.
+#[test]
+fn a_variant_built_inside_a_generic_instance_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_instance_variants.vl"),
+        include_str!("native/generic_instance_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_instance_variants.vl"),
+        Verdict::Identical,
+        "a variant built inside a generic instance must take that instance's arguments"
+    );
+}
+
+/// A closure's expression body is the closure's RETURN position (native-46's
+/// find, beside F66). `closure_body` handed the body the expectation the
+/// literal arrived under — the closure TYPE — so a variant constructor whose
+/// site recorded an open type (`|k: i32| Maybe::Just(k + 1)`, recorded
+/// `Maybe<any>`, a payload with no record of its own) had nothing to close
+/// from and was refused as "a generic type instantiated at `any`". The body
+/// now takes the position's return when it is closed, else the literal's
+/// written one. The probe: a sum, a string literal, an interpolation and a
+/// nested constructor as payloads, an `if` choosing between two constructors,
+/// a written return (also handed to a generic callee), and a literal at a
+/// narrow `u8` return.
+#[test]
+fn a_closure_body_takes_the_closures_return_as_its_position_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_closure_body_positions.vl"),
+        include_str!("native/closure_body_positions.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_closure_body_positions.vl"),
+        Verdict::Identical,
+        "a closure body must be emitted at the closure's return position"
+    );
+}
+
+/// F70: a NESTED tuple access natively. The analyzer folds `t.0.1` onto its
+/// root and records the JS layout's FLAT offset, and the emitter wrote that
+/// offset as a Rust tuple index — `t.0.1` over `((1, 2), 3)` read `t.1` and
+/// printed `3` where node prints `2` (a wrong answer with no error whenever the
+/// neighbour has the same type; rustc's E0308 otherwise), and a multi-slot
+/// element was refused by name. The recorded index chain
+/// (`tuple_index_paths`) is the Rust path. The probe: a same-typed
+/// neighbour, a write, a compound write, a `&mut` handed on, a multi-slot read,
+/// a destructure of a nested element, three levels, a `Shared` view read and
+/// write, and a generic function at an instance whose parameter is a tuple.
+#[test]
+fn a_nested_tuple_access_reads_the_nested_element_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_nested_tuple_slots.vl"),
+        include_str!("native/nested_tuple_slots.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_nested_tuple_slots.vl"),
+        Verdict::Identical,
+        "a nested tuple access must read the element its index chain names"
+    );
+}
+
+/// F67: a LOCAL closure binding called and then read. The literal's cast
+/// left its return to Rust (`as Rc<dyn Fn(i32) -> _>`), which settles it from
+/// the closure's first use — too late for `make(1).name` (E0282) and wrongly
+/// for `i"{f()}"` over `f = || row.name` (the unsized `str`, E0277). The cast
+/// writes the return the body was rendered at, else the literal's recorded
+/// one. The probe: a field read and arithmetic on a call, a `str` and an `i32`
+/// return interpolated, a method on the result, a closure returning a
+/// closure, a list and an `Option`.
+#[test]
+fn a_local_closures_result_is_read_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_local_closure_returns.vl"),
+        include_str!("native/local_closure_returns.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_local_closure_returns.vl"),
+        Verdict::Identical,
+        "a local closure's result must be readable the same way on both backends"
+    );
+}
+
+/// F69 + F77: a closure whose parameter is a VIEW, reached other than
+/// through the type written for it. The analyzer records a closure type's
+/// views beside the WRITTEN annotation, by id; a closure arriving through a
+/// match capture, a loop binding or a closure's unannotated parameter carries
+/// a type built elsewhere, with no record, so its call read `f(&mut s)` into a
+/// copy and `|f| f(&cell.write())` bound `f` as `Fn(T)` against the field's
+/// `Fn(&T)` (rustc E0308). The call keeps the `&`/`&mut` the source wrote
+/// (B464: a closure's view parameter takes a written view), and an
+/// unannotated closure parameter takes the position's written closure type.
+/// The probe: `inference::borrows`' B467 pin (a nested closure's parameter, a
+/// field, a match capture, a loop) and a generic lender over view closures.
+#[test]
+fn a_view_closure_reached_by_another_route_keeps_its_views_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_closure_view_parameters.vl"),
+        include_str!("native/closure_view_parameters.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_closure_view_parameters.vl"),
+        Verdict::Identical,
+        "a view closure reached through a capture, a loop or a parameter must keep its views"
+    );
+}
+
+/// B495: the closure type carries its parameters' MODES, so a literal with a
+/// bare parameter takes the view of the position it reaches by every route —
+/// an annotation re-typing a `let`, a generic identity, an `Option`/`List` of
+/// view closures, a generic struct's field, a match capture, a loop binding,
+/// `List::push` — and the call through each passes a view natively too. JS
+/// stored the `(base, key)` pair as the value at the first two on v0.43.0,
+/// refused the `Option`/`List` literal, and native passed a value to a `&mut`.
+#[test]
+fn a_closure_literal_takes_its_positions_parameter_modes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_closure_parameter_modes.vl"),
+        include_str!("native/closure_parameter_modes.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_closure_parameter_modes.vl"),
+        Verdict::Identical,
+        "a closure literal must take its position's parameter modes on both backends"
+    );
+}
+
+/// B509: `match &mut place` / `&mut place is ..` bind payload captures as
+/// writable views and `match &place` as readonly ones — natively through
+/// Rust's binding modes, a capture handed on to a `&mut` position by reborrow
+/// (`f(p0)` emitted `&mut p0` on a `&mut P` binding, rustc E0596, the first
+/// time std's derive wrote its enum step in place).
+#[test]
+fn a_payload_view_writes_the_enum_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_payload_views.vl"),
+        include_str!("native/payload_views.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_payload_views.vl"),
+        Verdict::Identical,
+        "a payload view must write the enum in place on both backends"
+    );
+}
+
+/// B538: a tuple assignment target holding an element, a nested tuple, a
+/// tuple-typed binding or a tuple-typed position assigns each place on both
+/// backends (JS threw at load; natively `(p).clone()` stood in the pattern,
+/// rustc E0070).
+#[test]
+fn a_tuple_target_of_places_assigns_each_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_tuple_assignment_targets.vl"),
+        include_str!("native/tuple_assignment_targets.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_tuple_assignment_targets.vl"),
+        Verdict::Identical,
+        "a tuple target of places must assign each on both backends"
+    );
+}
+
+/// F48 (pinned, not reproduced at the Order 46 base): a reassigned
+/// closure-typed `mut` binding and a `List` of closures build — F44's counted
+/// literal closed what was filed as rustc E0308 in Order 43.
+#[test]
+fn a_reassigned_closure_binding_and_a_list_of_closures_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_reassigned_closures.vl"),
+        include_str!("native/reassigned_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_reassigned_closures.vl"),
+        Verdict::Identical,
+        "a reassigned closure binding and a list of closures must build and run the same"
+    );
+}
+
+/// F51 (pinned, not reproduced at the Order 46 base): a captured value
+/// returned from a closure — an expression body, a `match` leg, a block tail,
+/// and `KeyedSource::or`'s own shape over a generic list — copies rather than
+/// moving out of the `Fn` closure (F63/F64 closed what was filed as rustc
+/// E0507). The base refuses this probe only for F67's `|| row.name`.
+#[test]
+fn a_capture_returned_from_a_closure_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_captured_returns.vl"),
+        include_str!("native/captured_returns.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_captured_returns.vl"),
+        Verdict::Identical,
+        "a capture handed back from a closure must be copied, not moved"
+    );
+}
+
+/// F78 (pinned, not reproduced at the Order 46 base): a trait DEFAULT calling
+/// an overridable hook reached through a BLANKET — `Flow`'s `on_change`/`sub`
+/// as defaults over `start`, with a generic cell reaching `Flow<List<E>>` only
+/// through the `Source` blanket — builds; Order 45 saw it refused as "an
+/// unbound generic type parameter … of `ListCell`". (The lane also built
+/// `delta-law.vl`, `list-cell.vl` and the reactive programs against a std copy
+/// with those defaults written and eight pipe impls' copies removed:
+/// identical.)
+#[test]
+fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_default_hook_through_blanket.vl"),
+        include_str!("native/default_hook_through_blanket.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_default_hook_through_blanket.vl"),
+        Verdict::Identical,
+        "a default calling a hook a blanket supplies must build and run the same"
+    );
+}
+
+/// A152: `zip_some`'s mapped-tuple stage (start, pull and attach over every
+/// input flow) and `unzip`'s split of a tuple-valued cell, at arity two and
+/// three. Both are mapped tuples, which the native backend refuses by name
+/// today (`combine`'s state, B397's pin above); the claim is the
+/// differential's own — a refusal now, never a different answer, and the same
+/// bytes once it lowers comprehensions.
+#[test]
+fn zip_some_and_unzip_are_never_a_different_answer_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_zip_some_unzip.vl"),
+        include_str!("native/zip_some_unzip.vl"),
+    )
+    .expect("write the probe program");
+    let verdict = compare(&staged, "native_probe_zip_some_unzip.vl");
+    match &verdict {
+        Verdict::Identical => {}
+        Verdict::Refused(reason) => assert!(
+            reason.contains("a mapped tuple"),
+            "refused for another reason than the mapped tuple: {reason}"
+        ),
+        other => panic!(
+            "the native backend must refuse this program by name or print what node prints: \
+             {other:?}"
+        ),
+    }
+}
+
+/// F68 + B503: `print` lays a value out by ONE rule on both backends — node's
+/// `console.log`, which the JS backend binds and `vilan_rt::inspect` ports.
+/// Natively every container printed on one line, so a 22-element `List<str>`
+/// printed one line against node's nine; and a `List<dyn T>` printed each
+/// object as its `[ value, {} ]` pair on BOTH backends (B436 converted a lone
+/// object only). The JS backend now maps a list of objects at the host
+/// boundary, and the native `Js::js_hosted` renders the same split. The probe
+/// walks node's rules (grouped columns padded by kind, the 80-column break, a
+/// many-field struct, the depth cut, "... n more items", string quoting and
+/// splitting, a cell, a map, a set, a tuple, a list of `Option`s) and B503's
+/// shapes (a list and a nested list of objects; an object in an `Option` and in
+/// a struct field, which stay pairs on both).
+#[test]
+fn print_lays_values_out_by_nodes_rule_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_print_layout.vl"),
+        include_str!("native/print_layout.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_print_layout.vl"),
+        Verdict::Identical,
+        "print must lay every value out by node's console.log rule on both backends"
+    );
+}
+
 /// F75: a trait DEFAULT reached through the `Flow` blanket over a generic
 /// source whose `Source` argument is written in the source impl's own binder
 /// — `impl W<type P> with Source<Option<P>>`, then `w.effect(..)` — builds
@@ -8758,10 +9515,11 @@ fn a_default_over_a_source_written_in_its_providers_binder_is_identical_on_both_
 /// Inside the struct's OWN impl a literal of ANOTHER instantiation
 /// (`Pair<V, K>` in `impl Pair<type K, type V>`) cannot take that rule — the
 /// impl's binders are the declaration's parameters, and installing the
-/// literal's bindings would retype the value's own reads — so a field that
-/// only mentions a parameter expects nothing there, and a value that needed
-/// the expectation is refused by name rather than built at the wrong
-/// instantiation (rustc E0308 before).
+/// literal's bindings would retype the value's own reads. F82: the field's
+/// type is MINTED with the literal's arguments written in there, so the
+/// swapped literal's `held = Maybe::Nothing` closes from `Maybe<str>` and the
+/// probe below is identical (it was refused by name before, and accepted here
+/// only as that refusal).
 #[test]
 fn a_struct_literals_fields_close_their_values_on_both_backends() {
     let staged = stage();
@@ -8780,16 +9538,33 @@ fn a_struct_literals_fields_close_their_values_on_both_backends() {
         SWAPPED_LITERAL_PROBE,
     )
     .expect("write the probe program");
-    match compare(&staged, "native_probe_swapped_literal.vl") {
-        Verdict::Identical => {}
-        Verdict::Refused(reason) => assert!(
-            reason.contains("instantiated at `any`"),
-            "the swapped literal's refusal moved to another construct: {reason}"
-        ),
-        Verdict::Broken(detail) => {
-            panic!("a swapped literal in its own impl was built wrong: {detail}")
-        }
-    }
+    assert_eq!(
+        compare(&staged, "native_probe_swapped_literal.vl"),
+        Verdict::Identical,
+        "a swapped literal in its own impl must close its fields from its own arguments"
+    );
+}
+
+/// F82: a struct literal of another instantiation inside the struct's own
+/// impl closes EVERY field from the field's type read under the literal's
+/// arguments — the emitter mints `Maybe<str>` from `held: Maybe<V>` where
+/// the literal's `V` is the method's `K` (`Emitter::substituted`). The probe:
+/// a nullary variant, `None`, an empty list, a cell around `None`, a tuple of
+/// both parameters, a bare parameter, a field naming no parameter and a
+/// closure field, swapped twice (so both instantiations build each way).
+#[test]
+fn a_swapped_struct_literal_closes_every_field_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_swapped_struct_literals.vl"),
+        include_str!("native/swapped_struct_literals.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_swapped_struct_literals.vl"),
+        Verdict::Identical,
+        "a swapped struct literal must close every field from its own instantiation"
+    );
 }
 
 const SWAPPED_LITERAL_PROBE: &str = concat!(
@@ -9030,6 +9805,28 @@ fn a142_s7_an_enum_store_builds_and_wakes_the_same_on_both_backends() {
         compare(&staged, "native_probe_store_variant.vl"),
         Verdict::Identical,
         "an enum store must build and wake the same on both backends"
+    );
+}
+
+/// A149 S3: collection fields as keyed and sequence nodes build and wake the
+/// same on both backends — a write to one key of a map field waking that key's
+/// readers and nobody else's (the wake counts), keyed slots living as long as
+/// their subscriptions, a map field's flow told one op per changed key (handle
+/// writes, a whole write reconciled by key, a root write), a set field's members
+/// and ops, a keyed list read by key, and a list field's flow told splices with
+/// an operator that maps only what arrived.
+#[test]
+fn a149_s3_collection_fields_build_and_wake_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_collections.vl"),
+        include_str!("native/store_collections.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_collections.vl"),
+        Verdict::Identical,
+        "collection fields of a store must build and wake the same on both backends"
     );
 }
 

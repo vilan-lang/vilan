@@ -14,7 +14,7 @@
 //
 //   1. the module loads and its version is the crate's;
 //   2. a compile answers JavaScript with no error diagnostic — an empty `main`
-//      and a browser program that exercises std::ui and std::reactive;
+//      and a browser program that exercises std::web::ui and std::reactive;
 //   3. `compile_for(.., "node")` compiles a process program;
 //   4. `complete` offers a signal's members after `count.`.
 //
@@ -55,7 +55,7 @@ const programs = [
 		"a browser program",
 		"browser",
 		`import std::reactive::Signal;
-import std::ui::{ mount_root, view };
+import std::web::ui::{ mount_root, view };
 
 fun main() {
 	mount_root("app", || {

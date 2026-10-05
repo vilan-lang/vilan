@@ -1,6 +1,6 @@
 //! A33: a read-only binding takes a `Source`, and it is a LIVE one.
 //!
-//! `std::ui`'s read-only binders were widened from the concrete `SignalCell<T>` to a
+//! `std::web::ui`'s read-only binders were widened from the concrete `SignalCell<T>` to a
 //! `Source<T>` bound, so a user's own reactive type can drive them. That the
 //! widened signatures ACCEPT such a type is a compile fact, pinned in
 //! `vilan-core`'s inference suite. What only a running program can show is that
@@ -128,7 +128,7 @@ fn build_and_run(tag: &str, app: &str) -> String {
 fn app_source() -> String {
     format!(
         r#"import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-import std::ui::{{ View, each, mount_root, view, when }};
+import std::web::ui::{{ View, each, mount_root, view, when }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]
@@ -250,7 +250,7 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
 fn a_user_source_drives_swap_and_keeps_driving_it() {
     let app = format!(
         r#"import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
-import std::ui::{{ View, mount_root, swap, view }};
+import std::web::ui::{{ View, mount_root, swap, view }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]
@@ -302,14 +302,74 @@ fun main() {{
 // change builds or tears down. Only a running program shows that — a helper that
 // rebuilt on every payload write would compile, mount and update identically.
 
+/// B526 (mirrored-store.md S0, Q11): a `when_live` body's binding reads the
+/// LAST payload when the variant ends, not the one the body was built over. A
+/// device renamed through another handle and then taken offline: the body's
+/// own derivation sees `phone` on the rename, and when the variant ends in the
+/// next turn — where a derivation settles ahead of the effect that tears the
+/// body down — it sees `phone` again; before the fix it read `laptop`, the
+/// payload the body was built over, for that turn.
+#[test]
+fn b526_a_when_live_body_reads_the_last_payload_as_its_variant_ends() {
+    let app = r#"import std::io::print;
+import std::reactive::{ Flow, Pipe, Signal, Source, batch };
+import std::reactive::store::{ Storable, Store };
+import std::web::ui::{ View, mount_root, view, when_live };
+
+[derive(PartialEq, Storable)]
+struct Device {
+	name: str,
+}
+
+[derive(PartialEq, Storable)]
+enum Presence {
+	Offline,
+	Online(Device),
+}
+
+fun main() {
+	let presence = Store::new(Presence::Online(Device { name = "laptop" }));
+	let _root = mount_root("app", || view("main").child(when_live(presence.online(), |device| {
+		// A DERIVATION in the body: a turn settles it ahead of the effect that
+		// tears the body down, so it runs in the turn that ends the variant.
+		let shown = device
+			.name()
+			.derive(|name| {
+				print(i"saw {name}");
+				name
+			})
+			.memo();
+		view("p").bind_text(shown)
+	})));
+	batch(|| {
+		let _renamed = presence.online().name().patch("phone");
+	});
+	batch(|| presence.set(Presence::Offline));
+	print("done");
+}
+"#;
+    let stdout = build_and_run("when_live_last", app);
+    let seen: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("saw ") || *line == "done")
+        .collect();
+    assert_eq!(
+        seen,
+        vec!["saw laptop", "saw phone", "saw phone", "done"],
+        "the body is built over `laptop`, the rename reaches it, and the turn that \
+         ends the variant reads the LAST payload (`phone`), never the one the body was \
+         built over; got:\n{stdout}"
+    );
+}
+
 /// A store whose variant carries a payload, behind `when_live`. The body PRINTS
 /// each time it is built, so the build count is on stdout beside the dumps.
 #[test]
 fn a142_s7_when_live_rebuilds_only_when_the_variant_changes() {
     let app = r#"import std::io::print;
 import std::reactive::{ Signal, Source };
-import std::store::{ Storable, Store };
-import std::ui::{ View, mount_root, view, when_live };
+import std::reactive::store::{ Storable, Store };
+import std::web::ui::{ View, mount_root, view, when_live };
 
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]

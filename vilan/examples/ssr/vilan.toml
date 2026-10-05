@@ -1,7 +1,7 @@
 # The server-side-rendering example (proposal/ssr.md, A7 — render and replace):
 # ONE package, two entries. The browser client and the Node server build from
 # the same source tree, so the one `fun app(): View` in `src/app.vl` is shared
-# by construction. `import std::ui` resolves per ENTRY: the browser layer (live
+# by construction. `import std::web::ui` resolves per ENTRY: the browser layer (live
 # DOM) in the client leg, the process layer (an HTML string) in the server leg —
 # the same source, no annotation. That per-leg shadow is the whole SSR mechanism
 # (proposal/ssr.md §0): one component, two rendered forms.
@@ -19,14 +19,14 @@
 # key, so both entries share it, and this example is where that stops being an
 # economy and starts being the point: `src/app.vl` is compiled by BOTH legs, so
 # its ambient scope has to mean the same thing on node and in the browser.
-# `std::web` is built to: the base seven (`print`, `Option`/`Some`/`None`,
+# `std::web::prelude` is built to: the base seven (`print`, `Option`/`Some`/`None`,
 # `Result`/`Ok`/`Err`), `Signal`, `SignalCell`, `view` and `View`, plus the
 # MODULES `style` and `ui` — every one of them base-layer or declared by both
 # platform layers, which is exactly the admission test a one-layer name like
 # `Server` or `fs` fails. `src/app.vl` ends up importing nothing at all.
 [package]
 name = "ssr"
-prelude = "std::web"
+prelude = "std::web::prelude"
 
 [entry.client]
 target = "browser"

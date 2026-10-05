@@ -1,0 +1,114 @@
+# The nightly performance REPORT (M105 S7, `proposal/performance-gates.md` §3's
+# "report" tier and §6.3/§6.4, RULED Q1–Q12).
+#
+# **A report, not a gate.** It refuses nothing: the gates are ci.yml's `perf`
+# job (instruction budgets on every push) and the seal's verdict, which
+# `scripts/cut-release.sh` reads. What this produces is what names the NEXT
+# optimization and what shows a trend no single run can:
+#
+#   - the instruction table of every subject in `perf/budgets.toml` on a CI
+#     runner (`perf_gate.py measure --class ci`), uploaded — one more sample of
+#     the spread between runners that S2 asks for, every night;
+#   - the ignored measurement pins in RELEASE: `perf_baseline_full_run` and
+#     E121/E126's four editor gates (`keystroke_path_budget`, its view twin,
+#     `diagnostics_budget`, the exhibit-shape pin) — release figures, which is
+#     why they never run in the debug suite (E141);
+#   - a callgrind top 25 by inclusive instructions of the kolt-shaped generated
+#     app on a `profiling` build (the release binary is stripped, so a profile
+#     of it names only malloc and free, §6.4);
+#   - the macOS row (§6.3, class M): `vilan check` CPU time on the generated
+#     app on a GitHub macOS runner. Informational only — a shared VM's CPU time
+#     is noisy (§2.1) and instruction counts are per ISA — but a trend over
+#     releases is a real signal for the owner's MacBook complaint.
+#
+# Every job is `continue-on-error`: a red one never blocks anything, and this
+# workflow is in nothing's `needs`, so it cannot strand a PR (the reasoning
+# ignored-pins.yml gives for itself). Every `uses:` is pinned to a full commit
+# SHA with its tag in the comment (L14), the same pins ci.yml carries.
+name: perf
+
+on:
+  schedule:
+    # Nightly, 04:41 UTC — off the hour, as ignored-pins.yml's reasoning goes.
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  counts:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      VILAN_PERF_CLASS: ci
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: perf-nightly
+      - name: valgrind, for the callgrind fallback and the top 25
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: The instruction table (every budgets.toml subject, class ci)
+        run: |
+          cargo build --release -p vilan-cli
+          python3 scripts/perf_gate.py measure --vilan target/release/vilan --class ci --json target/perf-gate/nightly.json
+      - name: The ignored measurement pins, in release
+        run: >-
+          cargo nextest run --release -p vilan-cli -p vilan-lsp --run-ignored only --no-fail-fast
+          -E 'test(=perf_baseline_full_run) | test(/keystroke_path_budget/) | test(/diagnostics_budget/) | test(/the_view_exhibit_tracks_the_recorded_application_shape/)'
+          2>&1 | tee target/perf-gate/ignored-pins.log
+      - name: Where the time goes — callgrind top 25, profiling build, the generated app
+        run: |
+          cargo build --profile profiling -p vilan-cli
+          python3 scripts/perf_genapp.py target/perf-gate/genapp-profile
+          (cd target/perf-gate/genapp-profile && ../../profiling/vilan check . > /dev/null 2>&1 || true)
+          (cd target/perf-gate/genapp-profile && valgrind --tool=callgrind --callgrind-out-file=../callgrind.genapp ../../profiling/vilan check . > /dev/null 2>&1 || true)
+          callgrind_annotate --inclusive=yes target/perf-gate/callgrind.genapp | head -60 > target/perf-gate/top25.txt
+          cat target/perf-gate/top25.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: perf-nightly
+          path: |
+            target/perf-gate/nightly.json
+            target/perf-gate/ignored-pins.log
+            target/perf-gate/top25.txt
+          if-no-files-found: ignore
+
+  macos:
+    # §6.3's class M: a common dev machine's CPU time on the generated app.
+    # Wall and CPU both, never budgeted.
+    runs-on: macos-14
+    continue-on-error: true
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: perf-macos
+      - name: vilan check CPU on the generated app (informational)
+        run: |
+          cargo build --release -p vilan-cli
+          python3 scripts/perf_genapp.py target/perf-gate/genapp
+          cd target/perf-gate/genapp
+          ../../release/vilan check . > /dev/null 2>&1 || true
+          for run in 1 2 3; do /usr/bin/time -p ../../release/vilan check . > /dev/null; done 2>&1 | tee ../macos-time.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: perf-macos
+          path: target/perf-gate/macos-time.txt
+          if-no-files-found: ignore

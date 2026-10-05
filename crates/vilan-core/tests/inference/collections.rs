@@ -213,7 +213,7 @@ fn a142_s4_filter_map_and_any_over_transients() {
         r#"
         import std::reactive::{ ListCell, comp };
         import std::result::Result::{ self, Err, Ok };
-        import std::transient::Transient;
+        import std::reactive::transient::Transient;
 
         fun main() {
             let a: Transient<str, str> = Transient::pending();

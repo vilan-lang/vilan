@@ -165,9 +165,9 @@ fn wait_for_port(lines: &mpsc::Receiver<String>, deadline: Duration) -> Option<u
 /// tell carry (initializer NOT re-run) from fresh (re-run). `stash`/`take` and
 /// `on_teardown` are exercised; a `tally.effect` under the mount root proves
 /// subscription disposal.
-const CLIENT_A: &str = r#"import std::ui::{ view, View, mount_root };
+const CLIENT_A: &str = r#"import std::web::ui::{ view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
-import std::dev;
+import std::web::dev;
 import std::option::Option::{ self, Some, None };
 
 [extern("globalThis.__mark")]
@@ -243,9 +243,9 @@ fun main() {
 /// Bundle B: `Cfg` gains a field, so `cfg`'s structural fingerprint changes and
 /// it fresh-initializes (§4). Everything else is identical, so `count`/`tally`
 /// carry and `strap` re-inits as the excluded form.
-const CLIENT_B: &str = r#"import std::ui::{ view, View, mount_root };
+const CLIENT_B: &str = r#"import std::web::ui::{ view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
-import std::dev;
+import std::web::dev;
 import std::option::Option::{ self, Some, None };
 
 [extern("globalThis.__mark")]
@@ -533,7 +533,7 @@ fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
 /// `Unsubscribe` frames. `@@TAG@@` is the bundle's identity: bundle B is this
 /// same program with the other tag, so every mark says which bundle made it and
 /// the rebuilt bytes differ from A's.
-const SOCKET_CLIENT: &str = r#"import std::ui::{ view, View, mount_root };
+const SOCKET_CLIENT: &str = r#"import std::web::ui::{ view, View, mount_root };
 import std::rpc::{ ReactiveClient, RemoteSource, bridge, connect_socket };
 import std::json::json_codec;
 import std::option::Option::{ self, Some, None };
@@ -887,7 +887,7 @@ import std::reactive::{
 	run_with_owner,
 };
 import std::shared::Shared;
-import std::ui::{ Region, Row, Slot, View, mount_root, view };
+import std::web::ui::{ Region, Row, Slot, View, mount_root, view };
 
 [extern("globalThis.__mark")]
 external fun mark(tag: str): void;
@@ -969,7 +969,7 @@ fn user_slot_client_source(tag: &str) -> String {
 /// which is where a std form can be observed from an app at all.
 const WHEN_SOME_CLIENT: &str = r#"import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell, get_owner };
-import std::ui::{ View, mount_root, view, when_some };
+import std::web::ui::{ View, mount_root, view, when_some };
 
 [extern("globalThis.__mark")]
 external fun mark(tag: str): void;

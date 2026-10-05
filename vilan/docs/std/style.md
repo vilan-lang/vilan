@@ -1,10 +1,10 @@
-# std::style reference
+# std::web::style reference
 
 Typed, compile-time atomic styles. Concepts and the emission model: the
 [styling guide](../guide/styling.md).
 
 ```vilan,fragment
-import std::style::{
+import std::web::style::{
 	style, space, Style, Length, Color, Gradient,
 	Display, Position, FlexDirection, AlignItems, JustifyContent,
 	TextAlign, Cursor, Overflow, WhiteSpace, UserSelect, RadialExtent,
@@ -239,11 +239,11 @@ fun on<C: IntoConditions>(self, conditions: C, inner: Style): Style
 
 ### The condition values
 
-Free functions in `std::style` (and in `std::style::prelude`, which is ambient
+Free functions in `std::web::style` (and in `std::web::style::prelude`, which is ambient
 inside a `css` block, along with `var`, `piece`, the `Length`/`Color`
 constructors, `s()`, and the keyword-property types `Length`, `Cursor`,
 `TextAlign` and `AlignItems` — so one file-level
-`import std::style::prelude::{ … };` answers a whole chain built outside a
+`import std::web::style::prelude::{ … };` answers a whole chain built outside a
 hole):
 
 ```vilan,fragment
@@ -434,13 +434,13 @@ impl Declarations {
 }
 ```
 
-`declare` is compile-time-only — it reaches `std::asset::emit`, so it belongs
+`declare` is compile-time-only — it reaches `std::web::asset::emit`, so it belongs
 inside a `const` expression. Building the chain is ordinary code: a
 `Declarations` value accumulates the token lines it owes and `declare` puts
 them on the sheet with the block.
 
 ```vilan
-import std::style::{ Color, declare, declarations, space };
+import std::web::style::{ Color, declare, declarations, space };
 
 fun theme(id: str) {
     declare(
@@ -493,7 +493,7 @@ flag and nothing to switch off, because the only door into the stylesheet
 is a `const` expression:
 
 ```vilan
-import std::style::preflight;
+import std::web::style::preflight;
 
 let _reset = const preflight();
 

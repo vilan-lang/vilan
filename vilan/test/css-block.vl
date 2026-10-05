@@ -1,5 +1,5 @@
 import std::io::print;
-import std::style::{ Color, Length, Style, space, style };
+import std::web::style::{ Color, Length, Style, space, style };
 
 // The `css` block (proposal/css-block.md): CSS-shaped sugar over the `style()`
 // chain, lowered before analysis. There is no third emission channel and no

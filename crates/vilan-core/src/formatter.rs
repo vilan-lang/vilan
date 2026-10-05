@@ -99,8 +99,9 @@ fn code_tokens_spanned(source: &str) -> Option<Vec<Spanned<Token<'_>>>> {
 /// The formatter's token-level canonicalization, used to check a reprint changed
 /// nothing but trivia and the canonical orders. Order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
-/// (dropped), an `export` marker written after its item's attributes (moved
-/// ahead of them, B445), the canonical ordering of a top-level import run (see the
+/// (dropped), a declaration head's markers — its attributes and keywords —
+/// written in any order (put into THE order, B536), the canonical ordering of a
+/// top-level import run (see the
 /// canonical-import-order section below), the canonical ordering of an ELEMENT
 /// HEAD's items (see the canonical-element-head-order section), the canonical
 /// ordering of an `on` HEAD's condition values (see the canonical-on-head-order
@@ -117,9 +118,9 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_on_heads(sort_element_heads(
         sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
             canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
-                collapse_field_shorthands(lead_export_past_attribute_runs(
-                    drop_redundant_view_prefixes(drop_trailing_commas(tokens)),
-                )),
+                collapse_field_shorthands(canonicalize_marker_heads(drop_redundant_view_prefixes(
+                    drop_trailing_commas(tokens),
+                ))),
             )),
         ))),
     ))))
@@ -164,80 +165,42 @@ fn drop_redundant_view_prefixes(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     result
 }
 
-/// Moves a declaration's `export (in PATH)?` marker AHEAD of an attribute run
-/// written before it — `[platform("browser")] export impl …` becomes `export
-/// [platform("browser")] impl …` — in BOTH streams, so the safety net reads
-/// the two sides of the marker (B445) as one spelling and accepts the printer
-/// moving it to the ruled side, after the attributes
-/// ([`Printer::print_exported_item`], B485 §6.2). The parser reads the same
-/// rotation (`Parser::lead_export_past_its_attributes`), so the tree the
-/// printer walks holds the run as the item's prefix whichever side it was on.
+/// Puts a declaration head's marker run — its attribute groups and its
+/// keywords, `export (in PATH)?` included — into THE order (B485 §6.2, B536:
+/// the attributes by `parsing::attribute_rank`, then `export`,
+/// `const`|`lazy`, `async`, `external`|`macro`) in BOTH streams, so the safety
+/// net accepts the printer writing the head the parser read, whatever order
+/// it was written in: `[internal(..)] [deprecated(..)] fun` (warned), `export
+/// [must_use] fun` and `async [platform(..)] fun` (refused, and still read —
+/// [`parse`] formats a source whose only errors are marker-order ones). The
+/// parser reorders the same run before a production reads it
+/// (`Parser::canonicalize_marker_run`), through the same scanner
+/// ([`crate::parsing::marker_run_in_written_order`]).
 ///
-/// Recognized by SHAPE where a statement can begin (the stream's start, or
-/// after a `;`, `{` or `}`): a run of `[name …]` groups ending at `export`.
-/// A relocation, not a deletion, so the net still sees every attribute and
-/// the marker survive; it runs over both streams.
-fn lead_export_past_attribute_runs(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+/// Recognized where a statement can begin (the stream's start, or after a
+/// `;`, `{` or `}`): two or more units ending at a declaration word — never
+/// at a `;` or an operator, so `[a][b];`, a list indexed by a list, is
+/// untouched. A stable relocation of whole units: the net still sees every
+/// attribute and keyword survive.
+fn canonicalize_marker_heads(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
     let mut index = 0;
     while index < tokens.len() {
         let at_statement_head = matches!(result.last(), None | Some(Token::Ctrl(';' | '{' | '}')));
         if at_statement_head
-            && let Some((marker, past_marker)) = attribute_run_before_export(&tokens, index)
+            && let Some((units, word_at)) =
+                crate::parsing::marker_run_in_written_order(&tokens, index)
         {
-            result.extend(tokens[marker..past_marker].iter().cloned());
-            result.extend(tokens[index..marker].iter().cloned());
-            index = past_marker;
+            for unit in units {
+                result.extend(tokens[unit].iter().cloned());
+            }
+            index = word_at;
             continue;
         }
         result.push(tokens[index].clone());
         index += 1;
     }
     result
-}
-
-/// When a run of `[name …]` groups starting at `start` ends at an `export`
-/// marker, the marker's index and the index just past it (and past its `(in
-/// PATH)` scope); `None` otherwise, and for `export *;`, which takes no
-/// attributes.
-fn attribute_run_before_export(tokens: &[Token<'_>], start: usize) -> Option<(usize, usize)> {
-    let past_group = |open: usize| -> Option<usize> {
-        let mut depth = 0usize;
-        let mut at = open;
-        loop {
-            match tokens.get(at)? {
-                Token::Ctrl('[' | '(' | '{') => depth += 1,
-                Token::Ctrl(']' | ')' | '}') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(at + 1);
-                    }
-                }
-                _ => {}
-            }
-            at += 1;
-        }
-    };
-    let mut at = start;
-    while tokens.get(at) == Some(&Token::Ctrl('['))
-        && matches!(tokens.get(at + 1), Some(Token::Ident(_)))
-    {
-        at = past_group(at)?;
-    }
-    if at == start || tokens.get(at) != Some(&Token::Export) {
-        return None;
-    }
-    let marker = at;
-    let mut past_marker = marker + 1;
-    if tokens.get(past_marker) == Some(&Token::Ctrl('('))
-        && tokens.get(past_marker + 1) == Some(&Token::In)
-    {
-        past_marker = past_group(past_marker)?;
-    }
-    if tokens.get(past_marker) == Some(&Token::Op("*")) {
-        return None;
-    }
-    Some((marker, past_marker))
 }
 
 /// Moves every bare `export *;` to the FRONT of the token stream, so the safety
@@ -552,11 +515,17 @@ enum RootRank {
 /// Some }` reprinted as `Option::{ None, Some, self }` in 37 groups under N55's
 /// reformat, std's `prelude.vl` and `web.vl` among them — and `self` first is
 /// what a reader arrives with: it names the group's own namespace, so it reads
-/// as the head of the list rather than one more member of it. Only a bare
-/// `self` ranks: `self as name` is a rename and keys as one.
+/// as the head of the list rather than one more member of it.
+///
+/// `SelfAlias` — `self as name`, the namespace under a name of its own — is
+/// declared right after it (E256, RULED 2026-10-03, E251's ruling that
+/// `self` sorts first): it is still the group's own head, renamed, so it
+/// leads every member and follows only a bare `self`. Two renames of one
+/// namespace order by their alias.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum BranchKey {
     SelfLeaf,
+    SelfAlias(String),
     End,
     Path(String, Box<BranchKey>),
     /// An `(impl TYPE)` selector (B318 S3): its subject's rendered type text
@@ -630,10 +599,20 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
             TokenBranch::Set(branches.iter().map(branch_from_ast).collect())
         }
         ImportBranch::Selector(selector) => TokenBranch::Selector(
-            selector_key_text(&selector.subject_text),
+            selector_key_text(&selector_written_text(selector)),
             Vec::new(),
             selector.members.iter().map(|(name, _)| *name).collect(),
         ),
+    }
+}
+
+/// The selector's text between `(impl ` and `)`: the subject, and ` with
+/// TRAIT` when the selector names its block by the trait (B455). The token
+/// path keys on the same run of tokens, so the two keys agree.
+fn selector_written_text<'src>(selector: &ImplSelector<'src>) -> Cow<'src, str> {
+    match &selector.trait_text {
+        Some(trait_text) => Cow::Owned(format!("{} with {trait_text}", selector.subject_text)),
+        None => selector.subject_text.clone(),
     }
 }
 
@@ -673,8 +652,10 @@ fn unwrap_singleton_set<'branch, 'src>(
 /// one-member set keys as its member ([`unwrap_singleton_set`]).
 fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
     match unwrap_singleton_set(branch) {
-        // A bare `self` is the group's own namespace and sorts first (E146).
+        // A bare `self` is the group's own namespace and sorts first (E146),
+        // and `self as name` right after it (E256).
         TokenBranch::Path("self", None, None) => BranchKey::SelfLeaf,
+        TokenBranch::Path("self", None, Some(alias)) => BranchKey::SelfAlias((*alias).to_string()),
         // An alias keys as the segment it renames plus the alias itself, so
         // `a::b as c` and `a::b as d` are two imports the run orders stably
         // rather than two spellings of one key (E142).
@@ -1127,7 +1108,7 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
 // pseudo): the same shape as Tailwind's plugin putting variant groups last.
 //
 // Two rules keep the reorder SEMANTICS-preserving, which is not optional: a
-// chain merges last-wins per property slot (`vilan/std/src/style.vl`).
+// chain merges last-wins per property slot (`vilan/std/src/web/style.vl`).
 //
 //   * A method the table does not know is a BARRIER — a user `impl Style`
 //     extension (kolt's `paint_primary` writes colour AND background), or one
@@ -1184,7 +1165,7 @@ pub enum StyleCategory {
 /// The condition axes, in the order a selector writes them — which is both the
 /// order the nesting SUGAR requires at the call site and the canonical order the
 /// canonicaliser sorts a condition SET into (`token_axis` and `render_rule` in
-/// `vilan/std/src/style.vl`, style-conditions.md §2.1).
+/// `vilan/std/src/web/style.vl`, style-conditions.md §2.1).
 ///
 /// `Guard` and `Child` were one `Relation` axis while a relation was one slot.
 /// A95 splits them, because they are not the same position: an ancestor guard
@@ -1643,7 +1624,7 @@ pub fn sort_style_chains<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
 // --- Canonical `on` head order ------------------------------------------------
 //
 // A95 S3. `Style::on(conditions, inner)` takes a condition SET, and a set has no
-// order — `canonical_condition` in `vilan/std/src/style.vl` sorts the tokens
+// order — `canonical_condition` in `vilan/std/src/web/style.vl` sorts the tokens
 // itself before the slot key is built, so `md() + hover()` and `hover() + md()`
 // already mint one class. That is what lets the formatter put the SOURCE in the
 // order the selector reads in: the reorder cannot change the emitted stylesheet,
@@ -2084,6 +2065,8 @@ fn prune_import_branch<'src>(
             ImportBranch::Selector(Box::new(ImplSelector {
                 subject: None,
                 subject_text: selector.subject_text.clone(),
+                trait_: None,
+                trait_text: selector.trait_text.clone(),
                 members: selector.members.clone(),
                 span: selector.span,
             }))
@@ -2236,6 +2219,8 @@ fn attach_selector<'src>(module: ImportBranch<'src>, subject: String) -> ImportB
                 Box::new(ImplSelector {
                     subject: None,
                     subject_text: Cow::Owned(subject),
+                    trait_: None,
+                    trait_text: None,
                     members: Vec::new(),
                     span: Span::default(),
                 }),
@@ -2661,6 +2646,102 @@ pub fn import_leaf_name_spans(source: &str) -> Vec<Span> {
     spans
 }
 
+/// E255: one import leaf that binds what an EARLIER leaf of the file already
+/// binds — the same path under the same name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DuplicateImport {
+    /// The repeated leaf's name span (its alias's, where it has one).
+    pub span: Span,
+    /// The name it binds.
+    pub name: String,
+    /// The span of the earlier leaf it repeats.
+    pub first: Span,
+}
+
+/// E255: every top-level `import` leaf that repeats an earlier one — what
+/// Organize Imports' duplicate pass (E251) removes. Two leaves repeat when
+/// they reach the same path and bind the same name: `import a::B;` twice,
+/// `import a::{ B, B };`, `import a::B;` beside `import a::{ B, C };`, and a
+/// module import beside a `self` leaf of the same module. An alias is a
+/// different binding (`import a::B as D;` repeats nothing), and an `only`
+/// import, a `use`, a re-export and a marked or selector branch are not
+/// compared at all — the organizer leaves them as written.
+pub fn duplicate_import_leaves(source: &str) -> Vec<DuplicateImport> {
+    let Some(items) = parse(source) else {
+        return Vec::new();
+    };
+    let mut seen: Vec<(Vec<&str>, &str, Span)> = Vec::new();
+    let mut duplicates = Vec::new();
+    for item in items.iter() {
+        let Node::Import(branch, ImportModifier::None) = &item.0 else {
+            continue;
+        };
+        let mut leaves: Vec<(Vec<&str>, &str, Span)> = Vec::new();
+        if !collect_bound_leaves(branch, &mut Vec::new(), &mut leaves) {
+            continue;
+        }
+        for (path, bound, span) in leaves {
+            match seen
+                .iter()
+                .find(|(seen_path, seen_bound, _)| *seen_path == path && *seen_bound == bound)
+            {
+                Some((_, _, first)) => duplicates.push(DuplicateImport {
+                    span,
+                    name: bound.to_string(),
+                    first: *first,
+                }),
+                None => seen.push((path, bound, span)),
+            }
+        }
+    }
+    duplicates
+}
+
+/// [`duplicate_import_leaves`]' walk: each leaf as (the full path it reaches,
+/// the name it binds, its span) — a `self` leaf reaches its group's own path
+/// and binds that path's last segment. `false` for a branch the duplicate
+/// pass does not compare (a reach marker, a selector).
+fn collect_bound_leaves<'src>(
+    branch: &ImportBranch<'src>,
+    prefix: &mut Vec<&'src str>,
+    out: &mut Vec<(Vec<&'src str>, &'src str, Span)>,
+) -> bool {
+    match branch {
+        ImportBranch::Path(name, span, tail) => {
+            let (path, default_name) = if *name == "self" {
+                (prefix.clone(), prefix.last().copied())
+            } else {
+                let mut path = prefix.clone();
+                path.push(name);
+                (path, Some(*name))
+            };
+            match tail {
+                ImportTail::Continue(child) => {
+                    prefix.push(name);
+                    let compared = collect_bound_leaves(child, prefix, out);
+                    prefix.pop();
+                    compared
+                }
+                ImportTail::Leaf => match default_name {
+                    Some(bound) => {
+                        out.push((path, bound, *span));
+                        true
+                    }
+                    None => false,
+                },
+                ImportTail::Alias(alias, alias_span) => {
+                    out.push((path, alias, *alias_span));
+                    true
+                }
+            }
+        }
+        ImportBranch::Set(branches) => branches
+            .iter()
+            .all(|branch| collect_bound_leaves(branch, prefix, out)),
+        ImportBranch::Reach(..) | ImportBranch::Selector(_) => false,
+    }
+}
+
 /// [`import_leaf_name_spans`]' recursion: a `Path` with a `::` continuation
 /// defers to the continuation, a brace `Set` yields every member's leaf, and a
 /// terminal `Path` IS the leaf.
@@ -2712,6 +2793,301 @@ pub fn organize_import_runs(
     // so the comment width knob cannot reach its output.
     let mut printer = Printer::new(source, FormatOptions::default());
     Some(printer.organize_runs(&items, keep, keep_module))
+}
+
+/// One organizer entry: its sort key, its source position, the statement, and
+/// the trailing comment that travels with it.
+type ImportEntry<'ast, 'src> = (
+    ImportSortKey,
+    usize,
+    PrunedStatement<'ast, 'src>,
+    Option<&'src str>,
+);
+
+/// E251: Organize Imports removes DUPLICATE imports. The code action only —
+/// `vilan fmt` deletes no code, and never reaches here.
+///
+/// - **Identical statements collapse** to the first, under the same key the
+///   run is sorted by (a brace set's order is not part of an import's
+///   identity) — and an `export`, a `use` and an `only` import are each their
+///   own kind, never one another's duplicate.
+/// - **Statements over one module merge** into one group when the module has
+///   a brace group — `import a::b::C;` and `import a::b::{ C, D };` are
+///   `import a::b::{ C, D };`, and so are `import a::b::D;` and `import
+///   a::b::{ C }` — or when a name is reachable through two of them; a name
+///   repeated in one group drops. Distinct single members with no group stay
+///   the separate lines they are (`import a::b::C; import a::b::D;` is
+///   canonical, as it always was). "One module"
+///   is a prefix of at least two segments: `import std::json;` and `import
+///   std::io;` share only the ORIGIN.
+/// - **A module import beside a member import of that module** merges into the
+///   `self` form: `import std::json;` and `import std::json::{ Json };` are
+///   `import std::json::{ self, Json };` (the printer puts `self` first, E146);
+///   `import std::json as j;` becomes `self as j`.
+/// - **An alias is a different import**: `import a::B as D;` stays beside
+///   `import a::B;`.
+///
+/// Conservative where an edit could lose something: a statement carrying a
+/// trailing comment, an `only` or `use` statement, a re-export, and any branch
+/// holding a reach marker, a selector or a nested path is left exactly as it
+/// is (identical-statement collapse aside, which keeps the first and its
+/// comment). Idempotent: a merged run has nothing left to merge.
+fn merge_duplicate_imports<'ast, 'src>(
+    entries: Vec<ImportEntry<'ast, 'src>>,
+) -> Vec<ImportEntry<'ast, 'src>> {
+    // Identical statements: the first stays; a later one's comment moves up
+    // only when the first has none, and two different comments keep both.
+    let mut kept: Vec<ImportEntry<'ast, 'src>> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let shape = statement_shape(entry.2.node());
+        if let Some(first) = kept
+            .iter_mut()
+            .find(|first| first.0 == entry.0 && statement_shape(first.2.node()) == shape)
+        {
+            match (first.3, entry.3) {
+                (_, None) => continue,
+                (None, Some(comment)) => {
+                    first.3 = Some(comment);
+                    continue;
+                }
+                (Some(left), Some(right)) if left == right => continue,
+                _ => {}
+            }
+        }
+        kept.push(entry);
+    }
+
+    // The mergeable statements, flattened to (module prefix, leaves).
+    let flat: Vec<Option<FlatImport<'src>>> = kept
+        .iter()
+        .map(
+            |(_, _, statement, trailing)| match (statement.node(), trailing) {
+                (Node::Import(branch, ImportModifier::None), None) => flatten_import(branch),
+                _ => None,
+            },
+        )
+        .collect();
+    // Every module a group can form over: a braced statement's prefix, or a
+    // single member's.
+    let modules: Vec<&[&'src str]> = flat
+        .iter()
+        .flatten()
+        .map(|import| import.prefix.as_slice())
+        .filter(|prefix| prefix.len() >= 2)
+        .collect();
+    // Each mergeable entry's group: the module it imports from, or — a module
+    // import of a module another statement imports from — that module, as
+    // its `self`.
+    // (module, member entries, their leaves, whether a module import joined
+    // it as `self`)
+    let mut groups: Vec<(Vec<&'src str>, Vec<usize>, Vec<FlatLeaf<'src>>, bool)> = Vec::new();
+    for (index, import) in flat.iter().enumerate() {
+        let Some(import) = import else {
+            continue;
+        };
+        let (prefix, leaves, as_self) = match import.leaves.as_slice() {
+            [leaf] if !import.braced => {
+                let mut full = import.prefix.clone();
+                full.push(leaf.name);
+                if modules.contains(&full.as_slice()) {
+                    (
+                        full,
+                        vec![FlatLeaf {
+                            name: "self",
+                            alias: leaf.alias,
+                        }],
+                        true,
+                    )
+                } else if leaf.alias.is_some() {
+                    // An aliased member is its own import (case 4).
+                    continue;
+                } else {
+                    (import.prefix.clone(), import.leaves.clone(), false)
+                }
+            }
+            _ => (import.prefix.clone(), import.leaves.clone(), false),
+        };
+        if prefix.len() < 2 {
+            continue;
+        }
+        match groups.iter_mut().find(|(module, ..)| *module == prefix) {
+            Some((_, members, group_leaves, joined)) => {
+                members.push(index);
+                group_leaves.extend(leaves);
+                *joined |= as_self;
+            }
+            None => groups.push((prefix, vec![index], leaves, as_self)),
+        }
+    }
+
+    let mut merged: Vec<Option<ImportEntry<'ast, 'src>>> = kept.into_iter().map(Some).collect();
+    for (prefix, members, leaves, joined_as_self) in groups {
+        let mut unique: Vec<FlatLeaf<'src>> = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            if !unique.contains(&leaf) {
+                unique.push(leaf);
+            }
+        }
+        // What merges: a leaf reachable twice (across the group's statements
+        // or inside one brace set), a brace group the module's other lines
+        // join, or a module import joining its members as `self`. Single
+        // unbraced members with nothing else stay separate lines.
+        let repeated = unique.len()
+            < members
+                .iter()
+                .filter_map(|member| flat[*member].as_ref())
+                .map(|import| import.leaves.len())
+                .sum::<usize>();
+        let braced_groups = members
+            .iter()
+            .filter_map(|member| flat[*member].as_ref())
+            .filter(|import| import.braced)
+            .count();
+        if !(repeated || (braced_groups >= 1 && members.len() >= 2) || joined_as_self) {
+            continue;
+        }
+        let position = members
+            .iter()
+            .filter_map(|member| merged[*member].as_ref().map(|entry| entry.1))
+            .min()
+            .unwrap_or(0);
+        for member in &members {
+            merged[*member] = None;
+        }
+        let node = Node::Import(build_import(&prefix, unique), ImportModifier::None);
+        merged[members[0]] = Some((
+            node_import_key(&node),
+            position,
+            PrunedStatement::Rebuilt(node),
+            None,
+        ));
+    }
+    merged.into_iter().flatten().collect()
+}
+
+/// What an import statement IS, beyond its path — E251's duplicate test keeps
+/// an `export`, a `use` and an `only` import apart from a plain `import` of
+/// the same path.
+#[derive(PartialEq, Eq)]
+enum StatementShape {
+    Import,
+    ImportOnly,
+    Use,
+    Export,
+}
+
+fn statement_shape(node: &Node<'_>) -> StatementShape {
+    match node {
+        Node::Import(_, ImportModifier::None) => StatementShape::Import,
+        Node::Import(_, ImportModifier::Only(_)) => StatementShape::ImportOnly,
+        Node::Use(_) => StatementShape::Use,
+        _ => StatementShape::Export,
+    }
+}
+
+/// An import statement as E251 merges it: the module path its leaves are
+/// taken from, the leaves, and whether it was written with braces.
+struct FlatImport<'src> {
+    prefix: Vec<&'src str>,
+    leaves: Vec<FlatLeaf<'src>>,
+    braced: bool,
+}
+
+/// One leaf — a name (or `self`) and its alias, if any. An alias naming the
+/// leaf itself is no alias (E145, which the printer drops too).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FlatLeaf<'src> {
+    name: &'src str,
+    alias: Option<&'src str>,
+}
+
+/// `branch` as a [`FlatImport`], or `None` for a shape E251 leaves alone: a
+/// reach marker, a selector, a nested path inside braces, a root-level set.
+fn flatten_import<'src>(branch: &ImportBranch<'src>) -> Option<FlatImport<'src>> {
+    let leaf = |name: &'src str, tail: &ImportTail<'src>| match tail {
+        ImportTail::Leaf => Some(FlatLeaf { name, alias: None }),
+        ImportTail::Alias(alias, _) => Some(FlatLeaf {
+            name,
+            alias: (*alias != name).then_some(*alias),
+        }),
+        ImportTail::Continue(_) => None,
+    };
+    let mut prefix: Vec<&'src str> = Vec::new();
+    let mut current = branch;
+    loop {
+        match current {
+            ImportBranch::Path(name, _, ImportTail::Continue(child)) => {
+                prefix.push(name);
+                current = child;
+            }
+            ImportBranch::Path(name, _, tail) => {
+                return Some(FlatImport {
+                    prefix,
+                    leaves: vec![leaf(name, tail)?],
+                    braced: false,
+                });
+            }
+            ImportBranch::Set(branches) if !prefix.is_empty() => {
+                let leaves = branches
+                    .iter()
+                    .map(|branch| match branch {
+                        ImportBranch::Path(name, _, tail) => leaf(name, tail),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                return Some(FlatImport {
+                    prefix,
+                    leaves,
+                    braced: true,
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The merged statement's branch: `prefix::{ leaves }`, or `prefix::leaf` for
+/// one leaf (a lone `self` is the module itself, `prefix`). Spans are empty —
+/// a rebuilt statement is printed, never walked.
+fn build_import<'src>(prefix: &[&'src str], leaves: Vec<FlatLeaf<'src>>) -> ImportBranch<'src> {
+    let nowhere = Span::from(0..0);
+    let leaf_branch = |leaf: FlatLeaf<'src>| {
+        ImportBranch::Path(
+            leaf.name,
+            nowhere,
+            match leaf.alias {
+                Some(alias) => ImportTail::Alias(alias, nowhere),
+                None => ImportTail::Leaf,
+            },
+        )
+    };
+    let (segments, tail) = match leaves.as_slice() {
+        [
+            FlatLeaf {
+                name: "self",
+                alias,
+            },
+        ] => {
+            let (last, head) = prefix.split_last().expect("a module prefix");
+            let tail = ImportBranch::Path(
+                last,
+                nowhere,
+                match alias {
+                    Some(alias) => ImportTail::Alias(alias, nowhere),
+                    None => ImportTail::Leaf,
+                },
+            );
+            (head, tail)
+        }
+        [only] => (prefix, leaf_branch(*only)),
+        _ => (
+            prefix,
+            ImportBranch::Set(leaves.into_iter().map(leaf_branch).collect()),
+        ),
+    };
+    segments.iter().rev().fold(tail, |child, segment| {
+        ImportBranch::Path(segment, nowhere, ImportTail::Continue(Box::new(child)))
+    })
 }
 
 // --- Insert an import (the add-import quickfix and auto-import completion) --
@@ -3028,10 +3404,24 @@ fn insert_import_into(
 /// two missing tokens and silently bail the whole file. Recording them makes
 /// user-written parentheses PRESERVED: the formatter reprints the group it was
 /// given and never adjudicates whether it was redundant.
+///
+/// One refusal does not stop it: a declaration head written out of THE order
+/// (`ParseErrorReason::MarkerOrder` — `export [must_use] fun`, the order
+/// before B485 S3, or `async [platform(..)] fun`). The parser reads such a
+/// head exactly as written in the order, so the tree is the canonical one,
+/// and `vilan fmt` writing it is the migration the refusal asks for (B536).
 fn parse(source: &str) -> Option<NodeList<'_>> {
     BUFFER_PARSES.with(|count| count.set(count.get() + 1));
     let (tree, errors) = crate::parsing::parse_preserving_groups(source);
-    tree.filter(|_| errors.is_empty()).map(|(items, _)| items)
+    tree.filter(|_| {
+        errors.iter().all(|error| {
+            matches!(
+                error.reason,
+                crate::parsing::ParseErrorReason::MarkerOrder { .. }
+            )
+        })
+    })
+    .map(|(items, _)| items)
 }
 
 /// Why a reprint handed back the original bytes instead of a reprint
@@ -3590,11 +3980,13 @@ struct Printer<'src> {
     head_start: Option<usize>,
 }
 
-/// `[resource]` as it prints today: on the declaration line, in the slot the
-/// keyword it was until B413 held. B485's layout (Q10) moves it to a line of
-/// its own; until then it is the one attribute the declaration line opens
-/// with, and an `export` placed on that line goes after it.
-const RESOURCE_ON_THE_HEAD: &str = "[resource] ";
+/// `[resource]`, on a line of its own above the declaration like every other
+/// attribute (B485 Q10, RULED): until B413 it was a keyword in the
+/// declaration line's slot, and it printed there — `[resource] export struct
+/// H` — which needed one attribute AFTER the keywords' line start, an
+/// exception to the one order. A field's or a variant's attributes are not
+/// declarations' and stay inline (the 2026-10-02 amendment).
+const RESOURCE_ATTRIBUTE: &str = "[resource]";
 
 /// `(in PATH)` after an `export` — printed verbatim, `::`-joined, with no
 /// space before the `(` (`export(in pkg) fun f()`). Empty when the marker
@@ -3995,8 +4387,16 @@ impl<'src> Printer<'src> {
     /// started. The block is every leading import, comments and blank lines and
     /// all.
     fn export_all_marker_slot(&self, items: &[Spanned<Node<'src>>], marker: usize) -> usize {
-        let mut slot = 0;
-        let mut index = 0;
+        // A file's `[platform(..)] mod self;` is its FIRST statement by rule
+        // (B415) — the import run and the marker below it both come after it.
+        // Slot 0 here put `export *;` above it, and the reprint no longer
+        // parsed (layout-46's find: every fenced module with an `export *;`).
+        let first = usize::from(matches!(
+            items.first().map(|item| &item.0),
+            Some(Node::ModulePlatform(_))
+        ));
+        let mut slot = first;
+        let mut index = first;
         while index < items.len() {
             if index == marker {
                 index += 1;
@@ -4344,6 +4744,11 @@ impl<'src> Printer<'src> {
             });
         }
 
+        // E251: duplicates go — identical statements collapse, a name repeated
+        // in one group drops, statements over one module merge into one group
+        // (a module import becoming its `self`).
+        let mut entries = merge_duplicate_imports(entries);
+
         // Canonical order — a stable sort, so equal keys keep their source order.
         entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
@@ -4497,8 +4902,7 @@ impl<'src> Printer<'src> {
     /// line begins; the marker is placed THERE once the item is printed, so
     /// every item kind — and a derive, a service or a macro attribute
     /// wrapping one — takes it at its signature without an arm of its own.
-    /// `[resource]`, which still prints on the declaration line, is an
-    /// attribute and stays ahead of it (`[resource] export struct H`). An item
+    /// `[resource]` is an attribute line like the rest (B485 Q10). An item
     /// with no attribute takes the marker at its start, as it always did. The
     /// declaration line's width rule measures from the same offset, so it
     /// reads the line with the marker on it.
@@ -4507,9 +4911,23 @@ impl<'src> Printer<'src> {
         scope: Option<&ExportScope<'src>>,
         exported: &Spanned<Node<'src>>,
     ) {
+        let marker = format!("export{} ", export_scope_text(scope));
+        let _ = self.print_item_under_keyword(&marker, |printer| printer.print_item(exported));
+    }
+
+    /// Prints a declaration with a marker KEYWORD on its signature line, after
+    /// every attribute line the declaration prints above it — B485 §6.2's one
+    /// order, for `export` ([`Printer::print_exported_item`]) and for the two
+    /// keywords that wrap a declaration node of their own, `const` (B487) and
+    /// `macro`. `print` prints the declaration; the keyword (with its trailing
+    /// space) is placed at the declaration line it marked, or at the start
+    /// when it printed no attribute. The declaration line stays marked at the
+    /// keyword, so an enclosing `export` lands ahead of it: `[deprecated(..)]`
+    /// ⏎ `export const fun f()`.
+    fn print_item_under_keyword(&mut self, keyword: &str, print: impl FnOnce(&mut Self)) -> usize {
         let start = self.out.len();
         let enclosing_head = self.head_start.take();
-        self.print_item(exported);
+        print(self);
         let declaration = match self.head_start {
             Some(head) if head >= start => head,
             _ => {
@@ -4517,13 +4935,8 @@ impl<'src> Printer<'src> {
                 start
             }
         };
-        let declaration = if self.out[declaration..].starts_with(RESOURCE_ON_THE_HEAD) {
-            declaration + RESOURCE_ON_THE_HEAD.len()
-        } else {
-            declaration
-        };
-        let marker = format!("export{} ", export_scope_text(scope));
-        self.out.insert_str(declaration, &marker);
+        self.out.insert_str(declaration, keyword);
+        declaration
     }
 
     /// `(in PATH)` after an `export` — see [`export_scope_text`].
@@ -4609,13 +5022,14 @@ impl<'src> Printer<'src> {
     /// handled, so `format` falls back to the original source.
     fn print_item(&mut self, item: &Spanned<Node<'src>>) {
         match &item.0 {
-            // `[[resource] ][external ]struct Name[<…>][;|{ fields }]` — canonical
-            // order is `[resource] external struct` (destruction.md §3; B413's
-            // attribute, printed on the declaration's line as the keyword was).
+            // `[[resource] ⏎ ][external ]struct Name[<…>][;|{ fields }]` —
+            // canonical order is `[resource] external struct` (destruction.md
+            // §3; B413's attribute, on its own line since B485 Q10).
             Node::Struct(name, generics, external, resource, body, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str(RESOURCE_ON_THE_HEAD);
+                    self.out.push_str(RESOURCE_ATTRIBUTE);
+                    self.end_attribute_line();
                 }
                 if *external {
                     self.out.push_str("external ");
@@ -4689,11 +5103,12 @@ impl<'src> Printer<'src> {
                     }
                 }
             }
-            // `[[resource] ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
+            // `[[resource] ⏎ ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
             Node::Enum(name, generics, resource, variants, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str(RESOURCE_ON_THE_HEAD);
+                    self.out.push_str(RESOURCE_ATTRIBUTE);
+                    self.end_attribute_line();
                 }
                 self.out.push_str("enum ");
                 self.out.push_str(name.0);
@@ -4788,7 +5203,8 @@ impl<'src> Printer<'src> {
             Node::Trait(name, generics, supertraits, body, labels) => {
                 self.print_item_labels(labels);
                 if labels.as_ref().is_some_and(|labels| labels.resource) {
-                    self.out.push_str(RESOURCE_ON_THE_HEAD);
+                    self.out.push_str(RESOURCE_ATTRIBUTE);
+                    self.end_attribute_line();
                 }
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
@@ -4853,9 +5269,18 @@ impl<'src> Printer<'src> {
             // estate file writes the form, which is why nothing noticed —
             // `formatter_never_silently_bails` asserts the bail set over the
             // tree, and the tree had no exhibit.
-            Node::Const(inner) if matches!(inner.0, Node::Func(_)) => {
-                self.out.push_str("const ");
-                self.print_item(inner);
+            //
+            // B487: a `const` declaration carries the label prefix, which the
+            // keyword follows as `export` does — `[deprecated(..)]` ⏎ `const
+            // fun f()` — so the declaration prints its own attribute lines and
+            // the keyword goes on its signature. A labelled `const let` takes
+            // this arm too; an unlabelled one stays the expression printer's.
+            Node::Const(inner)
+                if matches!(inner.0, Node::Func(_))
+                    || matches!(inner.0, Node::Let(.., Some(_))) =>
+            {
+                let _ =
+                    self.print_item_under_keyword("const ", |printer| printer.print_item(inner));
             }
             // `export *;` — the module-wide marker. It carries no inner item, so
             // `needs_semicolon` leaves it out of its exclusion list and the
@@ -4880,9 +5305,18 @@ impl<'src> Printer<'src> {
             }
             // `macro fun name(..) { .. }` — a macro definition. The `macro`
             // keyword then the ordinary function form.
+            // Its attributes, if any, print above it with the keyword on the
+            // signature line, as `export`'s do.
+            // An async macro is written `async macro fun` (B524: Q8's table,
+            // `async` before `external`|`macro`), so the keyword goes in
+            // after the `async` the function printed.
             Node::MacroFun(func) => {
-                self.out.push_str("macro ");
-                self.print_func(func);
+                let at =
+                    self.print_item_under_keyword("macro ", |printer| printer.print_func(func));
+                if func.is_async && self.out[at..].starts_with("macro async ") {
+                    self.out
+                        .replace_range(at..at + "macro async ".len(), "async macro ");
+                }
             }
             // `[name(args)?] <item>` — a user macro attribute, on its own line
             // above the struct/enum/function it annotates (like `[derive(..)]`).
@@ -4969,6 +5403,10 @@ impl<'src> Printer<'src> {
             ImportBranch::Selector(selector) => {
                 self.out.push_str("(impl ");
                 self.out.push_str(&selector.subject_text);
+                if let Some(trait_text) = &selector.trait_text {
+                    self.out.push_str(" with ");
+                    self.out.push_str(trait_text);
+                }
                 self.out.push(')');
                 let mut members: Vec<&'src str> =
                     selector.members.iter().map(|(name, _)| *name).collect();
@@ -5988,7 +6426,7 @@ impl<'src> Printer<'src> {
     // lines; the prefix is a line like any other and breaks like one, while the
     // construct's own body lines are its business and are measured where they
     // are printed. (This used to refuse to measure such a rendering at all,
-    // which exempted the whole statement from the budget: a `std::ui` tree
+    // which exempted the whole statement from the budget: a `std::web::ui` tree
     // ending in `.when(cond, || { … })` stayed inline at any width — one
     // hand-split example collapsed to 707 columns.)
     //
@@ -6395,7 +6833,7 @@ impl<'src> Printer<'src> {
     /// Prints a list literal in split form: `[` closes the line that opened it,
     /// every element takes its own line one indentation level in with a trailing
     /// comma — the last one included, so adding an element is a one-line diff and
-    /// the shape matches what the `std::ui` idiom is already hand-written as —
+    /// the shape matches what the `std::web::ui` idiom is already hand-written as —
     /// and `]` returns to the opening line's indent, where the caller's closing
     /// parens and terminator glue after it.
     ///
@@ -7666,20 +8104,25 @@ impl<'src> Printer<'src> {
                 self.out.push(']');
             }
             Node::Call(callee, generic_arguments, arguments) => {
-                // A call binds tighter than `.`/`[]`, so `a.b(c)` parses as
-                // `a.(b(c))`. To call the *result* of a member/index access the
+                // A call binds tighter than `.`, so `a.b(c)` parses as
+                // `a.(b(c))`. To call the *result* of a member access the
                 // callee must be parenthesized — `(a.b)(c)` — or it reparses wrong.
                 // A `?.` lift chain likewise absorbs a following call into its
                 // continuation, so a `Lift` callee needs its own parens: `(a?.b)()`.
+                //
+                // An INDEX is not one of them (E252): `adders[2](30)` and
+                // `h.fs[0](30)` parse as a call OF the index — the postfix
+                // chain reads `[..]` and then `(..)` on its result — so the
+                // index prints as written. The parens it used to gain made the
+                // net decline the file. A grouped callee the author wrote,
+                // `(h.fs[0])(30)`, is a `LiftGroup` and prints its own.
                 //
                 // A member chain that already ENDS in a call is the exception:
                 // `kept.read()(2)` calls the result of `kept.read()`, which is
                 // what the postfix chain reads anyway, so it prints as written
                 // rather than as `(kept.read())(2)`, which the net declined.
-                if matches!(
-                    callee.0,
-                    Node::MemberAccessor(_, _) | Node::Index(_, _) | Node::Lift(_, _)
-                ) && !Self::member_chain_ends_in_a_call(&callee.0)
+                if matches!(callee.0, Node::MemberAccessor(_, _) | Node::Lift(_, _))
+                    && !Self::member_chain_ends_in_a_call(&callee.0)
                 {
                     self.out.push('(');
                     self.print_expr(callee);
@@ -8688,12 +9131,14 @@ mod reformats {
         );
     }
 
-    // B445 + B485 §6.2 (RULED): an attribute run may stand on either side of
-    // `export`, and the formatter prints the ruled order — attributes, then
-    // the keywords with `export` first, then the declaration word — so the
-    // signature is one line. Every item kind a label leads, a run of several,
+    // B445 + B485 §6.2 (RULED): the formatter prints the ruled order —
+    // attributes, then the keywords with `export` first, then the declaration
+    // word — so the signature is one line. The run written on the other side
+    // of `export` is refused since B485 S3 and still read as the order, so
+    // `vilan fmt` writes it in the order too: the migration the refusal asks
+    // for (B536). Every item kind a label leads, a run of several,
     // a scoped marker, a re-export's label, a comment above the statement, a
-    // run split across the marker, `[resource]` on the declaration line, an
+    // run split across the marker, `[resource]` on its own line (Q10), an
     // unattributed export (unchanged), and a rotated statement after an
     // untouched one.
     #[test]
@@ -8729,15 +9174,101 @@ mod reformats {
             ),
             (
                 "export [resource] struct Handle { id: i32 }\n",
-                "[resource] export struct Handle {\n\tid: i32,\n}\n",
+                "[resource]\nexport struct Handle {\n\tid: i32,\n}\n",
             ),
             (
                 "export [hint(Show)] [resource] external struct Handle;\n",
-                "[hint(Show)]\n[resource] export external struct Handle;\n",
+                "[hint(Show)]\n[resource]\nexport external struct Handle;\n",
             ),
             (
                 "export fun a() {}\n\n[must_use] export fun b(): i32 { 1 }\n",
                 "export fun a() {}\n\n[must_use]\nexport fun b(): i32 {\n\t1\n}\n",
+            ),
+        ] {
+            assert_formats(written, expected);
+        }
+    }
+
+    // B485 Q7 (RULED): attributes are written in ANY order, and `vilan fmt`
+    // prints them in the one canonical order (`parsing::attribute_rank`) — on
+    // a function, a struct (with `[derive]` and `[resource]`), a labelled
+    // `let`, a trait, under `export` on either side, and in a trait body.
+    // The net sorts both streams the same way, so none of these declines.
+    // E252: a call through an indexed closure prints as written — the
+    // postfix chain reads `[..]` and then the call on its result — where the
+    // printer wrapped the index in parens and the net declined the whole file
+    // (native-46's `print(adders[2](30));`). A member chain ahead of the index,
+    // a chained index, a call of the call, and the author's own groups.
+    #[test]
+    fn e252_a_call_through_an_indexed_closure_prints_as_written() {
+        for source in [
+            "fun main() {\n\tprint(adders[2](30));\n}\n",
+            "fun main() {\n\tlet a = adders[0](30);\n}\n",
+            "fun main() {\n\th.fs[0](30);\n}\n",
+            "fun main() {\n\ta[0][1](2);\n}\n",
+            "fun main() {\n\th.fs[0](30)(1);\n}\n",
+            "fun main() {\n\t(h.fs[0])(30);\n}\n",
+            "fun main() {\n\t(h.fs)[0](30);\n}\n",
+            "fun main() {\n\t(a.b)(c);\n}\n",
+        ] {
+            // `reprint`, not `format`: a decline hands the source back, which
+            // an identity expectation cannot tell from a reprint.
+            assert_eq!(
+                crate::formatter::reprint(source).as_deref(),
+                Ok(source),
+                "{source}"
+            );
+        }
+    }
+
+    // B524 (decided by B485 Q8's table): an async macro is written `async
+    // macro fun` — `async` before `external`|`macro` — with its attributes
+    // above; `macro async fun`, the one order the production read before,
+    // is refused and still read, so `vilan fmt` writes it in the order.
+    // Idempotent; a plain macro and a plain async function are untouched.
+    #[test]
+    fn b524_an_async_macro_prints_async_macro_fun() {
+        let canonical = "async macro fun m() {}\n";
+        assert_formats(canonical, canonical);
+        assert_formats("macro async fun m() {}\n", canonical);
+        assert_formats(
+            "macro [deprecated(\"d\")] async fun m() {}\n",
+            "[deprecated(\"d\")]\nasync macro fun m() {}\n",
+        );
+        assert_formats(
+            "[deprecated(\"d\")]\nasync macro fun m() {}\n",
+            "[deprecated(\"d\")]\nasync macro fun m() {}\n",
+        );
+        assert_formats("macro fun m() {}\n", "macro fun m() {}\n");
+        assert_formats("async fun f() {}\n", "async fun f() {}\n");
+    }
+
+    #[test]
+    fn b485_an_attribute_run_in_any_order_prints_in_the_canonical_one() {
+        for (written, expected) in [
+            (
+                "[platform(\"node\")] [must_use] [internal(\"r\")] [deprecated(\"d\")] fun f(): i32 { 1 }\n",
+                "[deprecated(\"d\")]\n[internal(\"r\")]\n[must_use]\n[platform(\"node\")]\nfun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "[resource] [internal(\"r\")] [derive(PartialEq)] struct S { a: i32 }\n",
+                "[derive(PartialEq)]\n[internal(\"r\")]\n[resource]\nstruct S {\n\ta: i32,\n}\n",
+            ),
+            (
+                "[internal(\"r\")] [deprecated(\"d\")] lazy let x = 1;\n",
+                "[deprecated(\"d\")]\n[internal(\"r\")]\nlazy let x = 1;\n",
+            ),
+            (
+                "[resource] [platform(\"node\")] export trait T {\n\tfun t(self): i32;\n}\n",
+                "[platform(\"node\")]\n[resource]\nexport trait T {\n\tfun t(self): i32;\n}\n",
+            ),
+            (
+                "export [must_use] [deprecated(\"d\")] async fun f(): i32 { 1 }\n",
+                "[deprecated(\"d\")]\n[must_use]\nexport async fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "trait T {\n\t[must_use] [deprecated(\"d\")] fun t(self): i32;\n}\n",
+                "trait T {\n\t[deprecated(\"d\")]\n\t[must_use]\n\tfun t(self): i32;\n}\n",
             ),
         ] {
             assert_formats(written, expected);
@@ -8846,7 +9377,7 @@ mod reformats {
             "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
             "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
         );
-        // The shape `std::dom`'s listen surface is declared in (`router.md`
+        // The shape `std::web::dom`'s listen surface is declared in (`router.md`
         // §5.2): a MARKED registration and an UNMARKED removal, adjacent, on
         // the same host object. The audit rule draws its line between these two
         // lines — `addEventListener` stores the closure, `removeEventListener`
@@ -8921,7 +9452,7 @@ mod reformats {
     fn resource_struct_modifier_round_trips() {
         assert_formats(
             "[resource] struct S{x:i32}\n",
-            "[resource] struct S {\n\tx: i32,\n}\n",
+            "[resource]\nstruct S {\n\tx: i32,\n}\n",
         );
     }
 
@@ -8929,7 +9460,7 @@ mod reformats {
     fn resource_external_struct_keeps_canonical_order() {
         assert_formats(
             "[resource] external struct Database;\n",
-            "[resource] external struct Database;\n",
+            "[resource]\nexternal struct Database;\n",
         );
     }
 
@@ -8938,11 +9469,11 @@ mod reformats {
         // B470: `[resource]` closes a trait's label prefix, as on a struct.
         assert_formats(
             "[resource] trait Flow<T>{fun start(own self);}\n",
-            "[resource] trait Flow<T> {\n\tfun start(own self);\n}\n",
+            "[resource]\ntrait Flow<T> {\n\tfun start(own self);\n}\n",
         );
         assert_formats(
             "[deprecated(\"use Flow\")] [resource] trait Old{}\n",
-            "[deprecated(\"use Flow\")]\n[resource] trait Old {}\n",
+            "[deprecated(\"use Flow\")]\n[resource]\ntrait Old {}\n",
         );
     }
 
@@ -8950,7 +9481,7 @@ mod reformats {
     fn resource_enum_modifier_round_trips() {
         assert_formats(
             "[resource] enum E{A,B}\n",
-            "[resource] enum E {\n\tA,\n\tB,\n}\n",
+            "[resource]\nenum E {\n\tA,\n\tB,\n}\n",
         );
     }
 
@@ -9122,11 +9653,11 @@ mod reformats {
     /// formatted rather than a failure anyone sees.
     #[test]
     fn a_module_qualified_type_path_round_trips() {
-        let source = "import std::reactive;\nimport std::style;\n\n\
+        let source = "import std::reactive;\nimport std::web::style;\n\n\
              struct Card {\n\
              \tstyle: style::Style,\n\
              \thits: reactive::SignalCell<i32>,\n\
-             \tdeep: List<std::style::Style>,\n\
+             \tdeep: List<std::web::style::Style>,\n\
              }\n\n\
              impl style::Style {\n\
              \tfun tag(&self): str {\n\
@@ -9215,13 +9746,13 @@ mod idempotency {
     // bailed on all three; this is the pin the item asked for, and with
     // `assert_fixed_point` reading `reprint` it can no longer pass by bailing.
     fixed_point_tests! {
-        null_vl => "null.vl",
+        null_vl => "js/null.vl",
         boolean_vl => "boolean.vl",
         option_vl => "option.vl",
         result_vl => "result.vl",
         list_vl => "list.vl",
         string_vl => "string.vl",
-        set_vl => "set.vl",
+        hash_set_vl => "hash_set.vl",
         iterator_vl => "iterator.vl",
         arena_vl => "arena.vl",
         shared_vl => "shared.vl",
@@ -9428,7 +9959,7 @@ mod idempotency {
         // F27 R1: the file's own line, an impl's label and a nominal's.
         let source = concat!(
             "[platform(\"browser\")] mod self;\n\n",
-            "import std::ui::Region;\n\n",
+            "import std::web::ui::Region;\n\n",
             "[platform(\"browser\")]\n",
             "struct Slot {}\n\n",
             "[platform(\"browser\", \"@process\")]\n",
@@ -9489,7 +10020,8 @@ mod idempotency {
             "export struct Map<S, T, U> {\n\tup: S,\n}\n\n",
             "[internal(\"a node\")]\n",
             "[hint(Iterator<(usize, T)>)]\n",
-            "[resource] struct Enumerated<I, T> {\n\tupstream: I,\n}\n\n",
+            "[resource]\n",
+            "struct Enumerated<I, T> {\n\tupstream: I,\n}\n\n",
             "[hint(Source<Option<T>>)]\n",
             "enum Maybe<T> {\n\tSome(T),\n\tNone,\n}\n",
         );
@@ -10244,6 +10776,34 @@ mod const_declaration_printing {
         );
     }
 
+    /// B487: a `const` declaration carries the label prefix, and prints it as
+    /// every declaration does (B485 §6.2) — each attribute on its own line,
+    /// the keywords on the signature, `export` ahead of `const`. Written in
+    /// either order around `export`.
+    #[test]
+    fn a_const_declarations_labels_print_above_its_keywords() {
+        for (written, expected) in [
+            (
+                "[deprecated(\"use g\")] [must_use] const fun f(): i32 { 1 }\n",
+                "[deprecated(\"use g\")]\n[must_use]\nconst fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "export [internal(\"why\")] const fun f(): i32 { 1 }\n",
+                "[internal(\"why\")]\nexport const fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "[internal(\"why\")] const let x = 1;\n",
+                "[internal(\"why\")]\nconst let x = 1;\n",
+            ),
+            (
+                "[deprecated(\"use y\")] export const let y: i32 = 1;\n",
+                "[deprecated(\"use y\")]\nexport const let y: i32 = 1;\n",
+            ),
+        ] {
+            assert_construct(written, expected);
+        }
+    }
+
     /// N108: the other half of `Node::Const` — the weak-precedence EXPRESSION
     /// prefix, whose statement form takes its `;` like any other expression
     /// statement.
@@ -10991,7 +11551,7 @@ mod nested_layout {
     // --- R1: a link's own line is measured, and its argument splits ----------
 
     /// The motivating shape, from the website's `art.vl` `diagram()`: a
-    /// hand-nested `std::ui` view tree flattened onto one line. The statement's
+    /// hand-nested `std::web::ui` view tree flattened onto one line. The statement's
     /// chain splits, then each `.child(…)` link whose OWN line overflows splits
     /// its argument tree one level deeper — its subject staying on the link's
     /// line after `.child(`, its links one level in, and the enclosing call's
@@ -11683,7 +12243,7 @@ mod spanning_renderings {
     //!
     //! This used to be the opposite: a rendering containing any newline was
     //! refused a measurement, which exempted the ENTIRE statement from the
-    //! budget. One block-bodied closure at the tail of a `std::ui` tree kept the
+    //! budget. One block-bodied closure at the tail of a `std::web::ui` tree kept the
     //! whole chain inline at any width — `examples/reactive-ui/todos.vl`, hand
     //! split by its author, reformatted into a single 707-column line, and the
     //! formatter had no way back out of it.
@@ -12524,7 +13084,7 @@ mod signature_layout {
     use super::chain_splitting::{assert_over_budget, columns};
 
     /// The motivating signature — `serve_connected` as it stood in
-    /// `std/src/process/rpc_server.vl` (since retired, E71): 172 columns of
+    /// `std/src/process/rpc/server.vl` (since retired, E71): 172 columns of
     /// closure-typed parameters, wide by construction.
     #[test]
     fn an_over_budget_signature_splits_one_parameter_per_line() {
@@ -13359,20 +13919,48 @@ mod import_sorting {
         );
     }
 
-    // Only a BARE `self` heads the group. `self as name` renames the namespace
-    // — a binding of its own — and keys by the text it writes, so it stays where
-    // the alias sorts it (E142's rule, unchanged).
+    // E256 (RULED 2026-10-03): `self as name` is the group's own namespace
+    // under a name, so it heads the group as a bare `self` does — after a bare
+    // `self`, ahead of every member, two renames by their alias. It sorted
+    // among the names by its text before (E142's key), so E251's merged
+    // `{ Json, JsonValue, self as j }` put the namespace last.
     #[test]
-    fn an_aliased_self_does_not_head_the_group() {
+    fn e256_an_aliased_self_heads_the_group_after_a_bare_self() {
         assert_sorts(
             "import std::option::Option::{ Some, self as Maybe, None };\n",
-            "import std::option::Option::{ None, Some, self as Maybe };\n",
+            "import std::option::Option::{ self as Maybe, None, Some };\n",
         );
-        // A group carrying BOTH: the bare `self` heads it, the rename sorts by
-        // its own text.
+        assert_sorts(
+            "import std::json::{ Json, JsonValue, self as j };\n",
+            "import std::json::{ self as j, Json, JsonValue };\n",
+        );
+        // A group carrying BOTH: the bare `self` first, then the rename.
         assert_sorts(
             "import std::option::Option::{ Some, self as Maybe, None, self };\n",
-            "import std::option::Option::{ self, None, Some, self as Maybe };\n",
+            "import std::option::Option::{ self, self as Maybe, None, Some };\n",
+        );
+        // Two renames order by their alias; already-first is a fixed point.
+        assert_sorts(
+            "import std::option::Option::{ None, self as b, self as a };\n",
+            "import std::option::Option::{ self as a, self as b, None };\n",
+        );
+        assert_sorts(
+            "import std::option::Option::{ self as Maybe, None, Some };\n",
+            "import std::option::Option::{ self as Maybe, None, Some };\n",
+        );
+        // Organize Imports writes the same order: one key serves both.
+        assert_eq!(
+            super::organize::organize("import std::json::{ Json, JsonValue, self as j };\n", &[]),
+            "import std::json::{ self as j, Json, JsonValue };\n"
+        );
+        // The net reads the two orders of one group as one.
+        assert_eq!(
+            normalize(raw_tokens(
+                "import std::option::Option::{ Some, self as Maybe, None };\n"
+            )),
+            normalize(raw_tokens(
+                "import std::option::Option::{ self as Maybe, None, Some };\n"
+            )),
         );
     }
 
@@ -13443,6 +14031,24 @@ mod import_sorting {
         ] {
             assert_sorts(source, source);
         }
+    }
+
+    // B455: `with TRAIT` names the block by its trait and round-trips with a
+    // tail and beside a plain selector; two selectors over one subject order
+    // by their whole text.
+    #[test]
+    fn a_selector_naming_its_trait_round_trips_and_sorts() {
+        for source in [
+            "import pkg::a::{ (impl Box with One) };\n",
+            "import pkg::a::{ (impl Box with One)::describe };\n",
+            "import pkg::a::{ (impl Box<_> with Feed<i32>) };\n",
+        ] {
+            assert_sorts(source, source);
+        }
+        assert_sorts(
+            "import pkg::a::{ (impl Box with Two), (impl Box with One) };\n",
+            "import pkg::a::{ (impl Box with One), (impl Box with Two) };\n",
+        );
     }
 
     // A `use` always sorts after every `import`, whatever the paths — the kind
@@ -13570,7 +14176,7 @@ mod import_sorting {
     fn an_aliased_brace_member_sorts_and_keeps_its_alias() {
         assert_sorts(
             "import std::option::Option::{ Some, self as Maybe, None };\n",
-            "import std::option::Option::{ None, Some, self as Maybe };\n",
+            "import std::option::Option::{ self as Maybe, None, Some };\n",
         );
     }
 
@@ -13731,6 +14337,27 @@ mod export_marker_placement {
         assert_places(
             "import std::io::print;\nexport *;\nfun main() {}\n",
             "import std::io::print;\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // A file's `[platform(..)] mod self;` is its first statement (B415), so
+    // the marker's slot is below it — and below the import run after it. The
+    // slot used to count from 0, put `export *;` ABOVE `mod self;`, and the
+    // reprint no longer parsed: every fenced module carrying the marker was
+    // declined (layout-46's find, on std's F28 move).
+    #[test]
+    fn a_file_platform_declaration_stays_first_above_the_marker() {
+        assert_places(
+            "[platform(\"browser\")] mod self;\n\nexport *;\n\nfun f() {}\n",
+            "[platform(\"browser\")] mod self;\n\nexport *;\n\nfun f() {}\n",
+        );
+        assert_places(
+            "[platform(\"browser\")] mod self;\n\nexport *;\n\nimport std::io::print;\n\nfun f() {}\n",
+            "[platform(\"browser\")] mod self;\n\nimport std::io::print;\n\nexport *;\n\nfun f() {}\n",
+        );
+        assert_places(
+            "// what this module is\n\n[platform(\"@process\")] mod self;\n\nfun f() {}\n\nexport *;\n",
+            "// what this module is\n\n[platform(\"@process\")] mod self;\n\nexport *;\n\nfun f() {}\n",
         );
     }
 
@@ -14611,7 +15238,7 @@ mod style_chain_order {
     //! slots are entangled share a FAMILY and never move relative to each
     //! other. Everything below either pins the ruling or pins one of those two
     //! rules. `crates/vilan-core/tests/style_table_sync.rs` holds the table to
-    //! `vilan/std/src/style.vl`; `crates/vilan-cli/tests/style_chain_order.rs`
+    //! `vilan/std/src/web/style.vl`; `crates/vilan-cli/tests/style_chain_order.rs`
     //! proves the reorder leaves the emitted CSS byte-identical.
     use super::bailing_constructs::assert_construct;
     use super::{
@@ -15100,7 +15727,7 @@ mod on_head_order {
     //!
     //! The reorder is safe for a reason the model gives rather than a bet a test
     //! has to make: a condition SET has no order. `canonical_condition` in
-    //! `vilan/std/src/style.vl` sorts the tokens before the slot key is built,
+    //! `vilan/std/src/web/style.vl` sorts the tokens before the slot key is built,
     //! so `md() + hover()` and `hover() + md()` already mint one class, and the
     //! formatter is putting the SOURCE in the order the selector reads in.
     //! `crates/vilan-core/tests/style_table_sync.rs` gate 6 holds the axis

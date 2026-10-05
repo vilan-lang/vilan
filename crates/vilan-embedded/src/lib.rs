@@ -141,7 +141,102 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
 /// the toolchain version and a hash of `macro_std` and discards the whole file
 /// when either moves.
 pub fn default_check_cache_root() -> PathBuf {
+    // N137: an explicit root wins. The workspace's `.cargo/config.toml` sets it
+    // for every test process (and so for every `vilan` a test spawns), which
+    // is what stops the suite minting thousands of tables — one per temp
+    // package path — in the developer's own home.
+    if let Some(root) = std::env::var_os("VILAN_CHECK_CACHE").filter(|root| !root.is_empty()) {
+        return PathBuf::from(root);
+    }
     toolchain_cache("check-cache")
+}
+
+/// The check-cache's bound (N137): a table untouched this long is removed.
+/// Thirty days, not [`STALE_AFTER`]'s seven: a table is a package's warm macro
+/// worlds, and a package a developer returns to monthly should still find them.
+pub const CHECK_CACHE_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The bound's other two halves: at most this many tables, and at most this
+/// many bytes in all — the oldest go first. An entry younger than
+/// [`CHECK_CACHE_GRACE`] is never evicted by them, because a check running
+/// right now may be reading it.
+pub const CHECK_CACHE_MAX_ENTRIES: usize = 256;
+pub const CHECK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const CHECK_CACHE_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Holds the check-cache at `cache_root` to its bound (N137): every table older
+/// than [`CHECK_CACHE_MAX_AGE`], then — oldest first — enough of the rest to
+/// bring the root under [`CHECK_CACHE_MAX_ENTRIES`] and
+/// [`CHECK_CACHE_MAX_BYTES`], never `keep` (the package being checked) and
+/// never a table younger than [`CHECK_CACHE_GRACE`]. Returns what it removed.
+///
+/// It walks every table, so it runs at most once a day per root: a stamp file
+/// in the root records the last pass, and a pass younger than a day returns at
+/// once. The first pass on a machine that grew 19,000 tables before the bound
+/// existed is the expensive one, and it is paid once.
+pub fn bound_check_cache(cache_root: &Path, keep: Option<&Path>) -> Vec<CacheEntry> {
+    let stamp = cache_root.join(".last-bound");
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let recent = std::fs::metadata(&stamp)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < day);
+    if recent {
+        return Vec::new();
+    }
+    let removed = enforce_check_cache_bound(
+        cache_root,
+        keep,
+        CHECK_CACHE_MAX_AGE,
+        CHECK_CACHE_MAX_ENTRIES,
+        CHECK_CACHE_MAX_BYTES,
+        CHECK_CACHE_GRACE,
+    );
+    if std::fs::create_dir_all(cache_root).is_ok() {
+        let _ = std::fs::write(&stamp, b"");
+    }
+    removed
+}
+
+/// [`bound_check_cache`]'s policy with its limits as arguments, and no daily
+/// stamp — the seam the tests use.
+pub fn enforce_check_cache_bound(
+    cache_root: &Path,
+    keep: Option<&Path>,
+    max_age: std::time::Duration,
+    max_entries: usize,
+    max_bytes: u64,
+    grace: std::time::Duration,
+) -> Vec<CacheEntry> {
+    let keep = keep.map(|keep| keep.to_path_buf());
+    let mut entries: Vec<CacheEntry> = cache_entries(cache_root)
+        .into_iter()
+        .filter(|entry| Some(&entry.path) != keep.as_ref())
+        .collect();
+    // Oldest first; an entry whose age the platform will not report is treated
+    // as young, as `prune` treats it.
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.age.unwrap_or_default()));
+    let mut removed = Vec::new();
+    let mut kept_entries =
+        entries.len() + usize::from(keep.as_ref().is_some_and(|keep| keep.is_dir()));
+    let mut kept_bytes: u64 = entries.iter().map(|entry| entry.bytes).sum::<u64>()
+        + keep.as_ref().map(|keep| directory_bytes(keep)).unwrap_or(0);
+    for entry in entries {
+        let age = entry.age.unwrap_or_default();
+        let expired = age > max_age;
+        let over = kept_entries > max_entries || kept_bytes > max_bytes;
+        if !expired && !(over && age > grace) {
+            continue;
+        }
+        if std::fs::remove_dir_all(&entry.path).is_ok() {
+            kept_entries -= 1;
+            kept_bytes = kept_bytes.saturating_sub(entry.bytes);
+            removed.push(entry);
+        }
+    }
+    removed
 }
 
 /// Where **git dependencies** are cached: `~/.vilan/git-deps`, beside the std
@@ -453,5 +548,122 @@ mod tests {
     fn no_home_variable_at_all_is_none() {
         assert_eq!(home_dir_from(false, environment(&[])), None);
         assert_eq!(home_dir_from(true, environment(&[])), None);
+    }
+}
+
+/// N137: the check-cache's bound, against a fixture root whose tables are
+/// AGED by their directory mtimes. The bound reads ages from the same clock
+/// on every platform (`SystemTime` against the entry's mtime), and the pin
+/// sets the mtimes itself rather than waiting on one — so it holds on Windows,
+/// where a directory's mtime is settable the same way.
+#[cfg(test)]
+mod check_cache_bound_tests {
+    use super::enforce_check_cache_bound;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    fn root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "vilan-check-cache-bound-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create the fixture root");
+        root
+    }
+
+    /// A table of `bytes` bytes, last written `age` ago.
+    fn table(root: &Path, name: &str, bytes: usize, age: Duration) -> PathBuf {
+        let path = root.join(name);
+        std::fs::create_dir_all(&path).expect("create a table");
+        std::fs::write(path.join("macro-expansions"), vec![b'x'; bytes]).expect("write a table");
+        age_directory(&path, SystemTime::now() - age).expect("age the table");
+        path
+    }
+
+    /// Sets a DIRECTORY's mtime, which is what the bound reads as a table's
+    /// age. Opening a directory as a file differs by platform: unix opens it
+    /// read-only and `futimens` needs only ownership, while Windows refuses to
+    /// open a directory at all without `FILE_FLAG_BACKUP_SEMANTICS`, and
+    /// refuses to stamp a time through a handle without
+    /// `FILE_WRITE_ATTRIBUTES` (the first CI run read "Access is denied." on
+    /// every one of these pins). Asking for exactly those two is the whole of
+    /// what the platform needs; the bound itself reads the mtime through
+    /// `metadata().modified()`, which works the same everywhere.
+    #[cfg(not(windows))]
+    fn age_directory(path: &Path, when: SystemTime) -> std::io::Result<()> {
+        std::fs::File::open(path)?.set_modified(when)
+    }
+
+    #[cfg(windows)]
+    fn age_directory(path: &Path, when: SystemTime) -> std::io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // winnt.h / winbase.h.
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?
+            .set_modified(when)
+    }
+
+    fn names(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .expect("read the root")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_expired_table_goes_and_a_young_one_stays() {
+        let root = root("age");
+        table(&root, "old", 10, 40 * DAY);
+        table(&root, "young", 10, DAY);
+        let removed =
+            enforce_check_cache_bound(&root, None, 30 * DAY, 100, u64::MAX, Duration::ZERO);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(names(&root), ["young"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn past_the_count_the_oldest_go_first_and_the_kept_table_never_does() {
+        let root = root("count");
+        table(&root, "a", 10, 5 * DAY);
+        let keep = table(&root, "b", 10, 9 * DAY);
+        table(&root, "c", 10, 7 * DAY);
+        table(&root, "d", 10, 2 * DAY);
+        // Four tables, at most two: the two oldest that are not `keep` go —
+        // `c` (7 days) and `a` (5) — and `b`, the oldest of all, stays.
+        enforce_check_cache_bound(&root, Some(&keep), 30 * DAY, 2, u64::MAX, Duration::ZERO);
+        assert_eq!(names(&root), ["b", "d"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn past_the_bytes_the_oldest_go_until_it_fits_but_never_inside_the_grace() {
+        let root = root("bytes");
+        table(&root, "old", 1000, 3 * DAY);
+        table(&root, "mid", 1000, 2 * DAY);
+        table(&root, "now", 1000, Duration::from_secs(60));
+        // 3,000 bytes against 500: `old` and `mid` go; `now` is inside the
+        // ten-minute grace (a check may be reading it), so it stays even
+        // though the root is still over after the two.
+        enforce_check_cache_bound(
+            &root,
+            None,
+            30 * DAY,
+            100,
+            500,
+            Duration::from_secs(10 * 60),
+        );
+        assert_eq!(names(&root), ["now"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

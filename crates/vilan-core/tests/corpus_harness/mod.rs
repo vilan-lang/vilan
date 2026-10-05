@@ -176,6 +176,7 @@ macro_rules! corpus_manifest {
             self_return => "self-return.vl",
             set => "set.vl",
             shared => "shared.vl",
+            shared_compound_write => "shared-compound-write.vl",
             side_effect_let => "side-effect-let.vl",
             signal_update => "signal-update.vl",
             spread_parameters => "spread-parameters.vl",

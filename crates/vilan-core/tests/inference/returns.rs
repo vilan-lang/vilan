@@ -5539,8 +5539,8 @@ fn b369_the_kolt_shape_a_context_carrying_closure_parameter_and_a_slot_impl() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Source, SignalCell, owner_scope };
-        import std::ui::{ Region, Slot, View };
-        import std::ui;
+        import std::web::ui::{ Region, Slot, View };
+        import std::web::ui;
 
         struct Conditional<T, S: Source<Option<T>>, C: Slot> {
         	condition: S,
@@ -5757,5 +5757,68 @@ fn b452_a_resource_temporary_in_an_earlier_argument_still_drops_after_its_statem
         }
         "#,
         "make 5\nblk\nmake 7\nblk2\n19\ndrop 7\ndrop 5\nend\n",
+    );
+}
+
+// --- B523: an unbound `return` is steered to `ret` -----------------------------
+
+/// B523: the shapes of `return` the parser must leave a name — a bare
+/// `return;`, `return (x)` (a call), `return -x` (a subtraction) and a block
+/// tail `{ return }` — fail where the name fails to resolve, with B520's
+/// steer word for word, so the diagnostic carries the same code and the same
+/// quick fix (`parsing::foreign_spelling_fix`), whose edit compiles. Bound,
+/// `return` is the binding it always was. (`return (y);` as a value body's
+/// last STATEMENT also gets "this body ends without producing a value", which
+/// is true of what was written; the two value shapes here are tails.)
+#[test]
+fn b523_an_unbound_return_is_steered_to_ret() {
+    use vilan_core::parsing::{ForeignSpelling, foreign_spelling_fix};
+    let steer = ForeignSpelling::Return.message();
+    for (body, fixed) in [
+        (
+            "\tif x > 0 {\n\t\treturn;\n\t}\n\tprint(x);\n",
+            "\tif x > 0 {\n\t\tret;\n\t}\n\tprint(x);\n",
+        ),
+        ("\tlet y = x;\n\treturn (y)\n", "\tlet y = x;\n\tret (y)\n"),
+        ("\treturn -x\n", "\tret -x\n"),
+        (
+            "\tif x > 0 { return }\n\tprint(x);\n",
+            "\tif x > 0 { ret }\n\tprint(x);\n",
+        ),
+    ] {
+        let returns = if body.contains("(y)") || body.contains("-x") {
+            ": i32"
+        } else {
+            ""
+        };
+        let program = |body: &str| {
+            format!(
+                "import std::io::print;\n\nfun f(x: i32){returns} {{\n{body}}}\n\nfun main() {{\n\tf(1);\n}}\n"
+            )
+        };
+        let source = program(body);
+        let diagnostics = failure_diagnostics(&source);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|(message, _)| message.as_str())
+                .collect::<Vec<_>>(),
+            vec![steer],
+            "{source}"
+        );
+        let span = diagnostics[0].1.clone();
+        assert_eq!(&source[span.clone()], "return", "{source}");
+        let fix = foreign_spelling_fix(&source, steer, (span.start..span.end).into())
+            .expect("the foreign-spelling fix");
+        assert_eq!(fix.code, "foreign-spelling/return");
+        let mut edited = source.clone();
+        edited.replace_range(fix.span.start..fix.span.end, fix.replacement);
+        assert_eq!(edited, program(fixed));
+        compile(&edited).unwrap_or_else(|errors| panic!("{edited}: {errors:#?}"));
+    }
+    // A program that binds `return` reads it, as before.
+    assert_compiles_and_runs(
+        "import std::io::print;\n\nfun main() {\n\tlet return = 4;\n\tprint(return);\n}\n",
+        "4\n",
     );
 }

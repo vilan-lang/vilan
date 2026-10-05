@@ -1,4 +1,4 @@
-//! End-to-end runtime test for `std::router` + `View.swap` (backlog A10,
+//! End-to-end runtime test for `std::web::router` + `View.swap` (backlog A10,
 //! proposal/router.md): a browser-target app is built with the real CLI and
 //! run under node against a ~60-line DOM/history stub, asserting the routing
 //! semantics the corpus can't reach (it only runs process-platform programs):
@@ -31,9 +31,9 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// The app under test: the Kolt-shaped route space — nested enums mirroring
 /// nested layouts, a hand-written `parse`/`href` pair over `segments`, typed
 /// `link`s, programmatic `navigate`, and a `swap`-rendered page tree.
-const APP: &str = r#"import std::ui::{ View, mount_root, swap, view };
+const APP: &str = r#"import std::web::ui::{ View, mount_root, swap, view };
 import std::reactive::{ Signal, SignalCell };
-import std::router::{ current_path, navigate, segments, link, Routable };
+import std::web::router::{ current_path, navigate, segments, link, Routable };
 import std::option::Option::{ self, Some, None };
 
 [derive(PartialEq)]
@@ -268,7 +268,7 @@ fn router_swap_link_and_history_semantics() {
 /// `segments` replaced by a `FromPath` impl over `parse_path(path).segments` —
 /// and the query, fragment and percent-decoding that were unreachable before.
 const PARSE_APP: &str = r#"import std::io::print;
-import std::router::{
+import std::web::router::{
 	FromPath,
 	Routable,
 	from_path,
@@ -523,8 +523,8 @@ fn a62_parse_path_reads_a_url_and_from_path_round_trips_through_to_path() {
 /// into a link by `View::link_to`. Both must carry `href` AND
 /// `draggable="false"`, and both must still intercept exactly the plain
 /// left-click.
-const DRAGGABLE_APP: &str = r#"import std::ui::{ View, view, mount_root };
-import std::router::{ link, Routable };
+const DRAGGABLE_APP: &str = r#"import std::web::ui::{ View, view, mount_root };
+import std::web::router::{ link, Routable };
 
 [derive(PartialEq)]
 enum Route {
@@ -634,7 +634,7 @@ fn b293_the_anchor_link_builds_is_not_drag_armed() {
 // through the redirect and arrive where it started, so an app wrote the other
 // half itself: kolt's `client.vl:39/44` is a hand-declared
 // `[extern("history.replaceState")]` plus a `navigate_in_place` that reaches
-// `std::router`'s own unexported `ensure_wired` and `path_signal`, under
+// `std::web::router`'s own unexported `ensure_wired` and `path_signal`, under
 // `// FIXME: Implement with std (A72)`.
 //
 // The pin's instrument is the history STACK, because the difference between the
@@ -643,8 +643,8 @@ fn b293_the_anchor_link_builds_is_not_drag_armed() {
 
 const REPLACE_APP: &str = r#"import std::io::print;
 import std::reactive::SignalCell;
-import std::router::{ current_path, navigate, navigate_replace };
-import std::ui::{ View, mount_root, view };
+import std::web::router::{ current_path, navigate, navigate_replace };
+import std::web::ui::{ View, mount_root, view };
 
 fun main() {
 	let path: SignalCell<str> = current_path();

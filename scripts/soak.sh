@@ -262,7 +262,7 @@ trap cleanup EXIT INT TERM
 write_client() { # dir
     mkdir -p "$1/src"
     cat > "$1/src/client.vl" <<'CLIENT'
-import std::asset::emit;
+import std::web::asset::emit;
 
 fun styles(): i32 {
 	emit("css", ".soak{color:red}");
@@ -341,12 +341,12 @@ MANIFEST
     write_client "$SERVER_DIR"
     cat > "$SERVER_DIR/src/server.vl" <<SERVER
 import std::build::require_build;
-import std::document::Document;
+import std::web::document::Document;
 import std::http::{ Response, Server };
 import std::json::json_codec;
 import std::process;
 import std::reactive::{ Signal, SignalCell };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 

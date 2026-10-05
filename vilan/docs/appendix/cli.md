@@ -214,23 +214,80 @@ compile no macro world at all — and that memory lives under
 `~/.vilan/check-cache/`, keyed by the package's path, *not* in the package.
 `dist/.cache` belongs to `vilan build`, which has a `dist/` because it has
 artifacts; a check has neither, and creating one would make a read-only
-command mutate the tree it was pointed at. `vilan cache prune` sweeps the
-check tables beside the std trees.
+command mutate the tree it was pointed at. The root holds itself to a
+bound — tables untouched for thirty days go, and past 256 tables or 256 MiB
+the oldest go first — and `vilan cache clean` empties it; `vilan cache
+prune` sweeps the check tables beside the std trees. `VILAN_CHECK_CACHE`
+names a different root.
+
+In a multi-entry package the entries are checked **at the same time**, one
+thread each, and their diagnostics are printed in entry order, exactly as
+a one-by-one round would print them (`VILAN_SEQUENTIAL_CHECK=1` runs them
+one by one).
+
+**`--explain-cost [N]`** prints, after checking, the `N` declarations
+(default 20) of your own package whose type inference cost the solver the
+most work: the constraint attempts, inferences, impl selections, type slots
+and impl rows its body's constraints took, each a *count* — never a time —
+so the same program ranks the same on every machine. Closures count toward
+the function that writes them, generated code toward the attribute that
+generated it, and std's declarations are left out.
+
+```sh
+vilan check --explain-cost 5
+```
 
 **`--fix`** is the one exception to "writes nothing", and it is asked for
-by name. Before checking, it applies the fix every **numeric mismatch**
-carries — the `.as_*()` conversion the message names, or `: usize` on a
-counter bound by a bare literal — to the package's own files (never to
-std or a dependency), analyzes again, and repeats until a round finds
-nothing more to fix; then it checks as usual and reports what is left.
-It prints one line first, `fixed 12 numeric mismatches in 3 files`. The
-edits are the editor's quick fixes (**Convert with `.as_usize()`**,
-**Declare `at` a `usize`**), computed by the same function, so the two
-never disagree. It is the migration tool for the release that moved
-std's positions, lengths and counts to [`usize`](../std/numbers.md): what
-it cannot decide — a `-1` "not found", a `for i >= 0` loop, signed
-arithmetic that should convert once at its end — stays a diagnostic, for
-a person. It cannot be combined with `--watch`.
+by name. Before checking, it applies the fixes the diagnostics carry to
+the package's own files (never to std or a dependency), analyzes again,
+and repeats until a round finds nothing more to fix; then it checks as
+usual and reports what is left. The edits are the editor's quick fixes,
+computed by the same functions, so the two never disagree. It cannot be
+combined with `--watch`. It fixes two kinds of diagnostic, each the
+migration tool for one release:
+
+- **A moved std path** (v0.44.0, where std's modules were grouped under
+  namespaces): every `import std::dom::…` becomes `import
+  std::web::dom::…`, a brace list keeps its names (`std::{ delta::SeqOp }`
+  becomes `std::{ reactive::delta::SeqOp }`), and `prelude = "std::web"`
+  in `vilan.toml` becomes `prelude = "std::web::prelude"` — only that
+  value changes, the file's comments and layout stay. One run migrates a
+  package, even one whose old imports are its only errors. A file that
+  `vilan fmt` left canonical is kept canonical (a moved import can sort
+  to a new place). Two things are left, and named: a file under the
+  package's
+  [`generated`](../guide/dev-loop.md#when-the-hook-generates-vilan)
+  root, which the project regenerates — change what generates it — and
+  a brace list
+  under the old web-prelude path that names `self`
+  (`std::web::{ self, Signal }`), which no one edit rewrites correctly.
+
+  ```sh
+  vilan check --fix
+  ```
+
+- **A numeric mismatch** (the release that moved std's positions,
+  lengths and counts to [`usize`](../std/numbers.md)): the `.as_*()`
+  conversion the message names, or `: usize` on a counter bound by a bare
+  literal (**Convert with `.as_usize()`**, **Declare `at` a `usize`**).
+  What it cannot decide — a `-1` "not found", a `for i >= 0` loop, signed
+  arithmetic that should convert once at its end — stays a diagnostic,
+  for a person.
+
+It prints what it did before the check's own report: for moved paths, a
+total and then one line per file with its count, and a line for each
+path it left; then, always, the numeric line.
+
+```text
+fixed 4 moved std paths in 3 files
+  src/main.vl: 2
+  src/views.vl: 1
+  vilan.toml: 1
+fixed 0 numeric mismatches in 0 files
+```
+
+A second run finds nothing, writes nothing, and says
+`fixed 0 numeric mismatches in 0 files`.
 
 One thing it does that `build` does not: when the file has a **syntax
 error**, `check` reports it and then type-checks the rest of the file
@@ -270,6 +327,10 @@ expression. Under `--watch` it rebuilds and
 restarts on every save; in a project with a browser leg, hot module
 replacement is on by default: the page swaps changed code in place
 instead of reloading (see [the dev loop](../guide/dev-loop.md)).
+
+Stdout is the program's: what the build itself reports on the way (the
+`Bundled` line for each resource it carries) goes to stderr, so a
+program prints the same bytes under either backend.
 
 - `--watch`: place it before the file, ahead of any program args.
 - `--no-hmr`: plain restart-the-server watching, no dev channel.
@@ -856,3 +917,19 @@ nothing can keep memory without writing into your tree. Deleting a table
 costs a recompile of that package's macro worlds and nothing else; the
 same seven-day guard applies, because a check running right now is holding
 its own table open.
+
+## `vilan cache clean`
+
+Deletes every macro expansion table `vilan check` keeps in
+`~/.vilan/check-cache/`, whatever its age. Each one is re-created by the
+next check of its package, so nothing is lost but the warm start.
+
+```sh
+vilan cache clean            # every check table
+vilan cache clean --dry-run  # print what would go, with sizes; delete nothing
+```
+
+A check also holds that root to a bound by itself, at most once a day:
+every table untouched for thirty days goes, and past 256 tables or 256 MiB
+the oldest go first — never the package being checked, and never a table
+younger than ten minutes, which a check running right now may be reading.

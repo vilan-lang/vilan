@@ -1,10 +1,10 @@
 # Browser modules reference
 
-The browser layer of std: `std::dom`, `std::ui`, `std::router`,
-`std::storage`. Available only for browser builds. Concepts:
+The browser layer of std: `std::web::dom`, `std::web::ui`, `std::web::router`,
+`std::web::storage`. Available only for browser builds. Concepts:
 [Building UI](../guide/ui.md), [Routing](../guide/routing.md).
 
-## std::dom
+## std::web::dom
 
 Opaque handles over real DOM objects.
 
@@ -230,7 +230,7 @@ if is_open {
 }
 ```
 
-## std::ui
+## std::web::ui
 
 ```vilan,fragment
 struct View { element: Element }
@@ -252,7 +252,7 @@ host's `null` typed as an `Element`, so the alternative was a
 `Cannot read properties of null` from somewhere inside the attach, with
 the one thing you got wrong appearing nowhere in the message. On the
 server side that mismatch is caught before it can happen: the id is what
-[`check_shell`](process.md#stddocument) holds the document against.
+[`check_shell`](process.md#stdwebdocument) holds the document against.
 
 `view` knows the SVG vocabulary: an SVG tag name (`svg`, `path`, `rect`,
 `clipPath`, …; exact case) creates its element in the SVG namespace, so
@@ -269,7 +269,7 @@ too.
 | `text` | `(content: str): View` | static text |
 | `class` | `(name: str): View` | static class |
 | `styled` | `(style: Style): View` | classes from a compiled style |
-| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, any `Source<str>` tracks; an `Option<str>` sets it or leaves it off, and a `Source<Option<str>>` tracks with `None` **removing** it (A115) — so the element-syntax form `<div data-dragging(maybe)>` takes every shape `bind_attr` does |
+| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, any `Source<str>` tracks; an `Option<str>` sets it or leaves it off, and a `Source<Option<str>>` tracks with `None` **removing** it (A115) — so the element-syntax form `<div data-dragging(maybe)>` takes every shape `bind_attr` does. Every name is written as spelled: `.attr("autofocus", "")` is the native attribute (for a `<dialog>` or a popover); an element head's written `autofocus` warns and steers to `.autofocus()` (A157) |
 | `style_var` | `(name: str, source: S): View`; `S: Source<str>` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
@@ -284,7 +284,7 @@ too.
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle — sets the `hidden` attribute AND an inline `display:none`, restoring the element's own inline `display` when it turns true |
 | `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
-| `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve; also WRITES the `autofocus` attribute, which is how a focus scope reads the author's choice (the SSR twin writes neither) |
+| `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve; writes NO attribute: it registers the element (a `WeakSet`), which is how an enclosing focus scope's `focus_initial` reads the author's choice, and inside a live scope it leaves the initial focus to the scope's show (A157). The SSR twin writes the native `autofocus` |
 | `focus_scope` | `(containment: FocusContainment): View` | make this element a focus scope and take the initial focus on `autofocus`'s clock — the sugar for the case with no show hook |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
@@ -334,13 +334,15 @@ the handler and drops it.
 The conditional, the dynamic subtree and the keyed run are **values**, not
 `View` methods. Each fills a child position, so it sits exactly where it is
 written — between siblings, not after them. They are bare names in the
-`std::web` prelude, and
-`std::ui::{ when, when_some, swap, each, each_values, each_by }` otherwise:
+`std::web::prelude`, the web prelude, and
+`std::web::ui::{ when, when_some, swap, each, each_values, each_by }` otherwise
+(`when_all_some` is reached as `ui::when_all_some` or imported by name):
 
 | function | signature | returns |
 |---|---|---|
 | `when` | `(condition: S, body: (sync \|\| C) context owner_scope)`; `S: Source<bool>, C: Slot` | `Conditional<S, C>` |
 | `when_some` | `(source: S, render: (sync \|SignalCell<T>\| C) context owner_scope)`; `S: Source<Option<T>>, C: Slot` | `WhenSome<T, S, C>` |
+| `when_all_some` | `(flows: (U in T: dyn Flow<Option<U>>), render: (sync \|(U in T: SignalCell<U>)\| C) context owner_scope)`; `T: (2..), C: Slot` | `WhenSome<T, ZipSome<T>, C>` |
 | `swap` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<T>, C: Slot` | `Swap<T, S, C>` |
 | `each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot` | `Each<T, K, S, C>` |
 | `each_values` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq + Hashable, S: Source<List<T>>, C: Slot` | `EachValues<T, S, C>` |
@@ -480,7 +482,7 @@ Two things deliberately still ask for the concrete type:
   `Flow` today — a source or a pipe; `AttrValue`'s `Option` arms (A115) arrived
   the same way.
 
-## std::router
+## std::web::router
 
 ```vilan,fragment
 fun current_path(): SignalCell<str>       // location.pathname, live (navigate + back/forward)
@@ -568,7 +570,7 @@ is remembered as in flight, so clicking the link again retries; there is no
 retry API because a link is one. Worked example:
 [the dev loop](../guide/dev-loop.md#shipping-routes-separately).
 
-## std::storage
+## std::web::storage
 
 `localStorage` / `sessionStorage`, string-keyed strings, in **two forms**: six
 free functions for the site that touches one key, and a `Storage` handle for
@@ -602,7 +604,7 @@ impl Storage {
 ```
 
 ```vilan,browser
-import std::storage;
+import std::web::storage;
 
 fun main() {
 	storage::set("token", "abc");
@@ -633,8 +635,8 @@ walk, since `len` and `key_at` are two host calls and another tab may remove a
 key between them.
 
 ```vilan,browser
-import std::dom::window;
-import std::storage;
+import std::web::dom::window;
+import std::web::storage;
 
 fun main() {
 	let store = window().local_storage();
@@ -647,14 +649,14 @@ fun main() {
 ```
 
 The two reader verbs live on `Window`, so a module that calls them imports
-**both** `std::dom`'s `window` and `std::storage` — the `impl Window` block is
-declared in `std::storage`, and an impl is in scope only where its module is.
+**both** `std::web::dom`'s `window` and `std::web::storage` — the `impl Window` block is
+declared in `std::web::storage`, and an impl is in scope only where its module is.
 
 ```vilan,browser
-import std::dom::window;
+import std::web::dom::window;
 import std::io::print;
 import std::option::Option::{ self, None, Some };
-import std::storage;
+import std::web::storage;
 
 fun main() {
 	let store = window().local_storage();
@@ -681,6 +683,6 @@ fun main() {
 `window` (a crash on the server) or an in-memory map answering reads with
 values the browser never wrote — and the second turns a layer mistake into a
 silent divergence between the two renders of one component. Importing
-`std::storage` from a process module is a cross-platform error at analysis
+`std::web::storage` from a process module is a cross-platform error at analysis
 instead. Server-side persistence is [`std::db`](process.md); state that must
 reach the browser rides the render or an rpc call.

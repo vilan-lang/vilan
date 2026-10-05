@@ -1,8 +1,0 @@
-// `std::set` — the hash set's name before tracker I9, kept ONE release as a
-// deprecated alias. The type is `std::hash_set::HashSet` now, beside
-// `std::hash_map::HashMap`.
-//
-// `Set` IS `HashSet` — the re-export publishes a second spelling of the same item.
-// Every use outside std warns with the steer; the module goes in the release after
-// the one that deprecated it.
-[deprecated("use std::hash_set::HashSet")] export import pkg::hash_set::HashSet as Set;

@@ -1,11 +1,11 @@
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each, render, swap, view };
+import std::web::ui::{ View, each, render, swap, view };
 
-// Server-side rendering (proposal/ssr.md, A7): on `@process`, `std::ui` builds
+// Server-side rendering (proposal/ssr.md, A7): on `@process`, `std::web::ui` builds
 // an HTML string tree and `render` serializes it. The component below is the
 // same shape a browser client would `mount` — the layer system gives each leg
-// its own `std::ui`, so the component code is unannotated and identical.
+// its own `std::web::ui`, so the component code is unannotated and identical.
 
 [derive(PartialEq)]
 enum Page {

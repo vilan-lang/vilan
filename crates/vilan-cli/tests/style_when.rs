@@ -20,7 +20,7 @@ mod support;
 /// The 015 exhibit's shape: a base style and two deltas on independent state
 /// axes, spelled both ways, over all four cells of the two flags.
 const EXHIBIT: &str = r#"import std::io::print;
-import std::style::{ Color, Style, space, style };
+import std::web::style::{ Color, Style, space, style };
 
 let base: Style = const style()
 	.padding(space(2))

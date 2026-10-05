@@ -343,6 +343,15 @@
      }
     },
     {
+     "comment": "The `only` MODIFIER ending an import statement \u2014 `import a::{ b } only;`, `import a::b only;` (B318, K26). Contextual: the lexer hands it back as an identifier and a value may be NAMED `only`, so the guard is a path's end (a name or a brace set's `}`) before it and the statement's `;` after it \u2014 and none of the words that put a VALUE there (`ret only;`, `c else only;`, `c then only;`, `await`/`const`/`async only;`).",
+     "match": "(?<=[A-Za-z0-9_\\}])(?<!\\bret)(?<!\\belse)(?<!\\bthen)(?<!\\bawait)(?<!\\bconst)(?<!\\basync)\\s+(only)\\b(?=\\s*;)",
+     "captures": {
+      "1": {
+       "name": "keyword.control.import.vilan"
+      }
+     }
+    },
+    {
      "comment": "B414: the POSITIONAL contextual keywords `with` (an `impl` or `trait` head's trait list) and `borrows` (a declaration's return clause). Each follows a TYPE and precedes a name, so the guard is both sides, as for `context`: something a type can end with before it, and a name (or a bound's `(`, `&`, `|`) after it \u2014 never `in`/`is`/`as`, which would make it a binder (`for with in xs`). `let with = 1`, `list.with(f)` and `fun with(self)` all fail the guard and stay names.",
      "match": "(?<=[A-Za-z0-9_>\\)\\]])\\s+(with)\\b(?=\\s+(?!i[ns]\\b|as\\b)[A-Za-z_(&|])",
      "captures": {

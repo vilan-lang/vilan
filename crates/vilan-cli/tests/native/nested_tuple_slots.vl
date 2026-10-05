@@ -1,0 +1,64 @@
+// F70: a NESTED tuple access — `t.0.1`, `nested.1.0 = 9` — natively. The
+// analyzer folds a chained access onto its root and records the JS layout's
+// FLAT offset (tuples splice their elements' slots in there), and the Rust
+// emitter wrote that offset as a Rust tuple index: `t.0.1` over `((1, 2), 3)`
+// read `t.1` and printed 3 where node prints 2 — a wrong answer whenever the
+// neighbour has the same type, a rustc refusal otherwise — and a multi-slot
+// element (`let inner = nested.1;`) was refused by name. The access's index
+// chain is the Rust path. Each line is one position: a read of a same-typed
+// neighbour, a write, a compound write, a `&mut` handed on, a multi-slot read,
+// a destructure of a nested element, three levels deep, through a `Shared`
+// view (read and write), and inside a generic function at an instance whose
+// parameter is itself a tuple (so the flat layout differs per instance).
+import std::io::print;
+import std::shared::Shared;
+
+fun bump(slot: &mut i32) {
+	slot += 1;
+}
+
+fun middle<A, B>(value: (A, (B, A))): B {
+	value.1.0
+}
+
+fun last<A, B>(value: (A, (B, A))): A {
+	value.1.1
+}
+
+fun main() {
+	let t = ((1, 2), 3);
+	print(t.0.1);
+	print(t.1);
+
+	mut nested = (1, (2, "x"));
+	nested.1.0 = 9;
+	print(nested.1.0);
+	print(nested.1.1);
+	nested.1.0 += 5;
+	print(nested.1.0);
+	bump(&mut nested.1.0);
+	print(nested.1.0);
+	let inner = nested.1;
+	print(inner.0);
+	print(inner.1);
+
+	mut deep = ((1, 2), (3, (4, 5)), 6);
+	deep.1.1.0 += 40;
+	print(deep.1.1.0);
+	print(deep.1.1.1);
+	print(deep.2);
+	print(deep.0.1);
+	let (a, b) = deep.1;
+	print(a);
+	print(b.1);
+
+	let cell = Shared::new((0, (7, 8)));
+	print(cell.read().1.0);
+	cell.write().1.1 = 80;
+	print(cell.read().1.1);
+
+	print(middle((1, ("b", 2))));
+	print(middle(((1, 2), (true, (3, 4)))));
+	let wide = last(((1, 2), (true, (3, 4))));
+	print(wide.1);
+}

@@ -1,5 +1,5 @@
 // `std::ws` — the RFC 6455 WebSocket frame layer (transport-rpc.md §5): pure
-// byte logic, shared by the in-language server half (`std::rpc_server`'s
+// byte logic, shared by the in-language server half (`std::rpc::server`'s
 // upgrade path — node has no WS server) and unit tests. Clients don't need it:
 // every host (browser, node 22+, deno, bun) provides the `WebSocket` class,
 // which does its own framing.

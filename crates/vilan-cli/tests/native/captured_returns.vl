@@ -1,0 +1,58 @@
+// F51 (pinned; not reproduced at the Order 46 base): a CAPTURED value returned
+// from a closure. Filed in Order 43 as rustc E0507 — a closure body's tail and
+// a `match` leg moved the capture out of an `Fn` closure — blocking
+// `KeyedSource::or` natively; F63 and F64 (Order 45) made a closure's body and
+// a `match` leg handing back a place copy it. Each closure here hands back a
+// capture: an expression body (a `str` field and a `List` field, each called
+// twice), a `match` leg, a leg beside a method call on a capture, a block tail,
+// and `KeyedSource::or`'s own shape over a generic list at two instances.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+fun or_list<T>(initial: List<T>): |Option<List<T>>| List<T> {
+	|value| match value {
+		Some(let present) => present,
+		None => initial,
+	}
+}
+
+struct Row {
+	name: str,
+	tags: List<str>,
+}
+
+fun main() {
+	let row = Row { name = "r", tags = ["a", "b"] };
+	let name = || row.name;
+	print(name());
+	print(name());
+	let tags = || row.tags;
+	print(tags().len());
+	print(tags().len());
+	let label = "lbl";
+	let pick = |flag: bool| match flag {
+		true => label,
+		false => "other",
+	};
+	print(pick(true));
+	print(pick(true));
+	let fallback: Option<str> = Some("fb");
+	let or_else = |value: Option<str>| match value {
+		Some(let v) => v,
+		None => fallback.unwrap_or("none"),
+	};
+	print(or_else(None));
+	print(or_else(None));
+	let block = || {
+		let unused = 1;
+		row.name
+	};
+	print(block());
+	print(block());
+	let fallback_list = or_list(["x", "y"]);
+	print(fallback_list(None).len());
+	print(fallback_list(None).len());
+	print(fallback_list(Some(["z"]))[0]);
+	let numbers = or_list([1]);
+	print(numbers(None)[0]);
+}

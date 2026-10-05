@@ -158,3 +158,39 @@ fn a_decline_outranks_an_unformatted_neighbour() {
         "the unformatted neighbour is still reported: {text}"
     );
 }
+
+/// N138: a cargo workspace's `target/` is not walked, tag or no tag. Cargo
+/// writes `CACHEDIR.TAG` only into a target directory it creates, so a
+/// `target/` made before the first build carries none — and the scratch
+/// projects the suite leaves under `target/tmp` (unformatted, some
+/// unformattable) turned the repository's `vilan fmt --check .` red. A module
+/// DIRECTORY named `target` in a vilan package, with no `Cargo.toml` beside
+/// it, is formatted like any other.
+#[test]
+fn a_cargo_target_directory_is_not_walked_and_a_module_named_target_is() {
+    let dir = tree("n138", &[("main.vl", CLEAN)]);
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").expect("write the cargo manifest");
+    let scratch = dir.join("target/tmp/probe");
+    std::fs::create_dir_all(&scratch).expect("create the scratch tree");
+    std::fs::write(scratch.join("unformatted.vl"), "fun main(){let x=1;}\n")
+        .expect("write an unformatted scratch file");
+    assert!(!dir.join("target/CACHEDIR.TAG").exists());
+    let output = vilan_fmt(&dir, &["--check"]);
+    assert_eq!(output.status.code(), Some(0), "{}", streams(&output));
+    assert!(
+        !streams(&output).contains("unformatted.vl"),
+        "{}",
+        streams(&output)
+    );
+
+    // The same `target/` with no `Cargo.toml` beside it is a package directory.
+    std::fs::remove_file(dir.join("Cargo.toml")).expect("remove the cargo manifest");
+    let output = vilan_fmt(&dir, &["--check"]);
+    assert_eq!(output.status.code(), Some(1), "{}", streams(&output));
+    assert!(
+        streams(&output).contains("unformatted.vl"),
+        "{}",
+        streams(&output)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

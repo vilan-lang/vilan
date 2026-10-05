@@ -1238,7 +1238,7 @@ fn a_view_annotation_is_transparent_to_the_trait_reading_at_both_positions() {
 // T-dependent body still gets one copy per type, a T-independent one still
 // gets one copy in total, and the counts match the written spelling's.
 
-/// The three estate sites the census was taken on, shaped like `std::ui`'s
+/// The three estate sites the census was taken on, shaped like `std::web::ui`'s
 /// A33-widened bindings (`fun bind_text<S: Source<str>>(self, source: S)`):
 /// a T-DEPENDENT body (the bound's member is resolved per impl), a
 /// T-INDEPENDENT one, and a two-parameter site. `{bound}` is spliced with the
@@ -1335,12 +1335,12 @@ fn b186_the_sugared_estate_runs() {
 #[test]
 fn b186_a_kolt_shaped_view_extension_takes_a_source_parameter() {
     // The exhibit the owner will write next: a `View` extension bound on
-    // `Source<i32>` without a `<S: ..>` list, against the real `std::ui` and
+    // `Source<i32>` without a `<S: ..>` list, against the real `std::web::ui` and
     // the real `std::reactive` — the shape A33 widened `bind_text` into, now
     // spelled the way §7.3 says it should be.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::web::ui::{ View, view, mount_root };
         import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         import std::display::Display;
 
@@ -3058,73 +3058,15 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
     );
 }
 
-/// I9: `Map` is `HashMap`'s spelling before the rename, kept one release as
-/// `std::map`'s deprecated alias — and the keyed exposure reads its annotation
-/// AS WRITTEN, before any type resolves, in two places (the analyzer's shape
-/// check and the `[service]` expansion). Both must take the old spelling as the
-/// map: the program compiles, and the contract it states is the `HashMap`
-/// spelling's, keyed — not the whole-value channel's, which is what the
-/// expansion would fall back to if it did not recognise the element.
-#[test]
-fn i9_the_deprecated_map_spelling_is_still_a_keyed_expose_map() {
-    assert_compiles_and_runs(
-        r#"
-        import std::io::print;
-        import std::hash_map::HashMap;
-        import std::map::Map;
-        import std::reactive::{ Signal, SignalCell };
-        import std::wire::Keyed;
-        [derive(Wire, PartialEq, Debug)]
-        struct Task { id: str }
-        impl Task with Keyed<str> {
-            fun key(self): str { self.id }
-        }
-        [service(NewClient)]
-        struct NewStore {
-            [expose(keyed)] tasks: SignalCell<HashMap<str, Task>>,
-        }
-        impl NewStore {
-            [rpc]
-            fun count(self): usize { self.tasks.get().len() }
-        }
-        [service(OldClient)]
-        struct OldStore {
-            [expose(keyed)] tasks: SignalCell<Map<str, Task>>,
-        }
-        impl OldStore {
-            [rpc]
-            fun count(self): usize { self.tasks.get().len() }
-        }
-        [service(WholeClient)]
-        struct WholeStore {
-            [expose] tasks: SignalCell<HashMap<str, Task>>,
-        }
-        impl WholeStore {
-            [rpc]
-            fun count(self): usize { self.tasks.get().len() }
-        }
-        fun main() {
-            let keyed = NewStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
-            let old = OldStore { tasks = Signal::new(Map::new()) }.contract_hash();
-            let whole = WholeStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
-            print(old == keyed);
-            print(keyed == whole);
-        }
-        main();
-        "#,
-        "true\nfalse\n",
-    );
-}
-
 /// A144 (R-f): the contract hash reads the RESOLVED type, so every spelling of
-/// one wire contract hashes alike — the deprecated `Map<..>`, `HashMap<..>`, a
-/// renaming import of it, on an `[rpc]` signature and on a WHOLE-value
-/// `[expose]` (whose element the hash names). Red before A144 (the hash read
-/// the types as written): the three `[rpc]` services printed `7edcd9bc`,
-/// `966c1d7c` and `1956457c`, and the two whole exposures differed. The value
-/// itself is djb2 over the canonical surface,
+/// one wire contract hashes alike — `HashMap<..>` and a renaming import of it,
+/// on an `[rpc]` signature and on a WHOLE-value `[expose]` (whose element the
+/// hash names). Red before A144 (the hash read the types as written): the
+/// `[rpc]` services printed different hashes, and the two whole exposures
+/// differed. The value itself is djb2 over the canonical surface,
 /// `counts(HashMap<str, i32>)->HashMap<str, i32>;` — the spelling a plainly
-/// written service already had, so its hash did not move.
+/// written service already had, so its hash did not move. (The deprecated
+/// `Map<..>` spelling was the third until R-e removed it.)
 #[test]
 fn a144_an_alias_and_its_target_hash_alike() {
     assert_compiles_and_runs(
@@ -3132,7 +3074,6 @@ fn a144_an_alias_and_its_target_hash_alike() {
         import std::io::print;
         import std::hash_map::HashMap;
         import std::hash_map::HashMap as Table;
-        import std::map::Map;
         import std::reactive::{ Signal, SignalCell };
         [service(NewClient)]
         struct NewSpelling {
@@ -3141,14 +3082,6 @@ fn a144_an_alias_and_its_target_hash_alike() {
         impl NewSpelling {
             [rpc]
             fun counts(self, names: HashMap<str, i32>): HashMap<str, i32> { names }
-        }
-        [service(OldClient)]
-        struct OldSpelling {
-            unused: i32,
-        }
-        impl OldSpelling {
-            [rpc]
-            fun counts(self, names: Map<str, i32>): Map<str, i32> { names }
         }
         [service(RenamedClient)]
         struct RenamedSpelling {
@@ -3166,26 +3099,139 @@ fn a144_an_alias_and_its_target_hash_alike() {
             [rpc]
             fun size(self): usize { self.counts.get().len() }
         }
-        [service(WholeOldClient)]
-        struct WholeOld {
-            [expose] counts: SignalCell<Map<str, i32>>,
+        [service(WholeRenamedClient)]
+        struct WholeRenamed {
+            [expose] counts: SignalCell<Table<str, i32>>,
         }
-        impl WholeOld {
+        impl WholeRenamed {
             [rpc]
             fun size(self): usize { self.counts.get().len() }
         }
         fun main() {
             print(NewSpelling { unused = 0 }.contract_hash());
-            print(OldSpelling { unused = 0 }.contract_hash());
             print(RenamedSpelling { unused = 0 }.contract_hash());
             let whole_new = WholeNew { counts = Signal::new(HashMap::new()) }.contract_hash();
-            let whole_old = WholeOld { counts = Signal::new(Map::new()) }.contract_hash();
-            print(whole_new == whole_old);
+            let whole_renamed = WholeRenamed { counts = Signal::new(HashMap::new()) }.contract_hash();
+            print(whole_new == whole_renamed);
         }
         main();
         "#,
-        "7edcd9bc\n7edcd9bc\n7edcd9bc\ntrue\n",
+        "7edcd9bc\n7edcd9bc\ntrue\n",
     );
+}
+
+// --- B525: the contract hash sees a Wire type's SHAPE -------------------------
+//
+// mirrored-store.md S0 (Q14, ruled into v0.44.0): the binary codec reads by
+// position and the JSON one by name, so a type whose fields or variants moved is
+// another contract under the same name. Each pin builds the same service over
+// two declarations of its Wire type and compares the hashes.
+
+/// The service every B525 pin hashes: one `[rpc]` taking and returning the
+/// type under test, and one handle return of it.
+fn b525_hash_of(declarations: &str) -> String {
+    let source = format!(
+        "{}{declarations}{}",
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+        ),
+        concat!(
+            "[service(SvcClient)]\n",
+            "struct Svc {\n",
+            "\tlast: SignalCell<Option<Message>>,\n",
+            "}\n",
+            "impl Svc {\n",
+            "\t[rpc]\n",
+            "\tfun echo(self, message: Message): Message { message }\n",
+            "\t[rpc]\n",
+            "\tfun watch(self): SignalCell<Option<Message>> { self.last }\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(Svc { last = Signal::new(None) }.contract_hash());\n",
+            "}\n",
+        )
+    );
+    compile_and_run(&source)
+        .unwrap_or_else(|errors| panic!("expected a clean run, got: {errors:#?}"))
+        .trim()
+        .to_string()
+}
+
+/// A struct that gains a field, loses one, reorders two, renames one or
+/// changes one's type is a different contract; the same declaration hashes
+/// the same. Red on 0.43.0, where all six printed `b8fcf645`-alike.
+#[test]
+fn b525_a_wire_structs_fields_are_in_the_contract_hash() {
+    let base = "[derive(Wire)]\nstruct Message {\n\tid: u53,\n\tcontent: str,\n}\n";
+    let variants = [
+        "[derive(Wire)]\nstruct Message {\n\tid: u53,\n\tcontent: str,\n\tedited: bool,\n}\n",
+        "[derive(Wire)]\nstruct Message {\n\tid: u53,\n}\n",
+        "[derive(Wire)]\nstruct Message {\n\tcontent: str,\n\tid: u53,\n}\n",
+        "[derive(Wire)]\nstruct Message {\n\tid: u53,\n\ttext: str,\n}\n",
+        "[derive(Wire)]\nstruct Message {\n\tid: i32,\n\tcontent: str,\n}\n",
+    ];
+    let base_hash = b525_hash_of(base);
+    assert_eq!(base_hash, b525_hash_of(base), "one declaration, one hash");
+    let mut seen = vec![base_hash.clone()];
+    for variant in variants {
+        let hash = b525_hash_of(variant);
+        assert!(
+            !seen.contains(&hash),
+            "a changed shape must move the hash; {variant:?} hashed {hash}, already seen in {seen:?}"
+        );
+        seen.push(hash);
+    }
+}
+
+/// The walk is recursive: a field's own struct, an enum's variants (added,
+/// reordered, a payload changed) and a backed enum's backing values are all in
+/// the hash — and a recursive type ends the walk at its second mention.
+#[test]
+fn b525_the_shape_walk_reaches_nested_types_variants_and_instances() {
+    let pairs = [
+        (
+            "[derive(Wire)]\nstruct Author {\n\tname: str,\n}\n",
+            "[derive(Wire)]\nstruct Author {\n\tname: str,\n\tid: u53,\n}\n",
+        ),
+        (
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(str),\n}\n",
+            "[derive(Wire)]\nenum Kind {\n\tImage(str),\n\tText,\n}\n",
+        ),
+        (
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(str),\n}\n",
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(u53),\n}\n",
+        ),
+        (
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(str),\n}\n",
+            "[derive(Wire)]\nenum Kind {\n\tText,\n\tImage(str),\n\tVideo,\n}\n",
+        ),
+        (
+            "[derive(Wire)]\nenum Level {\n\tLow = 1,\n\tHigh = 2,\n}\n",
+            "[derive(Wire)]\nenum Level {\n\tLow = 1,\n\tHigh = 3,\n}\n",
+        ),
+    ];
+    let message = |inner: &str, field: &str| {
+        format!("{inner}[derive(Wire)]\nstruct Message {{\n\tid: u53,\n\t{field},\n}}\n")
+    };
+    for (before, after) in pairs {
+        let field = if before.contains("Author") {
+            "author: Author"
+        } else if before.contains("Level") {
+            "level: Level"
+        } else {
+            "kind: Kind"
+        };
+        assert_ne!(
+            b525_hash_of(&message(before, field)),
+            b525_hash_of(&message(after, field)),
+            "a nested shape change must move the hash: {before:?} -> {after:?}"
+        );
+    }
+    // A recursive type: the second mention is the name alone, so the walk ends.
+    let recursive = "[derive(Wire)]\nstruct Reply {\n\ttext: str,\n\tquoted: List<Reply>,\n}\n\
+                     [derive(Wire)]\nstruct Message {\n\tid: u53,\n\treply: Reply,\n}\n";
+    assert_eq!(b525_hash_of(recursive).len(), 8);
 }
 
 /// A56 / R6: the field names its key TWICE — once in the attribute, once in the
@@ -6327,7 +6373,7 @@ fn b279_the_strict_body_of_the_other_trait_still_fences_when_it_is_called() {
 fn b279_the_const_only_check_still_refuses_through_a_bounded_generics_dispatch() {
     assert_fails_with(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
 
         trait Paint { fun paint(self); }
 
@@ -6357,7 +6403,7 @@ fn b279_the_const_only_check_still_refuses_through_a_bounded_generics_dispatch()
 fn b279_a_same_named_member_on_an_unrelated_trait_does_not_let_the_const_only_check_miss() {
     assert_fails_with(
         r#"
-        import std::asset::emit;
+        import std::web::asset::emit;
 
         trait Paint { fun paint(self); }
         trait Coat { fun paint(self); }
@@ -6393,7 +6439,7 @@ fn b279_a_clean_instantiation_of_the_same_generic_is_still_admitted() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::asset::emit;
+        import std::web::asset::emit;
 
         trait Paint { fun paint(self); }
 
@@ -7441,7 +7487,7 @@ fn b391_a_services_generated_client_call_is_admitted_under_its_own_module() {
     let exported = concat!(
         "import std::io::print;\n",
         "import std::reactive::{ Signal, SignalCell };\n",
-        "import std::rpc_server::{ Connection, Service };\n",
+        "import std::rpc::server::{ Connection, Service };\n",
         "import std::json::json_codec;\n",
         "\n",
         "[client_service]\n",
@@ -8208,6 +8254,61 @@ fn b460_a_free_fun_returns_the_one_type_its_body_picks() {
     );
 }
 
+/// B489: a bare-trait return's ARGUMENTS reach the body. `SignalCell::new(None)`
+/// under `Source<Option<i32>>` typed as `SignalCell<Option<unknown>>` (JS ran
+/// it; native refused "an unresolved type"); the annotation is now the tail's
+/// expectation, read through the result's impl of the trait — in a block
+/// tail, in both arms of an `if`, with a generic argument, and through a
+/// trait of two parameters.
+#[test]
+fn b489_a_bare_trait_returns_arguments_reach_the_body() {
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            import std::option::Option::{ self, None, Some };
+            trait Pair<A, B> {
+                fun left(self): A;
+            }
+            struct Both<A, B> { a: A, b: B }
+            impl Both<type A, type B> with Pair<A, B> {
+                fun left(self): A { self.a }
+            }
+            fun nothing(): Source<Option<i32>> { SignalCell::new(None) }
+            fun nested(): Source<List<str>> {
+                let unused = 1;
+                { SignalCell::new([]) }
+            }
+            fun chosen(flag: bool): Source<Option<str>> {
+                if flag { SignalCell::new(None) } else { SignalCell::new(Some("x")) }
+            }
+            fun empty<T>(): Source<Option<T>> { SignalCell::new(None) }
+            fun both(): Pair<Option<i32>, List<str>> { Both { a = None, b = [] } }
+            fun main() {
+                let n: Option<i32> = nothing().get();
+                print(n.is_none());
+                print(nested().get().len());
+                print(chosen(true).get().is_none());
+                let e: Option<bool> = empty().get();
+                print(e.is_none());
+                print(both().left().is_none());
+            }
+            "#,
+        ),
+        "true\n0\ntrue\ntrue\ntrue\n",
+    );
+    // The typing itself (JS ran the hole; the type is what changed).
+    assert_fails_with(
+        &b460_program(
+            r#"
+            import std::option::Option::{ self, None };
+            fun nothing(): Source<Option<i32>> { SignalCell::new(None) }
+            fun main() { let wrong: i32 = nothing(); }
+            "#,
+        ),
+        "got SignalCell<Option<i32>>",
+    );
+}
+
 #[test]
 fn b460_a_generic_fun_and_an_inherent_method_pick_per_instantiation() {
     assert_compiles_and_runs(
@@ -8283,6 +8384,23 @@ fn b460_a_trait_methods_bare_trait_return_stays_refused() {
         ),
         steer,
     );
+}
+
+/// B491: the trait-method refusal steers to the APPLICATION — `dyn
+/// Holder<i32>` — where it printed `dyn Holder`, a type that does not compile.
+#[test]
+fn b491_the_trait_method_steer_writes_the_traits_arguments() {
+    let source = "
+trait Holder<T> {
+    fun held(self): T;
+}
+trait Maker {
+    fun make(self): Holder<i32>;
+}
+fun main() {}
+";
+    assert_fails_with(source, "Return `dyn Holder<i32>` from `make`");
+    assert_fails_with(source, "may return `Holder<i32>` itself");
 }
 
 // --- A142 §3.3: a read on a pipe steers to sealing (Order 44, item 12) ------
@@ -8618,6 +8736,261 @@ fn b473_a_qualified_subtrait_call_on_a_type_without_the_subtrait_is_refused() {
     );
 }
 
+// --- B511: a qualified call to a blanket's member is monomorphized ----------
+//
+// `Same::same(a, &b)` over `impl type T: PartialEq with Same` emitted the
+// blanket's body UN-instanced on JS — `self === other`, `false` for two equal
+// structs and even for `1` and `1` — and natively refused "a value of an
+// unbound generic type parameter"; `a.same(&b)` was right. The receiver's
+// binding was found, then dropped with the call's working context: a blanket's
+// subject IS its binder, and the call kept only binders written inside a
+// nominal subject's arguments.
+
+/// The concrete receivers: a struct by view and bare, a scalar, a `str`, a
+/// list, and the blanket's trait DEFAULT reached the same way — each answers
+/// as the method form beside it does.
+#[test]
+fn b511_a_qualified_call_to_a_blankets_member_is_monomorphized() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Same {
+            fun same(&self, other: &Self): bool;
+            fun differs(&self, other: &Self): bool {
+                !self.same(other)
+            }
+        }
+
+        impl type T: PartialEq with Same {
+            fun same(&self, other: &T): bool {
+                *self == *other
+            }
+        }
+
+        [derive(PartialEq)]
+        struct Pair {
+            a: i32,
+            b: i32,
+        }
+
+        fun main() {
+            let x = Pair { a = 1, b = 2 };
+            let y = Pair { a = 1, b = 2 };
+            let z = Pair { a = 1, b = 3 };
+            print(Same::same(&x, &y));
+            print(Same::same(x, &z));
+            print(x.same(&y));
+            print(Same::same(&1, &1));
+            print(Same::same(1, &2));
+            print(Same::same(&"x", &"x"));
+            print(Same::same(&[1, 2], &[1, 2]));
+            print(Same::differs(&x, &z));
+        }
+        "#,
+        "true\nfalse\ntrue\ntrue\nfalse\ntrue\ntrue\ntrue\n",
+    );
+}
+
+/// The receivers the qualified spelling did not route at all: a caller's
+/// parameter whose bound reaches the blanket (`T: PartialEq`, not `T: Same` —
+/// refused "has bare trait type 'Same'"), a tuple subject (typed as the bare
+/// trait `Swap`), and a blanket body that makes the qualified call itself.
+#[test]
+fn b511_a_qualified_call_reaches_a_blanket_through_a_bound_and_a_tuple_subject() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Same {
+            fun same(&self, other: &Self): bool;
+        }
+
+        impl type T: PartialEq with Same {
+            fun same(&self, other: &T): bool {
+                *self == *other
+            }
+        }
+
+        trait Swap {
+            fun swapped(self): Self;
+        }
+
+        impl (type A, type B) with Swap {
+            fun swapped(self): (A, B) {
+                self
+            }
+        }
+
+        trait Describe {
+            fun describe(self): str;
+        }
+
+        impl type T: Same with Describe {
+            fun describe(self): str {
+                if Same::same(&self, &self) { "same" } else { "differs" }
+            }
+        }
+
+        [derive(PartialEq)]
+        struct Pair {
+            a: i32,
+            b: i32,
+        }
+
+        fun through<T: PartialEq>(a: T, b: T): bool {
+            Same::same(&a, &b)
+        }
+
+        fun main() {
+            print(through(Pair { a = 1, b = 2 }, Pair { a = 1, b = 3 }));
+            print(through("a", "a"));
+            print(Describe::describe(4));
+            let pair = Swap::swapped((1, "one"));
+            print(pair.1);
+        }
+        "#,
+        "false\ntrue\nsame\none\n",
+    );
+}
+
+// --- B498: a static call on a NESTED binder, reached through a bound ---------
+//
+// `N::default()` in a member of `impl Stage<type S, type R: IntoFlow<type N:
+// Default>>` named `N`, which only `R`'s own `IntoFlow` impl grounds. A direct
+// call recorded it; reached through a bound (`f.fresh()` with `F: Fresh<T>`) the
+// JS emitter bound the impl's binders from the receiver's SHAPE alone, and the
+// static landed on `Default`'s bodiless requirement — "internal: a call resolved
+// to `Default`'s requirement `default`, which has no body".
+
+/// B498: the nested binder is grounded however the member is reached — the
+/// direct method call, through a generic bound at two instantiations, and the
+/// qualified spelling.
+#[test]
+fn b498_a_static_call_on_a_nested_binder_reached_through_a_bound_is_grounded() {
+    assert_compiles_and_runs(
+        r#"
+        import std::default::Default;
+        import std::reactive::delta::IntoFlow;
+        import std::io::print;
+
+        trait Fresh<T> {
+            fun fresh(self): T;
+        }
+
+        struct Stage<S, R> {
+            s: S,
+            r: R,
+        }
+
+        impl Stage<type S, type R: IntoFlow<type N: Default>> with Fresh<N> {
+            fun fresh(self): N {
+                N::default()
+            }
+        }
+
+        fun through<F: Fresh<T>, T>(f: F): T {
+            f.fresh()
+        }
+
+        fun main() {
+            print(Stage { s = "x", r = 1 }.fresh());
+            print(through(Stage { s = "x", r = "y" }) == "");
+            print(through(Stage { s = 1, r = 5 }) + 1);
+            print(Fresh::fresh(Stage { s = 1, r = true }));
+        }
+        "#,
+        "0\ntrue\n1\nfalse\n",
+    );
+}
+
+// --- B510: a trait default hands `self` to a generic over the same trait -----
+//
+// `Obs<T>`'s default `observe` calling `observe_flow<U, F: Obs<U>>(self, ..)`:
+// the analyzer read `F`'s `Obs` arguments off the FIRST implementor of `Obs`
+// (`Self` is typed as the bare trait there), refusing the default's own `T`
+// ("Expected T, but got i32"); with that answered, a closure literal in the call
+// typed its parameter at the callee's unbound `U`, and the JS instance bound `F`
+// to the bare trait — "internal: a call resolved to `Obs`'s requirement
+// `start`, which has no body" (reactive-45 met it making `Flow::observe` a
+// default).
+
+/// B510: the default runs for two implementors at two instantiations — with
+/// the observer passed on, with a closure literal wrapping it, `own self`, and
+/// through a SUB-trait's default reaching a generic over the sub-trait.
+#[test]
+fn b510_a_trait_default_passing_self_to_a_generic_over_its_trait_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Obs<T> {
+            fun start(own self): T;
+            fun observe(own self, observer: |T| void) {
+                observe_flow(self, |value| observer(value), true)
+            }
+            fun first(own self): T {
+                first_of(self)
+            }
+        }
+
+        fun observe_flow<U, F: Obs<U>>(own flow: F, observer: |U| void, immediately: bool) {
+            let value = flow.start();
+            if immediately {
+                observer(value);
+            }
+        }
+
+        fun first_of<U, F: Obs<U>>(own flow: F): U {
+            flow.start()
+        }
+
+        trait Wrap<T> with Obs<T> {
+            fun wrapped(own self): T {
+                through_sub(self)
+            }
+        }
+
+        fun through_sub<U, W: Wrap<U>>(own wrap: W): U {
+            wrap.start()
+        }
+
+        struct Thing {
+            n: i32,
+        }
+
+        impl Thing with Obs<i32> {
+            fun start(own self): i32 {
+                self.n
+            }
+        }
+
+        impl Thing with Wrap<i32> {}
+
+        struct Word {
+            s: str,
+        }
+
+        impl Word with Obs<str> {
+            fun start(own self): str {
+                self.s
+            }
+        }
+
+        fun main() {
+            Thing { n = 5 }.observe(|n| print(n + 1));
+            Word { s = "w" }.observe(|s| print(s));
+            print(Thing { n = 6 }.first());
+            print(Word { s = "v" }.first());
+            print(Thing { n = 7 }.wrapped());
+        }
+        "#,
+        "6\nw\n6\nv\n7\n",
+    );
+}
+
 // --- One trait at two instantiations: every provider is asked ------------------
 //
 // A type may provide one trait at two instantiations: `impl type T with Into2<T>`
@@ -8923,5 +9296,37 @@ fn b479_a_stage_selector_in_a_generic_body_takes_the_receivers_own_answer() {
             "}\n",
         ),
         "2\n",
+    );
+}
+
+/// B508: a blanket `impl type T with Trait` reaches a CLOSURE-typed receiver —
+/// `f.named()` on a `|| void` was "cannot call method 'named' on || void",
+/// which is why the Store held closure-typed fields behind `store_opaque`. A
+/// closure value of each arity, and one held in a struct field, are pinned.
+#[test]
+fn b508_a_blanket_reaches_a_closure_typed_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        trait Named {
+            fun named(self): str;
+        }
+        impl type T with Named {
+            fun named(self): str {
+                "anything"
+            }
+        }
+        struct Holder { run: |i32| i32 }
+        fun nothing() {}
+        fun main() {
+            print(5.named());
+            let f: || void = nothing;
+            print(f.named());
+            let g = |x: i32| x + 1;
+            print(g.named());
+            let holder = Holder { run = |x| x * 2 };
+            print(holder.run.named());
+        }
+        "#,
+        "anything\nanything\nanything\nanything\n",
     );
 }

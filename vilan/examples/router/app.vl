@@ -1,17 +1,17 @@
-// A routed app (`std::router`, proposal/router.md): routes are ENUMS — the
+// A routed app (`std::web::router`, proposal/router.md): routes are ENUMS — the
 // URL is just a wire format for a typed value. Nested enums mirror nested
 // layouts, `parse`/`href` are an ordinary inverse pair, `link` takes a route
 // VALUE, and the page body swaps on the derived route signal.
 //
 // `Option`/`Some`/`None`, `SignalCell`, `view` and `View` are ambient
-// (`prelude = "std::web"` in vilan.toml), so the import block below is what is
-// left after the prelude: `Range` and `std::router`'s surface, neither of which
+// (`prelude = "std::web::prelude"` in vilan.toml), so the import block below is what is
+// left after the prelude: `Range` and `std::web::router`'s surface, neither of which
 // is in any prelude. `mount_root` is reached as `ui::mount_root` — the web set
 // carries `ui` as a MODULE, so a browser-only name stays qualified and a node
 // build's error lands at the call.
 
 import std::range::Range;
-import std::router::{ Routable, current_path, link, segments };
+import std::web::router::{ Routable, current_path, link, segments };
 
 // === The route space =========================================================
 

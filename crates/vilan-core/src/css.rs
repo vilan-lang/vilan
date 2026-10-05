@@ -17,7 +17,7 @@
 //! |---|---|
 //! | `css { … }` | `style()` followed by the items in written order |
 //! | `prop(value);` | `.raw("prop", <the one argument, untouched>)` |
-//! | `prop(a, b, …);` | `.raw("prop", <the arguments joined by one space, each through `std::style::piece`>)` |
+//! | `prop(a, b, …);` | `.raw("prop", <the arguments joined by one space, each through `std::web::style::piece`>)` |
 //! | `.name { … }` | `.name(style() … )` |
 //! | `.name(a, b) { … }` | `.name(a, b, style() … )` |
 //! | `.name(a, b);` | `.name(a, b)` — a chain link, verbatim (A69) |
@@ -39,15 +39,15 @@
 //! `style()`, which takes the `css` keyword's own span — a diagnostic about
 //! the block's own value then underlines the word that asked for one.
 //!
-//! **The seed is HYGIENIC** (B270): it is a `Node::StdItem("style", "style")`,
-//! a scope-independent reference to `std::style::style`, not a bare `style`
+//! **The seed is HYGIENIC** (B270): it is a `Node::StdItem("web::style", "style")`,
+//! a scope-independent reference to `std::web::style::style`, not a bare `style`
 //! accessor resolved at the site. A bare accessor made the whole form unusable
-//! under `prelude = "std::web"`, where `style` is the ambient MODULE — every
+//! under `prelude = "std::web::prelude"`, where `style` is the ambient MODULE — every
 //! block in an application package failed with "`style` is a module, not a
 //! value" — and it let any local `style` capture a desugar nobody had written.
 //! A block means std's `style()` under the web prelude, under a local
-//! `let style = 1;`, under `import std::style::style as s;`, and with no
-//! prelude at all; the loader seeds `std::style` off the reference itself, so
+//! `let style = 1;`, under `import std::web::style::style as s;`, and with no
+//! prelude at all; the loader seeds `std::web::style` off the reference itself, so
 //! the form needs no import to work.
 //!
 //! Property names are stored as SPANS by the parser (a hyphenated or custom
@@ -125,7 +125,7 @@ fn desugar<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             // which is the diagnostic that was always wanted here.
             // A70: the chain is wrapped in a `CssScope` too, INSIDE the
             // `const` — the mark that says "these expressions were written
-            // inside a block", which is where `std::style::prelude` is
+            // inside a block", which is where `std::web::style::prelude` is
             // ambient. Both wrappers forward to their inner expression, so the
             // tree the analyzer types is still the chain.
             let scoped = (Node::CssScope(Box::new((chain.0, span))), span);
@@ -139,7 +139,7 @@ fn desugar<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
 fn build_chain<'src>(body: CssBody<'src>, head: Span, source: &'src str) -> Spanned<Node<'src>> {
     let mut chain: Spanned<Node<'src>> = (
         Node::Call(
-            Box::new((Node::StdItem("style", "style"), head)),
+            Box::new((Node::StdItem("web::style", "style"), head)),
             None,
             (Vec::new(), head),
         ),
@@ -200,7 +200,7 @@ fn declaration_link<'src>(
 /// `margin(px(4), px(8));` is `margin:4px 8px`. `raw`'s ARITY does not change:
 /// the join is built here, as the same parenthesized concatenation the lexer
 /// builds for an i-string (`("" + a + " " + b)`, left-associated, seeded with
-/// the empty string), with every argument through `std::style::piece` (A34) —
+/// the empty string), with every argument through `std::web::style::piece` (A34) —
 /// which returns the piece's text and puts its `:root` line on the sheet on the
 /// way past. Without it a `Length` mid-list would emit `var(--space-4)` with
 /// nothing declaring it, which is the hazard the one-argument path exists to
@@ -233,7 +233,7 @@ fn join<'src>(left: Spanned<Node<'src>>, right: Spanned<Node<'src>>) -> Spanned<
     )
 }
 
-/// One argument of a MULTI-argument value, wrapped in `std::style::piece`
+/// One argument of a MULTI-argument value, wrapped in `std::web::style::piece`
 /// (A34): the call returns the argument's text and emits its `:root` line, so a
 /// typed style token mid-value carries its token exactly as a whole value does.
 ///
@@ -245,7 +245,7 @@ fn wrap_piece<'src>(expression: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
     let span = expression.1;
     (
         Node::Call(
-            Box::new((Node::StdItem("style", "piece"), span)),
+            Box::new((Node::StdItem("web::style", "piece"), span)),
             None,
             (vec![expression], span),
         ),
@@ -600,7 +600,7 @@ mod tests {
     /// compared here is what they wrap.
     ///
     /// The SEED is normalized for the same reason: B270 made it hygienic, so
-    /// the block's is `std::style::style` where a hand-written chain's is
+    /// the block's is `std::web::style::style` where a hand-written chain's is
     /// whatever `style` means at the site.
     fn shapes_match(block: &str, chain: &str) -> (String, String) {
         (strip_spans(&peeled(block)), strip_spans(&peeled(chain)))
@@ -630,8 +630,8 @@ mod tests {
             node = inner;
         }
         format!("{node:?}")
-            .replace("StdItem(\"style\", \"style\")", "Accessor(\"style\")")
-            .replace("StdItem(\"ui\", \"view\")", "Accessor(\"view\")")
+            .replace("StdItem(\"web::style\", \"style\")", "Accessor(\"style\")")
+            .replace("StdItem(\"web::ui\", \"view\")", "Accessor(\"view\")")
     }
 
     /// A `Debug` tree with every span (`Span` renders as `start..end`) replaced
@@ -692,7 +692,7 @@ mod tests {
         // R10: N arguments are ONE value, joined by a single space — the same
         // parenthesized concatenation `lexing::emit_interpolated` builds for an
         // i-string, seeded with the empty string — with every ARGUMENT wrapped
-        // in `std::style::piece` (A34), which returns its text and puts its
+        // in `std::web::style::piece` (A34), which returns its text and puts its
         // `:root` line on the sheet.
         //
         // The chain side spells the wrapper out, so the two sides are the same
@@ -700,7 +700,7 @@ mod tests {
         // hygienic reference in the block, and the normalization below reads it
         // as the name a hand-written chain would import.
         let block = strip_spans(&peeled("css { border(\"1px solid\", gray(500)); }"))
-            .replace("StdItem(\"style\", \"piece\")", "Accessor(\"piece\")");
+            .replace("StdItem(\"web::style\", \"piece\")", "Accessor(\"piece\")");
         let chain = strip_spans(&peeled(
             r#"style().raw("border", "" + piece("1px solid") + " " + piece(gray(500)))"#,
         ));
@@ -824,7 +824,7 @@ mod tests {
         // is 12 bytes, so the keyword is 12..15.
         let tree = lowered("css { display(\"flex\"); }");
         assert!(
-            tree.contains("(StdItem(\"style\", \"style\"), 12..15)"),
+            tree.contains("(StdItem(\"web::style\", \"style\"), 12..15)"),
             "{tree}"
         );
     }
@@ -833,13 +833,16 @@ mod tests {
 
     #[test]
     fn the_seed_is_a_scope_independent_std_reference() {
-        // Not `Accessor("style")`: the block means `std::style::style`, and no
-        // binding at the site — a local `let style`, `std::web`'s ambient
+        // Not `Accessor("style")`: the block means `std::web::style::style`, and no
+        // binding at the site — a local `let style`, `std::web::prelude`'s ambient
         // `style` MODULE — can be what it reaches. The resolution half is
         // pinned in `inference::styling` and `module_resolution`; this is the
         // TREE half, which is where the bare accessor used to be.
         let tree = lowered("css { display(\"flex\"); }");
-        assert!(tree.contains("StdItem(\"style\", \"style\")"), "{tree}");
+        assert!(
+            tree.contains("StdItem(\"web::style\", \"style\")"),
+            "{tree}"
+        );
         assert!(!tree.contains("Accessor(\"style\")"), "{tree}");
     }
 
@@ -850,7 +853,7 @@ mod tests {
         // there either.
         let tree = lowered("css { .hover { color(\"red\"); } }");
         assert_eq!(
-            tree.matches("StdItem(\"style\", \"style\")").count(),
+            tree.matches("StdItem(\"web::style\", \"style\")").count(),
             2,
             "{tree}"
         );
@@ -880,7 +883,7 @@ mod tests {
         // `.hover` as a method reference.
         let tree = lowered("css { .hover { color(\"red\"); } }");
         assert!(
-            tree.contains("(StdItem(\"style\", \"style\"), 25..25)"),
+            tree.contains("(StdItem(\"web::style\", \"style\"), 25..25)"),
             "{tree}"
         );
     }

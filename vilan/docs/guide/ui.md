@@ -1,6 +1,6 @@
 # Building UI
 
-`std::ui` is a declarative view layer with no virtual DOM. A `View`
+`std::web::ui` is a declarative view layer with no virtual DOM. A `View`
 describes a DOM element. Methods chain to build it. Where React re-runs
 components and diffs the result, Vilan binds individual DOM properties to
 signals: when a signal changes, exactly that text node or attribute
@@ -10,7 +10,7 @@ Available in browser builds (`target = "browser"` in `vilan.toml`, or
 `vilan build --target browser`).
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
+import std::web::ui::{ view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 fun main() {
@@ -38,7 +38,7 @@ view so you can keep going:
 - **Events**: `.on(event, handler)`, or `.on_event(event, |e| …)` when
   you need the DOM event itself (`prevent_default`, `key()`, modifiers,
   `pointer_x()`/`pointer_y()`). For window-level events, and for a listener
-  you need to remove, drop to `std::dom` — [Escaping to the DOM](#escaping-to-the-dom).
+  you need to remove, drop to `std::web::dom` — [Escaping to the DOM](#escaping-to-the-dom).
 - **Reactive bindings**: `.bind_text(source)`, `.bind_class(source)`,
   `.bind_attr(name, source)`, `.toggle_attr(name, flag)`,
   `.style_var(name, source)`.
@@ -92,7 +92,7 @@ Text nodes make mixed content direct: prose around an inline element is
 a run of siblings, not a pile of wrapper spans.
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
+import std::web::ui::{ view, View, mount_root };
 
 fun tip(): View {
 	view("p")
@@ -153,7 +153,7 @@ written — the same methods, in the same order, emitting the same code:
 
 ```vilan,browser
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun counter(): View {
 	let count = Signal::new(0);
@@ -201,7 +201,7 @@ arms, and takes postfix chains. The two forms mix freely —
 
 ```vilan,browser
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, each, mount_root, view };
+import std::web::ui::{ View, each, mount_root, view };
 
 fun panel(items: SignalCell<List<str>>, flag: SignalCell<bool>): View {
 	<section class("panel")>
@@ -224,7 +224,7 @@ literal** of its children — so its type is `List<View>`, the arm `child`
 already places:
 
 ```vilan,browser
-import std::ui::{ View, mount_root, view };
+import std::web::ui::{ View, mount_root, view };
 
 fun labelled(name: str, value: str): List<View> {
 	<>
@@ -261,7 +261,7 @@ called in holes: `{todo_row(items, todo)}`. Reactivity stays explicit:
 an `if` or `match` inside a hole runs once at build, exactly as it does
 in a chain; reactive structure is `.show` in head position and the
 `when`/`swap`/`each` values in holes, with `Signal` values in slots. The sugar adds no
-semantics: an element means `std::ui::view` whatever the file has
+semantics: an element means `std::web::ui::view` whatever the file has
 imported, so element syntax needs no `view` import of its own (a `View`
 you write as a TYPE still needs one, and the editor offers it), and
 everything this guide says about ownership, boundaries, and binding
@@ -274,7 +274,7 @@ registration, special types, or props system; the parameters are the
 props:
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
+import std::web::ui::{ view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 fun labelled_input(label: str, value: SignalCell<str>): View {
@@ -336,7 +336,7 @@ An echo of your own edit never moves the caret. Use it for fields that
 edit *server* state as you type:
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
+import std::web::ui::{ view, View, mount_root };
 import std::reactive::{ draft, Draft, DraftState };
 import std::option::Option::{ self, Some, None };
 
@@ -373,7 +373,7 @@ prop, and the key does real work here:
   row's bindings die with the row.
 
 ```vilan,browser
-import std::ui::{ each, view, View, mount_root };
+import std::web::ui::{ each, view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 [derive(PartialEq)]
@@ -441,7 +441,7 @@ row instead of N.
   or when the row's own bindings are the natural update path.
 
 ```vilan,browser
-import std::ui::{ each_by, each_values, view, View, mount_root };
+import std::web::ui::{ each_by, each_values, view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 struct Task {
@@ -499,7 +499,7 @@ So `autofocus` is not `on_mount(|e| e.focus())`: it attempts in the
 microtask, and if the element did not take focus it attempts again on the
 next animation frame and once more on the frame after, then stops. Three
 attempts on the platform's own clock — no timer, no millisecond to tune.
-Written out, with `std::dom::request_animation_frame` as the clock and
+Written out, with `std::web::dom::request_animation_frame` as the clock and
 `matches(":focus")` as the read-back (`focus()` returns nothing):
 
 ```vilan,fragment
@@ -519,15 +519,22 @@ steps run once the dialog is rendered.
 
 The hook is a **microtask**, which is enough because the whole
 synchronous build — and the `mount` that finishes it — runs to
-completion before any microtask does. On the SSR twin both methods
-accept and drop, like the event binders: there is no document to be in.
+completion before any microtask does. On the SSR twin `on_mount` accepts
+and drops, like the event binders: there is no document to be in.
 
-`autofocus` also writes the `autofocus` **attribute**. The attribute is
-inert for an element inserted after the page parsed — that is *why* this
-method exists — so it costs nothing at runtime and makes the choice
-readable: to a focus scope, to devtools, and to a test that asserts
-markup. The SSR twin deliberately does not write it, because a *served*
-`autofocus` is honored by the browser's own initial parse.
+`autofocus` writes **no attribute** in the browser. It registers the
+element with std (in a `WeakSet`, so nothing is kept alive), and a focus
+scope reads that registration — see below. The native `autofocus`
+attribute is not free on an element inserted after the page parsed: the
+document queues it as an autofocus candidate and refuses it once
+something has focus, which Chromium reports on the console once per page.
+So `.autofocus()` is the one spelling, and an element head's *written*
+`autofocus` attribute (`<input autofocus />`) gets a warning with a quick
+fix that rewrites it to `.autofocus()`. The native attribute is still
+yours when you mean it — `.attr("autofocus", "")` writes it as spelled,
+for a `<dialog>` or a popover, whose own focusing steps read it. On the
+SSR twin `.autofocus()` writes the native attribute: a *served* page's
+initial parse is the one place it works, and it logs nothing there.
 
 ## Focus scopes
 
@@ -564,12 +571,19 @@ let scope = focus_scope(panel, FocusContainment::Contain);
 let _took = scope.focus_initial();
 ```
 
-`focus_initial` focuses the first `[autofocus]` descendant, else the
-first tabbable one, else the panel itself at `tabindex="-1"` — and it
-answers whether the focus was taken, so a show that fired too early is
-simply asked again on the next pass. It is idempotent: once focus has
-been taken, a later call leaves alone whatever the user has since moved
-to.
+`focus_initial` focuses the first descendant, in tree order, that
+`.autofocus()` registered; else the first carrying a native `[autofocus]`;
+else the first tabbable one; else the panel itself at `tabindex="-1"` —
+and it answers whether the focus was taken, so a show that fired too
+early is simply asked again on the next pass. It is idempotent: once
+focus has been taken, a later call leaves alone whatever the user has
+since moved to. Inside a scope, `.autofocus()`'s own bounded clock stands
+aside and lets the show decide.
+
+The scope does not have to exist before its content is built: the walk
+happens at the show, over whatever the panel holds then, so an element
+that mounts later — a `when` that opens inside the panel — is found in its
+place, and an element removed since it registered is simply not there.
 
 Scopes NEST as a stack, not by DOM ancestry, because an overlay is a
 portal: a submenu opened from inside a menu mounts beside its parent's
@@ -654,10 +668,25 @@ Read the cell inside a binding, exactly as an `each_by` row does:
 {when_some(selected, |account| <p>{account.derive(|current| current.name)}</p>)}
 ```
 
+When the content needs SEVERAL maybes — a message and its author — reach for
+`ui::when_all_some` rather than nesting `when_some`s. It takes a tuple of flows
+of `Option`s and builds while EVERY one is `Some`; the body takes ONE
+parameter, a tuple of cells, destructured where it is written. The cells are
+made under the body's owner, written in place while everything stays `Some`,
+and released with the body when any part goes `None` — so the negative states
+are handled once, here, and the body reads plain values:
+
+```vilan,fragment
+{ui::when_all_some((message, author), |(message, author)| <p>
+	<b>{author.derive(|user| user.name)}</b>
+	{message.derive(|current| current.content)}
+</p>)}
+```
+
 ### Position, and placing one at the end
 
 A value fills a child position, so the conditional or the run sits exactly
-among the siblings it is written between. `std::ui` exports six —
+among the siblings it is written between. `std::web::ui` exports six —
 `when`, `when_some`, `swap`, `each`, `each_values`, `each_by` — and each
 returns something that fills a child slot:
 
@@ -753,14 +782,14 @@ boundary.
 
 ## Server-side rendering
 
-The same component code runs on the server. On a Node build `std::ui`
+The same component code runs on the server. On a Node build `std::web::ui`
 builds an HTML string instead of live DOM, and `render(view)`
 serializes it: first paint and SEO, before any JavaScript. A route
 handler calls your own `app()` and splices the markup into its HTML
 shell. The [server-side rendering guide](ssr.md) walks the whole loop.
 
 ```vilan
-import std::ui::{ view, View, render };
+import std::web::ui::{ view, View, render };
 import std::reactive::{ Signal, SignalCell };
 
 fun greeting(name: SignalCell<str>): View {
@@ -785,13 +814,13 @@ Two rules make one component serve both legs:
   renderable view, so the natural factoring is a shared `fun app(): View` with a
   per-leg `main`: `mount_root("app", app)` in the browser, `render(app())` on the
   server. Event handlers (`on`) are accepted and discarded; a server-rendered
-  `<button>` is a plain button. `std::dom` stays browser-only, so a component
+  `<button>` is a plain button. `std::web::dom` stays browser-only, so a component
   reaching for raw DOM cannot SSR; the cross-platform error says so at the import.
 
 ## Escaping to the DOM
 
-`View` is a thin wrapper over `std::dom::Element` (it's right there as
-`view.element`). For anything the chain doesn't cover, use `std::dom`
+`View` is a thin wrapper over `std::web::dom::Element` (it's right there as
+`view.element`). For anything the chain doesn't cover, use `std::web::dom`
 directly: `get_element_by_id`, `query_selector`,
 `element.set_attribute`, and so on. See the
 [browser reference](../std/browser.md).

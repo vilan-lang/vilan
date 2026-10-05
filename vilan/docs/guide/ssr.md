@@ -10,7 +10,7 @@ Vilan's model is **render, then replace**. There is no hydration: the client
 does not adopt the server's DOM. It renders the same view fresh and swaps it in.
 
 1. **Render.** The server calls your own view-building code against the process
-   layer's `std::ui`, which builds an HTML string instead of live DOM.
+   layer's `std::web::ui`, which builds an HTML string instead of live DOM.
    `render(view)` serializes it.
 2. **Serve.** The handler splices that markup into an HTML shell and serves the
    page. The user (and the crawler) sees the full content: first paint and SEO
@@ -23,7 +23,7 @@ does not adopt the server's DOM. It renders the same view fresh and swaps it in.
 
 ## One component, both legs
 
-Both legs share one `fun app(): View`. It imports `std::ui`, which
+Both legs share one `fun app(): View`. It imports `std::web::ui`, which
 resolves *per entry*: the browser layer (live DOM) in the client leg, the
 process layer (an HTML string tree) in the server leg. The same source, no
 annotation. Put it in a module beside the two entry files (one package, two
@@ -31,7 +31,7 @@ entries: the [full-stack shape](../tour/platforms.md)); in a workspace, put it
 in a `common` library both packages depend on instead.
 
 ```vilan
-import std::ui::{ each, view, View, render };
+import std::web::ui::{ each, view, View, render };
 import std::reactive::{ Signal, SignalCell };
 
 // The one component both legs build.
@@ -53,14 +53,14 @@ fun main() {
 
 The server serves the client leg's build and an HTML shell. `require_shell`
 reads that shell and checks it against the build ([the
-reference](../std/process.md#stddocument)); `render(view)` puts the markup
+reference](../std/process.md#stdwebdocument)); `render(view)` puts the markup
 *inside the mount element* — the same `<div id="app">` the client mounts into:
 
 ```vilan,norun
 import std::build::require_build;
-import std::document::require_shell;
+import std::web::document::require_shell;
 import std::http::{ Server, Request, Response };
-import std::ui::{ view, View };
+import std::web::ui::{ view, View };
 
 fun app(): View {
 	view("main").child(view("h1").text("Tasks"))
@@ -112,7 +112,7 @@ mount: mounting is a client entry, not a renderable view, which is why
 the natural factoring is a shared `fun app(): View` with a per-leg `main`.
 
 ```vilan,browser
-import std::ui::{ each, view, View, mount_root };
+import std::web::ui::{ each, view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 fun app(): View {

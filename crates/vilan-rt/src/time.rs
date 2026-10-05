@@ -2,7 +2,7 @@
 //!
 //! `vilan/std/src/time.vl` binds `Date.now` as `now_millis(): f64` —
 //! milliseconds since the Unix epoch, which is what `now()` builds an
-//! `Instant` from and what `std::rpc_server`'s handshake rate limit stamps
+//! `Instant` from and what `std::rpc::server`'s handshake rate limit stamps
 //! each attempt with. That one binding is this module. The timers the same
 //! file binds (`__sleep`, `__timer`) are the executor's, which keeps its own
 //! MONOTONIC clock: a deadline must not move when the wall clock does, and a

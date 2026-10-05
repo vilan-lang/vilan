@@ -145,6 +145,35 @@ impl Fixture {
     /// failure", "in_progress ", "none", …; "unreachable" makes the shim
     /// fail the way an offline gh does).
     fn script_with_ci(&self, name: &str, arguments: &[&str], verdict: &str) -> (bool, String) {
+        self.script_with(name, arguments, verdict, Some("green"))
+    }
+
+    /// `script_with_ci`, with the seal's performance verdict (M105 S6) for
+    /// every commit in the fixture set to `perf` — `Some("green")` is the
+    /// cut's default world, `Some("red")` a regressed seal, `None` no verdict
+    /// at all. The verdicts live under the fixture's own `HOME`.
+    fn script_with(
+        &self,
+        name: &str,
+        arguments: &[&str],
+        verdict: &str,
+        perf: Option<&str>,
+    ) -> (bool, String) {
+        let verdicts = self.home.join(".vilan").join("perf-verdicts");
+        let _ = fs::remove_dir_all(&verdicts);
+        if let Some(perf) = perf {
+            fs::create_dir_all(&verdicts).expect("create the fixture's verdict directory");
+            let commits = self.git(&["rev-list", "--all"]);
+            for sha in String::from_utf8_lossy(&commits.stdout).split_whitespace() {
+                fs::write(
+                    verdicts.join(format!("perf-{sha}.json")),
+                    format!(
+                        "{{\n \"sha\": \"{sha}\",\n \"verdict\": \"{perf}\",\n \"red\": []\n}}\n"
+                    ),
+                )
+                .expect("write a fixture verdict");
+            }
+        }
         let output = self
             .command("sh")
             .arg(format!("scripts/{name}"))
@@ -339,7 +368,13 @@ fn the_cut_refuses_an_entry_it_cannot_classify_instead_of_guessing() {
 fn traced_entries(report: &str) -> usize {
     report
         .lines()
-        .filter(|line| line.starts_with("  ok    ") && !line.contains("ci.yml"))
+        // The CI and performance verdicts (L17, M105 S6) print an `ok` line of
+        // their own; neither is an entry.
+        .filter(|line| {
+            line.starts_with("  ok    ")
+                && !line.contains("ci.yml")
+                && !line.contains("performance verdict")
+        })
         .count()
 }
 
@@ -994,6 +1029,143 @@ fn allow_red_ci_overrides_loudly_and_lifts_only_the_ci_red() {
         "--allow-red-ci lifted a refusal that is not CI's:\n{report}"
     );
     assert!(report.contains("refusing to cut"), "{report}");
+}
+
+// --- M105 S6: the cut refuses a commit without a green performance verdict ---
+//
+// The seal's perf leg writes `perf-<sha>.json`; the cut reads it at the commit
+// that becomes the tag, fail-closed like the CI check: absent, red or
+// unreadable refuses, and `--allow-perf-regression "<reason>"` overrides
+// loudly with the reason written into the release section.
+
+#[test]
+fn the_cut_names_a_green_performance_verdict() {
+    let fixture = Fixture::new("perf-green", SCRAMBLED);
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &["--date", "2026-01-02", "--dry-run", "9.9.9"],
+    );
+    assert!(ok, "a green verdict refused the cut:\n{report}");
+    assert!(
+        report.contains("the performance verdict is green at"),
+        "the cut must say it read the verdict:\n{report}"
+    );
+}
+
+#[test]
+fn the_cut_refuses_an_absent_a_red_and_an_unreadable_performance_verdict_each_by_name() {
+    let fixture = Fixture::new("perf-absent", SCRAMBLED);
+    let arguments = ["--date", "2026-01-02", "--dry-run", "9.9.9"];
+    let (ok, report) = fixture.script_with("cut-release.sh", &arguments, "completed success", None);
+    assert!(
+        !ok,
+        "the cut proceeded with no performance verdict:\n{report}"
+    );
+    assert!(
+        report.contains("no performance verdict at"),
+        "the refusal must say the verdict is missing:\n{report}"
+    );
+    assert!(report.contains("refusing to cut"), "{report}");
+
+    let (ok, report) = fixture.script_with(
+        "cut-release.sh",
+        &arguments,
+        "completed success",
+        Some("red"),
+    );
+    assert!(!ok, "the cut proceeded over a red verdict:\n{report}");
+    assert!(
+        report.contains("is RED"),
+        "the refusal must name the red:\n{report}"
+    );
+
+    let (ok, report) = fixture.script_with(
+        "cut-release.sh",
+        &arguments,
+        "completed success",
+        Some("maybe"),
+    );
+    assert!(
+        !ok,
+        "the cut proceeded over an unreadable verdict:\n{report}"
+    );
+    assert!(
+        report.contains("unreadable is not green"),
+        "the refusal must say it could not read the verdict:\n{report}"
+    );
+}
+
+#[test]
+fn allow_perf_regression_writes_its_reason_into_the_release_notes_and_lifts_only_the_perf_red() {
+    let fixture = Fixture::new("perf-override", SCRAMBLED);
+    let out = fixture.root.join("proposed.md");
+    let reason = "peak memory +20% on kolt, accepted for M108's exception";
+    let (ok, report) = fixture.script_with(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--allow-perf-regression",
+            reason,
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.9",
+        ],
+        "completed success",
+        Some("red"),
+    );
+    assert!(
+        ok,
+        "--allow-perf-regression did not lift the perf red:\n{report}"
+    );
+    assert!(
+        report.contains("OVERRIDDEN by --allow-perf-regression"),
+        "the override must print what it is, loudly:\n{report}"
+    );
+    let proposed = fs::read_to_string(&out).expect("the overridden cut wrote its CHANGELOG");
+    let heading = proposed
+        .lines()
+        .position(|line| line == "## v9.9.9 — 2026-01-02")
+        .expect("the release section is retitled");
+    let note = proposed.lines().nth(heading + 2).unwrap_or_default();
+    assert!(
+        note.starts_with("> Performance: ") && note.contains(reason),
+        "the reason must open the release section as a note:\n{proposed}"
+    );
+
+    // It lifts the performance red and nothing else: red CI still refuses.
+    let (ok, report) = fixture.script_with(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--allow-perf-regression",
+            reason,
+            "--dry-run",
+            "9.9.9",
+        ],
+        "completed failure",
+        Some("red"),
+    );
+    assert!(!ok, "--allow-perf-regression lifted the CI red:\n{report}");
+    assert!(report.contains("refusing to cut"), "{report}");
+
+    // And a reason is required: the note is the point of the override.
+    let (ok, report) = fixture.script_with(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--allow-perf-regression",
+            " ",
+            "--dry-run",
+            "9.9.9",
+        ],
+        "completed success",
+        Some("red"),
+    );
+    assert!(!ok, "a blank reason was accepted:\n{report}");
+    assert!(report.contains("needs a reason"), "{report}");
 }
 
 #[test]

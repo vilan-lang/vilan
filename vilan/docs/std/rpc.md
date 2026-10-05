@@ -36,8 +36,14 @@ that runs on every read.
 host over WebSocket, waits for the server's announcement, and verifies the
 **contract hash**: a drifted server fails the connect with
 `RpcError::Contract`. The hash covers the surface's RESOLVED types, so a
-respelling is not a drift: `Map<str, i32>` (the deprecated alias), `HashMap<str,
-i32>` and a renaming import of it hash alike.
+respelling is not a drift: `HashMap<str, i32>` and a renaming import of it hash
+alike. It also covers each of your Wire types' SHAPE — a struct's fields in
+declaration order (name and type, recursively), an enum's variants in order —
+because a codec reads the type itself: a field added, removed, renamed or
+reordered, or a variant moved, is a different contract under the same name,
+and a server redeployed with one refuses its old clients at connect instead of
+being mis-decoded by them. (std's own types stand for themselves: they change
+only with the toolchain both sides are built by.)
 
 ## Mirrors: `RemoteSource<T>`
 
@@ -62,9 +68,10 @@ impl RemoteSource<type T> {
 	fun sub(self, observer: (|T| void) context tracking): Subscription  // counted, manual: present values; dispose to release
 }
 
-// A mirror is a transient source (std::transient): Status mapped arm for arm.
+// A mirror is a transient source (std::reactive::transient): Status mapped arm for arm.
 impl RemoteSource<type T> with TransientSource<T, RpcError> {
-	fun state(self): MemoCell<TransientState<T, RpcError>>   // passive, like `status`
+	fun state(self): MemoCell<TransientState<T, RpcError>>   // passive, like `status`: leases nothing
+	fun states(self): dyn Pipe<TransientState<T, RpcError>>  // leases while bound; the whole state
 	fun latest(self): dyn Pipe<Option<T>>                    // leases while bound; keeps the stale value
 	fun is_pending(self): dyn Pipe<bool>                     // leases while bound
 }
@@ -499,7 +506,7 @@ nothing could not tell a 401 from an outage and paid the whole backoff to learn
 nothing. `connect_socket_with` offers exactly the list it is given, which is the
 seam for a peer that speaks something else.
 
-## Server plumbing (`std::rpc_server`, process layer)
+## Server plumbing (`std::rpc::server`, process layer)
 
 ```vilan,fragment
 impl Service {
@@ -540,7 +547,7 @@ attach). The `{mount}rpc` route is the server side of `std::rpc`'s
 usually; serving the build's own artifacts is
 `ServerBuilder::serve_build`'s job, on the same builder. Details:
 [Services & RPC](../guide/services.md#growing-past-one-service) and the
-[process reference](process.md#stdrpc_server).
+[process reference](process.md#stdrpcserver).
 
 One matching rule is worth knowing: a service claims a path **segment** —
 its route exactly, or its route followed by `?` — so `/rpc` does not

@@ -12,7 +12,7 @@
 // The `const` style chain is evaluated at build time into dist/client.css,
 // which src/server.vl serves and src/app.html links.
 //
-// `Signal`, `SignalCell`, `view` and `View` are ambient: `prelude = "std::web"` in
+// `Signal`, `SignalCell`, `view` and `View` are ambient: `prelude = "std::web::prelude"` in
 // vilan.toml puts them in scope with no import, along with the MODULES `style`
 // and `ui` — which is why the chain below writes `style::Display::Flex` and
 // the mount writes `ui::mount_root`. The prelude carries the module, not its

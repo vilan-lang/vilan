@@ -48,7 +48,7 @@ pub struct ChunkPlan {
 
 /// The gate wiring for one entry (`bundle-splitting.md` §2). `swap`'s render
 /// closure is `sync` and cannot await a chunk, so the wait moves upstream: the
-/// recognized calls are emitted against `std::ui::swap_split`, which holds a
+/// recognized calls are emitted against `std::web::ui::swap_split`, which holds a
 /// gated signal and advances it only once the arm's chunk has landed.
 pub struct Gate {
     /// The `swap` call ids the emitter retargets.
@@ -65,7 +65,7 @@ pub struct Gate {
     /// the same generics in the same order — so the call's own type binding
     /// carries over by position.
     pub retarget: Vec<(Id, Id, usize)>,
-    /// `std::ui::chunk_preload` — the boot preload the emitter plants ahead of
+    /// `std::web::ui::chunk_preload` — the boot preload the emitter plants ahead of
     /// the statement that mounts the swap (`bundle-splitting.md` §S3). Declares
     /// the same generics as `swap_split` in the same order, so the gate call's
     /// type argument rebinds onto it by position too.
@@ -313,7 +313,7 @@ impl SplitCost {
     }
 }
 
-/// A free std function by name that is NOT an impl member — `std::ui::swap`,
+/// A free std function by name that is NOT an impl member — `std::web::ui::swap`,
 /// A85's value form. A99 retired the `View.swap` METHOD it used to share the
 /// name with, but the member exclusion stays: a USER type may declare a `swap`
 /// method of its own, and an impl member is never the function this gate wires.

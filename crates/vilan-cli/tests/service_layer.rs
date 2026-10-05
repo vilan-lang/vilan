@@ -20,13 +20,14 @@ use std::time::{Duration, Instant};
 /// channel the macro mints, the `KeyedSource` mirror the generated client
 /// carries, and a per-key subscription taken through it (A39).
 const KEYED_SERVICE: &str = r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::hash_map::HashMap;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::wire::{ Keyed, Wire };
 
 [derive(Wire, PartialEq, Debug)]
@@ -245,7 +246,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::rpc::HttpTransport;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(Client)]
 struct Counter {
@@ -331,7 +332,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::rpc::HttpTransport;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(NotesClient)]
 struct Notes {
@@ -435,7 +436,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::rpc::connect_socket;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(NotesClient)]
 struct Notes {
@@ -647,7 +648,7 @@ const BYTE_IDENTICAL_SERVER: &str = r#"import std::io::print;
 import std::shared::Shared;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(Client)]
 struct Counter {
@@ -855,12 +856,13 @@ fn the_segment_match_lets_rpcs_through_where_starts_with_swallowed_it() {
 /// — the identity a method could not learn when one instance served the whole
 /// process (`transport-rpc.md` Q9).
 const FACTORY_SERVER: &str = r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 
 [service(NotesClient)]
 struct Notes {
@@ -1117,7 +1119,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+import std::rpc::server::{ Connection, Handshake, Reject, Service, Session };
 
 [service(NotesClient)]
 struct Notes {
@@ -1892,8 +1894,10 @@ fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subs
     // other, which is exactly right: the frames differ. The plain-`[expose]`
     // hash pinned in `a_factory_service_builds_one_instance_per_connection`
     // (`d1d5fba0`) is the other half of the claim: it did not move at all.
+    // B525 (v0.44.0) moved both of these on purpose — `43077e29` and
+    // `d093c571` before it: the surface writes `Message`'s fields now.
     assert!(
-        stdout.contains("hash:43077e29"),
+        stdout.contains("hash:b034cc03"),
         "the keyed service's contract hash moved:\n{stdout}"
     );
     // I9 moved this one on purpose: the whole-value channel hashes its element
@@ -1901,7 +1905,7 @@ fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subs
     // (`c63e39e3` was the `Map<str, Message>` spelling's). The keyed hash above
     // hashes the map's VALUE type and did not move.
     assert!(
-        stdout.contains("plain-hash:d093c571"),
+        stdout.contains("plain-hash:9f8b135b"),
         "the plain twin's contract hash moved:\n{stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -2146,7 +2150,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::{ connect_socket, connect_socket_with };
-import std::rpc_server::{ Handshake, Reject, Service, Session };
+import std::rpc::server::{ Handshake, Reject, Service, Session };
 
 [service(NotesClient)]
 struct Notes {
@@ -2250,13 +2254,14 @@ fun run(port: i32) {
 /// hash the same. `PlainChat` is the control that keeps that from being
 /// vacuous — the same surface with a whole-value exposure hashes differently.
 const KEYED_LIST_SERVICE: &str = r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::hash_map::HashMap;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::wire::{ Keyed, Wire };
 
 [derive(Wire, PartialEq, Debug)]
@@ -2505,12 +2510,13 @@ fn a_mut_ref_self_rpc_write_survives_the_next_call_on_that_connection_alone() {
         &dir,
         "src/main.vl",
         r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::shared::Shared;
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 
 [service(GateClient)]
 struct Gate {
@@ -2722,7 +2728,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::RpcError;
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 import std::time::sleep;
 
 [client_service]
@@ -3181,7 +3187,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 import std::time::sleep;
 
 [service(PeerClient, client = Peer)]
@@ -3275,7 +3281,7 @@ fn a_peer_to_peer_struct_carries_both_halves_and_both_directions_work() {
 const RECEIVE_LOOP_GATE: &str = r#"import std::io::print;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -3476,7 +3482,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::wire::Wire;
 
@@ -3744,31 +3750,35 @@ fn a_handle_returning_method_hands_the_client_a_mirror_and_hashes_as_the_mapped_
             "`{expected}` is missing from the handle service's run:\n{stdout}"
         );
     }
-    // The hash halves.
+    // The hash halves. Since B525 a surface writes each of its own Wire types'
+    // SHAPE where it first reaches the type (`MessageBody{id: str, ..}`).
     let handle_surface = "get_messages(str,i32)->List<str>;\
-                          get_message(str)->RemoteSource<MessageBody>;\
+                          get_message(str)->RemoteSource<MessageBody{id: str, author: str, body: str}>;\
                           edit(str,str)->bool;\
                           expose:topic:str;";
     let value_surface = "get_messages(str,i32)->List<str>;\
-                         get_message(str)->MessageBody;\
+                         get_message(str)->MessageBody{id: str, author: str, body: str};\
                          edit(str,str)->bool;\
                          expose:topic:str;";
     let option_surface = "get_messages(str,i32)->List<str>;\
-                          get_message(str)->RemoteSource<MessageBody>?;\
+                          get_message(str)->RemoteSource<MessageBody{id: str, author: str, body: str}>?;\
                           edit(str,str)->bool;\
                           expose:topic:str;";
     let plain_surface = "get_messages(str,i32)->List<str>;\
-                         get_message(str)->MessageBody;\
+                         get_message(str)->MessageBody{id: str, author: str, body: str};\
                          expose:topic:str;";
+    // Frozen: a service with no handle return hashed `78bdada7` from c3ed9239
+    // until B525 (v0.44.0) moved it on purpose — the surface names
+    // `MessageBody`'s fields now. The handle forms still do not move it.
     assert_eq!(
         line_of("plain-hash:"),
-        "78bdada7",
+        "ddcd4de6",
         "a service with no handle return must hash byte-identically to what it \
-         hashed at c3ed9239 — this number was measured there:\n{stdout}"
+         hashed at B525 — this number was measured there:\n{stdout}"
     );
     assert_eq!(
         contract_hash_of(plain_surface),
-        "78bdada7",
+        "ddcd4de6",
         "the frozen number and the surface it was measured from disagree"
     );
     assert_eq!(
@@ -3818,7 +3828,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::{ RemoteSource, session_of };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::wire::Wire;
 
@@ -4328,11 +4338,12 @@ fn an_rpc_answering_a_result_over_a_u53_id_round_trips_both_arms() {
         &dir,
         "src/main.vl",
         r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 
 [service(StoreClient)]
 struct Store {
@@ -4451,13 +4462,14 @@ fn an_awaited_void_rpc_acks_after_its_handler_ran() {
         &dir,
         "src/main.vl",
         r#"import std::io::print;
+import std::debug::Debug;
 import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::option::Option::{ self, None, Some };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 
 [service(StoreClient)]
 struct Store {
@@ -4713,7 +4725,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::{ Connection, Service };
+import std::rpc::server::{ Connection, Service };
 import std::time::sleep;
 
 [client_service]
@@ -5305,7 +5317,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc::{ KeyedCell, KeyedSource, RemoteSource, session_of };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::wire::{ Keyed, Wire };
 
@@ -5558,7 +5570,8 @@ fn a_keyed_handle_return_hands_the_client_a_patched_mirror_minted_at_its_first_l
         "both mirrors of the one source must be fed, each in its own frame \
          shape:\n{stdout}"
     );
-    let keyed_surface = "tasks_in(str)->KeyedSource<i32, Task>;\
+    // B525: `Task`'s shape is written where the surface first reaches it.
+    let keyed_surface = "tasks_in(str)->KeyedSource<i32, Task{id: i32, title: str}>;\
                          rows_in(str)->RemoteSource<List<Task>>;\
                          add(str,i32,str)->bool;\
                          stats()->List<i32>;\
@@ -5979,7 +5992,7 @@ fn an_rpc_call_whose_argument_count_disagrees_with_the_method_is_a_decode_failur
     const ARITY_SERVER: &str = r#"import std::io::print;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(Client)]
 struct Counter {
@@ -6111,7 +6124,7 @@ import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::Server;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::wire::Wire;
 
 [derive(Wire)]
@@ -6362,7 +6375,7 @@ fn the_post_legs_status_says_what_the_envelope_says() {
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 
 [service(Client)]
 struct Door {
@@ -6529,7 +6542,7 @@ import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::rpc::RpcError;
 
 [service(Client)]
@@ -6609,7 +6622,7 @@ import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Request, Response, Server };
-import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+import std::rpc::server::{ Connection, Handshake, Reject, Service, Session };
 import std::rpc::{ Dispatcher, reply };
 
 [service(Client)]
@@ -6816,7 +6829,7 @@ import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Request, Response, Server };
-import std::rpc_server::{ Reject, Service, Session };
+import std::rpc::server::{ Reject, Service, Session };
 import std::rpc::RpcError;
 
 [service(Client)]
@@ -6905,7 +6918,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::binary::binary_codec;
 import std::http::{ Request, Response, Server };
-import std::rpc_server::{ Reject, Service, Session };
+import std::rpc::server::{ Reject, Service, Session };
 import std::rpc::RpcError;
 
 [service(Client)]

@@ -3149,7 +3149,7 @@ import std::process::exit;
 import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ RemoteSource, SocketTransport };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -3398,7 +3398,7 @@ import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ KeyedCell, KeyedSource, RemoteSource };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 import std::wire::{ Keyed, Wire };
@@ -3655,7 +3655,7 @@ import std::http::{ Response, Server };
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ KeyedCell, KeyedSource };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 import std::wire::{ Keyed, Wire };
@@ -3787,6 +3787,7 @@ fn a139_a_per_key_joiner_is_seeded_over_a_socket() {
 /// goes, the wire hands `a` back to a per-key forward. Red before on
 /// `forwards=2`, both faults and `notified: first=5 second=6`.
 const A143_ONE_FORWARD: &str = r#"import std::io::print;
+import std::hash::Hashable;
 import std::json::json_codec;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
@@ -3935,12 +3936,14 @@ fn a143_mixed_demands_on_one_keyed_channel_share_one_forward_and_fan_out_by_dema
 /// A143 OVER A SOCKET: the same two demands over a real WebSocket. Red before
 /// on both faults and `notified: first=7 second=8`.
 const A143_ONE_FORWARD_SOCKET: &str = r#"import std::io::print;
+import std::debug::Debug;
+import std::hash::Hashable;
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ KeyedCell, KeyedSource };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 import std::wire::{ Keyed, Wire };
@@ -4355,7 +4358,7 @@ import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -4521,7 +4524,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::shared::Shared;
 import std::task::Task;
 import std::time::sleep;
-import std::transient::{ TaskSource, Transient, TransientSource, TransientState };
+import std::reactive::transient::{ TaskSource, Transient, TransientSource, TransientState };
 
 fun show<E>(state: TransientState<i32, E>, error: |E| str): str {
 	match state {
@@ -4679,10 +4682,10 @@ import std::process::exit;
 import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, Owner, owner_scope };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::{ RemoteSource, RpcError };
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
-import std::transient::{ TransientSource, TransientState };
+import std::reactive::transient::{ TransientSource, TransientState };
 
 [service(BoardClient)]
 struct Board {
@@ -4778,6 +4781,129 @@ fn a142_s3_a_mirror_is_a_transient_absent_versus_pending_over_a_socket() {
     );
 }
 
+// --- A150: `states()`, the whole state LEASED (R-c door (b)) ---------------
+
+/// A150 OVER A SOCKET: `state()` stays a passive report (an unwatched mirror
+/// reads `Pending` forever), and `states()` is a pipe of the whole state that
+/// LEASES the mirror while its consumer holds it — so binding it alone moves a
+/// present mirror to `Ready` and a missing one to `Absent`, which is what tells
+/// a spinner from "not found". `TransientState::map` reads through it.
+const A150_STATES_SOCKET: &str = r#"import std::io::print;
+import std::debug::Debug;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::hash_map::HashMap;
+import std::process::exit;
+import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, Owner, owner_scope };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ RemoteSource, RpcError };
+import std::rpc::server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+import std::reactive::transient::{ TransientSource, TransientState };
+
+[service(BoardClient)]
+struct Board {
+	notes: Shared<HashMap<i32, SignalCell<str>>>,
+}
+
+impl Board {
+	[rpc]
+	fun write(self, id: i32, text: str): i32 {
+		match self.notes.read().get(id) {
+			Some(let cell) => cell.set(text),
+			None => {},
+		}
+		0
+	}
+
+	[rpc]
+	fun note(self, id: i32): Option<SignalCell<str>> {
+		self.notes.read().get(id)
+	}
+}
+
+let board: Board = Board { notes = Shared::new(HashMap::new()) };
+
+fun main() {
+	board.notes.write().insert(1, Signal::new("one"));
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 300 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+fun count(n: usize): str {
+	i"{n}"
+}
+
+fun show<T>(state: TransientState<T, RpcError>, text: |T| str): str {
+	match state {
+		TransientState::Pending => "Pending",
+		TransientState::Ready(let v) => i"Ready({text(v)})",
+		TransientState::Refreshing(let v) => i"Refreshing({text(v)})",
+		TransientState::Failed(let _e, let _stale) => "Failed",
+		TransientState::Absent => "Absent",
+	}
+}
+
+async fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let owner = Owner::new();
+			let present: RemoteSource<str> = client.note(1);
+			let missing: RemoteSource<str> = client.note(9);
+			// The passive report, and nothing else watching: it stays Pending.
+			let reported = owner_scope.run(owner, || present.state());
+			sleep(50);
+			print(i"reported: {show(reported.get(), |v| v)}");
+			// `states()` alone leases: Ready for the present note, Absent for the
+			// missing one — and `map` reads through the state.
+			let present_states = owner_scope.run(owner, || present
+				.states()
+				.derive(|state| state.map(|text| text.len()))
+				.memo());
+			let missing_states = owner_scope.run(owner, || missing.states().memo());
+			until(|| !present_states.get().is_pending() && !missing_states.get().is_pending());
+			print(i"watched: present={show(present_states.get(), count)} missing={show(missing_states.get(), |v| v)}");
+			print(i"write:{client.write(1, "three").unwrap_or(0 - 1)}");
+			until(|| present_states.get().latest() == Some(5));
+			print(i"after: present={show(present_states.get(), count)}");
+			owner.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a150_states_leases_a_mirror_and_state_stays_a_passive_report() {
+    let stdout = run_program("a150_states_socket", A150_STATES_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "reported: Pending",
+            "watched: present=Ready(3) missing=Absent",
+            "write:0",
+            "after: present=Ready(5)",
+        ],
+        "states() must lease the mirror and report every arm; got:\n{stdout}"
+    );
+}
+
 // --- A145: the read-only seal crosses as a handle ----------------------------
 
 /// A145 OVER A SOCKET: `MemoCell<T>` — the read-only seal of a derivation (A142
@@ -4793,7 +4919,7 @@ import std::process::exit;
 import std::reactive::{ MemoCell, Pipe, Signal, SignalCell, Source };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -4901,7 +5027,7 @@ import std::process::exit;
 import std::reactive::{ HashMapCell, HashMapEntry, Source };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -5092,7 +5218,7 @@ import std::process::exit;
 import std::reactive::{ Signal, SignalCell, Source };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
@@ -5210,7 +5336,7 @@ import std::process::exit;
 import std::reactive::{ Signal, SignalCell, Source };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::RemoteSource;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 

@@ -126,7 +126,7 @@ Top-level bindings like these keep their live values while you edit the view
 that renders them:
 
 ```vilan,browser
-import std::dev;
+import std::web::dev;
 import std::reactive::{ Signal, SignalCell };
 
 // Carried across every swap by key + type. Edit main's body, save, and these
@@ -161,7 +161,7 @@ Change the binding's *type*, though, and the old value is the wrong shape:
 that binding fresh-initializes (a "fingerprint miss"), which is the correct
 answer, not a failure. To carry a value your edit reshapes anyway, or to carry
 something minted inside a function, reach for the manual channel:
-[`std::dev`](../std/dev.md)'s `stash`/`take`.
+[`std::web::dev`](../std/dev.md)'s `stash`/`take`.
 
 ## Escape hatches
 
@@ -507,8 +507,8 @@ takes:
 ```vilan,browser
 import std::option::Option::{ None, Some, self };
 import std::reactive::{ Signal, SignalCell };
-import std::router::{ chunk_error, current_path, pending, segments };
-import std::ui::{ View, mount_root, swap, view };
+import std::web::router::{ chunk_error, current_path, pending, segments };
+import std::web::ui::{ View, mount_root, swap, view };
 
 [derive(PartialEq)]
 enum Route {
@@ -616,4 +616,4 @@ The swap disposes the UI root and closes the live rpc socket for you. Anything
 *else* a bundle started outside the reactive system (a raw interval, a bare
 task) keeps running after a swap unless you register a cleanup. That, plus
 the `stash`/`take` carryover channel and the `hmr_active` guard, is the whole
-of [`std::dev`](../std/dev.md).
+of [`std::web::dev`](../std/dev.md).

@@ -30,7 +30,7 @@
 //!   - **A copy the build stops naming is swept**, because a stale file in
 //!     `dist/` SHIPS — on the per-kind prune's law and not a second one: only
 //!     what the build recorded, never a file it merely found.
-//!   - **The call is compile-time-only**, like its `std::asset` siblings.
+//!   - **The call is compile-time-only**, like its `std::web::asset` siblings.
 //!
 //! The last block pins kolt.local 035's three additions on the same machinery:
 //! `bundle_as`'s target spelled at the call, `read_dir_all`'s sorted and
@@ -93,8 +93,8 @@ fn stage(tag: &str, port: u16) -> PathBuf {
     write(
         &dir,
         "src/client.vl",
-        "import std::asset::bundle;\n\
-         import std::ui::{ mount_root, view };\n\
+        "import std::web::asset::bundle;\n\
+         import std::web::ui::{ mount_root, view };\n\
          \n\
          let icon = const bundle(\"static/icon.svg\");\n\
          \n\
@@ -283,7 +283,7 @@ fn a_name_a_legs_build_owns_is_refused() {
             &dir,
             "src/client.vl",
             &format!(
-                "import std::asset::bundle;\n\
+                "import std::web::asset::bundle;\n\
                  import std::io::print;\n\
                  \n\
                  let taken = const bundle(\"{bundled}\");\n\
@@ -324,7 +324,7 @@ fn a_resource_that_is_already_in_place_is_not_copied_over_itself() {
     write(
         &dir,
         "app.vl",
-        "import std::asset::bundle;\n\
+        "import std::web::asset::bundle;\n\
          import std::io::print;\n\
          \n\
          let note = const bundle(\"note.txt\");\n\
@@ -375,7 +375,7 @@ fn the_const_channel_reads_and_bundles_through_a_symlinked_tree() {
     write(
         &dir,
         "src/main.vl",
-        "import std::asset::{ bundle, read, read_dir };\n\
+        "import std::web::asset::{ bundle, read, read_dir };\n\
          import std::io::print;\n\
          \n\
          let icon = const bundle(\"icons/check.svg\");\n\
@@ -424,7 +424,7 @@ fn the_containment_refusal_speaks_about_the_path_as_written() {
     write(
         &dir,
         "src/main.vl",
-        "import std::asset::read;\n\
+        "import std::web::asset::read;\n\
          let _outside = const read(\"../outside.txt\");\n\
          fun main() {}\nmain();\n",
     );
@@ -470,8 +470,8 @@ fn a_watch_round_recopies_a_changed_resource() {
     write(
         &dir,
         "src/client.vl",
-        "import std::asset::bundle;\n\
-         import std::ui::{ mount_root, view };\n\
+        "import std::web::asset::bundle;\n\
+         import std::web::ui::{ mount_root, view };\n\
          \n\
          let note = const bundle(\"static/note.txt\");\n\
          \n\
@@ -546,8 +546,8 @@ fn stage_estate(dir: &Path) {
 
 /// The client of that project: 035's recipe verbatim — enumerate, strip the
 /// prefix, bundle each file at the url the strip produced.
-const ESTATE_CLIENT: &str = "import std::asset;\n\
-     import std::ui::{ mount_root, view };\n\
+const ESTATE_CLIENT: &str = "import std::web::asset;\n\
+     import std::web::ui::{ mount_root, view };\n\
      \n\
      fun estate(): List<str> {\n\
      \tmut urls: List<str> = [];\n\
@@ -720,7 +720,7 @@ fn a_fingerprinted_url_is_the_files_digest_and_moves_with_it() {
     write(
         &dir,
         "src/app.vl",
-        "import std::asset;\n\
+        "import std::web::asset;\n\
          import std::io::print;\n\
          \n\
          let LOGO = const asset::bundle_as(\n\
@@ -787,7 +787,7 @@ fn a_target_that_is_not_a_url_is_refused() {
             &dir,
             "src/main.vl",
             &format!(
-                "import std::asset;\n\
+                "import std::web::asset;\n\
                  import std::io::print;\n\
                  \n\
                  let TAKEN = const asset::bundle_as(\"note.txt\", \"{url}\");\n\
@@ -823,7 +823,7 @@ fn two_files_bundling_to_one_url_are_refused_naming_both() {
     write(
         &dir,
         "src/main.vl",
-        "import std::asset;\n\
+        "import std::web::asset;\n\
          import std::io::print;\n\
          \n\
          let ONE = const asset::bundle_as(\"first.txt\", \"/pinned.txt\");\n\
@@ -864,8 +864,8 @@ fn two_legs_bundling_to_one_url_are_refused_at_the_copy() {
     write(
         &dir,
         "src/client.vl",
-        "import std::asset;\n\
-         import std::ui::{ mount_root, view };\n\
+        "import std::web::asset;\n\
+         import std::web::ui::{ mount_root, view };\n\
          \n\
          let ONE = const asset::bundle_as(\"first.txt\", \"/pinned.txt\");\n\
          \n\
@@ -876,7 +876,7 @@ fn two_legs_bundling_to_one_url_are_refused_at_the_copy() {
     write(
         &dir,
         "src/server.vl",
-        "import std::asset;\n\
+        "import std::web::asset;\n\
          import std::io::print;\n\
          \n\
          let TWO = const asset::bundle_as(\"second.txt\", \"/pinned.txt\");\n\
@@ -920,8 +920,8 @@ fn a_target_a_legs_build_owns_is_refused() {
             &dir,
             "src/client.vl",
             &format!(
-                "import std::asset;\n\
-                 import std::ui::{{ mount_root, view }};\n\
+                "import std::web::asset;\n\
+                 import std::web::ui::{{ mount_root, view }};\n\
                  \n\
                  let TAKEN = const asset::bundle_as(\"note.txt\", \"{url}\");\n\
                  \n\
@@ -989,7 +989,7 @@ fn a_bundle_the_build_stops_naming_is_swept_from_dist() {
     write(
         &dir,
         "src/client.vl",
-        "import std::ui::{ mount_root, view };\n\
+        "import std::web::ui::{ mount_root, view };\n\
          \n\
          fun main() {\n\
          \tlet _root = mount_root(\"app\", || view(\"p\"));\n\
@@ -1046,8 +1046,8 @@ fn a_sweep_leaves_the_other_legs_bundles_alone() {
     write(
         &dir,
         "src/client.vl",
-        "import std::asset;\n\
-         import std::ui::{ mount_root, view };\n\
+        "import std::web::asset;\n\
+         import std::web::ui::{ mount_root, view };\n\
          \n\
          let MINE = const asset::bundle_as(\"first.txt\", \"/client-only.txt\");\n\
          let OURS = const asset::bundle_as(\"both.txt\", \"/shared.txt\");\n\
@@ -1059,7 +1059,7 @@ fn a_sweep_leaves_the_other_legs_bundles_alone() {
     write(
         &dir,
         "src/server.vl",
-        "import std::asset;\n\
+        "import std::web::asset;\n\
          import std::io::print;\n\
          \n\
          let MINE = const asset::bundle_as(\"second.txt\", \"/server-only.txt\");\n\

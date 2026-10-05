@@ -1363,7 +1363,7 @@ fn rk_a_transient_in_a_module_bindings_initializer_is_refused_with_its_own_twin(
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source };
         import std::result::Result::{ self, Ok, Err };
-        import std::transient::Transient;
+        import std::reactive::transient::Transient;
 
         let id: SignalCell<i32> = Signal::new(1);
         let fetched: Transient<i32, str> = id.derive(|x| async Ok(x * 10)).transient();
@@ -1373,7 +1373,7 @@ fn rk_a_transient_in_a_module_bindings_initializer_is_refused_with_its_own_twin(
             print(fetched.get().is_some());
         }
         "#;
-    // Occurrence 0 is the import's `std::transient`; 1 and 2 are the two seals.
+    // Occurrence 0 is the import's `std::reactive::transient`; 1 and 2 are the two seals.
     for occurrence in [1, 2] {
         assert_fails_spanning_nth(
             source,
@@ -1400,7 +1400,7 @@ fn rk_transient_global_at_module_level_compiles_and_follows_its_source() {
         import std::reactive::{ Signal, SignalCell, Source };
         import std::result::Result::{ self, Ok, Err };
         import std::time::sleep;
-        import std::transient::Transient;
+        import std::reactive::transient::Transient;
 
         let id: SignalCell<i32> = Signal::new(1);
         let fetched: Transient<i32, str> = id.derive(|x| async Ok(x * 10)).transient_global();
@@ -1432,7 +1432,7 @@ fn rk_transient_global_ignores_an_ambient_owner_where_transient_is_released_with
         import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
         import std::result::Result::{ self, Ok, Err };
         import std::time::sleep;
-        import std::transient::Transient;
+        import std::reactive::transient::Transient;
 
         fun main() {
             let id: SignalCell<i32> = Signal::new(1);
@@ -2781,7 +2781,7 @@ fn f60_a_dropped_pipe_warns_whichever_function_built_it() {
         r#"
         import std::option::Option::{ self, None, Some };
         import std::reactive::{ Derive, Signal, SignalCell, Source, derive };
-        import std::transient::{ Transient, TransientSource };
+        import std::reactive::transient::{ Transient, TransientSource };
 
         fun doubled(source: SignalCell<i32>): Derive<SignalCell<i32>, i32, i32> {
             source.derive(|value| value * 2)

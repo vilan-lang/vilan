@@ -74,13 +74,12 @@ path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set )
                    | "as" NAME ] ;        (* alias, §4.3 *)
 path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
 set-element = path-branch | impl-selector ;
-impl-selector = "(" "impl" type ")"
+impl-selector = "(" "impl" type [ "with" type ] ")"
                 [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
-export      = { lead-attribute }   (* the item's own prefix: B485's one order *)
+export      = { lead-attribute }   (* the item's own prefix, in THE order below *)
               "export" [ "(" "in" path-branch ")" ]
-              [ deprecated-label ]   (* B382's re-export label, the pre-B485 side *)
               statement   (* §4.8 *)
             | "export" "*" ";" ;          (* the whole-module marker *)
 lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
@@ -92,7 +91,9 @@ lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
 `import` brings names from another module into scope; `use` brings names
 from a type's namespace (e.g. variants) into scope. In a set, `self` names
 the item itself (`Option::{ self, Some, None }` imports the type and its
-variants). Semantics: §4.
+variants), and `self as name` imports it under another name. `vilan fmt`
+and Organize Imports write a set's `self` first, then `self as name`, then
+the members. Semantics: §4.
 
 `export` is a statement WRAPPER, not a declaration kind: it takes the
 statement under it, which is what lets one production cover every
@@ -103,18 +104,54 @@ declaration as the module's surface (or re-exports an import);
 is the one form carrying no inner statement. The wrapper does not change
 the statement's own shape, so a wrapped `let` keeps its terminator —
 `export let registry = …;` — and a wrapped `fun` still takes none. A
-declaration carrying attributes is wrapped as a whole, attributes and all.
-The ONE order (B485) is attributes, then the keywords — `export` first
-among them — then the declaration word: `[derive(Wire)]` ⏎ `export struct
-Handle { … }`, `[platform("browser")]` ⏎ `export impl …`. This release also
-reads the run on the other side of the marker (`export [derive(Wire)]
-struct Handle`, the spelling before B445), and `vilan fmt` rewrites it into
-the order; the release after refuses it. An attribute written on either
-side is read exactly as one after the marker (and its scope) always was: it
-joins the item's own prefix, whose order and admissions are the item
-production's (§3.3), and a run may be split across the marker. Only an
-attribute shape — `[` then a name — leads a marker; `export *;` takes none. The marker is written once: a second `export` on one declaration is refused (B492). A `#` before
-a path element is the **reach** marker:
+declaration carrying attributes is wrapped as a whole, attributes and all;
+an attribute it carries joins the item's own prefix, whose admissions are
+the item production's (§3.3).
+
+**A declaration head is written in ONE order** (B485, B536): its
+attributes, by rank; then its keywords, in Q8's order — `export` (with its
+`(in PATH)`), then `const` or `lazy`, then `async`, then `external` or
+`macro`; then the declaration word (`fun`, `struct`, `enum`, `trait`,
+`impl`, `let`, `mut`, `mod`, `import`, `use`). The productions in §3.3
+each state their own slice of it.
+
+The attributes' ranks, which are the order `vilan fmt` prints them in,
+each on its own line:
+
+1. generation — `[derive(..)]`, `[service(..)]`, `[client_service(..)]`, a
+   macro attribute (among themselves, as written);
+2. the labels — `[deprecated(..)]`, then `[internal(..)]`, then `[hint(..)]`;
+3. the binding — `[extern(..)]`;
+4. the checks — `[must_use]`, then `[rpc]`, then `[trait_only]`;
+5. the fence — `[platform(..)]`;
+6. the class — `[resource]`.
+
+So `[derive(Wire)]` ⏎ `export struct Handle { … }`, `[platform("browser")]`
+⏎ `export impl …`, `[deprecated("use g")]` ⏎ `[must_use]` ⏎ `export async
+fun f()`, `[deprecated("use b")] export import a::b as c;`, and `async macro
+fun` (B524). A head written in another order is read exactly as if written
+in this one, and reported:
+
+- **attributes out of rank**, and nothing else out of order —
+  `[internal("why")]` ⏎ `[deprecated("use g")]` ⏎ `fun` — a **warning**
+  that names the head in the order (`` write `[deprecated(..)] [internal(..)]
+  fun` ``);
+- **a keyword ahead of an attribute, or two keywords inverted** — `async
+  [platform("node")] fun`, `external async fun`, `lazy export let`, `macro
+  async fun` — an **error**, with the head respelled in the order. That
+  includes `export` and `macro` ahead of the attributes: `export
+  [derive(Wire)] struct Handle`, the spelling before B485, read by v0.43.0
+  and refused from v0.44.0 (B485 S3).
+
+`vilan fmt` writes every such head in the order, the refused ones included,
+so it is the migration either diagnostic asks for; the editor's quick fix
+does the same for one head. A keyword set no order makes legal (`async const
+fun`, `lazy fun`) is refused by its production instead. Only an attribute
+shape — `[` then a name — leads a head; `export *;` takes none. The
+marker is written once: a second `export` on one declaration is refused
+(B492).
+
+A `#` before a path element is the **reach** marker:
 `import pkg::a::{ #hidden };` imports an item the module does not export,
 deliberately (§4.3, §4.8).
 
@@ -137,7 +174,11 @@ which of the module's `impl` blocks this file admits, and its optional
 `::` tail names the members it takes (§4.3). `_` stands for any type at
 an argument position (`(impl List<_>)`) and `(impl _)` selects every
 implementation the module declares; a selector writes no `type X` binders
-and takes no `as`. The subject is the ordinary `type` production, and it
+and takes no `as`. `with TRAIT` names the block by the trait it implements,
+as its declaration does — `(impl Box with One)` takes `impl Box with One`
+and no other `Box` block — which is how a block with no declarations of its
+own (all defaults, or a marker) is named; the trait resolves in the
+importing file's scope, as the subject does. The subject is the ordinary `type` production, and it
 resolves in the IMPORTING file's scope, so `impl S` reaches an alias that
 file bound and `impl item::Struct` is the qualified spelling.
 
@@ -230,9 +271,9 @@ combines with a convention — the argument is a tuple the *call site*
 builds, so there is nothing to transfer or alias — but `mut` may precede
 it (`mut ...items: T`).
 
-The attribute prefix is **ordered** — each attribute is optional, but
-they appear in exactly the production's order. `[deprecated("use …")]`
-leads it: the function is **deprecated**, and every use in code outside
+Each attribute of the prefix is optional, and the prefix is written in any
+order (§3.2): the production lists the canonical one, which `vilan fmt`
+prints. `[deprecated("use …")]` leads it: the function is **deprecated**, and every use in code outside
 the standard library — a call, a method call, the function passed as a
 value — still compiles but raises the non-fatal warning
 `` `{name}` is deprecated; {steer} ``, anchored at the using name, once
@@ -268,7 +309,7 @@ semantic-token modifier) and leads its hover with the steer.
 `[internal("reason")]` follows it, and answers a different question.
 Visibility says whether a module may **name** an item; this says whether
 a reader should **reach for** one that is named — an item exported on
-purpose and dangerous on purpose, like `std::ui`'s `Region.anchor`,
+purpose and dangerous on purpose, like `std::web::ui`'s `Region.anchor`,
 which `each` and a hand-written `Slot` legitimately need and which
 corrupts the reconciler's view when a row is moved through it without
 `hold_rows`. The one argument is the reason, and it is required: it is
@@ -458,7 +499,7 @@ service-arg    = IDENT | "http" | "client" "=" IDENT ;
 client-service-attr = "[" "client_service" "]" ;
 macro-attributed-item = macro-attr ( struct | enum | function ) ;
 macro-attr       = "[" IDENT [ "(" [ expr-span { "," expr-span } ] ")" ] "]" ;
-macro-fun        = "macro" function ;
+macro-fun        = "macro" function ;   (* written in §3.2's order: attributes, [ "async" ] "macro", "fun" *)
 macro-invocation = "macro" IDENT "(" [ expr-span { "," expr-span } ] ")" ;
 macro-block      = "macro" block ;
 ```
@@ -471,7 +512,7 @@ attribute names (`derive`, `service`, `client_service`, `extern`,
 available as user macro-attribute names.
 
 `[reactive(..)]` is a field's store knobs, read by `[derive(Storable)]`
-(`std::store`) and by nothing else: `coarse` makes the field one slot,
+(`std::reactive::store`) and by nothing else: `coarse` makes the field one slot,
 compared whole, and `name = "x"` generates its projection as `x()`. The
 `name` must be an identifier. It may stand on either side of `[expose]`.
 
@@ -497,14 +538,20 @@ jump       = "jump" IDENT ;          (* break | continue *)
 ```
 
 `let` binds immutably, `mut` mutably; a tuple binder destructures
-(irrefutably: names and nested tuples only). Both the type and the
+(irrefutably: names and nested tuples only), one sub-pattern per element of
+the value's own shape — `let ((a, b), c) = ((1, 2), 3);` — and a pattern of
+another arity, or over a value that is no tuple, is refused. Both the type and the
 initializer are syntactically optional. `lazy` is accepted only on a
 MODULE-LEVEL `let` binding one name to one initializer (§6.10): a `lazy
 mut`, a lazy destructure, a lazy binding with no initializer and a lazy
 local are each refused. A **place** is a chain expression
 (§3.6) denoting a location: a local, a field chain, an index, or a place
-reached through a call (`a.write().count`); the optional leading `*`
-assigns through a view. `jump break` / `jump continue` control the
+reached through a call (`a.write().count`), a call that returns a `&mut`
+view (`cell.write() += 1`), or a tuple of places (`(a, b) = (b, a)`); the
+optional leading `*` assigns through a view. The grammar reads any chain
+there, so a left side that denotes no location — `-x`, `!b`, `(x + 1)`,
+`await p`, a literal, a value-returning call, a variant constructor — is
+refused by the checker, once per assignment. `jump break` / `jump continue` control the
 innermost enclosing loop.
 
 ## 3.5 Blocks and control expressions
@@ -658,7 +705,7 @@ tag's token for token. In a head item, an undotted name is an attribute
 (a bare name is a boolean attribute) and a leading `.` is an ordinary
 chain member — the grammar never consults any method list. Text
 children are quoted strings; bare text is a parse error. An element is
-an ordinary expression: it desugars before analysis to the `std::ui`
+an ordinary expression: it desugars before analysis to the `std::web::ui`
 view chain (`view("tag")` with one method call per head item and a
 `.child(…)` per child), and postfix suffixes apply to it
 (`<div />.show(flag)`).
@@ -706,7 +753,7 @@ arguments are ordinary expressions
 (`.on(within(attribute("data-theme").eq("dark")) + hover()) { … }`).
 
 Like an element, a block is an ordinary expression that desugars before
-analysis — to the `std::style` chain: `style()`, then `.raw(property,
+analysis — to the `std::web::style` chain: `style()`, then `.raw(property,
 value)` per declaration and `.name(args…, style() … )` per condition
 rule, with the rule's own chain appended as the final argument, in
 written order. `@` does not lex at all, so there are no at-rules inside

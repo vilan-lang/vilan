@@ -177,6 +177,17 @@ pub enum ParseErrorReason {
     /// [`Parser::visibility_marker_before`] recognizes ever reach here, which is
     /// what keeps the payload `'static`.
     VisibilityMarker { marker: &'static str },
+    /// A spelling another language uses, written where vilan has its own
+    /// (B520): the parse went on as if vilan's had been written.
+    ForeignSpelling(ForeignSpelling),
+    /// A declaration head whose markers are out of the ruled order (B486,
+    /// B485 Q6/Q8): `canonical` is the head respelled in it. The parse went on
+    /// as if it had been written so.
+    MarkerOrder { canonical: String },
+    /// A WARNING, never an error (B536): a declaration head whose attributes
+    /// are written out of [`attribute_rank`]'s order, and nothing else out of
+    /// order. `canonical` is the head respelled in it; the parse read it so.
+    AttributeOrder { canonical: String },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -364,6 +375,15 @@ const CSS_ITEM_EXPECTED: &str = "a declaration (`property(value);`), a nested ru
 const CONST_HAS_NO_MUTATION: &str = "a compile-time value has no runtime mutation: `const let` binds a value the BUILD \
      computes, and there is nowhere for a later write to go. Write `const let` for the \
      compile-time binding, or `mut name = const ..;` for a runtime binding seeded from one";
+
+/// The rule `async x = 1;` and `async let x = 1;` break (B494). Curated
+/// (diagnostics-standard.md B6): `async` marks a function or an expression
+/// run as a task, never a binding, and the two spellings the author can have
+/// meant are named. `async x = 1;` was read as an ASSIGNMENT whose place is
+/// `async x` — refused only when `x` was unbound ("cannot find 'x'"), and
+/// emitted as invalid JS when it was bound.
+const ASYNC_MARKS_NO_BINDING: &str = "`async` does not mark a binding: it marks a function, `async fun load()`, or an \
+     expression run as a task, `let pending = async load();` — a binding is `let name = …`";
 
 /// The rule a CSS pseudo-class written CSS-style breaks (tracker E153).
 /// Curated (diagnostics-standard.md B6): the prohibition explains itself and
@@ -556,6 +576,606 @@ fn visibility_marker_rule(marker: &str) -> String {
          (`import pkg::util::{{ #helper }};`). (`export` also RE-exports something this module \
          imported: `export import pkg::io::panic;`.)"
     )
+}
+
+/// A spelling another language uses for something vilan writes differently
+/// (B520, R-h RULED 2026-10-03): `return` for `ret`, `fn`/`function`/`func`/
+/// `def` for `fun`, and the `->` arrow for the `:` before a return type.
+///
+/// None of the four words is reserved — each stays an ordinary name wherever
+/// it is one today (`let return = 1;`, a field `fn: i32`, `fun def()`). The
+/// parser recognizes them only where no name can stand, so no valid program
+/// reads differently:
+///
+/// - `return` at the head of an expression, followed by a token that BEGINS
+///   an expression and cannot CONTINUE one after a name — another name, a
+///   literal, `if`/`match`/`await`/`const`/`css`/`async`
+///   ([`starts_foreign_return`]). Two names side by side are never an
+///   expression, so `return x` has no other reading. `return;`, `return
+///   (x)` and `return -x` DO have one — a read of a binding named `return`, a
+///   call, a subtraction — and are left to the analyzer;
+/// - `fn`/`function`/`func`/`def` at an item head (past any attribute run and
+///   marker keywords), followed by a name and the `(` or `<` that opens a
+///   signature ([`Parser::take_foreign_item_word`]);
+/// - `->`, the two tokens written against each other, where a return type's
+///   `:` may stand: after a `fun`'s parameter list, a closure literal's, and
+///   a closure type's. A `-` followed directly by `>` is never an expression.
+///
+/// Each reports ONE diagnostic at the foreign token — "vilan spells this
+/// `ret`" — and the parse goes on as if the right spelling had been written:
+/// the word's token is rewritten in place (to `ret` or `fun`), and the arrow
+/// is read as the `:`. So the declaration or the return is in the tree, and
+/// nothing after it cascades.
+///
+/// **The editor's half.** [`ForeignSpelling::code`] is the diagnostic's stable
+/// code, [`ForeignSpelling::of_message`] recognizes the diagnostic from its
+/// rendered text (the one field a diagnostic carries through the pipeline),
+/// and [`foreign_spelling_fix`] is the quick fix's edit: the span to replace
+/// and the text to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForeignSpelling {
+    /// `return value;` — vilan writes `ret value;`.
+    Return,
+    /// `fn name(..)` (Rust) — vilan writes `fun`.
+    Fn,
+    /// `function name(..)` (JavaScript, Lua, PHP) — vilan writes `fun`.
+    Function,
+    /// `func name(..)` (Go, Swift) — vilan writes `fun`.
+    Func,
+    /// `def name(..)` (Python, Ruby, Scala) — vilan writes `fun`.
+    Def,
+    /// `fun name() -> T` (Rust, Swift, Python's annotations) — vilan writes
+    /// `fun name(): T`, and `|x| -> T body` on a closure literal is `|x|: T
+    /// body`.
+    Arrow,
+    /// `|i32| -> str` in a closure TYPE — vilan writes the result directly
+    /// after the `|..|`, `|i32| str`, so the fix deletes the arrow rather
+    /// than writing a `:`.
+    TypeArrow,
+}
+
+/// The `fun` steer's sentence for one written word — one literal per word, so
+/// each message is a fixed string the diagnostics ledger can key on.
+macro_rules! fun_spelling_steer {
+    ($word:literal) => {
+        concat!(
+            "`",
+            $word,
+            "` is not a vilan keyword: vilan spells this `fun` — `fun name(parameter: Type): \
+             Result { … }`"
+        )
+    };
+}
+
+impl ForeignSpelling {
+    /// Every foreign spelling, in a fixed order.
+    pub const ALL: [ForeignSpelling; 7] = [
+        ForeignSpelling::Return,
+        ForeignSpelling::Fn,
+        ForeignSpelling::Function,
+        ForeignSpelling::Func,
+        ForeignSpelling::Def,
+        ForeignSpelling::Arrow,
+        ForeignSpelling::TypeArrow,
+    ];
+
+    /// The foreign spelling as the author wrote it.
+    pub fn written(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => "return",
+            ForeignSpelling::Fn => "fn",
+            ForeignSpelling::Function => "function",
+            ForeignSpelling::Func => "func",
+            ForeignSpelling::Def => "def",
+            ForeignSpelling::Arrow | ForeignSpelling::TypeArrow => "->",
+        }
+    }
+
+    /// The spelling vilan uses in its place — the quick fix's replacement
+    /// text for the foreign token (empty for a closure type's arrow, which
+    /// vilan does not write at all).
+    pub fn vilan(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => "ret",
+            ForeignSpelling::Fn
+            | ForeignSpelling::Function
+            | ForeignSpelling::Func
+            | ForeignSpelling::Def => "fun",
+            ForeignSpelling::Arrow => ":",
+            ForeignSpelling::TypeArrow => "",
+        }
+    }
+
+    /// The diagnostic's STABLE code: `foreign-spelling/<what was written>`,
+    /// with the arrow named `arrow` (`type-arrow` in a closure type). The editor publishes it as the LSP
+    /// diagnostic's `code` and keys its quick fix on it; it never changes
+    /// when the message is reworded.
+    pub fn code(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => "foreign-spelling/return",
+            ForeignSpelling::Fn => "foreign-spelling/fn",
+            ForeignSpelling::Function => "foreign-spelling/function",
+            ForeignSpelling::Func => "foreign-spelling/func",
+            ForeignSpelling::Def => "foreign-spelling/def",
+            ForeignSpelling::Arrow => "foreign-spelling/arrow",
+            ForeignSpelling::TypeArrow => "foreign-spelling/type-arrow",
+        }
+    }
+
+    /// The diagnostic's text.
+    pub fn message(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => {
+                "`return` is not a vilan keyword: vilan spells this `ret` — `ret value;` returns \
+                 a value, and a bare `ret;` leaves a function that returns nothing"
+            }
+            ForeignSpelling::Fn => fun_spelling_steer!("fn"),
+            ForeignSpelling::Function => fun_spelling_steer!("function"),
+            ForeignSpelling::Func => fun_spelling_steer!("func"),
+            ForeignSpelling::Def => fun_spelling_steer!("def"),
+            ForeignSpelling::Arrow => {
+                "`->` is not how vilan writes a return type: vilan spells this `:` — `fun \
+                 name(parameter: Type): Result`, and `|parameter: Type|: Result` on a closure"
+            }
+            ForeignSpelling::TypeArrow => {
+                "`->` is not how vilan writes a closure type: its result follows the `|..|` \
+                 directly — `|Type| Result`, and `|| Result` with no parameters"
+            }
+        }
+    }
+
+    /// The quick fix's title.
+    pub fn fix_title(self) -> &'static str {
+        match self {
+            ForeignSpelling::Return => "Write `ret`",
+            ForeignSpelling::Fn
+            | ForeignSpelling::Function
+            | ForeignSpelling::Func
+            | ForeignSpelling::Def => "Write `fun`",
+            ForeignSpelling::Arrow => "Write `:` for the return type",
+            ForeignSpelling::TypeArrow => "Remove the `->`",
+        }
+    }
+
+    /// The foreign spelling a diagnostic's rendered message reports, if it
+    /// reports one. The parser renders these with no context and no hint, so
+    /// the message is exactly [`ForeignSpelling::message`].
+    pub fn of_message(message: &str) -> Option<ForeignSpelling> {
+        Self::ALL
+            .into_iter()
+            .find(|spelling| message == spelling.message())
+    }
+
+    /// The `fun` steer's word, by its text.
+    fn item_word(word: &str) -> Option<ForeignSpelling> {
+        match word {
+            "fn" => Some(ForeignSpelling::Fn),
+            "function" => Some(ForeignSpelling::Function),
+            "func" => Some(ForeignSpelling::Func),
+            "def" => Some(ForeignSpelling::Def),
+            _ => None,
+        }
+    }
+}
+
+/// The quick fix for a foreign-spelling diagnostic (B520): the span to
+/// replace and the text to write there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpellingFix {
+    /// The diagnostic's stable code ([`ForeignSpelling::code`]).
+    pub code: &'static str,
+    /// The quick fix's title ([`ForeignSpelling::fix_title`]).
+    pub title: &'static str,
+    /// The source range the edit replaces.
+    pub span: Span,
+    /// What the edit writes there.
+    pub replacement: &'static str,
+}
+
+/// The quick fix for the diagnostic `message` anchored at `span` in `source`,
+/// or `None` when it is not a foreign-spelling diagnostic (B520).
+///
+/// A word's fix replaces the word: its span IS the diagnostic's. The arrow's
+/// also takes the blanks written between the parameter list and the `->`, so
+/// `fun f() -> i32` becomes `fun f(): i32` — the `:` against the `)`, the way
+/// the formatter prints it — rather than `fun f() : i32`. A closure type's
+/// arrow is deleted with the blanks AFTER it, so `|i32| -> str` becomes
+/// `|i32| str`.
+pub fn foreign_spelling_fix(source: &str, message: &str, span: Span) -> Option<SpellingFix> {
+    const BLANKS: [char; 4] = [' ', '\t', '\r', '\n'];
+    let spelling = ForeignSpelling::of_message(message)?;
+    let (mut start, mut end) = (span.start, span.end);
+    match spelling {
+        ForeignSpelling::Arrow => {
+            start = source.get(..span.start)?.trim_end_matches(BLANKS).len();
+        }
+        ForeignSpelling::TypeArrow => {
+            let after = source.get(span.end..)?;
+            end += after.len() - after.trim_start_matches(BLANKS).len();
+        }
+        _ => {}
+    }
+    Some(SpellingFix {
+        code: spelling.code(),
+        title: spelling.fix_title(),
+        span: Span::from(start..end),
+        replacement: spelling.vilan(),
+    })
+}
+
+/// A154 (ruled 2026-10-03): the std modules that moved under a namespace, each
+/// old path (under `std::`) with the path that replaced it. The ONE table: the
+/// analyzer's refusal of an old import or qualified path, the manifest's refusal
+/// of an old `prelude` value and the editor's quick fix all read it, so no two of
+/// them can disagree about where a module went. There are no forwarding modules
+/// (the ruling's (2)): an old path resolves to nothing and is refused with this.
+///
+/// `web` is the web PRELUDE's old path — `std::web` itself is a namespace now,
+/// so its row is consulted only where a path stops AT `web` or reaches a name
+/// the namespace does not hold (see the analyzer's import walk).
+pub const MOVED_STD_MODULES: &[(&str, &str)] = &[
+    ("dom", "web::dom"),
+    ("ui", "web::ui"),
+    ("style", "web::style"),
+    ("dev", "web::dev"),
+    ("router", "web::router"),
+    ("storage", "web::storage"),
+    ("document", "web::document"),
+    ("asset", "web::asset"),
+    ("web", "web::prelude"),
+    ("hash_map_cell", "reactive::hash_map_cell"),
+    ("hash_set_cell", "reactive::hash_set_cell"),
+    ("transient", "reactive::transient"),
+    ("store", "reactive::store"),
+    ("store_core", "reactive::store_core"),
+    ("delta", "reactive::delta"),
+    ("null", "js::null"),
+    ("promise", "js::promise"),
+    ("native_map", "js::native_map"),
+    ("rpc_server", "rpc::server"),
+];
+
+/// The path [`MOVED_STD_MODULES`] gives the old std module `old` (the segment
+/// after `std::`), or `None` when `old` did not move.
+pub fn moved_std_module(old: &str) -> Option<&'static str> {
+    MOVED_STD_MODULES
+        .iter()
+        .find(|(module, _)| *module == old)
+        .map(|(_, new)| *new)
+}
+
+/// The stable code of the moved-module refusal ([`moved_std_module_message`]).
+/// The editor publishes it as the LSP diagnostic's `code`.
+pub const MOVED_STD_MODULE_CODE: &str = "std-path/moved";
+
+/// The refusal for a path through the moved std module `old` (A154). The text
+/// is its whole contract: [`moved_std_module_fix`] reads the two paths back out
+/// of it, so its head is fixed.
+pub fn moved_std_module_message(old: &str, new: &str) -> String {
+    format!(
+        "`std::{old}` moved to `std::{new}`: std's modules are grouped under namespaces since \
+         v0.44.0, and the old path is gone — write `std::{new}`"
+    )
+}
+
+/// The `(old, new)` pair a moved-module refusal names, when `message` is one.
+pub fn moved_std_module_of_message(message: &str) -> Option<(&'static str, &'static str)> {
+    let rest = message.strip_prefix("`std::")?;
+    let (old, rest) = rest.split_once('`')?;
+    let rest = rest.strip_prefix(" moved to `std::")?;
+    let (new, _) = rest.split_once('`')?;
+    MOVED_STD_MODULES
+        .iter()
+        .find(|(module, moved)| *module == old && *moved == new)
+        .map(|(module, moved)| (*module, *moved))
+}
+
+/// The stable code of a std-path diagnostic `message`, if it is one.
+pub fn std_path_diagnostic_code(message: &str) -> Option<&'static str> {
+    moved_std_module_of_message(message).map(|_| MOVED_STD_MODULE_CODE)
+}
+
+/// The quick fix for a moved-module refusal: the span to replace and the text
+/// to write there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StdPathFix {
+    /// The diagnostic's stable code ([`MOVED_STD_MODULE_CODE`]).
+    pub code: &'static str,
+    /// The quick fix's title: "Write `std::web::dom`".
+    pub title: String,
+    /// The source range the edit replaces: the OLD module segment, or, for a
+    /// brace list under the old web-prelude path that also names `std::web`'s
+    /// own children, the stretch from its first prelude name to its last.
+    pub span: Span,
+    /// What the edit writes there: the new path below `std::` (`web::dom`), or
+    /// that stretch with `prelude::` written before each prelude name.
+    pub replacement: String,
+}
+
+/// The quick fix for the diagnostic `message` anchored at `span` in `source`
+/// (A154), or `None` when it is not a moved-module refusal, `span` no longer
+/// covers the old segment (the buffer moved on), or the import is a shape no
+/// one edit rewrites correctly ([`moved_std_module_edit`] says which and why).
+pub fn moved_std_module_fix(source: &str, message: &str, span: Span) -> Option<StdPathFix> {
+    moved_std_module_edit(source, message, span)?.ok()
+}
+
+/// The edit that answers a moved-module refusal (A154) — the ONE computation the
+/// editor's quick fix and `vilan check --fix` both apply, so the two cannot
+/// write different paths for the same refusal. `None` when `message` is not a
+/// moved-module refusal or `span` no longer covers the old segment;
+/// `Some(Err(reason))` when the import is a shape the fix leaves to a person,
+/// with the reason in words.
+///
+/// The refusal anchors at the old module's own segment — `dom` in
+/// `import std::dom::create_element;`, `web` in `std::web::Signal` — so the edit
+/// replaces exactly that segment with the new path below `std::`, and whatever
+/// the path continues with (`::create_element`, a brace list, an alias) stays.
+///
+/// One shape needs more (E268): a brace list under the old web-prelude path
+/// that also names one of `std::web`'s own children — `std::web::{ Signal,
+/// dom::create_element }`. `std::web` is that namespace now, so `dom::..`
+/// already resolves there; rewriting `web` to `web::prelude` would carry it
+/// along and break it. The edit instead writes `prelude::` before each name
+/// that is not a child: `std::web::{ prelude::Signal, dom::create_element }`.
+/// The children are read off the one table (every module that moved to
+/// `web::<child>`), so a name that is not one is a prelude name — or a typo,
+/// which stays an ordinary miss under `prelude::` exactly as it does under
+/// `std::web::prelude::{ .. }`.
+pub fn moved_std_module_edit(
+    source: &str,
+    message: &str,
+    span: Span,
+) -> Option<Result<StdPathFix, &'static str>> {
+    let (old, new) = moved_std_module_of_message(message)?;
+    if source.get(span.into_range())? != old {
+        return None;
+    }
+    let whole = || StdPathFix {
+        code: MOVED_STD_MODULE_CODE,
+        title: format!("Write `std::{new}`"),
+        span,
+        replacement: new.to_string(),
+    };
+    if old != "web" {
+        return Some(Ok(whole()));
+    }
+    let (tree, _errors) = parse(source);
+    let Some(elements) = tree
+        .as_ref()
+        .and_then(|(nodes, _)| web_brace_list_at(nodes, span))
+    else {
+        // `std::web::Signal`, `std::web::{ .. }` read as no import (a parse
+        // the tree does not hold): the segment alone is the edit.
+        return Some(Ok(whole()));
+    };
+    let mut prelude_names = Vec::new();
+    let mut names_a_child = false;
+    for element in elements {
+        match element {
+            ImportBranch::Path("self", ..) => return Some(Err(MOVED_WEB_SELF_REASON)),
+            ImportBranch::Path(name, ..) if is_web_namespace_child(name) => names_a_child = true,
+            ImportBranch::Path(name, name_span, _) => prelude_names.push((*name, *name_span)),
+            ImportBranch::Reach(..) | ImportBranch::Selector(..) | ImportBranch::Set(..) => {
+                return Some(Err(MOVED_WEB_MARKED_REASON));
+            }
+        }
+    }
+    if !names_a_child || prelude_names.is_empty() {
+        return Some(Ok(whole()));
+    }
+    let first = prelude_names[0].1.start;
+    let last = prelude_names[prelude_names.len() - 1].1.start;
+    let mut replacement = String::new();
+    let mut cursor = first;
+    for (_, name_span) in &prelude_names {
+        replacement.push_str(&source[cursor..name_span.start]);
+        replacement.push_str("prelude::");
+        cursor = name_span.start;
+    }
+    let names = prelude_names
+        .iter()
+        .map(|(name, _)| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(Ok(StdPathFix {
+        code: MOVED_STD_MODULE_CODE,
+        title: format!("Write `prelude::` before {names} (the web prelude is `std::web::prelude`)"),
+        span: Span::from(first..last),
+        replacement,
+    }))
+}
+
+/// Why [`moved_std_module_edit`] leaves `std::web::{ self, .. }` to a person:
+/// `self` bound the old prelude module under the name `web`, and no path
+/// edit keeps both that binding and the list's other names.
+pub const MOVED_WEB_SELF_REASON: &str = "the brace list names `self`, which bound the old web      prelude as `web`; `std::web` is a namespace now, so write `prelude as web` (or import the      names from `std::web::prelude`) by hand";
+
+/// Why [`moved_std_module_edit`] leaves a marked brace list under the old
+/// web-prelude path to a person: a reach marker (`#name`), an impl selector
+/// (`(impl T)`) or a nested `{ .. }` group binds no plain name the edit can
+/// prefix with `prelude::`.
+pub const MOVED_WEB_MARKED_REASON: &str = "the brace list holds a reach marker, an impl selector      or a nested group, which the edit cannot prefix with `prelude::`; move those names under      `std::web::prelude` by hand";
+
+/// Whether `name` is one of `std::web`'s own children — every module the one
+/// table moved to `web::<name>`, the web prelude among them.
+fn is_web_namespace_child(name: &str) -> bool {
+    MOVED_STD_MODULES
+        .iter()
+        .filter_map(|(_, new)| new.strip_prefix("web::"))
+        .any(|child| child == name)
+}
+
+/// The elements of the brace list that follows the import segment spanning
+/// exactly `anchor` (`std::web::{ .. }`), wherever the import sits — at the
+/// top of a file or block-scoped. `None` when that segment is not followed by
+/// a brace list (or no import holds it).
+fn web_brace_list_at<'tree, 'src>(
+    nodes: &'tree NodeList<'src>,
+    anchor: Span,
+) -> Option<&'tree [ImportBranch<'src>]> {
+    fn in_branch<'tree, 'src>(
+        branch: &'tree ImportBranch<'src>,
+        anchor: Span,
+    ) -> Option<&'tree [ImportBranch<'src>]> {
+        match branch {
+            ImportBranch::Path(_, span, ImportTail::Continue(next)) if *span == anchor => {
+                match next.as_ref() {
+                    ImportBranch::Set(elements) => Some(elements),
+                    _ => None,
+                }
+            }
+            ImportBranch::Path(_, _, ImportTail::Continue(next)) => in_branch(next, anchor),
+            ImportBranch::Path(..) | ImportBranch::Selector(..) => None,
+            ImportBranch::Set(elements) => elements
+                .iter()
+                .find_map(|element| in_branch(element, anchor)),
+            ImportBranch::Reach(_, inner) => in_branch(inner, anchor),
+        }
+    }
+    fn in_node<'tree, 'src>(
+        node: &'tree Spanned<Node<'src>>,
+        anchor: Span,
+    ) -> Option<&'tree [ImportBranch<'src>]> {
+        if !(node.1.start <= anchor.start && anchor.end <= node.1.end) {
+            return None;
+        }
+        match &node.0 {
+            Node::Import(branch, _) | Node::Use(branch) => return in_branch(branch, anchor),
+            _ => {}
+        }
+        let mut found = None;
+        node.0.for_each_child(&mut |child| {
+            if found.is_none() {
+                found = in_node(child, anchor);
+            }
+        });
+        found
+    }
+    nodes.iter().find_map(|node| in_node(node, anchor))
+}
+
+/// A157: the warning on a WRITTEN `autofocus` attribute in an element head
+/// (`<input autofocus />`, which lowers to `.attr("autofocus", "")`). Raised by
+/// the analyzer's `check_written_autofocus`, at the attribute's NAME; an
+/// explicit `.attr("autofocus", ..)` is not steered (it is how a `<dialog>` or
+/// a popover gets the native attribute). Fixed text, no slots: the editor
+/// recognizes the diagnostic by it ([`written_autofocus_fix`]).
+pub const WRITTEN_AUTOFOCUS_MESSAGE: &str = "a written `autofocus` attribute is the browser's \
+     native one, which acts only while the page is first parsed: on an element inserted later \
+     the document refuses it once something has focus, and Chromium logs \"Autofocus processing \
+     was blocked because a document already has a focused element\". Write `.autofocus()` — it \
+     focuses the element once it is in the document, an enclosing focus scope starts on it, and a \
+     server render still writes the native attribute (for a `<dialog>` or a popover that wants \
+     the native one, write `.attr(\"autofocus\", \"\")`)";
+
+/// [`WRITTEN_AUTOFOCUS_MESSAGE`]'s STABLE code. The editor publishes it as the
+/// LSP diagnostic's `code`; it never changes when the message is reworded.
+pub const WRITTEN_AUTOFOCUS_CODE: &str = "element-attribute/autofocus";
+
+/// The stable code of an element-syntax diagnostic `message`, if it is one.
+pub fn element_diagnostic_code(message: &str) -> Option<&'static str> {
+    (message == WRITTEN_AUTOFOCUS_MESSAGE).then_some(WRITTEN_AUTOFOCUS_CODE)
+}
+
+/// The quick fix for an element-syntax diagnostic: the span to replace and the
+/// text to write there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElementFix {
+    /// The diagnostic's stable code ([`WRITTEN_AUTOFOCUS_CODE`]).
+    pub code: &'static str,
+    /// The quick fix's title.
+    pub title: &'static str,
+    /// The source range the edit replaces.
+    pub span: Span,
+    /// What the edit writes there.
+    pub replacement: &'static str,
+}
+
+/// The quick fix for the diagnostic `message` anchored at `span` in `source`
+/// (A157), or `None` when it is not [`WRITTEN_AUTOFOCUS_MESSAGE`], `span` no
+/// longer covers the word `autofocus` (the buffer moved on), or the attribute
+/// carries a value other than `("")` — `autofocus(flag)` is a value the method
+/// form has no slot for, so the warning stands without an edit.
+///
+/// The edit replaces the attribute — the bare name, or the name through its
+/// `("")` — with `.autofocus()` IN PLACE: a dotted link may stand anywhere in
+/// a head, and the formatter's element-head order treats it as a barrier, so
+/// the result is already what `vilan fmt` prints.
+pub fn written_autofocus_fix(source: &str, message: &str, span: Span) -> Option<ElementFix> {
+    if message != WRITTEN_AUTOFOCUS_MESSAGE || source.get(span.into_range())? != "autofocus" {
+        return None;
+    }
+    let after = source.get(span.end..)?;
+    let rest = after.trim_start();
+    let end = if let Some(inside) = rest.strip_prefix('(') {
+        let close = inside.find(')')?;
+        if inside[..close].trim() != "\"\"" {
+            return None;
+        }
+        span.end + (after.len() - rest.len()) + 1 + close + 1
+    } else {
+        span.end
+    };
+    Some(ElementFix {
+        code: WRITTEN_AUTOFOCUS_CODE,
+        title: "Write `.autofocus()`",
+        span: Span::from(span.start..end),
+        replacement: ".autofocus()",
+    })
+}
+
+/// Whether the identifier `return` at `index` begins a FOREIGN return (B520):
+/// the token after it begins an expression and cannot continue one after a
+/// name. Anything else after the word — `;`, `}`, `(`, `-`, `.`, `=`, an
+/// operator, `then` — reads the NAME `return` as it always did.
+fn starts_foreign_return(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
+    if tokens.get(index).map(|(token, _)| token) != Some(&Token::Ident("return")) {
+        return false;
+    }
+    matches!(
+        tokens.get(index + 1).map(|(token, _)| token),
+        Some(
+            Token::Number(..)
+                | Token::String(_)
+                | Token::MultilineString(_)
+                | Token::Bool(_)
+                | Token::Null
+                | Token::If
+                | Token::Match
+                | Token::Await
+                | Token::Const
+                | Token::Css
+                | Token::Async
+        )
+    ) || matches!(
+        tokens.get(index + 1).map(|(token, _)| token),
+        // `then` is the one name that continues an operand (B459's infix
+        // conditional): `return then go();` tests a binding named `return`.
+        Some(Token::Ident(name)) if *name != "then"
+    )
+}
+
+/// Whether `fn`/`function`/`func`/`def` at `index` heads a foreign item
+/// (B520): followed by a name and the `(` or `<` that opens a signature —
+/// [`Parser::take_foreign_item_word`]'s shape at a statement head, for the
+/// recovery's sync points.
+fn starts_foreign_item(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
+    let token = |offset: usize| tokens.get(index + offset).map(|(token, _)| token);
+    matches!(token(0), Some(Token::Ident(word)) if ForeignSpelling::item_word(word).is_some())
+        && matches!(token(1), Some(Token::Ident(name)) if *name != "then")
+        && matches!(token(2), Some(Token::Ctrl('(' | '<')))
+}
+
+/// Whether the two tokens at `index` are the `->` arrow (B520): a `-` written
+/// directly against a `>`, with nothing between them.
+fn is_foreign_arrow(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
+    match (tokens.get(index), tokens.get(index + 1)) {
+        (Some((Token::Op("-"), minus)), Some((Token::Ctrl('>'), greater))) => {
+            minus.end == greater.start
+        }
+        _ => false,
+    }
 }
 
 /// The rule an impl selector written OUTSIDE a brace set breaks (B318 S3,
@@ -931,13 +1551,19 @@ fn starts_item(token: &Token<'_>) -> bool {
 /// pick up cleanly. Identifiers and literals are deliberately NOT: they begin an
 /// expression statement, but they also appear all through a broken one, so
 /// stopping at them would resume mid-garbage and report again (the cascade
-/// `editing-dx.md` §9 records vilan as not having).
+/// `editing-dx.md` §9 records vilan as not having). B520's foreign heads are the
+/// exception, by shape rather than by word: `fn name(` and `return value` are
+/// two names (or a name and a literal) side by side, which no broken statement
+/// is made of either, and a `pub fn f()` reaches the visibility rule through
+/// here.
 fn starts_statement_or_item(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
     let Some((token, _)) = tokens.get(index) else {
         return false;
     };
     starts_item(token)
         || starts_contextual_statement(tokens, index)
+        || starts_foreign_item(tokens, index)
+        || starts_foreign_return(tokens, index)
         || matches!(
             token,
             Token::Let
@@ -1013,6 +1639,9 @@ pub fn render(error: &ParseError) -> String {
     let mut message = match &error.reason {
         ParseErrorReason::Rule(rule) => rule.to_string(),
         ParseErrorReason::VisibilityMarker { marker } => visibility_marker_rule(marker),
+        ParseErrorReason::ForeignSpelling(spelling) => spelling.message().to_string(),
+        ParseErrorReason::MarkerOrder { canonical } => marker_order_rule(canonical),
+        ParseErrorReason::AttributeOrder { canonical } => attribute_order_rule(canonical),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -1079,8 +1708,29 @@ pub fn render(error: &ParseError) -> String {
 /// slices are `&'src str` copied out of the tokens), exactly like the chumsky
 /// parser; the intermediate token vector does not outlive this call.
 pub fn parse(source: &str) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
+    let (tree, errors, _) = parse_with(source, false);
+    (tree, errors)
+}
+
+/// [`parse`], and the parse's WARNINGS beside its errors (B536): what the
+/// parser accepted and reads as written in canonical form, and still reports
+/// — today, a declaration's attributes written out of [`attribute_rank`]'s
+/// order ([`ParseErrorReason::AttributeOrder`]). A warning never makes a
+/// source unclean: the tree is the one the canonical spelling parses to.
+///
+/// The pipelines that REPORT diagnostics read this (the entry analysis, the
+/// CLI, the module loader, the clean-parse cache); every other reader of a
+/// tree keeps calling [`parse`].
+pub fn parse_with_warnings(source: &str) -> ParsedWithWarnings<'_> {
     parse_with(source, false)
 }
+
+/// What [`parse_with_warnings`] returns: the tree, the errors, the warnings.
+pub type ParsedWithWarnings<'src> = (
+    Option<Spanned<NodeList<'src>>>,
+    Vec<ParseError>,
+    Vec<ParseError>,
+);
 
 /// [`parse`], but every parenthesized expression is RECORDED as a
 /// [`Node::LiftGroup`] node instead of dissolving into its inner expression.
@@ -1097,13 +1747,11 @@ pub fn parse(source: &str) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
 /// tree, so nothing downstream changes. That separation is what the corpus
 /// byte-gate and `tests/parse_differential.rs` guard.
 pub fn parse_preserving_groups(source: &str) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
-    parse_with(source, true)
+    let (tree, errors, _) = parse_with(source, true);
+    (tree, errors)
 }
 
-fn parse_with(
-    source: &str,
-    preserve_paren_groups: bool,
-) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
+fn parse_with(source: &str, preserve_paren_groups: bool) -> ParsedWithWarnings<'_> {
     let (mut tokens, lex_errors) = lexing::tokenize(source);
     let token_count = tokens.len();
 
@@ -1146,11 +1794,15 @@ fn parse_with(
     // that `attempt` could not roll it back — see `Parser::nesting_refusal`. It
     // sorts into place with the rest below.
     errors.extend(parser.nesting_refusal.take());
+    // B520's rewrites, held off `parser.errors` for the same reason.
+    errors.append(&mut parser.rewrite_refusals);
     // A stable, span-ordered diagnostic list (diagnostics-standard.md C1): lexer
     // errors and recovered-region errors interleave by where they occur.
     errors.sort_by_key(|error| (error.span.start, error.span.end));
+    let mut warnings = std::mem::take(&mut parser.warnings);
+    warnings.sort_by_key(|warning| (warning.span.start, warning.span.end));
 
-    (Some(root), errors)
+    (Some(root), errors, warnings)
 }
 
 /// The spans of `source`'s CONTEXTUAL keywords (B414) where the parser read
@@ -1326,6 +1978,29 @@ struct Parser<'a, 'src> {
     /// restored around each statement's expression, so a statement nested in
     /// a block inside it has its own.
     statement_head: Option<usize>,
+    /// The diagnostics of the parser's in-place TOKEN REWRITES (B520's
+    /// foreign spellings), held aside from `errors` for `nesting_refusal`'s
+    /// reason: [`Parser::attempt`] truncates `errors` when a branch declines,
+    /// but the rewrite it reports is not undone — the token stays `ret` or
+    /// `fun` for every alternative read after it — so a refusal rolled back
+    /// with the branch would leave the foreign word silently accepted. One
+    /// per span ([`Parser::record_rewrite`]); [`parse_with`] folds them into
+    /// the error list at the end.
+    rewrite_refusals: Vec<ParseError>,
+    /// Where a REORDERED marker run began in the source, by the stream
+    /// position each suffix of the run now starts at
+    /// ([`Parser::canonicalize_marker_run`]): `(position, offset)`. A node
+    /// beginning at `position` covers that suffix and the declaration after
+    /// it, and so begins at `offset` — the earliest of those units as written
+    /// — rather than at whichever unit the reorder placed first.
+    /// [`Parser::span_from`] reads it; empty unless a run was reordered.
+    written_starts: Vec<(usize, usize)>,
+    /// The parse's WARNINGS (B536): a declaration head whose attributes are
+    /// written out of [`attribute_rank`]'s order. The head parses and analyzes
+    /// as if written in it ([`Parser::canonicalize_marker_run`]), so nothing
+    /// is refused; [`parse_with_warnings`] hands them back beside the errors.
+    /// One per span, held aside from `errors` for `rewrite_refusals`' reason.
+    warnings: Vec<ParseError>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -1461,6 +2136,435 @@ fn is_known_attribute_marker(name: &str) -> bool {
     KNOWN_ATTRIBUTE_MARKERS.contains(&name)
 }
 
+/// A declaration attribute's place in the ONE canonical order
+/// (keywords-vs-attributes.md §6.2, Q7 RULED 2026-10-01): attributes are
+/// written in any order, and this is the order `vilan fmt` prints them in —
+/// today's production order, so no attribute moved:
+///
+/// - generation (0): `[derive]`, `[service]`, `[client_service]`, a user
+///   macro attribute (any name the table does not know);
+/// - labels: `[deprecated]` (1), `[internal]` (2), `[hint]` (3);
+/// - binding: `[extern]` (4);
+/// - checks: `[must_use]` (5), `[rpc]` (6), `[trait_only]` (7), and the
+///   retired `[doc(hidden)]` (8), refused where a function's prefix reads it;
+/// - fence: `[platform]` (9);
+/// - class: `[resource]` (10).
+///
+/// Ties keep the order they were written in (a `[service]` and a
+/// `[client_service]`, two `[hint]`s). The parser sorts a run into this
+/// order before a production reads it ([`Parser::canonicalize_marker_run`]),
+/// and the formatter's safety net sorts both streams by it.
+pub fn attribute_rank(name: &str) -> u8 {
+    match name {
+        "deprecated" => 1,
+        "internal" => 2,
+        "hint" => 3,
+        "extern" => 4,
+        "must_use" => 5,
+        "rpc" => 6,
+        "trait_only" => 7,
+        "doc" => 8,
+        "platform" => 9,
+        "resource" => 10,
+        _ => 0,
+    }
+}
+
+/// The marker KEYWORDS of a declaration head (B485 Q8, B486), in the order
+/// they are written: `export`, then `const` or `lazy`, then `async`, then
+/// `external` or `macro` — after every attribute, before the declaration
+/// word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerKeyword {
+    Export,
+    Const,
+    Lazy,
+    Async,
+    External,
+    Macro,
+}
+
+impl MarkerKeyword {
+    fn word(self) -> &'static str {
+        match self {
+            MarkerKeyword::Export => "export",
+            MarkerKeyword::Const => "const",
+            MarkerKeyword::Lazy => "lazy",
+            MarkerKeyword::Async => "async",
+            MarkerKeyword::External => "external",
+            MarkerKeyword::Macro => "macro",
+        }
+    }
+
+    /// The ruled WRITTEN order (Q8).
+    fn written_rank(self) -> u8 {
+        match self {
+            MarkerKeyword::Export => 0,
+            MarkerKeyword::Const | MarkerKeyword::Lazy => 1,
+            MarkerKeyword::Async => 2,
+            MarkerKeyword::External | MarkerKeyword::Macro => 3,
+        }
+    }
+}
+
+/// One unit of a declaration's marker run: an attribute group or a keyword
+/// (with `export`'s `(in PATH)` scope), and the token range it occupies.
+#[derive(Clone, Debug)]
+struct MarkerUnit<'src> {
+    tokens: std::ops::Range<usize>,
+    kind: MarkerUnitKind<'src>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MarkerUnitKind<'src> {
+    Attribute { name: &'src str, arguments: bool },
+    Keyword(MarkerKeyword),
+}
+
+impl MarkerUnitKind<'_> {
+    /// Where the unit stands in the order the PRODUCTIONS read — which is not
+    /// the written one for three keywords: `export` wraps the whole statement,
+    /// and `const` and `macro` each wrap the declaration their production then
+    /// reads with its own attribute prefix (`parse_const_declaration`,
+    /// `parse_macro_fun`), so all three lead the attributes on the stream.
+    fn reading_key(self) -> (u8, u8) {
+        match self {
+            MarkerUnitKind::Keyword(MarkerKeyword::Export) => (0, 0),
+            MarkerUnitKind::Keyword(MarkerKeyword::Const) => (1, 0),
+            MarkerUnitKind::Keyword(MarkerKeyword::Macro) => (2, 0),
+            MarkerUnitKind::Attribute { name, .. } => (3, attribute_rank(name)),
+            MarkerUnitKind::Keyword(MarkerKeyword::Lazy) => (4, 0),
+            MarkerUnitKind::Keyword(MarkerKeyword::Async) => (5, 0),
+            MarkerUnitKind::Keyword(MarkerKeyword::External) => (6, 0),
+        }
+    }
+
+    /// Where the unit stands in the WRITTEN canonical order (§6.2): every
+    /// attribute by its rank, then the keywords by theirs.
+    fn written_key(self) -> (u8, u8) {
+        match self {
+            MarkerUnitKind::Attribute { name, .. } => (0, attribute_rank(name)),
+            MarkerUnitKind::Keyword(keyword) => (1, keyword.written_rank()),
+        }
+    }
+
+    /// The unit as the steer spells it: `[platform(..)]`, `[must_use]`, `async`.
+    fn spelled(self) -> String {
+        match self {
+            MarkerUnitKind::Attribute { name, arguments } => {
+                format!("[{name}{}]", if arguments { "(..)" } else { "" })
+            }
+            MarkerUnitKind::Keyword(keyword) => keyword.word().to_string(),
+        }
+    }
+}
+
+/// The declaration word a marker run may end at, as the steer spells it, or
+/// `None` for any other token — where the run is not a declaration's.
+fn declaration_word(token: Option<&Token<'_>>) -> Option<&'static str> {
+    Some(match token? {
+        Token::Fun => "fun",
+        Token::Struct => "struct",
+        Token::Enum => "enum",
+        Token::Trait => "trait",
+        Token::Impl => "impl",
+        Token::Let => "let",
+        Token::Mut => "mut",
+        Token::Mod => "mod",
+        Token::Import => "import",
+        Token::Use => "use",
+        _ => return None,
+    })
+}
+
+/// Whether `keywords` (in written order, `export` left out) is a set the
+/// declaration `word` takes — so a swapped pair can be steered to an order
+/// that then PARSES. A set no order makes legal (`async const fun`, `lazy
+/// fun`) is left as written, for the production's own refusal.
+///
+/// `async macro fun` is one (B524, decided by Q8's table): `async` before
+/// `external`|`macro`, so `macro async fun`, the one order the macro
+/// production read before, is the steered spelling.
+fn marker_keywords_are_legal(keywords: &[MarkerKeyword], word: &str) -> bool {
+    use MarkerKeyword::*;
+    match word {
+        "fun" => matches!(
+            keywords,
+            [] | [Async] | [External] | [Async, External] | [Const] | [Macro] | [Async, Macro]
+        ),
+        "struct" => matches!(keywords, [] | [External]),
+        "let" | "mut" => matches!(keywords, [] | [Const] | [Lazy]),
+        _ => keywords.is_empty(),
+    }
+}
+
+/// The steer for a declaration head written out of order (B486; B485 Q6 and
+/// Q8, RULED; B485 S3 for `export` and `macro`): the markers stack
+/// attributes first, then the keywords in one order, then the declaration
+/// word. `canonical` is the head respelled in that order, attributes
+/// abbreviated. An ERROR ([`MarkerOrderDiagnostic::Keywords`]).
+fn marker_order_rule(canonical: &str) -> String {
+    format!(
+        "a declaration's markers are written in one order — its attributes, then the keywords \
+         `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration \
+         word: write `{canonical}`"
+    )
+}
+
+/// [`marker_order_rule`]'s fixed head, which recognizes it (the rule spells
+/// it out in full, for the diagnostics ledger's literal search; the fix pin
+/// holds the two together).
+const MARKER_ORDER_HEAD: &str = "a declaration's markers are written in one order — ";
+
+/// The warning for a declaration whose attributes alone are out of
+/// [`attribute_rank`]'s order (B536, the owner's ruling revising Q7). The
+/// head parses as written in the order, so it is not refused; `vilan fmt`
+/// writes it so. A WARNING ([`MarkerOrderDiagnostic::Attributes`]).
+fn attribute_order_rule(canonical: &str) -> String {
+    format!(
+        "a declaration's attributes are written in one order — `[derive]` and the other \
+         generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, \
+         `[trait_only]`, `[platform]`, `[resource]`: write `{canonical}`"
+    )
+}
+
+/// [`attribute_order_rule`]'s fixed head, which recognizes it (spelled out
+/// there in full, as [`MARKER_ORDER_HEAD`] is).
+const ATTRIBUTE_ORDER_HEAD: &str = "a declaration's attributes are written in one order — ";
+
+/// The two diagnostics a declaration head written out of THE order carries
+/// (B536), as the editor keys them. The head is read as if written in the
+/// order either way; what differs is whether the order it broke is one this
+/// release refuses.
+///
+/// **The editor's half**, the same shape as [`ForeignSpelling`]'s:
+/// [`MarkerOrderDiagnostic::code`] is the stable code to publish as the
+/// diagnostic's `code`, [`MarkerOrderDiagnostic::of_message`] recognizes the
+/// diagnostic from its rendered text, and [`marker_order_fix`] is the quick
+/// fix's edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MarkerOrderDiagnostic {
+    /// A WARNING: the attributes are out of [`attribute_rank`]'s order, and
+    /// nothing else is ([`ParseErrorReason::AttributeOrder`]).
+    Attributes,
+    /// An ERROR: a keyword stands ahead of an attribute — `export` and
+    /// `macro` included (B485 S3) — or two keywords are inverted
+    /// ([`ParseErrorReason::MarkerOrder`]).
+    Keywords,
+}
+
+impl MarkerOrderDiagnostic {
+    /// The diagnostic's stable code.
+    pub fn code(self) -> &'static str {
+        match self {
+            MarkerOrderDiagnostic::Attributes => "marker-order/attributes",
+            MarkerOrderDiagnostic::Keywords => "marker-order/keywords",
+        }
+    }
+
+    /// Whether the diagnostic is a warning (the program is accepted).
+    pub fn is_warning(self) -> bool {
+        self == MarkerOrderDiagnostic::Attributes
+    }
+
+    /// The marker-order diagnostic a rendered message reports, if it reports
+    /// one. The parser renders both with no context and no hint, so each
+    /// message begins with its fixed head.
+    pub fn of_message(message: &str) -> Option<MarkerOrderDiagnostic> {
+        if message.starts_with(ATTRIBUTE_ORDER_HEAD) {
+            Some(MarkerOrderDiagnostic::Attributes)
+        } else if message.starts_with(MARKER_ORDER_HEAD) {
+            Some(MarkerOrderDiagnostic::Keywords)
+        } else {
+            None
+        }
+    }
+}
+
+/// The quick fix for a marker-order diagnostic (B536): replace `span` — the
+/// diagnostic's own, the head's marker run — with `replacement`, the run's
+/// units in THE order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkerOrderFix {
+    /// The diagnostic's stable code ([`MarkerOrderDiagnostic::code`]).
+    pub code: &'static str,
+    /// The quick fix's title: "Write `[deprecated(..)] [must_use] fun`".
+    pub title: String,
+    /// The source range the edit replaces.
+    pub span: Span,
+    /// What the edit writes there.
+    pub replacement: String,
+}
+
+/// The quick fix for the diagnostic `message` anchored at `span` in `source`,
+/// or `None` when it is not a marker-order diagnostic (B536), or `span` is
+/// not a marker run in `source` (the buffer moved on since the diagnostic).
+///
+/// The edit permutes the run's UNITS — each attribute group and keyword
+/// (`export` with its `(in PATH)`) exactly as written, arguments and all —
+/// into THE order, and keeps what stood BETWEEN them where it stood: the
+/// blanks, a line break, a comment. So `[must_use]` ⏎ `[deprecated("d")]` ⏎
+/// `fun` becomes `[deprecated("d")]` ⏎ `[must_use]` ⏎ `fun`, and `export
+/// [must_use] fun` becomes `[must_use] export fun`. The result is the head
+/// the parser read; `vilan fmt` lays it out.
+pub fn marker_order_fix(source: &str, message: &str, span: Span) -> Option<MarkerOrderFix> {
+    let diagnostic = MarkerOrderDiagnostic::of_message(message)?;
+    let (tokens, _) = lexing::tokenize(source);
+    let start = tokens
+        .iter()
+        .position(|(_, token_span)| token_span.start == span.start)?;
+    let run = marker_run_at(&tokens, start)?;
+    let unit_range = |unit: &MarkerUnit<'_>| {
+        tokens[unit.tokens.start].1.start..tokens[unit.tokens.end - 1].1.end
+    };
+    let mut written = run.units.clone();
+    written.sort_by_key(|unit| tokens[unit.tokens.start].1.start);
+    let run_end = written.iter().map(|unit| unit_range(unit).end).max()?;
+    if run_end != span.end {
+        return None;
+    }
+    let mut canonical = written.clone();
+    canonical.sort_by_key(|unit| unit.kind.written_key());
+    let mut replacement = String::new();
+    for (index, (slot, unit)) in written.iter().zip(&canonical).enumerate() {
+        if index > 0 {
+            let gap = unit_range(&written[index - 1]).end..unit_range(slot).start;
+            replacement.push_str(source.get(gap)?);
+        }
+        replacement.push_str(source.get(unit_range(unit))?);
+    }
+    let mut spelled: Vec<String> = canonical.iter().map(|unit| unit.kind.spelled()).collect();
+    spelled.push(run.word.to_string());
+    Some(MarkerOrderFix {
+        code: diagnostic.code(),
+        title: format!("Write `{}`", spelled.join(" ")),
+        span,
+        replacement,
+    })
+}
+
+/// A declaration's marker run: its units in STREAM order, and the declaration
+/// word it ends at.
+struct MarkerRun<'src> {
+    units: Vec<MarkerUnit<'src>>,
+    /// The declaration word, as the steer spells it.
+    word: &'static str,
+    /// The word's token index.
+    word_at: usize,
+}
+
+/// The token index just past the balanced group opening at `open`, or `None`
+/// when it never closes.
+fn past_balanced_group_in(tokens: &[Spanned<Token<'_>>], open: usize) -> Option<usize> {
+    past_balanced_group_with(|at| tokens.get(at).map(|(token, _)| token), open)
+}
+
+/// [`past_balanced_group_in`] over any token reader.
+fn past_balanced_group_with<'t, 'src: 't>(
+    token_at: impl Fn(usize) -> Option<&'t Token<'src>>,
+    open: usize,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut at = open;
+    loop {
+        match token_at(at)? {
+            Token::Ctrl('[' | '(' | '{') => depth += 1,
+            Token::Ctrl(']' | ')' | '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at + 1);
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+}
+
+/// The run of attribute groups and marker keywords starting at `start` in
+/// `tokens`, when it ends at a declaration word ([`declaration_word`]);
+/// `None` for any other run — `[a][b];`, `async { .. }`, an unclosed group.
+/// The ONE scanner the parser's canonicalizer, the quick fix and the
+/// formatter's safety net share ([`marker_run_with`]).
+fn marker_run_at<'src>(tokens: &[Spanned<Token<'src>>], start: usize) -> Option<MarkerRun<'src>> {
+    marker_run_with(|at| tokens.get(at).map(|(token, _)| token), start)
+}
+
+/// The token ranges of the marker run at `start` in a bare token stream, in
+/// THE written order (attributes by [`attribute_rank`], then the keywords by
+/// Q8's), ties as written, and the index of the declaration word it ends at;
+/// `None` when no run of two or more units ending at a declaration word
+/// starts there. The formatter's safety net puts both of its streams' heads
+/// into this order (B536), so it accepts the printer writing a head the
+/// parser read in THE order whatever order it was written in.
+pub(crate) fn marker_run_in_written_order(
+    tokens: &[Token<'_>],
+    start: usize,
+) -> Option<(Vec<std::ops::Range<usize>>, usize)> {
+    let run = marker_run_with(|at| tokens.get(at), start)?;
+    if run.units.len() < 2 {
+        return None;
+    }
+    let mut units = run.units;
+    units.sort_by_key(|unit| unit.kind.written_key());
+    Some((
+        units.into_iter().map(|unit| unit.tokens).collect(),
+        run.word_at,
+    ))
+}
+
+/// [`marker_run_at`] over any token reader.
+fn marker_run_with<'t, 'src: 't>(
+    token_at: impl Fn(usize) -> Option<&'t Token<'src>> + Copy,
+    start: usize,
+) -> Option<MarkerRun<'src>> {
+    let mut units: Vec<MarkerUnit<'src>> = Vec::new();
+    let mut at = start;
+    loop {
+        let keyword = match token_at(at) {
+            Some(Token::Ctrl('[')) => {
+                let Some(Token::Ident(name)) = token_at(at + 1) else {
+                    break;
+                };
+                let name = *name;
+                let end = past_balanced_group_with(token_at, at)?;
+                let arguments = token_at(at + 2) == Some(&Token::Ctrl('('));
+                units.push(MarkerUnit {
+                    tokens: at..end,
+                    kind: MarkerUnitKind::Attribute { name, arguments },
+                });
+                at = end;
+                continue;
+            }
+            Some(Token::Export) => MarkerKeyword::Export,
+            Some(Token::Const) => MarkerKeyword::Const,
+            Some(Token::Ident("lazy")) => MarkerKeyword::Lazy,
+            Some(Token::Async) => MarkerKeyword::Async,
+            Some(Token::External) => MarkerKeyword::External,
+            Some(Token::Macro) => MarkerKeyword::Macro,
+            _ => break,
+        };
+        let mut end = at + 1;
+        if keyword == MarkerKeyword::Export
+            && token_at(end) == Some(&Token::Ctrl('('))
+            && token_at(end + 1) == Some(&Token::In)
+        {
+            end = past_balanced_group_with(token_at, end)?;
+        }
+        units.push(MarkerUnit {
+            tokens: at..end,
+            kind: MarkerUnitKind::Keyword(keyword),
+        });
+        at = end;
+    }
+    let word = declaration_word(token_at(at))?;
+    Some(MarkerRun {
+        units,
+        word,
+        word_at: at,
+    })
+}
+
 thread_local! {
     /// How many atoms ([`Parser::parse_atom`]) this thread's parser has entered
     /// — the parser's unit of real work, and what speculative re-parsing
@@ -1563,6 +2667,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             contextual_readings: Vec::new(),
             member_readings: Vec::new(),
             statement_head: None,
+            rewrite_refusals: Vec::new(),
+            written_starts: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -1877,7 +2984,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         if start >= self.tokens.len() {
             return (self.eoi..self.eoi).into();
         }
-        let start_offset = self.tokens[start].1.start;
+        let mut start_offset = self.tokens[start].1.start;
+        if let Some((_, written)) = self
+            .written_starts
+            .iter()
+            .find(|(position, _)| *position == start)
+        {
+            start_offset = start_offset.min(*written);
+        }
         let end_offset = if self.position > start {
             self.tokens[self.position - 1].1.end
         } else if start > 0 {
@@ -2895,6 +4009,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         // nested inside this one reads false.
         let file_head = std::mem::take(&mut self.file_head);
         let _ = self.lead_export_past_its_attributes();
+        self.take_foreign_item_word();
+        self.canonicalize_marker_run();
         if let Some(item) = self.attempt(Self::parse_module_self) {
             if !file_head {
                 self.errors.push(ParseError {
@@ -2935,6 +4051,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some(item);
         }
         if let Some(item) = self.attempt(Self::parse_labelled_let) {
+            return Some(item);
+        }
+        if let Some(item) = self.attempt(Self::parse_misplaced_async_binding) {
             return Some(item);
         }
         // Items 8-11 & 21: `expression ;`, or a block-bearing form
@@ -3060,24 +4179,317 @@ impl<'a, 'src> Parser<'a, 'src> {
         true
     }
 
+    /// Records the refusal for a token rewrite ([`Parser::rewrite_refusals`]),
+    /// once per span: a rewrite reached again by a later alternative is the
+    /// same rewrite.
+    fn record_rewrite(&mut self, span: Span, reason: ParseErrorReason) {
+        if self
+            .rewrite_refusals
+            .iter()
+            .any(|refusal| refusal.span == span)
+        {
+            return;
+        }
+        self.rewrite_refusals.push(ParseError {
+            span,
+            reason,
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// B485 and B536 (RULED): the declaration head at the cursor — a run of
+    /// attribute groups and marker keywords ending at a declaration word — is
+    /// put into the order the productions read, once, before any of them
+    /// reads it. THE order it is WRITTEN in is the attributes by
+    /// [`attribute_rank`], then the keywords — `export`, `const`|`lazy`,
+    /// `async`, `external`|`macro` (Q8) — then the declaration word (Q6).
+    ///
+    /// - **Attributes out of rank** (and nothing else out of order) are read
+    ///   in rank and WARNED, once, spanning the run
+    ///   ([`ParseErrorReason::AttributeOrder`], B536 revising Q7's free
+    ///   order): `[internal(..)] [deprecated(..)] fun` reads as
+    ///   `[deprecated(..)] [internal(..)] fun`, which `vilan fmt` writes.
+    /// - **A keyword ahead of an attribute, or two keywords inverted**, is
+    ///   REFUSED once, spanning the run, with the head respelled in the order
+    ///   ([`ParseErrorReason::MarkerOrder`]), and read as if written so:
+    ///   `async [platform(..)] fun`, `external async fun`, `lazy export let`.
+    ///   That includes `export` and `macro` ahead of the attributes (B485 S3,
+    ///   v0.44.0): `export [must_use] fun`, the order before B485, and
+    ///   `macro [deprecated(..)] fun`.
+    ///
+    /// The WRITTEN order is read off the tokens' spans, not their places on
+    /// the stream: [`Parser::lead_export_past_its_attributes`] has already
+    /// rotated a canonical `[..] export` into the `export [..]` the
+    /// productions read, and each token kept its own span.
+    ///
+    /// The run is rewritten by permuting whole units on the token stream, as
+    /// that rotation does; every token keeps its own span, and
+    /// [`Parser::written_starts`] keeps each node beginning where its first
+    /// unit was written. Only a run that ENDS at a declaration word is touched
+    /// — `[a][b];` is a list indexed by a list, `async { .. }` a block — and
+    /// a run in THE order reads exactly as it did before B486. A keyword set
+    /// no order makes legal (`async const fun`, `lazy const let`) is left as
+    /// written, for its production's own refusal.
+    fn canonicalize_marker_run(&mut self) {
+        let start = self.position;
+        // A run already put in reading order — at its head, or at any suffix
+        // a production reads again from (`export`'s statement, `const`'s
+        // declaration) — is not a written one: `const [deprecated(..)] let`
+        // there is this pass's own output, not the author's.
+        if self
+            .written_starts
+            .iter()
+            .any(|(position, _)| *position == start)
+        {
+            return;
+        }
+        let Some(MarkerRun {
+            units,
+            word,
+            word_at: at,
+        }) = marker_run_at(self.tokens, start)
+        else {
+            return;
+        };
+        if units.len() < 2 {
+            return;
+        }
+        // A REPEATED keyword is its own refusal (`export export`, B492) or its
+        // production's, read where it was written.
+        let mut keywords_seen: Vec<MarkerKeyword> = Vec::new();
+        for unit in &units {
+            if let MarkerUnitKind::Keyword(keyword) = unit.kind {
+                if keywords_seen.contains(&keyword) {
+                    return;
+                }
+                keywords_seen.push(keyword);
+            }
+        }
+        let mut written = units.clone();
+        written.sort_by_key(|unit| self.token_span(unit.tokens.start).start);
+        // Out of THE order: a keyword ahead of an attribute (Q6; `export` and
+        // `macro` too since B485 S3), or two keywords inverted (Q8) — refused;
+        // or, short of either, two attributes out of rank (B536) — warned.
+        let mut out_of_order = false;
+        let mut out_of_rank = false;
+        let mut keyword_written = false;
+        let mut highest_keyword = None;
+        let mut highest_attribute = None;
+        for unit in &written {
+            match unit.kind {
+                MarkerUnitKind::Attribute { name, .. } => {
+                    out_of_order |= keyword_written;
+                    let rank = attribute_rank(name);
+                    out_of_rank |= highest_attribute.is_some_and(|highest| rank < highest);
+                    highest_attribute = highest_attribute.max(Some(rank));
+                }
+                MarkerUnitKind::Keyword(keyword) => {
+                    let rank = keyword.written_rank();
+                    out_of_order |= highest_keyword.is_some_and(|highest| rank < highest);
+                    highest_keyword = highest_keyword.max(Some(rank));
+                    keyword_written = true;
+                }
+            }
+        }
+        let mut canonical: Vec<MarkerUnitKind<'src>> =
+            written.iter().map(|unit| unit.kind).collect();
+        canonical.sort_by_key(|kind| kind.written_key());
+        let keywords: Vec<MarkerKeyword> = canonical
+            .iter()
+            .filter_map(|kind| match kind {
+                MarkerUnitKind::Keyword(MarkerKeyword::Export) => None,
+                MarkerUnitKind::Keyword(keyword) => Some(*keyword),
+                MarkerUnitKind::Attribute { .. } => None,
+            })
+            .collect();
+        // A keyword set no order makes legal is read as written, in whatever
+        // order: reordering it would only trade one refusal for another, and
+        // could hand a production a spelling it reads (`lazy const let`
+        // becoming the `const` prefix over `lazy let`).
+        if !marker_keywords_are_legal(&keywords, word) {
+            return;
+        }
+        let mut reading = units.clone();
+        reading.sort_by_key(|unit| unit.kind.reading_key());
+        let reordered = reading
+            .iter()
+            .zip(&units)
+            .any(|(read, written)| read.tokens != written.tokens);
+        // `const [deprecated(..)] fun` is already in the order the production
+        // reads, and still out of the written one: refused, not reordered.
+        if !reordered && !out_of_order && !out_of_rank {
+            return;
+        }
+        // The run as WRITTEN: from its first unit to the end of its last —
+        // which, after `lead_export_past_its_attributes`' rotation, is not
+        // the token ahead of the word.
+        let run_span = Span::from(
+            units
+                .iter()
+                .map(|unit| self.token_span(unit.tokens.start).start)
+                .min()
+                .unwrap_or_default()
+                ..units
+                    .iter()
+                    .map(|unit| self.token_span(unit.tokens.end - 1).end)
+                    .max()
+                    .unwrap_or_default(),
+        );
+        // Each suffix of the reading order begins where the earliest of its
+        // units was written — and is marked as read, so a production reading
+        // on from it (`export`'s statement, `const`'s declaration) does not
+        // take this pass's output for a written run and refuse it again.
+        let mut position = start;
+        for (index, unit) in reading.iter().enumerate() {
+            let earliest = reading[index..]
+                .iter()
+                .map(|later| self.token_span(later.tokens.start).start)
+                .min()
+                .unwrap_or_default();
+            self.written_starts.push((position, earliest));
+            position += unit.tokens.len();
+        }
+        if reordered {
+            let tokens: Vec<Spanned<Token<'src>>> = reading
+                .iter()
+                .flat_map(|unit| self.tokens[unit.tokens.clone()].iter().cloned())
+                .collect();
+            let reachable: Vec<bool> = reading
+                .iter()
+                .flat_map(|unit| {
+                    self.assignment_reachable[unit.tokens.clone()]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            self.tokens[start..at].clone_from_slice(&tokens);
+            self.assignment_reachable[start..at].copy_from_slice(&reachable);
+        }
+        let mut spelled: Vec<String> = canonical.iter().map(|kind| kind.spelled()).collect();
+        spelled.push(word.to_string());
+        let canonical = spelled.join(" ");
+        if out_of_order {
+            self.record_rewrite(run_span, ParseErrorReason::MarkerOrder { canonical });
+        } else if out_of_rank {
+            self.record_warning(run_span, ParseErrorReason::AttributeOrder { canonical });
+        }
+    }
+
+    /// Records a WARNING ([`Parser::warnings`]), once per span.
+    fn record_warning(&mut self, span: Span, reason: ParseErrorReason) {
+        if self.warnings.iter().any(|warning| warning.span == span) {
+            return;
+        }
+        self.warnings.push(ParseError {
+            span,
+            reason,
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// B520: `fn`/`function`/`func`/`def` at the ITEM HEAD at the cursor —
+    /// past any attribute run and marker keywords (`export`, `async`,
+    /// `external`, `const`, `macro`) — followed by a name and the `(` or `<`
+    /// that opens a signature, is refused once and rewritten to `fun` in
+    /// place, so every production reads the declaration it is.
+    ///
+    /// A name followed by a name is never an expression, and none of the four
+    /// words is a contextual keyword, so nothing that parses today reaches
+    /// the rewrite. `then` is the one exception the name test makes (`fn then
+    /// (go());` is B459's conditional over a binding named `fn`). In a member
+    /// body a method may be named by a reserved word, so one is admitted
+    /// there as the name — except `else`, `is` and `in`, which continue an
+    /// operand.
+    fn take_foreign_item_word(&mut self) {
+        let mut at = self.position;
+        loop {
+            match self.tokens.get(at).map(|(token, _)| token) {
+                Some(Token::Ctrl('['))
+                    if matches!(self.tokens.get(at + 1), Some((Token::Ident(_), _))) =>
+                {
+                    let Some(after) = self.past_balanced_group(at) else {
+                        return;
+                    };
+                    at = after;
+                }
+                Some(Token::Export) => {
+                    at += 1;
+                    if self.tokens.get(at).map(|(token, _)| token) == Some(&Token::Ctrl('('))
+                        && self.tokens.get(at + 1).map(|(token, _)| token) == Some(&Token::In)
+                    {
+                        let Some(after) = self.past_balanced_group(at) else {
+                            return;
+                        };
+                        at = after;
+                    }
+                }
+                Some(Token::Async | Token::External | Token::Const | Token::Macro) => at += 1,
+                _ => break,
+            }
+        }
+        let Some((Token::Ident(word), span)) = self.tokens.get(at) else {
+            return;
+        };
+        let Some(spelling) = ForeignSpelling::item_word(word) else {
+            return;
+        };
+        let span = *span;
+        let named = match self.tokens.get(at + 1).map(|(token, _)| token) {
+            Some(Token::Ident(name)) => *name != "then",
+            Some(Token::Else | Token::Is | Token::In) => false,
+            Some(token) => self.in_member_body && is_reserved_word(token),
+            None => false,
+        };
+        let opens_signature = matches!(
+            self.tokens.get(at + 2).map(|(token, _)| token),
+            Some(Token::Ctrl('(' | '<'))
+        );
+        if !named || !opens_signature {
+            return;
+        }
+        self.tokens[at].0 = Token::Fun;
+        self.record_rewrite(span, ParseErrorReason::ForeignSpelling(spelling));
+    }
+
+    /// B520: the identifier `return` at the cursor, where it begins a foreign
+    /// return ([`starts_foreign_return`]), refused once and rewritten to `ret`
+    /// in place, then read as the return it is. Its own method so the arm in
+    /// [`Parser::parse_secondary_inner`] adds nothing to that frame.
+    #[inline(never)]
+    fn parse_foreign_return(&mut self) -> Option<Spanned<Node<'src>>> {
+        let span = self.here_span();
+        self.tokens[self.position].0 = Token::Ret;
+        self.record_rewrite(
+            span,
+            ParseErrorReason::ForeignSpelling(ForeignSpelling::Return),
+        );
+        self.parse_return()
+    }
+
+    /// B520: the `->` arrow at the cursor, where a return type's `:` may
+    /// stand (or, `spelling` [`ForeignSpelling::TypeArrow`], where a closure
+    /// type's result may) — refused once and read past, so the caller reads
+    /// the return type the arrow introduced. `false`, consuming nothing, when the cursor
+    /// is not at an arrow.
+    fn eat_foreign_arrow(&mut self, spelling: ForeignSpelling) -> bool {
+        if !is_foreign_arrow(self.tokens, self.position) {
+            return false;
+        }
+        let span = Span::from(
+            self.token_span(self.position).start..self.token_span(self.position + 1).end,
+        );
+        self.record_rewrite(span, ParseErrorReason::ForeignSpelling(spelling));
+        self.bump();
+        self.bump();
+        true
+    }
+
     /// The index just past the bracket group opening at `open` (a `[`, `(` or
     /// `{`), counting every bracket kind, or `None` if the stream ends first.
     fn past_balanced_group(&self, open: usize) -> Option<usize> {
-        let mut depth = 0usize;
-        let mut at = open;
-        loop {
-            match &self.tokens.get(at)?.0 {
-                Token::Ctrl('[' | '(' | '{') => depth += 1,
-                Token::Ctrl(']' | ')' | '}') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(at + 1);
-                    }
-                }
-                _ => {}
-            }
-            at += 1;
-        }
+        past_balanced_group_in(self.tokens, open)
     }
 
     // --- Expressions ---------------------------------------------------------
@@ -3352,6 +4764,11 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return self.parse_let();
             }
             Some(Token::Ret) => return self.parse_return(),
+            // B520: `return value` — vilan's `ret`, written another
+            // language's way where no name can stand.
+            Some(Token::Ident("return")) if starts_foreign_return(self.tokens, self.position) => {
+                return self.parse_foreign_return();
+            }
             // The four block-bearing heads. They share one rule past their closing
             // brace — B248/B259's: the form is COMPLETE there, so an operator or a
             // `.` after it is refused rather than read as a continuation.
@@ -4291,7 +5708,12 @@ impl<'a, 'src> Parser<'a, 'src> {
         if let Some(macro_block) = self.parse_macro_block() {
             return Some(macro_block);
         }
-        if let Some(Token::Ident(name)) = self.peek() {
+        // B520: a foreign `return value` is no operand — the same as the `ret`
+        // it stands for — so `1 + return 5` declines at the word, and the
+        // statement's recovery resumes there and reads the return.
+        if let Some(Token::Ident(name)) = self.peek()
+            && !starts_foreign_return(self.tokens, self.position)
+        {
             let node = Node::Accessor(name);
             let span = self.here_span();
             self.bump();
@@ -5703,15 +7125,46 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// — the initializer evaluated at build time, the body capability-checked
     /// at its declaration — is recorded beside the entity rather than spelled
     /// as a second AST.
+    ///
+    /// B487: both take the label prefix a plain declaration does —
+    /// `[deprecated("use g")] const fun f()`, `[internal("why")] const let x
+    /// = 1;` — so the deprecation policy reaches a `const` item. Written ahead
+    /// of the keyword (B485 §6.2), the run reaches here BEHIND it:
+    /// [`Parser::canonicalize_marker_run`] leads `const` past the attributes
+    /// on the stream, as `export` is led, and the declaration under it reads
+    /// its own prefix — `parse_function`'s for a `fun`, the item labels for a
+    /// `let`. `const mut` takes none: it is refused and read as the `mut` it
+    /// spells.
     fn parse_const_declaration(&mut self) -> Option<Spanned<Node<'src>>> {
         if !self.peek_is(&Token::Const) {
             return None;
         }
         let start = self.position;
-        match self.peek_at(1) {
+        let mut head = start + 1;
+        while self.tokens.get(head).map(|(token, _)| token) == Some(&Token::Ctrl('['))
+            && matches!(self.tokens.get(head + 1), Some((Token::Ident(_), _)))
+        {
+            head = self.past_balanced_group(head)?;
+        }
+        let labelled = head > start + 1;
+        match self.tokens.get(head).map(|(token, _)| token) {
             Some(Token::Let) => {
                 self.bump();
-                let declaration = self.parse_let()?;
+                let labels = self.parse_item_labels();
+                if self.position != head {
+                    // An attribute a binding does not take (`[must_use]`):
+                    // declined, for the statement funnel's refusal.
+                    return None;
+                }
+                let declaration = match (self.parse_let()?, labels) {
+                    (declaration, None) => declaration,
+                    ((Node::Let(name, type_, value, mutable, lazy, None), span), labels) => {
+                        (Node::Let(name, type_, value, mutable, lazy, labels), span)
+                    }
+                    // Only a plain binding takes a label, as a plain `let`'s
+                    // does (`parse_labelled_let`).
+                    _ => return None,
+                };
                 self.eat_declaration_terminator()?;
                 Some((Node::Const(Box::new(declaration)), self.span_from(start)))
             }
@@ -5719,7 +7172,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // it spells, so the rest of the file parses and the author gets
             // one diagnostic rather than a cascade. The error survives the
             // statement funnel's `attempt` because this arm returns `Some`.
-            Some(Token::Mut) => {
+            Some(Token::Mut) if !labelled => {
                 let context = self.context_stack.clone();
                 self.errors.push(ParseError {
                     span: self.here_span(),
@@ -5739,6 +7192,43 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             _ => None,
         }
+    }
+
+    /// B494: `async` written where a binding begins — `async x = 1;`,
+    /// `async x: i32 = 1;`, `async let x = 1;`, `async mut x = 1;` — is
+    /// refused once ([`ASYNC_MARKS_NO_BINDING`]) and read as the plain binding
+    /// it spells, so the name is bound and nothing after it cascades. `async x
+    /// = 1;` rewrites the `async` to the `let` it stands in for; before `let`
+    /// or `mut` the word is read past.
+    ///
+    /// Nothing that works today reads differently: `async NAME =` was the
+    /// assignment `(async NAME) = …`, which the JS backend emits as an invalid
+    /// left-hand side, and `async let` never parsed. `async { … }`, `async
+    /// load()` and `async fun` are untouched.
+    fn parse_misplaced_async_binding(&mut self) -> Option<Spanned<Node<'src>>> {
+        if !self.peek_is(&Token::Async) {
+            return None;
+        }
+        let names_a_binding = match self.peek_at(1) {
+            Some(Token::Let | Token::Mut) => true,
+            Some(Token::Ident(_)) => {
+                matches!(self.peek_at(2), Some(Token::Op("=") | Token::Op(":")))
+            }
+            _ => false,
+        };
+        if !names_a_binding {
+            return None;
+        }
+        let span = self.here_span();
+        if matches!(self.peek_at(1), Some(Token::Ident(_))) {
+            self.tokens[self.position].0 = Token::Let;
+        } else {
+            self.bump();
+        }
+        self.record_rewrite(span, ParseErrorReason::Rule(ASYNC_MARKS_NO_BINDING));
+        let declaration = self.parse_let()?;
+        self.eat_declaration_terminator()?;
+        Some(declaration)
     }
 
     /// The `;` a `const let` owes, with the statement funnel's own recovery
@@ -5834,11 +7324,13 @@ impl<'a, 'src> Parser<'a, 'src> {
                  value is wanted",
             );
             let parameters = (parameters, parser.span_from(start));
-            let return_type = if parser.eat_op(":") {
-                Some(Box::new(parser.parse_type()?))
-            } else {
-                None
-            };
+            // B520: `|x| -> T body` reads as `|x|: T body`.
+            let return_type =
+                if parser.eat_op(":") || parser.eat_foreign_arrow(ForeignSpelling::Arrow) {
+                    Some(Box::new(parser.parse_type()?))
+                } else {
+                    None
+                };
             let return_value = parser.parse_expression()?;
             Some((
                 Node::Closure(Closure {
@@ -6278,6 +7770,8 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         };
         let parameters = (parameters, self.span_from(start));
+        // B520: `|i32| -> str` reads as `|i32| str`, refused at the arrow.
+        self.eat_foreign_arrow(ForeignSpelling::TypeArrow);
         let return_type = self.attempt(|parser| parser.parse_type()).map(Box::new);
         Some((
             Node::ClosureType(parameters, return_type),
@@ -6494,6 +7988,8 @@ impl<'a, 'src> Parser<'a, 'src> {
             if self.peek_is_ctrl('}') || self.at_end() {
                 break;
             }
+            self.take_foreign_item_word();
+            self.canonicalize_marker_run();
             match self.attempt(Self::parse_function) {
                 Some(function) => functions.push(function),
                 None => break,
@@ -6664,7 +8160,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             );
         }
         self.reject_misplaced_spread(&parameters.0);
-        let mut return_type = if self.eat_op(":") {
+        // B520: `fun f() -> T` reads as `fun f(): T`, refused at the arrow.
+        let mut return_type = if self.eat_op(":") || self.eat_foreign_arrow(ForeignSpelling::Arrow)
+        {
             Some(Box::new(self.in_context("return type", Self::parse_type)?))
         } else {
             None
@@ -7892,6 +9390,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         self.refuse_selector_binders(&subject);
         let subject_text = self.text_of(subject.1);
+        // B455 (RULED 2026-10-01): `with TRAIT` names the block by the trait it
+        // implements, the declaration's own spelling.
+        let trait_ = match self.eat_word("with") {
+            true => match self.parse_type() {
+                Some(trait_) => {
+                    self.refuse_selector_binders(&trait_);
+                    Some(trait_)
+                }
+                None => {
+                    return Some(self.selector_refusal(
+                        start,
+                        Some((subject, subject_text)),
+                        Vec::new(),
+                    ));
+                }
+            },
+            false => None,
+        };
+        let trait_text = trait_
+            .as_ref()
+            .map(|trait_| Cow::Borrowed(self.text_of(trait_.1)));
         if !self.eat_ctrl(')') {
             return Some(self.selector_refusal(start, Some((subject, subject_text)), Vec::new()));
         }
@@ -7934,6 +9453,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some(ImportBranch::Selector(Box::new(ImplSelector {
             subject: Some(Box::new(subject)),
             subject_text: Cow::Borrowed(subject_text),
+            trait_: trait_.map(Box::new),
+            trait_text,
             members,
             span: self.span_from(start),
         })))
@@ -8009,6 +9530,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         ImportBranch::Selector(Box::new(ImplSelector {
             subject,
             subject_text: Cow::Borrowed(subject_text),
+            trait_: None,
+            trait_text: None,
             members,
             span: self.span_from(start),
         }))
@@ -10346,10 +11869,18 @@ mod tests {
             Node::Struct(_, _, external, resource, ..) => assert!(resource && !external),
             other => panic!("expected a resource Struct, got {other:?}"),
         }
-        // Both sides at once: one prefix, read in its order.
-        match exported(only_item(
-            "[deprecated(\"use g()\")] export [platform(\"node\")] fun f(): i32 { 1 }",
-        )) {
+        // Both sides at once: refused since B485 S3 (an attribute after the
+        // marker), and still read as one prefix, in its order.
+        let source = "[deprecated(\"use g()\")] export [platform(\"node\")] fun f(): i32 { 1 }";
+        let (tree, errors) = parse(source);
+        assert_eq!(
+            errors.iter().map(render).collect::<Vec<_>>(),
+            vec![marker_order_rule(
+                "[deprecated(..)] [platform(..)] export fun"
+            )]
+        );
+        let (mut statements, _) = tree.expect("a tree");
+        match exported(statements.remove(0).0) {
             Node::Func(function) => {
                 assert_eq!(function.deprecated, Some("use g()"));
                 assert_eq!(function.platform_fence.len(), 1);
@@ -10534,15 +12065,49 @@ mod tests {
     }
 
     #[test]
-    fn function_attributes_out_of_order_decline() {
-        // `[must_use]` must precede `[rpc]` (the chumsky attribute chain is ordered):
-        // `[rpc] [must_use] fun` is NOT a function, and no other alternative claims
-        // it, so the whole program declines.
-        assert!(declines("[rpc] [must_use] fun f() { }"));
-        // `[deprecated(..)]` leads the chain: after `[extern(..)]` it declines.
-        assert!(declines(
-            "[extern(\"fs\", \"read\")] [deprecated(\"use read_all()\")] external fun read();"
-        ));
+    fn function_attributes_in_any_order_read_as_the_canonical_prefix() {
+        // B485 Q7 (RULED): attributes are written in any order. The chain the
+        // prefix reads used to be ordered, and `[rpc] [must_use] fun` declined;
+        // the run is now sorted before the production reads it, so it is the
+        // function the canonical order spells, attribute for attribute.
+        for (written, canonical) in [
+            (
+                "[rpc] [must_use] fun f() { }",
+                "[must_use] [rpc] fun f() { }",
+            ),
+            (
+                "[extern(\"fs\", \"read\")] [deprecated(\"use read_all()\")] external fun read();",
+                "[deprecated(\"use read_all()\")] [extern(\"fs\", \"read\")] external fun read();",
+            ),
+        ] {
+            assert_eq!(
+                attributes_of(written),
+                attributes_of(canonical),
+                "{written}"
+            );
+        }
+    }
+
+    /// The attribute fields of the one `fun` in `source`, which must parse
+    /// clean — what a reordered prefix has to agree on with the canonical one.
+    fn attributes_of(source: &str) -> String {
+        match only_item(source) {
+            Node::Func(function) => format!(
+                "{:?} {:?} {:?} {} {} {} {:?}",
+                function.deprecated,
+                function.internal,
+                function.extern_binding,
+                function.must_use,
+                function.rpc,
+                function.trait_only,
+                function
+                    .platform_fence
+                    .iter()
+                    .map(|(pattern, _)| *pattern)
+                    .collect::<Vec<_>>(),
+            ),
+            other => panic!("expected a Func, got {other:?}"),
+        }
     }
 
     #[test]
@@ -10590,15 +12155,17 @@ mod tests {
         // and `internal` is a known marker, so no user-macro reading claims it
         // either: the program declines.
         assert!(declines("[internal] fun one() { }"));
-        // It follows `[deprecated(..)]` in the ordered prefix and precedes
-        // `[extern(..)]`; the other order declines.
+        // It follows `[deprecated(..)]` in the canonical prefix and precedes
+        // `[extern(..)]`; written in the other order it reads the same (B485
+        // Q7), where it used to decline.
         assert!(matches!(
             only_item("[deprecated(\"use two()\")] [internal(\"seam\")] fun one() { }"),
             Node::Func(_)
         ));
-        assert!(declines(
-            "[extern(\"fs\", \"read\")] [internal(\"seam\")] external fun read();"
-        ));
+        assert_eq!(
+            attributes_of("[extern(\"fs\", \"read\")] [internal(\"seam\")] external fun read();"),
+            attributes_of("[internal(\"seam\")] [extern(\"fs\", \"read\")] external fun read();"),
+        );
     }
 
     #[test]
@@ -10624,7 +12191,7 @@ mod tests {
             Some("use B")
         );
         // …and on an `export import`, the re-export the ruling names.
-        match only_item("export [deprecated(\"use D\")] import pkg::a::D as K;") {
+        match only_item("[deprecated(\"use D\")] export import pkg::a::D as K;") {
             Node::Export(_, inner, Some(labels)) => {
                 assert_eq!(labels.deprecated, Some("use D"));
                 assert!(matches!(&inner.0, Node::Import(..)));
@@ -10641,10 +12208,12 @@ mod tests {
             "{errors:?}"
         );
         assert!(matches!(tree.expect("a tree").0[0].0, Node::Import(..)));
-        // The order is the prefix's: `[internal]` before `[deprecated]` declines.
-        assert!(declines(
-            "[internal(\"x\")] [deprecated(\"use B\")] struct A {}"
-        ));
+        // Either order is the one prefix (B485 Q7): `[internal]` written
+        // before `[deprecated]` used to decline.
+        assert_eq!(
+            steer("[internal(\"x\")] [deprecated(\"use B\")] struct A {}"),
+            Some("use B")
+        );
     }
 
     #[test]
@@ -10690,7 +12259,7 @@ mod tests {
     fn a_file_leading_mod_self_hosts_the_files_platform() {
         // B415: `[platform("…")] mod self;` as the file's first statement is
         // the host for the file's own attributes (F27 R1's platform).
-        let items = program("[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n");
+        let items = program("[platform(\"browser\")] mod self;\n\nimport std::web::ui::Region;\n");
         match &items.0[0].0 {
             Node::ModulePlatform(patterns) => {
                 assert_eq!(
@@ -10736,8 +12305,8 @@ mod tests {
     #[test]
     fn mod_self_anywhere_but_the_files_head_is_refused() {
         for source in [
-            "import std::ui::Region;\n[platform(\"browser\")] mod self;\n",
-            "import std::ui::Region;\nmod self;\n",
+            "import std::web::ui::Region;\n[platform(\"browser\")] mod self;\n",
+            "import std::web::ui::Region;\nmod self;\n",
             "fun f() {\n\t[platform(\"browser\")] mod self;\n}\n",
             "mod inner {\n\t[platform(\"browser\")] mod self;\n}\n",
         ] {
@@ -10872,7 +12441,7 @@ mod tests {
             other => panic!("expected an Enum, got {other:?}"),
         }
         // Behind `export`, and after a `[derive(..)]`, as a function's is.
-        match only_item("export [internal(\"x\")] struct Marker {}") {
+        match only_item("[internal(\"x\")] export struct Marker {}") {
             Node::Export(_, inner, _) => {
                 assert!(
                     matches!(&inner.0, Node::Struct(.., Some(labels)) if labels.internal == Some("x"))
@@ -11544,7 +13113,7 @@ mod tests {
             "export use pkg::a::b;\n",
             // The attribute wrappers are transparent: the rule asks about the
             // declaration under them, not about the wrapper.
-            "export [derive(Wire)] struct S { x: i32 }\n",
+            "[derive(Wire)] export struct S { x: i32 }\n",
             "export external fun serve();\n",
         ] {
             assert!(
@@ -11994,5 +13563,991 @@ mod tests {
         assert_eq!(readings(source), vec!["then"]);
         let at = source.find("then go").expect("the keyword");
         assert_eq!(contextual_keyword_readings(source)[0].start, at);
+    }
+
+    /// The source with each `(foreign, vilan)` spelling replaced, padded with
+    /// spaces to the foreign text's length so every other token keeps its
+    /// offset — the tree of the rewrite is then comparable span for span.
+    fn respelled(source: &str, replacements: &[(&str, &str)]) -> String {
+        let mut respelled = source.to_string();
+        for (foreign, vilan) in replacements {
+            assert!(
+                vilan.len() <= foreign.len(),
+                "{vilan} must fit in {foreign}"
+            );
+            let padded = format!("{vilan:width$}", width = foreign.len());
+            respelled = respelled.replace(foreign, &padded);
+        }
+        respelled
+    }
+
+    #[test]
+    fn b520_a_foreign_spelling_is_refused_once_and_read_as_vilans() {
+        use ForeignSpelling::*;
+        // (source, the spellings it refuses in order, the replacements that
+        // make it vilan). The refusal spans the foreign token, and the tree is
+        // the tree of the source with vilan's spelling written instead.
+        let cases: &[(&str, &[ForeignSpelling], &[(&str, &str)])] = &[
+            ("fn  add(a: i32): i32 { a }", &[Fn], &[("fn ", "fun")]),
+            (
+                "function add(a: i32): i32 { a }",
+                &[Function],
+                &[("function", "fun")],
+            ),
+            ("func add(a: i32): i32 { a }", &[Func], &[("func", "fun")]),
+            ("def add(a: i32): i32 { a }", &[Def], &[("def", "fun")]),
+            // Past the markers and attributes that lead an item.
+            ("export fn  f() {}", &[Fn], &[("fn ", "fun")]),
+            ("async fn  f(): i32 { 1 }", &[Fn], &[("fn ", "fun")]),
+            ("[must_use] fn  f(): i32 { 1 }", &[Fn], &[("fn ", "fun")]),
+            ("const fn  f(): i32 { 1 }", &[Fn], &[("fn ", "fun")]),
+            (
+                "[platform(\"node\")] export def f() {}",
+                &[Def],
+                &[("def", "fun")],
+            ),
+            ("fn  id<T>(x: T): T { x }", &[Fn], &[("fn ", "fun")]),
+            // Members: an impl's item list, a trait body, a method named by a
+            // reserved word.
+            (
+                "impl S { fn  get(self): i32 { 1 } }",
+                &[Fn],
+                &[("fn ", "fun")],
+            ),
+            ("trait T { fn  t(self): i32; }", &[Fn], &[("fn ", "fun")]),
+            (
+                "impl S { def type(self): i32 { 1 } }",
+                &[Def],
+                &[("def", "fun")],
+            ),
+            // `return` wherever an expression begins.
+            (
+                "fun f(): i32 { return 1; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            ("fun f(): i32 { return 1 }", &[Return], &[("return", "ret")]),
+            (
+                "fun f(x: i32): i32 { if x > 0 { return x; } x }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(x: i32): i32 { match x { 1 => return 2, _ => 3 } }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(): i32 { let g = |x: i32| { return x; }; g(1) }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(c: bool): i32 { return if c { 1 } else { 2 }; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(): str { return \"s\"; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(self): i32 { return self.x; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            (
+                "fun f(): bool { return true; }",
+                &[Return],
+                &[("return", "ret")],
+            ),
+            // The arrow, where a return type's `:` stands — and in a closure
+            // type, where the result follows the `|..|` directly.
+            ("fun f() -> i32 { 1 }", &[Arrow], &[("->", ":")]),
+            ("trait T { fun t(self) -> i32; }", &[Arrow], &[("->", ":")]),
+            (
+                "fun f(): i32 { let g = |x: i32| -> i32 { x }; g(1) }",
+                &[Arrow],
+                &[("->", ":")],
+            ),
+            ("fun f(g: |i32| -> i32) {}", &[TypeArrow], &[("->", "")]),
+            ("fun f(g: || -> void) {}", &[TypeArrow], &[("->", "")]),
+            // Several in one declaration: each its own refusal, nothing more.
+            (
+                "fn  f() -> i32 { return 1; }",
+                &[Fn, Arrow, Return],
+                &[("fn ", "fun"), ("->", ":"), ("return", "ret")],
+            ),
+        ];
+        for (source, spellings, replacements) in cases {
+            let (tree, errors) = parse(source);
+            let refused: Vec<(Option<ForeignSpelling>, &str)> = errors
+                .iter()
+                .map(|error| {
+                    (
+                        ForeignSpelling::of_message(&render(error)),
+                        &source[error.span.start..error.span.end],
+                    )
+                })
+                .collect();
+            let expected: Vec<(Option<ForeignSpelling>, &str)> = spellings
+                .iter()
+                .map(|spelling| (Some(*spelling), spelling.written()))
+                .collect();
+            assert_eq!(refused, expected, "{source}");
+            let vilan = respelled(source, replacements);
+            let clean = program(&vilan);
+            assert_eq!(
+                format!("{:?}", tree.expect("a tree")),
+                format!("{clean:?}"),
+                "{source} reads as {vilan}"
+            );
+        }
+    }
+
+    #[test]
+    fn b520_the_foreign_words_stay_names_wherever_they_are_names() {
+        // None of the four words is reserved, and nothing that parses today
+        // reads differently: each of these is clean and means what it meant.
+        for source in [
+            "fun main() { let return = 1; let fn = 2; let function = 3; let def = 4; }",
+            "fun main() { let func = 5; return; fn; }",
+            "fun main() { return(1); fn(2); def(3); }",
+            "fun main() { return - 1; return.x; return = 2; return += 1; }",
+            "fun main() { return then go(); fn then (go()); return else go(); }",
+            "fun main() { let total = return + fn * def; }",
+            "fun main() { print(return); print([return, fn]); }",
+            "struct S { return: i32, fn: i32, function: i32, def: i32, func: i32 }",
+            "fun def(fn: i32): i32 { fn }",
+            "fun return(): i32 { 1 }",
+            "fun f(return: i32, own function: i32) {}",
+            "import a::{ fn, return };",
+            "import a::b as fn;",
+            "fun main() { x.return(1); x.fn; let s = S { return = 1, fn = 2 }; }",
+            "fun main() { if fn is Some(x) { } }",
+            "fun main() { match return { _ => 1 } }",
+            "fun main() { for x in fn { } }",
+            "fun main() { let f = |return: i32| return; }",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(errors.is_empty(), "{source}: {errors:?}");
+        }
+        // A `-` and a `>` apart are not the arrow: the parse errors stay
+        // today's, and none of them is the steer.
+        let (_, errors) = parse("fun f() - > i32 { 1 }");
+        assert!(!errors.is_empty());
+        for error in &errors {
+            assert_eq!(ForeignSpelling::of_message(&render(error)), None);
+        }
+    }
+
+    #[test]
+    fn b520_the_recovery_resumes_at_a_foreign_head() {
+        // `1 + return 5`: `return value` is no operand, as `ret` is none — the
+        // operand's refusal, then the return read as one.
+        let source = "fun main() {\n    let y = 1 +\n    return 5;\n}\n";
+        let (_, errors) = parse(source);
+        let rendered: Vec<String> = errors.iter().map(render).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "found 'return' expected an expression".to_string(),
+                ForeignSpelling::Return.message().to_string(),
+            ],
+            "{source}"
+        );
+        // `pub fn f()`: the visibility rule at `pub` — `fn name(` is a fresh
+        // item — then the `fun` steer; nothing else.
+        let source = "pub fn f(): i32 { 1 }\n";
+        let (tree, errors) = parse(source);
+        let rendered: Vec<String> = errors.iter().map(render).collect();
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
+        assert!(rendered[0].starts_with("`pub` is not a vilan keyword"));
+        assert_eq!(rendered[1], ForeignSpelling::Fn.message());
+        let (statements, _) = tree.expect("a tree");
+        assert!(
+            statements
+                .iter()
+                .any(|(node, _)| matches!(node, Node::Func(_))),
+            "the declaration is in the tree: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn b520_each_foreign_spelling_carries_its_code_and_its_fix() {
+        // The codes are the editor's keys: stable, distinct, and spelled here
+        // so a rename reds.
+        let codes: Vec<&str> = ForeignSpelling::ALL
+            .iter()
+            .map(|spelling| spelling.code())
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                "foreign-spelling/return",
+                "foreign-spelling/fn",
+                "foreign-spelling/function",
+                "foreign-spelling/func",
+                "foreign-spelling/def",
+                "foreign-spelling/arrow",
+                "foreign-spelling/type-arrow",
+            ]
+        );
+        // (source, the source after the fix): applying the diagnostic's own
+        // fix turns each into vilan, which parses clean.
+        for (source, fixed) in [
+            ("fun f(): i32 { return 1; }", "fun f(): i32 { ret 1; }"),
+            ("fn add(a: i32): i32 { a }", "fun add(a: i32): i32 { a }"),
+            ("function f() {}", "fun f() {}"),
+            ("func f() {}", "fun f() {}"),
+            ("def f() {}", "fun f() {}"),
+            ("fun f() -> i32 { 1 }", "fun f(): i32 { 1 }"),
+            ("fun f()->i32 { 1 }", "fun f():i32 { 1 }"),
+            ("fun f()\n    -> i32 { 1 }", "fun f(): i32 { 1 }"),
+            (
+                "fun f(): i32 { let g = |x: i32| -> i32 { x }; g(1) }",
+                "fun f(): i32 { let g = |x: i32|: i32 { x }; g(1) }",
+            ),
+            ("fun f(g: |i32| -> i32) {}", "fun f(g: |i32| i32) {}"),
+        ] {
+            let (_, errors) = parse(source);
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+            let message = render(&errors[0]);
+            let fix = foreign_spelling_fix(source, &message, errors[0].span)
+                .unwrap_or_else(|| panic!("{source}: no fix for {message}"));
+            let spelling = ForeignSpelling::of_message(&message).expect("a spelling");
+            assert_eq!(fix.code, spelling.code());
+            assert_eq!(fix.replacement, spelling.vilan());
+            let mut edited = source.to_string();
+            edited.replace_range(fix.span.start..fix.span.end, fix.replacement);
+            assert_eq!(edited, fixed, "{source}");
+            program(&edited);
+        }
+        // Any other diagnostic has no such fix.
+        let (_, errors) = parse("fun f( {");
+        let message = render(&errors[0]);
+        assert_eq!(
+            foreign_spelling_fix("fun f( {", &message, errors[0].span),
+            None
+        );
+    }
+
+    /// B486's matrix (papers-45's `order_matrix.py`), re-read in B536's THE
+    /// order: each declaration kind's full stack — its attributes by
+    /// [`attribute_rank`], then `export` and the other keywords by Q8's — and
+    /// every ADJACENT swap of it, 29 in all.
+    const B486_STACKS: &[(&[&str], &str)] = &[
+        (
+            &[
+                "[deprecated(\"use g\")]",
+                "[internal(\"why\")]",
+                "[extern(\"f\")]",
+                "[must_use]",
+                "[platform(\"node\")]",
+                "export",
+                "async",
+                "external",
+            ],
+            "fun f(): i32;",
+        ),
+        (
+            &[
+                "[deprecated(\"use g\")]",
+                "[internal(\"why\")]",
+                "[must_use]",
+                "[platform(\"node\")]",
+                "export",
+                "async",
+            ],
+            "fun f(): i32 { 1 }",
+        ),
+        (
+            &[
+                "[deprecated(\"use T\")]",
+                "[internal(\"why\")]",
+                "[platform(\"node\")]",
+                "[resource]",
+                "export",
+                "external",
+            ],
+            "struct H;",
+        ),
+        (
+            &[
+                "[derive(PartialEq)]",
+                "[deprecated(\"use T\")]",
+                "[internal(\"why\")]",
+                "[platform(\"node\")]",
+                "[resource]",
+                "export",
+            ],
+            "struct S { a: i32 }",
+        ),
+        (
+            &[
+                "[deprecated(\"use U\")]",
+                "[internal(\"why\")]",
+                "[platform(\"node\")]",
+                "[resource]",
+                "export",
+            ],
+            "trait T { fun t(self): i32; }",
+        ),
+        (
+            &[
+                "[deprecated(\"use y\")]",
+                "[internal(\"why\")]",
+                "export",
+                "lazy",
+            ],
+            "let x = 1;",
+        ),
+    ];
+
+    /// The declaration head a stack spells, attributes abbreviated as the
+    /// marker-order diagnostics write them.
+    fn b486_spelled(stack: &[&str], declaration: &str) -> String {
+        let mut spelled: Vec<String> = stack
+            .iter()
+            .map(|marker| {
+                if !marker.starts_with('[') {
+                    return marker.to_string();
+                }
+                let name = marker[1..].split(['(', ']']).next().unwrap();
+                if marker.contains('(') {
+                    format!("[{name}(..)]")
+                } else {
+                    format!("[{name}]")
+                }
+            })
+            .collect();
+        spelled.push(declaration.split(' ').next().unwrap().to_string());
+        spelled.join(" ")
+    }
+
+    /// B536's classification of the 29 swaps (RULED 2026-10-03): the stack is
+    /// CANONICAL; a swap of two attributes WARNS (out of rank, read in it); a
+    /// swap that puts a keyword ahead of an attribute — `export` included,
+    /// B485 S3 — or inverts two keywords is REFUSED, and read as the stack.
+    /// Every one of them `vilan fmt` writes as the stack, idempotently.
+    #[test]
+    fn b536_every_adjacent_marker_swap_is_canonical_warned_or_refused() {
+        let is_attribute = |marker: &str| marker.starts_with('[');
+        let (mut warned, mut refused) = (0, 0);
+        for (stack, declaration) in B486_STACKS {
+            let canonical = format!("{} {declaration}\n", stack.join(" "));
+            let spelled = b486_spelled(stack, declaration);
+            let (_, errors, warnings) = parse_with_warnings(&canonical);
+            assert!(
+                errors.is_empty() && warnings.is_empty(),
+                "{canonical}: {errors:?} {warnings:?}"
+            );
+            let canonical_print = crate::formatter::reprint(&canonical)
+                .unwrap_or_else(|decline| panic!("{canonical}: {decline:?}"));
+            assert_eq!(
+                crate::formatter::reprint(&canonical_print).as_deref(),
+                Ok(canonical_print.as_str()),
+                "{canonical}: not idempotent"
+            );
+            // The printer writes THE order itself — the net sorts both of its
+            // streams, so only this says the print is not merely the source's
+            // tokens in some order the net accepts.
+            let (_, errors, warnings) = parse_with_warnings(&canonical_print);
+            assert!(
+                errors.is_empty() && warnings.is_empty(),
+                "{canonical_print}: {errors:?} {warnings:?}"
+            );
+            for at in 0..stack.len() - 1 {
+                let mut swapped = stack.to_vec();
+                swapped.swap(at, at + 1);
+                let source = format!("{} {declaration}\n", swapped.join(" "));
+                let (tree, errors, warnings) = parse_with_warnings(&source);
+                let errors: Vec<String> = errors.iter().map(render).collect();
+                let warnings: Vec<(Span, String)> = warnings
+                    .iter()
+                    .map(|warning| (warning.span, render(warning)))
+                    .collect();
+                let run = Span::from(0..source.find(declaration).unwrap() - 1);
+                if is_attribute(swapped[at]) && is_attribute(swapped[at + 1]) {
+                    warned += 1;
+                    assert!(errors.is_empty(), "{source}: {errors:?}");
+                    assert_eq!(
+                        warnings,
+                        vec![(run, attribute_order_rule(&spelled))],
+                        "{source}"
+                    );
+                } else {
+                    refused += 1;
+                    assert!(warnings.is_empty(), "{source}: {warnings:?}");
+                    assert_eq!(errors, vec![marker_order_rule(&spelled)], "{source}");
+                    let (statements, _) = tree.expect("a tree");
+                    assert_eq!(statements.len(), 1, "{source}: {statements:?}");
+                    assert!(
+                        matches!(statements[0].0, Node::Export(..)),
+                        "{source}: {statements:?}"
+                    );
+                }
+                let print = crate::formatter::reprint(&source)
+                    .unwrap_or_else(|decline| panic!("{source}: {decline:?}"));
+                assert_eq!(print, canonical_print, "{source}");
+            }
+        }
+        assert_eq!((warned, refused), (18, 11));
+    }
+
+    /// B536: attributes out of [`attribute_rank`]'s order, and nothing else
+    /// out of order, are a WARNING — beside the errors, never among them, so
+    /// the source stays clean — spanning the run and naming the head in THE
+    /// order; the tree is the canonical spelling's.
+    #[test]
+    fn b536_attributes_out_of_rank_warn_and_read_in_it() {
+        for (source, canonical, spelled) in [
+            (
+                "[internal(\"r\")] [deprecated(\"d\")] fun f() {}",
+                "[deprecated(\"d\")] [internal(\"r\")] fun f() {}",
+                "[deprecated(..)] [internal(..)] fun",
+            ),
+            (
+                "[platform(\"node\")]\n[must_use]\nexport async fun f(): i32 { 1 }",
+                "[must_use]\n[platform(\"node\")]\nexport async fun f(): i32 { 1 }",
+                "[must_use] [platform(..)] export async fun",
+            ),
+            (
+                "[resource] [derive(PartialEq)] struct S { a: i32 }",
+                "[derive(PartialEq)] [resource] struct S { a: i32 }",
+                "[derive(..)] [resource] struct",
+            ),
+            (
+                "[internal(\"r\")] [deprecated(\"d\")] lazy let x = 1;",
+                "[deprecated(\"d\")] [internal(\"r\")] lazy let x = 1;",
+                "[deprecated(..)] [internal(..)] lazy let",
+            ),
+            (
+                "[must_use] [deprecated(\"d\")] const fun f(): i32 { 1 }",
+                "[deprecated(\"d\")] [must_use] const fun f(): i32 { 1 }",
+                "[deprecated(..)] [must_use] const fun",
+            ),
+            (
+                "trait T {\n\t[must_use] [deprecated(\"d\")] fun t(self): i32;\n}",
+                "trait T {\n\t[deprecated(\"d\")] [must_use] fun t(self): i32;\n}",
+                "[deprecated(..)] [must_use] fun",
+            ),
+            (
+                "[platform(\"node\")] [deprecated(\"d\")] async macro fun m() {}",
+                "[deprecated(\"d\")] [platform(\"node\")] async macro fun m() {}",
+                "[deprecated(..)] [platform(..)] async macro fun",
+            ),
+        ] {
+            let (tree, errors, warnings) = parse_with_warnings(source);
+            assert!(errors.is_empty(), "{source}: {errors:?}");
+            let rendered: Vec<String> = warnings.iter().map(render).collect();
+            assert_eq!(rendered, vec![attribute_order_rule(spelled)], "{source}");
+            let run_start = source.find('[').unwrap();
+            let word = spelled.rsplit(' ').next().unwrap();
+            let run_end = source[..source.find(&format!(" {word} ")).unwrap()]
+                .trim_end()
+                .len();
+            assert_eq!(warnings[0].span, Span::from(run_start..run_end), "{source}");
+            assert_eq!(
+                MarkerOrderDiagnostic::of_message(&rendered[0]),
+                Some(MarkerOrderDiagnostic::Attributes)
+            );
+            // The tree is the canonical spelling's: `vilan fmt` prints the
+            // two alike.
+            assert!(tree.is_some());
+            let (_, canonical_errors, canonical_warnings) = parse_with_warnings(canonical);
+            assert!(canonical_errors.is_empty() && canonical_warnings.is_empty());
+            assert_eq!(
+                crate::formatter::reprint(source),
+                crate::formatter::reprint(canonical),
+                "{source}"
+            );
+            // `parse` — what every reader but the reporting pipelines calls —
+            // hands back the same clean result, and no warning.
+            let (_, errors) = parse(source);
+            assert!(errors.is_empty(), "{source}: {errors:?}");
+        }
+        // Nothing to warn about: THE order, a tie kept as written (two
+        // generators, two `[hint]`s), one attribute, a run that is not a
+        // declaration head.
+        for source in [
+            "[deprecated(\"d\")] [internal(\"r\")] [must_use] [platform(\"node\")] export async fun f(): i32 { 1 }",
+            "[service(Api)] [derive(PartialEq)] struct S { a: i32 }",
+            "[hint(Show)] [hint(Eq)] [resource] external struct H;",
+            "[must_use] fun f(): i32 { 1 }",
+            "fun main() { let a = [1]; let b = [0]; [a][b]; }",
+        ] {
+            let (_, errors, warnings) = parse_with_warnings(source);
+            assert!(warnings.is_empty(), "{source}: {warnings:?}");
+            assert!(
+                errors
+                    .iter()
+                    .all(|error| !matches!(error.reason, ParseErrorReason::MarkerOrder { .. })),
+                "{source}: {errors:?}"
+            );
+        }
+    }
+
+    /// B536's editor half: the stable codes, the message recognizer, and the
+    /// quick fix — the run's units permuted into THE order with what stood
+    /// between them kept in place — which re-parses with neither the error
+    /// nor the warning.
+    #[test]
+    fn b536_the_marker_order_fix_writes_the_head_in_the_order() {
+        assert_eq!(
+            MarkerOrderDiagnostic::Attributes.code(),
+            "marker-order/attributes"
+        );
+        assert_eq!(
+            MarkerOrderDiagnostic::Keywords.code(),
+            "marker-order/keywords"
+        );
+        assert!(MarkerOrderDiagnostic::Attributes.is_warning());
+        assert!(!MarkerOrderDiagnostic::Keywords.is_warning());
+        assert_eq!(
+            MarkerOrderDiagnostic::of_message(&attribute_order_rule("[must_use] fun")),
+            Some(MarkerOrderDiagnostic::Attributes)
+        );
+        assert_eq!(
+            MarkerOrderDiagnostic::of_message(&marker_order_rule("[must_use] export fun")),
+            Some(MarkerOrderDiagnostic::Keywords)
+        );
+        assert_eq!(MarkerOrderDiagnostic::of_message("cannot find 'x'"), None);
+        for (source, fixed, code, title) in [
+            (
+                "[internal(\"r\")] [deprecated(\"d\")] fun f() {}",
+                "[deprecated(\"d\")] [internal(\"r\")] fun f() {}",
+                "marker-order/attributes",
+                "Write `[deprecated(..)] [internal(..)] fun`",
+            ),
+            (
+                "// lead\n[must_use]\n// between\n[deprecated(\"d\")]\nfun f(): i32 { 1 }",
+                "// lead\n[deprecated(\"d\")]\n// between\n[must_use]\nfun f(): i32 { 1 }",
+                "marker-order/attributes",
+                "Write `[deprecated(..)] [must_use] fun`",
+            ),
+            (
+                "export [must_use] fun f(): i32 { 1 }",
+                "[must_use] export fun f(): i32 { 1 }",
+                "marker-order/keywords",
+                "Write `[must_use] export fun`",
+            ),
+            (
+                "export(in pkg)\n[deprecated(\"d\")]\nfun f() {}",
+                "[deprecated(\"d\")]\nexport(in pkg)\nfun f() {}",
+                "marker-order/keywords",
+                "Write `[deprecated(..)] export fun`",
+            ),
+            (
+                "[internal(\"r\")] export [deprecated(\"d\")] struct S {}",
+                "[deprecated(\"d\")] [internal(\"r\")] export struct S {}",
+                "marker-order/keywords",
+                "Write `[deprecated(..)] [internal(..)] export struct`",
+            ),
+            (
+                "async [platform(\"node\")] fun f() {}",
+                "[platform(\"node\")] async fun f() {}",
+                "marker-order/keywords",
+                "Write `[platform(..)] async fun`",
+            ),
+            (
+                "external async fun f(): i32;",
+                "async external fun f(): i32;",
+                "marker-order/keywords",
+                "Write `async external fun`",
+            ),
+            (
+                "macro async fun m() {}",
+                "async macro fun m() {}",
+                "marker-order/keywords",
+                "Write `async macro fun`",
+            ),
+            (
+                "fun main() {}\nexport [must_use] [deprecated(\"d\")] fun f(): i32 { 1 }\n",
+                "fun main() {}\n[deprecated(\"d\")] [must_use] export fun f(): i32 { 1 }\n",
+                "marker-order/keywords",
+                "Write `[deprecated(..)] [must_use] export fun`",
+            ),
+        ] {
+            let (_, errors, warnings) = parse_with_warnings(source);
+            let diagnostics: Vec<&ParseError> = errors.iter().chain(&warnings).collect();
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            let message = render(diagnostics[0]);
+            let fix = marker_order_fix(source, &message, diagnostics[0].span)
+                .unwrap_or_else(|| panic!("{source}: no fix for {message}"));
+            assert_eq!(fix.code, code, "{source}");
+            assert_eq!(fix.title, title, "{source}");
+            let mut edited = source.to_string();
+            edited.replace_range(fix.span.start..fix.span.end, &fix.replacement);
+            assert_eq!(edited, fixed, "{source}");
+            let (_, errors, warnings) = parse_with_warnings(&edited);
+            assert!(
+                errors.is_empty() && warnings.is_empty(),
+                "{edited}: {errors:?} {warnings:?}"
+            );
+        }
+        // Any other diagnostic, and a span that is no longer a run, has none.
+        let (_, errors) = parse("fun f( {");
+        assert_eq!(
+            marker_order_fix("fun f( {", &render(&errors[0]), errors[0].span),
+            None
+        );
+        let source = "export [must_use] fun f(): i32 { 1 }";
+        let (_, errors) = parse(source);
+        let message = render(&errors[0]);
+        assert_eq!(
+            marker_order_fix("fun g() {}", &message, errors[0].span),
+            None
+        );
+    }
+
+    /// B485 S3 (RULED for v0.44.0): each stack in the order before B485 —
+    /// `export` ahead of every attribute — is refused, steered to THE order,
+    /// read as it, and written in it by `vilan fmt`.
+    #[test]
+    fn b485_s3_export_ahead_of_the_attributes_is_refused_and_formatted() {
+        for (stack, declaration) in B486_STACKS {
+            let canonical = format!("{} {declaration}\n", stack.join(" "));
+            let mut old = stack.to_vec();
+            old.retain(|marker| *marker != "export");
+            old.insert(0, "export");
+            let source = format!("{} {declaration}\n", old.join(" "));
+            let (_, errors) = parse(&source);
+            assert_eq!(
+                errors.iter().map(render).collect::<Vec<_>>(),
+                vec![marker_order_rule(&b486_spelled(stack, declaration))],
+                "{source}"
+            );
+            assert_eq!(
+                crate::formatter::reprint(&source),
+                crate::formatter::reprint(&canonical),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn b486_keywords_take_one_order_and_come_after_the_attributes() {
+        // (written, the head the steer spells): Q8's order — `export`,
+        // `const`|`lazy`, `async`, `external`|`macro` — after the attributes.
+        for (source, canonical) in [
+            ("async export fun f(): i32 { 1 }", "export async fun"),
+            ("lazy export let x = 1;", "export lazy let"),
+            ("const export fun f(): i32 { 1 }", "export const fun"),
+            ("macro export fun m() { }", "export macro fun"),
+            (
+                "[extern(\"f\")] external async fun f(): i32;",
+                "[extern(..)] async external fun",
+            ),
+            ("external export struct H;", "export external struct"),
+            (
+                "export async [must_use] fun f(): i32 { 1 }",
+                "[must_use] export async fun",
+            ),
+            (
+                "const [deprecated(\"x\")] fun f(): i32 { 1 }",
+                "[deprecated(..)] const fun",
+            ),
+            (
+                "export const [internal(\"x\")] let x = 1;",
+                "[internal(..)] export const let",
+            ),
+            (
+                "lazy [internal(\"x\")] let x = 1;",
+                "[internal(..)] lazy let",
+            ),
+            // B485 S3: `export` and `macro` ahead of the attributes, the
+            // order before B485 — and a run split across the marker.
+            (
+                "export [must_use] async fun f(): i32 { 1 }",
+                "[must_use] export async fun",
+            ),
+            (
+                "export(in pkg) [deprecated(\"x\")] fun f() {}",
+                "[deprecated(..)] export fun",
+            ),
+            (
+                "[deprecated(\"x\")] export [must_use] fun f(): i32 { 1 }",
+                "[deprecated(..)] [must_use] export fun",
+            ),
+            (
+                "export [deprecated(\"use b\")] import a::b as c;",
+                "[deprecated(..)] export import",
+            ),
+            (
+                "macro [deprecated(\"x\")] fun m() { }",
+                "[deprecated(..)] macro fun",
+            ),
+            // A keyword ahead of attributes that are out of rank as well: the
+            // one refusal, spelling the whole head in the order.
+            (
+                "export [must_use] [deprecated(\"x\")] fun f(): i32 { 1 }",
+                "[deprecated(..)] [must_use] export fun",
+            ),
+            // B524: `async` before `macro` (Q8's table), so the order the
+            // macro production read before B524 is the steered one.
+            ("macro async fun m() { }", "async macro fun"),
+            (
+                "macro [deprecated(\"x\")] async fun m() { }",
+                "[deprecated(..)] async macro fun",
+            ),
+        ] {
+            let (tree, errors) = parse(source);
+            let rendered: Vec<String> = errors.iter().map(render).collect();
+            assert_eq!(rendered, vec![marker_order_rule(canonical)], "{source}");
+            let (statements, _) = tree.expect("a tree");
+            assert_eq!(statements.len(), 1, "{source}: {statements:?}");
+        }
+        // A set no order makes legal is not steered to one: the production's
+        // own refusal stands.
+        for source in ["async const fun f(): i32 { 1 }", "async lazy let x = 1;"] {
+            let (_, errors) = parse(source);
+            assert!(!errors.is_empty(), "{source}");
+            for error in &errors {
+                assert!(
+                    !matches!(error.reason, ParseErrorReason::MarkerOrder { .. }),
+                    "{source}: {errors:?}"
+                );
+            }
+        }
+        // The ruled order reads clean, and a run the order does not reach — a
+        // list indexed by a list, an `async` block — is the expression it
+        // always was. (`export` ahead of the attributes, the order this test
+        // read clean before B485 S3, is in the list above.)
+        for source in [
+            "[must_use] export async fun f(): i32 { 1 }",
+            "[deprecated(\"x\")] export const fun f(): i32 { 1 }",
+            "async macro fun m() { }",
+            "[deprecated(\"x\")] async macro fun m() { }",
+            "[deprecated(\"x\")] export(in pkg) fun f() {}",
+            "[resource] export external struct H;",
+            "fun main() { [a][b]; }",
+            "fun main() { let x = async { 1 }; }",
+            "fun main() { const [1, 2]; }",
+        ] {
+            program(source);
+        }
+    }
+
+    #[test]
+    fn b486_a_reordered_head_still_begins_where_it_was_written() {
+        // The reorder permutes tokens, and every node still begins at the
+        // first unit as written — the statement, the export, the item.
+        let source = "[platform(\"node\")] [deprecated(\"x\")] export fun f() {}";
+        let (statements, _) = program(source);
+        assert_eq!(statements[0].1, Span::from(0..source.len()));
+        match &statements[0].0 {
+            Node::Export(_, inner, _) => assert_eq!(inner.1.start, 0, "{inner:?}"),
+            other => panic!("{other:?}"),
+        }
+        let source = "async [platform(\"node\")] fun f() {}";
+        let (tree, errors) = parse(source);
+        assert_eq!(errors.len(), 1);
+        let (statements, _) = tree.expect("a tree");
+        assert_eq!(statements[0].1, Span::from(0..source.len()));
+    }
+
+    #[test]
+    fn b487_a_const_declaration_carries_the_label_prefix() {
+        match only_item("[deprecated(\"use g\")] [must_use] const fun f(): i32 { 1 }") {
+            Node::Const(inner) => match &inner.0 {
+                Node::Func(function) => {
+                    assert_eq!(function.deprecated, Some("use g"));
+                    assert!(function.must_use);
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        match only_item("[internal(\"why\")] const let x = 1;") {
+            Node::Const(inner) => match &inner.0 {
+                Node::Let(name, _, _, _, _, Some(labels)) => {
+                    assert_eq!(name.0, "x");
+                    assert_eq!(labels.internal, Some("why"));
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // Under `export` (the other side of it is B485 S3's refusal).
+        for source in ["[deprecated(\"use y\")] export const let y = 1;"] {
+            match only_item(source) {
+                Node::Export(_, inner, None) => match &inner.0 {
+                    Node::Const(declaration) => {
+                        assert!(
+                            matches!(&declaration.0, Node::Let(.., Some(labels)) if labels.deprecated == Some("use y")),
+                            "{source}: {declaration:?}"
+                        );
+                    }
+                    other => panic!("{source}: {other:?}"),
+                },
+                other => panic!("{source}: {other:?}"),
+            }
+        }
+        // A binding takes no `[must_use]`, and a destructure no label: not a
+        // declaration this production reads.
+        assert!(declines("[must_use] const let x = 1;"));
+        assert!(declines("[internal(\"x\")] const let (a, b) = (1, 2);"));
+        // `const mut` stays the refusal it was, unlabelled.
+        let (_, errors) = parse("const mut x = 1;");
+        assert_eq!(render(&errors[0]), CONST_HAS_NO_MUTATION);
+    }
+
+    #[test]
+    fn b494_async_where_a_binding_begins_is_refused_and_read_as_the_binding() {
+        // (source, the binding's name): one refusal at `async`, and the
+        // binding bound — so nothing reading it cascades into "cannot find".
+        for (source, name) in [
+            ("fun main() { async x = 1; print(x); }", "x"),
+            (
+                "fun main() { async total: i32 = 1; print(total); }",
+                "total",
+            ),
+            ("fun main() { async let x = 1; print(x); }", "x"),
+            ("fun main() { async mut x = 1; x = 2; }", "x"),
+            ("async config = 1;", "config"),
+        ] {
+            let (tree, errors) = parse(source);
+            let refused: Vec<(String, &str)> = errors
+                .iter()
+                .map(|error| (render(error), &source[error.span.start..error.span.end]))
+                .collect();
+            assert_eq!(
+                refused,
+                vec![(ASYNC_MARKS_NO_BINDING.to_string(), "async")],
+                "{source}"
+            );
+            let printed = format!("{:?}", tree.expect("a tree"));
+            assert!(
+                printed.contains(&format!("Let((\"{name}\"")),
+                "{source}: the binding is in the tree: {printed}"
+            );
+        }
+        // `async` before a function, a block or an expression is untouched.
+        for source in [
+            "async fun f(): i32 { 1 }",
+            "fun main() { let pending = async { 1 }; }",
+            "fun main() { async go(); }",
+            "fun main() { let x = async load(); }",
+        ] {
+            program(source);
+        }
+    }
+
+    /// A154 / E268: the edit for a moved-module refusal, on every import shape
+    /// it meets. `anchor` is the n-th occurrence of the old segment the
+    /// refusal anchors at (the analyzer's span, pinned in `module_resolution`).
+    fn moved_edit(
+        source: &str,
+        old: &str,
+        occurrence: usize,
+    ) -> Option<Result<String, &'static str>> {
+        let start = source
+            .match_indices(old)
+            .nth(occurrence)
+            .map(|(start, _)| start)
+            .expect("the anchor");
+        let new = moved_std_module(old).expect("a moved module");
+        let message = moved_std_module_message(old, new);
+        let edit = moved_std_module_edit(source, &message, Span::from(start..start + old.len()))?;
+        Some(edit.map(|fix| {
+            let mut text = source.to_string();
+            text.replace_range(fix.span.into_range(), &fix.replacement);
+            text
+        }))
+    }
+
+    #[test]
+    fn a154_the_moved_path_edit_replaces_the_old_segment() {
+        for (source, old, after) in [
+            (
+                "import std::dom::{ create_element, Element };",
+                "dom",
+                "import std::web::dom::{ create_element, Element };",
+            ),
+            (
+                "import std::{ rpc_server::Server, ui::View };",
+                "rpc_server",
+                "import std::{ rpc::server::Server, ui::View };",
+            ),
+            (
+                "import std::web::Signal as S;",
+                "web",
+                "import std::web::prelude::Signal as S;",
+            ),
+            // A list of prelude names only: the segment is still the edit.
+            (
+                "import std::web::{ Signal, Memo };",
+                "web",
+                "import std::web::prelude::{ Signal, Memo };",
+            ),
+        ] {
+            assert_eq!(
+                moved_edit(source, old, 0),
+                Some(Ok(after.to_string())),
+                "{source}"
+            );
+        }
+    }
+
+    /// E268: a brace list under the old web-prelude path that also names one of
+    /// `std::web`'s children keeps the child and writes `prelude::` before each
+    /// prelude name — at the top of a file, nested in an outer list, aliased,
+    /// and block-scoped.
+    #[test]
+    fn e268_a_mixed_web_list_prefixes_the_prelude_names_and_keeps_the_children() {
+        for (source, after) in [
+            (
+                "import std::web::{ Signal, dom::create_element };",
+                "import std::web::{ prelude::Signal, dom::create_element };",
+            ),
+            (
+                "import std::web::{ dom::create_element, Signal, ui, Memo as M };",
+                "import std::web::{ dom::create_element, prelude::Signal, ui, prelude::Memo as M };",
+            ),
+            (
+                "import std::{ web::{ Signal, prelude::view }, option::Option };",
+                "import std::{ web::{ prelude::Signal, prelude::view }, option::Option };",
+            ),
+            (
+                "export import std::web::{\n\tSignal,\n\tstyle,\n};",
+                "export import std::web::{\n\tprelude::Signal,\n\tstyle,\n};",
+            ),
+            (
+                "fun main() {\n\timport std::web::{ Signal, dom::x };\n}",
+                "fun main() {\n\timport std::web::{ prelude::Signal, dom::x };\n}",
+            ),
+        ] {
+            assert_eq!(
+                moved_edit(source, "web", 0),
+                Some(Ok(after.to_string())),
+                "{source}"
+            );
+        }
+    }
+
+    /// The shapes no one edit rewrites correctly are left to a person, with
+    /// the reason; a span that no longer covers the old segment is no edit.
+    #[test]
+    fn e268_a_web_list_naming_self_or_a_marker_is_left_with_its_reason() {
+        assert_eq!(
+            moved_edit("import std::web::{ self, Signal };", "web", 0),
+            Some(Err(MOVED_WEB_SELF_REASON))
+        );
+        assert_eq!(
+            moved_edit("import std::web::{ #Signal, dom::x };", "web", 0),
+            Some(Err(MOVED_WEB_MARKED_REASON))
+        );
+        let source = "import std::dom::x;";
+        let message = moved_std_module_message("dom", "web::dom");
+        assert_eq!(
+            moved_std_module_edit(source, &message, Span::from(0..3)),
+            None
+        );
+        assert_eq!(
+            moved_std_module_edit(source, "cannot find 'x'", Span::from(11..14)),
+            None
+        );
     }
 }

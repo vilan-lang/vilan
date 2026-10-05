@@ -3,15 +3,15 @@
 // installed on rather than a boot function that owns the whole port.
 // Everything stateful lives in `pkg::store`, next to its database.
 //
-// This file shares the package's `prelude = "std::web"` — that is what gives
+// This file shares the package's `prelude = "std::web::prelude"` — that is what gives
 // `print` below with no import. Everything a server reaches beyond it is
 // one-layer and in no prelude by rule, so the process modules are named.
 
 import std::build::require_build;
-import std::document::require_shell;
 import std::http::{ Response, Server };
 import std::json::json_codec;
-import std::rpc_server::Service;
+import std::rpc::server::Service;
+import std::web::document::require_shell;
 import pkg::store::boot;
 
 async fun main() {

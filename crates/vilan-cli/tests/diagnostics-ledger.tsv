@@ -366,7 +366,7 @@ row	flagship	key
 332	flagship	`std::{name}` was removed: `{name}` is a primitive and is always in scope — delete the import (its module path, if you need it, is `std::{home}::{name}`)
 333	flagship	`std::{name}` was removed: `{name}` is in the default prelude (no import needed), and its module path is `std::{home}::{name}`
 334	flagship	`std::{name}` was removed: its module path is `std::{home}::{name}`
-336	flagship	`@` is not a vilan token; a `css` block has no at-rules — a media query is a breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is `std::style::declare`
+336	flagship	`@` is not a vilan token; a `css` block has no at-rules — a media query is a breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is `std::web::style::declare`
 337	-	std::db migrate: could not begin a transaction for migration '{step.name}': {message}
 338	-	std::db migrate: migration '{step.name}' failed and was not applied: {message}
 339	-	std::db migrate: migration '{step.name}' applied but could not be recorded: {message}
@@ -493,7 +493,7 @@ row	flagship	key
 469	-	`asset::schedule_at_end` outside a `const` expression
 470	-	`{function}` kinds name one file beside the build output; `{kind}` is not one path segment — pass a bare kind like `css`
 471	-	`{function}` kinds name one file beside the build output, and `{kind}` collides with {collision} — pass a kind of the program's own, like `routes`
-472	-	`asset::emit_keyed` cannot order the `{kind}` kind: the style sidecar is ordered by the CSS cascade, not by a contribution's key — write a rule with `asset::emit`, or let `std::style` own the sheet
+472	-	`asset::emit_keyed` cannot order the `{kind}` kind: the style sidecar is ordered by the CSS cascade, not by a contribution's key — write a rule with `asset::emit`, or let `std::web::style` own the sheet
 473	-	parameter {position} of `{subject}`'s `{member}` is {form}, but `{trait}` declares {declared}; match the declared laziness
 474	-	`{name}` is a `lazy` parameter of the resource type `{type}`: a lazy argument is carried by a thunk, and a thunk owning a resource is what R9 forbids
 475	-	this argument is the resource `{type}`, and it stands in the `lazy` parameter `{name}`: the thunk that carries it would own the resource
@@ -571,7 +571,7 @@ row	flagship	key
 547	-	`[derive({name})]` expanded before std's `{module}` declared its `{name}` macro: a compiler load-ordering bug (B21's class); please report how this module is reached
 548	-	{count} `context` {checks} did not run: this program does not type, so the call graph it would be checked over has holes in it — fix the errors above and check again
 549	-	`external fun {name}` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
-550	-	`{symbol}` is a host PROPERTY, not a function: the function form of `[extern]` emits a CALL, so this binding reaches the host as `{symbol}()` and fails there. Read it through a runtime helper (`std::dom`'s `__dom_active_element` and `__dom_window` are that shape), or, if the property hangs off a value the program holds rather than off a global, bind it with `[extern(get, "..")]` on a receiver
+550	-	`{symbol}` is a host PROPERTY, not a function: the function form of `[extern]` emits a CALL, so this binding reaches the host as `{symbol}()` and fails there. Read it through a runtime helper (`std::web::dom`'s `__dom_active_element` and `__dom_window` are that shape), or, if the property hangs off a value the program holds rather than off a global, bind it with `[extern(get, "..")]` on a receiver
 551	-	`{}` is not a derivable trait: nothing declares a `{}` macro — not std, not this file, and nothing it imports. std derives {}; a derive of your own is a `macro fun {}` in this file or imported by name
 552	-	`guarded_async`
 553	-	`[service]` on `{name}` has an empty contract surface: it declares no `[rpc]` method, no `[expose]`d field and no `client = ..` handler, so the client it generates can call nothing and every call answers `unknown method` at runtime
@@ -588,7 +588,7 @@ row	flagship	key
 564	flagship	`{root_name}` cannot be a `dyn` object: {reason}.{through} An object dispatches through a table of its trait's members, so every member it requires must take a receiver, name no `Self` in its signature, and be non-generic. Use a generic parameter (`<T: {root_name}>`) for a value whose type is known where it is written
 565	-	{subject_name} `{member}` is async, but `{trait_name}::{member}` is declared sync, so this value cannot become a `dyn {trait_name}`: a call through an object is compiled once, against the declaration, and would hand back an unawaited promise. Declare `{trait_name}::{member}` `async` (an implementation may then be either), or keep the value behind a generic bound, where each implementation is awaited as it is written
 566	-	`{name}` is internal: {reason}
-567	-	`{name}` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+567	-	`{name}` is a local binding, and {labels} {label} an item on a module's surface: nothing outside this body can name it, so {the label has} no reader — delete {it}
 568	-	`[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about
 569	-	Expected {expected}, but got {got} instead. There are no implicit numeric conversions; convert with `.as_{target}()`
 570	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
@@ -618,7 +618,7 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 593	-	`clear` must be called on a named context with a closure literal body
 594	-	'{type_label}' does not match the annotation on '{name}', '{annotation_label}': each trait written inside the annotation must be met by ONE type that implements it (values of different types need a trait object there, `dyn …`)
 595	-	`{name}` carries a payload, so it is not a value on its own: call it (`{name}({list})`), or pass it where a closure is expected, where it stands for `|{list}| {name}({list})`
-596	-	'{trait_name}' is a trait, not a type: a TRAIT method cannot return a bare trait yet — each impl would pick its own type, an associated type vilan does not have. Return `dyn {trait_name}` from `{member}` (the object), or a concrete type; a free `fun` or an inherent method may return `{trait_name}` itself
+596	-	'{trait_name}' is a trait, not a type: a TRAIT method cannot return a bare trait yet — each impl would pick its own type, an associated type vilan does not have. Return `dyn {application}` from `{member}` (the object), or a concrete type; a free `fun` or an inherent method may return `{application}` itself
 597	-	'{produced_label}' does not implement trait '{trait_label}', which `{name}` returns: a trait written as a return type is the ONE type the body produces, and it must implement the trait (callers see that type — the return is not hidden)
 598	-	a member name written against its `.` — `value.name`, with no space or line break between them, because a `.` at the end of a line would join whatever the next line starts with. A chain continued on the next line breaks BEFORE the dot, and the next line begins `.name()`
 599	-	{label} stored on a structure that outlives the call, in an `[rpc]` handler: the seal is owned by the handler's owner — the CONNECTION's under `Service::factory` — so a store every connection shares keeps handing it out dead once that connection closes. A derivation cached across calls is `.memo_global()` or `.cell_global()`
@@ -633,3 +633,30 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 608	-	`[derive(Storable)]` on `{name}`: the field `{field}` would project as `{method}()`, which a store handle already has (`{method}` is a handle member, and an inherent member wins over a projection) — rename the projection with `[reactive(name = "..")]` on the field
 609	-	`[derive(Storable)]` on `{name}`: the variant `{variant}` would project as `{snake}()`/`{flag}()`, which a store handle already has — rename the variant
 610	-	`[derive(Storable)]` on `{name}`: two variants project as `{snake}()`
+611	-	`return` is not a vilan keyword: vilan spells this `ret` — `ret value;` returns a value, and a bare `ret;` leaves a function that returns nothing
+612	-	`{word}` is not a vilan keyword: vilan spells this `fun` — `fun name(parameter: Type): Result { … }`
+613	-	`->` is not how vilan writes a return type: vilan spells this `:` — `fun name(parameter: Type): Result`, and `|parameter: Type|: Result` on a closure
+614	-	`->` is not how vilan writes a closure type: its result follows the `|..|` directly — `|Type| Result`, and `|| Result` with no parameters
+615	-	a declaration's markers are written in one order — its attributes, then the keywords `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration word: write `{canonical}`
+616	-	this pattern binds {n} {elements}, but the value is a {n}-tuple `{type}`: a tuple pattern takes one sub-pattern per element, and a nested pattern reaches inside one (`((a, b), c)`)
+617	-	this pattern binds {n} {elements}, but the value is a `{type}`, not a tuple: `(a, b)` destructures a tuple
+618	-	`{member}` is `{trait}`'s, and this file does not import `{trait}`: the call resolves only because another loaded module does. Import it (`{import}`) — this is an error from v0.45.0
+619	-	`{type}` is not a trait: a selector's `with` names the trait the block implements, as its declaration does (`(impl Box with One)` selects `impl Box with One`)
+620	-	a declaration's attributes are written in one order — `[derive]` and the other generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform]`, `[resource]`: write `{canonical}`
+621	-	the left side of this assignment is not a place: it is {what} — only a place can be assigned: a binding (`x`), a field (`p.x`), an element (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a `&mut` view
+622	-	cannot reassign '{place}' while a view into it is live: the view points into the storage this write replaces (rule 4: no invalidating mutation under a live view).
+623	-	`{symbol}` computes on two numbers, but the right operand is `{rhs}`, which is not one: there are no implicit conversions, and the host would compute on its lowering (`2 * true` is `2`, typed `{lhs}`). Compute on the number you mean (`if flag { 1 } else { 0 }`, or a `parse` of the string)
+624	-	`[rpc]` method `{method_name}` returns `{written}`, a trait: a bare-trait return hides the body's type from the caller, and what crosses the wire for a hidden type is not designed — return {steer}
+625	-	this element's class is written twice — `{earlier}` and then `{later}` — and only the last write stays: `{later}` replaces what `{earlier}` wrote. Compose them into one writer (two styles add: `.styled(a + b)`), or drop one
+626	-	`std::map` was removed: its `Map` is `std::hash_map::HashMap`
+627	-	`std::set` was removed: its `Set` is `std::hash_set::HashSet`
+628	-	`std::map_cell` is `std::reactive::hash_map_cell` now, and its `MapCell` is `HashMapCell` (re-exported from `std::reactive`)
+629	-	`std::set_cell` is `std::reactive::hash_set_cell` now, and its `SetCell` is `HashSetCell` (re-exported from `std::reactive`)
+630	-	`{part}` was renamed `{new}`: write `import std::{module}::{new};`
+631	-	a written `autofocus` attribute is the browser's native one, which acts only while the page is first parsed: on an element inserted later the document refuses it once something has focus, and Chromium logs "Autofocus processing was blocked because a document already has a focused element". Write `.autofocus()` — it focuses the element once it is in the document, an enclosing focus scope starts on it, and a server render still writes the native attribute (for a `<dialog>` or a popover that wants the native one, write `.attr("autofocus", "")`)
+632	-	{which} {got} where its type takes {expected}: a value closure and a view closure are different types, and no adapter is inserted; {adapt}.
+633	-	`mut {name}` would bind a COPY of the payload, but this matches a view (`{subject}`), whose captures are views into the payload: {steer}, and write `*{name}` where a copy is wanted
+634	-	cannot write through '{name}': this matches `&{place}`, a readonly view, so its captures are readonly views into the payload — match `&mut {place}` to write the payload in place
+635	-	cannot mutate '{name}': it is a COPY of the payload the pattern takes out of `{place}`, so a write to it (or to `mut {name}`) would not reach `{place}` — to write the payload in place, match a view of it, `match &mut {place}` (or `&mut {place} is ..`), whose `let` captures are writable views
+636	-	`std::{old}` moved to `std::{new}`: std's modules are grouped under namespaces since v0.44.0, and the old path is gone — write `std::{new}`
+637	-	`{section} prelude = "{path}"` names the old path of a std module: `std::{old}` moved to `std::{new}` — write `prelude = "{rewritten}"`

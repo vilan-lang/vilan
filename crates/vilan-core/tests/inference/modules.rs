@@ -1203,7 +1203,7 @@ fn a_genuinely_dead_module_closure_is_still_tree_shaken() {
 fn hmr_stash_in_a_generic_function_names_the_unbounded_generic_cause() {
     assert_fails_browser_with(
         r#"
-        import std::dev;
+        import std::web::dev;
 
         fun relay<type T>(key: str, value: T) {
             dev::stash(key, value);
@@ -1479,9 +1479,9 @@ fn a_genuine_non_function_call_still_reports_its_type() {
     );
 }
 
-// --- Server-side rendering: the process-layer `std::ui` (A7, proposal/ssr.md) --
+// --- Server-side rendering: the process-layer `std::web::ui` (A7, proposal/ssr.md) --
 //
-// On `@process` (the default platform here) `std::ui` builds an HTML string tree
+// On `@process` (the default platform here) `std::web::ui` builds an HTML string tree
 // and `render` serializes it. Each pin is one binding form rendered to an exact
 // string: attributes in insertion order, escaping in text and attribute values,
 // void elements without a closing tag, read-once bindings, discarded handlers.
@@ -1490,7 +1490,7 @@ fn a_genuine_non_function_call_still_reports_its_type() {
 fn ssr_renders_static_view_with_ordered_attributes_and_nesting() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("div").class("card").attr("data-id", "7").child(view("p").text("hi"))));
@@ -1507,7 +1507,7 @@ fn ssr_svg_root_carries_its_namespace() {
     // `xmlns` itself replaces the seed in place.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("svg")
@@ -1530,7 +1530,7 @@ fn browser_view_routes_svg_tags_through_create_element_ns() {
     // demanded (the H8 per-instantiation coverage fix restored this shape).
     let js = compile_browser(
         r#"
-        import std::ui::{ view, View };
+        import std::web::ui::{ view, View };
         fun main() {
             let _icon = view("svg").child(view("path").attr("d", "M5 12h14"));
             let _link = view("div").child(view("a").attr("href", "/"));
@@ -1558,7 +1558,7 @@ fn ssr_bind_text_embeds_current_signal_value() {
     // Read-once: `bind_text` takes `signal.get()` at render time — no subscription.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1573,7 +1573,7 @@ fn ssr_bind_text_embeds_current_signal_value() {
 fn ssr_bind_class_and_bind_attr_read_once() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1591,8 +1591,8 @@ fn ssr_bind_class_and_bind_attr_read_once() {
 fn ssr_bind_styled_reads_the_current_style_once() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
-        import std::style::{ style, space, Style };
+        import std::web::ui::{ view, View, render };
+        import std::web::style::{ style, space, Style };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1615,8 +1615,8 @@ fn ssr_bind_styled_reads_the_current_style_once() {
 fn bind_styled_cannot_construct_its_style_at_runtime() {
     assert_fails_with(
         r#"
-        import std::ui::{ view, View, render };
-        import std::style::{ style, space, Style };
+        import std::web::ui::{ view, View, render };
+        import std::web::style::{ style, space, Style };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1633,7 +1633,7 @@ fn bind_styled_cannot_construct_its_style_at_runtime() {
 fn ssr_each_renders_current_list() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ View, each, render, view };
+        import std::web::ui::{ View, each, render, view };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1649,7 +1649,7 @@ fn ssr_each_renders_current_list() {
 fn ssr_each_over_empty_list_renders_no_rows() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ View, each, render, view };
+        import std::web::ui::{ View, each, render, view };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1666,7 +1666,7 @@ fn ssr_when_renders_the_taken_branch_only() {
     // Both branches: true renders the body, false renders nothing.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ View, render, view, when };
+        import std::web::ui::{ View, render, view, when };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1682,7 +1682,7 @@ fn ssr_when_renders_the_taken_branch_only() {
 fn ssr_swap_renders_the_current_value_branch() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ View, render, swap, view };
+        import std::web::ui::{ View, render, swap, view };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         [derive(PartialEq)]
@@ -1705,7 +1705,7 @@ fn ssr_show_toggles_the_hidden_attribute() {
     // makes, because the attribute alone loses to any app `display` (A60).
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1721,7 +1721,7 @@ fn ssr_show_toggles_the_hidden_attribute() {
 fn ssr_style_var_folds_into_the_style_attribute() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1736,7 +1736,7 @@ fn ssr_style_var_folds_into_the_style_attribute() {
 fn ssr_bind_value_renders_the_input_value() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1751,7 +1751,7 @@ fn ssr_bind_value_renders_the_input_value() {
 fn ssr_bind_draft_renders_the_local_value() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::reactive::{ Signal, SignalCell, draft, Draft };
         import std::option::Option::{ self, Some, None };
         import std::io::print;
@@ -1771,7 +1771,7 @@ fn ssr_bind_draft_renders_the_local_value() {
 fn ssr_children_appends_all_views() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("ul").children([view("li").text("x"), view("li").text("y")])));
@@ -1787,7 +1787,7 @@ fn ssr_escapes_text_nodes() {
     // NOT escaped in a text node (only attribute values need that).
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("p").text("<script>alert(\"&\")</script>")));
@@ -1803,7 +1803,7 @@ fn ssr_escapes_attribute_values() {
     // legal inside a quoted attribute and stay literal.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("a").attr("title", "a \"b\" & <c>")));
@@ -1817,7 +1817,7 @@ fn ssr_escapes_attribute_values() {
 fn ssr_void_elements_have_no_closing_tag() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("br")));
@@ -1835,7 +1835,7 @@ fn ssr_void_element_drops_children() {
     // simply not serialized), not a build error.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("br").child(view("span").text("nope"))));
@@ -1852,7 +1852,7 @@ fn ssr_event_handler_is_discarded_and_never_runs() {
     // markup alone — an extra line would appear if the closure ran.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("button").text("click me").on("click", || print("HANDLER RAN"))));
@@ -1867,7 +1867,7 @@ fn ssr_text_replaces_children() {
     // `text` mirrors the DOM's `textContent`: it replaces any children the node had.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("div").child(view("span").text("old")).text("new")));
@@ -1882,7 +1882,7 @@ fn ssr_nested_component_composition() {
     // A "component" is a function returning a `View`; composition is just calls.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun badge(label: str): View {
             view("span").class("badge").text(label)
@@ -1902,7 +1902,7 @@ fn ssr_child_interleaves_text_and_element_children() {
     // children, in written order, escaped like any text.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("p")
@@ -1921,7 +1921,7 @@ fn ssr_child_reads_a_signal_text_node_once() {
     // the value served, escaped as text.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1937,7 +1937,7 @@ fn ssr_child_accepts_a_list_of_views() {
     // The `List<View>` arm of `Slot`: one child position, every view, in order.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             let pair: List<View> = [view("i").text("a"), view("b").text("b")];
@@ -1954,7 +1954,7 @@ fn ssr_attr_reads_a_signal_value_once() {
     // `bind_attr`: read once here, tracked on the browser twin.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
@@ -1971,7 +1971,7 @@ fn ssr_text_replaces_text_node_children_too() {
     // them exactly as it clears element children.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("p").child("gone").text("kept")));
@@ -1989,7 +1989,7 @@ fn browser_text_children_ride_create_text_node() {
     let js = compile_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ mount_root, view };
+        import std::web::ui::{ mount_root, view };
         fun main() {
             mount_root("app", || {
                 let status = Signal::new("ready");
@@ -2013,7 +2013,7 @@ fn element_lowering_is_the_chain_byte_for_byte() {
     let element = r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             let name = Signal::new("world");
             let page = <p data-live(name) title("hi")>
@@ -2027,7 +2027,7 @@ fn element_lowering_is_the_chain_byte_for_byte() {
     let chain = r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             let name = Signal::new("world");
             let page = view("p").attr("data-live", name).attr("title", "hi")
@@ -2050,7 +2050,7 @@ fn element_event_arity_lowers_to_on_and_on_event_byte_for_byte() {
     // `.on`, a one-parameter literal is `.on_event` — byte-identical to the
     // chain spellings.
     let element = r#"
-        import std::ui::{ View, mount_root, view };
+        import std::web::ui::{ View, mount_root, view };
         fun main() {
             mount_root("app", || {
                 view("div")
@@ -2062,7 +2062,7 @@ fn element_event_arity_lowers_to_on_and_on_event_byte_for_byte() {
         main();
         "#;
     let chain = r#"
-        import std::ui::{ View, mount_root, view };
+        import std::web::ui::{ View, mount_root, view };
         fun main() {
             mount_root("app", || {
                 view("div")
@@ -2087,7 +2087,7 @@ fn ssr_element_renders_mixed_content() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             print(render(<p title("a & b")>
                 "Take "
@@ -2111,7 +2111,7 @@ fn hyphenated_attribute_names_parse_and_emit_verbatim() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             print(render(<div data-foo-bar("x") aria-label("y")>"z"</div>));
         }
@@ -2124,8 +2124,8 @@ fn hyphenated_attribute_names_parse_and_emit_verbatim() {
 fn an_element_needs_no_view_import_at_all() {
     // B270, replacing `an_element_without_view_in_scope_fails_at_the_element_
     // head`, which pinned the behaviour this reverses. The desugar's callee is
-    // a scope-independent reference to `std::ui::view` and the loader seeds
-    // `std::ui` off that reference, so an element compiles with nothing
+    // a scope-independent reference to `std::web::ui::view` and the loader seeds
+    // `std::web::ui` off that reference, so an element compiles with nothing
     // imported — the import steer survives only for a std that cannot supply
     // `view` at all.
     assert_compiles(
@@ -2147,7 +2147,7 @@ fn an_element_needs_no_view_import_at_all() {
 // ground that shadowing a name is a ruled feature.
 //
 // B270 (the owner's find, 2026-09-07) overturns the ground: the `css` block's
-// twin seed made the whole form UNUSABLE under `prelude = "std::web"`, where
+// twin seed made the whole form UNUSABLE under `prelude = "std::web::prelude"`, where
 // the ambient `style` is a module, and no message can rescue a form that
 // cannot be written. Both desugars now name their std item directly, so
 // neither is capturable and A35's message has nothing left to report — it is
@@ -2189,7 +2189,7 @@ fn b270_the_lowered_call_still_needs_its_module() {
     // author wrote, and a bare `view()` still means the file's own.
     assert_compiles(
         r#"
-        import std::ui;
+        import std::web::ui;
         fun view(): i32 { 1 }
         fun main() {
             let _x = ui::view("div");
@@ -2227,9 +2227,9 @@ fn a35_a_hand_written_view_call_keeps_the_ordinary_arity_message() {
 #[test]
 fn n69_an_unresolved_view_is_reported_without_an_import_steer() {
     // N69: `element_view_import_note` is deleted, not narrowed. It attached
-    // "element syntax lowers to std::ui::view; add `import std::ui::{ view,
+    // "element syntax lowers to std::web::ui::view; add `import std::web::ui::{ view,
     // View };`" to an unresolved `view` whose span was MARKUP, and after B270
-    // an element's callee is a scope-independent reference to `std::ui::view`
+    // an element's callee is a scope-independent reference to `std::web::ui::view`
     // — so the note could only fire for a std with no `ui::view` at all, where
     // the import it steers at would miss exactly the same way. A note that can
     // only fire where its own advice is false is worse than no note; the
@@ -2263,7 +2263,7 @@ fn b270_an_explicit_view_import_is_still_redundant_rather_than_wrong() {
     // before B270 — keep compiling, and the import keeps meaning what it said.
     assert_compiles(
         r#"
-        import std::ui::view;
+        import std::web::ui::view;
         fun main() {
             let _x = <div/>;
             let _y = view("span");
@@ -2280,7 +2280,7 @@ fn an_element_text_attribute_warns_toward_the_content_method() {
     // UNQUOTED attribute name).
     let messages = warnings(
         r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun main() {
             let _x = <div text("hi") />;
         }
@@ -2298,7 +2298,7 @@ fn an_element_text_attribute_warns_toward_the_content_method() {
 fn a_hand_written_text_attr_does_not_warn() {
     let messages = warnings(
         r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun main() {
             let _x = view("div").attr("text", "hi");
         }
@@ -2317,7 +2317,7 @@ fn a_macro_generated_element_desugars() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             let banner = macro {
                 import macro_std::source;
@@ -2345,7 +2345,7 @@ fn a46_a_fragment_lowers_to_a_list_literal_byte_for_byte() {
     // the list-literal program emit the same JS, byte for byte.
     let fragment = r#"
         import std::io::print;
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             let group: List<View> = <>
                 <i>"a"</i>
@@ -2356,7 +2356,7 @@ fn a46_a_fragment_lowers_to_a_list_literal_byte_for_byte() {
         "#;
     let list = r#"
         import std::io::print;
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             let group: List<View> = [view("i").child("a"), view("b").child("b")];
             print(render(view("p").child(group)));
@@ -2374,7 +2374,7 @@ fn a46_an_empty_fragment_is_an_empty_list() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             let nothing: List<View> = <></>;
             print(render(view("p").child(nothing)));
@@ -2392,7 +2392,7 @@ fn a46_a_fragment_fills_a_child_position_bare_and_in_a_hole() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun pair(): List<View> {
             <><i>"a"</i><b>"b"</b></>
         }
@@ -2414,7 +2414,7 @@ fn a46_a_fragment_does_not_flatten_into_a_fragment() {
     // would have to concatenate. Documented as the limit it is.
     assert_fails_with(
         r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun main() {
             let _group: List<View> = <><i>"a"</i><>{view("b").child("b")}</></>;
         }
@@ -2431,7 +2431,7 @@ fn a46_a_fragment_is_a_list_and_not_a_view() {
     // special-cased message, and the span is the whole fragment.
     assert_fails_with(
         r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun toolbar(): View {
             <><i>"a"</i><b>"b"</b></>
         }
@@ -2446,7 +2446,7 @@ fn a46_a_fragment_close_must_be_the_nameless_one() {
     // inside a fragment is the mismatch, reported against `</>`.
     assert_fails_with(
         r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun main() {
             let _x = <><i>"a"</i></div>;
         }
@@ -2461,7 +2461,7 @@ fn a46_a_named_close_still_names_its_own_tag_inside_a_fragment() {
     // NESTED element's own close-tag mismatch.
     assert_fails_with(
         r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun main() {
             let _x = <><div>"x"</span></>;
         }
@@ -2479,7 +2479,7 @@ fn a46_a_reactive_fragment_is_the_source_list_arm() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, mount_root, view };
+        import std::web::ui::{ View, mount_root, view };
         fun main() {
             let mark: SignalCell<i32> = Signal::new(1);
             let _root = mount_root("app", || {
@@ -2502,7 +2502,7 @@ fn a46_the_ssr_twin_renders_a_fragment_as_its_run() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             print(render(<ul>{rows()}</ul>));
         }
@@ -2518,7 +2518,7 @@ fn a46_the_ssr_twin_renders_a_fragment_as_its_run() {
 fn a_mismatched_closing_tag_names_the_expected_close() {
     assert_fails_with(
         r#"
-        import std::ui::{ View, view };
+        import std::web::ui::{ View, view };
         fun main() {
             let _x = <div>"x"</span>;
         }
@@ -2580,7 +2580,7 @@ fn each_rows_dispatch_slot_children() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, each, render, view };
+        import std::web::ui::{ View, each, render, view };
         fun main() {
             let items: SignalCell<List<str>> = Signal::new(["alpha", "beta"]);
             print(render(view("ul").child(each(items, |t| t, |t| view("li").child(t)))));
@@ -2629,7 +2629,7 @@ fn a_let_bound_closure_with_an_untypable_parameter_reports_honestly() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::ui::{ View, render, view };
+        import std::web::ui::{ View, render, view };
         fun main() {
             let wrap = |x| view("p").child(x);
             print(render(wrap("later")));
@@ -2719,7 +2719,7 @@ fn browser_static_child_outside_a_boundary_compiles() {
     // again. The Signal arms keep the fence (the guards below).
     compile_browser(
         r#"
-        import std::ui::{ mount, view, View };
+        import std::web::ui::{ mount, view, View };
         fun main() {
             let content = view("div")
                 .attr("id", "card")
@@ -2740,7 +2740,7 @@ fn a_signal_child_outside_a_boundary_stays_fenced() {
     let errors = compile_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ mount, view, View };
+        import std::web::ui::{ mount, view, View };
         fun main() {
             mount("app", view("p").child(Signal::new("live")));
         }
@@ -2759,7 +2759,7 @@ fn a_signal_attr_outside_a_boundary_stays_fenced() {
     let errors = compile_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ mount, view, View };
+        import std::web::ui::{ mount, view, View };
         fun main() {
             mount("app", view("p").attr("data-live", Signal::new("v")));
         }
@@ -2782,7 +2782,7 @@ fn a_generic_slot_forwarder_with_a_static_slot_compiles() {
     // S1-era conservative pin, proven red against the union fallback).
     compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         fun wrap<T: Slot>(content: T): View {
             view("p").child(content)
         }
@@ -2802,7 +2802,7 @@ fn a_signal_through_a_generic_forwarder_stays_fenced() {
     // uncovered top-level call — fenced.
     let errors = compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T): View {
             view("p").child(content)
@@ -2828,7 +2828,7 @@ fn mixed_forwarder_call_sites_fence_by_their_own_instantiation() {
     // itself would conflate the two paths and reject this program.
     compile_browser(
         r#"
-        import std::ui::{ Slot, mount, mount_root, view, View };
+        import std::web::ui::{ Slot, mount, mount_root, view, View };
         import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T): View {
             view("p").child(content)
@@ -2849,7 +2849,7 @@ fn a_two_level_forwarder_resolves_through_both_levels() {
     // resolves at `outer`'s call sites.
     compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         fun wrap<T: Slot>(content: T): View {
             view("p").child(content)
         }
@@ -2869,7 +2869,7 @@ fn a_two_level_forwarder_resolves_through_both_levels() {
 fn a_two_level_forwarder_keeps_the_fence_for_a_signal() {
     let errors = compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T): View {
             view("p").child(content)
@@ -2897,7 +2897,7 @@ fn a_self_recursive_forwarder_resolves_exactly() {
     // through the external call, which resolves statically.
     compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         fun wrap<T: Slot>(content: T, depth: i32): View {
             if depth > 0 {
                 wrap(content, depth - 1)
@@ -2918,7 +2918,7 @@ fn a_self_recursive_forwarder_resolves_exactly() {
 fn a_self_recursive_forwarder_keeps_the_fence_for_a_signal() {
     let errors = compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T, depth: i32): View {
             if depth > 0 {
@@ -2947,7 +2947,7 @@ fn explicit_type_arguments_resolve_the_forwarder() {
     // shape records into, explicit arguments included.
     compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         fun wrap<T: Slot>(content: T): View {
             view("p").child(content)
         }
@@ -3066,7 +3066,7 @@ fn a_signal_through_a_closure_owned_dispatch_site_stays_fenced() {
     // union edges fenced this shape.
     let errors = compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T): View {
             let holder = view("p");
@@ -3094,7 +3094,7 @@ fn a_static_slot_through_a_closure_owned_dispatch_site_compiles() {
     // static arm (proven red against S1's union fallback).
     compile_browser(
         r#"
-        import std::ui::{ Slot, mount, view, View };
+        import std::web::ui::{ Slot, mount, view, View };
         fun wrap<T: Slot>(content: T): View {
             let holder = view("p");
             let attach = || content.place(holder);
@@ -3170,7 +3170,7 @@ fn child_of_an_unimplemented_type_names_the_slot_trait() {
     // points at the bound, not a generic mismatch.
     assert_fails_with(
         r#"
-        import std::ui::{ view, View };
+        import std::web::ui::{ view, View };
         fun main() {
             let _x = view("p").child(42);
         }
@@ -3183,7 +3183,7 @@ fn child_of_an_unimplemented_type_names_the_slot_trait() {
 fn attr_of_an_unimplemented_type_names_the_attr_value_trait() {
     assert_fails_with(
         r#"
-        import std::ui::{ view, View };
+        import std::web::ui::{ view, View };
         fun main() {
             let _x = view("p").attr("n", true);
         }
@@ -3196,10 +3196,10 @@ fn attr_of_an_unimplemented_type_names_the_attr_value_trait() {
 fn ssr_std_dom_import_fails_on_a_process_build() {
     // The boundary §2 relies on: a component reaching for raw DOM cannot SSR, and
     // the existing cross-platform gate says so at the `import` with the standard
-    // error — a process build never resolves `std::dom`.
+    // error — a process build never resolves `std::web::dom`.
     assert_fails_with(
         r#"
-        import std::dom::{ create_element };
+        import std::web::dom::{ create_element };
         import std::io::print;
         fun main() {
             let element = create_element("div");
@@ -3213,11 +3213,11 @@ fn ssr_std_dom_import_fails_on_a_process_build() {
 #[test]
 fn ssr_on_event_is_accepted_and_discarded() {
     // `on_event` mirrors `on`: accepted and dropped. Its event type is generic
-    // (the server layer cannot name the browser-only `std::dom::Event`), so a
+    // (the server layer cannot name the browser-only `std::web::dom::Event`), so a
     // handler that ignores the event renders the element and never runs.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::web::ui::{ view, View, render };
         import std::io::print;
         fun main() {
             print(render(view("button").text("x").on_event("click", |_event| print("HANDLER RAN"))));
@@ -3231,13 +3231,13 @@ fn ssr_on_event_is_accepted_and_discarded() {
 fn ssr_process_build_can_import_a_browser_module_that_binds_on_event() {
     // The platform model lets a process program IMPORT a browser module as long
     // as it never reaches the browser-requiring functions (analysis stays
-    // admissible). `std::router`'s `link` binds `on_event` on a `View`; the
+    // admissible). `std::web::router`'s `link` binds `on_event` on a `View`; the
     // process `ui` must therefore carry `on_event`, or loading `router` to color
     // the program would fail with "View has no method 'on_event'". `navigate` is
     // unreached from `main`, so the node build itself stays clean.
     assert_compiles(
         r#"
-        import std::router::navigate;
+        import std::web::router::navigate;
         import std::io::print;
         fun unused() {
             navigate("/home");
@@ -3263,7 +3263,7 @@ fn ssr_example_app_renders_the_served_markup() {
     // then replaces (proposal/ssr.md §1, §3).
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ View, each, render, view, when };
+        import std::web::ui::{ View, each, render, view, when };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun app(): View {
@@ -3292,7 +3292,7 @@ fn browser_mount_surface_compiles_after_the_replace_change() {
     // clear is pinned under the DOM stub (see the module note above).
     assert_compiles_browser(
         r#"
-        import std::ui::{ view, View, mount, mount_root };
+        import std::web::ui::{ view, View, mount, mount_root };
         fun main() {
             mount("aside", view("div").text("live"));
             let _root = mount_root("app", || view("main").text("app"));
@@ -3641,10 +3641,15 @@ fn entry_functions_with_a_requirement(entry: &Path) -> (usize, usize) {
     );
     let program = program.expect("the module analyzes");
     let requirements = vilan_core::platform_color::requirements(&program);
+    // A function with a BODY: a trait's requirement (`fun place(own self,
+    // parent: View);` in `ui.vl`'s `Slot`) runs nothing and requires nothing.
     let entry_functions: Vec<_> = program
         .functions
-        .keys()
-        .filter(|id| program.source_of(**id) == Some(vilan_core::analyzer::SourceId(0)))
+        .iter()
+        .filter(|(id, function)| {
+            function.has_body && program.source_of(**id) == Some(vilan_core::analyzer::SourceId(0))
+        })
+        .map(|(id, _)| id)
         .collect();
     let described = entry_functions
         .iter()
@@ -3688,7 +3693,7 @@ fn a_library_module_reached_through_a_symlink_is_still_library_territory() {
     let link = scratch.join("layer");
     std::os::unix::fs::symlink(&real, &link).expect("symlink the browser layer");
 
-    let through_link = link.join("dev.vl");
+    let through_link = link.join("web").join("ui.vl");
     assert!(
         !through_link.starts_with(&browser) && !through_link.starts_with(&real),
         "the pin needs a spelling that shares no prefix with the recorded root"
@@ -3703,8 +3708,11 @@ fn a_library_module_reached_through_a_symlink_is_still_library_territory() {
     );
 
     // The control: the same file by its ordinary spelling behaves identically,
-    // so the assertion above is about the SPELLING and not about `dev.vl`.
-    let (direct_described, direct_total) = entry_functions_with_a_requirement(&real.join("dev.vl"));
+    // so the assertion above is about the SPELLING and not about `web/ui.vl`.
+    // (A154 + F28: the module is the browser `ui` twin, which stays layered —
+    // `dev.vl`, the module this read, left the layer for a file-level fence.)
+    let (direct_described, direct_total) =
+        entry_functions_with_a_requirement(&real.join("web").join("ui.vl"));
     assert_eq!((direct_described, direct_total), (described, total));
 
     let _ = std::fs::remove_dir_all(&scratch);
@@ -5966,9 +5974,9 @@ fn an_entry_global_does_not_satisfy_a_std_import_path() {
 // `style::style()` and `style::Display::Flex` resolved and ran: the type
 // grammar's nominal form was a bare `IDENT`, so the `::` never belonged to the
 // type and whatever the position demanded next found it instead. That made the
-// `std::web` prelude — which carries `style` and `ui` as MODULE names — able to
-// reach every VALUE in `std::style` and no TYPE in it, and both web templates
-// carried a forced `import std::style::Style;` to work around it.
+// `std::web::prelude` prelude — which carries `style` and `ui` as MODULE names — able to
+// reach every VALUE in `std::web::style` and no TYPE in it, and both web templates
+// carried a forced `import std::web::style::Style;` to work around it.
 //
 // The positions below are the whole list a type can be written in. Each one is
 // its own pin, per file policy: a class of positions closed on one
@@ -6691,7 +6699,7 @@ fn b317_a_types_static_imports_under_its_bare_name() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::Length::rem;
+        import std::web::style::Length::rem;
         fun main() {
             print(rem(2f).text);
         }
@@ -6708,7 +6716,7 @@ fn b317_a_brace_set_of_statics_imports_and_aliases() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::Length::{ px, auto as automatic };
+        import std::web::style::Length::{ px, auto as automatic };
         fun main() {
             print(px(4f).text);
             print(automatic().text);
@@ -6726,7 +6734,7 @@ fn b317_use_binds_a_static_out_of_a_visible_type() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::Length;
+        import std::web::style::Length;
         use Length::em;
         use Length::{ pct as percent };
         fun main() {
@@ -6745,7 +6753,7 @@ fn b317_a_self_method_is_refused_by_name_under_the_import_form() {
     assert_fails_once_with(
         r#"
         import std::io::print;
-        import std::style::Style::text_align;
+        import std::web::style::Style::text_align;
         fun main() {
             print("x");
         }
@@ -6760,7 +6768,7 @@ fn b317_a_self_method_is_refused_by_name_under_the_use_form() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::style::Style;
+        import std::web::style::Style;
         use Style::text_align;
         fun main() {
             print("x");
@@ -6816,7 +6824,7 @@ fn b317_a_missing_static_still_says_it_cannot_be_found() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::style::Length::furlongs;
+        import std::web::style::Length::furlongs;
         fun main() {
             print("x");
         }
@@ -7128,24 +7136,109 @@ fn n113_the_helper_the_getter_and_an_unknown_global_still_compile() {
 
 // --- B472: the import steer indexes std's deprecated ALIAS re-exports -------
 
-/// `Map` and `Set` are `export [deprecated(..)] import … as Map;` in
+/// `Map` and `Set` were `export [deprecated(..)] import … as Map;` in
 /// `std::map`/`std::set` — re-exports, which declare nothing, so the steer's
 /// index held no entry and an unimported `Map` got no hint while an unimported
-/// `HashMap` got the right one. A deprecated alias now steers to the name it
-/// stands for, with the import that name takes.
+/// `HashMap` got the right one. B472 made a deprecated alias steer to the name
+/// it stands for; R-e (Order 46) removed the two aliases, and the unimported old
+/// name now carries R-e's renamed-name steer instead.
 #[test]
 fn b472_an_unimported_deprecated_alias_steers_to_the_name_it_stands_for() {
     assert_fails_with(
         "fun main() {\n    let counts: Map<str, i32> = Map::new();\n    print(counts.len());\n}\n",
-        "did you mean `HashMap` (`import std::hash_map::HashMap;`)? `Map` is its deprecated alias",
+        "`Map` was renamed `HashMap` — `import std::hash_map::HashMap;`",
     );
     assert_fails_with(
         "fun main() {\n    let seen: Set<i32> = Set::new();\n    print(seen.len());\n}\n",
-        "did you mean `HashSet` (`import std::hash_set::HashSet;`)? `Set` is its deprecated alias",
+        "`Set` was renamed `HashSet` — `import std::hash_set::HashSet;`",
     );
     // The control: the new name's own steer is the ordinary one.
     assert_fails_with(
         "fun main() {\n    let counts: HashMap<str, i32> = HashMap::new();\n    print(counts.len());\n}\n",
         "import it first (`import std::hash_map::HashMap;`)",
+    );
+}
+
+// --- B515: a trait method needs its trait in scope ---------------------------
+//
+// An `impl` registers when its file LOADS, and loading is program-wide, so a
+// trait's methods resolved in a file that never imported the trait once any
+// loaded module did: `import std::markdown;` made `42.to_string()` compile with
+// no `Display` in sight. R-g door (b), ruled by the count (55 sites across kolt,
+// the corpus and the docs): a WARNING for one release, refused in v0.45.0.
+
+/// B515: the call warns at the member's name, naming the trait and the import
+/// that brings it — a `Display` method reached through `std::markdown`'s
+/// import, and a `PartialOrd` one through `std::time`'s.
+#[test]
+fn b515_a_trait_method_resolved_through_another_modules_import_warns() {
+    assert_warns_spanning(
+        r#"
+        import std::markdown;
+
+        fun main() {
+            let shown = 42.to_string();
+        }
+        "#,
+        "to_string",
+        "`to_string` is `Display`'s, and this file does not import `Display`: the call resolves \
+         only because another loaded module does. Import it (`import std::display::Display;`)",
+    );
+    assert_warns_spanning(
+        r#"
+        import std::time::Duration;
+
+        fun main() {
+            let longer = Duration::hours(3).gt(Duration::minutes(179));
+        }
+        "#,
+        "gt",
+        "`gt` is `PartialOrd`'s, and this file does not import `PartialOrd`",
+    );
+}
+
+/// B515: a trait the file DOES reach is silent — imported by name, a call
+/// through a bound (the bound wrote the trait), the file's own trait and impl,
+/// a block a derive generated in the file, and a std trait the call names by
+/// its qualified spelling.
+#[test]
+fn b515_a_trait_in_scope_does_not_warn() {
+    let warnings = warning_diagnostics(
+        r#"
+        import std::markdown;
+        import std::display::Display;
+        import std::debug::Debug;
+
+        trait Mine {
+            fun mine(self): i32 {
+                1
+            }
+        }
+
+        impl i32 with Mine {}
+
+        [derive(Debug)]
+        struct Point {
+            x: i32,
+        }
+
+        fun shown<T: Display>(value: T): str {
+            value.to_string()
+        }
+
+        fun main() {
+            let a = 42.to_string();
+            let b = shown(7);
+            let c = 5.mine();
+            let d = Point { x = 1 }.debug();
+            let e = Display::to_string(8);
+        }
+        "#,
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|(message, _)| !message.contains("this file does not import")),
+        "{warnings:#?}"
     );
 }

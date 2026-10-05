@@ -81,6 +81,19 @@ large_enum_variant = "allow"
 # build-machine paths to hide — release CI also remaps, and checks).
 [profile.release]
 strip = true
+# M116 (ruled 2026-10-04): ONE codegen unit for the measured and shipped
+# profile. With rustc's default of 16 units, a crate's functions are split
+# between units by its module layout, and LLVM inlines only within a unit
+# (outside `#[inline]`), so adding unrelated code to one file can move a hot
+# function to another unit and change what is inlined into it: ui-46 measured
+# kolt's `vilan check` +564M instructions (~2%) from items added to one file.
+# One unit makes the count a property of the code that runs, which is what the
+# perf gates' ceilings (`perf/budgets.toml`) and the seal's comparison assume.
+# Measured at the change: kolt's check 25,766M -> 25,291M instructions
+# (-1.8%), a clean release build of vilan-cli + vilan-lsp 63 s -> 144 s.
+# `profiling` inherits it; `wasm-release` sets it too; release.yml builds
+# `--release` with no codegen override.
+codegen-units = 1
 
 # Release performance with debug symbols, for profilers (perf, callgrind):
 # `cargo build --profile profiling`.

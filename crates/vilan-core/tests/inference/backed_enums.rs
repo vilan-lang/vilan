@@ -1622,7 +1622,7 @@ fn b76_a_json_kind_outside_the_set_compares_false_and_traps_in_a_match() {
 //
 // The payoff the survey measured: eleven of the fifteen payload-free enums in
 // the whole standard library existed only to be converted to a host string,
-// all in `std/src/style.vl`, 52 `match` arms that delete outright. The strings
+// all in `std/src/web/style.vl`, 52 `match` arms that delete outright. The strings
 // moved from the wrappers to the declarations, so the TYPE now says at its
 // declaration what was only discoverable by reading a function 300 lines away.
 //
@@ -1634,7 +1634,7 @@ fn b76_style_keyword_enums_carry_their_css_keywords() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ AlignItems, Display, JustifyContent, UserSelect };
+        import std::web::style::{ AlignItems, Display, JustifyContent, UserSelect };
         fun main() {
             // The five §2.1 names no case convention produces.
             print(AlignItems::Start.value());
@@ -1658,7 +1658,7 @@ fn b76_style_wrappers_still_write_the_same_declaration() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ AlignItems, Display, RadialExtent, Style, style };
+        import std::web::style::{ AlignItems, Display, RadialExtent, Style, style };
         fun main() {
             let card = const style().display(Display::InlineBlock).align_items(AlignItems::End);
             print(card.class_list());

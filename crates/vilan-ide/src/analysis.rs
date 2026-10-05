@@ -35,6 +35,13 @@ use crate::line_index::LineIndex;
 pub struct Analysis<'a, 'src> {
     /// The analyzed program.
     pub program: &'a Program<'src>,
+    /// The source in `program` this document IS (M104): `SourceId(0)` when the
+    /// document was analyzed as its own entry — the playground always, and the
+    /// language server for an entry or a module no entry reaches — and the
+    /// module's own source when the server serves it from its entry's world.
+    /// `analyzed` is THIS source's text, and every "the document's own"
+    /// question below asks about it.
+    pub focus: SourceId,
     /// The text `program` was analyzed from — the coordinate space every
     /// program span and offset lives in.
     pub analyzed: &'a LineIndex,
@@ -88,10 +95,14 @@ pub struct Analysis<'a, 'src> {
     pub scope_extents: OnceCell<Vec<(usize, usize, Id)>>,
 }
 
-/// `(start, end, id)` for every entry-file entity with a real span, for
-/// [`entity_at`]'s innermost-containing lookup. Computed once per analysis by
-/// both front-ends through this one function, so neither can drift.
-pub fn entity_spans(program: &Program) -> Vec<(usize, usize, Id)> {
+/// `(start, end, id)` for every entity of the `focus` source with a real span,
+/// for [`entity_at`]'s innermost-containing lookup. Computed once per analysis
+/// by both front-ends through this one function, so neither can drift.
+///
+/// `focus` is the source the document IS (M104): `SourceId(0)` when the
+/// document was analyzed as its own entry, and the module's own source when
+/// it is served from its entry's world.
+pub fn entity_spans(program: &Program, focus: SourceId) -> Vec<(usize, usize, Id)> {
     // M27: walked by the ENTRY'S ID RANGE, not by scanning `span_map`.
     //
     // The map is whole-program, and this table is the entry file's alone: on
@@ -107,8 +118,8 @@ pub fn entity_spans(program: &Program) -> Vec<(usize, usize, Id)> {
     // `entity_at` breaks a tie on span width by taking the first, and "the
     // first" now means something.
     let mut entity_spans = Vec::new();
-    let entry_ids = program.id_ranges_of(SourceId(0));
-    for id in entry_ids.into_iter().flatten().map(Id) {
+    let focus_ids = program.id_ranges_of(focus);
+    for id in focus_ids.into_iter().flatten().map(Id) {
         let Some(span) = program.span_map.get(&id) else {
             continue;
         };
@@ -477,7 +488,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// this is the same read `doc_comment_of` performs.
     pub fn doc_comment_at(&self, source: SourceId, name_start: usize) -> Option<String> {
         let owned;
-        let text: &str = if source == SourceId(0) {
+        let text: &str = if source == self.focus {
             self.analyzed.text()
         } else {
             owned = self.source_text(source)?;

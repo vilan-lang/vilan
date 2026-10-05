@@ -225,7 +225,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
             let Some(parameter_record) = program.parameters.get(parameter) else {
                 continue;
             };
-            let Some(Type::Closure(_, return_type, _)) = program
+            let Some(Type::Closure(_, return_type, _, _)) = program
                 .type_id_to_type_map
                 .get(&parameter_record.type_id)
                 .cloned()
@@ -1123,7 +1123,7 @@ fn trait_method_candidates(program: &Program, trait_id: Id, member: &str) -> Vec
 /// A dispatched `receiver.name()` can only ever select a member with a
 /// receiver, so a same-named STATIC is not a candidate for it however sound the
 /// rest of the over-approximation is. Leaving statics in is not merely
-/// imprecise, it is wrong in a way users feel: `std::promise::Promise::all` is
+/// imprecise, it is wrong in a way users feel: `std::js::promise::Promise::all` is
 /// an `async external` static, `promise` is a force-loaded core module, and so
 /// every `xs.iter().all(p)` — an `OnType` re-dispatch, which cannot pin its
 /// trait and falls back to this scan — used to color its whole caller async,
@@ -1634,7 +1634,7 @@ fn closure_return_is_value(program: &Program, parameter_id: Id) -> bool {
     let Some(parameter) = program.parameters.get(&parameter_id) else {
         return false;
     };
-    let Some(Type::Closure(_, return_type, _)) =
+    let Some(Type::Closure(_, return_type, _, _)) =
         program.type_id_to_type_map.get(&parameter.type_id).cloned()
     else {
         return false;
@@ -1664,7 +1664,8 @@ struct FieldStore {
 /// about — i.e. NOT void (A.3: void positions keep spawn semantics) and not
 /// still unresolved.
 fn plain_closure_position(program: &Program, type_id: TypeId) -> bool {
-    let Some(Type::Closure(_, return_type, _)) = program.type_id_to_type_map.get(&type_id) else {
+    let Some(Type::Closure(_, return_type, _, _)) = program.type_id_to_type_map.get(&type_id)
+    else {
         return false;
     };
     !matches!(

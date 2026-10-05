@@ -180,6 +180,19 @@ fn compile(source: &str, platform: Platform) -> Result<(), Vec<String>> {
                 );
                 match program {
                     Some(program) if errors.is_empty() => {
+                        // B535: an example that calls a trait's method without
+                        // the trait in scope compiles today only through
+                        // another module's import, and B515 refuses it from
+                        // v0.45.0 — so the book never leans on the hole.
+                        let unimported: Vec<String> = program
+                            .warnings
+                            .iter()
+                            .filter(|warning| warning.msg.contains("and this file does not import"))
+                            .map(|warning| warning.msg.clone())
+                            .collect();
+                        if !unimported.is_empty() {
+                            return Err(unimported);
+                        }
                         transform(&program, &BuildOptions::default())
                             .map(|_| ())
                             .map_err(|error| vec![error.msg])
@@ -614,17 +627,17 @@ const RETIRED_STD_NAMES: &[&str] = &[
 /// never breaks, so a run anchored on one survives a reflow.
 const RETIREMENT_NOTES: &[(&str, &str)] = &[
     (
-        "browser/ui.vl",
+        "browser/web/ui.vl",
         "one-line sugar over them — `when`, `swap`, `swap_split`, `bind_each`,",
     ),
     (
-        "browser/ui.vl",
+        "browser/web/ui.vl",
         "`bind_each_values`, `bind_each_by` — are retired",
     ),
-    ("browser/ui.vl", "Named `each` and not `bind_each`"),
-    ("browser/ui.vl", "`{bind_each(..)}` read as a setter"),
+    ("browser/web/ui.vl", "Named `each` and not `bind_each`"),
+    ("browser/web/ui.vl", "`{bind_each(..)}` read as a setter"),
     (
-        "style.vl",
+        "web/style.vl",
         "all and pushed authors onto the deleted `child_relation` as a",
     ),
 ];
