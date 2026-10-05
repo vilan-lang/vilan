@@ -44146,9 +44146,10 @@ impl<'src> Analyzer<'src> {
     /// them — the specificity order picks, as it picks a member's body (§13.4(a)
     /// tier 3).
     ///
-    /// B533: unranked survivors that DISAGREE answer nothing. `Square: Shape<i32>
-    /// + Shape<str>` read for `S: Shape<T>` is no evidence for `T` at all — the
-    /// first in declaration order used to answer, overriding the call's own
+    /// B533: unranked survivors that DISAGREE answer nothing. A `Square` that
+    /// is `Shape<i32>` and `Shape<str>`, read for `S: Shape<T>`, is no evidence
+    /// for `T` at all — the first in declaration order used to answer,
+    /// overriding the call's own
     /// expectation (`let s: str = measure(square)` was refused "Expected str,
     /// but got i32") and silently choosing `i32` where nothing decided. The
     /// expectation, or a written type argument, decides; a call nothing decides
