@@ -53,7 +53,7 @@ function reverse(self) {
 	let index = self.length;
 	while (index > 0) {
 		index = index - 1;
-		result.push(__clone(__at(self, index, "std/src/list.vl:83:16")));
+		result.push(__clone(__at(self, index, "std/src/list.vl:98:16")));
 	}
 	return result;
 }

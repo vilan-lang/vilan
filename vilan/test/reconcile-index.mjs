@@ -170,8 +170,8 @@ function reconcile(old_keys, old_items, items, key_of, same) {
 	let build = held;
 	while (build > 0) {
 		build = build - 1;
-		const canonical = hash(__at(old_keys, build, "std/src/reactive.vl:3683:19"));
-		__at_put(next_same, build, __map_get(first, canonical), "std/src/reactive.vl:3684:3");
+		const canonical = hash(__at(old_keys, build, "std/src/reactive.vl:3677:19"));
+		__at_put(next_same, build, __map_get(first, canonical), "std/src/reactive.vl:3678:3");
 		first.set(canonical, build);
 	}
 	let steps = [  ];
@@ -185,8 +185,8 @@ function reconcile(old_keys, old_items, items, key_of, same) {
 			let $b = null;
 			if ($a[0] === 0) {
 				const at = $a[1];
-				if (__at(claimed, at, "std/src/reactive.vl:3700:9")) {
-					head = __at(next_same, at, "std/src/reactive.vl:3701:14");
+				if (__at(claimed, at, "std/src/reactive.vl:3694:9")) {
+					head = __at(next_same, at, "std/src/reactive.vl:3695:14");
 				} else {
 					advancing = false;
 				}
@@ -213,11 +213,11 @@ function reconcile(old_keys, old_items, items, key_of, same) {
 			let $f = null;
 			if ($e[0] === 0) {
 				const at3 = $e[1];
-				if (!(__at(claimed, at3, "std/src/reactive.vl:3719:10")) && __at(old_keys, at3, "std/src/reactive.vl:3719:25") === item_key) {
+				if (!(__at(claimed, at3, "std/src/reactive.vl:3713:10")) && __at(old_keys, at3, "std/src/reactive.vl:3713:25") === item_key) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
-					walk = __at(next_same, at3, "std/src/reactive.vl:3726:14");
+					walk = __at(next_same, at3, "std/src/reactive.vl:3720:14");
 				}
 				$f = undefined;
 			} else {
@@ -228,9 +228,9 @@ function reconcile(old_keys, old_items, items, key_of, same) {
 		let step = [ 2 ];
 		const $g = found;
 		if ($g[0] === 0) {
-			__at_put(claimed, $g[1], true, "std/src/reactive.vl:3734:4");
+			__at_put(claimed, $g[1], true, "std/src/reactive.vl:3728:4");
 			let $h = null;
-			if (same(__at(old_items, $g[1], "std/src/reactive.vl:3735:19"), item)) {
+			if (same(__at(old_items, $g[1], "std/src/reactive.vl:3729:19"), item)) {
 				$h = [ 0, $g[1] ];
 			} else {
 				$h = [ 1, $g[1] ];
@@ -242,7 +242,7 @@ function reconcile(old_keys, old_items, items, key_of, same) {
 	let removed = [  ];
 	let index = 0;
 	while (index < held) {
-		if (!(__at(claimed, index, "std/src/reactive.vl:3742:7"))) {
+		if (!(__at(claimed, index, "std/src/reactive.vl:3736:7"))) {
 			removed.push(index);
 		}
 		index = index + 1;
@@ -299,8 +299,8 @@ function reconcile2(old_keys, old_items, items, key_of, same) {
 	let build = held;
 	while (build > 0) {
 		build = build - 1;
-		const canonical = hash2(__at(old_keys, build, "std/src/reactive.vl:3683:19"));
-		__at_put(next_same, build, __map_get(first, canonical), "std/src/reactive.vl:3684:3");
+		const canonical = hash2(__at(old_keys, build, "std/src/reactive.vl:3677:19"));
+		__at_put(next_same, build, __map_get(first, canonical), "std/src/reactive.vl:3678:3");
 		first.set(canonical, build);
 	}
 	let steps = [  ];
@@ -314,8 +314,8 @@ function reconcile2(old_keys, old_items, items, key_of, same) {
 			let $o = null;
 			if ($n[0] === 0) {
 				const at = $n[1];
-				if (__at(claimed, at, "std/src/reactive.vl:3700:9")) {
-					head = __at(next_same, at, "std/src/reactive.vl:3701:14");
+				if (__at(claimed, at, "std/src/reactive.vl:3694:9")) {
+					head = __at(next_same, at, "std/src/reactive.vl:3695:14");
 				} else {
 					advancing = false;
 				}
@@ -342,11 +342,11 @@ function reconcile2(old_keys, old_items, items, key_of, same) {
 			let $s = null;
 			if ($r[0] === 0) {
 				const at3 = $r[1];
-				if (!(__at(claimed, at3, "std/src/reactive.vl:3719:10")) && eq(__at(old_keys, at3, "std/src/reactive.vl:3719:25"), item_key)) {
+				if (!(__at(claimed, at3, "std/src/reactive.vl:3713:10")) && eq(__at(old_keys, at3, "std/src/reactive.vl:3713:25"), item_key)) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
-					walk = __at(next_same, at3, "std/src/reactive.vl:3726:14");
+					walk = __at(next_same, at3, "std/src/reactive.vl:3720:14");
 				}
 				$s = undefined;
 			} else {
@@ -357,9 +357,9 @@ function reconcile2(old_keys, old_items, items, key_of, same) {
 		let step = [ 2 ];
 		const $t = found;
 		if ($t[0] === 0) {
-			__at_put(claimed, $t[1], true, "std/src/reactive.vl:3734:4");
+			__at_put(claimed, $t[1], true, "std/src/reactive.vl:3728:4");
 			let $u = null;
-			if (same(__at(old_items, $t[1], "std/src/reactive.vl:3735:19"), item)) {
+			if (same(__at(old_items, $t[1], "std/src/reactive.vl:3729:19"), item)) {
 				$u = [ 0, $t[1] ];
 			} else {
 				$u = [ 1, $t[1] ];
@@ -371,7 +371,7 @@ function reconcile2(old_keys, old_items, items, key_of, same) {
 	let removed = [  ];
 	let index = 0;
 	while (index < held) {
-		if (!(__at(claimed, index, "std/src/reactive.vl:3742:7"))) {
+		if (!(__at(claimed, index, "std/src/reactive.vl:3736:7"))) {
 			removed.push(index);
 		}
 		index = index + 1;
@@ -428,8 +428,8 @@ function reconcile3(old_keys, old_items, items, key_of, same) {
 	let build = held;
 	while (build > 0) {
 		build = build - 1;
-		const canonical = hash3(__at(old_keys, build, "std/src/reactive.vl:3683:19"));
-		__at_put(next_same, build, __map_get(first, canonical), "std/src/reactive.vl:3684:3");
+		const canonical = hash3(__at(old_keys, build, "std/src/reactive.vl:3677:19"));
+		__at_put(next_same, build, __map_get(first, canonical), "std/src/reactive.vl:3678:3");
 		first.set(canonical, build);
 	}
 	let steps = [  ];
@@ -443,8 +443,8 @@ function reconcile3(old_keys, old_items, items, key_of, same) {
 			let $x = null;
 			if ($w[0] === 0) {
 				const at = $w[1];
-				if (__at(claimed, at, "std/src/reactive.vl:3700:9")) {
-					head = __at(next_same, at, "std/src/reactive.vl:3701:14");
+				if (__at(claimed, at, "std/src/reactive.vl:3694:9")) {
+					head = __at(next_same, at, "std/src/reactive.vl:3695:14");
 				} else {
 					advancing = false;
 				}
@@ -471,11 +471,11 @@ function reconcile3(old_keys, old_items, items, key_of, same) {
 			let $B = null;
 			if ($A[0] === 0) {
 				const at3 = $A[1];
-				if (!(__at(claimed, at3, "std/src/reactive.vl:3719:10")) && eq2(__at(old_keys, at3, "std/src/reactive.vl:3719:25"), item_key)) {
+				if (!(__at(claimed, at3, "std/src/reactive.vl:3713:10")) && eq2(__at(old_keys, at3, "std/src/reactive.vl:3713:25"), item_key)) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
-					walk = __at(next_same, at3, "std/src/reactive.vl:3726:14");
+					walk = __at(next_same, at3, "std/src/reactive.vl:3720:14");
 				}
 				$B = undefined;
 			} else {
@@ -486,9 +486,9 @@ function reconcile3(old_keys, old_items, items, key_of, same) {
 		let step = [ 2 ];
 		const $C = found;
 		if ($C[0] === 0) {
-			__at_put(claimed, $C[1], true, "std/src/reactive.vl:3734:4");
+			__at_put(claimed, $C[1], true, "std/src/reactive.vl:3728:4");
 			let $D = null;
-			if (same(__at(old_items, $C[1], "std/src/reactive.vl:3735:19"), item)) {
+			if (same(__at(old_items, $C[1], "std/src/reactive.vl:3729:19"), item)) {
 				$D = [ 0, $C[1] ];
 			} else {
 				$D = [ 1, $C[1] ];
@@ -500,7 +500,7 @@ function reconcile3(old_keys, old_items, items, key_of, same) {
 	let removed = [  ];
 	let index = 0;
 	while (index < held) {
-		if (!(__at(claimed, index, "std/src/reactive.vl:3742:7"))) {
+		if (!(__at(claimed, index, "std/src/reactive.vl:3736:7"))) {
 			removed.push(index);
 		}
 		index = index + 1;

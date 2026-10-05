@@ -481,7 +481,7 @@ function splice_in_place(list, start, taking, inserted) {
 	let left = [  ];
 	let taken = 0;
 	while (taken < taking) {
-		left.push(__remove_at(list, start, "std/src/reactive/delta.vl:692:18"));
+		left.push(__remove_at(list, start, "std/src/reactive/delta.vl:693:18"));
 		taken = taken + 1;
 	}
 	let offset = 0;
@@ -491,7 +491,7 @@ function splice_in_place(list, start, taking, inserted) {
 		let $n = null;
 		if ($m[0] === 0) {
 			const value2 = $m[1];
-			$n = __insert_at(list, start + offset, value2, "std/src/reactive/delta.vl:699:28");
+			$n = __insert_at(list, start + offset, value2, "std/src/reactive/delta.vl:700:28");
 		} else {
 			$n = undefined;
 		}
@@ -603,7 +603,7 @@ function set_at(self, at2, value2, $z) {
 	let $B = null;
 	if ($A[0] === 0) {
 		const previous = $A[1];
-		__at_put(self[0].v, at2, __clone(value2), "std/src/reactive/delta.vl:844:5");
+		__at_put(self[0].v, at2, __clone(value2), "std/src/reactive/delta.vl:853:5");
 		record(self[2], [ 1, at2, previous, __clone(value2) ]);
 		publish(self, $z);
 		$B = undefined;
@@ -624,7 +624,7 @@ function move_range(self, from, count, to, $D) {
 	let lifted = [  ];
 	let taken = 0;
 	while (taken < count) {
-		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:864:35"));
+		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:873:35"));
 		taken = taken + 1;
 	}
 	let offset = 0;
@@ -633,7 +633,7 @@ function move_range(self, from, count, to, $D) {
 		let $F = null;
 		if ($E[0] === 0) {
 			const value2 = $E[1];
-			$F = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:870:43");
+			$F = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:879:43");
 		} else {
 			$F = undefined;
 		}
@@ -780,7 +780,7 @@ function set_at2(self, at2, value2, $z) {
 	let $ao = null;
 	if ($an[0] === 0) {
 		const previous = $an[1];
-		__at_put(self[0].v, at2, __clone(value2), "std/src/reactive/delta.vl:844:5");
+		__at_put(self[0].v, at2, __clone(value2), "std/src/reactive/delta.vl:853:5");
 		record2(self[2], [ 1, at2, previous, __clone(value2) ]);
 		publish2(self, $z);
 		$ao = undefined;
@@ -801,7 +801,7 @@ function move_range2(self, from, count, to, $D) {
 	let lifted = [  ];
 	let taken = 0;
 	while (taken < count) {
-		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:864:35"));
+		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:873:35"));
 		taken = taken + 1;
 	}
 	let offset = 0;
@@ -810,7 +810,7 @@ function move_range2(self, from, count, to, $D) {
 		let $aq = null;
 		if ($ap[0] === 0) {
 			const value2 = $ap[1];
-			$aq = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:870:43");
+			$aq = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:879:43");
 		} else {
 			$aq = undefined;
 		}
@@ -949,14 +949,14 @@ function reconcile_to(self, items, $aK) {
 	const new_length = items.length;
 	let prefix = 0;
 	while (prefix < old_length && prefix < new_length) {
-		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:925:7") !== __at(items, prefix, "std/src/reactive/delta.vl:925:36")) {
+		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:945:7") !== __at(items, prefix, "std/src/reactive/delta.vl:945:36")) {
 			break;
 		}
 		prefix = prefix + 1;
 	}
 	let suffix = 0;
 	while (prefix + suffix < old_length && prefix + suffix < new_length) {
-		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:932:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:932:53")) {
+		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:952:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:952:53")) {
 			break;
 		}
 		suffix = suffix + 1;
@@ -1127,14 +1127,14 @@ function reconcile_to2(self, items, $aK) {
 	const new_length = items.length;
 	let prefix = 0;
 	while (prefix < old_length && prefix < new_length) {
-		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:925:7") !== __at(items, prefix, "std/src/reactive/delta.vl:925:36")) {
+		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:945:7") !== __at(items, prefix, "std/src/reactive/delta.vl:945:36")) {
 			break;
 		}
 		prefix = prefix + 1;
 	}
 	let suffix = 0;
 	while (prefix + suffix < old_length && prefix + suffix < new_length) {
-		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:932:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:932:53")) {
+		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:952:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:952:53")) {
 			break;
 		}
 		suffix = suffix + 1;
