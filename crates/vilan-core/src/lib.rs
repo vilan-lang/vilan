@@ -27,6 +27,7 @@ pub mod fx;
 pub mod git_dep;
 pub mod id;
 pub mod impl_select;
+pub mod incremental;
 pub mod init_order;
 pub mod interpreter;
 pub mod keyword_table;
@@ -1341,6 +1342,11 @@ pub fn post_analysis_passes(
     if !macros::in_macro_world() {
         depth_stats::report();
     }
+    // M110 S0: what this analysis re-walked and replayed, and — under
+    // `VILAN_INCREMENTAL` — which items' interfaces and whether the global facts
+    // moved since the previous analysis of this entry. Here, after every pass,
+    // because an interface includes the EFFECTS the passes above settle.
+    incremental::report(program);
     counters::checkpoint("post-passes");
 }
 

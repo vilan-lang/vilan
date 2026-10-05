@@ -131,6 +131,76 @@ struct ManifestProblem {
     warning: bool,
 }
 
+/// M110 Q3's verify mode: analyzes the same request CLEAN and logs, on stderr,
+/// whether the incremental answer is the clean one — byte for byte over
+/// [`vilan_core::incremental::render_observation`], which is everything the
+/// editor reads, rendered without ids. One `[vilan incremental] verify` line per
+/// analysis: `identical`, or `DIFFERS` with the first differing row of each side
+/// and the hot seeds of the edit that produced it.
+fn verify_against_clean(
+    text: &str,
+    std: &vilan_core::PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    context: &ProjectContext,
+    incremental: &Program<'static>,
+    incremental_diagnostics: &[Error],
+) {
+    let (leaked, leaked_text) = Leaked::leak(
+        text.to_string().into_boxed_str(),
+        LeakSite::LspEntryText,
+        text.len(),
+    );
+    let clean = vilan_core::incremental::clean_analysis(|| {
+        analyze_source_owning_overlay_modules(
+            leaked_text,
+            std,
+            pkg_root,
+            entry_path,
+            context.platform,
+            &context.workspace,
+        )
+    });
+    let incremental_rendering =
+        vilan_core::incremental::render_observation(incremental, incremental_diagnostics);
+    let clean_rendering = clean
+        .program
+        .as_ref()
+        .map(|program| vilan_core::incremental::render_observation(program, &clean.diagnostics))
+        .unwrap_or_default();
+    if incremental_rendering == clean_rendering {
+        eprintln!(
+            "[vilan incremental] verify identical {} hot-seeds {:?}",
+            entry_path.display(),
+            context.workspace.hot_seeds
+        );
+    } else {
+        let incremental_rows: Vec<&str> = incremental_rendering.lines().collect();
+        let clean_rows: Vec<&str> = clean_rendering.lines().collect();
+        let first = incremental_rows
+            .iter()
+            .zip(&clean_rows)
+            .position(|(left, right)| left != right)
+            .unwrap_or(incremental_rows.len().min(clean_rows.len()));
+        eprintln!(
+            "[vilan incremental] verify DIFFERS {} hot-seeds {:?} at row {first}: incremental {:?} \
+             clean {:?} ({} rows against {})",
+            entry_path.display(),
+            context.workspace.hot_seeds,
+            incremental_rows.get(first),
+            clean_rows.get(first),
+            incremental_rows.len(),
+            clean_rows.len(),
+        );
+    }
+    // SAFETY: the pairing `analyze_in_context` makes — this program was built
+    // by `analyze_source_owning_overlay_modules` over `leaked_text` with exactly
+    // these handles, and nothing derived from it outlives this function.
+    drop(unsafe {
+        AnalyzedProgram::new(clean.program, Some(leaked), clean.ast, clean.owned_modules)
+    });
+}
+
 /// Resolves a file's [`ProjectContext`] from the nearest ancestor `vilan.toml`.
 /// A `[package]` roots `pkg::` at its source `root`, analyzes its files against
 /// its platform (the package `target`, or per-entry targets under the
@@ -1720,6 +1790,21 @@ impl Document {
         entry_path: &Path,
         cancel: &CancelToken,
     ) -> Option<Self> {
+        Self::analyze_cancellable_editing(text, std_dir, entry_path, Vec::new(), cancel)
+    }
+
+    /// [`analyze_cancellable`](Document::analyze_cancellable), naming the files
+    /// being EDITED (M110 S1, `Workspace::hot_seeds`): the analysis takes their
+    /// reverse import closure inside this entry's world as the hot set, serves
+    /// the rest of the world from the base cache, and re-walks only the hot
+    /// set. An empty list is exactly `analyze_cancellable`.
+    pub fn analyze_cancellable_editing(
+        text: &str,
+        std_dir: &Path,
+        entry_path: &Path,
+        hot_seeds: Vec<PathBuf>,
+        cancel: &CancelToken,
+    ) -> Option<Self> {
         // The pipeline recurses deeply (chumsky), and macro-world compiles NEST
         // a full analysis inside the analysis — run the whole thing on a
         // dedicated big-stack thread, like the CLI's compiler thread (128 MiB,
@@ -1758,7 +1843,12 @@ impl Document {
                     let document = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         #[cfg(test)]
                         analysis_fence_tests::maybe_inject(&entry_path);
-                        Self::analyze_on_this_thread(&text, &std_dir, &entry_path)
+                        Self::analyze_on_this_thread_editing(
+                            &text,
+                            &std_dir,
+                            &entry_path,
+                            hot_seeds,
+                        )
                     }))
                     .unwrap_or_else(|_| Self::internal_error(&text, &entry_path));
                     // Read AFTER the analysis, on the thread that ran it: a
@@ -1866,7 +1956,19 @@ impl Document {
         document
     }
 
+    #[cfg(test)]
     fn analyze_on_this_thread(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
+        Self::analyze_on_this_thread_editing(text, std_dir, entry_path, Vec::new())
+    }
+
+    /// [`analyze_on_this_thread`](Document::analyze_on_this_thread) with the
+    /// files being edited named (M110 S1's hot seeds).
+    fn analyze_on_this_thread_editing(
+        text: &str,
+        std_dir: &Path,
+        entry_path: &Path,
+        hot_seeds: Vec<PathBuf>,
+    ) -> Self {
         // Prefer the project's declared platform and source root (the file's role in
         // its `vilan.toml`); fall back to inferring the platform from imports and
         // rooting `pkg::` at the file's own directory.
@@ -1879,7 +1981,8 @@ impl Document {
         // re-reads the manifest closure beside it. The core line cannot see any
         // of it: it starts inside `analyze`.
         let phase_context_start = vilan_core::PhaseClock::now();
-        let context = resolve_project_context(entry_path, text);
+        let mut context = resolve_project_context(entry_path, text);
+        context.workspace.hot_seeds = hot_seeds;
         let phase_context = phase_context_start.elapsed();
         Self::analyze_in_context(text, std_dir, entry_path, context, Some(phase_context))
     }
@@ -1964,6 +2067,25 @@ impl Document {
             &context.workspace,
         );
         let phase_analyze = phase_analyze_start.elapsed();
+        // M110 Q3: `VILAN_INCREMENTAL=verify` — the owner's dogfooding mode. The
+        // same request again, CLEAN (no base-cache world, no replayed record, no
+        // hot set), compared with what the incremental analysis just answered,
+        // and any difference logged with the edit that produced it. Off by
+        // default: it doubles every analysis.
+        if vilan_core::incremental::mode() == vilan_core::incremental::Mode::Verify
+            && !vilan_core::cancel::cancelled()
+            && let Some(incremental) = program.as_ref()
+        {
+            verify_against_clean(
+                text,
+                &std,
+                &pkg_root,
+                entry_path,
+                &context,
+                incremental,
+                &diagnostics,
+            );
+        }
         // M26: the analysis was superseded while it ran. Everything below is
         // work for a result that cannot land — the editor tables the queries
         // index, and the shared-platform legs, which are a FULL analysis each

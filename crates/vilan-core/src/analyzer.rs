@@ -48480,6 +48480,30 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// M110 S0 (Q9): what the Class A window will replay and what it will run,
+    /// for the census — sources replayed, and functions checked (every function
+    /// outside the frozen std ranges and the replayed ones). The function count
+    /// is taken only when `VILAN_COUNTERS` asks: it is a pass over every
+    /// function, and nothing but the counters line reads it.
+    fn census_checks_scope(&self) {
+        if crate::macros::in_macro_world() {
+            return;
+        }
+        let records_replayed = self.reused_sources.len();
+        let functions_checked = if crate::counters::counters_enabled() {
+            self.functions
+                .keys()
+                .filter(|id| !self.reusable_entity(**id))
+                .count()
+        } else {
+            0
+        };
+        crate::incremental::update_census(|census| {
+            census.records_replayed = records_replayed;
+            census.functions_checked = functions_checked;
+        });
+    }
+
     /// The predicate the **Class A** checks ask (§3.3): module-local given the
     /// world, so a std entity's diagnostics are known absent AND a cached
     /// module's are remembered — the second half being what
@@ -69639,6 +69663,17 @@ pub struct Workspace {
     /// and to no other (M70; B239 answered the same hazard by storing nothing,
     /// which cost seven of kolt's files the cache entirely).
     pub entry_mode: EntryMode,
+    /// M110 (`incremental-analysis.md` §4.1, Q2): the files the front end is
+    /// EDITING — the language server's last-changed document — whose reverse
+    /// import closure inside this entry's world is the HOT SET. Empty for every
+    /// caller that edits nothing (the CLI, the playground, the tests), and an
+    /// empty set changes nothing: the world is the one it always was.
+    ///
+    /// A front-end fact like `entry_mode` beside it: only the editor knows which
+    /// buffer is being typed into. What the analysis does with it is in
+    /// [`crate::incremental`]; the seed itself is not a key — the CLOSURE it
+    /// computes is, because two seeds with one closure build one world.
+    pub hot_seeds: Vec<PathBuf>,
 }
 
 /// Whether the analysis is looking at a program its package declares, or at a
@@ -71683,6 +71718,8 @@ pub fn analyze_cancellable<'src>(
     // a reset there would forget worlds the same run had already compiled.
     if !crate::macros::in_macro_world() {
         crate::macros::world_phases_reset();
+        // M110 S0: the census is per top-level analysis for the same reason.
+        crate::incremental::reset_census();
     }
     let (sanitized, refusals) = drop_reserved_dependency_edges(workspace);
     let workspace = sanitized.as_ref().unwrap_or(workspace);
@@ -71775,6 +71812,488 @@ fn drop_reserved_dependency_edges(workspace: &Workspace) -> (Option<Workspace>, 
         spec.dependencies.retain(|(name, _)| !refused_root(name));
     }
     (Some(sanitized), refusals)
+}
+
+/// A module's package: `Std` modules resolve under the `std` library's layered
+/// roots into the `std` namespace (addressable as `std::name` everywhere, and as
+/// `pkg::name` from std's own sources); `Pkg` modules — the entry program's own
+/// multi-file siblings — resolve under `pkg_root` (the entry's directory) and
+/// are addressable only as `pkg::name`; `Dep(i)` modules — a dependency library
+/// (P2) — resolve under its layered roots into its own isolated namespace,
+/// reachable from a dependent as `<import-name>::name` and from within the
+/// dependency as `pkg::name`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Origin {
+    Std,
+    Pkg,
+    Dep(usize),
+}
+
+/// The canonical module load order (WO-1b), rhyming with WO-1's import sort:
+/// std modules first (tier 0), then each dependency package by its manifest
+/// index (tier 1), then the entry package's own modules (tier 2); ties broken
+/// by module name. Two distinct loaded modules never share a key — std/pkg
+/// names are unique within their package, and a dependency's modules are
+/// distinguished by the package index — so the order is total and stable. The
+/// drain below always loads the smallest key still pending, making the load
+/// order (and thus every entity id, and thus the emitted declaration order) a
+/// function only of WHICH modules are reachable and their packages, never of
+/// the order imports appear in the source.
+fn load_order_key(entry: (Origin, &str)) -> (u8, usize, &str) {
+    let (origin, name) = entry;
+    match origin {
+        Origin::Std => (0, 0, name),
+        Origin::Dep(index) => (1, index, name),
+        Origin::Pkg => (2, 0, name),
+    }
+}
+
+/// [`load_order_key`]'s inverse — the key is injective, which is what
+/// lets the drain's heap hold keys alone (M107).
+fn load_order_entry(key: (u8, usize, &str)) -> (Origin, &str) {
+    match key {
+        (0, _, name) => (Origin::Std, name),
+        (1, index, name) => (Origin::Dep(index), name),
+        (_, _, name) => (Origin::Pkg, name),
+    }
+}
+
+/// A65: the entity a module PATH denotes, created if this analysis has not
+/// met it yet — the parent chain first, so `lib::ui` exists before
+/// `lib::ui::widget` registers under it.
+///
+/// A node created here is a bare namespace: an entity, an (empty) item
+/// scope, and a binding in its parent. Whether it also has a BODY is not
+/// decided here — the path is requested from the loader on the way out, and
+/// the loader either finds `lib.vl` and adopts this node for it or reports
+/// the directory as a pure namespace. That request is idempotent: the drain
+/// has already recorded the path in `loaded_keys` by the time this runs, or
+/// records it on the next pass and finds nothing new to do.
+fn ensure_module_node<'src>(
+    analyzer: &mut Analyzer<'src>,
+    module_nodes: &mut HashMap<(Origin, &'src str), Id>,
+    to_load: &mut Vec<(Origin, &'src str)>,
+    origin: Origin,
+    path: &'src str,
+    origin_scope_id: Id,
+    global_scope_id: Id,
+) -> Id {
+    if let Some(module_id) = module_nodes.get(&(origin, path)).copied() {
+        return module_id;
+    }
+    let parent_scope_id = match path.rfind("::") {
+        None => origin_scope_id,
+        Some(cut) => {
+            let parent_id = ensure_module_node(
+                analyzer,
+                module_nodes,
+                to_load,
+                origin,
+                &path[..cut],
+                origin_scope_id,
+                global_scope_id,
+            );
+            module_children_scope(analyzer, parent_id, global_scope_id)
+        }
+    };
+    let scope = analyzer.create_scope(Some(global_scope_id));
+    let scope_id = analyzer.push_scope(scope);
+    let module_id = analyzer.new_entity_id();
+    let leaf = module_leaf_name(path);
+    analyzer.modules.insert(
+        module_id,
+        Module {
+            id: module_id,
+            name: leaf,
+            body: (Vec::new(), scope_id),
+        },
+    );
+    analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+    // A namespace has no file of its own, so its one-id range is attributed
+    // to the entry — the same answer the `pkg::<entry>` alias arm gives for
+    // the other module entity that names no source of its own.
+    analyzer.source_ranges.push(SourceRange {
+        start: module_id.0,
+        end: module_id.0 + 1,
+        source: SourceId(0),
+    });
+    analyzer
+        .expr_id_to_expr_map
+        .insert(module_id, Expr::Module(module_id));
+    analyzer
+        .mut_scope_for_scope_id(parent_scope_id)
+        .name_to_id_map
+        .insert(leaf, module_id);
+    module_nodes.insert((origin, path), module_id);
+    to_load.push((origin, path));
+    module_id
+}
+
+/// A65: the scope holding a module's SUBMODULES, created on demand.
+///
+/// Separate from the module's item scope on purpose: a child is reached by
+/// the import path that names it and by nothing else, so `import pkg::lib`
+/// binds `lib`'s own items and leaves `lib::util` to `import
+/// pkg::lib::util`. Only a package with a module directory ever allocates
+/// one.
+fn module_children_scope(analyzer: &mut Analyzer<'_>, module_id: Id, global_scope_id: Id) -> Id {
+    if let Some(scope_id) = analyzer.module_children_scopes.get(&module_id).copied() {
+        return scope_id;
+    }
+    let scope = analyzer.create_scope(Some(global_scope_id));
+    let scope_id = analyzer.push_scope(scope);
+    analyzer.module_children_scopes.insert(module_id, scope_id);
+    scope_id
+}
+
+/// M110 S0/S1 (`incremental-analysis.md` §4.1, ruled Q2): the HOT SET of an
+/// entry's world — the edited module plus every package module that imports
+/// it, transitively, closed over import cycles — computed SYNTACTICALLY, before
+/// the load drain runs, from the same `import`/`use` paths the drain itself
+/// follows ([`collect_module_paths`]) and resolved the same way
+/// ([`deepest_module_or_namespace`]).
+///
+/// Syntactic is enough because a module's dependence on another package module
+/// is spelled: an inline `pkg::m::f()` is refused (`pkg` is a namespace, not a
+/// value), so an `import`/`use` statement is the one way a module reaches a
+/// sibling's names. A nested module also depends on each of its ANCESTOR
+/// modules (the loader ensures the parent's node and the parent's file adopts
+/// it), so those edges are added too. What the syntax cannot show — a derive's
+/// GENERATED `pkg::` reference — is checked after the prefix drain instead, and
+/// a hot set it contradicts is dropped for that analysis (S1's guard).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct HotSet {
+    /// The hot modules' resolved `pkg::` names, sorted — what S1's drain holds
+    /// back until the prefix world is stored.
+    modules: Vec<&'static str>,
+    /// Their canonical paths, in the same order — the half of the base-cache
+    /// key that says WHICH modules the stored world is missing.
+    paths: Vec<PathBuf>,
+    /// Every load request the hot modules write — `std::`, dependency and
+    /// non-hot `pkg::` modules, and the std modules their own syntax seeds
+    /// (`css` blocks, elements, `[service]`). The prefix world loads these on
+    /// the hot modules' behalf (so lucide, reached from `views.vl`, is in the
+    /// prefix and not re-walked per keystroke), which makes them a function of
+    /// the hot modules' TEXT: they ride in the key, sorted, so a keystroke that
+    /// adds an import builds a new prefix and one that does not hits.
+    requests: Vec<(Origin, &'static str)>,
+    /// How many package module FILES the entry's world reaches — the census's
+    /// denominator.
+    package_modules: usize,
+    /// Whether the hot set can be walked AFTER the stored prefix at all. It
+    /// cannot when a hot module imports the ENTRY (`pkg::<entry>`, the B226
+    /// alias the drain mints when it meets the request) or DEFINES a macro
+    /// (its definitions register into the registry every file's expansion
+    /// reads, the entry's own `macro` bypass for the same reason) — two shapes
+    /// whose effect on the rest of the world the drain decides while it runs.
+    /// Measured either way; built only when this is `None` — otherwise it
+    /// names why not, which the census reports.
+    refusal: Option<&'static str>,
+}
+
+/// The hot set for this analysis: `None` when the front end named no seed, or
+/// when a package prelude the closure reaches makes every module hot (every
+/// module's ambient scope reads it); an EMPTY set when the seed is the entry
+/// itself (the entry is post-store in every world already) or no module of this
+/// world — which still carries the census's denominator.
+fn hot_set_closure(
+    entry_pkg_seeds: &[&'static str],
+    entry_path: &Path,
+    pkg_root: &Path,
+    workspace: &Workspace,
+) -> Option<HotSet> {
+    if workspace.hot_seeds.is_empty() {
+        return None;
+    }
+    let entry_canonical = crate::util::canonical_path(entry_path);
+    // A seed that IS the entry adds nothing (the entry walks after every world
+    // already) but still asks for the census, so it is filtered here rather
+    // than refused.
+    let seeds: HashSet<PathBuf> = workspace
+        .hot_seeds
+        .iter()
+        .map(crate::util::canonical_path)
+        .filter(|seed| *seed != entry_canonical)
+        .collect();
+    let roots: [&Path; 1] = [pkg_root];
+    let resolve = |request: &str| -> &'static str {
+        interned_display_name(
+            deepest_module_or_namespace(&roots, request).unwrap_or_else(|| request.to_string()),
+        )
+    };
+    // A nested module's ancestors: `lib::ui::widget` loads under `lib::ui`
+    // and `lib`, and depends on whatever their files declare.
+    let ancestors = |name: &'static str| -> Vec<&'static str> {
+        name.match_indices("::")
+            .map(|(cut, _)| interned_display_name(name[..cut].to_string()))
+            .collect()
+    };
+    let prelude_module: Option<&'static str> = workspace
+        .entry_prelude
+        .module_path()
+        .and_then(|path| path.strip_prefix("pkg::"))
+        .map(resolve);
+    let mut pending: Vec<&'static str> = entry_pkg_seeds.to_vec();
+    pending.extend(prelude_module);
+    // name -> (canonical path, the package modules it depends on, its AST).
+    type Reached = (
+        PathBuf,
+        Vec<&'static str>,
+        &'static crate::span::Spanned<NodeList<'static>>,
+    );
+    let mut reached: std::collections::BTreeMap<&'static str, Reached> = Default::default();
+    let mut visited: HashSet<&'static str> = HashSet::default();
+    // The name `pkg::<entry>` resolves to, when some module asks for it.
+    let mut entry_module: Option<&'static str> = None;
+    // The modules whose text could define a macro — the entry's own bypass
+    // test (`base_cacheable`), applied per module.
+    let mut macro_text: HashSet<&'static str> = HashSet::default();
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name) {
+            continue;
+        }
+        let parents = ancestors(name);
+        pending.extend(parents.iter().copied());
+        let Some(resolution) = resolve_module_in_roots(&roots, name) else {
+            // A pure namespace: no file, nothing to depend on.
+            continue;
+        };
+        let canonical = crate::util::canonical_path(&resolution.path);
+        if canonical == entry_canonical {
+            // `pkg::<entry>`: the alias onto the entry, which is post-store in
+            // every world.
+            entry_module = Some(name);
+            continue;
+        }
+        let Some(loaded) = load_package_module(&resolution.path) else {
+            continue;
+        };
+        if loaded.text.contains("macro") {
+            macro_text.insert(name);
+        }
+        let mut depends_on: Vec<&'static str> = collect_module_paths(&loaded.ast.0, "pkg")
+            .into_iter()
+            .map(|(request, _)| resolve(request))
+            .collect();
+        depends_on.extend(parents);
+        pending.extend(depends_on.iter().copied());
+        reached.insert(name, (canonical, depends_on, loaded.ast));
+    }
+    let edited: Vec<&'static str> = reached
+        .iter()
+        .filter(|(_, (canonical, ..))| seeds.contains(canonical))
+        .map(|(name, _)| *name)
+        .collect();
+    if edited.is_empty() {
+        // The entry itself, or a file this world does not load: nothing is hot
+        // but the entry, which the census still reports against the world.
+        return Some(HotSet {
+            package_modules: reached.len(),
+            ..HotSet::default()
+        });
+    }
+    let mut importers: HashMap<&'static str, Vec<&'static str>> = HashMap::default();
+    for (name, (_, depends_on, _)) in &reached {
+        for dependency in depends_on {
+            importers.entry(*dependency).or_default().push(*name);
+        }
+    }
+    let mut hot: std::collections::BTreeSet<&'static str> = Default::default();
+    let mut frontier = edited;
+    while let Some(name) = frontier.pop() {
+        if !hot.insert(name) {
+            continue;
+        }
+        frontier.extend(importers.get(name).into_iter().flatten().copied());
+    }
+    if prelude_module.is_some_and(|prelude| hot.contains(prelude)) {
+        return None;
+    }
+    let mut requests: Vec<(Origin, &'static str)> = Vec::new();
+    for name in &hot {
+        let (_, depends_on, ast) = &reached[name];
+        requests.extend(
+            depends_on
+                .iter()
+                .filter(|dependency| !hot.contains(*dependency))
+                .map(|dependency| (Origin::Pkg, *dependency)),
+        );
+        requests.extend(
+            collect_module_paths(&ast.0, "std")
+                .into_iter()
+                .map(|(module, _)| (Origin::Std, interned_display_name(module.to_string()))),
+        );
+        requests.extend(
+            collect_std_item_modules(&ast.0)
+                .into_iter()
+                .map(|module| (Origin::Std, module)),
+        );
+        if contains_service(&ast.0) {
+            requests.push((Origin::Std, "rpc"));
+        }
+        for (dependency, index) in &workspace.entry_dependencies {
+            requests.extend(collect_module_paths(&ast.0, dependency).into_iter().map(
+                |(module, _)| {
+                    (
+                        Origin::Dep(*index),
+                        interned_display_name(module.to_string()),
+                    )
+                },
+            ));
+        }
+    }
+    requests.sort_unstable();
+    requests.dedup();
+    let refusal = if hot.iter().any(|name| macro_text.contains(name)) {
+        Some("defines-a-macro")
+    } else if hot
+        .iter()
+        .any(|name| entry_module.is_some_and(|entry| reached[name].1.contains(&entry)))
+    {
+        Some("imports-the-entry")
+    } else if !hot_impls_stay_in_the_hot_set(&hot, &reached) {
+        Some("impl")
+    } else {
+        None
+    };
+    let modules: Vec<&'static str> = hot.into_iter().collect();
+    let paths = modules.iter().map(|name| reached[name].0.clone()).collect();
+    Some(HotSet {
+        modules,
+        paths,
+        requests,
+        package_modules: reached.len(),
+        refusal,
+    })
+}
+
+/// M110 S1's impl guard: whether no module OUTSIDE the hot set can resolve
+/// anything through an `impl` written INSIDE it.
+///
+/// The prefix resolves before the hot set is walked (that is the whole
+/// saving), so an impl the hot set declares is invisible to the prefix's
+/// method resolution — exactly as an impl in the ENTRY is invisible to every
+/// module today (`Foo has no method` from a module whose only impl lives in
+/// the entry file). A canonical analysis walks the hot modules among the rest,
+/// so their impls DO serve the prefix there, and the two would disagree. The
+/// guard makes that impossible rather than detecting it:
+///
+///  - an impl whose subject's head type is DECLARED in the hot set is safe —
+///    no module outside the hot set can name that type (it would have to
+///    import it, which would put it in the hot set), and a generic body that
+///    receives a value of it reaches members only through its bounds;
+///  - an INHERENT impl on a type declared elsewhere (kolt's `impl style::Style
+///    { fun flex_col .. }`) is safe when none of its member names occurs as
+///    an identifier in any package module outside the hot set: a member is
+///    reached by NAME (`.flex_col()`, `Style::flex_col`), and only package code
+///    can name a user's inherent member;
+///  - anything else — a trait impl on a foreign type (operators, `==`,
+///    interpolation and `for` reach trait members without naming them), a
+///    blanket `impl type T` — is not, and the analysis is built canonically.
+fn hot_impls_stay_in_the_hot_set(
+    hot: &std::collections::BTreeSet<&'static str>,
+    reached: &std::collections::BTreeMap<
+        &'static str,
+        (
+            PathBuf,
+            Vec<&'static str>,
+            &'static crate::span::Spanned<NodeList<'static>>,
+        ),
+    >,
+) -> bool {
+    // The item nodes at a module's top level, through the markers that wrap
+    // them (`export`, a derive, `const`) and into inline `mod`s.
+    fn items<'a>(nodes: &'a NodeList<'a>, out: &mut Vec<&'a Node<'a>>) {
+        for item in nodes {
+            let mut node = &item.0;
+            while let Node::Export(_, inner, _)
+            | Node::Derive(_, inner)
+            | Node::Service(_, inner)
+            | Node::MacroAttribute(_, _, _, inner)
+            | Node::Const(inner) = node
+            {
+                node = &inner.0;
+            }
+            match node {
+                Node::Module(_, body) => items(&body.0, out),
+                _ => out.push(node),
+            }
+        }
+    }
+    let mut declared: HashSet<&str> = HashSet::default();
+    let mut hot_impls: Vec<(&Node, &'static str)> = Vec::new();
+    for name in hot {
+        let (_, _, ast) = &reached[name];
+        let mut nodes = Vec::new();
+        items(&ast.0, &mut nodes);
+        for node in nodes {
+            match node {
+                Node::Struct(type_name, ..) | Node::Enum(type_name, ..) => {
+                    declared.insert(type_name.0);
+                }
+                Node::Impl(..) => hot_impls.push((node, name)),
+                _ => {}
+            }
+        }
+    }
+    // The head identifier of an impl's subject, when it is a bare type name
+    // (`Theme`, `Theme<T>`); `None` for a path (`style::Style`) or a binder.
+    fn subject_head<'a>(subject: &Node<'a>) -> Option<&'a str> {
+        match subject {
+            Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
+            _ => None,
+        }
+    }
+    let mut named_members: Vec<&str> = Vec::new();
+    for (node, _) in &hot_impls {
+        let Node::Impl(subject, traits, body, _) = node else {
+            continue;
+        };
+        if subject_head(&subject.0).is_some_and(|head| declared.contains(head)) {
+            continue;
+        }
+        if !traits.is_empty() {
+            return false;
+        }
+        for member in &body.0 {
+            let mut member_node = &member.0;
+            while let Node::Export(_, inner, _) | Node::Const(inner) = member_node {
+                member_node = &inner.0;
+            }
+            match member_node {
+                Node::Func(function) => named_members.push(function.name.0),
+                // Anything but a function in an inherent impl is a shape this
+                // guard has not been taught: refuse rather than guess.
+                _ => return false,
+            }
+        }
+    }
+    if named_members.is_empty() {
+        return true;
+    }
+    // Whether `word` occurs as a whole identifier in `text`.
+    let spells = |text: &str, word: &str| {
+        let identifier = |character: char| character.is_alphanumeric() || character == '_';
+        text.match_indices(word).any(|(at, _)| {
+            !text[..at].chars().next_back().is_some_and(identifier)
+                && !text[at + word.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(identifier)
+        })
+    };
+    for (name, (path, ..)) in reached {
+        if hot.contains(name) {
+            continue;
+        }
+        let Ok(text) = crate::util::read_source(path) else {
+            return false;
+        };
+        if named_members.iter().any(|member| spells(&text, member)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// `analyze` with the cache switchable: the derive/macro hoist's fallback —
@@ -71906,6 +72425,22 @@ fn analyze_inner<'src>(
         names.dedup();
         names
     };
+    // M110 S0: the hot set — the edited module and its reverse import closure
+    // — for an entry the front end named an edited file for. Measured only:
+    // the world is built as it always was. A DECLARED entry's (in file mode the
+    // open file is the entry, and walks after every world already).
+    let hot_set: Option<HotSet> = (!crate::macros::in_macro_world()
+        && matches!(workspace.entry_mode, EntryMode::Declared { .. }))
+    .then(|| hot_set_closure(&entry_pkg_seeds, entry_path, pkg_root, workspace))
+    .flatten();
+    if let Some(hot_set) = &hot_set {
+        crate::incremental::update_census(|census| {
+            census.hot_modules = hot_set.modules.len() + 1;
+            census.package_modules = hot_set.package_modules + 1;
+            // What S1 would make of it: a hot set it could not serve, and why.
+            census.hot_refusal = hot_set.refusal.filter(|_| !hot_set.modules.is_empty());
+        });
+    }
     // M70: the open-module half of the key (see [`BaseCacheKey::entry_open_module`]).
     // A file the front end handed us as the entry but which its package owns as
     // a MODULE builds a world that may be missing that very module — so the
@@ -71990,13 +72525,30 @@ fn analyze_inner<'src>(
     // waits for this world instead of building a second copy of it. The claim
     // is held for the rest of this analysis and released by its `Drop`, which
     // is after the store below, so a waiter wakes to a hit.
-    let (cached_world, build_claim) = if base_cacheable {
+    // M110 Q3: a CLEAN analysis (`crate::incremental::clean_analysis`) neither
+    // reads nor writes the cache — it is the canonical answer an incremental one
+    // is compared against, and it must leave the cache as it found it. Every
+    // other step is the cacheable path's own, so the two differ in the reuse
+    // and in nothing else (the entry expansion stays hoisted, which is what
+    // keeps the gensym counter, and so the emitted names, identical).
+    let clean = crate::incremental::clean_requested();
+    let reuse_allowed = base_cacheable && !clean;
+    let (cached_world, build_claim) = if reuse_allowed {
         base_cache_admit(&base_cache_key, entry_path)
     } else {
         (None, None)
     };
     let _build_claim = build_claim;
+    if reuse_allowed && !crate::macros::in_macro_world() {
+        crate::incremental::update_census(|census| match cached_world {
+            Some(_) => census.base_hits += 1,
+            None => census.base_misses += 1,
+        });
+    }
     if let Some(mut world) = cached_world {
+        if !crate::macros::in_macro_world() {
+            crate::incremental::update_census(|census| census.sources_walked = 1);
+        }
         world.sources[0] = entry_path.to_path_buf();
         world.source_hashes[0] = crate::content_hash(entry_source);
         world.analyzer.source_texts[0] = (SourceId(0), entry_source);
@@ -72177,138 +72729,6 @@ fn analyze_inner<'src>(
     // form of the entry's derive expansion, so a derived type imported from another
     // module has its `to_json`/`from_json`/... like one defined in the entry.
     let mut loaded: Vec<(&str, &Spanned<NodeList>, &str, Id, SourceId, Origin)> = Vec::new();
-    // A module's package: `Std` modules resolve under the `std` library's layered
-    // roots into the `std` namespace (addressable as `std::name` everywhere, and as
-    // `pkg::name` from std's own sources); `Pkg` modules — the entry program's own
-    // multi-file siblings — resolve under `pkg_root` (the entry's directory) and
-    // are addressable only as `pkg::name`; `Dep(i)` modules — a dependency library
-    // (P2) — resolve under its layered roots into its own isolated namespace,
-    // reachable from a dependent as `<import-name>::name` and from within the
-    // dependency as `pkg::name`.
-    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-    enum Origin {
-        Std,
-        Pkg,
-        Dep(usize),
-    }
-    // The canonical module load order (WO-1b), rhyming with WO-1's import sort:
-    // std modules first (tier 0), then each dependency package by its manifest
-    // index (tier 1), then the entry package's own modules (tier 2); ties broken
-    // by module name. Two distinct loaded modules never share a key — std/pkg
-    // names are unique within their package, and a dependency's modules are
-    // distinguished by the package index — so the order is total and stable. The
-    // drain below always loads the smallest key still pending, making the load
-    // order (and thus every entity id, and thus the emitted declaration order) a
-    // function only of WHICH modules are reachable and their packages, never of
-    // the order imports appear in the source.
-    fn load_order_key(entry: (Origin, &str)) -> (u8, usize, &str) {
-        let (origin, name) = entry;
-        match origin {
-            Origin::Std => (0, 0, name),
-            Origin::Dep(index) => (1, index, name),
-            Origin::Pkg => (2, 0, name),
-        }
-    }
-    /// [`load_order_key`]'s inverse — the key is injective, which is what
-    /// lets the drain's heap hold keys alone (M107).
-    fn load_order_entry(key: (u8, usize, &str)) -> (Origin, &str) {
-        match key {
-            (0, _, name) => (Origin::Std, name),
-            (1, index, name) => (Origin::Dep(index), name),
-            (_, _, name) => (Origin::Pkg, name),
-        }
-    }
-    /// A65: the entity a module PATH denotes, created if this analysis has not
-    /// met it yet — the parent chain first, so `lib::ui` exists before
-    /// `lib::ui::widget` registers under it.
-    ///
-    /// A node created here is a bare namespace: an entity, an (empty) item
-    /// scope, and a binding in its parent. Whether it also has a BODY is not
-    /// decided here — the path is requested from the loader on the way out, and
-    /// the loader either finds `lib.vl` and adopts this node for it or reports
-    /// the directory as a pure namespace. That request is idempotent: the drain
-    /// has already recorded the path in `loaded_keys` by the time this runs, or
-    /// records it on the next pass and finds nothing new to do.
-    fn ensure_module_node<'src>(
-        analyzer: &mut Analyzer<'src>,
-        module_nodes: &mut HashMap<(Origin, &'src str), Id>,
-        to_load: &mut Vec<(Origin, &'src str)>,
-        origin: Origin,
-        path: &'src str,
-        origin_scope_id: Id,
-        global_scope_id: Id,
-    ) -> Id {
-        if let Some(module_id) = module_nodes.get(&(origin, path)).copied() {
-            return module_id;
-        }
-        let parent_scope_id = match path.rfind("::") {
-            None => origin_scope_id,
-            Some(cut) => {
-                let parent_id = ensure_module_node(
-                    analyzer,
-                    module_nodes,
-                    to_load,
-                    origin,
-                    &path[..cut],
-                    origin_scope_id,
-                    global_scope_id,
-                );
-                module_children_scope(analyzer, parent_id, global_scope_id)
-            }
-        };
-        let scope = analyzer.create_scope(Some(global_scope_id));
-        let scope_id = analyzer.push_scope(scope);
-        let module_id = analyzer.new_entity_id();
-        let leaf = module_leaf_name(path);
-        analyzer.modules.insert(
-            module_id,
-            Module {
-                id: module_id,
-                name: leaf,
-                body: (Vec::new(), scope_id),
-            },
-        );
-        analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-        // A namespace has no file of its own, so its one-id range is attributed
-        // to the entry — the same answer the `pkg::<entry>` alias arm gives for
-        // the other module entity that names no source of its own.
-        analyzer.source_ranges.push(SourceRange {
-            start: module_id.0,
-            end: module_id.0 + 1,
-            source: SourceId(0),
-        });
-        analyzer
-            .expr_id_to_expr_map
-            .insert(module_id, Expr::Module(module_id));
-        analyzer
-            .mut_scope_for_scope_id(parent_scope_id)
-            .name_to_id_map
-            .insert(leaf, module_id);
-        module_nodes.insert((origin, path), module_id);
-        to_load.push((origin, path));
-        module_id
-    }
-
-    /// A65: the scope holding a module's SUBMODULES, created on demand.
-    ///
-    /// Separate from the module's item scope on purpose: a child is reached by
-    /// the import path that names it and by nothing else, so `import pkg::lib`
-    /// binds `lib`'s own items and leaves `lib::util` to `import
-    /// pkg::lib::util`. Only a package with a module directory ever allocates
-    /// one.
-    fn module_children_scope(
-        analyzer: &mut Analyzer<'_>,
-        module_id: Id,
-        global_scope_id: Id,
-    ) -> Id {
-        if let Some(scope_id) = analyzer.module_children_scopes.get(&module_id).copied() {
-            return scope_id;
-        }
-        let scope = analyzer.create_scope(Some(global_scope_id));
-        let scope_id = analyzer.push_scope(scope);
-        analyzer.module_children_scopes.insert(module_id, scope_id);
-        scope_id
-    }
     // The entry program's package root (`pkg_root`, passed in): the directory its
     // `import pkg::..` siblings live in. When it is one of `std`'s own layer roots
     // we're compiling std itself (or a std file opened in an editor), so every
@@ -74187,7 +74607,10 @@ fn analyze_inner<'src>(
     // this is belt and braces rather than a live branch; if it ever failed,
     // the analysis would simply store nothing, which is what B239 did.
     crate::counters::checkpoint("world");
-    if base_cacheable
+    if !crate::macros::in_macro_world() {
+        crate::incremental::update_census(|census| census.sources_walked = world.sources.len());
+    }
+    if reuse_allowed
         && (crate::macros::in_macro_world()
             || BASE_CACHE_STORE.load(std::sync::atomic::Ordering::Relaxed))
         && !entry_is_module
@@ -74195,6 +74618,9 @@ fn analyze_inner<'src>(
     {
         base_cache_store(base_cache_key.clone(), &world);
         crate::counters::checkpoint("world-stored");
+        if !crate::macros::in_macro_world() {
+            crate::incremental::update_census(|census| census.base_stores += 1);
+        }
     }
     // After the store, so the world the cache holds is the pre-entry one it
     // has always been.
@@ -74232,7 +74658,7 @@ fn analyze_inner<'src>(
         // `Analyzer::alias_reaching_sources` is what closes that gap, and it
         // narrows the READING side, so the record itself is filed the same way
         // on both shapes.
-        (base_cacheable && !entry_is_module).then_some(base_cache_key),
+        (reuse_allowed && !entry_is_module).then_some(base_cache_key),
         false,
     )
 }
@@ -74505,6 +74931,11 @@ fn analyze_over_world<'src>(
         // The splice (§3.2). Before every check that could add to the lists,
         // and the published order is `sort_in_step`'s either way.
         analyzer.replay_world_diagnostics(&replay_records);
+        // M110 S0's census (Q9): what this analysis replays and what it will
+        // check — read off the ranges just sealed, so it is the seam's own
+        // answer. The function count walks every function once with a binary
+        // search, so it is paid only when the counters line asks.
+        analyzer.census_checks_scope();
         // Infer the `borrows` effect before any check reads it (readonly-mutation
         // and the scalar-view lowering both consult `Function.borrows`).
         analyzer.infer_borrows();

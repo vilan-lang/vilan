@@ -409,12 +409,15 @@ async fn m104_a_world_that_read_a_buffer_since_moved_lands_nowhere() {
         .map(|name| (package.uri(name), package.directory.join("src").join(name)))
         .collect();
     let std_dir = discover_std_dir(&client_path);
+    // The module being typed into is the hot seed, as `did_change` makes it.
+    let edited = Some(vilan_core::util::canonical_path(&model_path));
     let analysis = tokio::task::spawn_blocking(move || {
         analyze_world(
             &client_path,
             Some(CLIENT.to_string()),
             &std_dir,
             &open,
+            edited,
             &CancelToken::new(),
         )
     })
