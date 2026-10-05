@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**`std/vilan.toml` keeps the census recipe and drops the figures that drifted.** Its comment said std has 741 top-level declarations across 63 files with 33 `export *;` modules (and 856 of every kind, 548 exported, 152 reached across files); the tree has 1,149, 70 and 34. Nothing gates a number in a comment, so every one of them went stale within an order. The comment now states the recipes alone — the two greps, the bare-marker grep, `check_plain_reaches` for the cross-file floor — says why there are no figures beside them, and spells `[resource] struct` where it still wrote the retired `resource struct`. Tracker N143.
+
+---
+
+<!-- family: tooling -->
 **Comments spell a deprecated re-export the way the parser accepts it, and F48's native probe calls through a subscript as it says it does.** B485 put a declaration's attributes ahead of `export` (`[deprecated(..)] export import …`), and the comments in `node.rs` and the inference suite's B472 note still wrote the refused `export [deprecated(..)] import …`; both are respelled. `native/reassigned_closures.vl` bound `let third = adders[2];` only to step around E252, which is fixed, so it now calls `adders[2](30)` directly — the "call through a subscript" its header names — and stays identical on both backends. The seven such comments in `analyzer.rs` wait for the next lane that touches that file, as the item recommends; the respelling is a ready patch. Tracker N142.
 
 ---
