@@ -111,12 +111,17 @@ SCENARIOS = [
         "completion": ("get_prefs().theme.derive", len("get_prefs().")),
     },
     {
+        # N145: anchored on `UserId`'s `Hashable` impl, which kolt@984a1dfb (the
+        # v0.44.0 seal's base) and the v0.44.0-migrated tree both hold once. The
+        # first anchors (`Transient`'s `ready`/`latest`) left shared.vl with the
+        # A150 migration, and the preflight refused the scenario on every tree
+        # after it.
         "name": "shared.vl keystroke",
         "file": "src/shared.vl",
-        "edit": ("fun ready(self): Option<T> {\n\t\t", len("fun ready(self): Option<T> {\n\t\t")),
+        "edit": ("\t\tself.uuid.hash()", 2),
         "text": " ",
-        "hover": ("fun latest(self)", 5),
-        "completion": ("Transient::Refreshing(let x) => Some(x)", len("Transient::")),
+        "hover": ("self.uuid.hash()", 10),
+        "completion": ("\t\tself.uuid.hash()", len("\t\tself.")),
     },
     {
         # The owner's case: an edit to the client MODEL re-analyses the whole
