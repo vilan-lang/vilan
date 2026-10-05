@@ -313,11 +313,11 @@ sees it.
 
 ## Quick fixes
 
-Twenty, each attached to the diagnostic that earns it:
+Twenty-one, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
-| ``Import `X` from std::json`` | `cannot find 'X'` where `X` is importable — in an expression, a type, a struct literal's head, a pattern's path head or an impl's `with` trait. One action per module when more than one exports the name — never a guess between them |
+| ``Import `X` from std::json`` | `cannot find 'X'` where `X` is importable — in an expression, a type, a struct literal's head, a pattern's path head or an impl's `with` trait. One action per module when more than one exports the name — never a guess between them. Also on a trait's method called where the file does not import the trait: ``…`to_string` is `Display`'s, and this file does not import `Display`…`` (the call resolves because another loaded module imports it; a warning, an error from v0.45.0) and ``i32 has no method 'to_string'; import std::display::Display to use it …`` (nothing loaded it) — the trait the message names, from the module it names when that module declares it |
 | ``Remove the duplicate import (Organize Imports)`` | ``Json is already imported on line 1`` — the warning a repeated import leaf carries; the fix is Organize Imports' own edit for that run, which merges the repeat away |
 | ``Change to `entries` `` | a `did you mean …?` note on a misspelled struct-initializer field |
 | ``Analyze this file under its platform: add `[platform("browser")] mod self;` `` | a member the OTHER `std` twin declares (`struct 'Region' has no field 'anchor'` in a file analyzed under node, whose note names the `browser` twin that has it). The edit is the file's first line — the one place a file's platform may be written — and the attribute is the one the note spells |
@@ -337,6 +337,7 @@ Twenty, each attached to the diagnostic that earns it:
 | ``Declare `at` a `usize` `` | the same index mismatch, when the value is a counter bound by a bare literal earlier in the same function (`mut at = 0;`). The edit writes `: usize` after the counter's name, because the counter IS an index — converting at each of its uses would leave `.as_usize()` on a value that should never have been anything else. Offered ahead of the conversion |
 | ``Convert all 2 indexes in this file`` | any index mismatch, when the file carries more than one — a file migrating to `usize` meets one per index, and this action takes each one's first fix (the declaration where there is one, else the conversion) in ONE edit. It is the edit `vilan check --fix` makes, file by file, until nothing is left to fix |
 | ``Write all 2 declaration heads in the order`` | a declaration head written out of THE order — ``a declaration's attributes are written in one order — …`` (a warning, an error from v0.45.0) or ``a declaration's markers are written in one order — …`` (a keyword ahead of an attribute, or two keywords inverted; refused) — when the file carries more than one. Each head also carries its own fix, titled with the head in the order (``Write `[deprecated(..)] [must_use] fun` ``); this action takes every head in the file in ONE edit. Each head's attributes and keywords move exactly as written, and what stood between them — the blanks, a line break, a comment — stays where it stood |
+| ``Import all 2 traits this file calls`` | either trait-method diagnostic above, when the file needs more than one trait — every one of them imported in ONE edit, a trait called twice imported once. A trait more than one module declares is left to its own fix |
 
 and two source actions:
 

@@ -33,6 +33,8 @@ mod moved_std_path_tests;
 #[cfg(test)]
 mod organize_duplicate_tests;
 #[cfg(test)]
+mod trait_import_tests;
+#[cfg(test)]
 mod written_autofocus_tests;
 
 use std::collections::HashMap;

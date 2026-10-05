@@ -7312,6 +7312,106 @@ impl Document {
         })
     }
 
+    /// The add-import edit: `import <module_path>::<name>;` written where the
+    /// formatter's import placement puts it (joining a brace list from the
+    /// same module when the file has one). The one constructor of the
+    /// "Import `X` from m" title, which a missing name and a trait method's
+    /// missing trait (B515) both offer.
+    fn import_fix(&self, module_path: &[String], name: &str) -> Option<QuickFix> {
+        let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+        let edit = vilan_core::formatter::insert_import(&self.text, &path_refs, name)?;
+        Some(QuickFix {
+            title: format!("Import `{name}` from {}", module_path.join("::")),
+            span: edit.span,
+            replacement: edit.replacement,
+            target: None,
+        })
+    }
+
+    /// B515 (B535): the trait `finding` says a method call needs imported, and
+    /// the modules to import it from — `None` when the finding is not one of
+    /// the two diagnostics that name a trait's import
+    /// ([`vilan_ide::trait_import`]).
+    ///
+    /// The message spells the statement where the ANALYZER found the trait,
+    /// and the path written is still the editor's own candidate scan's answer
+    /// (the add-import fix's, which reads what each module declares and
+    /// exports): the message's module when the scan agrees, every candidate
+    /// the scan finds otherwise — several only when the name is ambiguous,
+    /// and then never guessed between. A module the scan cannot reach is not
+    /// written into a file.
+    fn trait_import_paths<'finding>(
+        &self,
+        program: &Program,
+        finding: &'finding vilan_core::error::Error,
+    ) -> Option<(&'finding str, Vec<Vec<String>>)> {
+        let import = vilan_ide::trait_import::trait_import_of_message(&finding.msg)?;
+        let candidates = self.import_candidates(program, import.name);
+        let named: Option<Vec<String>> = import
+            .module
+            .map(|module| module.iter().map(|segment| segment.to_string()).collect());
+        let paths = match named {
+            Some(named) if candidates.contains(&named) => vec![named],
+            _ => candidates,
+        };
+        Some((import.name, paths))
+    }
+
+    /// Every trait this file's own findings say a method call needs imported,
+    /// each with the ONE module to import it from — a trait the scan finds in
+    /// several modules is left to its per-site fix, never guessed — in the
+    /// order the file first needs them.
+    fn unambiguous_trait_imports(&self, program: &Program) -> Vec<(String, Vec<String>)> {
+        let mut imports: Vec<(String, Vec<String>)> = Vec::new();
+        for finding in self.own_findings() {
+            let Some((name, paths)) = self.trait_import_paths(program, finding) else {
+                continue;
+            };
+            let [module_path] = paths.as_slice() else {
+                continue;
+            };
+            if !imports
+                .iter()
+                .any(|(known, path)| known == name && path == module_path)
+            {
+                imports.push((name.to_string(), module_path.clone()));
+            }
+        }
+        imports
+    }
+
+    /// B515's file-wide fix: every trait this file calls a method of without
+    /// importing it, imported in ONE edit — the migration R-c's flip waits on
+    /// (the warning is refused from v0.45.0), a file at a time. Offered where
+    /// a trait-import finding overlaps `range`, and only for two traits or
+    /// more (two calls of one trait are one import).
+    fn trait_import_all_fix(&self, program: &Program, range: Span) -> Option<QuickFix> {
+        let asked = self.own_findings().any(|finding| {
+            spans_overlap(finding.span, range)
+                && vilan_ide::trait_import::trait_import_of_message(&finding.msg).is_some()
+        });
+        if !asked {
+            return None;
+        }
+        let imports = self.unambiguous_trait_imports(program);
+        if imports.len() < 2 {
+            return None;
+        }
+        let mut working = self.text.clone();
+        for (name, module_path) in &imports {
+            let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+            let edit = vilan_core::formatter::insert_import(&working, &path_refs, name)?;
+            working = splice(&working, edit.span, &edit.replacement);
+        }
+        let (span, replacement) = narrowed_edit(&self.text, &working);
+        Some(QuickFix {
+            title: format!("Import all {} traits this file calls", imports.len()),
+            span,
+            replacement,
+            target: None,
+        })
+    }
+
     /// I5 §8.3's bulk fix: every index mismatch in this file — a value meeting
     /// a `usize` or a `usize` meeting another width — fixed by its PREFERRED
     /// edit (a literal-bound counter declared `usize`, else the conversion), as
@@ -7453,21 +7553,22 @@ impl Document {
                 });
                 continue;
             }
+            // B515 (B535): the no-method steer names the trait whose module
+            // nothing loaded; the fix imports it.
+            if let Some((name, module_paths)) = self.trait_import_paths(program, diagnostic) {
+                fixes.extend(
+                    module_paths
+                        .iter()
+                        .filter_map(|module_path| self.import_fix(module_path, name)),
+                );
+                continue;
+            }
             if let Some(name) = unresolved_name(&diagnostic.msg) {
-                for module_path in self.import_candidates(program, name) {
-                    let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
-                    let Some(edit) =
-                        vilan_core::formatter::insert_import(&self.text, &path_refs, name)
-                    else {
-                        continue;
-                    };
-                    fixes.push(QuickFix {
-                        title: format!("Import `{name}` from {}", module_path.join("::")),
-                        span: edit.span,
-                        replacement: edit.replacement,
-                        target: None,
-                    });
-                }
+                fixes.extend(
+                    self.import_candidates(program, name)
+                        .iter()
+                        .filter_map(|module_path| self.import_fix(module_path, name)),
+                );
             } else if let Some(attribute) = diagnostic
                 .note
                 .as_ref()
@@ -7627,6 +7728,10 @@ impl Document {
         if let Some(fix) = self.marker_order_all_fix(range) {
             fixes.push(fix);
         }
+        // B515's bulk half: every trait the file calls without importing.
+        if let Some(fix) = self.trait_import_all_fix(program, range) {
+            fixes.push(fix);
+        }
         // B318 §5: the two reach WARNINGS carry fixes of their own, and a
         // warning is not in `diagnostics` — deliberately, because 62 sites gate
         // on `diagnostics.is_empty()` and a warning must not disable Organize
@@ -7697,6 +7802,15 @@ impl Document {
                 // B536: attributes out of THE order — a warning this release,
                 // an error from v0.45.0 (R-c).
                 fixes.push(fix);
+            } else if let Some((name, module_paths)) = self.trait_import_paths(program, warning) {
+                // B515: a trait's method called where the file does not import
+                // the trait — it resolves only because another loaded module
+                // does. A warning this release, refused from v0.45.0 (R-c).
+                fixes.extend(
+                    module_paths
+                        .iter()
+                        .filter_map(|module_path| self.import_fix(module_path, name)),
+                );
             } else if let Some(fix) =
                 vilan_core::parsing::written_autofocus_fix(&self.text, &warning.msg, warning.span)
             {
@@ -8153,13 +8267,19 @@ impl Document {
                 names.push(name);
             }
         }
-        let mut working = self.text.clone();
-        let mut changed = false;
+        let mut imports: Vec<(String, Vec<String>)> = Vec::new();
         for name in names {
             let candidates = self.import_candidates(program, name);
             let [module_path] = candidates.as_slice() else {
                 continue; // zero or ambiguous candidates: never guess
             };
+            imports.push((name.to_string(), module_path.clone()));
+        }
+        // B515: the traits a method call needs imported, by the same rule.
+        imports.extend(self.unambiguous_trait_imports(program));
+        let mut working = self.text.clone();
+        let mut changed = false;
+        for (name, module_path) in &imports {
             let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
             if let Some(edit) = vilan_core::formatter::insert_import(&working, &path_refs, name) {
                 working = splice(&working, edit.span, &edit.replacement);
@@ -9817,6 +9937,76 @@ fn field_spans_of(program: &Program, focus: SourceId) -> Vec<(usize, usize, Id, 
 /// splice's result — so two new imports from the same not-yet-imported
 /// module land in one merged brace set, exactly as two separate manual
 /// add-imports would.
+/// The one edit that turns `before` into `after`, narrowed to the text that
+/// differs: their common prefix and suffix are trimmed (on character
+/// boundaries, and never overlapping), so an edit computed by rewriting the
+/// whole buffer still lands as a small one, and the client keeps the caret and
+/// the folds outside it.
+fn narrowed_edit(before: &str, after: &str) -> (Span, String) {
+    let mut prefix = before
+        .bytes()
+        .zip(after.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !before.is_char_boundary(prefix) || !after.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let room = before.len().min(after.len()) - prefix;
+    let mut suffix = before
+        .bytes()
+        .rev()
+        .zip(after.bytes().rev())
+        .take(room)
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !before.is_char_boundary(before.len() - suffix)
+        || !after.is_char_boundary(after.len() - suffix)
+    {
+        suffix -= 1;
+    }
+    (
+        Span::from(prefix..before.len() - suffix),
+        after[prefix..after.len() - suffix].to_string(),
+    )
+}
+
+#[cfg(test)]
+mod narrowed_edit_tests {
+    use super::{narrowed_edit, splice};
+
+    /// Each case: the edit narrows to the difference, and applying it to
+    /// `before` gives `after` back.
+    #[test]
+    fn the_edit_is_the_difference_and_applies_back() {
+        for (before, after, expected) in [
+            // An insertion at the top.
+            (
+                "fun main() {}\n",
+                "import a::B;\nfun main() {}\n",
+                "import a::B;\n",
+            ),
+            // A repeated character at the seam: prefix and suffix may not
+            // both claim it.
+            ("aa", "aaa", "a"),
+            ("abc", "abc", ""),
+            // A deletion.
+            ("abXc", "abc", ""),
+            // Multi-byte characters sharing a leading byte (`é` and `è` both
+            // open with 0xC3): the cut stays on a character boundary.
+            ("caf\u{e9}!", "caf\u{e8}!", "\u{e8}"),
+            ("\u{e9}", "\u{e8}\u{e9}", "\u{e8}"),
+        ] {
+            let (span, replacement) = narrowed_edit(before, after);
+            assert_eq!(replacement, expected, "{before:?} -> {after:?}");
+            assert_eq!(
+                splice(before, span, &replacement),
+                after,
+                "{before:?} -> {after:?}"
+            );
+        }
+    }
+}
+
 fn splice(source: &str, span: Span, replacement: &str) -> String {
     let range = span.into_range();
     let mut result =

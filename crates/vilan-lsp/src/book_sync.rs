@@ -1112,6 +1112,11 @@ fn editor_page_code_action_titles_are_the_servers() {
         "Eighteen",
         "Nineteen",
         "Twenty",
+        "Twenty-one",
+        "Twenty-two",
+        "Twenty-three",
+        "Twenty-four",
+        "Twenty-five",
     ];
     assert_eq!(
         number_words
