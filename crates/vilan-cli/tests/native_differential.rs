@@ -8590,6 +8590,27 @@ fn a_variant_constructor_as_a_receiver_is_identical_on_both_backends() {
     );
 }
 
+/// F88: `*{ &m }` — the spelled copy of a view a BLOCK's tail names. The
+/// tail is a value position, so it was emitted as its copy and then
+/// dereferenced (rustc E0614 over a scalar, E0599 over a `str` or a list);
+/// F81 had taught the `if` and `match` forms. The probe: a scalar, a `str`, a
+/// field, a subscript, a list copied then grown, statements before the tail,
+/// nested blocks, a block whose tail is an `if`.
+#[test]
+fn a_deref_of_a_blocks_view_reads_the_value_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_deref_of_a_block_view.vl"),
+        include_str!("native/deref_of_a_block_view.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_deref_of_a_block_view.vl"),
+        Verdict::Identical,
+        "a deref of a block whose tail is a view must read the value"
+    );
+}
+
 /// F57: every platform-bound corpus program the backend ACCEPTS prints what
 /// node prints, the ones it refuses say which construct stopped them, and the
 /// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is

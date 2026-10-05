@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**Native: `*{ &m }` — a dereference of a block whose tail is a view — builds and reads the value, where rustc refused it (E0614 "type `i32` cannot be dereferenced" over a scalar, E0599 over a `str` or a list).** A block's tail is a value position, so its `&m` was emitted as the copy `{ (m).clone() }` and the `*` was then applied to that copy. F81 taught the `if` and `match` forms that their branches' tails are already the copies; a block is the same position, and now takes the same rule at both sites (the deref's emission and its consumed read). JS reads the value since B514. Pin: `native_differential`'s `a_deref_of_a_blocks_view_reads_the_value_on_both_backends` (`native/deref_of_a_block_view.vl`: a scalar, a `str`, a field, a subscript, a list copied then grown, statements before the tail, nested blocks, a block whose tail is an `if` — six rustc errors on 0.44.0). Tracker F88.
+
+---
+
+<!-- family: fix -->
 **Native: a variant constructor as a METHOD RECEIVER builds — `Maybe::Just(3).and_then(big)`, `Maybe::Just(3).describe()` — and so does a method returning its own enum nested in itself, `nest(self): Maybe<Maybe<T>>`.** Two causes. The receiver is the call's first argument, so it takes F85's rule: its position is the `self` type rebuilt under the call's bindings (`Maybe<i32>`), which a constructor with a literal payload and no recorded type needed. And behind it, refused even on a `let`-bound receiver: a nominal instance's arguments were resolved at the HEAD only before the declaration's own parameters were bound to them, so `Maybe<Maybe<T>>` bound the enum's `T` to `Maybe<T>` — a type naming the parameter it binds — and rendering the payload recursed until the guard gave up ("an unbound generic type parameter"). The arguments are now resolved whole first (`deeply_resolved`). JS was always right. Pin: `native_differential`'s `a_variant_constructor_as_a_receiver_is_identical_on_both_backends` (`native/variant_receivers.vl`: a trait method, a chain through `and_then` and `nest`, `str`, `f64` and list payloads, a nested constructor receiver, `Option`'s own method, a generic struct literal receiver, `nest` on a bound receiver — refused on 0.44.0). Tracker F86.
 
 ---

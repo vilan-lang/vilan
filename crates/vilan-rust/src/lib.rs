@@ -4404,7 +4404,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // F81: `*if c { &a } else { &b }` — the spelled copy of a view a
             // branch chooses. The branches' tails are value positions here, so
             // each leaf is already its copy, and the `*` has nothing to cross.
-            Expr::Dereference(operand) if self.is_conditional(operand) => {
+            // F88: a block's tail is the same position (`*{ &m }`).
+            Expr::Dereference(operand) if self.yields_through_value_tails(operand) => {
                 self.expression(operand, depth)?
             }
             Expr::Dereference(operand) => format!("(*{})", self.expression(operand, depth)?),
@@ -5697,12 +5698,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .is_some_and(|declaration| matches!(declaration.name, "Option" | "Result"))
     }
 
-    /// Whether an expression CHOOSES its value among branches — an `if`, a
-    /// `match` — whose tails this emitter renders as value positions.
-    fn is_conditional(&self, id: Id) -> bool {
+    /// Whether an expression's value is the value of a TAIL this emitter
+    /// renders as a value position — an `if`'s or a `match`'s branches, which
+    /// choose among them, or a block's own tail (F88: `*{ &m }` emitted the
+    /// tail's copy `{ (m).clone() }` and then dereferenced it, rustc's E0614).
+    fn yields_through_value_tails(&self, id: Id) -> bool {
         matches!(
             self.program.entity_map.get(&id),
-            Some(Expr::If(_) | Expr::Match(..))
+            Some(Expr::If(_) | Expr::Match(..) | Expr::Block(_))
         )
     }
 
@@ -10122,8 +10125,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // never a last use either: what dies here is the view, not the
             // place it names.
             Some(Expr::Dereference(operand)) => {
-                // F81: over a conditional the leaves are the copies already.
-                if self.is_natively_copy(id) || self.is_conditional(*operand) {
+                // F81, F88: over a conditional or a block the leaves are the
+                // copies already.
+                if self.is_natively_copy(id) || self.yields_through_value_tails(*operand) {
                     return rendered;
                 }
                 self.copies_taken += 1;
