@@ -30,6 +30,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**B539: a trait-annotated binding's ARGUMENTS reach its initializer. `let a: Source<Option<i32>> = SignalCell::new(None)` typed as `SignalCell<Option<unknown>>` — the JS backend ran the hole, and natively it was refused as "an unresolved type" — and is now `SignalCell<Option<i32>>`, as under the concrete annotation it stands for.** B489's twin at a `let`. The annotation stays B161's constraint on the value's own type; when the value leaves a hole, the annotation's arguments are read through the value's one impl of the trait (B489's `type_expected_through_impl`) and the initializer is typed toward that concrete type, which the binding takes. A value with no hole is untouched, and a value of another instantiation is still refused by the constraint. **Pins:** `inference::traits::b539_a_trait_annotated_bindings_arguments_reach_its_initializer` (an `Option`, an empty list, a block tail, `if` arms, a two-parameter trait, a value with no hole, the typing asserted, the constraint's refusal kept) and `native_differential::a_trait_annotated_bindings_arguments_reach_its_initializer_on_both_backends`, both red on the base. Tracker B539.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

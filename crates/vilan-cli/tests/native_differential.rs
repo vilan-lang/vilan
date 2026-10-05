@@ -171,6 +171,21 @@ const B489_PROBE: &str = concat!(
     "}\n",
 );
 
+const B539_PROBE: &str = concat!(
+    "import std::reactive::{ Source, SignalCell };\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "\n",
+    "fun main() {\n",
+    "    let a: Source<Option<i32>> = SignalCell::new(None);\n",
+    "    print(a.get().is_none());\n",
+    "    let b: Source<List<str>> = SignalCell::new([]);\n",
+    "    print(b.get().len());\n",
+    "    let flag = false;\n",
+    "    let c: Source<Option<str>> = if flag { SignalCell::new(None) } else { SignalCell::new(Some(\"x\")) };\n",
+    "    print(c.get().is_none());\n",
+    "}\n",
+);
+
 const B532_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -8925,6 +8940,21 @@ fn a_bare_trait_returns_arguments_reach_the_body_on_both_backends() {
         compare(&staged, "native_probe_b489.vl"),
         Verdict::Identical,
         "a bare-trait return's arguments must reach the body on both backends"
+    );
+}
+
+/// B539: a trait-annotated binding's arguments reach its initializer
+/// (`let a: Source<Option<i32>> = SignalCell::new(None)`). Natively the `None`
+/// was "an unresolved type".
+#[test]
+fn a_trait_annotated_bindings_arguments_reach_its_initializer_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b539.vl"), B539_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b539.vl"),
+        Verdict::Identical,
+        "a trait-annotated binding's arguments must reach its initializer on both backends"
     );
 }
 

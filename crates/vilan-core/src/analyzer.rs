@@ -5250,6 +5250,9 @@ pub struct Analyzer<'src> {
     // The constraints those annotations recorded, checked after `build()` —
     // where the binding's own type has settled (B161).
     binding_trait_constraints: Vec<BindingTraitConstraint>,
+    // B539: the same annotations by binding — the trait and its written
+    // arguments — read by `resolve_variable` to direct the initializer.
+    binding_trait_annotations: HashMap<Id, (Id, Vec<TypeId>)>,
     // B184's twin of the above, for a BINDING annotated with a struct that
     // carries a hidden type parameter (`let c: C = C { x = A {} }`). The
     // annotation cannot name the hidden argument and must not invent one, so it
@@ -7216,6 +7219,7 @@ impl<'src> Analyzer<'src> {
             binding_annotation_type_ids: HashMap::default(),
             written_nominal_bound_sites: Vec::new(),
             binding_trait_constraints: Vec::new(),
+            binding_trait_annotations: HashMap::default(),
             refused_annotation_slots: HashMap::default(),
             refused_annotation_traits: HashMap::default(),
             expose_refused_field_slots: HashSet::default(),
@@ -51291,6 +51295,15 @@ impl<'src> Analyzer<'src> {
         }
 
         if let Some(&first_value_id) = value_ids.first() {
+            // B539: a trait annotation's arguments name the value's concrete
+            // type when the value left a hole; the binding takes it, as under
+            // the concrete annotation it stands for.
+            if unannotated
+                && let Some(through_trait) =
+                    self.direction_through_trait_annotation(variable_id, first_value_id)
+            {
+                variable_type = through_trait;
+            }
             let value_type = self.infer_type(first_value_id, &variable_type, &substitution_context);
             // Ready undirected (above) but not yet DIRECTED by the annotation:
             // a closure held to `|| i32` whose void tail's wording waits on a
@@ -51418,6 +51431,34 @@ impl<'src> Analyzer<'src> {
                 }));
         }
         Resolution::Resolved
+    }
+
+    /// B539: the direction a trait-annotated binding's initializer is typed in.
+    ///
+    /// `let a: Source<Option<i32>> = SignalCell::new(None)` is B161's
+    /// constraint reading — the binding's type is its initializer's, and the
+    /// annotation resolves to `Unknown` — so the initializer was typed in no
+    /// direction at all, and the arguments the annotation writes reached
+    /// nothing: the `None`'s payload stayed a hole of its own (natively, "an
+    /// unresolved type"). Read through the value's ONE impl of the trait
+    /// ([`Self::type_expected_through_impl`], B489's route for a bare-trait
+    /// return), the annotation names a concrete type, `SignalCell<Option<i32>>`,
+    /// and the initializer is typed toward it exactly as under that written
+    /// annotation. The binding still takes the value's type. `None` when the
+    /// binding carries no trait annotation with arguments, the value has no
+    /// hole, or no single impl answers.
+    fn direction_through_trait_annotation(
+        &mut self,
+        variable_id: Id,
+        value_id: Id,
+    ) -> Option<Type> {
+        let (trait_id, arguments) = self.binding_trait_annotations.get(&variable_id)?.clone();
+        let undirected = self.infer_type(value_id, &Type::Unknown, &HashMap::default());
+        let undirected_id = undirected.clone().get_type_id(self);
+        if !self.type_has_hole(undirected_id) {
+            return None;
+        }
+        self.type_expected_through_impl(&undirected, trait_id, &arguments)
     }
 
     /// Infer a function body's tail expression against the declared return type,
@@ -58257,6 +58298,10 @@ impl<'src> Analyzer<'src> {
                                 arguments: arguments.clone(),
                                 span,
                             });
+                            if !arguments.is_empty() {
+                                self.binding_trait_annotations
+                                    .insert(variable_id, (*trait_id, arguments.clone()));
+                            }
                         } else if let Some((owner_id, owner_scope_id)) =
                             self.parameter_annotation_type_ids.get(&type_id).copied()
                         {

@@ -9397,3 +9397,65 @@ fn b533_a_bound_provided_at_two_instantiations_binds_from_the_expectation() {
         );
     }
 }
+
+/// B539: B489's twin at a binding. A trait annotation on a `let` is B161's
+/// constraint on the value's own type, and its ARGUMENTS name that type when
+/// the value left a hole: `let a: Source<Option<i32>> = SignalCell::new(None)`
+/// typed as `SignalCell<Option<unknown>>` (natively "an unresolved type") and
+/// is now `SignalCell<Option<i32>>`, read through `SignalCell`'s one impl of
+/// `Source`. A block tail, `if` arms, a two-parameter trait and a value with
+/// no hole are pinned; the typing is asserted where JS alone ran the hole.
+#[test]
+fn b539_a_trait_annotated_bindings_arguments_reach_its_initializer() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        import std::option::Option::{ self, None, Some };
+        trait Pair<A, B> {
+            fun left(self): A;
+        }
+        struct Both<A, B> { a: A, b: B }
+        impl Both<type A, type B> with Pair<A, B> {
+            fun left(self): A { self.a }
+        }
+        fun main() {
+            let a: Source<Option<i32>> = SignalCell::new(None);
+            print(a.get().is_none());
+            let b: Source<List<str>> = SignalCell::new([]);
+            print(b.get().len());
+            let c: Source<Option<str>> = { SignalCell::new(None) };
+            print(c.get().is_none());
+            let flag = true;
+            let d: Source<Option<bool>> =
+                if flag { SignalCell::new(None) } else { SignalCell::new(Some(true)) };
+            print(d.get().is_none());
+            let e: Pair<Option<i32>, List<str>> = Both { a = None, b = [] };
+            print(e.left().is_none());
+            let f: Source<i32> = SignalCell::new(4);
+            print(f.get());
+        }
+        "#,
+        "true\n0\ntrue\ntrue\ntrue\n4\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        import std::option::Option::{ self, None };
+        fun main() {
+            let a: Source<Option<i32>> = SignalCell::new(None);
+            let wrong: i32 = a;
+        }
+        "#,
+        "got SignalCell<Option<i32>>",
+    );
+    // Still the constraint: a value of another instantiation is refused by it.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun main() {
+            let a: Source<str> = SignalCell::new(4);
+        }
+        "#,
+        "does not implement trait 'Source<str>'",
+    );
+}
