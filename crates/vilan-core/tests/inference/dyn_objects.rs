@@ -2069,3 +2069,35 @@ fun main() {
 fn b532_an_object_over_a_subtrait_answers_from_the_supertraits_instantiation() {
     assert_compiles_and_runs(B532_PROGRAM, "big\n9\nbig\nbig\nbig\n");
 }
+
+/// M89: a trait object's table is a function of its SLOT SET, so two
+/// `(type, trait)` pairs whose every member is the same emitted function share
+/// one table object. A generic struct whose impl does not depend on its
+/// parameter emits one body for every instantiation, and coercing `Holder<i32>`
+/// and `Holder<str>` built two identical tables (kolt's client: 14 tables, 10
+/// distinct). Both objects still dispatch.
+#[test]
+fn m89_two_pairs_with_one_slot_set_share_one_table() {
+    let source = r#"
+        import std::io::print;
+
+        trait Weight { fun weight(self): i32; }
+        struct Holder<T> { value: T, weight: i32 }
+        impl Holder<type T> with Weight {
+            fun weight(self): i32 { self.weight }
+        }
+
+        fun main() {
+            let a: dyn Weight = Holder { value = 1, weight = 2 };
+            let b: dyn Weight = Holder { value = "x", weight = 3 };
+            print(a.weight() + b.weight());
+        }
+    "#;
+    let js = compile(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert_eq!(
+        js.matches("Object.create(").count(),
+        1,
+        "two pairs with one slot set built two tables (M89):\n{js}"
+    );
+    assert_compiles_and_runs(source, "5\n");
+}

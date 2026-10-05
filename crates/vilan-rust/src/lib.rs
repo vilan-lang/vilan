@@ -1192,7 +1192,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // The top of a field spine over a binding: recorded with its PATH,
             // and the root read registered as the whole-binding walk would
             // have (the spine has no other children to visit).
-            Some(Expr::Field(..)) if let Some((binding, path)) = self.place_spine(expr_id) => {
+            Some(Expr::Field(..) | Expr::TupleIndex(..))
+                if let Some((binding, path)) = self.liveness_spine(expr_id) =>
+            {
                 let declared = state.declared_at.get(&binding).copied().unwrap_or(0);
                 let movable = depth <= declared;
                 // The root read still supersedes every earlier read of the
@@ -10073,6 +10075,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 Some((binding, path))
             }
             _ => None,
+        }
+    }
+
+    /// [`Self::place_spine`] through TUPLE ELEMENTS too — F37's field-liveness
+    /// spine (M109). A tuple element is a field by position: its FLAT offset
+    /// names it uniquely among its siblings (each element owns a disjoint
+    /// offset range), and a nested element extends the path one level down,
+    /// so a prefix is still exactly "contains". Kept apart from `place_spine`,
+    /// whose other readers (loaned arguments, receivers, aliasing) answer for
+    /// fields alone.
+    fn liveness_spine(&self, id: Id) -> Option<(Id, Vec<usize>)> {
+        let _guard = vilan_core::util::RecursionGuard::enter()?;
+        match *self.program.entity_map.get(&id)? {
+            Expr::TupleIndex(subject, offset, _) => {
+                let (binding, mut path) = self.liveness_spine(subject)?;
+                path.push(offset);
+                Some((binding, path))
+            }
+            Expr::Field(subject, _, index) => {
+                let (binding, mut path) = self.liveness_spine(subject)?;
+                path.push(index);
+                Some((binding, path))
+            }
+            _ => self.place_spine(id),
         }
     }
 

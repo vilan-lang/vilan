@@ -1132,6 +1132,12 @@ fn allow_perf_regression_writes_its_reason_into_the_release_notes_and_lifts_only
         note.starts_with("> Performance: ") && note.contains(reason),
         "the reason must open the release section as a note:\n{proposed}"
     );
+    // N146: the verdict is NAMED, never located — the note lands in a
+    // tracked file, and the v0.44.0 cut wrote the verdict's home path there.
+    assert!(
+        note.contains("perf-") && !note.contains(&fixture.home.display().to_string()),
+        "the note carries the verdict's machine path:\n{note}"
+    );
 
     // It lifts the performance red and nothing else: red CI still refuses.
     let (ok, report) = fixture.script_with(
@@ -1225,6 +1231,64 @@ fn the_fold_names_each_precondition_it_cannot_meet() {
     );
 }
 
+/// N146 (2): the fold reads ORIGIN's main, not the local one. The v0.43.0
+/// fold died at `git push origin main`; the resumed run saw a local main
+/// carrying the tag, skipped the push, and origin's main sat two releases
+/// behind. Here local main carries the merge and origin's does not: the fold
+/// plans the push, and verifies origin afterwards.
+#[test]
+fn the_fold_pushes_a_main_that_carries_the_tag_only_locally() {
+    let fixture = Fixture::new("fold-origin", SCRAMBLED);
+    let origin = fixture.root.join("origin.git");
+    let init = Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&origin)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git init --bare");
+    assert!(init.status.success(), "the bare origin");
+    fixture.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        origin.to_str().expect("utf-8"),
+    ]);
+    // No network: the manifest fetch fails the way an offline curl does.
+    write_shim(&fixture.bin.join("curl"), "#!/bin/sh\nexit 7\n");
+    // The release, as it stands after a fold that died at the push: next and
+    // the tag on origin, main merged LOCALLY in a worktree of its own.
+    fixture.git(&["tag", "v9.9.9"]);
+    fixture.git(&["push", "--quiet", "origin", "next", "v9.9.9"]);
+    let main_tree = fixture.root.join("main-tree");
+    fixture.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "main",
+        main_tree.to_str().expect("utf-8"),
+        "v9.9.9",
+    ]);
+    let (_, report) = fixture.script("fold-release.sh", &["v9.9.9", "--dry-run"]);
+    assert!(
+        report.contains("main carries v9.9.9 here but origin's main (absent) does not"),
+        "the fold trusted the local main:\n{report}"
+    );
+    assert!(
+        report.contains("push origin main")
+            && report.contains("git ls-remote origin refs/heads/main"),
+        "the fold must push main and verify origin's:\n{report}"
+    );
+    // Once origin carries it, there is nothing to push.
+    fixture.git(&["push", "--quiet", "origin", "main"]);
+    let (_, report) = fixture.script("fold-release.sh", &["v9.9.9", "--dry-run"]);
+    assert!(
+        report.contains("main already carries v9.9.9, and so does origin's"),
+        "{report}"
+    );
+}
+
 /// Both scripts are executable in the tree, and stay that way. A cut that has
 /// to be prefixed with `sh` is a cut whose muscle memory is wrong.
 #[test]
@@ -1297,6 +1361,59 @@ fn the_release_commit_stages_every_workspace_members_manifest() {
         script.contains("RELEASE_FILES=\"$(release_files)\""),
         "the staged list and the printed `git add` line are both `release_files`"
     );
+}
+
+/// N146: the cut runs the hygiene pin's home-path check on what it WROTE
+/// before anything is staged — the v0.44.0 cut wrote two machine paths into
+/// tracked files and they were removed by hand. The pin runs the script's own
+/// check (extracted, so nothing else executes) over a scratch tree, with a
+/// path planted and without.
+#[test]
+fn the_cut_refuses_a_machine_path_in_what_it_wrote() {
+    let root = repository_root();
+    let script = fs::read_to_string(root.join("scripts").join("cut-release.sh"))
+        .expect("read scripts/cut-release.sh");
+    let start = script
+        .find("home_paths=\"$(grep")
+        .expect("cut-release.sh checks what it wrote for home paths");
+    let end = start + script[start..].find("\nfi\n").expect("the check closes") + 4;
+    let check = &script[start..end];
+    let run = |changelog: &str| {
+        let scratch = support::scratch_root().join(format!(
+            "vilan-cut-hygiene-{}-{}",
+            std::process::id(),
+            changelog.len()
+        ));
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(scratch.join("perf")).expect("create the scratch tree");
+        fs::write(scratch.join("CHANGELOG.md"), changelog).expect("write");
+        fs::write(scratch.join("perf/budgets.toml"), "tolerance = 0.01\n").expect("write");
+        let output = Command::new("sh")
+            .current_dir(&scratch)
+            .arg("-c")
+            .arg(format!(
+                "say() {{ printf '%s\\n' \"$*\"; }}\nfail() {{ say \"$*\"; exit 1; }}\nVERSION=9.9.9\n{check}"
+            ))
+            .output()
+            .expect("run the check");
+        let _ = fs::remove_dir_all(&scratch);
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    };
+    let (ok, report) = run("## v9.9.9\n\n> Performance: see perf-0123.json\n");
+    assert!(ok, "a clean tree was refused:\n{report}");
+    let planted = format!(
+        "## v9.9.9\n\n> Performance: see /{}/someone/perf-0123.json\n",
+        "home"
+    );
+    let (ok, report) = run(&planted);
+    assert!(
+        !ok,
+        "a home path in CHANGELOG.md was let through:\n{report}"
+    );
+    assert!(report.contains("CHANGELOG.md:3:"), "{report}");
 }
 
 // --- The installer's checksum step (backlog §L item 15, the "S half") ------

@@ -106,7 +106,9 @@ def write_budgets(data, path=BUDGETS):
 
 
 def effective_ceiling(data, row):
-    ceiling = row["ceiling"] * (1 + data.get("tolerance", 0.01))
+    # A row may carry its own tolerance (M114: the `ci` class's counter moves by under 0.01% between runners,
+    # so Q7 holds it to 0.5% where the reference machine keeps the file's 1%).
+    ceiling = row["ceiling"] * (1 + row.get("tolerance", data.get("tolerance", 0.01)))
     for bump in data["bump"]:
         if bump["subject"] == row["subject"] and bump.get("class", row["class"]) == row["class"]:
             ceiling *= bump["ratio"]
@@ -274,28 +276,50 @@ def command_gate(options):
 
 
 def command_ratchet(options):
-    """Set or lower ceilings from a measured JSON (Q5): a row with no ceiling for the measurement's class
-    and counter is adopted at measured x 1 (the tolerance rides on top at judgement); a row more than 2%
-    under its ceiling is lowered to the new count. `--release` resets the bumps (they live one release)."""
+    """Set or lower ceilings from a measured JSON or a seal's verdict (Q5): a row with no ceiling for the
+    measurement's class and counter is adopted at measured x 1 (the tolerance rides on top at judgement); a
+    row more than 2% under its ceiling is lowered to the new count. `--release` ABSORBS the bumps (N146): a
+    bumped row's ceiling becomes its measured count and the bump rows reset (they live one release). From a
+    verdict, the E121 counts the seal advanced are written too — the release commit is where they land."""
     data = load_budgets(options.budgets)
     with open(options.source) as handle:
         measured = json.load(handle)
+    # A seal's VERDICT (`perf-<sha>.json`) reads like a measurement: its T2 results, plus the E121 count the
+    # seal advanced (N146: the cut ratchets from the verdict it checked, in the release commit).
+    verdict = "t2" in measured
+    results = measured["t2"]["results"] if verdict else measured["results"]
     counter, klass = measured["counter"], measured["class"]
-    stamp = options.stamp or measured["vilan"]
+    stamp = options.stamp or measured.get("vilan") or f"the seal's verdict at {str(measured.get('sha'))[:10]}"
+    bumped = {(bump["subject"], bump.get("class")) for bump in data["bump"]}
     changes = []
-    for subject, result in measured["results"].items():
+    for subject, result in results.items():
         if subject.startswith("plain:") or result["exit"] != 0:
             continue
         row = next((r for r in data["row"] if r["subject"] == subject and r["counter"] == counter
                     and r["class"] == klass), None)
+        absorbs = options.release and ((subject, klass) in bumped or (subject, None) in bumped)
+        if row is not None and absorbs and result["instructions"] != row["ceiling"]:
+            # N146: an approved bump lives one release. At the release its row's ceiling becomes the measured
+            # count — the bump ABSORBED — or resetting the bumps would turn the row red at the next gate.
+            changes.append(f"absorbed the bump on {subject} ({klass}/{counter}) {row['ceiling']:,} -> "
+                           f"{result['instructions']:,}")
+            row["ceiling"] = result["instructions"]
+            row["measured_at"] = stamp
+            continue
         if row is None:
-            data["row"].append({"subject": subject, "counter": counter, "class": klass,
-                                "ceiling": result["instructions"], "measured_at": stamp})
+            row = {"subject": subject, "counter": counter, "class": klass,
+                   "ceiling": result["instructions"], "measured_at": stamp}
+            if options.tolerance is not None:
+                row["tolerance"] = options.tolerance
+            data["row"].append(row)
             changes.append(f"adopted {subject} ({klass}/{counter}) at {result['instructions']:,}")
         elif result["instructions"] < row["ceiling"] * 0.98:
             changes.append(f"lowered {subject} ({klass}/{counter}) {row['ceiling']:,} -> {result['instructions']:,}")
             row["ceiling"] = result["instructions"]
             row["measured_at"] = stamp
+    if verdict and measured.get("e121_after") is not None:
+        data["e121"] = measured["e121_after"]
+        changes.append("E121's counts advanced as the seal recorded them")
     if options.release:
         if data["bump"]:
             changes.append(f"reset {len(data['bump'])} bump row(s) at the release")
@@ -352,7 +376,7 @@ def prepare_sources(options, scratch):
                "tip": {"copy": base_copy, "label": f"kolt@{kolt_sha}"}, "kolt": kolt_sha, "different": False}
     if options.tip_kolt:
         sources["tip"] = {"copy": prepare_tree(options.tip_kolt, scratch),
-                          "label": f"the prepared tree {os.path.abspath(options.tip_kolt)}"}
+                          "label": prepared_tree_label(options.tip_kolt)}
         sources["different"] = True
     if not options.base_std:
         for side in ("base", "tip"):
@@ -362,6 +386,12 @@ def prepare_sources(options, scratch):
                 sys.exit(f"perf_gate: the kolt copy {sources[side]['copy']} sits inside a vilan checkout; pass "
                          "--base-std (the release's std) or a --scratch outside it")
     return sources
+
+
+def prepared_tree_label(path):
+    """A prepared tree NAMED, never located (N146): the label goes into the verdict and from there into
+    `perf/report-vX.Y.Z.md`, a tracked file, where a machine path is a hygiene failure."""
+    return f"the prepared tree `{os.path.basename(os.path.normpath(path))}`"
 
 
 def different_sources_note(sources):
@@ -477,6 +507,31 @@ def e121_rows(data, lsp_json):
     return rows, blocking
 
 
+E121_STATE = "e121-state.json"
+
+
+def overlay_e121_state(data, verdict_dir):
+    """E121's two-green count as the seals have kept it (N146): beside the verdicts, OUTSIDE the tree, so
+    counting a seal never moves the sha its verdict is for. A row the state does not name keeps what
+    `perf/budgets.toml` says (the count a release commit last wrote)."""
+    path = os.path.join(verdict_dir, E121_STATE)
+    if not os.path.exists(path):
+        return
+    with open(path) as handle:
+        kept = {(row["scenario"], row.get("metric")): row for row in json.load(handle)}
+    for target in data["e121"]:
+        row = kept.get((target["scenario"], target.get("metric")))
+        if row:
+            target["green_seals"] = row.get("green_seals", 0)
+            target["blocking"] = row.get("blocking", False)
+
+
+def write_e121_state(verdict_dir, rows):
+    os.makedirs(verdict_dir, exist_ok=True)
+    with open(os.path.join(verdict_dir, E121_STATE), "w") as handle:
+        json.dump(rows, handle, indent=1)
+
+
 def advance_e121(data, rows):
     """After a seal: count consecutive green seals per row; the second makes it blocking (Q9)."""
     by_name = {(row["scenario"], row.get("metric")): row for row in rows}
@@ -530,7 +585,7 @@ def describe_source(source):
     if not source:
         return "(unrecorded)"
     if source.get("kind") == "prepared":
-        return f"the prepared tree {source.get('path')}"
+        return prepared_tree_label(source.get("path") or "")
     return f"kolt@{str(source.get('sha', ''))[:8]}"
 
 
@@ -569,6 +624,7 @@ def command_seal(options):
             lsp_notes = lsp_source_notes(options.lsp_json[0], options.lsp_json[1])
             for note in lsp_notes:
                 print(f"  NOTE  {note}")
+        overlay_e121_state(data, options.verdict_dir)
         e121, e121_red = e121_rows(data, options.lsp_json[1] if options.lsp_json else None)
         # §6.4: the report's first line names the most expensive phase — a SHARE of thread CPU on the
         # generated app, which a load moves far less than it moves the absolute figures.
@@ -576,12 +632,22 @@ def command_seal(options):
         bumps = [b for b in data["bump"]]
         owner_bumps = [b for b in bumps if b["ratio"] > 1.03 or b["subject"].startswith("kolt")]
         red = t2_red + (t3["red"] if t3 else []) + lsp_red + e121_red
+        # N146: `--advance` counts this seal toward E121's two-green rule IN THE VERDICT. Writing
+        # `perf/budgets.toml` here moved the tree past the sha the verdict is for, so the tip a cut tags had
+        # none; the advance is applied by `ratchet --from <this verdict>` in the release commit instead.
+        e121_after = None
+        if options.advance:
+            advanced = {"e121": [dict(target) for target in data["e121"]]}
+            advance_e121(advanced, e121)
+            e121_after = advanced["e121"]
+            write_e121_state(options.verdict_dir, e121_after)
         verdict = {
             "sha": sha, "date": datetime.date.today().isoformat(), "verdict": "red" if red else "green",
             "red": red, "load": loadavg(), "class": options.klass, "counter": counter,
             "t2": {"results": results, "judged": t2_lines}, "t3": t3, "lsp": lsp_rows, "lsp_notes": lsp_notes,
             "e121": e121,
             "bumps": bumps, "bumps_for_the_owner": owner_bumps, "genapp_phases_cpu_ms": phases,
+            "e121_after": e121_after,
         }
         os.makedirs(options.verdict_dir, exist_ok=True)
         out = os.path.join(options.verdict_dir, f"perf-{sha}.json")
@@ -590,9 +656,8 @@ def command_seal(options):
         print(f"wrote {out}")
         for bump in owner_bumps:
             print(f"  OWNER  bump {bump['subject']} x{bump['ratio']}: {bump['reason']} ({bump.get('item', '-')})")
-        if options.advance:
-            advance_e121(data, e121)
-            write_budgets(data, options.budgets)
+        if e121_after is not None:
+            print("  E121  this seal's count is in the verdict (`e121_after`); `ratchet --from` it applies it")
         print("PERF VERDICT: " + ("RED — " + "; ".join(red) if red else "green"))
         return 1 if red else 0
     finally:
@@ -652,7 +717,12 @@ def command_calibrate(options):
     genapp = subject_dir("genapp:46", work)
     scratch = tempfile.mkdtemp(prefix="perf-calibrate-", dir=options.scratch)
     try:
-        copy, sha = prepare_kolt(options.kolt, options.commit, scratch)
+        if options.kolt_tree:
+            # A prepared tree, as `seal --tip-kolt` takes one: no git is run in it, which is what a lane
+            # that may only read kolt through a scratch copy needs (M112).
+            copy, sha = prepare_tree(options.kolt_tree, scratch), "tree"
+        else:
+            copy, sha = prepare_kolt(options.kolt, options.commit, scratch)
         splits = {}
         for name, directory in (("genapp", genapp), (f"kolt@{sha}", copy)):
             phase_split(options.vilan, directory)  # warm-up
@@ -769,6 +839,8 @@ def main():
     p.add_argument("--from", dest="source", required=True)
     p.add_argument("--release", action="store_true")
     p.add_argument("--stamp")
+    p.add_argument("--tolerance", type=float,
+                   help="a tolerance for the rows this adopts, in place of the file's (M114: 0.005 for `ci`)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(run=command_ratchet)
 
@@ -787,7 +859,9 @@ def main():
     p.add_argument("--lsp-json", nargs=2, metavar=("BASE", "TIP"))
     p.add_argument("--sha")
     p.add_argument("--verdict-dir", default=os.environ.get("VILAN_PERF_VERDICTS", DEFAULT_VERDICTS))
-    p.add_argument("--advance", action="store_true", help="count this seal toward E121's two-green rule")
+    p.add_argument("--advance", action="store_true",
+                   help="count this seal toward E121's two-green rule: kept beside the verdicts and recorded in "
+                        "the verdict, never written into the tree (N146)")
     add_class(p)
     p.set_defaults(run=command_seal)
 
@@ -798,7 +872,9 @@ def main():
 
     p = sub.add_parser("calibrate")
     p.add_argument("--vilan", required=True)
-    p.add_argument("--kolt", required=True)
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--kolt", help="a kolt checkout, archived at --commit")
+    source.add_argument("--kolt-tree", help="a prepared kolt tree, used as it stands (no git)")
     p.add_argument("--commit", default="HEAD")
     p.set_defaults(run=command_calibrate)
 

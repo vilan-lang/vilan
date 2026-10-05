@@ -33,8 +33,24 @@ use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
 /// the author can change. The suggestion to annotate is a later slice; this
 /// one is the numbers.
 fn print_cost_report(program: &Program, platform: Platform, limit: usize) {
-    let own: Vec<&vilan_core::analyzer::ItemCost> = program
-        .item_costs
+    // M118: the selections the post-passes and the emission walk computed,
+    // charged to the declaration whose body asked (module-level code and the
+    // program-wide scans to `<module level>`) — the solver's per-constraint
+    // attribution ends at the fixpoint, before any of them is made, so the
+    // column read 0 for every declaration.
+    let mut selections = vilan_core::impl_select::take_selection_costs();
+    let mut costs: Vec<vilan_core::analyzer::ItemCost> = program.item_costs.clone();
+    for cost in &mut costs {
+        cost.work.selections += selections.remove(&cost.owner).unwrap_or(0);
+    }
+    costs.sort_by(|left, right| {
+        right
+            .work
+            .total()
+            .cmp(&left.work.total())
+            .then_with(|| left.owner.map(|id| id.0).cmp(&right.owner.map(|id| id.0)))
+    });
+    let own: Vec<&vilan_core::analyzer::ItemCost> = costs
         .iter()
         .filter(|cost| {
             cost.source

@@ -462,9 +462,14 @@ PERF_NOTE=""
 TARGET_FULL="$(git rev-parse "$TARGET")"
 PERF_DIR="${VILAN_PERF_VERDICTS:-$HOME/.vilan/perf-verdicts}"
 PERF_FILE="$PERF_DIR/perf-$TARGET_FULL.json"
+# N146: the verdict is NAMED in what this script writes, never located — the
+# reason lands in CHANGELOG.md, a tracked file, and the v0.44.0 cut wrote the
+# verdict's home path there. The terminal gets the path on a line of its own.
+PERF_NAME="perf-$TARGET_FULL.json"
 perf_verdict=""
 if [ ! -f "$PERF_FILE" ]; then
-    perf_verdict="no performance verdict at $TARGET_SHORT ($PERF_FILE) - run the seal's perf leg (scripts/perf_gate.py seal) at this commit, on the reference machine"
+    say "        (looked for $PERF_FILE)"
+    perf_verdict="no performance verdict at $TARGET_SHORT ($PERF_NAME) - run the seal's perf leg (scripts/perf_gate.py seal) at this commit, on the reference machine"
 else
     perf_state="$(sed -n 's/^[[:space:]]*"verdict":[[:space:]]*"\([a-z]*\)".*/\1/p' "$PERF_FILE" | head -n 1)"
     case "$perf_state" in
@@ -472,10 +477,10 @@ else
             say "  ok    the performance verdict is green at $TARGET_SHORT"
             ;;
         red)
-            perf_verdict="the performance verdict at $TARGET_SHORT is RED - $PERF_FILE names the rows"
+            perf_verdict="the performance verdict at $TARGET_SHORT is RED - $PERF_NAME names the rows"
             ;;
         *)
-            perf_verdict="$PERF_FILE holds no verdict this script can read - unreadable is not green"
+            perf_verdict="$PERF_NAME holds no verdict this script can read - unreadable is not green"
             ;;
     esac
 fi
@@ -702,6 +707,25 @@ if [ -f "$PERF_FILE" ] && [ -f scripts/perf_gate.py ] && command -v python3 > /d
     run python3 scripts/perf_gate.py report --verdict "$PERF_FILE" --title "v$VERSION" \
         --out "perf/report-v$VERSION.md"
     say ""
+    # N146: the release absorbs this release's bumps — a bumped row's ceiling
+    # becomes the count the seal measured, the bump rows reset — and lands the
+    # E121 count the seal advanced, in the release commit. Resetting the bumps
+    # and leaving their ceilings (what `ratchet --release` did, and the cut
+    # never even called it) turned every approved bump red at the next gate.
+    run python3 scripts/perf_gate.py ratchet --from "$PERF_FILE" --release --stamp "v$VERSION's seal"
+    say ""
+fi
+
+# N146: what this script wrote must pass the hygiene pin it would otherwise
+# fail in CI - no absolute home path in a tracked file (`hygiene::
+# no_tracked_file_contains_an_absolute_home_path`, the same three needles).
+# The v0.44.0 cut wrote two, removed by hand. Refused before anything is staged.
+# The needles are spelled in pieces so this file does not carry them itself.
+home_paths="$(grep -n -e "/""home""/" -e "/""Users""/" -e 'C:\\''Users\\' CHANGELOG.md perf/budgets.toml \
+    "perf/report-v$VERSION.md" 2> /dev/null || true)"
+if [ -n "$home_paths" ]; then
+    say "$home_paths"
+    fail "the cut wrote a machine path into a tracked file (above) - nothing is staged: remove it, then stage and commit by hand"
 fi
 
 # Every file the bump rewrites, which is exactly what the release commit stages:
@@ -716,7 +740,7 @@ release_files() {
     printf '%s\n' CHANGELOG.md Cargo.lock crates/*/Cargo.toml \
         editors/vscode/package.json editors/vscode/package-lock.json
     if [ -f "perf/report-v${VERSION:-}.md" ]; then
-        printf '%s\n' "perf/report-v$VERSION.md"
+        printf '%s\n' "perf/report-v$VERSION.md" perf/budgets.toml
     fi
 }
 RELEASE_FILES="$(release_files)"

@@ -1,15 +1,9 @@
-function __clone(value) {
-	if (Array.isArray(value)) return value.map(__clone);
-	if (value instanceof Set) return new Set([ ...value ].map(__clone));
-	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
-	return value;
-}
 const pair = [ 7, "vilan" ];
 console.log(pair[0]);
 console.log(pair[1].length);
 const nested = [ ...[ 1, 2 ], 3 ];
 console.log(nested[1]);
-const inner = __clone(nested.slice(0, 2));
+const inner = nested.slice(0, 2);
 console.log(inner[0] + inner[1] + nested[2]);
 let counter = [ 0, 100 ];
 counter[0] = counter[0] + 1;

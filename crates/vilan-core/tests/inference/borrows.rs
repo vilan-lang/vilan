@@ -12638,6 +12638,210 @@ fn b528_a_write_to_a_copy_or_readonly_capture_steers_to_the_view_subject() {
 /// payload out and back on every write. Counted, not timed: the emitted
 /// `__clone` is instrumented and every call counted. The old shape is the
 /// control that proves the counter is live.
+/// M90: a read-only `let` of a stable place SHARES it on JS. `let layout =
+/// config.layout; layout.table[at]` deep-copied the layout on every call
+/// (kolt's search matcher: a 16K-entry table per alignment), and `let x =
+/// found[a]` in a `sort_by` comparator copied two records per comparison.
+/// Counted: a hundred calls of each shape copy nothing now.
+#[test]
+fn m90_a_read_only_let_of_a_stable_place_copies_nothing() {
+    let source = r#"
+        import std::io::print;
+        import std::compare::Ordering;
+
+        struct Layout { table: List<i32> }
+        struct Config { layout: Layout }
+
+        fun cost(config: Config, at: usize): i32 {
+            let layout = config.layout;
+            layout.table[at] + layout.table[0]
+        }
+
+        fun main() {
+            let config = Config { layout = Layout { table = [1, 2, 3] } };
+            mut total = 0;
+            mut n = 0;
+            for n < 100 {
+                total += cost(config, 2);
+                n += 1;
+            }
+            let found = [config, Config { layout = Layout { table = [0] } }];
+            let order = [0, 1].sort_by(|a, b| {
+                let x = found[a];
+                let y = found[b];
+                if x.layout.table[0] < y.layout.table[0] { Ordering::Less } else { Ordering::Greater }
+            });
+            print(i"{total} {order[0]}{order[1]}");
+        }
+    "#;
+    let js = compile(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let counted = format!(
+        "process.on('exit', () => console.log('copies=' + (globalThis.__copies ?? 0)));\n{}",
+        js.replace(
+            "function __clone(value) {",
+            "function __clone(value) { globalThis.__copies = (globalThis.__copies ?? 0) + 1;",
+        )
+    );
+    let stdout = run_js(&counted).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(stdout.contains("400 10"), "{stdout}");
+    // The two-element list literal copies `config` into its slot (a store),
+    // which is two `__clone` calls per level: the copies the lets made are gone.
+    let copies: usize = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("copies="))
+        .expect("the exit hook prints the count")
+        .parse()
+        .expect("a count");
+    assert!(
+        copies < 10,
+        "the read-only lets deep-copied their places ({copies} `__clone` calls) (M90)"
+    );
+}
+
+/// M90's limits, run: a `let` of a place that LEAVES its frame — returned,
+/// captured by a closure, stored — keeps its copy (the store copies at the
+/// store), so a later write by the owner is not seen through it.
+#[test]
+fn m90_a_let_that_leaves_its_frame_still_copies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Layout { table: List<i32> }
+        struct Config { layout: Layout }
+
+        fun returned(config: Config): Layout {
+            let layout = config.layout;
+            layout
+        }
+
+        fun captured(config: Config): || i32 {
+            let layout = config.layout;
+            || layout.table[0]
+        }
+
+        fun stored(config: Config): List<Layout> {
+            let layout = config.layout;
+            mut out: List<Layout> = [];
+            out.push(layout);
+            out
+        }
+
+        fun main() {
+            mut c = Config { layout = Layout { table = [1] } };
+            let r = returned(c);
+            let get = captured(c);
+            let s = stored(c);
+            c.layout.table[0] = 9;
+            c.layout.table.push(5);
+            print(i"{r.table[0]} {get()} {s[0].table[0]} {r.table.len()}");
+        }
+        "#,
+        "1 1 1 1\n",
+    );
+}
+
+/// M109 (B509's remainder): the write-BACK of a dead payload copies nothing.
+/// The derive's multi-payload step (`mut payload = (p0, p1); f(&mut payload);
+/// held = V(payload.0, payload.1)`) and a single payload lent to a closure
+/// (`f(&mut p0); held = V(p0)`) deep-copied the payload back although it dies
+/// there — the first because rule 2 elided only a whole BINDING, never its
+/// disjoint fields, and both because a `&mut` loan to a CLOSURE binding made
+/// the owner opaque to the last-use pass. Counted, as B509's pin counts: each
+/// write still copies the payload OUT once (the capture, Q6), and no longer
+/// copies it back.
+#[test]
+fn m109_the_write_back_of_a_dead_payload_copies_nothing() {
+    fn copies_made(source: &str) -> usize {
+        let js = compile(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let counted = js.replace(
+            "function __clone(value) {",
+            "function __clone(value) { globalThis.__copies = (globalThis.__copies ?? 0) + 1;",
+        );
+        let counted = format!(
+            "process.on('exit', () => console.log('copies=' + (globalThis.__copies ?? 0)));\n{counted}"
+        );
+        let stdout = run_js(&counted).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("copies="))
+            .expect("the exit hook prints the count")
+            .parse()
+            .expect("a count")
+    }
+    let program = |step: &str, start: &str| {
+        format!(
+            r#"
+        import std::io::print;
+
+        struct P {{ x: i32 }}
+
+        enum E {{ A(P), B(P, i32), C }}
+
+        {step}
+
+        fun main() {{
+            mut e = {start};
+            mut n = 0;
+            for n < 100 {{
+                step(&mut e, |p: &mut P| {{
+                    p.x += 1;
+                }});
+                n += 1;
+            }}
+            print(match &e {{
+                E::A(let p) => p.x,
+                E::B(let p, _) => p.x,
+                E::C => 0,
+            }});
+        }}
+        "#
+        )
+    };
+    let single = program(
+        r#"
+        fun step(held: &mut E, f: |&mut P| void) {
+            match held {
+                E::A(mut p0) => {
+                    f(&mut p0);
+                    held = E::A(p0);
+                },
+                _ => {},
+            }
+        }
+        "#,
+        "E::A(P { x = 0 })",
+    );
+    let multi = program(
+        r#"
+        fun step(held: &mut E, f: |&mut P| void) {
+            match held {
+                E::B(let p0, let p1) => {
+                    mut payload = (p0, p1);
+                    f(&mut payload.0);
+                    held = E::B(payload.0, payload.1);
+                },
+                _ => {},
+            }
+        }
+        "#,
+        "E::B(P { x = 0 }, 7)",
+    );
+    // `__clone` counts itself once per value it visits: a `P` is two (the
+    // record and its field), so one copy out per write is 200 for 100 writes,
+    // and the copy back made it 400.
+    assert_eq!(
+        copies_made(&single),
+        200,
+        "a single payload lent to a closure copied back at its write-back (M109)"
+    );
+    assert_eq!(
+        copies_made(&multi),
+        200,
+        "the multi-payload step copied its dead payload back into the variant (M109)"
+    );
+}
+
 #[test]
 fn b509_a_through_variant_write_copies_nothing() {
     fn copies_made(source: &str) -> usize {

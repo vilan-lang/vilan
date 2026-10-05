@@ -2508,6 +2508,9 @@ struct Transformer<'src> {
     /// its JS name. One table per pair, reachability-driven (§6.2) — a pair
     /// nothing coerces emits nothing.
     vtables: HashMap<(Id, String), String>,
+    /// M89: the emitted tables by SLOT SET — every slot a named function, in
+    /// order — so two pairs whose tables would be identical share one object.
+    vtables_by_slots: HashMap<Vec<(String, String)>, String>,
     // Per-type `__drop` helpers (destruction.md §7), keyed by `type_key`. `None`
     // records a type whose destruction is a complete no-op (no `Drop` impl, no
     // resource members) so callers skip it; `Some(name)` is the emitted helper.
@@ -2998,6 +3001,7 @@ impl<'src> Transformer<'src> {
             current_self_type: None,
             default_instances: HashMap::default(),
             vtables: HashMap::default(),
+            vtables_by_slots: HashMap::default(),
             drop_helpers: HashMap::default(),
             shared_bodies: HashMap::default(),
             monomorphized: Vec::new(),
@@ -3881,6 +3885,12 @@ impl<'src> Transformer<'src> {
     /// that would otherwise alias its source. `__clone` (not `structuredClone`)
     /// so a value holding closures can be copied.
     fn maybe_clone(&mut self, value_id: Id, node: js::Node<'src>) -> js::Node<'src> {
+        // M90: a read-only `let` of a stable place shares it — nothing can
+        // write either side while the binding lives, and it never leaves the
+        // frame (`Analyzer::compute_shared_place_lets`).
+        if self.program.shared_place_inits.contains(&value_id) {
+            return node;
+        }
         if self.copy_applies(self.program.clone_sites.get(&value_id)) {
             self.used_helpers.insert("__clone");
             js::Node::Call(Box::new(js::Node::Local("__clone".to_string())), vec![node])
@@ -10133,6 +10143,9 @@ impl<'src> Transformer<'src> {
             self.bodyless_emissions.push((function.id, requester));
         }
         self.emitting_stack.push(function.id);
+        // M118: an `--explain-cost` report charges the selections this body's
+        // calls compute to the declaration that wrote them.
+        let enclosing_owner = crate::impl_select::set_selection_owner(Some(function.id));
         let parameters = function
             .parameters
             .iter()
@@ -10151,6 +10164,7 @@ impl<'src> Transformer<'src> {
         // the split form when the last use is short of the end; this wraps the
         // whole body otherwise, keeping parameters last in the reverse order.
         let body = self.wrap_own_param_drops(function, body);
+        crate::impl_select::set_selection_owner(enclosing_owner);
         self.emitting_stack.pop();
         js::Node::Function(js::Function {
             name,
@@ -10920,6 +10934,30 @@ impl<'src> Transformer<'src> {
                 }
             };
             entries.push((member_name.to_string(), slot));
+        }
+        // M89: a table whose every slot names a function is a function of its
+        // slot set, so a second pair answering every member with the same
+        // functions — a blanket's members over two stage types, say — names
+        // the first table rather than building an identical object. The name
+        // reserved above stays (a member body may already have taken it), as
+        // an alias of the first.
+        let slot_set: Option<Vec<(String, String)>> = entries
+            .iter()
+            .map(|(member, slot)| match slot {
+                js::Node::Local(function_name) => Some((member.clone(), function_name.clone())),
+                _ => None,
+            })
+            .collect();
+        if let Some(slot_set) = slot_set {
+            if let Some(first) = self.vtables_by_slots.get(&slot_set) {
+                self.monomorphized
+                    .push(js::Node::ConstVariable(js::Variable {
+                        name: name.clone(),
+                        value: Box::new(js::Node::Local(first.clone())),
+                    }));
+                return name;
+            }
+            self.vtables_by_slots.insert(slot_set, name.clone());
         }
         self.monomorphized
             .push(js::Node::ConstVariable(js::Variable {
