@@ -9,4 +9,4 @@ function __panic(message, location) {
 	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
 	return error;
 }
-function a(){console.log("built");return 5;}const b=7;const c=14;const d=196;const e=[0,3,6,9];const f=107;const g=a();console.log(b+c+d+__at(e,2,"src/main.vl:53:26")+f+g);
+function a(){console.log("built");return 5;}const b=7;const c=14;const d=196;const e=[0,3,6,9];const f=107;const g=a();console.log(String(b+c+d+__at(e,2,"src/main.vl:53:26")+f+g));

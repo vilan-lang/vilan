@@ -398,7 +398,7 @@ function new4(value2) {
 function list_cell(elements, log) {
 	return [ __shared_new(elements), new4(0), __clone(log) ];
 }
-function new7() {
+function new5() {
 	return list_cell([  ], new3());
 }
 function cursor(self) {
@@ -878,10 +878,10 @@ function prepend(self, value2, $av) {
 	return splice2(self, 0, 0, [ __clone(value2) ], $av);
 }
 function pop(self, $ay) {
-	const size5 = size(self);
+	const size3 = size(self);
 	let $az = null;
-	if (size5 > 0) {
-		$az = splice2(self, size5 - 1, 1, [  ], $ay);
+	if (size3 > 0) {
+		$az = splice2(self, size3 - 1, 1, [  ], $ay);
 	}
 	return $az;
 }
@@ -889,10 +889,10 @@ function remove_range(self, at2, count, $aA) {
 	return splice2(self, at2, count, [  ], $aA);
 }
 function truncate(self, length, $aB) {
-	const size5 = size(self);
+	const size3 = size(self);
 	let $aC = null;
-	if (size5 > length) {
-		$aC = splice2(self, length, size5 - length, [  ], $aB);
+	if (size3 > length) {
+		$aC = splice2(self, length, size3 - length, [  ], $aB);
 	}
 	return $aC;
 }
@@ -905,10 +905,10 @@ function set_all(self, values, $aE) {
 function clear(self, $aF) {
 	return splice2(self, 0, size(self), [  ], $aF);
 }
-function is_empty3(self) {
+function is_empty2(self) {
 	return size(self) === 0;
 }
-function size4(self) {
+function size2(self) {
 	return self[0].length;
 }
 function splice4(self, at2, removed, inserted) {
@@ -921,16 +921,16 @@ function splice4(self, at2, removed, inserted) {
 	self[1].push(splice_in_place(self[0], start, taking, inserted));
 }
 function push2(self, value2, $aG) {
-	return splice4(self, size4(self), 0, [ __clone(value2) ], $aG);
+	return splice4(self, size2(self), 0, [ __clone(value2) ], $aG);
 }
 function remove_at2(self, at2, $aH) {
 	return splice4(self, at2, 1, [  ], $aH);
 }
-function new8(elements) {
+function new6(elements) {
 	return [ elements, [  ] ];
 }
 function edit(self, body, $aI) {
-	let recorder = new8(__clone(self[0].v));
+	let recorder = new6(__clone(self[0].v));
 	body(recorder);
 	const produced = __clone(recorder[0]);
 	const recorded = __clone(recorder[1]);
@@ -1104,10 +1104,10 @@ function remove_at3(self, at2, $as) {
 	return splice3(self, at2, 1, [  ], $as);
 }
 function pop2(self, $ay) {
-	const size5 = size(self);
+	const size3 = size(self);
 	let $be = null;
-	if (size5 > 0) {
-		$be = splice3(self, size5 - 1, 1, [  ], $ay);
+	if (size3 > 0) {
+		$be = splice3(self, size3 - 1, 1, [  ], $ay);
 	}
 	return $be;
 }
@@ -1115,10 +1115,10 @@ function remove_range3(self, at2, count, $aA) {
 	return splice3(self, at2, count, [  ], $aA);
 }
 function truncate2(self, length, $aB) {
-	const size5 = size(self);
+	const size3 = size(self);
 	let $bf = null;
-	if (size5 > length) {
-		$bf = splice3(self, length, size5 - length, [  ], $aB);
+	if (size3 > length) {
+		$bf = splice3(self, length, size3 - length, [  ], $aB);
 	}
 	return $bf;
 }
@@ -1160,10 +1160,10 @@ function reconcile_to2(self, items, $aK) {
 	splice3(self, prefix, removed, arriving, $aK);
 }
 function push4(self, value2, $aG) {
-	return splice4(self, size4(self), 0, [ __clone(value2) ], $aG);
+	return splice4(self, size2(self), 0, [ __clone(value2) ], $aG);
 }
 function edit2(self, body, $aI) {
-	let recorder = new8(__clone(self[0].v));
+	let recorder = new6(__clone(self[0].v));
 	body(recorder);
 	const produced = __clone(recorder[0]);
 	const recorded = __clone(recorder[1]);
@@ -1184,14 +1184,14 @@ const notifications = __shared_new(0);
 const seed = __shared_new(7);
 const walk_calls = __shared_new(0);
 const chain_calls = __shared_new(0);
-const my_list = new7();
+const my_list = new5();
 const my_nums = map_each(my_list, (x) => {
 	console.log("ran");
 	return x.length;
 }, [ 1 ], [ 1 ]);
 push(my_list, "10.5", [ 1 ]);
 console.log("after one push: " + __at(get(my_nums), 0, "list-cell.vl:150:27"));
-const source = new7();
+const source = new5();
 const derived = map_each2(source, counted, [ 1 ], [ 1 ]);
 on_change(__clone(source), (_list, $ar) => {
 	notifications.v = notifications.v + 1;
@@ -1236,7 +1236,7 @@ expect("set_all x1", calls.v, 11);
 clear(source, [ 1 ]);
 law("clear", source, derived);
 expect("clear runs g", calls.v, 11);
-if (!(is_empty3(source))) {
+if (!(is_empty2(source))) {
 	(() => {
 		throw __panic("clear left something behind", "list-cell.vl:210:3");
 	})();
@@ -1335,27 +1335,27 @@ while (turn <= 300) {
 	batch(($bd) => {
 		let made = 0;
 		while (made < op_count) {
-			const size5 = size(walk);
+			const size3 = size(walk);
 			const choice = next_random(24);
-			if (choice < 8 || size5 === 0) {
+			if (choice < 8 || size3 === 0) {
 				push3(walk, next_random(100), [ 0, $bd ]);
 			} else if (choice < 11) {
-				insert_at3(walk, pick(size5 + 1), next_random(100), [ 0, $bd ]);
+				insert_at3(walk, pick(size3 + 1), next_random(100), [ 0, $bd ]);
 			} else if (choice < 13) {
-				remove_at3(walk, pick(size5), [ 0, $bd ]);
+				remove_at3(walk, pick(size3), [ 0, $bd ]);
 			} else if (choice < 15) {
-				set_at2(walk, pick(size5), next_random(100), [ 0, $bd ]);
+				set_at2(walk, pick(size3), next_random(100), [ 0, $bd ]);
 			} else if (choice < 17) {
-				const from = pick(size5);
-				const count = 1 + pick(size5 - from);
-				move_range2(walk, from, count, pick(size5 - count + 1), [ 0, $bd ]);
+				const from = pick(size3);
+				const count = 1 + pick(size3 - from);
+				move_range2(walk, from, count, pick(size3 - count + 1), [ 0, $bd ]);
 			} else if (choice < 18) {
 				pop2(walk, [ 0, $bd ]);
-			} else if (choice < 19 && size5 > 12) {
-				remove_range3(walk, pick(size5), 1 + pick(4), [ 0, $bd ]);
-			} else if (choice < 20 && size5 > 20) {
-				truncate2(walk, pick(size5), [ 0, $bd ]);
-			} else if (choice < 21 && size5 > 16) {
+			} else if (choice < 19 && size3 > 12) {
+				remove_range3(walk, pick(size3), 1 + pick(4), [ 0, $bd ]);
+			} else if (choice < 20 && size3 > 20) {
+				truncate2(walk, pick(size3), [ 0, $bd ]);
+			} else if (choice < 21 && size3 > 16) {
 				let fresh = [  ];
 				let fill_index = 0;
 				while (fill_index < 1 + next_random(6)) {
@@ -1365,11 +1365,11 @@ while (turn <= 300) {
 				set3(walk, fresh, [ 0, $bd ]);
 			} else if (choice < 22) {
 				let edited = get(walk);
-				__at_put(edited, pick(size5), next_random(100), "list-cell.vl:371:6");
+				__at_put(edited, pick(size3), next_random(100), "list-cell.vl:371:6");
 				edited.push(next_random(100));
 				reconcile_to2(walk, edited, [ 0, $bd ]);
 			} else {
-				const at2 = pick(size5);
+				const at2 = pick(size3);
 				edit2(walk, (list) => {
 					insert_at2(list, at2, next_random(100), [ 0, $bd ]);
 					remove_at2(list, 0, [ 0, $bd ]);

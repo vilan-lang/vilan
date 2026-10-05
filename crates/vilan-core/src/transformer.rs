@@ -12339,6 +12339,10 @@ impl<'src> Transformer<'src> {
             );
             self.record_leave(frame, emission);
             if let Some(shared) = shared {
+                // The minted name is never declared: it must not stay among
+                // the renameable names, where an undeclared one is RESERVED
+                // and would push every later `name` to `name2` (E259).
+                self.ng.forget_instance_name(&name);
                 return self.take_shared_body(key, shared);
             }
         }
@@ -14463,6 +14467,12 @@ impl NameGenerator {
             }
             _ => self.next_name(),
         }
+    }
+
+    /// Drops an instance name whose body was shared with an earlier one (and
+    /// so is never declared) from the renameable set.
+    fn forget_instance_name(&mut self, name: &str) {
+        self.instance_sources.retain(|(minted, _)| minted != name);
     }
 
     /// A readable identifier from `source`, suffixed (`greet2`, `greet3`, ...) until

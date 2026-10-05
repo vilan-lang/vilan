@@ -688,7 +688,7 @@ function new3(value) {
 function new4(value) {
 	return new3(value);
 }
-function new6(value) {
+function new5(value) {
 	return new3(value);
 }
 function switch2(self, select) {
@@ -883,7 +883,7 @@ function comp(body) {
 	const result = body(scope2);
 	return [ result, scope2 ];
 }
-function get3(self) {
+function get2(self) {
 	return get(self[0]);
 }
 function set2(self, value, $ay) {
@@ -898,7 +898,7 @@ function on_settle3(self, subscriber) {
 }
 function start4(self) {
 	return [ () => {
-		return get3(self);
+		return get2(self);
 	}, (subscriber) => {
 		return on_settle3(self, subscriber);
 	}, () => {
@@ -996,7 +996,7 @@ const owner_lists_allocated_count = __shared_new(0);
 const run_nurseries_allocated_count = __shared_new(0);
 const first = new4(1);
 const second = new4(10);
-const outer = new6(__clone(first));
+const outer = new5(__clone(first));
 const $aP = comp(($a) => {
 	return memo(switch2(__clone(outer), (inner, $b, $c, $d) => {
 		return __clone(inner);
@@ -1004,15 +1004,15 @@ const $aP = comp(($a) => {
 });
 const joined = $aP[0];
 const scope = $aP[1];
-console.log(String(get3(joined)));
+console.log(String(get2(joined)));
 set(first, 2, [ 1 ]);
-console.log(String(get3(joined)));
+console.log(String(get2(joined)));
 set2(outer, second, [ 1 ]);
-console.log(String(get3(joined)));
+console.log(String(get2(joined)));
 set(first, 99, [ 1 ]);
-console.log(String(get3(joined)));
+console.log(String(get2(joined)));
 set(second, 11, [ 1 ]);
-console.log(String(get3(joined)));
+console.log(String(get2(joined)));
 const $bd = comp(($aU) => {
 	return memo2(derive(__clone(joined), (value, $aV, $aW, $aX) => {
 		return value * 2;
@@ -1021,6 +1021,6 @@ const $bd = comp(($aU) => {
 const doubled = $bd[0];
 const stacked = $bd[1];
 set(second, 21, [ 1 ]);
-console.log(String(get3(doubled)));
+console.log(String(get2(doubled)));
 dispose2(stacked);
 dispose2(scope);

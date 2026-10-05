@@ -238,7 +238,7 @@ function from_json4(text) {
 	}
 	return $K;
 }
-function to_json6(self) {
+function to_json4(self) {
 	let result = "[";
 	let first = true;
 	for (const element of self) {
@@ -264,4 +264,4 @@ const $G = from_json(json);
 console.log($G[0] === 0 && to_json($G[1]) === json && to_json2($G[1][1]) === "[\"Ada\",\"Bob\"]");
 const teams = from_json4("[" + json + "]");
 const $O = teams;
-console.log($O[0] === 0 && to_json6($O[1]) === "[" + json + "]");
+console.log($O[0] === 0 && to_json4($O[1]) === "[" + json + "]");

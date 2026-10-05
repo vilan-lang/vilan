@@ -403,7 +403,7 @@ function release_under(handle, ambient) {
 	}
 	return $as;
 }
-function new5() {
+function new3() {
 	return [ __shared_new([ 0, no_cleanups, false, [ 1 ] ]), 0 ];
 }
 function is_disposed(self) {
@@ -1086,7 +1086,7 @@ function eq(self, other) {
 	}
 	return $cy;
 }
-function new6(value) {
+function new4(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
@@ -1214,7 +1214,7 @@ function start2(self) {
 	const upstream = start(__clone(self[0]));
 	const pull = upstream[0];
 	const upstream_attach = upstream[1];
-	const runs = new5();
+	const runs = new3();
 	const tracker = new_tracker();
 	return [ () => {
 		const value = pull();
@@ -1270,7 +1270,7 @@ function take(self, item, $aM) {
 function cell(self, $r, $s) {
 	const instance = start2(self);
 	const pull = instance[0];
-	const cached = new6(pull());
+	const cached = new4(pull());
 	const refreshed = instance[1](subscriber_of(() => {
 		set2(cached, pull(), $r);
 		return;
@@ -1362,7 +1362,7 @@ function start4(self) {
 	const upstream = start3(__clone(self[0]));
 	const pull = upstream[0];
 	const upstream_attach = upstream[1];
-	const runs = new5();
+	const runs = new3();
 	const tracker = new_tracker();
 	return [ () => {
 		const value = pull();
@@ -1427,7 +1427,7 @@ function start6(self) {
 	const upstream = start5(__clone(self[0]));
 	const pull = upstream[0];
 	const upstream_attach = upstream[1];
-	const runs = new5();
+	const runs = new3();
 	const tracker = new_tracker();
 	return [ () => {
 		const value = pull();
@@ -1517,7 +1517,7 @@ function follow3(flow, observer, $bs, $bt) {
 	take(get_owner($bt), sub3(flow, observer), $bs);
 }
 function swap_split(source, render, $bQ) {
-	const gated = new6(get(source));
+	const gated = new4(get(source));
 	const armed = __shared_new(false);
 	const generation = __shared_new(0);
 	const advance2 = (value, $bR) => {
@@ -1623,7 +1623,7 @@ function place_swap(parent, source, render, armed, $cp, $cq) {
 				$cC = undefined;
 			}
 			$cC;
-			const owner = new5();
+			const owner = new3();
 			const row2 = run_with_owner(owner, ($cD) => {
 				return open_row(region, render(value, $cD), $cp, $cD);
 			});
@@ -1662,7 +1662,7 @@ function child2(self, content, $bj, $bk) {
 	return __clone(self);
 }
 function comp(body) {
-	const scope = new5();
+	const scope = new3();
 	const result = body(scope);
 	return [ result, scope ];
 }
@@ -1673,10 +1673,10 @@ const releasing_turns = __shared_new([  ]);
 const no_cleanups = __shared_new([  ]);
 const owner_lists_allocated_count = __shared_new(0);
 const run_nurseries_allocated_count = __shared_new(0);
-const path_signal = new6("");
+const path_signal = new4("");
 const wired = __shared_new(false);
-const chunk_pending_signal = new6(false);
-const chunk_error_signal = new6([ 1 ]);
+const chunk_pending_signal = new4(false);
+const chunk_error_signal = new4([ 1 ]);
 const BASE = announce("BASE", 2);
 const SCALED = announce("SCALED", BASE * 3);
 const LABEL = "scale " + SCALED;

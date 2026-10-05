@@ -54,13 +54,13 @@ function fresh_id() {
 	next_subscriber_id.v = id + 1;
 	return id;
 }
-function mint_subscriber(notify4) {
+function mint_subscriber(notify3) {
 	const derived = minting_derivation.v;
 	minting_derivation.v = false;
-	return subscriber_of(notify4, derived);
+	return subscriber_of(notify3, derived);
 }
-function subscriber_of(notify4, derived) {
-	return [ fresh_id(), notify4, __shared_new(true), derived ];
+function subscriber_of(notify3, derived) {
+	return [ fresh_id(), notify3, __shared_new(true), derived ];
 }
 function new3() {
 	return [ __shared_new([  ]), __shared_new([  ]), __shared_new(new Map()), __shared_new(new Map()), __shared_new(false), __shared_new(false), __shared_new(false) ];
@@ -279,7 +279,7 @@ function update(self, mutate, $a) {
 function get(self) {
 	return __clone(self[0].v);
 }
-function new10(value) {
+function new7(value) {
 	return new5(value);
 }
 function insert(self, key, value) {
@@ -395,14 +395,14 @@ update(todos, (list) => {
 	return;
 }, [ 1 ]);
 console.log(String(get(todos).length));
-const scores = new10(new2());
+const scores = new7(new2());
 update2(scores, (entries) => {
 	insert(entries, "a", 1);
 	insert(entries, "b", 2);
 	return;
 }, [ 1 ]);
 console.log(String(len(get(scores))));
-const count = new10(1);
+const count = new7(1);
 update3(count, (value) => {
 	value[0][value[1]] = value[0][value[1]] + 10;
 	return;

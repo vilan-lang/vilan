@@ -6736,8 +6736,11 @@ fn a_failing_program_exits_one_on_both_backends_without_rusts_banner() {
              asserting nothing about the failure"
         );
         let stderr = String::from_utf8_lossy(&native.stderr);
+        // Rust's banner names its THREAD (`thread 'main' panicked at
+        // src/main.rs:..`); a vilan panic's own report (debugging.md S0) is
+        // `panicked at <the .vl site>: <message>`, which node prints too.
         assert!(
-            !stderr.contains("panicked at"),
+            !stderr.contains("thread '") && !stderr.contains(".rs:"),
             "{file}: Rust's panic banner must not reach stderr: {stderr:?}"
         );
         assert!(

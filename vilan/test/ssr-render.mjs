@@ -150,7 +150,7 @@ function new3(value) {
 function new4(value) {
 	return new3(value);
 }
-function new8(value) {
+function new5(value) {
 	return new3(value);
 }
 function get(self) {
@@ -328,8 +328,8 @@ function child6(self, content) {
 }
 const no_cleanups = __shared_new([  ]);
 const title = new4("Tasks <live>");
-const todos = new8([ "alpha", "beta & gamma" ]);
-const page = new8([ 1 ]);
+const todos = new5([ "alpha", "beta & gamma" ]);
+const page = new5([ 1 ]);
 console.log(render(app(title, todos, page)));
 console.log(render(text(view("p"), "<script>alert(\"&\")</script>")));
 console.log(render(attr(attr(view("img"), "src", "/logo.png"), "alt", "a & b")));

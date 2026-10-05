@@ -188,7 +188,7 @@ function next10(self) {
 function chain(self, other) {
 	return [ self, __clone(other), true ];
 }
-function next12(self) {
+function next11(self) {
 	if (self[2]) {
 		const $t = next3(self[0]);
 		if ($t[0] === 0) {
@@ -202,7 +202,7 @@ function count(self) {
 	let seen = 0;
 	const $u = self;
 	while (true) {
-		const $v = next12($u);
+		const $v = next11($u);
 		if ($v[0] !== 0) {
 			break;
 		}
@@ -214,7 +214,7 @@ function count(self) {
 function enumerate(self) {
 	return [ self, 0 ];
 }
-function next13(self) {
+function next12(self) {
 	const $w = next3(self[0]);
 	if ($w[0] === 0) {
 		const index = self[1];
@@ -316,7 +316,7 @@ function to_set(self) {
 function len(self) {
 	return self[0].size;
 }
-function next14(self) {
+function next13(self) {
 	const $J = next3(self[0]);
 	if ($J[0] === 0) {
 		return [ 0, self[1]($J[1]) ];
@@ -327,7 +327,7 @@ function to_list5(self) {
 	let result = [  ];
 	const $K = self;
 	while (true) {
-		const $L = next14($K);
+		const $L = next13($K);
 		if ($L[0] !== 0) {
 			break;
 		}
@@ -410,7 +410,7 @@ console.log(String(count(chain(iter([ 1, 2 ]), iter([ 3 ])))));
 let numbered = enumerate(iter([ "x", "y" ]));
 const $x = numbered;
 while (true) {
-	const $y = next13($x);
+	const $y = next12($x);
 	if ($y[0] !== 0) {
 		break;
 	}

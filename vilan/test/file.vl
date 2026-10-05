@@ -42,7 +42,7 @@ fun main() {
 	// positional off the OPEN file — no cursor, no seek — and the early drop
 	// runs the close AND clears the slot, so the scope's finally, still emitted
 	// because the drop is conditional on the path taken, does not close twice.
-	// witness: console.log(await (read_at(file, buffer, 3)));
+	// witness: console.log(String(await (read_at(file, buffer, 3))));
 	// witness: $b(file); file = null;
 	let file = File::open(scratch);
 	let buffer = Bytes::alloc(4);
@@ -54,7 +54,7 @@ fun main() {
 	// B141's historically-broken spellings, positive: a postfix chain straight
 	// off the implicitly-awaited constructor call. The temporary is bound, used
 	// and closed out of a finally of its own.
-	// witness: console.log(await (read_at($d, buffer, 0)));
+	// witness: console.log(String(await (read_at($d, buffer, 0))));
 	print(File::open(scratch).read_at(buffer, 0));
 	print(File::open(scratch).stat().size);
 

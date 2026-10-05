@@ -315,7 +315,7 @@ function new4(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
-function new6(value) {
+function new5(value) {
 	return new4(value);
 }
 function get(self) {
@@ -503,7 +503,7 @@ const draining_turns = __shared_new([  ]);
 const releasing_turns = __shared_new([  ]);
 const no_cleanups = __shared_new([  ]);
 const owner_lists_allocated_count = __shared_new(0);
-const current = new6(1);
+const current = new5(1);
 const selected = selector(current, [ 1 ], [ 1 ]);
 const rows = new3();
 const one = run_with_owner(rows, ($G) => {
@@ -527,7 +527,7 @@ set2(current, 2, [ 1 ]);
 console.log("same cell=" + get(again) + " entries=" + selected[0].v.size);
 dispose2(rows);
 console.log("after dispose=" + selected[0].v.size);
-const counted = new6(0);
+const counted = new5(0);
 let hits = 0;
 const watch = on_change(__clone(counted), (_, $ae) => {
 	hits = hits + 1;
