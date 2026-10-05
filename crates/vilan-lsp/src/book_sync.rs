@@ -884,14 +884,37 @@ fn table_data_rows(text: &str) -> Vec<Vec<String>> {
         if position_in_table <= 2 {
             continue;
         }
-        rows.push(
-            line.trim_matches('|')
-                .split('|')
-                .map(|cell| cell.trim().to_string())
-                .collect(),
-        );
+        rows.push(table_cells(line));
     }
     rows
+}
+
+/// A table row's cells, split at its UNESCAPED pipes: GitHub's table syntax
+/// (which the book's renderer follows) writes a `|` inside a cell, code span
+/// included, as `\|`, and the cell's text reads it back as `|` — a closure
+/// literal in a quick fix's title is one.
+fn table_cells(line: &str) -> Vec<String> {
+    let inner = line.trim();
+    let inner = inner.strip_prefix('|').unwrap_or(inner);
+    let inner = inner
+        .strip_suffix('|')
+        .filter(|rest| !rest.ends_with('\\'))
+        .unwrap_or(inner);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut characters = inner.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.peek() == Some(&'|') => {
+                cell.push('|');
+                characters.next();
+            }
+            '|' => cells.push(std::mem::take(&mut cell).trim().to_string()),
+            other => cell.push(other),
+        }
+    }
+    cells.push(cell.trim().to_string());
+    cells
 }
 
 /// A `title:` string literal as the server writes it, with the constructor it

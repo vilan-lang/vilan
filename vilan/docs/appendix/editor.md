@@ -313,7 +313,7 @@ sees it.
 
 ## Quick fixes
 
-Twenty-one, each attached to the diagnostic that earns it:
+Twenty-three, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -338,6 +338,8 @@ Twenty-one, each attached to the diagnostic that earns it:
 | ``Convert all 2 indexes in this file`` | any index mismatch, when the file carries more than one — a file migrating to `usize` meets one per index, and this action takes each one's first fix (the declaration where there is one, else the conversion) in ONE edit. It is the edit `vilan check --fix` makes, file by file, until nothing is left to fix |
 | ``Write all 2 declaration heads in the order`` | a declaration head written out of THE order — ``a declaration's attributes are written in one order — …`` (a warning, an error from v0.45.0) or ``a declaration's markers are written in one order — …`` (a keyword ahead of an attribute, or two keywords inverted; refused) — when the file carries more than one. Each head also carries its own fix, titled with the head in the order (``Write `[deprecated(..)] [must_use] fun` ``); this action takes every head in the file in ONE edit. Each head's attributes and keywords move exactly as written, and what stood between them — the blanks, a line break, a comment — stays where it stood |
 | ``Import all 2 traits this file calls`` | either trait-method diagnostic above, when the file needs more than one trait — every one of them imported in ONE edit, a trait called twice imported once. A trait more than one module declares is left to its own fix |
+| ``Take the parameter as `&str` `` | ``this closure takes `str` by value where its type takes a view `&str` …`` — a closure LITERAL whose parameter is written in the other mode from the closure type it meets (a value closure and a view closure are different types, and no adapter is inserted). The edit rewrites that parameter's type in the type's mode — `&`, `&mut` or by value — and nothing else; a body that read the value may then want a `*` |
+| ``Adapt it: `\|c\| g(*c)` `` | the same refusal on a NAMED one-parameter closure (`apply(g)`): the adapter the refusal names, written around it — `\|c\| g(*c)` copies a view's value out for a value closure, `\|c\| g(&c)` lends a view closure the value. Only around a plain name or path, since around any other expression the adapter would evaluate it on every call; a writable view meeting a value closure has none |
 
 and two source actions:
 

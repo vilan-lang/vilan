@@ -19,6 +19,8 @@ mod uri;
 mod world;
 
 #[cfg(test)]
+mod closure_mode_tests;
+#[cfg(test)]
 mod entry_world_tests;
 #[cfg(test)]
 mod foreign_spelling_tests;

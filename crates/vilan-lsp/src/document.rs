@@ -7663,6 +7663,31 @@ impl Document {
                 // §7.2 fix 2, the `#`'s twin: the one at-rule with a
                 // combinator spelling is a min-width media query.
                 fixes.push(fix);
+            } else if let Some(fix) = vilan_ide::closure_mode_fix::closure_mode_fixes(
+                &self.text,
+                diagnostic.span,
+                &diagnostic.msg,
+            )
+            .into_iter()
+            .next()
+            {
+                // E263: B495's mode mismatch — the literal's parameter written
+                // in the type's mode, or the adapter around a named closure.
+                use vilan_ide::closure_mode_fix::ClosureModeEdit;
+                fixes.push(match fix.edit {
+                    ClosureModeEdit::Parameter { written } => QuickFix {
+                        title: format!("Take the parameter as `{written}`"),
+                        span: fix.span,
+                        replacement: fix.replacement,
+                        target: None,
+                    },
+                    ClosureModeEdit::Adapter { written } => QuickFix {
+                        title: format!("Adapt it: `{written}`"),
+                        span: fix.span,
+                        replacement: fix.replacement,
+                        target: None,
+                    },
+                });
             } else if let Some(conversions) = numeric_conversion_fixes(&self.text, diagnostic) {
                 // E218: the mismatch names the one call that fixes it, and the
                 // fix writes that call at the value the diagnostic spans — or,
