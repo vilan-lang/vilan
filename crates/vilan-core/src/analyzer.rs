@@ -48257,6 +48257,61 @@ impl<'src> Analyzer<'src> {
         (target != source).then_some(target)
     }
 
+    /// B501: unbinds each of the callee's own generics the arguments bound to a
+    /// type holding a generic that is neither the callee's nor a binder in
+    /// scope at the call — another call's own parameter left open — when the
+    /// call carries an expectation the step after this one can read.
+    fn release_bindings_to_foreign_generics(
+        &mut self,
+        call_id: Id,
+        callee_id: Id,
+        substitution: &mut SubstitutionContext,
+    ) {
+        if !self.expected_types.contains_key(&call_id) {
+            return;
+        }
+        let Some((_, own_generics)) = self.method_signature(callee_id) else {
+            return;
+        };
+        for generic in own_generics {
+            let Some(bound) = substitution.get(&generic).copied() else {
+                continue;
+            };
+            let mut mentioned = Vec::new();
+            self.collect_generics(&bound.get_type(self), 0, &mut mentioned);
+            let foreign = mentioned.iter().any(|mentioned| {
+                *mentioned != generic && !self.generic_is_enclosing_binder(*mentioned, call_id)
+            });
+            if foreign {
+                substitution.remove(&generic);
+            }
+        }
+    }
+
+    /// B501: the concrete direction for a CALL argument whose parameter the
+    /// call has already decided — the parameter type through the call's
+    /// substitution, when that is fully ground. `None` for any other argument,
+    /// or while the parameter is still open.
+    fn decided_call_argument_direction(
+        &mut self,
+        argument_id: Id,
+        parameter_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> Option<Type> {
+        if !matches!(
+            self.expr_id_to_expr_map.get(&argument_id),
+            Some(Expr::Call(_))
+        ) {
+            return None;
+        }
+        if !matches!(parameter_type, Type::Generic(_)) {
+            return None;
+        }
+        let decided = self.substitute_type(parameter_type, substitution_context);
+        let decided_id = decided.clone().get_type_id(self);
+        self.type_is_ground(decided_id).then_some(decided)
+    }
+
     /// B542: which of B403's provisional `Self` bindings a bare `Type::f(..)`
     /// inside `Type`'s own impl keeps. B403 (ruled 2026-09-26) reads the bare
     /// path as `Self::f(..)`, which is what a parameter NOTHING at the call
@@ -49557,6 +49612,18 @@ impl<'src> Analyzer<'src> {
                         {
                             return Resolution::Deferred;
                         }
+                        // B501: an argument whose own type still holds ANOTHER
+                        // call's unbound generic (`source("x")` is `Src<T>`, `T`
+                        // being `source`'s, fixed only by its return) is no
+                        // evidence for this call's parameter — it is the
+                        // argument waiting to be told. Under an expectation the
+                        // parameter is released, so the expectation decides it
+                        // and the argument is then typed toward it.
+                        self.release_bindings_to_foreign_generics(
+                            call_id,
+                            target_id,
+                            &mut substitution_context,
+                        );
                         // The method path's third binding source, shared (B125):
                         // the call site's expectation fixes what the non-closure
                         // arguments left open, before any closure is typed.
@@ -49571,8 +49638,24 @@ impl<'src> Analyzer<'src> {
                         let parameter_name = parameter.name;
                         let parameter_type = parameter.type_id.get_type(self);
                         let argument_id = *argument_ids.get(index).unwrap();
-                        let argument_type =
-                            self.infer_type(argument_id, &parameter_type, &substitution_context);
+                        // B501: a CALL standing at a parameter the call has
+                        // already decided (`counted(source("x"))` under `let
+                        // c: Counted<Src<i32>>` binds `counted`'s `S` from the
+                        // expectation) is typed toward the decided type, so a
+                        // generic only ITS return mentions (`source`'s `T:
+                        // Wire`) is bound there as under an annotated `let`.
+                        // Handed the bare `S`, it bound nothing and its bound
+                        // was "cannot be checked".
+                        let argument_direction = self.decided_call_argument_direction(
+                            argument_id,
+                            &parameter_type,
+                            &substitution_context,
+                        );
+                        let argument_type = self.infer_type(
+                            argument_id,
+                            argument_direction.as_ref().unwrap_or(&parameter_type),
+                            &substitution_context,
+                        );
                         if matches!(argument_type, Type::Unresolved) {
                             return Resolution::Deferred;
                         }

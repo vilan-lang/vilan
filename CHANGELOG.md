@@ -75,6 +75,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**B501: an expectation reaches a generic call's generic argument. `let c: Counted<Src<i32>> = counted(source("x"))` with `counted<S>(inner: S): Counted<S>` and `source<T: Wire>(..): Src<T>` compiles; it was refused "cannot infer 'T' for this call; its bound ': Wire' cannot be checked", and an annotated `let` around the inner call was the workaround.** The argument's own type (`Src<T>`, `T` being `source`'s, fixed only by its return) bound `counted`'s `S` first and was no evidence: under an expectation such a binding is released, the expectation decides `S`, and the argument is typed toward the decided type, which binds `source`'s `T`. A method argument and a declared return's tail are pinned. Not reached: a call nested at ANOTHER call's parameter (`takes(counted(source(..)))`), whose inner call resolves before the outer is typed toward its parameter — pinned `#[ignore]`d under B501. **Pins:** `inference::generics::b501_an_expectation_reaches_a_generic_calls_generic_argument` (free, method and return-tail shapes run; the undecided call still refused) and the ignored `b501_an_expectation_reaches_through_a_call_at_another_calls_parameter`. Tracker B501.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

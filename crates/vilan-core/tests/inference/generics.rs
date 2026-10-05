@@ -9636,3 +9636,75 @@ fn b542_a_bare_static_in_its_own_impl_takes_an_argument_the_self_reading_refuses
         "#,
     );
 }
+
+/// B501: expected-type inference reaches through a generic argument.
+/// `counted(source("x"))` with `counted<S>(inner: S): Counted<S>` under `let c:
+/// Counted<Src<i32>>` bound `S` to the argument's own `Src<T>` — `T` being
+/// `source`'s, fixed only by its return — and `source`'s `T: Wire` was "cannot
+/// infer 'T' for this call; its bound ': Wire' cannot be checked". The
+/// argument's still-open type is no evidence under an expectation: the
+/// expectation decides `S`, and the argument is typed toward it. A method
+/// argument and a declared return's tail are pinned; a call nested a level
+/// deeper, at ANOTHER call's parameter, is B501's remainder (ignored below).
+#[test]
+fn b501_an_expectation_reaches_a_generic_calls_generic_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::wire::Wire;
+        struct Src<T> { value: Option<T> }
+        fun source<T: Wire>(name: str): Src<T> { Src { value = None } }
+        struct Client {}
+        impl Client {
+            fun source<T: Wire>(self, name: str): Src<T> { Src { value = None } }
+        }
+        struct Counted<S> { inner: S }
+        fun counted<S>(inner: S): Counted<S> { Counted { inner } }
+        fun made(): Counted<Src<str>> { counted(Client {}.source("z")) }
+        fun main() {
+            let free: Counted<Src<i32>> = counted(source("x"));
+            print(free.inner.value.is_none());
+            let client = Client {};
+            let method: Counted<Src<bool>> = counted(client.source("y"));
+            print(method.inner.value.is_none());
+            print(made().inner.value.is_none());
+        }
+        "#,
+        "true\ntrue\ntrue\n",
+    );
+    // With nothing to decide `S`, the refusal stands.
+    assert_fails_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::wire::Wire;
+        struct Src<T> { value: Option<T> }
+        fun source<T: Wire>(name: str): Src<T> { Src { value = None } }
+        struct Counted<S> { inner: S }
+        fun counted<S>(inner: S): Counted<S> { Counted { inner } }
+        fun main() {
+            let open = counted(source("x"));
+        }
+        "#,
+        "cannot infer 'T' for this call",
+    );
+}
+
+#[test]
+#[ignore = "B501: the expectation does not yet reach a call nested at ANOTHER call's parameter (`takes(counted(source(..)))`): the inner call resolves before the outer is typed toward its parameter"]
+fn b501_an_expectation_reaches_through_a_call_at_another_calls_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::wire::Wire;
+        struct Src<T> { value: Option<T> }
+        fun source<T: Wire>(name: str): Src<T> { Src { value = None } }
+        struct Counted<S> { inner: S }
+        fun counted<S>(inner: S): Counted<S> { Counted { inner } }
+        fun takes(counted: Counted<Src<i32>>): bool { counted.inner.value.is_none() }
+        fun main() {
+            print(takes(counted(source("y"))));
+        }
+        "#,
+        "true\n",
+    );
+}
