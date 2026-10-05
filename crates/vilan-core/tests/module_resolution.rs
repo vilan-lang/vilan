@@ -9058,3 +9058,58 @@ fn b547_a_with_clause_names_a_reexported_trait_beside_a_same_named_derive() {
         "x\n"
     );
 }
+
+/// B367: B318 S4's ADMISSION MISS is reachable. The four-module reproducer —
+/// the trait in `a`, a non-exported `impl` in `b`, a generic body in `c` that
+/// imports only the trait, the entry importing `b` with `#(impl _)` — was once
+/// reported to compile clean (which would have made the refusal dead code). On
+/// this base it is refused, at `c`, naming the member, the providing module and
+/// the declaring one, as visibility.md §3.5 writes the rule: a generic body
+/// resolves under the file it was DECLARED in, so the entry's marker does not
+/// reach it. `c`'s own `import pkg::b::{ #(impl _) };` — the fix the refusal
+/// names — admits it.
+#[test]
+fn b367_a_generic_body_resolves_under_its_own_files_admission() {
+    let files = |c_imports: &str| {
+        vec![
+            (
+                "a.vl".to_string(),
+                "export trait Speak {\n    fun speak(self): str;\n}\n".to_string(),
+            ),
+            (
+                "b.vl".to_string(),
+                "import pkg::a::Speak;\nexport struct Dog {}\nimpl Dog with Speak {\n    fun speak(self): str { \"woof\" }\n}\n"
+                    .to_string(),
+            ),
+            (
+                "c.vl".to_string(),
+                format!(
+                    "import pkg::a::Speak;\n{c_imports}export fun twice<T: Speak>(value: T): str {{ value.speak() + value.speak() }}\n"
+                ),
+            ),
+            (
+                "main.vl".to_string(),
+                "import pkg::b::{ Dog, #(impl _) };\nimport pkg::c::twice;\nfun main() {\n    print(twice(Dog {}));\n}\nmain();\n"
+                    .to_string(),
+            ),
+        ]
+    };
+    let refused_files = files("");
+    let refused: Vec<(&str, &str)> = refused_files
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_str()))
+        .collect();
+    let refusal = transform_package(&refused, "main.vl", Platform::default())
+        .expect_err("`c` admits nothing from `b`: the entry's marker must not answer its body");
+    assert!(
+        refusal.contains("'speak' is provided by an `impl` in module `b`")
+            && refusal.contains("module `c` does not admit it"),
+        "{refusal}"
+    );
+    let admitted_files = files("import pkg::b::{ #(impl _) };\n");
+    let admitted: Vec<(&str, &str)> = admitted_files
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_str()))
+        .collect();
+    assert_eq!(run_package(&admitted, "main.vl"), "woofwoof\n");
+}
