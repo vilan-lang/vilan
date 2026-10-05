@@ -187,8 +187,15 @@ pub fn span_of(program: &Program, id: Id) -> Option<Span> {
 /// §19.3); every other call answers its wired subject. The erased subject
 /// entity survives in `entity_map`, so a chain walk continues through it
 /// normally and lands on the declaration the source names.
+///
+/// A method call the analysis never WIRED (E253: it deferred to the end on a
+/// closure argument whose body is refused) has no call record at all; its
+/// subject is the member its lookup found, a definition the walks land on
+/// directly.
 pub fn source_call_subject(program: &Program, call_id: Id) -> Option<Id> {
-    let call = program.function_calls.get(&call_id)?;
+    let Some(call) = program.function_calls.get(&call_id) else {
+        return program.unwired_method_calls.get(&call_id).copied();
+    };
     Some(
         program
             .context_erased_subjects
@@ -704,8 +711,13 @@ impl Analysis<'_, '_> {
             seen.push(current);
             // A bare use carries no type on its own id; resolve through its
             // binding (and through that binding's own kind, e.g. an imported
-            // enum variant).
-            match program.entity_map.get(&current)? {
+            // enum variant). A method call the analysis never wired has no
+            // entity at all, and resolves through the member it found (E253).
+            let Some(entity) = program.entity_map.get(&current) else {
+                current = source_call_subject(program, current)?;
+                continue;
+            };
+            match entity {
                 Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
                     current = *binding;
                 }

@@ -5371,6 +5371,14 @@ impl Document {
                 current = source_call_subject(program, current)?;
                 continue;
             }
+            // A method call the analysis never wired (E253) has no entity:
+            // resolve through the member its lookup found.
+            if !program.entity_map.contains_key(&current)
+                && let Some(member) = program.unwired_method_calls.get(&current)
+            {
+                current = *member;
+                continue;
+            }
             return match program.entity_map.get(&current)? {
                 Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
                     // Resolve to the name span of the thing the binding actually is —

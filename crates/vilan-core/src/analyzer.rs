@@ -4004,6 +4004,13 @@ pub struct Analyzer<'src> {
     // The span of the member identifier in a field access or method call (`.x`),
     // keyed by the access expr id — the precise use-site span for rename/nav.
     member_name_spans: HashMap<Id, Span>,
+    /// E253: a method call whose member the lookup FOUND but which never
+    /// wired — it deferred on an argument that never typed (a closure whose
+    /// body is refused leaves its generic return open, so the call waits for
+    /// it to the end): call entity → the member. Removed when the call wires.
+    /// The editor reads it ([`Program::unwired_method_calls`]); nothing else
+    /// does.
+    unwired_method_calls: HashMap<Id, Id>,
     /// E241: every variant pattern the ENTRY file matches, as resolved — read
     /// E241: every variant pattern and `_` the ENTRY file matches, as
     /// resolved — read by the label build into [`Program::pattern_labels`].
@@ -7069,6 +7076,7 @@ impl<'src> Analyzer<'src> {
             expr_id_to_scope_id_map: HashMap::default(),
             expr_id_to_type_id_map: HashMap::default(),
             member_name_spans: HashMap::default(),
+            unwired_method_calls: HashMap::default(),
             pattern_sites: Vec::new(),
             unresolved_method_calls: Vec::new(),
             arity_invalid_calls: Vec::new(),
@@ -24166,6 +24174,7 @@ impl<'src> Analyzer<'src> {
         mut argument_ids: Vec<Id>,
         arguments_span: Span,
     ) {
+        self.unwired_method_calls.remove(&id);
         let member_local_id = self.new_entity_id();
         self.expr_id_to_expr_map
             .insert(member_local_id, Expr::Local(member_id));
@@ -51898,6 +51907,7 @@ impl<'src> Analyzer<'src> {
                             .iter()
                             .any(|argument_id| self.is_unknown_closure_parameter(*argument_id)))
                 {
+                    self.unwired_method_calls.insert(id, member_id);
                     return Resolution::Deferred;
                 }
                 // The call site's expectation binds what is still open (`map<U>`'s
@@ -51924,6 +51934,7 @@ impl<'src> Analyzer<'src> {
                 if unresolved_closure_argument
                     && self.own_generics_undetermined(member_id, &substitution)
                 {
+                    self.unwired_method_calls.insert(id, member_id);
                     return Resolution::Deferred;
                 }
                 // B424, door (b): see `default_own_generics_from_receiver`.
@@ -65740,6 +65751,15 @@ pub struct Program<'src> {
     /// so tooling resolves hover and go-to-definition through this map to
     /// answer the source view.
     pub context_erased_subjects: HashMap<Id, Id>,
+    /// E253: the method calls the analysis never wired, each with the member
+    /// its lookup found (`Analyzer::unwired_method_calls`): a call deferred to
+    /// the end on an argument that never typed — a closure argument whose body
+    /// is refused, mid-edit, leaves the method's generic return open. Such a
+    /// call has a span and no `entity_map` or `function_calls` record, so
+    /// without this the editor answers nothing on the method's name exactly
+    /// while the author is fixing the closure. Tooling only: emission never
+    /// reaches a program with the refusal that caused it.
+    pub unwired_method_calls: HashMap<Id, Id>,
     /// The hidden context parameters the context pass minted (editing-dx.md
     /// §19.3): parameter id → the context binding whose value it threads.
     /// Deliberately a MARKER, not real records — a fabricated `parameters`
@@ -77099,6 +77119,7 @@ fn analyze_over_world<'src>(
         owned_nursery_enter_fn_id,
         spawn_nursery_sources: HashMap::default(),
         context_erased_subjects: HashMap::default(),
+        unwired_method_calls: analyzer.unwired_method_calls,
         context_hidden_parameters: HashMap::default(),
         context_optional_hidden_parameters: HashSet::default(),
         cleared_clause_contexts: HashSet::default(),
