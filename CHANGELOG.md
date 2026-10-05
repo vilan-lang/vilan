@@ -66,6 +66,11 @@ written down.
 ---
 
 <!-- family: tooling -->
+**The editor writes a declaration head in THE order: a quick fix on each head out of it, and one for every head in the file.** B536 made a head's attributes out of rank a warning (an error from v0.45.0) and a keyword ahead of an attribute, or two keywords inverted, a refusal; both now publish with their stable codes (`marker-order/attributes`, `marker-order/keywords`) and carry the fix the parser already computed: the head's attributes and keywords, each exactly as written, moved into the order, with what stood between them (a line break, a comment) kept where it stood. The title spells the head (``Write `[deprecated(..)] [must_use] fun` ``). Where the file carries more than one such head, `Write all N declaration heads in the order` takes them all in one edit: the migration the v0.45.0 flip waits on, a file at a time. Pins: `vilan-lsp`'s `marker_order_tests` (the warning, a stacked head with a comment, the refusal, a head wrong both ways, the file-wide fix offered from each head and applied, none with one head, both codes published). Tracker B536.
+
+---
+
+<!-- family: tooling -->
 **`std/vilan.toml` keeps the census recipe and drops the figures that drifted.** Its comment said std has 741 top-level declarations across 63 files with 33 `export *;` modules (and 856 of every kind, 548 exported, 152 reached across files); the tree has 1,149, 70 and 34. Nothing gates a number in a comment, so every one of them went stale within an order. The comment now states the recipes alone — the two greps, the bare-marker grep, `check_plain_reaches` for the cross-file floor — says why there are no figures beside them, and spells `[resource] struct` where it still wrote the retired `resource struct`. Tracker N143.
 
 ---

@@ -7200,20 +7200,47 @@ impl Document {
                 edits.push(edit);
             }
         }
-        if !asked || edits.len() < 2 {
+        if !asked {
             return None;
         }
+        let (span, replacement, count) = self.spliced_edit(edits)?;
+        Some(QuickFix {
+            title: format!("Write all {count} `css` declarations as calls"),
+            span,
+            replacement,
+            target: None,
+        })
+    }
+
+    /// The file-wide fixes' one edit (E201, I5 §8.3, B536, B515): `edits` —
+    /// each a span of THIS document's live text and what to write there — as a
+    /// single span, its replacement and how many sites it fixes, or `None` when
+    /// fewer than two remain once repeats are dropped (with one, the action
+    /// would be the per-site fix under a longer name). The caller titles it,
+    /// with the count, in a `QuickFix` literal the editor page's gate reads
+    /// (`book_sync`).
+    ///
+    /// `QuickFix` carries a single span and replacement, so the edit spans from
+    /// the first site to the last and splices the text between them through
+    /// verbatim. That is what keeps everything the fix does NOT touch — a
+    /// declining declaration, a comment, the code between two heads — exactly
+    /// as the author wrote it while its neighbours move.
+    fn spliced_edit(&self, mut edits: Vec<(Span, String)>) -> Option<(Span, String, usize)> {
         edits.sort_by_key(|(span, _)| (span.start, span.end));
-        // One diagnostic per declaration is the parser's own recovery, but a
-        // duplicate here would splice the same bytes twice.
-        edits.dedup_by_key(|(span, _)| span.start);
+        // One finding per site is each diagnostic's own rule, but two findings
+        // can name one site (a refusal and a warning on one head, several
+        // uses of one counter), and a repeat would splice the same bytes twice.
+        edits.dedup_by_key(|(span, _)| (span.start, span.end));
+        if edits.len() < 2 {
+            return None;
+        }
         let first = edits.first()?.0.start;
         let last = edits.last()?.0.end;
         let mut replacement = String::new();
         let mut cursor = first;
         for (span, text) in &edits {
             // A later edit that OVERLAPS an earlier one cannot be spliced, and
-            // the declarations are disjoint by construction — so this is a
+            // every caller's sites are disjoint by construction — so this is a
             // guard against a text scan gone wrong, not an expected shape.
             if span.start < cursor {
                 return None;
@@ -7222,9 +7249,64 @@ impl Document {
             replacement.push_str(text);
             cursor = span.end;
         }
+        Some((Span::from(first..last), replacement, edits.len()))
+    }
+
+    /// This document's own findings — its diagnostics and its warnings —
+    /// without the ones the analysis attributes to another file (an edit can
+    /// only ever reach this document).
+    fn own_findings(&self) -> impl Iterator<Item = &vilan_core::error::Error> {
+        let own = |sources: &[SourceId], index: usize| {
+            sources.get(index).copied().unwrap_or(SourceId(0)) == self.focus
+        };
+        let diagnostics = self
+            .diagnostics
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| own(&self.diagnostic_sources, *index));
+        let warnings = self
+            .warnings
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| own(&self.warning_sources, *index));
+        diagnostics.chain(warnings).map(|(_, finding)| finding)
+    }
+
+    /// B536: a declaration head written out of THE order — the attribute
+    /// WARNING and the keyword REFUSAL alike — rewritten in the order, as the
+    /// parser's own fix data spells it (`parsing::marker_order_fix`, which
+    /// permutes the head's units and keeps what stood between them).
+    fn marker_order_quick_fix(&self, finding: &vilan_core::error::Error) -> Option<QuickFix> {
+        let fix = vilan_core::parsing::marker_order_fix(&self.text, &finding.msg, finding.span)?;
         Some(QuickFix {
-            title: format!("Write all {} `css` declarations as calls", edits.len()),
-            span: Span::from(first..last),
+            title: fix.title,
+            span: fix.span,
+            replacement: fix.replacement,
+            target: None,
+        })
+    }
+
+    /// B536's file-wide fix: every head in this file written out of the order,
+    /// as ONE edit — the migration R-c's flip waits on (the attribute-order
+    /// warning is an error from v0.45.0), a file at a time. Offered where a
+    /// marker-order finding overlaps `range`.
+    fn marker_order_all_fix(&self, range: Span) -> Option<QuickFix> {
+        let mut asked = false;
+        let mut edits: Vec<(Span, String)> = Vec::new();
+        for finding in self.own_findings() {
+            let Some(fix) = self.marker_order_quick_fix(finding) else {
+                continue;
+            };
+            asked |= spans_overlap(finding.span, range);
+            edits.push((fix.span, fix.replacement));
+        }
+        if !asked {
+            return None;
+        }
+        let (span, replacement, count) = self.spliced_edit(edits)?;
+        Some(QuickFix {
+            title: format!("Write all {count} declaration heads in the order"),
+            span,
             replacement,
             target: None,
         })
@@ -7265,28 +7347,15 @@ impl Document {
             asked |= spans_overlap(diagnostic.span, range);
             edits.push((preferred.span, preferred.replacement));
         }
-        edits.sort_by_key(|(span, _)| (span.start, span.end));
-        edits.dedup_by_key(|(span, _)| (span.start, span.end));
-        if !asked || edits.len() < 2 {
+        if !asked {
             return None;
         }
-        let first = edits.first()?.0.start;
-        let last = edits.last()?.0.end;
-        let mut replacement = String::new();
-        let mut cursor = first;
-        for (span, text) in &edits {
-            // Two fixes over overlapping text (a conversion inside another's
-            // value) cannot be spliced in one edit; the per-site fixes remain.
-            if span.start < cursor {
-                return None;
-            }
-            replacement.push_str(self.text.get(cursor..span.start)?);
-            replacement.push_str(text);
-            cursor = span.end;
-        }
+        // Two fixes over overlapping text (a conversion inside another's
+        // value) cannot be spliced in one edit; the per-site fixes remain.
+        let (span, replacement, count) = self.spliced_edit(edits)?;
         Some(QuickFix {
-            title: format!("Convert all {} indexes in this file", edits.len()),
-            span: Span::from(first..last),
+            title: format!("Convert all {count} indexes in this file"),
+            span,
             replacement,
             target: None,
         })
@@ -7356,6 +7425,13 @@ impl Document {
                     replacement: fix.replacement.to_string(),
                     target: None,
                 });
+                continue;
+            }
+            // B536: a keyword ahead of an attribute, or two keywords inverted
+            // — refused, and read as the head in the order; the fix writes it
+            // so.
+            if let Some(fix) = self.marker_order_quick_fix(diagnostic) {
+                fixes.push(fix);
                 continue;
             }
             // A154: a path through a std module that moved under a namespace —
@@ -7547,6 +7623,10 @@ impl Document {
         if let Some(fix) = self.numeric_index_all_fix(range) {
             fixes.push(fix);
         }
+        // B536's bulk half: the heads of a migrating file, all at once.
+        if let Some(fix) = self.marker_order_all_fix(range) {
+            fixes.push(fix);
+        }
         // B318 §5: the two reach WARNINGS carry fixes of their own, and a
         // warning is not in `diagnostics` — deliberately, because 62 sites gate
         // on `diagnostics.is_empty()` and a warning must not disable Organize
@@ -7613,6 +7693,10 @@ impl Document {
                     replacement: String::new(),
                     target: None,
                 });
+            } else if let Some(fix) = self.marker_order_quick_fix(warning) {
+                // B536: attributes out of THE order — a warning this release,
+                // an error from v0.45.0 (R-c).
+                fixes.push(fix);
             } else if let Some(fix) =
                 vilan_core::parsing::written_autofocus_fix(&self.text, &warning.msg, warning.span)
             {

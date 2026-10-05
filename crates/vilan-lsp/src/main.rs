@@ -25,6 +25,8 @@ mod foreign_spelling_tests;
 #[cfg(test)]
 mod import_position_tests;
 #[cfg(test)]
+mod marker_order_tests;
+#[cfg(test)]
 mod member_admission_tests;
 #[cfg(test)]
 mod moved_std_path_tests;

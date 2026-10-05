@@ -519,12 +519,16 @@ fn diagnostic_groups(document: &Document, owner: &Url, paint: bool) -> Vec<(Url,
             DiagnosticSeverity::ERROR
         };
         // B520: a diagnostic with a stable code publishes it — the foreign
-        // spellings, A157's written-`autofocus` steer and A154's moved std
-        // path, each recognized by its message.
+        // spellings, A157's written-`autofocus` steer, A154's moved std path
+        // and B536's marker order, each recognized by its message.
         let code = vilan_core::parsing::ForeignSpelling::of_message(&item.message)
             .map(|spelling| spelling.code())
             .or_else(|| vilan_core::parsing::element_diagnostic_code(&item.message))
             .or_else(|| vilan_core::parsing::std_path_diagnostic_code(&item.message))
+            .or_else(|| {
+                vilan_core::parsing::MarkerOrderDiagnostic::of_message(&item.message)
+                    .map(|diagnostic| diagnostic.code())
+            })
             .map(|code| NumberOrString::String(code.to_string()));
         let diagnostic = |range| Diagnostic {
             range,

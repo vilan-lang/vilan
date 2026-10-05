@@ -313,7 +313,7 @@ sees it.
 
 ## Quick fixes
 
-Nineteen, each attached to the diagnostic that earns it:
+Twenty, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -336,6 +336,7 @@ Nineteen, each attached to the diagnostic that earns it:
 | ``Convert with `.as_u53()` `` | ``Expected u53, but got i32 instead. There are no implicit numeric conversions; convert with `.as_u53()` `` — a value of one numeric width where another is declared (an argument, a `let` annotation, a reassignment, a return, a field, a subscript's index). The edit writes the conversion the message names after the value, parenthesizing it first unless it is already a name, a field path or a call chain, so `xs.len() + 1` becomes `(xs.len() + 1).as_u53()` — the whole value, not its last operand. Where the message names an index (``Expected usize (an index: a position, a length or a count), but got i32 instead. …``) it is the same edit, and it is also offered on an operator between a `usize` and another integer width (`` `<` compares two values of the same type, but the operands are `i32` and `usize` ``), where nothing is declared: the non-index operand converts to `usize` |
 | ``Declare `at` a `usize` `` | the same index mismatch, when the value is a counter bound by a bare literal earlier in the same function (`mut at = 0;`). The edit writes `: usize` after the counter's name, because the counter IS an index — converting at each of its uses would leave `.as_usize()` on a value that should never have been anything else. Offered ahead of the conversion |
 | ``Convert all 2 indexes in this file`` | any index mismatch, when the file carries more than one — a file migrating to `usize` meets one per index, and this action takes each one's first fix (the declaration where there is one, else the conversion) in ONE edit. It is the edit `vilan check --fix` makes, file by file, until nothing is left to fix |
+| ``Write all 2 declaration heads in the order`` | a declaration head written out of THE order — ``a declaration's attributes are written in one order — …`` (a warning, an error from v0.45.0) or ``a declaration's markers are written in one order — …`` (a keyword ahead of an attribute, or two keywords inverted; refused) — when the file carries more than one. Each head also carries its own fix, titled with the head in the order (``Write `[deprecated(..)] [must_use] fun` ``); this action takes every head in the file in ONE edit. Each head's attributes and keywords move exactly as written, and what stood between them — the blanks, a line break, a comment — stays where it stood |
 
 and two source actions:
 
