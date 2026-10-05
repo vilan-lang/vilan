@@ -5492,6 +5492,9 @@ pub struct Analyzer<'src> {
     // B537: where each unbound `return` read B523 steered starts — a body
     // whose last statement starts there has had its one report.
     unbound_return_starts: HashSet<(Option<SourceId>, usize)>,
+    // B438: the calls an argument mismatch was reported at — a generic the
+    // refused argument would have bound is that report's consequence.
+    calls_with_refused_arguments: HashSet<Id>,
     // The `std::reactive` `Source` TRAIT, if loaded. `[expose]` reconciles an
     // exposed field's type against it (A32's ruling): a field is exposable when
     // its type IMPLEMENTS the nominal std trait, not when its spelling happens
@@ -7263,6 +7266,7 @@ impl<'src> Analyzer<'src> {
             guard_continuations: Vec::new(),
             guard_continuation_captures: HashMap::default(),
             unbound_return_starts: HashSet::default(),
+            calls_with_refused_arguments: HashSet::default(),
             source_trait_id: None,
             wire_trait_id: None,
             hashable_trait_id: None,
@@ -8196,6 +8200,13 @@ impl<'src> Analyzer<'src> {
             // and least actionable voice — it read as a compiler fault where
             // the refusal two pages down was the fix.
             if self.call_stands_down_on_refused_annotation(call_id) {
+                continue;
+            }
+            // B438 (E189's rule at this shape): an argument of this call was
+            // refused, and a generic it would have bound being open is that
+            // refusal's consequence — `swap(flag, |on: str| 42)`'s `C` is open
+            // because the closure did not fit, which the mismatch already says.
+            if self.calls_with_refused_arguments.contains(&call_id) {
                 continue;
             }
             // B403: a bare `Type::f()` OUTSIDE `Type`'s impls binds the impl's
@@ -49785,6 +49796,7 @@ impl<'src> Analyzer<'src> {
                                     ),
                                 };
                                 let span = **self.span_map.get(&argument_id).unwrap();
+                                self.calls_with_refused_arguments.insert(call_id);
                                 // A later argument may still defer the call
                                 // (B495's mode refusal stands at a closure
                                 // literal whose parameter types already

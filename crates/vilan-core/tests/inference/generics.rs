@@ -9708,3 +9708,26 @@ fn b501_an_expectation_reaches_through_a_call_at_another_calls_parameter() {
         "true\n",
     );
 }
+
+/// B438 (E189's rule at this shape): `swap(flag, |on: str| 42)` reports the
+/// closure's mismatch ONCE — "cannot infer 'C' for this call" beside it was the
+/// mismatch's consequence (`C` is open because the closure did not fit). A
+/// call whose arguments all fit and still leaves a bounded generic open keeps
+/// its refusal (B533's and B501's pins).
+#[test]
+fn b438_a_refused_argument_carries_no_cannot_infer_beside_it() {
+    let source = r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::web::ui::swap;
+        fun main() {
+            let flag = Signal::new(true);
+            let view = swap(flag, |on: str| 42);
+        }
+        "#;
+    assert_fails_browser_once_with(source, "but got |str| i32");
+    let diagnostics = match compile_browser(source) {
+        Ok(_) => panic!("expected a refusal"),
+        Err(diagnostics) => diagnostics,
+    };
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+}

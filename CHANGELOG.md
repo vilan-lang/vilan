@@ -80,6 +80,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**B438: `swap(flag, |on: str| 42)` reports the closure's mismatch once. "cannot infer 'C' for this call" stood beside it — the consequence of the same refusal (`C` is open because the closure did not fit), which E189's rule suppresses along an unresolved path and did not reach at this shape.** A call whose argument was refused no longer carries the never-determined report for its own generics; a call whose arguments all fit and still leaves a bounded generic open keeps it. **Pins:** `inference::generics::b438_a_refused_argument_carries_no_cannot_infer_beside_it` (one diagnostic, the mismatch). Tracker B438.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.
