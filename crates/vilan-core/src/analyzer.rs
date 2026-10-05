@@ -44124,12 +44124,35 @@ impl<'src> Analyzer<'src> {
     /// [`bindings_for_binders`] is what makes it true of a reconciliation that
     /// is merely a unification (B168).
     fn trait_args_for(&mut self, concrete: &Type, trait_id: Id) -> Option<Vec<TypeId>> {
+        if let Some(arguments) = self.object_trait_arguments(concrete, trait_id) {
+            return Some(arguments);
+        }
         let (answered, fallback) = self.trait_args_candidates(concrete, trait_id, true);
         answered
             .into_iter()
             .next()
             .map(|(_, arguments)| arguments)
             .or(fallback)
+    }
+
+    /// M118: a trait OBJECT provides its own trait at the arguments it was
+    /// erased at — `dyn Flow<X>` is a `Flow<X>` — and no impl subject names
+    /// it. Asked the provider question, the candidate scan below reconciled
+    /// the object against EVERY implementor of the trait through the erasure
+    /// arm (each one re-proving `type_implements_trait_at` over every other
+    /// provider and minting its instantiation), to arrive at the object's own
+    /// arguments: ~11k type slots per attempt for one `.derive` on a
+    /// `dyn Flow`, re-paid on every re-queue while a closure's types were
+    /// still open.
+    fn object_trait_arguments(&mut self, concrete: &Type, trait_id: Id) -> Option<Vec<TypeId>> {
+        match concrete {
+            Type::Dyn(object_trait_id, object_arguments)
+                if *object_trait_id == trait_id && !object_arguments.is_empty() =>
+            {
+                Some(object_arguments.clone())
+            }
+            _ => None,
+        }
     }
 
     /// [`Self::trait_args_for`] for a caller holding the bound that asks — its
@@ -44177,6 +44200,18 @@ impl<'src> Analyzer<'src> {
         trait_id: Id,
         pattern: &[TypeId],
     ) -> PatternProviders {
+        // M118: an object answers for its own trait, when what the bound
+        // wrote agrees with what the object carries — one instantiation, so
+        // never B533's ambiguity.
+        if let Some(arguments) = self.object_trait_arguments(concrete, trait_id)
+            && (arguments.len() != pattern.len()
+                || pattern
+                    .iter()
+                    .zip(&arguments)
+                    .all(|(written, provided)| self.impl_subject_matches(*written, *provided)))
+        {
+            return PatternProviders::One(arguments);
+        }
         let (answered, fallback) = self.trait_args_candidates(concrete, trait_id, false);
         let agreeing: Vec<(TypeId, Vec<TypeId>)> = answered
             .into_iter()

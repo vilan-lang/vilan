@@ -10133,6 +10133,9 @@ impl<'src> Transformer<'src> {
             self.bodyless_emissions.push((function.id, requester));
         }
         self.emitting_stack.push(function.id);
+        // M118: an `--explain-cost` report charges the selections this body's
+        // calls compute to the declaration that wrote them.
+        let enclosing_owner = crate::impl_select::set_selection_owner(Some(function.id));
         let parameters = function
             .parameters
             .iter()
@@ -10151,6 +10154,7 @@ impl<'src> Transformer<'src> {
         // the split form when the last use is short of the end; this wraps the
         // whole body otherwise, keeping parameters last in the reverse order.
         let body = self.wrap_own_param_drops(function, body);
+        crate::impl_select::set_selection_owner(enclosing_owner);
         self.emitting_stack.pop();
         js::Node::Function(js::Function {
             name,

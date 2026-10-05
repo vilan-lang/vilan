@@ -5499,6 +5499,150 @@ fn m106_cost_attribution_ranks_declarations_by_solver_work_and_repeats_exactly()
     );
 }
 
+/// One analysis of `source` with attribution on, on a worker thread: the
+/// declarations' work counts by name, and — when `emit` — the selections the
+/// emission charged to each declaration (M118).
+fn m118_costs(
+    source: String,
+    emit: bool,
+) -> (
+    Vec<(String, vilan_core::counters::WorkCounts)>,
+    Vec<(String, u64)>,
+) {
+    vilan_core::counters::set_cost_attribution(20);
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let source: &'static str = String::leak(source);
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let mut selections = Vec::new();
+            if emit {
+                vilan_core::impl_select::take_selection_costs();
+                transform(&program, &BuildOptions::default()).expect("the program emits");
+                let charged = vilan_core::impl_select::take_selection_costs();
+                for cost in &program.item_costs {
+                    if let Some(count) = charged.get(&cost.owner) {
+                        selections.push((cost.name.clone(), *count));
+                    }
+                }
+            }
+            let work = program
+                .item_costs
+                .iter()
+                .map(|cost| (cost.name.clone(), cost.work))
+                .collect();
+            (work, selections)
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// M118: a `.derive` on a `dyn Flow` cost ~11k type slots PER ATTEMPT. Asked
+/// which arguments the object provides `Flow` at (the blanket's `F: Flow<type
+/// T>`), the solver reconciled the object against every implementor of
+/// `Flow` through the erasure arm, re-proving each one's instantiation, to
+/// arrive at the object's own arguments; and a closure whose parameter was
+/// not written re-queued the call until its types settled, paying it again
+/// each time. kolt's `Channel::find` was 44k work units where its siblings
+/// were 1k. An object answers for its own trait now, so the unannotated form
+/// costs what the annotated one does, and both cost what a concrete stage
+/// would.
+#[test]
+fn m118_a_derive_on_a_trait_object_costs_what_its_annotated_form_does() {
+    let program = |parameter: &str| {
+        format!(
+            r#"
+            import std::reactive::{{ Flow, MemoCell, Source, SignalCell }};
+
+            enum St<T> {{
+                Pending,
+                Ready(T),
+                Failed(str, Option<T>),
+                Absent,
+            }}
+
+            fun upstream(): dyn Flow<St<Option<i32>>> {{
+                let state: dyn Flow<St<Option<i32>>> = Source::constant(St::Pending);
+                state
+            }}
+
+            fun find(client: SignalCell<Option<i32>>): MemoCell<Option<St<i32>>> {{
+                client.switch_some(|id| upstream().derive(|{parameter}| match x {{
+                    St::Pending => St::Pending,
+                    St::Ready(Some(let v)) => St::Ready(v),
+                    St::Ready(None) => St::Absent,
+                    St::Failed(let e, let v) => St::Failed(e, v.flatten()),
+                    St::Absent => St::Absent,
+                }})).memo()
+            }}
+
+            fun main() {{
+                let state = find(SignalCell::new(Some(1)));
+            }}
+            "#
+        )
+    };
+    let slots_of_find = |source: String| {
+        let (work, _) = m118_costs(source, false);
+        work.iter()
+            .find(|(name, _)| name == "find")
+            .map(|(_, work)| work.slots)
+            .expect("`find` is charged work")
+    };
+    let unannotated = slots_of_find(program("x"));
+    let annotated = slots_of_find(program("x: St<Option<i32>>"));
+    assert!(
+        annotated < 3_000,
+        "the annotated `find` minted {annotated} type slots: the object's `Flow` arguments \
+         were re-derived from every implementor (M118)"
+    );
+    assert!(
+        unannotated <= annotated * 2,
+        "the unannotated `find` minted {unannotated} type slots against the annotated form's \
+         {annotated}: an unwritten closure parameter re-paid the provider question per \
+         attempt (M118)"
+    );
+}
+
+/// M118's second half: `--explain-cost`'s `selections` column read 0 for every
+/// declaration, because the solver's per-constraint attribution ends at the
+/// fixpoint and implementation selection happens after it. The emission walk
+/// now charges each selection it computes to the declaration whose body it is
+/// emitting.
+#[test]
+fn m118_emission_charges_its_selections_to_the_declaration_that_asked() {
+    let source = r#"
+        import std::io::print;
+        trait Describe<T> { fun describe(self): T; }
+        struct Badge { size: i32 }
+        impl Badge with Describe<i32> { fun describe(self): i32 { self.size } }
+        fun tell<V: Describe<i32>>(value: V) { print(i"{value.describe()}"); }
+        fun main() { tell(Badge { size = 1 }); }
+    "#;
+    let (_, selections) = m118_costs(source.to_string(), true);
+    assert!(
+        selections
+            .iter()
+            .any(|(name, count)| name == "tell" && *count > 0),
+        "`tell`'s bound-directed call computed a selection at emission and it was charged to \
+         no declaration: {selections:?}"
+    );
+}
+
 // --- B4 §2.2: a bare trait annotation must not launder a resource -----------
 //
 // `proposal/trait-objects.md` §2.2 (probes P8/P9): the resource analysis

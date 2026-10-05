@@ -1177,7 +1177,7 @@ pub fn applying_implementations<'a, 'src>(
             .map(|index| &program.implementations[*index])
             .collect();
     }
-    APPLYING_COMPUTED.with(|count| count.set(count.get() + 1));
+    count_computed_selection();
     let trips = crate::util::RecursionGuard::trips();
     let applying = applying_implementations_uncached(program, file, concrete, wanted);
     if crate::util::RecursionGuard::trips() == trips {
@@ -1290,6 +1290,38 @@ thread_local! {
     /// thread since [`reset_applying_computed`], as against served from its
     /// per-program memo (M98) — the only thing that can see the memo work.
     static APPLYING_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The declaration a computed selection is charged to in a
+    /// `--explain-cost` report (M118): the function whose body is being
+    /// emitted, set by the emitter around each body. `None` outside one.
+    static SELECTION_OWNER: std::cell::Cell<Option<Id>> = const { std::cell::Cell::new(None) };
+    /// The computed selections charged per declaration since
+    /// [`take_selection_costs`] — `None` collects the ones made outside any
+    /// declaration's body (the post-passes' program-wide scans).
+    static SELECTION_COSTS: std::cell::RefCell<HashMap<Option<Id>, u64>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// Charges this thread's computed selections to `owner` until the next call,
+/// returning the owner it replaces so a nested body can restore it. A no-op
+/// beyond the swap unless a cost report was asked for.
+pub fn set_selection_owner(owner: Option<Id>) -> Option<Id> {
+    SELECTION_OWNER.with(|current| current.replace(owner))
+}
+
+/// The selections computed per declaration since the last call (M118: the
+/// `selections` column of `--explain-cost`, which the solver's per-constraint
+/// attribution cannot see — implementation selection happens after the
+/// fixpoint, in the post-passes and the emission walk).
+pub fn take_selection_costs() -> HashMap<Option<Id>, u64> {
+    SELECTION_COSTS.with(|costs| std::mem::take(&mut *costs.borrow_mut()))
+}
+
+fn count_computed_selection() {
+    APPLYING_COMPUTED.with(|count| count.set(count.get() + 1));
+    if crate::counters::cost_report_limit().is_some() {
+        let owner = SELECTION_OWNER.with(std::cell::Cell::get);
+        SELECTION_COSTS.with(|costs| *costs.borrow_mut().entry(owner).or_default() += 1);
+    }
 }
 
 /// The number of selections [`applying_implementations`] computed rather than
