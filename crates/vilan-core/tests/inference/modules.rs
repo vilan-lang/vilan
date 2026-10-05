@@ -7136,7 +7136,7 @@ fn n113_the_helper_the_getter_and_an_unknown_global_still_compile() {
 
 // --- B472: the import steer indexes std's deprecated ALIAS re-exports -------
 
-/// `Map` and `Set` were `export [deprecated(..)] import … as Map;` in
+/// `Map` and `Set` were `[deprecated(..)] export import … as Map;` in
 /// `std::map`/`std::set` — re-exports, which declare nothing, so the steer's
 /// index held no entry and an unimported `Map` got no hint while an unimported
 /// `HashMap` got the right one. B472 made a deprecated alias steer to the name

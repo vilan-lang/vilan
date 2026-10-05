@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**Comments spell a deprecated re-export the way the parser accepts it, and F48's native probe calls through a subscript as it says it does.** B485 put a declaration's attributes ahead of `export` (`[deprecated(..)] export import …`), and the comments in `node.rs` and the inference suite's B472 note still wrote the refused `export [deprecated(..)] import …`; both are respelled. `native/reassigned_closures.vl` bound `let third = adders[2];` only to step around E252, which is fixed, so it now calls `adders[2](30)` directly — the "call through a subscript" its header names — and stays identical on both backends. The seven such comments in `analyzer.rs` wait for the next lane that touches that file, as the item recommends; the respelling is a ready patch. Tracker N142.
+
+---
+
 <!-- family: diagnostics -->
 **`std::markdown`'s nineteen strict-parse refusals are in the diagnostics ledger.** The parser refuses every construct outside the census grammar with a `ParseError` naming the construct and its line — an image, a footnote, a reference-style link or definition, strikethrough, a backslash escape, a raw HTML tag, an indented code block, a tilde fence, an unclosed fence, a custom heading id, a setext heading or thematic break, a lazy blockquote or list continuation, an indented or nested list item, a table alignment colon, a hard or backslash line break — and none of the nineteen messages had a row, so a reworded one reddened nothing. Each is rowed now (`NEW`, for integration to number), keyed on the message as it prints, the two composed ones (`a backslash escape (\{escaped})…`, `a raw HTML tag (<{inner}>)…`) with their slots; every fragment of every key is held to `vilan/std`, proven by rewording two of them. Each message already had its own pin (`inference::markdown::markdown_refuses_*`). No message changed: their em-dash style waits on the ruling the process layer's REWORD parking already names. Tracker L16.
 
