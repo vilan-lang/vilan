@@ -520,7 +520,7 @@ fn diagnostic_groups(document: &Document, owner: &Url, paint: bool) -> Vec<(Url,
         };
         // B520: a diagnostic with a stable code publishes it — the foreign
         // spellings, A157's written-`autofocus` steer, A154's moved std path,
-        // B536's marker order and B515's trait not imported, each recognized
+        // B536's marker order and B535's trait not imported, each recognized
         // by its message.
         let code = vilan_core::parsing::ForeignSpelling::of_message(&item.message)
             .map(|spelling| spelling.code())
@@ -530,7 +530,10 @@ fn diagnostic_groups(document: &Document, owner: &Url, paint: bool) -> Vec<(Url,
                 vilan_core::parsing::MarkerOrderDiagnostic::of_message(&item.message)
                     .map(|diagnostic| diagnostic.code())
             })
-            .or_else(|| vilan_ide::trait_import::trait_import_code(&item.message))
+            .or_else(|| {
+                vilan_core::analyzer::trait_scope_import(&item.message)
+                    .map(|_| vilan_core::analyzer::TRAIT_SCOPE_CODE)
+            })
             .map(|code| NumberOrString::String(code.to_string()));
         let diagnostic = |range| Diagnostic {
             range,

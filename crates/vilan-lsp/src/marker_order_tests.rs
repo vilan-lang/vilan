@@ -1,12 +1,11 @@
 //! B536's editor half: a declaration head written out of THE order publishes
-//! with its stable code (`marker-order/attributes` for the warning on
-//! attributes out of rank, `marker-order/keywords` for the refusal of a keyword
-//! ahead of an attribute or two keywords inverted) and carries a quick fix that
-//! writes the head in the order — one head at a time, and every head in the
-//! file at once. The diagnostics and the edit's data are
+//! with its stable code (`marker-order/attributes` for attributes out of rank
+//! — a warning until v0.45.0, refused since, R-c — and `marker-order/keywords`
+//! for a keyword ahead of an attribute or two keywords inverted) and carries
+//! a quick fix that writes the head in the order — one head at a time, and
+//! every head in the file at once. The diagnostics and the edit's data are
 //! `vilan_core::parsing::{MarkerOrderDiagnostic, marker_order_fix}`; this is
-//! the code action over them. R-c: the attribute-order warning becomes an
-//! error in v0.45.0, and this fix is the migration the flip waits on.
+//! the code action over them.
 
 use std::path::Path;
 
@@ -124,7 +123,7 @@ fn a_head_wrong_both_ways_is_one_edit() {
     );
 }
 
-/// The file-wide fix: every head in the file — warnings and refusals alike —
+/// The file-wide fix: every head in the file — either code —
 /// in ONE edit, offered from any one of them, the text between the heads
 /// carried through untouched.
 #[test]

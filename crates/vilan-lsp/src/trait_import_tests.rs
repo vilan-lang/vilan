@@ -1,11 +1,12 @@
 //! B515's editor half (B535): a trait method called in a file that does not
-//! import its trait carries a quick fix that writes the import — on B515's
-//! warning (the call resolves because another loaded module imports the
-//! trait; refused from v0.45.0, R-c) and on the no-method steer (nothing
-//! loaded it) alike — one trait at a time, and every trait the file needs at
-//! once. The warning publishes with its stable code. The message's import is
-//! read by `vilan_ide::trait_import`; the candidate scan the add-import fix
-//! uses decides the path written.
+//! import its trait carries a quick fix that writes the import — on B535's
+//! refusal (B515's warning until v0.45.0, R-c: the call would resolve because
+//! another loaded module imports the trait) and on the no-method steer
+//! (nothing loaded it) alike — one trait at a time, and every trait the file
+//! needs at once. The refusal publishes with its stable code. The message's
+//! import is read by `vilan_ide::trait_import` (through the analyzer's own
+//! `trait_scope_import`); the candidate scan the add-import fix uses decides
+//! the path written.
 
 use std::path::Path;
 
@@ -72,7 +73,7 @@ fn clean(source: &str) {
 const LOADS_THE_TRAITS: &str = "import std::markdown::parse;\n\n";
 
 #[test]
-fn b515s_warning_imports_the_trait() {
+fn b535s_refusal_imports_the_trait() {
     let source = format!(
         "{LOADS_THE_TRAITS}fun main() {{\n\tlet _ = parse(\"x\");\n\tprint(42.to_string());\n}}\n"
     );
@@ -110,10 +111,15 @@ fn every_trait_the_file_needs_is_imported_at_once() {
     let title = "Import all 2 traits this file calls";
     let document = Document::analyze(&source, &std_root(), Path::new("test.vl"));
     let program = document.program.as_ref().expect("a program");
-    assert_eq!(document.warnings.len(), 3, "the premise: three calls warn");
-    for warning in &document.warnings {
+    let refusals: Vec<_> = document
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| vilan_core::analyzer::trait_scope_import(&diagnostic.msg).is_some())
+        .collect();
+    assert_eq!(refusals.len(), 3, "the premise: three calls are refused");
+    for refusal in refusals {
         let offered: Vec<String> = document
-            .quickfixes(program, warning.span)
+            .quickfixes(program, refusal.span)
             .into_iter()
             .map(|fix| fix.title)
             .collect();
@@ -169,7 +175,7 @@ fn add_all_missing_imports_writes_the_traits() {
 /// B515's warning publishes with its stable code; the no-method steer, an
 /// error of another kind, carries none.
 #[test]
-fn the_warning_is_published_with_its_code() {
+fn the_refusal_is_published_with_its_code() {
     let path = std::env::temp_dir().join(format!(
         "vilan-b515-code-{}-{:?}.vl",
         std::process::id(),
@@ -257,14 +263,14 @@ fn a_nested_std_trait_is_imported_from_where_it_is_declared() {
     let document = Document::analyze(source, &std_root(), &path);
     assert!(
         document
-            .warnings
+            .diagnostics
             .iter()
-            .any(|warning| warning.msg.contains("does not import `SequenceCell`")),
-        "the premise: the call warns {:?}",
+            .any(|refusal| refusal.msg.contains("does not import `SequenceCell`")),
+        "the premise: the call is refused {:?}",
         document
-            .warnings
+            .diagnostics
             .iter()
-            .map(|warning| warning.msg.clone())
+            .map(|refusal| refusal.msg.clone())
             .collect::<Vec<_>>()
     );
     let fixes: Vec<QuickFix> = offered(&document)

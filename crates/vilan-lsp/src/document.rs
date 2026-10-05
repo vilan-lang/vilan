@@ -7533,9 +7533,10 @@ impl Document {
                 });
                 continue;
             }
-            // B536: a keyword ahead of an attribute, or two keywords inverted
-            // — refused, and read as the head in the order; the fix writes it
-            // so.
+            // B536: a head out of THE order — attributes out of rank, a
+            // keyword ahead of an attribute, two keywords inverted — refused
+            // (the attribute half since v0.45.0) and read as the head in the
+            // order; the fix writes it so.
             if let Some(fix) = self.marker_order_quick_fix(diagnostic) {
                 fixes.push(fix);
                 continue;
@@ -7559,8 +7560,10 @@ impl Document {
                 });
                 continue;
             }
-            // B515 (B535): the no-method steer names the trait whose module
-            // nothing loaded; the fix imports it.
+            // B535 (B515's refusal since v0.45.0): a trait's method called
+            // where the file does not import the trait, and the no-method
+            // steer, which names the trait whose module nothing loaded — the
+            // fix imports it.
             if let Some((name, module_paths)) = self.trait_import_paths(program, diagnostic) {
                 fixes.extend(
                     module_paths
@@ -7829,19 +7832,6 @@ impl Document {
                     replacement: String::new(),
                     target: None,
                 });
-            } else if let Some(fix) = self.marker_order_quick_fix(warning) {
-                // B536: attributes out of THE order — a warning this release,
-                // an error from v0.45.0 (R-c).
-                fixes.push(fix);
-            } else if let Some((name, module_paths)) = self.trait_import_paths(program, warning) {
-                // B515: a trait's method called where the file does not import
-                // the trait — it resolves only because another loaded module
-                // does. A warning this release, refused from v0.45.0 (R-c).
-                fixes.extend(
-                    module_paths
-                        .iter()
-                        .filter_map(|module_path| self.import_fix(module_path, name)),
-                );
             } else if let Some(fix) =
                 vilan_core::parsing::written_autofocus_fix(&self.text, &warning.msg, warning.span)
             {
