@@ -1069,6 +1069,13 @@ pub const WRITTEN_AUTOFOCUS_MESSAGE: &str = "a written `autofocus` attribute is 
      server render still writes the native attribute (for a `<dialog>` or a popover that wants \
      the native one, write `.attr(\"autofocus\", \"\")`)";
 
+/// The element-head ATTRIBUTE names the analyzer steers to a `View` method
+/// instead (A157's `autofocus`, at [`WRITTEN_AUTOFOCUS_MESSAGE`]), each with
+/// the method it steers to. The HTML attribute table is name-blind and keeps
+/// them; completion reads this to offer the method and not the attribute that
+/// would warn on the next analysis (E264).
+pub const STEERED_ELEMENT_ATTRIBUTES: &[(&str, &str)] = &[("autofocus", "autofocus")];
+
 /// [`WRITTEN_AUTOFOCUS_MESSAGE`]'s STABLE code. The editor publishes it as the
 /// LSP diagnostic's `code`; it never changes when the message is reworded.
 pub const WRITTEN_AUTOFOCUS_CODE: &str = "element-attribute/autofocus";

@@ -19244,6 +19244,39 @@ pub(crate) mod tests {
         );
     }
 
+    // E264: a name the compiler STEERS away from is not offered as an
+    // attribute. A written `autofocus` warns (A157: the browser's native
+    // attribute acts only at the page's first parse) and steers to
+    // `.autofocus()`, so `<input |>` offers the method — which the head
+    // offers already, dot included — and not the bare attribute that would
+    // warn on the next analysis. Every other global stays.
+    #[test]
+    fn element_head_offers_autofocus_as_the_method_only() {
+        for head in [
+            "\t<input ~/>\n",
+            "\t<div ~></div>\n",
+            "\t<button ~></button>\n",
+        ] {
+            let labels = element_head_completions(head);
+            assert!(
+                labels.contains(&".autofocus".to_string()),
+                "the method, dot included: {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"autofocus".to_string()),
+                "the steered attribute is not offered: {labels:?}"
+            );
+            assert!(
+                labels.contains(&"tabindex".to_string()),
+                "the other globals stay: {labels:?}"
+            );
+        }
+        // After a dot the head offers the View's methods, `autofocus` among
+        // them, exactly as before.
+        let dotted = element_head_completions("\t<input .~/>\n");
+        assert!(dotted.contains(&"autofocus".to_string()), "{dotted:?}");
+    }
+
     // The SVG half of the ruling, and lucide's own shape: `<svg |>` offers
     // `viewBox` (the per-element index) and the presentation attributes the
     // SVG namespace gives every element (`fill`, `stroke-width`).

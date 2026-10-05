@@ -66,6 +66,11 @@ written down.
 ---
 
 <!-- family: tooling -->
+**Element-head completion offers `.autofocus()` and no longer the bare `autofocus` attribute it would warn on.** `<input |>` offered `autofocus` from the HTML attribute table (a global attribute), and accepting it wrote the attribute A157 steers away from on the next analysis. The table stays name-blind; the compiler's list of attribute names it steers to a `View` method (`parsing::STEERED_ELEMENT_ATTRIBUTES`) is read by the completion layer, which leaves those names out, so the head offers the method its chain-form candidates already carry. The same holds in the playground, which shares the engine. Pin: `vilan-lsp`'s `element_head_offers_autofocus_as_the_method_only` (`<input>`, `<div>` and `<button>` offer `.autofocus` and not `autofocus`, the other globals stay, and a dotted head still offers the method). Tracker E264.
+
+---
+
+<!-- family: tooling -->
 **B495's closure-mode refusal carries a quick fix: the literal's parameter written in the type's mode, or the adapter around a named closure.** "this closure takes `str` by value where its type takes a view `&str` …" named the two ways out and offered neither. Where the refusal spans a closure literal, ``Take the parameter as `&str` `` rewrites that one parameter's type in the mode the closure type takes (`&`, `&mut`, or by value) and nothing else. Where it spans a named one-parameter closure, ``Adapt it: `|c| g(*c)` `` writes the adapter the refusal names: `*c` copies a view's value out for a value closure, `&c` lends a view closure the value. The adapter is offered only around a plain name or path, since around any other expression it would evaluate that expression on every call; a writable view meeting a value closure has no adapter, and a named closure of several parameters gets none (the refusal does not say how many it takes). A `\|` in a cell of the editor page's tables now reads as a `|`, so the page can quote a closure. Pins: `vilan-lsp`'s `closure_mode_tests` (a literal argument, an annotated `let`, a `&mut` parameter, a named closure; each fixed program checks clean) and `vilan-ide`'s `closure_mode_fix::tests` (the refusal's facts read, four parameter rewrites, two adapters, six declined guesses). Tracker E263.
 
 ---

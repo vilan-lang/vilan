@@ -962,6 +962,16 @@ fn attribute_completions(tag: &str) -> Vec<Completion> {
     let wide = wide.iter().copied();
     own.chain(GLOBAL_ATTRIBUTES.iter().copied())
         .chain(wide)
+        // E264: a name the compiler steers to a `View` method (`autofocus` →
+        // `.autofocus()`, A157) is offered as that method — the head's
+        // chain-form candidates carry it, dot included — and not as the
+        // attribute, which would warn on the next analysis. The vendored
+        // table stays name-blind; the steer is the compiler's fact.
+        .filter(|attribute| {
+            !vilan_core::parsing::STEERED_ELEMENT_ATTRIBUTES
+                .iter()
+                .any(|(steered, _)| steered == attribute)
+        })
         .map(|attribute| {
             let mut completion = Completion::bare(attribute.to_string(), CompletionKind::Field);
             // An attribute takes exactly one value (`parse_element_head_item`
