@@ -65294,9 +65294,10 @@ pub struct Program<'src> {
     /// every pass that refines dispatch (M97). Derived data, like the graph.
     bound_selection_memo:
         std::sync::Mutex<HashMap<crate::dispatch_refine::BoundSelectionKey, Vec<Id>>>,
-    /// [`crate::impl_select::applying_implementations`]' answers, as indices
-    /// into `implementations` (M98). Derived data, like the graph.
-    applying_memo: std::sync::Mutex<HashMap<crate::impl_select::ApplyingKey, Vec<usize>>>,
+    /// [`crate::impl_select`]'s answers — which impls apply to a type (M98),
+    /// the bound proofs under them and the arguments a type provides a trait at
+    /// (M111). Derived data, like the graph.
+    selection_memos: crate::impl_select::SelectionMemos,
     /// The receiver-reachable candidates of a `self`/inherited-default
     /// dispatch, per member name (M103) — `async_infer`'s
     /// `trait_subject_candidates` before its receiver filter. Derived data,
@@ -65778,14 +65779,9 @@ impl<'src> Program<'src> {
         let _ = self.call_graph_memo.set(graph);
     }
 
-    /// [`crate::impl_select::applying_implementations`]' memo (M98), read
-    /// through a poisoned lock for [`Self::bound_selection_memo`]'s reason.
-    pub(crate) fn applying_memo(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<crate::impl_select::ApplyingKey, Vec<usize>>> {
-        self.applying_memo
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// [`crate::impl_select`]'s memos (M98, M111).
+    pub(crate) fn selection_memos(&self) -> &crate::impl_select::SelectionMemos {
+        &self.selection_memos
     }
 
     /// `async_infer`'s per-member subject-reachability memo (M103), read
@@ -75036,7 +75032,7 @@ fn analyze_over_world<'src>(
         hmr_bindings,
         call_graph_memo: std::sync::OnceLock::new(),
         bound_selection_memo: std::sync::Mutex::default(),
-        applying_memo: std::sync::Mutex::default(),
+        selection_memos: crate::impl_select::SelectionMemos::default(),
         trait_subject_memo: std::sync::Mutex::default(),
     })
 }

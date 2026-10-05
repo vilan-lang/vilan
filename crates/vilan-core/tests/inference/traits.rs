@@ -9262,6 +9262,59 @@ fn a_second_emission_of_one_program_computes_no_impl_selection() {
     );
 }
 
+/// M111: a BOUND-DIRECTED call — one naming its trait at arguments
+/// (`V: Describe<i32>`) — was never memoized: `applying_implementations` keyed
+/// only the argument-free questions, so every such call the emission walk met
+/// re-ranked the program's impls, re-proving every blanket bound under them
+/// (kolt's check spent a third of its instructions there). The count a body
+/// computes is now the same for one call site and for six.
+#[test]
+fn m111_bound_directed_calls_compute_their_selection_once_however_many_sites() {
+    fn computed_for(sites: usize) -> usize {
+        let calls = "\tprint(i\"{value.describe()}\");\n".repeat(sites);
+        // `analyze_source` borrows its text for the program's lifetime.
+        let source: &'static str = String::leak(format!(
+            "import std::io::print;\n\
+             trait Describe<T> {{ fun describe(self): T; }}\n\
+             struct Badge {{ size: i32 }}\n\
+             impl Badge with Describe<i32> {{ fun describe(self): i32 {{ self.size }} }}\n\
+             fun tell<V: Describe<i32>>(value: V) {{\n{calls}}}\n\
+             fun main() {{ tell(Badge {{ size = 1 }}); }}\n"
+        ));
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                let program = program.expect("analysis should produce a program");
+                vilan_core::impl_select::reset_applying_computed();
+                transform(&program, &BuildOptions::default()).expect("the program emits");
+                vilan_core::impl_select::applying_computed()
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    let one = computed_for(1);
+    let six = computed_for(6);
+    assert_eq!(
+        one, six,
+        "six bound-directed calls computed {six} impl selections where one call computed \
+         {one}: each site re-ranked the impls (M111)"
+    );
+}
+
 /// B479 without std: a stage type's own impl provides `Fl<U>` in the caller's
 /// parameter (`Der<S, T, I>` → `Fl<I>`), and a blanket over every `Src`
 /// provides `Fl` too — written first, its `T` grounded by nothing a `Der` has.

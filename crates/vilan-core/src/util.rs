@@ -351,6 +351,7 @@ pub fn case_exact_mismatch(root: &Path, relative: &Path) -> Option<(String, Stri
 
 thread_local! {
     static RECURSION_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static RECURSION_TRIPS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// A safety net for the recursive type operations (`reconcile_type`,
@@ -368,6 +369,7 @@ impl RecursionGuard {
         RECURSION_DEPTH.with(|depth| {
             let current = depth.get();
             if current >= 2048 {
+                RECURSION_TRIPS.with(|trips| trips.set(trips.get() + 1));
                 None
             } else {
                 depth.set(current + 1);
@@ -377,6 +379,14 @@ impl RecursionGuard {
                 Some(RecursionGuard)
             }
         })
+    }
+
+    /// How many times [`Self::enter`] has refused on this thread. A memo whose
+    /// answer was computed while this moved holds a TRUNCATED answer — one
+    /// that depended on how deep the walk began — and must not be stored
+    /// (M111: `impl_select`'s proof memos read it).
+    pub fn trips() -> u64 {
+        RECURSION_TRIPS.with(Cell::get)
     }
 }
 
