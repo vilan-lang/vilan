@@ -31820,7 +31820,7 @@ impl<'src> Analyzer<'src> {
     /// classification, 158–342 ms of a 5.7 s debug checks phase on kolt's
     /// client leg against the drop planner's gate at 950–1230 ms in the same
     /// phase. It is named residue rather than left unmentioned.
-    fn compute_capture_clone_sites(&mut self) -> CapturePlan {
+    fn compute_capture_clone_sites(&mut self, written_roots: &WrittenRoots) -> CapturePlan {
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
         // leaves its scope (a function/closure tail, a `ret` value, a match
@@ -31886,7 +31886,6 @@ impl<'src> Analyzer<'src> {
         //
         // The SHARE decision consults no elision, so it is complete before
         // phase 3 needs it.
-        let written_roots = self.collect_written_roots();
         let mut classified: Vec<(Id, Id, CopyDecision)> = Vec::new();
         let mut shared: HashSet<Id> = HashSet::default();
         let mut materialized: HashSet<Id> = HashSet::default();
@@ -31910,7 +31909,7 @@ impl<'src> Analyzer<'src> {
             // every write but a whole-binding rebind is
             // ([`Self::subject_is_mutated_in_place`]).
             if self.subject_is_writable_view(subject_id)
-                || self.subject_is_mutated_in_place(subject_id, &written_roots)
+                || self.subject_is_mutated_in_place(subject_id, written_roots)
             {
                 materialized.insert(capture_id);
             }
@@ -31950,7 +31949,7 @@ impl<'src> Analyzer<'src> {
                 triggers => CopyDecision::UnlessResource(triggers),
             };
             if !capture_is_mutable
-                && self.share_subject_is_stable(subject_id, &written_roots)
+                && self.share_subject_is_stable(subject_id, written_roots)
                 && !seam_roots.contains(&capture_id)
             {
                 shared.insert(capture_id);
@@ -32440,19 +32439,16 @@ impl<'src> Analyzer<'src> {
     /// backend keeps its copy: a `clone_sites` decision is how it learns that a
     /// Rust value must be cloned out of a borrow, so this is a JS emission
     /// choice and `clone_sites` is unchanged.
-    fn compute_shared_place_lets(&self) -> (HashSet<Id>, HashSet<Id>) {
-        let written_roots = self.collect_written_roots();
-        // A leaf whose type cannot carry storage — a scalar read off the
-        // binding at a tail (`layout.table[at]`) — aliases nothing.
-        let seam_roots = self.value_seam_roots_where(&|analyzer, leaf| {
-            analyzer.place_value_type_id(leaf).is_none_or(|type_id| {
-                let leaf_type = type_id.get_type(analyzer);
-                analyzer.is_cloneable_aggregate(&leaf_type) || matches!(leaf_type, Type::Generic(_))
-            })
-        });
-        let handed_on = self.bindings_handed_on_whole();
-        let mut bindings = HashSet::default();
-        let mut initializers = HashSet::default();
+    fn compute_shared_place_lets(
+        &self,
+        written_roots: &WrittenRoots,
+        seam_leaves: &std::cell::OnceCell<Vec<Id>>,
+    ) -> (HashSet<Id>, HashSet<Id>) {
+        // The cheap tests first, so a program with no candidate pays for none
+        // of the whole-program sets below: an immutable `let` holding no view,
+        // initialized from a projection of another binding, at a type a copy
+        // would actually copy.
+        let mut candidates: Vec<(Id, Id, Id)> = Vec::new();
         for expr in self.expr_id_to_expr_map.values() {
             let Expr::Variable(variable_id) = expr else {
                 continue;
@@ -32463,25 +32459,48 @@ impl<'src> Analyzer<'src> {
             let Some(value_id) = variable.initial else {
                 continue;
             };
-            if variable.mutable
-                || handed_on.contains(variable_id)
-                || self.view_binding_mutability(*variable_id).is_some()
-                || written_roots.in_place.contains(variable_id)
-                || seam_roots.contains(variable_id)
-                || self.last_use.is_opaque(*variable_id)
-            {
+            if variable.mutable || self.view_binding_mutability(*variable_id).is_some() {
                 continue;
             }
             let Some(root) = self.projection_root(value_id) else {
                 continue;
             };
-            if root != *variable_id
-                && self.root_is_stable(root, &written_roots)
-                && self.type_is_plain_value(variable.type_id, &mut Vec::new())
+            if root == *variable_id
+                || !self.is_cloneable_aggregate(&variable.type_id.get_type(self))
+                || !self.type_is_plain_value(variable.type_id, &mut Vec::new())
             {
-                bindings.insert(*variable_id);
-                initializers.insert(value_id);
+                continue;
             }
+            candidates.push((*variable_id, value_id, root));
+        }
+        if candidates.is_empty() {
+            return (HashSet::default(), HashSet::default());
+        }
+        // A leaf whose type cannot carry storage — a scalar read off the
+        // binding at a tail (`layout.table[at]`) — aliases nothing.
+        let seam_leaves = seam_leaves.get_or_init(|| self.value_seam_leaves());
+        let seam_roots = self.seam_roots_of(seam_leaves, &|analyzer, leaf| {
+            analyzer.place_value_type_id(leaf).is_none_or(|type_id| {
+                let leaf_type = type_id.get_type(analyzer);
+                analyzer.is_cloneable_aggregate(&leaf_type) || matches!(leaf_type, Type::Generic(_))
+            })
+        });
+        let candidate_bindings: HashSet<Id> =
+            candidates.iter().map(|candidate| candidate.0).collect();
+        let handed_on = self.bindings_handed_on_whole(&candidate_bindings);
+        let mut bindings = HashSet::default();
+        let mut initializers = HashSet::default();
+        for (variable_id, value_id, root) in candidates {
+            if handed_on.contains(&variable_id)
+                || written_roots.in_place.contains(&variable_id)
+                || seam_roots.contains(&variable_id)
+                || self.last_use.is_opaque(variable_id)
+                || !self.root_is_stable(root, written_roots)
+            {
+                continue;
+            }
+            bindings.insert(variable_id);
+            initializers.insert(value_id);
         }
         (bindings, initializers)
     }
@@ -32574,11 +32593,15 @@ impl<'src> Analyzer<'src> {
     /// projections and loans: a shared binding owns nothing, so rule 2 could
     /// not donate it at a store, and the copy it then took there would be a
     /// copy the native backend (which keeps the `let`'s own) never needed.
-    fn bindings_handed_on_whole(&self) -> HashSet<Id> {
+    fn bindings_handed_on_whole(&self, of: &HashSet<Id>) -> HashSet<Id> {
         let mut handed_on = HashSet::default();
+        let reads_one = |value_id: Id| match self.expr_id_to_expr_map.get(&value_id) {
+            Some(Expr::Local(binding_id)) => of.contains(binding_id).then_some(*binding_id),
+            _ => None,
+        };
         let whole = |handed_on: &mut HashSet<Id>, value_id: Id| {
-            if let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(&value_id) {
-                handed_on.insert(*binding_id);
+            if let Some(binding_id) = reads_one(value_id) {
+                handed_on.insert(binding_id);
             }
         };
         for expr in self.expr_id_to_expr_map.values() {
@@ -32610,6 +32633,13 @@ impl<'src> Analyzer<'src> {
                     let Some(function_call) = self.function_calls.get(call_id) else {
                         continue;
                     };
+                    if !function_call
+                        .argument_ids
+                        .iter()
+                        .any(|argument_id| reads_one(*argument_id).is_some())
+                    {
+                        continue;
+                    }
                     let conventions = self.callee_conventions(function_call.subject_id);
                     for (index, argument_id) in function_call.argument_ids.iter().enumerate() {
                         let loaned = conventions.as_ref().is_some_and(|conventions| {
@@ -32669,12 +32699,16 @@ impl<'src> Analyzer<'src> {
         self.shared_read_bindings.contains(&root)
     }
 
-    fn compute_shared_read_bindings(&self) -> (HashSet<Id>, HashSet<Id>) {
+    fn compute_shared_read_bindings(
+        &self,
+        written_roots: &WrittenRoots,
+        seam_leaves: &std::cell::OnceCell<Vec<Id>>,
+    ) -> (HashSet<Id>, HashSet<Id>) {
         if self.shared_cells.reads.is_empty() {
             return (HashSet::default(), HashSet::default());
         }
-        let written_roots = self.collect_written_roots();
-        let seam_roots = self.value_seam_roots();
+        let seam_leaves = seam_leaves.get_or_init(|| self.value_seam_leaves());
+        let seam_roots = self.seam_roots_of(seam_leaves, &|_, _| true);
         let sequences = self.statement_sequences();
         let mut bindings = HashSet::default();
         let mut reads = HashSet::default();
@@ -32995,82 +33029,63 @@ impl<'src> Analyzer<'src> {
     /// [`Self::compute_capture_clone_sites`] asks of its captures, asked of the
     /// whole program, because B267's elision has to know whether the storage it
     /// is about to share can leave the frame that shares it.
-    fn value_seam_roots(&self) -> HashSet<Id> {
-        self.value_seam_roots_where(&|_, _| true)
-    }
-
-    /// [`Self::value_seam_roots`], counting only the seam LEAVES `keep` admits
-    /// — M90 asks for the leaves that can carry storage out (an aggregate, or a
-    /// generic one copied at every instantiation), since a scalar read off a
-    /// binding at a tail aliases nothing.
-    fn value_seam_roots_where(&self, keep: &dyn Fn(&Self, Id) -> bool) -> HashSet<Id> {
-        let mut roots = HashSet::default();
+    ///
+    /// Collected as LEAVES, once, for the passes that each root them their own
+    /// way ([`Self::seam_roots_of`]: B267 every leaf, M90 the aggregate ones).
+    fn value_seam_leaves(&self) -> Vec<Id> {
+        let mut leaves = Vec::new();
         for function in self.functions.values() {
             if function.has_body {
-                self.insert_seam_roots_where(function.body.1, &mut roots, keep);
+                self.collect_tail_leaves(function.body.1, &mut leaves);
             }
         }
         for closure in self.closures.values() {
-            self.insert_seam_roots_where(closure.return_, &mut roots, keep);
+            self.collect_tail_leaves(closure.return_, &mut leaves);
         }
         for module in self.modules.values() {
-            self.insert_seam_roots_where(module.body.1, &mut roots, keep);
+            self.collect_tail_leaves(module.body.1, &mut leaves);
         }
         for expr in self.expr_id_to_expr_map.values() {
             match expr {
                 Expr::FunctionReturn(Some(value_id)) => {
-                    self.insert_seam_roots_where(*value_id, &mut roots, keep);
+                    self.collect_tail_leaves(*value_id, &mut leaves);
                 }
                 Expr::Match(_, legs) => {
                     for leg in legs {
-                        self.insert_seam_roots_where(leg.body, &mut roots, keep);
+                        self.collect_tail_leaves(leg.body, &mut leaves);
                     }
                 }
                 Expr::Block((_, tail_id))
                 | Expr::For(_, (_, tail_id))
                 | Expr::ForEach(_, _, (_, tail_id)) => {
-                    self.insert_seam_roots_where(*tail_id, &mut roots, keep)
+                    self.collect_tail_leaves(*tail_id, &mut leaves)
                 }
-                Expr::If(branch) => self.insert_branch_seam_roots(branch, &mut roots, keep),
+                Expr::If(branch) => self.collect_branch_tail_leaves(branch, &mut leaves),
                 _ => {}
             }
         }
-        roots
+        leaves
     }
 
-    /// [`Self::insert_seam_roots`] over the leaves `keep` admits.
-    fn insert_seam_roots_where(
-        &self,
-        expr_id: Id,
-        seam_roots: &mut HashSet<Id>,
-        keep: &dyn Fn(&Self, Id) -> bool,
-    ) {
-        let mut leaves = Vec::new();
-        self.collect_tail_leaves(expr_id, &mut leaves);
-        for leaf in leaves {
-            if keep(self, leaf)
-                && let Some(root) = self.place_root(leaf)
-            {
-                seam_roots.insert(root);
-            }
-        }
+    /// The roots of the `leaves` that `keep` admits.
+    fn seam_roots_of(&self, leaves: &[Id], keep: &dyn Fn(&Self, Id) -> bool) -> HashSet<Id> {
+        leaves
+            .iter()
+            .filter(|leaf| keep(self, **leaf))
+            .filter_map(|leaf| self.place_root(*leaf))
+            .collect()
     }
 
     /// The `if` chain's tails, for the walk above.
-    fn insert_branch_seam_roots(
-        &self,
-        branch: &ExprIfBranch,
-        roots: &mut HashSet<Id>,
-        keep: &dyn Fn(&Self, Id) -> bool,
-    ) {
+    fn collect_branch_tail_leaves(&self, branch: &ExprIfBranch, leaves: &mut Vec<Id>) {
         match branch {
             ExprIfBranch::If(_, (_, tail_id), otherwise) => {
-                self.insert_seam_roots_where(*tail_id, roots, keep);
+                self.collect_tail_leaves(*tail_id, leaves);
                 if let Some(otherwise) = otherwise {
-                    self.insert_branch_seam_roots(otherwise, roots, keep);
+                    self.collect_branch_tail_leaves(otherwise, leaves);
                 }
             }
-            ExprIfBranch::Else((_, tail_id)) => self.insert_seam_roots_where(*tail_id, roots, keep),
+            ExprIfBranch::Else((_, tail_id)) => self.collect_tail_leaves(*tail_id, leaves),
         }
     }
 
@@ -74663,16 +74678,22 @@ fn analyze_over_world<'src>(
     // feeds every elision below — a binding it admits copies nothing at its
     // read and may donate nothing at its own.
     analyzer.shared_cells = analyzer.compute_shared_cells();
+    // The three passes below read one whole-program written-roots set and one
+    // set of value-seam leaves; the tree is final, so they are taken once.
+    let written_roots = analyzer.collect_written_roots();
+    // Taken on first ask: a program with no `Shared` read and no candidate
+    // `let` (plain code) never walks the seams for these two passes.
+    let seam_leaves: std::cell::OnceCell<Vec<Id>> = std::cell::OnceCell::new();
     (analyzer.shared_read_bindings, analyzer.elided_shared_reads) =
-        analyzer.compute_shared_read_bindings();
+        analyzer.compute_shared_read_bindings(&written_roots, &seam_leaves);
     // M90: before the capture plan, whose move elision must refuse to move out
     // of a shared `let` exactly as rule 2 below does.
     (analyzer.shared_place_lets, analyzer.shared_place_inits) =
-        analyzer.compute_shared_place_lets();
+        analyzer.compute_shared_place_lets(&written_roots, &seam_leaves);
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
-    let capture_plan = analyzer.compute_capture_clone_sites();
+    let capture_plan = analyzer.compute_capture_clone_sites(&written_roots);
     crate::phase_pass_mark("the drop extents, shared cells and capture plan");
     let resource_types = analyzer.compute_resource_types();
     crate::phase_pass_mark("analyzer.compute_resource_types()");
