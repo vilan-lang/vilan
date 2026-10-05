@@ -8508,3 +8508,58 @@ fn b541_an_underdetermined_mapped_element_is_named_not_reported_as_a_mismatch() 
     );
     assert_compiles_and_runs(&program("count((Some(1), Some(\"two\")))"), "3\n");
 }
+
+/// B543: `entries()` and `get(key)` on a MAPPED tuple type the element at the
+/// mapped type, not the family's binder. `(U in (V in T: F<V>): G<U>)` — a
+/// tuple method's answer over a mapped receiver — composes to `(V in T:
+/// G<F<V>>)`; kept nested, `entries()` over `(U in T: Option<U>)` answered
+/// `(key, U)` pairs ("cannot call method 'is_none' on U"), and over `(U in T:
+/// bool)` an `if` refused its `U` condition. The constant template's walk,
+/// whose call binds no instance, built no pairs at all on JS (`[ ]`, the loop
+/// ran zero times) and now builds them over the receiver as `keys()` does.
+#[test]
+fn b543_entries_and_get_on_a_mapped_tuple_read_the_mapped_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::tuple::Tuple;
+        fun all_some<T: (2..)>(values: (U in T: Option<U>)): bool {
+            for (key, value) in values.entries() {
+                if value.is_none() { ret false; }
+            }
+            true
+        }
+        fun all_some_by_key<T: (2..)>(values: (U in T: Option<U>)): bool {
+            mut all = true;
+            for key in values.keys() {
+                if values.get(key).is_none() { all = false; }
+            }
+            all
+        }
+        fun all_true<T: (2..)>(values: (U in T: bool)): bool {
+            for (key, value) in values.entries() {
+                if !value { ret false; }
+            }
+            true
+        }
+        fun count_entries<T: (2..)>(values: (U in T: bool)): i32 {
+            mut count = 0;
+            for (key, value) in values.entries() {
+                count += 1;
+            }
+            count
+        }
+        fun main() {
+            let missing: Option<str> = None;
+            print(all_some((Some(1), Some("x"))));
+            print(all_some((Some(1), missing)));
+            print(all_some_by_key((Some(1), Some("x"), Some(true))));
+            print(all_some_by_key((missing, Some(2))));
+            print(all_true((true, true)));
+            print(all_true((true, false, true)));
+            print(count_entries((true, false, true)));
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\ntrue\nfalse\n3\n",
+    );
+}

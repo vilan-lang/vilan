@@ -46171,6 +46171,20 @@ impl<'src> Analyzer<'src> {
                             .collect();
                         Type::Tuple(slots)
                     }
+                    // B543: a source that is ITSELF mapped composes —
+                    // `(U in (V in S: F<V>): G<U>)` walks `S`, and its element
+                    // at each position is `G[U := F<V>]`. Kept nested, the
+                    // outer template read the bare binder: `entries()` over a
+                    // `(V in T: Option<V>)` answered `(key, V)` pairs, and the
+                    // element's `is_none()` was "cannot call method on U".
+                    Type::Mapped(inner_binder_id, inner_source_id, inner_template_id) => {
+                        let template = template_id.get_type(self);
+                        let mut context = substitution_context.clone();
+                        context.insert(binder_id, inner_template_id);
+                        let template_id =
+                            self.substitute_type(&template, &context).get_type_id(self);
+                        Type::Mapped(inner_binder_id, inner_source_id, template_id)
+                    }
                     // Still abstract: the TEMPLATE substitutes too, around its
                     // own binder — `(U in T: TupleKey<T, U>)` under `T := S` is
                     // `(U in S: TupleKey<S, U>)`, not a template still naming

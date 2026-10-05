@@ -50,6 +50,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**B543: `entries()` and `get(key)` on a mapped tuple read the mapped element. A tuple method's answer over a mapped receiver, `(U in (V in T: F<V>): G<U>)`, composes to `(V in T: G<F<V>>)`; kept nested, `for (key, value) in values.entries()` over `(U in T: Option<U>)` typed `value` as `U` ("cannot call method 'is_none' on U"), and over `(U in T: bool)` an `if value` was refused. And on JS a walk of `entries()` whose call instantiated no family — a constant template binds nothing — built no pairs (`[ ]`), so the loop silently ran zero times; it builds them over the receiver now, as `keys()` does.** **Pins:** `inference::tuples::b543_entries_and_get_on_a_mapped_tuple_read_the_mapped_element` (entries and `get(key)` over an `Option` family, a `bool` family's condition, the zero-iteration walk counted). Tracker B543.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.
