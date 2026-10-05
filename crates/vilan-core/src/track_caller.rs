@@ -409,8 +409,12 @@ fn own_body_children(program: &Program, id: Id, out: &mut Vec<Id>) {
 /// line starts, computed once per program on first ask.
 #[derive(Debug, Default)]
 pub struct SiteLocator {
-    paths: Vec<String>,
-    line_starts: Vec<Vec<usize>>,
+    package_root: std::path::PathBuf,
+    /// Per source, built on its first location: a program names sites in a
+    /// handful of files, and scanning every std source for its line starts
+    /// was a fixed cost on every build.
+    paths: Vec<std::sync::OnceLock<String>>,
+    line_starts: Vec<std::sync::OnceLock<Vec<usize>>>,
     texts: HashMap<SourceId, usize>,
 }
 
@@ -426,19 +430,44 @@ impl SiteLocator {
             .find(|directory| directory.join("vilan.toml").is_file())
             .map(Path::to_path_buf)
             .unwrap_or(source_root);
-        let paths = (0..program.sources.len())
-            .map(|index| {
-                let source = SourceId(index as u32);
-                let path = program
-                    .canonical_sources
-                    .get(index)
-                    .unwrap_or(&program.sources[index]);
-                display_path(path, &package_root, program.std_sources.contains(&source))
-            })
+        let texts = program
+            .source_texts
+            .iter()
+            .enumerate()
+            .map(|(index, (source, _))| (*source, index))
             .collect();
-        let mut line_starts = Vec::with_capacity(program.source_texts.len());
-        let mut texts = HashMap::default();
-        for (index, (source, text)) in program.source_texts.iter().enumerate() {
+        SiteLocator {
+            package_root,
+            paths: (0..program.sources.len())
+                .map(|_| std::sync::OnceLock::new())
+                .collect(),
+            line_starts: (0..program.source_texts.len())
+                .map(|_| std::sync::OnceLock::new())
+                .collect(),
+            texts,
+        }
+    }
+
+    fn path(&self, program: &Program, source: SourceId) -> &str {
+        let index = source.0 as usize;
+        let Some(cell) = self.paths.get(index) else {
+            return "";
+        };
+        cell.get_or_init(|| {
+            let path = program
+                .canonical_sources
+                .get(index)
+                .unwrap_or(&program.sources[index]);
+            display_path(
+                path,
+                &self.package_root,
+                program.std_sources.contains(&source),
+            )
+        })
+    }
+
+    fn line_starts(&self, text_index: usize, text: &str) -> &[usize] {
+        self.line_starts[text_index].get_or_init(|| {
             let mut starts = vec![0];
             starts.extend(
                 text.bytes()
@@ -446,14 +475,8 @@ impl SiteLocator {
                     .filter(|(_, byte)| *byte == b'\n')
                     .map(|(at, _)| at + 1),
             );
-            line_starts.push(starts);
-            texts.insert(*source, index);
-        }
-        SiteLocator {
-            paths,
-            line_starts,
-            texts,
-        }
+            starts
+        })
     }
 }
 
@@ -504,11 +527,7 @@ impl Program<'_> {
     pub fn site_location(&self, anchor: Id) -> String {
         let locator = self.site_locator.get_or_init(|| SiteLocator::build(self));
         let source = self.source_of(anchor).unwrap_or(SourceId(0));
-        let path = locator
-            .paths
-            .get(source.0 as usize)
-            .map(String::as_str)
-            .unwrap_or("");
+        let path = locator.path(self, source);
         let Some((text_index, offset)) = locator.texts.get(&source).copied().and_then(|index| {
             let (_, text) = self.source_texts[index];
             let offset = self.site_offset(anchor, text)?;
@@ -517,7 +536,7 @@ impl Program<'_> {
             return format!("{path}:1:1");
         };
         let (_, text) = self.source_texts[text_index];
-        let starts = &locator.line_starts[text_index];
+        let starts = locator.line_starts(text_index, text);
         let line = starts.partition_point(|&start| start <= offset).max(1);
         let line_start = starts[line - 1];
         let column = text
