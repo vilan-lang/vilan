@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**A `match` or an `if` whose arms are two different pipe stages now names the annotation that joins them.** "match legs have mismatched types: expected Constant<TransientState<unknown, unknown>>, but got Derive<SignalCell<Option<str>>, ..> instead" was correct and named two internal, half-inferred stage types. A stage's type is its whole recipe, so two stages are different types by construction and meet only as one erased flow; when both arms implement std's `Flow`, the refusal now goes on: "Both are pipe stages, and two stages of different types meet only as one erased flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the function's return), with `T` the value they carry, and each erases to it". kolt's `Channel::find` selector is the exhibit; with the annotation it infers (B480's pin). A function returning a bare trait keeps B460's own steer, and arms that are not both std flows (a value beside a stage, a program's own trait named `Flow`) keep the plain sentence. Pins: `inference::dyn_objects::e261_two_pipe_stages_in_a_match_steer_to_the_dyn_flow_annotation` (a `match` at the offending leg, an `if`) and `e261_arms_that_are_not_both_flows_get_no_flow_steer`. One ledger row `NEW`. Tracker E261.
+
+---
+
 <!-- family: miscompile -->
 **`print` writes a number by the language's own conversion on both backends, so negative zero prints `0` (N136, R-g door (a)).** `print(0.0 * -1.0)` printed `-0` on the JS backend (node's `console.log` special-cases it) and `0` natively; a number now goes through `String(x)`, the conversion an i-string and the native backend already use, and both print `0`. Integers counted too (`print(zero * -1)` was `-0` on JS). Nothing else `print` shows moved. `f64-print-negative-zero.vl` left the differential's exclusions and joined its default suite; corpus goldens gained the `String(..)` wrap on numeric prints.
 

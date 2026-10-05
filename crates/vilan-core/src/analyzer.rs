@@ -34631,6 +34631,36 @@ impl<'src> Analyzer<'src> {
         )
     }
 
+    /// E261: two arms that are each a FLOW — pipe stages of different types,
+    /// `Source::constant(..)` beside a `.derive(..)` — are different types by
+    /// construction (a stage's type is its whole recipe), and meet only as
+    /// one erased `dyn Flow<T>`. The mismatch alone names two internal stage
+    /// types, often half-inferred; the annotation is the fix every reader
+    /// needs, so the steer names it. Keyed on std's `Flow`: a program's own
+    /// trait of that name is not the pipe layer.
+    fn erased_flow_arm_steer(&self, expected: &Type, got: &Type) -> String {
+        let Some(flow) = self
+            .traits
+            .values()
+            .find(|declared| {
+                declared.name == "Flow"
+                    && self
+                        .source_of_id(declared.id)
+                        .is_some_and(|source| self.std_sources.contains(&source))
+            })
+            .map(|declared| declared.id)
+        else {
+            return String::new();
+        };
+        if !(self.type_implements_trait(expected, flow) && self.type_implements_trait(got, flow)) {
+            return String::new();
+        }
+        " Both are pipe stages, and two stages of different types meet only as one erased \
+         flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the \
+         function's return), with `T` the value they carry, and each erases to it"
+            .to_string()
+    }
+
     /// B460 (RULED 2026-09-29, R-a door (i)): each function returning a bare
     /// trait — the type its body produced must implement it. That type is
     /// what callers see (the return is NOT hidden; opacity is a later slice).
@@ -56548,7 +56578,10 @@ impl<'src> Analyzer<'src> {
                                 .get(body_id)
                                 .map(|span| **span)
                                 .unwrap_or(fallback_span);
-                            let steer = self.opaque_return_arm_steer(expression_id);
+                            let mut steer = self.opaque_return_arm_steer(expression_id);
+                            if steer.is_empty() {
+                                steer = self.erased_flow_arm_steer(&current, &body_type);
+                            }
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
                                 note: None,
