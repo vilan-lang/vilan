@@ -1,0 +1,44 @@
+// A closure-typed field or payload of a derived type is a LEAF with no equality
+// on both backends: every write that covers it wakes its slot. The derive diffs
+// it through `StoreLeaf`'s bare tier (B508's one-tier reach), like a coarse field.
+import std::io::print;
+import std::reactive::store::{ Storable, Store };
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+
+[derive(Storable)]
+struct Button {
+	label: str,
+	on_press: || void,
+}
+
+[derive(Storable)]
+enum Action {
+	Idle,
+	Run(|i32| i32),
+	Keyed(str, |str| bool),
+}
+
+fun nothing() {}
+
+fun main() {
+	let button = Store::new(Button { label = "ok", on_press = nothing });
+	let action = Store::new(Action::Run(|x| x + 1));
+	let watching = Owner::new();
+	run_with_owner(watching, || {
+		button.on_press().effect_on_change(|_f| print("on_press woke"));
+		button.label().effect_on_change(|_l| print("label woke"));
+		action.run().effect_on_change(|_r| print("run woke"));
+		action.keyed().effect_on_change(|_k| print("keyed woke"));
+	});
+	button.set(Button { label = "ok", on_press = nothing });
+	print("-- same variant, a closure payload");
+	action.set(Action::Run(|x| x + 2));
+	print("-- to a two-payload variant");
+	action.set(Action::Keyed("k", |s| s == "k"));
+	print("-- same variant again");
+	action.set(Action::Keyed("k", |s| s == "j"));
+	watching.dispose();
+	print("done");
+}
+
+main();

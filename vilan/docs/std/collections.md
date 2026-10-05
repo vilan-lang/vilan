@@ -67,8 +67,8 @@ fun main() {
 ```
 
 The methods that take `self` by value are pure — they return a new list and
-leave the receiver alone. The mutating ones take `&mut self`: `push`, `pop`,
-`insert`, `remove`.
+leave the receiver alone. The mutating ones take `&mut self`: `push`,
+`push_many`, `pop`, `insert`, `remove`.
 
 "Leave the receiver alone" reaches the ELEMENTS, not just the spine: the list a
 pure method returns never shares element storage with the receiver, so writing
@@ -141,6 +141,27 @@ fun main() {
 	print(xs[0]);          // 2
 }
 ```
+
+### Appending a run
+
+`push_many(items)` appends every item of a run, in order: another list, a
+`HashSet` (its members in insertion order) or any iterator — whatever is
+`Items<T>` (`std::iterator`). The run is taken whole first, so a list pushed
+onto itself appends a copy of itself as it stood.
+
+```vilan
+fun main() {
+	mut xs = [1, 2];
+	xs.push_many([3, 4]);
+	xs.push_many([5, 6].iter().map(|x| x * 10));
+	xs.push_many(xs);
+	print(xs.len());   // 12
+}
+```
+
+A reactive list takes the same call as ONE write: `ListCell::push_many` is a
+single `Splice` at the end, so its readers see one change for the batch
+([`std::reactive`](reactive.md)).
 
 ### Joining
 

@@ -2184,8 +2184,31 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .unwrap_or_default();
         if let Some(type_id) = receiver_type {
             self.push_blanket_methods(type_id, &mut items);
+            self.push_field_syntax(type_id, &mut items);
         }
         items
+    }
+
+    /// A149 S4: on a store handle, the fields of the struct it handles, offered
+    /// the way field syntax reads them (`app.user`). Each REPLACES its
+    /// projection's method candidate of the same name: the two are one member,
+    /// and the field spelling is the one a reader writes. The answer is
+    /// `vilan_core::field_syntax`'s, the analyzer's own reader, so the list
+    /// cannot offer a field the analysis would refuse.
+    fn push_field_syntax(&self, receiver: TypeId, items: &mut Vec<Completion>) {
+        let program = self.program;
+        let Some(receiver) = program.type_id_to_type_map.get(&receiver) else {
+            return;
+        };
+        for (name, projection) in program.field_syntax().projected_fields(receiver) {
+            items.retain(|item| !(item.label == name && item.kind == CompletionKind::Method));
+            let mut completion = Completion::bare(name.to_string(), CompletionKind::Field);
+            if let Some(target) = self.function_target(projection) {
+                completion.detail = signature_label(program, target);
+                completion.documentation = self.doc_first_paragraph(target);
+            }
+            items.push(completion);
+        }
     }
 
     /// The receiver's resolved type — its live-token walk (E131) first, then
@@ -2295,15 +2318,27 @@ impl<'a, 'src> Analysis<'a, 'src> {
         if let Some(structure) = program.structs.get(&type_id) {
             let source = program.source_of(type_id);
             for (index, field) in structure.fields.iter().enumerate() {
+                // A149 S4: std's `[internal]` field is no member outside std,
+                // so it is not offered there at all — the analysis refuses it.
+                if vilan_core::labels::internal_field_out_of_reach(
+                    field.internal,
+                    source,
+                    Some(self.focus),
+                    &program.std_sources,
+                )
+                .is_some()
+                {
+                    continue;
+                }
                 let mut completion =
                     Completion::bare(field.name.to_string(), CompletionKind::Field);
                 completion.detail = self.field_type_label(type_id, index, field.name);
                 completion.documentation = source.and_then(|source| {
                     self.doc_first_paragraph_at(source, field.name_span.into_range().start)
                 });
-                // E213: `Region.anchor` is the exhibit — public on purpose,
+                // E213: a package's own labelled field — public on purpose,
                 // dangerous on purpose, and the one case declaration
-                // visibility cannot serve at all.
+                // visibility cannot serve at all. (std's are skipped above.)
                 completion.internal = field.internal.map(str::to_string);
                 items.push(completion);
             }
@@ -2551,15 +2586,36 @@ impl<'a, 'src> Analysis<'a, 'src> {
             return None;
         };
         match index.checked_sub(1).map(|before| &tokens[before].0) {
-            // `x.f` — a field read.
+            // `x.f` — a field read; on a store handle, field syntax (A149 S4):
+            // the projection's result, grounded through the handle's type.
             Some(Token::Ctrl('.')) => {
                 let receiver = self.live_receiver_type_id(tokens, index - 2, depth + 1)?;
-                let structure = program.structs.get(&nominal_type_id(program, receiver)?)?;
-                structure
+                let nominal = nominal_type_id(program, receiver)?;
+                let structure = program.structs.get(&nominal)?;
+                let field = structure
                     .fields
                     .iter()
-                    .find(|field| field.name == name)
-                    .map(|field| field.type_id)
+                    .find(|field| {
+                        field.name == name
+                            && vilan_core::labels::internal_field_out_of_reach(
+                                field.internal,
+                                program.source_of(nominal),
+                                Some(self.focus),
+                                &program.std_sources,
+                            )
+                            .is_none()
+                    })
+                    .map(|field| field.type_id);
+                field.or_else(|| {
+                    let receiver_type = program.type_id_to_type_map.get(&receiver)?;
+                    let vilan_core::field_syntax::Reading::Projection(member) =
+                        program.field_syntax().read(receiver_type, name)
+                    else {
+                        return None;
+                    };
+                    self.receiver_grounded_result_type_id(member, receiver)
+                        .or_else(|| self.declared_result_type_id(member))
+                })
             }
             // `a::B` names a namespace, not a value.
             Some(Token::Op("::")) => None,

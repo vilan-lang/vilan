@@ -126,7 +126,6 @@ export import pkg::reactive::store_core::{
 	store_feed_census,
 	store_has_me,
 	store_kid,
-	store_opaque,
 	store_switch,
 	store_wake_all,
 	store_wake_me,
@@ -1085,6 +1084,21 @@ macro fun store_operand(type_: TypeExpr): str {
 	written
 }
 
+/// Whether a written type is a closure type — `|&F| void`, `|| void`.
+macro fun store_is_closure(type_: TypeExpr): bool {
+	type_.render().contains("|")
+}
+
+/// The diff a payload position takes: a closure-typed one is a leaf, through
+/// `StoreLeaf` (see `store_struct_impls`); every other type is `Storable`.
+macro fun store_step(type_: TypeExpr): str {
+	if store_is_closure(type_) {
+		"store_leaf_diff"
+	} else {
+		"store_diff"
+	}
+}
+
 /// The `<type A, type B>` an inherent impl on `Store<Subject<A, B>>` binds, bare.
 macro fun store_bare_binders(generics: List<GenericParameter>): str {
 	import macro_std::build::join;
@@ -1139,14 +1153,16 @@ export macro fun store_struct_impls(target: StructItem): str {
 		if store_reserved(method) {
 			panic(i"`[derive(Storable)]` on `{target.name}`: the field `{field.name}` would project as `{method}()`, which a store handle already has (`{method}` is a handle member, and an inherent member wins over a projection) — rename the projection with `[reactive(name = \"..\")]` on the field");
 		}
-		// A closure-typed field takes no method at all, so the leaf tiers cannot
-		// reach it: it is the bare tier's answer, written out.
-		if field.type_.render().contains("|") {
-			diff = diff.line(i"changed = store_opaque(store_kid(node, {index}), woken) || changed;");
+		// A coarse field is diffed whole, through the leaf tiers. So is a
+		// closure-typed one: a blanket reaches a closure one tier deep (B508), so
+		// `StoreLeaf`'s bare tier answers it, but not yet through `Storable`'s
+		// blanket over `StoreLeaf`, a second tier (B508's remainder).
+		let step = if field.reactive_coarse || store_is_closure(field.type_) {
+			"store_leaf_diff"
 		} else {
-			let step = if field.reactive_coarse { "store_leaf_diff" } else { "store_diff" };
-			diff = diff.line(i"changed = self.{field.name}.{step}(&other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
-		}
+			"store_diff"
+		};
+		diff = diff.line(i"changed = self.{field.name}.{step}(&other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
 		store_impl = store_impl.member(store_projection("Store", subject, method, field.name, index, field.type_));
 		some_impl = some_impl.member(store_projection("StoreSome", subject, method, field.name, index, field.type_));
 		index = index + 1;
@@ -1237,22 +1253,16 @@ export macro fun store_enum_impls(target: EnumItem): str {
 			// are its children, by position.
 			mut same: List<str> = [];
 			if arity == 1 {
-				if variant.payload[0].render().contains("|") {
-					same.push(i"store_opaque(store_kid(node, {child}), woken)");
-				} else {
-					same.push(i"a0.store_diff(&b0, store_kid(node, {child}), here, woken)");
-				}
+				let step = store_step(variant.payload[0]);
+				same.push(i"a0.{step}(&b0, store_kid(node, {child}), here, woken)");
 			} else {
 				same.push(i"let payload = store_kid(node, {child});");
 				same.push("let deep = here || store_has_me(payload);");
 				same.push("mut moved = false;");
 				position = 0;
 				for type_ in variant.payload {
-					if type_.render().contains("|") {
-						same.push(i"moved = store_opaque(store_kid(payload, {position}), woken) || moved;");
-					} else {
-						same.push(i"moved = a{position}.store_diff(&b{position}, store_kid(payload, {position}), deep && !moved, woken) || moved;");
-					}
+					let step = store_step(type_);
+					same.push(i"moved = a{position}.{step}(&b{position}, store_kid(payload, {position}), deep && !moved, woken) || moved;");
 					position = position + 1;
 				}
 				same.push("store_wake_me(payload, moved, woken);");
@@ -1335,16 +1345,16 @@ export macro fun store_enum_impls(target: EnumItem): str {
 }
 
 /// `[derive(Storable)]`: the struct's or enum's store surface (§3.1). Its output
-/// carries its own imports, from `std::reactive::store_core` where the names are
-/// declared: a module's own `Storable` here is this macro, and the re-exported
-/// trait of the same name is not reached through `std::reactive::store` from
-/// generated code (N?3).
+/// carries its own imports, through `std::reactive::store` — the module a program
+/// names — which re-exports the core's names. Its `Storable` is two items, the
+/// re-exported TRAIT and this derive macro; an import binds the trait, as it does
+/// in a hand-written module (B547).
 export macro fun Storable(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 
 	let header = "import std::option::Option;\n"
 		+ "import std::shared::Shared;\n"
-		+ "import std::reactive::store_core::{ Storable, StoreFlag, StoreLeaf, StoreNode, StoreSlot, StoreWoken, Store, StoreSome, store_has_me, store_kid, store_opaque, store_switch, store_wake_me };\n";
+		+ "import std::reactive::store::{ Storable, StoreFlag, StoreLeaf, StoreNode, StoreSlot, StoreWoken, Store, StoreSome, store_has_me, store_kid, store_switch, store_wake_me };\n";
 	if item.as_struct() is Some(let target) {
 		ret source(header + store_struct_impls(target));
 	}

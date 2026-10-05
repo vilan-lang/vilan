@@ -63,6 +63,28 @@ pub fn member_internal<'src>(program: &Program<'src>, access: Id) -> Option<&'sr
     }
 }
 
+/// A149 S4 (R-e): whether an `[internal("reason")]` FIELD is out of reach as a
+/// member — declared in std (`declared` is a std source) and read from code
+/// that is not (`access` is a source std does not own). The reason when it
+/// is, `None` when the field is a member there.
+///
+/// ONE rule for the analyzer (which refuses the read, and lets a store
+/// handle's field syntax see past the handle's own fields) and the editor
+/// (which offers no such field after a `.`), so the two cannot disagree. An
+/// access with no source — synthesized — is read as std's. A field a PACKAGE
+/// labels stays a member everywhere, with `[lints] internal_use` to warn at
+/// it: the ruled door is about std's machinery, not about every label.
+pub fn internal_field_out_of_reach<'src>(
+    internal: Option<&'src str>,
+    declared: Option<SourceId>,
+    access: Option<SourceId>,
+    std_sources: &HashSet<SourceId>,
+) -> Option<&'src str> {
+    let declared_in_std = declared.is_some_and(|source| std_sources.contains(&source));
+    let read_outside_std = access.is_some_and(|source| !std_sources.contains(&source));
+    internal.filter(|_| declared_in_std && read_outside_std)
+}
+
 /// The DECLARATION a member access reaches — the struct a field lives on, or
 /// the method a call selected — for the same-module test below.
 fn member_declaration(program: &Program, access: Id) -> Option<Id> {

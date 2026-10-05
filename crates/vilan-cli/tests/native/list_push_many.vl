@@ -1,0 +1,44 @@
+// A158 on both backends: `List::push_many` appends another list, an iterator
+// chain and a set's members in order, takes a list pushed onto itself whole, and
+// a `ListCell` records each batch as ONE splice.
+import std::hash_set::HashSet;
+import std::io::print;
+import std::iterator::Iterator;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ DeltaSource, ListCell, SeqOp, SequenceCell };
+
+fun describe(ops: List<SeqOp<i32>>): str {
+	mut out = "";
+	for op in ops {
+		match op {
+			SeqOp::Splice(let at, let removed, let inserted) => out = out + i"splice({at},-{removed.len()},+{inserted.len()}) ",
+			_ => out = out + "other ",
+		}
+	}
+	out
+}
+
+fun main() {
+	mut xs = [1, 2];
+	xs.push_many([3, 4]);
+	xs.push_many([5, 6].iter().map(|x| x * 10));
+	mut set: HashSet<i32> = HashSet::new();
+	set.insert(8);
+	set.insert(7);
+	xs.push_many(set);
+	xs.push_many(xs);
+	mut out = "";
+	for x in xs {
+		out = out + i"{x} ";
+	}
+	print(out);
+	let cell: ListCell<i32> = ListCell::of([1, 2]);
+	let cursor = cell.cursor();
+	cell.push_many([3, 4, 5].iter().map(|x| x * 10));
+	print(describe(cell.since(cursor)));
+	cell.edit(|rows| rows.push_many([8, 9]));
+	print(describe(cell.since(cursor)));
+	print(cell.size());
+}
+
+main();

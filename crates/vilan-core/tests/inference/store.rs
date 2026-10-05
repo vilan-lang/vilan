@@ -1546,3 +1546,283 @@ fun main() {"#,
         "false\ntrue\ntrue\nindex: i1=1 one\ntrue\ntrue\nmembers: x=1\nlog: m4=1 2\n",
     );
 }
+
+// --- A149 S4: field syntax on store handles (R-e) ----------------------------
+//
+// The ruled door: std's `[internal]` fields stop resolving as members outside
+// std (the cause), and then, on a `Store<T>` or `StoreSome<T>`, a member that
+// names a field of `T` resolves to the projection of that name —
+// `app.user.name` for `app.user().name()`. It sits after the handle's own
+// (now visible) fields, so it shadows nothing.
+
+/// A root whose fields are named like the handle's own machinery (`root`,
+/// `path`, `lend`, `modify`): before S4 those names were the handle's
+/// `[internal]` fields, and field syntax would have read the slot tree.
+const S4_TYPES: &str = r#"
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+import std::reactive::store::{ Storable, Store, StoreSome };
+
+[derive(Storable)]
+struct Address {
+    city: str,
+    root: str,
+}
+
+[derive(Storable)]
+struct Doc {
+    path: List<str>,
+    lend: i32,
+    modify: bool,
+}
+
+[derive(Storable)]
+struct App {
+    name: str,
+    address: Address,
+    home: Option<Address>,
+    doc: Doc,
+}
+
+fun app(): App {
+    App {
+        name = "Ann",
+        address = Address { city = "Oslo", root = "r" },
+        home = Some(Address { city = "Bergen", root = "h" }),
+        doc = Doc { path = ["a", "b"], lend = 7, modify = true },
+    }
+}
+"#;
+
+fn s4_program(body: &str) -> String {
+    format!("{S4_TYPES}\nfun main() {{\n{body}\n}}\n\nmain();\n")
+}
+
+#[test]
+fn a149_s4_a_field_of_the_handled_struct_reads_through_its_projection() {
+    // The read, the write and the subscription each go through the projection:
+    // `app.address.city` is the same handle `app.address().city()` is, so a
+    // write through one wakes a subscription on the other. Red on the base:
+    // "struct 'Store' has no field 'address'".
+    assert_compiles_and_runs(
+        &s4_program(
+            r#"
+            let store = Store::new(app());
+            print(store.name.get());
+            print(store.address.city.get());
+            let watching = Owner::new();
+            run_with_owner(watching, || {
+                store.address().city().effect_on_change(|city| print(i"woke city={city}"));
+            });
+            store.address.city.set("Tromso");
+            print(store.address().city().get());
+            watching.dispose();
+            "#,
+        ),
+        "Ann\nOslo\nwoke city=Tromso\nTromso\n",
+    );
+}
+
+#[test]
+fn a149_s4_a_field_named_like_a_handle_internal_reaches_the_projection() {
+    // `root`, `path`, `lend` and `modify` are `Store`'s own fields, labelled
+    // `[internal]`. Outside std they are no members, so the tier reaches `T`'s
+    // field of that name. Red on the base, where `store.doc.path` read the
+    // handle's path (a `List<StoreStep>`) — and `.get()` on it did not compile.
+    assert_compiles_and_runs(
+        &s4_program(
+            r#"
+            let store = Store::new(app());
+            print(store.address.root.get());
+            print(store.doc.path.get().len());
+            print(store.doc.lend.get());
+            print(store.doc.modify.get());
+            store.doc.lend.set(8);
+            print(store.get().doc.lend);
+            "#,
+        ),
+        "r\n2\n7\ntrue\n8\n",
+    );
+}
+
+#[test]
+fn a149_s4_field_syntax_reads_through_a_store_some() {
+    // `StoreSome<Address>` carries projections too (the derive writes both
+    // handle types), so `home.some().city` is field syntax on the through-Option
+    // handle: `None` while the option is `None`.
+    assert_compiles_and_runs(
+        &s4_program(
+            r#"
+            let store = Store::new(app());
+            let home: StoreSome<Address> = store.home.some();
+            print(home.city.get().unwrap_or("-"));
+            print(store.home.some().root.get().unwrap_or("-"));
+            store.home.set(None);
+            print(home.city.get().unwrap_or("-"));
+            "#,
+        ),
+        "Bergen\nh\n-\n",
+    );
+}
+
+#[test]
+fn a149_s4_field_syntax_reads_a_generic_structs_projection() {
+    // The derive's `impl Store<Pair<type T>>` is a projection on the handle at
+    // `Pair`'s own type, whatever its arguments: `pair.left` is `Store<i32>`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, Source };
+        import std::reactive::store::{ Storable, Store };
+
+        [derive(Storable)]
+        struct Pair<T> {
+            left: T,
+            right: T,
+        }
+
+        fun main() {
+            let pair = Store::new(Pair { left = 1, right = 2 });
+            pair.right.set(5);
+            print(pair.left.get() + pair.right.get());
+        }
+
+        main();
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn a149_s4_a_renamed_projection_is_not_read_under_the_fields_name() {
+    // Q9's rename: field `get` projects as `verb()`. `request.get` names the
+    // FIELD, whose projection is not called `get` — and reaching the handle's
+    // own `get()` there would hand back the whole `Request`. Refused, saying so.
+    assert_fails_with(
+        r#"
+        import std::reactive::Source;
+        import std::reactive::store::{ Storable, Store };
+
+        [derive(Storable)]
+        struct Request {
+            [reactive(name = "verb")]
+            get: str,
+        }
+
+        fun main() {
+            let request = Store::new(Request { get = "/" });
+            let _verb = request.get;
+        }
+        "#,
+        "has no projection named `get` to read it through",
+    );
+}
+
+#[test]
+fn a149_s4_a_struct_that_does_not_derive_storable_has_no_field_syntax() {
+    // A type that does not derive `Storable` is a LEAF (Q3): its store has no
+    // projections, so its fields are not members of the handle.
+    assert_fails_with(
+        r#"
+        import std::reactive::store::Store;
+
+        struct Plain {
+            label: str,
+        }
+
+        fun main() {
+            let plain = Store::new(Plain { label = "x" });
+            let _label = plain.label;
+        }
+        "#,
+        "`Plain` does not `[derive(Storable)]`",
+    );
+}
+
+#[test]
+fn a149_s4_an_internal_std_field_is_no_member_outside_std() {
+    // The ruled door itself: `Store`'s `path` and `StoreFlag`'s `read` are std's
+    // `[internal]` fields, and outside std they do not resolve. Red on the base,
+    // where both compiled.
+    for (read, field, owner) in [
+        ("store.path", "path", "Store"),
+        ("store.lend", "lend", "Store"),
+        ("store.address().city().root", "root", "Store"),
+        ("store.home().is_some().read", "read", "StoreFlag"),
+    ] {
+        assert_fails_with(
+            &format!(
+                "{S4_TYPES}\nfun main() {{\n    let store = Store::new(app());\n    let _x = {read};\n}}\n"
+            ),
+            &format!("`{field}` is an `[internal]` field of std's `{owner}`"),
+        );
+    }
+}
+
+#[test]
+fn a149_s4_a_call_named_like_an_internal_field_is_not_steered_to_it() {
+    // B4's steer ("`lend` is a field holding a closure: parenthesize it") would
+    // send the reader to a member that no longer resolves.
+    assert_fails_without(
+        &format!(
+            "{S4_TYPES}\nfun main() {{\n    let store = Store::new(app());\n    store.address().lend(|_held| {{}});\n}}\n"
+        ),
+        "parenthesize",
+    );
+}
+
+#[test]
+fn a149_s4_an_assignment_through_field_syntax_steers_to_set() {
+    // `store.name = "Bob"` reads like a field write, and `store.name` is a
+    // handle: refused once, with the write a handle takes — not a second
+    // "Expected Store<str>, but got str" beside it.
+    let source = s4_program(
+        r#"
+        let store = Store::new(app());
+        store.name = "Bob";
+        "#,
+    );
+    assert_fails_once_with(&source, "write through it with `.set(..)`");
+    assert_fails_without(&source, "Expected Store<str>");
+}
+
+#[test]
+fn a149_a_closure_payload_is_a_leaf_with_no_equality() {
+    // `store_opaque` is gone: a closure-typed field or payload is diffed through
+    // `StoreLeaf`'s bare tier (a blanket reaches a closure one tier deep, B508),
+    // as a coarse field is. A one-payload and a two-payload variant holding a
+    // closure each wake on every covering write — the bare tier's answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, Source, run_with_owner };
+        import std::reactive::store::{ Storable, Store };
+
+        [derive(Storable)]
+        enum Action {
+            Idle,
+            Run(|i32| i32),
+            Keyed(str, |str| bool),
+        }
+
+        fun main() {
+            let action = Store::new(Action::Run(|x| x + 1));
+            let watching = Owner::new();
+            run_with_owner(watching, || {
+                action.run().effect_on_change(|_r| print("run woke"));
+                action.keyed().effect_on_change(|_k| print("keyed woke"));
+                action.is_idle().effect_on_change(|idle| print(i"idle={idle}"));
+            });
+            action.set(Action::Run(|x| x + 2));
+            action.set(Action::Keyed("k", |s| s == "k"));
+            action.set(Action::Keyed("k", |s| s == "j"));
+            action.set(Action::Idle);
+            watching.dispose();
+        }
+
+        main();
+        "#,
+        "run woke\nrun woke\nkeyed woke\nkeyed woke\nkeyed woke\nidle=true\n",
+    );
+}

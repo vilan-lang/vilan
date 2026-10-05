@@ -372,6 +372,14 @@ export impl Region {
 		self.open_row(content)
 	}
 
+	/// The region's END — the bound `cut_row` and `open_row_before` take for the
+	/// last row (A149 S4). There is no marker on this twin, so it is a `Row`, which
+	/// is what those take here. KEEP IN STEP with the browser twin.
+	[internal("the region's end marker: place against it, never through it")]
+	fun end(self): Row {
+		Row {}
+	}
+
 	/// Cuts a row out of the document — there is no document to cut it out of,
 	/// and nothing that ever moves. Accepted and dropped. KEEP IN STEP.
 	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]

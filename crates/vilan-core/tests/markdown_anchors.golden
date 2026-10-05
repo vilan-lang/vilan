@@ -347,6 +347,7 @@ std/collections.md h2 listt
 std/collections.md h3 searching--equality
 std/collections.md h3 ordering
 std/collections.md h3 splicing
+std/collections.md h3 appending-a-run
 std/collections.md h3 joining
 std/collections.md h2 hashmapk-v
 std/collections.md h2 hashsett

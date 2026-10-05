@@ -674,3 +674,34 @@ fun main() {
 }
 main();
 "#;
+
+/// A158: a reactive list takes a whole run as ONE write. `ListCell::push_many`
+/// is a single `Splice` at the end — from a list, an iterator, or inside an
+/// `edit` body through `Tracked::push_many` — so a reader sees one op for the
+/// batch where a loop of `push` would record one per element.
+#[test]
+fn a158_a_list_cell_pushes_a_batch_as_one_splice() {
+    assert_compiles_and_runs(
+        &format!(
+            "{DESCRIBE}\n{}",
+            r#"
+            import std::iterator::Iterator;
+            import std::reactive::{ ListCell, SequenceCell };
+
+            fun main() {
+                let cell: ListCell<i32> = ListCell::of([1, 2]);
+                let cursor = cell.cursor();
+                cell.push_many([3, 4, 5].iter().map(|x| x * 10));
+                print(describe(cell.since(cursor)));
+                cell.push_many([6, 7]);
+                print(describe(cell.since(cursor)));
+                cell.edit(|rows| rows.push_many([8, 9]));
+                print(describe(cell.since(cursor)));
+                print(cell.size());
+            }
+            main();
+            "#
+        ),
+        "splice(2,-0,+3) \nsplice(5,-0,+2) \nsplice(7,-0,+2) \n9\n",
+    );
+}

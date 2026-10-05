@@ -10093,6 +10093,63 @@ fn a142_s7_a_struct_store_builds_and_wakes_the_same_on_both_backends() {
     );
 }
 
+/// A149 S4: field syntax on store handles reads, writes and subscribes the same
+/// on both backends — `app.address.city` is the projection call, a field named
+/// like a handle internal (`root`, `path`) reads the struct's field, a
+/// `StoreSome` reads through its projections, and a generic struct's
+/// projection is reached by its field name.
+#[test]
+fn a149_s4_field_syntax_reads_and_writes_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_field_syntax.vl"),
+        include_str!("native/store_field_syntax.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_field_syntax.vl"),
+        Verdict::Identical,
+        "field syntax must read and write the same on both backends"
+    );
+}
+
+/// A149 (store_opaque's removal): a closure-typed field, a closure payload and
+/// a closure beside another payload are LEAVES with no equality on both
+/// backends, diffed through `StoreLeaf`'s bare tier — every covering write
+/// wakes them.
+#[test]
+fn a149_a_closure_leaf_wakes_on_every_covering_write_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_closure_leaves.vl"),
+        include_str!("native/store_closure_leaves.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_closure_leaves.vl"),
+        Verdict::Identical,
+        "a closure leaf must wake the same on both backends"
+    );
+}
+
+/// A158: `List::push_many` appends a list, an iterator chain and a set's
+/// members in order on both backends, takes a list pushed onto itself whole,
+/// and a `ListCell` records each batch as ONE splice.
+#[test]
+fn a158_push_many_appends_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_list_push_many.vl"),
+        include_str!("native/list_push_many.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_list_push_many.vl"),
+        Verdict::Identical,
+        "push_many must append the same on both backends"
+    );
+}
+
 /// A142 S7 S2: a derived enum's store builds and wakes the same on both
 /// backends — a same-variant write patching the payload, a switch away and back,
 /// a `patch` through a dead and a live variant, a multi-payload variant read and

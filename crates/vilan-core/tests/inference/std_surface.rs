@@ -7666,3 +7666,85 @@ fn a150_transient_state_zip_pairs_two_states_by_precedence() {
         ),
     );
 }
+
+// --- A158: `List::push_many(items)` -----------------------------------------
+
+#[test]
+fn a158_push_many_appends_a_list_an_iterator_and_a_set_in_order() {
+    // Whatever `for` walks: another list (taken directly), any iterator (an
+    // adapter chain), and a `HashSet`, in its insertion order — appended in
+    // order, after what the list already held.
+    assert_compiles_and_runs(
+        r#"
+        import std::hash_set::HashSet;
+        import std::io::print;
+        import std::iterator::Iterator;
+
+        fun main() {
+            mut xs = [1, 2];
+            xs.push_many([3, 4]);
+            xs.push_many([5, 6].iter().map(|x| x * 10));
+            mut set: HashSet<i32> = HashSet::new();
+            set.insert(8);
+            set.insert(7);
+            xs.push_many(set);
+            mut out = "";
+            for x in xs {
+                out = out + i"{x} ";
+            }
+            print(out);
+        }
+
+        main();
+        "#,
+        "1 2 3 4 50 60 8 7 \n",
+    );
+}
+
+#[test]
+fn a158_push_many_takes_the_run_whole_before_it_appends() {
+    // `own items`: a list pushed onto itself appends a copy of itself as it
+    // stood, not a walk that chases its own growth; the argument's binding is
+    // not the receiver's, so the source list is untouched.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            mut xs = [1, 2, 3];
+            xs.push_many(xs);
+            print(xs.len());
+            let source = [9];
+            mut ys: List<i32> = [];
+            ys.push_many(source);
+            ys.push(10);
+            print(i"{source.len()} {ys.len()}");
+        }
+
+        main();
+        "#,
+        "6\n1 2\n",
+    );
+}
+
+#[test]
+fn a158_push_many_of_an_empty_run_appends_nothing() {
+    // An empty list and an exhausted iterator are runs of nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+
+        fun main() {
+            mut names = ["a"];
+            let none: List<str> = [];
+            names.push_many(none);
+            names.push_many(["b", "c"].iter().filter(|name| name == "z"));
+            print(names.len());
+        }
+
+        main();
+        "#,
+        "1\n",
+    );
+}
