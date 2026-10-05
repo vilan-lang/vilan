@@ -10,50 +10,50 @@ function __list_get(list, index) {
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
-function $a(self, fallback) {
-	const $b = self;
-	let $c = null;
-	if ($b[0] === 0) {
-		const x = __clone($b[1]);
-		$c = x;
+function unwrap_or(self, fallback) {
+	const $a = self;
+	let $b = null;
+	if ($a[0] === 0) {
+		const x = __clone($a[1]);
+		$b = x;
 	} else {
-		$c = __clone(fallback);
+		$b = __clone(fallback);
 	}
-	return $c;
+	return $b;
 }
-function $d(self) {
-	const $e = self;
-	return $e[0] === 1;
+function is_none(self) {
+	const $c = self;
+	return $c[0] === 1;
 }
-function $f(self) {
+function first(self) {
 	return __list_get(self, 0);
 }
-function $h(self) {
+function is_empty(self) {
 	return self.length === 0;
 }
-function $g(self) {
-	let $i = null;
-	if ($h(self)) {
-		$i = [ 1 ];
+function last(self) {
+	let $d = null;
+	if (is_empty(self)) {
+		$d = [ 1 ];
 	} else {
-		$i = __list_get(self, self.length - 1);
+		$d = __list_get(self, self.length - 1);
 	}
-	return $i;
+	return $d;
 }
 let xs = [  ];
 xs.push(10);
 xs.push(20);
 xs.push(30);
-console.log($a(__list_get(xs, 0), 0));
-console.log($a(__list_get(xs, 2), 0));
-console.log($a(__list_get(xs, 5), 0));
-console.log($d(__list_get(xs, 9)));
-console.log($a($f(xs), 0));
-console.log($a($g(xs), 0));
-console.log($a(__list_pop(xs), 0));
-console.log(xs.length);
-console.log($a($g(xs), 0));
+console.log(String(unwrap_or(__list_get(xs, 0), 0)));
+console.log(String(unwrap_or(__list_get(xs, 2), 0)));
+console.log(String(unwrap_or(__list_get(xs, 5), 0)));
+console.log(is_none(__list_get(xs, 9)));
+console.log(String(unwrap_or(first(xs), 0)));
+console.log(String(unwrap_or(last(xs), 0)));
+console.log(String(unwrap_or(__list_pop(xs), 0)));
+console.log(String(xs.length));
+console.log(String(unwrap_or(last(xs), 0)));
 let single = [  ];
 single.push(7);
-console.log($a(__list_pop(single), 0));
-console.log($d(__list_pop(single)));
+console.log(String(unwrap_or(__list_pop(single), 0)));
+console.log(is_none(__list_pop(single)));

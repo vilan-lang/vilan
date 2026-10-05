@@ -43,10 +43,12 @@ pub mod options;
 pub mod owned_modules;
 pub mod parsing;
 pub mod platform_color;
+pub mod printer;
 pub mod span;
 pub mod stack_guard;
 pub mod target;
 pub mod token;
+pub mod track_caller;
 pub mod transformer;
 pub mod type_;
 pub mod util;
@@ -904,6 +906,7 @@ fn analyze_source_unfenced(
                     extern_binding: None,
                     extern_retains: false,
                     must_use: false,
+                    track_caller: false,
                     platform_fence: Vec::new(),
                     rpc: false,
                     trait_only: false,
@@ -1176,6 +1179,10 @@ pub fn post_analysis_passes(
     let call_graph =
         context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
     let phase_contexts = phase_contexts_start.elapsed();
+    // debugging.md S0: `[track_caller]`'s hidden locations, threaded over the
+    // graph just built. It appends ARGUMENTS only (a location is a value, not
+    // a call), so the graph every pass below reads still describes the program.
+    track_caller::thread_locations(program, &call_graph);
     // M26's `contexts+graph` boundary, the first the phase line names and the
     // largest post-pass (171–242 ms on kolt): a cancel that arrived while the
     // graph was being built stops here rather than paying the six passes that

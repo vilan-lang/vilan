@@ -1,12 +1,19 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
 	if (value instanceof Set) return new Set([ ...value ].map(__clone));
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function __replace(target, value) {
 	if (Array.isArray(target) && Array.isArray(value)) target.length = value.length;
@@ -57,7 +64,7 @@ function step(self) {
 	const at = $p[2];
 	if ($p[0] === 0) {
 		__replace(self, [ 0, __clone(items), at + 1 ]);
-		return __at(items, as_usize(at));
+		return __at(items, as_usize(at), "capture-clones.vl:75:8");
 	}
 	return "-";
 }
@@ -235,41 +242,41 @@ function owned_call() {
 let entries = [  ];
 entries.push([ 1, 2 ]);
 entries.push([ 10, 20 ]);
-console.log(sum_over(entries));
+console.log(String(sum_over(entries)));
 let rows = [  ];
 rows.push([ [ 1, 2 ], 3 ]);
 rows.push([ [ 4 ], 1 ]);
-console.log(total_width(rows));
-console.log(guarded_width(rows));
+console.log(String(total_width(rows)));
+console.log(String(guarded_width(rows)));
 const held = [ 0, [ 1, 2 ] ];
 let got = first_or(held, [  ]);
 got.push(9);
-console.log(got.length);
+console.log(String(got.length));
 let guarded = first_or_guarded(held, 1, [  ]);
 guarded.push(9);
-console.log(guarded.length);
+console.log(String(guarded.length));
 const $m = held;
 let $n = null;
 if ($m[0] === 0) {
 	const inner = $m[1];
-	$n = console.log(inner.length);
+	$n = console.log(String(inner.length));
 } else {
-	$n = console.log(0);
+	$n = console.log(String(0));
 }
 $n;
 const pair = [ [ 1, 2 ], 3 ];
-console.log(grow_first(pair));
-console.log(pair[0].length);
+console.log(String(grow_first(pair)));
+console.log(String(pair[0].length));
 let feed = [ 0, [ "a", "b", "c" ], 0 ];
 console.log(step(feed));
 console.log(step(feed));
-console.log(width(feed));
+console.log(String(width(feed)));
 let viewed = [ [ 1, 2 ], 3 ];
-console.log(viewed_guarded(viewed));
-console.log(viewed[1]);
-console.log(place_component());
-console.log(place_rebound());
-console.log(place_guarded());
-console.log(called_component());
-console.log(called_readonly());
-console.log(owned_call());
+console.log(String(viewed_guarded(viewed)));
+console.log(String(viewed[1]));
+console.log(String(place_component()));
+console.log(String(place_rebound()));
+console.log(String(place_guarded()));
+console.log(String(called_component()));
+console.log(String(called_readonly()));
+console.log(String(owned_call()));

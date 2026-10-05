@@ -166,8 +166,10 @@ impl OptionalCrates {
 /// that wrote it, in exactly the shape a compiler diagnostic takes — so
 /// `vilan build --backend rust` reports an unsupported program the way it
 /// reports any other refusal, rather than producing Rust that will not build.
-pub fn emit(program: &Program<'_>, _options: &BuildOptions) -> Result<Emitted, Error> {
-    Emitter::new(program).run()
+pub fn emit(program: &Program<'_>, options: &BuildOptions) -> Result<Emitted, Error> {
+    let mut emitter = Emitter::new(program);
+    emitter.dbg_policy = options.dbg;
+    emitter.run()
 }
 
 /// The name `async fun main`'s body takes, since `fn main` cannot be `async`
@@ -181,7 +183,10 @@ const PRELUDE: &str = "\
 #![allow(unreachable_patterns, non_camel_case_types, non_snake_case, clippy::all)]
 use vilan_rt::Js as _;
 use vilan_rt::Json as _;
+use vilan_rt::Subscript as _;
 ";
+
+mod dbg;
 
 /// F56: every nominal declaration (struct or enum) with an `impl … with Drop`.
 ///
@@ -254,6 +259,12 @@ struct Reserved {
 
 struct Emitter<'a, 'src> {
     program: &'a Program<'src>,
+    /// `dbg`'s generated printers (debugging.md S1, `dbg.rs`): by type key
+    /// the printer's name, and the bodies, in generation order.
+    printers: HashMap<String, String>,
+    printer_bodies: Vec<String>,
+    /// What `dbg(..)` does in this build (`[build] dbg`, debugging.md Q4).
+    dbg_policy: vilan_core::options::DbgPolicy,
     /// Function bodies, keyed by the slot reserved for them — so the emitted
     /// order is discovery order and a body written during a nested walk cannot
     /// reorder the file.
@@ -598,6 +609,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn new(program: &'a Program<'src>) -> Self {
         Emitter {
             program,
+            printers: HashMap::default(),
+            printer_bodies: Vec::new(),
+            dbg_policy: vilan_core::options::DbgPolicy::Keep,
             functions: BTreeMap::new(),
             instances: HashMap::default(),
             default_instances: HashMap::default(),
@@ -701,6 +715,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         for body in self.functions.values() {
             source.push('\n');
             source.push_str(body);
+        }
+        for printer in &self.printer_bodies {
+            source.push('\n');
+            source.push_str(printer);
         }
         source.push('\n');
         source.push_str(&main_body);
@@ -2580,6 +2598,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // what it costs; it is a newtype and not a bare `i128` because
             // node prints a `BigInt` with its `n`.
             "BigInt" => Ok("vilan_rt::BigInt".to_string()),
+            // debugging.md S0: `std::debug::Location`, a call site.
+            "Location" => Ok("vilan_rt::Location".to_string()),
             // F18 slice 2: `std::json`'s opaque host value. It stands apart
             // from the HTTP table because it is a different module's host
             // surface and because two of the HTTP bindings (`headers`,
@@ -4228,6 +4248,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.number_literal(id, whole, fraction, suffix, span)?
             }
             Expr::String(text) => format!("vilan_rt::str_new({})", rust_string(text)),
+            // debugging.md S0: a `[track_caller]` call's location argument, a
+            // `Copy` handle over a `&'static str`.
+            Expr::CallerLocation(anchor) => format!(
+                "vilan_rt::Location({})",
+                rust_literal(&self.program.site_location(anchor))
+            ),
             Expr::MultilineString(_) => {
                 return Err(unsupported("a triple-quoted string", span));
             }
@@ -4337,7 +4363,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // out `1u64`.
                 let index_text =
                     self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
-                format!("{subject_text}[({index_text}) as usize]")
+                // debugging.md S0: the checked read, so an out-of-bounds
+                // subscript panics in vilan's words at its vilan site.
+                let location = self.subscript_location(id, depth)?;
+                format!("(*({subject_text}).vilan_at(({index_text}) as usize, {location}))")
             }
             Expr::List(elements) => {
                 // An element's position declares the list's ELEMENT type, not
@@ -8997,6 +9026,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "(({}) as {scalar})",
                 self.value_argument(argument_ids, 0, depth)?
             ),
+            // debugging.md S0: `Location::text` is `String(location)` on JS,
+            // where a location IS its text. The pair is std's alone: the other
+            // `String` binding is `std::json`'s `coerce_str`.
+            Some(ExternBinding::Function {
+                module: None,
+                symbol: "String",
+            }) if name == "text" => {
+                format!(
+                    "vilan_rt::str_new(({}).0)",
+                    self.value_argument(argument_ids, 0, depth)?
+                )
+            }
             Some(ExternBinding::Method {
                 symbol: Some("charCodeAt"),
             }) if name == "code_at" => format!(
@@ -9498,6 +9539,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ));
         }
 
+        if Some(target) == self.program.dbg_fn_id {
+            return self.dbg_call(call_id, &function_call.argument_ids, depth, span);
+        }
         if Some(target) == self.program.print_fn_id {
             self.refuse_unprintable(&function_call.argument_ids, span)?;
             let value = self.place_argument(&function_call.argument_ids, 0, depth)?;
@@ -9505,7 +9549,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         if Some(target) == self.program.panic_fn_id {
             let value = self.place_argument(&function_call.argument_ids, 0, depth)?;
-            return Ok(format!("vilan_rt::panic_with(&({value}))"));
+            // debugging.md S0: the site (or the forwarded caller), appended by
+            // `track_caller` as the second argument.
+            let location =
+                self.caller_location_argument(&function_call.argument_ids, 1, call_id, depth)?;
+            return Ok(format!("vilan_rt::panic_at(&({value}), {location})"));
+        }
+        if Some(target) == self.program.caller_fn_id {
+            return self.caller_location_argument(&function_call.argument_ids, 0, call_id, depth);
         }
         if Some(target) == self.program.list_new_fn_id {
             return Ok("Vec::new()".to_string());
@@ -9959,6 +10010,42 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `fresh` read again by the two statements after it). A consumed argument
     /// that reads a place copies, which is what rule 1 says a value read into a
     /// call or an aggregate does anyway.
+    /// A `[track_caller]` lowering's location (debugging.md S0): the argument
+    /// at `position` the pass appended — the site, or the forwarded caller —
+    /// and, for a call the pass did not reach, the site of `anchor` itself.
+    fn caller_location_argument(
+        &mut self,
+        argument_ids: &[Id],
+        position: usize,
+        anchor: Id,
+        depth: usize,
+    ) -> Result<String, Error> {
+        match argument_ids.get(position) {
+            Some(argument) => self.expression(*argument, depth),
+            None => Ok(format!(
+                "vilan_rt::Location({})",
+                rust_literal(&self.program.site_location(anchor))
+            )),
+        }
+    }
+
+    /// The location a checked subscript's bounds panic reports: its own site,
+    /// or — inside a `[track_caller]` function's own body — the caller's.
+    fn subscript_location(&mut self, index_id: Id, depth: usize) -> Result<String, Error> {
+        match self
+            .program
+            .index_location_arguments
+            .get(&index_id)
+            .copied()
+        {
+            Some(argument) => self.expression(argument, depth),
+            None => Ok(format!(
+                "vilan_rt::Location({})",
+                rust_literal(&self.program.site_location(index_id))
+            )),
+        }
+    }
+
     fn value_arguments(&mut self, argument_ids: &[Id], depth: usize) -> Result<Vec<String>, Error> {
         let mut rendered = Vec::new();
         for argument in argument_ids {
@@ -11393,7 +11480,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let subject_text = self.mutable_place(subject, depth)?;
                 let index_text =
                     self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
-                Ok(format!("{subject_text}[({index_text}) as usize]"))
+                let location = self.subscript_location(id, depth)?;
+                Ok(format!(
+                    "(*({subject_text}).vilan_at_mut(({index_text}) as usize, {location}))"
+                ))
             }
             Some(Expr::TupleIndex(subject, offset, width)) => {
                 let Some(path) = self.tuple_slot_path(id, offset, width) else {
@@ -11469,8 +11559,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::ListLen => format!("{}.len()", next()),
             Intrinsic::ListGet => format!("vilan_rt::list_get(&{}, {})", next(), next()),
             Intrinsic::ListPop => format!("vilan_rt::list_pop(&mut {})", next()),
+            // Both are `[track_caller]` (debugging.md S0): the location is the
+            // last argument.
             Intrinsic::ListRemove => {
-                format!("vilan_rt::list_remove(&mut {}, {})", next(), next())
+                format!(
+                    "vilan_rt::list_remove(&mut {}, {}, {})",
+                    next(),
+                    next(),
+                    next()
+                )
             }
             // `sort_by` answers a COPY (`own self`), and its comparator arrives
             // as an `Rc<dyn Fn>` — which implements no `Fn` trait itself, so it
@@ -11484,7 +11581,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 )
             }
             Intrinsic::ListInsert => format!(
-                "vilan_rt::list_insert(&mut {}, {}, {})",
+                "vilan_rt::list_insert(&mut {}, {}, {}, {})",
+                next(),
                 next(),
                 next(),
                 next()
@@ -11816,7 +11914,12 @@ fn sanitize(name: &str) -> String {
 /// the function is private to `transformer.rs`; the lane's report asks for it to
 /// be shared.
 fn rust_string(text: &str) -> String {
-    let value = unescape_string_value(text);
+    rust_literal(&unescape_string_value(text))
+}
+
+/// A string VALUE as a Rust literal — [`rust_string`] for text that is already
+/// the value (a location, `dbg`'s expression text, a printer's label).
+fn rust_literal(value: &str) -> String {
     let mut out = String::from("\"");
     for character in value.chars() {
         match character {

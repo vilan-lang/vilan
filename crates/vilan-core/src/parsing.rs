@@ -2116,6 +2116,9 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "client_service",
     "extern",
     "must_use",
+    // debugging.md S0 (Q11): the function reports its CALLER's location when
+    // it panics, through a hidden `std::debug::Location` parameter.
+    "track_caller",
     "rpc",
     "trait_only",
     "doc",
@@ -2145,10 +2148,11 @@ fn is_known_attribute_marker(name: &str) -> bool {
 ///   macro attribute (any name the table does not know);
 /// - labels: `[deprecated]` (1), `[internal]` (2), `[hint]` (3);
 /// - binding: `[extern]` (4);
-/// - checks: `[must_use]` (5), `[rpc]` (6), `[trait_only]` (7), and the
-///   retired `[doc(hidden)]` (8), refused where a function's prefix reads it;
-/// - fence: `[platform]` (9);
-/// - class: `[resource]` (10).
+/// - checks: `[must_use]` (5), `[track_caller]` (6), `[rpc]` (7),
+///   `[trait_only]` (8), and the retired `[doc(hidden)]` (9), refused where a
+///   function's prefix reads it;
+/// - fence: `[platform]` (10);
+/// - class: `[resource]` (11).
 ///
 /// Ties keep the order they were written in (a `[service]` and a
 /// `[client_service]`, two `[hint]`s). The parser sorts a run into this
@@ -2161,11 +2165,12 @@ pub fn attribute_rank(name: &str) -> u8 {
         "hint" => 3,
         "extern" => 4,
         "must_use" => 5,
-        "rpc" => 6,
-        "trait_only" => 7,
-        "doc" => 8,
-        "platform" => 9,
-        "resource" => 10,
+        "track_caller" => 6,
+        "rpc" => 7,
+        "trait_only" => 8,
+        "doc" => 9,
+        "platform" => 10,
+        "resource" => 11,
         _ => 0,
     }
 }
@@ -8095,6 +8100,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             None => (None, false),
         };
         let must_use = self.eat_marker_attribute("must_use");
+        let track_caller = self.eat_marker_attribute("track_caller");
         let rpc = self.eat_marker_attribute("rpc");
         let trait_only = self.eat_marker_attribute("trait_only");
         self.refuse_doc_hidden_attribute();
@@ -8304,6 +8310,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 extern_binding,
                 extern_retains,
                 must_use,
+                track_caller,
                 rpc,
                 trait_only,
                 platform_fence,

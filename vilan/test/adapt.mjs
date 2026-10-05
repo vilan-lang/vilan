@@ -15,23 +15,23 @@ function __sleep(ms, signal) {
 function fold_unsigned(value, modulus) {
 	const truncated = Math.trunc(value);
 	const wrapped = truncated % modulus;
-	let $h = null;
+	let $e = null;
 	if (wrapped < 0) {
-		$h = wrapped + modulus;
+		$e = wrapped + modulus;
 	} else {
-		$h = wrapped;
+		$e = wrapped;
 	}
-	return $h;
+	return $e;
 }
 function fold_signed(value, modulus, half) {
 	const wrapped = fold_unsigned(value, modulus);
-	let $i = null;
+	let $f = null;
 	if (wrapped >= half) {
-		$i = wrapped - modulus;
+		$f = wrapped - modulus;
 	} else {
-		$i = wrapped;
+		$f = wrapped;
 	}
-	return $i;
+	return $f;
 }
 function as_i32(self) {
 	const widened = Number(self);
@@ -54,49 +54,49 @@ function ambient_signal($b) {
 function run(f) {
 	return f() + 100;
 }
-async function $e(self, fn) {
+async function map(self, fn) {
 	let result = [  ];
 	for (const item of [ ...self ]) {
 		result.push(await (fn(item)));
 	}
 	return result;
 }
-function $f(self, fn) {
+function map2(self, fn) {
 	let result = [  ];
 	for (const item of self) {
 		result.push(fn(item));
 	}
 	return result;
 }
-async function $g(f) {
+async function run2(f) {
 	return await (f()) + 100;
 }
-async function $j(urls, f) {
-	return await ($e(urls, f));
+async function helper(urls, f) {
+	return await (map(urls, f));
 }
 (async () => {
 	const urls = [ "ab", "cdef" ];
-	const ids = await ($e(urls, async (url) => {
+	const ids = await (map(urls, async (url) => {
 		const length = url.length;
 		await (sleep(1, [ 1 ]));
 		return length;
 	}));
 	console.log(ids);
-	console.log($f(urls, (url) => {
+	console.log(map2(urls, (url) => {
 		return url.length;
 	}));
-	console.log(await ($g(async () => {
+	console.log(String(await (run2(async () => {
 		await (sleep(1, [ 1 ]));
 		return 7;
-	})));
-	console.log(run(() => {
+	}))));
+	console.log(String(run(() => {
 		return 1;
-	}));
-	console.log(await ($j(urls, async (url) => {
+	})));
+	console.log(await (helper(urls, async (url) => {
 		await (sleep(1, [ 1 ]));
 		return as_i32(url.length) + 10;
 	})));
-})().catch(($l) => {
-	console.error(String($l));
+})().catch(($g) => {
+	console.error(String($g));
 	process.exit(1);
 });

@@ -7,8 +7,8 @@ function mul(self, b2) {
 const a = [ 1, 2 ];
 const b = [ 3, 4 ];
 const sum = add(a, b);
-console.log(sum[0]);
-console.log(sum[1]);
+console.log(String(sum[0]));
+console.log(String(sum[1]));
 const product = mul(a, b);
-console.log(product[0]);
-console.log(product[1]);
+console.log(String(product[0]));
+console.log(String(product[1]));

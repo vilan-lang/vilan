@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -11,36 +11,43 @@ function __clone(value) {
 function __list_get(list, index) {
 	return index >= 0 && index < list.length ? [ 0, __clone(list[index]) ] : [ 1 ];
 }
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
+}
 function fold_unsigned(value, modulus) {
 	const truncated = Math.trunc(value);
 	const wrapped = truncated % modulus;
-	let $f = null;
+	let $d = null;
 	if (wrapped < 0) {
-		$f = wrapped + modulus;
+		$d = wrapped + modulus;
 	} else {
-		$f = wrapped;
+		$d = wrapped;
 	}
-	return $f;
+	return $d;
 }
 function saturate_unsigned(value) {
 	const truncated = Math.trunc(value);
-	let $h = null;
+	let $f = null;
 	if (truncated > 0) {
-		$h = truncated;
+		$f = truncated;
 	} else {
-		$h = 0;
+		$f = 0;
 	}
-	return $h;
+	return $f;
 }
 function fold_signed(value, modulus, half) {
 	const wrapped = fold_unsigned(value, modulus);
-	let $g = null;
+	let $e = null;
 	if (wrapped >= half) {
-		$g = wrapped - modulus;
+		$e = wrapped - modulus;
 	} else {
-		$g = wrapped;
+		$e = wrapped;
 	}
-	return $g;
+	return $e;
 }
 function as_usize(self) {
 	const widened = Number(self);
@@ -59,23 +66,23 @@ function take(count) {
 function zero() {
 	return 0;
 }
-function $c(value) {
+function identity(value) {
 	return __clone(value);
 }
-function $d(self) {
-	const $e = self;
-	return $e[0] === 0;
+function is_some(self) {
+	const $c = self;
+	return $c[0] === 0;
 }
-function $i(self, fallback) {
-	const $j = self;
-	let $k = null;
-	if ($j[0] === 0) {
-		const x = __clone($j[1]);
-		$k = x;
+function unwrap_or(self, fallback) {
+	const $g = self;
+	let $h = null;
+	if ($g[0] === 0) {
+		const x = __clone($g[1]);
+		$h = x;
 	} else {
-		$k = __clone(fallback);
+		$h = __clone(fallback);
 	}
-	return $k;
+	return $h;
 }
 const letters = [ "a", "b", "c" ];
 console.log("" + take(3));
@@ -111,20 +118,20 @@ const doubled = (n) => {
 	return n * 2;
 };
 console.log("" + doubled(7));
-const through = $c(5);
+const through = identity(5);
 console.log("" + through);
 const bare = 0;
 console.log("" + take(bare));
 const found = [ 0, 0 ];
-console.log($d(found));
+console.log(is_some(found));
 const at = 1;
-console.log(__at(letters, 0));
-console.log(__at(letters, at));
-console.log($i(__list_get(letters, as_usize(as_i32(at))), "none"));
+console.log(__at(letters, 0, "usize-literals.vl:76:8"));
+console.log(__at(letters, at, "usize-literals.vl:77:8"));
+console.log(unwrap_or(__list_get(letters, as_usize(as_i32(at))), "none"));
 const length = as_usize2(letters.length);
 console.log("" + length);
 let index = length;
 while (index > 0) {
 	index = index - 1;
-	console.log(__at(letters, index));
+	console.log(__at(letters, index, "usize-literals.vl:87:9"));
 }

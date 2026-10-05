@@ -9,24 +9,24 @@ function __parse_f64(text) {
 	const value = Number(trimmed);
 	return trimmed === "" || Number.isNaN(value) ? [ 1 ] : [ 0, value ];
 }
-function $a(self, fallback) {
-	const $b = self;
-	let $c = null;
-	if ($b[0] === 0) {
-		const x = __clone($b[1]);
-		$c = x;
+function unwrap_or(self, fallback) {
+	const $a = self;
+	let $b = null;
+	if ($a[0] === 0) {
+		const x = __clone($a[1]);
+		$b = x;
 	} else {
-		$c = __clone(fallback);
+		$b = __clone(fallback);
 	}
-	return $c;
+	return $b;
 }
-function $d(self) {
-	const $e = self;
-	return $e[0] === 0;
+function is_some(self) {
+	const $c = self;
+	return $c[0] === 0;
 }
-console.log($a(__parse_f64("3.14"), 0));
-console.log($a(__parse_f64("42"), 0));
-console.log($a(__parse_f64("-2.5"), 0));
-console.log($a(__parse_f64("nope"), -(1)));
-console.log($d(__parse_f64("3.14")));
-console.log($d(__parse_f64("abc")));
+console.log(String(unwrap_or(__parse_f64("3.14"), 0)));
+console.log(String(unwrap_or(__parse_f64("42"), 0)));
+console.log(String(unwrap_or(__parse_f64("-2.5"), 0)));
+console.log(String(unwrap_or(__parse_f64("nope"), -(1))));
+console.log(is_some(__parse_f64("3.14")));
+console.log(is_some(__parse_f64("abc")));

@@ -165,7 +165,10 @@ The manifest declares what a directory builds. Sections:
   `preset` (`"debug"` | `"release"`) and the per-feature overrides
   `indent`, `spaces`, `debug-names`. The **codegen options** never
   change program semantics (§7.6), only the emitted text; the hooks are
-  not among them. `run` is a command line (or a list of them) executed
+  not among them. `dbg` (`"keep"` | `"strip"`) says what a `dbg(..)`
+  call does: the `debug` preset keeps it (it prints), the `release`
+  preset refuses the build at each call, `"strip"` makes the call its
+  argument and prints nothing, and `"keep"` prints in release too. `run` is a command line (or a list of them) executed
   through the host shell **before** each build (each `--watch` round
   included), in the manifest's directory, in order; a non-zero exit
   fails the build. It runs with the invoking user's privileges and

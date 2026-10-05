@@ -1,12 +1,19 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
 	if (value instanceof Set) return new Set([ ...value ].map(__clone));
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function to_string(self) {
 	return "" + self;
@@ -16,52 +23,52 @@ function fetch2(log3, value) {
 	return value;
 }
 function parse(tag) {
-	let $o = null;
+	let $n = null;
 	if (tag === "good") {
-		$o = [ 0, 21 ];
+		$n = [ 0, 21 ];
 	} else {
-		$o = [ 1, "bad: " + tag ];
+		$n = [ 1, "bad: " + tag ];
 	}
-	return $o;
+	return $n;
 }
 function total(a, b) {
-	let $A = null;
-	const $B = a;
-	if ($B[0] === 1) {
-		$A = $B;
+	let $z = null;
+	const $A = a;
+	if ($A[0] === 1) {
+		$z = $A;
 	} else {
-		const $C = b;
-		if ($C[0] === 1) {
-			$A = $C;
+		const $B = b;
+		if ($B[0] === 1) {
+			$z = $B;
 		} else {
-			$A = [ 0, $B[1] + $C[1] ];
+			$z = [ 0, $A[1] + $B[1] ];
 		}
 	}
-	const $D = $A;
-	if ($D[0] === 1) {
-		return $D;
+	const $C = $z;
+	if ($C[0] === 1) {
+		return $C;
 	}
-	const sum2 = $D[1];
+	const sum2 = $C[1];
 	return [ 0, sum2 * 10 ];
 }
-function $c(self, fallback) {
-	const $d = self;
-	let $e = null;
-	if ($d[0] === 0) {
-		const x = __clone($d[1]);
-		$e = x;
+function unwrap_or(self, fallback) {
+	const $c = self;
+	let $d = null;
+	if ($c[0] === 0) {
+		const x = __clone($c[1]);
+		$d = x;
 	} else {
-		$e = __clone(fallback);
+		$d = __clone(fallback);
 	}
-	return $e;
+	return $d;
 }
-function $H(self, fn) {
+function map(self, fn) {
 	return [ fn(self[0]), self[1] + ".map" ];
 }
-function $J(value) {
+function format(value) {
 	return to_string(value);
 }
-function $K(self, fn) {
+function and_then(self, fn) {
 	const inner = fn(self[0]);
 	return [ __clone(inner[0]), self[1] + "+" + inner[1] ];
 }
@@ -73,133 +80,133 @@ if ($b[0] === 1) {
 } else {
 	$a = [ 0, $b[1] * 2 ];
 }
-console.log($c($a, -(1)));
-let $f = null;
-const $g = count;
-if ($g[0] === 1) {
-	$f = $g;
+console.log(String(unwrap_or($a, -(1))));
+let $e = null;
+const $f = count;
+if ($f[0] === 1) {
+	$e = $f;
 } else {
-	$f = [ 0, 2 * $g[1] ];
+	$e = [ 0, 2 * $f[1] ];
 }
-console.log($c($f, -(1)));
+console.log(String(unwrap_or($e, -(1))));
 let log = [  ];
-let $h = null;
-const $i = fetch2(log, [ 0, 40 ]);
-if ($i[0] === 1) {
-	$h = $i;
+let $g = null;
+const $h = fetch2(log, [ 0, 40 ]);
+if ($h[0] === 1) {
+	$g = $h;
 } else {
-	const $j = fetch2(log, [ 0, 2 ]);
-	if ($j[0] === 1) {
-		$h = $j;
+	const $i = fetch2(log, [ 0, 2 ]);
+	if ($i[0] === 1) {
+		$g = $i;
 	} else {
-		$h = [ 0, $i[1] + $j[1] ];
+		$g = [ 0, $h[1] + $i[1] ];
 	}
 }
-const both = $h;
-console.log($c(both, -(1)));
-console.log(log.length);
+const both = $g;
+console.log(String(unwrap_or(both, -(1))));
+console.log(String(log.length));
 let log2 = [  ];
-let $k = null;
-const $l = fetch2(log2, [ 1 ]);
-if ($l[0] === 1) {
-	$k = $l;
+let $j = null;
+const $k = fetch2(log2, [ 1 ]);
+if ($k[0] === 1) {
+	$j = $k;
 } else {
-	const $m = fetch2(log2, [ 0, 2 ]);
-	if ($m[0] === 1) {
-		$k = $m;
+	const $l = fetch2(log2, [ 0, 2 ]);
+	if ($l[0] === 1) {
+		$j = $l;
 	} else {
-		$k = [ 0, $l[1] + $m[1] ];
+		$j = [ 0, $k[1] + $l[1] ];
 	}
 }
-const bad = $k;
-console.log($c(bad, -(1)));
-console.log(log2.length);
-let $n = null;
-const $p = parse("good");
-if ($p[0] === 1) {
-	$n = $p;
+const bad = $j;
+console.log(String(unwrap_or(bad, -(1))));
+console.log(String(log2.length));
+let $m = null;
+const $o = parse("good");
+if ($o[0] === 1) {
+	$m = $o;
 } else {
-	const $q = parse("good");
-	if ($q[0] === 1) {
-		$n = $q;
+	const $p = parse("good");
+	if ($p[0] === 1) {
+		$m = $p;
 	} else {
-		$n = [ 0, $p[1] + $q[1] ];
+		$m = [ 0, $o[1] + $p[1] ];
 	}
 }
-const sum = $n;
-const $r = sum;
+const sum = $m;
+const $q = sum;
+let $r = null;
+if ($q[0] === 0) {
+	const n = $q[1];
+	$r = console.log(String(n));
+} else {
+	const e = $q[1];
+	$r = console.log(e);
+}
+$r;
 let $s = null;
-if ($r[0] === 0) {
-	const n = $r[1];
-	$s = console.log(n);
+const $t = parse("x");
+if ($t[0] === 1) {
+	$s = $t;
 } else {
-	const e = $r[1];
-	$s = console.log(e);
-}
-$s;
-let $t = null;
-const $u = parse("x");
-if ($u[0] === 1) {
-	$t = $u;
-} else {
-	const $v = parse("y");
-	if ($v[0] === 1) {
-		$t = $v;
+	const $u = parse("y");
+	if ($u[0] === 1) {
+		$s = $u;
 	} else {
-		$t = [ 0, $u[1] + $v[1] ];
+		$s = [ 0, $t[1] + $u[1] ];
 	}
 }
-const $w = $t;
-let $x = null;
-if ($w[0] === 0) {
-	const n2 = $w[1];
-	$x = console.log(n2);
+const $v = $s;
+let $w = null;
+if ($v[0] === 0) {
+	const n2 = $v[1];
+	$w = console.log(String(n2));
 } else {
-	const e2 = $w[1];
-	$x = console.log(e2);
+	const e2 = $v[1];
+	$w = console.log(e2);
 }
-$x;
+$w;
 const rows = [ 0, [ [ 0, 7 ], [ 1 ] ] ];
-let $y = null;
-const $z = rows;
-if ($z[0] === 1) {
-	$y = $z;
+let $x = null;
+const $y = rows;
+if ($y[0] === 1) {
+	$x = $y;
 } else {
-	$y = __at($z[1], 0);
+	$x = __at($y[1], 0, "expression-lift.vl:77:27");
 }
-const first = $y;
-console.log($c(first, -(1)));
-console.log($c(total([ 0, 4 ], [ 0, 2 ]), -(1)));
-console.log($c(total([ 0, 4 ], [ 1 ]), -(1)));
+const first = $x;
+console.log(String(unwrap_or(first, -(1))));
+console.log(String(unwrap_or(total([ 0, 4 ], [ 0, 2 ]), -(1))));
+console.log(String(unwrap_or(total([ 0, 4 ], [ 1 ]), -(1))));
 const size = [ 0, 4 ];
-let $E = null;
-const $F = size;
-if ($F[0] === 1) {
-	$E = $F;
+let $D = null;
+const $E = size;
+if ($E[0] === 1) {
+	$D = $E;
 } else {
-	const $G = size;
-	if ($G[0] === 1) {
-		$E = $G;
+	const $F = size;
+	if ($F[0] === 1) {
+		$D = $F;
 	} else {
-		$E = [ 0, $F[1] * $G[1] ];
+		$D = [ 0, $E[1] * $F[1] ];
 	}
 }
-console.log($c($E, -(1)));
+console.log(String(unwrap_or($D, -(1))));
 const boxed = [ 20, "a" ];
-const doubled = $H(boxed, ($I) => {
-	return $I * 2;
+const doubled = map(boxed, ($G) => {
+	return $G * 2;
 });
-console.log("" + $J(doubled[0]) + " [" + doubled[1] + "]");
+console.log("" + format(doubled[0]) + " [" + doubled[1] + "]");
 const left = [ 40, "L" ];
 const right = [ 2, "R" ];
-const paired = $K(left, ($L) => {
-	return $H(right, ($M) => {
-		return $L + $M;
+const paired = and_then(left, ($H) => {
+	return map(right, ($I) => {
+		return $H + $I;
 	});
 });
-console.log("" + $J(paired[0]) + " [" + paired[1] + "]");
+console.log("" + format(paired[0]) + " [" + paired[1] + "]");
 const boxes = [ [ [ 7, "inner" ] ], "outer" ];
-const picked = $K(boxes, ($O) => {
-	return __at($O, 0);
+const picked = and_then(boxes, ($J) => {
+	return __at($J, 0, "expression-lift.vl:102:26");
 });
-console.log("" + $J(picked[0]) + " [" + picked[1] + "]");
+console.log("" + format(picked[0]) + " [" + picked[1] + "]");

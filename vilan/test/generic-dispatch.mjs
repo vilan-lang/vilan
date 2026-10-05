@@ -1,7 +1,7 @@
-function $a(value) {
+function describe(value) {
 	return JSON.stringify(value);
 }
-function $c(self) {
+function to_json(self) {
 	let result = "[";
 	let first = true;
 	for (const element of self) {
@@ -13,22 +13,22 @@ function $c(self) {
 	}
 	return result + "]";
 }
-function $d(self) {
-	const $e = self;
-	let $f = null;
-	if ($e[0] === 0) {
-		const value = $e[1];
-		$f = JSON.stringify(value);
+function to_json2(self) {
+	const $a = self;
+	let $b = null;
+	if ($a[0] === 0) {
+		const value = $a[1];
+		$b = JSON.stringify(value);
 	} else {
-		$f = "null";
+		$b = "null";
 	}
-	return $f;
+	return $b;
 }
-console.log($a(42));
-console.log($a("hi"));
+console.log(describe(42));
+console.log(describe("hi"));
 const nums = [ 1, 2, 3 ];
-console.log($c(nums));
+console.log(to_json(nums));
 const maybe = [ 0, 7 ];
-console.log($d(maybe));
+console.log(to_json2(maybe));
 const nothing = [ 1 ];
-console.log($d(nothing));
+console.log(to_json2(nothing));

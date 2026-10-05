@@ -4,6 +4,13 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
+}
 function to_string(self) {
 	return "" + self;
 }
@@ -19,44 +26,44 @@ function parse_bool(self) {
 	}
 	return $b;
 }
-function $c(self, fallback) {
-	const $d = self;
-	let $e = null;
-	if ($d[0] === 0) {
-		const x = __clone($d[1]);
-		$e = x;
+function unwrap_or(self, fallback) {
+	const $c = self;
+	let $d = null;
+	if ($c[0] === 0) {
+		const x = __clone($c[1]);
+		$d = x;
 	} else {
-		$e = __clone(fallback);
+		$d = __clone(fallback);
 	}
-	return $e;
+	return $d;
 }
-function $f(self) {
-	const $g = self;
-	let $h = null;
-	if ($g[0] === 0) {
-		const x = __clone($g[1]);
-		$h = x;
+function unwrap(self, caller) {
+	const $e = self;
+	let $f = null;
+	if ($e[0] === 0) {
+		const x = __clone($e[1]);
+		$f = x;
 	} else {
-		$h = (() => {
-			throw "expected Some but got None";
+		$f = (() => {
+			throw __panic("expected Some but got None", caller);
 		})();
 	}
-	return $h;
+	return $f;
 }
-function $i(self) {
-	const $j = self;
-	return $j[0] === 0;
+function is_some(self) {
+	const $g = self;
+	return $g[0] === 0;
 }
-console.log($c(parse_bool("true"), false));
-console.log($c(parse_bool("false"), true));
+console.log(unwrap_or(parse_bool("true"), false));
+console.log(unwrap_or(parse_bool("false"), true));
 console.log(to_string(true));
-console.log($f(parse_bool(to_string(false))));
-console.log($i(parse_bool("1")));
-console.log($i(parse_bool("0")));
-console.log($i(parse_bool("True")));
-console.log($i(parse_bool("FALSE")));
-console.log($i(parse_bool("yes")));
-console.log($i(parse_bool("")));
-console.log($c(parse_bool(" true "), false));
-console.log($i(parse_bool("tr ue")));
-console.log($c(parse_bool("nonsense"), true));
+console.log(unwrap(parse_bool(to_string(false)), "parse-bool.vl:12:39"));
+console.log(is_some(parse_bool("1")));
+console.log(is_some(parse_bool("0")));
+console.log(is_some(parse_bool("True")));
+console.log(is_some(parse_bool("FALSE")));
+console.log(is_some(parse_bool("yes")));
+console.log(is_some(parse_bool("")));
+console.log(unwrap_or(parse_bool(" true "), false));
+console.log(is_some(parse_bool("tr ue")));
+console.log(unwrap_or(parse_bool("nonsense"), true));

@@ -4652,8 +4652,8 @@ fn a_task_is_a_handle_copies_observe_the_same_run() {
 fn an_unobserved_task_failure_reports_and_the_program_continues() {
     // Absorption: the failed spawn never becomes a host unhandled rejection
     // (which would crash node). One macrotask after it settles unobserved,
-    // it is reported to stderr with the spawn origin — and main still runs
-    // to completion with exit 0.
+    // it is reported to stderr with the spawn origin and the panic's own
+    // site (debugging.md S0) — and main still runs to completion with exit 0.
     match compile_and_run_capturing_stderr(
         r#"
         import std::io::print;
@@ -4672,7 +4672,9 @@ fn an_unobserved_task_failure_reports_and_the_program_continues() {
         Ok((stdout, stderr)) => {
             assert_eq!(stdout, "alive\n", "stdout mismatch");
             assert!(
-                stderr.contains("unhandled task error (spawned in main): boom"),
+                stderr.contains(
+                    "unhandled task error (spawned in main): panicked at test.vl:6:13: boom"
+                ),
                 "missing the origin-stamped report, stderr was: {stderr:?}"
             );
         }
@@ -7070,7 +7072,8 @@ fn b377_a_pure_element_in_a_discarded_comprehension_is_still_elided() {
             print(over_a_literal((1, 2, 3)));
         }
         "#,
-        "function $a(values) {\n\treturn 0;\n}",
+        // E259: the instance carries its function's name.
+        "function over_a_literal(values) {\n\treturn 0;\n}",
     );
 }
 

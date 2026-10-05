@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -19,6 +19,13 @@ function __json_kind(value) {
 function __map_get(map, key) {
 	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
 }
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
+}
 function __try_parse_json(text) {
 	try {
 		return [ 0, JSON.parse(text) ];
@@ -33,55 +40,55 @@ function hash(self) {
 	return __hash(self);
 }
 function from_json(text) {
-	const $m = __try_parse_json(text);
-	let $n = null;
-	if ($m[0] === 0) {
-		const value = $m[1];
-		$n = from_json_value(value);
+	const $i = __try_parse_json(text);
+	let $j = null;
+	if ($i[0] === 0) {
+		const value = $i[1];
+		$j = from_json_value(value);
 	} else {
-		$n = [ 1, "not valid JSON" ];
+		$j = [ 1, "not valid JSON" ];
 	}
-	return $n;
+	return $j;
 }
 function from_json_value(value) {
-	let $o = null;
+	let $k = null;
 	if (__json_kind(value) === "number") {
-		$o = [ 0, Number(value) ];
+		$k = [ 0, Number(value) ];
 	} else {
-		$o = [ 1, "expected a number" ];
+		$k = [ 1, "expected a number" ];
 	}
-	return $o;
+	return $k;
 }
 function fold_unsigned(value, modulus) {
 	const truncated = Math.trunc(value);
 	const wrapped = truncated % modulus;
-	let $j = null;
+	let $g = null;
 	if (wrapped < 0) {
-		$j = wrapped + modulus;
+		$g = wrapped + modulus;
 	} else {
-		$j = wrapped;
+		$g = wrapped;
 	}
-	return $j;
+	return $g;
 }
 function saturate_unsigned(value) {
 	const truncated = Math.trunc(value);
-	let $i = null;
+	let $f = null;
 	if (truncated > 0) {
-		$i = truncated;
+		$f = truncated;
 	} else {
-		$i = 0;
+		$f = 0;
 	}
-	return $i;
+	return $f;
 }
 function fold_signed(value, modulus, half) {
 	const wrapped = fold_unsigned(value, modulus);
-	let $k = null;
+	let $h = null;
 	if (wrapped >= half) {
-		$k = wrapped - modulus;
+		$h = wrapped - modulus;
 	} else {
-		$k = wrapped;
+		$h = wrapped;
 	}
-	return $k;
+	return $h;
 }
 function as_usize(self) {
 	const widened = Number(self);
@@ -101,22 +108,22 @@ function rem(self, m) {
 	return self - Math.trunc(self / m) * m;
 }
 function checked_sub(self, other) {
-	let $c = null;
-	if (self >= other) {
-		$c = [ 0, self - other ];
-	} else {
-		$c = [ 1 ];
-	}
-	return $c;
-}
-function saturating_sub(self, other) {
 	let $b = null;
 	if (self >= other) {
-		$b = self - other;
+		$b = [ 0, self - other ];
 	} else {
-		$b = 0;
+		$b = [ 1 ];
 	}
 	return $b;
+}
+function saturating_sub(self, other) {
+	let $a = null;
+	if (self >= other) {
+		$a = self - other;
+	} else {
+		$a = 0;
+	}
+	return $a;
 }
 function as_u8(self) {
 	const widened = Number(self);
@@ -133,46 +140,46 @@ function as_usize3(self) {
 function div(self, b) {
 	return Math.trunc(self / b);
 }
-function $a(value, divisor) {
+function halve(value, divisor) {
 	return div(value, divisor);
 }
-function $d(self) {
-	const $e = self;
-	return $e[0] === 1;
+function is_none(self) {
+	const $c = self;
+	return $c[0] === 1;
 }
-function $f(self, fallback) {
-	const $g = self;
-	let $h = null;
-	if ($g[0] === 0) {
-		const x = __clone($g[1]);
-		$h = x;
+function unwrap_or(self, fallback) {
+	const $d = self;
+	let $e = null;
+	if ($d[0] === 0) {
+		const x = __clone($d[1]);
+		$e = x;
 	} else {
-		$h = __clone(fallback);
+		$e = __clone(fallback);
 	}
-	return $h;
+	return $e;
 }
-function $l(value) {
+function format(value) {
 	return to_string(value);
 }
-function $r() {
+function new2() {
 	const table = new Map();
 	return [ table ];
 }
-function $s(self, key, value) {
+function insert(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
-function $t(self, key) {
-	const $u = __map_get(self[0], hash(key));
-	let $v = null;
-	if ($u[0] === 0) {
-		const entry = $u[1];
-		$v = [ 0, __clone(entry[1]) ];
+function get(self, key) {
+	const $n = __map_get(self[0], hash(key));
+	let $o = null;
+	if ($n[0] === 0) {
+		const entry = $n[1];
+		$o = [ 0, __clone(entry[1]) ];
 	} else {
-		$v = [ 1 ];
+		$o = [ 1 ];
 	}
-	return $v;
+	return $o;
 }
-function $z(self) {
+function to_json(self) {
 	let result = "[";
 	let first = true;
 	for (const element of self) {
@@ -184,33 +191,33 @@ function $z(self) {
 	}
 	return result + "]";
 }
-function $D(value) {
-	let $E = null;
+function from_json_value2(value) {
+	let $t = null;
 	if (__json_kind(value) !== "array") {
 		return [ 1, "expected an array" ];
 	}
-	$E;
+	$t;
 	let result = [  ];
 	for (const element of value) {
-		const $G = result;
-		const $F = from_json_value(element);
-		if ($F[0] === 1) {
-			return $F;
+		const $v = result;
+		const $u = from_json_value(element);
+		if ($u[0] === 1) {
+			return $u;
 		}
-		$G.push($F[1]);
+		$v.push($u[1]);
 	}
 	return [ 0, result ];
 }
-function $A(text) {
-	const $B = __try_parse_json(text);
-	let $C = null;
-	if ($B[0] === 0) {
-		const value = $B[1];
-		$C = $D(value);
+function from_json2(text) {
+	const $r = __try_parse_json(text);
+	let $s = null;
+	if ($r[0] === 0) {
+		const value = $r[1];
+		$s = from_json_value2(value);
 	} else {
-		$C = [ 1, "not valid JSON" ];
+		$s = [ 1, "not valid JSON" ];
 	}
-	return $C;
+	return $s;
 }
 const count = 42;
 const step = 5;
@@ -220,7 +227,7 @@ const scaled = count * step;
 const quotient = Math.trunc(count / step);
 const remainder = rem(count, step);
 console.log("" + total + " " + left + " " + scaled + " " + quotient + " " + remainder);
-const halved = $a(count, 4);
+const halved = halve(count, 4);
 console.log("" + halved);
 console.log("" + (count > step) + " " + (count === 42) + " " + (count !== step));
 const top = max_value();
@@ -228,8 +235,8 @@ const bottom = min_value();
 console.log("" + top + " " + bottom);
 const floor = saturating_sub(step, count);
 console.log("" + floor);
-console.log($d(checked_sub(step, count)));
-const back = $f(checked_sub(count, step), 0);
+console.log(is_none(checked_sub(step, count)));
+const back = unwrap_or(checked_sub(count, step), 0);
 console.log("" + back);
 const from_i32 = as_usize2(12);
 const from_f64 = as_usize3(7.9);
@@ -239,34 +246,34 @@ const to_u8 = as_u8(300);
 console.log("" + from_i32 + " " + from_f64 + " " + from_u8 + " " + to_i32 + " " + to_u8);
 const letters = [ "a", "b", "c", "d" ];
 const at = 2;
-console.log(__at(letters, at));
-console.log($l(count));
+console.log(__at(letters, at, "usize.vl:55:8"));
+console.log(format(count));
 console.log(JSON.stringify(count));
 console.log(JSON.stringify(count));
-const $p = from_json("17");
-let $q = null;
-if ($p[0] === 0) {
-	const parsed = $p[1];
-	$q = console.log("" + parsed);
+const $l = from_json("17");
+let $m = null;
+if ($l[0] === 0) {
+	const parsed = $l[1];
+	$m = console.log("" + parsed);
 } else {
-	const reason = $p[1];
-	$q = console.log(reason);
+	const reason = $l[1];
+	$m = console.log(reason);
 }
-$q;
-let rows = $r();
-$s(rows, 3, "three");
-console.log($f($t(rows, 3), "none"));
+$m;
+let rows = new2();
+insert(rows, 3, "three");
+console.log(unwrap_or(get(rows, 3), "none"));
 const positions = [ 0, 3, 2147483647 ];
-const encoded = $z(positions);
+const encoded = to_json(positions);
 console.log(encoded);
-const decoded = $A(encoded);
-const $H = decoded;
-let $I = null;
-if ($H[0] === 0) {
-	const back2 = $H[1];
-	$I = console.log("" + back2.length + " " + __at(back2, 2));
+const decoded = from_json2(encoded);
+const $w = decoded;
+let $x = null;
+if ($w[0] === 0) {
+	const back2 = $w[1];
+	$x = console.log("" + back2.length + " " + __at(back2, 2, "usize.vl:75:41"));
 } else {
-	const reason2 = $H[1];
-	$I = console.log(reason2);
+	const reason2 = $w[1];
+	$x = console.log(reason2);
 }
-process.exit($I);
+process.exit($x);

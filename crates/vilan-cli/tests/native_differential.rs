@@ -1091,9 +1091,11 @@ const DEFAULT_SUITE: &[&str] = &[
     // N106: `vilan_rt::js_number`'s four documented departures from Rust's
     // own `{}` — 1e21's exponential switch, the 1e-6 linear floor, and the
     // two infinities — pinned identical on a corpus program rather than left
-    // unrecorded (negative zero is the one departure that is NOT identical;
-    // it is `f64-print-negative-zero.vl`, outside this differential by name).
+    // unrecorded.
     "f64-print-boundary.vl",
+    // N136: negative zero prints `0` on both backends since `print` formats a
+    // number by `String(x)` on JS.
+    "f64-print-negative-zero.vl",
     // N106: `str::len` counts UTF-16 code units to match JavaScript's
     // `.length`; a character outside the BMP is a surrogate pair on JS and
     // `char::len_utf16` counts it the same way natively — verified here
@@ -1127,18 +1129,10 @@ const DEFAULT_SUITE: &[&str] = &[
 /// corpus keeps its JS golden, and
 /// [`an_underflowing_usize_is_outside_the_differential_by_name`] pins the
 /// native half.
-const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[
-    (
-        "usize-underflow.vl",
-        "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
-    ),
-    (
-        "f64-print-negative-zero.vl",
-        "negative zero prints \"-0\" through node's `console.log` (a `util.inspect` \
-         special case) but \"0\" through every JS stringification `vilan_rt::js_number` \
-         implements instead (`String(x)`, a template literal, `JSON.stringify`) — N106",
-    ),
-];
+const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[(
+    "usize-underflow.vl",
+    "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
+)];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
 ///
@@ -1489,50 +1483,22 @@ fn an_underflowing_usize_is_outside_the_differential_by_name() {
     );
 }
 
-/// N106: the other [`OUTSIDE_THE_DIFFERENTIAL`] program — negative zero is
-/// the one `vilan_rt::js_number` departure from `console.log` that is NOT
-/// identical: node's `console.log` special-cases it to `"-0"` (`util.inspect`),
-/// while every JS *stringification* (`String(x)`, a template literal,
-/// `JSON.stringify`) answers `"0"`, which is what `js_number` — and so the
-/// native backend's `print` — implements. Both backends do what the book
-/// says; the sweep leaves the program out so it is not called broken.
+/// N136 (R-g door (a)): negative zero prints `0` on BOTH backends — `print`
+/// formats a number by the language's own conversion (`String(x)` on JS, the
+/// one an i-string and `vilan_rt::js_number` use) where node's `console.log`
+/// wrote `-0`. The program left `OUTSIDE_THE_DIFFERENTIAL` with the fix.
 #[test]
-fn negative_zero_prints_differently_on_each_backend_by_name() {
-    for (program, _) in OUTSIDE_THE_DIFFERENTIAL {
-        assert!(
-            corpus_dir().join(program).is_file(),
-            "{program} is named outside the differential but is not a corpus program"
-        );
-        assert!(
-            !platform_free_programs().contains(&program.to_string()),
-            "{program} is named outside the differential but the sweep still enumerates it"
-        );
-        assert!(
-            !DEFAULT_SUITE.contains(program),
-            "{program} is outside the differential and cannot be in its default suite"
-        );
-    }
+fn negative_zero_prints_zero_on_both_backends() {
     let staged = stage();
-    let javascript = vilan(&staged)
-        .args(["run", "f64-print-negative-zero.vl"])
-        .output()
-        .expect("run the JS backend");
-    assert!(
-        javascript.status.success(),
-        "the JS leg runs clean: {}",
-        String::from_utf8_lossy(&javascript.stderr)
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, "f64-print-negative-zero.vl");
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "0\n0\n0\n", "{backend:?}");
+    }
+    assert_eq!(
+        compare(&staged, "f64-print-negative-zero.vl"),
+        Verdict::Identical
     );
-    assert_eq!(String::from_utf8_lossy(&javascript.stdout), "-0\n");
-    let native = vilan(&staged)
-        .args(["run", "--backend", "rust", "f64-print-negative-zero.vl"])
-        .output()
-        .expect("run the native backend");
-    assert!(
-        native.status.success(),
-        "the native leg runs clean: {}",
-        String::from_utf8_lossy(&native.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&native.stdout), "0\n");
 }
 
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.
@@ -6770,8 +6736,11 @@ fn a_failing_program_exits_one_on_both_backends_without_rusts_banner() {
              asserting nothing about the failure"
         );
         let stderr = String::from_utf8_lossy(&native.stderr);
+        // Rust's banner names its THREAD (`thread 'main' panicked at
+        // src/main.rs:..`); a vilan panic's own report (debugging.md S0) is
+        // `panicked at <the .vl site>: <message>`, which node prints too.
         assert!(
-            !stderr.contains("panicked at"),
+            !stderr.contains("thread '") && !stderr.contains(".rs:"),
             "{file}: Rust's panic banner must not reach stderr: {stderr:?}"
         );
         assert!(
@@ -10208,5 +10177,277 @@ fn a_trait_objects_print_and_its_tables_are_identical_on_both_backends() {
         compare(&staged, "native_probe_dyn_print_and_tables.vl"),
         Verdict::Identical,
         "an object prints its value and dispatches through its own application's table"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// debugging.md S0 (E258): `[track_caller]` and panic locations.
+// ---------------------------------------------------------------------------
+
+/// What one backend did with one run: stdout, stderr, exit code.
+struct Run {
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+}
+
+fn run_on(staged: &Path, backend: Option<&str>, program: &str) -> Run {
+    let mut command = vilan(staged);
+    command.arg("run");
+    if let Some(backend) = backend {
+        command.args(["--backend", backend]);
+    }
+    let output = command.arg(program).output().expect("run vilan");
+    Run {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code(),
+    }
+}
+
+/// `file:line:column` of `column_needle` on the first line of `source`
+/// holding `line_needle` — the site a location names, computed from the
+/// fixture rather than written down, so an edit to it moves both sides.
+fn site_of(file: &str, source: &str, line_needle: &str, column_needle: &str) -> String {
+    let (index, line) = source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(line_needle))
+        .unwrap_or_else(|| panic!("the fixture has no line holding {line_needle:?}"));
+    let byte = line
+        .find(column_needle)
+        .unwrap_or_else(|| panic!("{column_needle:?} is not on the line {line:?}"));
+    let column = line[..byte].chars().count() + 1;
+    format!("{file}:{}:{column}", index + 1)
+}
+
+const PANIC_LOCATIONS: &str = include_str!("native/panic_locations.vl");
+const PANIC_LOCATIONS_FILE: &str = "native_probe_panic_locations.vl";
+
+/// E258 / debugging.md S0: each std panic path — `panic`, `assert`, a read, a
+/// write and a `&mut` view out of bounds, `Option`'s `unwrap`/`expect`,
+/// `Result`'s four, `List::remove`/`insert` — reports `panicked at
+/// <file>:<line>:<column>: <message>` naming the vilan site that reached it,
+/// identically on both backends (the native leg prints that line alone; node
+/// prints it as the uncaught `Error`'s header). A chain of `[track_caller]`
+/// functions names the outermost caller, a subscript in a tracking body names
+/// its caller, and a closure inside one names its own site.
+#[test]
+fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
+    let staged = stage();
+    let site =
+        |line: &str, column: &str| site_of(PANIC_LOCATIONS_FILE, PANIC_LOCATIONS, line, column);
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("panic", site("panic(\"boom\")", "panic"), "boom"),
+        ("assert", site("\"asserted\"", "assert"), "asserted"),
+        (
+            "read",
+            site("print(values[5])", "values[5]"),
+            "index out of bounds: the length is 2 but the index is 5",
+        ),
+        (
+            "write",
+            site("values[7] = 3", "values[7]"),
+            "index out of bounds: the length is 2 but the index is 7",
+        ),
+        (
+            "view",
+            site("&mut values[9]", "values[9]"),
+            "index out of bounds: the length is 2 but the index is 9",
+        ),
+        (
+            "unwrap",
+            site("print(none.unwrap())", "unwrap"),
+            "expected Some but got None",
+        ),
+        ("expect", site("none.expect(", "expect"), "expected a value"),
+        (
+            "result_unwrap",
+            site("failed.unwrap()", "unwrap"),
+            "called `unwrap` on an `Err` value",
+        ),
+        (
+            "unwrap_err",
+            site("fine.unwrap_err()", "unwrap_err"),
+            "called `unwrap_err` on an `Ok` value",
+        ),
+        (
+            "expect_err",
+            site("fine.expect_err(", "expect_err"),
+            "expected an error",
+        ),
+        (
+            "remove",
+            site("values.remove(4)", "remove"),
+            "index out of bounds: the length is 2 but the index is 4",
+        ),
+        (
+            "insert",
+            site("values.insert(6, 1)", "insert"),
+            "index out of bounds: the length is 2 but the index is 6",
+        ),
+        (
+            "relay",
+            site("relay(0)", "relay"),
+            "checked wants a positive value",
+        ),
+        (
+            "pick",
+            site("pick(values, 8)", "pick"),
+            "index out of bounds: the length is 2 but the index is 8",
+        ),
+        (
+            "closure",
+            site("panic(\"from the closure\")", "panic"),
+            "from the closure",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (path, location, message) in cases {
+        let expected = format!("panicked at {location}: {message}");
+        // One program per path, all under the same FILE name so the sites
+        // read the same; each is written over the last.
+        std::fs::write(
+            staged.join(PANIC_LOCATIONS_FILE),
+            PANIC_LOCATIONS.replace("\"PATH\"", &format!("{path:?}")),
+        )
+        .expect("write the probe program");
+        let native = run_on(&staged, Some("rust"), PANIC_LOCATIONS_FILE);
+        if native.code != Some(1) || native.stderr != format!("{expected}\n") {
+            wrong.push(format!(
+                "{path}: native exited {:?} with stderr {:?}, expected exit 1 and {expected:?}",
+                native.code, native.stderr
+            ));
+        }
+        let javascript = run_on(&staged, None, PANIC_LOCATIONS_FILE);
+        if javascript.code != Some(1) || !javascript.stderr.lines().any(|line| line == expected) {
+            wrong.push(format!(
+                "{path}: node exited {:?} with stderr {:?}, expected exit 1 and the line {expected:?}",
+                javascript.code, javascript.stderr
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// debugging.md S0: `std::debug::caller()` outside a tracking function is its
+/// own site, inside one the caller's; a `Location` reads back its file, line
+/// and column; and a CAUGHT panic still answers its message alone (the JS
+/// `error.message`, the native payload's message) — identical on both backends.
+#[test]
+fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join(PANIC_LOCATIONS_FILE),
+        PANIC_LOCATIONS.replace("\"PATH\"", "\"none\""),
+    )
+    .expect("write the probe program");
+    let javascript = run_on(&staged, None, PANIC_LOCATIONS_FILE);
+    let native = run_on(&staged, Some("rust"), PANIC_LOCATIONS_FILE);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(
+        javascript.stdout, native.stdout,
+        "both backends print the same"
+    );
+    let site =
+        |line: &str, column: &str| site_of(PANIC_LOCATIONS_FILE, PANIC_LOCATIONS, line, column);
+    let own = site("let own = caller()", "caller");
+    let (line, column) = {
+        let mut parts = own.rsplit(':');
+        let column = parts.next().unwrap().to_string();
+        let line = parts.next().unwrap().to_string();
+        (line, column)
+    };
+    let expected = format!(
+        "{}\n{PANIC_LOCATIONS_FILE}\n{line}\n{column}\n{own}\n[ 0, 'expected Some but got None' ]\n",
+        site("print(here())", "here"),
+    );
+    assert_eq!(native.stdout, expected);
+}
+
+// ---------------------------------------------------------------------------
+// debugging.md S1: `dbg(..)`.
+// ---------------------------------------------------------------------------
+
+const DBG_PRINTER: &str = include_str!("native/dbg_printer.vl");
+const DBG_PRINTER_FILE: &str = "native_probe_dbg_printer.vl";
+
+/// debugging.md S1: every `dbg` line is the same bytes on both backends, and
+/// those bytes are the committed ones (`native/dbg_printer.stderr`): each
+/// shape in vilan's literal syntax, the call forms (several arguments, none,
+/// one wrapping an expression, a generic `T` per instantiation, a statement
+/// reading a resource in place and an expression moving it), the 80-column
+/// break with trailing commas, the 100-entry cut and a closure by its type —
+/// on stderr, with the program's own output on stdout untouched.
+#[test]
+fn s1_dbg_writes_the_same_bytes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join(DBG_PRINTER_FILE), DBG_PRINTER).expect("write the probe program");
+    let expected_stderr = include_str!("native/dbg_printer.stderr");
+    let expected_stdout = include_str!("native/dbg_printer.stdout");
+    let javascript = run_on(&staged, None, DBG_PRINTER_FILE);
+    let native = run_on(&staged, Some("rust"), DBG_PRINTER_FILE);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(javascript.stderr, expected_stderr, "the JS leg's dbg lines");
+    assert_eq!(native.stderr, expected_stderr, "the native leg's dbg lines");
+    assert_eq!(javascript.stdout, expected_stdout);
+    assert_eq!(native.stdout, expected_stdout);
+}
+
+/// debugging.md S1b: std's handles print as themselves, the same bytes on
+/// both backends (`native/dbg_handles.stderr`): a `HashMap` and a `HashSet`
+/// by their members in insertion order, a `Shared` and a `SignalCell` by their
+/// value (the cell read without tracking), a pipe by its type alone (sampling
+/// it would run it), and a `Shared` cycle cut at `<cycle>`.
+#[test]
+fn s1b_std_handles_print_as_themselves_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_dbg_handles.vl";
+    std::fs::write(staged.join(file), include_str!("native/dbg_handles.vl"))
+        .expect("write the probe program");
+    let expected = include_str!("native/dbg_handles.stderr");
+    let javascript = run_on(&staged, None, file);
+    let native = run_on(&staged, Some("rust"), file);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(javascript.stderr, expected, "the JS leg's dbg lines");
+    assert_eq!(native.stderr, expected, "the native leg's dbg lines");
+}
+
+/// debugging.md S4 (E260): `Debug` over a list, an option and a result, a
+/// derived struct holding them, and a float's `.0` render the same on both
+/// backends.
+#[test]
+fn s4_debug_over_containers_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_debug_containers.vl"),
+        concat!(
+            "import std::debug::Debug;\n",
+            "\n",
+            "[derive(Debug)]\n",
+            "struct Bag { items: List<i32>, maybe: Option<f64> }\n",
+            "\n",
+            "fun show<T: Debug>(value: T): str {\n",
+            "\tvalue.debug()\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(Bag { items = [1, 2], maybe = Some(3.0) }.debug());\n",
+            "\tprint(show([Some([2.5])]));\n",
+            "\tlet failed: Result<i32, str> = Err(\"no\");\n",
+            "\tprint(show(failed));\n",
+            "\tprint(3.0.debug());\n",
+            "\tprint((0.0 * -1.0).debug());\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_debug_containers.vl"),
+        Verdict::Identical,
+        "Debug over containers must render the same on both backends"
     );
 }

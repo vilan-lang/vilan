@@ -101,8 +101,9 @@ pub enum Failure {
     /// A cancel signal fired under a suspended operation — the abort a
     /// nursery's `cancel` (or its first error) delivers.
     Cancelled,
-    /// A vilan `panic`, or any other Rust panic raised inside the task.
-    Panic(Str),
+    /// A vilan `panic`, or any other Rust panic raised inside the task: the
+    /// message, and the vilan site a `panic` names (debugging.md S0).
+    Panic(Str, Option<crate::Location>),
 }
 
 /// The payload a cancellation panics with. A distinct type rather than a magic
@@ -115,7 +116,8 @@ struct Cancellation;
 fn raise(failure: Failure) -> ! {
     match failure {
         Failure::Cancelled => std::panic::panic_any(Cancellation),
-        Failure::Panic(message) => crate::panic_with(&message),
+        Failure::Panic(message, Some(location)) => crate::panic_at(&message, location),
+        Failure::Panic(message, None) => crate::panic_with(&message),
     }
 }
 
@@ -123,7 +125,7 @@ fn classify(payload: &Box<dyn std::any::Any + Send>) -> Failure {
     if payload.downcast_ref::<Cancellation>().is_some() {
         Failure::Cancelled
     } else {
-        Failure::Panic(describe_panic(payload))
+        Failure::Panic(describe_panic(payload), crate::panic_location(payload))
     }
 }
 
@@ -185,11 +187,18 @@ impl TaskNode {
         if self.reported.replace(true) {
             return;
         }
-        if let Some(Failure::Panic(message)) = self.failure.borrow().as_ref() {
-            eprintln!(
+        // `String(error)` on the JS leg, which for a vilan panic is its
+        // `panicked at <location>: <message>` line.
+        match self.failure.borrow().as_ref() {
+            Some(Failure::Panic(message, Some(location))) => eprintln!(
+                "unhandled task error (spawned in {}): panicked at {}: {message}",
+                self.origin, location.0
+            ),
+            Some(Failure::Panic(message, None)) => eprintln!(
                 "unhandled task error (spawned in {}): {message}",
                 self.origin
-            );
+            ),
+            _ => {}
         }
     }
 }
@@ -557,8 +566,12 @@ pub async fn nursery_run<T>(nursery: Nursery, body: Boxed<T>) -> T {
     let winner = nursery.failed().expect("the latch was just read as set");
     let failure = winner.failure.borrow().clone();
     match failure {
-        Some(Failure::Panic(message)) => {
-            crate::panic_with(&format!("{message} (in task spawned in {})", winner.origin))
+        Some(Failure::Panic(message, location)) => {
+            let message = format!("{message} (in task spawned in {})", winner.origin);
+            match location {
+                Some(location) => crate::panic_at(&message, location),
+                None => crate::panic_with(&message),
+            }
         }
         // `__fail` is only ever called for a non-cancellation error, so a
         // cancelled winner cannot arise; raising the cancellation is the honest

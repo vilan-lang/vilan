@@ -83,7 +83,8 @@ export      = { lead-attribute }   (* the item's own prefix, in THE order below 
               statement   (* §4.8 *)
             | "export" "*" ";" ;          (* the whole-module marker *)
 lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
-               | resource-attr | extern-attr | "[" "must_use" "]" | "[" "rpc" "]"
+               | resource-attr | extern-attr | "[" "must_use" "]"
+               | "[" "track_caller" "]" | "[" "rpc" "]"
                | "[" "trait_only" "]" | derive-attr | service-attr
                | client-service-attr | macro-attr ;
 ```
@@ -122,7 +123,8 @@ each on its own line:
    macro attribute (among themselves, as written);
 2. the labels — `[deprecated(..)]`, then `[internal(..)]`, then `[hint(..)]`;
 3. the binding — `[extern(..)]`;
-4. the checks — `[must_use]`, then `[rpc]`, then `[trait_only]`;
+4. the checks — `[must_use]`, then `[track_caller]`, then `[rpc]`, then
+   `[trait_only]`;
 5. the fence — `[platform(..)]`;
 6. the class — `[resource]`.
 
@@ -199,8 +201,8 @@ together and leave a trailing separator where it was.
 ```text
 function = [ "[" "deprecated" "(" STRING ")" "]" ]
            [ "[" "internal" "(" STRING ")" "]" ]
-           [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "rpc" "]" ]
-           [ "[" "trait_only" "]" ]
+           [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "track_caller" "]" ]
+           [ "[" "rpc" "]" ] [ "[" "trait_only" "]" ]
            [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
            [ "async" ] [ "external" ]
            "fun" MEMBER [ generic-params ]   (* IDENT unless an impl/trait member *)
@@ -517,8 +519,8 @@ macro-block      = "macro" block ;
 A macro attribute's arguments are captured as **source spans**: the
 macro receives their text, not their values (§10). The built-in
 attribute names (`derive`, `service`, `client_service`, `extern`,
-`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
-`deprecated`, `internal`, `resource`, `hint`, `reactive`) are not
+`must_use`, `track_caller`, `rpc`, `trait_only`, `doc`, `expose`,
+`platform`, `deprecated`, `internal`, `resource`, `hint`, `reactive`) are not
 available as user macro-attribute names.
 
 `[reactive(..)]` is a field's store knobs, read by `[derive(Storable)]`

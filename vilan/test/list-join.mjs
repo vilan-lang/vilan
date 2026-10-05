@@ -7,7 +7,7 @@ function to_string2(self) {
 function to_string3(self) {
 	return "<" + self[0] + ">";
 }
-function $a(self, separator) {
+function join(self, separator) {
 	let result = "";
 	let first = true;
 	for (const item of self) {
@@ -20,7 +20,7 @@ function $a(self, separator) {
 	}
 	return result;
 }
-function $b(self, separator) {
+function join2(self, separator) {
 	let result = "";
 	let first = true;
 	for (const item of self) {
@@ -33,7 +33,7 @@ function $b(self, separator) {
 	}
 	return result;
 }
-function $c(self, separator) {
+function join3(self, separator) {
 	let result = "";
 	let first = true;
 	for (const item of self) {
@@ -46,12 +46,12 @@ function $c(self, separator) {
 	}
 	return result;
 }
-console.log($a([ "alpha", "beta", "gamma" ], ", "));
-console.log($b([ 1, 2, 3 ], "-"));
-console.log($a([ "solo" ], ", "));
+console.log(join([ "alpha", "beta", "gamma" ], ", "));
+console.log(join2([ 1, 2, 3 ], "-"));
+console.log(join([ "solo" ], ", "));
 let empty = [  ];
-console.log($a(empty, ", ") === "");
+console.log(join(empty, ", ") === "");
 let tags = [  ];
 tags.push([ "red" ]);
 tags.push([ "blue" ]);
-console.log($c(tags, " "));
+console.log(join3(tags, " "));

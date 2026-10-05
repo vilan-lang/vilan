@@ -3,6 +3,9 @@
 // via the host `JSON.stringify` (numbers/bools raw, strings quoted and escaped);
 // nested derived structs recurse through their own `debug`.
 
+import pkg::option::Option::{ self, None, Some };
+import pkg::result::Result::{ self, Err, Ok };
+
 export *;
 
 trait Debug {
@@ -25,13 +28,61 @@ impl u32 with Debug {
 }
 
 impl f64 with Debug {
-	[extern("JSON.stringify")]
-	external fun debug(self): str;
+	/// The language's number text, keeping the `.0` an integral value drops (`3.0`,
+	/// not `3`): `dbg`'s rule (debugging.md S4, E260).
+	fun debug(self): str {
+		let text = "" + self;
+		if text.contains(".") || text.contains("e") || text.contains("N") || text.contains("I") {
+			text
+		} else {
+			text + ".0"
+		}
+	}
 }
 
 impl bool with Debug {
 	[extern("JSON.stringify")]
 	external fun debug(self): str;
+}
+
+// Every container the `dbg` printer prints is `Debug` when its elements are
+// (debugging.md S4, E260), so a struct with a `List` or `Option` field derives it
+// and `T: Debug` takes a list, an option or a result. The rendering is the
+// printer's, on one line. A TUPLE is not covered yet: a blanket over the tuple
+// family (`impl type T: (2..: Debug)`) is admitted for a non-tuple at the bound
+// check, which made every type `Debug` (the lane's find B?4).
+
+impl List<type T: Debug> with Debug {
+	fun debug(self): str {
+		mut out = "[";
+		mut first = true;
+		for item in self {
+			if !first {
+				out = out + ", ";
+			}
+			first = false;
+			out = out + item.debug();
+		}
+		out + "]"
+	}
+}
+
+impl Option<type T: Debug> with Debug {
+	fun debug(self): str {
+		match self {
+			Some(let value) => "Some(" + value.debug() + ")",
+			None => "None",
+		}
+	}
+}
+
+impl Result<type T: Debug, type E: Debug> with Debug {
+	fun debug(self): str {
+		match self {
+			Ok(let value) => "Ok(" + value.debug() + ")",
+			Err(let error) => "Err(" + error.debug() + ")",
+		}
+	}
 }
 
 // The `Debug` derive: a prelude macro (this module is always loaded).
@@ -104,6 +155,66 @@ macro fun Debug(item: Item): Source {
 	source("")
 }
 
+// --- Locations (debugging.md S0) ---
+
+/// Where a call was made: the file relative to its package root (std's own as
+/// `std/src/..`), a 1-based line and a 1-based column — `src/main.vl:12:5`. A
+/// `[track_caller]` function receives its caller's as a hidden parameter, and
+/// `caller()` reads it.
+external struct Location;
+
+impl Location {
+	/// The location as written: `file:line:column`.
+	[extern("String")]
+	external fun text(self): str;
+
+	/// The file, relative to its package root.
+	fun file(self): str {
+		let parts = self.text().split(":");
+		mut file = "";
+		mut index: usize = 0;
+		for index + 2 < parts.len() {
+			if index > 0 {
+				file = file + ":";
+			}
+			file = file + parts[index];
+			index = index + 1;
+		}
+		file
+	}
+
+	/// The 1-based line.
+	fun line(self): i32 {
+		let parts = self.text().split(":");
+		parts[parts.len() - 2].parse_i32().unwrap_or(0)
+	}
+
+	/// The 1-based column, in characters.
+	fun column(self): i32 {
+		let parts = self.text().split(":");
+		parts[parts.len() - 1].parse_i32().unwrap_or(0)
+	}
+}
+
+/// Inside a `[track_caller]` function, the location it was called from;
+/// anywhere else, the location of this call itself.
+[track_caller]
+external fun caller(): Location;
+
+// --- `dbg` (debugging.md S1) ---
+
+/// `dbg(a, b, ..)` prints each argument to stderr (`console.log` in the
+/// browser) as `[src/main.vl:12:5] expr = value`, in vilan's own literal syntax
+/// (`Point { x = 1, y = 2 }`, `Some(5)`, `[1, 2]`, `3.0`), the same bytes on
+/// both backends. It answers its argument — a tuple of them for several, `()`
+/// for none — so it can wrap an expression: `let total = dbg(price * qty) +
+/// tax;`. Written as a statement (`dbg(guard);`) it reads its arguments in
+/// place and moves nothing. It takes ANY number of arguments of any types: the
+/// compiler types and lowers every call, and this declaration exists to be
+/// named, imported and documented. A release build refuses it unless
+/// `vilan.toml` sets `[build] dbg = "strip"` or `"keep"`.
+external fun dbg(): void;
+
 // --- Json / Wire (shared JSON impls via in-world helpers) ---
 
 // --- The sized numeric family (proposal/numeric-types.md §5) ---
@@ -144,6 +255,14 @@ impl usize with Debug {
 }
 
 impl f32 with Debug {
-	[extern("JSON.stringify")]
-	external fun debug(self): str;
+	/// The language's number text, keeping the `.0` an integral value drops (`3.0`,
+	/// not `3`): `dbg`'s rule (debugging.md S4, E260).
+	fun debug(self): str {
+		let text = "" + self;
+		if text.contains(".") || text.contains("e") || text.contains("N") || text.contains("I") {
+			text
+		} else {
+			text + ".0"
+		}
+	}
 }

@@ -8,25 +8,25 @@ function checked_sub(self, other) {
 	return $a;
 }
 function saturating_sub(self, other) {
-	let $d = null;
+	let $c = null;
 	if (self >= other) {
-		$d = self - other;
+		$c = self - other;
 	} else {
-		$d = 0;
+		$c = 0;
 	}
-	return $d;
+	return $c;
 }
 function step_back(at) {
 	return at - 1;
 }
-function $b(self) {
-	const $c = self;
-	return $c[0] === 1;
+function is_none(self) {
+	const $b = self;
+	return $b[0] === 1;
 }
 const first = 0;
 const under = step_back(first);
 console.log("" + under);
 console.log(under < first);
-console.log($b(checked_sub(first, 1)));
+console.log(is_none(checked_sub(first, 1)));
 const floor = saturating_sub(first, 1);
 console.log("" + floor);

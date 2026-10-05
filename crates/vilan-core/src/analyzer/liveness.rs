@@ -867,6 +867,7 @@ impl Liveness<'_, '_> {
             | Expr::Number(_, _, _)
             | Expr::String(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Void
             | Expr::Error

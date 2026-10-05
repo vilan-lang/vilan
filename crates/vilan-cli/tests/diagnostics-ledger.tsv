@@ -683,3 +683,7 @@ row	flagship	key
 659	-	cannot mutate '{name}': a capture inside a tuple pattern is a COPY of its element even under a view subject (tuples store flat), so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
 660	-	`{member_name}` is an `[internal]` field of std's `{struct_name}`, and an internal std field is not a member outside std: {reason}
 661	-	`{member_name}` is a field of `{subject_name}`, and this `{struct_name}<{subject_name}>` has no projection named `{member_name}` to read it through: `{subject_name}` does not `[derive(Storable)]`, or the field's projection is renamed
+662	-	`[track_caller]` is not supported on a trait method: a call through a trait is dispatched, so no call site knows to pass its location
+663	-	`{name}` is `[track_caller]`: it takes its caller's location as a hidden argument, and a call through a value cannot pass one
+664	-	`dbg` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
+665	-	`dbg` takes no type arguments: it prints each argument at the type it already has

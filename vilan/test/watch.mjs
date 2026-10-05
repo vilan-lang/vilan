@@ -143,8 +143,8 @@ async function watch(path) {
 async function watch_all(path) {
 	return await (__fs_watch(path, true, 300));
 }
-async function next(self, $b) {
-	const raw = await (self.next_change(ambient_signal($b)));
+async function next(self, $a) {
+	const raw = await (self.next_change(ambient_signal($a)));
 	return [ raw.path, raw.kind ];
 }
 function drop(self) {
@@ -164,48 +164,48 @@ function basename(path) {
 function range(low, high) {
 	return __random_int(low, high);
 }
-function ambient_signal($c) {
-	const $d = $c;
-	let $e = null;
-	if ($d[0] === 0) {
-		const n = $d[1];
-		$e = [ 0, n.signal_of() ];
+function ambient_signal($b) {
+	const $c = $b;
+	let $d = null;
+	if ($c[0] === 0) {
+		const n = $c[1];
+		$d = [ 0, n.signal_of() ];
 	} else {
-		$e = [ 1 ];
+		$d = [ 1 ];
 	}
-	return $e;
+	return $d;
 }
 function describe(change) {
-	const $f = change[1];
-	let $g = null;
-	if ($f[0] === 0) {
-		$g = "created " + basename(change[0]);
-	} else if ($f[0] === 1) {
-		$g = "modified " + basename(change[0]);
+	const $e = change[1];
+	let $f = null;
+	if ($e[0] === 0) {
+		$f = "created " + basename(change[0]);
+	} else if ($e[0] === 1) {
+		$f = "modified " + basename(change[0]);
 	} else {
-		$g = "removed " + basename(change[0]);
+		$f = "removed " + basename(change[0]);
 	}
-	return $g;
+	return $f;
 }
-function $a(low, high) {
+function range2(low, high) {
 	return range(low, high);
 }
-function $h($i) {
-	drop($i);
+function $g($h) {
+	drop($h);
 }
 (async () => {
-	const root = "watch-corpus-" + $a(100000, 999999);
+	const root = "watch-corpus-" + range2(100000, 999999);
 	await (create_dir_all(root));
 	const probe = "" + root + "/probe.txt";
 	let flat = await (watch(root));
 	try {
 		await (writeFile(probe, "one"));
 		console.log(describe(await (next(flat, [ 1 ]))));
-		$h(flat);
+		$g(flat);
 		flat = null;
 	} finally {
 		if (flat !== null) {
-			$h(flat);
+			$g(flat);
 		}
 	}
 	const deep = await (watch_all(root));
@@ -213,10 +213,10 @@ function $h($i) {
 		await (writeFile(probe, "a second write, of a different length"));
 		console.log(describe(await (next(deep, [ 1 ]))));
 	} finally {
-		$h(deep);
+		$g(deep);
 	}
 	await (remove_dir_all(root));
-})().catch(($j) => {
-	console.error(String($j));
+})().catch(($i) => {
+	console.error(String($i));
 	process.exit(1);
 });

@@ -644,6 +644,12 @@ pub enum Expr<'src> {
     Dereference(Id),
     Variable(Id),
     Void,
+    /// A call site's `file:line:column`, as a `std::debug::Location` value
+    /// (debugging.md S0): the argument `track_caller::thread_locations`
+    /// appends to a static call of a `[track_caller]` function. The id is the
+    /// ANCHOR whose span is the site — the call, or the index expression —
+    /// and [`Program::site_location`] renders it. Never written in source.
+    CallerLocation(Id),
     // A `macro fun`'s NAME, bound in its module's scope so imports/`use`
     // resolve it and go-to-definition lands on the definition. Not a value:
     // referencing it outside `[name]` / `macro name(..)` is a clean error.
@@ -1146,6 +1152,10 @@ pub struct Function<'src> {
     pub returns_view: bool,
     /// Declared `[must_use]`: dropping a call's result is a warning.
     pub must_use: bool,
+    /// Declared `[track_caller]` (debugging.md S0): the function takes a
+    /// hidden trailing `std::debug::Location` parameter, minted and threaded
+    /// by [`crate::track_caller`] after analysis.
+    pub track_caller: bool,
     /// Declared `[deprecated("use …")]`: every resolved use in code outside
     /// std warns, non-fatally, carrying this replacement steer verbatim
     /// (proposal/deprecation.md §1–§2; `check_deprecated`).
@@ -1215,6 +1225,10 @@ pub struct ExternalFunction<'src> {
     /// often externals, and the editor must not answer differently depending on
     /// which kind the declaration is.
     pub internal: Option<&'src str>,
+    /// Declared `[track_caller]` — `Function`'s field of the same name. On an
+    /// external it marks a COMPILER lowering that reads its call site:
+    /// `std::io::panic` and `std::debug::caller`.
+    pub track_caller: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5505,6 +5519,22 @@ pub struct Analyzer<'src> {
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `Never` (which reconciles with any expected type) and lowers to
     // a `throw`.
+    // `std::debug::caller` (debugging.md S0), captured beside `panic`.
+    caller_fn_id: Option<Id>,
+    // `std::debug::dbg` (debugging.md S1): the variadic intrinsic the
+    // analyzer types by its arguments (`resolve_dbg_call`).
+    dbg_fn_id: Option<Id>,
+    // Every resolved `dbg(..)` call, in resolution order, and the subject of
+    // each → (the call, its argument count) — `callee_conventions` answers a
+    // dbg call's conventions from it.
+    dbg_calls: IndexMap<Id, (Id, usize)>,
+    // The `dbg(..)` calls written as STATEMENTS (their value discarded),
+    // whose arguments are read in place (Q2) — `classify_dbg_calls`.
+    dbg_statement_calls: HashSet<Id>,
+    // Each `dbg(..)` argument's settled type, for the emitters' printers.
+    dbg_argument_types: HashMap<Id, TypeId>,
+    // N136: the `print` arguments typed as a number.
+    number_print_arguments: HashSet<Id>,
     panic_fn_id: Option<Id>,
     // Every call's `(call id, subject id)` pair, banked at WALK time (B204).
     // `function_calls` holds the same pair, but only once the call's own
@@ -7307,6 +7337,12 @@ impl<'src> Analyzer<'src> {
             anonymous_binder_parameters: HashMap::default(),
             anonymous_binder_scopes: HashMap::default(),
             panic_fn_id: None,
+            caller_fn_id: None,
+            dbg_fn_id: None,
+            dbg_calls: IndexMap::default(),
+            dbg_statement_calls: HashSet::default(),
+            dbg_argument_types: HashMap::default(),
+            number_print_arguments: HashSet::default(),
             call_subjects: Vec::new(),
             call_subject_ids: HashSet::default(),
             divergence_leaves: DivergenceLeaves::default(),
@@ -14150,7 +14186,8 @@ impl<'src> Analyzer<'src> {
             | Expr::Macro
             | Expr::Local(_)
             | Expr::Parameter(_)
-            | Expr::ExternalFunction(_) => {}
+            | Expr::ExternalFunction(_)
+            | Expr::CallerLocation(_) => {}
         }
     }
 
@@ -14450,6 +14487,14 @@ impl<'src> Analyzer<'src> {
         let mut candidates: Vec<Id> = candidates.into_iter().collect();
         candidates.sort_by_key(|id| id.0);
         for expr_id in candidates {
+            // debugging.md S1 (Q2): a `dbg(..)` STATEMENT answers nothing —
+            // it read its argument in place, and the resource is still its
+            // binding's to tear down.
+            if let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&expr_id)
+                && self.dbg_statement_calls.contains(call_id)
+            {
+                continue;
+            }
             let inferred =
                 self.infer_type(expr_id, &Type::Unknown, &SubstitutionContext::default());
             if matches!(inferred, Type::Unresolved | Type::Unknown) {
@@ -14946,6 +14991,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Number(_, _, _)
             | Expr::String(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Void
             | Expr::Error
@@ -16004,6 +16050,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Number(_, _, _)
             | Expr::String(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Void
             | Expr::Error
@@ -16194,7 +16241,191 @@ impl<'src> Analyzer<'src> {
         self.functions.contains_key(callee_id) || self.external_functions.contains_key(callee_id)
     }
 
+    /// N136: whether `type_` is a number of the language's own — an integer of
+    /// any width, `f32` or `f64` (`BigInt` prints its `n` and is not one).
+    fn is_a_number_type(&self, type_: &Type) -> bool {
+        let Type::Struct(struct_id, _) = type_ else {
+            return false;
+        };
+        self.structs.get(struct_id).is_some_and(|declaration| {
+            matches!(
+                declaration.name,
+                "i8" | "u8"
+                    | "i16"
+                    | "u16"
+                    | "i32"
+                    | "u32"
+                    | "i53"
+                    | "u53"
+                    | "usize"
+                    | "f32"
+                    | "f64"
+            )
+        })
+    }
+
+    /// debugging.md S1: a `dbg(..)` call. The intrinsic is the one call that
+    /// takes any number of arguments of any types (§3.1), so it skips the
+    /// arity check and types each argument on its own; the call's type is
+    /// [`Self::dbg_call_type`]'s. Written generic arguments mean nothing here.
+    #[inline(never)]
+    fn resolve_dbg_call(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        generic_argument_ids: &[TypeId],
+        argument_ids: &[Id],
+        arguments_span: Span,
+    ) -> Resolution {
+        for argument_id in argument_ids {
+            let argument_type = self.infer_type(*argument_id, &Type::Unknown, &HashMap::default());
+            if matches!(argument_type, Type::Unresolved)
+                || (matches!(argument_type, Type::Unknown)
+                    && self.is_unknown_closure_parameter(*argument_id))
+            {
+                return Resolution::Deferred;
+            }
+        }
+        if !generic_argument_ids.is_empty() {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: self.clamp_span_to_first_line(arguments_span, call_id),
+                msg: "`dbg` takes no type arguments: it prints each argument at the type it \
+                      already has"
+                    .to_string(),
+            });
+        }
+        self.wire_call(call_id, subject_id, &[], argument_ids, arguments_span);
+        self.dbg_calls
+            .insert(subject_id, (call_id, argument_ids.len()));
+        Resolution::Resolved
+    }
+
+    /// The type of a `dbg(..)` call (Q2): its one argument's, a tuple of its
+    /// arguments' for several, `()` for none. Read off the arguments each
+    /// time, so it follows them as they settle.
+    fn dbg_call_type(
+        &mut self,
+        argument_ids: &[Id],
+        substitution_context: &SubstitutionContext,
+        exprs_seen: &mut HashSet<Id>,
+    ) -> Type {
+        let mut types = Vec::with_capacity(argument_ids.len());
+        for argument_id in argument_ids {
+            let argument_type = self.infer_type_inner(
+                *argument_id,
+                &Type::Unknown,
+                substitution_context,
+                exprs_seen,
+            );
+            if matches!(argument_type, Type::Unresolved) {
+                return Type::Unresolved;
+            }
+            types.push(argument_type);
+        }
+        match types.len() {
+            0 => Type::Void,
+            1 => types.pop().unwrap_or(Type::Void),
+            _ => Type::Tuple(
+                types
+                    .into_iter()
+                    .map(|argument_type| argument_type.get_type_id(self))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// debugging.md S1 (Q2): the `dbg(..)` calls standing as STATEMENTS —
+    /// a function body's or a block's, the value discarded. Only a program
+    /// that called `dbg` pays for the sweep.
+    fn classify_dbg_calls(&mut self) {
+        if self.dbg_calls.is_empty() {
+            return;
+        }
+        let calls: HashSet<Id> = self
+            .dbg_calls
+            .values()
+            .map(|(call_id, _)| *call_id)
+            .collect();
+        let mut statement_calls = HashSet::default();
+        let consider = |statement_id: &Id, statement_calls: &mut HashSet<Id>| {
+            if let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(statement_id)
+                && calls.contains(call_id)
+            {
+                statement_calls.insert(*call_id);
+            }
+        };
+        for function in self.functions.values() {
+            for statement_id in &function.body.0 {
+                consider(statement_id, &mut statement_calls);
+            }
+        }
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                Expr::Block((statements, _))
+                | Expr::For(_, (statements, _))
+                | Expr::ForEach(_, _, (statements, _)) => {
+                    for statement_id in statements {
+                        consider(statement_id, &mut statement_calls);
+                    }
+                }
+                Expr::If(branch) => {
+                    let mut current = Some(branch);
+                    while let Some(branch) = current {
+                        let (statements, next) = match branch {
+                            ExprIfBranch::If(_, (statements, _), next) => {
+                                (statements, next.as_deref())
+                            }
+                            ExprIfBranch::Else((statements, _)) => (statements, None),
+                        };
+                        for statement_id in statements {
+                            consider(statement_id, &mut statement_calls);
+                        }
+                        current = next;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.dbg_statement_calls = statement_calls;
+        let call_ids: Vec<Id> = self
+            .dbg_calls
+            .values()
+            .map(|(call_id, _)| *call_id)
+            .collect();
+        for call_id in call_ids {
+            let Some(argument_ids) = self
+                .function_calls
+                .get(&call_id)
+                .map(|call| call.argument_ids.clone())
+            else {
+                continue;
+            };
+            for argument_id in argument_ids {
+                let argument_type =
+                    self.infer_type(argument_id, &Type::Unknown, &HashMap::default());
+                if !matches!(argument_type, Type::Unresolved | Type::Unknown) {
+                    let type_id = argument_type.get_type_id(self);
+                    self.dbg_argument_types.insert(argument_id, type_id);
+                }
+            }
+        }
+    }
+
     fn callee_conventions(&self, subject_id: Id) -> Option<Vec<Convention>> {
+        // debugging.md S1 (Q2): a `dbg(..)` statement READS its arguments in
+        // place, so `dbg(guard);` leaves the resource where it was; in
+        // expression position each argument moves through, as into any
+        // by-value parameter.
+        if let Some(&(call_id, arity)) = self.dbg_calls.get(&subject_id) {
+            let convention = if self.dbg_statement_calls.contains(&call_id) {
+                Convention::Ref
+            } else {
+                Convention::Own
+            };
+            return Some(vec![convention; arity]);
+        }
         let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
             return None;
         };
@@ -19098,6 +19329,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Number(_, _, _)
             | Expr::String(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Void
             | Expr::Error
@@ -31447,6 +31679,19 @@ impl<'src> Analyzer<'src> {
                         Some(Expr::Local(callee_id)) => *callee_id,
                         _ => continue,
                     };
+                    // debugging.md S1 (Q2): a `dbg(..)` in expression position
+                    // hands its arguments back, so each is a copy, exactly as
+                    // into an `own` parameter — `mut copy = dbg(xs);
+                    // copy.push(9)` must leave `xs` alone. A statement reads
+                    // in place and copies nothing.
+                    if self.dbg_calls.contains_key(&function_call.subject_id) {
+                        if !self.dbg_statement_calls.contains(call_id) {
+                            for argument_id in &function_call.argument_ids {
+                                consider(self, *argument_id, None);
+                            }
+                        }
+                        continue;
+                    }
                     // A variant construction is spelled as a call but builds an
                     // aggregate: `Some(xs)` stores `xs` as the payload, so its
                     // arguments are construction slots. Variants carry no
@@ -38038,6 +38283,22 @@ impl<'src> Analyzer<'src> {
         if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
             self.record_type_context_clause(return_type_id, names, body_scope_id, None);
         }
+        // debugging.md S0: `[track_caller]`'s location travels as a hidden
+        // trailing parameter, threaded at every STATIC call. A trait member is
+        // reached by dispatch — a `dyn` table, a generic bound — where no one
+        // call site knows it is calling a tracking function, so the attribute
+        // is refused there rather than silently reporting nothing.
+        if function.track_caller && (self.walking_trait_body || self.walking_trait_impl_body) {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: function.name.1,
+                msg: "`[track_caller]` is not supported on a trait method: a call through \
+                      a trait is dispatched, so no call site knows to pass its location. \
+                      Mark a free function or an inherent method instead"
+                    .to_string(),
+            });
+        }
         if function.external {
             // An `external` function is an intrinsic: no Vilan body, a
             // declared (or void) return type, registered as an external
@@ -38075,6 +38336,7 @@ impl<'src> Analyzer<'src> {
                     is_async: function.is_async,
                     deprecated: function.deprecated,
                     internal: function.internal,
+                    track_caller: function.track_caller,
                 },
             );
             let function_type_id = self.new_type_id();
@@ -38237,6 +38499,7 @@ impl<'src> Analyzer<'src> {
                         Some(Node::Reference(_, _))
                     ),
                     must_use: function.must_use,
+                    track_caller: function.track_caller,
                     deprecated: function.deprecated,
                     internal: function.internal,
                     platform_fence: function
@@ -43543,6 +43806,15 @@ impl<'src> Analyzer<'src> {
                         // the sole body of a function with any return type).
                         if Some(function_id) == self.panic_fn_id {
                             return Type::Never;
+                        }
+                        // debugging.md S1 (Q2): `dbg(..)` answers its argument,
+                        // a tuple of them for several, `()` for none.
+                        if Some(function_id) == self.dbg_fn_id {
+                            return self.dbg_call_type(
+                                &argument_ids,
+                                substitution_context,
+                                exprs_seen,
+                            );
                         }
                         let function = self.functions.get(&function_id).map(|f| {
                             (
@@ -50002,6 +50274,17 @@ impl<'src> Analyzer<'src> {
                     );
                     return Resolution::Resolved;
                 }
+                if let Expr::ExternalFunction(function_id) = &target
+                    && Some(*function_id) == self.dbg_fn_id
+                {
+                    return self.resolve_dbg_call(
+                        call_id,
+                        subject_id,
+                        generic_argument_ids,
+                        argument_ids,
+                        arguments_span,
+                    );
+                }
                 let function_data = match &target {
                     Expr::Function(function_id) | Expr::ExternalFunction(function_id) => self
                         .callable_signature(*function_id)
@@ -50228,6 +50511,14 @@ impl<'src> Analyzer<'src> {
                         );
                         if matches!(argument_type, Type::Unresolved) {
                             return Resolution::Deferred;
+                        }
+                        // N136: a NUMBER handed to `print` prints by the
+                        // language's own conversion on JS, which needs to
+                        // know it is one.
+                        if Some(function_id) == self.print_fn_id
+                            && self.is_a_number_type(&argument_type)
+                        {
+                            self.number_print_arguments.insert(argument_id);
                         }
                         // B372: an argument BUILT FROM a closure parameter that
                         // is still awaiting its fill — `wrap(m * 2)` inside
@@ -65401,6 +65692,41 @@ pub struct Program<'src> {
     /// searches on it (M107). Nothing writes `source_ranges` after the program
     /// is built, which is what makes caching the answer sound.
     source_ranges_searchable: std::sync::OnceLock<bool>,
+    /// Each source's TEXT, parallel to the analyzer's own table: what a
+    /// call site's `file:line:column` and `dbg`'s expression text are read
+    /// from (debugging.md S0/S1). Borrowed, so it costs a vector of slices.
+    pub source_texts: Vec<(SourceId, &'src str)>,
+    /// The line starts and display paths [`Program::site_location`] reads,
+    /// built on first ask: a program that never names a location never pays.
+    pub(crate) site_locator: std::sync::OnceLock<crate::track_caller::SiteLocator>,
+    /// `std::debug::caller` (debugging.md S0): a `[track_caller]` external the
+    /// emitters lower to its location argument.
+    pub caller_fn_id: Option<Id>,
+    /// `std::debug::dbg` (debugging.md S1): the variadic intrinsic both
+    /// emitters lower to the printer.
+    pub dbg_fn_id: Option<Id>,
+    /// Every `dbg(..)` call the analysis resolved, in source-walk order.
+    pub dbg_calls: Vec<Id>,
+    /// The `dbg(..)` calls written as statements: their arguments are read in
+    /// place and nothing is returned (Q2).
+    pub dbg_statement_calls: HashSet<Id>,
+    /// Each `dbg(..)` argument's type as the analysis settled it — which may
+    /// name the enclosing function's generics; an emitter resolves it under
+    /// the instance it is emitting.
+    pub dbg_argument_types: HashMap<Id, TypeId>,
+    /// N136: the `print` arguments the analysis typed as a number of the
+    /// language's own (every integer width, `f32`, `f64`) — the JS backend
+    /// prints them through `String(x)`.
+    pub number_print_arguments: HashSet<Id>,
+    /// `[track_caller]` (debugging.md S0): each tracking function's hidden
+    /// trailing `Location` parameter, minted by
+    /// [`crate::track_caller::thread_locations`].
+    pub track_caller_parameters: HashMap<Id, Id>,
+    /// An `xs[i]` inside a `[track_caller]` function's own body → a minted
+    /// read of the hidden parameter (an `Expr::Local`) whose location its
+    /// bounds panic reports. Every other subscript reports its own site
+    /// ([`Program::site_location`]).
+    pub index_location_arguments: HashMap<Id, Id>,
     /// The sources that ARE std: every module loaded with `Origin::Std`,
     /// overlaid or off disk — never the entry. This is the RESIDENCE question,
     /// the one "is this the standard library's own declaration?" means, and it
@@ -73422,6 +73748,17 @@ fn analyze_inner<'src>(
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("print").copied());
     }
+    // `std::debug::caller` (debugging.md S0): lowered to its location argument.
+    if let Some(debug_scope_id) = module_scopes.get("debug") {
+        analyzer.caller_fn_id = analyzer
+            .scopes
+            .get(debug_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("caller").copied());
+        analyzer.dbg_fn_id = analyzer
+            .scopes
+            .get(debug_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("dbg").copied());
+    }
     // Remember `std::web::asset`'s const-only compile-time channel — lines out (in
     // both spellings), the end-of-evaluation hook, text in, whole files out
     // (in both spellings), a directory listing in, a digest in (const-eval.md
@@ -74283,6 +74620,9 @@ fn analyze_over_world<'src>(
         // ban) read the thunk set.
         analyzer.record_lazy_bindings();
         analyzer.record_lazy_arguments();
+        // debugging.md S1 (Q2): which `dbg(..)` calls are statements — read by
+        // the ownership checks below and by both emitters.
+        analyzer.classify_dbg_calls();
     }
     // ------------------------------------------------------------------
     // M19 T1's Class A window (`per-module-analysis-reuse.md` §3.3).
@@ -75609,6 +75949,20 @@ fn analyze_over_world<'src>(
         source_hashes,
         source_ranges: std::mem::take(&mut analyzer.source_ranges),
         source_ranges_searchable: std::sync::OnceLock::new(),
+        source_texts: analyzer.source_texts.clone(),
+        site_locator: std::sync::OnceLock::new(),
+        caller_fn_id: analyzer.caller_fn_id,
+        dbg_fn_id: analyzer.dbg_fn_id,
+        dbg_calls: analyzer
+            .dbg_calls
+            .values()
+            .map(|(call_id, _)| *call_id)
+            .collect(),
+        dbg_statement_calls: analyzer.dbg_statement_calls.clone(),
+        dbg_argument_types: analyzer.dbg_argument_types.clone(),
+        number_print_arguments: std::mem::take(&mut analyzer.number_print_arguments),
+        track_caller_parameters: HashMap::default(),
+        index_location_arguments: HashMap::default(),
         std_sources: std::mem::take(&mut analyzer.std_sources),
         frozen_sources: std::mem::take(&mut analyzer.frozen_sources),
         dependency_sources: std::mem::take(&mut analyzer.dependency_sources),
@@ -77799,6 +78153,8 @@ pub fn check_unlowered_externals(program: &mut Program) {
         program.list_new_fn_id,
         program.list_push_fn_id,
         program.panic_fn_id,
+        program.caller_fn_id,
+        program.dbg_fn_id,
         program.print_fn_id,
         program.drop_fn_id,
         program.context_new_fn_id,

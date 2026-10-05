@@ -7,11 +7,11 @@ function constant_1() {
 function constant_2() {
 	return 20;
 }
-console.log(constant_0() + constant_1() + constant_2());
+console.log(String(constant_0() + constant_1() + constant_2()));
 const folded = 55;
-console.log(folded);
+console.log(String(folded));
 const __s3_m0 = 5;
 const first = __s3_m0 * 2;
 const __s4_m0 = 7;
 const second = __s4_m0 * 3;
-console.log(first + second);
+console.log(String(first + second));

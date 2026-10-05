@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -14,6 +14,13 @@ function __hash(value) {
 function __map_get(map, key) {
 	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
 }
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
+}
 function hash(self) {
 	return __hash(self);
 }
@@ -24,411 +31,411 @@ function new2(start, end) {
 	return [ start, end ];
 }
 function next(self) {
-	let $G = null;
+	let $m = null;
 	if (self[0] < self[1]) {
 		const value = self[0];
 		self[0] = self[0] + 1;
-		$G = [ 0, value ];
+		$m = [ 0, value ];
 	} else {
-		$G = [ 1 ];
+		$m = [ 1 ];
 	}
-	return $G;
+	return $m;
 }
 function next2(self) {
 	self[0] = self[0] + 1;
 	return [ 0, self[0] ];
 }
-function $a(self) {
+function iter(self) {
 	return [ __clone(self), 0 ];
 }
-function $b(self, predicate) {
+function filter(self, predicate) {
 	return [ self, predicate ];
 }
-function $c(self, fn) {
+function map(self, fn) {
 	return [ self, fn ];
 }
-function $d(self, count) {
-	return [ self, count ];
+function skip(self, count3) {
+	return [ self, count3 ];
 }
-function $e(self, count) {
-	return [ self, count ];
+function take(self, count3) {
+	return [ self, count3 ];
 }
-function $k(self) {
-	let $l = null;
+function next3(self) {
+	let $a = null;
 	if (self[1] < self[0].length) {
-		const value = __clone(__at(self[0], self[1]));
+		const value = __clone(__at(self[0], self[1], "std/src/iterator.vl:168:16"));
 		self[1] = self[1] + 1;
-		$l = [ 0, value ];
+		$a = [ 0, value ];
 	} else {
-		$l = [ 1 ];
+		$a = [ 1 ];
 	}
-	return $l;
+	return $a;
 }
-function $j(self) {
+function next4(self) {
 	let found = [ 1 ];
 	let searching = true;
 	while (searching) {
-		const $m = $k(self[0]);
-		let $n = null;
-		if ($m[0] === 0) {
-			if (self[1]($m[1])) {
-				found = [ 0, $m[1] ];
+		const $b = next3(self[0]);
+		let $c = null;
+		if ($b[0] === 0) {
+			if (self[1]($b[1])) {
+				found = [ 0, $b[1] ];
 				searching = false;
 			}
-			$n = undefined;
+			$c = undefined;
 		} else {
 			searching = false;
 		}
-		$n;
+		$c;
 	}
 	return found;
 }
-function $i(self) {
-	const $o = $j(self[0]);
-	if ($o[0] === 0) {
-		return [ 0, self[1]($o[1]) ];
+function next5(self) {
+	const $d = next4(self[0]);
+	if ($d[0] === 0) {
+		return [ 0, self[1]($d[1]) ];
 	}
 	return [ 1 ];
 }
-function $h(self) {
+function next6(self) {
 	while (self[1] > 0) {
 		self[1] = self[1] - 1;
-		const $p = $i(self[0]);
-		if ($p[0] === 1) {
+		const $e = next5(self[0]);
+		if ($e[0] === 1) {
 			self[1] = 0;
 			return [ 1 ];
 		}
 	}
-	return $i(self[0]);
+	return next5(self[0]);
 }
-function $g(self) {
+function next7(self) {
 	if (self[1] <= 0) {
 		return [ 1 ];
 	}
 	self[1] = self[1] - 1;
-	return $h(self[0]);
+	return next6(self[0]);
 }
-function $f(self) {
+function to_list(self) {
 	let result = [  ];
-	const $q = self;
+	const $f = self;
 	while (true) {
-		const $r = $g($q);
-		if ($r[0] !== 0) {
+		const $g = next7($f);
+		if ($g[0] !== 0) {
 			break;
 		}
-		const value = $r[1];
+		const value = $g[1];
 		result.push(__clone(value));
 	}
 	return result;
 }
-function $w(self) {
-	const $x = next2(self[0]);
-	if ($x[0] === 0) {
-		return [ 0, self[1]($x[1]) ];
+function next8(self) {
+	const $h = next2(self[0]);
+	if ($h[0] === 0) {
+		return [ 0, self[1]($h[1]) ];
 	}
 	return [ 1 ];
 }
-function $v(self) {
+function next9(self) {
 	if (self[1] <= 0) {
 		return [ 1 ];
 	}
 	self[1] = self[1] - 1;
-	return $w(self[0]);
+	return next8(self[0]);
 }
-function $u(self) {
+function to_list2(self) {
 	let result = [  ];
-	const $y = self;
+	const $i = self;
 	while (true) {
-		const $z = $v($y);
-		if ($z[0] !== 0) {
+		const $j = next9($i);
+		if ($j[0] !== 0) {
 			break;
 		}
-		const value = $z[1];
+		const value = $j[1];
 		result.push(__clone(value));
 	}
 	return result;
 }
-function $A(self, predicate) {
-	const $B = self;
+function any(self, predicate) {
+	const $k = self;
 	while (true) {
-		const $C = next2($B);
-		if ($C[0] !== 0) {
+		const $l = next2($k);
+		if ($l[0] !== 0) {
 			break;
 		}
-		const value = $C[1];
+		const value = $l[1];
 		if (predicate(value)) {
 			return true;
 		}
 	}
 	return false;
 }
-function $E(self, other) {
+function zip(self, other) {
 	return [ self, __clone(other) ];
 }
-function $F(self) {
-	const $H = next(self[0]);
-	let $L = null;
-	if ($H[0] === 0) {
-		const $K = $k(self[1]);
-		if ($K[0] === 0) {
-			return [ 0, [ $H[1], $K[1] ] ];
+function next10(self) {
+	const $n = next(self[0]);
+	let $q = null;
+	if ($n[0] === 0) {
+		const $p = next3(self[1]);
+		if ($p[0] === 0) {
+			return [ 0, [ $n[1], $p[1] ] ];
 		}
-		$L = undefined;
+		$q = undefined;
 	}
-	$L;
+	$q;
 	return [ 1 ];
 }
-function $O(self, other) {
+function chain(self, other) {
 	return [ self, __clone(other), true ];
 }
-function $Q(self) {
+function next11(self) {
 	if (self[2]) {
-		const $R = $k(self[0]);
-		if ($R[0] === 0) {
-			return [ 0, $R[1] ];
+		const $t = next3(self[0]);
+		if ($t[0] === 0) {
+			return [ 0, $t[1] ];
 		}
 		self[2] = false;
 	}
-	return $k(self[1]);
+	return next3(self[1]);
 }
-function $P(self) {
+function count(self) {
 	let seen = 0;
-	const $S = self;
+	const $u = self;
 	while (true) {
-		const $T = $Q($S);
-		if ($T[0] !== 0) {
+		const $v = next11($u);
+		if ($v[0] !== 0) {
 			break;
 		}
-		const _value = $T[1];
+		const _value = $v[1];
 		seen = seen + 1;
 	}
 	return seen;
 }
-function $U(self) {
+function enumerate(self) {
 	return [ self, 0 ];
 }
-function $V(self) {
-	const $W = $k(self[0]);
-	if ($W[0] === 0) {
+function next12(self) {
+	const $w = next3(self[0]);
+	if ($w[0] === 0) {
 		const index = self[1];
 		self[1] = index + 1;
-		return [ 0, [ index, $W[1] ] ];
+		return [ 0, [ index, $w[1] ] ];
 	}
 	return [ 1 ];
 }
-function $Z(self, init, fn) {
+function fold(self, init, fn) {
 	let accumulator = __clone(init);
-	const $aa = self;
+	const $z = self;
 	while (true) {
-		const $ab = $k($aa);
-		if ($ab[0] !== 0) {
+		const $A = next3($z);
+		if ($A[0] !== 0) {
 			break;
 		}
-		const value = $ab[1];
+		const value = $A[1];
 		accumulator = fn(accumulator, value);
 	}
 	return accumulator;
 }
-function $ac(self, predicate) {
-	const $ad = self;
+function all(self, predicate) {
+	const $B = self;
 	while (true) {
-		const $ae = $k($ad);
-		if ($ae[0] !== 0) {
+		const $C = next3($B);
+		if ($C[0] !== 0) {
 			break;
 		}
-		const value = $ae[1];
+		const value = $C[1];
 		if (!(predicate(value))) {
 			return false;
 		}
 	}
 	return true;
 }
-function $ag(self) {
+function to_list3(self) {
 	let result = [  ];
-	const $ah = self;
+	const $D = self;
 	while (true) {
-		const $ai = $k($ah);
-		if ($ai[0] !== 0) {
+		const $E = next3($D);
+		if ($E[0] !== 0) {
 			break;
 		}
-		const value = $ai[1];
+		const value = $E[1];
 		result.push(__clone(value));
 	}
 	return result;
 }
-function $aj(self) {
+function reverse(self) {
 	let result = [  ];
 	let index = self.length;
 	while (index > 0) {
 		index = index - 1;
-		result.push(__clone(__at(self, index)));
+		result.push(__clone(__at(self, index, "std/src/list.vl:98:16")));
 	}
 	return result;
 }
-function $af(self) {
-	return [ $aj($ag(self)), 0 ];
+function rev(self) {
+	return [ reverse(to_list3(self)), 0 ];
 }
-function $ak(self, fn) {
-	const $al = self;
+function for_each(self, fn) {
+	const $F = self;
 	while (true) {
-		const $am = $k($al);
-		if ($am[0] !== 0) {
+		const $G = next3($F);
+		if ($G[0] !== 0) {
 			break;
 		}
-		const value = $am[1];
+		const value = $G[1];
 		fn(value);
 	}
 }
-function $an(self) {
+function to_list4(self) {
 	let result = [  ];
-	const $ao = self;
+	const $H = self;
 	while (true) {
-		const $ap = $j($ao);
-		if ($ap[0] !== 0) {
+		const $I = next4($H);
+		if ($I[0] !== 0) {
 			break;
 		}
-		const value = $ap[1];
+		const value = $I[1];
 		result.push(__clone(value));
 	}
 	return result;
 }
-function $ar() {
+function new3() {
 	const table = new Map();
 	return [ table ];
 }
-function $as(self, value) {
+function insert(self, value) {
 	self[0].set(hash2(value), value);
 }
-function $aq(self) {
-	let result = $ar();
+function to_set(self) {
+	let result = new3();
 	for (const value of self) {
-		$as(result, value);
+		insert(result, value);
 	}
 	return result;
 }
-function $at(self) {
+function len(self) {
 	return self[0].size;
 }
-function $aw(self) {
-	const $ax = $k(self[0]);
-	if ($ax[0] === 0) {
-		return [ 0, self[1]($ax[1]) ];
+function next13(self) {
+	const $J = next3(self[0]);
+	if ($J[0] === 0) {
+		return [ 0, self[1]($J[1]) ];
 	}
 	return [ 1 ];
 }
-function $av(self) {
+function to_list5(self) {
 	let result = [  ];
-	const $ay = self;
+	const $K = self;
 	while (true) {
-		const $az = $aw($ay);
-		if ($az[0] !== 0) {
+		const $L = next13($K);
+		if ($L[0] !== 0) {
 			break;
 		}
-		const value = $az[1];
+		const value = $L[1];
 		result.push(__clone(value));
 	}
 	return result;
 }
-function $aB() {
+function new4() {
 	const table = new Map();
 	return [ table ];
 }
-function $aC(self, key, value) {
+function insert2(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
-function $aA(self) {
-	let result = $aB();
+function to_map(self) {
+	let result = new4();
 	for (const entry2 of self) {
-		$aC(result, entry2[0], entry2[1]);
+		insert2(result, entry2[0], entry2[1]);
 	}
 	return result;
 }
-function $aD(self, key) {
-	const $aE = __map_get(self[0], hash(key));
-	let $aF = null;
-	if ($aE[0] === 0) {
-		const entry2 = $aE[1];
-		$aF = [ 0, __clone(entry2[1]) ];
+function get(self, key) {
+	const $M = __map_get(self[0], hash(key));
+	let $N = null;
+	if ($M[0] === 0) {
+		const entry2 = $M[1];
+		$N = [ 0, __clone(entry2[1]) ];
 	} else {
-		$aF = [ 1 ];
+		$N = [ 1 ];
 	}
-	return $aF;
+	return $N;
 }
-function $aG(self, fallback) {
-	const $aH = self;
-	let $aI = null;
-	if ($aH[0] === 0) {
-		const x = __clone($aH[1]);
-		$aI = x;
+function unwrap_or(self, fallback) {
+	const $O = self;
+	let $P = null;
+	if ($O[0] === 0) {
+		const x = __clone($O[1]);
+		$P = x;
 	} else {
-		$aI = __clone(fallback);
+		$P = __clone(fallback);
 	}
-	return $aI;
+	return $P;
 }
-function $aJ(self) {
+function count2(self) {
 	let seen = 0;
-	const $aK = self;
+	const $Q = self;
 	while (true) {
-		const $aL = $k($aK);
-		if ($aL[0] !== 0) {
+		const $R = next3($Q);
+		if ($R[0] !== 0) {
 			break;
 		}
-		const _value = $aL[1];
+		const _value = $R[1];
 		seen = seen + 1;
 	}
 	return seen;
 }
-console.log($f($e($d($c($b($a([ 1, 2, 3, 4, 5, 6 ]), (n) => {
+console.log(to_list(take(skip(map(filter(iter([ 1, 2, 3, 4, 5, 6 ]), (n) => {
 	return n % 2 === 0;
 }), (n) => {
 	return n * 10;
 }), 1), 2)));
-console.log($u($e($c([ 0 ], (n) => {
+console.log(to_list2(take(map([ 0 ], (n) => {
 	return n * n;
 }), 4)));
-console.log($A([ 0 ], (n) => {
+console.log(any([ 0 ], (n) => {
 	return n === 3;
 }));
-let zipped = $E(new2(0, 9), $a([ "a", "b" ]));
-const $M = zipped;
+let zipped = zip(new2(0, 9), iter([ "a", "b" ]));
+const $r = zipped;
 while (true) {
-	const $N = $F($M);
-	if ($N[0] !== 0) {
+	const $s = next10($r);
+	if ($s[0] !== 0) {
 		break;
 	}
-	const pair = $N[1];
+	const pair = $s[1];
 	console.log("" + pair[0] + pair[1]);
 }
-console.log($P($O($a([ 1, 2 ]), $a([ 3 ]))));
-let numbered = $U($a([ "x", "y" ]));
-const $X = numbered;
+console.log(String(count(chain(iter([ 1, 2 ]), iter([ 3 ])))));
+let numbered = enumerate(iter([ "x", "y" ]));
+const $x = numbered;
 while (true) {
-	const $Y = $V($X);
-	if ($Y[0] !== 0) {
+	const $y = next12($x);
+	if ($y[0] !== 0) {
 		break;
 	}
-	const entry = $Y[1];
+	const entry = $y[1];
 	console.log("" + entry[0] + "=" + entry[1]);
 }
-console.log($Z($a([ 1, 2, 3 ]), 0, (total, n) => {
+console.log(String(fold(iter([ 1, 2, 3 ]), 0, (total, n) => {
 	return total + n;
-}));
-console.log($ac($a([ 1, 2, 3 ]), (n) => {
+})));
+console.log(all(iter([ 1, 2, 3 ]), (n) => {
 	return n > 0;
 }));
-console.log($ag($af($a([ 1, 2, 3 ]))));
-$ak($a([ 1, 2 ]), (n) => {
-	return console.log(n);
+console.log(to_list3(rev(iter([ 1, 2, 3 ]))));
+for_each(iter([ 1, 2 ]), (n) => {
+	return console.log(String(n));
 });
-console.log($at($aq($an($b($a([ 1, 2, 2, 3 ]), (n) => {
+console.log(String(len(to_set(to_list4(filter(iter([ 1, 2, 2, 3 ]), (n) => {
 	return n > 1;
-})))));
-const lengths = $aA($av($c($a([ "alpha", "hi" ]), (word) => {
+}))))));
+const lengths = to_map(to_list5(map(iter([ "alpha", "hi" ]), (word) => {
 	return [ word, word.length ];
 })));
-console.log($aG($aD(lengths, "hi"), 0));
+console.log(String(unwrap_or(get(lengths, "hi"), 0)));
 let live = [ 1, 2 ];
-let cursor = $a(live);
+let cursor = iter(live);
 live.push(3);
-console.log($aJ(cursor));
-console.log(live.length);
+console.log(String(count2(cursor)));
+console.log(String(live.length));

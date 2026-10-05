@@ -7040,6 +7040,10 @@ fn compile_to_js(
             platform,
             &vilan_core::options::BuildOptions::default(),
         );
+        // debugging.md §3.3 (Q4): a release build refuses a `dbg(..)` it was
+        // not told to keep or strip. It reads the BUILD's options, which the
+        // shared passes above deliberately do not.
+        vilan_core::track_caller::refuse_release_dbg(&mut program, options);
 
         // Every file `const asset::read` touched is a build input: hand the
         // set to the watcher so a change to one — or the appearance of one

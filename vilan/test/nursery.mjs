@@ -62,7 +62,17 @@ async function __nursery_run(n, body) {
 	for (const task of n.children) task.then(null, () => {});
 	if (bodyFailed) throw bodyError;
 	const winner = n.failedTask;
-	throw typeof winner.error === "string" ? winner.error + " (in task spawned in " + winner.origin + ")" : winner.error;
+	const failure = winner.error;
+	if (typeof failure === "string") throw failure + " (in task spawned in " + winner.origin + ")";
+	if (failure && failure.location !== undefined) throw __panic(failure.message + " (in task spawned in " + winner.origin + ")", failure.location);
+	throw failure;
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function __sleep(ms, signal) {
 	const sig = signal && signal[0] === 0 ? signal[1] : undefined;
@@ -128,16 +138,16 @@ function spawn_step(label, ms, $b) {
 		return;
 	}, "spawn_step", __nursery_of($b));
 }
-async function $g(body, $h) {
-	const n = __nursery_new($h);
-	return await ((async ($i) => {
+async function nursery(body, $g) {
+	const n = __nursery_new($g);
+	return await ((async ($h) => {
 		return await (__nursery_run(n, () => {
-			return body(n, $i);
+			return body(n, $h);
 		}));
 	})(n));
 }
 (async () => {
-	const value = await ($g((n, $a) => {
+	const value = await (nursery((n, $a) => {
 		spawn_step("helper", 15, [ 0, $a ]);
 		__task(async () => {
 			await (sleep(5, [ 0, $a ]));
@@ -148,8 +158,8 @@ async function $g(body, $h) {
 		console.log("body");
 		return 7;
 	}, [ 1 ]));
-	console.log(value);
-})().catch(($j) => {
-	console.error(String($j));
+	console.log(String(value));
+})().catch(($i) => {
+	console.error(String($i));
 	process.exit(1);
 });

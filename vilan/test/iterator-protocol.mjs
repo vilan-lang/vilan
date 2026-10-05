@@ -17,7 +17,7 @@ function next(self) {
 	}
 	return $a;
 }
-function $d(self) {
+function sum(self) {
 	let total = default2();
 	let seeded = false;
 	for (const item of self) {
@@ -30,7 +30,7 @@ function $d(self) {
 	}
 	return total;
 }
-function $e(self) {
+function product(self) {
 	let total = default2();
 	let seeded = false;
 	for (const item of self) {
@@ -52,11 +52,11 @@ while (true) {
 		break;
 	}
 	const n = $c[1];
-	console.log(n);
+	console.log(String(n));
 }
 let numbers = [  ];
 numbers.push(2);
 numbers.push(3);
 numbers.push(4);
-console.log($d(numbers));
-console.log($e(numbers));
+console.log(String(sum(numbers)));
+console.log(String(product(numbers)));

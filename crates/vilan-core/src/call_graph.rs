@@ -950,6 +950,7 @@ impl<'a, 'src> Collector<'a, 'src> {
             | Expr::Number(_, _, _)
             | Expr::String(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Struct(_)
             | Expr::Trait(_)
             | Expr::Void

@@ -4388,7 +4388,7 @@ fn b102_a_self_recursive_call_keeps_its_own_generic_bound() {
 #[test]
 fn b102_a_static_the_call_cannot_instantiate_stays_one_declaration() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             r#"
             import std::io::print;
             import std::hash_map::HashMap;
@@ -4398,9 +4398,14 @@ fn b102_a_static_the_call_cannot_instantiate_stays_one_declaration() {
                 print(scores.get().len());
             }
             "#,
-            "function new",
+            "new",
         ),
-        1,
+        // Asked of the instance memo since E259 named instances after their
+        // function (the emitted name no longer tells an instance from the
+        // declaration): the two `new`s the program instantiates —
+        // `Signal::new` and the `Shared::new` inside it — and NOT
+        // `HashMap::new`, which stays the one shared declaration.
+        2,
     );
 }
 
@@ -4410,10 +4415,12 @@ fn b102_a_static_the_call_cannot_instantiate_stays_one_declaration() {
 /// bind. Once the record keys on that set, the missing binder took the whole
 /// substitution with it and the static stopped monomorphizing: the emitted
 /// program grew a plain `from_fn` declaration where the instance had been.
+/// Asked of the instance memo since E259 named instances after their
+/// function, which made the emitted name no longer tell the two apart.
 #[test]
 fn b102_a_static_on_a_trait_monomorphizes_through_its_binder() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             r#"
             import std::io::print;
             trait Iterator<T> {
@@ -4441,9 +4448,9 @@ fn b102_a_static_on_a_trait_monomorphizes_through_its_binder() {
                 print(naturals.next());
             }
             "#,
-            "function from_fn",
+            "from_fn",
         ),
-        0,
+        1,
     );
 }
 

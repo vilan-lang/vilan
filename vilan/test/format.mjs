@@ -13,25 +13,25 @@ function to_string4(self) {
 function to_string5(self) {
 	return "Point { x = " + to_string2(self[0]) + ", y = " + to_string2(self[1]) + " }";
 }
-function $a(value) {
+function format(value) {
 	return to_string4(value);
 }
-function $b(value) {
+function format2(value) {
 	return to_string5(value);
 }
-function $c(value) {
+function format3(value) {
 	return to_string2(value);
 }
-function $d(value) {
+function format4(value) {
 	return to_string(value);
 }
-function $e(value) {
+function format5(value) {
 	return to_string3(value);
 }
 const id = [ 0 ];
 console.log(id);
-console.log($a(id));
-console.log($b([ 1, 2 ]));
-console.log($c(42));
-console.log($d("hi"));
-console.log($e(true));
+console.log(format(id));
+console.log(format2([ 1, 2 ]));
+console.log(format3(42));
+console.log(format4("hi"));
+console.log(format5(true));

@@ -34,6 +34,7 @@ reactive-flatten	43	0
 list-cell	2231	0
 reactive-selector	36	0
 f64-print-boundary	0	0
+f64-print-negative-zero	0	0
 non-bmp-string-length	0	0
 keyword-members	0	0
 shared	2	0

@@ -75,6 +75,33 @@ pub struct BuildOptions {
     /// `vilan build file.vl` with no manifest resolves the default, the corpus
     /// goldens are unaffected by construction.
     pub infer_const: bool,
+    /// What a `dbg(..)` call does in this build (debugging.md §3.3, Q4): the
+    /// `debug` preset prints, the `release` preset refuses the build, and
+    /// `[build] dbg = "strip"` / `"keep"` overrides either.
+    pub dbg: DbgPolicy,
+}
+
+/// The `[build] dbg` policy (debugging.md Q4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbgPolicy {
+    /// Print: the debug preset, and `dbg = "keep"`.
+    Keep,
+    /// `dbg(x)` is `x`, printing nothing: `dbg = "strip"`.
+    Strip,
+    /// "`dbg` left in a release build": the release preset's default.
+    Refuse,
+}
+
+impl DbgPolicy {
+    /// Parses a `[build] dbg = "..."` value: `"keep"` or `"strip"`. The
+    /// refusal is a preset's default, not a value a manifest asks for.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "keep" => Some(DbgPolicy::Keep),
+            "strip" => Some(DbgPolicy::Strip),
+            _ => None,
+        }
+    }
 }
 
 impl BuildOptions {
@@ -88,6 +115,7 @@ impl BuildOptions {
                 debug_names: false,
                 hmr: false,
                 infer_const: false,
+                dbg: DbgPolicy::Keep,
             },
             Preset::Release => Self {
                 indent: false,
@@ -96,6 +124,7 @@ impl BuildOptions {
                 debug_names: false,
                 hmr: false,
                 infer_const: true,
+                dbg: DbgPolicy::Refuse,
             },
         }
     }

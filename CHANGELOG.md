@@ -25,6 +25,16 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**`print` writes a number by the language's own conversion on both backends, so negative zero prints `0` (N136, R-g door (a)).** `print(0.0 * -1.0)` printed `-0` on the JS backend (node's `console.log` special-cases it) and `0` natively; a number now goes through `String(x)`, the conversion an i-string and the native backend already use, and both print `0`. Integers counted too (`print(zero * -1)` was `-0` on JS). Nothing else `print` shows moved. `f64-print-negative-zero.vl` left the differential's exclusions and joined its default suite; corpus goldens gained the `String(..)` wrap on numeric prints.
+
+---
+
+<!-- family: tooling -->
+**A generic function's emitted instance is named after the function in the readable (debug) build (E259).** `fun first<T>` emits `function first(items)`, and a second instance whose body differs `first2`, where every instance used to be `$a`, which is what a stack trace and a debugger showed; std's generic methods read the same way (`unwrap`, `is_some`, not `$f`). Release builds keep their short names. Corpus goldens moved by name only.
+
+---
+
 <!-- family: perf -->
 **A focus scope's autofocus scan stops at the first registered element.** `FocusScope` walks its content for the element `.autofocus()` registered (falling back to a native `autofocus` attribute); once it had found the registered one it kept visiting every remaining descendant and did nothing with them. The loop now leaves there (`registered.is_none() else jump break;`). No behaviour changes: the same element is chosen. (The owner's edit.)
 
@@ -217,6 +227,26 @@ written down.
 
 <!-- family: performance -->
 **Two trait-object tables with the same slots are one object on JS: kolt's client builds 10 tables where it built 14.** M89. A table is keyed by its `(trait, type)` pair, and a generic struct whose impl does not depend on its parameter emits one body for every instantiation, so `Holder<i32>` and `Holder<str>` coerced to one trait built two identical `Object.create({..})` tables. A table whose every slot names an emitted function is now a function of that slot set: the second pair's table is `const $b = $a;` (the name stays, since a member body may already have taken it during its own coercion). A table with a wrapping-arrow slot (an async member, an intrinsic, an extern) is never shared. No corpus golden moves (none coerces two such pairs). **Pin:** `inference::dyn_objects::m89_two_pairs_with_one_slot_set_share_one_table`.
+
+---
+
+<!-- family: feature -->
+**`Debug` covers lists, options and results, and a float keeps its `.0` (debugging.md S4, E260).** `[derive(Debug)]` on a struct with a `List` or `Option` field compiles (it failed inside the generated code), `fun show<T: Debug>` takes a `List`, an `Option` or a `Result` of `Debug` elements, and `3.0.debug()` is `"3.0"` where it was `"3"`: the same spellings `dbg` prints. A tuple is not covered yet.
+
+---
+
+<!-- family: feature -->
+**`dbg` prints std's handles as themselves (debugging.md S1b).** `HashMap { "ada" => 36, "alan" => 41 }` and `HashSet { "a", "b" }` by their members in insertion order (not the hashed table inside), `Shared(Point { x = 7, y = 8 })`, `SignalCell(3)` by its current value read without tracking, a pipe by its type alone (`<pipe Derive<SignalCell<i32>, i32, i32>>`, since sampling it would run it), and a cycle through a `Shared` cut at `<cycle>`. Both backends print the same bytes. A trait object still prints as `<dyn Area>`.
+
+---
+
+<!-- family: feature -->
+**`dbg(..)`: print any values with the expression and the line that produced them, in vilan's own syntax, the same bytes on both backends (debugging.md S1, E257).** `dbg(point, rows.len())` writes `[src/main.vl:12:5] point = Point { x = 1, y = 2 }` and `[src/main.vl:12:5] rows.len() = 3` to stderr (`console.log` in the browser), where `print` shows a struct as the array it is at run time. It takes any number of arguments of any types and answers its argument (a tuple of them for several, `()` for none), so `let total = dbg(price * qty) + tax;` wraps an expression in place. Written as a statement it reads its arguments in place, so `dbg(guard);` moves nothing; in expression position the value moves through, and a list or struct comes back as a copy. The compiler generates a printer per type a `dbg` reaches: structs by their fields, enum variants qualified (the prelude's four bare), tuples, lists, quoted strings, floats that keep their `.0`, closures by their type; a value past 80 columns breaks one entry per line with trailing commas, and a list stops after 100 entries. In a generic function each instantiation prints its own type. A `release` build refuses a `dbg` (at the call) unless `vilan.toml` sets `[build] dbg = "strip"` (the call is its argument) or `"keep"`. `dbg` is in the prelude; a program's own `dbg` still wins.
+
+---
+
+<!-- family: feature -->
+**A panic names its vilan line, on both backends and in release builds (debugging.md S0, E258).** An uncaught panic prints `panicked at src/main.vl:12:5: <message>`, where node printed the message alone and pointed at `--trace-uncaught`, and the native binary printed the message alone. `assert`, `Option`'s `unwrap`/`expect`, `Result`'s `unwrap`/`unwrap_err`/`expect`/`expect_err`, `List::remove`/`insert` and every subscript out of bounds name the line that CALLED them. The new `[track_caller]` attribute gives your own helpers the same: the function takes its call site as a hidden parameter, and `std::debug::caller()` returns it as a `Location` (`file()`, `line()`, `column()`, `text()`). On node a panic is now an `Error` (so a stack exists) whose header is that line; a caught panic (`guarded`, a task's failure) still answers its message alone. `[track_caller]` is refused on a trait method, and a tracking function cannot be passed as a value. Natively, `List::insert` past the end now panics as it does on JS (it used to clamp), and an out-of-bounds `remove` uses the same words as `xs[i]`.
 
 ## v0.44.0 — 2026-10-04
 

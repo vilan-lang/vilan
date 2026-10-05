@@ -225,7 +225,9 @@ pub fn signature_label(program: &Program, target: Id) -> Option<String> {
 /// `self` dropped (the receiver is not a call argument) — the tab-stop labels a
 /// call-shaped completion fills. `Some(vec![])` for a zero-parameter callable;
 /// `None` when the id is not a function or external. `target` is a DEFINITION
-/// id (resolve through [`Document::function_target`] first).
+/// id (resolve through [`Document::function_target`] first). A
+/// `[track_caller]` function's hidden location parameter is the compiler's,
+/// not a tab stop.
 pub fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>> {
     let parameter_ids = if let Some(function) = program.functions.get(&target) {
         &function.parameters
@@ -233,9 +235,11 @@ pub fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>
         let external = program.external_functions.get(&target)?;
         &external.parameters
     };
+    let hidden = program.track_caller_parameters.get(&target).copied();
     Some(
         parameter_ids
             .iter()
+            .filter(|parameter_id| Some(**parameter_id) != hidden)
             .filter_map(|parameter_id| program.parameters.get(parameter_id))
             .filter(|parameter| parameter.name != "self")
             .map(|parameter| parameter.name.to_string())

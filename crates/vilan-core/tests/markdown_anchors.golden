@@ -53,6 +53,10 @@ appendix/gotchas.md h2 language
 appendix/gotchas.md h2 reactive--ui
 appendix/gotchas.md h2 services--the-wire
 appendix/gotchas.md h2 process--testing
+guide/debugging.md h1 debugging
+guide/debugging.md h2 what-dbg
+guide/debugging.md h2 where-panics-name-their-line
+guide/debugging.md h3 track_caller
 guide/dev-loop.md h1 the-dev-loop
 guide/dev-loop.md h2 what-each-edit-does
 guide/dev-loop.md h2 when-a-round-fails
@@ -358,6 +362,10 @@ std/collections.md h2 iterator
 std/collections.md h3 what-a-for-can-iterate
 std/collections.md h3 adapters
 std/collections.md h3 terminations
+std/debug.md h1 debugging-stddebug
+std/debug.md h2 dbg
+std/debug.md h2 debug
+std/debug.md h2 locations
 std/dev.md h1 dev--hmr-reference
 std/dev.md h2 hmr_active
 std/dev.md h2 on_teardown

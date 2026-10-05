@@ -23,72 +23,72 @@ function drop(self) {
 function data_take_replace() {
 	let a = [ 0, 5 ];
 	const taken = __option_take(a);
-	console.log("take-data taken=" + $a(taken, 0) + " left_none=" + $d(a));
+	console.log("take-data taken=" + unwrap_or(taken, 0) + " left_none=" + is_none(a));
 	let b = [ 0, 1 ];
 	const old = __option_replace(b, 2);
-	console.log("replace-data old=" + $a(old, 0) + " now=" + $a(b, 0));
+	console.log("replace-data old=" + unwrap_or(old, 0) + " now=" + unwrap_or(b, 0));
 }
 function take_resource() {
 	let opt = [ 0, [ "taken" ] ];
 	try {
 		const moved = __option_take(opt);
-		$f(moved);
+		$d(moved);
 		console.log("take-res in-block");
 	} finally {
-		$f(opt);
+		$d(opt);
 	}
 	console.log("take-res after-block");
 }
 function conditional_teardown() {
 	let full = [ 0, [ "cond" ] ];
 	try {
-		const $j = __option_take(full);
-		let $k = null;
-		if ($j[0] === 0) {
-			let c = $j[1];
+		const $h = __option_take(full);
+		let $i = null;
+		if ($h[0] === 0) {
+			let c = $h[1];
 			try {
-				$h(c);
-				$k = c = null;
+				$f(c);
+				$i = c = null;
 			} finally {
 				if (c !== null) {
-					$h(c);
+					$f(c);
 				}
 			}
 		} else {
-			$k = undefined;
+			$i = undefined;
 		}
-		$k;
+		$i;
 	} finally {
-		$f(full);
+		$d(full);
 	}
 	console.log("cond after-some");
 	let empty = [ 1 ];
 	try {
-		const $l = __option_take(empty);
-		let $m = null;
-		if ($l[0] === 0) {
-			let c2 = $l[1];
+		const $j = __option_take(empty);
+		let $k = null;
+		if ($j[0] === 0) {
+			let c2 = $j[1];
 			try {
-				$h(c2);
-				$m = c2 = null;
+				$f(c2);
+				$k = c2 = null;
 			} finally {
 				if (c2 !== null) {
-					$h(c2);
+					$f(c2);
 				}
 			}
 		} else {
-			$m = console.log("cond none-arm");
+			$k = console.log("cond none-arm");
 		}
-		return $m;
+		return $k;
 	} finally {
-		$f(empty);
+		$d(empty);
 	}
 }
 function sink(r) {
 	try {
 		console.log("sink " + r[0]);
 	} finally {
-		$h(r);
+		$f(r);
 	}
 }
 function passthrough(r) {
@@ -97,117 +97,117 @@ function passthrough(r) {
 }
 function match_move() {
 	const holder = [ 0, [ "held" ] ];
-	const $n = holder;
-	let $o = null;
-	if ($n[0] === 0) {
-		const inner = $n[1];
-		$o = inner;
+	const $l = holder;
+	let $m = null;
+	if ($l[0] === 0) {
+		const inner = $l[1];
+		$m = inner;
 	} else {
-		$o = [ "default" ];
+		$m = [ "default" ];
 	}
-	let extracted = $o;
+	let extracted = $m;
 	try {
 		console.log("match extracted " + extracted[0]);
-		$h(extracted);
+		$f(extracted);
 		extracted = null;
 	} finally {
 		if (extracted !== null) {
-			$h(extracted);
+			$f(extracted);
 		}
 	}
 }
 function match_leg_drop() {
 	const held = [ 0, [ "leg" ] ];
-	const $p = held;
-	let $q = null;
-	if ($p[0] === 0) {
-		const r = $p[1];
+	const $n = held;
+	let $o = null;
+	if ($n[0] === 0) {
+		const r = $n[1];
 		try {
-			$q = console.log("leg " + r[0]);
+			$o = console.log("leg " + r[0]);
 		} finally {
-			$h(r);
+			$f(r);
 		}
 	} else {
-		$q = console.log("leg none");
+		$o = console.log("leg none");
 	}
-	$q;
+	$o;
 	console.log("leg after");
 }
 function match_leg_pair() {
 	const both = [ 0, [ "left" ], [ "right" ] ];
-	const $r = both;
-	let $s = null;
-	if ($r[0] === 0) {
-		const first = $r[1];
-		const second = $r[2];
+	const $p = both;
+	let $q = null;
+	if ($p[0] === 0) {
+		const first = $p[1];
+		const second = $p[2];
 		try {
-			$s = console.log("pair " + first[0] + " " + second[0]);
+			$q = console.log("pair " + first[0] + " " + second[0]);
 		} finally {
-			$h(second);
-			$h(first);
+			$f(second);
+			$f(first);
 		}
 	} else {
-		$s = console.log("pair none");
+		$q = console.log("pair none");
 	}
-	$s;
+	$q;
 	console.log("pair after");
 }
 function match_leg_guard(want) {
 	const held = [ 0, [ "kept" ] ];
-	const $t = held;
-	let $u = null;
-	if ($t[0] === 0 && $t[1][0] === want) {
+	const $r = held;
+	let $s = null;
+	if ($r[0] === 0 && $r[1][0] === want) {
 		try {
-			$u = console.log("guard-yes " + $t[1][0]);
+			$s = console.log("guard-yes " + $r[1][0]);
 		} finally {
-			$h($t[1]);
+			$f($r[1]);
 		}
-	} else if ($t[0] === 0) {
-		const r = $t[1];
+	} else if ($r[0] === 0) {
+		const r = $r[1];
 		try {
-			$u = console.log("guard-no " + r[0]);
+			$s = console.log("guard-no " + r[0]);
 		} finally {
-			$h(r);
+			$f(r);
 		}
 	} else {
-		$u = console.log("guard none");
+		$s = console.log("guard none");
 	}
-	$u;
+	$s;
 	console.log("guard after");
 }
 function destructure_drop() {
 	const pair = [ [ "destructured" ], 3 ];
-	const $v = pair;
-	const r = $v[0];
-	const n = $v[1];
+	const $t = pair;
+	const r = $t[0];
+	const n = $t[1];
 	try {
 		console.log("destructure " + r[0] + " " + n);
 	} finally {
-		$h(r);
+		$f(r);
 	}
 	console.log("destructure after");
 }
-function $a(self, fallback) {
-	const $b = self;
-	let $c = null;
-	if ($b[0] === 0) {
-		const x = __clone($b[1]);
-		$c = x;
+function unwrap_or(self, fallback) {
+	const $a = self;
+	let $b = null;
+	if ($a[0] === 0) {
+		const x = __clone($a[1]);
+		$b = x;
 	} else {
-		$c = __clone(fallback);
+		$b = __clone(fallback);
 	}
-	return $c;
+	return $b;
 }
-function $d(self) {
-	const $e = self;
-	return $e[0] === 1;
-}
-function $h($i) {
-	drop($i);
+function is_none(self) {
+	const $c = self;
+	return $c[0] === 1;
 }
 function $f($g) {
-	if ($g[0] === 0) {
-		$h($g[1]);
+	drop($g);
+}
+function $d($e) {
+	if ($e[0] === 0) {
+		$f($e[1]);
 	}
 }
 data_take_replace();
@@ -221,15 +221,15 @@ console.log("sink returned");
 let back = passthrough([ "through" ]);
 try {
 	console.log("passthrough returned");
-	$h(back);
+	$f(back);
 	back = null;
 } finally {
 	if (back !== null) {
-		$h(back);
+		$f(back);
 	}
 }
 console.log("--");
-$h(passthrough([ "unbound" ]));
+$f(passthrough([ "unbound" ]));
 console.log("unbound dropped");
 console.log("--");
 match_move();
@@ -247,11 +247,11 @@ console.log("--");
 let db = [ "immediate" ];
 try {
 	console.log("before drop");
-	$h(db);
+	$f(db);
 	db = null;
 } finally {
 	if (db !== null) {
-		$h(db);
+		$f(db);
 	}
 }
 console.log("after drop");

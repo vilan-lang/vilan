@@ -105,7 +105,10 @@ pub fn transform_functions<'src>(
         .collect::<Vec<_>>();
     t_functions.sort_by_key(|a| a.0.0);
     let t_functions = t_functions.into_iter().map(|x| x.1);
-    let t_instances = transformer.monomorphized.into_iter();
+    let t_instances = transformer
+        .monomorphized
+        .into_iter()
+        .chain(transformer.printer_functions);
 
     let imports = transformer
         .used_imports
@@ -115,7 +118,8 @@ pub fn transform_functions<'src>(
             format!("import {{ {} }} from \"{}\";", names, module)
         })
         .collect::<Vec<_>>();
-    let helpers = transformer.used_helpers.into_iter().collect::<Vec<_>>();
+    let mut helpers = transformer.used_helpers.into_iter().collect::<Vec<_>>();
+    close_helper_dependencies(&mut helpers);
 
     let nodes = t_functions
         .chain(t_instances)
@@ -1102,6 +1106,39 @@ pub fn unescape_string(raw: &str) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
+/// The helpers a helper's own body calls, added to a sorted helper list so a
+/// program that reaches the caller also emits the callee.
+///
+/// - `__chunk_ready`/`__chunk_load` read the registry through
+///   `__chunk_registry` — including in a build that reached the gate without
+///   splitting, where an empty registry makes every arm ready;
+/// - the checked subscripts and the nursery join raise a panic through
+///   `__panic` (debugging.md S0).
+fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
+    let mut added = false;
+    if helpers
+        .iter()
+        .any(|helper| matches!(*helper, "__chunk_ready" | "__chunk_load"))
+        && !helpers.contains(&"__chunk_registry")
+    {
+        helpers.push("__chunk_registry");
+        added = true;
+    }
+    if helpers.iter().any(|helper| {
+        matches!(
+            *helper,
+            "__at" | "__at_put" | "__at_view" | "__remove_at" | "__insert_at" | "__nursery_run"
+        )
+    }) && !helpers.contains(&"__panic")
+    {
+        helpers.push("__panic");
+        added = true;
+    }
+    if added {
+        helpers.sort();
+    }
+}
+
 /// The `__`-named free externs whose implementations live in the helper table:
 /// a std module binds `[extern("__name")]`, and transforming a call through
 /// one marks its helper for emission. Returns the canonical `'static` name.
@@ -1847,9 +1884,130 @@ fn helper_source(name: &str) -> &'static str {
         // `list[i]` — the checked subscript read: out of bounds panics (`get`
         // is the total, Option-returning form above).
         "__at" => {
-            "function __at(list, index) {\n\
+            "function __at(list, index, location) {\n\
              \tif (index >= 0 && index < list.length) return list[index];\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
+             }"
+        }
+        // `dbg(..)`'s runtime (debugging.md S1): the layout and the scalar
+        // spellings every generated `__show_*` printer builds on, written to
+        // agree byte for byte with `vilan_rt::show`. A document is a string or
+        // a group `{ o, c, p, e }`: open text, close text, whether the entries
+        // are padded by a space (`Point { x = 1 }` against `[1, 2]`), and
+        // `[label, document]` entries. It lays out on one line when that fits
+        // 80 columns from where it starts, else one entry per line, two spaces
+        // deeper, each with a trailing comma (Q1). Widths count characters.
+        "__dbg" => {
+            "function __dbg(write, location, entries) {\n\
+             \tif (entries.length === 0) {\n\
+             \t\twrite(\"[\" + location + \"]\");\n\
+             \t\treturn;\n\
+             \t}\n\
+             \tfor (const entry of entries) {\n\
+             \t\tconst head = \"[\" + location + \"] \" + entry[0] + \" = \";\n\
+             \t\twrite(head + __dbg_layout(entry[1], __dbg_width(head), 0));\n\
+             \t}\n\
+             }\n\
+             function __dbg_value(write, location, text, show, value) {\n\
+             \t__dbg(write, location, [ [ text, show(value) ] ]);\n\
+             \treturn value;\n\
+             }\n\
+             function __dbg_values(write, location, texts, shows, values, spread) {\n\
+             \t__dbg(write, location, values.map((value, index) => [ texts[index], shows[index](value) ]));\n\
+             \treturn spread ? values.flatMap((value, index) => spread[index] ? value : [ value ]) : values;\n\
+             }\n\
+             function __dbg_group(open, close, padded, entries) {\n\
+             \treturn { o: open, c: close, p: padded, e: entries };\n\
+             }\n\
+             function __dbg_list(items, show) {\n\
+             \tconst entries = [];\n\
+             \tconst shown = Math.min(items.length, 100);\n\
+             \tfor (let index = 0; index < shown; index++) entries.push([ \"\", show(items[index]) ]);\n\
+             \tif (items.length > shown) entries.push([ \"\", \"\u{2026} \" + (items.length - shown) + \" more\" ]);\n\
+             \treturn __dbg_group(\"[\", \"]\", false, entries);\n\
+             }\n\
+             const __dbg_seen = [];\n\
+             function __dbg_shared(cell, show) {\n\
+             \tif (__dbg_seen.includes(cell)) return \"<cycle>\";\n\
+             \t__dbg_seen.push(cell);\n\
+             \ttry {\n\
+             \t\treturn __dbg_group(\"Shared(\", \")\", false, [ [ \"\", show(cell.v) ] ]);\n\
+             \t} finally {\n\
+             \t\t__dbg_seen.pop();\n\
+             \t}\n\
+             }\n\
+             function __dbg_members(open, items, show) {\n\
+             \tconst entries = [];\n\
+             \tfor (const item of items) {\n\
+             \t\tif (entries.length === 100) {\n\
+             \t\t\tentries.push([ \"\", \"\u{2026} \" + (items.length - 100) + \" more\" ]);\n\
+             \t\t\tbreak;\n\
+             \t\t}\n\
+             \t\tentries.push(show(item));\n\
+             \t}\n\
+             \treturn __dbg_group(open, \"}\", true, entries);\n\
+             }\n\
+             function __dbg_map(open, table, showKey, showValue, keyWidth, valueWidth) {\n\
+             \tconst items = Array.from(table.values());\n\
+             \treturn __dbg_members(open, items, (pair) => {\n\
+             \t\tconst key = keyWidth === 1 ? pair[0] : pair.slice(0, keyWidth);\n\
+             \t\tconst value = valueWidth === 1 ? pair[keyWidth] : pair.slice(keyWidth, keyWidth + valueWidth);\n\
+             \t\treturn [ __dbg_flat(showKey(key)) + \" => \", showValue(value) ];\n\
+             \t});\n\
+             }\n\
+             function __dbg_set(open, table, show) {\n\
+             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ]);\n\
+             }\n\
+             function __dbg_str(text) {\n\
+             \tlet out = \"\\\"\";\n\
+             \tfor (const character of text) {\n\
+             \t\tif (character === \"\\\\\") out += \"\\\\\\\\\";\n\
+             \t\telse if (character === \"\\\"\") out += \"\\\\\\\"\";\n\
+             \t\telse if (character === \"\\n\") out += \"\\\\n\";\n\
+             \t\telse if (character === \"\\t\") out += \"\\\\t\";\n\
+             \t\telse if (character === \"\\r\") out += \"\\\\r\";\n\
+             \t\telse if (character === \"\\0\") out += \"\\\\0\";\n\
+             \t\telse out += character;\n\
+             \t}\n\
+             \treturn out + \"\\\"\";\n\
+             }\n\
+             function __dbg_float(value) {\n\
+             \tconst text = String(value);\n\
+             \treturn Number.isInteger(value) && !text.includes(\"e\") ? text + \".0\" : text;\n\
+             }\n\
+             function __dbg_width(text) {\n\
+             \tlet width = 0;\n\
+             \tfor (const _ of text) width++;\n\
+             \treturn width;\n\
+             }\n\
+             function __dbg_flat(document) {\n\
+             \tif (typeof document === \"string\") return document;\n\
+             \tif (document.e.length === 0) return document.o + document.c;\n\
+             \tconst inner = document.e.map((entry) => entry[0] + __dbg_flat(entry[1])).join(\", \");\n\
+             \treturn document.p ? document.o + \" \" + inner + \" \" + document.c : document.o + inner + document.c;\n\
+             }\n\
+             function __dbg_layout(document, column, indent) {\n\
+             \tconst flat = __dbg_flat(document);\n\
+             \tif (typeof document === \"string\" || document.e.length === 0 || column + __dbg_width(flat) <= 80) return flat;\n\
+             \tconst pad = \" \".repeat(indent + 2);\n\
+             \tlet out = document.o + \"\\n\";\n\
+             \tfor (const entry of document.e) out += pad + entry[0] + __dbg_layout(entry[1], __dbg_width(pad + entry[0]), indent + 2) + \",\\n\";\n\
+             \treturn out + \" \".repeat(indent) + document.c;\n\
+             }"
+        }
+        // `panic(message)` (debugging.md S0): an `Error`, so a stack exists, whose
+        // NAME carries the location — an uncaught one prints `panicked at
+        // src/main.vl:12:5: message`, the line the native runtime writes, and a
+        // catcher reading `error.message` (`__guarded`, the db pair) still sees
+        // the message alone. `location` marks it as a vilan panic for the
+        // nursery's task-origin decoration.
+        "__panic" => {
+            "function __panic(message, location) {\n\
+             \tconst error = new Error(message);\n\
+             \terror.name = \"panicked at \" + location;\n\
+             \tObject.defineProperty(error, \"location\", { value: location });\n\
+             \tif (Error.captureStackTrace) Error.captureStackTrace(error, __panic);\n\
+             \treturn error;\n\
              }"
         }
         // `List.remove(i): T` — the checked splice read. `splice` is the native
@@ -1858,35 +2016,35 @@ fn helper_source(name: &str) -> &'static str {
         // exactly the indices `[]` panics on. The guard is `__at`'s, word for
         // word, so a caller cannot tell which of the two refused.
         "__remove_at" => {
-            "function __remove_at(list, index) {\n\
+            "function __remove_at(list, index, location) {\n\
              \tif (index >= 0 && index < list.length) return list.splice(index, 1)[0];\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
         // `List.insert(i, v)` — the checked splice write. `index == length`
         // appends (a `push`, which is what the vilan shift loop did); anything
         // outside `0..=length` panics in `__at`'s words.
         "__insert_at" => {
-            "function __insert_at(list, index, value) {\n\
+            "function __insert_at(list, index, value, location) {\n\
              \tif (index >= 0 && index < list.length) return void list.splice(index, 0, value);\n\
              \tif (index === list.length) return void list.push(value);\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
         // `list[i] = v` — the checked subscript write: writing never creates a
         // slot (growth is `push`), so out of bounds panics.
         "__at_put" => {
-            "function __at_put(list, index, value) {\n\
+            "function __at_put(list, index, value, location) {\n\
              \tif (index >= 0 && index < list.length) return list[index] = value;\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
         // `&mut list[i]` — the checked view mint: the scalar `(base, key)` pair
         // exists only for an in-bounds element.
         "__at_view" => {
-            "function __at_view(list, index) {\n\
+            "function __at_view(list, index, location) {\n\
              \tif (index >= 0 && index < list.length) return [ list, index ];\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
         // `str.substring(start, end)` — the checked slice. The native JS method
@@ -1975,7 +2133,7 @@ fn helper_source(name: &str) -> &'static str {
             "function __force(cell) {\n\
              \tif (cell.state === 2) return cell.value;\n\
              \tif (cell.state === 1) throw \"lazy initialization cycle: `\" + cell.name + \"`\";\n\
-             \tif (cell.state === 3) throw \"lazy `\" + cell.name + \"` is poisoned: its initializer panicked: \" + cell.value;\n\
+             \tif (cell.state === 3) throw \"lazy `\" + cell.name + \"` is poisoned: its initializer panicked: \" + (cell.value && cell.value.location !== undefined ? cell.value.message : cell.value);\n\
              \tcell.state = 1;\n\
              \ttry {\n\
              \t\tcell.value = cell.thunk();\n\
@@ -2211,7 +2369,10 @@ fn helper_source(name: &str) -> &'static str {
              \tfor (const task of n.children) task.then(null, () => {});\n\
              \tif (bodyFailed) throw bodyError;\n\
              \tconst winner = n.failedTask;\n\
-             \tthrow typeof winner.error === \"string\" ? winner.error + \" (in task spawned in \" + winner.origin + \")\" : winner.error;\n\
+             \tconst failure = winner.error;\n\
+             \tif (typeof failure === \"string\") throw failure + \" (in task spawned in \" + winner.origin + \")\";\n\
+             \tif (failure && failure.location !== undefined) throw __panic(failure.message + \" (in task spawned in \" + winner.origin + \")\", failure.location);\n\
+             \tthrow failure;\n\
              }"
         }
         // The abortable timer behind `std::time::sleep`: resolve after `ms`,
@@ -2524,6 +2685,13 @@ struct Transformer<'src> {
     // when a body may join them.
     shared_bodies: HashMap<(SharedBodySubject, String), SharedBody>,
     monomorphized: Vec<js::Node<'src>>,
+    // `dbg`'s generated printers (debugging.md S1, `transformer/dbg.rs`): by
+    // type key the printer's name, the names taken, and the declarations.
+    printers: HashMap<String, String>,
+    printer_names: HashSet<String>,
+    printer_functions: Vec<js::Node<'src>>,
+    // What `dbg(..)` does in this build (`[build] dbg`, debugging.md Q4).
+    dbg_policy: crate::options::DbgPolicy,
     // Captures introduced by an `is` test, aliased to the subject's payload
     // slots (e.g. `t[1]`) since they can't be JS bindings in expression position.
     is_bindings: HashMap<Id, js::Node<'src>>,
@@ -3005,6 +3173,10 @@ impl<'src> Transformer<'src> {
             drop_helpers: HashMap::default(),
             shared_bodies: HashMap::default(),
             monomorphized: Vec::new(),
+            printers: HashMap::default(),
+            printer_names: HashSet::default(),
+            printer_functions: Vec::new(),
+            dbg_policy: options.dbg,
             is_bindings: HashMap::default(),
             hoisted_values: HashMap::default(),
             const_capture_values: HashMap::default(),
@@ -3612,7 +3784,12 @@ impl<'src> Transformer<'src> {
         // function id, so they are never chunked — a conservative eager
         // placement, correct at the cost of a chunk-exclusive instantiation
         // riding along.
-        let t_instances = self.monomorphized.into_iter();
+        // `dbg`'s printers (debugging.md S1) ride with the instances: plain
+        // declarations, eager, never chunked.
+        let t_instances = self
+            .monomorphized
+            .into_iter()
+            .chain(std::mem::take(&mut self.printer_functions));
 
         let mut nodes = t_functions.collect::<Vec<_>>();
         // Each chunk's declarations occupy one contiguous run, recorded so the
@@ -3653,18 +3830,7 @@ impl<'src> Transformer<'src> {
             })
             .collect::<Vec<_>>();
         let mut helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
-        // `__chunk_ready`/`__chunk_load` read the registry through
-        // `__chunk_registry`, so the helper's own dependency travels with it —
-        // including in a build that reached the gate without splitting, where
-        // an empty registry makes every arm ready.
-        if helpers
-            .iter()
-            .any(|helper| matches!(*helper, "__chunk_ready" | "__chunk_load"))
-            && !helpers.contains(&"__chunk_registry")
-        {
-            helpers.push("__chunk_registry");
-            helpers.sort();
-        }
+        close_helper_dependencies(&mut helpers);
 
         // Re-allocate names over the JS scope tree so disjoint scopes share them
         // (readable: both sibling `value`s stay `value`; release: reuse short
@@ -4278,6 +4444,7 @@ impl<'src> Transformer<'src> {
             | Expr::Macro
             | Expr::Module(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Number(_, _, _)
             | Expr::Parameter(_)
@@ -4804,10 +4971,11 @@ impl<'src> Transformer<'src> {
             Some(Expr::Index(subject, index)) => {
                 let base = self.walk_entity(*subject, block).unwrap_or(js::Node::Void);
                 let key = self.walk_entity(*index, block).unwrap_or(js::Node::Void);
+                let location = self.subscript_location(operand, block);
                 self.used_helpers.insert("__at_view");
                 return js::Node::Call(
                     Box::new(js::Node::Local("__at_view".to_string())),
-                    vec![base, key],
+                    vec![base, key, location],
                 );
             }
             // A boxed scalar local: the cell itself (slot 0 holds the value),
@@ -5084,6 +5252,55 @@ impl<'src> Transformer<'src> {
             Some(Expr::Block((_, tail))) => self.sibling_value_is_settled(*tail, node),
             _ => false,
         }
+    }
+
+    /// N136 (R-g door (a)): `print` of a NUMBER formats it by the language's
+    /// own conversion, `String(x)` — the one an i-string and the native
+    /// backend use — so negative zero prints `0`, where `console.log`'s
+    /// inspect wrote `-0`. Every other `print` is untouched.
+    fn number_print_arguments(
+        &self,
+        target_id: Id,
+        argument_ids: &[Id],
+        args: Vec<js::Node<'src>>,
+    ) -> Vec<js::Node<'src>> {
+        if target_id != self.print_fn_id
+            || !argument_ids
+                .first()
+                .is_some_and(|argument| self.program.number_print_arguments.contains(argument))
+        {
+            return args;
+        }
+        args.into_iter()
+            .map(|argument| {
+                js::Node::Call(
+                    Box::new(js::Node::Local("String".to_string())),
+                    vec![argument],
+                )
+            })
+            .collect()
+    }
+
+    /// The location a checked subscript's bounds panic reports (debugging.md
+    /// S0): its own site, or — inside a `[track_caller]` function's own body —
+    /// the caller's, through the hidden parameter.
+    fn subscript_location(
+        &mut self,
+        index_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        if let Some(argument) = self
+            .program
+            .index_location_arguments
+            .get(&index_id)
+            .copied()
+            && let Some(read) = self.walk_entity(argument, block)
+        {
+            return read;
+        }
+        js::Node::String(std::borrow::Cow::Owned(
+            self.program.site_location(index_id),
+        ))
     }
 
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
@@ -5363,6 +5580,11 @@ impl<'src> Transformer<'src> {
                 js::Node::Number(whole, fraction.map(|x| x.to_string()))
             }
             Expr::String(x) => js::Node::String(unescape_string(x)),
+            // debugging.md S0: a `[track_caller]` call's location argument —
+            // `std::debug::Location` is its text on this backend.
+            Expr::CallerLocation(anchor) => {
+                js::Node::String(std::borrow::Cow::Owned(self.program.site_location(*anchor)))
+            }
             // A triple-quoted string: RAW (no escape interpretation), trimmed
             // to its content; the analyzer already validated, so an error here
             // is unreachable and degrades to "".
@@ -5506,10 +5728,11 @@ impl<'src> Transformer<'src> {
                     .walk_entity(*subject_id, block)
                     .unwrap_or(js::Node::Void);
                 let index = self.walk_entity(*index_id, block).unwrap_or(js::Node::Void);
+                let location = self.subscript_location(id, block);
                 self.used_helpers.insert("__at");
                 js::Node::Call(
                     Box::new(js::Node::Local("__at".to_string())),
-                    vec![subject, index],
+                    vec![subject, index, location],
                 )
             }
             Expr::Call(id) => {
@@ -5751,6 +5974,11 @@ impl<'src> Transformer<'src> {
                         {
                             let args =
                                 self.host_arguments(target_id, &function_call.argument_ids, args);
+                            let args = self.number_print_arguments(
+                                target_id,
+                                &function_call.argument_ids,
+                                args,
+                            );
                             let call = self.emit_extern(target_id, binding, args);
                             return Some(self.maybe_await(target_id, call));
                         }
@@ -5761,6 +5989,9 @@ impl<'src> Transformer<'src> {
                             self.program.entity_map.get(&target_id)
                         {
                             return Some(self.variant_value(*enum_id, *variant_index, args));
+                        }
+                        if Some(target_id) == self.program.dbg_fn_id {
+                            return Some(self.dbg_call(*id, &function_call.argument_ids, args));
                         }
                         if target_id == self.print_fn_id {
                             return Some(js::Node::Call(
@@ -5775,16 +6006,37 @@ impl<'src> Transformer<'src> {
                         // an immediately-invoked arrow so it stays valid in
                         // expression position (e.g. a match leg).
                         if Some(target_id) == self.panic_fn_id {
-                            let message = args.into_iter().next().unwrap_or(js::Node::Void);
+                            let mut args = args.into_iter();
+                            let message = args.next().unwrap_or(js::Node::Void);
+                            // debugging.md S0: `track_caller` appended the
+                            // site (or the forwarded caller) as the second.
+                            let location = args.next().unwrap_or_else(|| {
+                                js::Node::String(std::borrow::Cow::Owned(
+                                    self.program.site_location(*id),
+                                ))
+                            });
+                            self.used_helpers.insert("__panic");
+                            let error = js::Node::Call(
+                                Box::new(js::Node::Local("__panic".to_string())),
+                                vec![message, location],
+                            );
                             return Some(js::Node::Call(
                                 Box::new(js::Node::Closure(js::Closure {
                                     parameters: Vec::new(),
-                                    body: vec![js::Node::Throw(Box::new(message))],
+                                    body: vec![js::Node::Throw(Box::new(error))],
                                     is_async: false,
                                     origin: None,
                                 })),
                                 Vec::new(),
                             ));
+                        }
+                        // `std::debug::caller()` IS its location argument.
+                        if Some(target_id) == self.program.caller_fn_id {
+                            return Some(args.into_iter().next().unwrap_or_else(|| {
+                                js::Node::String(std::borrow::Cow::Owned(
+                                    self.program.site_location(*id),
+                                ))
+                            }));
                         }
                         // `drop(x)` — the std early-teardown sink (destruction.md
                         // §6), rewritten by the concrete argument type at THIS
@@ -6880,10 +7132,11 @@ impl<'src> Transformer<'src> {
                         .walk_entity(subject_id, block)
                         .unwrap_or(js::Node::Void);
                     let index = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+                    let location = self.subscript_location(*target_id, block);
                     self.used_helpers.insert("__at_put");
                     return Some(js::Node::Call(
                         Box::new(js::Node::Local("__at_put".to_string())),
-                        vec![subject, index, value],
+                        vec![subject, index, value, location],
                     ));
                 }
                 let target = self
@@ -8950,10 +9203,11 @@ impl<'src> Transformer<'src> {
                         .walk_entity(subject_id, block)
                         .unwrap_or(js::Node::Void);
                     let index = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+                    let location = self.subscript_location(element, block);
                     self.used_helpers.insert("__at_put");
                     block.push(js::Node::Call(
                         Box::new(js::Node::Local("__at_put".to_string())),
-                        vec![subject, index, slot],
+                        vec![subject, index, slot, location],
                     ));
                 }
                 Some(Expr::TupleIndex(subject_id, baked_offset, baked_width))
@@ -11181,7 +11435,12 @@ impl<'src> Transformer<'src> {
             self.record_hit(|recorder| recorder.defaults.get(&key).copied());
             return name;
         }
-        let name = self.ng.next_name();
+        let source_name = self
+            .program
+            .functions
+            .get(&default_id)
+            .map(|function| function.name);
+        let name = self.ng.instance_name(source_name);
         self.default_instances.insert(key.clone(), name.clone());
         if let Some(function) = self.program.functions.get(&default_id) {
             let emission = self.record_keyed(|recorder, id| {
@@ -12053,7 +12312,12 @@ impl<'src> Transformer<'src> {
             let logged = function.name.to_string();
             INSTANCE_LOG.with(|log| log.borrow_mut().push(logged));
         }
-        let name = self.ng.next_name();
+        let source_name = self
+            .program
+            .functions
+            .get(&function_id)
+            .map(|function| function.name);
+        let name = self.ng.instance_name(source_name);
         self.instances.insert(key.clone(), name.clone());
         if let Some(function) = self.program.functions.get(&function_id) {
             let emission = self.record_keyed(|recorder, id| {
@@ -12075,6 +12339,10 @@ impl<'src> Transformer<'src> {
             );
             self.record_leave(frame, emission);
             if let Some(shared) = shared {
+                // The minted name is never declared: it must not stay among
+                // the renameable names, where an undeclared one is RESERVED
+                // and would push every later `name` to `name2` (E259).
+                self.ng.forget_instance_name(&name);
                 return self.take_shared_body(key, shared);
             }
         }
@@ -13632,6 +13900,8 @@ impl<'src> ConstWorld<'src> {
     }
 }
 
+mod dbg;
+
 pub mod js {
     use crate::node::BinaryOp;
     use std::borrow::Cow;
@@ -13886,6 +14156,22 @@ const RESERVED_NAMES: &[&str] = &[
     "Request",
     // Runtime helpers (emitted as `function __clone(..)`, etc.).
     "__clone",
+    "__panic",
+    "__dbg",
+    "__dbg_value",
+    "__dbg_values",
+    "__dbg_group",
+    "__dbg_list",
+    "__dbg_str",
+    "__dbg_float",
+    "__dbg_width",
+    "__dbg_flat",
+    "__dbg_layout",
+    "__dbg_seen",
+    "__dbg_shared",
+    "__dbg_members",
+    "__dbg_map",
+    "__dbg_set",
     "__scan",
     "__parse_i32",
     "__parse_f64",
@@ -14102,6 +14388,9 @@ struct NameGenerator {
     /// a base shared by thousands of locals (`item`, `found`, `i`) costs one
     /// probe a name instead of one per earlier namesake.
     next_suffix: HashMap<String, u64>,
+    /// E259: each readable monomorphized-instance name and the source name it
+    /// was minted from — renameable alongside the entities' own.
+    instance_sources: Vec<(String, String)>,
 }
 
 impl NameGenerator {
@@ -14115,6 +14404,7 @@ impl NameGenerator {
             seed,
             minted: HashSet::default(),
             next_suffix: HashMap::default(),
+            instance_sources: Vec::new(),
         }
     }
 
@@ -14154,6 +14444,35 @@ impl NameGenerator {
         };
         self.names.insert(id, name.clone());
         name
+    }
+
+    /// The name of one monomorphized instance of the function called `source`
+    /// (E259): in the readable build its source name, suffixed past the
+    /// first (`first`, `first2`), so a stack trace and a debugger read the
+    /// function they are in instead of `$a`; annotated as an entity is in the
+    /// annotated build; a plain generated name in release.
+    fn instance_name(&mut self, source: Option<&str>) -> String {
+        match (&self.seed.style, source) {
+            (NameStyle::Readable, Some(source)) => {
+                let name = self.unique_readable(source);
+                // Renameable like the entity it is named after: the scope
+                // re-allocation must not hand the same name to another
+                // declaration (E259).
+                self.instance_sources
+                    .push((name.clone(), source.to_string()));
+                name
+            }
+            (NameStyle::Annotated, Some(source)) => {
+                format!("{}/*{}*/", self.next_name(), source)
+            }
+            _ => self.next_name(),
+        }
+    }
+
+    /// Drops an instance name whose body was shared with an earlier one (and
+    /// so is never declared) from the renameable set.
+    fn forget_instance_name(&mut self, name: &str) {
+        self.instance_sources.retain(|(minted, _)| minted != name);
     }
 
     /// A readable identifier from `source`, suffixed (`greet2`, `greet3`, ...) until
@@ -14627,6 +14946,9 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
         if let Some(source) = ng.seed.source_names.get(id) {
             source_of.insert(name.clone(), source.clone());
         }
+    }
+    for (name, source) in &ng.instance_sources {
+        source_of.insert(name.clone(), source.clone());
     }
     // Release re-allocates EVERY name the generator minted — including the
     // anonymous temps (`ng.names` holds only the id-keyed ones), whose names come
