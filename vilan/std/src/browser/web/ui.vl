@@ -2566,12 +2566,11 @@ export impl FocusScope {
 		mut registered: Option<Element> = None;
 		mut native: Option<Element> = None;
 		for candidate in self.root.query_selector_all("*") {
-			if registered.is_none() {
-				if autofocus_registered(autofocus_elements, candidate) {
-					registered = Some(candidate);
-				} else if native.is_none() && candidate.has_attribute("autofocus") {
-					native = Some(candidate);
-				}
+			registered.is_none() else jump break;
+			if autofocus_registered(autofocus_elements, candidate) {
+				registered = Some(candidate);
+			} else if native.is_none() && candidate.has_attribute("autofocus") {
+				native = Some(candidate);
 			}
 		}
 		let marked = registered.or(native);

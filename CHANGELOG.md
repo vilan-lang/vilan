@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: perf -->
+**A focus scope's autofocus scan stops at the first registered element.** `FocusScope` walks its content for the element `.autofocus()` registered (falling back to a native `autofocus` attribute); once it had found the registered one it kept visiting every remaining descendant and did nothing with them. The loop now leaves there (`registered.is_none() else jump break;`). No behaviour changes: the same element is chosen. (The owner's edit.)
+
+---
+
 <!-- family: tooling -->
 **`[derive(Storable)]`'s output imports through `std::reactive::store`, the module a program names, instead of stepping around B547 through `std::reactive::store_core`.** The derive's generated code named the core module because, in a module that was the first to load `std::reactive::store`, an import of `Storable` there bound the derive macro rather than the re-exported trait ("'Storable' is not a trait"). B547's compiler fix makes an import bind the trait once re-exports have bound, so the generated code now spells its imports the way a hand-written module does. No behaviour changed. Pin: `module_resolution::a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map` (a derive in a non-entry module whose entry imports nothing of the store), red on a compiler without B547's fix; B547's own pin stands. Tracker B547 (std side).
 
