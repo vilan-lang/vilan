@@ -661,3 +661,5 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 636	-	`std::{old}` moved to `std::{new}`: std's modules are grouped under namespaces since v0.44.0, and the old path is gone — write `std::{new}`
 637	-	`{section} prelude = "{path}"` names the old path of a std module: `std::{old}` moved to `std::{new}` — write `prelude = "{rewritten}"`
 NEW	-	cannot infer `{family_label}`'s element {}: {written} is `{element}` and names no type for it, and nothing else at this call binds `{family_label}` — annotate the argument, or bind `{family_label}` through another parameter
+NEW	-	`mut {name}` would bind a COPY of a tuple element, and its write would not reach `{place}`: a capture inside a tuple pattern is a copy even under a view subject (tuples store flat) — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
+NEW	-	cannot mutate '{name}': a capture inside a tuple pattern is a COPY of its element even under a view subject (tuples store flat), so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`

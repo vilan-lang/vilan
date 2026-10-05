@@ -60,6 +60,11 @@ written down.
 
 ---
 
+<!-- family: breaking -->
+**B545: under `match &mut place`, a capture inside a TUPLE sub-pattern (`Some((let a, let b))`) is a copy of its element (tuples store flat), and both traps it left are closed: a write to it is refused with the steer to bind the tuple whole — "a capture inside a tuple pattern is a COPY of its element even under a view subject … bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`" — where it steered to "declare it mut"; and `mut a` there is refused as B509 Q4 refuses a `mut` payload capture, where it compiled and its write never landed.** Breaking for the second: a `mut` tuple-leaf capture under a view subject was accepted (the estate has no `match &`/`match &mut` subject). Not built: the paper's one-slot tuple leaf as a VIEW (a `(tuple, offset)` pair on JS); the refusal is the sound half and names the spelling that writes in place. **Pins:** `inference::borrows::b545_a_tuple_leaf_capture_under_a_view_subject_is_refused_with_the_whole_tuple_steer` (the write, the `mut`, the steered spelling running, a readonly read of a leaf). Tracker B545.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

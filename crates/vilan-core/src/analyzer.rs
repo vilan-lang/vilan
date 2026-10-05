@@ -27767,8 +27767,25 @@ impl<'src> Analyzer<'src> {
                 _ => continue,
             };
             let mut captures = Vec::new();
-            for pattern in patterns {
+            let mut tuple_leaves = Vec::new();
+            for pattern in &patterns {
                 Self::collect_payload_captures(pattern, &mut captures);
+                Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
+            }
+            // B545: under a view subject a tuple leaf is still a copy of its
+            // element; the steer is the tuple bound whole, which is a view.
+            if tuple_leaves.contains(&capture_id)
+                && self.reference_subject_mode(subject_id).is_some()
+            {
+                let place = match self.expr_id_to_expr_map.get(&subject_id) {
+                    Some(Expr::Reference(operand, _)) => {
+                        self.receiver_spelling(*operand).unwrap_or("place")
+                    }
+                    _ => "place",
+                };
+                return Some(format!(
+                    "cannot mutate '{name}': a capture inside a tuple pattern is a COPY of its element even under a view subject (tuples store flat), so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                ));
             }
             if !captures.contains(&capture_id) {
                 continue;
@@ -27805,7 +27822,7 @@ impl<'src> Analyzer<'src> {
     /// was written to make (B528's trap: the old steer led there, and the
     /// write silently did not land).
     fn check_mut_captures_under_view_subjects(&mut self) {
-        let mut refusals: Vec<(Id, &'src str, Option<&'src str>, bool)> = Vec::new();
+        let mut refusals: Vec<(Id, &'src str, Option<&'src str>, bool, bool)> = Vec::new();
         for expr in self.expr_id_to_expr_map.values() {
             let (subject_id, patterns): (Id, Vec<&ExprPattern>) = match expr {
                 Expr::Match(subject_id, legs) => {
@@ -27825,21 +27842,47 @@ impl<'src> Analyzer<'src> {
                 _ => None,
             };
             let mut captures = Vec::new();
+            let mut tuple_leaves = Vec::new();
             for pattern in patterns {
                 Self::collect_payload_captures(pattern, &mut captures);
+                Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
             }
-            for capture_id in captures {
+            for (capture_id, in_tuple) in captures
+                .into_iter()
+                .map(|capture_id| (capture_id, false))
+                .chain(
+                    tuple_leaves
+                        .into_iter()
+                        .map(|capture_id| (capture_id, true)),
+                )
+            {
                 if let Some(variable) = self.variables.get(&capture_id)
                     && variable.mutable
                 {
                     let place = operand.and_then(|operand| self.receiver_spelling(operand));
-                    refusals.push((capture_id, variable.name, place, mutable));
+                    refusals.push((capture_id, variable.name, place, mutable, in_tuple));
                 }
             }
         }
         refusals.sort_unstable_by_key(|(capture_id, ..)| capture_id.0);
-        for (capture_id, name, place, mutable) in refusals {
+        for (capture_id, name, place, mutable, in_tuple) in refusals {
             let place = place.unwrap_or("place");
+            if in_tuple {
+                // B545: a tuple leaf is a copy under any subject; `mut` on it
+                // under a view subject reads as the in-place write it is not.
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&capture_id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "`mut {name}` would bind a COPY of a tuple element, and its write would not reach `{place}`: a capture inside a tuple pattern is a copy even under a view subject (tuples store flat) — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                        ),
+                    },
+                    capture_id,
+                );
+                continue;
+            }
             let (subject, steer) = if mutable {
                 (
                     format!("&mut {place}"),
@@ -27873,6 +27916,40 @@ impl<'src> Analyzer<'src> {
                 match sub_pattern {
                     ExprPattern::Binding(capture_id) => out.push(*capture_id),
                     ExprPattern::Variant(..) => Self::collect_payload_captures(sub_pattern, out),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// B545: the bindings a variant pattern reaches INSIDE a tuple sub-pattern
+    /// of a payload (`Some((let a, let b))`), with the payload's tuple-typed
+    /// position. Tuples store flat, so such a leaf is a copy of its element,
+    /// never a view into the payload — under a view subject a write to one, or
+    /// a `mut` on one, would not reach the subject (B528's trap one level
+    /// down).
+    fn collect_tuple_leaf_captures(pattern: &ExprPattern, out: &mut Vec<Id>) {
+        fn leaves(pattern: &ExprPattern, out: &mut Vec<Id>) {
+            match pattern {
+                ExprPattern::Binding(capture_id) => out.push(*capture_id),
+                ExprPattern::Tuple(elements) => {
+                    for (element, _) in elements {
+                        leaves(element, out);
+                    }
+                }
+                ExprPattern::Variant(_, _, sub_patterns) => {
+                    for sub_pattern in sub_patterns {
+                        leaves(sub_pattern, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let ExprPattern::Variant(_, _, sub_patterns) = pattern {
+            for sub_pattern in sub_patterns {
+                match sub_pattern {
+                    ExprPattern::Tuple(_) => leaves(sub_pattern, out),
+                    ExprPattern::Variant(..) => Self::collect_tuple_leaf_captures(sub_pattern, out),
                     _ => {}
                 }
             }

@@ -12848,3 +12848,58 @@ fn b544_a_whole_write_to_an_is_capture_in_its_block_steers_to_the_view_subject()
         "2\n",
     );
 }
+
+/// B545: under `match &mut place` a capture inside a TUPLE sub-pattern
+/// (`Some((let a, let b))`) is a copy of its element — tuples store flat — so a
+/// write to it is refused with the steer to bind the tuple whole (a payload
+/// view) and write its slot, and `mut a` there is refused as B509 Q4 refuses a
+/// `mut` payload capture. Before, the write was refused with "declare it
+/// mut", and `mut a` compiled and its write never landed.
+#[test]
+fn b545_a_tuple_leaf_capture_under_a_view_subject_is_refused_with_the_whole_tuple_steer() {
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held = Some((1, 2));
+            match &mut held {
+                Some((let a, let b)) => { a += 1; },
+                None => {},
+            }
+        }
+        "#,
+        "cannot mutate 'a': a capture inside a tuple pattern is a COPY of its element even \
+         under a view subject",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held = Some((1, 2));
+            match &mut held {
+                Some((mut a, let b)) => { a += 1; },
+                None => {},
+            }
+        }
+        "#,
+        "`mut a` would bind a COPY of a tuple element, and its write would not reach `held`",
+    );
+    // The steered spelling writes in place; a read of a tuple leaf is fine.
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held = Some((1, 2));
+            match &mut held {
+                Some(let pair) => { pair.0 += 10; },
+                None => {},
+            }
+            match &held {
+                Some((let a, let b)) => print(a + b),
+                None => {},
+            }
+        }
+        "#,
+        "13\n",
+    );
+}
