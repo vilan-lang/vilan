@@ -1,10 +1,17 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
-function __at_view(list, index) {
+function __at_view(list, index, location) {
 	if (index >= 0 && index < list.length) return [ list, index ];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function saturate_unsigned(value) {
 	const truncated = Math.trunc(value);
@@ -32,7 +39,7 @@ function inner_mut(self) {
 function item_mut(self, index) {
 	let $h = null;
 	if (as_usize(index) < self[1].length) {
-		$h = [ 0, __at_view(self[1], as_usize(index)) ];
+		$h = [ 0, __at_view(self[1], as_usize(index), "option-view.vl:42:14") ];
 	} else {
 		$h = [ 1 ];
 	}
@@ -82,7 +89,7 @@ if ($i[0] === 0) {
 	$j = undefined;
 }
 $j;
-console.log(__at(outer[1], 1));
+console.log(__at(outer[1], 1, "option-view.vl:87:8"));
 const $k = item_mut(outer, 9);
 let $l = null;
 if ($k[0] === 0) {

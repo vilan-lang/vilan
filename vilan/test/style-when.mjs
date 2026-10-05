@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -17,6 +17,13 @@ function __map_get(map, key) {
 function __map_values(map) {
 	return [ ...map.values() ].map(__clone);
 }
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
+}
 function hash(self) {
 	return __hash(self);
 }
@@ -24,10 +31,10 @@ function slot_of(key) {
 	const parts = key.split(":");
 	if (parts.length !== 3) {
 		(() => {
-			throw "this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read";
+			throw __panic("this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read", "std/src/web/style.vl:873:3");
 		})();
 	}
-	return [ __at(parts, 0), __at(parts, 1), __at(parts, 2) ];
+	return [ __at(parts, 0, "std/src/web/style.vl:875:17"), __at(parts, 1, "std/src/web/style.vl:875:39"), __at(parts, 2, "std/src/web/style.vl:875:60") ];
 }
 function family_longhands(property) {
 	const $g = property;

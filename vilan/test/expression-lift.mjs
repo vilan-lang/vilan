@@ -1,12 +1,19 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
 	if (value instanceof Set) return new Set([ ...value ].map(__clone));
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function to_string(self) {
 	return "" + self;
@@ -165,7 +172,7 @@ const $z = rows;
 if ($z[0] === 1) {
 	$y = $z;
 } else {
-	$y = __at($z[1], 0);
+	$y = __at($z[1], 0, "expression-lift.vl:77:27");
 }
 const first = $y;
 console.log($c(first, -(1)));
@@ -200,6 +207,6 @@ const paired = $K(left, ($L) => {
 console.log("" + $J(paired[0]) + " [" + paired[1] + "]");
 const boxes = [ [ [ 7, "inner" ] ], "outer" ];
 const picked = $K(boxes, ($O) => {
-	return __at($O, 0);
+	return __at($O, 0, "expression-lift.vl:102:26");
 });
 console.log("" + $J(picked[0]) + " [" + picked[1] + "]");

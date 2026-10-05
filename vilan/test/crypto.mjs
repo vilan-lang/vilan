@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -19,6 +19,13 @@ function __json_kind(value) {
 }
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 async function __pbkdf2_sha512(password, salt, iterations, bits) {
 	const imported = await crypto.subtle.importKey("raw", password, "PBKDF2", false, [ "deriveBits" ]);
@@ -250,7 +257,7 @@ function top(self) {
 	if (!(ok(self)) || $K(self[0])) {
 		$L = JSON.parse("null");
 	} else {
-		$L = __clone(__at(self[0], self[0].length - 1));
+		$L = __clone(__at(self[0], self[0].length - 1, "std/src/json.vl:521:4"));
 	}
 	return $L;
 }
@@ -486,17 +493,17 @@ function $z(segment) {
 async function $t(secret, token) {
 	const parts = token.split(".");
 	let $u = null;
-	if (parts.length !== 3 || __at(parts, 0) !== header_segment) {
+	if (parts.length !== 3 || __at(parts, 0, "std/src/jwt.vl:29:25") !== header_segment) {
 		$u = [ 1 ];
 	} else {
-		const expected = await (__hmac_sha512(secret, encode_utf8(__at(parts, 0) + "." + __at(parts, 1))));
-		const $v = decode_url(__at(parts, 2));
+		const expected = await (__hmac_sha512(secret, encode_utf8(__at(parts, 0, "std/src/jwt.vl:32:50") + "." + __at(parts, 1, "std/src/jwt.vl:32:67"))));
+		const $v = decode_url(__at(parts, 2, "std/src/jwt.vl:33:20"));
 		let $w = null;
 		if ($v[0] === 0) {
 			const given = $v[1];
 			let $Z = null;
 			if (equals_constant_time(expected, given)) {
-				$Z = $z(__at(parts, 1));
+				$Z = $z(__at(parts, 1, "std/src/jwt.vl:36:20"));
 			} else {
 				$Z = [ 1 ];
 			}

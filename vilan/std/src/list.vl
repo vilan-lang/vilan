@@ -111,6 +111,7 @@ impl List<type T> {
 	/// emitted helper keeps the panic, because `splice` CLAMPS an index past the
 	/// end — it would silently accept exactly the index this doc says a caller must
 	/// be punished for.
+	[track_caller]
 	external fun insert(&mut self, index: usize, own value: T): void;
 
 	/// Removes and returns the element at `index`, shifting the tail left. PANICS
@@ -121,6 +122,7 @@ impl List<type T> {
 	/// helper keeps the panic: `splice` reads a NEGATIVE index from the END,
 	/// so a bare `splice(index, 1)[0]` would answer `xs.remove(-1)` with the
 	/// last element instead of refusing.
+	[track_caller]
 	external fun remove(&mut self, index: usize): T;
 }
 

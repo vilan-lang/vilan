@@ -1,10 +1,10 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
-function __at_put(list, index, value) {
+function __at_put(list, index, value, location) {
 	if (index >= 0 && index < list.length) return list[index] = value;
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -15,10 +15,10 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __insert_at(list, index, value) {
+function __insert_at(list, index, value, location) {
 	if (index >= 0 && index < list.length) return void list.splice(index, 0, value);
 	if (index === list.length) return void list.push(value);
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __list_get(list, index) {
 	return index >= 0 && index < list.length ? [ 0, __clone(list[index]) ] : [ 1 ];
@@ -26,9 +26,16 @@ function __list_get(list, index) {
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
-function __remove_at(list, index) {
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
+}
+function __remove_at(list, index, location) {
 	if (index >= 0 && index < list.length) return list.splice(index, 1)[0];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __shared_new(value) {
 	return { v: value };
@@ -125,10 +132,10 @@ function enqueue(turn2, subscribers) {
 		} else if (!(turn2[2].v.has(key))) {
 			turn2[2].v.set(key, true);
 			let index = turn2[0].v.length;
-			while (index > 0 && __at(turn2[0].v, index - 1)[0] > subscriber[0]) {
+			while (index > 0 && __at(turn2[0].v, index - 1, "std/src/reactive.vl:414:21")[0] > subscriber[0]) {
 				index = index - 1;
 			}
-			__insert_at(turn2[0].v, index, __clone(subscriber));
+			__insert_at(turn2[0].v, index, __clone(subscriber), "std/src/reactive.vl:417:25");
 		}
 		$T;
 	}
@@ -322,14 +329,14 @@ function law(label, source2, derived2) {
 	const held = $j(derived2);
 	if (held.length !== naive2.length) {
 		(() => {
-			throw "" + label + ": derived holds " + held.length + " where the rerun holds " + naive2.length;
+			throw __panic("" + label + ": derived holds " + held.length + " where the rerun holds " + naive2.length, "list-cell.vl:66:3");
 		})();
 	}
 	let index = 0;
 	while (index < naive2.length) {
-		if (__at(held, index) !== __at(naive2, index)) {
+		if (__at(held, index, "list-cell.vl:70:6") !== __at(naive2, index, "list-cell.vl:70:21")) {
 			(() => {
-				throw "" + label + ": element " + index + " is " + __at(held, index) + ", not " + __at(naive2, index);
+				throw __panic("" + label + ": element " + index + " is " + __at(held, index, "list-cell.vl:71:41") + ", not " + __at(naive2, index, "list-cell.vl:71:60"), "list-cell.vl:71:4");
 			})();
 		}
 		index = index + 1;
@@ -338,7 +345,7 @@ function law(label, source2, derived2) {
 function expect(label, seen, wanted) {
 	if (seen !== wanted) {
 		(() => {
-			throw "" + label + ": " + seen + ", expected " + wanted;
+			throw __panic("" + label + ": " + seen + ", expected " + wanted, "list-cell.vl:79:3");
 		})();
 	}
 }
@@ -368,14 +375,14 @@ function shifted(value2) {
 function same(label, turn2, held, wanted) {
 	if (held.length !== wanted.length) {
 		(() => {
-			throw "turn " + turn2 + ": " + label + " holds " + held.length + ", the rerun " + wanted.length;
+			throw __panic("turn " + turn2 + ": " + label + " holds " + held.length + ", the rerun " + wanted.length, "list-cell.vl:131:3");
 		})();
 	}
 	let index = 0;
 	while (index < wanted.length) {
-		if (__at(held, index) !== __at(wanted, index)) {
+		if (__at(held, index, "list-cell.vl:135:6") !== __at(wanted, index, "list-cell.vl:135:21")) {
 			(() => {
-				throw "turn " + turn2 + ": " + label + "[" + index + "] is " + __at(held, index) + ", not " + __at(wanted, index);
+				throw __panic("turn " + turn2 + ": " + label + "[" + index + "] is " + __at(held, index, "list-cell.vl:136:46") + ", not " + __at(wanted, index, "list-cell.vl:136:65"), "list-cell.vl:136:4");
 			})();
 		}
 		index = index + 1;
@@ -474,7 +481,7 @@ function $D(list, start, taking, inserted) {
 	let left = [  ];
 	let taken = 0;
 	while (taken < taking) {
-		left.push(__remove_at(list, start));
+		left.push(__remove_at(list, start, "std/src/reactive/delta.vl:692:18"));
 		taken = taken + 1;
 	}
 	let offset = 0;
@@ -484,7 +491,7 @@ function $D(list, start, taking, inserted) {
 		let $F = null;
 		if ($E[0] === 0) {
 			const value2 = $E[1];
-			$F = __insert_at(list, start + offset, value2);
+			$F = __insert_at(list, start + offset, value2, "std/src/reactive/delta.vl:699:28");
 		} else {
 			$F = undefined;
 		}
@@ -596,7 +603,7 @@ function $aa(self, at, value2, $ab) {
 	let $ad = null;
 	if ($ac[0] === 0) {
 		const previous = $ac[1];
-		__at_put(self[0].v, at, __clone(value2));
+		__at_put(self[0].v, at, __clone(value2), "std/src/reactive/delta.vl:844:5");
 		$G(self[2], [ 1, at, previous, __clone(value2) ]);
 		$K(self, $ab);
 		$ad = undefined;
@@ -617,7 +624,7 @@ function $ag(self, from, count, to, $ah) {
 	let lifted = [  ];
 	let taken = 0;
 	while (taken < count) {
-		lifted.push(__remove_at(self[0].v, from));
+		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:864:35"));
 		taken = taken + 1;
 	}
 	let offset = 0;
@@ -626,7 +633,7 @@ function $ag(self, from, count, to, $ah) {
 		let $aj = null;
 		if ($ai[0] === 0) {
 			const value2 = $ai[1];
-			$aj = __insert_at(self[0].v, to + offset, value2);
+			$aj = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:870:43");
 		} else {
 			$aj = undefined;
 		}
@@ -773,7 +780,7 @@ function $bu(self, at, value2, $ab) {
 	let $bw = null;
 	if ($bv[0] === 0) {
 		const previous = $bv[1];
-		__at_put(self[0].v, at, __clone(value2));
+		__at_put(self[0].v, at, __clone(value2), "std/src/reactive/delta.vl:844:5");
 		$aT(self[2], [ 1, at, previous, __clone(value2) ]);
 		$aX(self, $ab);
 		$bw = undefined;
@@ -794,7 +801,7 @@ function $by(self, from, count, to, $ah) {
 	let lifted = [  ];
 	let taken = 0;
 	while (taken < count) {
-		lifted.push(__remove_at(self[0].v, from));
+		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:864:35"));
 		taken = taken + 1;
 	}
 	let offset = 0;
@@ -803,7 +810,7 @@ function $by(self, from, count, to, $ah) {
 		let $bA = null;
 		if ($bz[0] === 0) {
 			const value2 = $bz[1];
-			$bA = __insert_at(self[0].v, to + offset, value2);
+			$bA = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:870:43");
 		} else {
 			$bA = undefined;
 		}
@@ -942,14 +949,14 @@ function $cq(self, items, $cr) {
 	const new_length = items.length;
 	let prefix = 0;
 	while (prefix < old_length && prefix < new_length) {
-		if (__at(self[0].v, prefix) !== __at(items, prefix)) {
+		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:925:7") !== __at(items, prefix, "std/src/reactive/delta.vl:925:36")) {
 			break;
 		}
 		prefix = prefix + 1;
 	}
 	let suffix = 0;
 	while (prefix + suffix < old_length && prefix + suffix < new_length) {
-		if (__at(self[0].v, old_length - 1 - suffix) !== __at(items, new_length - 1 - suffix)) {
+		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:932:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:932:53")) {
 			break;
 		}
 		suffix = suffix + 1;
@@ -1120,14 +1127,14 @@ function $dn(self, items, $cr) {
 	const new_length = items.length;
 	let prefix = 0;
 	while (prefix < old_length && prefix < new_length) {
-		if (__at(self[0].v, prefix) !== __at(items, prefix)) {
+		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:925:7") !== __at(items, prefix, "std/src/reactive/delta.vl:925:36")) {
 			break;
 		}
 		prefix = prefix + 1;
 	}
 	let suffix = 0;
 	while (prefix + suffix < old_length && prefix + suffix < new_length) {
-		if (__at(self[0].v, old_length - 1 - suffix) !== __at(items, new_length - 1 - suffix)) {
+		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:932:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:932:53")) {
 			break;
 		}
 		suffix = suffix + 1;
@@ -1183,7 +1190,7 @@ const my_nums = $e(my_list, (x) => {
 	return x.length;
 }, [ 1 ], [ 1 ]);
 $aM(my_list, "10.5", [ 1 ]);
-console.log("after one push: " + __at($j(my_nums), 0));
+console.log("after one push: " + __at($j(my_nums), 0, "list-cell.vl:150:27"));
 const source = $a();
 const derived = $bc(source, counted, [ 1 ], [ 1 ]);
 $bC(__clone(source), (_list, $bB) => {
@@ -1231,7 +1238,7 @@ law("clear", source, derived);
 expect("clear runs g", calls.v, 11);
 if (!($cd(source))) {
 	(() => {
-		throw "clear left something behind";
+		throw __panic("clear left something behind", "list-cell.vl:210:3");
 	})();
 }
 console.log("twelve defaults: calls=" + calls.v + " notifications=" + notifications.v);
@@ -1358,7 +1365,7 @@ while (turn <= 300) {
 				$bx(walk, fresh, [ 0, $de ]);
 			} else if (choice < 22) {
 				let edited = $j(walk);
-				__at_put(edited, pick(size), next_random(100));
+				__at_put(edited, pick(size), next_random(100), "list-cell.vl:371:6");
 				edited.push(next_random(100));
 				$dn(walk, edited, [ 0, $de ]);
 			} else {
@@ -1377,7 +1384,7 @@ while (turn <= 300) {
 	const waves = walk_notifications.v - before;
 	if (waves > 1) {
 		(() => {
-			throw "turn " + turn + ": " + waves + " notifications, expected one per turn";
+			throw __panic("turn " + turn + ": " + waves + " notifications, expected one per turn", "list-cell.vl:390:4");
 		})();
 	}
 	if (waves === 0) {
@@ -1396,7 +1403,7 @@ while (turn <= 300) {
 }
 if (walk_calls.v + chain_calls.v >= naive) {
 	(() => {
-		throw "walk: " + walk_calls.v + " + " + chain_calls.v + " calls against a rerun of " + naive;
+		throw __panic("walk: " + walk_calls.v + " + " + chain_calls.v + " calls against a rerun of " + naive, "list-cell.vl:409:3");
 	})();
 }
 console.log("walk: turns=300 silent=" + silent + " length=" + $j(walk).length + " g=" + walk_calls.v + " h=" + chain_calls.v + " rerun=" + naive);

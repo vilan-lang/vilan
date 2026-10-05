@@ -72,7 +72,7 @@
 		const ATTRIBUTE = {
 			className: "meta",
 			// GENERATED(attribute-markers): parsing.rs KNOWN_ATTRIBUTE_MARKERS — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
-			begin: "^\\s*\\[(?:derive|service|client_service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated|internal|resource|hint|reactive)\\b",
+			begin: "^\\s*\\[(?:derive|service|client_service|extern|must_use|track_caller|rpc|trait_only|doc|expose|platform|deprecated|internal|resource|hint|reactive)\\b",
 			// END GENERATED(attribute-markers)
 			end: "\\]",
 		};

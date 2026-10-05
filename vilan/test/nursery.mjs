@@ -62,7 +62,17 @@ async function __nursery_run(n, body) {
 	for (const task of n.children) task.then(null, () => {});
 	if (bodyFailed) throw bodyError;
 	const winner = n.failedTask;
-	throw typeof winner.error === "string" ? winner.error + " (in task spawned in " + winner.origin + ")" : winner.error;
+	const failure = winner.error;
+	if (typeof failure === "string") throw failure + " (in task spawned in " + winner.origin + ")";
+	if (failure && failure.location !== undefined) throw __panic(failure.message + " (in task spawned in " + winner.origin + ")", failure.location);
+	throw failure;
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function __sleep(ms, signal) {
 	const sig = signal && signal[0] === 0 ? signal[1] : undefined;

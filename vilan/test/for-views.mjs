@@ -1,6 +1,13 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 let xs = [  ];
 xs.push(1);
@@ -11,8 +18,8 @@ for (const $b of $a.keys()) {
 	const e = [ $a, $b ];
 	e[0][e[1]] = e[0][e[1]] * 10;
 }
-console.log(__at(xs, 0));
-console.log(__at(xs, 2));
+console.log(__at(xs, 0, "for-views.vl:21:8"));
+console.log(__at(xs, 2, "for-views.vl:22:8"));
 let ps = [  ];
 ps.push([ 1 ]);
 ps.push([ 2 ]);
@@ -21,8 +28,8 @@ for (const $d of $c.keys()) {
 	const p = $c[$d];
 	p[0] = p[0] + 100;
 }
-console.log(__at(ps, 0)[0]);
-console.log(__at(ps, 1)[0]);
+console.log(__at(ps, 0, "for-views.vl:31:8")[0]);
+console.log(__at(ps, 1, "for-views.vl:32:8")[0]);
 let sum = 0;
 const $e = xs;
 for (const $f of $e.keys()) {

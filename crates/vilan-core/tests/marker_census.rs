@@ -268,6 +268,12 @@ const ATTRIBUTE_CLASSES: &[(&str, &str, Class, &str)] = &[
         "warns when the function's result is dropped",
     ),
     (
+        "track_caller",
+        "[track_caller]",
+        Class::CodeGeneration,
+        "passes the caller's location as a hidden parameter, so a panic inside names the call site",
+    ),
+    (
         "rpc",
         "[rpc]",
         Class::CodeGeneration,

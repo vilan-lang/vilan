@@ -104,6 +104,52 @@ macro fun Debug(item: Item): Source {
 	source("")
 }
 
+// --- Locations (debugging.md S0) ---
+
+/// Where a call was made: the file relative to its package root (std's own as
+/// `std/src/..`), a 1-based line and a 1-based column — `src/main.vl:12:5`. A
+/// `[track_caller]` function receives its caller's as a hidden parameter, and
+/// `caller()` reads it.
+external struct Location;
+
+impl Location {
+	/// The location as written: `file:line:column`.
+	[extern("String")]
+	external fun text(self): str;
+
+	/// The file, relative to its package root.
+	fun file(self): str {
+		let parts = self.text().split(":");
+		mut file = "";
+		mut index: usize = 0;
+		for index + 2 < parts.len() {
+			if index > 0 {
+				file = file + ":";
+			}
+			file = file + parts[index];
+			index = index + 1;
+		}
+		file
+	}
+
+	/// The 1-based line.
+	fun line(self): i32 {
+		let parts = self.text().split(":");
+		parts[parts.len() - 2].parse_i32().unwrap_or(0)
+	}
+
+	/// The 1-based column, in characters.
+	fun column(self): i32 {
+		let parts = self.text().split(":");
+		parts[parts.len() - 1].parse_i32().unwrap_or(0)
+	}
+}
+
+/// Inside a `[track_caller]` function, the location it was called from;
+/// anywhere else, the location of this call itself.
+[track_caller]
+external fun caller(): Location;
+
 // --- Json / Wire (shared JSON impls via in-world helpers) ---
 
 // --- The sized numeric family (proposal/numeric-types.md §5) ---

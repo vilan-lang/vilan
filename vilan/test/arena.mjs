@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -10,6 +10,13 @@ function __clone(value) {
 }
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function sum_from(arena, handle) {
 	const $y = $v(arena, handle);
@@ -34,8 +41,8 @@ function $b(self, value) {
 	let $d = null;
 	if ($c[0] === 0) {
 		const index = $c[1];
-		__at(self[0], index)[1] = __clone(value);
-		$d = [ index, __at(self[0], index)[0] ];
+		__at(self[0], index, "std/src/arena.vl:77:5")[1] = __clone(value);
+		$d = [ index, __at(self[0], index, "std/src/arena.vl:78:34")[0] ];
 	} else {
 		const index2 = self[0].length;
 		self[0].push([ self[2], __clone(value) ]);
@@ -47,12 +54,12 @@ function $e(self) {
 	return self[0].length - self[1].length;
 }
 function $g(self, handle) {
-	return handle[0] < self[0].length && __at(self[0], handle[0])[0] === handle[1];
+	return handle[0] < self[0].length && __at(self[0], handle[0], "std/src/arena.vl:95:38")[0] === handle[1];
 }
 function $f(self, handle) {
 	let $h = null;
 	if ($g(self, handle)) {
-		$h = [ 0, __at(self[0], handle[0])[1] ];
+		$h = [ 0, __at(self[0], handle[0], "std/src/arena.vl:104:10")[1] ];
 	} else {
 		$h = [ 1 ];
 	}
@@ -72,7 +79,7 @@ function $i(self, fallback) {
 function $l(self, handle, value) {
 	let $m = null;
 	if ($g(self, handle)) {
-		__at(self[0], handle[0])[1] = __clone(value);
+		__at(self[0], handle[0], "std/src/arena.vl:114:4")[1] = __clone(value);
 		$m = true;
 	} else {
 		$m = false;
@@ -82,8 +89,8 @@ function $l(self, handle, value) {
 function $n(self, handle) {
 	let $o = null;
 	if ($g(self, handle)) {
-		const removed = __clone(__at(self[0], handle[0])[1]);
-		__at(self[0], handle[0])[0] = __at(self[0], handle[0])[0] + 1;
+		const removed = __clone(__at(self[0], handle[0], "std/src/arena.vl:125:18")[1]);
+		__at(self[0], handle[0], "std/src/arena.vl:126:4")[0] = __at(self[0], handle[0], "std/src/arena.vl:126:42")[0] + 1;
 		self[1].push(handle[0]);
 		$o = [ 0, removed ];
 	} else {
@@ -98,7 +105,7 @@ function $p(self) {
 function $v(self, handle) {
 	let $x = null;
 	if ($g(self, handle)) {
-		$x = [ 0, __at(self[0], handle[0])[1] ];
+		$x = [ 0, __at(self[0], handle[0], "std/src/arena.vl:104:10")[1] ];
 	} else {
 		$x = [ 1 ];
 	}

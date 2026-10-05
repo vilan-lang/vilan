@@ -1,10 +1,10 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
-function __at_put(list, index, value) {
+function __at_put(list, index, value, location) {
 	if (index >= 0 && index < list.length) return list[index] = value;
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -23,10 +23,10 @@ function __guarded(body) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __insert_at(list, index, value) {
+function __insert_at(list, index, value, location) {
 	if (index >= 0 && index < list.length) return void list.splice(index, 0, value);
 	if (index === list.length) return void list.push(value);
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __list_get(list, index) {
 	return index >= 0 && index < list.length ? [ 0, __clone(list[index]) ] : [ 1 ];
@@ -110,7 +110,17 @@ async function __nursery_run(n, body) {
 	for (const task of n.children) task.then(null, () => {});
 	if (bodyFailed) throw bodyError;
 	const winner = n.failedTask;
-	throw typeof winner.error === "string" ? winner.error + " (in task spawned in " + winner.origin + ")" : winner.error;
+	const failure = winner.error;
+	if (typeof failure === "string") throw failure + " (in task spawned in " + winner.origin + ")";
+	if (failure && failure.location !== undefined) throw __panic(failure.message + " (in task spawned in " + winner.origin + ")", failure.location);
+	throw failure;
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function __shared_new(value) {
 	return { v: value };
@@ -154,10 +164,10 @@ function enqueue(turn, subscribers) {
 		} else if (!(turn[2].v.has(key))) {
 			turn[2].v.set(key, true);
 			let index = turn[0].v.length;
-			while (index > 0 && __at(turn[0].v, index - 1)[0] > subscriber[0]) {
+			while (index > 0 && __at(turn[0].v, index - 1, "std/src/reactive.vl:414:21")[0] > subscriber[0]) {
 				index = index - 1;
 			}
-			__insert_at(turn[0].v, index, __clone(subscriber));
+			__insert_at(turn[0].v, index, __clone(subscriber), "std/src/reactive.vl:417:25");
 		}
 		$s;
 	}
@@ -413,7 +423,7 @@ function advance(self, carried) {
 			if ($ae[0] === 0) {
 				const message2 = $ae[1];
 				$af = (() => {
-					throw message2;
+					throw __panic(message2, "std/src/reactive.vl:1207:27");
 				})();
 			} else {
 				$af = undefined;
@@ -509,8 +519,8 @@ function reconnect(tracker, lists, target) {
 		let $br = null;
 		if ($bq[0] === 0) {
 			const index = $bq[1];
-			__at_put(kept, index, true);
-			next.push(__clone(__at(held, index)));
+			__at_put(kept, index, true, "std/src/reactive.vl:1624:5");
+			next.push(__clone(__at(held, index, "std/src/reactive.vl:1625:15")));
 			$br = undefined;
 		} else {
 			next.push([ dependency[0], dependency[1](relay_for(tracker, target)) ]);
@@ -522,7 +532,7 @@ function reconnect(tracker, lists, target) {
 	lists.v[2] = next;
 	let index2 = 0;
 	for (const edge of held) {
-		if (!(__at(kept, index2))) {
+		if (!(__at(kept, index2, "std/src/reactive.vl:1639:7"))) {
 			detach(edge[1]);
 		}
 		index2 = index2 + 1;
@@ -534,12 +544,12 @@ function reusable(held, kept, identity, position) {
 	let $bn = null;
 	if ($bm[0] === 0) {
 		const wanted = $bm[1];
-		if (position < held.length && !(__at(kept, position)) && same_identity(__at(held, position)[0], wanted)) {
+		if (position < held.length && !(__at(kept, position, "std/src/reactive.vl:1662:9")) && same_identity(__at(held, position, "std/src/reactive.vl:1663:22")[0], wanted)) {
 			return [ 0, position ];
 		}
 		let index = 0;
 		while (index < held.length) {
-			if (!(__at(kept, index)) && same_identity(__at(held, index)[0], wanted)) {
+			if (!(__at(kept, index, "std/src/reactive.vl:1668:9")) && same_identity(__at(held, index, "std/src/reactive.vl:1668:38")[0], wanted)) {
 				return [ 0, index ];
 			}
 			index = index + 1;
@@ -761,7 +771,7 @@ function $S(runs, body) {
 		})(run);
 	} else {
 		$ak = (() => {
-			throw "a renewed run carries its nursery";
+			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1318:11");
 		})();
 	}
 	return $ak;
@@ -849,7 +859,7 @@ function $be(runs, body) {
 		})(run);
 	} else {
 		$bg = (() => {
-			throw "a renewed run carries its nursery";
+			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1318:11");
 		})();
 	}
 	return $bg;

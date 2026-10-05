@@ -1,10 +1,10 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
-function __at_put(list, index, value) {
+function __at_put(list, index, value, location) {
 	if (index >= 0 && index < list.length) return list[index] = value;
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __chunk_arm(value) {
 	return Array.isArray(value) ? value[0] : -1;
@@ -75,10 +75,10 @@ function __hash(value) {
 function __hmr_active() {
 	return typeof globalThis.__VILAN_HMR__ !== "undefined";
 }
-function __insert_at(list, index, value) {
+function __insert_at(list, index, value, location) {
 	if (index >= 0 && index < list.length) return void list.splice(index, 0, value);
 	if (index === list.length) return void list.push(value);
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __is_null(value) {
 	return value === null || value === undefined;
@@ -165,7 +165,17 @@ async function __nursery_run(n, body) {
 	for (const task of n.children) task.then(null, () => {});
 	if (bodyFailed) throw bodyError;
 	const winner = n.failedTask;
-	throw typeof winner.error === "string" ? winner.error + " (in task spawned in " + winner.origin + ")" : winner.error;
+	const failure = winner.error;
+	if (typeof failure === "string") throw failure + " (in task spawned in " + winner.origin + ")";
+	if (failure && failure.location !== undefined) throw __panic(failure.message + " (in task spawned in " + winner.origin + ")", failure.location);
+	throw failure;
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function __parse_i32(text) {
 	const trimmed = text.trim();
@@ -230,10 +240,10 @@ function enqueue(turn, subscribers) {
 		} else if (!(turn[2].v.has(key))) {
 			turn[2].v.set(key, true);
 			let index = turn[0].v.length;
-			while (index > 0 && __at(turn[0].v, index - 1)[0] > subscriber[0]) {
+			while (index > 0 && __at(turn[0].v, index - 1, "std/src/reactive.vl:414:21")[0] > subscriber[0]) {
 				index = index - 1;
 			}
-			__insert_at(turn[0].v, index, __clone(subscriber));
+			__insert_at(turn[0].v, index, __clone(subscriber), "std/src/reactive.vl:417:25");
 		}
 		$l;
 	}
@@ -489,7 +499,7 @@ function advance(self, carried) {
 			if ($aj[0] === 0) {
 				const message2 = $aj[1];
 				$ak = (() => {
-					throw message2;
+					throw __panic(message2, "std/src/reactive.vl:1207:27");
 				})();
 			} else {
 				$ak = undefined;
@@ -585,8 +595,8 @@ function reconnect(tracker, lists, target) {
 		let $aC = null;
 		if ($aB[0] === 0) {
 			const index = $aB[1];
-			__at_put(kept, index, true);
-			next.push(__clone(__at(held, index)));
+			__at_put(kept, index, true, "std/src/reactive.vl:1624:5");
+			next.push(__clone(__at(held, index, "std/src/reactive.vl:1625:15")));
 			$aC = undefined;
 		} else {
 			next.push([ dependency[0], dependency[1](relay_for(tracker, target)) ]);
@@ -598,7 +608,7 @@ function reconnect(tracker, lists, target) {
 	lists.v[2] = next;
 	let index2 = 0;
 	for (const edge of held) {
-		if (!(__at(kept, index2))) {
+		if (!(__at(kept, index2, "std/src/reactive.vl:1639:7"))) {
 			detach(edge[1]);
 		}
 		index2 = index2 + 1;
@@ -610,12 +620,12 @@ function reusable(held, kept, identity, position) {
 	let $ay = null;
 	if ($ax[0] === 0) {
 		const wanted = $ax[1];
-		if (position < held.length && !(__at(kept, position)) && same_identity(__at(held, position)[0], wanted)) {
+		if (position < held.length && !(__at(kept, position, "std/src/reactive.vl:1662:9")) && same_identity(__at(held, position, "std/src/reactive.vl:1663:22")[0], wanted)) {
 			return [ 0, position ];
 		}
 		let index = 0;
 		while (index < held.length) {
-			if (!(__at(kept, index)) && same_identity(__at(held, index)[0], wanted)) {
+			if (!(__at(kept, index, "std/src/reactive.vl:1668:9")) && same_identity(__at(held, index, "std/src/reactive.vl:1668:38")[0], wanted)) {
 				return [ 0, index ];
 			}
 			index = index + 1;
@@ -923,7 +933,7 @@ function close(self) {
 	for (const row of rows) {
 		let $dM = null;
 		if (at + 1 < rows.length) {
-			$dM = __at(rows, at + 1)[0];
+			$dM = __at(rows, at + 1, "std/src/browser/web/ui.vl:829:39")[0];
 		} else {
 			$dM = self[0];
 		}
@@ -945,7 +955,7 @@ function mount_target(id) {
 	const element = document.getElementById(id);
 	if (__is_null(element)) {
 		(() => {
-			throw "mount: no element with id \'" + id + "\'";
+			throw __panic("mount: no element with id \'" + id + "\'", "std/src/browser/web/ui.vl:2262:3");
 		})();
 	}
 	return element;
@@ -983,8 +993,8 @@ function parse(path) {
 		return [ 0 ];
 	}
 	let $z = null;
-	if (__at(parts, 0) === "docs" && parts.length === 2) {
-		const $x = __parse_i32(__at(parts, 1));
+	if (__at(parts, 0, "app.vl:38:5") === "docs" && parts.length === 2) {
+		const $x = __parse_i32(__at(parts, 1, "app.vl:39:9"));
 		let $y = null;
 		if ($x[0] === 0) {
 			const page = $x[1];
@@ -1167,7 +1177,7 @@ function $X(runs, body) {
 		})(run);
 	} else {
 		$ap = (() => {
-			throw "a renewed run carries its nursery";
+			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1318:11");
 		})();
 	}
 	return $ap;
@@ -1315,7 +1325,7 @@ function $co(runs, body) {
 		})(run);
 	} else {
 		$cq = (() => {
-			throw "a renewed run carries its nursery";
+			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1318:11");
 		})();
 	}
 	return $cq;

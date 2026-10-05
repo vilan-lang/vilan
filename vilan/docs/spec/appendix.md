@@ -42,7 +42,7 @@ own       self      Self      sync      then      void      with
 ```
 
 Also matched by text in one position: `break`/`continue` (after `jump`), and the
-attribute names `derive` `service` `client_service` `extern` `must_use` `rpc` `trait_only`
+attribute names `derive` `service` `client_service` `extern` `must_use` `track_caller` `rpc` `trait_only`
 `doc` `expose` `platform` `deprecated` `internal` `resource` `hint` `reactive`
 (`resource` was a keyword until B413 made it the `[resource]` attribute).
 

@@ -1,6 +1,13 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function new2(start, end) {
 	return [ start, end ];
@@ -46,4 +53,4 @@ const squared = square(b);
 const steps = scale(4);
 const shifted = offset(a);
 const announced = announce();
-console.log(a + b + squared + __at(steps, 2) + shifted + announced);
+console.log(a + b + squared + __at(steps, 2, "main.vl:53:26") + shifted + announced);

@@ -7,10 +7,16 @@ export *;
 [extern("console.log")]
 external fun print(message: any): void;
 
+/// Aborts with `message`. The report names the call's file, line and column
+/// (`panicked at src/main.vl:12:5: message`), or, inside a `[track_caller]`
+/// function, its caller's (debugging.md S0).
+[track_caller]
 external fun panic(message: str): void;
 
 /// Aborts with `message` (a `panic`) unless `condition` holds. A failed assertion
-/// exits non-zero, which is how `vilan test` detects a failing test.
+/// exits non-zero, which is how `vilan test` detects a failing test, and reports
+/// the location of the `assert` call.
+[track_caller]
 fun assert(condition: bool, message: str): void {
 	if !condition {
 		panic(message)

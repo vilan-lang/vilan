@@ -644,6 +644,12 @@ pub enum Expr<'src> {
     Dereference(Id),
     Variable(Id),
     Void,
+    /// A call site's `file:line:column`, as a `std::debug::Location` value
+    /// (debugging.md S0): the argument `track_caller::thread_locations`
+    /// appends to a static call of a `[track_caller]` function. The id is the
+    /// ANCHOR whose span is the site — the call, or the index expression —
+    /// and [`Program::site_location`] renders it. Never written in source.
+    CallerLocation(Id),
     // A `macro fun`'s NAME, bound in its module's scope so imports/`use`
     // resolve it and go-to-definition lands on the definition. Not a value:
     // referencing it outside `[name]` / `macro name(..)` is a clean error.
@@ -1146,6 +1152,10 @@ pub struct Function<'src> {
     pub returns_view: bool,
     /// Declared `[must_use]`: dropping a call's result is a warning.
     pub must_use: bool,
+    /// Declared `[track_caller]` (debugging.md S0): the function takes a
+    /// hidden trailing `std::debug::Location` parameter, minted and threaded
+    /// by [`crate::track_caller`] after analysis.
+    pub track_caller: bool,
     /// Declared `[deprecated("use …")]`: every resolved use in code outside
     /// std warns, non-fatally, carrying this replacement steer verbatim
     /// (proposal/deprecation.md §1–§2; `check_deprecated`).
@@ -1215,6 +1225,10 @@ pub struct ExternalFunction<'src> {
     /// often externals, and the editor must not answer differently depending on
     /// which kind the declaration is.
     pub internal: Option<&'src str>,
+    /// Declared `[track_caller]` — `Function`'s field of the same name. On an
+    /// external it marks a COMPILER lowering that reads its call site:
+    /// `std::io::panic` and `std::debug::caller`.
+    pub track_caller: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5505,6 +5519,8 @@ pub struct Analyzer<'src> {
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `Never` (which reconciles with any expected type) and lowers to
     // a `throw`.
+    // `std::debug::caller` (debugging.md S0), captured beside `panic`.
+    caller_fn_id: Option<Id>,
     panic_fn_id: Option<Id>,
     // Every call's `(call id, subject id)` pair, banked at WALK time (B204).
     // `function_calls` holds the same pair, but only once the call's own
@@ -7307,6 +7323,7 @@ impl<'src> Analyzer<'src> {
             anonymous_binder_parameters: HashMap::default(),
             anonymous_binder_scopes: HashMap::default(),
             panic_fn_id: None,
+            caller_fn_id: None,
             call_subjects: Vec::new(),
             call_subject_ids: HashSet::default(),
             divergence_leaves: DivergenceLeaves::default(),
@@ -14150,7 +14167,8 @@ impl<'src> Analyzer<'src> {
             | Expr::Macro
             | Expr::Local(_)
             | Expr::Parameter(_)
-            | Expr::ExternalFunction(_) => {}
+            | Expr::ExternalFunction(_)
+            | Expr::CallerLocation(_) => {}
         }
     }
 
@@ -14946,6 +14964,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Number(_, _, _)
             | Expr::String(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Void
             | Expr::Error
@@ -16004,6 +16023,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Number(_, _, _)
             | Expr::String(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Void
             | Expr::Error
@@ -19098,6 +19118,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Number(_, _, _)
             | Expr::String(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Void
             | Expr::Error
@@ -38038,6 +38059,22 @@ impl<'src> Analyzer<'src> {
         if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
             self.record_type_context_clause(return_type_id, names, body_scope_id, None);
         }
+        // debugging.md S0: `[track_caller]`'s location travels as a hidden
+        // trailing parameter, threaded at every STATIC call. A trait member is
+        // reached by dispatch — a `dyn` table, a generic bound — where no one
+        // call site knows it is calling a tracking function, so the attribute
+        // is refused there rather than silently reporting nothing.
+        if function.track_caller && (self.walking_trait_body || self.walking_trait_impl_body) {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: function.name.1,
+                msg: "`[track_caller]` is not supported on a trait method: a call through \
+                      a trait is dispatched, so no call site knows to pass its location. \
+                      Mark a free function or an inherent method instead"
+                    .to_string(),
+            });
+        }
         if function.external {
             // An `external` function is an intrinsic: no Vilan body, a
             // declared (or void) return type, registered as an external
@@ -38075,6 +38112,7 @@ impl<'src> Analyzer<'src> {
                     is_async: function.is_async,
                     deprecated: function.deprecated,
                     internal: function.internal,
+                    track_caller: function.track_caller,
                 },
             );
             let function_type_id = self.new_type_id();
@@ -38237,6 +38275,7 @@ impl<'src> Analyzer<'src> {
                         Some(Node::Reference(_, _))
                     ),
                     must_use: function.must_use,
+                    track_caller: function.track_caller,
                     deprecated: function.deprecated,
                     internal: function.internal,
                     platform_fence: function
@@ -65401,6 +65440,26 @@ pub struct Program<'src> {
     /// searches on it (M107). Nothing writes `source_ranges` after the program
     /// is built, which is what makes caching the answer sound.
     source_ranges_searchable: std::sync::OnceLock<bool>,
+    /// Each source's TEXT, parallel to the analyzer's own table: what a
+    /// call site's `file:line:column` and `dbg`'s expression text are read
+    /// from (debugging.md S0/S1). Borrowed, so it costs a vector of slices.
+    pub source_texts: Vec<(SourceId, &'src str)>,
+    /// The line starts and display paths [`Program::site_location`] reads,
+    /// built on first ask: a program that never names a location never pays.
+    pub(crate) site_locator: std::sync::OnceLock<crate::track_caller::SiteLocator>,
+    /// `std::debug::caller` (debugging.md S0): a `[track_caller]` external the
+    /// emitters lower to its location argument.
+    pub caller_fn_id: Option<Id>,
+
+    /// `[track_caller]` (debugging.md S0): each tracking function's hidden
+    /// trailing `Location` parameter, minted by
+    /// [`crate::track_caller::thread_locations`].
+    pub track_caller_parameters: HashMap<Id, Id>,
+    /// An `xs[i]` inside a `[track_caller]` function's own body → a minted
+    /// read of the hidden parameter (an `Expr::Local`) whose location its
+    /// bounds panic reports. Every other subscript reports its own site
+    /// ([`Program::site_location`]).
+    pub index_location_arguments: HashMap<Id, Id>,
     /// The sources that ARE std: every module loaded with `Origin::Std`,
     /// overlaid or off disk — never the entry. This is the RESIDENCE question,
     /// the one "is this the standard library's own declaration?" means, and it
@@ -73422,6 +73481,13 @@ fn analyze_inner<'src>(
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("print").copied());
     }
+    // `std::debug::caller` (debugging.md S0): lowered to its location argument.
+    if let Some(debug_scope_id) = module_scopes.get("debug") {
+        analyzer.caller_fn_id = analyzer
+            .scopes
+            .get(debug_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("caller").copied());
+    }
     // Remember `std::web::asset`'s const-only compile-time channel — lines out (in
     // both spellings), the end-of-evaluation hook, text in, whole files out
     // (in both spellings), a directory listing in, a digest in (const-eval.md
@@ -75609,6 +75675,11 @@ fn analyze_over_world<'src>(
         source_hashes,
         source_ranges: std::mem::take(&mut analyzer.source_ranges),
         source_ranges_searchable: std::sync::OnceLock::new(),
+        source_texts: analyzer.source_texts.clone(),
+        site_locator: std::sync::OnceLock::new(),
+        caller_fn_id: analyzer.caller_fn_id,
+        track_caller_parameters: HashMap::default(),
+        index_location_arguments: HashMap::default(),
         std_sources: std::mem::take(&mut analyzer.std_sources),
         frozen_sources: std::mem::take(&mut analyzer.frozen_sources),
         dependency_sources: std::mem::take(&mut analyzer.dependency_sources),
@@ -77799,6 +77870,7 @@ pub fn check_unlowered_externals(program: &mut Program) {
         program.list_new_fn_id,
         program.list_push_fn_id,
         program.panic_fn_id,
+        program.caller_fn_id,
         program.print_fn_id,
         program.drop_fn_id,
         program.context_new_fn_id,

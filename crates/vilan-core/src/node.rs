@@ -114,6 +114,11 @@ pub struct Func<'src> {
     // Declared `[must_use]`: dropping a call's result (a bare statement that
     // discards it) is a warning.
     pub must_use: bool,
+    // Declared `[track_caller]` (debugging.md S0): the function takes a hidden
+    // `std::debug::Location` parameter carrying its call site, so a panic
+    // inside it (and `std::debug::caller()`) names the CALLER's file, line and
+    // column. Threaded by `track_caller::thread_locations`.
+    pub track_caller: bool,
     // Declared `[platform("…", …)]` — a platform FENCE: the function's
     // inferred requirement is checked against these patterns on every
     // compile (platform-coloring.md §3.7). Empty = no fence.

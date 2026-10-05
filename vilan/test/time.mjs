@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -20,6 +20,13 @@ function __json_tag(value) {
 }
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function __sleep(ms, signal) {
 	const sig = signal && signal[0] === 0 ? signal[1] : undefined;
@@ -548,7 +555,7 @@ function top(self) {
 	if (!(ok2(self)) || $z(self[0])) {
 		$A = JSON.parse("null");
 	} else {
-		$A = __clone(__at(self[0], self[0].length - 1));
+		$A = __clone(__at(self[0], self[0].length - 1, "std/src/json.vl:521:4"));
 	}
 	return $A;
 }
@@ -648,7 +655,7 @@ function begin_list4(self) {
 		let index = elements.length;
 		while (index > 0) {
 			index = index - 1;
-			self[0].push(__clone(__at(elements, index)));
+			self[0].push(__clone(__at(elements, index, "std/src/json.vl:669:21")));
 		}
 		$I = as_i322(elements.length);
 	} else {
@@ -695,7 +702,7 @@ function begin_variant4(self, name, arity) {
 				let index = elements.length;
 				while (index > 0) {
 					index = index - 1;
-					self[0].push(__clone(__at(elements, index)));
+					self[0].push(__clone(__at(elements, index, "std/src/json.vl:719:23")));
 				}
 				$M = undefined;
 			}

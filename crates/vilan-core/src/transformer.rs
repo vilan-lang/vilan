@@ -115,7 +115,8 @@ pub fn transform_functions<'src>(
             format!("import {{ {} }} from \"{}\";", names, module)
         })
         .collect::<Vec<_>>();
-    let helpers = transformer.used_helpers.into_iter().collect::<Vec<_>>();
+    let mut helpers = transformer.used_helpers.into_iter().collect::<Vec<_>>();
+    close_helper_dependencies(&mut helpers);
 
     let nodes = t_functions
         .chain(t_instances)
@@ -1102,6 +1103,39 @@ pub fn unescape_string(raw: &str) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
+/// The helpers a helper's own body calls, added to a sorted helper list so a
+/// program that reaches the caller also emits the callee.
+///
+/// - `__chunk_ready`/`__chunk_load` read the registry through
+///   `__chunk_registry` — including in a build that reached the gate without
+///   splitting, where an empty registry makes every arm ready;
+/// - the checked subscripts and the nursery join raise a panic through
+///   `__panic` (debugging.md S0).
+fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
+    let mut added = false;
+    if helpers
+        .iter()
+        .any(|helper| matches!(*helper, "__chunk_ready" | "__chunk_load"))
+        && !helpers.contains(&"__chunk_registry")
+    {
+        helpers.push("__chunk_registry");
+        added = true;
+    }
+    if helpers.iter().any(|helper| {
+        matches!(
+            *helper,
+            "__at" | "__at_put" | "__at_view" | "__remove_at" | "__insert_at" | "__nursery_run"
+        )
+    }) && !helpers.contains(&"__panic")
+    {
+        helpers.push("__panic");
+        added = true;
+    }
+    if added {
+        helpers.sort();
+    }
+}
+
 /// The `__`-named free externs whose implementations live in the helper table:
 /// a std module binds `[extern("__name")]`, and transforming a call through
 /// one marks its helper for emission. Returns the canonical `'static` name.
@@ -1847,9 +1881,24 @@ fn helper_source(name: &str) -> &'static str {
         // `list[i]` — the checked subscript read: out of bounds panics (`get`
         // is the total, Option-returning form above).
         "__at" => {
-            "function __at(list, index) {\n\
+            "function __at(list, index, location) {\n\
              \tif (index >= 0 && index < list.length) return list[index];\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
+             }"
+        }
+        // `panic(message)` (debugging.md S0): an `Error`, so a stack exists, whose
+        // NAME carries the location — an uncaught one prints `panicked at
+        // src/main.vl:12:5: message`, the line the native runtime writes, and a
+        // catcher reading `error.message` (`__guarded`, the db pair) still sees
+        // the message alone. `location` marks it as a vilan panic for the
+        // nursery's task-origin decoration.
+        "__panic" => {
+            "function __panic(message, location) {\n\
+             \tconst error = new Error(message);\n\
+             \terror.name = \"panicked at \" + location;\n\
+             \tObject.defineProperty(error, \"location\", { value: location });\n\
+             \tif (Error.captureStackTrace) Error.captureStackTrace(error, __panic);\n\
+             \treturn error;\n\
              }"
         }
         // `List.remove(i): T` — the checked splice read. `splice` is the native
@@ -1858,35 +1907,35 @@ fn helper_source(name: &str) -> &'static str {
         // exactly the indices `[]` panics on. The guard is `__at`'s, word for
         // word, so a caller cannot tell which of the two refused.
         "__remove_at" => {
-            "function __remove_at(list, index) {\n\
+            "function __remove_at(list, index, location) {\n\
              \tif (index >= 0 && index < list.length) return list.splice(index, 1)[0];\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
         // `List.insert(i, v)` — the checked splice write. `index == length`
         // appends (a `push`, which is what the vilan shift loop did); anything
         // outside `0..=length` panics in `__at`'s words.
         "__insert_at" => {
-            "function __insert_at(list, index, value) {\n\
+            "function __insert_at(list, index, value, location) {\n\
              \tif (index >= 0 && index < list.length) return void list.splice(index, 0, value);\n\
              \tif (index === list.length) return void list.push(value);\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
         // `list[i] = v` — the checked subscript write: writing never creates a
         // slot (growth is `push`), so out of bounds panics.
         "__at_put" => {
-            "function __at_put(list, index, value) {\n\
+            "function __at_put(list, index, value, location) {\n\
              \tif (index >= 0 && index < list.length) return list[index] = value;\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
         // `&mut list[i]` — the checked view mint: the scalar `(base, key)` pair
         // exists only for an in-bounds element.
         "__at_view" => {
-            "function __at_view(list, index) {\n\
+            "function __at_view(list, index, location) {\n\
              \tif (index >= 0 && index < list.length) return [ list, index ];\n\
-             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
         // `str.substring(start, end)` — the checked slice. The native JS method
@@ -1975,7 +2024,7 @@ fn helper_source(name: &str) -> &'static str {
             "function __force(cell) {\n\
              \tif (cell.state === 2) return cell.value;\n\
              \tif (cell.state === 1) throw \"lazy initialization cycle: `\" + cell.name + \"`\";\n\
-             \tif (cell.state === 3) throw \"lazy `\" + cell.name + \"` is poisoned: its initializer panicked: \" + cell.value;\n\
+             \tif (cell.state === 3) throw \"lazy `\" + cell.name + \"` is poisoned: its initializer panicked: \" + (cell.value && cell.value.location !== undefined ? cell.value.message : cell.value);\n\
              \tcell.state = 1;\n\
              \ttry {\n\
              \t\tcell.value = cell.thunk();\n\
@@ -2211,7 +2260,10 @@ fn helper_source(name: &str) -> &'static str {
              \tfor (const task of n.children) task.then(null, () => {});\n\
              \tif (bodyFailed) throw bodyError;\n\
              \tconst winner = n.failedTask;\n\
-             \tthrow typeof winner.error === \"string\" ? winner.error + \" (in task spawned in \" + winner.origin + \")\" : winner.error;\n\
+             \tconst failure = winner.error;\n\
+             \tif (typeof failure === \"string\") throw failure + \" (in task spawned in \" + winner.origin + \")\";\n\
+             \tif (failure && failure.location !== undefined) throw __panic(failure.message + \" (in task spawned in \" + winner.origin + \")\", failure.location);\n\
+             \tthrow failure;\n\
              }"
         }
         // The abortable timer behind `std::time::sleep`: resolve after `ms`,
@@ -3653,18 +3705,7 @@ impl<'src> Transformer<'src> {
             })
             .collect::<Vec<_>>();
         let mut helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
-        // `__chunk_ready`/`__chunk_load` read the registry through
-        // `__chunk_registry`, so the helper's own dependency travels with it —
-        // including in a build that reached the gate without splitting, where
-        // an empty registry makes every arm ready.
-        if helpers
-            .iter()
-            .any(|helper| matches!(*helper, "__chunk_ready" | "__chunk_load"))
-            && !helpers.contains(&"__chunk_registry")
-        {
-            helpers.push("__chunk_registry");
-            helpers.sort();
-        }
+        close_helper_dependencies(&mut helpers);
 
         // Re-allocate names over the JS scope tree so disjoint scopes share them
         // (readable: both sibling `value`s stay `value`; release: reuse short
@@ -4278,6 +4319,7 @@ impl<'src> Transformer<'src> {
             | Expr::Macro
             | Expr::Module(_)
             | Expr::MultilineString(_)
+            | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Number(_, _, _)
             | Expr::Parameter(_)
@@ -4804,10 +4846,11 @@ impl<'src> Transformer<'src> {
             Some(Expr::Index(subject, index)) => {
                 let base = self.walk_entity(*subject, block).unwrap_or(js::Node::Void);
                 let key = self.walk_entity(*index, block).unwrap_or(js::Node::Void);
+                let location = self.subscript_location(operand, block);
                 self.used_helpers.insert("__at_view");
                 return js::Node::Call(
                     Box::new(js::Node::Local("__at_view".to_string())),
-                    vec![base, key],
+                    vec![base, key, location],
                 );
             }
             // A boxed scalar local: the cell itself (slot 0 holds the value),
@@ -5084,6 +5127,28 @@ impl<'src> Transformer<'src> {
             Some(Expr::Block((_, tail))) => self.sibling_value_is_settled(*tail, node),
             _ => false,
         }
+    }
+
+    /// The location a checked subscript's bounds panic reports (debugging.md
+    /// S0): its own site, or — inside a `[track_caller]` function's own body —
+    /// the caller's, through the hidden parameter.
+    fn subscript_location(
+        &mut self,
+        index_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        if let Some(argument) = self
+            .program
+            .index_location_arguments
+            .get(&index_id)
+            .copied()
+            && let Some(read) = self.walk_entity(argument, block)
+        {
+            return read;
+        }
+        js::Node::String(std::borrow::Cow::Owned(
+            self.program.site_location(index_id),
+        ))
     }
 
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
@@ -5363,6 +5428,11 @@ impl<'src> Transformer<'src> {
                 js::Node::Number(whole, fraction.map(|x| x.to_string()))
             }
             Expr::String(x) => js::Node::String(unescape_string(x)),
+            // debugging.md S0: a `[track_caller]` call's location argument —
+            // `std::debug::Location` is its text on this backend.
+            Expr::CallerLocation(anchor) => {
+                js::Node::String(std::borrow::Cow::Owned(self.program.site_location(*anchor)))
+            }
             // A triple-quoted string: RAW (no escape interpretation), trimmed
             // to its content; the analyzer already validated, so an error here
             // is unreachable and degrades to "".
@@ -5506,10 +5576,11 @@ impl<'src> Transformer<'src> {
                     .walk_entity(*subject_id, block)
                     .unwrap_or(js::Node::Void);
                 let index = self.walk_entity(*index_id, block).unwrap_or(js::Node::Void);
+                let location = self.subscript_location(id, block);
                 self.used_helpers.insert("__at");
                 js::Node::Call(
                     Box::new(js::Node::Local("__at".to_string())),
-                    vec![subject, index],
+                    vec![subject, index, location],
                 )
             }
             Expr::Call(id) => {
@@ -5775,16 +5846,37 @@ impl<'src> Transformer<'src> {
                         // an immediately-invoked arrow so it stays valid in
                         // expression position (e.g. a match leg).
                         if Some(target_id) == self.panic_fn_id {
-                            let message = args.into_iter().next().unwrap_or(js::Node::Void);
+                            let mut args = args.into_iter();
+                            let message = args.next().unwrap_or(js::Node::Void);
+                            // debugging.md S0: `track_caller` appended the
+                            // site (or the forwarded caller) as the second.
+                            let location = args.next().unwrap_or_else(|| {
+                                js::Node::String(std::borrow::Cow::Owned(
+                                    self.program.site_location(*id),
+                                ))
+                            });
+                            self.used_helpers.insert("__panic");
+                            let error = js::Node::Call(
+                                Box::new(js::Node::Local("__panic".to_string())),
+                                vec![message, location],
+                            );
                             return Some(js::Node::Call(
                                 Box::new(js::Node::Closure(js::Closure {
                                     parameters: Vec::new(),
-                                    body: vec![js::Node::Throw(Box::new(message))],
+                                    body: vec![js::Node::Throw(Box::new(error))],
                                     is_async: false,
                                     origin: None,
                                 })),
                                 Vec::new(),
                             ));
+                        }
+                        // `std::debug::caller()` IS its location argument.
+                        if Some(target_id) == self.program.caller_fn_id {
+                            return Some(args.into_iter().next().unwrap_or_else(|| {
+                                js::Node::String(std::borrow::Cow::Owned(
+                                    self.program.site_location(*id),
+                                ))
+                            }));
                         }
                         // `drop(x)` — the std early-teardown sink (destruction.md
                         // §6), rewritten by the concrete argument type at THIS
@@ -6880,10 +6972,11 @@ impl<'src> Transformer<'src> {
                         .walk_entity(subject_id, block)
                         .unwrap_or(js::Node::Void);
                     let index = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+                    let location = self.subscript_location(*target_id, block);
                     self.used_helpers.insert("__at_put");
                     return Some(js::Node::Call(
                         Box::new(js::Node::Local("__at_put".to_string())),
-                        vec![subject, index, value],
+                        vec![subject, index, value, location],
                     ));
                 }
                 let target = self
@@ -8950,10 +9043,11 @@ impl<'src> Transformer<'src> {
                         .walk_entity(subject_id, block)
                         .unwrap_or(js::Node::Void);
                     let index = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+                    let location = self.subscript_location(element, block);
                     self.used_helpers.insert("__at_put");
                     block.push(js::Node::Call(
                         Box::new(js::Node::Local("__at_put".to_string())),
-                        vec![subject, index, slot],
+                        vec![subject, index, slot, location],
                     ));
                 }
                 Some(Expr::TupleIndex(subject_id, baked_offset, baked_width))
@@ -13886,6 +13980,7 @@ const RESERVED_NAMES: &[&str] = &[
     "Request",
     // Runtime helpers (emitted as `function __clone(..)`, etc.).
     "__clone",
+    "__panic",
     "__scan",
     "__parse_i32",
     "__parse_f64",

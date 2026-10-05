@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -10,6 +10,13 @@ function __clone(value) {
 }
 function __list_get(list, index) {
 	return index >= 0 && index < list.length ? [ 0, __clone(list[index]) ] : [ 1 ];
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function fold_unsigned(value, modulus) {
 	const truncated = Math.trunc(value);
@@ -118,13 +125,13 @@ console.log("" + take(bare));
 const found = [ 0, 0 ];
 console.log($d(found));
 const at = 1;
-console.log(__at(letters, 0));
-console.log(__at(letters, at));
+console.log(__at(letters, 0, "usize-literals.vl:76:8"));
+console.log(__at(letters, at, "usize-literals.vl:77:8"));
 console.log($i(__list_get(letters, as_usize(as_i32(at))), "none"));
 const length = as_usize2(letters.length);
 console.log("" + length);
 let index = length;
 while (index > 0) {
 	index = index - 1;
-	console.log(__at(letters, index));
+	console.log(__at(letters, index, "usize-literals.vl:87:9"));
 }

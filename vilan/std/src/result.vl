@@ -72,6 +72,7 @@ impl Result<type T, type E> {
 		}
 	}
 
+	[track_caller]
 	fun unwrap(self): T {
 		match self {
 			Ok(let x) => x,
@@ -79,6 +80,7 @@ impl Result<type T, type E> {
 		}
 	}
 
+	[track_caller]
 	fun unwrap_err(self): E {
 		match self {
 			Err(let e) => e,
@@ -106,6 +108,7 @@ impl Result<type T, type E> {
 	/// `message` is `lazy` (proposal/lazy.md §6b): the text is BUILT on the `Err`
 	/// path only, so `res.expect(i"no row for {key}")` costs nothing when the row
 	/// is there.
+	[track_caller]
 	fun expect(self, lazy message: str): T {
 		match self {
 			Ok(let x) => x,
@@ -119,6 +122,7 @@ impl Result<type T, type E> {
 	/// trap: `expect`, `unwrap_or` and both of `Option`'s twins were retrofitted
 	/// and this one was not, so the cost of the message depended on which of two
 	/// neighbouring methods you reached for (A109).
+	[track_caller]
 	fun expect_err(self, lazy message: str): E {
 		match self {
 			Err(let e) => e,

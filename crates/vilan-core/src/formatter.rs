@@ -6007,6 +6007,10 @@ impl<'src> Printer<'src> {
             self.out.push_str("[must_use]");
             self.end_attribute_line();
         }
+        if func.track_caller {
+            self.out.push_str("[track_caller]");
+            self.end_attribute_line();
+        }
         if func.rpc {
             self.out.push_str("[rpc]");
             self.end_attribute_line();

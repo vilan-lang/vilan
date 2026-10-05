@@ -339,10 +339,57 @@ fn js_exponential(value: f64) -> String {
 
 // ------------------------------------------------------------ panic paths ---
 
-/// `panic(message)` — `std::io::panic`. The payload is a `String` so
-/// [`guarded`] can hand the message back the way the JS `catch` does.
+/// `panic(message)` from the runtime's own checks — a payload with no vilan
+/// location. A `String` so [`guarded`] can hand the message back the way the
+/// JS `catch` does.
 pub fn panic_with(message: &str) -> ! {
     std::panic::panic_any(message.to_string())
+}
+
+/// `std::debug::Location` (debugging.md S0): a call site, `file:line:column`.
+/// The JS backend's location IS this text; natively it is a `Copy` handle on
+/// the literal the emitter wrote, so threading one through a `[track_caller]`
+/// call costs a pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Location(pub &'static str);
+
+/// A vilan `panic` — what [`panic_at`] raises: the message, and the site the
+/// report names. [`describe_panic`] answers the message alone, so a catcher
+/// (`guarded`, a task's failure) sees exactly what the JS `error.message`
+/// gives it.
+#[derive(Debug)]
+pub struct Panic {
+    pub message: String,
+    pub location: Location,
+}
+
+/// `panic(message)` — `std::io::panic`, at `location` (debugging.md S0). An
+/// uncaught one prints `panicked at <location>: <message>`, the line the JS
+/// build's `Error` prints.
+pub fn panic_at(message: &str, location: Location) -> ! {
+    std::panic::panic_any(Panic {
+        message: message.to_string(),
+        location,
+    })
+}
+
+/// The vilan location a panic payload carries, if it is a vilan `panic`.
+pub fn panic_location(payload: &Box<dyn std::any::Any + Send>) -> Option<Location> {
+    payload.downcast_ref::<Panic>().map(|panic| panic.location)
+}
+
+/// A panic payload's report line: `panicked at <location>: <message>` for a
+/// vilan `panic`, the message alone for anything else.
+fn panic_report(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(panic) = payload.downcast_ref::<Panic>() {
+        return format!("panicked at {}: {}", panic.location.0, panic.message);
+    }
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("the program failed")
+        .to_string()
 }
 
 /// The whole of an emitted program's `main` (tracker F25).
@@ -411,13 +458,7 @@ fn run_guarded_main(body: impl FnOnce()) -> bool {
         if is_caught() {
             return;
         }
-        let payload = info.payload();
-        let message = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or("the program failed");
-        eprintln!("{message}");
+        eprintln!("{}", panic_report(info.payload()));
     }));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
     std::panic::set_hook(previous);
@@ -482,7 +523,9 @@ pub fn with_finally(body: impl FnOnce(), after: impl FnOnce()) {
 }
 
 fn describe_panic(payload: &Box<dyn std::any::Any + Send>) -> Str {
-    if let Some(message) = payload.downcast_ref::<String>() {
+    if let Some(panic) = payload.downcast_ref::<Panic>() {
+        Rc::from(panic.message.as_str())
+    } else if let Some(message) = payload.downcast_ref::<String>() {
         Rc::from(message.as_str())
     } else if let Some(message) = payload.downcast_ref::<&str>() {
         Rc::from(*message)
@@ -1968,11 +2011,11 @@ pub fn list_pop<T>(list: &mut Vec<T>) -> Option<T> {
 }
 
 /// `List::remove` — `remove(&mut self, index: usize): T`, so it answers the
-/// ELEMENT, not an `Option`. An out-of-range index is a panic with a message
-/// rather than a silent `undefined`.
-pub fn list_remove<T>(list: &mut Vec<T>, index: usize) -> T {
+/// ELEMENT, not an `Option`. An out-of-range index is a panic in `__at`'s
+/// words, at the caller's vilan site (`[track_caller]`, debugging.md S0).
+pub fn list_remove<T>(list: &mut Vec<T>, index: usize, location: Location) -> T {
     if index >= list.len() {
-        panic_with("List::remove: index out of range");
+        out_of_bounds(list.len(), index, location);
     }
     list.remove(index)
 }
@@ -1992,9 +2035,54 @@ pub fn list_sort_by<T: Clone>(list: &[T], compare: impl Fn(T, T) -> i32) -> Vec<
     sorted
 }
 
-pub fn list_insert<T>(list: &mut Vec<T>, index: usize, value: T) {
-    let at = index.min(list.len());
-    list.insert(at, value);
+pub fn list_insert<T>(list: &mut Vec<T>, index: usize, value: T, location: Location) {
+    // `__insert_at`'s rule: `index == len` appends, anything past it panics
+    // in `__at`'s words (it used to clamp natively, answering a different
+    // program than the JS build).
+    if index > list.len() {
+        out_of_bounds(list.len(), index, location);
+    }
+    list.insert(index, value);
+}
+
+/// `list[index]` — the checked subscript every index lowers to (debugging.md
+/// S0): out of bounds panics in the JS helper's words, at the vilan site.
+///
+/// A METHOD rather than a free function taking `&mut list`, so the place
+/// reaches it the way `list[index]` did: through auto-reborrow and auto-deref.
+/// A `&mut Vec` parameter that is not itself `mut`, a `RefMut` out of a cell
+/// and a fixed array all answer `list.vilan_at_mut(..)`, where
+/// `at_mut(&mut list, ..)` would borrow the binding rather than its target.
+pub trait Subscript<T> {
+    fn vilan_at(&self, index: usize, location: Location) -> &T;
+    fn vilan_at_mut(&mut self, index: usize, location: Location) -> &mut T;
+}
+
+impl<T> Subscript<T> for [T] {
+    #[inline]
+    fn vilan_at(&self, index: usize, location: Location) -> &T {
+        match self.get(index) {
+            Some(element) => element,
+            None => out_of_bounds(self.len(), index, location),
+        }
+    }
+
+    #[inline]
+    fn vilan_at_mut(&mut self, index: usize, location: Location) -> &mut T {
+        let length = self.len();
+        match self.get_mut(index) {
+            Some(element) => element,
+            None => out_of_bounds(length, index, location),
+        }
+    }
+}
+
+#[cold]
+fn out_of_bounds(length: usize, index: usize, location: Location) -> ! {
+    panic_at(
+        &format!("index out of bounds: the length is {length} but the index is {index}"),
+        location,
+    )
 }
 
 // ---------------------------------------------------------- str intrinsics --

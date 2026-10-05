@@ -10210,3 +10210,189 @@ fn a_trait_objects_print_and_its_tables_are_identical_on_both_backends() {
         "an object prints its value and dispatches through its own application's table"
     );
 }
+
+// ---------------------------------------------------------------------------
+// debugging.md S0 (E258): `[track_caller]` and panic locations.
+// ---------------------------------------------------------------------------
+
+/// What one backend did with one run: stdout, stderr, exit code.
+struct Run {
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+}
+
+fn run_on(staged: &Path, backend: Option<&str>, program: &str) -> Run {
+    let mut command = vilan(staged);
+    command.arg("run");
+    if let Some(backend) = backend {
+        command.args(["--backend", backend]);
+    }
+    let output = command.arg(program).output().expect("run vilan");
+    Run {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code(),
+    }
+}
+
+/// `file:line:column` of `column_needle` on the first line of `source`
+/// holding `line_needle` — the site a location names, computed from the
+/// fixture rather than written down, so an edit to it moves both sides.
+fn site_of(file: &str, source: &str, line_needle: &str, column_needle: &str) -> String {
+    let (index, line) = source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(line_needle))
+        .unwrap_or_else(|| panic!("the fixture has no line holding {line_needle:?}"));
+    let byte = line
+        .find(column_needle)
+        .unwrap_or_else(|| panic!("{column_needle:?} is not on the line {line:?}"));
+    let column = line[..byte].chars().count() + 1;
+    format!("{file}:{}:{column}", index + 1)
+}
+
+const PANIC_LOCATIONS: &str = include_str!("native/panic_locations.vl");
+const PANIC_LOCATIONS_FILE: &str = "native_probe_panic_locations.vl";
+
+/// E258 / debugging.md S0: each std panic path — `panic`, `assert`, a read, a
+/// write and a `&mut` view out of bounds, `Option`'s `unwrap`/`expect`,
+/// `Result`'s four, `List::remove`/`insert` — reports `panicked at
+/// <file>:<line>:<column>: <message>` naming the vilan site that reached it,
+/// identically on both backends (the native leg prints that line alone; node
+/// prints it as the uncaught `Error`'s header). A chain of `[track_caller]`
+/// functions names the outermost caller, a subscript in a tracking body names
+/// its caller, and a closure inside one names its own site.
+#[test]
+fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
+    let staged = stage();
+    let site =
+        |line: &str, column: &str| site_of(PANIC_LOCATIONS_FILE, PANIC_LOCATIONS, line, column);
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("panic", site("panic(\"boom\")", "panic"), "boom"),
+        ("assert", site("\"asserted\"", "assert"), "asserted"),
+        (
+            "read",
+            site("print(values[5])", "values[5]"),
+            "index out of bounds: the length is 2 but the index is 5",
+        ),
+        (
+            "write",
+            site("values[7] = 3", "values[7]"),
+            "index out of bounds: the length is 2 but the index is 7",
+        ),
+        (
+            "view",
+            site("&mut values[9]", "values[9]"),
+            "index out of bounds: the length is 2 but the index is 9",
+        ),
+        (
+            "unwrap",
+            site("print(none.unwrap())", "unwrap"),
+            "expected Some but got None",
+        ),
+        ("expect", site("none.expect(", "expect"), "expected a value"),
+        (
+            "result_unwrap",
+            site("failed.unwrap()", "unwrap"),
+            "called `unwrap` on an `Err` value",
+        ),
+        (
+            "unwrap_err",
+            site("fine.unwrap_err()", "unwrap_err"),
+            "called `unwrap_err` on an `Ok` value",
+        ),
+        (
+            "expect_err",
+            site("fine.expect_err(", "expect_err"),
+            "expected an error",
+        ),
+        (
+            "remove",
+            site("values.remove(4)", "remove"),
+            "index out of bounds: the length is 2 but the index is 4",
+        ),
+        (
+            "insert",
+            site("values.insert(6, 1)", "insert"),
+            "index out of bounds: the length is 2 but the index is 6",
+        ),
+        (
+            "relay",
+            site("relay(0)", "relay"),
+            "checked wants a positive value",
+        ),
+        (
+            "pick",
+            site("pick(values, 8)", "pick"),
+            "index out of bounds: the length is 2 but the index is 8",
+        ),
+        (
+            "closure",
+            site("panic(\"from the closure\")", "panic"),
+            "from the closure",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (path, location, message) in cases {
+        let expected = format!("panicked at {location}: {message}");
+        // One program per path, all under the same FILE name so the sites
+        // read the same; each is written over the last.
+        std::fs::write(
+            staged.join(PANIC_LOCATIONS_FILE),
+            PANIC_LOCATIONS.replace("\"PATH\"", &format!("{path:?}")),
+        )
+        .expect("write the probe program");
+        let native = run_on(&staged, Some("rust"), PANIC_LOCATIONS_FILE);
+        if native.code != Some(1) || native.stderr != format!("{expected}\n") {
+            wrong.push(format!(
+                "{path}: native exited {:?} with stderr {:?}, expected exit 1 and {expected:?}",
+                native.code, native.stderr
+            ));
+        }
+        let javascript = run_on(&staged, None, PANIC_LOCATIONS_FILE);
+        if javascript.code != Some(1) || !javascript.stderr.lines().any(|line| line == expected) {
+            wrong.push(format!(
+                "{path}: node exited {:?} with stderr {:?}, expected exit 1 and the line {expected:?}",
+                javascript.code, javascript.stderr
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// debugging.md S0: `std::debug::caller()` outside a tracking function is its
+/// own site, inside one the caller's; a `Location` reads back its file, line
+/// and column; and a CAUGHT panic still answers its message alone (the JS
+/// `error.message`, the native payload's message) — identical on both backends.
+#[test]
+fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join(PANIC_LOCATIONS_FILE),
+        PANIC_LOCATIONS.replace("\"PATH\"", "\"none\""),
+    )
+    .expect("write the probe program");
+    let javascript = run_on(&staged, None, PANIC_LOCATIONS_FILE);
+    let native = run_on(&staged, Some("rust"), PANIC_LOCATIONS_FILE);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(
+        javascript.stdout, native.stdout,
+        "both backends print the same"
+    );
+    let site =
+        |line: &str, column: &str| site_of(PANIC_LOCATIONS_FILE, PANIC_LOCATIONS, line, column);
+    let own = site("let own = caller()", "caller");
+    let (line, column) = {
+        let mut parts = own.rsplit(':');
+        let column = parts.next().unwrap().to_string();
+        let line = parts.next().unwrap().to_string();
+        (line, column)
+    };
+    let expected = format!(
+        "{}\n{PANIC_LOCATIONS_FILE}\n{line}\n{column}\n{own}\n[ 0, 'expected Some but got None' ]\n",
+        site("print(here())", "here"),
+    );
+    assert_eq!(native.stdout, expected);
+}

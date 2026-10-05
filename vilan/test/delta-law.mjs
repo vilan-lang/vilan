@@ -1,10 +1,10 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
-function __at_put(list, index, value) {
+function __at_put(list, index, value, location) {
 	if (index >= 0 && index < list.length) return list[index] = value;
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -15,10 +15,10 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __insert_at(list, index, value) {
+function __insert_at(list, index, value, location) {
 	if (index >= 0 && index < list.length) return void list.splice(index, 0, value);
 	if (index === list.length) return void list.push(value);
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __list_get(list, index) {
 	return index >= 0 && index < list.length ? [ 0, __clone(list[index]) ] : [ 1 ];
@@ -26,9 +26,16 @@ function __list_get(list, index) {
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
-function __remove_at(list, index) {
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
+}
+function __remove_at(list, index, location) {
 	if (index >= 0 && index < list.length) return list.splice(index, 1)[0];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __replace(target, value) {
 	if (Array.isArray(target) && Array.isArray(value)) target.length = value.length;
@@ -126,10 +133,10 @@ function enqueue(turn, subscribers) {
 		} else if (!(turn[2].v.has(key))) {
 			turn[2].v.set(key, true);
 			let index = turn[0].v.length;
-			while (index > 0 && __at(turn[0].v, index - 1)[0] > subscriber[0]) {
+			while (index > 0 && __at(turn[0].v, index - 1, "std/src/reactive.vl:414:21")[0] > subscriber[0]) {
 				index = index - 1;
 			}
-			__insert_at(turn[0].v, index, __clone(subscriber));
+			__insert_at(turn[0].v, index, __clone(subscriber), "std/src/reactive.vl:417:25");
 		}
 		$L;
 	}
@@ -229,7 +236,7 @@ function drain_mirror(source2, cursor, held, label, at_turn) {
 			const _previous = $aB[2];
 			const value2 = $aB[3];
 			ops_to_mirror.v = ops_to_mirror.v + 1;
-			__at_put(mirror, at, value2);
+			__at_put(mirror, at, value2, "delta-law.vl:324:5");
 			$aC = undefined;
 		} else if ($aB[0] === 0) {
 			const at2 = $aB[1];
@@ -239,7 +246,7 @@ function drain_mirror(source2, cursor, held, label, at_turn) {
 			let taken = 0;
 			const leaving = removed.length;
 			while (taken < leaving) {
-				__remove_at(mirror, at2);
+				__remove_at(mirror, at2, "delta-law.vl:331:28");
 				taken = taken + 1;
 			}
 			let offset = 0;
@@ -249,7 +256,7 @@ function drain_mirror(source2, cursor, held, label, at_turn) {
 				let $aE = null;
 				if ($aD[0] === 0) {
 					const value3 = $aD[1];
-					$aE = __insert_at(mirror, at2 + offset, value3);
+					$aE = __insert_at(mirror, at2 + offset, value3, "delta-law.vl:338:33");
 				} else {
 					$aE = undefined;
 				}
@@ -262,7 +269,7 @@ function drain_mirror(source2, cursor, held, label, at_turn) {
 			const _count = $aB[2];
 			const _to = $aB[3];
 			(() => {
-				throw "the generator emits no Move";
+				throw __panic("the generator emits no Move", "delta-law.vl:345:5");
 			})();
 			$aC = undefined;
 		}
@@ -271,7 +278,7 @@ function drain_mirror(source2, cursor, held, label, at_turn) {
 	checks.v = checks.v + 1;
 	if (!(same(mirror, $i(source2)))) {
 		(() => {
-			throw "turn " + at_turn + ": " + label + "=[" + render(mirror) + "] source=[" + render($i(source2)) + "]";
+			throw __panic("turn " + at_turn + ": " + label + "=[" + render(mirror) + "] source=[" + render($i(source2)) + "]", "delta-law.vl:351:3");
 		})();
 	}
 	return mirror;
@@ -445,7 +452,7 @@ function $x(self, at, removed, inserted, $y) {
 		let left = [  ];
 		let taken = 0;
 		while (taken < removed) {
-			left.push(__remove_at(list, at));
+			left.push(__remove_at(list, at, "delta-law.vl:185:20"));
 			taken = taken + 1;
 		}
 		let offset = 0;
@@ -455,7 +462,7 @@ function $x(self, at, removed, inserted, $y) {
 			let $A = null;
 			if ($z[0] === 0) {
 				const value2 = $z[1];
-				$A = __insert_at(list, at + offset, value2);
+				$A = __insert_at(list, at + offset, value2, "delta-law.vl:192:30");
 			} else {
 				$A = undefined;
 			}
@@ -468,8 +475,8 @@ function $x(self, at, removed, inserted, $y) {
 }
 function $S(self, at, value2, $T) {
 	$F(self[0], (list) => {
-		const previous = __clone(__at(list, at));
-		__at_put(list, at, __clone(value2));
+		const previous = __clone(__at(list, at, "delta-law.vl:82:19"));
+		__at_put(list, at, __clone(value2), "delta-law.vl:83:4");
 		$B(self[1], [ 1, at, previous, __clone(value2) ]);
 		return;
 	}, $T);
@@ -562,7 +569,7 @@ function $e(source2, $f) {
 				const _count = $v[2];
 				const _to = $v[3];
 				(() => {
-					throw "the generator emits no Move";
+					throw __panic("the generator emits no Move", "delta-law.vl:273:6");
 				})();
 				$w = undefined;
 			}
@@ -704,7 +711,7 @@ while (turn_index <= 400) {
 	const waves = notifications.v - before;
 	if (waves !== 1) {
 		(() => {
-			throw "turn " + turn_index + ": notifications=" + waves + " (expected 1)";
+			throw __panic("turn " + turn_index + ": notifications=" + waves + " (expected 1)", "delta-law.vl:406:4");
 		})();
 	}
 	let reference = [  ];
@@ -715,7 +722,7 @@ while (turn_index <= 400) {
 	checks.v = checks.v + 1;
 	if (!(same($i(derived), reference))) {
 		(() => {
-			throw "turn " + turn_index + ": derived=[" + render($i(derived)) + "] expected=[" + render(reference) + "]";
+			throw __panic("turn " + turn_index + ": derived=[" + render($i(derived)) + "] expected=[" + render(reference) + "]", "delta-law.vl:417:4");
 		})();
 	}
 	if (turn_index % 3 === 0) {
@@ -730,17 +737,17 @@ drain_mirror(source, near, mirror_near, "mirror_near", 0);
 drain_mirror(source, far, mirror_far, "mirror_far", 0);
 if (ops_to_mirror.v === 0) {
 	(() => {
-		throw "no lagging cursor was ever answered with ops";
+		throw __panic("no lagging cursor was ever answered with ops", "delta-law.vl:437:3");
 	})();
 }
 if (resets_to_mirror.v === 0) {
 	(() => {
-		throw "no lagging cursor ever fell past the log\'s base";
+		throw __panic("no lagging cursor ever fell past the log\'s base", "delta-law.vl:440:3");
 	})();
 }
 if (calls.v >= naive_calls.v) {
 	(() => {
-		throw "the derivation made " + calls.v + " calls against the rerun\'s " + naive_calls.v;
+		throw __panic("the derivation made " + calls.v + " calls against the rerun\'s " + naive_calls.v, "delta-law.vl:443:3");
 	})();
 }
 console.log("turns=400 checks=" + checks.v + " failures=0");

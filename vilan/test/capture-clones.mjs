@@ -1,12 +1,19 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
 	if (value instanceof Set) return new Set([ ...value ].map(__clone));
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function __replace(target, value) {
 	if (Array.isArray(target) && Array.isArray(value)) target.length = value.length;
@@ -57,7 +64,7 @@ function step(self) {
 	const at = $p[2];
 	if ($p[0] === 0) {
 		__replace(self, [ 0, __clone(items), at + 1 ]);
-		return __at(items, as_usize(at));
+		return __at(items, as_usize(at), "capture-clones.vl:75:8");
 	}
 	return "-";
 }

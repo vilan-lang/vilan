@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -18,6 +18,13 @@ function __json_kind(value) {
 }
 function __map_get(map, key) {
 	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function __try_parse_json(text) {
 	try {
@@ -239,7 +246,7 @@ const to_u8 = as_u8(300);
 console.log("" + from_i32 + " " + from_f64 + " " + from_u8 + " " + to_i32 + " " + to_u8);
 const letters = [ "a", "b", "c", "d" ];
 const at = 2;
-console.log(__at(letters, at));
+console.log(__at(letters, at, "usize.vl:55:8"));
 console.log($l(count));
 console.log(JSON.stringify(count));
 console.log(JSON.stringify(count));
@@ -264,7 +271,7 @@ const $H = decoded;
 let $I = null;
 if ($H[0] === 0) {
 	const back2 = $H[1];
-	$I = console.log("" + back2.length + " " + __at(back2, 2));
+	$I = console.log("" + back2.length + " " + __at(back2, 2, "usize.vl:75:41"));
 } else {
 	const reason2 = $H[1];
 	$I = console.log(reason2);

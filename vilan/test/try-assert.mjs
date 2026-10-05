@@ -7,7 +7,7 @@ function __clone(value) {
 function __force(cell) {
 	if (cell.state === 2) return cell.value;
 	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
-	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + (cell.value && cell.value.location !== undefined ? cell.value.message : cell.value);
 	cell.state = 1;
 	try {
 		cell.value = cell.thunk();

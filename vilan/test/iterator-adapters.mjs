@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -13,6 +13,13 @@ function __hash(value) {
 }
 function __map_get(map, key) {
 	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function hash(self) {
 	return __hash(self);
@@ -56,7 +63,7 @@ function $e(self, count) {
 function $k(self) {
 	let $l = null;
 	if (self[1] < self[0].length) {
-		const value = __clone(__at(self[0], self[1]));
+		const value = __clone(__at(self[0], self[1], "std/src/iterator.vl:168:16"));
 		self[1] = self[1] + 1;
 		$l = [ 0, value ];
 	} else {
@@ -261,7 +268,7 @@ function $aj(self) {
 	let index = self.length;
 	while (index > 0) {
 		index = index - 1;
-		result.push(__clone(__at(self, index)));
+		result.push(__clone(__at(self, index, "std/src/list.vl:83:16")));
 	}
 	return result;
 }

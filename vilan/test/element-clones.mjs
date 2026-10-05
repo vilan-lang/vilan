@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -10,6 +10,13 @@ function __clone(value) {
 }
 function __list_sort_by(list, compare) {
 	return list.slice().sort(compare);
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function compare(self, b) {
 	let $g = null;
@@ -88,23 +95,23 @@ function elements_are_independent() {
 	let kept = $d(rows, (row) => {
 		return true;
 	});
-	__at(kept, 0).push(9);
-	console.log(__at(rows, 0).length);
+	__at(kept, 0, "element-clones.vl:130:2").push(9);
+	console.log(__at(rows, 0, "element-clones.vl:131:8").length);
 	let flipped = $e(rows);
-	__at(flipped, 0).push(9);
-	console.log(__at(rows, 0).length);
+	__at(flipped, 0, "element-clones.vl:133:2").push(9);
+	console.log(__at(rows, 0, "element-clones.vl:134:8").length);
 	let mapped = $f(rows, (row) => {
 		return __clone(row);
 	});
-	__at(mapped, 0).push(9);
-	console.log(__at(rows, 0).length);
+	__at(mapped, 0, "element-clones.vl:136:2").push(9);
+	console.log(__at(rows, 0, "element-clones.vl:137:8").length);
 	let cells = [  ];
 	cells.push([ 5 ]);
 	let sorted = __list_sort_by(__clone(cells), (a, b) => {
 		return compare(a[0], b[0]);
 	});
-	__at(sorted, 0)[0] = 99;
-	console.log(__at(cells, 0)[0]);
+	__at(sorted, 0, "element-clones.vl:141:2")[0] = 99;
+	console.log(__at(cells, 0, "element-clones.vl:142:8")[0]);
 }
 function $d(self, predicate) {
 	let result = [  ];
@@ -120,7 +127,7 @@ function $e(self) {
 	let index = self.length;
 	while (index > 0) {
 		index = index - 1;
-		result.push(__clone(__at(self, index)));
+		result.push(__clone(__at(self, index, "std/src/list.vl:83:16")));
 	}
 	return result;
 }
@@ -133,7 +140,7 @@ function $f(self, fn) {
 }
 let source = [ 1, 2 ];
 let listed = hold_in_list(source);
-__at(listed, 0).push(9);
+__at(listed, 0, "element-clones.vl:148:2").push(9);
 console.log(source.length);
 let tupled = hold_in_tuple(source);
 tupled[0].push(9);

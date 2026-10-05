@@ -1,0 +1,96 @@
+// debugging.md S0: every std panic path reports the vilan site that reached
+// it — `panicked at <file>:<line>:<column>: <message>` — on both backends.
+// `PATH` picks the path: the test writes one copy per path (the native
+// backend has no `args()`), and the substitution keeps every line in place.
+import std::debug::caller;
+import std::display::Display;
+import std::io::{ assert, panic };
+import std::reactive::guarded;
+
+[track_caller]
+fun checked(value: i32): i32 {
+	assert(value > 0, "checked wants a positive value");
+	value
+}
+
+// A chain of two tracking functions reports the OUTERMOST caller.
+[track_caller]
+fun relay(value: i32): i32 {
+	checked(value)
+}
+
+// A subscript in a tracking function's own body reports its caller too.
+[track_caller]
+fun pick(values: List<i32>, index: usize): i32 {
+	values[index]
+}
+
+// A closure is a boundary: its own site, not the tracking caller's. (Its
+// panic sits under an `if`: a closure whose body ONLY panics does not build
+// natively yet, which is the lane's find F?1.)
+[track_caller]
+fun later(armed: bool): || void {
+	|| {
+		if armed {
+			panic("from the closure");
+		}
+	}
+}
+
+[track_caller]
+fun here(): str {
+	caller().text()
+}
+
+fun main() {
+	let path = "PATH";
+	mut values = [1, 2];
+	let none: Option<i32> = None;
+	let failed: Result<i32, str> = Err("failed");
+	let fine: Result<i32, str> = Ok(1);
+	if path == "none" {
+		// No panic: the locations a program can read.
+		print(here());
+		let own = caller();
+		print(own.file());
+		print(own.line());
+		print(own.column());
+		print(own.to_string());
+		// A caught panic keeps its message alone.
+		print(guarded(|| {
+			none.unwrap();
+		}));
+	} else if path == "panic" {
+		panic("boom");
+	} else if path == "assert" {
+		assert(values.len() > 5, "asserted");
+	} else if path == "read" {
+		print(values[5]);
+	} else if path == "write" {
+		values[7] = 3;
+	} else if path == "view" {
+		let slot = &mut values[9];
+		slot = 4;
+	} else if path == "unwrap" {
+		print(none.unwrap());
+	} else if path == "expect" {
+		print(none.expect("expected a value"));
+	} else if path == "result_unwrap" {
+		print(failed.unwrap());
+	} else if path == "unwrap_err" {
+		print(fine.unwrap_err());
+	} else if path == "expect_err" {
+		print(fine.expect_err("expected an error"));
+	} else if path == "remove" {
+		print(values.remove(4));
+	} else if path == "insert" {
+		values.insert(6, 1);
+	} else if path == "relay" {
+		print(relay(0));
+	} else if path == "pick" {
+		print(pick(values, 8));
+	} else if path == "closure" {
+		let run = later(true);
+		run();
+	}
+}

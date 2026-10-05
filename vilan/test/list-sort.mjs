@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -10,6 +10,13 @@ function __clone(value) {
 }
 function __list_sort_by(list, compare) {
 	return list.slice().sort(compare);
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function compare(self, b) {
 	let $f = null;
@@ -46,7 +53,7 @@ function $a(self) {
 	let index = self.length;
 	while (index > 0) {
 		index = index - 1;
-		result.push(__clone(__at(self, index)));
+		result.push(__clone(__at(self, index, "std/src/list.vl:83:16")));
 	}
 	return result;
 }
@@ -61,16 +68,16 @@ function $e(self) {
 	});
 }
 const xs = [ 3, 1, 2 ];
-console.log(__at($a(xs), 0));
-console.log(__at($a(xs), 2));
-console.log(__at($b(xs), 0));
-console.log(__at($b(xs), 2));
-console.log(__at(xs, 0));
+console.log(__at($a(xs), 0, "list-sort.vl:11:8"));
+console.log(__at($a(xs), 2, "list-sort.vl:12:8"));
+console.log(__at($b(xs), 0, "list-sort.vl:13:8"));
+console.log(__at($b(xs), 2, "list-sort.vl:14:8"));
+console.log(__at(xs, 0, "list-sort.vl:15:8"));
 const numeric = $b([ 10, 2, 1 ]);
-console.log(__at(numeric, 0));
-console.log(__at(numeric, 2));
+console.log(__at(numeric, 0, "list-sort.vl:20:8"));
+console.log(__at(numeric, 2, "list-sort.vl:21:8"));
 const words = $e([ "pear", "apple", "fig" ]);
-console.log(__at(words, 0));
+console.log(__at(words, 0, "list-sort.vl:24:8"));
 const descending = __list_sort_by(xs, (a, b) => {
 	let $h = null;
 	if (a > b) {
@@ -86,7 +93,7 @@ const descending = __list_sort_by(xs, (a, b) => {
 	}
 	return $h;
 });
-console.log(__at(descending, 0));
+console.log(__at(descending, 0, "list-sort.vl:37:8"));
 let entries = [  ];
 entries.push([ 1, "a" ]);
 entries.push([ 0, "b" ]);

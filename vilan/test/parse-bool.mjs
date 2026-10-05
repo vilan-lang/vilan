@@ -4,6 +4,13 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
+}
 function to_string(self) {
 	return "" + self;
 }
@@ -30,7 +37,7 @@ function $c(self, fallback) {
 	}
 	return $e;
 }
-function $f(self) {
+function $f(self, caller) {
 	const $g = self;
 	let $h = null;
 	if ($g[0] === 0) {
@@ -38,7 +45,7 @@ function $f(self) {
 		$h = x;
 	} else {
 		$h = (() => {
-			throw "expected Some but got None";
+			throw __panic("expected Some but got None", caller);
 		})();
 	}
 	return $h;
@@ -50,7 +57,7 @@ function $i(self) {
 console.log($c(parse_bool("true"), false));
 console.log($c(parse_bool("false"), true));
 console.log(to_string(true));
-console.log($f(parse_bool(to_string(false))));
+console.log($f(parse_bool(to_string(false)), "parse-bool.vl:12:39"));
 console.log($i(parse_bool("1")));
 console.log($i(parse_bool("0")));
 console.log($i(parse_bool("True")));
