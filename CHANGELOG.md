@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**`std::markdown`'s nineteen strict-parse refusals are in the diagnostics ledger.** The parser refuses every construct outside the census grammar with a `ParseError` naming the construct and its line — an image, a footnote, a reference-style link or definition, strikethrough, a backslash escape, a raw HTML tag, an indented code block, a tilde fence, an unclosed fence, a custom heading id, a setext heading or thematic break, a lazy blockquote or list continuation, an indented or nested list item, a table alignment colon, a hard or backslash line break — and none of the nineteen messages had a row, so a reworded one reddened nothing. Each is rowed now (`NEW`, for integration to number), keyed on the message as it prints, the two composed ones (`a backslash escape (\{escaped})…`, `a raw HTML tag (<{inner}>)…`) with their slots; every fragment of every key is held to `vilan/std`, proven by rewording two of them. Each message already had its own pin (`inference::markdown::markdown_refuses_*`). No message changed: their em-dash style waits on the ruling the process layer's REWORD parking already names. Tracker L16.
+
+---
+
 <!-- family: tooling -->
 **The diagnostics ledger's index holds its `NEW` rows to the tail, and loses the stale one that sat mid-file for three orders.** The index's header has always said a `NEW` row (a message a lane shipped, numbered by integration at the merge) sits at the END of `diagnostics-ledger.tsv`; nothing checked it, and one did not: B407's unsigned negative-literal row, numbered 570 in Order 42, survived as a second, `NEW` copy after a rebase fold in Order 44 "restored" it from the branch it had already left. It was a duplicate, not an unnumbered row, so it is deleted rather than numbered. `the_index_is_well_formed` now refuses a numbered row after a `NEW` one, naming both and the two ways out. Proven on a planted mid-file row. Tracker N140.
 

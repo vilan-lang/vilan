@@ -659,3 +659,22 @@ row	flagship	key
 635	-	cannot mutate '{name}': it is a COPY of the payload the pattern takes out of `{place}`, so a write to it (or to `mut {name}`) would not reach `{place}` — to write the payload in place, match a view of it, `match &mut {place}` (or `&mut {place} is ..`), whose `let` captures are writable views
 636	-	`std::{old}` moved to `std::{new}`: std's modules are grouped under namespaces since v0.44.0, and the old path is gone — write `std::{new}`
 637	-	`{section} prelude = "{path}"` names the old path of a std module: `std::{old}` moved to `std::{new}` — write `prelude = "{rewritten}"`
+NEW	-	an image (![alt](destination)) — images are outside the census grammar
+NEW	-	a footnote ([^label]) — footnotes are outside the census grammar
+NEW	-	a reference-style link ([text][label]) — only inline [text](destination) links are in the census grammar
+NEW	-	strikethrough (~~text~~) — outside the census grammar
+NEW	-	a backslash escape (\{escaped}) — the census grammar's only escape is \| inside a table cell
+NEW	-	a raw HTML tag (<{inner}>) — the census grammar's only HTML passthrough is <a id="…"></a>; wrap literal <…> text (a generic like List<T>) in backticks
+NEW	-	an indented code block (four or more leading spaces) — the census grammar's only code blocks are backtick fences
+NEW	-	a tilde fence (~~~) — the census grammar's fences use backticks
+NEW	-	an unclosed code fence — no closing ``` at the opening fence's indent
+NEW	-	a custom heading id ({{#…}}) — census-grammar heading ids are computed, mdBook's algorithm
+NEW	-	a setext heading underline or thematic break (---, ===, ***) — both outside the census grammar; headings are ATX (# Title)
+NEW	-	a lazy blockquote continuation — prefix the line with > or separate it from the quote with a blank line
+NEW	-	an indented list item — the census grammar's lists are flat, at the left margin
+NEW	-	a nested list item — the census grammar's lists are flat
+NEW	-	a lazy list continuation — indent the line under its item (two spaces) or separate it from the list with a blank line
+NEW	-	a table alignment colon (:---) — the census grammar's tables carry no alignment
+NEW	-	a reference link definition ([label]: destination) — only inline [text](destination) links are in the census grammar
+NEW	-	a hard line break (two trailing spaces) — outside the census grammar
+NEW	-	a backslash line break — outside the census grammar
