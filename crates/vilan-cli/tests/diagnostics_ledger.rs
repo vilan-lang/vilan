@@ -20,8 +20,9 @@
 //!
 //! # What this file verifies
 //!
-//! 1. **The index is well formed.** Rows ascend, none repeats, every key has a
-//!    literal fragment to search for (the two recorded exceptions below).
+//! 1. **The index is well formed.** Rows ascend, none repeats, `NEW` rows sit
+//!    at the tail (N140), every key has a literal fragment to search for (the
+//!    two recorded exceptions below).
 //! 2. **Every row still lives** ([`every_indexed_row_still_lives_in_the_tree`]).
 //!    A key is split on its `{...}` slots and `...` elisions and EVERY literal
 //!    fragment of [`MIN_FRAGMENT`] characters or more is searched,
@@ -1694,7 +1695,8 @@ fn the_index_is_well_formed() {
     let rows = index();
     assert!(rows.len() > 300, "the index lost rows: {}", rows.len());
     let mut previous = 0u32;
-    for row in &rows {
+    let mut first_new: Option<usize> = None;
+    for (position, row) in rows.iter().enumerate() {
         // A `NEW` row has no ordinal yet, so it sits outside the order rather
         // than breaking it. Everything else below still applies to it.
         if let Some(ordinal) = row.ordinal {
@@ -1704,6 +1706,21 @@ fn the_index_is_well_formed() {
                 row.number
             );
             previous = ordinal;
+            // N140: `NEW` rows sit at the END, as the index's header says —
+            // integration numbers the tail, so a `NEW` row with a numbered row
+            // after it is one integration walked past. One sat mid-file for
+            // three orders (a duplicate of row 570 that a rebase fold had
+            // restored) because nothing here held the header to its word.
+            if let Some(new_position) = first_new {
+                panic!(
+                    "row {} follows the `NEW` row at index position {new_position}: \
+                     `NEW` rows sit at the end of the index — number the earlier \
+                     one, or delete it if a numbered row already records its message",
+                    row.number
+                );
+            }
+        } else if first_new.is_none() {
+            first_new = Some(position + 1);
         }
         assert!(
             !row.key.trim().is_empty(),
