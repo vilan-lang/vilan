@@ -1315,7 +1315,17 @@ const DISK_FORMAT: &str = "vilan-macro-expansions 1";
 /// eviction — and the entries kept are the numerically smallest keys, which
 /// makes the file a deterministic function of its contents rather than of the
 /// order a build happened to visit macros in.
-const DISK_ENTRY_CAP: usize = 4096;
+///
+/// M113: the bound must sit above any package's own expansion count, because a
+/// package that outgrows it re-runs every expansion past the cap on EVERY
+/// check — the table keeps the same smallest keys each time, so the rest never
+/// become warm. At 4,096 that was the generated plain package between 320
+/// modules (~3,800 expansions, all served) and 640 (~7,700, 3,600 re-run per
+/// check): 1.9 G of the 7.4 G a doubling added, which read as a superlinear
+/// lookup (x2.33 per doubling) and was a cache that stopped caching. At ~120
+/// bytes an entry, 65,536 entries is an ~8 MiB file, and the check-cache
+/// root's own byte bound (N137) still holds the whole tree.
+const DISK_ENTRY_CAP: usize = 65_536;
 
 static DISK_TABLES: OnceLock<Mutex<HashMap<PathBuf, DiskTable>>> = OnceLock::new();
 
@@ -3401,6 +3411,32 @@ fn construct_arguments(arguments: &[Cow<'_, str>]) -> js::Node<'static> {
 /// those modules whose name is a derivable trait and is missing from the table
 /// would be the second, and is checked as the exact inverse — every name the
 /// table claims is found, and the count of found rows is the table's length.
+#[cfg(test)]
+mod disk_table_tests {
+    use super::{DISK_ENTRY_CAP, parse_disk_table, render_disk_table};
+    use crate::fx::FxHashMap as HashMap;
+
+    /// M113: a package's table keeps every expansion of a package of 8,000 —
+    /// twice what the generated 640-module package needs. At the old cap of
+    /// 4,096 the rest were re-run on every check.
+    #[test]
+    fn a_table_of_eight_thousand_expansions_is_written_whole() {
+        let entries: HashMap<u64, &'static str> = (0..8_000u64)
+            .map(|key| (key.wrapping_mul(0x9e37_79b9_7f4a_7c15), "fun derived() {}"))
+            .collect();
+        let text = render_disk_table("stamp", &entries);
+        let read = parse_disk_table(&text, "stamp").expect("the table reads back");
+        assert_eq!(
+            read.len(),
+            entries.len(),
+            "the table kept {} of {} expansions (cap {DISK_ENTRY_CAP}): the rest re-run on \
+             every check (M113)",
+            read.len(),
+            entries.len()
+        );
+    }
+}
+
 #[cfg(test)]
 mod derive_table_tests {
     use super::STD_DERIVE_MACROS;
