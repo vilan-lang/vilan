@@ -9650,18 +9650,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // read is indistinguishable from the place and costs no borrow that
             // could collide with another read in the same statement.
             let wants_a_mutable_place = matches!(conventions.get(index), Some(Receiving::RefMut));
-            let expecting =
-                declared
-                    .get(index)
-                    .map(|parameter| match callee_substitution.clone() {
-                        Some(callee) => {
-                            let saved = self.enter_substitution(callee.into_iter().collect());
-                            let concrete = self.concrete(parameter.type_id);
-                            self.current_substitution = saved;
-                            concrete
-                        }
-                        None => self.concrete(parameter.type_id),
-                    });
+            let expecting = declared.get(index).map(|parameter| {
+                self.argument_position(parameter.type_id, callee_substitution.as_ref())
+            });
             // A parameter declared `async |T| U` takes a future-answering
             // closure, so a sync literal at the call site is wrapped.
             // F22: an argument standing in a parameter this INSTANCE adapts is
@@ -9744,6 +9735,37 @@ impl<'a, 'src> Emitter<'a, 'src> {
             rendered.push(text);
         }
         Ok(rendered)
+    }
+
+    /// The type a call's argument is rendered at: its parameter's declared
+    /// type under the CALL's substitution.
+    ///
+    /// [`Self::concrete`] resolves the head only, so a closure parameter `f:
+    /// |T| U` of `apply<T, U>` stayed `|T| U` — the CALLEE's generics, which
+    /// the caller's body cannot resolve — and a literal handed there without a
+    /// written return (`apply(4, |k| Maybe::Just(k * 10))`) had no closed
+    /// return to build its constructor at, and was refused as instantiated at
+    /// `any` (F85). The whole type is rebuilt under the call's bindings
+    /// ([`Self::substituted`]) and taken when that closes it — the position the
+    /// call already resolved. An open rebuild says no more than the head did,
+    /// so the head stands there.
+    fn argument_position(
+        &mut self,
+        declared: TypeId,
+        callee_substitution: Option<&HashMap<TypeId, TypeId>>,
+    ) -> TypeId {
+        let Some(callee) = callee_substitution else {
+            return self.concrete(declared);
+        };
+        let saved = self.enter_substitution(callee.clone().into_iter().collect());
+        let head = self.concrete(declared);
+        self.current_substitution = saved;
+        let entries = self.resolved_entries(callee);
+        let rebuilt = self.substituted(declared, &entries);
+        if rebuilt != declared && self.is_grounded(rebuilt) {
+            return rebuilt;
+        }
+        head
     }
 
     /// The other direction of [`Self::call_arguments_adapting`]'s surplus rule:

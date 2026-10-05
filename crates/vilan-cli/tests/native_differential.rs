@@ -8544,6 +8544,29 @@ fn a_pattern_over_an_indexed_element_copies_it_on_both_backends() {
     );
 }
 
+/// F85: a closure literal handed to a GENERIC callee without a written
+/// return. Its position was the parameter type with only the head resolved —
+/// `|T| U`, the callee's own generics — so the body had no closed return to
+/// build a constructor at and `apply(4, |k| Maybe::Just(k * 10))` was refused
+/// as instantiated at `any`. The position is now the parameter's type rebuilt
+/// under the call's bindings. The probe: a user enum over an `i32`, a `str` and
+/// a nested constructor, a list, `Option`, a generic struct literal, a generic
+/// METHOD's closure, a call from a generic body, a closure answering a closure.
+#[test]
+fn a_closure_handed_to_a_generic_callee_builds_at_the_calls_position_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_callee_closures.vl"),
+        include_str!("native/generic_callee_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_callee_closures.vl"),
+        Verdict::Identical,
+        "a closure handed to a generic callee must build at the call's own position"
+    );
+}
+
 /// F57: every platform-bound corpus program the backend ACCEPTS prints what
 /// node prints, the ones it refuses say which construct stopped them, and the
 /// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is
