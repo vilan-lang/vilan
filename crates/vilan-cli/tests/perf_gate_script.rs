@@ -124,6 +124,63 @@ fn the_ratchet_adopts_a_new_class_lowers_past_two_percent_and_resets_bumps_at_a_
     );
 }
 
+/// M114: the `ci` class's rows are adopted from the CI `perf` job's own JSON
+/// at a tolerance of their own — the job's callgrind count moved by under
+/// 0.01% across four runner CPUs, so Q7 holds the class to 0.5% — and a row's
+/// tolerance is the one `gate` judges it by.
+#[test]
+fn the_ratchet_adopts_a_class_at_its_own_tolerance_and_the_gate_reads_it() {
+    let scratch = Scratch::new("ratchet-tolerance");
+    let budgets = scratch.path("budgets.toml");
+    fs::write(&budgets, HEADER).expect("write the fixture budgets");
+    let measured = scratch.path("measured.json");
+    fs::write(
+        &measured,
+        r#"{"vilan": "fixture", "counter": "callgrind", "class": "ci", "results": {
+            "example:math": {"instructions": 1000000, "exit": 0}}}"#,
+    )
+    .expect("write the fixture measurement");
+    let (ok, report) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &[
+            "ratchet",
+            "--from",
+            measured.to_str().expect("utf-8"),
+            "--tolerance",
+            "0.005",
+        ],
+    );
+    assert!(ok, "the ratchet failed:\n{report}");
+    let written = fs::read_to_string(&budgets).expect("read the ratcheted budgets");
+    assert!(
+        written.contains("class = \"ci\"") && written.contains("tolerance = 0.005"),
+        "the ci row is adopted at its own tolerance:\n{written}"
+    );
+    // The judgement: 0.6% over the ceiling is red at the row's 0.5% and would
+    // be green at the file's 1%.
+    let script = format!(
+        "import sys; sys.path.insert(0, {scripts:?}); import perf_gate; \
+         data = perf_gate.load_budgets({budgets:?}); row = data['row'][0]; \
+         print(perf_gate.effective_ceiling(data, row))",
+        scripts = repository_root().join("scripts").display().to_string(),
+        budgets = budgets.display().to_string(),
+    );
+    let output = Command::new("python3")
+        .args(["-c", &script])
+        .output()
+        .expect("run python3");
+    let ceiling: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("an integer ceiling");
+    // 1,000,000 x 1.005, floored (the float product reads 1,004,999).
+    assert!(
+        (1_004_999..=1_005_000).contains(&ceiling),
+        "the gate reads the row's own tolerance, not the file's: {ceiling}"
+    );
+}
+
 #[test]
 fn an_e121_row_reports_until_green_at_two_consecutive_seals_and_then_blocks() {
     let scratch = Scratch::new("e121");

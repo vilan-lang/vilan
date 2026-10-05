@@ -106,7 +106,9 @@ def write_budgets(data, path=BUDGETS):
 
 
 def effective_ceiling(data, row):
-    ceiling = row["ceiling"] * (1 + data.get("tolerance", 0.01))
+    # A row may carry its own tolerance (M114: the `ci` class's counter moves by under 0.01% between runners,
+    # so Q7 holds it to 0.5% where the reference machine keeps the file's 1%).
+    ceiling = row["ceiling"] * (1 + row.get("tolerance", data.get("tolerance", 0.01)))
     for bump in data["bump"]:
         if bump["subject"] == row["subject"] and bump.get("class", row["class"]) == row["class"]:
             ceiling *= bump["ratio"]
@@ -289,8 +291,11 @@ def command_ratchet(options):
         row = next((r for r in data["row"] if r["subject"] == subject and r["counter"] == counter
                     and r["class"] == klass), None)
         if row is None:
-            data["row"].append({"subject": subject, "counter": counter, "class": klass,
-                                "ceiling": result["instructions"], "measured_at": stamp})
+            row = {"subject": subject, "counter": counter, "class": klass,
+                   "ceiling": result["instructions"], "measured_at": stamp}
+            if options.tolerance is not None:
+                row["tolerance"] = options.tolerance
+            data["row"].append(row)
             changes.append(f"adopted {subject} ({klass}/{counter}) at {result['instructions']:,}")
         elif result["instructions"] < row["ceiling"] * 0.98:
             changes.append(f"lowered {subject} ({klass}/{counter}) {row['ceiling']:,} -> {result['instructions']:,}")
@@ -774,6 +779,8 @@ def main():
     p.add_argument("--from", dest="source", required=True)
     p.add_argument("--release", action="store_true")
     p.add_argument("--stamp")
+    p.add_argument("--tolerance", type=float,
+                   help="a tolerance for the rows this adopts, in place of the file's (M114: 0.005 for `ci`)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(run=command_ratchet)
 

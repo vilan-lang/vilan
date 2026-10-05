@@ -386,14 +386,15 @@ jobs:
   # gate never needs the private repository, §5) and a plain package at two
   # sizes whose RATIO is held to x2.3 per doubling (M107, Q11).
   #
-  # Whether a GitHub runner exposes the hardware counter was not measurable
-  # from the lane that built this (S2): `perf_count.py` uses it when the
-  # kernel allows and falls back to callgrind's Ir otherwise, which is why
-  # valgrind is installed, and the measured JSON names the counter it used.
-  # Ceilings bind only the class they were measured on, so until a seal adopts
-  # this job's own uploaded counts (`perf_gate.py ratchet --from`), the ci
-  # class's rows report and only the growth ratio refuses — and the artifact
-  # is the spread measurement S2 asks for, one per run.
+  # The runners expose no hardware counter: every run so far fell back to
+  # callgrind's Ir (which is why valgrind is installed), and the measured JSON
+  # names the counter it used. M114 read the first fourteen runs: the same
+  # code counted the same within 0.01% on four runner CPUs (AMD EPYC
+  # 7763/9V74/9V45, Intel Xeon 6973P-C), so the `ci` class's ceilings were
+  # adopted from this job's own uploaded counts (`perf_gate.py ratchet --from
+  # measured.json --tolerance 0.005`) and now refuse like the reference
+  # class's do, at 0.5% (Q7). A new stable rustc can move the counts: a bump
+  # that raises them is a `[[bump]]` row, one that lowers them is ratcheted.
   perf:
     needs: changes
     if: needs.changes.outputs.code == 'true'

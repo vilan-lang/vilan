@@ -8,7 +8,9 @@
 # A row is a subject's `vilan check` on a release build, counted by `counter` (`instructions:u`, the
 # hardware counter; `callgrind`, its Ir where there is no PMU) on machine `class` — counts are per ISA and
 # per libc, so a ceiling binds only the class it was measured on (`reference` is the owner's 9800X3D,
-# `ci` the GitHub runner once S2's spread is known and a seal adopts CI's own measurement).
+# `ci` the GitHub runner's callgrind count, adopted from the CI `perf` job's own JSON by M114). A row may
+# carry its own `tolerance` in place of the file's: the `ci` rows hold to 0.5% (Q7), because the job's
+# count moved by under 0.01% across the four runner CPUs it met.
 #
 # A change that legitimately costs more adds, IN THE SAME COMMIT:
 #   [[bump]]
@@ -118,6 +120,102 @@ counter = "instructions:u"
 class = "reference"
 ceiling = 9_952_066_589
 measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+
+[[row]]
+subject = "example:math"
+counter = "callgrind"
+class = "ci"
+ceiling = 255_110_326
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:watch"
+counter = "callgrind"
+class = "ci"
+ceiling = 322_339_626
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:browser"
+counter = "callgrind"
+class = "ci"
+ceiling = 1_534_929_500
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:fullstack"
+counter = "callgrind"
+class = "ci"
+ceiling = 3_313_903_357
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:router"
+counter = "callgrind"
+class = "ci"
+ceiling = 1_952_820_413
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:reactive-ui"
+counter = "callgrind"
+class = "ci"
+ceiling = 2_699_740_740
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:ssr"
+counter = "callgrind"
+class = "ci"
+ceiling = 4_270_825_922
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:canvas"
+counter = "callgrind"
+class = "ci"
+ceiling = 1_540_811_994
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:rpc"
+counter = "callgrind"
+class = "ci"
+ceiling = 2_166_877_229
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:todo"
+counter = "callgrind"
+class = "ci"
+ceiling = 6_231_630_945
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "example:walkthrough"
+counter = "callgrind"
+class = "ci"
+ceiling = 6_519_692_337
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
+
+[[row]]
+subject = "genapp:46"
+counter = "callgrind"
+class = "ci"
+ceiling = 10_107_674_641
+measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+tolerance = 0.005
 
 [[growth]]
 small = 160
