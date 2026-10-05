@@ -90,6 +90,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**B500: an `[rpc]` signature written with a module path — `hash_map::HashMap<str, i32>` — is the same contract as the bare spelling. It was refused in the generated code ("cannot infer 'T' for this call; its bound ': Wire' cannot be checked").** The macro surface handed a module-qualified type to `[service]` as one opaque name with no arguments, so a generator reading the arguments read none. A qualified head now keeps its arguments, under its whole written path as the `TypeExpr`'s name. **Pins:** `inference::traits::b500_an_rpc_signature_written_with_a_module_path_is_the_bare_contract` (the two spellings' contract hashes agree; red on the base). Tracker B500.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

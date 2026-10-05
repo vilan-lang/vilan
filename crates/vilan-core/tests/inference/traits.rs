@@ -9459,3 +9459,42 @@ fn b539_a_trait_annotated_bindings_arguments_reach_its_initializer() {
         "does not implement trait 'Source<str>'",
     );
 }
+
+/// B500: an `[rpc]` signature written with a MODULE PATH (`hash_map::HashMap<str,
+/// i32>`) is the same contract as the bare spelling. The macro surface handed a
+/// path type to `[service]` as one opaque name with NO arguments, so the
+/// generated code whose type parameter only those arguments fix was refused
+/// ("cannot infer 'T' … ': Wire'"). A path head now keeps its arguments, under
+/// its whole written path; the contract hash agrees with the bare spelling's.
+#[test]
+fn b500_an_rpc_signature_written_with_a_module_path_is_the_bare_contract() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map;
+        import std::hash_map::HashMap;
+        [service(BareClient)]
+        struct Bare {
+            unused: i32,
+        }
+        impl Bare {
+            [rpc]
+            fun counts(self, names: HashMap<str, i32>): HashMap<str, i32> { names }
+        }
+        [service(PathClient)]
+        struct Path {
+            unused: i32,
+        }
+        impl Path {
+            [rpc]
+            fun counts(self, names: hash_map::HashMap<str, i32>): hash_map::HashMap<str, i32> {
+                names
+            }
+        }
+        fun main() {
+            print(Bare { unused = 0 }.contract_hash() == Path { unused = 0 }.contract_hash());
+        }
+        "#,
+        "true\n",
+    );
+}
