@@ -1345,16 +1345,16 @@ export macro fun store_enum_impls(target: EnumItem): str {
 }
 
 /// `[derive(Storable)]`: the struct's or enum's store surface (§3.1). Its output
-/// carries its own imports, from `std::reactive::store_core` where the names are
-/// declared: a module's own `Storable` here is this macro, and the re-exported
-/// trait of the same name is not reached through `std::reactive::store` from
-/// generated code (N?3).
+/// carries its own imports, through `std::reactive::store` — the module a program
+/// names — which re-exports the core's names. Its `Storable` is two items, the
+/// re-exported TRAIT and this derive macro; an import binds the trait, as it does
+/// in a hand-written module (B547).
 export macro fun Storable(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 
 	let header = "import std::option::Option;\n"
 		+ "import std::shared::Shared;\n"
-		+ "import std::reactive::store_core::{ Storable, StoreFlag, StoreLeaf, StoreNode, StoreSlot, StoreWoken, Store, StoreSome, store_has_me, store_kid, store_switch, store_wake_me };\n";
+		+ "import std::reactive::store::{ Storable, StoreFlag, StoreLeaf, StoreNode, StoreSlot, StoreWoken, Store, StoreSome, store_has_me, store_kid, store_switch, store_wake_me };\n";
 	if item.as_struct() is Some(let target) {
 		ret source(header + store_struct_impls(target));
 	}

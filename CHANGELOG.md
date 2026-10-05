@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**`[derive(Storable)]`'s output imports through `std::reactive::store`, the module a program names, instead of stepping around B547 through `std::reactive::store_core`.** The derive's generated code named the core module because, in a module that was the first to load `std::reactive::store`, an import of `Storable` there bound the derive macro rather than the re-exported trait ("'Storable' is not a trait"). B547's compiler fix makes an import bind the trait once re-exports have bound, so the generated code now spells its imports the way a hand-written module does. No behaviour changed. Pin: `module_resolution::a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map` (a derive in a non-entry module whose entry imports nothing of the store), red on a compiler without B547's fix; B547's own pin stands. Tracker B547 (std side).
+
+---
+
 <!-- family: feature -->
 **`List::push_many(items)` appends a whole run in one call — another list, a set or any iterator — and a `ListCell` takes the same call as ONE splice.** `xs.push_many([3, 4])`, `xs.push_many(ys.iter().map(f))`, `xs.push_many(set)`: every item, in order, after what the list holds. The run is taken whole first (`own`), so `xs.push_many(xs)` appends a copy of the list as it stood. What it takes is `Items<T>` (new in `std::iterator`): a `List<T>`, a `HashSet<T>` (its members in insertion order) and every `Iterator<T>` are runs of their items, which is what `for` walks. On a reactive list, `ListCell::push_many` records the batch as a single `Splice` at the end — one op and one notification for its readers, where a loop of `push` records one per element — and `Tracked::push_many` does the same inside an `edit` body; `extend` remains the list-only spelling. Both backends. Pins: `inference::std_surface::a158_*` (three: a list, an iterator and a set in order; a run taken whole; an empty run), `inference::collections::a158_a_list_cell_pushes_a_batch_as_one_splice`, and `native_differential`'s `a158_push_many_appends_the_same_on_both_backends` (`native/list_push_many.vl`). Tracker A158.
 

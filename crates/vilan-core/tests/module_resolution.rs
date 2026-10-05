@@ -1259,11 +1259,14 @@ fn derive_in_an_imported_module_resolves() {
 fn a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map() {
     // A149 S3: `[derive(Storable)]` in an imported module — the shape kolt's
     // `account.vl` and `store.vl` are — expands there with its own imports, and
-    // its map field is a keyed node the importer writes and watches by key. Red
-    // when the derive's output named `Storable` through `std::reactive::store`, where the
-    // module's own `Storable` is the derive macro: "'Storable' is not a trait"
-    // when the derive's module is the first to load `std::reactive::store` (the entry
-    // imports none of it here, as kolt's does not).
+    // its map field is a keyed node the importer writes and watches by key. The
+    // derive's output names `Storable` through `std::reactive::store`, where the
+    // module's own `Storable` is the derive macro beside the re-exported trait:
+    // before B547 that was "'Storable' is not a trait" when the derive's module
+    // is the first to load `std::reactive::store` (the entry imports none of it
+    // here, as kolt's does not), and the output named `store_core` to step
+    // around it. B547's std side reverted the step: red on a compiler without
+    // B547's fix.
     let entry = concat!(
         "import std::io::print;\n",
         "import std::reactive::{ Owner, Signal, Source, run_with_owner };\n",
