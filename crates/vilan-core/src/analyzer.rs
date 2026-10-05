@@ -5253,6 +5253,9 @@ pub struct Analyzer<'src> {
     // B539: the same annotations by binding — the trait and its written
     // arguments — read by `resolve_variable` to direct the initializer.
     binding_trait_annotations: HashMap<Id, (Id, Vec<TypeId>)>,
+    // B540: the `mut` bindings whose reassignments have not all been typed
+    // yet — the writers that can still fill a hole the initializer left.
+    reassignments_pending: HashSet<Id>,
     // B184's twin of the above, for a BINDING annotated with a struct that
     // carries a hidden type parameter (`let c: C = C { x = A {} }`). The
     // annotation cannot name the hidden argument and must not invent one, so it
@@ -7220,6 +7223,7 @@ impl<'src> Analyzer<'src> {
             written_nominal_bound_sites: Vec::new(),
             binding_trait_constraints: Vec::new(),
             binding_trait_annotations: HashMap::default(),
+            reassignments_pending: HashSet::default(),
             refused_annotation_slots: HashMap::default(),
             refused_annotation_traits: HashMap::default(),
             expose_refused_field_slots: HashSet::default(),
@@ -49790,6 +49794,16 @@ impl<'src> Analyzer<'src> {
         {
             return Resolution::Deferred;
         }
+        // B540, B6's twin for a binding: `mut found = Maybe::Nothing` is
+        // `Maybe<unknown>` until a reassignment names the payload (`found =
+        // Maybe::Just(item)`), and a method called on it before then
+        // (`found.is_empty()`) bound nothing for the hole — its instance kept
+        // the enum's parameter unbound, natively refused. The call waits for
+        // the binding's pending reassignments, and only until the fixpoint
+        // stalls (a hole nothing will fill stays the commit's to type).
+        if !self.fixpoint_stalled && self.receiver_awaits_reassignment(subject_id, &subject_type) {
+            return Resolution::Deferred;
+        }
         // `[T; n].len()` is STRUCTURAL and stays so: the length is a compile-time
         // constant read off the TYPE, resolved directly to `Expr::ArrayLen`
         // (fixed-arrays.md §10). No impl can provide it and none is consulted —
@@ -51318,6 +51332,19 @@ impl<'src> Analyzer<'src> {
                     for (constraint_id, type_id) in bindings {
                         substitution_context.insert(constraint_id, type_id);
                     }
+                    // A re-queued constraint's first value is a REASSIGNMENT
+                    // (B540, below).
+                    let is_reassignment = self
+                        .variables
+                        .get(&variable_id)
+                        .is_some_and(|variable| variable.initial != Some(first_value_id));
+                    if is_reassignment {
+                        self.fill_binding_holes_from_reassignment(
+                            initial_type_id,
+                            &value_type,
+                            first_value_id,
+                        );
+                    }
                     if let Type::Unknown = variable_type {
                         variable_type = unified;
                         if unannotated && inferred_origin.is_none() {
@@ -51391,6 +51418,7 @@ impl<'src> Analyzer<'src> {
                     for (constraint_id, type_id) in bindings {
                         substitution_context.insert(constraint_id, type_id);
                     }
+                    self.fill_binding_holes_from_reassignment(var_type_id, &value_type, value_id);
                 }
                 None => {
                     let expected_str =
@@ -51418,6 +51446,9 @@ impl<'src> Analyzer<'src> {
                     });
                 }
             }
+        }
+        if deferred_value_ids.is_empty() {
+            self.reassignments_pending.remove(&variable_id);
         }
         if !deferred_value_ids.is_empty() {
             // Re-queue the still-pending reassignments against the now-grounded
@@ -51927,17 +51958,78 @@ impl<'src> Analyzer<'src> {
         self.resolve_return_type(body_id, concrete_id, statement_ids)
     }
 
+    /// B540: whether `subject_id` reads a `mut` binding whose type still holds
+    /// a hole while a reassignment of it is still queued — the one writer
+    /// that can fill the hole ([`Self::fill_binding_holes_from_reassignment`]).
+    fn receiver_awaits_reassignment(&self, subject_id: Id, subject_type: &Type) -> bool {
+        let (Type::Enum(_, arguments) | Type::Struct(_, arguments)) = subject_type else {
+            return false;
+        };
+        if !arguments
+            .iter()
+            .any(|argument| self.type_has_hole(*argument))
+        {
+            return false;
+        }
+        let Some(&Expr::Local(variable_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+            return false;
+        };
+        let Some(variable) = self.variables.get(&variable_id) else {
+            return false;
+        };
+        variable.mutable && self.reassignments_pending.contains(&variable_id)
+    }
+
+    /// B540: a binding grounded with a HOLE (`mut found = Maybe::Nothing` is
+    /// `Maybe<unknown>` — a nullary variant names no payload type) takes the
+    /// hole's type from a reassignment that names it (`found =
+    /// Maybe::Just(item)`, `Maybe<T>`). The reassignment reconciled with the
+    /// hole and bound nothing, so the binding stayed `Maybe<unknown>` through
+    /// the fixpoint and was committed as `Maybe<any>` after it: JS did not
+    /// care, natively the program was refused ("instantiated at `any`"). The
+    /// hole is filled where it stands ([`Self::fill_holes_from`]), so every
+    /// reader of the slot — the variant's own type included — sees it. A
+    /// component is written when it has no hole of its own and every generic
+    /// in it is a binder in scope at the reassignment (the enclosing body's
+    /// `T`, which is a fixed type there).
+    fn fill_binding_holes_from_reassignment(
+        &mut self,
+        binding_type_id: TypeId,
+        value: &Type,
+        value_id: Id,
+    ) {
+        if !self.type_has_hole(binding_type_id) {
+            return;
+        }
+        self.fill_holes_admitting(binding_type_id, value, Some(value_id));
+    }
+
     /// Writes `wanted`'s components into the `Unknown` slots of `held`, at
     /// matching positions of matching shapes (B489). Only a ground component
     /// is written; a slot that is already a type is left as it is.
     fn fill_holes_from(&mut self, held: TypeId, wanted: &Type) {
+        self.fill_holes_admitting(held, wanted, None);
+    }
+
+    /// [`Self::fill_holes_from`], also admitting a component whose generics
+    /// are all binders in scope at `rigid_at` (B540).
+    fn fill_holes_admitting(&mut self, held: TypeId, wanted: &Type, rigid_at: Option<Id>) {
         let Some(_guard) = crate::util::RecursionGuard::enter() else {
             return;
         };
         match (held.get_type(self), wanted) {
             (Type::Unknown, wanted) => {
                 let wanted_id = wanted.clone().get_type_id(self);
-                if self.type_is_ground(wanted_id) {
+                let admitted = self.type_is_ground(wanted_id)
+                    || rigid_at.is_some_and(|at| {
+                        let mut generics = Vec::new();
+                        self.collect_generics(wanted, 0, &mut generics);
+                        !self.type_has_hole(wanted_id)
+                            && generics
+                                .iter()
+                                .all(|generic| self.generic_is_enclosing_binder(*generic, at))
+                    });
+                if admitted {
                     self.write_type_slot(held, wanted.clone());
                 }
             }
@@ -51948,7 +52040,7 @@ impl<'src> Analyzer<'src> {
                 for (held_argument, wanted_argument) in held_arguments.iter().zip(wanted_arguments)
                 {
                     let wanted_argument = wanted_argument.get_type(self);
-                    self.fill_holes_from(*held_argument, &wanted_argument);
+                    self.fill_holes_admitting(*held_argument, &wanted_argument, rigid_at);
                 }
             }
             (Type::Tuple(held_elements), Type::Tuple(wanted_elements))
@@ -51956,7 +52048,7 @@ impl<'src> Analyzer<'src> {
             {
                 for (held_element, wanted_element) in held_elements.iter().zip(wanted_elements) {
                     let wanted_element = wanted_element.get_type(self);
-                    self.fill_holes_from(*held_element, &wanted_element);
+                    self.fill_holes_admitting(*held_element, &wanted_element, rigid_at);
                 }
             }
             _ => {}
@@ -57459,6 +57551,7 @@ impl<'src> Analyzer<'src> {
             && let Some(Constraint::Variable(constraint)) = self.constraints.get_mut(position)
         {
             constraint.value_ids.push(value_id);
+            self.reassignments_pending.insert(variable_id);
         }
     }
 

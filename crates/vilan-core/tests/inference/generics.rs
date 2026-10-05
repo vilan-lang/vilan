@@ -9510,3 +9510,81 @@ fn b518_a_closure_typed_parameter_prints_parenthesized() {
         "but got |(|i32| void)| void",
     );
 }
+
+/// B540 (B530's cause): `mut found = Maybe::Nothing` grounds to `Maybe<unknown>`
+/// — a nullary variant names no payload type — and a later `found =
+/// Maybe::Just(item)` reconciled with the hole and bound nothing, so the
+/// binding was committed as `Maybe<any>` after the fixpoint (JS ran it,
+/// natively "instantiated at `any`"). The reassignment now fills the hole, and
+/// a method called on the binding before the reassignment is typed waits for
+/// it. The typing is asserted through an unannotated return; the shapes run on
+/// both backends in `native_differential`.
+#[test]
+fn b540_a_nullary_variant_binding_grounds_from_its_reassignment() {
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        enum Maybe<T> { Nothing, Just(T) }
+        impl Maybe<type T> {
+            fun empty(self): bool {
+                match self { Maybe::Nothing => true, Maybe::Just(_) => false }
+            }
+        }
+        struct Pair<A, B> { a: A, b: B }
+        fun last<T>(items: List<T>): Maybe<T> {
+            mut found = Maybe::Nothing;
+            for item in items {
+                found = Maybe::Just(item);
+            }
+            found
+        }
+        fun first<T>(items: List<T>): Maybe<T> {
+            mut found = Maybe::Nothing;
+            for item in items {
+                if found.empty() { found = Maybe::Just(item); }
+            }
+            found
+        }
+        fun first_some<T>(items: List<T>): Option<T> {
+            mut found = None;
+            for item in items {
+                if found.is_none() { found = Some(item); }
+            }
+            found
+        }
+        fun paired<A, B>(a: A, b: B): Maybe<Pair<A, B>> {
+            mut held = Maybe::Nothing;
+            held = Maybe::Just(Pair { a = a, b = b });
+            held
+        }
+        fun main() {
+            let l = last(["x", "y"]);
+            match l { Maybe::Just(let v) => print(v), Maybe::Nothing => print("none") }
+            let f = first([4, 5]);
+            match f { Maybe::Just(let v) => print(v), Maybe::Nothing => print("none") }
+            print(first_some([6, 7]).unwrap());
+            let p = paired(1, "q");
+            match p { Maybe::Just(let pair) => print(pair.b), Maybe::Nothing => print("none") }
+            let e: Maybe<i32> = last([]);
+            print(e.empty());
+        }
+        "#,
+        "y\n4\n6\nq\ntrue\n",
+    );
+    assert_fails_with(
+        r#"
+        enum Maybe<T> { Nothing, Just(T) }
+        fun last<T>(items: List<T>) {
+            mut found = Maybe::Nothing;
+            for item in items {
+                found = Maybe::Just(item);
+            }
+            found
+        }
+        fun main() {
+            let wrong: i32 = last(["a"]);
+        }
+        "#,
+        "but got Maybe<str>",
+    );
+}

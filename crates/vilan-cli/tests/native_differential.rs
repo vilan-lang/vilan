@@ -186,6 +186,63 @@ const B539_PROBE: &str = concat!(
     "}\n",
 );
 
+const B540_PROBE: &str = concat!(
+    "import std::option::Option::{ self, Some, None };\n",
+    "\n",
+    "enum Maybe<T> {\n",
+    "    Nothing,\n",
+    "    Just(T),\n",
+    "}\n",
+    "\n",
+    "impl Maybe<type T> {\n",
+    "    fun empty(self): bool {\n",
+    "        match self {\n",
+    "            Maybe::Nothing => true,\n",
+    "            Maybe::Just(_) => false,\n",
+    "        }\n",
+    "    }\n",
+    "}\n",
+    "\n",
+    "fun last<T>(items: List<T>): Maybe<T> {\n",
+    "    mut found = Maybe::Nothing;\n",
+    "    for item in items {\n",
+    "        found = Maybe::Just(item);\n",
+    "    }\n",
+    "    found\n",
+    "}\n",
+    "\n",
+    "fun first<T>(items: List<T>): Maybe<T> {\n",
+    "    mut found = Maybe::Nothing;\n",
+    "    for item in items {\n",
+    "        if found.empty() {\n",
+    "            found = Maybe::Just(item);\n",
+    "        }\n",
+    "    }\n",
+    "    found\n",
+    "}\n",
+    "\n",
+    "fun first_some<T>(items: List<T>): Option<T> {\n",
+    "    mut found = None;\n",
+    "    for item in items {\n",
+    "        if found.is_none() {\n",
+    "            found = Some(item);\n",
+    "        }\n",
+    "    }\n",
+    "    found\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "    let l = last([\"x\", \"y\"]);\n",
+    "    match l {\n",
+    "        Maybe::Just(let v) => print(v),\n",
+    "        Maybe::Nothing => print(\"none\"),\n",
+    "    }\n",
+    "    let f = first([4, 5]);\n",
+    "    print(f.empty());\n",
+    "    print(first_some([6, 7]).unwrap());\n",
+    "}\n",
+);
+
 const B532_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -8955,6 +9012,21 @@ fn a_trait_annotated_bindings_arguments_reach_its_initializer_on_both_backends()
         compare(&staged, "native_probe_b539.vl"),
         Verdict::Identical,
         "a trait-annotated binding's arguments must reach its initializer on both backends"
+    );
+}
+
+/// B540: a `mut` binding grounded by a nullary variant takes its payload type
+/// from its reassignment, and a method called on it before then waits for it.
+/// Natively it was "instantiated at `any`".
+#[test]
+fn a_nullary_variant_binding_grounds_from_its_reassignment_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b540.vl"), B540_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b540.vl"),
+        Verdict::Identical,
+        "a nullary-variant binding must ground from its reassignment on both backends"
     );
 }
 

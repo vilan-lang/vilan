@@ -35,6 +35,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**B540 (closes B530): `mut found = Maybe::Nothing` followed by `found = Maybe::Just(item)` types the binding as `Maybe<T>`. It was `Maybe<unknown>` through the fixpoint and committed as `Maybe<any>` after it — the JS backend did not care; natively the program was refused ("instantiated at `any`") — and a method called on the binding before the reassignment (`if found.is_none() { found = Some(item); }`) left the method's instance unbound.** The cause was not B540's hypothesis (the readiness probe deferring): the binding grounds at once to `Maybe<hole>`, and the reassignment reconciled with the hole and bound nothing. The reassignment now fills the hole where it stands (`fill_holes_from`'s writer, admitting a component whose generics are the enclosing body's binders), and a method call on a `mut` binding whose type holds a hole waits while that binding's reassignments are still to be typed (until the fixpoint stalls, as B6's list-slot wait does). **Pins:** `inference::generics::b540_a_nullary_variant_binding_grounds_from_its_reassignment` (a loop, a read before the write, `Option`'s `None`, a struct payload of two parameters, an empty call; the typing asserted through an unannotated return, red on the base) and `native_differential::a_nullary_variant_binding_grounds_from_its_reassignment_on_both_backends` (red on the base). Tracker B540, B530.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.
