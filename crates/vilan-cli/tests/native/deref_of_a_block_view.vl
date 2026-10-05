@@ -1,0 +1,59 @@
+// F88: `*{ &m }` — the spelled copy of a view a BLOCK's tail names — builds
+// natively. The block's tail is a value position, so it was emitted as the
+// tail's copy and then dereferenced: rustc's E0614 ("type `i32` cannot be
+// dereferenced") over a scalar, E0599 over a `str` or a list. F81 had taught
+// the `if` and `match` forms; a block is the same position. One line per
+// pointee: a scalar, a `str`, a field, a subscript, a list copied and then
+// grown (the original keeps its length), a block with statements before its
+// tail, nested blocks, and a block whose tail is an `if`.
+import std::io::print;
+
+struct Point {
+	x: i32,
+}
+
+fun main() {
+	let m = 5;
+	print(*{
+		&m
+	});
+	let s = "text";
+	let t = *{
+		&s
+	};
+	print(t);
+	let p = Point { x = 3 };
+	print(*{
+		&p.x
+	});
+	let xs = [1, 2, 3];
+	print(*{
+		&xs[1]
+	});
+	mut grown = *{
+		&xs
+	};
+	grown.push(4);
+	print(i"{grown.len()} {xs.len()}");
+	let n = *{
+		let offset = 2;
+		print(offset);
+		&m
+	};
+	print(n);
+	print(*{
+		{
+			&s
+		}
+	});
+	let c = m > 1;
+	print(*{
+		if c {
+			&m
+		} else {
+			&n
+		}
+	});
+}
+
+main();

@@ -7257,6 +7257,7 @@ fn compile_to_js(
                         native::record_copy_census(
                             emitted.consumed_copies,
                             emitted.consumed_copies_elided,
+                            emitted.capture_copies,
                         );
                         native::record_host_gaps(emitted.host_gaps);
                         native::record_optional_crates(emitted.optional_crates);

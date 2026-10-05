@@ -114,6 +114,15 @@ pub struct Emitted {
     /// handle is one of those and is not a copy).
     pub consumed_copies: usize,
     pub consumed_copies_elided: usize,
+    /// F50: how many CAPTURES this emit copied into a closure at its creation
+    /// — the `let x = x.clone();` prelude every `move` closure carries — that
+    /// are a real copy of the value rather than a handle bump (a boxed
+    /// binding's cell, a closure, a counted host handle, a `str`) or a scalar.
+    /// The consumed-read count above never sees them: a closure-creation
+    /// copy is no consumed place read. kolt's native server carried 277
+    /// prelude clones over 114 closures (closure-captures-on-native.md §4.2)
+    /// that no census could count.
+    pub capture_copies: usize,
 }
 
 /// The runtime crates a program links only when it REACHES them — each one a
@@ -228,11 +237,13 @@ fn unsupported(what: &str, span: Span) -> Error {
 }
 
 /// One link of a spine read through a `Shared` view (F62): a field, by its
-/// subject and index, or a tuple access, as the Rust path it renders to
-/// (`.1.0` for a nested one — see [`Emitter::tuple_slot_path`]).
+/// subject and index, a tuple access, as the Rust path it renders to (`.1.0`
+/// for a nested one — see [`Emitter::tuple_slot_path`]), or a subscript.
 enum Step {
     Field(Id, usize),
     Slot(String),
+    /// A subscript, by its index expression (F90).
+    Index(Id),
 }
 
 /// Where in the emitted file one reserved slot's text goes, and under what name.
@@ -491,6 +502,8 @@ struct Emitter<'a, 'src> {
     /// consumed place reads this emit COPIED and how many it moved.
     copies_taken: usize,
     copies_elided: usize,
+    /// F50's column: the capture-prelude copies — see [`Emitted::capture_copies`].
+    capture_copies: usize,
     /// A124 R3: the Rust trait each OBJECT type lowers to — one per vilan trait
     /// at its concrete arguments (`dyn Source<i32>` and `dyn Source<str>` are
     /// two), keyed like a nominal instance. See [`Emitter::ensure_object_trait`].
@@ -629,6 +642,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             liveness_walked: HashSet::new(),
             copies_taken: 0,
             copies_elided: 0,
+            capture_copies: 0,
             object_traits: HashMap::default(),
             object_impls: HashSet::new(),
             drop_nominals: drop_implementing_nominals(program),
@@ -701,6 +715,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
             consumed_copies_elided: self.copies_elided,
+            capture_copies: self.capture_copies,
         })
     }
 
@@ -1575,6 +1590,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.type_entry(&type_id) == Some(&rebuilt) {
             return type_id;
         }
+        self.mint(rebuilt)
+    }
+
+    /// A type the program's table does not hold, in the minted-type overlay
+    /// ([`Self::type_entry`] reads it).
+    fn mint(&mut self, rebuilt: Type) -> TypeId {
         let minted = TypeId(u32::MAX - self.minted_types.len() as u32);
         self.minted_types.insert(minted, rebuilt);
         minted
@@ -2636,16 +2657,62 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ///
     /// The arguments are resolved through the substitution in force FIRST, so a
     /// `Pair<T>` reached from inside a `T = i32` instance instantiates
-    /// `Pair<i32>` rather than re-binding `T` to itself.
+    /// `Pair<i32>` rather than re-binding `T` to itself — and resolved WHOLE
+    /// ([`Self::deeply_resolved`]), not only at the head: inside `impl
+    /// Maybe<type T>`'s `nest(self): Maybe<Maybe<T>>` the return's argument is
+    /// `Maybe<T>`, and an entry `T -> Maybe<T>` re-bound `T` to a type that
+    /// names it, so rendering the payload recursed until the guard gave up and
+    /// the instance was refused as "an unbound generic type parameter" (F86).
     fn nominal_entries(
-        &self,
+        &mut self,
         parameters: &[TypeId],
         arguments: &[TypeId],
     ) -> Vec<(TypeId, TypeId)> {
         parameters
             .iter()
             .zip(arguments.iter())
-            .map(|(parameter, argument)| (*parameter, self.concrete(*argument)))
+            .map(|(parameter, argument)| (*parameter, self.deeply_resolved(*argument)))
+            .collect()
+    }
+
+    /// A type under the substitution in force at EVERY level: the head through
+    /// [`Self::concrete`], then each argument, element, parameter and return
+    /// the same way, rebuilt in the minted-type overlay where anything moved.
+    fn deeply_resolved(&mut self, type_id: TypeId) -> TypeId {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return type_id;
+        };
+        let head = self.concrete(type_id);
+        let Some(entry) = self.type_entry(&head).cloned() else {
+            return head;
+        };
+        let rebuilt = match entry {
+            Type::Struct(id, ref arguments) => {
+                Type::Struct(id, self.deeply_resolved_all(arguments))
+            }
+            Type::Enum(id, ref arguments) => Type::Enum(id, self.deeply_resolved_all(arguments)),
+            Type::Trait(id, ref arguments) => Type::Trait(id, self.deeply_resolved_all(arguments)),
+            Type::Dyn(id, ref arguments) => Type::Dyn(id, self.deeply_resolved_all(arguments)),
+            Type::Tuple(ref elements) => Type::Tuple(self.deeply_resolved_all(elements)),
+            Type::Array(element, length) => Type::Array(self.deeply_resolved(element), length),
+            Type::Closure(ref parameters, returns, ref contexts, ref modes) => Type::Closure(
+                self.deeply_resolved_all(parameters),
+                self.deeply_resolved(returns),
+                contexts.clone(),
+                modes.clone(),
+            ),
+            _ => return head,
+        };
+        if rebuilt == entry {
+            return head;
+        }
+        self.mint(rebuilt)
+    }
+
+    fn deeply_resolved_all(&mut self, type_ids: &[TypeId]) -> Vec<TypeId> {
+        type_ids
+            .iter()
+            .map(|type_id| self.deeply_resolved(*type_id))
             .collect()
     }
 
@@ -3268,14 +3335,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// Whether `id` is a field spine read through a `Shared` view — what
-    /// [`Self::shared_view_field_read`] renders.
+    /// Whether `id` is a spine of fields, tuple slots and subscripts read
+    /// through a `Shared` view — what [`Self::shared_view_field_read`] renders.
     fn reads_through_a_shared_view(&self, id: Id) -> bool {
         let mut current = id;
         let mut stepped = false;
         loop {
             match self.program.entity_map.get(&current) {
-                Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, _)) => {
+                Some(&Expr::Field(subject, _, _))
+                | Some(&Expr::TupleIndex(subject, _, _))
+                | Some(&Expr::Index(subject, _)) => {
                     stepped = true;
                     current = subject;
                 }
@@ -3307,10 +3376,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// A field (or tuple slot) READ through a `Shared` view, as a scoped
-    /// borrow (F62): `cell.write().inner.depth` is `(cell).read_with(|view|
-    /// view.inner.depth)`, copied out of the borrow when it is not `Copy`.
-    /// `None` when `id` is not a spine of fields over a view call.
+    /// A field, tuple slot or subscript READ through a `Shared` view, as a
+    /// scoped borrow (F62): `cell.write().inner.depth` is `(cell).read_with(
+    /// |view| view.inner.depth)`, copied out of the borrow when it is not
+    /// `Copy`. `None` when `id` is not such a spine over a view call.
+    ///
+    /// F90: a SUBSCRIPT is a link of the same spine. `cell.write()[i]` read as
+    /// a value had rendered `(cell).borrow_mut()[i]` — the place's borrow, held
+    /// as a temporary to the end of the statement — so the re-read half of
+    /// `counts.write()[0] += 1` was still borrowing when the write took its
+    /// own, and any other touch of the cell in the statement died with
+    /// `REENTRANT_READ`; `cell.read()[i]` copied the whole list (`get()`) to
+    /// read one element. Each subscript is settled in a `let` ahead of the
+    /// borrow, root first, which is the order the source evaluates them in and
+    /// keeps the borrow to the element read alone.
     ///
     /// The whole spine is one borrow, so a nested field copies only itself —
     /// not the struct above it. Both views read this way: on the JS backend
@@ -3335,6 +3414,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     steps.push(Step::Slot(path));
                     current = subject;
                 }
+                Some(&Expr::Index(subject, index)) => {
+                    steps.push(Step::Index(index));
+                    current = subject;
+                }
                 _ => match self.shared_view_of(current) {
                     Some((cell, _)) if !steps.is_empty() => break cell,
                     _ => return Ok(None),
@@ -3342,6 +3425,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
         };
         let mut path = String::new();
+        let mut subscripts = String::new();
+        let mut settled = 0;
         for step in steps.iter().rev() {
             match *step {
                 Step::Field(subject, index) => {
@@ -3349,6 +3434,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     let _ = write!(path, ".{field}");
                 }
                 Step::Slot(ref slot) => path.push_str(slot),
+                Step::Index(index) => {
+                    let index_text =
+                        self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
+                    let name = format!("__index{settled}");
+                    settled += 1;
+                    let _ = write!(subscripts, "let {name} = {index_text}; ");
+                    let _ = write!(path, "[({name}) as usize]");
+                }
             }
         }
         let cell_text = self.expecting_nothing(|emitter| emitter.expression(cell, depth))?;
@@ -3357,9 +3450,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         } else {
             ".clone()"
         };
-        Ok(Some(format!(
-            "({cell_text}).read_with(|view| view{path}{copied})"
-        )))
+        let read = format!("({cell_text}).read_with(|view| view{path}{copied})");
+        if subscripts.is_empty() {
+            return Ok(Some(read));
+        }
+        Ok(Some(format!("{{ {subscripts}{read} }}")))
     }
 
     /// The type an `await` produces (J6): a `Task<T>`'s payload.
@@ -4230,6 +4325,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 format!("{subject_text}.{field}")
             }
             Expr::Index(subject, index) => {
+                if let Some(read) = self.shared_view_field_read(id, depth)? {
+                    return Ok(read);
+                }
                 let subject_text = self.expression(subject, depth)?;
                 // An index is an index, whatever the surrounding position
                 // expects: `xs[1] = xs[1] + 2` on a `List<u53>` expects `u53`
@@ -4319,7 +4417,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // F81: `*if c { &a } else { &b }` — the spelled copy of a view a
             // branch chooses. The branches' tails are value positions here, so
             // each leaf is already its copy, and the `*` has nothing to cross.
-            Expr::Dereference(operand) if self.is_conditional(operand) => {
+            // F88: a block's tail is the same position (`*{ &m }`).
+            Expr::Dereference(operand) if self.yields_through_value_tails(operand) => {
                 self.expression(operand, depth)?
             }
             Expr::Dereference(operand) => format!("(*{})", self.expression(operand, depth)?),
@@ -4570,6 +4669,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn is_resource_type(&self, type_id: TypeId) -> bool {
         let concrete = self.concrete(type_id);
         self.program.resource_types.contains(&concrete)
+    }
+
+    /// Whether a pattern's SUBJECT names storage — a binding, or a field, a
+    /// tuple slot or a subscript of one — so destructuring it would MOVE its
+    /// payload out of a place (F20, F89). Rust binds a capture by value only
+    /// from a value, and rule 1 makes every capture a copy, so the subject is
+    /// copied first: `match names[0] { Some(let name) => .. }` over a
+    /// `List<Option<str>>` was rustc's E0507 ("cannot move out of index of
+    /// `Vec<..>`") until a subscript joined the binding and the field here,
+    /// and std bound the element to a `let` first to get past it.
+    ///
+    /// A spine read through a `Shared` view is not one: it is already a copy
+    /// out of the cell's scoped borrow ([`Self::shared_view_field_read`]).
+    fn subject_is_a_place(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::Local(_) | Expr::Parameter(_)) => true,
+            Some(Expr::Field(..) | Expr::TupleIndex(..) | Expr::Index(..)) => {
+                !self.reads_through_a_shared_view(id)
+            }
+            _ => false,
+        }
     }
 
     /// F56: whether `id` reads a binding this frame OWNS whose type is a
@@ -4840,20 +4960,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             });
         self.hoisted = saved;
         let (target_text, value_text) = rendered?;
-        // F62: a place behind a cell's borrow — `cell.write().n = ..`, a field
-        // of a boxed or module-level binding — takes that borrow for the rest
-        // of the statement, and every temporary the VALUE leaves (a mutating
-        // call's `borrow_mut` of the same cell, `cell.write().items.pop()`)
-        // lives exactly as long. The value is settled in its own statement
-        // first, which is the order Rust evaluates an assignment in anyway.
-        if self.place_lives_in_a_cell(target) {
-            let _ = write!(prelude, "let __assigned = {value_text}; ");
-            return Ok(format!("{{ {prelude}{target_text} = __assigned; }}"));
-        }
-        if prelude.is_empty() {
-            return Ok(format!("{target_text} = {value_text}"));
-        }
-        Ok(format!("{{ {prelude}{target_text} = {value_text}; }}"))
+        Ok(self.finish_assignment(target, prelude, &target_text, &value_text))
     }
 
     /// Every subscript along one place's spine into a `let`, root first — the
@@ -4974,9 +5081,41 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if prelude.is_empty() {
             return Ok(None);
         }
-        Ok(Some(format!(
-            "{{ {prelude}{target_text} = {value_text}; }}"
+        Ok(Some(self.finish_assignment(
+            target,
+            prelude,
+            &target_text,
+            &value_text,
         )))
+    }
+
+    /// An assignment's statement, its hoisted subscripts first: the prelude,
+    /// then the write.
+    ///
+    /// F62: a place behind a cell's borrow — `cell.write().n = ..`, a field of
+    /// a boxed or module-level binding — takes that borrow for the rest of the
+    /// statement, and every temporary the VALUE leaves (a mutating call's
+    /// `borrow_mut` of the same cell, `cell.write().items.pop()`) lives exactly
+    /// as long. The value is settled in its own statement first, which is the
+    /// order Rust evaluates an assignment in anyway. F90: the compound form's
+    /// subscript hoist is the same statement — `counts.write()[0] += 1` re-reads
+    /// `counts.borrow_mut()[i]` in its value — so it takes the same rule; it
+    /// had its own `format!` and died with `REENTRANT_READ`.
+    fn finish_assignment(
+        &self,
+        target: Id,
+        mut prelude: String,
+        target_text: &str,
+        value_text: &str,
+    ) -> String {
+        if self.place_lives_in_a_cell(target) {
+            let _ = write!(prelude, "let __assigned = {value_text}; ");
+            return format!("{{ {prelude}{target_text} = __assigned; }}");
+        }
+        if prelude.is_empty() {
+            return format!("{target_text} = {value_text}");
+        }
+        format!("{{ {prelude}{target_text} = {value_text}; }}")
     }
 
     /// The two place spines in lockstep — they are the same source place walked
@@ -5572,12 +5711,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .is_some_and(|declaration| matches!(declaration.name, "Option" | "Result"))
     }
 
-    /// Whether an expression CHOOSES its value among branches — an `if`, a
-    /// `match` — whose tails this emitter renders as value positions.
-    fn is_conditional(&self, id: Id) -> bool {
+    /// Whether an expression's value is the value of a TAIL this emitter
+    /// renders as a value position — an `if`'s or a `match`'s branches, which
+    /// choose among them, or a block's own tail (F88: `*{ &m }` emitted the
+    /// tail's copy `{ (m).clone() }` and then dereferenced it, rustc's E0614).
+    fn yields_through_value_tails(&self, id: Id) -> bool {
         matches!(
             self.program.entity_map.get(&id),
-            Some(Expr::If(_) | Expr::Match(..))
+            Some(Expr::If(_) | Expr::Match(..) | Expr::Block(_))
         )
     }
 
@@ -5964,10 +6105,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // captures by reference under Rust's default binding modes, and a
         // capture is a copy by rule 1.
         let mut subject_text = self.expression(subject, depth)?;
-        if matches!(
-            self.program.entity_map.get(&subject),
-            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
-        ) {
+        if self.subject_is_a_place(subject) {
             subject_text = format!("({subject_text}).clone()");
         }
         let subject_type = self.type_of(subject);
@@ -6204,10 +6342,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         // `&Option<i32>` bound `x: &i32` and `x == y` had no
                         // `PartialEq` across the reference. A capture is a copy
                         // (rule 1), and copying the subject is how it binds one.
-                        if matches!(
-                            self.program.entity_map.get(subject),
-                            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
-                        ) {
+                        if self.subject_is_a_place(*subject) {
                             subject_text = format!("({subject_text}).clone()");
                         }
                         let subject_type = self.type_of(*subject);
@@ -6270,10 +6405,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             !bindings.is_empty()
         });
         if destructures
-            && matches!(
-                self.program.entity_map.get(&subject),
-                Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
-            )
+            && self.subject_is_a_place(subject)
             && !self.moves_an_owned_resource(subject)
         {
             subject_text = format!("({subject_text}).clone()");
@@ -7348,6 +7480,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let body = self.closure_body(&closure, depth);
         self.closure_captures.pop();
         let body = body?;
+        self.capture_copies += captures
+            .iter()
+            .filter(|binding| self.capture_is_a_copy(**binding))
+            .count();
         let prelude: String = captures
             .iter()
             .map(|binding| {
@@ -7403,6 +7539,62 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "{{ {prelude}std::rc::Rc::new(move |{}| {{ {body} }}){as_counted} }}",
             parameters.join(", ")
         ))
+    }
+
+    /// Whether a closure's capture prelude COPIES `binding`'s value (F50's
+    /// census column) rather than bumping a count: a boxed binding is its
+    /// `Captured` cell, a closure an `Rc`, a context value and the counted host
+    /// handles (`Shared`, `Weak`, the executor's) are handles, a `str` is an
+    /// `Rc<str>`, and a scalar copies nothing worth counting.
+    fn capture_is_a_copy(&self, binding: Id) -> bool {
+        if self.boxed.contains(&binding)
+            || self
+                .program
+                .context_hidden_parameters
+                .contains_key(&binding)
+        {
+            return false;
+        }
+        let type_id = self
+            .program
+            .variables
+            .get(&binding)
+            .map(|variable| variable.type_id)
+            .or_else(|| {
+                self.program
+                    .parameters
+                    .get(&binding)
+                    .map(|parameter| parameter.type_id)
+            });
+        let Some(type_id) = type_id else {
+            return true;
+        };
+        if self.is_numeric_scalar(type_id) || self.is_str_type(type_id) {
+            return false;
+        }
+        match self.resolve(type_id) {
+            Some(Type::Closure(..)) => false,
+            Some(Type::Enum(enum_id, _)) => self.program.bool_enum_id != Some(*enum_id),
+            Some(Type::Struct(struct_id, _)) => {
+                !self
+                    .program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| {
+                        declaration.external
+                            && matches!(
+                                declaration.name,
+                                "Shared"
+                                    | "Weak"
+                                    | "Task"
+                                    | "Nursery"
+                                    | "CancelSignal"
+                                    | "TimerHandle"
+                            )
+                    })
+            }
+            _ => true,
+        }
     }
 
     /// The return type a closure literal's `dyn Fn` cast WRITES (F67), or
@@ -8056,10 +8248,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut subject = self.expression(step, depth)?;
         // A pattern over a PLACE binds by reference under Rust's default
         // binding modes; the payload is a copy by rule 1, as an `if let`'s is.
-        if matches!(
-            self.program.entity_map.get(&step),
-            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
-        ) {
+        if self.subject_is_a_place(step) {
             subject = format!("({subject}).clone()");
         }
         let name = self.binding_name(binder);
@@ -9589,18 +9778,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // read is indistinguishable from the place and costs no borrow that
             // could collide with another read in the same statement.
             let wants_a_mutable_place = matches!(conventions.get(index), Some(Receiving::RefMut));
-            let expecting =
-                declared
-                    .get(index)
-                    .map(|parameter| match callee_substitution.clone() {
-                        Some(callee) => {
-                            let saved = self.enter_substitution(callee.into_iter().collect());
-                            let concrete = self.concrete(parameter.type_id);
-                            self.current_substitution = saved;
-                            concrete
-                        }
-                        None => self.concrete(parameter.type_id),
-                    });
+            let expecting = declared.get(index).map(|parameter| {
+                self.argument_position(parameter.type_id, callee_substitution.as_ref())
+            });
             // A parameter declared `async |T| U` takes a future-answering
             // closure, so a sync literal at the call site is wrapped.
             // F22: an argument standing in a parameter this INSTANCE adapts is
@@ -9683,6 +9863,37 @@ impl<'a, 'src> Emitter<'a, 'src> {
             rendered.push(text);
         }
         Ok(rendered)
+    }
+
+    /// The type a call's argument is rendered at: its parameter's declared
+    /// type under the CALL's substitution.
+    ///
+    /// [`Self::concrete`] resolves the head only, so a closure parameter `f:
+    /// |T| U` of `apply<T, U>` stayed `|T| U` — the CALLEE's generics, which
+    /// the caller's body cannot resolve — and a literal handed there without a
+    /// written return (`apply(4, |k| Maybe::Just(k * 10))`) had no closed
+    /// return to build its constructor at, and was refused as instantiated at
+    /// `any` (F85). The whole type is rebuilt under the call's bindings
+    /// ([`Self::substituted`]) and taken when that closes it — the position the
+    /// call already resolved. An open rebuild says no more than the head did,
+    /// so the head stands there.
+    fn argument_position(
+        &mut self,
+        declared: TypeId,
+        callee_substitution: Option<&HashMap<TypeId, TypeId>>,
+    ) -> TypeId {
+        let Some(callee) = callee_substitution else {
+            return self.concrete(declared);
+        };
+        let saved = self.enter_substitution(callee.clone().into_iter().collect());
+        let head = self.concrete(declared);
+        self.current_substitution = saved;
+        let entries = self.resolved_entries(callee);
+        let rebuilt = self.substituted(declared, &entries);
+        if rebuilt != declared && self.is_grounded(rebuilt) {
+            return rebuilt;
+        }
+        head
     }
 
     /// The other direction of [`Self::call_arguments_adapting`]'s surplus rule:
@@ -9987,8 +10198,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // never a last use either: what dies here is the view, not the
             // place it names.
             Some(Expr::Dereference(operand)) => {
-                // F81: over a conditional the leaves are the copies already.
-                if self.is_natively_copy(id) || self.is_conditional(*operand) {
+                // F81, F88: over a conditional or a block the leaves are the
+                // copies already.
+                if self.is_natively_copy(id) || self.yields_through_value_tails(*operand) {
                     return rendered;
                 }
                 self.copies_taken += 1;

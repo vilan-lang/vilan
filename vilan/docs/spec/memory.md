@@ -1050,6 +1050,17 @@ leaves the frame whose place the view names. Nothing in std does this,
 and the shape needs the closure-escape analysis §6.4's dynamic remainder
 is future work for.
 
+**Native limit: a captured binding can close a cycle.** On the native
+backend a mutably-captured binding lives in a counted cell, so a binding
+whose own value holds a closure that captures it — `mut holder = ..;
+holder = Holder { run = || holder.n, .. }` — is a reference cycle: the cell
+holds the closure that holds the cell, and neither is released when the
+program ends. JavaScript's collector reclaims the same cycle. It is the
+limit §6.7's `Shared` cells already have, for the same reason: a counted
+cell cannot collect a cycle through itself. The program's output is the
+same on both backends; only the memory differs. The native leak census
+pins the shape as a row that is live by design.
+
 ## 6.10 `lazy` — a binding initialized at first use
 
 *(Design: [`lazy`](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/lazy.md) §2.)*

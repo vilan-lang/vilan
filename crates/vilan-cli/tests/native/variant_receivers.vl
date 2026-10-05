@@ -1,0 +1,90 @@
+// F86: a variant constructor as a METHOD RECEIVER with a literal payload —
+// `Maybe::Just(3).and_then(big)` — was refused as "instantiated at `any`": the
+// constructor records no type and a receiver had no position. The receiver is
+// the call's first argument, and its position is now the `self` type rebuilt
+// under the call's bindings (F85's rule). Behind it stood a second cause the
+// item had folded in: `nest(self): Maybe<Maybe<T>>` was refused even on a
+// `let`-bound receiver, because the nested enum's instance re-bound `T` to a
+// type that names it (`T -> Maybe<T>`). The probe: a trait method, a chain
+// through `and_then` and `nest`, a `str`, an `f64` and a list payload, a nested
+// constructor receiver, `Option`'s own method, a generic struct literal
+// receiver, and `nest` on a bound receiver.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::result::Result::{ self, Err, Ok };
+
+enum Maybe<T> {
+	Just(T),
+	Nothing,
+}
+
+trait Describe {
+	fun describe(self): str;
+}
+
+impl Maybe<type T> with Describe {
+	fun describe(self): str {
+		match self {
+			Maybe::Just(_) => "just",
+			Maybe::Nothing => "nothing",
+		}
+	}
+}
+
+impl Maybe<type T> {
+	fun and_then<U>(self, f: |T| Maybe<U>): Maybe<U> {
+		match self {
+			Maybe::Just(let value) => f(value),
+			Maybe::Nothing => Maybe::Nothing,
+		}
+	}
+
+	fun nest(self): Maybe<Maybe<T>> {
+		Maybe::Just(self)
+	}
+
+	fun or(self, other: T): T {
+		match self {
+			Maybe::Just(let value) => value,
+			Maybe::Nothing => other,
+		}
+	}
+}
+
+struct Holder<T> {
+	value: T,
+}
+
+impl Holder<type T> {
+	fun get(self): T {
+		self.value
+	}
+}
+
+fun big(value: i32): Maybe<str> {
+	if value > 2 {
+		Maybe::Just("big")
+	} else {
+		Maybe::Nothing
+	}
+}
+
+fun main() {
+	print(Maybe::Just(3).describe());
+	print(Maybe::Just(3).and_then(big).nest().describe());
+	print(Maybe::Just("x").or("y"));
+	print(Some(4).unwrap_or(0));
+	print(Holder { value = "held" }.get());
+	let picked: Result<i32, str> = Ok(2);
+	print(picked.is_ok());
+	print(Maybe::Just(Maybe::Just(5)).or(Maybe::Nothing).or(0));
+	print(Maybe::Just(1.5).nest().describe());
+	print(Maybe::Just([1, 2]).and_then(|items| Maybe::Just(items.len())).or(0));
+	let bound = Maybe::Just("abc");
+	let nested = bound.nest();
+	if nested is Maybe::Just(Maybe::Just(let s)) {
+		print(s);
+	}
+}
+
+main();

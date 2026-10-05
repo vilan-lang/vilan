@@ -40,19 +40,24 @@ pub fn record_boxed_bindings(count: usize) {
 /// path too — the census wants the numbers, not a linked binary.
 static CONSUMED_COPIES: AtomicUsize = AtomicUsize::new(0);
 static CONSUMED_COPIES_ELIDED: AtomicUsize = AtomicUsize::new(0);
+/// F50: the copies a closure's capture prelude takes, which no consumed read
+/// counts (`vilan_rust::Emitted::capture_copies`).
+static CAPTURE_COPIES: AtomicUsize = AtomicUsize::new(0);
 
-pub fn record_copy_census(copied: usize, elided: usize) {
+pub fn record_copy_census(copied: usize, elided: usize, captured: usize) {
     CONSUMED_COPIES.store(copied, Ordering::Relaxed);
     CONSUMED_COPIES_ELIDED.store(elided, Ordering::Relaxed);
+    CAPTURE_COPIES.store(captured, Ordering::Relaxed);
 }
 
 /// The one line both report paths print.
 fn report_copy_census() {
     if std::env::var_os("VILAN_NATIVE_REPORT_COPIES").is_some() {
         println!(
-            "vilan-native: consumed-copies={} elided={}",
+            "vilan-native: consumed-copies={} elided={} capture-copies={}",
             CONSUMED_COPIES.load(Ordering::Relaxed),
-            CONSUMED_COPIES_ELIDED.load(Ordering::Relaxed)
+            CONSUMED_COPIES_ELIDED.load(Ordering::Relaxed),
+            CAPTURE_COPIES.load(Ordering::Relaxed)
         );
     }
 }

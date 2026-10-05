@@ -1,0 +1,98 @@
+// F89: a pattern over an INDEXED element whose payload is not `Copy`. Rust
+// binds a capture by value only from a value, and the emitter copied the
+// subject first for a binding and a field but not for a subscript, so
+// `match names[0] { Some(let name) => .. }` was rustc's E0507 ("cannot move
+// out of index of `Vec<..>`"), and std bound the element to a `let` first. One
+// line per subject shape: an `Option<str>`, an enum whose payload is a `Hash`
+// (std's `StoreStep`), a tuple, an element of a field and of a loaned
+// parameter, a nested subscript, an `is` test, a destructuring `let` and a `?`
+// lift — each followed by a read of the list it matched.
+import std::hash::{ Hash, canonical_hash };
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+enum Step {
+	Field(usize),
+	Key(Hash),
+	Name(str),
+}
+
+struct Holder {
+	names: List<Option<str>>,
+	steps: List<Step>,
+}
+
+impl Holder {
+	fun first(&self): str {
+		match self.names[0] {
+			Some(let name) => name,
+			None => "-",
+		}
+	}
+
+	fun second_length(self): Option<usize> {
+		self.names[1]?.len()
+	}
+}
+
+fun read_first(names: &List<Option<str>>): str {
+	if names[0] is Some(let name) {
+		ret name;
+	}
+	"-"
+}
+
+fun describe(steps: &List<Step>, index: usize): str {
+	match steps[index] {
+		Step::Field(let slot) => i"field {slot}",
+		Step::Key(let hash) => i"key {hash == canonical_hash("k")}",
+		Step::Name(let name) => i"name {name}",
+	}
+}
+
+fun main() {
+	let names: List<Option<str>> = [Some("a"), None];
+	match names[0] {
+		Some(let name) => print(name),
+		None => print("-"),
+	}
+	print(names.len());
+
+	let steps = [Step::Field(2), Step::Key(canonical_hash("k")), Step::Name("x")];
+	for index in [0usize, 1, 2] {
+		print(describe(&steps, index));
+	}
+	match steps[2] {
+		Step::Name(let name) => print(i"direct {name}"),
+		_ => print("other"),
+	}
+	print(steps.len());
+
+	let pairs: List<(str, List<i32>)> = [("a", [1]), ("b", [2, 3])];
+	match pairs[1] {
+		(let label, let values) => print(i"tuple {label} {values.len()}"),
+	}
+	let (label, values) = pairs[0];
+	print(i"let {label} {values.len()} {pairs.len()}");
+
+	let holder = Holder { names = [Some("h"), Some("ij")], steps };
+	print(holder.first());
+	print(holder.second_length() == Some(2));
+	print(read_first(&holder.names));
+	if holder.names[1] is Some(let name) {
+		print(i"is {name}");
+	}
+	match holder.steps[0] {
+		Step::Field(let slot) => print(i"field of a field {slot}"),
+		_ => print("other"),
+	}
+
+	let nested: List<List<Option<str>>> = [[Some("deep")]];
+	match nested[0][0] {
+		Some(let name) => print(name),
+		None => print("-"),
+	}
+	print(nested[0].len());
+}
+
+main();

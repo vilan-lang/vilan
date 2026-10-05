@@ -487,10 +487,7 @@ fun prune(root: Shared<StoreNode>, path: List<StoreStep>) {
 fun prune_empty(chain: List<Shared<StoreNode>>, path: List<StoreStep>) {
 	mut depth = path.len();
 	for depth > 0 && node_empty(chain[depth]) {
-		// Bound first: a `match` on an indexed element whose payload is not `Copy`
-		// moves out of the list in the native emit (N?1).
-		let step = path[depth - 1];
-		match step {
+		match path[depth - 1] {
 			StoreStep::Field(let index) => {
 				chain[depth - 1].write().kids[index] = None;
 			},
