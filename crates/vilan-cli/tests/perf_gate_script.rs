@@ -379,11 +379,10 @@ fn a_seal_with_a_tip_source_refuses_when_either_side_does_not_check_its_own() {
         "a tip source that does not check was measured:\n{report}"
     );
     assert!(
-        report.contains(&format!(
-            "REFUSED  the tip's source (the prepared tree {}) does not check under the tip compiler \
-             (exit 1): error: this source does not check",
-            broken_tip.display()
-        )),
+        report.contains(
+            "REFUSED  the tip's source (the prepared tree `tip-broken`) does not check under the tip \
+             compiler (exit 1): error: this source does not check"
+        ),
         "{report}"
     );
     assert!(report.contains("PERF VERDICT: REFUSED"), "{report}");
@@ -535,16 +534,154 @@ perf_gate.main()
     );
     assert!(ok, "{written}");
     let report = fs::read_to_string(&report_md).expect("the report is written");
+    // N146: the tree is NAMED, never located — the report is a tracked file,
+    // and the v0.44.0 cut wrote the prepared tree's home path into it twice.
     assert!(
         report.contains("> **Note:** the two sides checked DIFFERENT sources: the base kolt@")
-            && report.contains(&format!("the tip the prepared tree {}", tip.display())),
+            && report.contains("the tip the prepared tree `tip`"),
         "{report}"
+    );
+    assert!(
+        !report.contains(&scratch.0.display().to_string()),
+        "the report carries a machine path:\n{report}"
     );
     assert!(
         report.contains(
             "> **Note:** the LSP harness replayed its edit script over DIFFERENT sources"
         ),
         "{report}"
+    );
+}
+
+/// N146 (4): `seal --advance` counts the seal toward E121's two-green rule
+/// WITHOUT writing the tree — the v0.44.0 seal rewrote `perf/budgets.toml`
+/// after writing the verdict for the sha, so the tip a cut would tag had no
+/// verdict. The count is kept beside the verdicts and recorded IN the verdict;
+/// a second seal reads it back.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_seal_that_advances_e121_leaves_the_budgets_untouched_and_keeps_the_count_beside_the_verdicts()
+{
+    let scratch = Scratch::new("seal-advance");
+    let budgets = scratch.path("budgets.toml");
+    let fixture = format!(
+        "{HEADER}\n[[e121]]\nscenario = \"leaf keystroke\"\nmetric = \"diagnostics_cpu_ms\"\n\
+         target_ms = 500\ngreen_seals = 0\nblocking = false\n"
+    );
+    fs::write(&budgets, &fixture).expect("write the fixture budgets");
+    let vilan = fake_vilan(&scratch);
+    let base = base_kolt(&scratch, "base", false);
+    let lsp = scratch.path("lsp.json");
+    fs::write(
+        &lsp,
+        r#"{"header": "", "source": {"kind": "commit", "sha": "984a1dfb00"}, "open": {}, "edits": {"leaf keystroke": [{"diagnostics_cpu_ms": 100}]}}"#,
+    )
+    .expect("write a harness JSON");
+    let verdicts = scratch.path("verdicts");
+    let seal = |sha: &str| {
+        let driver = format!(
+            r#"
+import os, sys
+sys.path.insert(0, {scripts:?})
+import perf_count, perf_gate
+perf_count.measure = lambda argv, cwd=None, env=None, counter="auto", log=None: {{
+    "counter": "instructions:u", "instructions": 1, "peak_rss_kb": 100, "cpu_s": 1.0, "exit": 0}}
+perf_count.hardware_counter_available = lambda: True
+perf_gate.loadavg = lambda: 0.5
+perf_gate.phase_split = lambda vilan, directory: {{"analyze": 1.0}}
+perf_gate.subject_dir = lambda subject, work: work
+sys.argv = ["perf_gate.py", "--budgets", {budgets:?}, "--work", {work:?}, "--scratch", {work:?}, "seal",
+            "--tip", {vilan:?}, "--base", {vilan:?}, "--kolt", {base:?}, "--base-std", {work:?},
+            "--runs", "1", "--threshold", "5", "--verdict-dir", {verdicts:?}, "--sha", {sha:?},
+            "--lsp-json", {lsp:?}, {lsp:?}, "--advance"]
+perf_gate.main()
+"#,
+            scripts = repository_root().join("scripts").display().to_string(),
+            budgets = budgets.display().to_string(),
+            work = scratch.0.display().to_string(),
+            vilan = vilan.display().to_string(),
+            base = base.display().to_string(),
+            verdicts = verdicts.display().to_string(),
+            lsp = lsp.display().to_string(),
+        );
+        let output = Command::new("python3")
+            .args(["-c", &driver])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .expect("run the seal driver");
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "the seal failed:\n{text}");
+        fs::read_to_string(verdicts.join(format!("perf-{sha}.json"))).expect("the verdict")
+    };
+    let first = seal("1111111111");
+    assert_eq!(
+        fs::read_to_string(&budgets).expect("read"),
+        fixture,
+        "the seal wrote the tree after its verdict"
+    );
+    assert!(
+        first.contains("\"e121_after\"") && first.contains("\"green_seals\": 1"),
+        "the verdict records the advanced count:\n{first}"
+    );
+    // The second seal reads the first's count from beside the verdicts: two
+    // consecutive greens, so the row blocks — and the tree is still untouched.
+    let second = seal("2222222222");
+    assert!(
+        second.contains("\"green_seals\": 2") && second.contains("\"blocking\": true"),
+        "the second seal did not read the first's count:\n{second}"
+    );
+    assert_eq!(fs::read_to_string(&budgets).expect("read"), fixture);
+}
+
+/// N146 (3): at a release the ratchet ABSORBS an approved bump — the bumped
+/// row's ceiling becomes its measured count, even inside the 2% band — and it
+/// reads a seal's VERDICT, whose E121 count lands in the release commit.
+/// Resetting the bumps alone left the bumped rows red at the next gate.
+#[test]
+fn the_release_ratchet_absorbs_a_bump_and_applies_the_verdicts_e121_count() {
+    let scratch = Scratch::new("ratchet-absorb");
+    let budgets = scratch.path("budgets.toml");
+    fs::write(
+        &budgets,
+        format!(
+            "{HEADER}\n[[row]]\nsubject = \"example:todo\"\ncounter = \"instructions:u\"\nclass = \"reference\"\n\
+             ceiling = 1_000_000\nmeasured_at = \"old\"\n\n[[bump]]\nsubject = \"example:todo\"\n\
+             class = \"reference\"\nratio = 1.03\nreason = \"x\"\nitem = \"M1\"\n\n[[e121]]\n\
+             scenario = \"leaf keystroke\"\nmetric = \"diagnostics_cpu_ms\"\ntarget_ms = 500\n\
+             green_seals = 0\nblocking = false\n"
+        ),
+    )
+    .expect("write the fixture budgets");
+    let verdict = scratch.path("perf-0123.json");
+    fs::write(
+        &verdict,
+        r#"{"sha": "0123456789", "verdict": "green", "counter": "instructions:u", "class": "reference",
+            "t2": {"results": {"example:todo": {"instructions": 1020000, "exit": 0}}},
+            "e121_after": [{"scenario": "leaf keystroke", "metric": "diagnostics_cpu_ms", "target_ms": 500,
+                            "green_seals": 1, "blocking": false}]}"#,
+    )
+    .expect("write the fixture verdict");
+    let (ok, report) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &[
+            "ratchet",
+            "--from",
+            verdict.to_str().expect("utf-8"),
+            "--release",
+        ],
+    );
+    assert!(ok, "the ratchet failed:\n{report}");
+    let written = fs::read_to_string(&budgets).expect("read the ratcheted budgets");
+    assert!(
+        written.contains("ceiling = 1_020_000"),
+        "the bumped row's ceiling absorbs its measured count:\n{written}"
+    );
+    assert!(!written.contains("[[bump]]"), "{written}");
+    assert!(
+        written.contains("green_seals = 1"),
+        "the verdict's E121 count lands with the release:\n{written}"
     );
 }
 

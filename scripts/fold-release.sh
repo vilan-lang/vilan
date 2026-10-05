@@ -177,6 +177,7 @@ fi
 # answers that without touching a worktree.
 MAIN_TREE=""
 FOLD_PENDING=0
+MAIN_PUSH_PENDING=0
 MAIN_WORKTREE="$(worktree_of main)"
 if [ -z "$TAG_COMMIT" ]; then
     skip "main's readiness (needs the tag)"
@@ -187,7 +188,24 @@ elif [ -z "$MAIN_WORKTREE" ]; then
 elif worktree_dirty "$MAIN_WORKTREE"; then
     red "the worktree holding main ($MAIN_WORKTREE) has uncommitted changes — commit or stash them"
 elif git merge-base --is-ancestor "$TAG_COMMIT" refs/heads/main; then
-    done_ "main already carries $VERSION ($(git rev-parse --short refs/heads/main))"
+    # N146: LOCAL main is not origin's. The v0.43.0 fold died at `git push
+    # origin main`; the resumed run read local main, skipped the push, and
+    # origin's main sat two releases behind until the v0.44.0 fold. Origin's
+    # main is read (`ls-remote`, nothing fetched) and pushed when it lacks the
+    # merge.
+    remote_main=""
+    if [ "$HAVE_ORIGIN" = 1 ]; then
+        remote_main="$(git ls-remote origin refs/heads/main 2> /dev/null | awk '{print $1}' | head -n 1)"
+    fi
+    if [ "$HAVE_ORIGIN" = 0 ]; then
+        done_ "main already carries $VERSION ($(git rev-parse --short refs/heads/main))"
+    elif [ -n "$remote_main" ] && git cat-file -e "$remote_main^{commit}" 2> /dev/null &&
+        git merge-base --is-ancestor "$TAG_COMMIT" "$remote_main"; then
+        done_ "main already carries $VERSION, and so does origin's ($(git rev-parse --short "$remote_main"))"
+    else
+        MAIN_PUSH_PENDING=1
+        ok "main carries $VERSION here but origin's main (${remote_main:-absent}) does not — step 6 pushes it"
+    fi
 elif MAIN_TREE="$(git merge-tree --write-tree refs/heads/main "$TAG_COMMIT" 2> /dev/null)"; then
     FOLD_PENDING=1
     ok "$VERSION merges into main cleanly (tree $(printf '%s' "$MAIN_TREE" | cut -c1-8)), in $MAIN_WORKTREE"
@@ -264,11 +282,28 @@ fi
 say "steps"
 say ""
 
+# N146: a push is verified against origin, not trusted — the branch on origin
+# must BE the local one afterwards, or the fold stops and says so.
+verify_pushed() {
+    [ "$DRY_RUN" = 1 ] && { plan "git ls-remote origin refs/heads/$1  # must equal the local $1"; return 0; }
+    pushed="$(git ls-remote origin "refs/heads/$1" 2> /dev/null | awk '{print $1}' | head -n 1)"
+    local_sha="$(git rev-parse "refs/heads/$1")"
+    if [ "$pushed" != "$local_sha" ]; then
+        say "  RED   origin's $1 is ${pushed:-absent}, not $local_sha, after the push — stopping here"
+        exit 1
+    fi
+    say "  ok    origin's $1 is $(git rev-parse --short "$local_sha")"
+}
+
 # 6. Fold main.
 if [ "$FOLD_PENDING" = 1 ]; then
     run git -C "$MAIN_WORKTREE" merge --no-ff "$VERSION" \
         -m "Merge $VERSION — main catches the release train"
     run git -C "$MAIN_WORKTREE" push origin main
+    verify_pushed main
+elif [ "$MAIN_PUSH_PENDING" = 1 ]; then
+    run git -C "$MAIN_WORKTREE" push origin main
+    verify_pushed main
 else
     say "  (6) main already carries $VERSION — skipped"
 fi
@@ -277,6 +312,7 @@ fi
 if [ "$NEXT_PENDING" = 1 ]; then
     run git -C "$NEXT_WORKTREE" merge --ff-only main
     run git -C "$NEXT_WORKTREE" push origin next
+    verify_pushed next
 else
     say "  (7) next already carries the fold — skipped"
 fi

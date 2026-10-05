@@ -19,15 +19,18 @@
 #   ratio = 1.02
 #   reason = "one sentence"
 #   item = "Mnnn"
-# The seal lists every bump since the release; the owner approves one over 3%, or any on kolt (Q6). The
-# bumps reset at each release (`ratchet --release`).
+# The seal lists every bump since the release; the owner approves one over 3%, or any on kolt (Q6). A bump
+# lives one release: the cut ABSORBS it (`ratchet --release --from <the seal's verdict>`, in the release
+# commit) — the bumped row's ceiling becomes the count the seal measured, and the bump rows reset (N146).
 #
 # `[[growth]]` holds everywhere, whatever the class: the plain package of `small` and of `large` modules,
 # measured in one run, may differ by at most `max_ratio` (≤ x2.3 per doubling, Q11; M107 met it in
 # Order 46 at x1.94 from v0.43.0's x2.99).
 #
 # `[[e121]]` are the editor's targets (Q9) on the seal's LSP harness rows: each reports red until it has
-# been green at two consecutive seals (`green_seals`), then `blocking` flips and it refuses (S8).
+# been green at two consecutive seals (`green_seals`), then `blocking` flips and it refuses (S8). The seals
+# keep that count beside their verdicts (`e121-state.json`), never in this file mid-order; the release
+# commit writes it here (N146).
 tolerance = 0.01
 
 # Every subject the gate measures, whether or not this class has a ceiling for it yet.
