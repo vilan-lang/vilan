@@ -9113,3 +9113,35 @@ fn b367_a_generic_body_resolves_under_its_own_files_admission() {
         .collect();
     assert_eq!(run_package(&admitted, "main.vl"), "woofwoof\n");
 }
+
+/// B549, the process side: a node build importing `std::web::document`
+/// without reaching it checks clean (the module is the process layer's).
+#[test]
+fn b549_a_node_build_importing_the_document_module_checks_clean() {
+    let entry = "import std::web::document::check_shell;\n\nfun main() {}\n";
+    assert_eq!(
+        analyze_package(
+            &[("main.vl", entry)],
+            "main.vl",
+            Platform::Node { version: 24 }
+        ),
+        Vec::<String>::new()
+    );
+}
+
+/// B549, the browser side: the same import in a BROWSER build is refused
+/// inside std — `document.vl` (a process-layer module) imports
+/// `pkg::web::ui::{ render, escape_attribute, escape_text }`, and in a browser
+/// build that import binds the BROWSER twin of `ui`, which declares none of
+/// them. It is B548's fault (a twin import binds the BUILD platform's side,
+/// whatever platform the importing file belongs to), carried to Order 48 with
+/// F28's retry; the pin un-ignores with it.
+#[test]
+#[ignore = "B549: a process-layer std module's twin import binds the browser twin in a browser build (B548's fault, carried to Order 48 with F28)"]
+fn b549_a_browser_build_importing_the_document_module_checks_clean() {
+    let entry = "import std::web::document::check_shell;\n\nfun main() {}\n";
+    assert_eq!(
+        analyze_package(&[("main.vl", entry)], "main.vl", Platform::Browser),
+        Vec::<String>::new()
+    );
+}
