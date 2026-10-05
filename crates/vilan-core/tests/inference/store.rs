@@ -1786,3 +1786,43 @@ fn a149_s4_an_assignment_through_field_syntax_steers_to_set() {
     assert_fails_once_with(&source, "write through it with `.set(..)`");
     assert_fails_without(&source, "Expected Store<str>");
 }
+
+#[test]
+fn a149_a_closure_payload_is_a_leaf_with_no_equality() {
+    // `store_opaque` is gone: a closure-typed field or payload is diffed through
+    // `StoreLeaf`'s bare tier (a blanket reaches a closure one tier deep, B508),
+    // as a coarse field is. A one-payload and a two-payload variant holding a
+    // closure each wake on every covering write — the bare tier's answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, Source, run_with_owner };
+        import std::reactive::store::{ Storable, Store };
+
+        [derive(Storable)]
+        enum Action {
+            Idle,
+            Run(|i32| i32),
+            Keyed(str, |str| bool),
+        }
+
+        fun main() {
+            let action = Store::new(Action::Run(|x| x + 1));
+            let watching = Owner::new();
+            run_with_owner(watching, || {
+                action.run().effect_on_change(|_r| print("run woke"));
+                action.keyed().effect_on_change(|_k| print("keyed woke"));
+                action.is_idle().effect_on_change(|idle| print(i"idle={idle}"));
+            });
+            action.set(Action::Run(|x| x + 2));
+            action.set(Action::Keyed("k", |s| s == "k"));
+            action.set(Action::Keyed("k", |s| s == "j"));
+            action.set(Action::Idle);
+            watching.dispose();
+        }
+
+        main();
+        "#,
+        "run woke\nrun woke\nkeyed woke\nkeyed woke\nkeyed woke\nidle=true\n",
+    );
+}

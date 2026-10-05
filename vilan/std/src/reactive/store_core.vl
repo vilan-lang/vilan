@@ -256,15 +256,6 @@ export fun store_wake_all(node: Option<Shared<StoreNode>>, woken: &mut StoreWoke
 	}
 }
 
-/// A value with no methods at all — a closure-typed field — diffed: the bare tier's
-/// answer (every covering write is a change), which a closure type cannot reach as
-/// a method.
-[internal("the derive's diff of a closure-typed field (A142 S7)")]
-export fun store_opaque(node: Option<Shared<StoreNode>>, woken: &mut StoreWoken): bool {
-	store_wake_all(node, woken);
-	true
-}
-
 /// An enum's variant changed from variant `from` to variant `to` (§2.6) — their
 /// payloads are children `from` and `to`. The discriminant is child 0, and ITS
 /// child `i` is variant `i`'s flag (`is_online()`): the two flags whose answer
