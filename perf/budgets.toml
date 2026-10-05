@@ -301,3 +301,31 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
+
+[[bump]]
+subject = "example:math"
+class = "ci"
+ratio = 1.03
+reason = "a program this small is nearly all fixed cost, and the fixed cost grew in Order 47: S0's `[track_caller]` pass and location arguments plus the larger always-loaded `debug.vl` (+2.0%, debug-47), `Items<T>` and its blanket over every iterator (+0.5%, store-47), and the copy passes (+0.3%, perf-47). CI read x1.0086 at db2df5f1 before debug-47."
+item = "M120"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.025
+reason = "the same fixed cost as math on another small program: debug-47's S0 and `debug.vl` (+1.9%) over x1.0036 at db2df5f1."
+item = "M120"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.01
+reason = "debug-47's fixed cost (+0.6%) over x1.0021 at db2df5f1; the web prelude's own load is M120's."
+item = "M120"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.01
+reason = "debug-47's fixed cost (+0.7%) over x1.0015 at db2df5f1."
+item = "M120"
