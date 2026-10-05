@@ -36,6 +36,7 @@ import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
+import pkg::iterator::Items;
 import pkg::js::native_map::NativeMap;
 import pkg::operators::{ Add, Sub };
 import pkg::option::Option::{ self, None, Some };
@@ -723,6 +724,14 @@ export impl Tracked<type T> {
 	fun new(own elements: List<T>): Tracked<T> {
 		Tracked { elements, ops = [] }
 	}
+
+	/// Every item of `items` at the end, in order, as ONE op (A158) — see
+	/// `ListCell::push_many`.
+	fun push_many<S: Items<T>>(&mut self, own items: S) {
+		mut arrived: List<T> = [];
+		items.push_onto(&mut arrived);
+		self.splice(self.size(), 0, arrived)
+	}
 }
 
 export impl Tracked<type T> with Sequence<T> {
@@ -874,6 +883,17 @@ export impl ListCell<type T> {
 		}
 		self.log.record(SeqOp::Move(from, count, to));
 		publish(self);
+	}
+
+	/// Every item of `items` at the end, in order — another list, a set or any
+	/// iterator — as ONE op (A158): `List::push_many` for a cell, so a reader sees
+	/// one `Splice` for the batch, not one per item. `extend` is this over a list
+	/// alone. (An inherent member rather than a `SequenceCell` default: a trait
+	/// default with a generic of its own does not emit its bound's member yet.)
+	fun push_many<S: Items<T>>(self, own items: S) {
+		mut arrived: List<T> = [];
+		items.push_onto(&mut arrived);
+		self.splice(self.size(), 0, arrived)
 	}
 
 	/// The BATCH door: hand `body` a recorder, then publish its whole run as ONE

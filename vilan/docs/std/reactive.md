@@ -1391,6 +1391,11 @@ fun main() {
 
 `peek` is for reading: its closure must not write the cell it is peeking at.
 
+`push_many(items)` appends a whole run — another list, a set, any iterator —
+as ONE `Splice`, so a reader of the cell sees one change for the batch where a
+loop of `push` would record one op per element. `extend(values)` is the same
+write over a list alone.
+
 Its mutators are trait defaults over ONE primitive, so there is one place a
 write is recorded and no method can forget:
 

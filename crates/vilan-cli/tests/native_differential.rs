@@ -10132,6 +10132,24 @@ fn a149_a_closure_leaf_wakes_on_every_covering_write_on_both_backends() {
     );
 }
 
+/// A158: `List::push_many` appends a list, an iterator chain and a set's
+/// members in order on both backends, takes a list pushed onto itself whole,
+/// and a `ListCell` records each batch as ONE splice.
+#[test]
+fn a158_push_many_appends_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_list_push_many.vl"),
+        include_str!("native/list_push_many.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_list_push_many.vl"),
+        Verdict::Identical,
+        "push_many must append the same on both backends"
+    );
+}
+
 /// A142 S7 S2: a derived enum's store builds and wakes the same on both
 /// backends — a same-variant write patching the payload, a switch away and back,
 /// a `patch` through a dead and a live variant, a multi-payload variant read and
