@@ -43,6 +43,7 @@ pub mod options;
 pub mod owned_modules;
 pub mod parsing;
 pub mod platform_color;
+pub mod printer;
 pub mod span;
 pub mod stack_guard;
 pub mod target;

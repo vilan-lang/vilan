@@ -2,6 +2,38 @@
 
 The reference for the guide's [Debugging](../guide/debugging.md) chapter.
 
+## `dbg`
+
+```vilan,fragment
+fun dbg(..)    // any number of arguments, any types; in the prelude
+```
+
+`dbg(a, b, ..)` writes `[file:line:column] <expression> = <value>` per argument
+to stderr (`console.log` in the browser) and answers the argument, a tuple of
+them for several, or `()` for none. The compiler types and lowers every call:
+the declaration exists to be named, imported and documented. A statement
+(`dbg(x);`) reads its arguments in place; an expression moves them through.
+
+The value is written in vilan's literal syntax by a printer the compiler
+generates for each type a `dbg` reaches, the same on both backends:
+
+| value | prints |
+|---|---|
+| a struct | `Point { x = 1, y = 2 }`, a field-less one by its name |
+| an enum variant | `Shape::Circle(1.5)`, `Shape::Empty`; `Some(5)`, `None`, `Ok(1)`, `Err("no")` |
+| a tuple, a list | `(1, "two", 3.0)`, `[1, 2, 3]` |
+| a string | `"a \"quoted\" line\n"` |
+| a float, an integer | `3.0`, `0.25`, `1e+21`; `7`, `-3` |
+| a closure | `<closure |i32, i32| -> i32>` |
+
+A value that fits in 80 columns from where it starts stays on one line;
+otherwise each entry takes a line of its own, two spaces deeper, with a
+trailing comma. A list stops after 100 entries with `… N more`.
+
+`[build] dbg` in `vilan.toml` decides what a call does in a build: the
+`debug` preset prints, the `release` preset refuses the build, `"strip"` makes
+each call its argument, `"keep"` prints in release too.
+
 ## Locations
 
 ```vilan,fragment

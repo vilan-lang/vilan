@@ -100,6 +100,16 @@ its own, with the default prelude and no dependencies.
   ([the dev loop](../guide/dev-loop.md#shipping-routes-separately)).
 - `--explain`: after the build, print where every output came from — see
   below.
+
+A `dbg(..)` call prints in a `debug` build, which is the default. A
+`release` build refuses one — "`dbg` left in a release build", at the
+call — unless `vilan.toml` says what to do with it:
+
+```toml
+[build]
+preset = "release"
+dbg = "strip"    # dbg(x) is x and prints nothing; "keep" prints in release too
+```
 - `--backend <js|rust>`: which emitter runs. `js` is the default. `rust`
   emits the program as Rust, writes a cargo project under `dist/native/`
   and builds it with the host's `cargo` — **in debug**, because rustc is

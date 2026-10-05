@@ -10396,3 +10396,33 @@ fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
     );
     assert_eq!(native.stdout, expected);
 }
+
+// ---------------------------------------------------------------------------
+// debugging.md S1: `dbg(..)`.
+// ---------------------------------------------------------------------------
+
+const DBG_PRINTER: &str = include_str!("native/dbg_printer.vl");
+const DBG_PRINTER_FILE: &str = "native_probe_dbg_printer.vl";
+
+/// debugging.md S1: every `dbg` line is the same bytes on both backends, and
+/// those bytes are the committed ones (`native/dbg_printer.stderr`): each
+/// shape in vilan's literal syntax, the call forms (several arguments, none,
+/// one wrapping an expression, a generic `T` per instantiation, a statement
+/// reading a resource in place and an expression moving it), the 80-column
+/// break with trailing commas, the 100-entry cut and a closure by its type —
+/// on stderr, with the program's own output on stdout untouched.
+#[test]
+fn s1_dbg_writes_the_same_bytes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join(DBG_PRINTER_FILE), DBG_PRINTER).expect("write the probe program");
+    let expected_stderr = include_str!("native/dbg_printer.stderr");
+    let expected_stdout = include_str!("native/dbg_printer.stdout");
+    let javascript = run_on(&staged, None, DBG_PRINTER_FILE);
+    let native = run_on(&staged, Some("rust"), DBG_PRINTER_FILE);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(javascript.stderr, expected_stderr, "the JS leg's dbg lines");
+    assert_eq!(native.stderr, expected_stderr, "the native leg's dbg lines");
+    assert_eq!(javascript.stdout, expected_stdout);
+    assert_eq!(native.stdout, expected_stdout);
+}

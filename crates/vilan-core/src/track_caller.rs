@@ -255,6 +255,38 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
     program.next_entity_id = next_id;
 }
 
+/// debugging.md §3.3 (Q4): every `dbg(..)` in a build whose policy is
+/// [`DbgPolicy::Refuse`] — the release preset's default — is an error at the
+/// call. A browser release prints to every user's console, and a silent
+/// strip is how a debugging line survives for a year.
+pub fn refuse_release_dbg(program: &mut Program, options: &crate::options::BuildOptions) {
+    if options.dbg != crate::options::DbgPolicy::Refuse || program.dbg_calls.is_empty() {
+        return;
+    }
+    for call_id in program.dbg_calls.clone() {
+        let span = program
+            .span_map
+            .get(&call_id)
+            .map(|span| **span)
+            .unwrap_or(Span { start: 0, end: 0 });
+        let source = program.source_of(call_id).unwrap_or(SourceId(0));
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: "`dbg` left in a release build: a release build refuses it, so a \
+                      debugging line cannot ship by accident. Remove the call and keep its \
+                      argument, or set `[build] dbg = \"strip\"` (print nothing) or \
+                      `\"keep\"` (print in release too) in `vilan.toml`"
+                    .to_string(),
+            },
+            source,
+        );
+    }
+    program.normalize_diagnostic_order();
+}
+
 /// The expressions one step below `id` that still belong to the SAME function
 /// body: a closure, an `async` block and a nested declaration are other
 /// bodies, and a tracking function's location does not reach into them.
@@ -384,7 +416,16 @@ pub struct SiteLocator {
 
 impl SiteLocator {
     fn build(program: &Program) -> SiteLocator {
-        let package_root = crate::util::canonical_path(&program.pkg_root);
+        // The PACKAGE root is the directory its `vilan.toml` sits in — the
+        // source root (`pkg_root`, `src/` by default) is below it — so a
+        // location reads `src/main.vl:12:5`. A file built with no manifest
+        // above it is its own package, rooted where it sits.
+        let source_root = crate::util::canonical_path(&program.pkg_root);
+        let package_root = source_root
+            .ancestors()
+            .find(|directory| directory.join("vilan.toml").is_file())
+            .map(Path::to_path_buf)
+            .unwrap_or(source_root);
         let paths = (0..program.sources.len())
             .map(|index| {
                 let source = SourceId(index as u32);
@@ -485,6 +526,28 @@ impl Program<'_> {
             .unwrap_or(0)
             + 1;
         format!("{path}:{line}:{column}")
+    }
+
+    /// The source text of `id`'s span, whitespace runs collapsed to one
+    /// space — how `dbg` prints the expression it was handed (§3.2).
+    pub fn source_text_of(&self, id: Id) -> String {
+        let source = self.source_of(id).unwrap_or(SourceId(0));
+        let Some(text) = self
+            .source_texts
+            .iter()
+            .find(|(candidate, _)| *candidate == source)
+            .map(|(_, text)| *text)
+        else {
+            return String::new();
+        };
+        let Some(written) = self
+            .span_map
+            .get(&id)
+            .and_then(|span| text.get(span.start..span.end))
+        else {
+            return String::new();
+        };
+        written.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// The byte offset [`Self::site_location`] reports for `anchor`.

@@ -166,8 +166,10 @@ impl OptionalCrates {
 /// that wrote it, in exactly the shape a compiler diagnostic takes — so
 /// `vilan build --backend rust` reports an unsupported program the way it
 /// reports any other refusal, rather than producing Rust that will not build.
-pub fn emit(program: &Program<'_>, _options: &BuildOptions) -> Result<Emitted, Error> {
-    Emitter::new(program).run()
+pub fn emit(program: &Program<'_>, options: &BuildOptions) -> Result<Emitted, Error> {
+    let mut emitter = Emitter::new(program);
+    emitter.dbg_policy = options.dbg;
+    emitter.run()
 }
 
 /// The name `async fun main`'s body takes, since `fn main` cannot be `async`
@@ -183,6 +185,8 @@ use vilan_rt::Js as _;
 use vilan_rt::Json as _;
 use vilan_rt::Subscript as _;
 ";
+
+mod dbg;
 
 /// F56: every nominal declaration (struct or enum) with an `impl … with Drop`.
 ///
@@ -255,6 +259,12 @@ struct Reserved {
 
 struct Emitter<'a, 'src> {
     program: &'a Program<'src>,
+    /// `dbg`'s generated printers (debugging.md S1, `dbg.rs`): by type key
+    /// the printer's name, and the bodies, in generation order.
+    printers: HashMap<String, String>,
+    printer_bodies: Vec<String>,
+    /// What `dbg(..)` does in this build (`[build] dbg`, debugging.md Q4).
+    dbg_policy: vilan_core::options::DbgPolicy,
     /// Function bodies, keyed by the slot reserved for them — so the emitted
     /// order is discovery order and a body written during a nested walk cannot
     /// reorder the file.
@@ -599,6 +609,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn new(program: &'a Program<'src>) -> Self {
         Emitter {
             program,
+            printers: HashMap::default(),
+            printer_bodies: Vec::new(),
+            dbg_policy: vilan_core::options::DbgPolicy::Keep,
             functions: BTreeMap::new(),
             instances: HashMap::default(),
             default_instances: HashMap::default(),
@@ -702,6 +715,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         for body in self.functions.values() {
             source.push('\n');
             source.push_str(body);
+        }
+        for printer in &self.printer_bodies {
+            source.push('\n');
+            source.push_str(printer);
         }
         source.push('\n');
         source.push_str(&main_body);
@@ -9522,6 +9539,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ));
         }
 
+        if Some(target) == self.program.dbg_fn_id {
+            return self.dbg_call(call_id, &function_call.argument_ids, depth, span);
+        }
         if Some(target) == self.program.print_fn_id {
             self.refuse_unprintable(&function_call.argument_ids, span)?;
             let value = self.place_argument(&function_call.argument_ids, 0, depth)?;
@@ -11898,7 +11918,7 @@ fn rust_string(text: &str) -> String {
 }
 
 /// A string VALUE as a Rust literal — [`rust_string`] for text that is already
-/// the value (a location).
+/// the value (a location, `dbg`'s expression text, a printer's label).
 fn rust_literal(value: &str) -> String {
     let mut out = String::from("\"");
     for character in value.chars() {

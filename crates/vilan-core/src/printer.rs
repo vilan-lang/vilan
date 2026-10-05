@@ -1,0 +1,272 @@
+//! The `dbg` printer's SHAPES (debugging.md §2, S1): the one answer both
+//! emitters build their generated printers from.
+//!
+//! A printer writes a value in vilan's own literal syntax — `Point { x = 1,
+//! y = 2 }`, `Shape::Circle(1.5)`, `Some(5)`, `(1, "two", 3.0)`, `[1, 2]` — and
+//! the two backends must write the same bytes. Each emitter generates one
+//! printer per concrete type a `dbg` reaches (`__show_*` functions on JS,
+//! `show_*` functions natively), and each asks THIS module what the type is
+//! for printing: [`shape_of`] classifies it, and the labels it carries (the
+//! qualified variant names, a closure's `<closure |i32| -> i32>`) are spelled
+//! here, once. What the emitters add is only how a value of that shape is
+//! READ on their backend: a JS struct is its field array, a native one has
+//! named fields.
+//!
+//! The layout — one line when it fits 80 columns, else one entry per line,
+//! two spaces deeper, with a trailing comma — and the scalar spellings (a
+//! float keeps its `.0`, a string is quoted and escaped as vilan writes it)
+//! are the runtimes' (`__dbg_*` on JS, `vilan_rt::show` natively), written
+//! twice and pinned against each other by the native differential.
+
+use crate::analyzer::{BackingValue, Program};
+use crate::id::Id;
+use crate::type_::{Type, TypeId};
+
+/// What a value of one concrete type prints as.
+#[derive(Clone, Debug)]
+pub enum Shape {
+    /// An integer of any width (`i32`, `u8`, `usize`, …): its decimal digits.
+    Integer,
+    /// `f32` / `f64`: the language's number text, with `.0` on an integral
+    /// value (Q1).
+    Float,
+    /// `BigInt`: its digits.
+    BigInt,
+    Bool,
+    /// `str`: quoted and escaped.
+    Str,
+    /// `void` / `()`.
+    Void,
+    /// A struct. `bindings` grounds its generic parameters for the field
+    /// types; a field-less struct prints its bare name.
+    Struct {
+        name: String,
+        fields: Vec<(String, TypeId)>,
+        bindings: Vec<(TypeId, TypeId)>,
+    },
+    /// An enum over the array layout: each variant's printed label (`Some`,
+    /// `Shape::Circle`) and payload types.
+    Enum {
+        variants: Vec<(String, Vec<TypeId>)>,
+        bindings: Vec<(TypeId, TypeId)>,
+    },
+    /// A BACKED enum (backed-enums.md): a value IS its backing literal, so a
+    /// variant is found by comparing against each one.
+    Backed {
+        variants: Vec<(String, BackingValue)>,
+    },
+    /// A tuple: its element types, in order.
+    Tuple(Vec<TypeId>),
+    /// `List<T>` and `[T; n]`.
+    List(TypeId),
+    /// A value that prints as fixed text: a closure by its type, an opaque
+    /// host handle by its name, a generic the build never grounded.
+    Text(String),
+}
+
+/// The numeric scalars, by the name std declares them under.
+fn is_integer_name(name: &str) -> bool {
+    matches!(
+        name,
+        "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i53" | "u53" | "usize"
+    )
+}
+
+/// The printing shape of `type_id`. `resolve` grounds a generic under the
+/// asking emitter's active substitution (and returns any other id as is);
+/// the shape's own type ids are NOT resolved — an emitter recursing into a
+/// field resolves it under the shape's `bindings`.
+pub fn shape_of(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> Shape {
+    let type_id = resolve(type_id);
+    let Some(resolved) = program.type_id_to_type_map.get(&type_id) else {
+        return Shape::Text("<unknown>".to_string());
+    };
+    match resolved {
+        Type::Void => Shape::Void,
+        Type::Tuple(elements) if elements.is_empty() => Shape::Void,
+        Type::Tuple(elements) => Shape::Tuple(elements.clone()),
+        Type::Array(element, _) => Shape::List(*element),
+        Type::Closure(..) | Type::Function(_) => Shape::Text(format!(
+            "<closure {}>",
+            closure_text(program, type_id, resolve)
+        )),
+        Type::Struct(struct_id, arguments) => struct_shape(program, *struct_id, arguments),
+        Type::Enum(enum_id, arguments) => enum_shape(program, *enum_id, arguments),
+        Type::Dyn(trait_id, _) => Shape::Text(format!(
+            "<dyn {}>",
+            program
+                .traits
+                .get(trait_id)
+                .map(|declaration| declaration.name)
+                .unwrap_or("trait")
+        )),
+        Type::Generic(_) => Shape::Text(format!("<{}>", type_text(program, type_id, resolve))),
+        _ => Shape::Text(format!("<{}>", type_text(program, type_id, resolve))),
+    }
+}
+
+fn struct_shape(program: &Program, struct_id: Id, arguments: &[TypeId]) -> Shape {
+    let Some(declaration) = program.structs.get(&struct_id) else {
+        return Shape::Text("<struct>".to_string());
+    };
+    if declaration.external {
+        return match declaration.name {
+            name if is_integer_name(name) => Shape::Integer,
+            "f32" | "f64" => Shape::Float,
+            "BigInt" => Shape::BigInt,
+            "str" => Shape::Str,
+            "List" => match arguments.first() {
+                Some(element) => Shape::List(*element),
+                None => Shape::Text("[]".to_string()),
+            },
+            name => Shape::Text(format!("<{name}>")),
+        };
+    }
+    let bindings = declaration
+        .generic_parameter_constraint_ids
+        .iter()
+        .copied()
+        .zip(arguments.iter().copied())
+        .collect();
+    Shape::Struct {
+        name: declaration.name.to_string(),
+        fields: declaration
+            .fields
+            .iter()
+            .map(|field| (field.name.to_string(), field.type_id))
+            .collect(),
+        bindings,
+    }
+}
+
+fn enum_shape(program: &Program, enum_id: Id, arguments: &[TypeId]) -> Shape {
+    if program.bool_enum_id == Some(enum_id) {
+        return Shape::Bool;
+    }
+    let Some(declaration) = program.enums.get(&enum_id) else {
+        return Shape::Text("<enum>".to_string());
+    };
+    // The prelude's four print bare, as they are written (§2.1).
+    let bare = matches!(declaration.name, "Option" | "Result");
+    let label = |variant: &str| {
+        if bare {
+            variant.to_string()
+        } else {
+            format!("{}::{variant}", declaration.name)
+        }
+    };
+    if declaration.backing.is_some() {
+        return Shape::Backed {
+            variants: declaration
+                .variants
+                .iter()
+                .map(|variant| (label(variant.name), variant.backing_value.clone()))
+                .collect(),
+        };
+    }
+    let bindings = declaration
+        .generic_parameter_constraint_ids
+        .iter()
+        .copied()
+        .zip(arguments.iter().copied())
+        .collect();
+    Shape::Enum {
+        variants: declaration
+            .variants
+            .iter()
+            .map(|variant| (label(variant.name), variant.data_type_ids.clone()))
+            .collect(),
+        bindings,
+    }
+}
+
+/// `|i32, str| -> bool`: a closure type as `dbg` prints it.
+fn closure_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> String {
+    match program.type_id_to_type_map.get(&resolve(type_id)) {
+        Some(Type::Closure(parameters, return_type, _, _)) => {
+            let parameters: Vec<String> = parameters
+                .iter()
+                .map(|parameter| type_text(program, *parameter, resolve))
+                .collect();
+            format!(
+                "|{}| -> {}",
+                parameters.join(", "),
+                type_text(program, *return_type, resolve)
+            )
+        }
+        Some(Type::Function(function_id)) => program
+            .functions
+            .get(function_id)
+            .map(|function| format!("fun {}", function.name))
+            .unwrap_or_else(|| "fun".to_string()),
+        _ => "||".to_string(),
+    }
+}
+
+/// A type as vilan writes it — `List<Point>`, `(i32, str)`, `|i32| -> bool`.
+pub fn type_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> String {
+    let Some(_guard) = crate::util::RecursionGuard::enter() else {
+        return "..".to_string();
+    };
+    let type_id = resolve(type_id);
+    let arguments_text = |arguments: &[TypeId]| {
+        if arguments.is_empty() {
+            String::new()
+        } else {
+            let parts: Vec<String> = arguments
+                .iter()
+                .map(|argument| type_text(program, *argument, resolve))
+                .collect();
+            format!("<{}>", parts.join(", "))
+        }
+    };
+    match program.type_id_to_type_map.get(&type_id) {
+        Some(Type::Void) => "void".to_string(),
+        Some(Type::Struct(id, arguments)) => format!(
+            "{}{}",
+            program
+                .structs
+                .get(id)
+                .map(|declaration| declaration.name)
+                .unwrap_or("?"),
+            arguments_text(arguments)
+        ),
+        Some(Type::Enum(id, arguments)) => format!(
+            "{}{}",
+            program
+                .enums
+                .get(id)
+                .map(|declaration| declaration.name)
+                .unwrap_or("?"),
+            arguments_text(arguments)
+        ),
+        Some(Type::Dyn(id, arguments)) => format!(
+            "dyn {}{}",
+            program
+                .traits
+                .get(id)
+                .map(|declaration| declaration.name)
+                .unwrap_or("?"),
+            arguments_text(arguments)
+        ),
+        Some(Type::Tuple(elements)) => {
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|element| type_text(program, *element, resolve))
+                .collect();
+            format!("({})", parts.join(", "))
+        }
+        Some(Type::Array(element, length)) => {
+            format!("[{}; {length}]", type_text(program, *element, resolve))
+        }
+        Some(Type::Closure(..)) | Some(Type::Function(_)) => {
+            closure_text(program, type_id, resolve)
+        }
+        // A parameter the build never grounded (a generic body emitted
+        // without an instantiation): its name is not on the program.
+        Some(Type::Generic(_)) => "T".to_string(),
+        Some(Type::Never) => "never".to_string(),
+        Some(Type::Any) => "any".to_string(),
+        _ => "?".to_string(),
+    }
+}

@@ -42,6 +42,7 @@ pub mod fs;
 pub mod http;
 pub mod inspect;
 pub mod json;
+pub mod show;
 pub mod time;
 
 // ---------------------------------------------------------------- strings ---

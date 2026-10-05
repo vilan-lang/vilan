@@ -150,6 +150,20 @@ impl Location {
 [track_caller]
 external fun caller(): Location;
 
+// --- `dbg` (debugging.md S1) ---
+
+/// `dbg(a, b, ..)` prints each argument to stderr (`console.log` in the
+/// browser) as `[src/main.vl:12:5] expr = value`, in vilan's own literal syntax
+/// (`Point { x = 1, y = 2 }`, `Some(5)`, `[1, 2]`, `3.0`), the same bytes on
+/// both backends. It answers its argument — a tuple of them for several, `()`
+/// for none — so it can wrap an expression: `let total = dbg(price * qty) +
+/// tax;`. Written as a statement (`dbg(guard);`) it reads its arguments in
+/// place and moves nothing. It takes ANY number of arguments of any types: the
+/// compiler types and lowers every call, and this declaration exists to be
+/// named, imported and documented. A release build refuses it unless
+/// `vilan.toml` sets `[build] dbg = "strip"` or `"keep"`.
+external fun dbg(): void;
+
 // --- Json / Wire (shared JSON impls via in-world helpers) ---
 
 // --- The sized numeric family (proposal/numeric-types.md §5) ---

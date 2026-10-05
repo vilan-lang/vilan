@@ -21,7 +21,7 @@
 			keyword: "async await const css else enum export external for fun if impl import in is let macro match mod mut ret struct trait type use",
 			literal: "true false null void self Self",
 			// END GENERATED(keyword-groups)
-			built_in: "print panic assert",
+			built_in: "print panic assert dbg dbg_stack",
 		};
 		const NUMBER = {
 			className: "number",

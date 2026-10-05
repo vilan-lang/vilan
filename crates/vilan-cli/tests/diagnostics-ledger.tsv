@@ -685,3 +685,5 @@ row	flagship	key
 661	-	`{member_name}` is a field of `{subject_name}`, and this `{struct_name}<{subject_name}>` has no projection named `{member_name}` to read it through: `{subject_name}` does not `[derive(Storable)]`, or the field's projection is renamed
 NEW	-	`[track_caller]` is not supported on a trait method: a call through a trait is dispatched, so no call site knows to pass its location
 NEW	-	`{name}` is `[track_caller]`: it takes its caller's location as a hidden argument, and a call through a value cannot pass one
+NEW	-	`dbg` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
+NEW	-	`dbg` takes no type arguments: it prints each argument at the type it already has

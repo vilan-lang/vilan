@@ -105,7 +105,10 @@ pub fn transform_functions<'src>(
         .collect::<Vec<_>>();
     t_functions.sort_by_key(|a| a.0.0);
     let t_functions = t_functions.into_iter().map(|x| x.1);
-    let t_instances = transformer.monomorphized.into_iter();
+    let t_instances = transformer
+        .monomorphized
+        .into_iter()
+        .chain(transformer.printer_functions);
 
     let imports = transformer
         .used_imports
@@ -1886,6 +1889,80 @@ fn helper_source(name: &str) -> &'static str {
              \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
+        // `dbg(..)`'s runtime (debugging.md S1): the layout and the scalar
+        // spellings every generated `__show_*` printer builds on, written to
+        // agree byte for byte with `vilan_rt::show`. A document is a string or
+        // a group `{ o, c, p, e }`: open text, close text, whether the entries
+        // are padded by a space (`Point { x = 1 }` against `[1, 2]`), and
+        // `[label, document]` entries. It lays out on one line when that fits
+        // 80 columns from where it starts, else one entry per line, two spaces
+        // deeper, each with a trailing comma (Q1). Widths count characters.
+        "__dbg" => {
+            "function __dbg(write, location, entries) {\n\
+             \tif (entries.length === 0) {\n\
+             \t\twrite(\"[\" + location + \"]\");\n\
+             \t\treturn;\n\
+             \t}\n\
+             \tfor (const entry of entries) {\n\
+             \t\tconst head = \"[\" + location + \"] \" + entry[0] + \" = \";\n\
+             \t\twrite(head + __dbg_layout(entry[1], __dbg_width(head), 0));\n\
+             \t}\n\
+             }\n\
+             function __dbg_value(write, location, text, show, value) {\n\
+             \t__dbg(write, location, [ [ text, show(value) ] ]);\n\
+             \treturn value;\n\
+             }\n\
+             function __dbg_values(write, location, texts, shows, values, spread) {\n\
+             \t__dbg(write, location, values.map((value, index) => [ texts[index], shows[index](value) ]));\n\
+             \treturn spread ? values.flatMap((value, index) => spread[index] ? value : [ value ]) : values;\n\
+             }\n\
+             function __dbg_group(open, close, padded, entries) {\n\
+             \treturn { o: open, c: close, p: padded, e: entries };\n\
+             }\n\
+             function __dbg_list(items, show) {\n\
+             \tconst entries = [];\n\
+             \tconst shown = Math.min(items.length, 100);\n\
+             \tfor (let index = 0; index < shown; index++) entries.push([ \"\", show(items[index]) ]);\n\
+             \tif (items.length > shown) entries.push([ \"\", \"\u{2026} \" + (items.length - shown) + \" more\" ]);\n\
+             \treturn __dbg_group(\"[\", \"]\", false, entries);\n\
+             }\n\
+             function __dbg_str(text) {\n\
+             \tlet out = \"\\\"\";\n\
+             \tfor (const character of text) {\n\
+             \t\tif (character === \"\\\\\") out += \"\\\\\\\\\";\n\
+             \t\telse if (character === \"\\\"\") out += \"\\\\\\\"\";\n\
+             \t\telse if (character === \"\\n\") out += \"\\\\n\";\n\
+             \t\telse if (character === \"\\t\") out += \"\\\\t\";\n\
+             \t\telse if (character === \"\\r\") out += \"\\\\r\";\n\
+             \t\telse if (character === \"\\0\") out += \"\\\\0\";\n\
+             \t\telse out += character;\n\
+             \t}\n\
+             \treturn out + \"\\\"\";\n\
+             }\n\
+             function __dbg_float(value) {\n\
+             \tconst text = String(value);\n\
+             \treturn Number.isInteger(value) && !text.includes(\"e\") ? text + \".0\" : text;\n\
+             }\n\
+             function __dbg_width(text) {\n\
+             \tlet width = 0;\n\
+             \tfor (const _ of text) width++;\n\
+             \treturn width;\n\
+             }\n\
+             function __dbg_flat(document) {\n\
+             \tif (typeof document === \"string\") return document;\n\
+             \tif (document.e.length === 0) return document.o + document.c;\n\
+             \tconst inner = document.e.map((entry) => entry[0] + __dbg_flat(entry[1])).join(\", \");\n\
+             \treturn document.p ? document.o + \" \" + inner + \" \" + document.c : document.o + inner + document.c;\n\
+             }\n\
+             function __dbg_layout(document, column, indent) {\n\
+             \tconst flat = __dbg_flat(document);\n\
+             \tif (typeof document === \"string\" || document.e.length === 0 || column + __dbg_width(flat) <= 80) return flat;\n\
+             \tconst pad = \" \".repeat(indent + 2);\n\
+             \tlet out = document.o + \"\\n\";\n\
+             \tfor (const entry of document.e) out += pad + entry[0] + __dbg_layout(entry[1], __dbg_width(pad + entry[0]), indent + 2) + \",\\n\";\n\
+             \treturn out + \" \".repeat(indent) + document.c;\n\
+             }"
+        }
         // `panic(message)` (debugging.md S0): an `Error`, so a stack exists, whose
         // NAME carries the location — an uncaught one prints `panicked at
         // src/main.vl:12:5: message`, the line the native runtime writes, and a
@@ -2576,6 +2653,13 @@ struct Transformer<'src> {
     // when a body may join them.
     shared_bodies: HashMap<(SharedBodySubject, String), SharedBody>,
     monomorphized: Vec<js::Node<'src>>,
+    // `dbg`'s generated printers (debugging.md S1, `transformer/dbg.rs`): by
+    // type key the printer's name, the names taken, and the declarations.
+    printers: HashMap<String, String>,
+    printer_names: HashSet<String>,
+    printer_functions: Vec<js::Node<'src>>,
+    // What `dbg(..)` does in this build (`[build] dbg`, debugging.md Q4).
+    dbg_policy: crate::options::DbgPolicy,
     // Captures introduced by an `is` test, aliased to the subject's payload
     // slots (e.g. `t[1]`) since they can't be JS bindings in expression position.
     is_bindings: HashMap<Id, js::Node<'src>>,
@@ -3057,6 +3141,10 @@ impl<'src> Transformer<'src> {
             drop_helpers: HashMap::default(),
             shared_bodies: HashMap::default(),
             monomorphized: Vec::new(),
+            printers: HashMap::default(),
+            printer_names: HashSet::default(),
+            printer_functions: Vec::new(),
+            dbg_policy: options.dbg,
             is_bindings: HashMap::default(),
             hoisted_values: HashMap::default(),
             const_capture_values: HashMap::default(),
@@ -3664,7 +3752,12 @@ impl<'src> Transformer<'src> {
         // function id, so they are never chunked — a conservative eager
         // placement, correct at the cost of a chunk-exclusive instantiation
         // riding along.
-        let t_instances = self.monomorphized.into_iter();
+        // `dbg`'s printers (debugging.md S1) ride with the instances: plain
+        // declarations, eager, never chunked.
+        let t_instances = self
+            .monomorphized
+            .into_iter()
+            .chain(std::mem::take(&mut self.printer_functions));
 
         let mut nodes = t_functions.collect::<Vec<_>>();
         // Each chunk's declarations occupy one contiguous run, recorded so the
@@ -5832,6 +5925,9 @@ impl<'src> Transformer<'src> {
                             self.program.entity_map.get(&target_id)
                         {
                             return Some(self.variant_value(*enum_id, *variant_index, args));
+                        }
+                        if Some(target_id) == self.program.dbg_fn_id {
+                            return Some(self.dbg_call(*id, &function_call.argument_ids, args));
                         }
                         if target_id == self.print_fn_id {
                             return Some(js::Node::Call(
@@ -13726,6 +13822,8 @@ impl<'src> ConstWorld<'src> {
     }
 }
 
+mod dbg;
+
 pub mod js {
     use crate::node::BinaryOp;
     use std::borrow::Cow;
@@ -13981,6 +14079,16 @@ const RESERVED_NAMES: &[&str] = &[
     // Runtime helpers (emitted as `function __clone(..)`, etc.).
     "__clone",
     "__panic",
+    "__dbg",
+    "__dbg_value",
+    "__dbg_values",
+    "__dbg_group",
+    "__dbg_list",
+    "__dbg_str",
+    "__dbg_float",
+    "__dbg_width",
+    "__dbg_flat",
+    "__dbg_layout",
     "__scan",
     "__parse_i32",
     "__parse_f64",

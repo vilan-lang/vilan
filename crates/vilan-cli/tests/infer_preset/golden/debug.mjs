@@ -53,4 +53,4 @@ const squared = square(b);
 const steps = scale(4);
 const shifted = offset(a);
 const announced = announce();
-console.log(a + b + squared + __at(steps, 2, "main.vl:53:26") + shifted + announced);
+console.log(a + b + squared + __at(steps, 2, "src/main.vl:53:26") + shifted + announced);

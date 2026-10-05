@@ -4,6 +4,56 @@ A program that misbehaves usually answers two questions badly: *where* did it
 go wrong, and *what* did it hold when it did. Vilan answers the first with
 locations on every panic and the second with `dbg`.
 
+## What: `dbg`
+
+`dbg(..)` prints each value it is given, with the expression you wrote and
+where you wrote it, in vilan's own literal syntax:
+
+```vilan
+struct Point { x: i32, y: i32 }
+enum Shape { Circle(f64), Empty }
+
+fun main() {
+	let origin = Point { x = 0, y = 0 };
+	dbg(origin, Shape::Circle(1.0), Some([1, 2]));
+	let area = dbg(2.0 * 3.5) + 1.0;
+	print(area);
+}
+```
+
+```text
+[src/main.vl:6:2] origin = Point { x = 0, y = 0 }
+[src/main.vl:6:2] Shape::Circle(1.0) = Shape::Circle(1.0)
+[src/main.vl:6:2] Some([1, 2]) = Some([1, 2])
+[src/main.vl:7:13] 2.0 * 3.5 = 7.0
+```
+
+- **Any number of arguments, any types.** Each gets its own line. `dbg()`
+  prints the bare location, which is a quick "did we get here".
+- **It answers its argument** (a tuple of them for several, `()` for none), so
+  it wraps an expression where it stands: `let area = dbg(2.0 * 3.5) + 1.0;`.
+- **A statement reads in place.** `dbg(guard);` with a semicolon moves nothing,
+  so a resource stays where it was. In expression position the value moves
+  through, as it would into any function, and a list or struct comes back as a
+  copy.
+- **The format is vilan's.** A struct prints its fields, an enum variant its
+  qualified name (`Some`, `None`, `Ok` and `Err` bare), a float keeps its `.0`,
+  a string is quoted and escaped, a closure prints its type
+  (`<closure |i32| -> i32>`). A value that fits in 80 columns stays on one line;
+  a longer one breaks one entry per line, two spaces deeper, with a trailing
+  comma. A list shows its first 100 entries and then `… N more`.
+- **Generic code prints the real type.** In `fun show<T>(value: T)`, `dbg(value)`
+  prints a `Point` as a `Point` and an `i32` as an `i32`.
+- **Both backends print the same bytes**, to stderr (`console.log` in the
+  browser, which has no stderr).
+- **Release builds refuse it.** A `dbg` left in a `release` build is an error at
+  the call, so a debugging line cannot ship by accident. `[build] dbg =
+  "strip"` makes every call its argument and prints nothing; `dbg = "keep"`
+  prints in release too.
+
+A function of your own named `dbg` takes precedence, as it would over any
+prelude name.
+
 ## Where: panics name their line
 
 An uncaught panic prints the file, the line and the column that raised it, on
