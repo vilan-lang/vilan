@@ -85,6 +85,11 @@ written down.
 
 ---
 
+<!-- family: breaking -->
+**B149: a call to a function written `async` whose declared return is itself a `Task` types as the value it hands back. `async fun make(): Task<i32>`'s calls are implicitly awaited and the host assimilates the returned handle, so `make()` was `7` at run time while its type read `Task<i32>` — one layer deeper than the value, refused at `let n: i32 = make()`.** The written `async` is known at typing time; the call's type is the declared return's assimilated payload (`assimilated_task_payload`). A function async only by inference (`async_infer`, after typing) keeps its declared type. Breaking for the one spelling that relied on the old type: `let handle: Task<i32> = make();` is now refused ("Expected Task<i32>, but got i32") — the estate has none. **Pins:** `inference::std_surface::an_async_function_returning_a_task_types_as_the_value` (replaces the ignored `an_async_function_returning_a_task_should_type_as_the_value` and the residual `…_is_assimilated_at_runtime_only`). Natively the assimilation is not emitted (the call stays a `Task`; filed). Tracker B149.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

@@ -43151,6 +43151,21 @@ impl<'src> Analyzer<'src> {
                         };
                         let return_type =
                             self.substitute_type(&callee_return_type, &substitution_context);
+                        // B149: a call to a function WRITTEN `async` is
+                        // implicitly awaited, and the host assimilates a handle
+                        // its body returns — `async fun make(): Task<i32>`
+                        // hands its caller the `i32`, so the call types as it.
+                        // (A function async only by inference is the residual
+                        // `async_infer` decides after typing, and keeps its
+                        // declared type.)
+                        let return_type = match self
+                            .functions
+                            .get(&function_id)
+                            .is_some_and(|function| function.is_async)
+                        {
+                            true => self.assimilated_task_payload(return_type),
+                            false => return_type,
+                        };
                         // A generic parameter fixed only by the return type — no
                         // argument binds it — is inferred by unifying the return
                         // type against the call's expected type, and recorded so
