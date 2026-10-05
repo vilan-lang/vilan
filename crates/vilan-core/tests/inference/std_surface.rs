@@ -3195,36 +3195,35 @@ fn a_plain_function_returning_a_task_still_yields_a_handle() {
     );
 }
 
-/// RESIDUAL, pinned with the honest CURRENT behavior: an `async fun` whose
-/// DECLARED return is itself a `Task`. Its calls are implicitly awaited, so the
-/// host assimilates the returned handle and the call site receives the inner
-/// `i32` — this program prints `7`, not a handle — while the type still reads
-/// `Task<i32>`. The same divergence as the one above, at a seam this fix cannot
-/// reach: async-ness is a whole-program fixpoint over the call graph
-/// (`async_infer::infer`), computed AFTER type inference, so while a call's type
-/// is being decided the analyzer does not yet know whether its callee is async
-/// and its result therefore assimilated. Closing it needs the two passes
-/// interleaved (or an `Awaited<T>` type-level operator), which is more than this
-/// item. Recorded in async-polymorphism.md.
+/// B149: an `async fun` whose DECLARED return is itself a `Task`. Its calls are
+/// implicitly awaited, so the host assimilates the returned handle and the call
+/// site receives the inner `i32` — and the call now TYPES as that value, read
+/// off the written `async` (`assimilated_task_payload` at the call). Until B149
+/// the type still read `Task<i32>`, one layer deeper than the value. A function
+/// async only by inference is decided after typing (`async_infer::infer`) and
+/// keeps its declared type — that residual is not this shape.
 #[test]
-fn an_async_function_returning_a_task_is_assimilated_at_runtime_only() {
-    // The runtime: the call site receives the VALUE.
+fn an_async_function_returning_a_task_types_as_the_value() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::task::Task;
 
         async fun make(): Task<i32> { async { 7 } }
+        async fun plain(): i32 { 3 }
 
         fun main() {
             let result = make();
             print(result);
+            let value: i32 = make();
+            print(value + 1);
+            print(plain() + 1);
         }
         "#,
-        "7\n",
+        "7\n8\n4\n",
     );
-    // The type: still the handle, one layer deeper than that value.
-    assert_compiles(
+    // The handle spelling is refused now: the call is the value.
+    assert_fails_with(
         r#"
         import std::task::Task;
 
@@ -3232,22 +3231,7 @@ fn an_async_function_returning_a_task_is_assimilated_at_runtime_only() {
 
         fun main() { let result: Task<i32> = make(); }
         "#,
-    );
-}
-
-/// The residual's desired end state — `#[ignore]`d until the seam above closes.
-/// Un-ignore when an async call's type assimilates its awaited result.
-#[test]
-#[ignore = "B149: async-fun return assimilation needs the async fixpoint at typing time"]
-fn an_async_function_returning_a_task_should_type_as_the_value() {
-    assert_compiles(
-        r#"
-        import std::task::Task;
-
-        async fun make(): Task<i32> { async { 7 } }
-
-        fun main() { let result: i32 = make(); }
-        "#,
+        "Expected Task<i32>, but got i32",
     );
 }
 

@@ -30859,7 +30859,7 @@ mod hint_abbreviation_tests {
     #[test]
     fn inlay_hint_abbreviates_tracked_and_collection_stages() {
         let text = "import std::option::Option::{ self, None, Some };\n\
-             import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, comp, derive };\n\n\
+             import std::reactive::{ CollPipe, Flow, Pipe, Signal, SignalCell, Source, comp, derive };\n\n\
              fun main() {\n\
              \tlet a = SignalCell::new(1);\n\
              \tlet tracked = derive(|| a.track() + 1);\n\

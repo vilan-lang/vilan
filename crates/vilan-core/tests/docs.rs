@@ -179,20 +179,11 @@ fn compile(source: &str, platform: Platform) -> Result<(), Vec<String>> {
                     &Workspace::default(),
                 );
                 match program {
+                    // B535: an example calling a trait's method without the
+                    // trait in scope is refused like any other error since
+                    // v0.45.0 (it warned, and this gate refused it, for one
+                    // release).
                     Some(program) if errors.is_empty() => {
-                        // B535: an example that calls a trait's method without
-                        // the trait in scope compiles today only through
-                        // another module's import, and B515 refuses it from
-                        // v0.45.0 — so the book never leans on the hole.
-                        let unimported: Vec<String> = program
-                            .warnings
-                            .iter()
-                            .filter(|warning| warning.msg.contains("and this file does not import"))
-                            .map(|warning| warning.msg.clone())
-                            .collect();
-                        if !unimported.is_empty() {
-                            return Err(unimported);
-                        }
                         transform(&program, &BuildOptions::default())
                             .map(|_| ())
                             .map_err(|error| vec![error.msg])

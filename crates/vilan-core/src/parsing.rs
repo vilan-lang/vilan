@@ -2344,7 +2344,8 @@ const ATTRIBUTE_ORDER_HEAD: &str = "a declaration's attributes are written in on
 /// fix's edit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MarkerOrderDiagnostic {
-    /// A WARNING: the attributes are out of [`attribute_rank`]'s order, and
+    /// Refused since v0.45.0 (a WARNING for one release, B536): the attributes
+    /// are out of [`attribute_rank`]'s order, and
     /// nothing else is ([`ParseErrorReason::AttributeOrder`]).
     Attributes,
     /// An ERROR: a keyword stands ahead of an attribute — `export` and
@@ -2362,9 +2363,10 @@ impl MarkerOrderDiagnostic {
         }
     }
 
-    /// Whether the diagnostic is a warning (the program is accepted).
+    /// Whether the diagnostic is a warning (the program is accepted). Neither
+    /// is since v0.45.0: the attribute order warned for one release (B536).
     pub fn is_warning(self) -> bool {
-        self == MarkerOrderDiagnostic::Attributes
+        false
     }
 
     /// The marker-order diagnostic a rendered message reports, if it reports
@@ -4369,24 +4371,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut spelled: Vec<String> = canonical.iter().map(|kind| kind.spelled()).collect();
         spelled.push(word.to_string());
         let canonical = spelled.join(" ");
+        // B536 (v0.45.0, R-c): attributes out of rank are refused as the
+        // keyword orders are — read as written in THE order, so the analysis
+        // goes on and `vilan fmt` still writes the migration — where they
+        // warned for a release.
         if out_of_order {
             self.record_rewrite(run_span, ParseErrorReason::MarkerOrder { canonical });
         } else if out_of_rank {
-            self.record_warning(run_span, ParseErrorReason::AttributeOrder { canonical });
+            self.record_rewrite(run_span, ParseErrorReason::AttributeOrder { canonical });
         }
-    }
-
-    /// Records a WARNING ([`Parser::warnings`]), once per span.
-    fn record_warning(&mut self, span: Span, reason: ParseErrorReason) {
-        if self.warnings.iter().any(|warning| warning.span == span) {
-            return;
-        }
-        self.warnings.push(ParseError {
-            span,
-            reason,
-            context: Vec::new(),
-            hint: None,
-        });
     }
 
     /// B520: `fn`/`function`/`func`/`def` at the ITEM HEAD at the cursor —
@@ -12066,10 +12059,10 @@ mod tests {
 
     #[test]
     fn function_attributes_in_any_order_read_as_the_canonical_prefix() {
-        // B485 Q7 (RULED): attributes are written in any order. The chain the
-        // prefix reads used to be ordered, and `[rpc] [must_use] fun` declined;
-        // the run is now sorted before the production reads it, so it is the
-        // function the canonical order spells, attribute for attribute.
+        // B485 Q7 (RULED): the run is sorted before the production reads it,
+        // so another order is the function the canonical order spells,
+        // attribute for attribute — refused since v0.45.0 (B536), and still
+        // read so, which is what lets `vilan fmt` write the migration.
         for (written, canonical) in [
             (
                 "[rpc] [must_use] fun f() { }",
@@ -12088,10 +12081,28 @@ mod tests {
         }
     }
 
+    /// The single top-level item of `source`, which parses clean or carries
+    /// exactly one refusal of its attribute ORDER (B536): such a head is read
+    /// as if written in the order, so the item is the canonical one's.
+    fn only_item_read_in_order(source: &str) -> Node<'_> {
+        let (tree, errors) = parse(source);
+        assert!(
+            errors.len() <= 1
+                && errors
+                    .iter()
+                    .all(|error| matches!(error.reason, ParseErrorReason::AttributeOrder { .. })),
+            "parse errors on {source:?}: {errors:?}"
+        );
+        let (mut statements, _) = tree.expect("program did not parse");
+        assert_eq!(statements.len(), 1, "expected one item in {source:?}");
+        statements.remove(0).0
+    }
+
     /// The attribute fields of the one `fun` in `source`, which must parse
-    /// clean — what a reordered prefix has to agree on with the canonical one.
+    /// clean but for its attribute order (refused since v0.45.0, B536, and read
+    /// in it) — what a reordered prefix has to agree on with the canonical one.
     fn attributes_of(source: &str) -> String {
-        match only_item(source) {
+        match only_item_read_in_order(source) {
             Node::Func(function) => format!(
                 "{:?} {:?} {:?} {} {} {} {:?}",
                 function.deprecated,
@@ -12173,7 +12184,7 @@ mod tests {
         // B382: the function attribute, admitted on the nominals and a trait —
         // leading the ordered prefix, as it leads a function's.
         fn steer(source: &str) -> Option<&str> {
-            match only_item(source) {
+            match only_item_read_in_order(source) {
                 Node::Struct(.., labels) | Node::Enum(.., labels) | Node::Trait(.., labels) => {
                     labels.and_then(|labels| labels.deprecated)
                 }
@@ -13927,10 +13938,11 @@ mod tests {
     }
 
     /// B536's classification of the 29 swaps (RULED 2026-10-03): the stack is
-    /// CANONICAL; a swap of two attributes WARNS (out of rank, read in it); a
-    /// swap that puts a keyword ahead of an attribute — `export` included,
-    /// B485 S3 — or inverts two keywords is REFUSED, and read as the stack.
-    /// Every one of them `vilan fmt` writes as the stack, idempotently.
+    /// CANONICAL; a swap of two attributes is REFUSED as out of rank (it
+    /// warned for one release, v0.44.0 — the v0.45.0 flip, R-c) and read in
+    /// it; a swap that puts a keyword ahead of an attribute — `export`
+    /// included, B485 S3 — or inverts two keywords is REFUSED, and read as the
+    /// stack. Every one of them `vilan fmt` writes as the stack, idempotently.
     #[test]
     fn b536_every_adjacent_marker_swap_is_canonical_warned_or_refused() {
         let is_attribute = |marker: &str| marker.starts_with('[');
@@ -13971,12 +13983,10 @@ mod tests {
                 let run = Span::from(0..source.find(declaration).unwrap() - 1);
                 if is_attribute(swapped[at]) && is_attribute(swapped[at + 1]) {
                     warned += 1;
-                    assert!(errors.is_empty(), "{source}: {errors:?}");
-                    assert_eq!(
-                        warnings,
-                        vec![(run, attribute_order_rule(&spelled))],
-                        "{source}"
-                    );
+                    assert!(warnings.is_empty(), "{source}: {warnings:?}");
+                    assert_eq!(errors, vec![attribute_order_rule(&spelled)], "{source}");
+                    let (_, spanned, _) = parse_with_warnings(&source);
+                    assert_eq!(spanned[0].span, run, "{source}");
                 } else {
                     refused += 1;
                     assert!(warnings.is_empty(), "{source}: {warnings:?}");
@@ -13997,11 +14007,11 @@ mod tests {
     }
 
     /// B536: attributes out of [`attribute_rank`]'s order, and nothing else
-    /// out of order, are a WARNING — beside the errors, never among them, so
-    /// the source stays clean — spanning the run and naming the head in THE
-    /// order; the tree is the canonical spelling's.
+    /// out of order, are REFUSED since v0.45.0 (a WARNING for one release) —
+    /// spanning the run and naming the head in THE order; the tree is still
+    /// the canonical spelling's, which is what `vilan fmt` writes.
     #[test]
-    fn b536_attributes_out_of_rank_warn_and_read_in_it() {
+    fn b536_attributes_out_of_rank_are_refused_and_read_in_it() {
         for (source, canonical, spelled) in [
             (
                 "[internal(\"r\")] [deprecated(\"d\")] fun f() {}",
@@ -14040,15 +14050,15 @@ mod tests {
             ),
         ] {
             let (tree, errors, warnings) = parse_with_warnings(source);
-            assert!(errors.is_empty(), "{source}: {errors:?}");
-            let rendered: Vec<String> = warnings.iter().map(render).collect();
+            assert!(warnings.is_empty(), "{source}: {warnings:?}");
+            let rendered: Vec<String> = errors.iter().map(render).collect();
             assert_eq!(rendered, vec![attribute_order_rule(spelled)], "{source}");
             let run_start = source.find('[').unwrap();
             let word = spelled.rsplit(' ').next().unwrap();
             let run_end = source[..source.find(&format!(" {word} ")).unwrap()]
                 .trim_end()
                 .len();
-            assert_eq!(warnings[0].span, Span::from(run_start..run_end), "{source}");
+            assert_eq!(errors[0].span, Span::from(run_start..run_end), "{source}");
             assert_eq!(
                 MarkerOrderDiagnostic::of_message(&rendered[0]),
                 Some(MarkerOrderDiagnostic::Attributes)
@@ -14064,9 +14074,9 @@ mod tests {
                 "{source}"
             );
             // `parse` — what every reader but the reporting pipelines calls —
-            // hands back the same clean result, and no warning.
+            // hands back the same refusal.
             let (_, errors) = parse(source);
-            assert!(errors.is_empty(), "{source}: {errors:?}");
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
         }
         // Nothing to warn about: THE order, a tie kept as written (two
         // generators, two `[hint]`s), one attribute, a run that is not a
@@ -14103,7 +14113,8 @@ mod tests {
             MarkerOrderDiagnostic::Keywords.code(),
             "marker-order/keywords"
         );
-        assert!(MarkerOrderDiagnostic::Attributes.is_warning());
+        // Neither is a warning since v0.45.0 (B536's flip).
+        assert!(!MarkerOrderDiagnostic::Attributes.is_warning());
         assert!(!MarkerOrderDiagnostic::Keywords.is_warning());
         assert_eq!(
             MarkerOrderDiagnostic::of_message(&attribute_order_rule("[must_use] fun")),
@@ -14334,8 +14345,11 @@ mod tests {
     fn b486_a_reordered_head_still_begins_where_it_was_written() {
         // The reorder permutes tokens, and every node still begins at the
         // first unit as written — the statement, the export, the item.
+        // (Refused since v0.45.0, B536 — and still read, so still spanned.)
         let source = "[platform(\"node\")] [deprecated(\"x\")] export fun f() {}";
-        let (statements, _) = program(source);
+        let (tree, errors) = parse(source);
+        assert_eq!(errors.len(), 1);
+        let (statements, _) = tree.expect("a tree");
         assert_eq!(statements[0].1, Span::from(0..source.len()));
         match &statements[0].0 {
             Node::Export(_, inner, _) => assert_eq!(inner.1.start, 0, "{inner:?}"),

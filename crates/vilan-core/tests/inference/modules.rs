@@ -7165,14 +7165,17 @@ fn b472_an_unimported_deprecated_alias_steers_to_the_name_it_stands_for() {
 // trait's methods resolved in a file that never imported the trait once any
 // loaded module did: `import std::markdown;` made `42.to_string()` compile with
 // no `Display` in sight. R-g door (b), ruled by the count (55 sites across kolt,
-// the corpus and the docs): a WARNING for one release, refused in v0.45.0.
+// the corpus and the docs): a WARNING for one release (v0.44.0), REFUSED since
+// v0.45.0 (B535, R-c).
 
-/// B515: the call warns at the member's name, naming the trait and the import
-/// that brings it — a `Display` method reached through `std::markdown`'s
-/// import, and a `PartialOrd` one through `std::time`'s.
+/// B515/B535: the call is refused at the member's name, naming the trait and
+/// the import that brings it — a `Display` method reached through
+/// `std::markdown`'s import, and a `PartialOrd` one through `std::time`'s —
+/// and the refusal's fix data is that import (`trait_scope_import`), under
+/// its stable code.
 #[test]
-fn b515_a_trait_method_resolved_through_another_modules_import_warns() {
-    assert_warns_spanning(
+fn b515_a_trait_method_resolved_through_another_modules_import_is_refused() {
+    assert_fails_spanning(
         r#"
         import std::markdown;
 
@@ -7181,10 +7184,11 @@ fn b515_a_trait_method_resolved_through_another_modules_import_warns() {
         }
         "#,
         "to_string",
-        "`to_string` is `Display`'s, and this file does not import `Display`: the call resolves \
-         only because another loaded module does. Import it (`import std::display::Display;`)",
+        "`to_string` is `Display`'s, and this file does not import `Display`: a trait's methods \
+         resolve only in a file that imports the trait. Import it (`import \
+         std::display::Display;`)",
     );
-    assert_warns_spanning(
+    assert_fails_spanning(
         r#"
         import std::time::Duration;
 
@@ -7195,15 +7199,30 @@ fn b515_a_trait_method_resolved_through_another_modules_import_warns() {
         "gt",
         "`gt` is `PartialOrd`'s, and this file does not import `PartialOrd`",
     );
+    let message = "`to_string` is `Display`'s, and this file does not import `Display`: a \
+                   trait's methods resolve only in a file that imports the trait. Import it \
+                   (`import std::display::Display;`)";
+    assert_eq!(
+        vilan_core::analyzer::trait_scope_import(message),
+        Some("import std::display::Display;")
+    );
+    assert_eq!(
+        vilan_core::analyzer::trait_scope_import("cannot find 'x'"),
+        None
+    );
+    assert_eq!(
+        vilan_core::analyzer::TRAIT_SCOPE_CODE,
+        "trait-scope/not-imported"
+    );
 }
 
-/// B515: a trait the file DOES reach is silent — imported by name, a call
+/// B515: a trait the file DOES reach is accepted — imported by name, a call
 /// through a bound (the bound wrote the trait), the file's own trait and impl,
 /// a block a derive generated in the file, and a std trait the call names by
 /// its qualified spelling.
 #[test]
-fn b515_a_trait_in_scope_does_not_warn() {
-    let warnings = warning_diagnostics(
+fn b515_a_trait_in_scope_is_accepted() {
+    assert_compiles(
         r#"
         import std::markdown;
         import std::display::Display;
@@ -7234,11 +7253,5 @@ fn b515_a_trait_in_scope_does_not_warn() {
             let e = Display::to_string(8);
         }
         "#,
-    );
-    assert!(
-        warnings
-            .iter()
-            .all(|(message, _)| !message.contains("this file does not import")),
-        "{warnings:#?}"
     );
 }

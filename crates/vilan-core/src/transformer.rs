@@ -9674,6 +9674,29 @@ impl<'src> Transformer<'src> {
                     })],
                 ),
             },
+            // B543: with no concrete layout (a family no call instantiated —
+            // a constant template `(U in T: bool)` binds nothing), the pairs
+            // are built over the receiver as `keys` builds its keys, one slot
+            // per position. It answered `[ ]` before, so the walk ran no times.
+            Intrinsic::TupleEntries if positions.is_none() => js::Node::Call(
+                Box::new(js::Node::Property(Box::new(receiver), "map".to_string())),
+                vec![js::Node::Closure(js::Closure {
+                    parameters: vec![
+                        js::Parameter {
+                            name: "$value".to_string(),
+                        },
+                        js::Parameter {
+                            name: "$at".to_string(),
+                        },
+                    ],
+                    body: vec![js::Node::Return(Box::new(js::Node::Array(vec![
+                        js::Node::Array(vec![js::Node::Local("$at".to_string())]),
+                        js::Node::Local("$value".to_string()),
+                    ])))],
+                    is_async: false,
+                    origin: None,
+                })],
+            ),
             Intrinsic::TupleEntries => {
                 let positions = positions.unwrap_or_default();
                 let tuple = subject(&receiver);

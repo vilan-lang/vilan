@@ -2608,23 +2608,17 @@ export impl SignalCell<type T: (2..)> {
 	/// compares (`T` needs no `PartialEq`). The parts are copies of the whole's
 	/// payloads, so a `set` on a part does not write back.
 	fun unzip(self): (U in T: SignalCell<U>) {
-		unzip_cell(self)
+		let parts = (part in self.get() => SignalCell::new(part));
+		as_derivation();
+		let whole = self;
+		let _owned = register_with_owner(whole.on_settle(subscriber_of(|| {
+			let current = whole.get();
+			for key in current.keys() {
+				parts.get(key).set(current.get(key));
+			}
+		}, true)));
+		parts
 	}
-}
-
-/// `unzip`'s body, outside the impl: inside `SignalCell<type T>`'s block a part's
-/// `SignalCell::new` and `set` read the block's `T` where each position wants its
-/// own element type (a solver find of A152's, filed by reactive-46).
-fun unzip_cell<W: (2..)>(whole: SignalCell<W>): (V in W: SignalCell<V>) {
-	let parts = (part in whole.get() => SignalCell::new(part));
-	as_derivation();
-	let _owned = register_with_owner(whole.on_settle(subscriber_of(|| {
-		let current = whole.get();
-		for key in current.keys() {
-			parts.get(key).set(current.get(key));
-		}
-	}, true)));
-	parts
 }
 
 /// A SEALED derivation's read-only face — what `.memo()` and `.memo_global()` hand

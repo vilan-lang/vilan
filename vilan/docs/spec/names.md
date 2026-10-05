@@ -352,6 +352,16 @@ fun main() {
 }
 ```
 
+A trait's method resolves only in a file that **imports the trait** — by
+name, through a bound that writes it, or because the file declares the
+trait or the impl itself (the base prelude brings `Iterator`, the web
+prelude the pipe sealers). An `impl` registers when its module loads, and
+loading is program-wide, so `42.to_string()` would otherwise resolve in a
+file that never imported `Display` just because another loaded module did.
+Such a call is refused at the member's name, naming the import that brings
+the trait (`` Import it (`import std::display::Display;`) ``) — a warning in
+v0.44.0, an error from v0.45.0 (B515, B535).
+
 `Trait::member(receiver, args…)` is the disambiguator: it names which
 provider to use, and works on a concrete receiver or a trait-bounded
 generic one. `Type::member(receiver, args…)` means the type's own member

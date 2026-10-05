@@ -602,7 +602,7 @@ row	flagship	key
 578	-	a `{got}` does not become a `{expected}` as a whole: an object is built where ONE value lands, and each `{concrete}` inside this one was built already; {steer}
 579	-	`-` on an unsigned value: `{name}` has no negative values, so its negation is out of range on every backend. Convert it to a signed type first (`.as_i53()`) and negate that
 580	-	`{name}` is unsigned ({range}), and this constant folds to `{value}`: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
-581	-	cannot infer '{generic_label}' for this call: nothing it is passed binds it, and its result is typed by it. Write the type — on the binding the result lands in (`let value: … = …`), or as the call's type argument (`{member}<…>(…)`)
+581	-	cannot infer '{generic_label}' for this call: {why}. Write the type — on the binding the result lands in (`let value: … = …`), or as the call's type argument (`{member}<…>(…)`)
 582	-	a function cannot be named `Self`: `Self` names the type an `impl` or `trait` is about, so `value.Self()` reads as that type and never reaches this member. Give it another name
 583	-	`map` over a tuple takes one closure LITERAL with one parameter: its body is checked once per position, at that position's element, and a closure value has one type. Write `t.map(|x| f(x))`
 584	-	'{value_label}' is a mapped tuple whose family is not bound to guarantee '{bound_label}', which this argument's parameter requires
@@ -639,7 +639,7 @@ row	flagship	key
 615	-	a declaration's markers are written in one order — its attributes, then the keywords `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration word: write `{canonical}`
 616	-	this pattern binds {n} {elements}, but the value is a {n}-tuple `{type}`: a tuple pattern takes one sub-pattern per element, and a nested pattern reaches inside one (`((a, b), c)`)
 617	-	this pattern binds {n} {elements}, but the value is a `{type}`, not a tuple: `(a, b)` destructures a tuple
-618	-	`{member}` is `{trait}`'s, and this file does not import `{trait}`: the call resolves only because another loaded module does. Import it (`{import}`) — this is an error from v0.45.0
+618	-	`{member_name}` is `{trait_name}`'s, and this file does not import `{trait_name}`: a trait's methods resolve only in a file that imports the trait. Import it (`{import}`)
 619	-	`{type}` is not a trait: a selector's `with` names the trait the block implements, as its declaration does (`(impl Box with One)` selects `impl Box with One`)
 620	-	a declaration's attributes are written in one order — `[derive]` and the other generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform]`, `[resource]`: write `{canonical}`
 621	-	the left side of this assignment is not a place: it is {what} — only a place can be assigned: a binding (`x`), a field (`p.x`), an element (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a `&mut` view
@@ -678,3 +678,6 @@ row	flagship	key
 654	-	a reference link definition ([label]: destination) — only inline [text](destination) links are in the census grammar
 655	-	a hard line break (two trailing spaces) — outside the census grammar
 656	-	a backslash line break — outside the census grammar
+657	-	cannot infer `{family_label}`'s element {}: {written} is `{element}` and names no type for it, and nothing else at this call binds `{family_label}` — annotate the argument, or bind `{family_label}` through another parameter
+658	-	`mut {name}` would bind a COPY of a tuple element, and its write would not reach `{place}`: a capture inside a tuple pattern is a copy even under a view subject (tuples store flat) — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
+659	-	cannot mutate '{name}': a capture inside a tuple pattern is a COPY of its element even under a view subject (tuples store flat), so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`

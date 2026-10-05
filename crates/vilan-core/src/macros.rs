@@ -2889,6 +2889,30 @@ fn construct_type_expr(node: &Spanned<Node>, text: &str) -> js::Node<'static> {
                     .collect(),
             ),
         ]),
+        // B500: a module-qualified head (`hash_map::HashMap<str, i32>`) keeps
+        // its arguments too, under its whole written path as the name. As one
+        // opaque text with no arguments, a generator that reads the arguments
+        // (`[service]`'s handle and key types) read none, and generated code
+        // whose type parameter only those arguments could fix was refused.
+        Node::MemberAccessor(namespace, member) => match &member.0 {
+            Node::AccessorWithGenerics(name, arguments) => {
+                let path = format!("{}::{name}", slice(text, namespace.1));
+                array(vec![
+                    string_literal(&path),
+                    array(
+                        arguments
+                            .0
+                            .iter()
+                            .map(|argument| construct_type_expr(argument, text))
+                            .collect(),
+                    ),
+                ])
+            }
+            _ => array(vec![
+                string_literal(&slice(text, node.1)),
+                array(Vec::new()),
+            ]),
+        },
         _ => array(vec![
             string_literal(&slice(text, node.1)),
             array(Vec::new()),

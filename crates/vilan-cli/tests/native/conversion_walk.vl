@@ -1,5 +1,5 @@
 // A142 S5's random walk (`inference/collections.rs`), run on both backends.
-import std::reactive::{ Signal, SignalCell, comp };
+import std::reactive::{ CollPipe, Signal, SignalCell, comp };
 
 mut seed = 99;
 

@@ -233,6 +233,7 @@ async fun main() {
 
 #[cfg(unix)]
 const CLIENT: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Flow, Source };
 import std::shared::Shared;
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
@@ -318,6 +319,7 @@ async fun main() {
 /// the generated client at all.
 #[cfg(unix)]
 const WATCH_CLIENT: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Flow, Source };
 import std::json::json_codec;
 import std::process::args;
 import std::result::Result::{ self, Ok, Err };
@@ -685,6 +687,7 @@ fn a_spent_retry_budget_closes_for_good_and_disposes_the_client() {
 /// tests above — the outage is produced by killing the server process.
 #[cfg(unix)]
 const DRAFT_CLIENT: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Flow, Source };
 import std::shared::Shared;
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
@@ -933,6 +936,7 @@ async fun main() {
 /// about.
 #[cfg(unix)]
 const DYNAMIC_CLIENT: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Flow, Source };
 import std::json::json_codec;
 import std::process::args;
 import std::result::Result::{ self, Ok, Err };

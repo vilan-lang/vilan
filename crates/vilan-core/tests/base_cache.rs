@@ -367,7 +367,7 @@ fn macro_worlds_share_one_base_world_and_observe_identically() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Two defining files: `PartialEq` lives in compare.vl, `Debug` in
     // debug.vl — so this entry compiles two macro worlds, not one.
-    const TWO_WORLDS: &str = "import std::io::print;\n[derive(PartialEq, Debug)]\nstruct P { x: i32 }\nfun main() { print((P { x = 1 } == P { x = 1 }).debug()); }\n";
+    const TWO_WORLDS: &str = "import std::io::print;\n[derive(PartialEq, Debug)]\nstruct P { x: i32 }\nfun main() { print(P { x = 1 } == P { x = 1 }); }\n";
 
     vilan_core::analyzer::base_cache_clear();
     vilan_core::macro_world_cache_clear();
