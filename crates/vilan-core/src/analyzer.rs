@@ -458,6 +458,19 @@ impl TupleBoundRequirement {
     }
 }
 
+/// What the providers of a trait answer for a bound's written pattern
+/// ([`Analyzer::trait_args_providers_for_pattern`]).
+enum PatternProviders {
+    /// One provider ranks above every other that agrees with the pattern.
+    One(Vec<TypeId>),
+    /// Unranked providers that DISAGREE, each instantiation once (B533): no
+    /// evidence for the bound's arguments.
+    Ambiguous(Vec<Vec<TypeId>>),
+    /// No concrete provider agreed; the first agreeing one, else the first
+    /// that matched at all.
+    Fallback(Option<Vec<TypeId>>),
+}
+
 /// Why a comprehension's sources do not make one walk (B183).
 #[derive(Clone, Copy, Debug)]
 enum ZipRefusal {
@@ -8217,18 +8230,24 @@ impl<'src> Analyzer<'src> {
                 let generic_label =
                     self.pretty_print_type(&Type::Generic(constraint_id), &HashMap::default());
                 let member = self.callable_name(member_id).unwrap_or("this function");
+                let why =
+                    match self.ambiguous_bound_providers(call_id, &own_generics, constraint_id) {
+                        Some(ambiguity) => ambiguity,
+                        None => "nothing it is passed binds it, and its result is typed by it"
+                            .to_string(),
+                    };
                 errors.push((
                     call_id,
                     **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
                     format!(
-                        "cannot infer '{generic_label}' for this call: nothing it is passed binds \
-                         it, and its result is typed by it. Write the type — on the binding the \
-                         result lands in (`let value: … = …`), or as the call's type argument \
-                         (`{member}<…>(…)`)"
+                        "cannot infer '{generic_label}' for this call: {why}. Write the type — on \
+                         the binding the result lands in (`let value: … = …`), or as the call's \
+                         type argument (`{member}<…>(…)`)"
                     ),
                     constraint_id,
                 ));
             }
+            let own_generics_listed = own_generics.clone();
             for constraint_id in own_generics.into_iter().chain(unbindable) {
                 let bound_traits = self.generic_bound_traits(constraint_id);
                 if bound_traits.is_empty() {
@@ -8249,12 +8268,16 @@ impl<'src> Analyzer<'src> {
                         self.bound_trait_label(*trait_id, arguments)
                     })
                     .collect();
+                let ambiguity = self
+                    .ambiguous_bound_providers(call_id, &own_generics_listed, constraint_id)
+                    .map(|ambiguity| format!(": {ambiguity}"))
+                    .unwrap_or_default();
                 errors.push((
                     call_id,
                     **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
                     format!(
                         "cannot infer '{generic_label}' for this call; its bound ': {}' \
-                         cannot be checked",
+                         cannot be checked{ambiguity}",
                         bound_labels.join(" + ")
                     ),
                     constraint_id,
@@ -43964,13 +43987,38 @@ impl<'src> Analyzer<'src> {
     /// can mean (a `bool` written there turns the `SignalCell<bool>` one down),
     /// and when more than one survives — a bare `type U` agrees with all of
     /// them — the specificity order picks, as it picks a member's body (§13.4(a)
-    /// tier 3). Unranked survivors keep declaration order, the old answer.
+    /// tier 3).
+    ///
+    /// B533: unranked survivors that DISAGREE answer nothing. `Square: Shape<i32>
+    /// + Shape<str>` read for `S: Shape<T>` is no evidence for `T` at all — the
+    /// first in declaration order used to answer, overriding the call's own
+    /// expectation (`let s: str = measure(square)` was refused "Expected str,
+    /// but got i32") and silently choosing `i32` where nothing decided. The
+    /// expectation, or a written type argument, decides; a call nothing decides
+    /// is refused as ambiguous, naming the instantiations
+    /// ([`Self::ambiguous_bound_providers`]). Survivors that agree keep the old
+    /// answer.
     fn trait_args_for_pattern(
         &mut self,
         concrete: &Type,
         trait_id: Id,
         pattern: &[TypeId],
     ) -> Option<Vec<TypeId>> {
+        match self.trait_args_providers_for_pattern(concrete, trait_id, pattern) {
+            PatternProviders::One(arguments) => Some(arguments),
+            PatternProviders::Ambiguous(_) => None,
+            PatternProviders::Fallback(arguments) => arguments,
+        }
+    }
+
+    /// [`Self::trait_args_for_pattern`]'s whole answer: the one provider, the
+    /// unranked disagreeing survivors (B533), or the fallback.
+    fn trait_args_providers_for_pattern(
+        &mut self,
+        concrete: &Type,
+        trait_id: Id,
+        pattern: &[TypeId],
+    ) -> PatternProviders {
         let (answered, fallback) = self.trait_args_candidates(concrete, trait_id, false);
         let agreeing: Vec<(TypeId, Vec<TypeId>)> = answered
             .into_iter()
@@ -43991,12 +44039,40 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         match maxima.as_slice() {
-            [only] => Some(only.1.clone()),
-            _ => agreeing
-                .first()
-                .map(|(_, arguments)| arguments.clone())
-                .or(fallback),
+            [only] => PatternProviders::One(only.1.clone()),
+            [first, rest @ ..]
+                if rest
+                    .iter()
+                    .any(|other| !self.same_type_arguments(&other.1, &first.1)) =>
+            {
+                let mut instantiations: Vec<Vec<TypeId>> = Vec::new();
+                for (_, arguments) in &maxima {
+                    if !instantiations
+                        .iter()
+                        .any(|kept| self.same_type_arguments(kept, arguments))
+                    {
+                        instantiations.push(arguments.clone());
+                    }
+                }
+                PatternProviders::Ambiguous(instantiations)
+            }
+            _ => PatternProviders::Fallback(
+                agreeing
+                    .first()
+                    .map(|(_, arguments)| arguments.clone())
+                    .or(fallback),
+            ),
         }
+    }
+
+    /// Two argument lists naming the same types ([`Self::same_type_structure`]
+    /// per position: substitution mints a fresh id for every type it builds).
+    fn same_type_arguments(&self, left: &[TypeId], right: &[TypeId]) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| self.same_type_structure(*left, *right, 0))
     }
 
     /// [`Self::impl_outranks`] over bare subjects.
@@ -55454,6 +55530,60 @@ impl<'src> Analyzer<'src> {
             self.collect_generics(&return_type, 0, &mut generics);
         }
         generics
+    }
+
+    /// B533: why a call left `constraint_id` unbound when the reason is an
+    /// AMBIGUOUS provider — another of the callee's parameters is bound to a
+    /// type that implements a bound mentioning `constraint_id` at several
+    /// unranked instantiations (`S: Shape<T>` with `Square: Shape<i32> +
+    /// Shape<str>`). Rendered as the clause the never-determined refusal leads
+    /// with: "`Square` implements `Shape` at 2 instantiations, `Shape<i32>`
+    /// and `Shape<str>`, and nothing at this call chooses one".
+    fn ambiguous_bound_providers(
+        &mut self,
+        call_id: Id,
+        own_generics: &[TypeId],
+        constraint_id: TypeId,
+    ) -> Option<String> {
+        let substitution = self.method_call_substitution.get(&call_id)?.clone();
+        for owner in own_generics {
+            let Some(bound_id) = substitution.get(owner).copied() else {
+                continue;
+            };
+            let concrete = bound_id.get_type(self);
+            if matches!(concrete, Type::Generic(_) | Type::Trait(..) | Type::Dyn(..)) {
+                continue;
+            }
+            for (trait_id, arguments) in self.generic_bound_traits(*owner) {
+                let mut mentioned = Vec::new();
+                for argument in &arguments {
+                    self.collect_generics(&argument.get_type(self), 0, &mut mentioned);
+                }
+                if !mentioned.contains(&constraint_id) {
+                    continue;
+                }
+                let PatternProviders::Ambiguous(instantiations) =
+                    self.trait_args_providers_for_pattern(&concrete, trait_id, &arguments)
+                else {
+                    continue;
+                };
+                let trait_name = self.traits.get(&trait_id).map(|trait_| trait_.name)?;
+                let labels: Vec<String> = instantiations
+                    .iter()
+                    .filter_map(|instantiation| self.bound_trait_label(trait_id, instantiation))
+                    .map(|label| format!("`{label}`"))
+                    .collect();
+                let (last, rest) = labels.split_last()?;
+                let type_label = self.pretty_print_type(&concrete, &HashMap::default());
+                return Some(format!(
+                    "`{type_label}` implements `{trait_name}` at {} instantiations, {} and \
+                     {last}, and nothing at this call chooses one",
+                    labels.len(),
+                    rest.join(", ")
+                ));
+            }
+        }
+        None
     }
 
     /// B426: see the call site in `finalize_build`.

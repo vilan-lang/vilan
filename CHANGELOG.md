@@ -23,6 +23,13 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: breaking -->
+**B533: a type that implements a bound's trait at two instantiations is no evidence for the bound's arguments. `measure<T, S: Shape<T>>` called on a `Square: Shape<i32> + Shape<str>` now binds `T` from the call's expectation (`let s: str = measure(square)` was refused "Expected str, but got i32") or a written type argument, and a call nothing decides is refused naming both: "cannot infer 'T' for this call: `Square` implements `Shape` at 2 instantiations, `Shape<i32>` and `Shape<str>`, and nothing at this call chooses one".** Before, the first provider in declaration order answered, so the unannotated call compiled and silently chose `i32`; that program is now refused (breaking; the estate carries none). Unranked providers that agree, and every ranked pair, answer as before. The bounded generic's twin message ("its bound … cannot be checked") names the instantiations the same way. **Pins:** `inference::traits::b533_a_bound_provided_at_two_instantiations_binds_from_the_expectation` (a `let` at each instantiation, a parameter, a declared return, a written type argument and a method, each run; the undecided free and method calls refused once each); red with the first-provider answer planted back. Ledger row 581 re-keyed (`{why}`). Tracker B533.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

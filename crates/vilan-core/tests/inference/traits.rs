@@ -9330,3 +9330,70 @@ fn b508_a_blanket_reaches_a_closure_typed_receiver() {
         "anything\nanything\nanything\nanything\n",
     );
 }
+
+/// B533: a type implementing a bound's trait at TWO instantiations is no
+/// evidence for the bound's arguments. `measure<T, S: Shape<T>>` called on a
+/// `Square: Shape<i32> + Shape<str>` read `T` from the FIRST provider in
+/// declaration order, so `let s: str = measure(square)` was refused "Expected
+/// str, but got i32" and an unannotated call silently chose `i32`. The
+/// expectation decides (a `let`, a parameter, a return), a written type
+/// argument decides, and a call nothing decides is refused naming the
+/// instantiations — on a free function and a method alike.
+#[test]
+fn b533_a_bound_provided_at_two_instantiations_binds_from_the_expectation() {
+    let program = |body: &str| {
+        format!(
+            r#"
+            import std::io::print;
+            trait Shape<T> {{
+                fun area(self): T;
+            }}
+            struct Square {{ side: i32 }}
+            impl Square with Shape<i32> {{
+                fun area(self): i32 {{ self.side * self.side }}
+            }}
+            impl Square with Shape<str> {{
+                fun area(self): str {{ "square" }}
+            }}
+            struct Ruler {{}}
+            impl Ruler {{
+                fun measure<T, S: Shape<T>>(self, shape: S): T {{ shape.area() }}
+            }}
+            fun measure<T, S: Shape<T>>(shape: S): T {{ shape.area() }}
+            fun takes(label: str): str {{ label }}
+            fun counted(square: Square): i32 {{ measure(square) }}
+            fun main() {{
+                {body}
+            }}
+            "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program(
+            r#"
+            let named: str = measure(Square { side = 2 });
+            print(named);
+            let area: i32 = measure(Square { side = 3 });
+            print(area);
+            print(takes(measure(Square { side = 4 })));
+            print(counted(Square { side = 5 }));
+            print(measure<str, Square>(Square { side = 6 }));
+            let by_method: str = Ruler {}.measure(Square { side = 7 });
+            print(by_method);
+            let by_method_area: i32 = Ruler {}.measure(Square { side = 8 });
+            print(by_method_area);
+            "#,
+        ),
+        "square\n9\nsquare\n25\nsquare\nsquare\n64\n",
+    );
+    for undecided in [
+        "let shape = measure(Square { side = 2 });",
+        "let shape = Ruler {}.measure(Square { side = 2 });",
+    ] {
+        assert_fails_once_with(
+            &program(undecided),
+            "cannot infer 'T' for this call: `Square` implements `Shape` at 2 instantiations, \
+             `Shape<i32>` and `Shape<str>`, and nothing at this call chooses one",
+        );
+    }
+}
