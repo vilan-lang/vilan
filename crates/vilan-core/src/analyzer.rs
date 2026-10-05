@@ -5489,6 +5489,9 @@ pub struct Analyzer<'src> {
     // B544: the `is` captures a guard published to its continuation, with the
     // offset they are visible from — a whole write there rebinds a local.
     guard_continuation_captures: HashMap<Id, usize>,
+    // B537: where each unbound `return` read B523 steered starts — a body
+    // whose last statement starts there has had its one report.
+    unbound_return_starts: HashSet<(Option<SourceId>, usize)>,
     // The `std::reactive` `Source` TRAIT, if loaded. `[expose]` reconciles an
     // exposed field's type against it (A32's ruling): a field is exposable when
     // its type IMPLEMENTS the nominal std trait, not when its spelling happens
@@ -7259,6 +7262,7 @@ impl<'src> Analyzer<'src> {
             divergence_leaves: DivergenceLeaves::default(),
             guard_continuations: Vec::new(),
             guard_continuation_captures: HashMap::default(),
+            unbound_return_starts: HashSet::default(),
             source_trait_id: None,
             wire_trait_id: None,
             hashable_trait_id: None,
@@ -52421,6 +52425,21 @@ impl<'src> Analyzer<'src> {
         if self.block_diverges(statement_ids, body_id) {
             return ReturnPositionCheck::Matched;
         }
+        // B537 (door (b)): a body whose last STATEMENT is written over an
+        // unbound `return` (`return (y);`, `return -x;`) was meant to leave
+        // with that value. B523's steer at the `return` already says so, and
+        // "this body ends without producing a value" — true of what was
+        // written — only repeats it; B520 avoided the same cascade for
+        // `return value;` by rewriting the token.
+        if matches!(self.expr_id_to_expr_map.get(&body_id), Some(Expr::Void))
+            && let Some(last) = statement_ids.last()
+            && let Some(span) = self.span_map.get(last)
+            && self
+                .unbound_return_starts
+                .contains(&(self.source_of_id(*last), span.start))
+        {
+            return ReturnPositionCheck::Matched;
+        }
         // S3 (editing-dx.md §3.6-3.7): a body that ends WITHOUT PRODUCING A
         // VALUE is a distinct mistake from an ordinary type mismatch — the
         // parser's synthesized `Expr::Void` tail is the marker (nothing else
@@ -57730,6 +57749,10 @@ impl<'src> Analyzer<'src> {
                     // `return (x)`, `return -x`, a tail): the same message,
                     // so the same code and quick fix (`foreign_spelling_fix`).
                     let msg = if name == "return" {
+                        if let Some(span) = self.span_map.get(&id) {
+                            let start = (self.source_of_id(id), span.start);
+                            self.unbound_return_starts.insert(start);
+                        }
                         crate::parsing::ForeignSpelling::Return
                             .message()
                             .to_string()

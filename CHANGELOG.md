@@ -65,6 +65,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**B537 (door (b)): `return (y);` or `return -x;` as a value body's last statement carries B523's `ret` steer and nothing else.** "Expected i32, but got void instead: this body ends without producing a value" stood beside it — true of what was written, and only a restatement of the steer (B520 avoided the same cascade for `return value;` by rewriting the token). The return check stands down when the body's last statement starts at an unbound `return` B523 steered; a body whose unbound `return` is not its last statement still says it ends without a value. **Pins:** `inference::returns::b537_a_statement_over_an_unbound_return_carries_the_steer_alone` (three shapes, one diagnostic each; the not-last control). Tracker B537.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.
