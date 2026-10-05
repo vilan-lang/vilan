@@ -3881,6 +3881,12 @@ impl<'src> Transformer<'src> {
     /// that would otherwise alias its source. `__clone` (not `structuredClone`)
     /// so a value holding closures can be copied.
     fn maybe_clone(&mut self, value_id: Id, node: js::Node<'src>) -> js::Node<'src> {
+        // M90: a read-only `let` of a stable place shares it — nothing can
+        // write either side while the binding lives, and it never leaves the
+        // frame (`Analyzer::compute_shared_place_lets`).
+        if self.program.shared_place_inits.contains(&value_id) {
+            return node;
+        }
         if self.copy_applies(self.program.clone_sites.get(&value_id)) {
             self.used_helpers.insert("__clone");
             js::Node::Call(Box::new(js::Node::Local("__clone".to_string())), vec![node])

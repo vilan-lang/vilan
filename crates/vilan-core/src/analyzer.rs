@@ -5181,6 +5181,12 @@ pub struct Analyzer<'src> {
     /// which donate their storage instead of being copied (rule 2, one level
     /// below a binding). Filled by [`Self::compute_donated_projections`].
     donated_projections: HashSet<Id>,
+    /// M90: the read-only `let` bindings of a STABLE place that the JS
+    /// emitter shares instead of deep-copying (`let layout = config.layout`),
+    /// and their initializers. A binding here owns nothing, so rule 2 never
+    /// donates it. Filled by [`Self::compute_shared_place_lets`].
+    shared_place_lets: HashSet<Id>,
+    shared_place_inits: HashSet<Id>,
     resolved_types: HashMap<Id, TypeId>,
     // B70 (`variadic-generics.md` §T.8): the type of every ELEMENT of a tuple
     // construction, keyed by the element's expr id — the type the tuple rule
@@ -7243,6 +7249,8 @@ impl<'src> Analyzer<'src> {
             shared_read_bindings: HashSet::default(),
             elided_shared_reads: HashSet::default(),
             donated_projections: HashSet::default(),
+            shared_place_lets: HashSet::default(),
+            shared_place_inits: HashSet::default(),
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
             tuple_index_paths: HashMap::default(),
@@ -32409,6 +32417,258 @@ impl<'src> Analyzer<'src> {
     /// holds through it and the wave list is never deep-copied per drain
     /// iteration. What the elision cannot survive is an in-place write reaching
     /// the storage first, which is exactly what the ordering test refuses.
+    /// M90: a read-only `let` of a STABLE place shares it on JS instead of
+    /// deep-copying it. `let layout = config.layout; layout.table[at]` emitted
+    /// `const layout = __clone(config[0])` though neither side can change while
+    /// the binding lives — in kolt's search matcher that one line cloned a
+    /// 16K-entry table per alignment. The binding is shared when:
+    ///
+    /// - it is an immutable `let` that holds no view, initialized from a field,
+    ///   element or index projection (or a bare read) of a binding;
+    /// - that root cannot change while the binding lives: a non-`mut` bare or a
+    ///   `&` parameter (the caller's storage, which nothing in this frame can
+    ///   write), an `own` parameter nothing writes, or an immutable `let` that
+    ///   holds no view and is never written in place;
+    /// - it never leaves the frame: no value seam roots it (a return, a tail, a
+    ///   match leg's value) and no other region reads it (a closure capture,
+    ///   which the last-use pass reports as opaque).
+    ///
+    /// The same three conditions the capture SHARE elision rests on (B53),
+    /// asked of a `let`. A store of the binding (an `own` argument, a
+    /// construction slot) still copies at the store, and the binding never
+    /// DONATES (rule 2 refuses it, as it refuses a shared capture). The native
+    /// backend keeps its copy: a `clone_sites` decision is how it learns that a
+    /// Rust value must be cloned out of a borrow, so this is a JS emission
+    /// choice and `clone_sites` is unchanged.
+    fn compute_shared_place_lets(&self) -> (HashSet<Id>, HashSet<Id>) {
+        let written_roots = self.collect_written_roots();
+        // A leaf whose type cannot carry storage — a scalar read off the
+        // binding at a tail (`layout.table[at]`) — aliases nothing.
+        let seam_roots = self.value_seam_roots_where(&|analyzer, leaf| {
+            analyzer.place_value_type_id(leaf).is_none_or(|type_id| {
+                let leaf_type = type_id.get_type(analyzer);
+                analyzer.is_cloneable_aggregate(&leaf_type) || matches!(leaf_type, Type::Generic(_))
+            })
+        });
+        let handed_on = self.bindings_handed_on_whole();
+        let mut bindings = HashSet::default();
+        let mut initializers = HashSet::default();
+        for expr in self.expr_id_to_expr_map.values() {
+            let Expr::Variable(variable_id) = expr else {
+                continue;
+            };
+            let Some(variable) = self.variables.get(variable_id) else {
+                continue;
+            };
+            let Some(value_id) = variable.initial else {
+                continue;
+            };
+            if variable.mutable
+                || handed_on.contains(variable_id)
+                || self.view_binding_mutability(*variable_id).is_some()
+                || written_roots.in_place.contains(variable_id)
+                || seam_roots.contains(variable_id)
+                || self.last_use.is_opaque(*variable_id)
+            {
+                continue;
+            }
+            let Some(root) = self.projection_root(value_id) else {
+                continue;
+            };
+            if root != *variable_id
+                && self.root_is_stable(root, &written_roots)
+                && self.type_is_plain_value(variable.type_id, &mut Vec::new())
+            {
+                bindings.insert(*variable_id);
+                initializers.insert(value_id);
+            }
+        }
+        (bindings, initializers)
+    }
+
+    /// Whether a value of this type can change ONLY through a write the
+    /// analysis sees — a `&mut` method, a component assignment — so "nothing
+    /// writes the root" means "nothing changes it" (M90). A host type is opaque:
+    /// `Bytes::set(self, ..)` writes its typed array in place through a bare
+    /// `self` (`bytes-aliasing.vl`), and a DOM node is mutated by the page, so an
+    /// `external` struct qualifies only when std's own semantics are known: the
+    /// scalars, `List`, and the handles whose copy SHARES anyway (`Shared`,
+    /// `Weak`, `SignalCell` — `__clone` keeps a cell by reference). A generic
+    /// still open, a trait object (whose table may reach a host type) and
+    /// anything not resolved do not qualify.
+    fn type_is_plain_value(&self, type_id: TypeId, visiting: &mut Vec<Id>) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        let Some(type_) = self.type_id_to_type_map.get(&type_id) else {
+            return false;
+        };
+        // An ARGUMENT is a type in the caller's terms, asked afresh: a binder
+        // still open there is an instantiation nobody knows.
+        let arguments_plain = |analyzer: &Self, arguments: &[TypeId], _: &mut Vec<Id>| {
+            arguments
+                .iter()
+                .all(|argument| analyzer.type_is_plain_value(*argument, &mut Vec::new()))
+        };
+        match type_ {
+            Type::Struct(id, arguments) => {
+                if self.is_scalar_primitive(*id) {
+                    return true;
+                }
+                let known_handle = ["List", "Shared", "Weak", "SignalCell"]
+                    .iter()
+                    .any(|name| self.primitive_struct_ids.get(name) == Some(id));
+                if known_handle {
+                    return arguments_plain(self, arguments, visiting);
+                }
+                let Some(struct_) = self.structs.get(id) else {
+                    return false;
+                };
+                if struct_.external {
+                    return false;
+                }
+                if visiting.contains(id) {
+                    return true;
+                }
+                visiting.push(*id);
+                let plain = struct_
+                    .fields
+                    .iter()
+                    .all(|field| self.type_is_plain_value(field.type_id, visiting))
+                    && arguments_plain(self, arguments, visiting);
+                visiting.pop();
+                plain
+            }
+            Type::Enum(id, arguments) => {
+                let Some(enum_) = self.enums.get(id) else {
+                    return false;
+                };
+                if visiting.contains(id) {
+                    return true;
+                }
+                visiting.push(*id);
+                let plain = enum_.variants.iter().all(|variant| {
+                    variant
+                        .data_type_ids
+                        .iter()
+                        .all(|data| self.type_is_plain_value(*data, visiting))
+                }) && arguments_plain(self, arguments, visiting);
+                visiting.pop();
+                plain
+            }
+            Type::Tuple(items) => items
+                .iter()
+                .all(|item| self.type_is_plain_value(*item, visiting)),
+            Type::Array(item, _) => self.type_is_plain_value(*item, visiting),
+            // A field written in the struct's own terms: the ARGUMENTS the
+            // instantiation binds are checked beside the fields.
+            Type::Generic(_) => !visiting.is_empty(),
+            Type::Closure(..) => true,
+            _ => false,
+        }
+    }
+
+    /// The bindings some expression hands on WHOLE — a store (a construction
+    /// slot, an assignment, another `let`), a call argument not provably a loan,
+    /// a pattern's subject. M90 shares only a `let` that is read through
+    /// projections and loans: a shared binding owns nothing, so rule 2 could
+    /// not donate it at a store, and the copy it then took there would be a
+    /// copy the native backend (which keeps the `let`'s own) never needed.
+    fn bindings_handed_on_whole(&self) -> HashSet<Id> {
+        let mut handed_on = HashSet::default();
+        let whole = |handed_on: &mut HashSet<Id>, value_id: Id| {
+            if let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(&value_id) {
+                handed_on.insert(*binding_id);
+            }
+        };
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                Expr::Variable(variable_id) => {
+                    if let Some(initial) = self
+                        .variables
+                        .get(variable_id)
+                        .and_then(|variable| variable.initial)
+                    {
+                        whole(&mut handed_on, initial);
+                    }
+                }
+                Expr::Assignment(_, value_id) => whole(&mut handed_on, *value_id),
+                Expr::List(slots) | Expr::Tuple(slots) => {
+                    for slot in slots {
+                        whole(&mut handed_on, *slot);
+                    }
+                }
+                Expr::StructInitializer(_, assignments) => {
+                    for value_id in assignments.values() {
+                        whole(&mut handed_on, *value_id);
+                    }
+                }
+                Expr::Match(subject_id, _)
+                | Expr::Is(subject_id, _)
+                | Expr::Destructure(subject_id, _) => whole(&mut handed_on, *subject_id),
+                Expr::Call(call_id) => {
+                    let Some(function_call) = self.function_calls.get(call_id) else {
+                        continue;
+                    };
+                    let conventions = self.callee_conventions(function_call.subject_id);
+                    for (index, argument_id) in function_call.argument_ids.iter().enumerate() {
+                        let loaned = conventions.as_ref().is_some_and(|conventions| {
+                            matches!(
+                                conventions.get(index),
+                                Some(Convention::Bare | Convention::Ref)
+                            )
+                        });
+                        if !loaned {
+                            whole(&mut handed_on, *argument_id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        handed_on
+    }
+
+    /// The binding a chain of field, element and index projections reads —
+    /// `config.layout.table` → `config`; a bare read is its own root. `None`
+    /// through anything else (a dereference, a call), which [`Self::compute_shared_place_lets`]
+    /// does not reason about.
+    fn projection_root(&self, expr_id: Id) -> Option<Id> {
+        match self.expr_id_to_expr_map.get(&expr_id)? {
+            Expr::Local(binding_id) => Some(*binding_id),
+            Expr::Field(subject_id, _, _)
+            | Expr::TupleIndex(subject_id, _, _)
+            | Expr::Index(subject_id, _) => self.projection_root(*subject_id),
+            _ => None,
+        }
+    }
+
+    /// Whether `root`'s storage cannot change while this frame runs — M90's
+    /// stability, written for a ROOT (see [`Self::compute_shared_place_lets`]).
+    fn root_is_stable(&self, root: Id, written_roots: &WrittenRoots) -> bool {
+        if let Some(parameter) = self.parameters.get(&root) {
+            return match parameter.convention {
+                Convention::Bare => !parameter.mutable,
+                Convention::Ref => true,
+                Convention::Own => !written_roots.any.contains(&root),
+                _ => false,
+            };
+        }
+        self.variables.get(&root).is_some_and(|variable| {
+            !variable.mutable
+                && self.view_binding_mutability(root).is_none()
+                && !written_roots.in_place.contains(&root)
+                && !self.shared_cells_root(root)
+        })
+    }
+
+    /// Whether `root` is a binding B267 lets alias a `Shared` cell's storage —
+    /// stable by B267's own rule, but asked of explicitly so a change to that
+    /// rule cannot widen this one silently.
+    fn shared_cells_root(&self, root: Id) -> bool {
+        self.shared_read_bindings.contains(&root)
+    }
+
     fn compute_shared_read_bindings(&self) -> (HashSet<Id>, HashSet<Id>) {
         if self.shared_cells.reads.is_empty() {
             return (HashSet::default(), HashSet::default());
@@ -32736,48 +32996,81 @@ impl<'src> Analyzer<'src> {
     /// whole program, because B267's elision has to know whether the storage it
     /// is about to share can leave the frame that shares it.
     fn value_seam_roots(&self) -> HashSet<Id> {
+        self.value_seam_roots_where(&|_, _| true)
+    }
+
+    /// [`Self::value_seam_roots`], counting only the seam LEAVES `keep` admits
+    /// — M90 asks for the leaves that can carry storage out (an aggregate, or a
+    /// generic one copied at every instantiation), since a scalar read off a
+    /// binding at a tail aliases nothing.
+    fn value_seam_roots_where(&self, keep: &dyn Fn(&Self, Id) -> bool) -> HashSet<Id> {
         let mut roots = HashSet::default();
         for function in self.functions.values() {
             if function.has_body {
-                self.insert_seam_roots(function.body.1, &mut roots);
+                self.insert_seam_roots_where(function.body.1, &mut roots, keep);
             }
         }
         for closure in self.closures.values() {
-            self.insert_seam_roots(closure.return_, &mut roots);
+            self.insert_seam_roots_where(closure.return_, &mut roots, keep);
         }
         for module in self.modules.values() {
-            self.insert_seam_roots(module.body.1, &mut roots);
+            self.insert_seam_roots_where(module.body.1, &mut roots, keep);
         }
         for expr in self.expr_id_to_expr_map.values() {
             match expr {
                 Expr::FunctionReturn(Some(value_id)) => {
-                    self.insert_seam_roots(*value_id, &mut roots);
+                    self.insert_seam_roots_where(*value_id, &mut roots, keep);
                 }
                 Expr::Match(_, legs) => {
                     for leg in legs {
-                        self.insert_seam_roots(leg.body, &mut roots);
+                        self.insert_seam_roots_where(leg.body, &mut roots, keep);
                     }
                 }
                 Expr::Block((_, tail_id))
                 | Expr::For(_, (_, tail_id))
-                | Expr::ForEach(_, _, (_, tail_id)) => self.insert_seam_roots(*tail_id, &mut roots),
-                Expr::If(branch) => self.insert_branch_seam_roots(branch, &mut roots),
+                | Expr::ForEach(_, _, (_, tail_id)) => {
+                    self.insert_seam_roots_where(*tail_id, &mut roots, keep)
+                }
+                Expr::If(branch) => self.insert_branch_seam_roots(branch, &mut roots, keep),
                 _ => {}
             }
         }
         roots
     }
 
+    /// [`Self::insert_seam_roots`] over the leaves `keep` admits.
+    fn insert_seam_roots_where(
+        &self,
+        expr_id: Id,
+        seam_roots: &mut HashSet<Id>,
+        keep: &dyn Fn(&Self, Id) -> bool,
+    ) {
+        let mut leaves = Vec::new();
+        self.collect_tail_leaves(expr_id, &mut leaves);
+        for leaf in leaves {
+            if keep(self, leaf)
+                && let Some(root) = self.place_root(leaf)
+            {
+                seam_roots.insert(root);
+            }
+        }
+    }
+
     /// The `if` chain's tails, for the walk above.
-    fn insert_branch_seam_roots(&self, branch: &ExprIfBranch, roots: &mut HashSet<Id>) {
+    fn insert_branch_seam_roots(
+        &self,
+        branch: &ExprIfBranch,
+        roots: &mut HashSet<Id>,
+        keep: &dyn Fn(&Self, Id) -> bool,
+    ) {
         match branch {
             ExprIfBranch::If(_, (_, tail_id), otherwise) => {
-                self.insert_seam_roots(*tail_id, roots);
+                self.insert_seam_roots_where(*tail_id, roots, keep);
                 if let Some(otherwise) = otherwise {
-                    self.insert_branch_seam_roots(otherwise, roots);
+                    self.insert_branch_seam_roots(otherwise, roots, keep);
                 }
             }
-            ExprIfBranch::Else((_, tail_id)) => self.insert_seam_roots(*tail_id, roots),
+            ExprIfBranch::Else((_, tail_id)) => self.insert_seam_roots_where(*tail_id, roots, keep),
         }
     }
 
@@ -32892,6 +33185,7 @@ impl<'src> Analyzer<'src> {
                 || !self.binding_owns_a_construction(binding_id)
                 || shared_captures.contains(&binding_id)
                 || self.shared_read_bindings.contains(&binding_id)
+                || self.shared_place_lets.contains(&binding_id)
                 || self.binding_or_param_is_view(binding_id)
             {
                 continue;
@@ -32953,7 +33247,10 @@ impl<'src> Analyzer<'src> {
         // it owns nothing, so it has nothing to donate, and moving out of it
         // would hand a second owner the cell's storage through an elision that
         // is sound only for an owner.
-        if shared_captures.contains(binding_id) || self.shared_read_bindings.contains(binding_id) {
+        if shared_captures.contains(binding_id)
+            || self.shared_read_bindings.contains(binding_id)
+            || self.shared_place_lets.contains(binding_id)
+        {
             return false;
         }
         // An `own` PARAMETER is a dead owner at its last use exactly as a local
@@ -65459,6 +65756,9 @@ pub struct Program<'src> {
     // Call exprs resolving to a `borrows` function that returns a scalar view, so
     // `*call` derefs through `call[0][call[1]]`.
     pub scalar_view_calls: HashSet<Id>,
+    /// M90: the initializers of read-only `let`s of a stable place, whose
+    /// `clone_sites` copy the JS emitter skips (the native one keeps it).
+    pub shared_place_inits: HashSet<Id>,
     // The HMR transfer classification (`hmr.md` §4), one entry per module-level
     // `let` binding of the ENTRY package: its transfer form, source-derived
     // identity key, and structural fingerprint. Computed always (a cheap type-
@@ -74365,6 +74665,10 @@ fn analyze_over_world<'src>(
     analyzer.shared_cells = analyzer.compute_shared_cells();
     (analyzer.shared_read_bindings, analyzer.elided_shared_reads) =
         analyzer.compute_shared_read_bindings();
+    // M90: before the capture plan, whose move elision must refuse to move out
+    // of a shared `let` exactly as rule 2 below does.
+    (analyzer.shared_place_lets, analyzer.shared_place_inits) =
+        analyzer.compute_shared_place_lets();
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
@@ -75207,6 +75511,7 @@ fn analyze_over_world<'src>(
         primitive_views,
         scalar_view_refs,
         scalar_view_calls,
+        shared_place_inits: std::mem::take(&mut analyzer.shared_place_inits),
         hmr_bindings,
         call_graph_memo: std::sync::OnceLock::new(),
         bound_selection_memo: std::sync::Mutex::default(),
