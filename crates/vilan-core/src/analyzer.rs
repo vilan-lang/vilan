@@ -5176,6 +5176,11 @@ pub struct Analyzer<'src> {
     /// standing on the initializer, not on the binding), rule 2 asks by binding
     /// — one pass fills both.
     elided_shared_reads: HashSet<Id>,
+    /// M109: the field projections of a DYING owner that a construction takes
+    /// whole — `held = V(payload.0, payload.1)` with `payload` dead after it —
+    /// which donate their storage instead of being copied (rule 2, one level
+    /// below a binding). Filled by [`Self::compute_donated_projections`].
+    donated_projections: HashSet<Id>,
     resolved_types: HashMap<Id, TypeId>,
     // B70 (`variadic-generics.md` §T.8): the type of every ELEMENT of a tuple
     // construction, keyed by the element's expr id — the type the tuple rule
@@ -7237,6 +7242,7 @@ impl<'src> Analyzer<'src> {
             shared_cells: SharedCells::default(),
             shared_read_bindings: HashSet::default(),
             elided_shared_reads: HashSet::default(),
+            donated_projections: HashSet::default(),
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
             tuple_index_paths: HashMap::default(),
@@ -31274,6 +31280,7 @@ impl<'src> Analyzer<'src> {
     /// is the only position a value reaches a `&mut` binding through, a `&mut`
     /// parameter taking a view and nothing else.
     fn compute_clone_sites(&mut self, shared_captures: &HashSet<Id>) -> HashMap<Id, CopyDecision> {
+        self.donated_projections = self.compute_donated_projections(shared_captures);
         // Phase 1 — the candidate positions, collected before any classifying
         // so the (`&mut`, memoizing) resource query can run over them.
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
@@ -31559,6 +31566,7 @@ impl<'src> Analyzer<'src> {
         if self.assignment_target_is_view(value_id)
             || self.resource_value_places.contains(&value_id)
             || self.is_elidable_copy(value_id, shared_captures)
+            || self.donated_projections.contains(&value_id)
         {
             return None;
         }
@@ -32801,6 +32809,141 @@ impl<'src> Analyzer<'src> {
     /// `pair.0` through two elisions that are each sound alone. Refusing here
     /// makes the second binding copy, which restores the invariant every other
     /// elision rests on: only an OWNER moves.
+    /// M109: rule 2 one level below a binding. A construction that takes
+    /// DISJOINT field projections of one owned binding as its slots —
+    /// `held = V(payload.0, payload.1)`, `P { a = pair.0, b = pair.1 }` — where
+    /// the projection evaluated last is the binding's last use, donates every
+    /// one of them: the binding is dead once the construction has read it, and
+    /// no two slots name the same storage, so the copies could never be
+    /// observed. Only constructions whose other slots cannot read the binding
+    /// qualify (literals, other bindings and their projections), which is what
+    /// makes "the last projection is the last use" cover the earlier ones too.
+    /// The derive's multi-payload write step deep-copied its dead payload back
+    /// into the variant on every write (B509's remainder).
+    fn compute_donated_projections(&self, shared_captures: &HashSet<Id>) -> HashSet<Id> {
+        let mut donated = HashSet::default();
+        for expr in self.expr_id_to_expr_map.values() {
+            let slots: Vec<Id> = match expr {
+                Expr::List(slots) | Expr::Tuple(slots) => slots.clone(),
+                Expr::StructInitializer(_, assignments) => assignments.values().copied().collect(),
+                Expr::Call(call_id) => {
+                    let Some(function_call) = self.function_calls.get(call_id) else {
+                        continue;
+                    };
+                    let is_variant = matches!(
+                        self.expr_id_to_expr_map.get(&function_call.subject_id),
+                        Some(Expr::Local(callee_id)) if matches!(
+                            self.expr_id_to_expr_map.get(callee_id),
+                            Some(Expr::EnumVariant(_, _))
+                        )
+                    );
+                    if !is_variant {
+                        continue;
+                    }
+                    function_call.argument_ids.clone()
+                }
+                _ => continue,
+            };
+            self.donate_disjoint_projections(&slots, shared_captures, &mut donated);
+        }
+        donated
+    }
+
+    /// [`Self::compute_donated_projections`] for one construction's slots, in
+    /// evaluation order.
+    fn donate_disjoint_projections(
+        &self,
+        slots: &[Id],
+        shared_captures: &HashSet<Id>,
+        donated: &mut HashSet<Id>,
+    ) {
+        // The binding one level under each slot, with the slot's flat range
+        // and the `Local` read inside it; `None` for a slot that reads no
+        // binding at all (a literal). A slot of any other shape may read
+        // anything, so the construction does not qualify.
+        let mut projections: Vec<(Id, Id, std::ops::Range<usize>, Id)> = Vec::new();
+        let mut plain_reads: Vec<Id> = Vec::new();
+        for slot_id in slots {
+            match self.expr_id_to_expr_map.get(slot_id) {
+                Some(Expr::TupleIndex(subject_id, offset, width)) => {
+                    let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(subject_id)
+                    else {
+                        return;
+                    };
+                    projections.push((*slot_id, *binding_id, *offset..offset + width, *subject_id));
+                }
+                Some(Expr::Field(subject_id, _, index)) => {
+                    let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(subject_id)
+                    else {
+                        return;
+                    };
+                    projections.push((*slot_id, *binding_id, *index..index + 1, *subject_id));
+                }
+                Some(Expr::Local(binding_id)) => plain_reads.push(*binding_id),
+                Some(Expr::Number(..) | Expr::String(..) | Expr::Bool(..) | Expr::Null) => {}
+                _ => return,
+            }
+        }
+        let mut bindings: Vec<Id> = projections.iter().map(|projection| projection.1).collect();
+        bindings.sort_by_key(|id| id.0);
+        bindings.dedup();
+        for binding_id in bindings {
+            if plain_reads.contains(&binding_id)
+                || !self.binding_owns_a_construction(binding_id)
+                || shared_captures.contains(&binding_id)
+                || self.shared_read_bindings.contains(&binding_id)
+                || self.binding_or_param_is_view(binding_id)
+            {
+                continue;
+            }
+            let own: Vec<&(Id, Id, std::ops::Range<usize>, Id)> = projections
+                .iter()
+                .filter(|projection| projection.1 == binding_id)
+                .collect();
+            let disjoint = own.iter().enumerate().all(|(index, left)| {
+                own[index + 1..]
+                    .iter()
+                    .all(|right| left.2.end <= right.2.start || right.2.end <= left.2.start)
+            });
+            let Some(last) = own.last() else {
+                continue;
+            };
+            if disjoint && self.last_use.is_last_use(last.3, binding_id) {
+                donated.extend(own.iter().map(|projection| projection.0));
+            }
+        }
+    }
+
+    /// Whether `binding_id` is a `let`/`mut` whose initializer BUILDS its value
+    /// — a tuple, list, struct or variant construction — so the binding owns
+    /// every slot outright (rule 1 copied or donated each one in). A pattern
+    /// capture may share its subject's storage (a wrapped view's `Some(let
+    /// entry)` reads the map in place), and a binding initialized from a place
+    /// or a call owns only what the rules beneath it decided, so neither is a
+    /// donor of its FIELDS here (M109).
+    fn binding_owns_a_construction(&self, binding_id: Id) -> bool {
+        let Some(initial) = self
+            .variables
+            .get(&binding_id)
+            .and_then(|variable| variable.initial)
+        else {
+            return false;
+        };
+        match self.expr_id_to_expr_map.get(&initial) {
+            Some(Expr::Tuple(_) | Expr::List(_) | Expr::StructInitializer(..)) => true,
+            Some(Expr::Call(call_id)) => self.function_calls.get(call_id).is_some_and(|call| {
+                matches!(
+                    self.expr_id_to_expr_map.get(&call.subject_id),
+                    Some(Expr::Local(callee_id)) if matches!(
+                        self.expr_id_to_expr_map.get(callee_id),
+                        Some(Expr::EnumVariant(_, _))
+                    )
+                )
+            }),
+            _ => false,
+        }
+    }
+
     fn is_elidable_copy(&self, value_id: Id, shared_captures: &HashSet<Id>) -> bool {
         let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(&value_id) else {
             return false;

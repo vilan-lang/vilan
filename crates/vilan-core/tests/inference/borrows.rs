@@ -12638,6 +12638,107 @@ fn b528_a_write_to_a_copy_or_readonly_capture_steers_to_the_view_subject() {
 /// payload out and back on every write. Counted, not timed: the emitted
 /// `__clone` is instrumented and every call counted. The old shape is the
 /// control that proves the counter is live.
+/// M109 (B509's remainder): the write-BACK of a dead payload copies nothing.
+/// The derive's multi-payload step (`mut payload = (p0, p1); f(&mut payload);
+/// held = V(payload.0, payload.1)`) and a single payload lent to a closure
+/// (`f(&mut p0); held = V(p0)`) deep-copied the payload back although it dies
+/// there — the first because rule 2 elided only a whole BINDING, never its
+/// disjoint fields, and both because a `&mut` loan to a CLOSURE binding made
+/// the owner opaque to the last-use pass. Counted, as B509's pin counts: each
+/// write still copies the payload OUT once (the capture, Q6), and no longer
+/// copies it back.
+#[test]
+fn m109_the_write_back_of_a_dead_payload_copies_nothing() {
+    fn copies_made(source: &str) -> usize {
+        let js = compile(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let counted = js.replace(
+            "function __clone(value) {",
+            "function __clone(value) { globalThis.__copies = (globalThis.__copies ?? 0) + 1;",
+        );
+        let counted = format!(
+            "process.on('exit', () => console.log('copies=' + (globalThis.__copies ?? 0)));\n{counted}"
+        );
+        let stdout = run_js(&counted).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("copies="))
+            .expect("the exit hook prints the count")
+            .parse()
+            .expect("a count")
+    }
+    let program = |step: &str, start: &str| {
+        format!(
+            r#"
+        import std::io::print;
+
+        struct P {{ x: i32 }}
+
+        enum E {{ A(P), B(P, i32), C }}
+
+        {step}
+
+        fun main() {{
+            mut e = {start};
+            mut n = 0;
+            for n < 100 {{
+                step(&mut e, |p: &mut P| {{
+                    p.x += 1;
+                }});
+                n += 1;
+            }}
+            print(match &e {{
+                E::A(let p) => p.x,
+                E::B(let p, _) => p.x,
+                E::C => 0,
+            }});
+        }}
+        "#
+        )
+    };
+    let single = program(
+        r#"
+        fun step(held: &mut E, f: |&mut P| void) {
+            match held {
+                E::A(mut p0) => {
+                    f(&mut p0);
+                    held = E::A(p0);
+                },
+                _ => {},
+            }
+        }
+        "#,
+        "E::A(P { x = 0 })",
+    );
+    let multi = program(
+        r#"
+        fun step(held: &mut E, f: |&mut P| void) {
+            match held {
+                E::B(let p0, let p1) => {
+                    mut payload = (p0, p1);
+                    f(&mut payload.0);
+                    held = E::B(payload.0, payload.1);
+                },
+                _ => {},
+            }
+        }
+        "#,
+        "E::B(P { x = 0 }, 7)",
+    );
+    // `__clone` counts itself once per value it visits: a `P` is two (the
+    // record and its field), so one copy out per write is 200 for 100 writes,
+    // and the copy back made it 400.
+    assert_eq!(
+        copies_made(&single),
+        200,
+        "a single payload lent to a closure copied back at its write-back (M109)"
+    );
+    assert_eq!(
+        copies_made(&multi),
+        200,
+        "the multi-payload step copied its dead payload back into the variant (M109)"
+    );
+}
+
 #[test]
 fn b509_a_through_variant_write_copies_nothing() {
     fn copies_made(source: &str) -> usize {

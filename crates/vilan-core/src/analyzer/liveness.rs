@@ -915,6 +915,35 @@ impl Liveness<'_, '_> {
 }
 
 impl Analyzer<'_> {
+    /// Whether a call's callee is a BINDING of closure type — a closure
+    /// parameter or local, called by name (M109). Its signature is read: the
+    /// closure type names each parameter's mode, and a view a closure is handed
+    /// cannot outlive the call (the view-escape rule holds inside a closure
+    /// body as anywhere), so a `&mut place` handed to it is call-bounded
+    /// exactly as one handed to a resolved function is. Refusing it made the
+    /// place's owner opaque, and the derive's write step `f(&mut payload);
+    /// held = V(payload)` deep-copied a payload that was already dead.
+    fn callee_is_a_closure_binding(&self, subject_id: Id) -> bool {
+        let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+            return false;
+        };
+        let type_id = self
+            .variables
+            .get(binding_id)
+            .map(|variable| variable.type_id)
+            .or_else(|| {
+                self.parameters
+                    .get(binding_id)
+                    .map(|parameter| parameter.type_id)
+            });
+        type_id.is_some_and(|type_id| {
+            matches!(
+                self.type_id_to_type_map.get(&type_id),
+                Some(super::Type::Closure(..))
+            )
+        })
+    }
+
     /// The owners of loans this pass cannot follow to their end.
     ///
     /// The extension rule (§6.1) only holds where the view has a liveness of
@@ -970,7 +999,9 @@ impl Analyzer<'_> {
                     // M37: the yes/no this position wants, without the
                     // `Vec<Convention>` that `callee_conventions(..).is_some()`
                     // built and dropped once per call in the program.
-                    if self.callee_is_resolved(function_call.subject_id) {
+                    if self.callee_is_resolved(function_call.subject_id)
+                        || self.callee_is_a_closure_binding(function_call.subject_id)
+                    {
                         anchored.extend(function_call.argument_ids.iter().copied());
                     }
                     if !self.callee_retains(function_call.subject_id) {
