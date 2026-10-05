@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**The native copy census counts what a closure copies when it is created, and the native leak census pins the one cycle a captured binding can close.** Two gaps closure-captures-on-native.md found. First, `native-copy-census.tsv` gains a fourth column, `capture_copies`: the values a closure's capture prelude copies at its creation (`let items = items.clone();` ahead of the `move`), not counting handle bumps (a boxed binding's cell, a closure, a counted host handle, a `str`) or scalars. The consumed-read columns never saw them. `VILAN_NATIVE_REPORT_COPIES=1` prints the count as `capture-copies=` on its existing line. No existing column moved; the new column is non-zero in nine of the 37 rows, the reactive programs leading (`reactive-flatten` 37, `dyn-objects` 25). Second, a binding captured by a closure stored in that binding's own value is a reference cycle natively: its counted cell holds the closure that holds the cell. JS's collector reclaims it. The leak census gains that program as a row that is live by design (`native_probe_captured_cycle 1 1`), and the spec states the limit beside §6.9. Pins: `native_differential`'s `the_capture_column_counts_a_copied_capture_and_no_handle` (one closure capturing a list, a `Shared`, a `str`, a closure, a scalar and a boxed `mut`; only the list counts), and the two regenerated census tables. Tracker F50.
+
+---
+
 <!-- family: fix -->
 **Native: `*{ &m }` — a dereference of a block whose tail is a view — builds and reads the value, where rustc refused it (E0614 "type `i32` cannot be dereferenced" over a scalar, E0599 over a `str` or a list).** A block's tail is a value position, so its `&m` was emitted as the copy `{ (m).clone() }` and the `*` was then applied to that copy. F81 taught the `if` and `match` forms that their branches' tails are already the copies; a block is the same position, and now takes the same rule at both sites (the deref's emission and its consumed read). JS reads the value since B514. Pin: `native_differential`'s `a_deref_of_a_blocks_view_reads_the_value_on_both_backends` (`native/deref_of_a_block_view.vl`: a scalar, a `str`, a field, a subscript, a list copied then grown, statements before the tail, nested blocks, a block whose tail is an `if` — six rustc errors on 0.44.0). Tracker F88.
 

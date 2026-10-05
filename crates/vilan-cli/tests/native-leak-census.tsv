@@ -39,3 +39,4 @@ keyword-members	0	0
 shared	2	0
 shared-compound-write	38	0
 native_probe_board	17	0
+native_probe_captured_cycle	1	1

@@ -114,6 +114,15 @@ pub struct Emitted {
     /// handle is one of those and is not a copy).
     pub consumed_copies: usize,
     pub consumed_copies_elided: usize,
+    /// F50: how many CAPTURES this emit copied into a closure at its creation
+    /// — the `let x = x.clone();` prelude every `move` closure carries — that
+    /// are a real copy of the value rather than a handle bump (a boxed
+    /// binding's cell, a closure, a counted host handle, a `str`) or a scalar.
+    /// The consumed-read count above never sees them: a closure-creation
+    /// copy is no consumed place read. kolt's native server carried 277
+    /// prelude clones over 114 closures (closure-captures-on-native.md §4.2)
+    /// that no census could count.
+    pub capture_copies: usize,
 }
 
 /// The runtime crates a program links only when it REACHES them — each one a
@@ -493,6 +502,8 @@ struct Emitter<'a, 'src> {
     /// consumed place reads this emit COPIED and how many it moved.
     copies_taken: usize,
     copies_elided: usize,
+    /// F50's column: the capture-prelude copies — see [`Emitted::capture_copies`].
+    capture_copies: usize,
     /// A124 R3: the Rust trait each OBJECT type lowers to — one per vilan trait
     /// at its concrete arguments (`dyn Source<i32>` and `dyn Source<str>` are
     /// two), keyed like a nominal instance. See [`Emitter::ensure_object_trait`].
@@ -631,6 +642,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             liveness_walked: HashSet::new(),
             copies_taken: 0,
             copies_elided: 0,
+            capture_copies: 0,
             object_traits: HashMap::default(),
             object_impls: HashSet::new(),
             drop_nominals: drop_implementing_nominals(program),
@@ -703,6 +715,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
             consumed_copies_elided: self.copies_elided,
+            capture_copies: self.capture_copies,
         })
     }
 
@@ -7467,6 +7480,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let body = self.closure_body(&closure, depth);
         self.closure_captures.pop();
         let body = body?;
+        self.capture_copies += captures
+            .iter()
+            .filter(|binding| self.capture_is_a_copy(**binding))
+            .count();
         let prelude: String = captures
             .iter()
             .map(|binding| {
@@ -7522,6 +7539,62 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "{{ {prelude}std::rc::Rc::new(move |{}| {{ {body} }}){as_counted} }}",
             parameters.join(", ")
         ))
+    }
+
+    /// Whether a closure's capture prelude COPIES `binding`'s value (F50's
+    /// census column) rather than bumping a count: a boxed binding is its
+    /// `Captured` cell, a closure an `Rc`, a context value and the counted host
+    /// handles (`Shared`, `Weak`, the executor's) are handles, a `str` is an
+    /// `Rc<str>`, and a scalar copies nothing worth counting.
+    fn capture_is_a_copy(&self, binding: Id) -> bool {
+        if self.boxed.contains(&binding)
+            || self
+                .program
+                .context_hidden_parameters
+                .contains_key(&binding)
+        {
+            return false;
+        }
+        let type_id = self
+            .program
+            .variables
+            .get(&binding)
+            .map(|variable| variable.type_id)
+            .or_else(|| {
+                self.program
+                    .parameters
+                    .get(&binding)
+                    .map(|parameter| parameter.type_id)
+            });
+        let Some(type_id) = type_id else {
+            return true;
+        };
+        if self.is_numeric_scalar(type_id) || self.is_str_type(type_id) {
+            return false;
+        }
+        match self.resolve(type_id) {
+            Some(Type::Closure(..)) => false,
+            Some(Type::Enum(enum_id, _)) => self.program.bool_enum_id != Some(*enum_id),
+            Some(Type::Struct(struct_id, _)) => {
+                !self
+                    .program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| {
+                        declaration.external
+                            && matches!(
+                                declaration.name,
+                                "Shared"
+                                    | "Weak"
+                                    | "Task"
+                                    | "Nursery"
+                                    | "CancelSignal"
+                                    | "TimerHandle"
+                            )
+                    })
+            }
+            _ => true,
+        }
     }
 
     /// The return type a closure literal's `dyn Fn` cast WRITES (F67), or

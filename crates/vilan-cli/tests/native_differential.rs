@@ -6445,16 +6445,28 @@ fn a_reentrant_read_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
 /// stop. Since F45 it can be told — SIGTERM stops it gracefully and the
 /// census reads it at process end — and the kolt shape's exit line is held by
 /// [`a_native_server_stops_on_sigterm_and_reaches_its_process_end`].
+///
+/// **One row is live by design** (F50): [`CAPTURED_CYCLE_PROBE`], a binding
+/// captured by a closure stored in the binding's own value. Natively the
+/// boxed binding's cell holds the closure that holds the cell — an `Rc` cycle
+/// JS's collector reclaims and a counted cell cannot (spec §6.9's native
+/// limit). The row pins the limit, `live = 1`, so it is a measured boundary
+/// rather than a hidden failure.
 #[test]
 fn the_native_leak_census_matches_its_table() {
     let staged = stage();
     std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
         .expect("write the board probe");
+    std::fs::write(
+        staged.join("native_probe_captured_cycle.vl"),
+        CAPTURED_CYCLE_PROBE,
+    )
+    .expect("write the captured-cycle probe");
     let mut rows = Vec::new();
     for program in DEFAULT_SUITE
         .iter()
         .copied()
-        .chain(std::iter::once("native_probe_board.vl"))
+        .chain(["native_probe_board.vl", "native_probe_captured_cycle.vl"])
     {
         let (minted, live) = leak_census_of(&staged, program);
         rows.push(format!(
@@ -6489,6 +6501,26 @@ fn the_native_leak_census_matches_its_table() {
 }
 
 const NATIVE_LEAK_CENSUS: &str = "crates/vilan-cli/tests/native-leak-census.tsv";
+
+/// closure-captures-on-native.md's p10 (F50): `holder`'s second value holds a
+/// closure that captures `holder`, so natively the boxed binding's cell and
+/// the closure keep each other alive past the program's end.
+const CAPTURED_CYCLE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Holder {\n",
+    "\tn: i32,\n",
+    "\trun: || i32,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut holder = Holder { n = 1, run = || 0 };\n",
+    "\tholder = Holder { n = 2, run = || holder.n };\n",
+    "\tprint((holder.run)());\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);
 
 /// Runs `program` natively under `VILAN_NATIVE_LEAK_CENSUS=1` and answers
 /// `(minted, live)` from the line the runtime prints on stderr.
@@ -7294,14 +7326,27 @@ fn a_last_use_inside_a_loop_keeps_its_copy_and_one_declared_inside_it_moves() {
 /// a destructure's), which are exactly the ones the native liveness pass is
 /// answerable for.
 ///
+/// **The capture column** (F50) counts what that consumed-read count cannot
+/// see: the copies a closure's capture prelude takes when the closure is
+/// created (`let items = items.clone();` ahead of the `move`), excluding the
+/// handle bumps (a boxed binding's cell, a closure, a counted host handle, a
+/// `str`) and scalars. It is the number closure-captures-on-native.md §4.2's
+/// shared-capture work has to move.
+///
 /// **The programs** are [`DEFAULT_SUITE`] plus the paper's board probe, because
 /// that is the set the byte gate runs on every build; the whole corpus is one
 /// list away and costs an emit per program.
 const NATIVE_COPY_CENSUS: &str = "crates/vilan-cli/tests/native-copy-census.tsv";
 
-/// One program's census line, as the compiler reports it under
-/// `VILAN_NATIVE_REPORT_COPIES=1`.
+/// One program's consumed-read census — copied, elided — as the compiler
+/// reports it under `VILAN_NATIVE_REPORT_COPIES=1`.
 fn copy_census_of(staged: &Path, program: &str) -> (usize, usize) {
+    let (copied, elided, _) = copy_census_line_of(staged, program);
+    (copied, elided)
+}
+
+/// One program's whole census line: copied, elided, and the capture copies.
+fn copy_census_line_of(staged: &Path, program: &str) -> (usize, usize, usize) {
     let output = vilan(staged)
         .env("VILAN_NATIVE_REPORT_COPIES", "1")
         .args(["build", "--backend", "rust", "--stdout", program])
@@ -7323,7 +7368,49 @@ fn copy_census_of(staged: &Path, program: &str) -> (usize, usize) {
         .map(|piece| piece.parse::<usize>().expect("a count"));
     let copied = numbers.next().expect("the copied count");
     let elided = numbers.next().expect("the elided count");
-    (copied, elided)
+    let captured = numbers.next().expect("the capture count");
+    (copied, elided, captured)
+}
+
+/// F50: the capture column counts a closure-creation COPY and nothing else.
+/// The probe's one closure captures six bindings and copies exactly one of
+/// them: the list. The `Shared`, the `str` (an `Rc<str>`), the closure (an
+/// `Rc`) and the boxed `mut` binding (its `Captured` cell) are handle bumps,
+/// and the `i32` is a scalar.
+#[test]
+fn the_capture_column_counts_a_copied_capture_and_no_handle() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_capture_copies.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet items = [1, 2, 3];\n",
+            "\tlet cell = Shared::new(4);\n",
+            "\tlet name = \"n\";\n",
+            "\tlet twice = |k: i32| k * 2;\n",
+            "\tlet count = 5;\n",
+            "\tmut seen = 0;\n",
+            "\tlet report = || {\n",
+            "\t\tseen += 1;\n",
+            "\t\tprint(i\"{name} {items.len()} {cell.read()} {twice(count)} {seen}\");\n",
+            "\t};\n",
+            "\treport();\n",
+            "}\n",
+            "\n",
+            "main();\n",
+        ),
+    )
+    .expect("write the probe program");
+    let (_, _, captured) = copy_census_line_of(&staged, "native_probe_capture_copies.vl");
+    assert_eq!(captured, 1, "only the list is copied into the closure");
+    assert_eq!(
+        compare(&staged, "native_probe_capture_copies.vl"),
+        Verdict::Identical,
+        "and the program prints the same bytes on both backends"
+    );
 }
 
 #[test]
@@ -7337,9 +7424,9 @@ fn the_native_copy_census_matches_its_table() {
         .copied()
         .chain(std::iter::once("native_probe_board.vl"))
     {
-        let (copied, elided) = copy_census_of(&staged, program);
+        let (copied, elided, captured) = copy_census_line_of(&staged, program);
         rows.push(format!(
-            "{}\t{copied}\t{elided}",
+            "{}\t{copied}\t{elided}\t{captured}",
             program.trim_end_matches(".vl")
         ));
     }
@@ -7347,7 +7434,8 @@ fn the_native_copy_census_matches_its_table() {
         "{}{}\n",
         concat!(
             "# Consumed place reads the NATIVE emitter copied, and the ones it\n",
-            "# moved at a last use (tracker F31). Regenerate with\n",
+            "# moved at a last use (tracker F31); then the values a closure's\n",
+            "# capture prelude copied at its creation (F50). Regenerate with\n",
             "# VILAN_REGENERATE_NATIVE_COPY_CENSUS=1 cargo test -p vilan-cli \
              --test native_differential\n",
         ),
