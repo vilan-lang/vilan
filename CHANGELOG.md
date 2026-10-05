@@ -23,6 +23,13 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: miscompile -->
+**Native: a compound write through a `Shared` view at a SUBSCRIPT — `counts.write()[0] += 1` — no longer aborts with "a cell was read while it is being updated".** F83's indexed twin. The compound form re-reads its place in its value, and a subscript read through a view rendered as the place's own borrow — `(counts).borrow_mut()[i]`, a temporary Rust keeps to the end of the statement — so the write met it; the subscript-hoisting path (B105) also had its own statement shape and skipped F62's settle-the-value-first rule. Both are fixed at the cause: a subscript is now a link of the scoped-borrow spine a field read through a view already was (`(cell).read_with(|view| view[i])`, its index settled in a `let` first, root first), for either view, and the hoisted compound write settles its value as every other write into a cell does. So `print(i"{grid.write()[1][2]} {grid.read()[0][1]}")` and `add(&mut picks.write()[0], picks.read()[2])`, which died the same way, run too, and `cell.read()[i]` no longer copies the whole list to read one element. JS was always right. Pin: `native_differential`'s `a_compound_write_at_a_subscript_through_a_shared_view_is_identical_on_both_backends` (`native/shared_indexed_writes.vl`: a subscript, a field and a tuple slot, each nested under the others, a value reading the same cell, a captured and a module-level `mut`, and subscript reads beside a `&mut` loan, a push and a loop — aborted on 0.44.0). Tracker F90.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

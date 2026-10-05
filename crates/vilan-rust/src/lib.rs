@@ -228,11 +228,13 @@ fn unsupported(what: &str, span: Span) -> Error {
 }
 
 /// One link of a spine read through a `Shared` view (F62): a field, by its
-/// subject and index, or a tuple access, as the Rust path it renders to
-/// (`.1.0` for a nested one — see [`Emitter::tuple_slot_path`]).
+/// subject and index, a tuple access, as the Rust path it renders to (`.1.0`
+/// for a nested one — see [`Emitter::tuple_slot_path`]), or a subscript.
 enum Step {
     Field(Id, usize),
     Slot(String),
+    /// A subscript, by its index expression (F90).
+    Index(Id),
 }
 
 /// Where in the emitted file one reserved slot's text goes, and under what name.
@@ -3268,14 +3270,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// Whether `id` is a field spine read through a `Shared` view — what
-    /// [`Self::shared_view_field_read`] renders.
+    /// Whether `id` is a spine of fields, tuple slots and subscripts read
+    /// through a `Shared` view — what [`Self::shared_view_field_read`] renders.
     fn reads_through_a_shared_view(&self, id: Id) -> bool {
         let mut current = id;
         let mut stepped = false;
         loop {
             match self.program.entity_map.get(&current) {
-                Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, _)) => {
+                Some(&Expr::Field(subject, _, _))
+                | Some(&Expr::TupleIndex(subject, _, _))
+                | Some(&Expr::Index(subject, _)) => {
                     stepped = true;
                     current = subject;
                 }
@@ -3307,10 +3311,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// A field (or tuple slot) READ through a `Shared` view, as a scoped
-    /// borrow (F62): `cell.write().inner.depth` is `(cell).read_with(|view|
-    /// view.inner.depth)`, copied out of the borrow when it is not `Copy`.
-    /// `None` when `id` is not a spine of fields over a view call.
+    /// A field, tuple slot or subscript READ through a `Shared` view, as a
+    /// scoped borrow (F62): `cell.write().inner.depth` is `(cell).read_with(
+    /// |view| view.inner.depth)`, copied out of the borrow when it is not
+    /// `Copy`. `None` when `id` is not such a spine over a view call.
+    ///
+    /// F90: a SUBSCRIPT is a link of the same spine. `cell.write()[i]` read as
+    /// a value had rendered `(cell).borrow_mut()[i]` — the place's borrow, held
+    /// as a temporary to the end of the statement — so the re-read half of
+    /// `counts.write()[0] += 1` was still borrowing when the write took its
+    /// own, and any other touch of the cell in the statement died with
+    /// `REENTRANT_READ`; `cell.read()[i]` copied the whole list (`get()`) to
+    /// read one element. Each subscript is settled in a `let` ahead of the
+    /// borrow, root first, which is the order the source evaluates them in and
+    /// keeps the borrow to the element read alone.
     ///
     /// The whole spine is one borrow, so a nested field copies only itself —
     /// not the struct above it. Both views read this way: on the JS backend
@@ -3335,6 +3349,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     steps.push(Step::Slot(path));
                     current = subject;
                 }
+                Some(&Expr::Index(subject, index)) => {
+                    steps.push(Step::Index(index));
+                    current = subject;
+                }
                 _ => match self.shared_view_of(current) {
                     Some((cell, _)) if !steps.is_empty() => break cell,
                     _ => return Ok(None),
@@ -3342,6 +3360,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
         };
         let mut path = String::new();
+        let mut subscripts = String::new();
+        let mut settled = 0;
         for step in steps.iter().rev() {
             match *step {
                 Step::Field(subject, index) => {
@@ -3349,6 +3369,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     let _ = write!(path, ".{field}");
                 }
                 Step::Slot(ref slot) => path.push_str(slot),
+                Step::Index(index) => {
+                    let index_text =
+                        self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
+                    let name = format!("__index{settled}");
+                    settled += 1;
+                    let _ = write!(subscripts, "let {name} = {index_text}; ");
+                    let _ = write!(path, "[({name}) as usize]");
+                }
             }
         }
         let cell_text = self.expecting_nothing(|emitter| emitter.expression(cell, depth))?;
@@ -3357,9 +3385,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         } else {
             ".clone()"
         };
-        Ok(Some(format!(
-            "({cell_text}).read_with(|view| view{path}{copied})"
-        )))
+        let read = format!("({cell_text}).read_with(|view| view{path}{copied})");
+        if subscripts.is_empty() {
+            return Ok(Some(read));
+        }
+        Ok(Some(format!("{{ {subscripts}{read} }}")))
     }
 
     /// The type an `await` produces (J6): a `Task<T>`'s payload.
@@ -4230,6 +4260,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 format!("{subject_text}.{field}")
             }
             Expr::Index(subject, index) => {
+                if let Some(read) = self.shared_view_field_read(id, depth)? {
+                    return Ok(read);
+                }
                 let subject_text = self.expression(subject, depth)?;
                 // An index is an index, whatever the surrounding position
                 // expects: `xs[1] = xs[1] + 2` on a `List<u53>` expects `u53`
@@ -4840,20 +4873,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             });
         self.hoisted = saved;
         let (target_text, value_text) = rendered?;
-        // F62: a place behind a cell's borrow — `cell.write().n = ..`, a field
-        // of a boxed or module-level binding — takes that borrow for the rest
-        // of the statement, and every temporary the VALUE leaves (a mutating
-        // call's `borrow_mut` of the same cell, `cell.write().items.pop()`)
-        // lives exactly as long. The value is settled in its own statement
-        // first, which is the order Rust evaluates an assignment in anyway.
-        if self.place_lives_in_a_cell(target) {
-            let _ = write!(prelude, "let __assigned = {value_text}; ");
-            return Ok(format!("{{ {prelude}{target_text} = __assigned; }}"));
-        }
-        if prelude.is_empty() {
-            return Ok(format!("{target_text} = {value_text}"));
-        }
-        Ok(format!("{{ {prelude}{target_text} = {value_text}; }}"))
+        Ok(self.finish_assignment(target, prelude, &target_text, &value_text))
     }
 
     /// Every subscript along one place's spine into a `let`, root first — the
@@ -4974,9 +4994,41 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if prelude.is_empty() {
             return Ok(None);
         }
-        Ok(Some(format!(
-            "{{ {prelude}{target_text} = {value_text}; }}"
+        Ok(Some(self.finish_assignment(
+            target,
+            prelude,
+            &target_text,
+            &value_text,
         )))
+    }
+
+    /// An assignment's statement, its hoisted subscripts first: the prelude,
+    /// then the write.
+    ///
+    /// F62: a place behind a cell's borrow — `cell.write().n = ..`, a field of
+    /// a boxed or module-level binding — takes that borrow for the rest of the
+    /// statement, and every temporary the VALUE leaves (a mutating call's
+    /// `borrow_mut` of the same cell, `cell.write().items.pop()`) lives exactly
+    /// as long. The value is settled in its own statement first, which is the
+    /// order Rust evaluates an assignment in anyway. F90: the compound form's
+    /// subscript hoist is the same statement — `counts.write()[0] += 1` re-reads
+    /// `counts.borrow_mut()[i]` in its value — so it takes the same rule; it
+    /// had its own `format!` and died with `REENTRANT_READ`.
+    fn finish_assignment(
+        &self,
+        target: Id,
+        mut prelude: String,
+        target_text: &str,
+        value_text: &str,
+    ) -> String {
+        if self.place_lives_in_a_cell(target) {
+            let _ = write!(prelude, "let __assigned = {value_text}; ");
+            return format!("{{ {prelude}{target_text} = __assigned; }}");
+        }
+        if prelude.is_empty() {
+            return format!("{target_text} = {value_text}");
+        }
+        format!("{{ {prelude}{target_text} = {value_text}; }}")
     }
 
     /// The two place spines in lockstep — they are the same source place walked

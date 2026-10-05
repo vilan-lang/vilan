@@ -1,0 +1,108 @@
+// F90: a COMPOUND write through a `Shared` view at a SUBSCRIPT — F83's
+// indexed twin. `counts.write()[0] += 1` re-reads `counts.write()[0]` in its
+// value, and that read held the cell's `borrow_mut` to the end of the
+// statement, so the write met it and the program died with "a cell was read
+// while it is being updated". Every place shape a compound write can stand in
+// through a view is one line here — a subscript, a field, a tuple slot, each
+// nested under the others — with a value that reads the same cell, and the
+// subscript reads that share a statement with another touch of the cell.
+import std::io::print;
+import std::shared::Shared;
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+struct Bag {
+	items: List<i32>,
+	point: Point,
+	pair: (i32, i32),
+	grid: List<List<i32>>,
+	name: str,
+}
+
+mut module_counts: List<i32> = [0, 0];
+
+fun bump() {
+	module_counts[1] += 3;
+}
+
+fun add(slot: &mut i32, by: i32) {
+	slot += by;
+}
+
+fun main() {
+	let counts = Shared::new([0, 0]);
+	counts.write()[0] += 1;
+	counts.write()[1] -= 2;
+	counts.write()[0] += counts.read()[1];
+	print(i"subscript: {counts.read()[0]} {counts.read()[1]}");
+
+	let point = Shared::new(Point { x = 1, y = 2 });
+	point.write().x += 10;
+	point.write().y *= point.read().x;
+	print(i"field: {point.read().x} {point.read().y}");
+
+	let pair = Shared::new((1, 2));
+	pair.write().0 += 5;
+	pair.write().1 += pair.read().0;
+	print(i"slot: {pair.read().0} {pair.read().1}");
+
+	let bag = Shared::new(Bag {
+		items = [1, 2],
+		point = Point { x = 0, y = 0 },
+		pair = (0, 0),
+		grid = [[1, 2], [3, 4]],
+		name = "a",
+	});
+	bag.write().items[1] += 40;
+	bag.write().point.x += 7;
+	bag.write().pair.1 += 9;
+	bag.write().grid[1][0] += bag.read().items[1];
+	bag.write().name += "b";
+	print(i"nested: {bag.read().items[1]} {bag.read().point.x} {bag.read().pair.1} {bag.read().grid[1][0]} {bag.read().name}");
+
+	let points = Shared::new([Point { x = 1, y = 1 }, Point { x = 2, y = 2 }]);
+	points.write()[1].x += 20;
+	let tuples = Shared::new([(1, 2), (3, 4)]);
+	tuples.write()[0].1 += 50;
+	let grid = Shared::new([[1, 2], [3, 4, 5]]);
+	grid.write()[0][1] += 1000;
+	let names = Shared::new(["a", "b"]);
+	names.write()[1] += "c";
+	print(i"element: {points.read()[1].x} {tuples.read()[0].1} {grid.read()[0][1]} {names.read()[1]}");
+
+	print(i"same statement: {grid.write()[1][2]} {grid.read()[0][1]}");
+	grid.write()[0] = grid.read()[1];
+	grid.write()[1].push(grid.read()[0][0]);
+	print(i"whole element: {grid.read()[0].len()}");
+	print(grid.read()[1]);
+
+	let picks = Shared::new([10, 20, 30]);
+	print(i"last: {picks.read()[picks.read().len() - 1]}");
+	add(&mut picks.write()[0], picks.read()[2]);
+	for value in grid.read()[1] {
+		picks.write()[1] += value;
+	}
+	print(i"loaned: {picks.read()[0]} {picks.read()[1]}");
+
+	mut index = 0;
+	let step = || {
+		index += 1;
+		picks.write()[index] *= 2;
+	};
+	step();
+	step();
+	print(picks.read());
+
+	mut local: List<i32> = [1, 2];
+	let bump_local = || {
+		local[0] += 5;
+	};
+	bump_local();
+	bump();
+	print(i"cells: {local[0]} {module_counts[1]}");
+}
+
+main();

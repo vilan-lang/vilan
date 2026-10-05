@@ -8496,6 +8496,30 @@ fn a_field_read_or_written_through_a_shared_view_is_identical_on_both_backends()
     }
 }
 
+/// F90: a compound write through a `Shared` view at a SUBSCRIPT — F83's
+/// indexed twin. `counts.write()[0] += 1` re-read `counts.write()[0]` as
+/// `(counts).borrow_mut()[i]`, a borrow held to the end of the statement, so the
+/// write met it and the program died with "a cell was read while it is being
+/// updated". A subscript read through either view is now a scoped borrow, its
+/// index settled first. The probe: every place shape (subscript, field, tuple
+/// slot, each nested under the others) with a value that reads the same cell,
+/// a captured binding and a module-level one, and subscript reads sharing a
+/// statement with another touch of the cell (a `&mut` loan, a push, a loop).
+#[test]
+fn a_compound_write_at_a_subscript_through_a_shared_view_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_shared_indexed_writes.vl"),
+        include_str!("native/shared_indexed_writes.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_shared_indexed_writes.vl"),
+        Verdict::Identical,
+        "a compound write at a subscript through a `Shared` view must not abort natively"
+    );
+}
+
 /// F57: every platform-bound corpus program the backend ACCEPTS prints what
 /// node prints, the ones it refuses say which construct stopped them, and the
 /// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is
