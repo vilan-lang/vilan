@@ -517,10 +517,7 @@ fun map_feed<K: Hashable, V>(
 				}
 				mut index: usize = 0;
 				for index < keys.len() {
-					// Bound first: a `match` on an indexed element whose payload is
-					// not `Copy` moves out of the list in the native emit (N?1).
-					let held = olds[index];
-					match held {
+					match olds[index] {
 						Some(let was) => match map.table.get(keys[index]) {
 							Some(let now) => log.record(MapOp::Put(now.0, Some(was.1), now.1)),
 							None => log.record(MapOp::Delete(was.0, was.1)),
@@ -569,8 +566,7 @@ fun set_feed<T: Hashable>(lend: |(|&HashSet<T>| void)| void, log: DeltaLog<SetOp
 				}
 				mut index: usize = 0;
 				for index < keys.len() {
-					let held = olds[index];
-					match held {
+					match olds[index] {
 						Some(let was) => {
 							if !set.table.contains_key(keys[index]) {
 								log.record(SetOp::Remove(was));

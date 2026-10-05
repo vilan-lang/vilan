@@ -8520,6 +8520,30 @@ fn a_compound_write_at_a_subscript_through_a_shared_view_is_identical_on_both_ba
     );
 }
 
+/// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
+/// subject of a destructuring `match`, an `is` capture, a `?` lift and a
+/// conjunction was copied for a binding and a field and MOVED for a subscript,
+/// so `match names[0] { Some(let name) => .. }` over a `List<Option<str>>` was
+/// rustc's E0507 and std bound the element to a `let` first (three sites in
+/// `std::reactive::store`/`store_core`, removed with the fix). The probe: an
+/// `Option<str>`, an enum with a `Hash` payload, a tuple, a field's and a
+/// loaned parameter's element, a nested subscript, an `is` test, a
+/// destructuring `let` and a `?` lift.
+#[test]
+fn a_pattern_over_an_indexed_element_copies_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_indexed_match_subjects.vl"),
+        include_str!("native/indexed_match_subjects.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_indexed_match_subjects.vl"),
+        Verdict::Identical,
+        "a pattern over an indexed element must copy it, not move it out of the list"
+    );
+}
+
 /// F57: every platform-bound corpus program the backend ACCEPTS prints what
 /// node prints, the ones it refuses say which construct stopped them, and the
 /// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is

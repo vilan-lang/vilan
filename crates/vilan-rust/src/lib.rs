@@ -4605,6 +4605,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.program.resource_types.contains(&concrete)
     }
 
+    /// Whether a pattern's SUBJECT names storage — a binding, or a field, a
+    /// tuple slot or a subscript of one — so destructuring it would MOVE its
+    /// payload out of a place (F20, F89). Rust binds a capture by value only
+    /// from a value, and rule 1 makes every capture a copy, so the subject is
+    /// copied first: `match names[0] { Some(let name) => .. }` over a
+    /// `List<Option<str>>` was rustc's E0507 ("cannot move out of index of
+    /// `Vec<..>`") until a subscript joined the binding and the field here,
+    /// and std bound the element to a `let` first to get past it.
+    ///
+    /// A spine read through a `Shared` view is not one: it is already a copy
+    /// out of the cell's scoped borrow ([`Self::shared_view_field_read`]).
+    fn subject_is_a_place(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::Local(_) | Expr::Parameter(_)) => true,
+            Some(Expr::Field(..) | Expr::TupleIndex(..) | Expr::Index(..)) => {
+                !self.reads_through_a_shared_view(id)
+            }
+            _ => false,
+        }
+    }
+
     /// F56: whether `id` reads a binding this frame OWNS whose type is a
     /// resource. Handing one on is a MOVE — the analyzer's move checker has
     /// already refused any later read — so a copy there is a second owner
@@ -6016,10 +6037,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // captures by reference under Rust's default binding modes, and a
         // capture is a copy by rule 1.
         let mut subject_text = self.expression(subject, depth)?;
-        if matches!(
-            self.program.entity_map.get(&subject),
-            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
-        ) {
+        if self.subject_is_a_place(subject) {
             subject_text = format!("({subject_text}).clone()");
         }
         let subject_type = self.type_of(subject);
@@ -6256,10 +6274,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         // `&Option<i32>` bound `x: &i32` and `x == y` had no
                         // `PartialEq` across the reference. A capture is a copy
                         // (rule 1), and copying the subject is how it binds one.
-                        if matches!(
-                            self.program.entity_map.get(subject),
-                            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
-                        ) {
+                        if self.subject_is_a_place(*subject) {
                             subject_text = format!("({subject_text}).clone()");
                         }
                         let subject_type = self.type_of(*subject);
@@ -6322,10 +6337,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             !bindings.is_empty()
         });
         if destructures
-            && matches!(
-                self.program.entity_map.get(&subject),
-                Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
-            )
+            && self.subject_is_a_place(subject)
             && !self.moves_an_owned_resource(subject)
         {
             subject_text = format!("({subject_text}).clone()");
@@ -8108,10 +8120,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut subject = self.expression(step, depth)?;
         // A pattern over a PLACE binds by reference under Rust's default
         // binding modes; the payload is a copy by rule 1, as an `if let`'s is.
-        if matches!(
-            self.program.entity_map.get(&step),
-            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
-        ) {
+        if self.subject_is_a_place(step) {
             subject = format!("({subject}).clone()");
         }
         let name = self.binding_name(binder);
