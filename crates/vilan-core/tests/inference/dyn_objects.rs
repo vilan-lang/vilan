@@ -1761,6 +1761,49 @@ fn b480_a_selector_matching_two_erased_arms_needs_no_switch_type_arguments() {
     );
 }
 
+/// E261: the same selector WITHOUT the annotation — two stages of different
+/// types meet only as one erased `dyn Flow<T>`, and the mismatch, which names
+/// two half-inferred stage types, now names the annotation too. For a `match`
+/// and an `if` alike (one rule, `unify_arm_bodies`), at the offending leg.
+#[test]
+fn e261_two_pipe_stages_in_a_match_steer_to_the_dyn_flow_annotation() {
+    let header = concat!(
+        "import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source };\n",
+        "import std::reactive::transient::TransientState;\n",
+    );
+    let steer = "Both are pipe stages, and two stages of different types meet only as one \
+         erased flow: annotate where the value lands, `let state: dyn Flow<T> = ..`";
+    assert_fails_spanning(
+        &format!(
+            "{header}fun main() {{\n\tlet client: SignalCell<Option<i32>> = Signal::new(None);\n\tlet names: SignalCell<Option<str>> = Signal::new(Some(\"general\"));\n\tlet found = client.switch(|connected| {{\n\t\tlet state = match connected {{\n\t\t\tNone => Source::constant(TransientState::Pending),\n\t\t\tSome(let _id) => names.derive(|name| match name {{\n\t\t\t\tSome(let present) => TransientState::Ready(present),\n\t\t\t\tNone => TransientState::Absent,\n\t\t\t}}),\n\t\t}};\n\t\tstate\n\t}}).memo();\n}}\n"
+        ),
+        "names.derive(|name| match name {\n\t\t\t\tSome(let present) => TransientState::Ready(present),\n\t\t\t\tNone => TransientState::Absent,\n\t\t\t})",
+        steer,
+    );
+    assert_fails_with(
+        &format!(
+            "{header}fun main() {{\n\tlet n: SignalCell<i32> = Signal::new(1);\n\tlet on = true;\n\tlet either = if on {{ n.derive(|v| v + 1) }} else {{ Source::constant(3) }};\n\tlet _ = either.memo();\n}}\n"
+        ),
+        &format!(
+            "`if` arms have mismatched types: expected Derive<SignalCell<i32>, i32, i32>, but got Constant<i32> instead. {steer}"
+        ),
+    );
+}
+
+/// E261's boundary: arms that are not both flows keep the plain mismatch, and
+/// a function's own trait named `Flow` is not std's pipe layer.
+#[test]
+fn e261_arms_that_are_not_both_flows_get_no_flow_steer() {
+    for source in [
+        "import std::reactive::{ Signal, SignalCell, Pipe };\nfun main() {\n\tlet n: SignalCell<i32> = Signal::new(1);\n\tlet on = true;\n\tlet either = if on { n.derive(|v| v + 1) } else { 3 };\n}\n",
+        "fun main() {\n\tlet on = true;\n\tlet either = if on { 1 } else { \"two\" };\n}\n",
+        "trait Flow {\n\tfun go(self): i32;\n}\nstruct A {}\nstruct B {}\nimpl A with Flow {\n\tfun go(self): i32 { 1 }\n}\nimpl B with Flow {\n\tfun go(self): i32 { 2 }\n}\nfun main() {\n\tlet on = true;\n\tlet either = if on { A {} } else { B {} };\n}\n",
+    ] {
+        assert_fails_with(source, "have mismatched types");
+        assert_fails_without(source, "pipe stages");
+    }
+}
+
 #[test]
 fn a142_a_source_object_stays_copyable_though_flow_is_a_resource_trait() {
     // R39 with B470's attribute on the DECLARING trait alone: `Source<T> with

@@ -10114,10 +10114,8 @@ fn b249_a_trait_parameter_takes_the_impls_argument() {
     assert_fails_with(flow, "missing 'start'; declare `fun start(");
     assert_fails_with(flow, "): Instance<i32>`");
     assert_fails_without(flow, "Instance<T>");
-    // `T` inside a closure parameter, substituted the same way. (The clause
-    // `context tracking` on it is not rendered for a program's own trait, where
-    // std's `Flow::on_change` rendered it — filed by reactive-46; this pin holds
-    // the substitution only.)
+    // `T` inside a closure parameter, substituted the same way — and its
+    // `context tracking` clause kept (E262, pinned on its own below).
     let clause = r#"
         import std::reactive::{ Subscription, tracking };
         trait Watched<T> {
@@ -10128,8 +10126,45 @@ fn b249_a_trait_parameter_takes_the_impls_argument() {
         fun main() {}
         "#;
     assert_fails_with(clause, "missing 'watch'; declare `fun watch(");
-    assert_fails_with(clause, "observer: |i32| void");
+    assert_fails_with(clause, "observer: (|i32| void) context tracking");
     assert_fails_without(clause, "|T| void");
+}
+
+/// E262: the "declare `fun ..`" steer keeps a callback parameter's `context`
+/// clause for a program's OWN trait, as it always did for std's. The clause is
+/// part of the parameter's closure TYPE (B309), and the program's clauses were
+/// resolved into their types only after conformance had run — so the steer
+/// printed the type without it, and the copied line declared a different
+/// member. With and without a substitution, nested in another type, and with
+/// two contexts.
+#[test]
+fn e262_the_declare_steer_keeps_a_callbacks_context_clause() {
+    let plain = r#"
+        import std::reactive::{ Subscription, tracking };
+        trait Plain {
+            fun watch(own self, observer: (|i32| void) context tracking): Subscription;
+        }
+        struct Box { n: i32 }
+        impl Box with Plain { }
+        fun main() {}
+        "#;
+    assert_fails_with(
+        plain,
+        "declare `fun watch(own self, observer: (|i32| void) context tracking): Subscription`",
+    );
+    let nested = r#"
+        import std::reactive::{ Subscription, owner_scope, tracking };
+        trait Many<T> {
+            fun watch(own self, observers: List<(|T| void) context (owner_scope, tracking)>): Subscription;
+        }
+        struct Box { n: i32 }
+        impl Box with Many<str> { }
+        fun main() {}
+        "#;
+    assert_fails_with(
+        nested,
+        "observers: List<(|str| void) context (owner_scope, tracking)>",
+    );
 }
 
 #[test]

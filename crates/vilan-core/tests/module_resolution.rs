@@ -9154,3 +9154,93 @@ fn b549_a_browser_build_importing_the_document_module_checks_clean() {
         Vec::<String>::new()
     );
 }
+
+/// B560: the "import it first" steer spells a NESTED module by its full path
+/// from the package root — `pkg::lib::thing::Thing`, not the leaf's
+/// `pkg::thing::Thing`, which resolves nowhere — and the import it names
+/// compiles when pasted.
+#[test]
+fn b560_the_import_steer_spells_a_nested_modules_full_path() {
+    const THING: &str = "export struct Thing {\n\tn: i32,\n}\n\nexport fun make_thing(): Thing {\n\tThing { n = 1 }\n}\n";
+    const HELPER: &str =
+        "import pkg::lib::thing::make_thing;\n\nexport fun count(): i32 {\n\tmake_thing().n\n}\n";
+    let entry = "import pkg::helper::count;\n\nfun main() {\n\tlet thing = Thing { n = count() };\n\tlet _ = thing.n;\n}\n";
+    let errors = analyze_package(
+        &[
+            ("lib/thing.vl", THING),
+            ("helper.vl", HELPER),
+            ("main.vl", entry),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("import it first (`import pkg::lib::thing::Thing;`)")),
+        "{errors:#?}"
+    );
+    let pasted = format!("import pkg::lib::thing::Thing;\n{entry}");
+    let pasted: &'static str = Box::leak(pasted.into_boxed_str());
+    let errors = analyze_package(
+        &[
+            ("lib/thing.vl", THING),
+            ("helper.vl", HELPER),
+            ("main.vl", pasted),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "the steer's import compiles: {errors:#?}"
+    );
+}
+
+/// B560: two modules with the same LEAF name in different directories are two
+/// homes, not one — the steer names neither rather than a path that is
+/// neither's.
+#[test]
+fn b560_two_modules_sharing_a_leaf_name_are_ambiguous() {
+    const THING: &str =
+        "export struct Thing {\n\tn: i32,\n}\n\nexport fun make(): Thing {\n\tThing { n = 1 }\n}\n";
+    const HELPER: &str = "import pkg::a::thing::make;\nimport pkg::b::thing::{ make as other };\n\nexport fun count(): i32 {\n\tmake().n + other().n\n}\n";
+    let entry = "import pkg::helper::count;\n\nfun main() {\n\tlet thing = Thing { n = count() };\n\tlet _ = thing.n;\n}\n";
+    let errors = analyze_package(
+        &[
+            ("a/thing.vl", THING),
+            ("b/thing.vl", THING),
+            ("helper.vl", HELPER),
+            ("main.vl", entry),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.iter().any(|error| error.contains("Thing")),
+        "the name still does not resolve: {errors:#?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("import it first")),
+        "an ambiguous name is not steered toward one home: {errors:#?}"
+    );
+}
+
+/// B560's std half: a type in a NESTED std module (`std::reactive::delta`'s
+/// `ListCell`), loaded through another module, steers to its full path.
+#[test]
+fn b560_the_import_steer_spells_a_nested_std_modules_full_path() {
+    const HELPER: &str = "import std::reactive::delta::ListCell;\n\nexport fun make(): ListCell<i32> {\n\tListCell::new()\n}\n";
+    let entry = "import pkg::helper::make;\n\nfun main() {\n\tlet cell: ListCell<i32> = make();\n\tlet _ = cell;\n}\n";
+    let errors = analyze_package(
+        &[("helper.vl", HELPER), ("main.vl", entry)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("import it first (`import std::reactive::delta::ListCell;`)")
+        }),
+        "{errors:#?}"
+    );
+}

@@ -4004,6 +4004,13 @@ pub struct Analyzer<'src> {
     // The span of the member identifier in a field access or method call (`.x`),
     // keyed by the access expr id — the precise use-site span for rename/nav.
     member_name_spans: HashMap<Id, Span>,
+    /// E253: a method call whose member the lookup FOUND but which never
+    /// wired — it deferred on an argument that never typed (a closure whose
+    /// body is refused leaves its generic return open, so the call waits for
+    /// it to the end): call entity → the member. Removed when the call wires.
+    /// The editor reads it ([`Program::unwired_method_calls`]); nothing else
+    /// does.
+    unwired_method_calls: HashMap<Id, Id>,
     /// E241: every variant pattern the ENTRY file matches, as resolved — read
     /// E241: every variant pattern and `_` the ENTRY file matches, as
     /// resolved — read by the label build into [`Program::pattern_labels`].
@@ -7069,6 +7076,7 @@ impl<'src> Analyzer<'src> {
             expr_id_to_scope_id_map: HashMap::default(),
             expr_id_to_type_id_map: HashMap::default(),
             member_name_spans: HashMap::default(),
+            unwired_method_calls: HashMap::default(),
             pattern_sites: Vec::new(),
             unresolved_method_calls: Vec::new(),
             arity_invalid_calls: Vec::new(),
@@ -24166,6 +24174,7 @@ impl<'src> Analyzer<'src> {
         mut argument_ids: Vec<Id>,
         arguments_span: Span,
     ) {
+        self.unwired_method_calls.remove(&id);
         let member_local_id = self.new_entity_id();
         self.expr_id_to_expr_map
             .insert(member_local_id, Expr::Local(member_id));
@@ -34620,6 +34629,36 @@ impl<'src> Analyzer<'src> {
             " `{name}` returns `{bound}`, a trait: that is ONE type the body picks, so every \
              branch must produce it; for branches of different types return `dyn {bound}`"
         )
+    }
+
+    /// E261: two arms that are each a FLOW — pipe stages of different types,
+    /// `Source::constant(..)` beside a `.derive(..)` — are different types by
+    /// construction (a stage's type is its whole recipe), and meet only as
+    /// one erased `dyn Flow<T>`. The mismatch alone names two internal stage
+    /// types, often half-inferred; the annotation is the fix every reader
+    /// needs, so the steer names it. Keyed on std's `Flow`: a program's own
+    /// trait of that name is not the pipe layer.
+    fn erased_flow_arm_steer(&self, expected: &Type, got: &Type) -> String {
+        let Some(flow) = self
+            .traits
+            .values()
+            .find(|declared| {
+                declared.name == "Flow"
+                    && self
+                        .source_of_id(declared.id)
+                        .is_some_and(|source| self.std_sources.contains(&source))
+            })
+            .map(|declared| declared.id)
+        else {
+            return String::new();
+        };
+        if !(self.type_implements_trait(expected, flow) && self.type_implements_trait(got, flow)) {
+            return String::new();
+        }
+        " Both are pipe stages, and two stages of different types meet only as one erased \
+         flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the \
+         function's return), with `T` the value they carry, and each erases to it"
+            .to_string()
     }
 
     /// B460 (RULED 2026-09-29, R-a door (i)): each function returning a bare
@@ -47970,6 +48009,30 @@ impl<'src> Analyzer<'src> {
         // name in scope that reaches nothing; refuse, and name the children,
         // because "write the child's own path" is the whole of the fix.
         if let Some(children) = self.namespace_only_modules.get(&target_id) {
+            // E269: `std::web` was the web PRELUDE until v0.44.0, and a bare
+            // `import std::web;` (read as `web::Signal`) is the one old
+            // spelling of it that RESOLVES — to the namespace — so it never
+            // reached the moved-path refusal above. It is that refusal, at the
+            // `web` segment, so the editor's fix and `vilan check --fix` write
+            // `std::web::prelude as web`.
+            let web_segment = match (path, name) {
+                ([("std", _)], "web") => Some(leaf_span),
+                ([("std", _), ("web", web_span)], "self") => Some(*web_span),
+                _ => None,
+            };
+            if let Some(web_span) = web_segment
+                && let Some(new) = crate::parsing::moved_std_module("web")
+            {
+                if report {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: web_span,
+                        msg: crate::parsing::moved_std_module_message("web", new),
+                    });
+                }
+                return false;
+            }
             if report {
                 let mut spelled: Vec<&str> = path.iter().map(|(segment, _)| *segment).collect();
                 if name != "self" {
@@ -51898,6 +51961,7 @@ impl<'src> Analyzer<'src> {
                             .iter()
                             .any(|argument_id| self.is_unknown_closure_parameter(*argument_id)))
                 {
+                    self.unwired_method_calls.insert(id, member_id);
                     return Resolution::Deferred;
                 }
                 // The call site's expectation binds what is still open (`map<U>`'s
@@ -51924,6 +51988,7 @@ impl<'src> Analyzer<'src> {
                 if unresolved_closure_argument
                     && self.own_generics_undetermined(member_id, &substitution)
                 {
+                    self.unwired_method_calls.insert(id, member_id);
                     return Resolution::Deferred;
                 }
                 // B424, door (b): see `default_own_generics_from_receiver`.
@@ -54438,14 +54503,51 @@ impl<'src> Analyzer<'src> {
     }
 
     fn import_steer_inner(&self, name: &str) -> Option<String> {
-        let std_members: HashSet<Id> = self
-            .module_id_by_name
-            .get("std")
-            .and_then(|std_id| self.modules.get(std_id))
-            .and_then(|module| self.scopes.get(&module.body.1))
-            .map(|scope| scope.name_to_id_map.values().copied().collect())
-            .unwrap_or_default();
-        let mut hit: Option<(&str, bool)> = None;
+        // B560: every loaded module's FULL path from its root — `std`'s and
+        // `pkg`'s scopes, then each module's children (A65/A154 namespaces),
+        // breadth-first — because the import the steer writes must be one the
+        // loader accepts. The module's own `name` is its LEAF, which spelled
+        // `pkg::lib::thing` as `pkg::thing` and `std::reactive::delta` as
+        // `pkg::delta`, imports that resolve nowhere.
+        let mut paths: HashMap<Id, String> = HashMap::default();
+        let mut pending: std::collections::VecDeque<(Id, String)> =
+            std::collections::VecDeque::new();
+        for root in ["std", "pkg"] {
+            let Some(scope) = self
+                .module_id_by_name
+                .get(root)
+                .and_then(|root_id| self.modules.get(root_id))
+                .and_then(|module| self.scopes.get(&module.body.1))
+            else {
+                continue;
+            };
+            for child_id in scope.name_to_id_map.values() {
+                if let Some(child) = self.modules.get(child_id) {
+                    pending.push_back((*child_id, format!("{root}::{}", child.name)));
+                }
+            }
+        }
+        while let Some((module_id, path)) = pending.pop_front() {
+            if paths.contains_key(&module_id) {
+                continue;
+            }
+            if let Some(children) = self
+                .module_children_scopes
+                .get(&module_id)
+                .and_then(|scope_id| self.scopes.get(scope_id))
+            {
+                for child_id in children.name_to_id_map.values() {
+                    if let Some(child) = self.modules.get(child_id) {
+                        pending.push_back((*child_id, format!("{path}::{}", child.name)));
+                    }
+                }
+            }
+            paths.insert(module_id, path);
+        }
+        // Hits are compared by that PATH, not by leaf name: two modules sharing
+        // a leaf in different directories are two homes (ambiguous, no steer),
+        // while one path loaded twice — a module's platform twins — is one.
+        let mut hit: Option<&str> = None;
         for module in self.modules.values() {
             if module.name == "pkg" || module.name == "std" {
                 continue;
@@ -54469,18 +54571,18 @@ impl<'src> Analyzer<'src> {
             if !self.is_exported_in(entity, module.body.1) {
                 continue;
             }
-            let is_std = std_members.contains(&module.id);
-            match &hit {
-                None => hit = Some((module.name, is_std)),
-                Some((existing, _)) if *existing == module.name => {}
+            // A module no root reaches (the entry itself) has no import path.
+            let Some(path) = paths.get(&module.id) else {
+                continue;
+            };
+            match hit {
+                None => hit = Some(path),
+                Some(existing) if existing == path => {}
                 Some(_) => return None,
             }
         }
-        if let Some((module, is_std)) = hit {
-            let root = if is_std { "std" } else { "pkg" };
-            return Some(format!(
-                "; import it first (`import {root}::{module}::{name};`)"
-            ));
+        if let Some(path) = hit {
+            return Some(format!("; import it first (`import {path}::{name};`)"));
         }
         if let Some(module) = self
             .std_export_index
@@ -56537,7 +56639,10 @@ impl<'src> Analyzer<'src> {
                                 .get(body_id)
                                 .map(|span| **span)
                                 .unwrap_or(fallback_span);
-                            let steer = self.opaque_return_arm_steer(expression_id);
+                            let mut steer = self.opaque_return_arm_steer(expression_id);
+                            if steer.is_empty() {
+                                steer = self.erased_flow_arm_steer(&current, &body_type);
+                            }
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
                                 note: None,
@@ -60973,6 +61078,14 @@ impl<'src> Analyzer<'src> {
             split.push(("types", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
+        // --- Resolve `context` clauses (ambient-owner.md §5, B242, B309) ---
+        // after the import fixpoint (a clause may name an imported context),
+        // BEFORE conformance (E262: a trait member's clause is part of its
+        // parameter's TYPE, which conformance compares and its "declare `fun
+        // ..`" steer prints), and before the fixpoint, so the clause a
+        // closure type carries is part of that type for every substitution and
+        // reconcile the solver performs.
+        self.resolve_context_clauses();
         // --- Check trait conformance for `impl Subject with Trait` ---
         for check in std::mem::take(&mut self.prepped_trait_impls) {
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
@@ -61515,12 +61628,6 @@ impl<'src> Analyzer<'src> {
             split.push(("divergence+guards", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
-        // --- Resolve `context` clauses (ambient-owner.md §5, B242, B309) ---
-        // after the import fixpoint (a clause may name an imported context) and
-        // BEFORE the fixpoint below, so the clause a closure type carries is
-        // part of that type for every substitution and reconcile the solver
-        // performs.
-        self.resolve_context_clauses();
         // B401: the admission the lookups below read — after the import drain
         // (which recorded each statement's path segments) and the type drain
         // (which typed each selector's subject), before the first lookup.
@@ -65740,6 +65847,15 @@ pub struct Program<'src> {
     /// so tooling resolves hover and go-to-definition through this map to
     /// answer the source view.
     pub context_erased_subjects: HashMap<Id, Id>,
+    /// E253: the method calls the analysis never wired, each with the member
+    /// its lookup found (`Analyzer::unwired_method_calls`): a call deferred to
+    /// the end on an argument that never typed — a closure argument whose body
+    /// is refused, mid-edit, leaves the method's generic return open. Such a
+    /// call has a span and no `entity_map` or `function_calls` record, so
+    /// without this the editor answers nothing on the method's name exactly
+    /// while the author is fixing the closure. Tooling only: emission never
+    /// reaches a program with the refusal that caused it.
+    pub unwired_method_calls: HashMap<Id, Id>,
     /// The hidden context parameters the context pass minted (editing-dx.md
     /// §19.3): parameter id → the context binding whose value it threads.
     /// Deliberately a MARKER, not real records — a fabricated `parameters`
@@ -77099,6 +77215,7 @@ fn analyze_over_world<'src>(
         owned_nursery_enter_fn_id,
         spawn_nursery_sources: HashMap::default(),
         context_erased_subjects: HashMap::default(),
+        unwired_method_calls: analyzer.unwired_method_calls,
         context_hidden_parameters: HashMap::default(),
         context_optional_hidden_parameters: HashSet::default(),
         cleared_clause_contexts: HashSet::default(),

@@ -261,16 +261,20 @@ migration tool for one release:
   std::web::dom::…`, a brace list keeps its names (`std::{ delta::SeqOp }`
   becomes `std::{ reactive::delta::SeqOp }`), and `prelude = "std::web"`
   in `vilan.toml` becomes `prelude = "std::web::prelude"` — only that
-  value changes, the file's comments and layout stay. One run migrates a
+  value changes, the file's comments and layout stay. A module imported
+  as a module keeps the name it bound: `import std::web;` (the old web
+  prelude, read as `web::Signal`) becomes `import std::web::prelude as
+  web;`, and a `self` in a brace list under that path becomes `prelude
+  as web`. One run migrates a
   package, even one whose old imports are its only errors. A file that
   `vilan fmt` left canonical is kept canonical (a moved import can sort
   to a new place). Two things are left, and named: a file under the
   package's
   [`generated`](../guide/dev-loop.md#when-the-hook-generates-vilan)
   root, which the project regenerates — change what generates it — and
-  a brace list
-  under the old web-prelude path that names `self`
-  (`std::web::{ self, Signal }`), which no one edit rewrites correctly.
+  a brace list under the old web-prelude path holding a reach marker,
+  an impl selector or a nested group (`std::web::{ #Signal, .. }`),
+  which no one edit rewrites correctly.
 
   ```sh
   vilan check --fix

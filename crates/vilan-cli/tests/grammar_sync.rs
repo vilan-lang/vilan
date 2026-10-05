@@ -917,6 +917,76 @@ fn b459_then_is_coloured_by_position_in_both_grammars() {
     }
 }
 
+/// E270: a `then` LEADING its line — the formatter's own broken form of a long
+/// conditional, `ready\n\tthen go() else wait()` — is the keyword too. The
+/// TextMate grammar matches one line at a time, so B459's operand lookbehind
+/// could never see the line above; the line-leading form takes the same
+/// right-hand guard, which keeps a name that starts a line (`then = 1;`,
+/// `then.x`, `then(f)`, `then: i32`) plain. The book's highlighter reads the
+/// whole fence, so the operand on the line above is behind it there. An
+/// `else` leading its line was never affected: it is an ordinary keyword in
+/// both grammars, pinned here beside it.
+#[test]
+fn e270_then_leading_its_line_is_coloured_in_both_grammars() {
+    let textmate = textmate_grammar(&[]);
+    let rule = contextual_rule(&textmate, "keywords", "then");
+    let leading: &[&str] = &[
+        "\tthen go();",
+        "    then \"on\" else \"off\";",
+        "\t\t\tthen ret x;",
+        "then -1 else 1",
+    ];
+    let names: &[&str] = &[
+        "then = 1;",
+        "\tthen.x",
+        "\tthen(f)",
+        "\tthen: i32,",
+        "\tthen;",
+        "\tthen in xs",
+    ];
+    assert_eq!(
+        regex_matches(&rule.regex, leading),
+        vec![true; leading.len()],
+        "{TEXTMATE_GRAMMAR}: {:?} misses a line-leading `then` among {leading:?}",
+        rule.regex,
+    );
+    assert_eq!(
+        regex_matches(&rule.regex, names),
+        vec![false; names.len()],
+        "{TEXTMATE_GRAMMAR}: {:?} colours a line-leading NAME `then` ({names:?})",
+        rule.regex,
+    );
+    let highlight = highlight_grammar(&[]);
+    let rule = contextual_rule(&highlight, "keyword", "then");
+    let fences: &[&str] = &[
+        "let label = ready\n\tthen \"on\"\n\telse \"off\";",
+        "x > 0\n\t\tthen ret x;",
+    ];
+    assert_eq!(
+        regex_matches(&rule.regex, fences),
+        vec![true; fences.len()],
+        "{HIGHLIGHT_THEME}: {:?} misses `then` after a line break among {fences:?}",
+        rule.regex,
+    );
+    // `else` leading its line: an ordinary keyword in both — a TextMate rule
+    // with no position guard, and a word in highlight.js's `keywords` object,
+    // which colours it wherever it stands.
+    assert!(
+        textmate.rules.iter().any(|rule| {
+            literal_words(&rule.regex).contains(&"else".to_string())
+                && regex_matches(&rule.regex, &["\telse \"off\";"]) == [true]
+        }),
+        "{TEXTMATE_GRAMMAR}: no rule colours a line-leading `else`"
+    );
+    assert!(
+        highlight
+            .keyword_groups
+            .iter()
+            .any(|(_, words)| words.iter().any(|word| word == "else")),
+        "{HIGHLIGHT_THEME}: `else` is not in the `keywords` object"
+    );
+}
+
 // --- Primitive types ---------------------------------------------------------
 
 #[test]

@@ -687,3 +687,4 @@ row	flagship	key
 663	-	`{name}` is `[track_caller]`: it takes its caller's location as a hidden argument, and a call through a value cannot pass one
 664	-	`dbg` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
 665	-	`dbg` takes no type arguments: it prints each argument at the type it already has
+666	-	Both are pipe stages, and two stages of different types meet only as one erased flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the function's return), with `T` the value they carry, and each erases to it

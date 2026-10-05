@@ -5371,6 +5371,14 @@ impl Document {
                 current = source_call_subject(program, current)?;
                 continue;
             }
+            // A method call the analysis never wired (E253) has no entity:
+            // resolve through the member its lookup found.
+            if !program.entity_map.contains_key(&current)
+                && let Some(member) = program.unwired_method_calls.get(&current)
+            {
+                current = *member;
+                continue;
+            }
             return match program.entity_map.get(&current)? {
                 Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
                     // Resolve to the name span of the thing the binding actually is —
@@ -7028,18 +7036,16 @@ impl Document {
             let mut seen_modules: HashSet<String> = HashSet::new();
             for root in &module_roots {
                 // A154: std's modules sit under namespaces (`std::web::dom`),
-                // so std is listed at every depth; another origin keeps the top
-                // level it always offered.
+                // so std is listed at every depth — and so is every other
+                // origin (E267): a package's nested module (A65's
+                // `pkg::lib::ui::widget`) is a name's home at its full path.
                 // A NESTED prelude (`web::prelude`, `web::style::prelude`) is
                 // never a name's home — the analyzer's B4 index skips it too.
-                let listed = if origin == "std" {
+                let listed: Vec<(String, PathBuf)> =
                     vilan_core::analyzer::modules_under_root(root, &module_roots)
                         .into_iter()
                         .filter(|(module_name, _)| !module_name.ends_with("::prelude"))
-                        .collect()
-                } else {
-                    vilan_core::analyzer::modules_in_root(root)
-                };
+                        .collect();
                 for (module_name, module_path) in listed {
                     if module_name == "lib" || !seen_modules.insert(module_name.clone()) {
                         continue;
@@ -7200,20 +7206,47 @@ impl Document {
                 edits.push(edit);
             }
         }
-        if !asked || edits.len() < 2 {
+        if !asked {
             return None;
         }
+        let (span, replacement, count) = self.spliced_edit(edits)?;
+        Some(QuickFix {
+            title: format!("Write all {count} `css` declarations as calls"),
+            span,
+            replacement,
+            target: None,
+        })
+    }
+
+    /// The file-wide fixes' one edit (E201, I5 §8.3, B536, B515): `edits` —
+    /// each a span of THIS document's live text and what to write there — as a
+    /// single span, its replacement and how many sites it fixes, or `None` when
+    /// fewer than two remain once repeats are dropped (with one, the action
+    /// would be the per-site fix under a longer name). The caller titles it,
+    /// with the count, in a `QuickFix` literal the editor page's gate reads
+    /// (`book_sync`).
+    ///
+    /// `QuickFix` carries a single span and replacement, so the edit spans from
+    /// the first site to the last and splices the text between them through
+    /// verbatim. That is what keeps everything the fix does NOT touch — a
+    /// declining declaration, a comment, the code between two heads — exactly
+    /// as the author wrote it while its neighbours move.
+    fn spliced_edit(&self, mut edits: Vec<(Span, String)>) -> Option<(Span, String, usize)> {
         edits.sort_by_key(|(span, _)| (span.start, span.end));
-        // One diagnostic per declaration is the parser's own recovery, but a
-        // duplicate here would splice the same bytes twice.
-        edits.dedup_by_key(|(span, _)| span.start);
+        // One finding per site is each diagnostic's own rule, but two findings
+        // can name one site (a refusal and a warning on one head, several
+        // uses of one counter), and a repeat would splice the same bytes twice.
+        edits.dedup_by_key(|(span, _)| (span.start, span.end));
+        if edits.len() < 2 {
+            return None;
+        }
         let first = edits.first()?.0.start;
         let last = edits.last()?.0.end;
         let mut replacement = String::new();
         let mut cursor = first;
         for (span, text) in &edits {
             // A later edit that OVERLAPS an earlier one cannot be spliced, and
-            // the declarations are disjoint by construction — so this is a
+            // every caller's sites are disjoint by construction — so this is a
             // guard against a text scan gone wrong, not an expected shape.
             if span.start < cursor {
                 return None;
@@ -7222,9 +7255,164 @@ impl Document {
             replacement.push_str(text);
             cursor = span.end;
         }
+        Some((Span::from(first..last), replacement, edits.len()))
+    }
+
+    /// This document's own findings — its diagnostics and its warnings —
+    /// without the ones the analysis attributes to another file (an edit can
+    /// only ever reach this document).
+    fn own_findings(&self) -> impl Iterator<Item = &vilan_core::error::Error> {
+        let own = |sources: &[SourceId], index: usize| {
+            sources.get(index).copied().unwrap_or(SourceId(0)) == self.focus
+        };
+        let diagnostics = self
+            .diagnostics
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| own(&self.diagnostic_sources, *index));
+        let warnings = self
+            .warnings
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| own(&self.warning_sources, *index));
+        diagnostics.chain(warnings).map(|(_, finding)| finding)
+    }
+
+    /// B536: a declaration head written out of THE order — the attribute
+    /// WARNING and the keyword REFUSAL alike — rewritten in the order, as the
+    /// parser's own fix data spells it (`parsing::marker_order_fix`, which
+    /// permutes the head's units and keeps what stood between them).
+    fn marker_order_quick_fix(&self, finding: &vilan_core::error::Error) -> Option<QuickFix> {
+        let fix = vilan_core::parsing::marker_order_fix(&self.text, &finding.msg, finding.span)?;
         Some(QuickFix {
-            title: format!("Write all {} `css` declarations as calls", edits.len()),
-            span: Span::from(first..last),
+            title: fix.title,
+            span: fix.span,
+            replacement: fix.replacement,
+            target: None,
+        })
+    }
+
+    /// B536's file-wide fix: every head in this file written out of the order,
+    /// as ONE edit — the migration R-c's flip waits on (the attribute-order
+    /// warning is an error from v0.45.0), a file at a time. Offered where a
+    /// marker-order finding overlaps `range`.
+    fn marker_order_all_fix(&self, range: Span) -> Option<QuickFix> {
+        let mut asked = false;
+        let mut edits: Vec<(Span, String)> = Vec::new();
+        for finding in self.own_findings() {
+            let Some(fix) = self.marker_order_quick_fix(finding) else {
+                continue;
+            };
+            asked |= spans_overlap(finding.span, range);
+            edits.push((fix.span, fix.replacement));
+        }
+        if !asked {
+            return None;
+        }
+        let (span, replacement, count) = self.spliced_edit(edits)?;
+        Some(QuickFix {
+            title: format!("Write all {count} declaration heads in the order"),
+            span,
+            replacement,
+            target: None,
+        })
+    }
+
+    /// The add-import edit: `import <module_path>::<name>;` written where the
+    /// formatter's import placement puts it (joining a brace list from the
+    /// same module when the file has one). The one constructor of the
+    /// "Import `X` from m" title, which a missing name and a trait method's
+    /// missing trait (B515) both offer.
+    fn import_fix(&self, module_path: &[String], name: &str) -> Option<QuickFix> {
+        let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+        let edit = vilan_core::formatter::insert_import(&self.text, &path_refs, name)?;
+        Some(QuickFix {
+            title: format!("Import `{name}` from {}", module_path.join("::")),
+            span: edit.span,
+            replacement: edit.replacement,
+            target: None,
+        })
+    }
+
+    /// B515 (B535): the trait `finding` says a method call needs imported, and
+    /// the modules to import it from — `None` when the finding is not one of
+    /// the two diagnostics that name a trait's import
+    /// ([`vilan_ide::trait_import`]).
+    ///
+    /// The message spells the statement where the ANALYZER found the trait,
+    /// and the path written is still the editor's own candidate scan's answer
+    /// (the add-import fix's, which reads what each module declares and
+    /// exports): the message's module when the scan agrees, every candidate
+    /// the scan finds otherwise — several only when the name is ambiguous,
+    /// and then never guessed between. A module the scan cannot reach is not
+    /// written into a file.
+    fn trait_import_paths<'finding>(
+        &self,
+        program: &Program,
+        finding: &'finding vilan_core::error::Error,
+    ) -> Option<(&'finding str, Vec<Vec<String>>)> {
+        let import = vilan_ide::trait_import::trait_import_of_message(&finding.msg)?;
+        let candidates = self.import_candidates(program, import.name);
+        let named: Option<Vec<String>> = import
+            .module
+            .map(|module| module.iter().map(|segment| segment.to_string()).collect());
+        let paths = match named {
+            Some(named) if candidates.contains(&named) => vec![named],
+            _ => candidates,
+        };
+        Some((import.name, paths))
+    }
+
+    /// Every trait this file's own findings say a method call needs imported,
+    /// each with the ONE module to import it from — a trait the scan finds in
+    /// several modules is left to its per-site fix, never guessed — in the
+    /// order the file first needs them.
+    fn unambiguous_trait_imports(&self, program: &Program) -> Vec<(String, Vec<String>)> {
+        let mut imports: Vec<(String, Vec<String>)> = Vec::new();
+        for finding in self.own_findings() {
+            let Some((name, paths)) = self.trait_import_paths(program, finding) else {
+                continue;
+            };
+            let [module_path] = paths.as_slice() else {
+                continue;
+            };
+            if !imports
+                .iter()
+                .any(|(known, path)| known == name && path == module_path)
+            {
+                imports.push((name.to_string(), module_path.clone()));
+            }
+        }
+        imports
+    }
+
+    /// B515's file-wide fix: every trait this file calls a method of without
+    /// importing it, imported in ONE edit — the migration R-c's flip waits on
+    /// (the warning is refused from v0.45.0), a file at a time. Offered where
+    /// a trait-import finding overlaps `range`, and only for two traits or
+    /// more (two calls of one trait are one import).
+    fn trait_import_all_fix(&self, program: &Program, range: Span) -> Option<QuickFix> {
+        let asked = self.own_findings().any(|finding| {
+            spans_overlap(finding.span, range)
+                && vilan_ide::trait_import::trait_import_of_message(&finding.msg).is_some()
+        });
+        if !asked {
+            return None;
+        }
+        let imports = self.unambiguous_trait_imports(program);
+        if imports.len() < 2 {
+            return None;
+        }
+        let mut working = self.text.clone();
+        for (name, module_path) in &imports {
+            let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+            let edit = vilan_core::formatter::insert_import(&working, &path_refs, name)?;
+            working = splice(&working, edit.span, &edit.replacement);
+        }
+        let (span, replacement) = narrowed_edit(&self.text, &working);
+        Some(QuickFix {
+            title: format!("Import all {} traits this file calls", imports.len()),
+            span,
             replacement,
             target: None,
         })
@@ -7265,28 +7453,15 @@ impl Document {
             asked |= spans_overlap(diagnostic.span, range);
             edits.push((preferred.span, preferred.replacement));
         }
-        edits.sort_by_key(|(span, _)| (span.start, span.end));
-        edits.dedup_by_key(|(span, _)| (span.start, span.end));
-        if !asked || edits.len() < 2 {
+        if !asked {
             return None;
         }
-        let first = edits.first()?.0.start;
-        let last = edits.last()?.0.end;
-        let mut replacement = String::new();
-        let mut cursor = first;
-        for (span, text) in &edits {
-            // Two fixes over overlapping text (a conversion inside another's
-            // value) cannot be spliced in one edit; the per-site fixes remain.
-            if span.start < cursor {
-                return None;
-            }
-            replacement.push_str(self.text.get(cursor..span.start)?);
-            replacement.push_str(text);
-            cursor = span.end;
-        }
+        // Two fixes over overlapping text (a conversion inside another's
+        // value) cannot be spliced in one edit; the per-site fixes remain.
+        let (span, replacement, count) = self.spliced_edit(edits)?;
         Some(QuickFix {
-            title: format!("Convert all {} indexes in this file", edits.len()),
-            span: Span::from(first..last),
+            title: format!("Convert all {count} indexes in this file"),
+            span,
             replacement,
             target: None,
         })
@@ -7358,6 +7533,14 @@ impl Document {
                 });
                 continue;
             }
+            // B536: a head out of THE order — attributes out of rank, a
+            // keyword ahead of an attribute, two keywords inverted — refused
+            // (the attribute half since v0.45.0) and read as the head in the
+            // order; the fix writes it so.
+            if let Some(fix) = self.marker_order_quick_fix(diagnostic) {
+                fixes.push(fix);
+                continue;
+            }
             // A154: a path through a std module that moved under a namespace —
             // the refusal anchors at the old segment, and the fix writes the
             // new path there (`dom` → `web::dom`), or, in a brace list under
@@ -7377,21 +7560,24 @@ impl Document {
                 });
                 continue;
             }
+            // B535 (B515's refusal since v0.45.0): a trait's method called
+            // where the file does not import the trait, and the no-method
+            // steer, which names the trait whose module nothing loaded — the
+            // fix imports it.
+            if let Some((name, module_paths)) = self.trait_import_paths(program, diagnostic) {
+                fixes.extend(
+                    module_paths
+                        .iter()
+                        .filter_map(|module_path| self.import_fix(module_path, name)),
+                );
+                continue;
+            }
             if let Some(name) = unresolved_name(&diagnostic.msg) {
-                for module_path in self.import_candidates(program, name) {
-                    let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
-                    let Some(edit) =
-                        vilan_core::formatter::insert_import(&self.text, &path_refs, name)
-                    else {
-                        continue;
-                    };
-                    fixes.push(QuickFix {
-                        title: format!("Import `{name}` from {}", module_path.join("::")),
-                        span: edit.span,
-                        replacement: edit.replacement,
-                        target: None,
-                    });
-                }
+                fixes.extend(
+                    self.import_candidates(program, name)
+                        .iter()
+                        .filter_map(|module_path| self.import_fix(module_path, name)),
+                );
             } else if let Some(attribute) = diagnostic
                 .note
                 .as_ref()
@@ -7478,6 +7664,31 @@ impl Document {
                 // §7.2 fix 2, the `#`'s twin: the one at-rule with a
                 // combinator spelling is a min-width media query.
                 fixes.push(fix);
+            } else if let Some(fix) = vilan_ide::closure_mode_fix::closure_mode_fixes(
+                &self.text,
+                diagnostic.span,
+                &diagnostic.msg,
+            )
+            .into_iter()
+            .next()
+            {
+                // E263: B495's mode mismatch — the literal's parameter written
+                // in the type's mode, or the adapter around a named closure.
+                use vilan_ide::closure_mode_fix::ClosureModeEdit;
+                fixes.push(match fix.edit {
+                    ClosureModeEdit::Parameter { written } => QuickFix {
+                        title: format!("Take the parameter as `{written}`"),
+                        span: fix.span,
+                        replacement: fix.replacement,
+                        target: None,
+                    },
+                    ClosureModeEdit::Adapter { written } => QuickFix {
+                        title: format!("Adapt it: `{written}`"),
+                        span: fix.span,
+                        replacement: fix.replacement,
+                        target: None,
+                    },
+                });
             } else if let Some(conversions) = numeric_conversion_fixes(&self.text, diagnostic) {
                 // E218: the mismatch names the one call that fixes it, and the
                 // fix writes that call at the value the diagnostic spans — or,
@@ -7545,6 +7756,14 @@ impl Document {
         // I5 §8.3's bulk half, for the same reason: a file migrating to `usize`
         // meets one mismatch per index, and the codemod is this action.
         if let Some(fix) = self.numeric_index_all_fix(range) {
+            fixes.push(fix);
+        }
+        // B536's bulk half: the heads of a migrating file, all at once.
+        if let Some(fix) = self.marker_order_all_fix(range) {
+            fixes.push(fix);
+        }
+        // B515's bulk half: every trait the file calls without importing.
+        if let Some(fix) = self.trait_import_all_fix(program, range) {
             fixes.push(fix);
         }
         // B318 §5: the two reach WARNINGS carry fixes of their own, and a
@@ -8069,13 +8288,19 @@ impl Document {
                 names.push(name);
             }
         }
-        let mut working = self.text.clone();
-        let mut changed = false;
+        let mut imports: Vec<(String, Vec<String>)> = Vec::new();
         for name in names {
             let candidates = self.import_candidates(program, name);
             let [module_path] = candidates.as_slice() else {
                 continue; // zero or ambiguous candidates: never guess
             };
+            imports.push((name.to_string(), module_path.clone()));
+        }
+        // B515: the traits a method call needs imported, by the same rule.
+        imports.extend(self.unambiguous_trait_imports(program));
+        let mut working = self.text.clone();
+        let mut changed = false;
+        for (name, module_path) in &imports {
             let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
             if let Some(edit) = vilan_core::formatter::insert_import(&working, &path_refs, name) {
                 working = splice(&working, edit.span, &edit.replacement);
@@ -9733,6 +9958,76 @@ fn field_spans_of(program: &Program, focus: SourceId) -> Vec<(usize, usize, Id, 
 /// splice's result — so two new imports from the same not-yet-imported
 /// module land in one merged brace set, exactly as two separate manual
 /// add-imports would.
+/// The one edit that turns `before` into `after`, narrowed to the text that
+/// differs: their common prefix and suffix are trimmed (on character
+/// boundaries, and never overlapping), so an edit computed by rewriting the
+/// whole buffer still lands as a small one, and the client keeps the caret and
+/// the folds outside it.
+fn narrowed_edit(before: &str, after: &str) -> (Span, String) {
+    let mut prefix = before
+        .bytes()
+        .zip(after.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !before.is_char_boundary(prefix) || !after.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let room = before.len().min(after.len()) - prefix;
+    let mut suffix = before
+        .bytes()
+        .rev()
+        .zip(after.bytes().rev())
+        .take(room)
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !before.is_char_boundary(before.len() - suffix)
+        || !after.is_char_boundary(after.len() - suffix)
+    {
+        suffix -= 1;
+    }
+    (
+        Span::from(prefix..before.len() - suffix),
+        after[prefix..after.len() - suffix].to_string(),
+    )
+}
+
+#[cfg(test)]
+mod narrowed_edit_tests {
+    use super::{narrowed_edit, splice};
+
+    /// Each case: the edit narrows to the difference, and applying it to
+    /// `before` gives `after` back.
+    #[test]
+    fn the_edit_is_the_difference_and_applies_back() {
+        for (before, after, expected) in [
+            // An insertion at the top.
+            (
+                "fun main() {}\n",
+                "import a::B;\nfun main() {}\n",
+                "import a::B;\n",
+            ),
+            // A repeated character at the seam: prefix and suffix may not
+            // both claim it.
+            ("aa", "aaa", "a"),
+            ("abc", "abc", ""),
+            // A deletion.
+            ("abXc", "abc", ""),
+            // Multi-byte characters sharing a leading byte (`é` and `è` both
+            // open with 0xC3): the cut stays on a character boundary.
+            ("caf\u{e9}!", "caf\u{e8}!", "\u{e8}"),
+            ("\u{e9}", "\u{e8}\u{e9}", "\u{e8}"),
+        ] {
+            let (span, replacement) = narrowed_edit(before, after);
+            assert_eq!(replacement, expected, "{before:?} -> {after:?}");
+            assert_eq!(
+                splice(before, span, &replacement),
+                after,
+                "{before:?} -> {after:?}"
+            );
+        }
+    }
+}
+
 fn splice(source: &str, span: Span, replacement: &str) -> String {
     let range = span.into_range();
     let mut result =
@@ -13190,6 +13485,69 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // E267: a package's NESTED module (A65's `pkg::lib::ui::widget`) is a
+    // name's home at its full path, for the auto-import table and the
+    // add-import quick fix alike — both walked a package's top level only,
+    // so neither ever offered a name declared one directory down.
+    #[test]
+    fn a_nested_package_modules_item_is_an_auto_import_candidate_at_its_full_path() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::lib::ui::widget::greet;\n\nfun main() {\n\tgreet();\n\t\n}\n",
+            ),
+            (
+                "lib/ui/widget.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n",
+            ),
+        ]);
+        let marker = "greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let offered: Vec<(String, Vec<String>)> = document
+            .completion(offset)
+            .into_iter()
+            .filter_map(|candidate| {
+                let import = candidate.needs_import?;
+                Some((candidate.label, import.module_path))
+            })
+            .filter(|(label, _)| label == "farewell")
+            .collect();
+        assert_eq!(
+            offered,
+            vec![(
+                "farewell".to_string(),
+                ["pkg", "lib", "ui", "widget"].map(str::to_string).to_vec()
+            )],
+            "offered once, at the module's full path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nested_package_modules_item_is_an_add_import_target() {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\tfarewell();\n}\n"),
+            (
+                "lib/ui/widget.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let titles: Vec<String> = document
+            .diagnostics
+            .iter()
+            .flat_map(|diagnostic| document.quickfixes(program, diagnostic.span))
+            .map(|fix| fix.title)
+            .filter(|title| title.starts_with("Import `farewell`"))
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Import `farewell` from pkg::lib::ui::widget".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // …and the exemption that carries the estate: a module carrying no marker
     // anywhere offers everything it declares, exactly as it did before the bit
     // existed (visibility.md §14).
@@ -16091,6 +16449,45 @@ pub(crate) mod tests {
         }
     }
 
+    /// E270's semantic-token side: a `then` that LEADS its line is the infix
+    /// conditional to the parser exactly as the same-line one is, and neither
+    /// carries a semantic token (the server classifies names, and a keyword is
+    /// none), so the TextMate keyword colour is what shows — a `Variable` token
+    /// there would paint over it. Its hover is the keyword's.
+    #[test]
+    fn e270_a_line_leading_then_carries_no_semantic_token() {
+        let text = concat!(
+            "fun main() {\n",
+            "\tlet ready = true;\n",
+            "\tlet label = ready\n",
+            "\t\tthen \"on\"\n",
+            "\t\telse \"off\";\n",
+            "\tlet same = ready then 1 else 2;\n",
+            "}\n",
+        );
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let tokens = document.semantic_tokens();
+        for (index, _) in text.match_indices("then ") {
+            assert!(
+                tokens
+                    .iter()
+                    .all(|(span, _, _)| !(span.start <= index && index < span.end)),
+                "no semantic token over `then` at {index}: {tokens:?}"
+            );
+            assert!(
+                document
+                    .hover(index + 1)
+                    .is_some_and(|hover| hover.contains("infix conditional")),
+                "`then` at {index} hovers as the keyword"
+            );
+        }
+    }
+
     /// B459: `then` hovers as the infix conditional where the parser read it
     /// as one, and as nothing of the kind where it is a name — a binding and a
     /// `.then(..)` call — in the same file.
@@ -18935,6 +19332,39 @@ pub(crate) mod tests {
             !plain.contains(&"placeholder".to_string()),
             "`placeholder` is not a `div` attribute: {plain:?}"
         );
+    }
+
+    // E264: a name the compiler STEERS away from is not offered as an
+    // attribute. A written `autofocus` warns (A157: the browser's native
+    // attribute acts only at the page's first parse) and steers to
+    // `.autofocus()`, so `<input |>` offers the method — which the head
+    // offers already, dot included — and not the bare attribute that would
+    // warn on the next analysis. Every other global stays.
+    #[test]
+    fn element_head_offers_autofocus_as_the_method_only() {
+        for head in [
+            "\t<input ~/>\n",
+            "\t<div ~></div>\n",
+            "\t<button ~></button>\n",
+        ] {
+            let labels = element_head_completions(head);
+            assert!(
+                labels.contains(&".autofocus".to_string()),
+                "the method, dot included: {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"autofocus".to_string()),
+                "the steered attribute is not offered: {labels:?}"
+            );
+            assert!(
+                labels.contains(&"tabindex".to_string()),
+                "the other globals stay: {labels:?}"
+            );
+        }
+        // After a dot the head offers the View's methods, `autofocus` among
+        // them, exactly as before.
+        let dotted = element_head_completions("\t<input .~/>\n");
+        assert!(dotted.contains(&"autofocus".to_string()), "{dotted:?}");
     }
 
     // The SVG half of the ruling, and lucide's own shape: `<svg |>` offers

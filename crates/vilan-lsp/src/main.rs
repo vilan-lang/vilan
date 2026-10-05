@@ -19,17 +19,23 @@ mod uri;
 mod world;
 
 #[cfg(test)]
+mod closure_mode_tests;
+#[cfg(test)]
 mod entry_world_tests;
 #[cfg(test)]
 mod foreign_spelling_tests;
 #[cfg(test)]
 mod import_position_tests;
 #[cfg(test)]
+mod marker_order_tests;
+#[cfg(test)]
 mod member_admission_tests;
 #[cfg(test)]
 mod moved_std_path_tests;
 #[cfg(test)]
 mod organize_duplicate_tests;
+#[cfg(test)]
+mod trait_import_tests;
 #[cfg(test)]
 mod written_autofocus_tests;
 
