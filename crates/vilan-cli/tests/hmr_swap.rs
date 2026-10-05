@@ -535,6 +535,7 @@ fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
 /// the rebuilt bytes differ from A's.
 const SOCKET_CLIENT: &str = r#"import std::web::ui::{ view, View, mount_root };
 import std::rpc::{ ReactiveClient, RemoteSource, bridge, connect_socket };
+import std::reactive::Flow;
 import std::json::json_codec;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };

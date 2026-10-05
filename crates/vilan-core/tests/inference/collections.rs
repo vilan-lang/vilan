@@ -579,7 +579,7 @@ fn a142_s5_coll_by_then_filter_map_joins_a_coarse_list_of_sources() {
     assert_compiles_and_runs(
         r#"
         import std::option::Option::{ self, None, Some };
-        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, comp };
+        import std::reactive::{ CollPipe, Signal, SignalCell, Source, Subscriber, Subscription, comp };
 
         struct Row {
             id: i32,
@@ -627,7 +627,7 @@ fn a142_s5_the_conversions_agree_with_the_list_under_a_random_walk() {
 }
 
 pub const CONVERSION_WALK: &str = r#"
-import std::reactive::{ Signal, SignalCell, comp };
+import std::reactive::{ CollPipe, Signal, SignalCell, comp };
 
 mut seed = 99;
 

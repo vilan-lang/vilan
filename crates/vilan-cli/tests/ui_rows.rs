@@ -1041,6 +1041,7 @@ fn a59_measurement_reads_the_host_box_and_a_detached_element_reads_zero() {
 /// way DOWN — before the target's own — and a disposed one is gone from the
 /// capture table rather than from the bubble table it never joined.
 const CAPTURE: &str = r#"import std::web::dom::{ get_element_by_id, window };
+import std::reactive::Disposable;
 import std::io::print;
 import std::web::ui::{ mount_root, view };
 
@@ -1126,6 +1127,7 @@ fn a59_capture_listeners_run_before_the_target_and_dispose_by_phase() {
 /// first-layout hook), fires again on a size change, and its `Subscription`
 /// disconnects the observer.
 const RESIZE: &str = r#"import std::web::dom::get_element_by_id;
+import std::reactive::Disposable;
 import std::io::print;
 import std::web::ui::{ mount_root, view };
 

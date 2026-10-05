@@ -95,6 +95,11 @@ written down.
 
 ---
 
+<!-- family: breaking -->
+**BREAKING (B535, B515's v0.45.0 half, R-c): a trait's method called in a file that does not import the trait is REFUSED — "`to_string` is `Display`'s, and this file does not import `Display`: a trait's methods resolve only in a file that imports the trait. Import it (`import std::display::Display;`)" — where v0.44.0 warned.** An `impl` registers when its module loads and loading is program-wide, so the call resolved through another module's import. The file reaches the trait by importing it by name, through a bound that writes it, or by declaring the trait or the impl; `Iterator` is in the base prelude and the pipe sealers (`CollPipe`, `SetPipe`) in the web prelude (Order 46's rulings), so iterator chains and `memo` need no import. **The editor's half** (for the quick fix): the refusal's stable code is `analyzer::TRAIT_SCOPE_CODE` (`trait-scope/not-imported`) and its fix data is `analyzer::trait_scope_import(message)`, the import statement the message names; the span is the member's name. **Migration:** add the import the message names. The estate before the flip: std 0 (std's own calls are exempt and import what they call), the corpus 0, the docs' fences 0 (gated since Order 46), the examples 2 (`todo` and `walkthrough`'s `client.vl` call `.debug()` without `Debug`; both import it now), kolt 0 (a scratch copy of the owner's working tree, `vilan check` clean). **Pins:** `inference::modules::b515_a_trait_method_resolved_through_another_modules_import_is_refused` (two traits; the fix data), `b515_a_trait_in_scope_is_accepted` (now a clean compile, not an empty warning list). Ledger row 618 re-keyed. Docs: `spec/names.md` §4.6. Tracker B535, B515.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.

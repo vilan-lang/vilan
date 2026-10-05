@@ -3,7 +3,7 @@
 // checked after EVERY step against a recomputation from the map itself.
 import std::hash_map::HashMap;
 import std::option::Option::{ self, None, Some };
-import std::reactive::{ HashMapCell, Signal, SignalCell, Source, comp };
+import std::reactive::{ CollPipe, HashMapCell, MapPipe, Signal, SignalCell, Source, comp };
 
 mut seed = 7;
 

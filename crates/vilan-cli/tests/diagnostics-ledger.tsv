@@ -640,7 +640,7 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 615	-	a declaration's markers are written in one order — its attributes, then the keywords `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration word: write `{canonical}`
 616	-	this pattern binds {n} {elements}, but the value is a {n}-tuple `{type}`: a tuple pattern takes one sub-pattern per element, and a nested pattern reaches inside one (`((a, b), c)`)
 617	-	this pattern binds {n} {elements}, but the value is a `{type}`, not a tuple: `(a, b)` destructures a tuple
-618	-	`{member}` is `{trait}`'s, and this file does not import `{trait}`: the call resolves only because another loaded module does. Import it (`{import}`) — this is an error from v0.45.0
+618	-	`{member_name}` is `{trait_name}`'s, and this file does not import `{trait_name}`: a trait's methods resolve only in a file that imports the trait. Import it (`{import}`)
 619	-	`{type}` is not a trait: a selector's `with` names the trait the block implements, as its declaration does (`(impl Box with One)` selects `impl Box with One`)
 620	-	a declaration's attributes are written in one order — `[derive]` and the other generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform]`, `[resource]`: write `{canonical}`
 621	-	the left side of this assignment is not a place: it is {what} — only a place can be assigned: a binding (`x`), a field (`p.x`), an element (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a `&mut` view

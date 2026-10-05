@@ -7380,6 +7380,7 @@ fn b359_a_for_loop_in_a_default_body_drives_the_traits_protocol_member() {
 fn b359_ords_clamp_default_still_answers_over_the_integers() {
     assert_compiles_and_runs(
         r#"
+        import std::compare::Ord;
         import std::io::print;
 
         fun main() {

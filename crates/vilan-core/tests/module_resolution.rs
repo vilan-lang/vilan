@@ -1410,10 +1410,10 @@ const B519_CLIENT_MAIN: &str = concat!(
 #[test]
 fn b519_a_service_in_an_imported_module_declares_every_mirror_table_it_uses() {
     let imported_entry = format!(
-        "import std::io::print;\nimport std::json::json_codec;\nimport pkg::store::MirClient;\n\n{B519_CLIENT_MAIN}"
+        "import std::io::print;\nimport std::json::json_codec;\nimport std::reactive::Source;\nimport pkg::store::MirClient;\n\n{B519_CLIENT_MAIN}"
     );
     let single_file = format!(
-        "import std::io::print;\nimport std::json::json_codec;\n{}\n{B519_CLIENT_MAIN}",
+        "import std::io::print;\nimport std::json::json_codec;\nimport std::reactive::Source;\n{}\n{B519_CLIENT_MAIN}",
         B519_STORE.replace("export *;\n", "")
     );
     for (layout, files) in [
@@ -3814,12 +3814,18 @@ fn b535_a_collection_pipes_memo_needs_no_import_under_the_web_prelude() {
             .all(|warning| !warning.contains("does not import")),
         "under the web set both sealers are in scope: {web:#?}"
     );
-    let base = warnings_under_prelude(base_prelude(), entry, Platform::default());
+    // Refused since v0.45.0 (B535's flip): a warning for one release.
+    let base = analyze_under_prelude(
+        base_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::default(),
+    );
     for sealer in ["`CollPipe`", "`SetPipe`"] {
         assert!(
             base.iter()
-                .any(|warning| warning.contains("does not import") && warning.contains(sealer)),
-            "the base set does not carry {sealer}, so B515 still asks for its import: {base:#?}"
+                .any(|error| error.contains("does not import") && error.contains(sealer)),
+            "the base set does not carry {sealer}, so B535 still asks for its import: {base:#?}"
         );
     }
 }
@@ -8571,7 +8577,7 @@ fn b401_files(imports: &str, p2_block: &str) -> Vec<(String, String)> {
         (
             "c.vl".to_string(),
             format!(
-                "import pkg::b::Box;\n{imports}\n\nfun main() {{\n\tprint(Box {{ n = 1 }}.describe());\n}}\n"
+                "import pkg::b::Box;\nimport pkg::t::{{ One, Two }};\n{imports}\n\nfun main() {{\n\tprint(Box {{ n = 1 }}.describe());\n}}\n"
             ),
         ),
     ]

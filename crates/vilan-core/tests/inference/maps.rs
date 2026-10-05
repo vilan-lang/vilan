@@ -626,7 +626,7 @@ fn a138_every_handle_to_one_cell_or_one_key_shares_an_identity() {
     assert_compiles_and_runs(
         r#"
         import std::hash_map::HashMap;
-        import std::reactive::{ HashMapCell, HashSetCell, Source, comp };
+        import std::reactive::{ CollPipe, HashMapCell, HashSetCell, MapPipe, Source, comp };
 
         fun main() {
             let cell: HashMapCell<str, i32> = HashMapCell::new();

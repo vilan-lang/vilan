@@ -12,6 +12,7 @@
 // `ui` — so what is left below is the codec and this package's own modules,
 // none of which any prelude carries.
 
+import std::debug::Debug;
 import std::json::json_codec;
 import pkg::store::TodoClient;
 import pkg::todos::todos;

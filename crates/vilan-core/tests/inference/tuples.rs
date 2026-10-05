@@ -425,6 +425,7 @@ fn a_bare_function_name_stays_a_value() {
 fn from_json_decodes_a_valid_scalar() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
@@ -440,6 +441,7 @@ fn from_json_decodes_a_valid_scalar() {
 fn from_json_rejects_a_wrong_typed_scalar() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
@@ -455,6 +457,7 @@ fn from_json_rejects_a_wrong_typed_scalar() {
 fn from_json_rejects_malformed_text() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
@@ -567,6 +570,7 @@ fn from_json_recurses_into_a_nested_struct() {
 fn from_json_reads_option_null_and_value() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -586,6 +590,7 @@ fn from_json_reads_option_null_and_value() {
 fn from_json_rejects_a_non_array_for_a_list() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
@@ -602,6 +607,7 @@ fn from_json_rejects_a_non_array_for_a_list() {
 fn from_json_short_circuits_on_a_bad_list_element() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 

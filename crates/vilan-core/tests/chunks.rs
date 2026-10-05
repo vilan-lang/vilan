@@ -320,6 +320,7 @@ fn a_node_program_plans_nothing() {
 /// registry.
 const CROSSING_SOURCE: &str = r#"
 import std::web::ui::{View, view, mount_root, swap};
+import std::reactive::Pipe;
 import std::web::router::{current_path, segments};
 
 [derive(PartialEq)]

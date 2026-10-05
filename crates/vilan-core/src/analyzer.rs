@@ -458,6 +458,28 @@ impl TupleBoundRequirement {
     }
 }
 
+/// B535's stable code: a trait's method called in a file that does not import
+/// the trait ([`Analyzer::check_trait_method_scope`]'s refusal). The editor
+/// publishes it as the diagnostic's `code`.
+pub const TRAIT_SCOPE_CODE: &str = "trait-scope/not-imported";
+
+/// The fixed head of B535's refusal after its member and trait names, which
+/// recognizes it.
+const TRAIT_SCOPE_MARK: &str = "and this file does not import `";
+
+/// B535's quick-fix data: the import statement the refusal `message` names
+/// (`import std::display::Display;`), or `None` when `message` is not that
+/// refusal. The editor inserts it among the file's imports.
+pub fn trait_scope_import(message: &str) -> Option<&str> {
+    if !message.contains(TRAIT_SCOPE_MARK) {
+        return None;
+    }
+    let start = message.rfind("Import it (`")? + "Import it (`".len();
+    let rest = &message[start..];
+    let end = rest.find("`)")?;
+    Some(&rest[..end])
+}
+
 /// What the providers of a trait answer for a bound's written pattern
 /// ([`Analyzer::trait_args_providers_for_pattern`]).
 enum PatternProviders {
@@ -54189,7 +54211,7 @@ impl<'src> Analyzer<'src> {
         if reached.is_empty() {
             return;
         }
-        let mut sites: Vec<(SourceId, Span, Id, &'src str)> = Vec::new();
+        let mut sites: Vec<(SourceId, Span, Id, &'src str, Id)> = Vec::new();
         let calls: Vec<(Id, Id, Id)> = self
             .function_calls
             .iter()
@@ -54285,30 +54307,55 @@ impl<'src> Analyzer<'src> {
                         .unwrap_or(&&EMPTY_SPAN)
                 });
             let member_name = self.callable_name(*member_id).unwrap_or("this method");
-            sites.push((source, span, trait_id, member_name));
+            sites.push((source, span, trait_id, member_name, *call_id));
         }
         // The calls are visited in the table's order, not the file's — sorted so
         // `vilan check` prints them stably, and one per site (an entry world
         // per package entry resolves a shared file's calls once each).
         sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
-        sites.dedup();
-        for (source, span, trait_id, member_name) in sites {
+        sites.dedup_by_key(|(source, span, trait_id, ..)| (*source, *span, *trait_id));
+        if !sites.is_empty() {
+            self.build_std_indexes_if_needed();
+        }
+        for (_, span, trait_id, member_name, call_id) in sites {
             let trait_name = self.traits.get(&trait_id).map_or("", |trait_| trait_.name);
-            let import = match self.import_path_of(trait_id) {
-                Some(path) => format!("import {path};"),
-                None => format!("import {trait_name};"),
+            // A std trait's import is spelled from std's own index — its
+            // module path whole (`std::reactive::delta::CollPipe`), where the
+            // flat lookup knew only top-level modules and spelled a nested
+            // one `pkg::delta::CollPipe`, which no user file can write.
+            let std_module = self
+                .traits
+                .get(&trait_id)
+                .and_then(|trait_| self.source_of_id(trait_.id))
+                .filter(|source| self.std_sources.contains(source))
+                .and_then(|_| {
+                    self.std_export_index
+                        .as_ref()
+                        .and_then(|index| index.get(trait_name))
+                        .cloned()
+                });
+            let import = match (std_module, self.import_path_of(trait_id)) {
+                (Some(module), _) => format!("import std::{module}::{trait_name};"),
+                (None, Some(path)) => format!("import {path};"),
+                (None, None) => format!("import {trait_name};"),
             };
-            self.warnings.push(Error {
-                trace: Vec::new(),
-                note: None,
-                span,
-                msg: format!(
-                    "`{member_name}` is `{trait_name}`'s, and this file does not import \
-                     `{trait_name}`: the call resolves only because another loaded module does. \
-                     Import it (`{import}`) — this is an error from v0.45.0"
-                ),
-            });
-            self.warning_sources.push(source);
+            // B535 (v0.45.0, R-c): the refusal B515's one-release warning
+            // announced. Its fix data is the message's own import statement
+            // (`trait_scope_import`), under the stable code
+            // `TRAIT_SCOPE_CODE`.
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`{member_name}` is `{trait_name}`'s, and this file does not import \
+                         `{trait_name}`: a trait's methods resolve only in a file that imports \
+                         the trait. Import it (`{import}`)"
+                    ),
+                },
+                call_id,
+            );
         }
     }
 
