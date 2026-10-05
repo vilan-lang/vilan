@@ -12796,3 +12796,55 @@ fn b509_a_through_variant_write_copies_nothing() {
         "a write through std's variant and Option steps copies the payload: {once} copies for one write, {many} for 200"
     );
 }
+
+/// B544: a WHOLE write to an `is` capture inside the block its test guards
+/// (`if held is Some(let v) { v += 1; }`) is B528's payload write, and gets
+/// B528's steer — `mut v` there binds a copy whose write never reaches `held`.
+/// A guard's CONTINUATION binding (`if !(held is Some(let n)) { panic(..) }
+/// n = 5;`, B222/B237) is an ordinary local, and a rebind of it still steers
+/// to `mut`.
+#[test]
+fn b544_a_whole_write_to_an_is_capture_in_its_block_steers_to_the_view_subject() {
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held = Some(1);
+            if held is Some(let v) {
+                v += 1;
+            }
+            print(held.unwrap());
+        }
+        "#,
+        "cannot mutate 'v': it is a COPY of the payload the pattern takes out of `held`",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let held = Some(1);
+            if !(held is Some(let n)) {
+                panic("none");
+            }
+            n = 5;
+            print(n);
+        }
+        "#,
+        "cannot mutate immutable 'n'; declare it `mut`",
+    );
+    // The view spelling the steer names writes the payload in place.
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held = Some(1);
+            if &mut held is Some(let v) {
+                v += 1;
+            }
+            print(held.unwrap());
+        }
+        "#,
+        "2\n",
+    );
+}

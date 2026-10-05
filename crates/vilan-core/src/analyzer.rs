@@ -5486,6 +5486,9 @@ pub struct Analyzer<'src> {
     // recorded by the walk, settled in `resolve_world` once the leaves above
     // exist and before any name resolves against the scope they publish into.
     guard_continuations: Vec<GuardContinuation<'src>>,
+    // B544: the `is` captures a guard published to its continuation, with the
+    // offset they are visible from — a whole write there rebinds a local.
+    guard_continuation_captures: HashMap<Id, usize>,
     // The `std::reactive` `Source` TRAIT, if loaded. `[expose]` reconciles an
     // exposed field's type against it (A32's ruling): a field is exposable when
     // its type IMPLEMENTS the nominal std trait, not when its spelling happens
@@ -7255,6 +7258,7 @@ impl<'src> Analyzer<'src> {
             call_subject_ids: HashSet::default(),
             divergence_leaves: DivergenceLeaves::default(),
             guard_continuations: Vec::new(),
+            guard_continuation_captures: HashMap::default(),
             source_trait_id: None,
             wire_trait_id: None,
             hashable_trait_id: None,
@@ -27736,11 +27740,22 @@ impl<'src> Analyzer<'src> {
         if !self.variables.contains_key(&capture_id) {
             return None;
         }
-        // A whole reassignment of an `is` capture (`n = 5` after a `guard`'s
-        // `if !(x is Some(let n))`) is a rebind of a local, which `mut` is the
-        // answer to; a write INTO it, or any write to a `match` leg's capture,
-        // is the payload write B528 is about.
+        // A whole reassignment of an `is` capture in a guard's CONTINUATION
+        // (`n = 5` after `if !(x is Some(let n)) { panic(..) }`, B222/B237) is
+        // a rebind of a local, which `mut` is the answer to. Inside the block
+        // the test guards (`if held is Some(let v) { v += 1 }`) it is the
+        // payload write B528 is about, as a write INTO a capture and any write
+        // to a `match` leg's capture are (B544): `mut v` there binds a copy.
         let writes_into = root != target_id;
+        let rebinds_a_continuation_local = !writes_into
+            && self
+                .guard_continuation_captures
+                .get(&capture_id)
+                .is_some_and(|visible_from| {
+                    self.span_map
+                        .get(&target_id)
+                        .is_some_and(|span| span.start >= *visible_from)
+                });
         for expr in self.expr_id_to_expr_map.values() {
             let (subject_id, patterns, is_test): (Id, Vec<&ExprPattern>, bool) = match expr {
                 Expr::Match(subject_id, legs) => (
@@ -27770,7 +27785,7 @@ impl<'src> Analyzer<'src> {
                     ))
                 }
                 Some(true) => None,
-                None if is_test && !writes_into => None,
+                None if is_test && rebinds_a_continuation_local => None,
                 None if self.place_root(subject_id).is_some() => {
                     let place = self.receiver_spelling(subject_id).unwrap_or("place");
                     Some(format!(
@@ -60124,6 +60139,8 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             for (name, capture_id, visible_until) in guard.captures {
+                self.guard_continuation_captures
+                    .insert(capture_id, guard.visible_from);
                 self.declare_scope_value_until(
                     guard.scope_id,
                     name,

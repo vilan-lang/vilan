@@ -55,6 +55,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**B544: a whole write to an `is` capture inside the block its test guards (`if held is Some(let v) { v += 1; }`) is refused with B528's steer — "cannot mutate 'v': it is a COPY of the payload the pattern takes out of `held`, so a write to it (or to `mut v`) would not reach `held` — … match a view of it, `match &mut held` (or `&mut held is ..`)" — where it steered to "declare it `mut`", whose copy's write silently never reached `held`.** A guard's continuation binding (`if !(held is Some(let n)) { panic(..) } n = 5;`, B222/B237) is an ordinary local and still steers to `mut`: the two are told apart by where the write stands (the continuation is visible from the end of the `if`). **Pins:** `inference::borrows::b544_a_whole_write_to_an_is_capture_in_its_block_steers_to_the_view_subject` (the block's write, the continuation's rebind, the view spelling running in place). Tracker B544.
+
+---
+
 ## v0.44.0 — 2026-10-04
 
 > Performance: this release was cut over a performance verdict that was not green (the verdict at 9fab0ff5 is RED on one editor row: with importers open, CPU to the edited file's own diagnostics; `perf/report-v0.44.0.md` has every row). With a module's importers open, a keystroke now runs ONE analysis of the entry's world where v0.43.0 ran four: every open file settles in about 28% of the CPU (5.1 s to 1.4 s on kolt), and the edited file's own diagnostics arrive with them (about 1.4 s, up from 0.35 s). A file open alone is unaffected. Incremental analysis (M110) addresses this in v0.45.0.
