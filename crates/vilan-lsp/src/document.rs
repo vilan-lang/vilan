@@ -16398,6 +16398,45 @@ pub(crate) mod tests {
         }
     }
 
+    /// E270's semantic-token side: a `then` that LEADS its line is the infix
+    /// conditional to the parser exactly as the same-line one is, and neither
+    /// carries a semantic token (the server classifies names, and a keyword is
+    /// none), so the TextMate keyword colour is what shows — a `Variable` token
+    /// there would paint over it. Its hover is the keyword's.
+    #[test]
+    fn e270_a_line_leading_then_carries_no_semantic_token() {
+        let text = concat!(
+            "fun main() {\n",
+            "\tlet ready = true;\n",
+            "\tlet label = ready\n",
+            "\t\tthen \"on\"\n",
+            "\t\telse \"off\";\n",
+            "\tlet same = ready then 1 else 2;\n",
+            "}\n",
+        );
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let tokens = document.semantic_tokens();
+        for (index, _) in text.match_indices("then ") {
+            assert!(
+                tokens
+                    .iter()
+                    .all(|(span, _, _)| !(span.start <= index && index < span.end)),
+                "no semantic token over `then` at {index}: {tokens:?}"
+            );
+            assert!(
+                document
+                    .hover(index + 1)
+                    .is_some_and(|hover| hover.contains("infix conditional")),
+                "`then` at {index} hovers as the keyword"
+            );
+        }
+    }
+
     /// B459: `then` hovers as the infix conditional where the parser read it
     /// as one, and as nothing of the kind where it is a name — a binding and a
     /// `.then(..)` call — in the same file.

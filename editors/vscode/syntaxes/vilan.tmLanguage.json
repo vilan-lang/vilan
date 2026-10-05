@@ -406,8 +406,8 @@
      }
     },
     {
-     "comment": "B459: `then`, the infix conditional \u2014 contextual, a keyword only after a complete operand (something an expression can END with before it) and before the branch that follows. A name there is never legal (vilan never puts two names side by side), so the guard is both sides, as for `context`: the word is not followed by what a NAME is followed by (`=`, `.`, `:`, `,`, `;`, a closer, or `in`/`is`/`as`), which keeps `let then = 1`, `for then in xs`, `then: i32` and `promise.then(f)` plain.",
-     "match": "(?<=[A-Za-z0-9_\\)\\]\\}\"'])\\s+(then)\\b(?=\\s+(?![=.:,;\\)\\]\\}]|i[ns]\\b|as\\b)\\S)",
+     "comment": "B459: `then`, the infix conditional \u2014 contextual, a keyword only after a complete operand (something an expression can END with before it) and before the branch that follows. A name there is never legal (vilan never puts two names side by side), so the guard is both sides, as for `context`: the word is not followed by what a NAME is followed by (`=`, `.`, `:`, `,`, `;`, a closer, or `in`/`is`/`as`), which keeps `let then = 1`, `for then in xs`, `then: i32` and `promise.then(f)` plain. E270: TextMate matches one LINE at a time, so the operand a `then` follows may sit on the line above \u2014 the formatter's own broken form of a long conditional \u2014 and a `then` that LEADS its line (indentation only before it) is the keyword on the same right-hand guard.",
+     "match": "(?:(?<=[A-Za-z0-9_\\)\\]\\}\"'])\\s+|^\\s*)(then)\\b(?=\\s+(?![=.:,;\\)\\]\\}]|i[ns]\\b|as\\b)\\S)",
      "captures": {
       "1": {
        "name": "keyword.control.vilan"
