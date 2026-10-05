@@ -755,9 +755,9 @@ export impl Region {
 	}
 
 	/// The region's END — its anchor, the bound `cut_row` and `open_row_before`
-	/// take for the last row. A hand-written `Slot` reads it here: the anchor
-	/// FIELD is std's `[internal]` machinery and is no member outside std (A149
-	/// S4). KEEP IN STEP with the process twin's copy (process/ui.vl).
+	/// take for the last row. A hand-written `Slot` reads it here: the anchor FIELD
+	/// is std's `[internal]` machinery and is no member outside std (A149 S4). KEEP
+	/// IN STEP with the process twin's copy (process/ui.vl).
 	[internal("the region's end marker: place against it, never through it")]
 	fun end(self): Text {
 		self.anchor
@@ -2634,7 +2634,8 @@ export impl FocusScope {
 /// `attach` gives every overlay — makes it exactly one open.
 ///
 /// The entry is `(id, root, containment, restore)`: the restore target is
-/// remembered at install, BEFORE the scope takes focus.
+/// remembered at install, BEFORE the scope takes focus — and before its content
+/// did, when the content's `autofocus` ran first (`restore_target`, B546).
 let focus_scopes: Shared<List<(i32, Element, FocusContainment, Element)>> = Shared::new([]);
 
 /// The id source. Ids are never reused, so a stale handle names nothing.
@@ -2663,6 +2664,34 @@ external fun autofocus_registered(registry: AutofocusRegistry, element: Element)
 /// The one registry, for the life of the page.
 let autofocus_elements: AutofocusRegistry = autofocus_registry();
 
+/// Where `View::autofocus` took focus FROM (B546): a host `WeakMap` from each
+/// element it focused to the element that held focus just before. A focus scope
+/// installed AFTER its content took focus reads it — the content's mount ran first,
+/// so at install `active_element()` is already inside the scope and is no element
+/// to give focus back to. WEAK for the registry's reason: it keeps nothing alive. A
+/// private mechanism, bound as free functions like the registry.
+external struct AutofocusOrigins;
+
+/// `new WeakMap()`.
+[extern(new, "WeakMap")]
+external fun autofocus_origins(): AutofocusOrigins;
+
+/// `origins.set(element, origin)`.
+[extern(method, "set")]
+external fun record_autofocus_origin(
+	origins: AutofocusOrigins,
+	element: Element,
+	origin: Element,
+): void;
+
+/// `origins.get(element)` — `undefined`, which `is_null` reads as null, for an
+/// element `autofocus` never focused.
+[extern(method, "get")]
+external fun autofocus_origin(origins: AutofocusOrigins, element: Element): Element;
+
+/// The one map, for the life of the page.
+let autofocus_from: AutofocusOrigins = autofocus_origins();
+
 /// One attempt on `View::autofocus`'s bounded clock, answering whether the clock is
 /// done: the element lies inside a live focus scope, whose show decides the initial
 /// focus (A157), or the focus took.
@@ -2670,8 +2699,33 @@ fun autofocus_settled(element: Element): bool {
 	if within_focus_scope(element) {
 		ret true;
 	}
+	let before = active_element();
 	element.focus();
-	element.matches(":focus")
+	let took = element.matches(":focus");
+	// B546: remember where the focus came from, for a scope installed after.
+	if took && !is_null(before) && !element.contains(before) {
+		record_autofocus_origin(autofocus_from, element, before);
+	}
+	took
+}
+
+/// What a scope installed at `root` gives focus back to at its disposal: what held
+/// focus at install — unless that is already INSIDE `root` (B546). Then the content
+/// took focus before the scope was installed (built before the panel, its
+/// `View::autofocus` ran first), and the element to give focus back to is the one
+/// `autofocus` took it from, followed out of `root` — a field that autofocused from
+/// a sibling field inside the panel came, before that, from the opener. Null when
+/// nothing outside is known, which the disposal reads as "restore nothing".
+fun restore_target(root: Element): Element {
+	mut target = active_element();
+	// Bounded: each step is one recorded `autofocus`, and a chain longer than the
+	// panel's own fields is no history worth following.
+	mut steps = 0;
+	for !is_null(target) && root.contains(target) && steps < 16 {
+		target = autofocus_origin(autofocus_from, target);
+		steps = steps + 1;
+	}
+	target
 }
 
 /// Whether `element` lies inside the root of any live focus scope.
@@ -2710,7 +2764,7 @@ export fun focus_scope(root: Element, containment: FocusContainment): FocusScope
 	let owner = get_owner();
 	let id = next_focus_scope.read() + 1;
 	next_focus_scope.write() = id;
-	let restore = active_element();
+	let restore = restore_target(root);
 	focus_scopes.write().push((id, root, containment, restore));
 	owner.defer(|| {
 		let kept = focus_scopes.read().filter(|entry| {
