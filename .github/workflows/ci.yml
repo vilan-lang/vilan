@@ -118,18 +118,25 @@ jobs:
       # Both legs always run: the windows result is the deliverable here, so a
       # red ubuntu leg must not cancel it.
       fail-fast: false
+      # The suite's wall clock on a GitHub runner is COLD COMPILE, not test
+      # time (L19). Two levers, and they fix different halves. The CACHE below
+      # removes the compile on the runs that get a hit; the SHARD splits what
+      # is left, because a warm compile still leaves the suite itself serial
+      # on one runner. Each shard pays its own cache restore and its own link,
+      # so the split stops buying long before the parallelism does: ubuntu
+      # stays at two. Windows is FOUR (2026-10-05, the owner): by Order 47 the
+      # suite had grown to 9,800 tests and the windows shards ran 50 and 66
+      # minutes against ubuntu's 32 and 54, the long pole of a 67-minute run;
+      # the windows runner is the slower machine and the one whose result is
+      # the deliverable here, so it takes the extra restores.
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        # The suite's wall clock on a GitHub runner is COLD COMPILE, not test
-        # time (L19). The last green run: every other job at or under 3 minutes,
-        # `test(ubuntu)` at 25 and `test(windows)` at 30 — while the identical
-        # suite runs in ~4.5 minutes warm on the owner's box. Two levers, and
-        # they fix different halves. The CACHE below removes the compile on the
-        # runs that get a hit; the SHARD splits what is left, because a warm
-        # compile still leaves the suite itself serial on one runner. Two is the
-        # count, not four: each shard pays its own cache restore and its own
-        # link, so the split stops buying long before the parallelism does.
-        partition: [1, 2]
+        include:
+          - { os: ubuntu-latest, partition: 1, shards: 2 }
+          - { os: ubuntu-latest, partition: 2, shards: 2 }
+          - { os: windows-latest, partition: 1, shards: 4 }
+          - { os: windows-latest, partition: 2, shards: 4 }
+          - { os: windows-latest, partition: 3, shards: 4 }
+          - { os: windows-latest, partition: 4, shards: 4 }
     runs-on: ${{ matrix.os }}
     # The suite proves the tree against CURRENT stable, not against the pin in
     # rust-toolchain.toml — that file is the formatter's pin (backlog N21; the
@@ -199,9 +206,9 @@ jobs:
         shell: bash
         env:
           # nextest's own sharding: `count:N/M` selects a deterministic Mth of
-          # the tests, so the two shards together are the whole suite and
-          # neither runs a test twice.
-          VILAN_CI_PARTITION: ${{ matrix.partition }}/2
+          # the tests, so an OS's shards together are the whole suite and
+          # none runs a test twice.
+          VILAN_CI_PARTITION: ${{ matrix.partition }}/${{ matrix.shards }}
         run: scripts/ci-local.sh test
       # nextest does not run doc-tests. Every doc-test set is empty today;
       # this leg exists so a future doc-test cannot silently stop running.
