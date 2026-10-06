@@ -340,7 +340,9 @@ def prepare_kolt(kolt, commit, scratch):
     os.makedirs(copy)
     archive = subprocess.run(["git", "-C", kolt, "archive", commit], stdout=subprocess.PIPE, check=True)
     subprocess.run(["tar", "-x", "-C", copy], input=archive.stdout, check=True)
-    for extra in ("search-dict", "src/search-dict"):  # untracked inputs the const pass reads
+    # Untracked inputs: the search dictionary the const pass reads, and the generated lucide icons
+    # (ignored since kolt's "ignore generated icons"; without them no commit after it checks).
+    for extra in ("search-dict", "src/search-dict", "src/lucide"):
         source = os.path.join(kolt, extra)
         if os.path.isdir(source) and not os.path.exists(os.path.join(copy, extra)):
             shutil.copytree(source, os.path.join(copy, extra))
