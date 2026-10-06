@@ -75,7 +75,7 @@ written down.
 
 ---
 
-<!-- family: perf -->
+<!-- family: performance -->
 **A focus scope's autofocus scan stops at the first registered element.** `FocusScope` walks its content for the element `.autofocus()` registered (falling back to a native `autofocus` attribute); once it had found the registered one it kept visiting every remaining descendant and did nothing with them. The loop now leaves there (`registered.is_none() else jump break;`). No behaviour changes: the same element is chosen. (The owner's edit.)
 
 ---
