@@ -128,96 +128,96 @@ measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WS
 subject = "example:math"
 counter = "callgrind"
 class = "ci"
-ceiling = 255_110_326
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 263_195_415
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 322_339_626
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 330_268_645
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:browser"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_534_929_500
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 1_556_877_078
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:fullstack"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_313_903_357
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 3_333_230_352
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:router"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_952_820_413
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 1_833_213_166
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "callgrind"
 class = "ci"
-ceiling = 2_699_740_740
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 2_046_065_797
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:ssr"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_270_825_922
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 4_224_049_740
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:canvas"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_540_811_994
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 1_565_773_420
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:rpc"
 counter = "callgrind"
 class = "ci"
-ceiling = 2_166_877_229
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 2_175_452_371
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 6_231_630_945
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 5_485_862_397
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 6_519_692_337
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 5_653_693_630
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[row]]
 subject = "genapp:46"
 counter = "callgrind"
 class = "ci"
-ceiling = 10_107_674_641
-measured_at = "CI perf job on next @c43d6ab9 (= the v0.44.0 fold e5e15ca7 + Dependabot), run 37319616657; adopted by M114 after 14 runs on next and main read (four runner CPUs: EPYC 7763/9V74/9V45, Xeon 6973P-C; same code within 0.01%)"
+ceiling = 10_010_871_400
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
 tolerance = 0.005
 
 [[growth]]
@@ -301,31 +301,3 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
-
-[[bump]]
-subject = "example:math"
-class = "ci"
-ratio = 1.03
-reason = "a program this small is nearly all fixed cost, and the fixed cost grew in Order 47: S0's `[track_caller]` pass and location arguments plus the larger always-loaded `debug.vl` (+2.0%, debug-47), `Items<T>` and its blanket over every iterator (+0.5%, store-47), and the copy passes (+0.3%, perf-47). CI read x1.0086 at db2df5f1 before debug-47."
-item = "M120"
-
-[[bump]]
-subject = "example:watch"
-class = "ci"
-ratio = 1.025
-reason = "the same fixed cost as math on another small program: debug-47's S0 and `debug.vl` (+1.9%) over x1.0036 at db2df5f1."
-item = "M120"
-
-[[bump]]
-subject = "example:browser"
-class = "ci"
-ratio = 1.01
-reason = "debug-47's fixed cost (+0.6%) over x1.0021 at db2df5f1; the web prelude's own load is M120's."
-item = "M120"
-
-[[bump]]
-subject = "example:canvas"
-class = "ci"
-ratio = 1.01
-reason = "debug-47's fixed cost (+0.7%) over x1.0015 at db2df5f1."
-item = "M120"
