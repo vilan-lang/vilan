@@ -10336,22 +10336,26 @@ fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
 /// `error.message`, the native payload's message) — identical on both backends.
 #[test]
 fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
+    // Its OWN program name. The native binary lands at `<shared target>/debug/<name>`, and the
+    // sibling test above builds `PANIC_LOCATIONS_FILE` fifteen times with other paths; two tests
+    // building one name at once run each other's binary (the Order 47 seal: this test read the
+    // `"panic"` build's exit 1 under load).
+    const CALLER_FILE: &str = "native_probe_panic_caller.vl";
     let staged = stage();
     std::fs::write(
-        staged.join(PANIC_LOCATIONS_FILE),
+        staged.join(CALLER_FILE),
         PANIC_LOCATIONS.replace("\"PATH\"", "\"none\""),
     )
     .expect("write the probe program");
-    let javascript = run_on(&staged, None, PANIC_LOCATIONS_FILE);
-    let native = run_on(&staged, Some("rust"), PANIC_LOCATIONS_FILE);
+    let javascript = run_on(&staged, None, CALLER_FILE);
+    let native = run_on(&staged, Some("rust"), CALLER_FILE);
     assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
     assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
     assert_eq!(
         javascript.stdout, native.stdout,
         "both backends print the same"
     );
-    let site =
-        |line: &str, column: &str| site_of(PANIC_LOCATIONS_FILE, PANIC_LOCATIONS, line, column);
+    let site = |line: &str, column: &str| site_of(CALLER_FILE, PANIC_LOCATIONS, line, column);
     let own = site("let own = caller()", "caller");
     let (line, column) = {
         let mut parts = own.rsplit(':');
@@ -10360,7 +10364,7 @@ fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
         (line, column)
     };
     let expected = format!(
-        "{}\n{PANIC_LOCATIONS_FILE}\n{line}\n{column}\n{own}\n[ 0, 'expected Some but got None' ]\n",
+        "{}\n{CALLER_FILE}\n{line}\n{column}\n{own}\n[ 0, 'expected Some but got None' ]\n",
         site("print(here())", "here"),
     );
     assert_eq!(native.stdout, expected);
