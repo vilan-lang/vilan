@@ -62,7 +62,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      # TRUSTED: the event's code is this repository's own — a push to a branch
+      # here, or a pull request whose head repository is this one (Dependabot's
+      # branches included). A fork's PR is not, whoever opened it. Only trusted
+      # events may reach the owner's self-hosted runner (the `test` job's
+      # `runs-on`): a self-hosted runner executes whatever the workflow's
+      # checkout holds, so a fork reaching it would be a fork running code on
+      # the owner's machine. The repository setting "require approval for all
+      # outside collaborators" is the second lock; this output is the first and
+      # does not depend on it.
+      trusted: ${{ steps.trust.outputs.trusted }}
     steps:
+      - id: trust
+        run: echo "trusted=${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The filter diffs against the base commit, so one commit is not
@@ -137,7 +149,12 @@ jobs:
           - { os: windows-latest, partition: 2, shards: 4 }
           - { os: windows-latest, partition: 3, shards: 4 }
           - { os: windows-latest, partition: 4, shards: 4 }
-    runs-on: ${{ matrix.os }}
+    # The ubuntu legs of a TRUSTED event run on the owner's self-hosted runner
+    # (label `vilan-linux`; proposals/scripts/integration/runner/), where the
+    # suite takes minutes instead of the better part of an hour. Everything
+    # else — a fork's PR, and the windows legs until a windows runner exists —
+    # stays on GitHub's machines.
+    runs-on: ${{ (matrix.os == 'ubuntu-latest' && needs.changes.outputs.trusted == 'true') && 'vilan-linux' || matrix.os }}
     # The suite proves the tree against CURRENT stable, not against the pin in
     # rust-toolchain.toml — that file is the formatter's pin (backlog N21; the
     # `fmt` job below is what follows it). Explicit because it would not hold
@@ -191,7 +208,11 @@ jobs:
       # `target/`. `save-if` keeps the WRITERS to the branches PRs are cut from:
       # a PR warms itself off `next`'s entry and does not evict it, which is the
       # difference between a cache and a queue of PRs overwriting each other.
+      # GitHub-hosted only: the self-hosted runner's `_work` persists between
+      # jobs, so its `target/` is already warm and a cache restore would only
+      # overwrite it with an older one.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: suite-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
