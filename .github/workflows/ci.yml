@@ -393,18 +393,22 @@ jobs:
   # 7763/9V74/9V45, Intel Xeon 6973P-C), so the `ci` class's ceilings were
   # adopted from this job's own uploaded counts (`perf_gate.py ratchet --from
   # measured.json --tolerance 0.005`) and now refuse like the reference
-  # class's do, at 0.5% (Q7). A new stable rustc can move the counts: a bump
-  # that raises them is a `[[bump]]` row, one that lowers them is ratcheted.
+  # class's do, at 0.5% (Q7).
+  #
+  # No `RUSTUP_TOOLCHAIN` and no toolchain action (M126): an instruction count
+  # is a property of the BINARY, so a new stable rustc moves every `ci` row
+  # by however much its codegen changed, and a tree nobody edited goes red
+  # on the Tuesday it ships. This leg resolves through rust-toolchain.toml
+  # like `fmt` does: the ceilings are adopted on the pinned toolchain, and a
+  # toolchain bump re-adopts them in the same commit.
   perf:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: stable
       VILAN_PERF_CLASS: ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       # Its own cache entry: a RELEASE `target/`, which no other leg builds.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
