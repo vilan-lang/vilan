@@ -301,3 +301,17 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
+
+[[bump]]
+subject = "example:math"
+class = "reference"
+ratio = 1.025
+reason = "a program this small is nearly all fixed cost, and the fixed cost grew in Order 47: S0's `[track_caller]` pass and location arguments plus the larger always-loaded `debug.vl` (+2.0%, debug-47), `Items<T>` and its blanket over every iterator (+0.5%, store-47), and the copy passes (+0.3%, perf-47); x1.0308 at the Order 47 seal (244,001,446 -> 251,515,912)."
+item = "M120"
+
+[[bump]]
+subject = "example:watch"
+class = "reference"
+ratio = 1.015
+reason = "the same fixed cost as math on another small program (debug-47's S0 and `debug.vl` +1.9%); x1.0237 at the Order 47 seal (309,382,444 -> 316,715,566)."
+item = "M120"
