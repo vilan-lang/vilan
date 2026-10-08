@@ -8,7 +8,7 @@
 //
 // `Signal`, `view` and `View` are ambient: `prelude = "std::web::prelude"` in vilan.toml
 // puts them in scope with no import, along with the MODULES `style` and `ui` —
-// which is why the chain below writes `style::Display::Flex` and imports nothing
+// which is why the style below writes `style::Display::Flex` and imports nothing
 // for it. The prelude carries the module, not its members, so you
 // qualify; importing the member `style` would SHADOW the module and take
 // `style::Display` with it, so the builder is qualified too. B172 made a
@@ -29,17 +29,18 @@ fun counter_card(): style::Style {
 		.radius(style::space(2))
 }
 
-// A component is just a function returning the `View` subtree it owns.
+// A component is just a function returning the `View` subtree it owns, written
+// as markup: each element lowers to the `view(..)` chain it reads as.
 fun counter(): View {
 	let count = Signal::new(0);
 	let card = const counter_card();
 
-	view("section")
-		.styled(card)
-		.child(view("h2").text("Counter"))
-		// `bind_text` binds to a `Source<str>`; derive one from `count`. The
-		// i-string renders the number directly (host coercion).
-		.child(view("p").bind_text(count.derive(|n| i"Count: {n}")))
-		.child(view("button").text("−").on("click", || count.set_with(|n| n - 1)))
-		.child(view("button").text("+").on("click", || count.set_with(|n| n + 1)))
+	<section .styled(card)>
+		<h2>"Counter"</h2>
+		// A `Source<str>` in a hole is a text node kept in sync; derive one from
+		// `count`. The i-string renders the number directly (host coercion).
+		<p>{count.derive(|n| i"Count: {n}")}</p>
+		<button on:click(|| count.set_with(|n| n - 1))>"−"</button>
+		<button on:click(|| count.set_with(|n| n + 1))>"+"</button>
+	</section>
 }

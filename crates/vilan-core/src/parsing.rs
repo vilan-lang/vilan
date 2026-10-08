@@ -931,16 +931,34 @@ pub fn moved_std_module_edit(
     if source.get(span.into_range())? != old {
         return None;
     }
-    let whole = || StdPathFix {
-        code: MOVED_STD_MODULE_CODE,
-        title: format!("Write `std::{new}`"),
-        span,
-        replacement: new.to_string(),
+    let (tree, _errors) = parse(source);
+    // E269: where the old module is itself the LEAF of the import —
+    // `import std::web;`, which bound the old web prelude as `web` — the new
+    // path's last segment would bind a different name (`prelude`, or `server`
+    // for `rpc_server`) and every `web::..` use after it would stop resolving.
+    // The edit keeps the binding's name with an alias. An aliased leaf
+    // (`import std::web as w;`) already names its binding, and a path that
+    // continues past the segment binds what it continues to.
+    let leaf = tree
+        .as_ref()
+        .and_then(|(nodes, _)| import_tail_at(nodes, span))
+        .is_some_and(|tail| matches!(tail, ImportTail::Leaf));
+    let renamed = new.rsplit("::").next() != Some(old);
+    let whole = || {
+        let written = match leaf && renamed {
+            true => format!("{new} as {old}"),
+            false => new.to_string(),
+        };
+        StdPathFix {
+            code: MOVED_STD_MODULE_CODE,
+            title: format!("Write `std::{written}`"),
+            span,
+            replacement: written,
+        }
     };
     if old != "web" {
         return Some(Ok(whole()));
     }
-    let (tree, _errors) = parse(source);
     let Some(elements) = tree
         .as_ref()
         .and_then(|(nodes, _)| web_brace_list_at(nodes, span))
@@ -951,9 +969,14 @@ pub fn moved_std_module_edit(
     };
     let mut prelude_names = Vec::new();
     let mut names_a_child = false;
+    // E269: a `self` element bound the old prelude module as `web` (or as its
+    // alias): it becomes `prelude as web` (`prelude`, under its alias).
+    let mut selves: Vec<(Span, bool)> = Vec::new();
     for element in elements {
         match element {
-            ImportBranch::Path("self", ..) => return Some(Err(MOVED_WEB_SELF_REASON)),
+            ImportBranch::Path("self", self_span, tail) => {
+                selves.push((*self_span, matches!(tail, ImportTail::Leaf)));
+            }
             ImportBranch::Path(name, ..) if is_web_namespace_child(name) => names_a_child = true,
             ImportBranch::Path(name, name_span, _) => prelude_names.push((*name, *name_span)),
             ImportBranch::Reach(..) | ImportBranch::Selector(..) | ImportBranch::Set(..) => {
@@ -961,35 +984,61 @@ pub fn moved_std_module_edit(
             }
         }
     }
-    if !names_a_child || prelude_names.is_empty() {
+    if selves.is_empty() && (!names_a_child || prelude_names.is_empty()) {
         return Some(Ok(whole()));
     }
-    let first = prelude_names[0].1.start;
-    let last = prelude_names[prelude_names.len() - 1].1.start;
+    // Each prelude name gets `prelude::` before it and each `self` becomes the
+    // prelude itself; a child of `std::web` stays where it resolves. One edit
+    // over the stretch from the first rewritten element to the last.
+    let mut edits: Vec<(Span, String)> = prelude_names
+        .iter()
+        .map(|(_, name_span)| {
+            (
+                Span::from(name_span.start..name_span.start),
+                "prelude::".to_string(),
+            )
+        })
+        .collect();
+    edits.extend(selves.iter().map(|(self_span, leaf)| {
+        let written = match leaf {
+            true => "prelude as web",
+            false => "prelude",
+        };
+        (*self_span, written.to_string())
+    }));
+    edits.sort_by_key(|(edit_span, _)| edit_span.start);
+    let first = edits.first()?.0.start;
+    let last = edits.last()?.0.end;
     let mut replacement = String::new();
     let mut cursor = first;
-    for (_, name_span) in &prelude_names {
-        replacement.push_str(&source[cursor..name_span.start]);
-        replacement.push_str("prelude::");
-        cursor = name_span.start;
+    for (edit_span, written) in &edits {
+        replacement.push_str(source.get(cursor..edit_span.start)?);
+        replacement.push_str(written);
+        cursor = edit_span.end;
     }
-    let names = prelude_names
-        .iter()
-        .map(|(name, _)| format!("`{name}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let title = match (selves.is_empty(), prelude_names.is_empty()) {
+        (false, true) => {
+            "Write `prelude as web` for `self` (the web prelude is `std::web::prelude`)".to_string()
+        }
+        (false, false) => "Write `prelude as web` for `self` and `prelude::` before the prelude's \
+             names (the web prelude is `std::web::prelude`)"
+            .to_string(),
+        (true, _) => {
+            let names = prelude_names
+                .iter()
+                .map(|(name, _)| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Write `prelude::` before {names} (the web prelude is `std::web::prelude`)")
+        }
+    };
     Some(Ok(StdPathFix {
         code: MOVED_STD_MODULE_CODE,
-        title: format!("Write `prelude::` before {names} (the web prelude is `std::web::prelude`)"),
+        title,
         span: Span::from(first..last),
         replacement,
     }))
 }
-
-/// Why [`moved_std_module_edit`] leaves `std::web::{ self, .. }` to a person:
-/// `self` bound the old prelude module under the name `web`, and no path
-/// edit keeps both that binding and the list's other names.
-pub const MOVED_WEB_SELF_REASON: &str = "the brace list names `self`, which bound the old web      prelude as `web`; `std::web` is a namespace now, so write `prelude as web` (or import the      names from `std::web::prelude`) by hand";
 
 /// Why [`moved_std_module_edit`] leaves a marked brace list under the old
 /// web-prelude path to a person: a reach marker (`#name`), an impl selector
@@ -1004,6 +1053,48 @@ fn is_web_namespace_child(name: &str) -> bool {
         .iter()
         .filter_map(|(_, new)| new.strip_prefix("web::"))
         .any(|child| child == name)
+}
+
+/// What follows the import segment spanning exactly `anchor` — the end of the
+/// statement, an alias, or more path — wherever the import sits. `None` when
+/// no import holds such a segment.
+fn import_tail_at<'tree, 'src>(
+    nodes: &'tree NodeList<'src>,
+    anchor: Span,
+) -> Option<&'tree ImportTail<'src>> {
+    fn in_branch<'tree, 'src>(
+        branch: &'tree ImportBranch<'src>,
+        anchor: Span,
+    ) -> Option<&'tree ImportTail<'src>> {
+        match branch {
+            ImportBranch::Path(_, span, tail) if *span == anchor => Some(tail),
+            ImportBranch::Path(_, _, ImportTail::Continue(next)) => in_branch(next, anchor),
+            ImportBranch::Path(..) | ImportBranch::Selector(..) => None,
+            ImportBranch::Set(elements) => elements
+                .iter()
+                .find_map(|element| in_branch(element, anchor)),
+            ImportBranch::Reach(_, inner) => in_branch(inner, anchor),
+        }
+    }
+    fn in_node<'tree, 'src>(
+        node: &'tree Spanned<Node<'src>>,
+        anchor: Span,
+    ) -> Option<&'tree ImportTail<'src>> {
+        if !(node.1.start <= anchor.start && anchor.end <= node.1.end) {
+            return None;
+        }
+        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
+            return in_branch(branch, anchor);
+        }
+        let mut found = None;
+        node.0.for_each_child(&mut |child| {
+            if found.is_none() {
+                found = in_node(child, anchor);
+            }
+        });
+        found
+    }
+    nodes.iter().find_map(|node| in_node(node, anchor))
 }
 
 /// The elements of the brace list that follows the import segment spanning
@@ -1068,6 +1159,13 @@ pub const WRITTEN_AUTOFOCUS_MESSAGE: &str = "a written `autofocus` attribute is 
      focuses the element once it is in the document, an enclosing focus scope starts on it, and a \
      server render still writes the native attribute (for a `<dialog>` or a popover that wants \
      the native one, write `.attr(\"autofocus\", \"\")`)";
+
+/// The element-head ATTRIBUTE names the analyzer steers to a `View` method
+/// instead (A157's `autofocus`, at [`WRITTEN_AUTOFOCUS_MESSAGE`]), each with
+/// the method it steers to. The HTML attribute table is name-blind and keeps
+/// them; completion reads this to offer the method and not the attribute that
+/// would warn on the next analysis (E264).
+pub const STEERED_ELEMENT_ATTRIBUTES: &[(&str, &str)] = &[("autofocus", "autofocus")];
 
 /// [`WRITTEN_AUTOFOCUS_MESSAGE`]'s STABLE code. The editor publishes it as the
 /// LSP diagnostic's `code`; it never changes when the message is reworded.
@@ -2116,6 +2214,9 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "client_service",
     "extern",
     "must_use",
+    // debugging.md S0 (Q11): the function reports its CALLER's location when
+    // it panics, through a hidden `std::debug::Location` parameter.
+    "track_caller",
     "rpc",
     "trait_only",
     "doc",
@@ -2145,10 +2246,11 @@ fn is_known_attribute_marker(name: &str) -> bool {
 ///   macro attribute (any name the table does not know);
 /// - labels: `[deprecated]` (1), `[internal]` (2), `[hint]` (3);
 /// - binding: `[extern]` (4);
-/// - checks: `[must_use]` (5), `[rpc]` (6), `[trait_only]` (7), and the
-///   retired `[doc(hidden)]` (8), refused where a function's prefix reads it;
-/// - fence: `[platform]` (9);
-/// - class: `[resource]` (10).
+/// - checks: `[must_use]` (5), `[track_caller]` (6), `[rpc]` (7),
+///   `[trait_only]` (8), and the retired `[doc(hidden)]` (9), refused where a
+///   function's prefix reads it;
+/// - fence: `[platform]` (10);
+/// - class: `[resource]` (11).
 ///
 /// Ties keep the order they were written in (a `[service]` and a
 /// `[client_service]`, two `[hint]`s). The parser sorts a run into this
@@ -2161,11 +2263,12 @@ pub fn attribute_rank(name: &str) -> u8 {
         "hint" => 3,
         "extern" => 4,
         "must_use" => 5,
-        "rpc" => 6,
-        "trait_only" => 7,
-        "doc" => 8,
-        "platform" => 9,
-        "resource" => 10,
+        "track_caller" => 6,
+        "rpc" => 7,
+        "trait_only" => 8,
+        "doc" => 9,
+        "platform" => 10,
+        "resource" => 11,
         _ => 0,
     }
 }
@@ -2344,7 +2447,8 @@ const ATTRIBUTE_ORDER_HEAD: &str = "a declaration's attributes are written in on
 /// fix's edit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MarkerOrderDiagnostic {
-    /// A WARNING: the attributes are out of [`attribute_rank`]'s order, and
+    /// Refused since v0.45.0 (a WARNING for one release, B536): the attributes
+    /// are out of [`attribute_rank`]'s order, and
     /// nothing else is ([`ParseErrorReason::AttributeOrder`]).
     Attributes,
     /// An ERROR: a keyword stands ahead of an attribute — `export` and
@@ -2362,9 +2466,10 @@ impl MarkerOrderDiagnostic {
         }
     }
 
-    /// Whether the diagnostic is a warning (the program is accepted).
+    /// Whether the diagnostic is a warning (the program is accepted). Neither
+    /// is since v0.45.0: the attribute order warned for one release (B536).
     pub fn is_warning(self) -> bool {
-        self == MarkerOrderDiagnostic::Attributes
+        false
     }
 
     /// The marker-order diagnostic a rendered message reports, if it reports
@@ -4369,24 +4474,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut spelled: Vec<String> = canonical.iter().map(|kind| kind.spelled()).collect();
         spelled.push(word.to_string());
         let canonical = spelled.join(" ");
+        // B536 (v0.45.0, R-c): attributes out of rank are refused as the
+        // keyword orders are — read as written in THE order, so the analysis
+        // goes on and `vilan fmt` still writes the migration — where they
+        // warned for a release.
         if out_of_order {
             self.record_rewrite(run_span, ParseErrorReason::MarkerOrder { canonical });
         } else if out_of_rank {
-            self.record_warning(run_span, ParseErrorReason::AttributeOrder { canonical });
+            self.record_rewrite(run_span, ParseErrorReason::AttributeOrder { canonical });
         }
-    }
-
-    /// Records a WARNING ([`Parser::warnings`]), once per span.
-    fn record_warning(&mut self, span: Span, reason: ParseErrorReason) {
-        if self.warnings.iter().any(|warning| warning.span == span) {
-            return;
-        }
-        self.warnings.push(ParseError {
-            span,
-            reason,
-            context: Vec::new(),
-            hint: None,
-        });
     }
 
     /// B520: `fn`/`function`/`func`/`def` at the ITEM HEAD at the cursor —
@@ -8102,6 +8198,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             None => (None, false),
         };
         let must_use = self.eat_marker_attribute("must_use");
+        let track_caller = self.eat_marker_attribute("track_caller");
         let rpc = self.eat_marker_attribute("rpc");
         let trait_only = self.eat_marker_attribute("trait_only");
         self.refuse_doc_hidden_attribute();
@@ -8311,6 +8408,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 extern_binding,
                 extern_retains,
                 must_use,
+                track_caller,
                 rpc,
                 trait_only,
                 platform_fence,
@@ -12066,10 +12164,10 @@ mod tests {
 
     #[test]
     fn function_attributes_in_any_order_read_as_the_canonical_prefix() {
-        // B485 Q7 (RULED): attributes are written in any order. The chain the
-        // prefix reads used to be ordered, and `[rpc] [must_use] fun` declined;
-        // the run is now sorted before the production reads it, so it is the
-        // function the canonical order spells, attribute for attribute.
+        // B485 Q7 (RULED): the run is sorted before the production reads it,
+        // so another order is the function the canonical order spells,
+        // attribute for attribute — refused since v0.45.0 (B536), and still
+        // read so, which is what lets `vilan fmt` write the migration.
         for (written, canonical) in [
             (
                 "[rpc] [must_use] fun f() { }",
@@ -12088,10 +12186,28 @@ mod tests {
         }
     }
 
+    /// The single top-level item of `source`, which parses clean or carries
+    /// exactly one refusal of its attribute ORDER (B536): such a head is read
+    /// as if written in the order, so the item is the canonical one's.
+    fn only_item_read_in_order(source: &str) -> Node<'_> {
+        let (tree, errors) = parse(source);
+        assert!(
+            errors.len() <= 1
+                && errors
+                    .iter()
+                    .all(|error| matches!(error.reason, ParseErrorReason::AttributeOrder { .. })),
+            "parse errors on {source:?}: {errors:?}"
+        );
+        let (mut statements, _) = tree.expect("program did not parse");
+        assert_eq!(statements.len(), 1, "expected one item in {source:?}");
+        statements.remove(0).0
+    }
+
     /// The attribute fields of the one `fun` in `source`, which must parse
-    /// clean — what a reordered prefix has to agree on with the canonical one.
+    /// clean but for its attribute order (refused since v0.45.0, B536, and read
+    /// in it) — what a reordered prefix has to agree on with the canonical one.
     fn attributes_of(source: &str) -> String {
-        match only_item(source) {
+        match only_item_read_in_order(source) {
             Node::Func(function) => format!(
                 "{:?} {:?} {:?} {} {} {} {:?}",
                 function.deprecated,
@@ -12173,7 +12289,7 @@ mod tests {
         // B382: the function attribute, admitted on the nominals and a trait —
         // leading the ordered prefix, as it leads a function's.
         fn steer(source: &str) -> Option<&str> {
-            match only_item(source) {
+            match only_item_read_in_order(source) {
                 Node::Struct(.., labels) | Node::Enum(.., labels) | Node::Trait(.., labels) => {
                     labels.and_then(|labels| labels.deprecated)
                 }
@@ -13927,10 +14043,11 @@ mod tests {
     }
 
     /// B536's classification of the 29 swaps (RULED 2026-10-03): the stack is
-    /// CANONICAL; a swap of two attributes WARNS (out of rank, read in it); a
-    /// swap that puts a keyword ahead of an attribute — `export` included,
-    /// B485 S3 — or inverts two keywords is REFUSED, and read as the stack.
-    /// Every one of them `vilan fmt` writes as the stack, idempotently.
+    /// CANONICAL; a swap of two attributes is REFUSED as out of rank (it
+    /// warned for one release, v0.44.0 — the v0.45.0 flip, R-c) and read in
+    /// it; a swap that puts a keyword ahead of an attribute — `export`
+    /// included, B485 S3 — or inverts two keywords is REFUSED, and read as the
+    /// stack. Every one of them `vilan fmt` writes as the stack, idempotently.
     #[test]
     fn b536_every_adjacent_marker_swap_is_canonical_warned_or_refused() {
         let is_attribute = |marker: &str| marker.starts_with('[');
@@ -13971,12 +14088,10 @@ mod tests {
                 let run = Span::from(0..source.find(declaration).unwrap() - 1);
                 if is_attribute(swapped[at]) && is_attribute(swapped[at + 1]) {
                     warned += 1;
-                    assert!(errors.is_empty(), "{source}: {errors:?}");
-                    assert_eq!(
-                        warnings,
-                        vec![(run, attribute_order_rule(&spelled))],
-                        "{source}"
-                    );
+                    assert!(warnings.is_empty(), "{source}: {warnings:?}");
+                    assert_eq!(errors, vec![attribute_order_rule(&spelled)], "{source}");
+                    let (_, spanned, _) = parse_with_warnings(&source);
+                    assert_eq!(spanned[0].span, run, "{source}");
                 } else {
                     refused += 1;
                     assert!(warnings.is_empty(), "{source}: {warnings:?}");
@@ -13997,11 +14112,11 @@ mod tests {
     }
 
     /// B536: attributes out of [`attribute_rank`]'s order, and nothing else
-    /// out of order, are a WARNING — beside the errors, never among them, so
-    /// the source stays clean — spanning the run and naming the head in THE
-    /// order; the tree is the canonical spelling's.
+    /// out of order, are REFUSED since v0.45.0 (a WARNING for one release) —
+    /// spanning the run and naming the head in THE order; the tree is still
+    /// the canonical spelling's, which is what `vilan fmt` writes.
     #[test]
-    fn b536_attributes_out_of_rank_warn_and_read_in_it() {
+    fn b536_attributes_out_of_rank_are_refused_and_read_in_it() {
         for (source, canonical, spelled) in [
             (
                 "[internal(\"r\")] [deprecated(\"d\")] fun f() {}",
@@ -14040,15 +14155,15 @@ mod tests {
             ),
         ] {
             let (tree, errors, warnings) = parse_with_warnings(source);
-            assert!(errors.is_empty(), "{source}: {errors:?}");
-            let rendered: Vec<String> = warnings.iter().map(render).collect();
+            assert!(warnings.is_empty(), "{source}: {warnings:?}");
+            let rendered: Vec<String> = errors.iter().map(render).collect();
             assert_eq!(rendered, vec![attribute_order_rule(spelled)], "{source}");
             let run_start = source.find('[').unwrap();
             let word = spelled.rsplit(' ').next().unwrap();
             let run_end = source[..source.find(&format!(" {word} ")).unwrap()]
                 .trim_end()
                 .len();
-            assert_eq!(warnings[0].span, Span::from(run_start..run_end), "{source}");
+            assert_eq!(errors[0].span, Span::from(run_start..run_end), "{source}");
             assert_eq!(
                 MarkerOrderDiagnostic::of_message(&rendered[0]),
                 Some(MarkerOrderDiagnostic::Attributes)
@@ -14064,9 +14179,9 @@ mod tests {
                 "{source}"
             );
             // `parse` — what every reader but the reporting pipelines calls —
-            // hands back the same clean result, and no warning.
+            // hands back the same refusal.
             let (_, errors) = parse(source);
-            assert!(errors.is_empty(), "{source}: {errors:?}");
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
         }
         // Nothing to warn about: THE order, a tie kept as written (two
         // generators, two `[hint]`s), one attribute, a run that is not a
@@ -14103,7 +14218,8 @@ mod tests {
             MarkerOrderDiagnostic::Keywords.code(),
             "marker-order/keywords"
         );
-        assert!(MarkerOrderDiagnostic::Attributes.is_warning());
+        // Neither is a warning since v0.45.0 (B536's flip).
+        assert!(!MarkerOrderDiagnostic::Attributes.is_warning());
         assert!(!MarkerOrderDiagnostic::Keywords.is_warning());
         assert_eq!(
             MarkerOrderDiagnostic::of_message(&attribute_order_rule("[must_use] fun")),
@@ -14334,8 +14450,11 @@ mod tests {
     fn b486_a_reordered_head_still_begins_where_it_was_written() {
         // The reorder permutes tokens, and every node still begins at the
         // first unit as written — the statement, the export, the item.
+        // (Refused since v0.45.0, B536 — and still read, so still spanned.)
         let source = "[platform(\"node\")] [deprecated(\"x\")] export fun f() {}";
-        let (statements, _) = program(source);
+        let (tree, errors) = parse(source);
+        assert_eq!(errors.len(), 1);
+        let (statements, _) = tree.expect("a tree");
         assert_eq!(statements[0].1, Span::from(0..source.len()));
         match &statements[0].0 {
             Node::Export(_, inner, _) => assert_eq!(inner.1.start, 0, "{inner:?}"),
@@ -14527,14 +14646,60 @@ mod tests {
         }
     }
 
+    /// E269: the old prelude imported AS A MODULE — `import std::web;`, read
+    /// as `web::Signal`, or `self` in a brace list under the old path — keeps
+    /// the binding's name: `prelude as web`. An aliased leaf keeps its alias,
+    /// and another moved module whose new path ends in another name
+    /// (`rpc_server` → `rpc::server`) is aliased back the same way.
+    #[test]
+    fn e269_the_old_web_prelude_as_a_module_keeps_its_name() {
+        for (source, old, after) in [
+            (
+                "import std::web;",
+                "web",
+                "import std::web::prelude as web;",
+            ),
+            (
+                "import std::web as w;",
+                "web",
+                "import std::web::prelude as w;",
+            ),
+            (
+                "import std::web::{ self };",
+                "web",
+                "import std::web::{ prelude as web };",
+            ),
+            (
+                "import std::web::{ self, Signal };",
+                "web",
+                "import std::web::{ prelude as web, prelude::Signal };",
+            ),
+            (
+                "import std::web::{ Signal, self as w, dom::x };",
+                "web",
+                "import std::web::{ prelude::Signal, prelude as w, dom::x };",
+            ),
+            (
+                "import std::rpc_server;",
+                "rpc_server",
+                "import std::rpc::server as rpc_server;",
+            ),
+            // A module whose new path ends in its own name needs no alias.
+            ("import std::dom;", "dom", "import std::web::dom;"),
+            ("import std::dom::x;", "dom", "import std::web::dom::x;"),
+        ] {
+            assert_eq!(
+                moved_edit(source, old, 0),
+                Some(Ok(after.to_string())),
+                "{source}"
+            );
+        }
+    }
+
     /// The shapes no one edit rewrites correctly are left to a person, with
     /// the reason; a span that no longer covers the old segment is no edit.
     #[test]
-    fn e268_a_web_list_naming_self_or_a_marker_is_left_with_its_reason() {
-        assert_eq!(
-            moved_edit("import std::web::{ self, Signal };", "web", 0),
-            Some(Err(MOVED_WEB_SELF_REASON))
-        );
+    fn e268_a_web_list_naming_a_marker_is_left_with_its_reason() {
         assert_eq!(
             moved_edit("import std::web::{ #Signal, dom::x };", "web", 0),
             Some(Err(MOVED_WEB_MARKED_REASON))

@@ -9510,3 +9510,224 @@ fn b518_a_closure_typed_parameter_prints_parenthesized() {
         "but got |(|i32| void)| void",
     );
 }
+
+/// B540 (B530's cause): `mut found = Maybe::Nothing` grounds to `Maybe<unknown>`
+/// — a nullary variant names no payload type — and a later `found =
+/// Maybe::Just(item)` reconciled with the hole and bound nothing, so the
+/// binding was committed as `Maybe<any>` after the fixpoint (JS ran it,
+/// natively "instantiated at `any`"). The reassignment now fills the hole, and
+/// a method called on the binding before the reassignment is typed waits for
+/// it. The typing is asserted through an unannotated return; the shapes run on
+/// both backends in `native_differential`.
+#[test]
+fn b540_a_nullary_variant_binding_grounds_from_its_reassignment() {
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        enum Maybe<T> { Nothing, Just(T) }
+        impl Maybe<type T> {
+            fun empty(self): bool {
+                match self { Maybe::Nothing => true, Maybe::Just(_) => false }
+            }
+        }
+        struct Pair<A, B> { a: A, b: B }
+        fun last<T>(items: List<T>): Maybe<T> {
+            mut found = Maybe::Nothing;
+            for item in items {
+                found = Maybe::Just(item);
+            }
+            found
+        }
+        fun first<T>(items: List<T>): Maybe<T> {
+            mut found = Maybe::Nothing;
+            for item in items {
+                if found.empty() { found = Maybe::Just(item); }
+            }
+            found
+        }
+        fun first_some<T>(items: List<T>): Option<T> {
+            mut found = None;
+            for item in items {
+                if found.is_none() { found = Some(item); }
+            }
+            found
+        }
+        fun paired<A, B>(a: A, b: B): Maybe<Pair<A, B>> {
+            mut held = Maybe::Nothing;
+            held = Maybe::Just(Pair { a = a, b = b });
+            held
+        }
+        fun main() {
+            let l = last(["x", "y"]);
+            match l { Maybe::Just(let v) => print(v), Maybe::Nothing => print("none") }
+            let f = first([4, 5]);
+            match f { Maybe::Just(let v) => print(v), Maybe::Nothing => print("none") }
+            print(first_some([6, 7]).unwrap());
+            let p = paired(1, "q");
+            match p { Maybe::Just(let pair) => print(pair.b), Maybe::Nothing => print("none") }
+            let e: Maybe<i32> = last([]);
+            print(e.empty());
+        }
+        "#,
+        "y\n4\n6\nq\ntrue\n",
+    );
+    assert_fails_with(
+        r#"
+        enum Maybe<T> { Nothing, Just(T) }
+        fun last<T>(items: List<T>) {
+            mut found = Maybe::Nothing;
+            for item in items {
+                found = Maybe::Just(item);
+            }
+            found
+        }
+        fun main() {
+            let wrong: i32 = last(["a"]);
+        }
+        "#,
+        "but got Maybe<str>",
+    );
+}
+
+/// B542: inside `impl Cell<type W: (2..)>`, a bare `Cell::new(part)` over a part
+/// of another type read the block's `W` — B403's ruled `Self` reading — and was
+/// refused "Expected W, but got U". The reading stands for every parameter the
+/// call's arguments do not decide (`Holder::tag()`, B403's own pins), and for an
+/// argument that agrees with it; an argument it would refuse decides instead.
+/// std's `SignalCell<(..)>::unzip` is written in its impl again (it was moved
+/// out to `unzip_cell` for this), and `a152_*` runs it.
+#[test]
+fn b542_a_bare_static_in_its_own_impl_takes_an_argument_the_self_reading_refuses() {
+    assert_compiles_and_runs(
+        r#"
+        struct Cell<T> { value: T }
+        impl Cell<type T> {
+            fun new(value: T): Cell<T> { Cell { value = value } }
+            fun get(self): T { self.value }
+            fun twin(self): Cell<T> { Cell::new(self.value) }
+        }
+        impl Cell<type W: (2..)> {
+            fun split(self): (U in W: Cell<U>) {
+                let parts = (part in self.get() => Cell::new(part));
+                parts
+            }
+        }
+        fun main() {
+            let whole = Cell::new((1, "x"));
+            let (a, b) = whole.split();
+            print(a.get());
+            print(b.get());
+            print(Cell::new(5).twin().get());
+        }
+        "#,
+        "1\nx\n5\n",
+    );
+    // The block that DECLARES `new` holds its `T` rigid: `Self` there, as B403
+    // ruled, so another type is still refused (its wording, "Expected str, but
+    // got str", is a solver-47 find, filed).
+    assert_fails(
+        r#"
+        struct Cell<T> { value: T }
+        impl Cell<type T> {
+            fun new(value: T): Cell<T> { Cell { value = value } }
+            fun relabel(self, label: str): Cell<str> { Cell::new(label) }
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+/// B501: expected-type inference reaches through a generic argument.
+/// `counted(source("x"))` with `counted<S>(inner: S): Counted<S>` under `let c:
+/// Counted<Src<i32>>` bound `S` to the argument's own `Src<T>` — `T` being
+/// `source`'s, fixed only by its return — and `source`'s `T: Wire` was "cannot
+/// infer 'T' for this call; its bound ': Wire' cannot be checked". The
+/// argument's still-open type is no evidence under an expectation: the
+/// expectation decides `S`, and the argument is typed toward it. A method
+/// argument and a declared return's tail are pinned; a call nested a level
+/// deeper, at ANOTHER call's parameter, is B501's remainder (ignored below).
+#[test]
+fn b501_an_expectation_reaches_a_generic_calls_generic_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::wire::Wire;
+        struct Src<T> { value: Option<T> }
+        fun source<T: Wire>(name: str): Src<T> { Src { value = None } }
+        struct Client {}
+        impl Client {
+            fun source<T: Wire>(self, name: str): Src<T> { Src { value = None } }
+        }
+        struct Counted<S> { inner: S }
+        fun counted<S>(inner: S): Counted<S> { Counted { inner } }
+        fun made(): Counted<Src<str>> { counted(Client {}.source("z")) }
+        fun main() {
+            let free: Counted<Src<i32>> = counted(source("x"));
+            print(free.inner.value.is_none());
+            let client = Client {};
+            let method: Counted<Src<bool>> = counted(client.source("y"));
+            print(method.inner.value.is_none());
+            print(made().inner.value.is_none());
+        }
+        "#,
+        "true\ntrue\ntrue\n",
+    );
+    // With nothing to decide `S`, the refusal stands.
+    assert_fails_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::wire::Wire;
+        struct Src<T> { value: Option<T> }
+        fun source<T: Wire>(name: str): Src<T> { Src { value = None } }
+        struct Counted<S> { inner: S }
+        fun counted<S>(inner: S): Counted<S> { Counted { inner } }
+        fun main() {
+            let open = counted(source("x"));
+        }
+        "#,
+        "cannot infer 'T' for this call",
+    );
+}
+
+#[test]
+#[ignore = "B501: the expectation does not yet reach a call nested at ANOTHER call's parameter (`takes(counted(source(..)))`): the inner call resolves before the outer is typed toward its parameter"]
+fn b501_an_expectation_reaches_through_a_call_at_another_calls_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::wire::Wire;
+        struct Src<T> { value: Option<T> }
+        fun source<T: Wire>(name: str): Src<T> { Src { value = None } }
+        struct Counted<S> { inner: S }
+        fun counted<S>(inner: S): Counted<S> { Counted { inner } }
+        fun takes(counted: Counted<Src<i32>>): bool { counted.inner.value.is_none() }
+        fun main() {
+            print(takes(counted(source("y"))));
+        }
+        "#,
+        "true\n",
+    );
+}
+
+/// B438 (E189's rule at this shape): `swap(flag, |on: str| 42)` reports the
+/// closure's mismatch ONCE — "cannot infer 'C' for this call" beside it was the
+/// mismatch's consequence (`C` is open because the closure did not fit). A
+/// call whose arguments all fit and still leaves a bounded generic open keeps
+/// its refusal (B533's and B501's pins).
+#[test]
+fn b438_a_refused_argument_carries_no_cannot_infer_beside_it() {
+    let source = r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::web::ui::swap;
+        fun main() {
+            let flag = Signal::new(true);
+            let view = swap(flag, |on: str| 42);
+        }
+        "#;
+    assert_fails_browser_once_with(source, "but got |str| i32");
+    let diagnostics = match compile_browser(source) {
+        Ok(_) => panic!("expected a refusal"),
+        Err(diagnostics) => diagnostics,
+    };
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+}

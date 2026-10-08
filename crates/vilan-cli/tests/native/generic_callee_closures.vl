@@ -1,0 +1,80 @@
+// F85: a closure literal handed to a GENERIC callee without a written return.
+// The literal's position was the callee's parameter type with only its head
+// resolved — `|T| U` of `apply<T, U>`, the callee's own generics — so its body
+// had no closed return to build a constructor at, and `apply(4, |k|
+// Maybe::Just(k * 10))` was refused as "instantiated at `any`". The position
+// is now the parameter's type rebuilt under the call's bindings. One line per
+// shape: a user enum over an `i32`, a `str` and a nested constructor, a list,
+// `Option`, a generic struct literal, a generic METHOD's closure, a call from
+// inside a generic body, and a closure answering a closure.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+enum Maybe<T> {
+	Just(T),
+	Nothing,
+}
+
+struct Pair<A, B> {
+	left: A,
+	right: B,
+}
+
+struct Holder<T> {
+	value: T,
+}
+
+impl Holder<type T> {
+	fun map<U>(self, f: |T| U): Holder<U> {
+		Holder { value = f(self.value) }
+	}
+}
+
+fun apply<T, U>(value: T, f: |T| U): U {
+	f(value)
+}
+
+fun twice<T>(value: T, f: |T| T): T {
+	f(f(value))
+}
+
+fun lift<T>(value: T): Maybe<T> {
+	apply(value, |v| Maybe::Just(v))
+}
+
+fun main() {
+	let wrapped = apply(4, |k| Maybe::Just(k * 10));
+	match wrapped {
+		Maybe::Just(let v) => print(v),
+		Maybe::Nothing => print("nothing"),
+	}
+	let named = apply("ab", |s| Maybe::Just(s + "c"));
+	if named is Maybe::Just(let s) {
+		print(s);
+	}
+	let nested = apply(2, |k| Maybe::Just(Maybe::Just(k)));
+	if nested is Maybe::Just(Maybe::Just(let k)) {
+		print(k);
+	}
+	print(apply(3, |k| [k, k + 1]).len());
+	print(twice(5, |k| k * 2));
+	print(apply(4, |k| Some(k + 1)) == Some(5));
+	let pair = apply("x", |s| Pair { left = s, right = s.len() });
+	print(i"{pair.left} {pair.right}");
+
+	let held = Holder { value = 3 };
+	let mapped = held.map(|v| Maybe::Just(v * 2));
+	if mapped.value is Maybe::Just(let v) {
+		print(v);
+	}
+	let lifted = lift("deep");
+	if lifted is Maybe::Just(let s) {
+		print(s);
+	}
+	let maker = apply(7, |k| || Maybe::Just(k));
+	if maker() is Maybe::Just(let v) {
+		print(v);
+	}
+}
+
+main();

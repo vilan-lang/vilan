@@ -114,6 +114,11 @@ pub struct Func<'src> {
     // Declared `[must_use]`: dropping a call's result (a bare statement that
     // discards it) is a warning.
     pub must_use: bool,
+    // Declared `[track_caller]` (debugging.md S0): the function takes a hidden
+    // `std::debug::Location` parameter carrying its call site, so a panic
+    // inside it (and `std::debug::caller()`) names the CALLER's file, line and
+    // column. Threaded by `track_caller::thread_locations`.
+    pub track_caller: bool,
     // Declared `[platform("…", …)]` — a platform FENCE: the function's
     // inferred requirement is checked against these patterns on every
     // compile (platform-coloring.md §3.7). Empty = no fence.
@@ -836,7 +841,7 @@ pub enum Node<'src> {
     // import. The first field is the optional `(in PATH)` narrowing (B318 §2.2).
     //
     // The third field is the re-export's `[deprecated("use …")]` (B382):
-    // `export [deprecated(..)] import …;` deprecates the NAME the re-export
+    // `[deprecated(..)] export import …;` deprecates the NAME the re-export
     // publishes, so the steer belongs to the export and not to the import —
     // which also keeps `Import`'s already-wide payload out of `node_size`'s way.
     Export(

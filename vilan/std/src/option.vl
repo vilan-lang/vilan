@@ -74,6 +74,7 @@ impl Option<type T> {
 		}
 	}
 
+	[track_caller]
 	fun unwrap(own self): T {
 		match self {
 			Some(let x) => x,
@@ -84,6 +85,7 @@ impl Option<type T> {
 	/// Panic with `message` when there is no value. The message is `lazy`, so the
 	/// text is BUILT only on the `None` path — `opt.expect(i"no row for {key}")`
 	/// costs nothing when the row is there (proposal/lazy.md §6b).
+	[track_caller]
 	fun expect(own self, lazy message: str): T {
 		match self {
 			Some(let x) => x,

@@ -407,54 +407,60 @@ fn a_module_warning_renders_in_the_module_file() {
 }
 
 /// B536: a declaration whose attributes are out of THE order is a parse
-/// WARNING, reported for the entry (served by the clean-parse cache, which
-/// carries a clean source's warnings) and for an imported module (the
-/// loader's), under `build` and `check`, in the file that holds it, once per
-/// head, and never fatal.
+/// error since v0.45.0 (a WARNING for one release), reported for the entry and
+/// for an imported module (the loader's), under `build` and `check`, in the
+/// file that holds it, once per head.
 #[test]
-fn b536_an_attribute_order_warning_renders_in_its_file_and_is_not_fatal() {
-    let dir = temp_files(
-        "attribute_order_warning",
-        &[
-            ("vilan.toml", MANIFEST),
-            (
-                "src/main.vl",
-                "import std::io::print;\nimport pkg::alpha::value;\n\n[must_use] [deprecated(\"use value\")]\nfun old(): i32 {\n\t1\n}\n\nfun main() {\n\tprint(value());\n}\n",
-            ),
-            (
-                "src/alpha.vl",
-                "[platform(\"node\")] [must_use]\nexport fun value(): i32 {\n\t2\n}\n",
-            ),
-        ],
-    );
-    let (output, stderr) = build_stderr(&dir);
-    let checked = vilan(&dir, &["check", "."], true);
-    let check_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
-    let _ = std::fs::remove_dir_all(&dir);
+fn b536_an_attribute_order_refusal_renders_in_its_file() {
+    // (file, the head written out of order, the order the refusal names)
+    for (name, entry, module, head, order) in [
+        (
+            "attribute_order_refusal_entry",
+            "import std::io::print;\nimport pkg::alpha::value;\n\n[must_use] [deprecated(\"use value\")]\nfun old(): i32 {\n\t1\n}\n\nfun main() {\n\tprint(value());\n}\n",
+            "[must_use]\nexport fun value(): i32 {\n\t2\n}\n",
+            ("main.vl", "[must_use] [deprecated(\"use value\")]"),
+            "write `[deprecated(..)] [must_use] fun`",
+        ),
+        (
+            "attribute_order_refusal_module",
+            "import std::io::print;\nimport pkg::alpha::value;\n\nfun main() {\n\tprint(value());\n}\n",
+            "[platform(\"node\")] [must_use]\nexport fun value(): i32 {\n\t2\n}\n",
+            ("alpha.vl", "[platform(\"node\")] [must_use]"),
+            "write `[must_use] [platform(..)] export fun`",
+        ),
+    ] {
+        let dir = temp_files(
+            name,
+            &[
+                ("vilan.toml", MANIFEST),
+                ("src/main.vl", entry),
+                ("src/alpha.vl", module),
+            ],
+        );
+        let (output, stderr) = build_stderr(&dir);
+        let checked = vilan(&dir, &["check", "."], true);
+        let check_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(output.status.success(), "a warning is not fatal: {stderr}");
-    assert!(checked.status.success(), "nor under check: {check_stderr}");
-    for stderr in [&stderr, &check_stderr] {
-        let warnings: Vec<&str> = stderr
-            .lines()
-            .filter(|line| line.starts_with("Warning: a declaration's attributes"))
-            .collect();
-        assert_eq!(warnings.len(), 2, "one per head: {stderr}");
-        assert!(
-            warnings[0].ends_with("write `[deprecated(..)] [must_use] fun`")
-                || warnings[1].ends_with("write `[deprecated(..)] [must_use] fun`"),
-            "the entry's head, in THE order: {stderr}"
-        );
-        assert!(
-            renders_in(stderr, "main.vl", "[must_use] [deprecated(\"use value\")]"),
-            "the entry's warning renders in the entry: {stderr}"
-        );
-        assert!(
-            renders_in(stderr, "alpha.vl", "[platform(\"node\")] [must_use]")
-                && stderr.contains("write `[must_use] [platform(..)] export fun`"),
-            "the module's renders in the module: {stderr}"
-        );
-        assert!(!stderr.contains("Error:"), "{stderr}");
+        // Refused since v0.45.0 (B536's flip, R-c): a warning for one release.
+        assert!(!output.status.success(), "the order is refused: {stderr}");
+        assert!(!checked.status.success(), "under check too: {check_stderr}");
+        for stderr in [&stderr, &check_stderr] {
+            let errors: Vec<&str> = stderr
+                .lines()
+                .filter(|line| line.starts_with("Error: a declaration's attributes"))
+                .collect();
+            assert_eq!(errors.len(), 1, "one per head: {stderr}");
+            assert!(
+                errors[0].ends_with(order),
+                "the head, in THE order: {stderr}"
+            );
+            assert!(
+                renders_in(stderr, head.0, head.1),
+                "the refusal renders in its file: {stderr}"
+            );
+            assert!(!stderr.contains("Warning:"), "{stderr}");
+        }
     }
 }
 

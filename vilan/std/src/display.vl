@@ -1,3 +1,4 @@
+import pkg::debug::Location;
 import pkg::string::str;
 
 export *;
@@ -126,5 +127,12 @@ impl usize with Display {
 impl f32 with Display {
 	fun to_string(self): str {
 		i"{self}"
+	}
+}
+
+/// A call site as `file:line:column` (debugging.md S0).
+impl Location with Display {
+	fun to_string(self): str {
+		self.text()
 	}
 }

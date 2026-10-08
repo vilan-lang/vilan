@@ -111,12 +111,29 @@ SCENARIOS = [
         "completion": ("get_prefs().theme.derive", len("get_prefs().")),
     },
     {
+        # M110 S1's acceptance row: the same keystroke with the ENTRY open beside
+        # `views.vl`, so the file is served from the client world (M104's world
+        # mode) — the row the hot-set world exists for (~14.3 G before it).
+        "name": "leaf keystroke, world mode",
+        "file": "src/views.vl",
+        "also_open": ["src/client.vl"],
+        "edit": ("\tlet theme_modal = create_theme_modal();", 1),
+        "text": " ",
+        "hover": ("create_theme_modal();", 3),
+        "completion": ("get_prefs().theme.derive", len("get_prefs().")),
+    },
+    {
+        # N145: anchored on `UserId`'s `Hashable` impl, which kolt@984a1dfb (the
+        # v0.44.0 seal's base) and the v0.44.0-migrated tree both hold once. The
+        # first anchors (`Transient`'s `ready`/`latest`) left shared.vl with the
+        # A150 migration, and the preflight refused the scenario on every tree
+        # after it.
         "name": "shared.vl keystroke",
         "file": "src/shared.vl",
-        "edit": ("fun ready(self): Option<T> {\n\t\t", len("fun ready(self): Option<T> {\n\t\t")),
+        "edit": ("\t\tself.uuid.hash()", 2),
         "text": " ",
-        "hover": ("fun latest(self)", 5),
-        "completion": ("Transient::Refreshing(let x) => Some(x)", len("Transient::")),
+        "hover": ("self.uuid.hash()", 10),
+        "completion": ("\t\tself.uuid.hash()", len("\t\tself.")),
     },
     {
         # The owner's case: an edit to the client MODEL re-analyses the whole
@@ -164,6 +181,44 @@ SCENARIOS = [
 ]
 
 KEYSTROKE_REQUESTS = ["hover", "completion", "inlay", "tokens"]
+
+# M110 S0's scripted session (`--session`): ten keystrokes in each of four
+# places the owner types, with the client ENTRY open beside every file so the
+# file is served from the client world (M104's world mode, the case incremental
+# analysis is for). Each keystroke is one `didChange`, typed into the text the
+# previous keystrokes left — the intermediate states are as broken as typing
+# makes them, which is Q10's question — and the four places are undone between
+# files so each starts from the tree as it stands. `anchor` is (text, offset
+# into it); the keystrokes insert there, in order.
+SESSION = [
+    {
+        "file": "src/views.vl",
+        "anchor": ("\tlet theme_modal = create_theme_modal();", len("\tlet theme_modal = create_theme_modal();")),
+        "keystrokes": list(" let x=1; "),
+    },
+    {
+        "file": "src/theme.vl",
+        "anchor": (
+            "\tmut initial_theme = get_prefs().theme.get();",
+            len("\tmut initial_theme = get_prefs().theme.get();"),
+        ),
+        "keystrokes": list(" let y=2; "),
+    },
+    {
+        "file": "src/model.vl",
+        "anchor": (
+            "\tfun create(name: str): Result<u53, RpcError> {",
+            len("\tfun create(name: str): Result<u53, RpcError> {"),
+        ),
+        "keystrokes": list(" let z=3; "),
+    },
+    {
+        "file": "src/styles.vl",
+        "anchor": ("\twidth(size(4));", len("\twidth(size(4));")),
+        "keystrokes": [" ", "h", "e", "i", "g", "h", "t", "(", "size(4)", ");"],
+    },
+]
+SESSION_COMPANIONS = ["src/client.vl"]
 
 
 # --- /proc readings -----------------------------------------------------------
@@ -329,6 +384,24 @@ class Server:
             elif message.get("method") == "window/logMessage":
                 self.log.write(f"{now:.3f} {message['params'].get('message', '')}\n")
                 self.log.flush()
+
+    def stderr_mark(self):
+        """Where the server's stderr ends now — `stderr_since` reads what
+        follows it."""
+        self.stderr.flush()
+        try:
+            return Path(self.stderr.name).stat().st_size
+        except OSError:
+            return 0
+
+    def stderr_since(self, mark):
+        self.stderr.flush()
+        try:
+            with open(self.stderr.name, "rb") as handle:
+                handle.seek(mark)
+                return handle.read().decode(errors="replace").splitlines()
+        except OSError:
+            return []
 
     def analyses_logged(self):
         """How many analyses the server has reported on stderr so far
@@ -664,6 +737,132 @@ def run_scenario(server, root, scenario, runs, callgrind=False):
     return cold, rows
 
 
+def phase_fields(line, prefix):
+    """`name value` pairs after `prefix`, as a dict of strings."""
+    words = line[len(prefix):].split()
+    return {words[index]: words[index + 1] for index in range(0, len(words) - 1, 2)}
+
+
+def counter_fields(line, prefix):
+    """`name=value` fields after `prefix`, as a dict of strings."""
+    return dict(word.split("=", 1) for word in line[len(prefix):].split() if "=" in word)
+
+
+def run_session(server, root, session):
+    """M110 S0: the scripted session — per keystroke, what the analysis re-walked
+    and what moved (the server's `hot-set` phase line and `incremental` counters
+    line), its instructions and analyses, and Q10's broken-signature count."""
+    companions = [Document(server, root / relative) for relative in SESSION_COMPANIONS]
+    for companion in companions:
+        opened = time.perf_counter()
+        companion.open()
+        server.wait_publish(companion.uri, opened)
+        server.settle()
+    rows = []
+    for place in session:
+        document = Document(server, root / place["file"])
+        opened = time.perf_counter()
+        document.open()
+        server.wait_publish(document.uri, opened)
+        server.settle()
+        offset = anchor_offset(document.text, place["anchor"], {"name": "session", "file": place["file"]}, "anchor")
+        typed = ""
+        for number, keystroke in enumerate(place["keystrokes"], start=1):
+            mark = server.stderr_mark()
+            instructions_before = server.instructions.read()
+            cpu_before = cpu_ms(server.pid)
+            started = time.perf_counter()
+            document.insert(offset, keystroke)
+            offset += len(keystroke)
+            typed += keystroke
+            server.wait_publish(document.uri, started)
+            server.settle()
+            instructions_after = server.instructions.read()
+            last = server.last_publish(document.uri, started)
+            lines = server.stderr_since(mark)
+            hot = [phase_fields(line, "[vilan phase]") for line in lines if line.startswith("[vilan phase] hot-set")]
+            counters = [
+                counter_fields(line, "[vilan counters] incremental")
+                for line in lines
+                if line.startswith("[vilan counters] incremental")
+            ]
+            moved = [line[len("[vilan phase] interface-moved-items "):] for line in lines
+                     if line.startswith("[vilan phase] interface-moved-items")]
+            verify = [line for line in lines if line.startswith("[vilan incremental] verify")]
+            # The world analysis is the LAST one the keystroke ran (a further
+            # platform leg or a dependent prints its own lines before it lands).
+            hot_line = hot[-1] if hot else {}
+            hot_set = hot_line.get("hot-set")
+            counter = counters[-1] if counters else {}
+            rows.append(
+                {
+                    "file": place["file"],
+                    "keystroke": number,
+                    "typed": typed,
+                    "hot_set": hot_set,
+                    "interface_moved": hot_line.get("interface-moved"),
+                    "global_moved": hot_line.get("global-moved"),
+                    "unknown_interfaces": hot_line.get("unknown-interfaces"),
+                    "hot_world": hot_line.get("hot-world"),
+                    "base_hits": counter.get("base-hits"),
+                    "base_misses": counter.get("base-misses"),
+                    "base_stores": counter.get("base-stores"),
+                    "sources_walked": counter.get("sources-walked"),
+                    "records_replayed": counter.get("records-replayed"),
+                    "functions_checked": counter.get("functions-checked"),
+                    "analyses": len(hot),
+                    "instructions": (
+                        instructions_after - instructions_before
+                        if instructions_before is not None and instructions_after is not None
+                        else None
+                    ),
+                    "cpu_ms": cpu_ms(server.pid) - cpu_before,
+                    "errors": sum(1 for d in last[2] if d.get("severity", 1) == 1) if last else 0,
+                    "moved": moved[-1] if moved else "",
+                    "verify": [line.split()[3] for line in verify],
+                }
+            )
+        undone = time.perf_counter()
+        document.delete(offset - len(typed), len(typed))
+        server.wait_publish(document.uri, undone)
+        server.settle()
+        document.close()
+        server.settle()
+    for companion in companions:
+        companion.close()
+    server.settle()
+    return rows
+
+
+def print_session(rows, header):
+    print(header)
+    print()
+    print(
+        "| file | # | typed so far | hot set | interface moved | global moved | unknown sigs | hot world "
+        "| base hit/miss/store | sources walked | records replayed | functions checked | instructions:u (G) "
+        "| analyses | errors | verify | moved items |"
+    )
+    print("|---|---:|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|---|")
+    for row in rows:
+        instructions = "-" if row["instructions"] is None else f"{row['instructions'] / 1e9:.2f}"
+        print(
+            f"| {row['file']} | {row['keystroke']} | `{row['typed']}` | {row['hot_set']} "
+            f"| {row['interface_moved']} | {row['global_moved']} | {row['unknown_interfaces']} | {row['hot_world']} "
+            f"| {row['base_hits']}/{row['base_misses']}/{row['base_stores']} | {row['sources_walked']} "
+            f"| {row['records_replayed']} | {row['functions_checked']} | {instructions} | {row['analyses']} "
+            f"| {row['errors']} | {' '.join(row['verify']) or '-'} | {row['moved'][:160]} |"
+        )
+    print()
+    print(
+        "One row per keystroke, the client entry open beside the file (world mode). `hot set` is the edited "
+        "module's reverse import closure, entry included, over the package modules the world reaches; "
+        "`interface moved` counts the items whose interface fingerprint (signature with the inferred return, "
+        "async, contexts, platform requirement, borrows/bumps) changed since the previous analysis; `global "
+        "moved` is the impl/trait/resource facts; `unknown sigs` counts functions whose signature renders an "
+        "unknown type (Q10). The counters are the world analysis's (the last one the keystroke ran)."
+    )
+
+
 def prepare_copy(kolt, commit, scratch):
     """A scratch copy of the package: `git archive` of `commit` when the source
     is a git checkout (reproducible), else the working tree minus build output."""
@@ -813,6 +1012,13 @@ def main():
     parser.add_argument("--json", default=None, help="also write every sample here")
     parser.add_argument("--callgrind", default=None, help="profile one scenario's edit into this directory")
     parser.add_argument("--top", type=int, default=25, help="callgrind offenders to print (default 25)")
+    parser.add_argument(
+        "--session",
+        action="store_true",
+        help="M110 S0: run the scripted keystroke session (ten keystrokes in views.vl, theme.vl, model.vl and a "
+        "css block, world mode) instead of the latency scenarios, and print what each keystroke re-walked and "
+        "moved; the server runs with VILAN_COUNTERS=1 and VILAN_INCREMENTAL=measure unless already set",
+    )
     arguments = parser.parse_args()
 
     scratch = Path(arguments.scratch or os.path.join(os.environ.get("TMPDIR", "/tmp"), "vilan-lsp-latency"))
@@ -838,6 +1044,8 @@ def main():
         if "VILAN_STD" in env
         else (f"std discovered at {discovered} (an ancestor checkout)" if discovered else "the server's embedded std")
     )
+    if arguments.session:
+        return run_session_main(arguments, root, described, lsp, version, env, scratch, std_note)
     scenarios = [s for s in SCENARIOS if not arguments.scenario or s["name"] in arguments.scenario]
     if not scenarios:
         raise SystemExit(f"no scenario named {arguments.scenario}; the names: {[s['name'] for s in SCENARIOS]}")
@@ -911,6 +1119,58 @@ def main():
         )
     if arguments.callgrind:
         callgrind_report(arguments.callgrind, arguments.top)
+
+
+def start_server(command, root, env, scratch):
+    server = Server(command, root, env, scratch / "vilan-lsp.stderr")
+    print(f"server pid {server.pid}: {' '.join(command)}", file=sys.stderr)
+    server.request(
+        "initialize",
+        {
+            "processId": os.getpid(),
+            "rootUri": root.resolve().as_uri(),
+            "capabilities": {
+                "textDocument": {
+                    "publishDiagnostics": {},
+                    "hover": {"contentFormat": ["markdown", "plaintext"]},
+                    "completion": {"completionItem": {"snippetSupport": True}},
+                    "inlayHint": {},
+                    "semanticTokens": {"requests": {"full": True}, "formats": ["relative"], "tokenTypes": [], "tokenModifiers": []},
+                },
+                "workspace": {"inlayHint": {"refreshSupport": True}, "semanticTokens": {"refreshSupport": True}},
+            },
+        },
+    )
+    server.notify("initialized", {})
+    server.instructions = InstructionCounter(server.pid)
+    return server
+
+
+def run_session_main(arguments, root, described, lsp, version, env, scratch, std_note):
+    problems = []
+    for place in SESSION:
+        text = (root / place["file"]).read_text()
+        count = text.count(place["anchor"][0])
+        if count != 1:
+            problems.append(f"{place['file']}: the session anchor {place['anchor'][0]!r} occurs {count} times")
+    if problems:
+        raise SystemExit("the session does not land in " + described + ":\n  " + "\n  ".join(problems))
+    env.setdefault("VILAN_PHASE_TIMING", "1")
+    env.setdefault("VILAN_COUNTERS", "1")
+    env.setdefault("VILAN_INCREMENTAL", "measure")
+    load_before = load_average()
+    server = start_server([lsp], root, env, scratch)
+    try:
+        rows = run_session(server, root, SESSION)
+    finally:
+        server.stop()
+    header = (
+        f"vilan-lsp keystroke session (M110 S0) — {version} on {described} ({std_note}); "
+        f"VILAN_INCREMENTAL={env['VILAN_INCREMENTAL']}; loadavg {load_before} before, {load_average()} after"
+    )
+    print_session(rows, header)
+    if arguments.json:
+        Path(arguments.json).write_text(json.dumps({"header": header, "session": rows}, indent=1))
 
 
 if __name__ == "__main__":

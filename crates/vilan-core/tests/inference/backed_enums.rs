@@ -2472,7 +2472,11 @@ fn a_compound_assignment_with_a_pure_index_mints_no_temp() {
         "#;
     match compile(source) {
         Ok(js) => assert!(
-            js.contains("__at_put(ys, index, __at(ys, index) + 5)"),
+            // Both checked subscripts carry the site they report (debugging.md
+            // S0), and that is all that rides along with them.
+            js.contains(
+                "__at_put(ys, index, __at(ys, index, \"test.vl:6:13\") + 5, \"test.vl:6:13\")"
+            ),
             "a pure subscript was hoisted into a temp:\n{js}"
         ),
         Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),

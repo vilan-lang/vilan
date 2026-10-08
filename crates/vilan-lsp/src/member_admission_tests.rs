@@ -148,19 +148,81 @@ fn hover_on_a_blanket_members_call_names_it() {
     );
 }
 
-/// Found while establishing the above: a call whose argument is a closure
-/// with a `context` clause — `switch`, `switch_some`, `and_then`, blanket or
-/// not — leaves no entity record behind the analysis (the context pass's
-/// lowering), so hover and go-to-definition answer nothing on it. Filed for
-/// the analyzer; pinned here so the day it is fixed this un-ignores.
+/// E253, re-read: a call taking a closure with a `context` clause —
+/// `switch`, `switch_some`, `and_then`, blanket or not — hovers and navigates
+/// like any other. The find's own program was refused (`MemoCell::new` does
+/// not exist), and THAT is what left the call unrecorded: see below.
 #[test]
-#[ignore = "E253: the analyzer drops the call's entity record (filed from editor-46, E249's probe)"]
 fn hover_on_a_call_taking_a_context_closure_names_the_member() {
-    let source = format!(
-        "{IMPORTS}fun pick(m: MemoCell<Option<i32>>) {{\n\tlet _ = m.switch_some(|value| MemoCell::new(value));\n}}\n"
-    );
-    let document = Document::analyze(&source, &std_root(), Path::new("test.vl"));
-    let at = source.find("switch_some").expect("the call") + 3;
-    let hover = document.hover(at).expect("a hover on the member");
-    assert!(hover.contains("fun switch_some"), "{hover}");
+    for (receiver, call, member) in [
+        (
+            "MemoCell<Option<i32>>",
+            "m.switch_some(|value| SignalCell::new(value))",
+            "fun switch_some",
+        ),
+        (
+            "MemoCell<Option<i32>>",
+            "m.and_then(|value| SignalCell::new(Some(value)))",
+            "fun and_then",
+        ),
+        (
+            "MemoCell<i32>",
+            "m.switch(|value| SignalCell::new(value))",
+            "fun switch",
+        ),
+    ] {
+        let source = format!("{IMPORTS}fun pick(m: {receiver}) {{\n\tlet _ = {call};\n}}\n");
+        let document = Document::analyze(&source, &std_root(), Path::new("test.vl"));
+        assert!(
+            document.diagnostics.is_empty(),
+            "the premise: {call} checks clean {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.msg.clone())
+                .collect::<Vec<_>>()
+        );
+        let name = member.trim_start_matches("fun ");
+        let at = source.find(&format!(".{name}(")).expect("the call") + 3;
+        let hover = document.hover(at).expect("a hover on the member");
+        assert!(hover.contains(member), "{call}: {hover}");
+        assert!(document.definition(at).is_some(), "{call}: a definition");
+    }
+}
+
+/// E253's real cause: a method call whose CLOSURE argument's body is refused
+/// never wires — the closure's return is the method's generic, so the call
+/// defers on it to the end — and left no record behind but its span. Hover
+/// and go-to-definition on the method answered nothing exactly while the
+/// author was fixing the closure. A refused argument that is not a closure
+/// never had the gap (the call wires, and the argument carries the error).
+#[test]
+fn hover_on_a_call_whose_closure_is_refused_names_the_member() {
+    for (receiver, call, member) in [
+        (
+            "MemoCell<Option<i32>>",
+            "m.switch_some(|value| MemoCell::new(value))",
+            "fun switch_some",
+        ),
+        ("Option<i32>", "m.map(|value| nope(value))", "fun map"),
+        (
+            "List<i32>",
+            "m.map(|value| { let doubled = value * 2; nope(doubled) })",
+            "fun map",
+        ),
+    ] {
+        let source = format!("{IMPORTS}fun pick(m: {receiver}) {{\n\tlet _ = {call};\n}}\n");
+        let document = Document::analyze(&source, &std_root(), Path::new("test.vl"));
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the premise: {call}'s closure is refused"
+        );
+        let name = member.trim_start_matches("fun ");
+        let at = source.find(&format!(".{name}(")).expect("the call") + 3;
+        let hover = document
+            .hover(at)
+            .unwrap_or_else(|| panic!("{call}: a hover on the member"));
+        assert!(hover.contains(member), "{call}: {hover}");
+        assert!(document.definition(at).is_some(), "{call}: a definition");
+    }
 }

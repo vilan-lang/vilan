@@ -17,10 +17,10 @@ for (const number of numbers) {
 	if (number === 4) {
 		break;
 	}
-	console.log(number);
+	console.log(String(number));
 }
 let count = 0;
 for (const _ of names) {
 	count = count + 1;
 }
-console.log(count);
+console.log(String(count));

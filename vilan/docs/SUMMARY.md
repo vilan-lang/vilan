@@ -29,6 +29,7 @@
 - [Server-side rendering](guide/ssr.md)
 - [A full-stack walkthrough](guide/walkthrough.md)
 - [The dev loop](guide/dev-loop.md)
+- [Debugging](guide/debugging.md)
 - [Native binaries](guide/native.md)
 
 # The std reference
@@ -50,6 +51,7 @@
 - [Style](std/style.md)
 - [RPC](std/rpc.md)
 - [Browser modules](std/browser.md)
+- [Debugging](std/debug.md)
 - [Dev / HMR](std/dev.md)
 - [Process modules](std/process.md)
 - [Misc](std/misc.md)

@@ -71,6 +71,41 @@ The value lives in the root, in place. `get()` copies out only the value at the
 handle's path — a read of `city` copies the city, never the whole user — and
 `set(v)` assigns in place through the root.
 
+**Field syntax.** A field reads the way the value spells it: on a `Store<T>`
+(and on a `StoreSome<T>`, below) a member that names a field of `T` is that
+field's projection, so `user.address.city` is `user.address().city()` — the
+same handle, written without the calls:
+
+```vilan
+import std::reactive::{ Signal, Source };
+import std::reactive::store::{ Storable, Store };
+
+[derive(Storable)]
+struct Address {
+	city: str,
+}
+
+[derive(Storable)]
+struct User {
+	name: str,
+	address: Address,
+}
+
+fun main() {
+	let user = Store::new(User { name = "Alice", address = Address { city = "Oslo" } });
+	user.address.city.set("Bergen");     // the handle `user.address().city()` is
+	print(user.address.city.get());      // Bergen
+}
+```
+
+A field read is a handle, so it is written through, never over:
+`user.name = "Bob"` is refused with the `.set(..)` that writes it. A field whose
+projection is renamed (`[reactive(name = "..")]`, below) is read by the
+projection's name, as a call; a type that does not derive `Storable` has no
+projections, so its store reads no fields this way. The handle's own fields
+are std's `[internal]` machinery and are not members outside std, so a field
+of `T` named `path` or `root` reads `T`'s field.
+
 A handle is data: copying it allocates nothing, and it has no owner. It is a
 `Source<T>`, so every pipe, effect and binding takes one (`city.derive(..)`,
 `<p>{city}</p>`), and a `Signal<T>`, so anything that writes a signal writes it
@@ -320,7 +355,8 @@ the flow is open.
   read and write — and it allocates nothing until something subscribes.
 - **A whole write costs one comparison per live slot.** A handle write costs
   the comparisons under the handle.
-- **Projections are methods**: `user.address().city()`.
+- **Projections are methods**: `user.address().city()`, and field syntax
+  (`user.address.city`) is the same call written without the parentheses.
 - **A write through a variant lands in place** for a single payload and an
   `Option`'s `Some` (a `match &mut` capture is a writable view); a variant
   with several payloads copies its tuple out and back. A write under a map key

@@ -7380,6 +7380,7 @@ fn b359_a_for_loop_in_a_default_body_drives_the_traits_protocol_member() {
 fn b359_ords_clamp_default_still_answers_over_the_integers() {
     assert_compiles_and_runs(
         r#"
+        import std::compare::Ord;
         import std::io::print;
 
         fun main() {
@@ -9261,6 +9262,59 @@ fn a_second_emission_of_one_program_computes_no_impl_selection() {
     );
 }
 
+/// M111: a BOUND-DIRECTED call — one naming its trait at arguments
+/// (`V: Describe<i32>`) — was never memoized: `applying_implementations` keyed
+/// only the argument-free questions, so every such call the emission walk met
+/// re-ranked the program's impls, re-proving every blanket bound under them
+/// (kolt's check spent a third of its instructions there). The count a body
+/// computes is now the same for one call site and for six.
+#[test]
+fn m111_bound_directed_calls_compute_their_selection_once_however_many_sites() {
+    fn computed_for(sites: usize) -> usize {
+        let calls = "\tprint(i\"{value.describe()}\");\n".repeat(sites);
+        // `analyze_source` borrows its text for the program's lifetime.
+        let source: &'static str = String::leak(format!(
+            "import std::io::print;\n\
+             trait Describe<T> {{ fun describe(self): T; }}\n\
+             struct Badge {{ size: i32 }}\n\
+             impl Badge with Describe<i32> {{ fun describe(self): i32 {{ self.size }} }}\n\
+             fun tell<V: Describe<i32>>(value: V) {{\n{calls}}}\n\
+             fun main() {{ tell(Badge {{ size = 1 }}); }}\n"
+        ));
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                let program = program.expect("analysis should produce a program");
+                vilan_core::impl_select::reset_applying_computed();
+                transform(&program, &BuildOptions::default()).expect("the program emits");
+                vilan_core::impl_select::applying_computed()
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    let one = computed_for(1);
+    let six = computed_for(6);
+    assert_eq!(
+        one, six,
+        "six bound-directed calls computed {six} impl selections where one call computed \
+         {one}: each site re-ranked the impls (M111)"
+    );
+}
+
 /// B479 without std: a stage type's own impl provides `Fl<U>` in the caller's
 /// parameter (`Der<S, T, I>` → `Fl<I>`), and a blanket over every `Src`
 /// provides `Fl` too — written first, its `T` grounded by nothing a `Der` has.
@@ -9328,5 +9382,173 @@ fn b508_a_blanket_reaches_a_closure_typed_receiver() {
         }
         "#,
         "anything\nanything\nanything\nanything\n",
+    );
+}
+
+/// B533: a type implementing a bound's trait at TWO instantiations is no
+/// evidence for the bound's arguments. `measure<T, S: Shape<T>>` called on a
+/// `Square: Shape<i32> + Shape<str>` read `T` from the FIRST provider in
+/// declaration order, so `let s: str = measure(square)` was refused "Expected
+/// str, but got i32" and an unannotated call silently chose `i32`. The
+/// expectation decides (a `let`, a parameter, a return), a written type
+/// argument decides, and a call nothing decides is refused naming the
+/// instantiations — on a free function and a method alike.
+#[test]
+fn b533_a_bound_provided_at_two_instantiations_binds_from_the_expectation() {
+    let program = |body: &str| {
+        format!(
+            r#"
+            import std::io::print;
+            trait Shape<T> {{
+                fun area(self): T;
+            }}
+            struct Square {{ side: i32 }}
+            impl Square with Shape<i32> {{
+                fun area(self): i32 {{ self.side * self.side }}
+            }}
+            impl Square with Shape<str> {{
+                fun area(self): str {{ "square" }}
+            }}
+            struct Ruler {{}}
+            impl Ruler {{
+                fun measure<T, S: Shape<T>>(self, shape: S): T {{ shape.area() }}
+            }}
+            fun measure<T, S: Shape<T>>(shape: S): T {{ shape.area() }}
+            fun takes(label: str): str {{ label }}
+            fun counted(square: Square): i32 {{ measure(square) }}
+            fun main() {{
+                {body}
+            }}
+            "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program(
+            r#"
+            let named: str = measure(Square { side = 2 });
+            print(named);
+            let area: i32 = measure(Square { side = 3 });
+            print(area);
+            print(takes(measure(Square { side = 4 })));
+            print(counted(Square { side = 5 }));
+            print(measure<str, Square>(Square { side = 6 }));
+            let by_method: str = Ruler {}.measure(Square { side = 7 });
+            print(by_method);
+            let by_method_area: i32 = Ruler {}.measure(Square { side = 8 });
+            print(by_method_area);
+            "#,
+        ),
+        "square\n9\nsquare\n25\nsquare\nsquare\n64\n",
+    );
+    for undecided in [
+        "let shape = measure(Square { side = 2 });",
+        "let shape = Ruler {}.measure(Square { side = 2 });",
+    ] {
+        assert_fails_once_with(
+            &program(undecided),
+            "cannot infer 'T' for this call: `Square` implements `Shape` at 2 instantiations, \
+             `Shape<i32>` and `Shape<str>`, and nothing at this call chooses one",
+        );
+    }
+}
+
+/// B539: B489's twin at a binding. A trait annotation on a `let` is B161's
+/// constraint on the value's own type, and its ARGUMENTS name that type when
+/// the value left a hole: `let a: Source<Option<i32>> = SignalCell::new(None)`
+/// typed as `SignalCell<Option<unknown>>` (natively "an unresolved type") and
+/// is now `SignalCell<Option<i32>>`, read through `SignalCell`'s one impl of
+/// `Source`. A block tail, `if` arms, a two-parameter trait and a value with
+/// no hole are pinned; the typing is asserted where JS alone ran the hole.
+#[test]
+fn b539_a_trait_annotated_bindings_arguments_reach_its_initializer() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        import std::option::Option::{ self, None, Some };
+        trait Pair<A, B> {
+            fun left(self): A;
+        }
+        struct Both<A, B> { a: A, b: B }
+        impl Both<type A, type B> with Pair<A, B> {
+            fun left(self): A { self.a }
+        }
+        fun main() {
+            let a: Source<Option<i32>> = SignalCell::new(None);
+            print(a.get().is_none());
+            let b: Source<List<str>> = SignalCell::new([]);
+            print(b.get().len());
+            let c: Source<Option<str>> = { SignalCell::new(None) };
+            print(c.get().is_none());
+            let flag = true;
+            let d: Source<Option<bool>> =
+                if flag { SignalCell::new(None) } else { SignalCell::new(Some(true)) };
+            print(d.get().is_none());
+            let e: Pair<Option<i32>, List<str>> = Both { a = None, b = [] };
+            print(e.left().is_none());
+            let f: Source<i32> = SignalCell::new(4);
+            print(f.get());
+        }
+        "#,
+        "true\n0\ntrue\ntrue\ntrue\n4\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        import std::option::Option::{ self, None };
+        fun main() {
+            let a: Source<Option<i32>> = SignalCell::new(None);
+            let wrong: i32 = a;
+        }
+        "#,
+        "got SignalCell<Option<i32>>",
+    );
+    // Still the constraint: a value of another instantiation is refused by it.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun main() {
+            let a: Source<str> = SignalCell::new(4);
+        }
+        "#,
+        "does not implement trait 'Source<str>'",
+    );
+}
+
+/// B500: an `[rpc]` signature written with a MODULE PATH (`hash_map::HashMap<str,
+/// i32>`) is the same contract as the bare spelling. The macro surface handed a
+/// path type to `[service]` as one opaque name with NO arguments, so the
+/// generated code whose type parameter only those arguments fix was refused
+/// ("cannot infer 'T' … ': Wire'"). A path head now keeps its arguments, under
+/// its whole written path; the contract hash agrees with the bare spelling's.
+#[test]
+fn b500_an_rpc_signature_written_with_a_module_path_is_the_bare_contract() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map;
+        import std::hash_map::HashMap;
+        [service(BareClient)]
+        struct Bare {
+            unused: i32,
+        }
+        impl Bare {
+            [rpc]
+            fun counts(self, names: HashMap<str, i32>): HashMap<str, i32> { names }
+        }
+        [service(PathClient)]
+        struct Path {
+            unused: i32,
+        }
+        impl Path {
+            [rpc]
+            fun counts(self, names: hash_map::HashMap<str, i32>): hash_map::HashMap<str, i32> {
+                names
+            }
+        }
+        fun main() {
+            print(Bare { unused = 0 }.contract_hash() == Path { unused = 0 }.contract_hash());
+        }
+        "#,
+        "true\n",
     );
 }

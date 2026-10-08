@@ -83,32 +83,32 @@ function basename(path) {
 function range(low, high) {
 	return __random_int(low, high);
 }
-function $a(low, high) {
+function range2(low, high) {
 	return range(low, high);
 }
-function $b($c) {
-	drop($c);
+function $a($b) {
+	drop($b);
 }
-async function $g(file, body) {
+async function scoped_file(file, body) {
 	try {
 		const result = await (body(file));
 		await (__fs_close_awaited(file));
 		return result;
 	} finally {
-		$b(file);
+		$a(file);
 	}
 }
-async function $f(path, body) {
-	return await ($g(await (open2(path)), body));
+async function with_file(path, body) {
+	return await (scoped_file(await (open2(path)), body));
 }
-async function $h(path, body) {
-	return await ($g(await (create(path)), body));
+async function with_file_create(path, body) {
+	return await (scoped_file(await (create(path)), body));
 }
-function $j($k) {
-	$b($k[0]);
+function $e($f) {
+	$a($f[0]);
 }
 (async () => {
-	const root = "file-corpus-" + $a(100000, 999999);
+	const root = "file-corpus-" + range2(100000, 999999);
 	await (create_dir_all(root));
 	const scratch = "" + root + "/data.txt";
 	console.log(basename(scratch));
@@ -116,33 +116,33 @@ function $j($k) {
 	let file = await (open2(scratch));
 	try {
 		const buffer = new Uint8Array(4);
-		console.log(await (read_at(file, buffer, 3)));
+		console.log(String(await (read_at(file, buffer, 3))));
 		console.log(decode_utf8(buffer.slice(0, 4)));
-		console.log((await (stat(file)))[0]);
-		$b(file);
+		console.log(String((await (stat(file)))[0]));
+		$a(file);
 		file = null;
-		const $d = await (open2(scratch));
+		const $c = await (open2(scratch));
 		try {
-			console.log(await (read_at($d, buffer, 0)));
+			console.log(String(await (read_at($c, buffer, 0))));
 		} finally {
-			$b($d);
+			$a($c);
 		}
 	} finally {
 		if (file !== null) {
-			$b(file);
+			$a(file);
 		}
 	}
-	const $e = await (open2(scratch));
+	const $d = await (open2(scratch));
 	try {
-		console.log((await (stat($e)))[0]);
+		console.log(String((await (stat($d)))[0]));
 	} finally {
-		$b($e);
+		$a($d);
 	}
-	const size = await ($f(scratch, async (f) => {
+	const size = await (with_file(scratch, async (f) => {
 		return (await (stat(f)))[0];
 	}));
-	console.log(size);
-	await ($h(scratch, async (f) => {
+	console.log(String(size));
+	await (with_file_create(scratch, async (f) => {
 		await (write_at(f, encode_utf8("0123456789"), 0));
 		return;
 	}));
@@ -157,17 +157,17 @@ function $j($k) {
 			whole = whole + decode_utf8(chunk);
 		}
 		console.log(whole);
-		console.log(position(reader));
-		$j(reader);
+		console.log(String(position(reader)));
+		$e(reader);
 		reader = null;
 	} finally {
 		if (reader !== null) {
-			$j(reader);
+			$e(reader);
 		}
 	}
 	await (unlink(scratch));
 	await (remove_dir_all(root));
-})().catch(($l) => {
-	console.error(String($l));
+})().catch(($g) => {
+	console.error(String($g));
 	process.exit(1);
 });

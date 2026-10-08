@@ -2566,6 +2566,7 @@ fn markdown_parses_atx_headings_with_mdbook_ids() {
     // each space becomes its own hyphen — measured against mdBook v0.5.4.
     assert_compiles_and_runs(
         r##"
+        import std::display::Display;
         import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
@@ -2781,6 +2782,7 @@ fn markdown_parses_flat_lists_ordered_and_unordered() {
     // Items block; a simple item is one Paragraph of inlines.
     assert_compiles_and_runs(
         r#"
+        import std::display::Display;
         import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
@@ -2814,6 +2816,7 @@ fn markdown_a_list_item_carries_blocks() {
     // glommed into the item's first line.
     assert_compiles_and_runs(
         r#"
+        import std::display::Display;
         import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
@@ -2850,6 +2853,7 @@ fn markdown_parses_blockquotes_recursively() {
     // §2's probed recursion: a quote holds blocks, including another quote.
     assert_compiles_and_runs(
         r#"
+        import std::display::Display;
         import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
@@ -2883,6 +2887,7 @@ fn markdown_parses_pipe_tables_and_unescapes_cell_pipes() {
     // the code span carries a real `|`.
     assert_compiles_and_runs(
         r#"
+        import std::display::Display;
         import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };

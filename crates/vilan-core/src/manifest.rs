@@ -710,6 +710,10 @@ pub struct Build {
     /// off under `debug`, overridable here like every other knob.
     #[serde(rename = "infer-const")]
     pub infer_const: Option<bool>,
+    /// What `dbg(..)` does in this build (debugging.md Q4): `"keep"` prints,
+    /// `"strip"` drops the printing. Unset, the preset decides: `debug`
+    /// prints, `release` refuses the build.
+    pub dbg: Option<String>,
 }
 
 impl Package {
@@ -1511,6 +1515,11 @@ impl Manifest {
         options.readable_names = build.readable_names.unwrap_or(options.readable_names);
         options.debug_names = build.debug_names.unwrap_or(options.debug_names);
         options.infer_const = build.infer_const.unwrap_or(options.infer_const);
+        if let Some(name) = &build.dbg {
+            options.dbg = crate::options::DbgPolicy::parse(name).ok_or_else(|| {
+                format!("unknown `[build] dbg` value `{name}` (expected `keep` or `strip`)")
+            })?;
+        }
         Ok(options)
     }
 }
@@ -5045,6 +5054,34 @@ mod tests {
         let options = manifest.build_options().unwrap();
         assert!(!options.indent); // release
         assert!(options.readable_names); // overridden on
+    }
+
+    /// debugging.md Q4: the `debug` preset prints a `dbg(..)`, the `release`
+    /// preset refuses it, and `[build] dbg` overrides either with `keep` or
+    /// `strip`; any other value is an error naming the two.
+    #[test]
+    fn the_dbg_policy_follows_the_preset_and_the_key_overrides_it() {
+        use crate::options::DbgPolicy;
+        let policy = |body: &str| {
+            parse(&format!("[package]\nname = \"x\"\n[build]\n{body}"))
+                .build_options()
+                .map(|options| options.dbg)
+        };
+        assert_eq!(policy(""), Ok(DbgPolicy::Keep));
+        assert_eq!(policy("preset = \"release\"\n"), Ok(DbgPolicy::Refuse));
+        assert_eq!(
+            policy("preset = \"release\"\ndbg = \"strip\"\n"),
+            Ok(DbgPolicy::Strip)
+        );
+        assert_eq!(
+            policy("preset = \"release\"\ndbg = \"keep\"\n"),
+            Ok(DbgPolicy::Keep)
+        );
+        assert_eq!(policy("dbg = \"strip\"\n"), Ok(DbgPolicy::Strip));
+        assert_eq!(
+            policy("dbg = \"refuse\"\n"),
+            Err("unknown `[build] dbg` value `refuse` (expected `keep` or `strip`)".to_string())
+        );
     }
 
     // ── `[[build.hook]]`: the table form of a build hook

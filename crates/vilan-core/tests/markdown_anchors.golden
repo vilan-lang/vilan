@@ -53,6 +53,10 @@ appendix/gotchas.md h2 language
 appendix/gotchas.md h2 reactive--ui
 appendix/gotchas.md h2 services--the-wire
 appendix/gotchas.md h2 process--testing
+guide/debugging.md h1 debugging
+guide/debugging.md h2 what-dbg
+guide/debugging.md h2 where-panics-name-their-line
+guide/debugging.md h3 track_caller
 guide/dev-loop.md h1 the-dev-loop
 guide/dev-loop.md h2 what-each-edit-does
 guide/dev-loop.md h2 when-a-round-fails
@@ -174,6 +178,7 @@ guide/ui.md h2 views
 guide/ui.md h2 text-children-and-mixed-content
 guide/ui.md h2 element-syntax
 guide/ui.md h3 fragments
+guide/ui.md h3 markup-or-chain
 guide/ui.md h2 components-are-just-functions
 guide/ui.md h2 events-run-in-turns
 guide/ui.md h2 inputs
@@ -346,6 +351,7 @@ std/collections.md h2 listt
 std/collections.md h3 searching--equality
 std/collections.md h3 ordering
 std/collections.md h3 splicing
+std/collections.md h3 appending-a-run
 std/collections.md h3 joining
 std/collections.md h2 hashmapk-v
 std/collections.md h2 hashsett
@@ -356,6 +362,10 @@ std/collections.md h2 iterator
 std/collections.md h3 what-a-for-can-iterate
 std/collections.md h3 adapters
 std/collections.md h3 terminations
+std/debug.md h1 debugging-stddebug
+std/debug.md h2 dbg
+std/debug.md h2 debug
+std/debug.md h2 locations
 std/dev.md h1 dev--hmr-reference
 std/dev.md h2 hmr_active
 std/dev.md h2 on_teardown

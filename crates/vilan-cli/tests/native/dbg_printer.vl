@@ -1,0 +1,67 @@
+// debugging.md S1: `dbg(..)` writes the same bytes on both backends — every
+// shape S1 prints, every call form, the 80-column layout and the list cut.
+struct Point {
+	x: i32,
+	y: i32,
+}
+struct Unit {}
+struct Line {
+	from: Point,
+	to: Point,
+	label: str,
+}
+struct Wrapper<T> {
+	inner: T,
+	tags: List<str>,
+}
+enum Shape {
+	Circle(f64),
+	Rect(i32, i32),
+	Empty,
+}
+enum Tree<T> {
+	Leaf(T),
+	Node(List<Tree<T>>),
+}
+
+[resource]
+struct Guard {
+	id: i32,
+}
+
+fun show<T>(value: T): T {
+	dbg(value)
+}
+
+fun main() {
+	let point = Point { x = 1, y = -2 };
+	dbg(point);
+	dbg(Line { from = point, to = Point { x = 3, y = 4 }, label = "di\"ag \\ line\n" });
+	dbg(Shape::Circle(1.5), Shape::Rect(2, 3), Shape::Empty);
+	let none: Option<u8> = None;
+	let failed: Result<i32, str> = Err("no");
+	dbg(Some(5), none, failed);
+	dbg((1, (2, "x")), [[1, 2], []], Unit {});
+	dbg(3.0, 0.25, 0.1 + 0.2, 0.0 * -1.0, 1000000.0 * 1000000.0 * 1000000.0 * 1000.0);
+	dbg(true, 7usize, 255u8, -3);
+	dbg(Wrapper { inner = [Some(Shape::Circle(1.0)), None], tags = ["a", "b"] });
+	show(3);
+	show("s");
+	show(Shape::Empty);
+	let total = dbg(2 * 3) + 1;
+	print(total);
+	let pair = dbg((1, 2), "x");
+	print(pair.1);
+	dbg();
+	let guard = Guard { id = 9 };
+	dbg(guard);
+	let kept = dbg(guard);
+	print(kept.id);
+	mut many: List<usize> = [];
+	for many.len() < 103 {
+		many.push(many.len());
+	}
+	print(dbg(many).len());
+	let add = |a: i32, b: i32| a + b;
+	dbg(add);
+}

@@ -299,7 +299,7 @@ out removes it and navigates home.
 itself, one keyed `each` over the mirror:
 
 ```vilan,fragment
-.child(view("ul").child(each(notes, |note| note.id, |note| note_row(client, note, token))))
+<ul>{each(notes, |note| note.id, |note| note_row(client, note, token))}</ul>
 ```
 
 That single line is the live sync. When any client adds or deletes a
@@ -325,9 +325,9 @@ entry.effect(|current: Option<Note>| {
 	}
 });
 
-view("div")
-	.child(view("input").styled(field).attr("placeholder", "Title…").bind_draft(title))
-	.child(view("span").styled(muted).bind_text(title.state.derive(state_text)))
+<div .styled(shell)>
+	<input .styled(field) placeholder("Title…") .bind_draft(title) />
+	<span .styled(muted)>{title.state.derive(state_text)}</span>
 	…
 ```
 

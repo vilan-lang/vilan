@@ -1,14 +1,14 @@
-function $a(fn) {
+function from_fn(fn) {
 	return [ fn ];
 }
-function $b(self) {
+function next(self) {
 	return self[0]();
 }
 let i = 0;
-const naturals = $a(() => {
+const naturals = from_fn(() => {
 	i = i + 1;
 	return i;
 });
-console.log($b(naturals));
-console.log($b(naturals));
-console.log($b(naturals));
+console.log(String(next(naturals)));
+console.log(String(next(naturals)));
+console.log(String(next(naturals)));

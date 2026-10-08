@@ -1,0 +1,12 @@
+[native_probe_dbg_handles.vl:23:2] ages = HashMap { "ada" => 36, "alan" => 41 }
+[native_probe_dbg_handles.vl:26:2] pairs = HashMap {
+  1 => (Point { x = 1, y = 2 }, "p"),
+}
+[native_probe_dbg_handles.vl:30:2] seen = HashSet { "a", "b" }
+[native_probe_dbg_handles.vl:32:2] empty = HashSet {}
+[native_probe_dbg_handles.vl:34:2] cell = Shared(Point { x = 7, y = 8 })
+[native_probe_dbg_handles.vl:36:2] count = SignalCell(3)
+[native_probe_dbg_handles.vl:38:2] doubled = <pipe Derive<SignalCell<i32>, i32, i32>>
+[native_probe_dbg_handles.vl:41:2] head = Shared(
+  Link { label = "head", next = Some(<cycle>) },
+)

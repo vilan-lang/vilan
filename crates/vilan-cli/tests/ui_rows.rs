@@ -1041,6 +1041,7 @@ fn a59_measurement_reads_the_host_box_and_a_detached_element_reads_zero() {
 /// way DOWN — before the target's own — and a disposed one is gone from the
 /// capture table rather than from the bubble table it never joined.
 const CAPTURE: &str = r#"import std::web::dom::{ get_element_by_id, window };
+import std::reactive::Disposable;
 import std::io::print;
 import std::web::ui::{ mount_root, view };
 
@@ -1126,6 +1127,7 @@ fn a59_capture_listeners_run_before_the_target_and_dispose_by_phase() {
 /// first-layout hook), fires again on a size change, and its `Subscription`
 /// disconnects the observer.
 const RESIZE: &str = r#"import std::web::dom::get_element_by_id;
+import std::reactive::Disposable;
 import std::io::print;
 import std::web::ui::{ mount_root, view };
 
@@ -6136,4 +6138,130 @@ fn a142_s4_a_run_over_a_collection_pipe_builds_only_what_arrived() {
             && ul.find("'three'") < ul.find("'four'"),
         "the open run must read two, three, four in order; got:\n{tree}"
     );
+}
+
+// --- B546: a scope installed AFTER its content took focus ------------------
+
+/// The content is built BEFORE the panel that holds it, so its `autofocus`
+/// mount runs before the panel's `on_mount` installs the scope: at install,
+/// focus is already on `inner`. `{content}` is where the content goes — the
+/// built-first binding, or the same element written inline (the control).
+const SCOPE_AFTER_CONTENT: &str = r#"import std::web::dom::window;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::web::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
+
+fun main() {
+	let open: SignalCell<bool> = Signal::new(false);
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("input").attr("name", "opener"))
+			.child(when(open, || {
+				{content}
+			}))
+	});
+	let _toggle = root.take(window().listen("toggle", |_event| {
+		open.set(!open.get());
+	}));
+	print("built");
+}
+
+main();
+"#;
+
+const BUILT_FIRST: &str = r#"let content = view("input").attr("name", "inner").autofocus();
+				view("div")
+					.attr("name", "panel")
+					.on_mount(|element| {
+						let _scope = focus_scope(element, FocusContainment::Contain);
+					})
+					.child(content)"#;
+
+const WRITTEN_INLINE: &str = r#"view("div")
+					.attr("name", "panel")
+					.on_mount(|element| {
+						let _scope = focus_scope(element, FocusContainment::Contain);
+					})
+					.child(view("input").attr("name", "inner").autofocus())"#;
+
+const SCOPE_AFTER_CONTENT_STEPS: &str = r##"
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+(async () => {
+  await tick();
+  findByName("opener").focus();
+  window.fire("toggle", {});
+  await tick();
+  console.log("open=" + at());
+  window.fire("toggle", {});
+  await tick();
+  console.log("closed=" + at());
+})();
+"##;
+
+fn scope_after_content(tag: &str, content: &str) -> (String, String) {
+    let harness = format!(
+        "{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n{SCOPE_AFTER_CONTENT_STEPS}"
+    );
+    let stdout = build_and_run(
+        tag,
+        &SCOPE_AFTER_CONTENT.replace("{content}", content),
+        &harness,
+    );
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    (line("open="), line("closed="))
+}
+
+#[test]
+fn b546_a_scope_installed_after_its_content_took_focus_restores_the_opener() {
+    let (open, closed) = scope_after_content("b546_built_first", BUILT_FIRST);
+    assert_eq!(
+        open, "open=inner",
+        "the control: the content's autofocus took the focus"
+    );
+    assert_eq!(
+        closed, "closed=opener",
+        "the scope was installed with focus already inside it, so what held \
+         focus at install is no element to give it back to: the opener, which \
+         `autofocus` took it from, is"
+    );
+}
+
+#[test]
+fn b546_a_scope_installed_before_its_content_restores_the_opener_as_before() {
+    // The control: written inline, the panel's head is built first, so the
+    // scope is installed before the content mounts, and A157 hands the initial
+    // focus to the scope's SHOW — which nothing here calls. Focus never left
+    // the opener, and the restore is the one A121 always made.
+    let (open, closed) = scope_after_content("b546_inline", WRITTEN_INLINE);
+    assert_eq!(
+        open, "open=opener",
+        "an installed scope decides the initial focus (A157)"
+    );
+    assert_eq!(closed, "closed=opener");
+}
+
+const TWO_BUILT_FIRST: &str = r#"let first = view("input").attr("name", "first").autofocus();
+				let second = view("input").attr("name", "second").autofocus();
+				view("div")
+					.attr("name", "panel")
+					.on_mount(|element| {
+						let _scope = focus_scope(element, FocusContainment::Contain);
+					})
+					.child(first)
+					.child(second)"#;
+
+#[test]
+fn b546_the_restore_target_is_followed_out_of_the_scope() {
+    // Two fields built first, each `autofocus`ed: the second took focus from
+    // the first, INSIDE the panel, and the first from the opener. The restore
+    // target is followed back until it leaves the scope.
+    let (open, closed) = scope_after_content("b546_two", TWO_BUILT_FIRST);
+    assert_eq!(open, "open=second", "the last autofocus wins the focus");
+    assert_eq!(closed, "closed=opener");
 }

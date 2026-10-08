@@ -2223,12 +2223,14 @@ fn file_mode_does_not_ask_a_module_for_a_main() {
 // and `default-entry` OUTRANKS inference, so R2's member evidence could not
 // reach it. A declaration outranks both.
 
-/// The owner's shape, declared.
-const DECLARED_REGION_MODULE: &str = "[platform(\"browser\")] mod self;\n\nimport std::web::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+/// The owner's shape, declared. It reads `live`, the browser twin's other
+/// field: `anchor` is std's `[internal]` end marker, which is no member
+/// outside std (A149 S4) under either twin.
+const DECLARED_REGION_MODULE: &str = "[platform(\"browser\")] mod self;\n\nimport std::web::ui::Region;\n\nexport fun live_of(region: Region) {\n\tregion.live;\n}\n";
 
 /// The same body under a function FENCE — which, before R1, changed nothing
 /// about how its body resolved.
-const FENCED_REGION_MODULE: &str = "import std::web::ui::Region;\n\n[platform(\"browser\")]\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+const FENCED_REGION_MODULE: &str = "import std::web::ui::Region;\n\n[platform(\"browser\")]\nexport fun live_of(region: Region) {\n\tregion.live;\n}\n";
 
 fn f27_package(tag: &str, slot: &str, server: &str) -> PathBuf {
     let dir = temp_project(tag);
@@ -2298,7 +2300,7 @@ fn f27_a_bare_files_declaration_is_its_platform_on_the_terminal_too() {
     write(
         &dir,
         "slot.vl",
-        "[platform(\"browser\")] mod self;\n\nimport std::web::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n\nfun main() {}\n",
+        "[platform(\"browser\")] mod self;\n\nimport std::web::ui::Region;\n\nfun live_of(region: Region) {\n\tregion.live;\n}\n\nfun main() {}\n",
     );
     let output = vilan_plain(&["check", dir.join("slot.vl").to_str().unwrap()]);
     let text = combined(&output);

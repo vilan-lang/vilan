@@ -3079,6 +3079,7 @@ fn b519_both_legs_of_a_fullstack_build_declare_every_mirror_table_they_read() {
         "src/client.vl",
         r#"import std::io::print;
 import std::json::json_codec;
+import std::reactive::Source;
 import pkg::b519_store::StoreClient;
 
 fun main() {

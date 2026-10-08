@@ -425,6 +425,7 @@ fn a_bare_function_name_stays_a_value() {
 fn from_json_decodes_a_valid_scalar() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
@@ -440,6 +441,7 @@ fn from_json_decodes_a_valid_scalar() {
 fn from_json_rejects_a_wrong_typed_scalar() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
@@ -455,6 +457,7 @@ fn from_json_rejects_a_wrong_typed_scalar() {
 fn from_json_rejects_malformed_text() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
@@ -567,6 +570,7 @@ fn from_json_recurses_into_a_nested_struct() {
 fn from_json_reads_option_null_and_value() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -586,6 +590,7 @@ fn from_json_reads_option_null_and_value() {
 fn from_json_rejects_a_non_array_for_a_list() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
@@ -602,6 +607,7 @@ fn from_json_rejects_a_non_array_for_a_list() {
 fn from_json_short_circuits_on_a_bad_list_element() {
     assert_compiles_and_runs(
         r#"
+        import std::json::FromJson;
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
@@ -4646,8 +4652,8 @@ fn a_task_is_a_handle_copies_observe_the_same_run() {
 fn an_unobserved_task_failure_reports_and_the_program_continues() {
     // Absorption: the failed spawn never becomes a host unhandled rejection
     // (which would crash node). One macrotask after it settles unobserved,
-    // it is reported to stderr with the spawn origin — and main still runs
-    // to completion with exit 0.
+    // it is reported to stderr with the spawn origin and the panic's own
+    // site (debugging.md S0) — and main still runs to completion with exit 0.
     match compile_and_run_capturing_stderr(
         r#"
         import std::io::print;
@@ -4666,7 +4672,9 @@ fn an_unobserved_task_failure_reports_and_the_program_continues() {
         Ok((stdout, stderr)) => {
             assert_eq!(stdout, "alive\n", "stdout mismatch");
             assert!(
-                stderr.contains("unhandled task error (spawned in main): boom"),
+                stderr.contains(
+                    "unhandled task error (spawned in main): panicked at test.vl:6:13: boom"
+                ),
                 "missing the origin-stamped report, stderr was: {stderr:?}"
             );
         }
@@ -7064,7 +7072,8 @@ fn b377_a_pure_element_in_a_discarded_comprehension_is_still_elided() {
             print(over_a_literal((1, 2, 3)));
         }
         "#,
-        "function $a(values) {\n\treturn 0;\n}",
+        // E259: the instance carries its function's name.
+        "function over_a_literal(values) {\n\treturn 0;\n}",
     );
 }
 
@@ -8472,5 +8481,94 @@ fn b538_a_tuple_target_of_elements_nested_tuples_and_tuple_typed_places_assigns_
     assert_compiles_and_runs(
         include_str!("../../../vilan-cli/tests/native/tuple_assignment_targets.vl"),
         "element: 1 2\nnested: 4 5 6\ntuple-typed binding: 7 8 9\ntuple-typed position: 11 12 13\nfield and element: 21 22\nswap: 5 4\n",
+    );
+}
+
+/// B541: a mapped-tuple argument whose element gives the family NO evidence,
+/// with the family bound nowhere else, is underdetermined — refused, and now
+/// said so at the element instead of as a mismatch ("Expected (U in T:
+/// Option<U>), but got (Option<i32>, Option<unknown>, Option<str>)"). With
+/// another parameter binding `T`, the same call compiles (B442's pin).
+#[test]
+fn b541_an_underdetermined_mapped_element_is_named_not_reported_as_a_mismatch() {
+    let program = |call: &str| {
+        format!(
+            r#"
+            import std::option::Option::{{ self, Some, None }};
+            fun count<T: (2..)>(items: (U in T: Option<U>)): i32 {{ 3 }}
+            fun main() {{
+                print({call});
+            }}
+            "#
+        )
+    };
+    assert_fails_once_with(
+        &program("count((Some(1), None, Some(\"two\")))"),
+        "cannot infer `T`'s element 2: `None` is `Option<unknown>` and names no type for it, \
+         and nothing else at this call binds `T`",
+    );
+    assert_fails_once_with(
+        &program("count((None, Some(1)))"),
+        "cannot infer `T`'s element 1: `None`",
+    );
+    assert_fails_without(
+        &program("count((Some(1), None, Some(\"two\")))"),
+        "Expected (U in T: Option<U>)",
+    );
+    assert_compiles_and_runs(&program("count((Some(1), Some(\"two\")))"), "3\n");
+}
+
+/// B543: `entries()` and `get(key)` on a MAPPED tuple type the element at the
+/// mapped type, not the family's binder. `(U in (V in T: F<V>): G<U>)` — a
+/// tuple method's answer over a mapped receiver — composes to `(V in T:
+/// G<F<V>>)`; kept nested, `entries()` over `(U in T: Option<U>)` answered
+/// `(key, U)` pairs ("cannot call method 'is_none' on U"), and over `(U in T:
+/// bool)` an `if` refused its `U` condition. The constant template's walk,
+/// whose call binds no instance, built no pairs at all on JS (`[ ]`, the loop
+/// ran zero times) and now builds them over the receiver as `keys()` does.
+#[test]
+fn b543_entries_and_get_on_a_mapped_tuple_read_the_mapped_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::tuple::Tuple;
+        fun all_some<T: (2..)>(values: (U in T: Option<U>)): bool {
+            for (key, value) in values.entries() {
+                if value.is_none() { ret false; }
+            }
+            true
+        }
+        fun all_some_by_key<T: (2..)>(values: (U in T: Option<U>)): bool {
+            mut all = true;
+            for key in values.keys() {
+                if values.get(key).is_none() { all = false; }
+            }
+            all
+        }
+        fun all_true<T: (2..)>(values: (U in T: bool)): bool {
+            for (key, value) in values.entries() {
+                if !value { ret false; }
+            }
+            true
+        }
+        fun count_entries<T: (2..)>(values: (U in T: bool)): i32 {
+            mut count = 0;
+            for (key, value) in values.entries() {
+                count += 1;
+            }
+            count
+        }
+        fun main() {
+            let missing: Option<str> = None;
+            print(all_some((Some(1), Some("x"))));
+            print(all_some((Some(1), missing)));
+            print(all_some_by_key((Some(1), Some("x"), Some(true))));
+            print(all_some_by_key((missing, Some(2))));
+            print(all_true((true, true)));
+            print(all_true((true, false, true)));
+            print(count_entries((true, false, true)));
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\ntrue\nfalse\n3\n",
     );
 }

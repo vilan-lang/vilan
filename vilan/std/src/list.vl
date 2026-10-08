@@ -2,7 +2,7 @@
 // a `List` value is a native JS array, `List::new()` is `[]`, and `push` is the
 // native `.push`. Iterating a `List` uses a native `for...of`.
 import pkg::default::Default;
-import pkg::iterator::ListIterator;
+import pkg::iterator::{ Items, ListIterator };
 import pkg::operators::{ Add, Mul };
 import pkg::option::Option;
 
@@ -23,6 +23,21 @@ impl List<type T> {
 	external fun pop(&mut self): Option<T>;
 
 	external fun len(self): usize;
+
+	/// Appends every item of `items`, in order — another list, a set, or any
+	/// iterator (whatever is `Items<T>`). The run is taken whole first, so
+	/// `xs.push_many(xs)` appends a copy of the list as it stood (A158):
+	///
+	///     mut xs = [1, 2];
+	///     xs.push_many([3, 4]);
+	///     xs.push_many([5, 6].iter().map(|x| x * 10));
+	///     print(xs.len());   // 6: [1, 2, 3, 4, 50, 60]
+	///
+	/// A reactive list writes a batch as ONE op: `ListCell::push_many` is a single
+	/// splice at the end, so a cell's readers see one change, not one per item.
+	fun push_many<S: Items<T>>(&mut self, own items: S) {
+		items.push_onto(self);
+	}
 
 	fun is_empty(self): bool {
 		self.len() == 0
@@ -96,6 +111,7 @@ impl List<type T> {
 	/// emitted helper keeps the panic, because `splice` CLAMPS an index past the
 	/// end — it would silently accept exactly the index this doc says a caller must
 	/// be punished for.
+	[track_caller]
 	external fun insert(&mut self, index: usize, own value: T): void;
 
 	/// Removes and returns the element at `index`, shifting the tail left. PANICS
@@ -106,6 +122,7 @@ impl List<type T> {
 	/// helper keeps the panic: `splice` reads a NEGATIVE index from the END,
 	/// so a bare `splice(index, 1)[0]` would answer `xs.remove(-1)` with the
 	/// last element instead of refusing.
+	[track_caller]
 	external fun remove(&mut self, index: usize): T;
 }
 
@@ -126,6 +143,15 @@ impl List<type T: Add + Default> {
 			}
 		}
 		total
+	}
+}
+
+/// A list is a run of its elements (A158): `xs.push_many(ys)` takes one directly.
+impl List<type T> with Items<T> {
+	fun push_onto(own self, target: &mut List<T>) {
+		for item in self {
+			target.push(item);
+		}
 	}
 }
 

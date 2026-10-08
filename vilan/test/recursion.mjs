@@ -25,7 +25,7 @@ function is_odd(n) {
 	}
 	return $c;
 }
-console.log(fact(5));
-console.log(fact(10));
+console.log(String(fact(5)));
+console.log(String(fact(10)));
 console.log(is_even(10));
 console.log(is_odd(7));

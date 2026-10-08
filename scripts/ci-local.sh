@@ -151,8 +151,9 @@ leg_wasm() {
 # (`VILAN_PERF_CLASS`; ci.yml sets `ci`, the reference machine `reference`), and
 # the growth rows (a package twice the size costs at most x2.3) everywhere.
 # Counts, never clocks: `instructions:u` from the hardware counter, callgrind's
-# Ir where the machine exposes no PMU. A class with no ceilings yet reports its
-# counts and refuses only on growth, until a seal adopts them (`ratchet`).
+# Ir where the machine exposes no PMU. A class with no ceilings yet (`local`)
+# reports its counts and refuses only on growth; `reference` and `ci` have
+# theirs (`ci`'s adopted from the CI job's own counts, M114).
 leg_perf() {
     cargo build --release -p vilan-cli
     python3 scripts/perf_gate.py gate --vilan target/release/vilan \

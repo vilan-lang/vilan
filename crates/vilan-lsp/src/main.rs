@@ -19,17 +19,23 @@ mod uri;
 mod world;
 
 #[cfg(test)]
+mod closure_mode_tests;
+#[cfg(test)]
 mod entry_world_tests;
 #[cfg(test)]
 mod foreign_spelling_tests;
 #[cfg(test)]
 mod import_position_tests;
 #[cfg(test)]
+mod marker_order_tests;
+#[cfg(test)]
 mod member_admission_tests;
 #[cfg(test)]
 mod moved_std_path_tests;
 #[cfg(test)]
 mod organize_duplicate_tests;
+#[cfg(test)]
+mod trait_import_tests;
 #[cfg(test)]
 mod written_autofocus_tests;
 
@@ -692,6 +698,11 @@ struct Backend {
     /// operation on it is "move this one to the front", and the order IS the
     /// state. Poison-recovering like every other synchronous lock here (E97).
     focus: Arc<std::sync::Mutex<Vec<Url>>>,
+    /// M110 S1: the document the user last TYPED into, canonical — the hot
+    /// seed a world analysis hands the analyzer (`Workspace::hot_seeds`), whose
+    /// reverse import closure is the part of the entry's world re-walked per
+    /// keystroke while the rest is served from the stored prefix.
+    edited: Arc<std::sync::Mutex<Option<PathBuf>>>,
     /// E197: the formatting decline each document was last TOLD about, by
     /// cause. `window/showMessage` is a toast and format-on-save fires on every
     /// save, so a file the printer cannot render would raise one per save
@@ -1664,6 +1675,8 @@ struct AnalysisContext {
     /// retention rule: the dependency sweep re-analyzes background documents,
     /// and a program that lands on one of them has to go straight back.
     focus: Arc<std::sync::Mutex<Vec<Url>>>,
+    /// M110 S1: [`Backend`]'s last-edited document — the hot seed.
+    edited: Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
 /// What one scheduled analysis did (M26).
@@ -2070,6 +2083,7 @@ fn analyze_world(
     trigger_text: Option<String>,
     std_dir: &Path,
     open: &[(Url, PathBuf)],
+    edited: Option<PathBuf>,
     cancel: &CancelToken,
 ) -> Option<WorldAnalysis> {
     let trigger_text = trigger_text.or_else(|| world::current_text(trigger_path))?;
@@ -2137,7 +2151,13 @@ fn analyze_world(
         // file's own analysis is the honest fallback.
         None => (trigger_path.to_path_buf(), trigger_text),
     };
-    let root = Document::analyze_cancellable(&root_text, std_dir, &root_path, cancel)?;
+    // M110 S1: the document being typed into is the hot seed. The analyzer
+    // takes its reverse import closure inside this world, stores the world
+    // WITHOUT it, and re-walks only that part on the next keystroke; a seed that
+    // is the entry itself, or no module of this world, changes nothing.
+    let hot_seeds: Vec<PathBuf> = edited.into_iter().collect();
+    let root =
+        Document::analyze_cancellable_editing(&root_text, std_dir, &root_path, hot_seeds, cancel)?;
     let root_path = vilan_core::util::canonical_path(&root_path);
     let entry_leg = root
         .manifest_dir()
@@ -2284,9 +2304,15 @@ async fn analyze_world_and_publish(
             Some((document.key().clone(), path))
         })
         .collect();
-    let analysis =
-        tokio::task::spawn_blocking(move || analyze_world(&path, text, &std_dir, &open, &token))
-            .await;
+    let edited = context
+        .edited
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let analysis = tokio::task::spawn_blocking(move || {
+        analyze_world(&path, text, &std_dir, &open, edited, &token)
+    })
+    .await;
     // The registration goes whatever the outcome: a joined task is an analysis
     // that is over, and leaving its ticket behind would make the next
     // supersede cancel a token nobody holds.
@@ -3497,6 +3523,7 @@ impl Backend {
             worlds: Arc::clone(&self.worlds),
             reference_worlds: Arc::clone(&self.reference_worlds),
             focus: Arc::clone(&self.focus),
+            edited: Arc::clone(&self.edited),
         }
     }
 
@@ -4487,6 +4514,13 @@ impl LanguageServer for Backend {
             // that runs meanwhile — a dependent's, this one's — sees the edit.
             if let Ok(path) = uri.to_file_path() {
                 vilan_core::analyzer::set_document_overlay(&path, Some(text.clone()));
+                // M110 S1: this document is the one being typed into, so it is
+                // the hot seed of the next analysis of its world.
+                *self
+                    .edited
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(vilan_core::util::canonical_path(&path));
             }
             // The world every analysis reads has moved (E117) — bump BEFORE the
             // debounced task samples it, so an analysis already in flight is
@@ -5831,6 +5865,7 @@ mod snapshot_consistency_tests {
             worlds: Arc::new(DashMap::new()),
             reference_worlds: Arc::new(DashMap::new()),
             focus: Arc::new(std::sync::Mutex::new(Vec::new())),
+            edited: Arc::new(std::sync::Mutex::new(None)),
             formatting_declines: Arc::new(DashMap::new()),
         })
     }
@@ -7679,6 +7714,7 @@ async fn main() {
         worlds: Arc::new(DashMap::new()),
         reference_worlds: Arc::new(DashMap::new()),
         focus: Arc::new(std::sync::Mutex::new(Vec::new())),
+        edited: Arc::new(std::sync::Mutex::new(None)),
         formatting_declines: Arc::new(DashMap::new()),
     })
     .custom_method(OPENS_A_GENERIC_LIST, Backend::opens_a_generic_list)

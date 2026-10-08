@@ -187,3 +187,82 @@ fn run_under_node(label: &str, javascript: &str) -> (String, i32) {
         output.status.code().unwrap_or(-1),
     )
 }
+
+/// Builds a one-file project whose `[build]` section is `build`, answering
+/// the build's output and, when it succeeded, what `node` printed (stdout,
+/// stderr) running it.
+fn build_dbg_project(tag: &str, build: &str) -> (std::process::Output, Option<(String, String)>) {
+    let work =
+        support::scratch_root().join(format!("vilan_dbg_policy_{}_{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(work.join("src")).expect("create work dir");
+    std::fs::write(
+        work.join("vilan.toml"),
+        format!("[package]\nname = \"probe\"\n[build]\n{build}"),
+    )
+    .expect("write manifest");
+    std::fs::write(
+        work.join("src/main.vl"),
+        "fun main() {\n\tlet total = dbg(2 * 3) + 1;\n\tprint(total);\n}\n",
+    )
+    .expect("write source");
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("build")
+        .arg(&work)
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    let ran = output.status.success().then(|| {
+        let run = Command::new("node")
+            .arg(work.join("src/main.mjs"))
+            .output()
+            .expect("run node");
+        (
+            String::from_utf8_lossy(&run.stdout).into_owned(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        )
+    });
+    let _ = std::fs::remove_dir_all(&work);
+    (output, ran)
+}
+
+/// debugging.md §3.3 (Q4): a release build REFUSES a `dbg(..)` it was not
+/// told to keep or strip — at the call, saying how to keep or strip it.
+#[test]
+fn a_release_build_refuses_a_dbg_left_in_it() {
+    let (output, _) = build_dbg_project("refuse", "preset = \"release\"\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the release build must fail");
+    assert!(
+        stderr.contains("`dbg` left in a release build")
+            && stderr.contains("`[build] dbg = \"strip\"`"),
+        "{stderr}"
+    );
+}
+
+/// Q4's two overrides: `strip` makes `dbg(x)` its argument and prints
+/// nothing; `keep` prints in release too, naming the file from the package
+/// root (`src/main.vl`).
+#[test]
+fn a_release_build_strips_or_keeps_dbg_as_the_manifest_says() {
+    let (output, ran) = build_dbg_project("strip", "preset = \"release\"\ndbg = \"strip\"\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(ran, Some(("7\n".to_string(), String::new())));
+    let (output, ran) = build_dbg_project("keep", "preset = \"release\"\ndbg = \"keep\"\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        ran,
+        Some((
+            "7\n".to_string(),
+            "[src/main.vl:2:14] 2 * 3 = 6\n".to_string()
+        ))
+    );
+}

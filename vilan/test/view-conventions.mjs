@@ -6,5 +6,5 @@ function peek(c2) {
 }
 let c = [ 10 ];
 bump(c);
-console.log(c[0]);
-console.log(peek(c));
+console.log(String(c[0]));
+console.log(String(peek(c)));

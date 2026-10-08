@@ -1,0 +1,42 @@
+// debugging.md S1b: std's handles print as themselves on both backends — a
+// map and a set by their members, a cell by its value, a `Shared` cycle cut,
+// a pipe by its type.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::reactive::{ Signal, SignalCell };
+import std::shared::Shared;
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+struct Link {
+	label: str,
+	next: Option<Shared<Link>>,
+}
+
+fun main() {
+	mut ages: HashMap<str, i32> = HashMap::new();
+	ages.insert("ada", 36);
+	ages.insert("alan", 41);
+	dbg(ages);
+	mut pairs: HashMap<i32, (Point, str)> = HashMap::new();
+	pairs.insert(1, (Point { x = 1, y = 2 }, "p"));
+	dbg(pairs);
+	mut seen: HashSet<str> = HashSet::new();
+	seen.insert("a");
+	seen.insert("b");
+	dbg(seen);
+	let empty: HashSet<i32> = HashSet::new();
+	dbg(empty);
+	let cell = Shared::new(Point { x = 7, y = 8 });
+	dbg(cell);
+	let count: SignalCell<i32> = Signal::new(3);
+	dbg(count);
+	let doubled = count.derive(|value| value * 2);
+	dbg(doubled);
+	let head = Shared::new(Link { label = "head", next = None });
+	head.write().next = Some(head.clone());
+	dbg(head);
+}

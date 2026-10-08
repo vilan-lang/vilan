@@ -3195,36 +3195,35 @@ fn a_plain_function_returning_a_task_still_yields_a_handle() {
     );
 }
 
-/// RESIDUAL, pinned with the honest CURRENT behavior: an `async fun` whose
-/// DECLARED return is itself a `Task`. Its calls are implicitly awaited, so the
-/// host assimilates the returned handle and the call site receives the inner
-/// `i32` — this program prints `7`, not a handle — while the type still reads
-/// `Task<i32>`. The same divergence as the one above, at a seam this fix cannot
-/// reach: async-ness is a whole-program fixpoint over the call graph
-/// (`async_infer::infer`), computed AFTER type inference, so while a call's type
-/// is being decided the analyzer does not yet know whether its callee is async
-/// and its result therefore assimilated. Closing it needs the two passes
-/// interleaved (or an `Awaited<T>` type-level operator), which is more than this
-/// item. Recorded in async-polymorphism.md.
+/// B149: an `async fun` whose DECLARED return is itself a `Task`. Its calls are
+/// implicitly awaited, so the host assimilates the returned handle and the call
+/// site receives the inner `i32` — and the call now TYPES as that value, read
+/// off the written `async` (`assimilated_task_payload` at the call). Until B149
+/// the type still read `Task<i32>`, one layer deeper than the value. A function
+/// async only by inference is decided after typing (`async_infer::infer`) and
+/// keeps its declared type — that residual is not this shape.
 #[test]
-fn an_async_function_returning_a_task_is_assimilated_at_runtime_only() {
-    // The runtime: the call site receives the VALUE.
+fn an_async_function_returning_a_task_types_as_the_value() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::task::Task;
 
         async fun make(): Task<i32> { async { 7 } }
+        async fun plain(): i32 { 3 }
 
         fun main() {
             let result = make();
             print(result);
+            let value: i32 = make();
+            print(value + 1);
+            print(plain() + 1);
         }
         "#,
-        "7\n",
+        "7\n8\n4\n",
     );
-    // The type: still the handle, one layer deeper than that value.
-    assert_compiles(
+    // The handle spelling is refused now: the call is the value.
+    assert_fails_with(
         r#"
         import std::task::Task;
 
@@ -3232,22 +3231,7 @@ fn an_async_function_returning_a_task_is_assimilated_at_runtime_only() {
 
         fun main() { let result: Task<i32> = make(); }
         "#,
-    );
-}
-
-/// The residual's desired end state — `#[ignore]`d until the seam above closes.
-/// Un-ignore when an async call's type assimilates its awaited result.
-#[test]
-#[ignore = "B149: async-fun return assimilation needs the async fixpoint at typing time"]
-fn an_async_function_returning_a_task_should_type_as_the_value() {
-    assert_compiles(
-        r#"
-        import std::task::Task;
-
-        async fun make(): Task<i32> { async { 7 } }
-
-        fun main() { let result: i32 = make(); }
-        "#,
+        "Expected Task<i32>, but got i32",
     );
 }
 
@@ -5515,6 +5499,150 @@ fn m106_cost_attribution_ranks_declarations_by_solver_work_and_repeats_exactly()
     );
 }
 
+/// One analysis of `source` with attribution on, on a worker thread: the
+/// declarations' work counts by name, and — when `emit` — the selections the
+/// emission charged to each declaration (M118).
+fn m118_costs(
+    source: String,
+    emit: bool,
+) -> (
+    Vec<(String, vilan_core::counters::WorkCounts)>,
+    Vec<(String, u64)>,
+) {
+    vilan_core::counters::set_cost_attribution(20);
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let source: &'static str = String::leak(source);
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let mut selections = Vec::new();
+            if emit {
+                vilan_core::impl_select::take_selection_costs();
+                transform(&program, &BuildOptions::default()).expect("the program emits");
+                let charged = vilan_core::impl_select::take_selection_costs();
+                for cost in &program.item_costs {
+                    if let Some(count) = charged.get(&cost.owner) {
+                        selections.push((cost.name.clone(), *count));
+                    }
+                }
+            }
+            let work = program
+                .item_costs
+                .iter()
+                .map(|cost| (cost.name.clone(), cost.work))
+                .collect();
+            (work, selections)
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// M118: a `.derive` on a `dyn Flow` cost ~11k type slots PER ATTEMPT. Asked
+/// which arguments the object provides `Flow` at (the blanket's `F: Flow<type
+/// T>`), the solver reconciled the object against every implementor of
+/// `Flow` through the erasure arm, re-proving each one's instantiation, to
+/// arrive at the object's own arguments; and a closure whose parameter was
+/// not written re-queued the call until its types settled, paying it again
+/// each time. kolt's `Channel::find` was 44k work units where its siblings
+/// were 1k. An object answers for its own trait now, so the unannotated form
+/// costs what the annotated one does, and both cost what a concrete stage
+/// would.
+#[test]
+fn m118_a_derive_on_a_trait_object_costs_what_its_annotated_form_does() {
+    let program = |parameter: &str| {
+        format!(
+            r#"
+            import std::reactive::{{ Flow, MemoCell, Source, SignalCell }};
+
+            enum St<T> {{
+                Pending,
+                Ready(T),
+                Failed(str, Option<T>),
+                Absent,
+            }}
+
+            fun upstream(): dyn Flow<St<Option<i32>>> {{
+                let state: dyn Flow<St<Option<i32>>> = Source::constant(St::Pending);
+                state
+            }}
+
+            fun find(client: SignalCell<Option<i32>>): MemoCell<Option<St<i32>>> {{
+                client.switch_some(|id| upstream().derive(|{parameter}| match x {{
+                    St::Pending => St::Pending,
+                    St::Ready(Some(let v)) => St::Ready(v),
+                    St::Ready(None) => St::Absent,
+                    St::Failed(let e, let v) => St::Failed(e, v.flatten()),
+                    St::Absent => St::Absent,
+                }})).memo()
+            }}
+
+            fun main() {{
+                let state = find(SignalCell::new(Some(1)));
+            }}
+            "#
+        )
+    };
+    let slots_of_find = |source: String| {
+        let (work, _) = m118_costs(source, false);
+        work.iter()
+            .find(|(name, _)| name == "find")
+            .map(|(_, work)| work.slots)
+            .expect("`find` is charged work")
+    };
+    let unannotated = slots_of_find(program("x"));
+    let annotated = slots_of_find(program("x: St<Option<i32>>"));
+    assert!(
+        annotated < 3_000,
+        "the annotated `find` minted {annotated} type slots: the object's `Flow` arguments \
+         were re-derived from every implementor (M118)"
+    );
+    assert!(
+        unannotated <= annotated * 2,
+        "the unannotated `find` minted {unannotated} type slots against the annotated form's \
+         {annotated}: an unwritten closure parameter re-paid the provider question per \
+         attempt (M118)"
+    );
+}
+
+/// M118's second half: `--explain-cost`'s `selections` column read 0 for every
+/// declaration, because the solver's per-constraint attribution ends at the
+/// fixpoint and implementation selection happens after it. The emission walk
+/// now charges each selection it computes to the declaration whose body it is
+/// emitting.
+#[test]
+fn m118_emission_charges_its_selections_to_the_declaration_that_asked() {
+    let source = r#"
+        import std::io::print;
+        trait Describe<T> { fun describe(self): T; }
+        struct Badge { size: i32 }
+        impl Badge with Describe<i32> { fun describe(self): i32 { self.size } }
+        fun tell<V: Describe<i32>>(value: V) { print(i"{value.describe()}"); }
+        fun main() { tell(Badge { size = 1 }); }
+    "#;
+    let (_, selections) = m118_costs(source.to_string(), true);
+    assert!(
+        selections
+            .iter()
+            .any(|(name, count)| name == "tell" && *count > 0),
+        "`tell`'s bound-directed call computed a selection at emission and it was charged to \
+         no declaration: {selections:?}"
+    );
+}
+
 // --- B4 §2.2: a bare trait annotation must not launder a resource -----------
 //
 // `proposal/trait-objects.md` §2.2 (probes P8/P9): the resource analysis
@@ -7680,5 +7808,87 @@ fn a150_transient_state_zip_pairs_two_states_by_precedence() {
             "Ready(12)\nRefreshing(12)\nPending\nAbsent\nFailed(b)\n",
             "Failed(a, 12)\nFailed(b)\n",
         ),
+    );
+}
+
+// --- A158: `List::push_many(items)` -----------------------------------------
+
+#[test]
+fn a158_push_many_appends_a_list_an_iterator_and_a_set_in_order() {
+    // Whatever `for` walks: another list (taken directly), any iterator (an
+    // adapter chain), and a `HashSet`, in its insertion order — appended in
+    // order, after what the list already held.
+    assert_compiles_and_runs(
+        r#"
+        import std::hash_set::HashSet;
+        import std::io::print;
+        import std::iterator::Iterator;
+
+        fun main() {
+            mut xs = [1, 2];
+            xs.push_many([3, 4]);
+            xs.push_many([5, 6].iter().map(|x| x * 10));
+            mut set: HashSet<i32> = HashSet::new();
+            set.insert(8);
+            set.insert(7);
+            xs.push_many(set);
+            mut out = "";
+            for x in xs {
+                out = out + i"{x} ";
+            }
+            print(out);
+        }
+
+        main();
+        "#,
+        "1 2 3 4 50 60 8 7 \n",
+    );
+}
+
+#[test]
+fn a158_push_many_takes_the_run_whole_before_it_appends() {
+    // `own items`: a list pushed onto itself appends a copy of itself as it
+    // stood, not a walk that chases its own growth; the argument's binding is
+    // not the receiver's, so the source list is untouched.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            mut xs = [1, 2, 3];
+            xs.push_many(xs);
+            print(xs.len());
+            let source = [9];
+            mut ys: List<i32> = [];
+            ys.push_many(source);
+            ys.push(10);
+            print(i"{source.len()} {ys.len()}");
+        }
+
+        main();
+        "#,
+        "6\n1 2\n",
+    );
+}
+
+#[test]
+fn a158_push_many_of_an_empty_run_appends_nothing() {
+    // An empty list and an exhausted iterator are runs of nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+
+        fun main() {
+            mut names = ["a"];
+            let none: List<str> = [];
+            names.push_many(none);
+            names.push_many(["b", "c"].iter().filter(|name| name == "z"));
+            print(names.len());
+        }
+
+        main();
+        "#,
+        "1\n",
     );
 }

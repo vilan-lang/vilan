@@ -1,10 +1,17 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
-function __at_view(list, index) {
+function __at_view(list, index, location) {
 	if (index >= 0 && index < list.length) return [ list, index ];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function saturate_unsigned(value) {
 	const truncated = Math.trunc(value);
@@ -32,7 +39,7 @@ function inner_mut(self) {
 function item_mut(self, index) {
 	let $h = null;
 	if (as_usize(index) < self[1].length) {
-		$h = [ 0, __at_view(self[1], as_usize(index)) ];
+		$h = [ 0, __at_view(self[1], as_usize(index), "option-view.vl:42:14") ];
 	} else {
 		$h = [ 1 ];
 	}
@@ -49,12 +56,12 @@ if ($a[0] === 0) {
 	$b = undefined;
 }
 $b;
-console.log(slot[0]);
+console.log(String(slot[0]));
 const $c = get(slot);
 let $d = null;
 if ($c[0] === 0) {
 	const v2 = $c[1];
-	console.log(v2[0][v2[1]]);
+	console.log(String(v2[0][v2[1]]));
 	$d = undefined;
 } else {
 	$d = undefined;
@@ -71,7 +78,7 @@ if ($e[0] === 0) {
 	$f = undefined;
 }
 $f;
-console.log(outer[0][0]);
+console.log(String(outer[0][0]));
 const $i = item_mut(outer, 1);
 let $j = null;
 if ($i[0] === 0) {
@@ -82,7 +89,7 @@ if ($i[0] === 0) {
 	$j = undefined;
 }
 $j;
-console.log(__at(outer[1], 1));
+console.log(String(__at(outer[1], 1, "option-view.vl:87:8")));
 const $k = item_mut(outer, 9);
 let $l = null;
 if ($k[0] === 0) {
@@ -90,7 +97,7 @@ if ($k[0] === 0) {
 	v5[0][v5[1]] = 0;
 	$l = undefined;
 } else {
-	console.log(0);
+	console.log(String(0));
 	$l = undefined;
 }
 process.exit($l);

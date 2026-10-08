@@ -595,7 +595,6 @@ row	flagship	key
 571	-	`resource` is an attribute, not a keyword: write `[resource]` before the declaration (`[resource] struct`, `[resource] external struct`, `[resource] enum`)
 572	-	Expected usize (an index: a position, a length or a count), but got {got} instead. There are no implicit numeric conversions; convert with `.as_usize()`
 573	-	Expected {expected}, but got usize (an index: a position, a length or a count) instead. There are no implicit numeric conversions; convert with `.as_{target}()`
-NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
 574	-	the literal `{literal}` is fractional, and the other operand of `{symbol}` is `{integer}`: an integer has no fractional part, so the literal would be typed `{integer}` and the arithmetic done in integers. Convert the integer first — `{peer}.as_f64()` — or write an integer literal
 575	-	`.{seal}()` in the initializer of the module binding `{name}` ties the cell to an owner, and a module binding has none: its subscription would stay on the upstream for the life of the program. Build it under the owner that reads it (inside the view, or an `owner_scope.run`), or write `.{seal}_global()`, which says that lifetime
 576	-	`{name}` returns a signal handle it builds with `.{seal}()` on every call: each call mints a fresh cell, so the reply never matches a channel this connection already carries (a capability and a forward per call), and the cell's subscription lives as long as the handler's owner (the connection under `Service::factory`, the service under `Service::new`). Return a cell that outlives the call — keep it on the service, keyed by the arguments (a `Memo` whose maker writes `.{seal}_global()`)
@@ -603,7 +602,7 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 578	-	a `{got}` does not become a `{expected}` as a whole: an object is built where ONE value lands, and each `{concrete}` inside this one was built already; {steer}
 579	-	`-` on an unsigned value: `{name}` has no negative values, so its negation is out of range on every backend. Convert it to a signed type first (`.as_i53()`) and negate that
 580	-	`{name}` is unsigned ({range}), and this constant folds to `{value}`: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
-581	-	cannot infer '{generic_label}' for this call: nothing it is passed binds it, and its result is typed by it. Write the type — on the binding the result lands in (`let value: … = …`), or as the call's type argument (`{member}<…>(…)`)
+581	-	cannot infer '{generic_label}' for this call: {why}. Write the type — on the binding the result lands in (`let value: … = …`), or as the call's type argument (`{member}<…>(…)`)
 582	-	a function cannot be named `Self`: `Self` names the type an `impl` or `trait` is about, so `value.Self()` reads as that type and never reaches this member. Give it another name
 583	-	`map` over a tuple takes one closure LITERAL with one parameter: its body is checked once per position, at that position's element, and a closure value has one type. Write `t.map(|x| f(x))`
 584	-	'{value_label}' is a mapped tuple whose family is not bound to guarantee '{bound_label}', which this argument's parameter requires
@@ -640,7 +639,7 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 615	-	a declaration's markers are written in one order — its attributes, then the keywords `export`, `const` or `lazy`, `async`, `external` or `macro`, then the declaration word: write `{canonical}`
 616	-	this pattern binds {n} {elements}, but the value is a {n}-tuple `{type}`: a tuple pattern takes one sub-pattern per element, and a nested pattern reaches inside one (`((a, b), c)`)
 617	-	this pattern binds {n} {elements}, but the value is a `{type}`, not a tuple: `(a, b)` destructures a tuple
-618	-	`{member}` is `{trait}`'s, and this file does not import `{trait}`: the call resolves only because another loaded module does. Import it (`{import}`) — this is an error from v0.45.0
+618	-	`{member_name}` is `{trait_name}`'s, and this file does not import `{trait_name}`: a trait's methods resolve only in a file that imports the trait. Import it (`{import}`)
 619	-	`{type}` is not a trait: a selector's `with` names the trait the block implements, as its declaration does (`(impl Box with One)` selects `impl Box with One`)
 620	-	a declaration's attributes are written in one order — `[derive]` and the other generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform]`, `[resource]`: write `{canonical}`
 621	-	the left side of this assignment is not a place: it is {what} — only a place can be assigned: a binding (`x`), a field (`p.x`), an element (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a `&mut` view
@@ -660,3 +659,32 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 635	-	cannot mutate '{name}': it is a COPY of the payload the pattern takes out of `{place}`, so a write to it (or to `mut {name}`) would not reach `{place}` — to write the payload in place, match a view of it, `match &mut {place}` (or `&mut {place} is ..`), whose `let` captures are writable views
 636	-	`std::{old}` moved to `std::{new}`: std's modules are grouped under namespaces since v0.44.0, and the old path is gone — write `std::{new}`
 637	-	`{section} prelude = "{path}"` names the old path of a std module: `std::{old}` moved to `std::{new}` — write `prelude = "{rewritten}"`
+638	-	an image (![alt](destination)) — images are outside the census grammar
+639	-	a footnote ([^label]) — footnotes are outside the census grammar
+640	-	a reference-style link ([text][label]) — only inline [text](destination) links are in the census grammar
+641	-	strikethrough (~~text~~) — outside the census grammar
+642	-	a backslash escape (\{escaped}) — the census grammar's only escape is \| inside a table cell
+643	-	a raw HTML tag (<{inner}>) — the census grammar's only HTML passthrough is <a id="…"></a>; wrap literal <…> text (a generic like List<T>) in backticks
+644	-	an indented code block (four or more leading spaces) — the census grammar's only code blocks are backtick fences
+645	-	a tilde fence (~~~) — the census grammar's fences use backticks
+646	-	an unclosed code fence — no closing ``` at the opening fence's indent
+647	-	a custom heading id ({{#…}}) — census-grammar heading ids are computed, mdBook's algorithm
+648	-	a setext heading underline or thematic break (---, ===, ***) — both outside the census grammar; headings are ATX (# Title)
+649	-	a lazy blockquote continuation — prefix the line with > or separate it from the quote with a blank line
+650	-	an indented list item — the census grammar's lists are flat, at the left margin
+651	-	a nested list item — the census grammar's lists are flat
+652	-	a lazy list continuation — indent the line under its item (two spaces) or separate it from the list with a blank line
+653	-	a table alignment colon (:---) — the census grammar's tables carry no alignment
+654	-	a reference link definition ([label]: destination) — only inline [text](destination) links are in the census grammar
+655	-	a hard line break (two trailing spaces) — outside the census grammar
+656	-	a backslash line break — outside the census grammar
+657	-	cannot infer `{family_label}`'s element {}: {written} is `{element}` and names no type for it, and nothing else at this call binds `{family_label}` — annotate the argument, or bind `{family_label}` through another parameter
+658	-	`mut {name}` would bind a COPY of a tuple element, and its write would not reach `{place}`: a capture inside a tuple pattern is a copy even under a view subject (tuples store flat) — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
+659	-	cannot mutate '{name}': a capture inside a tuple pattern is a COPY of its element even under a view subject (tuples store flat), so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
+660	-	`{member_name}` is an `[internal]` field of std's `{struct_name}`, and an internal std field is not a member outside std: {reason}
+661	-	`{member_name}` is a field of `{subject_name}`, and this `{struct_name}<{subject_name}>` has no projection named `{member_name}` to read it through: `{subject_name}` does not `[derive(Storable)]`, or the field's projection is renamed
+662	-	`[track_caller]` is not supported on a trait method: a call through a trait is dispatched, so no call site knows to pass its location
+663	-	`{name}` is `[track_caller]`: it takes its caller's location as a hidden argument, and a call through a value cannot pass one
+664	-	`dbg` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
+665	-	`dbg` takes no type arguments: it prints each argument at the type it already has
+666	-	Both are pipe stages, and two stages of different types meet only as one erased flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the function's return), with `T` the value they carry, and each erases to it

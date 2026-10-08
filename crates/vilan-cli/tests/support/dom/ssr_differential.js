@@ -47,7 +47,9 @@ function serialize(element) {
     for (const [name, value] of Object.entries(element.attributes)) out += ` ${name}="${escapeAttr(value)}"`;
     out += ">";
     if (VOID.has(element.tagName)) return out;
-    out += escapeText(element.textContent);
+    // The element's OWN text (what `.text(..)` wrote), not `textContent`,
+    // which reads every descendant: the children serialize themselves below.
+    out += escapeText(element._text);
     for (const child of element.children) out += serialize(child);
     return out + "</" + element.tagName + ">";
 }

@@ -1,7 +1,7 @@
 function to_string(self) {
 	return "Point";
 }
-function $a(value) {
+function format(value) {
 	return to_string(value);
 }
 const who = "world";
@@ -15,4 +15,4 @@ const nested = "" + ("{not a hole}" + who);
 console.log(nested);
 const empty = "";
 console.log("[" + empty + "]" + "!");
-console.log($a([ 1, 2 ]));
+console.log(format([ 1, 2 ]));

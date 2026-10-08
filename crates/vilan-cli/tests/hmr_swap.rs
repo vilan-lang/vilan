@@ -535,6 +535,7 @@ fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
 /// the rebuilt bytes differ from A's.
 const SOCKET_CLIENT: &str = r#"import std::web::ui::{ view, View, mount_root };
 import std::rpc::{ ReactiveClient, RemoteSource, bridge, connect_socket };
+import std::reactive::Flow;
 import std::json::json_codec;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
@@ -920,7 +921,7 @@ impl ConditionalValue<type T, type S: Source<Option<T>>, type C: Slot> with Slot
 		self.condition.effect(|on| {
 			if live_row.read() is Some(let row) {
 				live_owner.read()?.dispose();
-				let _cut = region.cut_row(row, region.anchor);
+				let _cut = region.cut_row(row, region.end());
 				region.drop_row(row);
 				region.hold_rows([]);
 				live_row.write() = None;

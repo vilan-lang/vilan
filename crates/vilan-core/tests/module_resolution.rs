@@ -1259,11 +1259,14 @@ fn derive_in_an_imported_module_resolves() {
 fn a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map() {
     // A149 S3: `[derive(Storable)]` in an imported module — the shape kolt's
     // `account.vl` and `store.vl` are — expands there with its own imports, and
-    // its map field is a keyed node the importer writes and watches by key. Red
-    // when the derive's output named `Storable` through `std::reactive::store`, where the
-    // module's own `Storable` is the derive macro: "'Storable' is not a trait"
-    // when the derive's module is the first to load `std::reactive::store` (the entry
-    // imports none of it here, as kolt's does not).
+    // its map field is a keyed node the importer writes and watches by key. The
+    // derive's output names `Storable` through `std::reactive::store`, where the
+    // module's own `Storable` is the derive macro beside the re-exported trait:
+    // before B547 that was "'Storable' is not a trait" when the derive's module
+    // is the first to load `std::reactive::store` (the entry imports none of it
+    // here, as kolt's does not), and the output named `store_core` to step
+    // around it. B547's std side reverted the step: red on a compiler without
+    // B547's fix.
     let entry = concat!(
         "import std::io::print;\n",
         "import std::reactive::{ Owner, Signal, Source, run_with_owner };\n",
@@ -1410,10 +1413,10 @@ const B519_CLIENT_MAIN: &str = concat!(
 #[test]
 fn b519_a_service_in_an_imported_module_declares_every_mirror_table_it_uses() {
     let imported_entry = format!(
-        "import std::io::print;\nimport std::json::json_codec;\nimport pkg::store::MirClient;\n\n{B519_CLIENT_MAIN}"
+        "import std::io::print;\nimport std::json::json_codec;\nimport std::reactive::Source;\nimport pkg::store::MirClient;\n\n{B519_CLIENT_MAIN}"
     );
     let single_file = format!(
-        "import std::io::print;\nimport std::json::json_codec;\n{}\n{B519_CLIENT_MAIN}",
+        "import std::io::print;\nimport std::json::json_codec;\nimport std::reactive::Source;\n{}\n{B519_CLIENT_MAIN}",
         B519_STORE.replace("export *;\n", "")
     );
     for (layout, files) in [
@@ -3814,12 +3817,18 @@ fn b535_a_collection_pipes_memo_needs_no_import_under_the_web_prelude() {
             .all(|warning| !warning.contains("does not import")),
         "under the web set both sealers are in scope: {web:#?}"
     );
-    let base = warnings_under_prelude(base_prelude(), entry, Platform::default());
+    // Refused since v0.45.0 (B535's flip): a warning for one release.
+    let base = analyze_under_prelude(
+        base_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::default(),
+    );
     for sealer in ["`CollPipe`", "`SetPipe`"] {
         assert!(
             base.iter()
-                .any(|warning| warning.contains("does not import") && warning.contains(sealer)),
-            "the base set does not carry {sealer}, so B515 still asks for its import: {base:#?}"
+                .any(|error| error.contains("does not import") && error.contains(sealer)),
+            "the base set does not carry {sealer}, so B535 still asks for its import: {base:#?}"
         );
     }
 }
@@ -8571,7 +8580,7 @@ fn b401_files(imports: &str, p2_block: &str) -> Vec<(String, String)> {
         (
             "c.vl".to_string(),
             format!(
-                "import pkg::b::Box;\n{imports}\n\nfun main() {{\n\tprint(Box {{ n = 1 }}.describe());\n}}\n"
+                "import pkg::b::Box;\nimport pkg::t::{{ One, Two }};\n{imports}\n\nfun main() {{\n\tprint(Box {{ n = 1 }}.describe());\n}}\n"
             ),
         ),
     ]
@@ -9000,4 +9009,238 @@ fn f28_a_file_importing_only_a_single_platform_module_is_analyzed_as_before() {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn b547_a_with_clause_names_a_reexported_trait_beside_a_same_named_derive() {
+    // B547: `std::reactive::store` RE-EXPORTS the `Storable` trait from
+    // `store_core` and DECLARES the `Storable` derive macro. A module that was
+    // the first to load `store` bound the macro marker (its re-export had not
+    // resolved yet) and its `impl Note with Storable` was refused "'Storable'
+    // is not a trait", spanned inside std's `lib.vl`. In the entry, or once the
+    // entry imported `store`, it compiled. A bound (`T: Storable`) and the
+    // derive in the same module are pinned beside it.
+    let entry = concat!(
+        "import pkg::model::{ Note, keep };\n",
+        "fun main() {\n",
+        "    print(keep(Note { text = \"x\" }).text);\n",
+        "}\n",
+        "main();\n",
+    );
+    let model = concat!(
+        "import std::option::Option;\n",
+        "import std::reactive::store::{ Storable, StoreNode, StoreWoken };\n",
+        "import std::shared::Shared;\n",
+        "\n",
+        "export *;\n",
+        "\n",
+        "struct Note {\n",
+        "    text: str,\n",
+        "}\n",
+        "\n",
+        "impl Note with Storable {\n",
+        "    fun store_diff(\n",
+        "        &self,\n",
+        "        other: &Note,\n",
+        "        node: Option<Shared<StoreNode>>,\n",
+        "        need: bool,\n",
+        "        woken: &mut StoreWoken,\n",
+        "    ): bool {\n",
+        "        self.text != other.text\n",
+        "    }\n",
+        "}\n",
+        "\n",
+        "fun keep<T: Storable>(value: T): T {\n",
+        "    value\n",
+        "}\n",
+    );
+    assert_eq!(
+        analyze_package(
+            &[("main.vl", entry), ("model.vl", model)],
+            "main.vl",
+            Platform::Browser
+        ),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        run_package(&[("main.vl", entry), ("model.vl", model)], "main.vl"),
+        "x\n"
+    );
+}
+
+/// B367: B318 S4's ADMISSION MISS is reachable. The four-module reproducer —
+/// the trait in `a`, a non-exported `impl` in `b`, a generic body in `c` that
+/// imports only the trait, the entry importing `b` with `#(impl _)` — was once
+/// reported to compile clean (which would have made the refusal dead code). On
+/// this base it is refused, at `c`, naming the member, the providing module and
+/// the declaring one, as visibility.md §3.5 writes the rule: a generic body
+/// resolves under the file it was DECLARED in, so the entry's marker does not
+/// reach it. `c`'s own `import pkg::b::{ #(impl _) };` — the fix the refusal
+/// names — admits it.
+#[test]
+fn b367_a_generic_body_resolves_under_its_own_files_admission() {
+    let files = |c_imports: &str| {
+        vec![
+            (
+                "a.vl".to_string(),
+                "export trait Speak {\n    fun speak(self): str;\n}\n".to_string(),
+            ),
+            (
+                "b.vl".to_string(),
+                "import pkg::a::Speak;\nexport struct Dog {}\nimpl Dog with Speak {\n    fun speak(self): str { \"woof\" }\n}\n"
+                    .to_string(),
+            ),
+            (
+                "c.vl".to_string(),
+                format!(
+                    "import pkg::a::Speak;\n{c_imports}export fun twice<T: Speak>(value: T): str {{ value.speak() + value.speak() }}\n"
+                ),
+            ),
+            (
+                "main.vl".to_string(),
+                "import pkg::b::{ Dog, #(impl _) };\nimport pkg::c::twice;\nfun main() {\n    print(twice(Dog {}));\n}\nmain();\n"
+                    .to_string(),
+            ),
+        ]
+    };
+    let refused_files = files("");
+    let refused: Vec<(&str, &str)> = refused_files
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_str()))
+        .collect();
+    let refusal = transform_package(&refused, "main.vl", Platform::default())
+        .expect_err("`c` admits nothing from `b`: the entry's marker must not answer its body");
+    assert!(
+        refusal.contains("'speak' is provided by an `impl` in module `b`")
+            && refusal.contains("module `c` does not admit it"),
+        "{refusal}"
+    );
+    let admitted_files = files("import pkg::b::{ #(impl _) };\n");
+    let admitted: Vec<(&str, &str)> = admitted_files
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_str()))
+        .collect();
+    assert_eq!(run_package(&admitted, "main.vl"), "woofwoof\n");
+}
+
+/// B549, the process side: a node build importing `std::web::document`
+/// without reaching it checks clean (the module is the process layer's).
+#[test]
+fn b549_a_node_build_importing_the_document_module_checks_clean() {
+    let entry = "import std::web::document::check_shell;\n\nfun main() {}\n";
+    assert_eq!(
+        analyze_package(
+            &[("main.vl", entry)],
+            "main.vl",
+            Platform::Node { version: 24 }
+        ),
+        Vec::<String>::new()
+    );
+}
+
+/// B549, the browser side: the same import in a BROWSER build is refused
+/// inside std — `document.vl` (a process-layer module) imports
+/// `pkg::web::ui::{ render, escape_attribute, escape_text }`, and in a browser
+/// build that import binds the BROWSER twin of `ui`, which declares none of
+/// them. It is B548's fault (a twin import binds the BUILD platform's side,
+/// whatever platform the importing file belongs to), carried to Order 48 with
+/// F28's retry; the pin un-ignores with it.
+#[test]
+#[ignore = "B549: a process-layer std module's twin import binds the browser twin in a browser build (B548's fault, carried to Order 48 with F28)"]
+fn b549_a_browser_build_importing_the_document_module_checks_clean() {
+    let entry = "import std::web::document::check_shell;\n\nfun main() {}\n";
+    assert_eq!(
+        analyze_package(&[("main.vl", entry)], "main.vl", Platform::Browser),
+        Vec::<String>::new()
+    );
+}
+
+/// B560: the "import it first" steer spells a NESTED module by its full path
+/// from the package root — `pkg::lib::thing::Thing`, not the leaf's
+/// `pkg::thing::Thing`, which resolves nowhere — and the import it names
+/// compiles when pasted.
+#[test]
+fn b560_the_import_steer_spells_a_nested_modules_full_path() {
+    const THING: &str = "export struct Thing {\n\tn: i32,\n}\n\nexport fun make_thing(): Thing {\n\tThing { n = 1 }\n}\n";
+    const HELPER: &str =
+        "import pkg::lib::thing::make_thing;\n\nexport fun count(): i32 {\n\tmake_thing().n\n}\n";
+    let entry = "import pkg::helper::count;\n\nfun main() {\n\tlet thing = Thing { n = count() };\n\tlet _ = thing.n;\n}\n";
+    let errors = analyze_package(
+        &[
+            ("lib/thing.vl", THING),
+            ("helper.vl", HELPER),
+            ("main.vl", entry),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("import it first (`import pkg::lib::thing::Thing;`)")),
+        "{errors:#?}"
+    );
+    let pasted = format!("import pkg::lib::thing::Thing;\n{entry}");
+    let pasted: &'static str = Box::leak(pasted.into_boxed_str());
+    let errors = analyze_package(
+        &[
+            ("lib/thing.vl", THING),
+            ("helper.vl", HELPER),
+            ("main.vl", pasted),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "the steer's import compiles: {errors:#?}"
+    );
+}
+
+/// B560: two modules with the same LEAF name in different directories are two
+/// homes, not one — the steer names neither rather than a path that is
+/// neither's.
+#[test]
+fn b560_two_modules_sharing_a_leaf_name_are_ambiguous() {
+    const THING: &str =
+        "export struct Thing {\n\tn: i32,\n}\n\nexport fun make(): Thing {\n\tThing { n = 1 }\n}\n";
+    const HELPER: &str = "import pkg::a::thing::make;\nimport pkg::b::thing::{ make as other };\n\nexport fun count(): i32 {\n\tmake().n + other().n\n}\n";
+    let entry = "import pkg::helper::count;\n\nfun main() {\n\tlet thing = Thing { n = count() };\n\tlet _ = thing.n;\n}\n";
+    let errors = analyze_package(
+        &[
+            ("a/thing.vl", THING),
+            ("b/thing.vl", THING),
+            ("helper.vl", HELPER),
+            ("main.vl", entry),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.iter().any(|error| error.contains("Thing")),
+        "the name still does not resolve: {errors:#?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("import it first")),
+        "an ambiguous name is not steered toward one home: {errors:#?}"
+    );
+}
+
+/// B560's std half: a type in a NESTED std module (`std::reactive::delta`'s
+/// `ListCell`), loaded through another module, steers to its full path.
+#[test]
+fn b560_the_import_steer_spells_a_nested_std_modules_full_path() {
+    const HELPER: &str = "import std::reactive::delta::ListCell;\n\nexport fun make(): ListCell<i32> {\n\tListCell::new()\n}\n";
+    let entry = "import pkg::helper::make;\n\nfun main() {\n\tlet cell: ListCell<i32> = make();\n\tlet _ = cell;\n}\n";
+    let errors = analyze_package(
+        &[("helper.vl", HELPER), ("main.vl", entry)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("import it first (`import std::reactive::delta::ListCell;`)")
+        }),
+        "{errors:#?}"
+    );
 }

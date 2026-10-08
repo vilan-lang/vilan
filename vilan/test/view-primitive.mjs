@@ -4,7 +4,7 @@ function scale(target, factor) {
 let a = [ 10 ];
 const c = [ a, 0 ];
 c[0][c[1]] = 40;
-console.log(a[0]);
+console.log(String(a[0]));
 let n = [ 5 ];
 scale([ n, 0 ], 4);
-console.log(n[0]);
+console.log(String(n[0]));

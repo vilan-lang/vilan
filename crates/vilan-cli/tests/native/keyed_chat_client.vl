@@ -1,6 +1,7 @@
 // The client half of `service_layer.rs`'s keyed pin (A39), always run under
 // node: it connects to the port in `CHAT_PORT`, holds a per-key subscription on
 // the keyed mirror, calls both rpcs and prints what the mirrors hold.
+import std::debug::Debug;
 import std::hash_map::HashMap;
 import std::http::{ Response, Server };
 import std::io::print;

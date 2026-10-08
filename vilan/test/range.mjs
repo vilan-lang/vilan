@@ -22,7 +22,7 @@ while (true) {
 	const i = $c[1];
 	sum = sum + i;
 }
-console.log(sum);
+console.log(String(sum));
 let count = 0;
 const $d = new2(0, 5);
 while (true) {
@@ -33,7 +33,7 @@ while (true) {
 	const j = $e[1];
 	count = count + 1;
 }
-console.log(count);
+console.log(String(count));
 let empty = 0;
 const $f = new2(3, 3);
 while (true) {
@@ -44,7 +44,7 @@ while (true) {
 	const k = $g[1];
 	empty = empty + 1;
 }
-console.log(empty);
+console.log(String(empty));
 let squares = [  ];
 const $h = new2(1, 5);
 while (true) {
@@ -55,4 +55,4 @@ while (true) {
 	const n = $i[1];
 	squares.push(Math.pow(n, 2));
 }
-console.log(squares.length);
+console.log(String(squares.length));

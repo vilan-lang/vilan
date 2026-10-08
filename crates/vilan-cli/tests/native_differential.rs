@@ -171,6 +171,78 @@ const B489_PROBE: &str = concat!(
     "}\n",
 );
 
+const B539_PROBE: &str = concat!(
+    "import std::reactive::{ Source, SignalCell };\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "\n",
+    "fun main() {\n",
+    "    let a: Source<Option<i32>> = SignalCell::new(None);\n",
+    "    print(a.get().is_none());\n",
+    "    let b: Source<List<str>> = SignalCell::new([]);\n",
+    "    print(b.get().len());\n",
+    "    let flag = false;\n",
+    "    let c: Source<Option<str>> = if flag { SignalCell::new(None) } else { SignalCell::new(Some(\"x\")) };\n",
+    "    print(c.get().is_none());\n",
+    "}\n",
+);
+
+const B540_PROBE: &str = concat!(
+    "import std::option::Option::{ self, Some, None };\n",
+    "\n",
+    "enum Maybe<T> {\n",
+    "    Nothing,\n",
+    "    Just(T),\n",
+    "}\n",
+    "\n",
+    "impl Maybe<type T> {\n",
+    "    fun empty(self): bool {\n",
+    "        match self {\n",
+    "            Maybe::Nothing => true,\n",
+    "            Maybe::Just(_) => false,\n",
+    "        }\n",
+    "    }\n",
+    "}\n",
+    "\n",
+    "fun last<T>(items: List<T>): Maybe<T> {\n",
+    "    mut found = Maybe::Nothing;\n",
+    "    for item in items {\n",
+    "        found = Maybe::Just(item);\n",
+    "    }\n",
+    "    found\n",
+    "}\n",
+    "\n",
+    "fun first<T>(items: List<T>): Maybe<T> {\n",
+    "    mut found = Maybe::Nothing;\n",
+    "    for item in items {\n",
+    "        if found.empty() {\n",
+    "            found = Maybe::Just(item);\n",
+    "        }\n",
+    "    }\n",
+    "    found\n",
+    "}\n",
+    "\n",
+    "fun first_some<T>(items: List<T>): Option<T> {\n",
+    "    mut found = None;\n",
+    "    for item in items {\n",
+    "        if found.is_none() {\n",
+    "            found = Some(item);\n",
+    "        }\n",
+    "    }\n",
+    "    found\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "    let l = last([\"x\", \"y\"]);\n",
+    "    match l {\n",
+    "        Maybe::Just(let v) => print(v),\n",
+    "        Maybe::Nothing => print(\"none\"),\n",
+    "    }\n",
+    "    let f = first([4, 5]);\n",
+    "    print(f.empty());\n",
+    "    print(first_some([6, 7]).unwrap());\n",
+    "}\n",
+);
+
 const B532_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -1019,9 +1091,11 @@ const DEFAULT_SUITE: &[&str] = &[
     // N106: `vilan_rt::js_number`'s four documented departures from Rust's
     // own `{}` — 1e21's exponential switch, the 1e-6 linear floor, and the
     // two infinities — pinned identical on a corpus program rather than left
-    // unrecorded (negative zero is the one departure that is NOT identical;
-    // it is `f64-print-negative-zero.vl`, outside this differential by name).
+    // unrecorded.
     "f64-print-boundary.vl",
+    // N136: negative zero prints `0` on both backends since `print` formats a
+    // number by `String(x)` on JS.
+    "f64-print-negative-zero.vl",
     // N106: `str::len` counts UTF-16 code units to match JavaScript's
     // `.length`; a character outside the BMP is a surrogate pair on JS and
     // `char::len_utf16` counts it the same way natively — verified here
@@ -1055,18 +1129,10 @@ const DEFAULT_SUITE: &[&str] = &[
 /// corpus keeps its JS golden, and
 /// [`an_underflowing_usize_is_outside_the_differential_by_name`] pins the
 /// native half.
-const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[
-    (
-        "usize-underflow.vl",
-        "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
-    ),
-    (
-        "f64-print-negative-zero.vl",
-        "negative zero prints \"-0\" through node's `console.log` (a `util.inspect` \
-         special case) but \"0\" through every JS stringification `vilan_rt::js_number` \
-         implements instead (`String(x)`, a template literal, `JSON.stringify`) — N106",
-    ),
-];
+const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[(
+    "usize-underflow.vl",
+    "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
+)];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
 ///
@@ -1417,50 +1483,22 @@ fn an_underflowing_usize_is_outside_the_differential_by_name() {
     );
 }
 
-/// N106: the other [`OUTSIDE_THE_DIFFERENTIAL`] program — negative zero is
-/// the one `vilan_rt::js_number` departure from `console.log` that is NOT
-/// identical: node's `console.log` special-cases it to `"-0"` (`util.inspect`),
-/// while every JS *stringification* (`String(x)`, a template literal,
-/// `JSON.stringify`) answers `"0"`, which is what `js_number` — and so the
-/// native backend's `print` — implements. Both backends do what the book
-/// says; the sweep leaves the program out so it is not called broken.
+/// N136 (R-g door (a)): negative zero prints `0` on BOTH backends — `print`
+/// formats a number by the language's own conversion (`String(x)` on JS, the
+/// one an i-string and `vilan_rt::js_number` use) where node's `console.log`
+/// wrote `-0`. The program left `OUTSIDE_THE_DIFFERENTIAL` with the fix.
 #[test]
-fn negative_zero_prints_differently_on_each_backend_by_name() {
-    for (program, _) in OUTSIDE_THE_DIFFERENTIAL {
-        assert!(
-            corpus_dir().join(program).is_file(),
-            "{program} is named outside the differential but is not a corpus program"
-        );
-        assert!(
-            !platform_free_programs().contains(&program.to_string()),
-            "{program} is named outside the differential but the sweep still enumerates it"
-        );
-        assert!(
-            !DEFAULT_SUITE.contains(program),
-            "{program} is outside the differential and cannot be in its default suite"
-        );
-    }
+fn negative_zero_prints_zero_on_both_backends() {
     let staged = stage();
-    let javascript = vilan(&staged)
-        .args(["run", "f64-print-negative-zero.vl"])
-        .output()
-        .expect("run the JS backend");
-    assert!(
-        javascript.status.success(),
-        "the JS leg runs clean: {}",
-        String::from_utf8_lossy(&javascript.stderr)
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, "f64-print-negative-zero.vl");
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "0\n0\n0\n", "{backend:?}");
+    }
+    assert_eq!(
+        compare(&staged, "f64-print-negative-zero.vl"),
+        Verdict::Identical
     );
-    assert_eq!(String::from_utf8_lossy(&javascript.stdout), "-0\n");
-    let native = vilan(&staged)
-        .args(["run", "--backend", "rust", "f64-print-negative-zero.vl"])
-        .output()
-        .expect("run the native backend");
-    assert!(
-        native.status.success(),
-        "the native leg runs clean: {}",
-        String::from_utf8_lossy(&native.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&native.stdout), "0\n");
 }
 
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.
@@ -6445,16 +6483,28 @@ fn a_reentrant_read_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
 /// stop. Since F45 it can be told — SIGTERM stops it gracefully and the
 /// census reads it at process end — and the kolt shape's exit line is held by
 /// [`a_native_server_stops_on_sigterm_and_reaches_its_process_end`].
+///
+/// **One row is live by design** (F50): [`CAPTURED_CYCLE_PROBE`], a binding
+/// captured by a closure stored in the binding's own value. Natively the
+/// boxed binding's cell holds the closure that holds the cell — an `Rc` cycle
+/// JS's collector reclaims and a counted cell cannot (spec §6.9's native
+/// limit). The row pins the limit, `live = 1`, so it is a measured boundary
+/// rather than a hidden failure.
 #[test]
 fn the_native_leak_census_matches_its_table() {
     let staged = stage();
     std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
         .expect("write the board probe");
+    std::fs::write(
+        staged.join("native_probe_captured_cycle.vl"),
+        CAPTURED_CYCLE_PROBE,
+    )
+    .expect("write the captured-cycle probe");
     let mut rows = Vec::new();
     for program in DEFAULT_SUITE
         .iter()
         .copied()
-        .chain(std::iter::once("native_probe_board.vl"))
+        .chain(["native_probe_board.vl", "native_probe_captured_cycle.vl"])
     {
         let (minted, live) = leak_census_of(&staged, program);
         rows.push(format!(
@@ -6489,6 +6539,26 @@ fn the_native_leak_census_matches_its_table() {
 }
 
 const NATIVE_LEAK_CENSUS: &str = "crates/vilan-cli/tests/native-leak-census.tsv";
+
+/// closure-captures-on-native.md's p10 (F50): `holder`'s second value holds a
+/// closure that captures `holder`, so natively the boxed binding's cell and
+/// the closure keep each other alive past the program's end.
+const CAPTURED_CYCLE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Holder {\n",
+    "\tn: i32,\n",
+    "\trun: || i32,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut holder = Holder { n = 1, run = || 0 };\n",
+    "\tholder = Holder { n = 2, run = || holder.n };\n",
+    "\tprint((holder.run)());\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);
 
 /// Runs `program` natively under `VILAN_NATIVE_LEAK_CENSUS=1` and answers
 /// `(minted, live)` from the line the runtime prints on stderr.
@@ -6666,8 +6736,11 @@ fn a_failing_program_exits_one_on_both_backends_without_rusts_banner() {
              asserting nothing about the failure"
         );
         let stderr = String::from_utf8_lossy(&native.stderr);
+        // Rust's banner names its THREAD (`thread 'main' panicked at
+        // src/main.rs:..`); a vilan panic's own report (debugging.md S0) is
+        // `panicked at <the .vl site>: <message>`, which node prints too.
         assert!(
-            !stderr.contains("panicked at"),
+            !stderr.contains("thread '") && !stderr.contains(".rs:"),
             "{file}: Rust's panic banner must not reach stderr: {stderr:?}"
         );
         assert!(
@@ -7294,14 +7367,27 @@ fn a_last_use_inside_a_loop_keeps_its_copy_and_one_declared_inside_it_moves() {
 /// a destructure's), which are exactly the ones the native liveness pass is
 /// answerable for.
 ///
+/// **The capture column** (F50) counts what that consumed-read count cannot
+/// see: the copies a closure's capture prelude takes when the closure is
+/// created (`let items = items.clone();` ahead of the `move`), excluding the
+/// handle bumps (a boxed binding's cell, a closure, a counted host handle, a
+/// `str`) and scalars. It is the number closure-captures-on-native.md §4.2's
+/// shared-capture work has to move.
+///
 /// **The programs** are [`DEFAULT_SUITE`] plus the paper's board probe, because
 /// that is the set the byte gate runs on every build; the whole corpus is one
 /// list away and costs an emit per program.
 const NATIVE_COPY_CENSUS: &str = "crates/vilan-cli/tests/native-copy-census.tsv";
 
-/// One program's census line, as the compiler reports it under
-/// `VILAN_NATIVE_REPORT_COPIES=1`.
+/// One program's consumed-read census — copied, elided — as the compiler
+/// reports it under `VILAN_NATIVE_REPORT_COPIES=1`.
 fn copy_census_of(staged: &Path, program: &str) -> (usize, usize) {
+    let (copied, elided, _) = copy_census_line_of(staged, program);
+    (copied, elided)
+}
+
+/// One program's whole census line: copied, elided, and the capture copies.
+fn copy_census_line_of(staged: &Path, program: &str) -> (usize, usize, usize) {
     let output = vilan(staged)
         .env("VILAN_NATIVE_REPORT_COPIES", "1")
         .args(["build", "--backend", "rust", "--stdout", program])
@@ -7323,7 +7409,49 @@ fn copy_census_of(staged: &Path, program: &str) -> (usize, usize) {
         .map(|piece| piece.parse::<usize>().expect("a count"));
     let copied = numbers.next().expect("the copied count");
     let elided = numbers.next().expect("the elided count");
-    (copied, elided)
+    let captured = numbers.next().expect("the capture count");
+    (copied, elided, captured)
+}
+
+/// F50: the capture column counts a closure-creation COPY and nothing else.
+/// The probe's one closure captures six bindings and copies exactly one of
+/// them: the list. The `Shared`, the `str` (an `Rc<str>`), the closure (an
+/// `Rc`) and the boxed `mut` binding (its `Captured` cell) are handle bumps,
+/// and the `i32` is a scalar.
+#[test]
+fn the_capture_column_counts_a_copied_capture_and_no_handle() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_capture_copies.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet items = [1, 2, 3];\n",
+            "\tlet cell = Shared::new(4);\n",
+            "\tlet name = \"n\";\n",
+            "\tlet twice = |k: i32| k * 2;\n",
+            "\tlet count = 5;\n",
+            "\tmut seen = 0;\n",
+            "\tlet report = || {\n",
+            "\t\tseen += 1;\n",
+            "\t\tprint(i\"{name} {items.len()} {cell.read()} {twice(count)} {seen}\");\n",
+            "\t};\n",
+            "\treport();\n",
+            "}\n",
+            "\n",
+            "main();\n",
+        ),
+    )
+    .expect("write the probe program");
+    let (_, _, captured) = copy_census_line_of(&staged, "native_probe_capture_copies.vl");
+    assert_eq!(captured, 1, "only the list is copied into the closure");
+    assert_eq!(
+        compare(&staged, "native_probe_capture_copies.vl"),
+        Verdict::Identical,
+        "and the program prints the same bytes on both backends"
+    );
 }
 
 #[test]
@@ -7337,9 +7465,9 @@ fn the_native_copy_census_matches_its_table() {
         .copied()
         .chain(std::iter::once("native_probe_board.vl"))
     {
-        let (copied, elided) = copy_census_of(&staged, program);
+        let (copied, elided, captured) = copy_census_line_of(&staged, program);
         rows.push(format!(
-            "{}\t{copied}\t{elided}",
+            "{}\t{copied}\t{elided}\t{captured}",
             program.trim_end_matches(".vl")
         ));
     }
@@ -7347,7 +7475,8 @@ fn the_native_copy_census_matches_its_table() {
         "{}{}\n",
         concat!(
             "# Consumed place reads the NATIVE emitter copied, and the ones it\n",
-            "# moved at a last use (tracker F31). Regenerate with\n",
+            "# moved at a last use (tracker F31); then the values a closure's\n",
+            "# capture prelude copied at its creation (F50). Regenerate with\n",
             "# VILAN_REGENERATE_NATIVE_COPY_CENSUS=1 cargo test -p vilan-cli \
              --test native_differential\n",
         ),
@@ -8496,6 +8625,121 @@ fn a_field_read_or_written_through_a_shared_view_is_identical_on_both_backends()
     }
 }
 
+/// F90: a compound write through a `Shared` view at a SUBSCRIPT — F83's
+/// indexed twin. `counts.write()[0] += 1` re-read `counts.write()[0]` as
+/// `(counts).borrow_mut()[i]`, a borrow held to the end of the statement, so the
+/// write met it and the program died with "a cell was read while it is being
+/// updated". A subscript read through either view is now a scoped borrow, its
+/// index settled first. The probe: every place shape (subscript, field, tuple
+/// slot, each nested under the others) with a value that reads the same cell,
+/// a captured binding and a module-level one, and subscript reads sharing a
+/// statement with another touch of the cell (a `&mut` loan, a push, a loop).
+#[test]
+fn a_compound_write_at_a_subscript_through_a_shared_view_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_shared_indexed_writes.vl"),
+        include_str!("native/shared_indexed_writes.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_shared_indexed_writes.vl"),
+        Verdict::Identical,
+        "a compound write at a subscript through a `Shared` view must not abort natively"
+    );
+}
+
+/// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
+/// subject of a destructuring `match`, an `is` capture, a `?` lift and a
+/// conjunction was copied for a binding and a field and MOVED for a subscript,
+/// so `match names[0] { Some(let name) => .. }` over a `List<Option<str>>` was
+/// rustc's E0507 and std bound the element to a `let` first (three sites in
+/// `std::reactive::store`/`store_core`, removed with the fix). The probe: an
+/// `Option<str>`, an enum with a `Hash` payload, a tuple, a field's and a
+/// loaned parameter's element, a nested subscript, an `is` test, a
+/// destructuring `let` and a `?` lift.
+#[test]
+fn a_pattern_over_an_indexed_element_copies_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_indexed_match_subjects.vl"),
+        include_str!("native/indexed_match_subjects.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_indexed_match_subjects.vl"),
+        Verdict::Identical,
+        "a pattern over an indexed element must copy it, not move it out of the list"
+    );
+}
+
+/// F85: a closure literal handed to a GENERIC callee without a written
+/// return. Its position was the parameter type with only the head resolved —
+/// `|T| U`, the callee's own generics — so the body had no closed return to
+/// build a constructor at and `apply(4, |k| Maybe::Just(k * 10))` was refused
+/// as instantiated at `any`. The position is now the parameter's type rebuilt
+/// under the call's bindings. The probe: a user enum over an `i32`, a `str` and
+/// a nested constructor, a list, `Option`, a generic struct literal, a generic
+/// METHOD's closure, a call from a generic body, a closure answering a closure.
+#[test]
+fn a_closure_handed_to_a_generic_callee_builds_at_the_calls_position_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_callee_closures.vl"),
+        include_str!("native/generic_callee_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_callee_closures.vl"),
+        Verdict::Identical,
+        "a closure handed to a generic callee must build at the call's own position"
+    );
+}
+
+/// F86: a variant constructor as a METHOD RECEIVER with a literal payload —
+/// `Maybe::Just(3).and_then(big)` — was refused as instantiated at `any`; the
+/// receiver is the call's first argument and takes F85's position. Behind it a
+/// second cause: `nest(self): Maybe<Maybe<T>>` was refused even on a bound
+/// receiver, because a nested enum's instance re-bound `T` to `Maybe<T>` (its
+/// arguments were resolved at the head only). The probe: a trait method, a
+/// chain, a `str`, an `f64` and a list payload, a nested constructor receiver,
+/// `Option`'s own method, a generic struct literal receiver, `nest` bound.
+#[test]
+fn a_variant_constructor_as_a_receiver_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_variant_receivers.vl"),
+        include_str!("native/variant_receivers.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_variant_receivers.vl"),
+        Verdict::Identical,
+        "a variant constructor as a method receiver must build at its `self` position"
+    );
+}
+
+/// F88: `*{ &m }` — the spelled copy of a view a BLOCK's tail names. The
+/// tail is a value position, so it was emitted as its copy and then
+/// dereferenced (rustc E0614 over a scalar, E0599 over a `str` or a list);
+/// F81 had taught the `if` and `match` forms. The probe: a scalar, a `str`, a
+/// field, a subscript, a list copied then grown, statements before the tail,
+/// nested blocks, a block whose tail is an `if`.
+#[test]
+fn a_deref_of_a_blocks_view_reads_the_value_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_deref_of_a_block_view.vl"),
+        include_str!("native/deref_of_a_block_view.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_deref_of_a_block_view.vl"),
+        Verdict::Identical,
+        "a deref of a block whose tail is a view must read the value"
+    );
+}
+
 /// F57: every platform-bound corpus program the backend ACCEPTS prints what
 /// node prints, the ones it refuses say which construct stopped them, and the
 /// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is
@@ -8925,6 +9169,36 @@ fn a_bare_trait_returns_arguments_reach_the_body_on_both_backends() {
         compare(&staged, "native_probe_b489.vl"),
         Verdict::Identical,
         "a bare-trait return's arguments must reach the body on both backends"
+    );
+}
+
+/// B539: a trait-annotated binding's arguments reach its initializer
+/// (`let a: Source<Option<i32>> = SignalCell::new(None)`). Natively the `None`
+/// was "an unresolved type".
+#[test]
+fn a_trait_annotated_bindings_arguments_reach_its_initializer_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b539.vl"), B539_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b539.vl"),
+        Verdict::Identical,
+        "a trait-annotated binding's arguments must reach its initializer on both backends"
+    );
+}
+
+/// B540: a `mut` binding grounded by a nullary variant takes its payload type
+/// from its reassignment, and a method called on it before then waits for it.
+/// Natively it was "instantiated at `any`".
+#[test]
+fn a_nullary_variant_binding_grounds_from_its_reassignment_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b540.vl"), B540_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b540.vl"),
+        Verdict::Identical,
+        "a nullary-variant binding must ground from its reassignment on both backends"
     );
 }
 
@@ -9788,6 +10062,63 @@ fn a142_s7_a_struct_store_builds_and_wakes_the_same_on_both_backends() {
     );
 }
 
+/// A149 S4: field syntax on store handles reads, writes and subscribes the same
+/// on both backends — `app.address.city` is the projection call, a field named
+/// like a handle internal (`root`, `path`) reads the struct's field, a
+/// `StoreSome` reads through its projections, and a generic struct's
+/// projection is reached by its field name.
+#[test]
+fn a149_s4_field_syntax_reads_and_writes_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_field_syntax.vl"),
+        include_str!("native/store_field_syntax.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_field_syntax.vl"),
+        Verdict::Identical,
+        "field syntax must read and write the same on both backends"
+    );
+}
+
+/// A149 (store_opaque's removal): a closure-typed field, a closure payload and
+/// a closure beside another payload are LEAVES with no equality on both
+/// backends, diffed through `StoreLeaf`'s bare tier — every covering write
+/// wakes them.
+#[test]
+fn a149_a_closure_leaf_wakes_on_every_covering_write_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_closure_leaves.vl"),
+        include_str!("native/store_closure_leaves.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_closure_leaves.vl"),
+        Verdict::Identical,
+        "a closure leaf must wake the same on both backends"
+    );
+}
+
+/// A158: `List::push_many` appends a list, an iterator chain and a set's
+/// members in order on both backends, takes a list pushed onto itself whole,
+/// and a `ListCell` records each batch as ONE splice.
+#[test]
+fn a158_push_many_appends_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_list_push_many.vl"),
+        include_str!("native/list_push_many.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_list_push_many.vl"),
+        Verdict::Identical,
+        "push_many must append the same on both backends"
+    );
+}
+
 /// A142 S7 S2: a derived enum's store builds and wakes the same on both
 /// backends — a same-variant write patching the payload, a switch away and back,
 /// a `patch` through a dead and a live variant, a multi-payload variant read and
@@ -9846,5 +10177,281 @@ fn a_trait_objects_print_and_its_tables_are_identical_on_both_backends() {
         compare(&staged, "native_probe_dyn_print_and_tables.vl"),
         Verdict::Identical,
         "an object prints its value and dispatches through its own application's table"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// debugging.md S0 (E258): `[track_caller]` and panic locations.
+// ---------------------------------------------------------------------------
+
+/// What one backend did with one run: stdout, stderr, exit code.
+struct Run {
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+}
+
+fn run_on(staged: &Path, backend: Option<&str>, program: &str) -> Run {
+    let mut command = vilan(staged);
+    command.arg("run");
+    if let Some(backend) = backend {
+        command.args(["--backend", backend]);
+    }
+    let output = command.arg(program).output().expect("run vilan");
+    Run {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code(),
+    }
+}
+
+/// `file:line:column` of `column_needle` on the first line of `source`
+/// holding `line_needle` — the site a location names, computed from the
+/// fixture rather than written down, so an edit to it moves both sides.
+fn site_of(file: &str, source: &str, line_needle: &str, column_needle: &str) -> String {
+    let (index, line) = source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(line_needle))
+        .unwrap_or_else(|| panic!("the fixture has no line holding {line_needle:?}"));
+    let byte = line
+        .find(column_needle)
+        .unwrap_or_else(|| panic!("{column_needle:?} is not on the line {line:?}"));
+    let column = line[..byte].chars().count() + 1;
+    format!("{file}:{}:{column}", index + 1)
+}
+
+const PANIC_LOCATIONS: &str = include_str!("native/panic_locations.vl");
+const PANIC_LOCATIONS_FILE: &str = "native_probe_panic_locations.vl";
+
+/// E258 / debugging.md S0: each std panic path — `panic`, `assert`, a read, a
+/// write and a `&mut` view out of bounds, `Option`'s `unwrap`/`expect`,
+/// `Result`'s four, `List::remove`/`insert` — reports `panicked at
+/// <file>:<line>:<column>: <message>` naming the vilan site that reached it,
+/// identically on both backends (the native leg prints that line alone; node
+/// prints it as the uncaught `Error`'s header). A chain of `[track_caller]`
+/// functions names the outermost caller, a subscript in a tracking body names
+/// its caller, and a closure inside one names its own site.
+#[test]
+fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
+    let staged = stage();
+    let site =
+        |line: &str, column: &str| site_of(PANIC_LOCATIONS_FILE, PANIC_LOCATIONS, line, column);
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("panic", site("panic(\"boom\")", "panic"), "boom"),
+        ("assert", site("\"asserted\"", "assert"), "asserted"),
+        (
+            "read",
+            site("print(values[5])", "values[5]"),
+            "index out of bounds: the length is 2 but the index is 5",
+        ),
+        (
+            "write",
+            site("values[7] = 3", "values[7]"),
+            "index out of bounds: the length is 2 but the index is 7",
+        ),
+        (
+            "view",
+            site("&mut values[9]", "values[9]"),
+            "index out of bounds: the length is 2 but the index is 9",
+        ),
+        (
+            "unwrap",
+            site("print(none.unwrap())", "unwrap"),
+            "expected Some but got None",
+        ),
+        ("expect", site("none.expect(", "expect"), "expected a value"),
+        (
+            "result_unwrap",
+            site("failed.unwrap()", "unwrap"),
+            "called `unwrap` on an `Err` value",
+        ),
+        (
+            "unwrap_err",
+            site("fine.unwrap_err()", "unwrap_err"),
+            "called `unwrap_err` on an `Ok` value",
+        ),
+        (
+            "expect_err",
+            site("fine.expect_err(", "expect_err"),
+            "expected an error",
+        ),
+        (
+            "remove",
+            site("values.remove(4)", "remove"),
+            "index out of bounds: the length is 2 but the index is 4",
+        ),
+        (
+            "insert",
+            site("values.insert(6, 1)", "insert"),
+            "index out of bounds: the length is 2 but the index is 6",
+        ),
+        (
+            "relay",
+            site("relay(0)", "relay"),
+            "checked wants a positive value",
+        ),
+        (
+            "pick",
+            site("pick(values, 8)", "pick"),
+            "index out of bounds: the length is 2 but the index is 8",
+        ),
+        (
+            "closure",
+            site("panic(\"from the closure\")", "panic"),
+            "from the closure",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (path, location, message) in cases {
+        let expected = format!("panicked at {location}: {message}");
+        // One program per path, all under the same FILE name so the sites
+        // read the same; each is written over the last.
+        std::fs::write(
+            staged.join(PANIC_LOCATIONS_FILE),
+            PANIC_LOCATIONS.replace("\"PATH\"", &format!("{path:?}")),
+        )
+        .expect("write the probe program");
+        let native = run_on(&staged, Some("rust"), PANIC_LOCATIONS_FILE);
+        if native.code != Some(1) || native.stderr != format!("{expected}\n") {
+            wrong.push(format!(
+                "{path}: native exited {:?} with stderr {:?}, expected exit 1 and {expected:?}",
+                native.code, native.stderr
+            ));
+        }
+        let javascript = run_on(&staged, None, PANIC_LOCATIONS_FILE);
+        if javascript.code != Some(1) || !javascript.stderr.lines().any(|line| line == expected) {
+            wrong.push(format!(
+                "{path}: node exited {:?} with stderr {:?}, expected exit 1 and the line {expected:?}",
+                javascript.code, javascript.stderr
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// debugging.md S0: `std::debug::caller()` outside a tracking function is its
+/// own site, inside one the caller's; a `Location` reads back its file, line
+/// and column; and a CAUGHT panic still answers its message alone (the JS
+/// `error.message`, the native payload's message) — identical on both backends.
+#[test]
+fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
+    // Its OWN program name. The native binary lands at `<shared target>/debug/<name>`, and the
+    // sibling test above builds `PANIC_LOCATIONS_FILE` fifteen times with other paths; two tests
+    // building one name at once run each other's binary (the Order 47 seal: this test read the
+    // `"panic"` build's exit 1 under load).
+    const CALLER_FILE: &str = "native_probe_panic_caller.vl";
+    let staged = stage();
+    std::fs::write(
+        staged.join(CALLER_FILE),
+        PANIC_LOCATIONS.replace("\"PATH\"", "\"none\""),
+    )
+    .expect("write the probe program");
+    let javascript = run_on(&staged, None, CALLER_FILE);
+    let native = run_on(&staged, Some("rust"), CALLER_FILE);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(
+        javascript.stdout, native.stdout,
+        "both backends print the same"
+    );
+    let site = |line: &str, column: &str| site_of(CALLER_FILE, PANIC_LOCATIONS, line, column);
+    let own = site("let own = caller()", "caller");
+    let (line, column) = {
+        let mut parts = own.rsplit(':');
+        let column = parts.next().unwrap().to_string();
+        let line = parts.next().unwrap().to_string();
+        (line, column)
+    };
+    let expected = format!(
+        "{}\n{CALLER_FILE}\n{line}\n{column}\n{own}\n[ 0, 'expected Some but got None' ]\n",
+        site("print(here())", "here"),
+    );
+    assert_eq!(native.stdout, expected);
+}
+
+// ---------------------------------------------------------------------------
+// debugging.md S1: `dbg(..)`.
+// ---------------------------------------------------------------------------
+
+const DBG_PRINTER: &str = include_str!("native/dbg_printer.vl");
+const DBG_PRINTER_FILE: &str = "native_probe_dbg_printer.vl";
+
+/// debugging.md S1: every `dbg` line is the same bytes on both backends, and
+/// those bytes are the committed ones (`native/dbg_printer.stderr`): each
+/// shape in vilan's literal syntax, the call forms (several arguments, none,
+/// one wrapping an expression, a generic `T` per instantiation, a statement
+/// reading a resource in place and an expression moving it), the 80-column
+/// break with trailing commas, the 100-entry cut and a closure by its type —
+/// on stderr, with the program's own output on stdout untouched.
+#[test]
+fn s1_dbg_writes_the_same_bytes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join(DBG_PRINTER_FILE), DBG_PRINTER).expect("write the probe program");
+    let expected_stderr = include_str!("native/dbg_printer.stderr");
+    let expected_stdout = include_str!("native/dbg_printer.stdout");
+    let javascript = run_on(&staged, None, DBG_PRINTER_FILE);
+    let native = run_on(&staged, Some("rust"), DBG_PRINTER_FILE);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(javascript.stderr, expected_stderr, "the JS leg's dbg lines");
+    assert_eq!(native.stderr, expected_stderr, "the native leg's dbg lines");
+    assert_eq!(javascript.stdout, expected_stdout);
+    assert_eq!(native.stdout, expected_stdout);
+}
+
+/// debugging.md S1b: std's handles print as themselves, the same bytes on
+/// both backends (`native/dbg_handles.stderr`): a `HashMap` and a `HashSet`
+/// by their members in insertion order, a `Shared` and a `SignalCell` by their
+/// value (the cell read without tracking), a pipe by its type alone (sampling
+/// it would run it), and a `Shared` cycle cut at `<cycle>`.
+#[test]
+fn s1b_std_handles_print_as_themselves_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_dbg_handles.vl";
+    std::fs::write(staged.join(file), include_str!("native/dbg_handles.vl"))
+        .expect("write the probe program");
+    let expected = include_str!("native/dbg_handles.stderr");
+    let javascript = run_on(&staged, None, file);
+    let native = run_on(&staged, Some("rust"), file);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(javascript.stderr, expected, "the JS leg's dbg lines");
+    assert_eq!(native.stderr, expected, "the native leg's dbg lines");
+}
+
+/// debugging.md S4 (E260): `Debug` over a list, an option and a result, a
+/// derived struct holding them, and a float's `.0` render the same on both
+/// backends.
+#[test]
+fn s4_debug_over_containers_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_debug_containers.vl"),
+        concat!(
+            "import std::debug::Debug;\n",
+            "\n",
+            "[derive(Debug)]\n",
+            "struct Bag { items: List<i32>, maybe: Option<f64> }\n",
+            "\n",
+            "fun show<T: Debug>(value: T): str {\n",
+            "\tvalue.debug()\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(Bag { items = [1, 2], maybe = Some(3.0) }.debug());\n",
+            "\tprint(show([Some([2.5])]));\n",
+            "\tlet failed: Result<i32, str> = Err(\"no\");\n",
+            "\tprint(show(failed));\n",
+            "\tprint(3.0.debug());\n",
+            "\tprint((0.0 * -1.0).debug());\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_debug_containers.vl"),
+        Verdict::Identical,
+        "Debug over containers must render the same on both backends"
     );
 }

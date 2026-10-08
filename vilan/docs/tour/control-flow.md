@@ -453,6 +453,12 @@ that should be impossible, not for expected failures; those are
 `Result`s. `assert(condition, message)` panics when the condition is
 false, and it's how `vilan test` decides a test failed.
 
+A panic names where it happened, on both backends and in release builds
+too: `panicked at src/main.vl:12:5: not a number: x`. `assert`, `unwrap`,
+`expect`, an index out of bounds and `List`'s `remove`/`insert` name the
+line that CALLED them, not a line inside std. Your own helpers can do the
+same with `[track_caller]` ([Debugging](../guide/debugging.md)).
+
 A `panic` never returns, so it fits wherever a value is expected and owes
 nothing back: a function whose body ends in one needs no return value,
 and neither does one that ends in a `for { … }` nothing breaks out of.

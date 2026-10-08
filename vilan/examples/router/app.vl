@@ -74,56 +74,67 @@ impl Route with Routable {
 // === Pages and layouts =======================================================
 
 fun home_page(): View {
-	view("section").child(view("p").text("Pick a section above."))
+	<section>
+		<p>"Pick a section above."</p>
+	</section>
 }
 
 // The nested layout: its own chrome (heading + subnav), then a match on the
 // INNER route — exactly the outer shell's shape, one level down.
 fun items_layout(inner: ItemsRoute): View {
-	view("section").child(view("h2").text("Items")).child(match inner {
-		ItemsRoute::List => items_list(),
-		ItemsRoute::Detail(let id) => item_detail(id),
-	})
+	<section>
+		<h2>"Items"</h2>
+		{match inner {
+			ItemsRoute::List => items_list(),
+			ItemsRoute::Detail(let id) => item_detail(id),
+		}}
+	</section>
 }
 
 fun items_list(): View {
 	mut rows: List<View> = [];
 	for id in Range::new(1, 4) {
-		rows.push(view("li").child(link(i"Item {id}", Route::Items(ItemsRoute::Detail(id)))));
+		rows.push(<li>{link(i"Item {id}", Route::Items(ItemsRoute::Detail(id)))}</li>);
 	}
-	view("ul").children(rows)
+	<ul>{rows}</ul>
 }
 
 // Params are values, so "adjacent" links are arithmetic, not string splicing.
 fun item_detail(id: i32): View {
-	view("article")
-		.child(view("h3").text(i"Item {id}"))
-		.child(view("nav")
-			.child(link("Previous", Route::Items(ItemsRoute::Detail(id - 1))))
-			.child(link("Next", Route::Items(ItemsRoute::Detail(id + 1))))
-			.child(link("All items", Route::Items(ItemsRoute::List))))
+	<article>
+		<h3>i"Item {id}"</h3>
+		<nav>
+			{link("Previous", Route::Items(ItemsRoute::Detail(id - 1)))}
+			{link("Next", Route::Items(ItemsRoute::Detail(id + 1)))}
+			{link("All items", Route::Items(ItemsRoute::List))}
+		</nav>
+	</article>
 }
 
 fun not_found_page(): View {
-	view("section").child(view("p").text("Nothing here."))
+	<section>
+		<p>"Nothing here."</p>
+	</section>
 }
 
 // === The shell ===============================================================
 
 fun app(route: SignalCell<Route>): View {
-	view("main")
-		.child(view("nav")
-			.child(link("Home", Route::Home))
-			.child(link("Items", Route::Items(ItemsRoute::List))))
+	<main>
+		<nav>
+			{link("Home", Route::Home)}
+			{link("Items", Route::Items(ItemsRoute::List))}
+		</nav>
 		// The address bar, live — the same signal the router drives.
-		.child(view("p").class("path").bind_text(current_path()))
+		<p .class("path")>{current_path()}</p>
 		// The page: swapped per route value; an unchanged route is a no-op,
 		// and a swapped-out page's bindings are disposed with it.
-		.child(swap(route, |current| match current {
+		{swap(route, |current| match current {
 			Route::Home => home_page(),
 			Route::Items(let inner) => items_layout(inner),
 			Route::NotFound => not_found_page(),
-		}))
+		})}
+	</main>
 }
 
 fun main() {

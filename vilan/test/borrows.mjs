@@ -4,8 +4,8 @@ function slot(self) {
 let w = [ 1 ];
 const $a = slot(w);
 $a[0][$a[1]] = 10;
-console.log(w[0]);
+console.log(String(w[0]));
 const v = slot(w);
-console.log(v[0][v[1]]);
+console.log(String(v[0][v[1]]));
 v[0][v[1]] = 25;
-console.log(w[0]);
+console.log(String(w[0]));

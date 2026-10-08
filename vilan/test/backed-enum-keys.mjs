@@ -19,74 +19,74 @@ function hash2(self) {
 function hash3(self) {
 	return __hash(self);
 }
-function $a() {
+function new2() {
 	const table = new Map();
 	return [ table ];
 }
-function $b(self, key, value) {
+function insert(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
-function $c(self, key) {
-	const $d = __map_get(self[0], hash(key));
-	let $e = null;
-	if ($d[0] === 0) {
-		const entry = $d[1];
-		$e = [ 0, __clone(entry[1]) ];
+function get(self, key) {
+	const $a = __map_get(self[0], hash(key));
+	let $b = null;
+	if ($a[0] === 0) {
+		const entry = $a[1];
+		$b = [ 0, __clone(entry[1]) ];
 	} else {
-		$e = [ 1 ];
+		$b = [ 1 ];
 	}
-	return $e;
+	return $b;
 }
-function $f(self, fallback) {
-	const $g = self;
-	let $h = null;
-	if ($g[0] === 0) {
-		const x = __clone($g[1]);
-		$h = x;
+function unwrap_or(self, fallback) {
+	const $c = self;
+	let $d = null;
+	if ($c[0] === 0) {
+		const x = __clone($c[1]);
+		$d = x;
 	} else {
-		$h = __clone(fallback);
+		$d = __clone(fallback);
 	}
-	return $h;
+	return $d;
 }
-function $i(self, key) {
+function contains_key(self, key) {
 	return self[0].has(hash(key));
 }
-function $j(self) {
+function len(self) {
 	return self[0].size;
 }
-function $k() {
+function new3() {
 	const table = new Map();
 	return [ table ];
 }
-function $l(self, value) {
+function insert2(self, value) {
 	self[0].set(hash2(value), value);
 }
-function $m(self, value) {
+function contains(self, value) {
 	return self[0].has(hash2(value));
 }
-function $n(self) {
+function len2(self) {
 	return self[0].size;
 }
-function $p(self, value) {
+function insert3(self, value) {
 	self[0].set(hash3(value), value);
 }
-function $q(self, value) {
+function contains2(self, value) {
 	return self[0].has(hash3(value));
 }
-let widths = $a();
-$b(widths, "flex-start", 1);
-$b(widths, "flex-end", 2);
-console.log($f($c(widths, "flex-start"), 0));
-console.log($f($c(widths, "flex-end"), 0));
-console.log($i(widths, "flex-start"));
-console.log($j(widths));
-let levels = $k();
-$l(levels, 1);
-$l(levels, 1);
-console.log($m(levels, 1));
-console.log($m(levels, 0));
-console.log($n(levels));
-let walked = $k();
-$p(walked, 6);
-console.log($q(walked, 6));
-console.log($q(walked, 7));
+let widths = new2();
+insert(widths, "flex-start", 1);
+insert(widths, "flex-end", 2);
+console.log(String(unwrap_or(get(widths, "flex-start"), 0)));
+console.log(String(unwrap_or(get(widths, "flex-end"), 0)));
+console.log(contains_key(widths, "flex-start"));
+console.log(String(len(widths)));
+let levels = new3();
+insert2(levels, 1);
+insert2(levels, 1);
+console.log(contains(levels, 1));
+console.log(contains(levels, 0));
+console.log(String(len2(levels)));
+let walked = new3();
+insert3(walked, 6);
+console.log(contains2(walked, 6));
+console.log(contains2(walked, 7));

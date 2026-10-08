@@ -8,7 +8,9 @@
 # A row is a subject's `vilan check` on a release build, counted by `counter` (`instructions:u`, the
 # hardware counter; `callgrind`, its Ir where there is no PMU) on machine `class` — counts are per ISA and
 # per libc, so a ceiling binds only the class it was measured on (`reference` is the owner's 9800X3D,
-# `ci` the GitHub runner once S2's spread is known and a seal adopts CI's own measurement).
+# `ci` the GitHub runner's callgrind count, adopted from the CI `perf` job's own JSON by M114). A row may
+# carry its own `tolerance` in place of the file's: the `ci` rows hold to 0.5% (Q7), because the job's
+# count moved by under 0.01% across the four runner CPUs it met.
 #
 # A change that legitimately costs more adds, IN THE SAME COMMIT:
 #   [[bump]]
@@ -17,15 +19,18 @@
 #   ratio = 1.02
 #   reason = "one sentence"
 #   item = "Mnnn"
-# The seal lists every bump since the release; the owner approves one over 3%, or any on kolt (Q6). The
-# bumps reset at each release (`ratchet --release`).
+# The seal lists every bump since the release; the owner approves one over 3%, or any on kolt (Q6). A bump
+# lives one release: the cut ABSORBS it (`ratchet --release --from <the seal's verdict>`, in the release
+# commit) — the bumped row's ceiling becomes the count the seal measured, and the bump rows reset (N146).
 #
 # `[[growth]]` holds everywhere, whatever the class: the plain package of `small` and of `large` modules,
 # measured in one run, may differ by at most `max_ratio` (≤ x2.3 per doubling, Q11; M107 met it in
 # Order 46 at x1.94 from v0.43.0's x2.99).
 #
 # `[[e121]]` are the editor's targets (Q9) on the seal's LSP harness rows: each reports red until it has
-# been green at two consecutive seals (`green_seals`), then `blocking` flips and it refuses (S8).
+# been green at two consecutive seals (`green_seals`), then `blocking` flips and it refuses (S8). The seals
+# keep that count beside their verdicts (`e121-state.json`), never in this file mid-order; the release
+# commit writes it here (N146).
 tolerance = 0.01
 
 # Every subject the gate measures, whether or not this class has a ceiling for it yet.
@@ -39,15 +44,15 @@ subjects = [
 subject = "example:math"
 counter = "instructions:u"
 class = "reference"
-ceiling = 244_001_446
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 251_513_271
+measured_at = "v0.45.0's seal"
 
 [[row]]
 subject = "example:watch"
 counter = "instructions:u"
 class = "reference"
-ceiling = 309_382_444
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 316_712_608
+measured_at = "v0.45.0's seal"
 
 [[row]]
 subject = "example:browser"
@@ -67,22 +72,22 @@ measured_at = "Order 46's seal on next @a1c1551a, one codegen unit (reference: R
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_925_969_896
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 1_764_167_515
+measured_at = "v0.45.0's seal"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_448_389_447
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 1_970_615_826
+measured_at = "v0.45.0's seal"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 4_225_229_690
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 4_087_327_915
+measured_at = "v0.45.0's seal"
 
 [[row]]
 subject = "example:canvas"
@@ -102,54 +107,129 @@ measured_at = "Order 46's seal on next @a1c1551a, one codegen unit (reference: R
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 5_971_915_998
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 5_323_096_056
+measured_at = "v0.45.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 6_213_895_236
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 5_485_296_221
+measured_at = "v0.45.0's seal"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 9_952_066_589
-measured_at = "perf-46 rebased on next @7ee822af (reference: Ryzen 7 9800X3D, WSL2, Debian glibc 2.41)"
+ceiling = 9_674_007_789
+measured_at = "v0.45.0's seal"
+
+[[row]]
+subject = "example:math"
+counter = "callgrind"
+class = "ci"
+ceiling = 263_195_415
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:watch"
+counter = "callgrind"
+class = "ci"
+ceiling = 330_268_645
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:browser"
+counter = "callgrind"
+class = "ci"
+ceiling = 1_556_877_078
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:fullstack"
+counter = "callgrind"
+class = "ci"
+ceiling = 3_333_230_352
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:router"
+counter = "callgrind"
+class = "ci"
+ceiling = 1_833_213_166
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:reactive-ui"
+counter = "callgrind"
+class = "ci"
+ceiling = 2_046_065_797
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:ssr"
+counter = "callgrind"
+class = "ci"
+ceiling = 4_224_049_740
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:canvas"
+counter = "callgrind"
+class = "ci"
+ceiling = 1_565_773_420
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:rpc"
+counter = "callgrind"
+class = "ci"
+ceiling = 2_175_452_371
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:todo"
+counter = "callgrind"
+class = "ci"
+ceiling = 5_485_862_397
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "example:walkthrough"
+counter = "callgrind"
+class = "ci"
+ceiling = 5_653_693_630
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
+
+[[row]]
+subject = "genapp:46"
+counter = "callgrind"
+class = "ci"
+ceiling = 10_010_871_400
+measured_at = "CI perf job on next @01909bbb (every Order 47 lane merged), run 37393647965, the FIRST run on the pinned toolchain (rust-toolchain.toml 1.98.1, M126); re-adopted whole from its uploaded counts, as M114 adopted the stable-toolchain rows at c43d6ab9"
+tolerance = 0.005
 
 [[growth]]
 small = 160
 large = 320
 max_ratio = 2.3
 
-[[bump]]
-subject = "example:reactive-ui"
-class = "reference"
-ratio = 1.07
-reason = "F78's trait defaults are instantiated per pipe stage type (+4.7% here; the browser example is 6.1% cheaper and kolt 0.3%), A152's combinators (+1.6%), and the order's other lanes (about 1.6%). Approved by the owner at Order 46's seal."
-item = "M119"
-
-[[bump]]
-subject = "example:todo"
-class = "reference"
-ratio = 1.02
-reason = "std grew: A152's combinators (+1.5%) and A150's states() (+1.4%), which this program does not call; F78 gives 0.9% back. Approved by the owner at Order 46's seal."
-item = "M120"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "reference"
-ratio = 1.03
-reason = "std grew in reactive-46 (+2.5% in all: A152, A150) plus the order's other lanes (about 1.3%). Approved by the owner at Order 46's seal."
-item = "M120"
-
 [[e121]]
 scenario = "leaf keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 0
+green_seals = 1
 blocking = false
 
 [[e121]]
@@ -163,7 +243,7 @@ blocking = false
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 0
+green_seals = 1
 blocking = false
 
 [[e121]]
@@ -177,12 +257,12 @@ blocking = false
 scenario = "css keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 0
+green_seals = 1
 blocking = false
 
 [[e121]]
 scenario = "parse break"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 0
+green_seals = 1
 blocking = false

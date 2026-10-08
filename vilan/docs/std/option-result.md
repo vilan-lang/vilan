@@ -101,7 +101,9 @@ you now hold is). The pure predicates — `is_some`, `is_none` — keep a
 borrowing `self` and never consume, so they stay free on a resource.
 
 `expect` is `unwrap` with your own panic message, and its message is
-deferred: it costs nothing on the path that has a value. Reaching a
+deferred: it costs nothing on the path that has a value. Both are
+`[track_caller]`: the panic names the line that called them
+(`panicked at src/main.vl:9:21: expected Some but got None`). Reaching a
 resource payload is a `match`, not a guarded `unwrap`: `match opt
 { Some(let value) => .., None => .. }` consumes `opt` on *every* path, which
 is what R7 requires. `if (opt.is_some()) { opt.unwrap() }` moves `opt` on one

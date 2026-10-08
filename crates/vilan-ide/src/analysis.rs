@@ -187,8 +187,15 @@ pub fn span_of(program: &Program, id: Id) -> Option<Span> {
 /// §19.3); every other call answers its wired subject. The erased subject
 /// entity survives in `entity_map`, so a chain walk continues through it
 /// normally and lands on the declaration the source names.
+///
+/// A method call the analysis never WIRED (E253: it deferred to the end on a
+/// closure argument whose body is refused) has no call record at all; its
+/// subject is the member its lookup found, a definition the walks land on
+/// directly.
 pub fn source_call_subject(program: &Program, call_id: Id) -> Option<Id> {
-    let call = program.function_calls.get(&call_id)?;
+    let Some(call) = program.function_calls.get(&call_id) else {
+        return program.unwired_method_calls.get(&call_id).copied();
+    };
     Some(
         program
             .context_erased_subjects
@@ -225,7 +232,9 @@ pub fn signature_label(program: &Program, target: Id) -> Option<String> {
 /// `self` dropped (the receiver is not a call argument) — the tab-stop labels a
 /// call-shaped completion fills. `Some(vec![])` for a zero-parameter callable;
 /// `None` when the id is not a function or external. `target` is a DEFINITION
-/// id (resolve through [`Document::function_target`] first).
+/// id (resolve through [`Document::function_target`] first). A
+/// `[track_caller]` function's hidden location parameter is the compiler's,
+/// not a tab stop.
 pub fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>> {
     let parameter_ids = if let Some(function) = program.functions.get(&target) {
         &function.parameters
@@ -233,9 +242,11 @@ pub fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>
         let external = program.external_functions.get(&target)?;
         &external.parameters
     };
+    let hidden = program.track_caller_parameters.get(&target).copied();
     Some(
         parameter_ids
             .iter()
+            .filter(|parameter_id| Some(**parameter_id) != hidden)
             .filter_map(|parameter_id| program.parameters.get(parameter_id))
             .filter(|parameter| parameter.name != "self")
             .map(|parameter| parameter.name.to_string())
@@ -700,8 +711,13 @@ impl Analysis<'_, '_> {
             seen.push(current);
             // A bare use carries no type on its own id; resolve through its
             // binding (and through that binding's own kind, e.g. an imported
-            // enum variant).
-            match program.entity_map.get(&current)? {
+            // enum variant). A method call the analysis never wired has no
+            // entity at all, and resolves through the member it found (E253).
+            let Some(entity) = program.entity_map.get(&current) else {
+                current = source_call_subject(program, current)?;
+                continue;
+            };
+            match entity {
                 Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
                     current = *binding;
                 }

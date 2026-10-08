@@ -62,8 +62,20 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      # TRUSTED: the event's code is this repository's own — a push to a branch
+      # here, or a pull request whose head repository is this one (Dependabot's
+      # branches included). A fork's PR is not, whoever opened it. Only trusted
+      # events may reach the owner's self-hosted runner (the `test` job's
+      # `runs-on`): a self-hosted runner executes whatever the workflow's
+      # checkout holds, so a fork reaching it would be a fork running code on
+      # the owner's machine. The repository setting "require approval for all
+      # outside collaborators" is the second lock; this output is the first and
+      # does not depend on it.
+      trusted: ${{ steps.trust.outputs.trusted }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: trust
+        run: echo "trusted=${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The filter diffs against the base commit, so one commit is not
           # enough. Full history is the only depth that is *always* enough (a
@@ -118,19 +130,31 @@ jobs:
       # Both legs always run: the windows result is the deliverable here, so a
       # red ubuntu leg must not cancel it.
       fail-fast: false
+      # The suite's wall clock on a GitHub runner is COLD COMPILE, not test
+      # time (L19). Two levers, and they fix different halves. The CACHE below
+      # removes the compile on the runs that get a hit; the SHARD splits what
+      # is left, because a warm compile still leaves the suite itself serial
+      # on one runner. Each shard pays its own cache restore and its own link,
+      # so the split stops buying long before the parallelism does: ubuntu
+      # stays at two. Windows is FOUR (2026-10-05, the owner): by Order 47 the
+      # suite had grown to 9,800 tests and the windows shards ran 50 and 66
+      # minutes against ubuntu's 32 and 54, the long pole of a 67-minute run;
+      # the windows runner is the slower machine and the one whose result is
+      # the deliverable here, so it takes the extra restores.
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        # The suite's wall clock on a GitHub runner is COLD COMPILE, not test
-        # time (L19). The last green run: every other job at or under 3 minutes,
-        # `test(ubuntu)` at 25 and `test(windows)` at 30 — while the identical
-        # suite runs in ~4.5 minutes warm on the owner's box. Two levers, and
-        # they fix different halves. The CACHE below removes the compile on the
-        # runs that get a hit; the SHARD splits what is left, because a warm
-        # compile still leaves the suite itself serial on one runner. Two is the
-        # count, not four: each shard pays its own cache restore and its own
-        # link, so the split stops buying long before the parallelism does.
-        partition: [1, 2]
-    runs-on: ${{ matrix.os }}
+        include:
+          - { os: ubuntu-latest, partition: 1, shards: 2 }
+          - { os: ubuntu-latest, partition: 2, shards: 2 }
+          - { os: windows-latest, partition: 1, shards: 4 }
+          - { os: windows-latest, partition: 2, shards: 4 }
+          - { os: windows-latest, partition: 3, shards: 4 }
+          - { os: windows-latest, partition: 4, shards: 4 }
+    # The ubuntu legs of a TRUSTED event run on the owner's self-hosted runner
+    # (label `vilan-linux`; proposals/scripts/integration/runner/), where the
+    # suite takes minutes instead of the better part of an hour. Everything
+    # else — a fork's PR, and the windows legs until a windows runner exists —
+    # stays on GitHub's machines.
+    runs-on: ${{ (matrix.os == 'ubuntu-latest' && needs.changes.outputs.trusted == 'true') && 'vilan-linux' || matrix.os }}
     # The suite proves the tree against CURRENT stable, not against the pin in
     # rust-toolchain.toml — that file is the formatter's pin (backlog N21; the
     # `fmt` job below is what follows it). Explicit because it would not hold
@@ -146,10 +170,10 @@ jobs:
     # 2026-07-25 (run 30136463220), and the allowance was removed per the
     # recorded plan.
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Many tests shell out to `node` (the macro/native equivalence gate, every
       # e2e suite). Pinned to the same version release.yml's gate job uses.
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       # The TextMate grammar's SCOPE pins (tracker E163). They tokenise with
@@ -184,7 +208,11 @@ jobs:
       # `target/`. `save-if` keeps the WRITERS to the branches PRs are cut from:
       # a PR warms itself off `next`'s entry and does not evict it, which is the
       # difference between a cache and a queue of PRs overwriting each other.
+      # GitHub-hosted only: the self-hosted runner's `_work` persists between
+      # jobs, so its `target/` is already warm and a cache restore would only
+      # overwrite it with an older one.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: suite-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
@@ -199,9 +227,9 @@ jobs:
         shell: bash
         env:
           # nextest's own sharding: `count:N/M` selects a deterministic Mth of
-          # the tests, so the two shards together are the whole suite and
-          # neither runs a test twice.
-          VILAN_CI_PARTITION: ${{ matrix.partition }}/2
+          # the tests, so an OS's shards together are the whole suite and
+          # none runs a test twice.
+          VILAN_CI_PARTITION: ${{ matrix.partition }}/${{ matrix.shards }}
         run: scripts/ci-local.sh test
       # nextest does not run doc-tests. Every doc-test set is empty today;
       # this leg exists so a future doc-test cannot silently stop running.
@@ -230,7 +258,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: wasm32-unknown-unknown
@@ -248,7 +276,7 @@ jobs:
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
       # The leg ends by RUNNING the artifact under node (N134): v0.41.0's
       # compiler built and bound here and trapped on every compile.
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       # The build, the bindings and the smoke, from the script. The same 16 MiB stack the
@@ -277,7 +305,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: The tree is formatted
         run: scripts/ci-local.sh fmt
 
@@ -298,7 +326,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -329,7 +357,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Clippy compiles the workspace's every target, so this leg's clock is a
       # build too. Its own `shared-key`: clippy's `target/` holds `.rmeta` where
       # the suite's holds linked test binaries, and one entry serving both would
@@ -368,7 +396,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The same installer the suite legs use for nextest, same pin.
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -386,24 +414,29 @@ jobs:
   # gate never needs the private repository, §5) and a plain package at two
   # sizes whose RATIO is held to x2.3 per doubling (M107, Q11).
   #
-  # Whether a GitHub runner exposes the hardware counter was not measurable
-  # from the lane that built this (S2): `perf_count.py` uses it when the
-  # kernel allows and falls back to callgrind's Ir otherwise, which is why
-  # valgrind is installed, and the measured JSON names the counter it used.
-  # Ceilings bind only the class they were measured on, so until a seal adopts
-  # this job's own uploaded counts (`perf_gate.py ratchet --from`), the ci
-  # class's rows report and only the growth ratio refuses — and the artifact
-  # is the spread measurement S2 asks for, one per run.
+  # The runners expose no hardware counter: every run so far fell back to
+  # callgrind's Ir (which is why valgrind is installed), and the measured JSON
+  # names the counter it used. M114 read the first fourteen runs: the same
+  # code counted the same within 0.01% on four runner CPUs (AMD EPYC
+  # 7763/9V74/9V45, Intel Xeon 6973P-C), so the `ci` class's ceilings were
+  # adopted from this job's own uploaded counts (`perf_gate.py ratchet --from
+  # measured.json --tolerance 0.005`) and now refuse like the reference
+  # class's do, at 0.5% (Q7).
+  #
+  # No `RUSTUP_TOOLCHAIN` and no toolchain action (M126): an instruction count
+  # is a property of the BINARY, so a new stable rustc moves every `ci` row
+  # by however much its codegen changed, and a tree nobody edited goes red
+  # on the Tuesday it ships. This leg resolves through rust-toolchain.toml
+  # like `fmt` does: the ceilings are adopted on the pinned toolchain, and a
+  # toolchain bump re-adopts them in the same commit.
   perf:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: stable
       VILAN_PERF_CLASS: ci
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Its own cache entry: a RELEASE `target/`, which no other leg builds.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -413,7 +446,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: The instruction budgets hold
         run: scripts/ci-local.sh perf
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: perf-measured

@@ -9,6 +9,7 @@
 import pkg::compare::PartialEq;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
+import pkg::iterator::Items;
 import pkg::js::native_map::NativeMap;
 
 export *;
@@ -102,6 +103,16 @@ impl HashSet<type T: Hashable> {
 /// insertion order is what iteration presents, not part of the value. Equal
 /// sizes and every member of `self` in `other` is both inclusions. Members compare
 /// by their canonical `Hash`, so this needs no bound beyond the set's own.
+/// A set is a run of its members, in insertion order (A158): `xs.push_many(set)`
+/// takes one directly.
+impl HashSet<type T: Hashable> with Items<T> {
+	fun push_onto(own self, target: &mut List<T>) {
+		for value in self.table.values() {
+			target.push(value);
+		}
+	}
+}
+
 impl HashSet<type T: Hashable> with PartialEq {
 	fun eq(self, other: HashSet<T>): bool {
 		if self.table.len() != other.table.len() {

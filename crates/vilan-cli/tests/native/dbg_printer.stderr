@@ -1,0 +1,141 @@
+[native_probe_dbg_printer.vl:38:2] point = Point { x = 1, y = -2 }
+[native_probe_dbg_printer.vl:39:2] Line { from = point, to = Point { x = 3, y = 4 }, label = "di\"ag \\ line\n" } = Line {
+  from = Point { x = 1, y = -2 },
+  to = Point { x = 3, y = 4 },
+  label = "di\"ag \\ line\n",
+}
+[native_probe_dbg_printer.vl:40:2] Shape::Circle(1.5) = Shape::Circle(1.5)
+[native_probe_dbg_printer.vl:40:2] Shape::Rect(2, 3) = Shape::Rect(2, 3)
+[native_probe_dbg_printer.vl:40:2] Shape::Empty = Shape::Empty
+[native_probe_dbg_printer.vl:43:2] Some(5) = Some(5)
+[native_probe_dbg_printer.vl:43:2] none = None
+[native_probe_dbg_printer.vl:43:2] failed = Err("no")
+[native_probe_dbg_printer.vl:44:2] (1, (2, "x")) = (1, (2, "x"))
+[native_probe_dbg_printer.vl:44:2] [[1, 2], []] = [[1, 2], []]
+[native_probe_dbg_printer.vl:44:2] Unit {} = Unit
+[native_probe_dbg_printer.vl:45:2] 3.0 = 3.0
+[native_probe_dbg_printer.vl:45:2] 0.25 = 0.25
+[native_probe_dbg_printer.vl:45:2] 0.1 + 0.2 = 0.30000000000000004
+[native_probe_dbg_printer.vl:45:2] 0.0 * -1.0 = 0.0
+[native_probe_dbg_printer.vl:45:2] 1000000.0 * 1000000.0 * 1000000.0 * 1000.0 = 1e+21
+[native_probe_dbg_printer.vl:46:2] true = true
+[native_probe_dbg_printer.vl:46:2] 7usize = 7
+[native_probe_dbg_printer.vl:46:2] 255u8 = 255
+[native_probe_dbg_printer.vl:46:2] -3 = -3
+[native_probe_dbg_printer.vl:47:2] Wrapper { inner = [Some(Shape::Circle(1.0)), None], tags = ["a", "b"] } = Wrapper {
+  inner = [Some(Shape::Circle(1.0)), None],
+  tags = ["a", "b"],
+}
+[native_probe_dbg_printer.vl:33:2] value = 3
+[native_probe_dbg_printer.vl:33:2] value = "s"
+[native_probe_dbg_printer.vl:33:2] value = Shape::Empty
+[native_probe_dbg_printer.vl:51:14] 2 * 3 = 6
+[native_probe_dbg_printer.vl:53:13] (1, 2) = (1, 2)
+[native_probe_dbg_printer.vl:53:13] "x" = "x"
+[native_probe_dbg_printer.vl:55:2]
+[native_probe_dbg_printer.vl:57:2] guard = Guard { id = 9 }
+[native_probe_dbg_printer.vl:58:13] guard = Guard { id = 9 }
+[native_probe_dbg_printer.vl:64:8] many = [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  30,
+  31,
+  32,
+  33,
+  34,
+  35,
+  36,
+  37,
+  38,
+  39,
+  40,
+  41,
+  42,
+  43,
+  44,
+  45,
+  46,
+  47,
+  48,
+  49,
+  50,
+  51,
+  52,
+  53,
+  54,
+  55,
+  56,
+  57,
+  58,
+  59,
+  60,
+  61,
+  62,
+  63,
+  64,
+  65,
+  66,
+  67,
+  68,
+  69,
+  70,
+  71,
+  72,
+  73,
+  74,
+  75,
+  76,
+  77,
+  78,
+  79,
+  80,
+  81,
+  82,
+  83,
+  84,
+  85,
+  86,
+  87,
+  88,
+  89,
+  90,
+  91,
+  92,
+  93,
+  94,
+  95,
+  96,
+  97,
+  98,
+  99,
+  … 3 more,
+]
+[native_probe_dbg_printer.vl:66:2] add = <closure |i32, i32| -> i32>

@@ -1,40 +1,42 @@
 # Consumed place reads the NATIVE emitter copied, and the ones it
-# moved at a last use (tracker F31). Regenerate with
+# moved at a last use (tracker F31); then the values a closure's
+# capture prelude copied at its creation (F50). Regenerate with
 # VILAN_REGENERATE_NATIVE_COPY_CENSUS=1 cargo test -p vilan-cli --test native_differential
-bool	1	0
-recursion	0	0
-loops	0	0
-copy-elision	0	1
-field-assignment	0	0
-for-in	0	0
-list-splice	0	0
-display	0	0
-match-ergonomics	0	1
-borrows	0	0
-generic-inference	0	4
-default-generic-param	0	1
-default	0	0
-mut-parameters	3	3
-compound-index	0	0
-interpolated-multiline-string	0	0
-derive-json	2	1
-json-roundtrip	2	12
-remainder	0	1
-numeric-types	1	6
-option-view	0	1
-dyn-objects	33	57
-usize	6	14
-usize-literals	1	6
-unsigned-saturate	0	17
-bytes-aliasing	3	7
-delta-law	22	60
-reactive-on-change	34	79
-reactive-flatten	38	88
-list-cell	68	172
-reactive-selector	13	33
-f64-print-boundary	0	0
-non-bmp-string-length	0	0
-keyword-members	1	2
-shared	0	0
-shared-compound-write	8	28
-native_probe_board	3	22
+bool	1	0	0
+recursion	0	0	0
+loops	0	0	0
+copy-elision	0	1	0
+field-assignment	0	0	0
+for-in	0	0	0
+list-splice	0	0	0
+display	0	0	0
+match-ergonomics	0	1	0
+borrows	0	0	0
+generic-inference	0	4	0
+default-generic-param	0	1	0
+default	0	0	0
+mut-parameters	3	3	0
+compound-index	0	0	0
+interpolated-multiline-string	0	0	0
+derive-json	2	1	0
+json-roundtrip	2	12	0
+remainder	0	1	0
+numeric-types	1	6	0
+option-view	0	1	0
+dyn-objects	33	57	25
+usize	6	14	0
+usize-literals	1	6	0
+unsigned-saturate	0	17	0
+bytes-aliasing	3	7	1
+delta-law	22	60	12
+reactive-on-change	34	79	22
+reactive-flatten	38	88	37
+list-cell	68	172	21
+reactive-selector	13	33	11
+f64-print-boundary	0	0	0
+f64-print-negative-zero	0	0	0
+non-bmp-string-length	0	0	0
+keyword-members	1	2	0
+shared	0	0	0
+shared-compound-write	8	28	11
+native_probe_board	3	22	4

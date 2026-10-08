@@ -93,7 +93,24 @@ fun main(): i32 {
 ```
 
 `panic(message)` aborts execution with the message; it types as `any`
-(§5.1). Failed `assert`s panic.
+(§5.1). Failed `assert`s panic. An uncaught panic reports `panicked at
+<file>:<line>:<column>: <message>`: the file relative to its package root,
+the line and the column of the call — or, inside a `[track_caller]`
+function, of the call that reached it (§7.1a). A panic that is CAUGHT
+(`std::reactive::guarded`, a task's failure) carries its message alone.
+
+**§7.1a `[track_caller]`.** A function marked `[track_caller]` takes a
+hidden trailing `std::debug::Location` parameter. Every static call passes
+its own site, or, from inside another tracking function's own body, that
+function's location, so a chain of tracking functions reports the outermost
+caller. A closure is a boundary: a closure written inside a tracking
+function reports its own sites. `std::debug::caller()` reads the location.
+The attribute is refused on a trait method (a call through a trait is
+dispatched, so no call site knows to pass a location), and a tracking
+function cannot be taken as a value. std's `panic`, `assert`, `unwrap`,
+`unwrap_err`, `expect`, `expect_err` and `List::remove`/`insert` are
+tracking, and so is every subscript: `xs[i]` out of bounds reports the
+subscript's own site.
 
 **A failing `main` terminates with a non-zero status**, whether `main`
 is sync or `async`. A panic that escapes a sync `main` aborts the

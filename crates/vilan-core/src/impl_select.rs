@@ -180,12 +180,18 @@ fn provides_trait(program: &Program, type_id: TypeId, trait_id: Id) -> bool {
     // pair. The cycle proves nothing, so it answers no, and the type's OTHER
     // providers decide: a cell with its own `Source` impl still provides it,
     // and a type with none still does not.
-    let Some(_proving) = ProvingGuard::enter(type_id, trait_id) else {
-        return false;
-    };
-    program.implementations.iter().any(|implementation| {
-        provided_trait_ids(program, implementation).contains(&trait_id)
-            && subject_applies(program, implementation.subject, type_id)
+    memoized_proof(program, ProofKey::Provides(type_id, trait_id), || {
+        let Some(_proving) = ProvingGuard::enter(type_id, trait_id) else {
+            return false;
+        };
+        // M111: only the impls that PROVIDE the trait are asked, in declaration
+        // order — the scan this replaces walked every impl and rebuilt its
+        // supertrait closure each time, and skipped the same ones.
+        program
+            .selection_memos()
+            .providers_of(program, trait_id)
+            .iter()
+            .any(|index| subject_applies(program, program.implementations[*index].subject, type_id))
     })
 }
 
@@ -195,6 +201,10 @@ thread_local! {
     /// reaches itself is seen as the cycle it is.
     static PROVING: std::cell::RefCell<Vec<(TypeId, Id)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The LOWEST position on [`PROVING`] a cycle was cut at since the
+    /// innermost [`memoized_proof`] began (`usize::MAX`: none) — what tells a
+    /// proof that leaned on an ANCESTOR's assumption from one that did not.
+    static LOWEST_CUT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 /// One `(type, trait)` question held open on [`PROVING`] for as long as the
@@ -205,13 +215,64 @@ impl ProvingGuard {
     fn enter(type_id: TypeId, trait_id: Id) -> Option<ProvingGuard> {
         PROVING.with(|proving| {
             let mut proving = proving.borrow_mut();
-            if proving.contains(&(type_id, trait_id)) {
+            if let Some(position) = proving.iter().position(|open| *open == (type_id, trait_id)) {
+                LOWEST_CUT.with(|lowest| lowest.set(lowest.get().min(position)));
                 return None;
             }
             proving.push((type_id, trait_id));
             Some(ProvingGuard)
         })
     }
+}
+
+/// A question [`memoized_proof`] answers once per program.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum ProofKey {
+    /// [`subject_applies`]`(subject, target)`.
+    Applies(TypeId, TypeId),
+    /// [`provides_trait`]`(type, trait)`.
+    Provides(TypeId, Id),
+}
+
+/// M111: [`subject_applies`] and [`provides_trait`] answered once per program
+/// and question, where every emitted member call re-proved them — kolt's
+/// emission walk asked ~870k `subject_applies` for a few thousand distinct
+/// questions, and the selection was a third of its whole check.
+///
+/// The two are a POSITIVE system (an `any` over providers of an `all` over
+/// bounds, nothing negated), and the cycle cut in [`ProvingGuard`] answers a
+/// question that reaches itself NO — so a question asked with nothing open
+/// (every caller outside this pair) is answered exactly by its least fixpoint,
+/// and a question asked INSIDE a proof may come out no only because an
+/// ancestor's assumption cut it. What is stored is therefore exactly what is
+/// true of the question on its own:
+///
+/// - a YES always: a proof found under cuts is a proof without them;
+/// - a NO only when no cut inside it reached below the question — a cut at
+///   the question itself or above it is the question's own cycle, which its
+///   least fixpoint answers no as well;
+/// - nothing computed while a [`crate::util::RecursionGuard`] refused, which
+///   is an answer truncated by where the walk began.
+///
+/// Serving those answers inside another proof changes no answer read outside
+/// one: the outermost question is a monotone combination of its parts,
+/// bounded above by its least fixpoint and below by the uncached walk, which
+/// already reached it. The cyclic shapes keep their answers under the pins
+/// `inference::bounds::a_supertrait_that_is_its_blankets_own_bound_does_not_overflow`
+/// and `a_blankets_subject_bound_provides_its_supertraits_members`.
+fn memoized_proof(program: &Program, key: ProofKey, prove: impl FnOnce() -> bool) -> bool {
+    if let Some(answer) = program.selection_memos().proof(key) {
+        return answer;
+    }
+    let start = PROVING.with(|proving| proving.borrow().len());
+    let outer_cut = LOWEST_CUT.with(|lowest| lowest.replace(usize::MAX));
+    let trips = crate::util::RecursionGuard::trips();
+    let answer = prove();
+    let inner_cut = LOWEST_CUT.with(|lowest| lowest.replace(outer_cut.min(lowest.get())));
+    if (answer || inner_cut >= start) && crate::util::RecursionGuard::trips() == trips {
+        program.selection_memos().store_proof(key, answer);
+    }
+    answer
 }
 
 impl Drop for ProvingGuard {
@@ -256,6 +317,14 @@ pub fn subject_applies(program: &Program, subject: TypeId, target: TypeId) -> bo
     if !subject_shape_matches(program, subject, target) {
         return false;
     }
+    memoized_proof(program, ProofKey::Applies(subject, target), || {
+        subject_bounds_hold(program, subject, target)
+    })
+}
+
+/// [`subject_applies`] past its shape test: every binder's bounds hold for
+/// the type that position binds.
+fn subject_bounds_hold(program: &Program, subject: TypeId, target: TypeId) -> bool {
     let mut bindings = HashMap::default();
     bind_subject(program, subject, target, &mut bindings);
     bindings.iter().all(|(constraint_id, bound_type)| {
@@ -914,7 +983,33 @@ fn provided_trait_arguments_matching(
 
 /// Every applying provider of `trait_id` for `concrete`, with the arguments it
 /// provides grounded from the receiver, in declaration order.
+///
+/// Memoized per program (M111) on `(concrete, trait)`: nothing here reads
+/// [`PROVING`] (no caller is inside a proof — asserted), so the answer is a
+/// function of the two ids, stored unless a depth guard truncated it.
 fn provided_trait_argument_sets(
+    program: &Program,
+    concrete: TypeId,
+    trait_id: Id,
+) -> Vec<(TypeId, Vec<TypeId>)> {
+    debug_assert!(
+        PROVING.with(|proving| proving.borrow().is_empty()),
+        "provided_trait_argument_sets is never asked inside a provides_trait proof"
+    );
+    if let Some(providers) = program.selection_memos().argument_sets(concrete, trait_id) {
+        return providers;
+    }
+    let trips = crate::util::RecursionGuard::trips();
+    let providers = provided_trait_argument_sets_uncached(program, concrete, trait_id);
+    if crate::util::RecursionGuard::trips() == trips {
+        program
+            .selection_memos()
+            .store_argument_sets(concrete, trait_id, providers.clone());
+    }
+    providers
+}
+
+fn provided_trait_argument_sets_uncached(
     program: &Program,
     concrete: TypeId,
     trait_id: Id,
@@ -1063,24 +1158,29 @@ pub fn applying_implementations<'a, 'src>(
     if !is_resolvable(concrete_type) {
         return Vec::new();
     }
+    // A question naming a trait AT ARGUMENTS grounds the impl's written
+    // arguments through the concrete id's own argument ids, so it is keyed by
+    // the ids themselves (M111: those were never memoized, and they are every
+    // bound-directed call the emission walk makes).
     let key = match wanted {
-        None => Some((file, concrete_type.clone(), None)),
+        None => ApplyingKey::ByType(file, concrete_type.clone(), None),
         Some(wanted) if wanted.arguments.is_empty() => {
-            Some((file, concrete_type.clone(), Some(wanted.trait_id)))
+            ApplyingKey::ByType(file, concrete_type.clone(), Some(wanted.trait_id))
         }
-        Some(_) => None,
+        Some(wanted) => {
+            ApplyingKey::AtArguments(file, concrete, wanted.trait_id, wanted.arguments.to_vec())
+        }
     };
-    if let Some(key) = &key
-        && let Some(indices) = program.applying_memo().get(key)
-    {
+    if let Some(indices) = program.selection_memos().applying(&key) {
         return indices
             .iter()
             .map(|index| &program.implementations[*index])
             .collect();
     }
-    APPLYING_COMPUTED.with(|count| count.set(count.get() + 1));
+    count_computed_selection();
+    let trips = crate::util::RecursionGuard::trips();
     let applying = applying_implementations_uncached(program, file, concrete, wanted);
-    if let Some(key) = key {
+    if crate::util::RecursionGuard::trips() == trips {
         let indices = applying
             .iter()
             .map(|implementation| {
@@ -1091,20 +1191,137 @@ pub fn applying_implementations<'a, 'src>(
                     .expect("an applying implementation is one of the program's")
             })
             .collect();
-        program.applying_memo().insert(key, indices);
+        program.selection_memos().store_applying(key, indices);
     }
     applying
 }
 
-/// The key [`applying_implementations`]' memo reads: (file, resolved concrete
-/// type, the wanted trait when it names no arguments).
-pub(crate) type ApplyingKey = (Option<SourceId>, Type, Option<Id>);
+/// The key [`applying_implementations`]' memo reads.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum ApplyingKey {
+    /// (file, resolved concrete type, the wanted trait when it names no
+    /// arguments) — a function of the TYPE, so two ids of one type share it.
+    ByType(Option<SourceId>, Type, Option<Id>),
+    /// (file, concrete id, wanted trait, its arguments' ids).
+    AtArguments(Option<SourceId>, TypeId, Id, Vec<TypeId>),
+}
+
+/// The selection answers a [`Program`] carries — derived data, like its call
+/// graph, filled on first ask and never invalidated: the impls, the admission
+/// map and the type slots are settled before anything here is asked.
+#[derive(Default)]
+pub struct SelectionMemos {
+    /// [`applying_implementations`]' answers, as indices into
+    /// `implementations` (M98, M111).
+    applying: std::sync::Mutex<HashMap<ApplyingKey, Vec<usize>>>,
+    /// [`memoized_proof`]'s answers.
+    proofs: std::sync::Mutex<HashMap<ProofKey, bool>>,
+    /// [`provided_trait_argument_sets`]' answers.
+    argument_sets: std::sync::Mutex<HashMap<(TypeId, Id), Vec<(TypeId, Vec<TypeId>)>>>,
+    /// Per trait, the impls whose `with` clause provides it or a subtrait of
+    /// it ([`provided_trait_ids`]), in declaration order.
+    providers: std::sync::OnceLock<HashMap<Id, Vec<usize>>>,
+}
+
+impl std::fmt::Debug for SelectionMemos {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SelectionMemos")
+    }
+}
+
+/// A lock read through poisoning: every value behind these is a finished
+/// answer, so a panic elsewhere cannot have left one half-written.
+fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl SelectionMemos {
+    fn applying(&self, key: &ApplyingKey) -> Option<Vec<usize>> {
+        locked(&self.applying).get(key).cloned()
+    }
+
+    fn store_applying(&self, key: ApplyingKey, indices: Vec<usize>) {
+        locked(&self.applying).insert(key, indices);
+    }
+
+    fn proof(&self, key: ProofKey) -> Option<bool> {
+        locked(&self.proofs).get(&key).copied()
+    }
+
+    fn store_proof(&self, key: ProofKey, answer: bool) {
+        locked(&self.proofs).insert(key, answer);
+    }
+
+    fn argument_sets(&self, concrete: TypeId, trait_id: Id) -> Option<Vec<(TypeId, Vec<TypeId>)>> {
+        locked(&self.argument_sets)
+            .get(&(concrete, trait_id))
+            .cloned()
+    }
+
+    fn store_argument_sets(
+        &self,
+        concrete: TypeId,
+        trait_id: Id,
+        providers: Vec<(TypeId, Vec<TypeId>)>,
+    ) {
+        locked(&self.argument_sets).insert((concrete, trait_id), providers);
+    }
+
+    fn providers_of(&self, program: &Program, trait_id: Id) -> &[usize] {
+        self.providers
+            .get_or_init(|| {
+                let mut providers: HashMap<Id, Vec<usize>> = HashMap::default();
+                for (index, implementation) in program.implementations.iter().enumerate() {
+                    for provided in provided_trait_ids(program, implementation) {
+                        providers.entry(provided).or_default().push(index);
+                    }
+                }
+                providers
+            })
+            .get(&trait_id)
+            .map_or(&[], Vec::as_slice)
+    }
+}
 
 thread_local! {
     /// How many selections [`applying_implementations`] has COMPUTED on this
     /// thread since [`reset_applying_computed`], as against served from its
     /// per-program memo (M98) — the only thing that can see the memo work.
     static APPLYING_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The declaration a computed selection is charged to in a
+    /// `--explain-cost` report (M118): the function whose body is being
+    /// emitted, set by the emitter around each body. `None` outside one.
+    static SELECTION_OWNER: std::cell::Cell<Option<Id>> = const { std::cell::Cell::new(None) };
+    /// The computed selections charged per declaration since
+    /// [`take_selection_costs`] — `None` collects the ones made outside any
+    /// declaration's body (the post-passes' program-wide scans).
+    static SELECTION_COSTS: std::cell::RefCell<HashMap<Option<Id>, u64>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// Charges this thread's computed selections to `owner` until the next call,
+/// returning the owner it replaces so a nested body can restore it. A no-op
+/// beyond the swap unless a cost report was asked for.
+pub fn set_selection_owner(owner: Option<Id>) -> Option<Id> {
+    SELECTION_OWNER.with(|current| current.replace(owner))
+}
+
+/// The selections computed per declaration since the last call (M118: the
+/// `selections` column of `--explain-cost`, which the solver's per-constraint
+/// attribution cannot see — implementation selection happens after the
+/// fixpoint, in the post-passes and the emission walk).
+pub fn take_selection_costs() -> HashMap<Option<Id>, u64> {
+    SELECTION_COSTS.with(|costs| std::mem::take(&mut *costs.borrow_mut()))
+}
+
+fn count_computed_selection() {
+    APPLYING_COMPUTED.with(|count| count.set(count.get() + 1));
+    if crate::counters::cost_report_limit().is_some() {
+        let owner = SELECTION_OWNER.with(std::cell::Cell::get);
+        SELECTION_COSTS.with(|costs| *costs.borrow_mut().entry(owner).or_default() += 1);
+    }
 }
 
 /// The number of selections [`applying_implementations`] computed rather than

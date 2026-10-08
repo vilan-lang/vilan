@@ -2205,6 +2205,12 @@ impl<'a> Interpreter<'a> {
                     Err(message) => Err(Failure::new(FailureKind::Thrown, message)),
                 }
             }
+            // `__panic(message, location)` (debugging.md S0) builds the value a
+            // `throw` raises. At compile time the location is the build's
+            // business, not the message's: a const failure reads "const
+            // evaluation failed in `f`: <message>", anchored by its own span,
+            // so the thrown value is the message alone.
+            "__panic" => Ok(take(0)),
             // The checked subscripts, matching the emitted `__at*` helpers: an
             // out-of-bounds index is a panic (`Thrown`), so a macro-time
             // violation fails the expansion with the same message a runtime

@@ -168,7 +168,7 @@ so `bind_value`/`bind_draft` are built on this — and a hand-written input
 handler should be too:
 
 ```vilan,fragment
-view("input").on_event("input", |event| query.set(event.target_value()))
+<input on:input(|event| query.set(event.target_value())) />
 ```
 
 **Measurement is a value, and it forces layout.** `bounding_rect` returns a
@@ -320,7 +320,11 @@ submenu opened from inside a menu mounts beside its parent's panel, not inside
 it. std holds the stack, the guard belongs to whichever `Contain` scope is
 topmost at event time, and a scope pops when the owner that installed it is
 disposed — restoring focus to whatever held it before, if focus is still inside
-the scope and the remembered element is still in the document.
+the scope and the remembered element is still in the document. "Before" means
+before the scope's CONTENT took focus, too: a panel whose content was built
+first, and whose `autofocus` therefore ran before the scope was installed,
+gives focus back to the element `autofocus` took it from (the opener), not to
+the field inside the panel.
 
 `FocusScope::on_leave(handler: |Element| void)` hears focus LEAVING the scope,
 from a capture-phase `focusout`: the handler runs with `relatedTarget` — the
@@ -357,11 +361,12 @@ The `View` methods these replaced — `when`, `swap`, `swap_split`, `bind_each`,
 `parent.child(swap(s, r))` or `{swap(s, r)}` in a child hole:
 
 ```vilan,fragment
-view("ul")
-	.child(view("li").text("Header"))
-	.child(each_values(items, |item: str| view("li").text(item)))
-	.child(when(more, || view("li").text("and more")))
-	.child(view("li").text("Footer"))
+<ul>
+	<li>"Header"</li>
+	{each_values(items, |item: str| <li>{item}</li>)}
+	{when(more, || <li>"and more"</li>)}
+	<li>"Footer"</li>
+</ul>
 ```
 
 The run is named `each` rather than `bind_each`: the `bind_` prefix means "one
@@ -393,10 +398,12 @@ the list once, so it has no change to follow).
 value form, and the run owns whatever the child placed:
 
 ```vilan,fragment
-view("ul").child(each_values(items, |item: str| [
-	view("li").text(item),
-	view("li").class("sep"),
-]))
+<ul>
+	{each_values(items, |item: str| <>
+		<li>{item}</li>
+		<li class("sep") />
+	</>)}
+</ul>
 ```
 
 The reconciler moves and removes a row by its SPAN — an empty text marker is

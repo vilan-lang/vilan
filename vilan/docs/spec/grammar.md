@@ -83,7 +83,8 @@ export      = { lead-attribute }   (* the item's own prefix, in THE order below 
               statement   (* §4.8 *)
             | "export" "*" ";" ;          (* the whole-module marker *)
 lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
-               | resource-attr | extern-attr | "[" "must_use" "]" | "[" "rpc" "]"
+               | resource-attr | extern-attr | "[" "must_use" "]"
+               | "[" "track_caller" "]" | "[" "rpc" "]"
                | "[" "trait_only" "]" | derive-attr | service-attr
                | client-service-attr | macro-attr ;
 ```
@@ -122,7 +123,8 @@ each on its own line:
    macro attribute (among themselves, as written);
 2. the labels — `[deprecated(..)]`, then `[internal(..)]`, then `[hint(..)]`;
 3. the binding — `[extern(..)]`;
-4. the checks — `[must_use]`, then `[rpc]`, then `[trait_only]`;
+4. the checks — `[must_use]`, then `[track_caller]`, then `[rpc]`, then
+   `[trait_only]`;
 5. the fence — `[platform(..)]`;
 6. the class — `[resource]`.
 
@@ -133,9 +135,9 @@ fun` (B524). A head written in another order is read exactly as if written
 in this one, and reported:
 
 - **attributes out of rank**, and nothing else out of order —
-  `[internal("why")]` ⏎ `[deprecated("use g")]` ⏎ `fun` — a **warning**
-  that names the head in the order (`` write `[deprecated(..)] [internal(..)]
-  fun` ``);
+  `[internal("why")]` ⏎ `[deprecated("use g")]` ⏎ `fun` — an **error** that
+  names the head in the order (`` write `[deprecated(..)] [internal(..)]
+  fun` ``): a warning in v0.44.0, refused from v0.45.0 (B536);
 - **a keyword ahead of an attribute, or two keywords inverted** — `async
   [platform("node")] fun`, `external async fun`, `lazy export let`, `macro
   async fun` — an **error**, with the head respelled in the order. That
@@ -199,8 +201,8 @@ together and leave a trailing separator where it was.
 ```text
 function = [ "[" "deprecated" "(" STRING ")" "]" ]
            [ "[" "internal" "(" STRING ")" "]" ]
-           [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "rpc" "]" ]
-           [ "[" "trait_only" "]" ]
+           [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "track_caller" "]" ]
+           [ "[" "rpc" "]" ] [ "[" "trait_only" "]" ]
            [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
            [ "async" ] [ "external" ]
            "fun" MEMBER [ generic-params ]   (* IDENT unless an impl/trait member *)
@@ -309,7 +311,7 @@ semantic-token modifier) and leads its hover with the steer.
 `[internal("reason")]` follows it, and answers a different question.
 Visibility says whether a module may **name** an item; this says whether
 a reader should **reach for** one that is named — an item exported on
-purpose and dangerous on purpose, like `std::web::ui`'s `Region.anchor`,
+purpose and dangerous on purpose, like `std::web::ui`'s `Region::cut_row`,
 which `each` and a hand-written `Slot` legitimately need and which
 corrupts the reconciler's view when a row is moved through it without
 `hold_rows`. The one argument is the reason, and it is required: it is
@@ -324,6 +326,16 @@ declaration itself, carries a semantic-token `internal` modifier that a
 theme dims; hover leads with the reason. A **field** is the case
 declaration visibility cannot serve at all, since vilan has no per-field
 visibility, and it is the case the attribute was asked for.
+
+One reach is refused, and it is std's: a field **std** labels
+`[internal(..)]` is not a member outside std (A149 S4). It is std's
+machinery — a store handle's slot tree and path, a region's end marker —
+and as a member it would shadow what a reader writes: field syntax on a
+store handle reads the handled struct's fields (`app.user.name`), and a
+`path` there must be the struct's `path`, not the handle's. Reading one is
+refused with the reason; what a program legitimately needs is a method
+(`Region::end`). A field a package labels in its own code stays a member
+everywhere, as above.
 
 The same label rides every other declaration a reader may be steered
 away from: a **struct**, an **enum**, one enum **variant**, a **trait**
@@ -507,8 +519,8 @@ macro-block      = "macro" block ;
 A macro attribute's arguments are captured as **source spans**: the
 macro receives their text, not their values (§10). The built-in
 attribute names (`derive`, `service`, `client_service`, `extern`,
-`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
-`deprecated`, `internal`, `resource`, `hint`, `reactive`) are not
+`must_use`, `track_caller`, `rpc`, `trait_only`, `doc`, `expose`,
+`platform`, `deprecated`, `internal`, `resource`, `hint`, `reactive`) are not
 available as user macro-attribute names.
 
 `[reactive(..)]` is a field's store knobs, read by `[derive(Storable)]`

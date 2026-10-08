@@ -14,7 +14,7 @@ function default5() {
 	return [ default4(), default2(), default3() ];
 }
 const d = default5();
-console.log(d[0]);
+console.log(String(d[0]));
 console.log(d[1]);
 console.log(d[2]);
 const d2 = default5();

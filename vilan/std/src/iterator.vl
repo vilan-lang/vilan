@@ -350,6 +350,23 @@ impl Chained<type I: Iterator<T>, type J: Iterator<T>, type T> with Iterator<T> 
 	}
 }
 
+/// A run of items, in order — what `List::push_many` (and a sequence cell's)
+/// takes: a `List<T>`, a `HashSet<T>`, or any `Iterator<T>`, the runs `for` walks
+/// (A158). `push_onto` appends every item to `target`, in order, consuming the
+/// run; an implementor is a run of `T`s it can hand over one at a time.
+trait Items<T> {
+	fun push_onto(own self, target: &mut List<T>);
+}
+
+/// Every iterator is a run of its items.
+impl type I: Iterator<type T> with Items<T> {
+	fun push_onto(own self, target: &mut List<T>) {
+		for item in self {
+			target.push(item);
+		}
+	}
+}
+
 trait Iterable<T> {
 	fun iter(self): Self;
 }

@@ -10114,10 +10114,8 @@ fn b249_a_trait_parameter_takes_the_impls_argument() {
     assert_fails_with(flow, "missing 'start'; declare `fun start(");
     assert_fails_with(flow, "): Instance<i32>`");
     assert_fails_without(flow, "Instance<T>");
-    // `T` inside a closure parameter, substituted the same way. (The clause
-    // `context tracking` on it is not rendered for a program's own trait, where
-    // std's `Flow::on_change` rendered it — filed by reactive-46; this pin holds
-    // the substitution only.)
+    // `T` inside a closure parameter, substituted the same way — and its
+    // `context tracking` clause kept (E262, pinned on its own below).
     let clause = r#"
         import std::reactive::{ Subscription, tracking };
         trait Watched<T> {
@@ -10128,8 +10126,45 @@ fn b249_a_trait_parameter_takes_the_impls_argument() {
         fun main() {}
         "#;
     assert_fails_with(clause, "missing 'watch'; declare `fun watch(");
-    assert_fails_with(clause, "observer: |i32| void");
+    assert_fails_with(clause, "observer: (|i32| void) context tracking");
     assert_fails_without(clause, "|T| void");
+}
+
+/// E262: the "declare `fun ..`" steer keeps a callback parameter's `context`
+/// clause for a program's OWN trait, as it always did for std's. The clause is
+/// part of the parameter's closure TYPE (B309), and the program's clauses were
+/// resolved into their types only after conformance had run — so the steer
+/// printed the type without it, and the copied line declared a different
+/// member. With and without a substitution, nested in another type, and with
+/// two contexts.
+#[test]
+fn e262_the_declare_steer_keeps_a_callbacks_context_clause() {
+    let plain = r#"
+        import std::reactive::{ Subscription, tracking };
+        trait Plain {
+            fun watch(own self, observer: (|i32| void) context tracking): Subscription;
+        }
+        struct Box { n: i32 }
+        impl Box with Plain { }
+        fun main() {}
+        "#;
+    assert_fails_with(
+        plain,
+        "declare `fun watch(own self, observer: (|i32| void) context tracking): Subscription`",
+    );
+    let nested = r#"
+        import std::reactive::{ Subscription, owner_scope, tracking };
+        trait Many<T> {
+            fun watch(own self, observers: List<(|T| void) context (owner_scope, tracking)>): Subscription;
+        }
+        struct Box { n: i32 }
+        impl Box with Many<str> { }
+        fun main() {}
+        "#;
+    assert_fails_with(
+        nested,
+        "observers: List<(|str| void) context (owner_scope, tracking)>",
+    );
 }
 
 #[test]
@@ -10817,12 +10852,13 @@ fn a_supertrait_member_called_through_a_bound_reaches_only_its_implementors() {
     );
 }
 
-/// B536: attributes out of THE order are a WARNING of the analysis the
+/// B536: attributes out of THE order are refused by the analysis the
 /// language server and the harnesses run (`analyze_source`), spanning the
-/// head's run — and only a warning: the analysis is otherwise clean.
+/// head's run — since v0.45.0; a WARNING for one release.
 #[test]
-fn b536_an_attribute_order_warning_rides_the_analysis() {
-    assert_warns_spanning(
+fn b536_an_attribute_order_refusal_rides_the_analysis() {
+    // Refused since v0.45.0 (B536's flip, R-c); a warning for one release.
+    assert_fails_spanning(
         "[must_use] [deprecated(\"use b\")]\nfun answer(): i32 {\n\t42\n}\n\nfun main() {\n\tif answer() > 0 {}\n}\n",
         "[must_use] [deprecated(\"use b\")]",
         "a declaration's attributes are written in one order",

@@ -33,8 +33,24 @@ use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
 /// the author can change. The suggestion to annotate is a later slice; this
 /// one is the numbers.
 fn print_cost_report(program: &Program, platform: Platform, limit: usize) {
-    let own: Vec<&vilan_core::analyzer::ItemCost> = program
-        .item_costs
+    // M118: the selections the post-passes and the emission walk computed,
+    // charged to the declaration whose body asked (module-level code and the
+    // program-wide scans to `<module level>`) — the solver's per-constraint
+    // attribution ends at the fixpoint, before any of them is made, so the
+    // column read 0 for every declaration.
+    let mut selections = vilan_core::impl_select::take_selection_costs();
+    let mut costs: Vec<vilan_core::analyzer::ItemCost> = program.item_costs.clone();
+    for cost in &mut costs {
+        cost.work.selections += selections.remove(&cost.owner).unwrap_or(0);
+    }
+    costs.sort_by(|left, right| {
+        right
+            .work
+            .total()
+            .cmp(&left.work.total())
+            .then_with(|| left.owner.map(|id| id.0).cmp(&right.owner.map(|id| id.0)))
+    });
+    let own: Vec<&vilan_core::analyzer::ItemCost> = costs
         .iter()
         .filter(|cost| {
             cost.source
@@ -7024,6 +7040,10 @@ fn compile_to_js(
             platform,
             &vilan_core::options::BuildOptions::default(),
         );
+        // debugging.md §3.3 (Q4): a release build refuses a `dbg(..)` it was
+        // not told to keep or strip. It reads the BUILD's options, which the
+        // shared passes above deliberately do not.
+        vilan_core::track_caller::refuse_release_dbg(&mut program, options);
 
         // Every file `const asset::read` touched is a build input: hand the
         // set to the watcher so a change to one — or the appearance of one
@@ -7257,6 +7277,7 @@ fn compile_to_js(
                         native::record_copy_census(
                             emitted.consumed_copies,
                             emitted.consumed_copies_elided,
+                            emitted.capture_copies,
                         );
                         native::record_host_gaps(emitted.host_gaps);
                         native::record_optional_crates(emitted.optional_crates);

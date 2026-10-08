@@ -1,6 +1,6 @@
-function __at(list, index) {
+function __at(list, index, location) {
 	if (index >= 0 && index < list.length) return list[index];
-	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
 }
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
@@ -11,22 +11,14 @@ function __clone(value) {
 function __list_sort_by(list, compare) {
 	return list.slice().sort(compare);
 }
-function compare(self, b) {
-	let $f = null;
-	if (self < b) {
-		$f = -1;
-	} else {
-		let $g = null;
-		if (self > b) {
-			$g = 1;
-		} else {
-			$g = 0;
-		}
-		$f = $g;
-	}
-	return $f;
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
-function compare2(self, b) {
+function compare(self, b) {
 	let $c = null;
 	if (self < b) {
 		$c = -1;
@@ -41,52 +33,67 @@ function compare2(self, b) {
 	}
 	return $c;
 }
-function $a(self) {
+function compare2(self, b) {
+	let $a = null;
+	if (self < b) {
+		$a = -1;
+	} else {
+		let $b = null;
+		if (self > b) {
+			$b = 1;
+		} else {
+			$b = 0;
+		}
+		$a = $b;
+	}
+	return $a;
+}
+function reverse(self) {
 	let result = [  ];
 	let index = self.length;
 	while (index > 0) {
 		index = index - 1;
-		result.push(__clone(__at(self, index)));
+		result.push(__clone(__at(self, index, "std/src/list.vl:98:16")));
 	}
 	return result;
 }
-function $b(self) {
+function sort(self) {
 	return __list_sort_by(__clone(self), (a, b) => {
 		return compare2(a, b);
 	});
 }
-function $e(self) {
+function sort2(self) {
 	return __list_sort_by(__clone(self), (a, b) => {
 		return compare(a, b);
 	});
 }
 const xs = [ 3, 1, 2 ];
-console.log(__at($a(xs), 0));
-console.log(__at($a(xs), 2));
-console.log(__at($b(xs), 0));
-console.log(__at($b(xs), 2));
-console.log(__at(xs, 0));
-const numeric = $b([ 10, 2, 1 ]);
-console.log(__at(numeric, 0));
-console.log(__at(numeric, 2));
-const words = $e([ "pear", "apple", "fig" ]);
-console.log(__at(words, 0));
+console.log(String(__at(reverse(xs), 0, "list-sort.vl:11:8")));
+console.log(String(__at(reverse(xs), 2, "list-sort.vl:12:8")));
+console.log(String(__at(sort(xs), 0, "list-sort.vl:13:8")));
+console.log(String(__at(sort(xs), 2, "list-sort.vl:14:8")));
+console.log(String(__at(xs, 0, "list-sort.vl:15:8")));
+const numeric = sort([ 10, 2, 1 ]);
+console.log(String(__at(numeric, 0, "list-sort.vl:20:8")));
+console.log(String(__at(numeric, 2, "list-sort.vl:21:8")));
+const words = sort2([ "pear", "apple", "fig" ]);
+console.log(__at(words, 0, "list-sort.vl:24:8"));
 const descending = __list_sort_by(xs, (a, b) => {
-	let $h = null;
+	let $e = null;
 	if (a > b) {
-		$h = -1;
+		$e = -1;
 	} else {
-		let $i = null;
+		let $f = null;
 		if (a < b) {
-			$i = 1;
+			$f = 1;
 		} else {
-			$i = 0;
+			$f = 0;
 		}
-		$h = $i;
+		$e = $f;
 	}
-	return $h;
+	return $e;
 });
-console.log(__at(descending, 0));
+console.log(String(__at(descending, 0, "list-sort.vl:37:8")));
 let entries = [  ];
 entries.push([ 1, "a" ]);
 entries.push([ 0, "b" ]);

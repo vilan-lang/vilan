@@ -10,7 +10,7 @@ spacing scale, color ramps), except the pieces are typed function calls,
 so a typo is a compile error instead of a silently-ignored class.
 
 ```vilan,browser
-import std::web::ui::{ view, View, mount_root };
+import std::web::ui::{ View, mount_root };
 import std::web::style::{ style, space, Style, Color, Length, Display, FlexDirection };
 
 let card = const style()
@@ -23,7 +23,9 @@ let card = const style()
 
 fun main() {
 	let _root = mount_root("app", || {
-		view("div").styled(card).child(view("p").text("hello"))
+		<div .styled(card)>
+			<p>"hello"</p>
+		</div>
 	});
 }
 ```
@@ -35,7 +37,8 @@ fun main() {
 - Styles are built inside `const`, the compile-time evaluation
   prefix (see [Macros & const](../tour/macros-and-const.md)). The rules
   are emitted during the build.
-- `view.styled(card)` puts the style's classes on the element.
+- `.styled(card)` in an element's head (the `View` method `styled`)
+  puts the style's classes on the element.
 - There is **no reset unless you ask for one**. Browser defaults are in
   force, so `body` keeps its 8px margin and
   `width(px(200)).padding(space(4))` measures 232px, not 200. Add
@@ -58,7 +61,7 @@ Here is one style written both ways, in one program. `card` and
 beside the chain, it becomes the chain.
 
 ```vilan,browser
-import std::web::ui::{ view, View, mount_root };
+import std::web::ui::{ View, mount_root };
 import std::web::style::{ style, space, Style, Color };
 
 let card = css {
@@ -80,7 +83,9 @@ let card_as_a_chain = const style()
 
 fun main() {
 	let _root = mount_root("app", || {
-		view("div").styled(card).child(view("p").text("hello"))
+		<div .styled(card)>
+			<p>"hello"</p>
+		</div>
 	});
 }
 ```
@@ -394,7 +399,7 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   `Display::parse(text)` goes the other way, `None` outside the set.
 
 ```vilan,browser
-import std::web::ui::{ view, View, mount_root };
+import std::web::ui::{ View, mount_root };
 import std::web::style::{ style, space, Style, Color, Gradient, Length, RadialExtent };
 
 let hero = const style()
@@ -417,7 +422,9 @@ let glow = const style().background_gradient(
 
 fun main() {
 	let _root = mount_root("app", || {
-		view("div").styled(hero).child(view("div").styled(glow))
+		<div .styled(hero)>
+			<div .styled(glow) />
+		</div>
 	});
 }
 ```
@@ -649,7 +656,7 @@ properties. The style declares a variable, and the element binds the
 variable to a signal with `style_var`:
 
 ```vilan,browser
-import std::web::ui::{ view, View, mount_root };
+import std::web::ui::{ View, mount_root };
 import std::web::style::{ style, Style, Length, Color };
 import std::reactive::Signal;
 
@@ -661,7 +668,7 @@ let bar = const style()
 fun main() {
 	let progress = Signal::new("40%");
 	let _root = mount_root("app", || {
-		view("div").styled(bar).style_var("--progress", progress)
+		<div .styled(bar) .style_var("--progress", progress) />
 	});
 }
 ```
@@ -678,7 +685,7 @@ pile as a chain — `self + delta` when the condition holds, `self`
 untouched when it doesn't:
 
 ```vilan,browser
-import std::web::ui::{ view, View, mount_root };
+import std::web::ui::{ View, mount_root };
 import std::web::style::{ style, space, Style, Color };
 
 let base = const style().padding(space(2)).color(Color::gray(900));
@@ -686,11 +693,11 @@ let chosen = const style().background(Color::blue(100)).color(Color::blue(900));
 let muted = const style().color(Color::gray(400));
 
 fun row(is_chosen: bool, is_muted: bool): View {
-	view("li").styled(base.when(is_chosen, chosen).when(is_muted, muted))
+	<li .styled(base.when(is_chosen, chosen).when(is_muted, muted)) />
 }
 
 fun main() {
-	let _root = mount_root("app", || view("ul").child(row(true, false)));
+	let _root = mount_root("app", || <ul>{row(true, false)}</ul>);
 }
 ```
 
@@ -714,7 +721,7 @@ the style in a signal and bind it. `bind_styled` is to `styled` what
 `bind_class` is to `class`:
 
 ```vilan,browser
-import std::web::ui::{ view, View, mount_root };
+import std::web::ui::{ View, mount_root };
 import std::web::style::{ style, space, Style, Color };
 import std::reactive::Signal;
 
@@ -724,9 +731,9 @@ let busy = const style().padding(space(2)).background(Color::blue(600));
 fun main() {
 	let state = Signal::new(idle);
 	let _root = mount_root("app", || {
-		view("div")
-			.bind_styled(state)
-			.child(view("button").text("start").on("click", || state.set(busy)))
+		<div .bind_styled(state)>
+			<button on:click(|| state.set(busy))>"start"</button>
+		</div>
 	});
 }
 ```

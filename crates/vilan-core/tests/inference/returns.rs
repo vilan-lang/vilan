@@ -5822,3 +5822,39 @@ fn b523_an_unbound_return_is_steered_to_ret() {
         "4\n",
     );
 }
+
+/// B537 (door (b)): `return (y);` and `return -x;` as a value body's last
+/// STATEMENT carry B523's steer and nothing else. "Expected i32, but got void
+/// instead: this body ends without producing a value" was true of what was
+/// written and only repeated the steer (B520 avoided the same cascade for
+/// `return value;` by rewriting the token). A body whose last statement is
+/// anything else still says it, and so does one whose unbound `return` is not
+/// the last statement.
+#[test]
+fn b537_a_statement_over_an_unbound_return_carries_the_steer_alone() {
+    use vilan_core::parsing::ForeignSpelling;
+    let steer = ForeignSpelling::Return.message();
+    for body in [
+        "\treturn (y);\n",
+        "\treturn -y;\n",
+        "\tlet z = y;\n\treturn (z);\n",
+    ] {
+        let source = format!(
+            "import std::io::print;\n\nfun f(y: i32): i32 {{\n{body}}}\n\nfun main() {{\n\tprint(f(1));\n}}\n"
+        );
+        let diagnostics = failure_diagnostics(&source);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|(message, _)| message.as_str())
+                .collect::<Vec<_>>(),
+            vec![steer],
+            "{source}"
+        );
+    }
+    // Not the last statement: the body still ends without a value.
+    assert_fails_with(
+        "import std::io::print;\n\nfun f(y: i32): i32 {\n\treturn (y);\n\tprint(y);\n}\n\nfun main() {\n\tprint(f(1));\n}\n",
+        "this body ends without producing a value",
+    );
+}

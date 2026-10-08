@@ -1,7 +1,9 @@
 //! The editor-facing queries the language server and the playground share
 //! (`proposal/playground-completion.md`): a line index, the completion engine,
 //! the navigation primitives it reads, and the numeric-mismatch edits the
-//! language server's quick fixes and `vilan check --fix` share (I5 §8.3).
+//! language server's quick fixes and `vilan check --fix` share (I5 §8.3), and
+//! the trait a method call needs imported (B515), and the closure-mode
+//! mismatch's edit (E263).
 //!
 //! Nothing here is a protocol. The language server maps [`Position`] to
 //! `lsp_types::Position` and a [`Completion`] to a `CompletionItem` at its own
@@ -16,10 +18,12 @@
 //! `wasm32-unknown-unknown` exactly as it does natively.
 
 pub mod analysis;
+pub mod closure_mode_fix;
 pub mod completion;
 pub mod html_attributes;
 pub mod line_index;
 pub mod numeric_fix;
+pub mod trait_import;
 
 /// E69's gate: the generated table above, re-rendered from its vendored TSV
 /// and diffed. Test-only — nothing ships it.

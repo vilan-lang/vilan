@@ -9,11 +9,12 @@ are the reference; this is the working code they describe.
 
 [`counter.vl`](counter.vl), the smallest component:
 
-- **A component is a function returning a `View`.** An app is composition.
-- **State is a `Signal`**; `count.map(..)` builds a *derived* signal whose
+- **A component is a function returning a `View`**, written as markup
+  (`<section .styled(card)>…</section>`). An app is composition.
+- **State is a `Signal`**; `count.derive(..)` builds a *derived* signal whose
   dependency is **structural**: known when it is built, never discovered by
   running a body.
-- **Bindings take a `Source`, not a tracking closure**: `bind_text(count.map(..))`.
+- **Bindings take a `Source`, not a tracking closure**: `<p>{count.derive(..)}</p>`.
 - **`const` styles**: `style()` chains evaluated at build time, so the rules
   land in `app.css` and `.styled(..)` only sets classes.
 

@@ -1,0 +1,54 @@
+// A149 S4 on both backends: field syntax on store handles — `app.address.city`
+// is the projection `app.address().city()`, read, written and subscribed; a
+// field named like the handle's own internals (`root`, `path`) reads the
+// struct's field; a `StoreSome` reads through its projections; and a generic
+// struct's projection is reached by its field name.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ Storable, Store, StoreSome };
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+
+[derive(Storable)]
+struct Address {
+	city: str,
+	root: str,
+}
+
+[derive(Storable)]
+struct App {
+	name: str,
+	path: List<str>,
+	address: Address,
+	home: Option<Address>,
+}
+
+[derive(Storable)]
+struct Pair<T> {
+	left: T,
+	right: T,
+}
+
+fun main() {
+	let app = Store::new(App {
+		name = "Ann",
+		path = ["a", "b"],
+		address = Address { city = "Oslo", root = "r" },
+		home = Some(Address { city = "Bergen", root = "h" }),
+	});
+	print(i"{app.name.get()} {app.address.city.get()} {app.address.root.get()} {app.path.get().len()}");
+	let watching = Owner::new();
+	run_with_owner(watching, || {
+		app.address().city().effect_on_change(|city| print(i"woke city={city}"));
+	});
+	app.address.city.set("Tromso");
+	watching.dispose();
+	let home: StoreSome<Address> = app.home.some();
+	print(i"home {home.city.get().unwrap_or("-")} {app.home.some().root.get().unwrap_or("-")}");
+	app.home.set(None);
+	print(i"home after None {home.city.get().unwrap_or("-")}");
+	let pair = Store::new(Pair { left = 1, right = 2 });
+	pair.right.set(5);
+	print(i"pair {pair.left.get() + pair.right.get()}");
+}
+
+main();

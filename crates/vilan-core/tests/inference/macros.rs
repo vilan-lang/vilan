@@ -1337,6 +1337,7 @@ fn i4_equal_lists_compare_equal_through_both_spellings() {
     // generic `T: PartialEq` world calls — same impl, both pinned.
     assert_compiles_and_runs(
         r#"
+        import std::compare::PartialEq;
         import std::io::print;
         fun main() {
             let a = [1, 2, 3];
