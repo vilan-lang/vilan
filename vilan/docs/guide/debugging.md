@@ -47,6 +47,9 @@ fun main() {
   comma — except a list or set of numbers, strings or other scalars, which
   fills each line to the 80 columns. A list shows its first 100 entries and
   then `… N more`.
+- **Your own `Debug` impl decides.** A type with a `Debug` impl you wrote
+  prints through it, wherever the value sits; a `[derive(Debug)]` spells
+  exactly what `dbg` prints (`Shape::Circle(1.0)`), so it changes nothing.
 - **Generic code prints the real type.** In `fun show<T>(value: T)`, `dbg(value)`
   prints a `Point` as a `Point` and an `i32` as an `i32`.
 - **Both backends print the same bytes**, to stderr (`console.log` in the

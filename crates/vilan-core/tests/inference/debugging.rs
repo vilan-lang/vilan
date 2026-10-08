@@ -365,6 +365,148 @@ fn e277_a_list_of_scalars_fills_its_lines_and_aggregates_keep_one_per_line() {
     );
 }
 
+/// E275 (1): a WRITTEN `Debug` impl decides how `dbg` prints its type — at
+/// the top, as a list element, as an option's payload, as a field of a type
+/// that prints by its structure, and through a generic `T` — and a written
+/// generic impl whose bound the type misses (`Boxed<Opaque>`) does not apply,
+/// so the structure prints.
+#[test]
+fn e275_a_written_debug_impl_decides_how_dbg_prints_its_type() {
+    assert_dbg_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "struct Celsius { degrees: f64 }\n",
+            "impl Celsius with Debug {\n",
+            "\tfun debug(self): str { self.degrees.debug() + \"C\" }\n",
+            "}\n",
+            "struct Boxed<T> { inner: T }\n",
+            "impl Boxed<type T: Debug> with Debug {\n",
+            "\tfun debug(self): str { \"boxed \" + self.inner.debug() }\n",
+            "}\n",
+            "struct Opaque { tag: i32 }\n",
+            "enum Signal { Go, Stop(str) }\n",
+            "impl Signal with Debug {\n",
+            "\tfun debug(self): str {\n",
+            "\t\tmatch self {\n",
+            "\t\t\tSignal::Go => \"go!\",\n",
+            "\t\t\tSignal::Stop(let why) => \"stop: \" + why,\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "struct Reading { place: str, temperature: Celsius }\n",
+            "fun show<T>(value: T) {\n",
+            "\tdbg(value);\n",
+            "}\n",
+            "fun main() {\n",
+            "\tdbg(Celsius { degrees = 21.5 });\n",
+            "\tdbg([Celsius { degrees = 1.0 }, Celsius { degrees = 2.0 }]);\n",
+            "\tdbg(Boxed { inner = 7 }, Boxed { inner = Opaque { tag = 1 } });\n",
+            "\tdbg(Signal::Go, Some(Signal::Stop(\"red\")));\n",
+            "\tshow(Celsius { degrees = 3.0 });\n",
+            "\tdbg(Reading { place = \"here\", temperature = Celsius { degrees = 4.5 } });\n",
+            "}\n",
+        ),
+        "",
+        concat!(
+            "[test.vl:25:2] Celsius { degrees = 21.5 } = 21.5C\n",
+            "[test.vl:26:2] [Celsius { degrees = 1.0 }, Celsius { degrees = 2.0 }] = [\n",
+            "  1.0C,\n",
+            "  2.0C,\n",
+            "]\n",
+            "[test.vl:27:2] Boxed { inner = 7 } = boxed 7\n",
+            "[test.vl:27:2] Boxed { inner = Opaque { tag = 1 } } = Boxed {\n",
+            "  inner = Opaque { tag = 1 },\n",
+            "}\n",
+            "[test.vl:28:2] Signal::Go = go!\n",
+            "[test.vl:28:2] Some(Signal::Stop(\"red\")) = Some(stop: red)\n",
+            "[test.vl:22:2] value = 3.0C\n",
+            "[test.vl:30:2] Reading { place = \"here\", temperature = Celsius { degrees = 4.5 } } = Reading {\n",
+            "  place = \"here\",\n",
+            "  temperature = 4.5C,\n",
+            "}\n",
+        ),
+    );
+}
+
+/// E275 (2): `[derive(Debug)]` spells an enum variant qualified
+/// (`Shape::Rect(2, 3)`) and a string as the printer escapes it, so `.debug()`
+/// is `dbg`'s spelling on one line; a field whose type has a written impl
+/// renders through it in both; and `dbg` still lays a derived value out over
+/// lines past 80 columns, where `.debug()` stays one line.
+#[test]
+fn e275_the_derive_spells_variants_qualified_and_agrees_with_dbg() {
+    assert_dbg_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "struct Celsius { degrees: f64 }\n",
+            "impl Celsius with Debug {\n",
+            "\tfun debug(self): str { self.degrees.debug() + \"C\" }\n",
+            "}\n",
+            "[derive(Debug)]\n",
+            "enum Shape { Circle(f64), Rect(i32, i32), Empty }\n",
+            "[derive(Debug)]\n",
+            "struct Reading { place: str, temperature: Celsius, shape: Shape }\n",
+            "[derive(Debug)]\n",
+            "struct Wide { first_label: str, second_label: str, numbers: List<i32> }\n",
+            "fun main() {\n",
+            "\tlet reading = Reading { place = \"a \\\"quoted\\\"\\tplace\\0\", temperature = Celsius { degrees = 4.5 }, shape = Shape::Rect(2, 3) };\n",
+            "\tdbg(reading);\n",
+            "\tprint(reading.debug());\n",
+            "\tprint(Shape::Circle(1.5).debug());\n",
+            "\tprint(Shape::Empty.debug());\n",
+            "\tlet wide = Wide { first_label = \"the first label\", second_label = \"the second label\", numbers = [1, 2, 3] };\n",
+            "\tdbg(wide);\n",
+            "\tprint(wide.debug());\n",
+            "}\n",
+        ),
+        concat!(
+            "Reading { place = \"a \\\"quoted\\\"\\tplace\\0\", temperature = 4.5C, shape = Shape::Rect(2, 3) }\n",
+            "Shape::Circle(1.5)\n",
+            "Shape::Empty\n",
+            "Wide { first_label = \"the first label\", second_label = \"the second label\", numbers = [1, 2, 3] }\n",
+        ),
+        concat!(
+            "[test.vl:14:2] reading = Reading {\n",
+            "  place = \"a \\\"quoted\\\"\\tplace\\0\",\n",
+            "  temperature = 4.5C,\n",
+            "  shape = Shape::Rect(2, 3),\n",
+            "}\n",
+            "[test.vl:19:2] wide = Wide {\n",
+            "  first_label = \"the first label\",\n",
+            "  second_label = \"the second label\",\n",
+            "  numbers = [1, 2, 3],\n",
+            "}\n",
+        ),
+    );
+}
+
+/// E275 (3): `.debug()` stays opt-in — a type without a derived or written
+/// impl has no `debug` method (`dbg` is the path that needs none) — and a
+/// program's own enum named `Option` prints qualified, as any enum of its own
+/// does; only std's `Option` and `Result` print bare.
+#[test]
+fn e275_debug_stays_opt_in_and_only_stds_prelude_enums_print_bare() {
+    assert_fails_with(
+        "import std::debug::Debug;\nstruct Point { x: i32 }\nfun main() { print(Point { x = 1 }.debug()); }\n",
+        "Point has no method 'debug'",
+    );
+    assert_dbg_runs(
+        concat!(
+            "mod mine {\n",
+            "\texport enum Option { Some(i32), None }\n",
+            "}\n",
+            "fun main() {\n",
+            "\tdbg(mine::Option::Some(3), Some(3));\n",
+            "}\n",
+        ),
+        "",
+        concat!(
+            "[test.vl:5:2] mine::Option::Some(3) = Option::Some(3)\n",
+            "[test.vl:5:2] Some(3) = Some(3)\n",
+        ),
+    );
+}
+
 /// A program's OWN `dbg` wins over the prelude's, as any prelude name does.
 #[test]
 fn s1_a_programs_own_dbg_shadows_the_intrinsic() {

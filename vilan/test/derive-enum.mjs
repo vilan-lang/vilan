@@ -72,13 +72,13 @@ function debug(self) {
 	let $d = null;
 	if ($c[0] === 0) {
 		const p0 = $c[1];
-		$d = "Circle(" + JSON.stringify(p0) + ")";
+		$d = "Shape::Circle(" + JSON.stringify(p0) + ")";
 	} else if ($c[0] === 1) {
 		const p02 = $c[1];
 		const p1 = $c[2];
-		$d = "Rect(" + JSON.stringify(p02) + ", " + JSON.stringify(p1) + ")";
+		$d = "Shape::Rect(" + JSON.stringify(p02) + ", " + JSON.stringify(p1) + ")";
 	} else {
-		$d = "Empty";
+		$d = "Shape::Empty";
 	}
 	return $d;
 }

@@ -66713,7 +66713,7 @@ impl<'src> Program<'src> {
 
     /// The attribute a GENERATED entity was expanded from: its span, in the
     /// file that WROTE it. `None` for ordinary code.
-    fn derived_origin(&self, id: Id) -> Option<(Span, SourceId)> {
+    pub(crate) fn derived_origin(&self, id: Id) -> Option<(Span, SourceId)> {
         if self.source_of(id) != Some(DERIVED_SOURCE) {
             return None;
         }

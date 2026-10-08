@@ -1,0 +1,4 @@
+Reading { place = "a \"quoted\"\tplace", temperature = 4.5°C, shape = Shape::Circle(1.5) }
+Shape::Rect(2, 3)
+Shape::Empty
+Wide { first_label = "the first label", second_label = "the second label", numbers = [1, 2, 3] }

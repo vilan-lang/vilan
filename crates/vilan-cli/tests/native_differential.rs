@@ -10471,6 +10471,21 @@ fn assert_dbg_lines_on_both_backends(file: &str, source: &str, stdout: &str, std
     }
 }
 
+/// E275: a written `Debug` impl decides how `dbg` prints its type (at the top,
+/// in a list, in an option, as a field, through a generic `T`; a generic impl
+/// whose bound misses leaves the structure), the derive spells variants
+/// qualified and agrees with `dbg`, and `dbg` still lays a derived value out —
+/// the same bytes on both backends (`native/dbg_debug_impls.*`).
+#[test]
+fn e275_written_and_derived_debug_print_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_debug_impls.vl",
+        include_str!("native/dbg_debug_impls.vl"),
+        include_str!("native/dbg_debug_impls.stdout"),
+        include_str!("native/dbg_debug_impls.stderr"),
+    );
+}
+
 /// E277: a broken list or set of scalars (numbers, strings, a field-less
 /// enum) fills its lines to 80 columns, nested ones two spaces deeper, while a
 /// list of structs or options keeps one entry per line — the same bytes on

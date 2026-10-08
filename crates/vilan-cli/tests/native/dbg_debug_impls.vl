@@ -1,0 +1,85 @@
+// E275: a written `Debug` impl decides how `dbg` prints its type; a derived
+// one spells its variants qualified and agrees with `dbg`, which keeps
+// laying a derived value out; `.debug()` stays opt-in.
+import std::debug::Debug;
+
+struct Celsius {
+	degrees: f64,
+}
+
+impl Celsius with Debug {
+	fun debug(self): str {
+		self.degrees.debug() + "°C"
+	}
+}
+
+struct Boxed<T> {
+	inner: T,
+}
+
+impl Boxed<type T: Debug> with Debug {
+	fun debug(self): str {
+		"boxed " + self.inner.debug()
+	}
+}
+
+struct Opaque {
+	tag: i32,
+}
+
+enum Signal {
+	Go,
+	Stop(str),
+}
+
+impl Signal with Debug {
+	fun debug(self): str {
+		match self {
+			Signal::Go => "go!",
+			Signal::Stop(let why) => "stop: " + why,
+		}
+	}
+}
+
+[derive(Debug)]
+enum Shape {
+	Circle(f64),
+	Rect(i32, i32),
+	Empty,
+}
+
+[derive(Debug)]
+struct Reading {
+	place: str,
+	temperature: Celsius,
+	shape: Shape,
+}
+
+[derive(Debug)]
+struct Wide {
+	first_label: str,
+	second_label: str,
+	numbers: List<i32>,
+}
+
+fun show<T>(value: T) {
+	dbg(value);
+}
+
+fun main() {
+	let warm = Celsius { degrees = 21.5 };
+	dbg(warm);
+	dbg([Celsius { degrees = 1.0 }, Celsius { degrees = -0.0 }]);
+	dbg(Boxed { inner = 7 }, Boxed { inner = Opaque { tag = 1 } });
+	dbg(Signal::Go, Some(Signal::Stop("red")));
+	show(Celsius { degrees = 3.0 });
+	let reading = Reading { place = "a \"quoted\"\tplace", temperature = Celsius { degrees = 4.5 }, shape = Shape::Circle(1.5) };
+	dbg(reading);
+	print(reading.debug());
+	print(Shape::Rect(2, 3).debug());
+	print(Shape::Empty.debug());
+	dbg(Shape::Rect(2, 3), Shape::Empty);
+	let wide = Wide { first_label = "the first label", second_label = "the second label", numbers = [1, 2, 3] };
+	dbg(wide);
+	print(wide.debug());
+}

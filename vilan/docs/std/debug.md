@@ -50,11 +50,35 @@ trait Debug {
 ```
 
 `.debug()` renders a value in the same syntax `dbg` prints, on one line. std
-implements it for `str`, `bool`, every number (a float keeps its `.0`:
-`3.0.debug()` is `"3.0"`, and negative zero is `"-0.0"`), and for `List`, `Option` and `Result` whose
-elements are `Debug`; `[derive(Debug)]` writes it for a struct or an enum from
-its fields, so a struct holding a `List<i32>` or an `Option<f64>` derives it.
-`dbg` needs none of this: it prints every type.
+implements it for `str` (quoted and escaped as `dbg` writes it), `bool`, every
+number (a float keeps its `.0`: `3.0.debug()` is `"3.0"`, and negative zero is
+`"-0.0"`), and for `List`, `Option` and `Result` whose elements are `Debug`;
+`[derive(Debug)]` writes it for a struct or an enum from its fields
+(`Point { x = 1, y = 2 }`, `Shape::Circle(1.5)`), so a struct holding a
+`List<i32>` or an `Option<f64>` derives it. `.debug()` is opt-in: a type has
+it only through the derive or an impl of its own.
+
+`dbg` needs none of this: it prints every type. A `Debug` impl you WRITE decides
+how `dbg` prints that type, wherever the value sits (a field, a list element,
+a generic `T`), and a written generic impl applies only where its bounds hold.
+A derived impl spells what `dbg` already prints, so `dbg` keeps laying a
+derived value out over lines past 80 columns:
+
+```vilan
+import std::debug::Debug;
+
+struct Celsius { degrees: f64 }
+
+impl Celsius with Debug {
+	fun debug(self): str {
+		self.degrees.debug() + "°C"
+	}
+}
+
+fun main() {
+	dbg(Celsius { degrees = 21.5 });   // [src/main.vl:12:2] Celsius { degrees = 21.5 } = 21.5°C
+}
+```
 
 ## Locations
 

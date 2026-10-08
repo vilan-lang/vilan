@@ -17,7 +17,7 @@ use vilan_core::printer::{Shape, shape_of};
 use vilan_core::span::Span;
 use vilan_core::type_::{Type, TypeId};
 
-use crate::{Emitter, rust_literal, rust_string, sanitize, unsupported};
+use crate::{Emitter, NativeDispatch, Receiving, rust_literal, rust_string, sanitize, unsupported};
 
 impl<'a, 'src> Emitter<'a, 'src> {
     /// `dbg(a, b, ..)`: prints `[file:line:col] expr = value` per argument to
@@ -139,6 +139,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // Recorded BEFORE the body is built: a recursive type's printer calls
         // itself.
         self.printers.insert(key, name.clone());
+        if let Some(body) = self.written_debug_body(type_id, span)? {
+            self.printer_bodies.push(format!(
+                "fn {name}(value: &{rust_type}) -> vilan_rt::show::Doc {{\n    {body}\n}}\n"
+            ));
+            return Ok(name);
+        }
         let body = match shape {
             Shape::Integer | Shape::BigInt => "vilan_rt::show::integer(value)".to_string(),
             Shape::Float => "vilan_rt::show::float(*value as f64)".to_string(),
@@ -286,6 +292,36 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "fn {name}(value: &{rust_type}) -> vilan_rt::show::Doc {{\n    {body}\n}}\n"
         ));
         Ok(name)
+    }
+
+    /// E275: a printer body that answers the text of the type's WRITTEN
+    /// `Debug` impl, or `None` when the structure prints
+    /// ([`vilan_core::printer::written_debug`] says which) — the twin of the
+    /// JS emitter's. The impl's `debug` takes its receiver as a loan or a
+    /// copy, by its own convention.
+    fn written_debug_body(&mut self, type_id: TypeId, span: Span) -> Result<Option<String>, Error> {
+        let Some(trait_id) = vilan_core::printer::written_debug(self.program, type_id) else {
+            return Ok(None);
+        };
+        let Some(NativeDispatch::Call(function_name)) =
+            self.resolve_dispatch(type_id, "debug", &[], Some((trait_id, Vec::new())), span)?
+        else {
+            return Ok(None);
+        };
+        let receiver = self
+            .instance_target(&function_name)
+            .and_then(|target| self.program.functions.get(&target))
+            .and_then(|function| function.parameters.first())
+            .and_then(|parameter| self.program.parameters.get(parameter))
+            .map(|parameter| self.receiving_form(parameter));
+        let argument = match receiver {
+            Some(Receiving::Ref) => "value",
+            Some(Receiving::ByValue) => "value.clone()",
+            _ => return Ok(None),
+        };
+        Ok(Some(format!(
+            "vilan_rt::show::Doc::text({function_name}({argument}).to_string())"
+        )))
     }
 
     /// Whether an element of `type_id` prints as one short token, so its list

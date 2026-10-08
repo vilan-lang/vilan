@@ -203,6 +203,10 @@ impl<'src> Transformer<'src> {
         // Recorded BEFORE the body is built: a recursive type's printer
         // calls itself.
         self.printers.insert(key, name.clone());
+        if let Some(body) = self.written_debug_body(type_id) {
+            self.push_printer(&name, body);
+            return name;
+        }
         let document = match shape {
             Shape::Integer | Shape::BigInt | Shape::Bool => js::Node::Binary(
                 BinaryOp::Add,
@@ -405,6 +409,22 @@ impl<'src> Transformer<'src> {
         };
         self.push_printer(&name, vec![js::Node::Return(Box::new(document))]);
         name
+    }
+
+    /// E275: a printer body that answers the text of the type's WRITTEN
+    /// `Debug` impl (`return debug(value);`), or `None` when the structure
+    /// prints ([`crate::printer::written_debug`] says which). An async
+    /// `debug` answers a promise, not text, so it leaves the structure in
+    /// charge.
+    fn written_debug_body(&mut self, type_id: TypeId) -> Option<Vec<js::Node<'src>>> {
+        let trait_id = crate::printer::written_debug(self.program, type_id)?;
+        let dispatch =
+            self.resolve_dispatch_with(type_id, "debug", &[], Some((trait_id, Vec::new())))?;
+        if matches!(dispatch, super::Dispatch::Call(_, true)) {
+            return None;
+        }
+        let call = self.emit_dispatch(dispatch, vec![js::Node::Local("value".to_string())], None);
+        Some(vec![js::Node::Return(Box::new(call))])
     }
 
     /// Whether an element of `type_id` prints as one short token, so its list
