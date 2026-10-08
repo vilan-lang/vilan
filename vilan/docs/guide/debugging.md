@@ -37,8 +37,8 @@ fun main() {
   through, as it would into any function, and a list or struct comes back as a
   copy.
 - **The format is vilan's.** A struct prints its fields, an enum variant its
-  qualified name (`Some`, `None`, `Ok` and `Err` bare), a float keeps its `.0`,
-  a string is quoted and escaped, a closure prints its type
+  qualified name (`Some`, `None`, `Ok` and `Err` bare), a float keeps its `.0`
+  (and negative zero shows as `-0.0`, where `print` writes `0`), a string is quoted and escaped, a closure prints its type
   (`<closure |i32| -> i32>`). std's handles print as themselves: `HashMap {
   "ada" => 36 }`, `HashSet { 1, 2 }`, `Shared(..)`, `SignalCell(3)` (read
   without subscribing), a pipe by its type (sampling it would run it), and a

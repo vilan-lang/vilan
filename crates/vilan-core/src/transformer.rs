@@ -1972,6 +1972,7 @@ fn helper_source(name: &str) -> &'static str {
              \treturn out + \"\\\"\";\n\
              }\n\
              function __dbg_float(value) {\n\
+             \tif (Object.is(value, -0)) return \"-0.0\";\n\
              \tconst text = String(value);\n\
              \treturn Number.isInteger(value) && !text.includes(\"e\") ? text + \".0\" : text;\n\
              }\n\

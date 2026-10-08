@@ -262,6 +262,36 @@ fn s1_a_programs_own_dbg_shadows_the_intrinsic() {
     );
 }
 
+/// E276: `dbg` shows the real value, so negative zero is `-0.0` — a literal,
+/// a computed one, an `f32`, and one inside an aggregate — while `print` keeps
+/// N136's `0`. `.debug()` agrees with `dbg` (the printer's spelling, E275).
+#[test]
+fn e276_dbg_shows_negative_zero_and_print_keeps_zero() {
+    assert_dbg_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "fun main() {\n",
+            "\tlet zero = 0.0;\n",
+            "\tdbg(-0.0, zero * -1.0, -0.0f, [0.0, -0.0], Some(-0.0));\n",
+            "\tprint(zero * -1.0);\n",
+            "\tprint((zero * -1.0).debug());\n",
+            "\tprint((-0.0f).debug());\n",
+            "\tdbg(0.0, -1.5);\n",
+            "}\n",
+        ),
+        "0\n-0.0\n-0.0\n",
+        concat!(
+            "[test.vl:4:2] -0.0 = -0.0\n",
+            "[test.vl:4:2] zero * -1.0 = -0.0\n",
+            "[test.vl:4:2] -0.0f = -0.0\n",
+            "[test.vl:4:2] [0.0, -0.0] = [0.0, -0.0]\n",
+            "[test.vl:4:2] Some(-0.0) = Some(-0.0)\n",
+            "[test.vl:8:2] 0.0 = 0.0\n",
+            "[test.vl:8:2] -1.5 = -1.5\n",
+        ),
+    );
+}
+
 // --- S4: `Debug` through the printer (E260) -----------------------------
 
 /// E260: `[derive(Debug)]` on a struct with a `List` and an `Option` field
@@ -293,7 +323,7 @@ fn s4_debug_covers_every_container_the_printer_prints() {
             "Some([Some(1)])\n",
             "Err(\"no\")\n",
             "3.0\n",
-            "0.0\n",
+            "-0.0\n",
             "1.5\n",
         ),
     );

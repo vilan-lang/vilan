@@ -16,7 +16,7 @@
 [native_probe_dbg_printer.vl:45:2] 3.0 = 3.0
 [native_probe_dbg_printer.vl:45:2] 0.25 = 0.25
 [native_probe_dbg_printer.vl:45:2] 0.1 + 0.2 = 0.30000000000000004
-[native_probe_dbg_printer.vl:45:2] 0.0 * -1.0 = 0.0
+[native_probe_dbg_printer.vl:45:2] 0.0 * -1.0 = -0.0
 [native_probe_dbg_printer.vl:45:2] 1000000.0 * 1000000.0 * 1000000.0 * 1000.0 = 1e+21
 [native_probe_dbg_printer.vl:46:2] true = true
 [native_probe_dbg_printer.vl:46:2] 7usize = 7

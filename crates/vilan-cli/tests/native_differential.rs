@@ -10455,3 +10455,44 @@ fn s4_debug_over_containers_is_identical_on_both_backends() {
         "Debug over containers must render the same on both backends"
     );
 }
+
+/// Runs `source` as `file` (its OWN program name: the shared target keys a
+/// native binary by it) on both backends and holds each leg's streams to the
+/// expected bytes — `dbg`'s lines on stderr, the program's own on stdout.
+#[track_caller]
+fn assert_dbg_lines_on_both_backends(file: &str, source: &str, stdout: &str, stderr: &str) {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stderr, stderr, "{backend:?}: the dbg lines");
+        assert_eq!(run.stdout, stdout, "{backend:?}: the program's output");
+    }
+}
+
+/// E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an
+/// `f32`, one inside a list — and `.debug()` agrees, while `print` keeps
+/// N136's `0`; the same bytes on both backends.
+#[test]
+fn e276_dbg_shows_negative_zero_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_e276_negative_zero.vl",
+        concat!(
+            "import std::debug::Debug;\n",
+            "fun main() {\n",
+            "\tlet zero = 0.0;\n",
+            "\tdbg(-0.0, zero * -1.0, -0.0f, [0.0, -0.0]);\n",
+            "\tprint(zero * -1.0);\n",
+            "\tprint((zero * -1.0).debug());\n",
+            "}\n",
+        ),
+        "0\n-0.0\n",
+        concat!(
+            "[native_probe_e276_negative_zero.vl:4:2] -0.0 = -0.0\n",
+            "[native_probe_e276_negative_zero.vl:4:2] zero * -1.0 = -0.0\n",
+            "[native_probe_e276_negative_zero.vl:4:2] -0.0f = -0.0\n",
+            "[native_probe_e276_negative_zero.vl:4:2] [0.0, -0.0] = [0.0, -0.0]\n",
+        ),
+    );
+}

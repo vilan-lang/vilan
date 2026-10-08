@@ -29,8 +29,12 @@ impl u32 with Debug {
 
 impl f64 with Debug {
 	/// The language's number text, keeping the `.0` an integral value drops (`3.0`,
-	/// not `3`): `dbg`'s rule (debugging.md S4, E260).
+	/// not `3`), and negative zero as `-0.0`: `dbg`'s rule (debugging.md S4, E260,
+	/// E276).
 	fun debug(self): str {
+		if self == 0.0 && 1.0 / self < 0.0 {
+			ret "-0.0";
+		}
 		let text = "" + self;
 		if text.contains(".") || text.contains("e") || text.contains("N") || text.contains("I") {
 			text
@@ -256,8 +260,12 @@ impl usize with Debug {
 
 impl f32 with Debug {
 	/// The language's number text, keeping the `.0` an integral value drops (`3.0`,
-	/// not `3`): `dbg`'s rule (debugging.md S4, E260).
+	/// not `3`), and negative zero as `-0.0`: `dbg`'s rule (debugging.md S4, E260,
+	/// E276).
 	fun debug(self): str {
+		if self == 0.0 && 1.0 / self < 0.0 {
+			ret "-0.0";
+		}
 		let text = "" + self;
 		if text.contains(".") || text.contains("e") || text.contains("N") || text.contains("I") {
 			text

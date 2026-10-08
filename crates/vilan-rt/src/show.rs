@@ -183,9 +183,12 @@ pub fn string(text: &str) -> Doc {
 
 /// A float as `dbg` writes it: the language's number text, `.0` on an
 /// integral value (`3.0`), and nothing added to an exponent form (`1e+21`)
-/// or a non-finite one (`NaN`, `Infinity`). `-0.0` is `0.0`, as `String(-0)`
-/// is `"0"` (N136).
+/// or a non-finite one (`NaN`, `Infinity`). Negative zero is `-0.0` (E276):
+/// `dbg` shows the real value, where `print` keeps N136's `0`.
 pub fn float(value: f64) -> Doc {
+    if value == 0.0 && value.is_sign_negative() {
+        return Doc::text("-0.0");
+    }
     let text = js_number(value);
     if value.is_finite() && value.fract() == 0.0 && !text.contains('e') {
         Doc::Text(format!("{text}.0"))
@@ -242,7 +245,8 @@ mod tests {
     #[test]
     fn floats_keep_their_point_and_strings_their_quotes() {
         assert_eq!(float(3.0).flat(), "3.0");
-        assert_eq!(float(-0.0).flat(), "0.0");
+        assert_eq!(float(-0.0).flat(), "-0.0");
+        assert_eq!(float(0.0).flat(), "0.0");
         assert_eq!(float(1.5).flat(), "1.5");
         assert_eq!(float(1e21).flat(), "1e+21");
         assert_eq!(float(f64::NAN).flat(), "NaN");
