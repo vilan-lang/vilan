@@ -427,6 +427,20 @@ impl<'src> Transformer<'src> {
         Some(vec![js::Node::Return(Box::new(call))])
     }
 
+    /// N136/N149: whether `argument` is a number of the language's own (an
+    /// integer of any width, `f32`, `f64`; not `BigInt`) under the active
+    /// substitution — what `print` formats by `String(x)`.
+    pub(super) fn prints_a_number(&self, argument: Id) -> bool {
+        let Some(type_id) = self.expr_type_id(argument) else {
+            return false;
+        };
+        let resolve = |type_id| self.ground_printer_type(type_id);
+        matches!(
+            shape_of(self.program, type_id, &resolve),
+            Shape::Integer | Shape::Float
+        )
+    }
+
     /// Whether an element of `type_id` prints as one short token, so its list
     /// or set fills its broken lines (E277).
     fn prints_as_a_scalar(&self, type_id: TypeId) -> bool {

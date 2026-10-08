@@ -1501,6 +1501,48 @@ fn negative_zero_prints_zero_on_both_backends() {
     );
 }
 
+/// N149: `print(value)` with `value: T` at a float or an integer instance
+/// prints negative zero as `0` on both backends (the JS instance is wrapped
+/// per instance), a string instance prints the string, and a struct field of
+/// a generic type and an inferred closure parameter follow the same rule.
+#[test]
+fn n149_a_generic_print_of_negative_zero_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_n149_generic_print.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "fun show<T>(value: T) {\n",
+            "\tprint(value);\n",
+            "}\n",
+            "\n",
+            "struct Holder<T> {\n",
+            "\tvalue: T,\n",
+            "}\n",
+            "\n",
+            "fun shout<T>(holder: Holder<T>) {\n",
+            "\tprint(holder.value);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet zero = 0.0;\n",
+            "\tshow(zero * -1.0);\n",
+            "\tshow(-0.0f);\n",
+            "\tshow(0 * -1);\n",
+            "\tshow(\"text\");\n",
+            "\tshout(Holder { value = zero * -1.0 });\n",
+            "\t[0.0 * -1.0].for_each(|n| print(n));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "0\n0\n0\ntext\n0\n0\n", "{backend:?}");
+    }
+}
+
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.
 ///
 /// It prints the census — refused / identical — because that census IS the

@@ -5273,6 +5273,14 @@ impl<'src> Transformer<'src> {
     /// own conversion, `String(x)` — the one an i-string and the native
     /// backend use — so negative zero prints `0`, where `console.log`'s
     /// inspect wrote `-0`. Every other `print` is untouched.
+    ///
+    /// N149: the analyzer's recording is STATIC, so it cannot see a generic
+    /// body's `print(value)` with `value: T` at a number. The argument's
+    /// type is therefore also read under the ACTIVE substitution: the
+    /// instance where `T` is a number is wrapped and the one where it is a
+    /// string is not — two bodies, which instance emission already keeps
+    /// apart. (The recording stays: the emitter's own type table does not
+    /// cover every argument expression the analyzer typed.)
     fn number_print_arguments(
         &self,
         target_id: Id,
@@ -5280,9 +5288,10 @@ impl<'src> Transformer<'src> {
         args: Vec<js::Node<'src>>,
     ) -> Vec<js::Node<'src>> {
         if target_id != self.print_fn_id
-            || !argument_ids
-                .first()
-                .is_some_and(|argument| self.program.number_print_arguments.contains(argument))
+            || !argument_ids.first().is_some_and(|argument| {
+                self.program.number_print_arguments.contains(argument)
+                    || self.prints_a_number(*argument)
+            })
         {
             return args;
         }

@@ -671,3 +671,41 @@ fn n136_print_writes_negative_zero_as_zero() {
     );
     assert_compiles_and_runs(source, "0\n0\n0\n2.5\n[ 1, 2 ]\n");
 }
+
+/// N149: N136's recording is static, so `print(value)` with `value: T` was not
+/// wrapped where `T` is a number and negative zero printed `-0` on JS (`0`
+/// natively). The type is read per instance now: the number instances share a
+/// wrapped body, the string's stays bare — and a closure parameter whose type
+/// is inferred from its use (`|n| print(n)` handed to a `List<i32>` walk) is
+/// wrapped too.
+#[test]
+fn n149_print_of_a_generic_number_is_wrapped_per_instance() {
+    let source = concat!(
+        "fun show<T>(value: T) {\n",
+        "\tprint(value);\n",
+        "}\n",
+        "struct Holder<T> { value: T }\n",
+        "fun shout<T>(holder: Holder<T>) {\n",
+        "\tprint(holder.value);\n",
+        "}\n",
+        "fun main() {\n",
+        "\tlet zero = 0.0;\n",
+        "\tshow(zero * -1.0);\n",
+        "\tshow(-0.0f);\n",
+        "\tshow(0 * -1);\n",
+        "\tshow(\"text\");\n",
+        "\tshout(Holder { value = zero * -1.0 });\n",
+        "\t[0.0 * -1.0].for_each(|n| print(n));\n",
+        "}\n",
+    );
+    let javascript = compile(source).expect("a clean compile");
+    assert!(
+        javascript.contains("function show(value) {\n\tconsole.log(String(value));"),
+        "{javascript}"
+    );
+    assert!(
+        javascript.contains("function show2(value) {\n\tconsole.log(value);"),
+        "{javascript}"
+    );
+    assert_compiles_and_runs(source, "0\n0\n0\ntext\n0\n0\n");
+}
