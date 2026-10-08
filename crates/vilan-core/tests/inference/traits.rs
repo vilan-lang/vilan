@@ -9552,3 +9552,124 @@ fn b500_an_rpc_signature_written_with_a_module_path_is_the_bare_contract() {
         "true\n",
     );
 }
+
+// --- B566: a trait DEFAULT with generic parameters of its OWN ---
+//
+// `fun shown<S: Show>(self, item: S): str { item.show() }` declared as a
+// default in `trait Bag<T>` was an INTERNAL error at emission ("a call
+// resolved to `Show`'s requirement `show`, which has no body"): the JS
+// emitter keyed a default's instance by (default, receiver type) and bound
+// only the trait's parameters, so the default's own `S` was unbound in its
+// body. The same member written inherent built. The native emitter has bound
+// them since F34.
+
+const B566_BAG: &str = r#"
+        import std::io::print;
+
+        trait Show {
+            fun show(self): str;
+        }
+        impl i32 with Show {
+            fun show(self): str { "i32" }
+        }
+        impl str with Show {
+            fun show(self): str { "str" }
+        }
+
+        trait Bag<T> {
+            fun size(self): usize;
+
+            fun shown<S: Show>(self, item: S): str {
+                item.show()
+            }
+        }
+
+        struct Box {
+            held: List<i32>,
+        }
+        impl Box with Bag<i32> {
+            fun size(self): usize { self.held.len() }
+        }
+"#;
+
+#[test]
+fn b566_a_default_with_its_own_generic_binds_it_on_a_concrete_receiver() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B566_BAG}
+        fun main() {{
+            let bag = Box {{ held = [1, 2] }};
+            print(bag.shown(3));
+        }}
+
+        main();
+        "
+        ),
+        "i32\n",
+    );
+}
+
+#[test]
+fn b566_each_binding_of_a_defaults_own_generic_is_its_own_instance() {
+    // Keyed by the receiver alone, the second call would reuse the first's
+    // instance and print `i32` twice.
+    assert_compiles_and_runs(
+        &format!(
+            "{B566_BAG}
+        fun main() {{
+            let bag = Box {{ held = [1, 2] }};
+            print(bag.shown(3));
+            print(bag.shown(\"x\"));
+        }}
+
+        main();
+        "
+        ),
+        "i32\nstr\n",
+    );
+}
+
+#[test]
+fn b566_a_default_with_its_own_generic_binds_it_through_a_bound() {
+    // The bounded route (`b: B` with `B: Bag<i32>`) re-dispatches to the
+    // default with the call's own-generic values too.
+    assert_compiles_and_runs(
+        &format!(
+            "{B566_BAG}
+        fun through<B: Bag<i32>>(bag: B): str {{
+            bag.shown(\"x\")
+        }}
+
+        fun main() {{
+            print(through(Box {{ held = [1] }}));
+        }}
+
+        main();
+        "
+        ),
+        "str\n",
+    );
+}
+
+#[test]
+fn b566_a_defaults_own_generic_bound_in_the_callers_binders_grounds() {
+    // The value is written in the CALLER's parameter (`U`), bound at the
+    // caller's own instantiation.
+    assert_compiles_and_runs(
+        &format!(
+            "{B566_BAG}
+        fun relay<U: Show>(bag: Box, item: U): str {{
+            bag.shown(item)
+        }}
+
+        fun main() {{
+            print(relay(Box {{ held = [1] }}, \"x\"));
+            print(relay(Box {{ held = [1] }}, 4));
+        }}
+
+        main();
+        "
+        ),
+        "str\ni32\n",
+    );
+}

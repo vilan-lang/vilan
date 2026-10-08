@@ -11301,3 +11301,67 @@ fn e276_dbg_shows_negative_zero_on_both_backends() {
         ),
     );
 }
+/// B566: a trait DEFAULT with a generic parameter of its OWN, bounded, calling
+/// the bound's member — bound per call (two bindings, two instances) on both
+/// backends. JS reached `Show`'s body-less requirement (an internal error).
+#[test]
+fn a_trait_default_with_its_own_generic_binds_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b566.vl"),
+        r#"import std::io::print;
+
+trait Show {
+    fun show(self): str;
+}
+
+impl i32 with Show {
+    fun show(self): str {
+        "i32"
+    }
+}
+
+impl str with Show {
+    fun show(self): str {
+        "str"
+    }
+}
+
+trait Bag<T> {
+    fun size(self): usize;
+
+    fun shown<S: Show>(self, item: S): str {
+        item.show()
+    }
+}
+
+struct Box {
+    held: List<i32>,
+}
+
+impl Box with Bag<i32> {
+    fun size(self): usize {
+        self.held.len()
+    }
+}
+
+fun through<B: Bag<i32>>(bag: B): str {
+    bag.shown("x")
+}
+
+fun main() {
+    let bag = Box { held = [1, 2] };
+    print(bag.shown(3));
+    print(bag.shown("y"));
+    print(through(bag));
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b566.vl"),
+        Verdict::Identical,
+        "a trait default's own generic must bind per call on both backends"
+    );
+}
+
