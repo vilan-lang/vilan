@@ -33,7 +33,9 @@ generates for each type a `dbg` reaches, the same on both backends:
 
 A value that fits in 80 columns from where it starts stays on one line;
 otherwise each entry takes a line of its own, two spaces deeper, with a
-trailing comma. A list stops after 100 entries with `… N more`.
+trailing comma. A list or a set of scalars (numbers, strings, bools, an enum
+whose variants carry nothing) fills each of those lines instead, as many
+entries as fit the 80 columns. A list stops after 100 entries with `… N more`.
 
 `[build] dbg` in `vilan.toml` decides what a call does in a build: the
 `debug` preset prints, the `release` preset refuses the build, `"strip"` makes

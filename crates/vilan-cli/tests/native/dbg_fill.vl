@@ -1,0 +1,46 @@
+// E277: a broken list or set of scalars fills its lines to 80 columns; an
+// aggregate element keeps a line of its own — the same bytes on both backends.
+import std::hash_set::HashSet;
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+enum Color {
+	Red,
+	Green,
+	Blue,
+}
+
+struct Bag {
+	label: str,
+	values: List<i32>,
+}
+
+fun main() {
+	mut numbers: List<i32> = [];
+	mut next = 0;
+	for next < 40 {
+		numbers.push(next);
+		next = next + 1;
+	}
+	dbg(numbers);
+	let words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa"];
+	dbg(words);
+	let points = [Point { x = 1, y = 2 }, Point { x = 3, y = 4 }, Point { x = 5, y = 6 }];
+	dbg(points);
+	let colors = [Color::Red, Color::Green, Color::Blue, Color::Red, Color::Green, Color::Blue];
+	dbg(colors);
+	let maybes = [Some(1), None, Some(3), None, Some(5), None, Some(7), None, Some(9)];
+	dbg(maybes);
+	dbg(Bag { label = "b", values = numbers });
+	mut seen: HashSet<i32> = HashSet::new();
+	mut item = 100;
+	for item < 130 {
+		seen.insert(item);
+		item = item + 1;
+	}
+	dbg(seen);
+	dbg([1.5, 2.5], [true, false]);
+}

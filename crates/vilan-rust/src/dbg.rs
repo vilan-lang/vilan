@@ -186,7 +186,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Shape::List(element) => {
                 let printer = self.native_printer_for(element, span)?;
-                format!("vilan_rt::show::list(&value[..], |item| {printer}(item))")
+                let fill = self.prints_as_a_scalar(element);
+                format!("vilan_rt::show::list(&value[..], {fill}, |item| {printer}(item))")
             }
             Shape::Shared(inner) => {
                 let printer = self.native_printer_for(inner, span)?;
@@ -214,7 +215,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let key_printer = self.native_printer_for(key, span)?;
                 let value_printer = self.native_printer_for(entry_value, span)?;
                 format!(
-                    "vilan_rt::show::members({}, &value.{}.values(), |entry| (format!(\"{{}} => \", {key_printer}(&entry.0).flat()), {value_printer}(&entry.1)))",
+                    "vilan_rt::show::members({}, &value.{}.values(), false, |entry| (format!(\"{{}} => \", {key_printer}(&entry.0).flat()), {value_printer}(&entry.1)))",
                     rust_literal(&format!("{label} {{")),
                     sanitize(&field)
                 )
@@ -225,8 +226,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 element,
             } => {
                 let printer = self.native_printer_for(element, span)?;
+                let fill = self.prints_as_a_scalar(element);
                 format!(
-                    "vilan_rt::show::members({}, &value.{}.values(), |item| (String::new(), {printer}(item)))",
+                    "vilan_rt::show::members({}, &value.{}.values(), {fill}, |item| (String::new(), {printer}(item)))",
                     rust_literal(&format!("{label} {{")),
                     sanitize(&field)
                 )
@@ -284,6 +286,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "fn {name}(value: &{rust_type}) -> vilan_rt::show::Doc {{\n    {body}\n}}\n"
         ));
         Ok(name)
+    }
+
+    /// Whether an element of `type_id` prints as one short token, so its list
+    /// or set fills its broken lines (E277) — the JS emitter asks the same.
+    fn prints_as_a_scalar(&self, type_id: TypeId) -> bool {
+        let resolve = |type_id| self.concrete(type_id);
+        shape_of(self.program, type_id, &resolve).is_scalar()
     }
 
     /// Runs `body` with a nominal declaration's generic parameters bound to

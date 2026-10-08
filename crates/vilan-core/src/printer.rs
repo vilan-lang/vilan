@@ -12,8 +12,9 @@
 //! READ on their backend: a JS struct is its field array, a native one has
 //! named fields.
 //!
-//! The layout — one line when it fits 80 columns, else one entry per line,
-//! two spaces deeper, with a trailing comma — and the scalar spellings (a
+//! The layout — one line when it fits 80 columns, else one entry per line
+//! (a list or set of scalars filling each line instead, E277), two spaces
+//! deeper, with a trailing comma — and the scalar spellings (a
 //! float keeps its `.0`, a string is quoted and escaped as vilan writes it)
 //! are the runtimes' (`__dbg_*` on JS, `vilan_rt::show` natively), written
 //! twice and pinned against each other by the native differential.
@@ -87,6 +88,27 @@ pub enum Shape {
         field: (usize, String),
         element: TypeId,
     },
+}
+
+impl Shape {
+    /// Whether a value of this shape prints as one short token — a number, a
+    /// bool, a string, `()`, a backed enum or one whose variants carry nothing
+    /// (`Color::Red`). A list or a set of scalars FILLS its broken lines up
+    /// to the 80-column limit rather than taking a line per entry (E277); any
+    /// other element keeps a line of its own.
+    pub fn is_scalar(&self) -> bool {
+        match self {
+            Shape::Integer
+            | Shape::Float
+            | Shape::BigInt
+            | Shape::Bool
+            | Shape::Str
+            | Shape::Void
+            | Shape::Backed { .. } => true,
+            Shape::Enum { variants, .. } => variants.iter().all(|(_, payload)| payload.is_empty()),
+            _ => false,
+        }
+    }
 }
 
 /// The numeric scalars, by the name std declares them under.

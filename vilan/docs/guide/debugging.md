@@ -44,7 +44,9 @@ fun main() {
   without subscribing), a pipe by its type (sampling it would run it), and a
   cycle through a `Shared` as `<cycle>`. A value that fits in 80 columns stays on one line;
   a longer one breaks one entry per line, two spaces deeper, with a trailing
-  comma. A list shows its first 100 entries and then `… N more`.
+  comma — except a list or set of numbers, strings or other scalars, which
+  fills each line to the 80 columns. A list shows its first 100 entries and
+  then `… N more`.
 - **Generic code prints the real type.** In `fun show<T>(value: T)`, `dbg(value)`
   prints a `Point` as a `Point` and an `i32` as an `i32`.
 - **Both backends print the same bytes**, to stderr (`console.log` in the

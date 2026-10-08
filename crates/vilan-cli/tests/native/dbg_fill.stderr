@@ -1,0 +1,40 @@
+[native_probe_dbg_fill.vl:28:2] numbers = [
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+  22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+]
+[native_probe_dbg_fill.vl:30:2] words = [
+  "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota",
+  "kappa",
+]
+[native_probe_dbg_fill.vl:32:2] points = [
+  Point { x = 1, y = 2 },
+  Point { x = 3, y = 4 },
+  Point { x = 5, y = 6 },
+]
+[native_probe_dbg_fill.vl:34:2] colors = [
+  Color::Red, Color::Green, Color::Blue, Color::Red, Color::Green, Color::Blue,
+]
+[native_probe_dbg_fill.vl:36:2] maybes = [
+  Some(1),
+  None,
+  Some(3),
+  None,
+  Some(5),
+  None,
+  Some(7),
+  None,
+  Some(9),
+]
+[native_probe_dbg_fill.vl:37:2] Bag { label = "b", values = numbers } = Bag {
+  label = "b",
+  values = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+  ],
+}
+[native_probe_dbg_fill.vl:44:2] seen = HashSet {
+  100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114,
+  115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129,
+}
+[native_probe_dbg_fill.vl:45:2] [1.5, 2.5] = [1.5, 2.5]
+[native_probe_dbg_fill.vl:45:2] [true, false] = [true, false]

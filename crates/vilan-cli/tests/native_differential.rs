@@ -10471,6 +10471,20 @@ fn assert_dbg_lines_on_both_backends(file: &str, source: &str, stdout: &str, std
     }
 }
 
+/// E277: a broken list or set of scalars (numbers, strings, a field-less
+/// enum) fills its lines to 80 columns, nested ones two spaces deeper, while a
+/// list of structs or options keeps one entry per line — the same bytes on
+/// both backends (`native/dbg_fill.stderr`).
+#[test]
+fn e277_scalar_lists_fill_their_lines_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_fill.vl",
+        include_str!("native/dbg_fill.vl"),
+        "",
+        include_str!("native/dbg_fill.stderr"),
+    );
+}
+
 /// E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an
 /// `f32`, one inside a list — and `.debug()` agrees, while `print` keeps
 /// N136's `0`; the same bytes on both backends.

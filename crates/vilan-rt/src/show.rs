@@ -7,7 +7,9 @@
 //! (`show_*` in the emitted `main.rs`) answers a [`Doc`] for its type; the
 //! layout puts a document on one line when that fits 80 columns from where it
 //! starts, else one entry per line, two spaces deeper, each with a trailing
-//! comma (Q1). Widths count characters, as the JS helper's `for .. of` does.
+//! comma (Q1) — or, for a list or a set of scalars, as many entries per line
+//! as fit the 80 columns (E277). Widths count characters, as the JS helper's
+//! `for .. of` does.
 
 use crate::{Location, js_number};
 
@@ -22,6 +24,9 @@ pub enum Doc {
         /// `Point { x = 1 }` pads its entries with a space; `[1, 2]` does not.
         padded: bool,
         entries: Vec<(String, Doc)>,
+        /// A broken group of scalars fills each line to the limit rather than
+        /// taking a line per entry (E277).
+        fill: bool,
     },
 }
 
@@ -36,6 +41,7 @@ impl Doc {
             close: close.to_string(),
             padded,
             entries,
+            fill: false,
         }
     }
 
@@ -48,6 +54,7 @@ impl Doc {
                 close,
                 padded,
                 entries,
+                ..
             } => {
                 if entries.is_empty() {
                     return format!("{open}{close}");
@@ -72,6 +79,7 @@ impl Doc {
             open,
             close,
             entries,
+            fill,
             ..
         } = self
         else {
@@ -82,6 +90,27 @@ impl Doc {
         }
         let pad = " ".repeat(indent + 2);
         let mut out = format!("{open}\n");
+        if *fill {
+            let mut line = String::new();
+            for (label, document) in entries {
+                let text = format!("{label}{},", document.flat());
+                if line.is_empty() {
+                    line = format!("{pad}{text}");
+                } else if width(&line) + 1 + width(&text) > 80 {
+                    out.push_str(&line);
+                    out.push('\n');
+                    line = format!("{pad}{text}");
+                } else {
+                    line.push(' ');
+                    line.push_str(&text);
+                }
+            }
+            out.push_str(&line);
+            out.push('\n');
+            out.push_str(&" ".repeat(indent));
+            out.push_str(close);
+            return out;
+        }
         for (label, document) in entries {
             let head = format!("{pad}{label}");
             out.push_str(&head);
@@ -113,8 +142,9 @@ pub fn dbg(location: Location, entries: Vec<(&str, Doc)>) {
     }
 }
 
-/// A `List`'s document: at most 100 entries, then `… N more`.
-pub fn list<T>(items: &[T], show: impl Fn(&T) -> Doc) -> Doc {
+/// A `List`'s document: at most 100 entries, then `… N more`; `fill` for a
+/// list of scalars (E277).
+pub fn list<T>(items: &[T], fill: bool, show: impl Fn(&T) -> Doc) -> Doc {
     let shown = items.len().min(100);
     let mut entries: Vec<(String, Doc)> = items[..shown]
         .iter()
@@ -126,12 +156,33 @@ pub fn list<T>(items: &[T], show: impl Fn(&T) -> Doc) -> Doc {
             Doc::text(format!("\u{2026} {} more", items.len() - shown)),
         ));
     }
-    Doc::group("[", "]", false, entries)
+    filled(Doc::group("[", "]", false, entries), fill)
+}
+
+/// `document` with its fill flag set to `fill`.
+fn filled(document: Doc, fill: bool) -> Doc {
+    match document {
+        Doc::Group {
+            open,
+            close,
+            padded,
+            entries,
+            ..
+        } => Doc::Group {
+            open,
+            close,
+            padded,
+            entries,
+            fill,
+        },
+        text => text,
+    }
 }
 
 /// A map's or a set's document (S1b): a padded group of the members, in the
-/// table's order, at most 100 of them and then `… N more`.
-pub fn members<T>(open: &str, items: &[T], show: impl Fn(&T) -> (String, Doc)) -> Doc {
+/// table's order, at most 100 of them and then `… N more`; `fill` for a set
+/// of scalars (E277).
+pub fn members<T>(open: &str, items: &[T], fill: bool, show: impl Fn(&T) -> (String, Doc)) -> Doc {
     let shown = items.len().min(100);
     let mut entries: Vec<(String, Doc)> = items[..shown].iter().map(show).collect();
     if items.len() > shown {
@@ -140,7 +191,7 @@ pub fn members<T>(open: &str, items: &[T], show: impl Fn(&T) -> (String, Doc)) -
             Doc::text(format!("\u{2026} {} more", items.len() - shown)),
         ));
     }
-    Doc::group(open, "}", true, entries)
+    filled(Doc::group(open, "}", true, entries), fill)
 }
 
 thread_local! {
@@ -230,7 +281,7 @@ mod tests {
 
     #[test]
     fn a_group_past_80_columns_breaks_one_entry_per_line_with_trailing_commas() {
-        let list = list(&(0..30).collect::<Vec<i32>>(), |n| point(*n, *n));
+        let list = list(&(0..30).collect::<Vec<i32>>(), false, |n| point(*n, *n));
         let laid_out = list.layout(10, 0);
         assert!(laid_out.starts_with("[\n  Point { x = 0, y = 0 },\n"));
         assert!(laid_out.ends_with("  Point { x = 29, y = 29 },\n]"));
@@ -238,8 +289,32 @@ mod tests {
 
     #[test]
     fn a_long_list_is_cut_at_100_entries() {
-        let laid_out = list(&(0..250).collect::<Vec<i32>>(), |n| integer(*n)).flat();
+        let laid_out = list(&(0..250).collect::<Vec<i32>>(), true, |n| integer(*n)).flat();
         assert!(laid_out.ends_with("98, 99, \u{2026} 150 more]"));
+    }
+
+    #[test]
+    fn a_broken_list_of_scalars_fills_each_line_to_80_columns() {
+        let laid_out = list(&(0..40).collect::<Vec<i32>>(), true, |n| integer(*n)).layout(10, 0);
+        assert_eq!(
+            laid_out,
+            "[\n  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,\n  \
+             22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,\n]"
+        );
+        let nested = Doc::group(
+            "Bag {",
+            "}",
+            true,
+            vec![(
+                "values = ".to_string(),
+                list(&(0..30).collect::<Vec<i32>>(), true, |n| integer(*n)),
+            )],
+        );
+        assert_eq!(
+            nested.layout(0, 0),
+            "Bag {\n  values = [\n    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,\n    \
+             21, 22, 23, 24, 25, 26, 27, 28, 29,\n  ],\n}"
+        );
     }
 
     #[test]

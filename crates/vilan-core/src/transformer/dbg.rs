@@ -262,13 +262,14 @@ impl<'src> Transformer<'src> {
             }
             Shape::List(element) => {
                 let printer = self.printer_for(element);
-                call(
-                    "__dbg_list",
-                    vec![
-                        js::Node::Local("value".to_string()),
-                        js::Node::Local(printer),
-                    ],
-                )
+                let mut arguments = vec![
+                    js::Node::Local("value".to_string()),
+                    js::Node::Local(printer),
+                ];
+                if self.prints_as_a_scalar(element) {
+                    arguments.push(js::Node::Bool(true));
+                }
+                call("__dbg_list", arguments)
             }
             Shape::Shared(inner) => {
                 let printer = self.printer_for(inner);
@@ -329,14 +330,15 @@ impl<'src> Transformer<'src> {
                 element,
             } => {
                 let printer = self.printer_for(element);
-                call(
-                    "__dbg_set",
-                    vec![
-                        text(format!("{label} {{")),
-                        slot(index),
-                        js::Node::Local(printer),
-                    ],
-                )
+                let mut arguments = vec![
+                    text(format!("{label} {{")),
+                    slot(index),
+                    js::Node::Local(printer),
+                ];
+                if self.prints_as_a_scalar(element) {
+                    arguments.push(js::Node::Bool(true));
+                }
+                call("__dbg_set", arguments)
             }
             Shape::Enum { variants, bindings } => {
                 let saved = self.current_substitution.clone();
@@ -403,6 +405,13 @@ impl<'src> Transformer<'src> {
         };
         self.push_printer(&name, vec![js::Node::Return(Box::new(document))]);
         name
+    }
+
+    /// Whether an element of `type_id` prints as one short token, so its list
+    /// or set fills its broken lines (E277).
+    fn prints_as_a_scalar(&self, type_id: TypeId) -> bool {
+        let resolve = |type_id| self.ground_printer_type(type_id);
+        shape_of(self.program, type_id, &resolve).is_scalar()
     }
 
     /// `type_id` under the active substitution. A generic enum's payload can

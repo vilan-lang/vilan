@@ -1892,11 +1892,13 @@ fn helper_source(name: &str) -> &'static str {
         // `dbg(..)`'s runtime (debugging.md S1): the layout and the scalar
         // spellings every generated `__show_*` printer builds on, written to
         // agree byte for byte with `vilan_rt::show`. A document is a string or
-        // a group `{ o, c, p, e }`: open text, close text, whether the entries
-        // are padded by a space (`Point { x = 1 }` against `[1, 2]`), and
-        // `[label, document]` entries. It lays out on one line when that fits
-        // 80 columns from where it starts, else one entry per line, two spaces
-        // deeper, each with a trailing comma (Q1). Widths count characters.
+        // a group `{ o, c, p, e, f }`: open text, close text, whether the
+        // entries are padded by a space (`Point { x = 1 }` against `[1, 2]`),
+        // `[label, document]` entries, and whether a broken group FILLS its
+        // lines (a list or set of scalars, E277). It lays out on one line when
+        // that fits 80 columns from where it starts, else one entry per line
+        // (or as many as fit, filled), two spaces deeper, each with a trailing
+        // comma (Q1). Widths count characters.
         "__dbg" => {
             "function __dbg(write, location, entries) {\n\
              \tif (entries.length === 0) {\n\
@@ -1916,15 +1918,15 @@ fn helper_source(name: &str) -> &'static str {
              \t__dbg(write, location, values.map((value, index) => [ texts[index], shows[index](value) ]));\n\
              \treturn spread ? values.flatMap((value, index) => spread[index] ? value : [ value ]) : values;\n\
              }\n\
-             function __dbg_group(open, close, padded, entries) {\n\
-             \treturn { o: open, c: close, p: padded, e: entries };\n\
+             function __dbg_group(open, close, padded, entries, fill) {\n\
+             \treturn { o: open, c: close, p: padded, e: entries, f: fill === true };\n\
              }\n\
-             function __dbg_list(items, show) {\n\
+             function __dbg_list(items, show, fill) {\n\
              \tconst entries = [];\n\
              \tconst shown = Math.min(items.length, 100);\n\
              \tfor (let index = 0; index < shown; index++) entries.push([ \"\", show(items[index]) ]);\n\
              \tif (items.length > shown) entries.push([ \"\", \"\u{2026} \" + (items.length - shown) + \" more\" ]);\n\
-             \treturn __dbg_group(\"[\", \"]\", false, entries);\n\
+             \treturn __dbg_group(\"[\", \"]\", false, entries, fill);\n\
              }\n\
              const __dbg_seen = [];\n\
              function __dbg_shared(cell, show) {\n\
@@ -1936,7 +1938,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\t__dbg_seen.pop();\n\
              \t}\n\
              }\n\
-             function __dbg_members(open, items, show) {\n\
+             function __dbg_members(open, items, show, fill) {\n\
              \tconst entries = [];\n\
              \tfor (const item of items) {\n\
              \t\tif (entries.length === 100) {\n\
@@ -1945,7 +1947,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\t}\n\
              \t\tentries.push(show(item));\n\
              \t}\n\
-             \treturn __dbg_group(open, \"}\", true, entries);\n\
+             \treturn __dbg_group(open, \"}\", true, entries, fill);\n\
              }\n\
              function __dbg_map(open, table, showKey, showValue, keyWidth, valueWidth) {\n\
              \tconst items = Array.from(table.values());\n\
@@ -1955,8 +1957,8 @@ fn helper_source(name: &str) -> &'static str {
              \t\treturn [ __dbg_flat(showKey(key)) + \" => \", showValue(value) ];\n\
              \t});\n\
              }\n\
-             function __dbg_set(open, table, show) {\n\
-             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ]);\n\
+             function __dbg_set(open, table, show, fill) {\n\
+             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ], fill);\n\
              }\n\
              function __dbg_str(text) {\n\
              \tlet out = \"\\\"\";\n\
@@ -1992,6 +1994,18 @@ fn helper_source(name: &str) -> &'static str {
              \tif (typeof document === \"string\" || document.e.length === 0 || column + __dbg_width(flat) <= 80) return flat;\n\
              \tconst pad = \" \".repeat(indent + 2);\n\
              \tlet out = document.o + \"\\n\";\n\
+             \tif (document.f) {\n\
+             \t\tlet line = \"\";\n\
+             \t\tfor (const entry of document.e) {\n\
+             \t\t\tconst text = entry[0] + __dbg_flat(entry[1]) + \",\";\n\
+             \t\t\tif (line === \"\") line = pad + text;\n\
+             \t\t\telse if (__dbg_width(line) + 1 + __dbg_width(text) > 80) {\n\
+             \t\t\t\tout += line + \"\\n\";\n\
+             \t\t\t\tline = pad + text;\n\
+             \t\t\t} else line += \" \" + text;\n\
+             \t\t}\n\
+             \t\treturn out + line + \"\\n\" + \" \".repeat(indent) + document.c;\n\
+             \t}\n\
              \tfor (const entry of document.e) out += pad + entry[0] + __dbg_layout(entry[1], __dbg_width(pad + entry[0]), indent + 2) + \",\\n\";\n\
              \treturn out + \" \".repeat(indent) + document.c;\n\
              }"

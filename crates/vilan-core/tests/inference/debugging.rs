@@ -224,9 +224,20 @@ fn s1_dbg_of_a_generic_value_prints_each_instantiations_type() {
     );
 }
 
+/// The first 98 entries of a filled `0..` list (E277), as `dbg` lays them out
+/// two spaces deep.
+const FILLED_ZERO_TO_97: &str = concat!(
+    "  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,\n",
+    "  22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,\n",
+    "  41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59,\n",
+    "  60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,\n",
+    "  79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97,\n",
+);
+
 /// Q1's layout: one line when it fits 80 columns from where it starts, else
-/// one entry per line, two spaces deeper, each with a trailing comma; a list
-/// past 100 entries stops with `… N more`; a closure prints by its type.
+/// one entry per line, two spaces deeper, each with a trailing comma (a list
+/// of scalars filling its lines instead, E277); a list past 100 entries stops
+/// with `… N more`; a closure prints by its type.
 #[test]
 fn s1_dbg_breaks_past_80_columns_and_cuts_a_long_list() {
     assert_dbg_runs(
@@ -247,8 +258,109 @@ fn s1_dbg_breaks_past_80_columns_and_cuts_a_long_list() {
         ),
         "103\n",
         &format!(
-            "[test.vl:4:2] long = Line {{\n  from = (1, 2),\n  to = (3, 4),\n  label = \"a label long enough to break\",\n}}\n[test.vl:9:13] many = [\n{}  \u{2026} 3 more,\n]\n[test.vl:12:2] add = <closure |i32, i32| -> i32>\n",
-            (0..100).map(|n| format!("  {n},\n")).collect::<String>()
+            "[test.vl:4:2] long = Line {{\n  from = (1, 2),\n  to = (3, 4),\n  label = \"a label long enough to break\",\n}}\n[test.vl:9:13] many = [\n{}  98, 99, \u{2026} 3 more,\n]\n[test.vl:12:2] add = <closure |i32, i32| -> i32>\n",
+            FILLED_ZERO_TO_97
+        ),
+    );
+}
+
+/// E277: a broken list (or set) whose entries are all scalars — numbers,
+/// strings, bools, a field-less enum — fills each line up to the 80-column
+/// limit, a trailing comma after every entry, where an aggregate element
+/// (a struct, an `Option`) keeps a line of its own; nested in a broken struct
+/// the filled lines sit two spaces deeper, and a list that fits stays on one
+/// line.
+#[test]
+fn e277_a_list_of_scalars_fills_its_lines_and_aggregates_keep_one_per_line() {
+    assert_dbg_runs(
+        concat!(
+            "import std::hash_set::HashSet;\n",
+            "\n",
+            "struct Point {\n",
+            "\tx: i32,\n",
+            "\ty: i32,\n",
+            "}\n",
+            "\n",
+            "enum Color {\n",
+            "\tRed,\n",
+            "\tGreen,\n",
+            "\tBlue,\n",
+            "}\n",
+            "\n",
+            "struct Bag {\n",
+            "\tlabel: str,\n",
+            "\tvalues: List<i32>,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut numbers: List<i32> = [];\n",
+            "\tmut next = 0;\n",
+            "\tfor next < 40 {\n",
+            "\t\tnumbers.push(next);\n",
+            "\t\tnext = next + 1;\n",
+            "\t}\n",
+            "\tdbg(numbers);\n",
+            "\tlet words = [\"alpha\", \"beta\", \"gamma\", \"delta\", \"epsilon\", \"zeta\", \"eta\", \"theta\", \"iota\", \"kappa\"];\n",
+            "\tdbg(words);\n",
+            "\tlet points = [Point { x = 1, y = 2 }, Point { x = 3, y = 4 }, Point { x = 5, y = 6 }];\n",
+            "\tdbg(points);\n",
+            "\tlet colors = [Color::Red, Color::Green, Color::Blue, Color::Red, Color::Green, Color::Blue];\n",
+            "\tdbg(colors);\n",
+            "\tlet maybes = [Some(1), None, Some(3), None, Some(5), None, Some(7), None, Some(9)];\n",
+            "\tdbg(maybes);\n",
+            "\tdbg(Bag { label = \"b\", values = numbers });\n",
+            "\tmut seen: HashSet<i32> = HashSet::new();\n",
+            "\tmut item = 100;\n",
+            "\tfor item < 130 {\n",
+            "\t\tseen.insert(item);\n",
+            "\t\titem = item + 1;\n",
+            "\t}\n",
+            "\tdbg(seen);\n",
+            "\tdbg([1.5, 2.5], [true, false]);\n",
+            "}\n",
+        ),
+        "",
+        concat!(
+            "[test.vl:26:2] numbers = [\n",
+            "  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,\n",
+            "  22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,\n",
+            "]\n",
+            "[test.vl:28:2] words = [\n",
+            "  \"alpha\", \"beta\", \"gamma\", \"delta\", \"epsilon\", \"zeta\", \"eta\", \"theta\", \"iota\",\n",
+            "  \"kappa\",\n",
+            "]\n",
+            "[test.vl:30:2] points = [\n",
+            "  Point { x = 1, y = 2 },\n",
+            "  Point { x = 3, y = 4 },\n",
+            "  Point { x = 5, y = 6 },\n",
+            "]\n",
+            "[test.vl:32:2] colors = [\n",
+            "  Color::Red, Color::Green, Color::Blue, Color::Red, Color::Green, Color::Blue,\n",
+            "]\n",
+            "[test.vl:34:2] maybes = [\n",
+            "  Some(1),\n",
+            "  None,\n",
+            "  Some(3),\n",
+            "  None,\n",
+            "  Some(5),\n",
+            "  None,\n",
+            "  Some(7),\n",
+            "  None,\n",
+            "  Some(9),\n",
+            "]\n",
+            "[test.vl:35:2] Bag { label = \"b\", values = numbers } = Bag {\n",
+            "  label = \"b\",\n",
+            "  values = [\n",
+            "    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,\n",
+            "    21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,\n",
+            "  ],\n",
+            "}\n",
+            "[test.vl:42:2] seen = HashSet {\n",
+            "  100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114,\n",
+            "  115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129,\n",
+            "}\n",
+            "[test.vl:43:2] [1.5, 2.5] = [1.5, 2.5]\n",
+            "[test.vl:43:2] [true, false] = [true, false]\n",
         ),
     );
 }

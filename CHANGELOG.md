@@ -28,6 +28,11 @@ written down.
 <!-- family: tooling -->
 **E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an `f32`, one inside a list or an option — where it printed `0.0`; `print` keeps N136's `0`.** `dbg` is the tool that shows the real value, so it no longer follows `print`'s `String(x)` rule for this one value; `.debug()` on `f32`/`f64` answers `"-0.0"` too, so a derived `Debug` and `dbg` still agree. Identical bytes on both backends (`__dbg_float`, `vilan_rt::show::float`). The committed `native/dbg_printer.stderr` moves by its one `0.0 * -1.0` line, and `s4_debug_covers_every_container_the_printer_prints`'s `(0.0 * -1.0).debug()` reads `-0.0`. Pins: `inference::debugging::e276_dbg_shows_negative_zero_and_print_keeps_zero`, `native_differential::e276_dbg_shows_negative_zero_on_both_backends`, `vilan_rt::show`'s `floats_keep_their_point_and_strings_their_quotes`. Tracker E276.
 
+---
+
+<!-- family: tooling -->
+**E277: a broken `dbg` list or set of scalars fills its lines to the 80-column limit — `[\n  0, 1, 2, …, 21,\n  22, …` — where it took a line per entry; an aggregate element (a struct, an `Option`, a tuple) keeps a line of its own, and the 100-entry cap stands.** A scalar is a number, a string, a bool, `()`, a backed enum or one whose variants carry nothing (`Color::Red`), decided from the element's printing shape (`printer::Shape::is_scalar`), so both backends decide alike; each line ends with a comma, the `… N more` marker packs like an entry, and a list nested in a broken struct fills two spaces deeper. Identical bytes on both backends (`__dbg_layout`, `vilan_rt::show::Doc::layout`, both taking a group's new `fill` flag). The committed `native/dbg_printer.stderr` moves by its 103-entry list (106 lines become 8). Pins: `inference::debugging::e277_a_list_of_scalars_fills_its_lines_and_aggregates_keep_one_per_line`, the re-read `s1_dbg_breaks_past_80_columns_and_cuts_a_long_list`, `native_differential::e277_scalar_lists_fill_their_lines_on_both_backends` (`native/dbg_fill.vl`), `vilan_rt::show`'s `a_broken_list_of_scalars_fills_each_line_to_80_columns`. Tracker E277.
+
 ## v0.45.0 — 2026-10-08
 
 <!-- family: breaking -->
