@@ -218,6 +218,7 @@ impl PublishState {
         after: &LineIndex,
     ) -> bool {
         let target = self.key(target);
+        let windows = self.windows;
         let mut touched = false;
         for groups in self.owned.values_mut() {
             for (candidate, group) in groups.iter_mut() {
@@ -225,18 +226,37 @@ impl PublishState {
                     continue;
                 }
                 touched = true;
-                group.retain_mut(|diagnostic| {
+                let follow = |range: Range| {
                     let span = Span {
-                        start: before.offset(diagnostic.range.start),
-                        end: before.offset(diagnostic.range.end),
+                        start: before.offset(range.start),
+                        end: before.offset(range.end),
                     };
-                    match follow_span(span, &edit) {
-                        Some(followed) => {
-                            diagnostic.range = after.range(&followed);
-                            true
-                        }
-                        None => false,
+                    follow_span(span, &edit).map(|followed| after.range(&followed))
+                };
+                group.retain_mut(|diagnostic| {
+                    let Some(range) = follow(diagnostic.range) else {
+                        return false;
+                    };
+                    diagnostic.range = range;
+                    // E279: a note that points into this same file (the
+                    // earlier declaration, the other arm) follows the edit
+                    // too; one whose code the edit took away goes, and the
+                    // diagnostic stays.
+                    if let Some(related) = diagnostic.related_information.as_mut() {
+                        related.retain_mut(|information| {
+                            if crate::uri::normalize(&information.location.uri, windows) != target {
+                                return true;
+                            }
+                            match follow(information.location.range) {
+                                Some(range) => {
+                                    information.location.range = range;
+                                    true
+                                }
+                                None => false,
+                            }
+                        });
                     }
+                    true
                 });
             }
         }
@@ -1971,6 +1991,53 @@ mod tests {
         assert!(!followed.is_empty(), "the fixture has an error");
         assert_eq!(followed, fresh_ranges(&edited), "the next analysis agrees");
         assert_eq!(followed[0].start.line, 3);
+    }
+
+    // E279: a diagnostic's related information in its OWN file follows the
+    // edit too — the trace's hops point at calls in the same buffer, and a
+    // line typed above them moved the squiggle but left every "see here" one
+    // line short until the analysis landed.
+    #[test]
+    fn e279_related_information_in_the_same_file_follows_the_edit() {
+        let text = "import std::context::Context;\nimport std::io::print;\nlet current: Context<i32> = Context::new();\nfun read_it(): i32 {\n\tcurrent.get()\n}\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
+        let path = std::env::temp_dir().join(format!("vilan_e279_{}.vl", std::process::id()));
+        let uri = Url::from_file_path(&path).unwrap();
+        let document = Document::analyze(text, &std_root(), &path);
+        let mut state = PublishState::new();
+        state.plan_publish(&uri, &document);
+        let related_lines = |state: &PublishState| -> Vec<Vec<u32>> {
+            state
+                .republish(&uri)
+                .1
+                .into_iter()
+                .filter_map(|diagnostic| diagnostic.related_information)
+                .map(|related| {
+                    related
+                        .into_iter()
+                        .filter(|information| information.location.uri == uri)
+                        .map(|information| information.location.range.start.line)
+                        .collect()
+                })
+                .collect()
+        };
+        let before = related_lines(&state);
+        assert!(
+            before.iter().any(|lines| !lines.is_empty()),
+            "the fixture carries same-file related information"
+        );
+        // A comment line typed at the very top: every location moves down one.
+        let edited = format!("// top\n{text}");
+        let edit = crate::document::EditDelta {
+            start: 0,
+            old_len: 0,
+            new_len: "// top\n".len(),
+        };
+        state.follow_edit(&uri, &LineIndex::new(text), edit, &LineIndex::new(&edited));
+        let expected: Vec<Vec<u32>> = before
+            .iter()
+            .map(|lines| lines.iter().map(|line| line + 1).collect())
+            .collect();
+        assert_eq!(related_lines(&state), expected);
     }
 
     #[test]

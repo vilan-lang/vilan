@@ -3056,6 +3056,44 @@ impl Document {
         self.analyzed_index.offset(position)
     }
 
+    /// E279: how the live buffer got from the analyzed text — the recorded
+    /// incremental-sync log, or the byte-exact region the two differ in when
+    /// there is none. The one map every sticky answer reads, in both
+    /// directions.
+    pub fn edit_trail(&self) -> EditTrail<'_> {
+        EditTrail::of(self.live_edits.as_deref(), self.analyzed_text(), &self.text)
+    }
+
+    /// E279: the ANALYZED offset a caret request at a LIVE `position` asks
+    /// about — the position read against the buffer on screen, then carried
+    /// back through the edits since the analysis. `None` when the caret sits
+    /// inside text typed since then: the analysis saw nothing there.
+    ///
+    /// Before E279 a caret request converted the live position through the
+    /// ANALYZED index (S1), which named the right byte only while the two
+    /// texts agreed: a line typed above the caret moved every answer onto the
+    /// line above it until the analysis landed.
+    pub fn request_offset(&self, position: Position) -> Option<usize> {
+        self.edit_trail().back(self.line_index.offset(position))
+    }
+
+    /// E279: the LIVE range of an ANALYZED-space span — carried forward
+    /// through the edits since the analysis by the rule a published
+    /// diagnostic follows ([`EditTrail::follow_span`]), then converted
+    /// against the buffer on screen. `None` when an edit across one of its
+    /// ends took the code it named away.
+    pub fn live_range_of(&self, span: &Span) -> Option<Range> {
+        self.live_range_through(&self.edit_trail(), span)
+    }
+
+    /// [`Document::live_range_of`] through a trail the caller built once —
+    /// a request answering many spans of one document (find-references)
+    /// pays for the trail once, not per span.
+    pub fn live_range_through(&self, trail: &EditTrail<'_>, span: &Span) -> Option<Range> {
+        let span = trail.follow_span(*span)?;
+        Some(self.line_index.range(&span))
+    }
+
     /// Record the world revision this analysis read (E117). Called on a fresh
     /// [`Document::analyze`] result before it is landed; the value travels with
     /// the analysis through [`Document::adopt_analysis`].
@@ -5178,8 +5216,8 @@ impl Document {
         abbreviate: bool,
     ) -> Vec<ServedHint> {
         let verdict = self.keystroke_verdict(dependency_moved);
-        let trail = EditTrail::of(self.live_edits.as_deref(), self.analyzed_text(), &self.text);
-        self.landed.hints_for(&trail, verdict, abbreviate)
+        self.landed
+            .hints_for(&self.edit_trail(), verdict, abbreviate)
     }
 
     /// Completion candidates at a LIVE `offset`, answered from the symbol
@@ -5966,11 +6004,13 @@ impl Document {
     /// the formatter — they are surface, not usage), and an import a macro
     /// expansion references is kept (see `unused_import_leaf_spans`).
     pub fn organize_import_edits(&self) -> Vec<(Span, String)> {
-        // The LIVE text: the returned spans come from the formatter's own parse
-        // of this string, so they are live-space and the handler converts them
-        // through the live index. (The handler also refuses outright while the
-        // snapshots diverge — S3 — so in practice the two texts are equal here.)
-        let source = self.text.as_str();
+        // The ANALYZED text (E279): the returned spans come from the
+        // formatter's own parse of this string, so they are in the space every
+        // finding of this document is in — the duplicate-import quick fix
+        // pairs them with its warnings, and the handler carries them onto the
+        // live buffer. The Organize Imports action itself refuses while the
+        // snapshots diverge (S3), so there the two texts are equal.
+        let source = self.analyzed_text();
         // Prune only against a fresh, diagnostic-free analysis of THIS buffer: a
         // stale or broken document (a mid-edit unresolved name might be about to
         // use an import) sorts but never prunes.
@@ -7202,7 +7242,9 @@ impl Document {
                 continue;
             }
             asked |= spans_overlap(diagnostic.span, range);
-            if let Some(edit) = css_declaration_call_edit(&self.text, diagnostic.span.start) {
+            if let Some(edit) =
+                css_declaration_call_edit(self.analyzed_text(), diagnostic.span.start)
+            {
                 edits.push(edit);
             }
         }
@@ -7251,7 +7293,7 @@ impl Document {
             if span.start < cursor {
                 return None;
             }
-            replacement.push_str(self.text.get(cursor..span.start)?);
+            replacement.push_str(self.analyzed_text().get(cursor..span.start)?);
             replacement.push_str(text);
             cursor = span.end;
         }
@@ -7283,7 +7325,11 @@ impl Document {
     /// parser's own fix data spells it (`parsing::marker_order_fix`, which
     /// permutes the head's units and keeps what stood between them).
     fn marker_order_quick_fix(&self, finding: &vilan_core::error::Error) -> Option<QuickFix> {
-        let fix = vilan_core::parsing::marker_order_fix(&self.text, &finding.msg, finding.span)?;
+        let fix = vilan_core::parsing::marker_order_fix(
+            self.analyzed_text(),
+            &finding.msg,
+            finding.span,
+        )?;
         Some(QuickFix {
             title: fix.title,
             span: fix.span,
@@ -7325,7 +7371,7 @@ impl Document {
     /// missing trait (B515) both offer.
     fn import_fix(&self, module_path: &[String], name: &str) -> Option<QuickFix> {
         let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
-        let edit = vilan_core::formatter::insert_import(&self.text, &path_refs, name)?;
+        let edit = vilan_core::formatter::insert_import(self.analyzed_text(), &path_refs, name)?;
         Some(QuickFix {
             title: format!("Import `{name}` from {}", module_path.join("::")),
             span: edit.span,
@@ -7403,13 +7449,13 @@ impl Document {
         if imports.len() < 2 {
             return None;
         }
-        let mut working = self.text.clone();
+        let mut working = self.analyzed_text().to_string();
         for (name, module_path) in &imports {
             let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
             let edit = vilan_core::formatter::insert_import(&working, &path_refs, name)?;
             working = splice(&working, edit.span, &edit.replacement);
         }
-        let (span, replacement) = narrowed_edit(&self.text, &working);
+        let (span, replacement) = narrowed_edit(self.analyzed_text(), &working);
         Some(QuickFix {
             title: format!("Import all {} traits this file calls", imports.len()),
             span,
@@ -7442,12 +7488,14 @@ impl Document {
             {
                 continue;
             }
-            let Some(preferred) =
-                vilan_ide::numeric_fix::numeric_fixes(&self.text, diagnostic.span, &diagnostic.msg)
-                    .into_iter()
-                    .next()
-                    .filter(|fix| fix.index)
-            else {
+            let Some(preferred) = vilan_ide::numeric_fix::numeric_fixes(
+                self.analyzed_text(),
+                diagnostic.span,
+                &diagnostic.msg,
+            )
+            .into_iter()
+            .next()
+            .filter(|fix| fix.index) else {
                 continue;
             };
             asked |= spans_overlap(diagnostic.span, range);
@@ -7467,16 +7515,65 @@ impl Document {
         })
     }
 
-    /// The quickfix menu for the diagnostics overlapping `range` (LIVE
-    /// space — safe because the caller gates staleness first, S3: while
-    /// non-stale, live spans and this document's own `diagnostics` spans
-    /// address the same text): one action per unambiguous add-import
-    /// candidate (E54b — several when a name is AMBIGUOUS across modules,
-    /// never guessed), and the field-rename fix on a closest-name suggestion
-    /// (E58c). Reads THIS document's own diagnostics directly rather than the
-    /// client-echoed `context.diagnostics` — only ours carries the span and
-    /// note data a fix needs, and the staleness refusal is what makes that a
-    /// safe substitution.
+    /// E279: the quickfix menu for a LIVE `range`, in live space — the menu
+    /// [`Document::quickfixes`] builds over the analyzed text, offered while
+    /// the buffer is ahead of the analysis wherever it still applies.
+    ///
+    /// The range is carried back onto the analyzed text (an end inside typed
+    /// text widens to the bytes it replaced), the fixes are built there —
+    /// every finding they answer is in that space, and so is every text they
+    /// read — and each fix's span is carried forward only where no edit since
+    /// touched its bytes ([`EditTrail::follow_untouched`]): a fix written over
+    /// text the user has typed into would overwrite it, so that one waits for
+    /// the analysis. A fix that edits ANOTHER file carries its own range and
+    /// is untouched by this buffer's edits. Before E279 the handler refused the
+    /// whole menu while the snapshots diverged (S3), which hid the quick fix
+    /// of every squiggle E242 had just carried along.
+    pub fn live_quickfixes(&self, program: &Program, range: Span) -> Vec<QuickFix> {
+        let trail = self.edit_trail();
+        self.quickfixes(program, trail.back_span(range))
+            .into_iter()
+            .filter_map(|fix| {
+                if fix.target.is_some() {
+                    return Some(fix);
+                }
+                let span = trail.follow_untouched(fix.span)?;
+                Some(QuickFix { span, ..fix })
+            })
+            .collect()
+    }
+
+    /// E279: [`Document::add_all_missing_imports_edit`] carried onto the live
+    /// buffer by [`Document::live_quickfixes`]'s rule — offered while the
+    /// buffer is ahead only where no edit since touched what it rewrites.
+    ///
+    /// The action rewrites the whole file, which every edit touches, so while
+    /// the buffer is ahead it is narrowed first to the bytes it changes (the
+    /// import block) — a keystroke in a body below leaves it offered.
+    pub fn live_add_all_missing_imports_edit(&self, program: &Program) -> Option<(Span, String)> {
+        let (span, text) = self.add_all_missing_imports_edit(program)?;
+        if !self.is_stale() {
+            return Some((span, text));
+        }
+        let analyzed = self.analyzed_text();
+        let after = format!(
+            "{}{text}{}",
+            analyzed.get(..span.start)?,
+            analyzed.get(span.end..)?
+        );
+        let (span, text) = narrowed_edit(analyzed, &after);
+        Some((self.edit_trail().follow_untouched(span)?, text))
+    }
+
+    /// The quickfix menu for the diagnostics overlapping `range`, in the
+    /// ANALYZED text's space — the space this document's own `diagnostics`
+    /// are in, and the text every fix below reads (E279; the server asks
+    /// through [`Document::live_quickfixes`]): one action per unambiguous
+    /// add-import candidate (E54b — several when a name is AMBIGUOUS across
+    /// modules, never guessed), and the field-rename fix on a closest-name
+    /// suggestion (E58c). Reads THIS document's own diagnostics directly
+    /// rather than the client-echoed `context.diagnostics` — only ours
+    /// carries the span and note data a fix needs.
     pub fn quickfixes(&self, program: &Program, range: Span) -> Vec<QuickFix> {
         let mut fixes = Vec::new();
         // E255: a duplicate import's fix is Organize Imports' own edit for the
@@ -7521,7 +7618,7 @@ impl Document {
             // message (the one field a diagnostic carries through the
             // pipeline).
             if let Some(fix) = vilan_core::parsing::foreign_spelling_fix(
-                &self.text,
+                self.analyzed_text(),
                 &diagnostic.msg,
                 diagnostic.span,
             ) {
@@ -7548,7 +7645,7 @@ impl Document {
             // `prelude::` before the prelude names (E268). The edit is the one
             // `vilan check --fix` applies.
             if let Some(fix) = vilan_core::parsing::moved_std_module_fix(
-                &self.text,
+                self.analyzed_text(),
                 &diagnostic.msg,
                 diagnostic.span,
             ) {
@@ -7628,7 +7725,7 @@ impl Document {
                 });
             } else if diagnostic.msg.ends_with(DISCARDED_VALUE_MESSAGE)
                 && let Some(semicolon_span) =
-                    trailing_semicolon_to_remove(&self.text, program, diagnostic.span)
+                    trailing_semicolon_to_remove(self.analyzed_text(), program, diagnostic.span)
             {
                 // Regime 1' (S3, editing-dx.md §17.4): the diagnostic anchors
                 // at the callable's closing BRACE, not the `;` — the fix
@@ -7645,7 +7742,8 @@ impl Document {
             } else if diagnostic
                 .msg
                 .starts_with(vilan_core::parsing::MISBOUND_RETURN_CLAUSE)
-                && let Some(replacement) = parenthesized_return_clause(&self.text, diagnostic.span)
+                && let Some(replacement) =
+                    parenthesized_return_clause(self.analyzed_text(), diagnostic.span)
             {
                 // B343 (R9): the refusal names BOTH readings, and the fix takes
                 // the one the position exists for — the clause on the FUNCTION.
@@ -7659,13 +7757,13 @@ impl Document {
                     target: None,
                 });
             } else if diagnostic.msg.starts_with(AT_IS_NOT_A_TOKEN)
-                && let Some(fix) = media_rule_fix(&self.text, diagnostic.span.start)
+                && let Some(fix) = media_rule_fix(self.analyzed_text(), diagnostic.span.start)
             {
                 // §7.2 fix 2, the `#`'s twin: the one at-rule with a
                 // combinator spelling is a min-width media query.
                 fixes.push(fix);
             } else if let Some(fix) = vilan_ide::closure_mode_fix::closure_mode_fixes(
-                &self.text,
+                self.analyzed_text(),
                 diagnostic.span,
                 &diagnostic.msg,
             )
@@ -7689,7 +7787,9 @@ impl Document {
                         target: None,
                     },
                 });
-            } else if let Some(conversions) = numeric_conversion_fixes(&self.text, diagnostic) {
+            } else if let Some(conversions) =
+                numeric_conversion_fixes(self.analyzed_text(), diagnostic)
+            {
                 // E218: the mismatch names the one call that fixes it, and the
                 // fix writes that call at the value the diagnostic spans — or,
                 // for a counter bound by a bare literal, declares it `usize`.
@@ -7707,7 +7807,7 @@ impl Document {
                 });
             } else if diagnostic.msg.starts_with(A_CSS_DECLARATION_IS_A_CALL)
                 && let Some((span, replacement)) =
-                    css_declaration_call_edit(&self.text, diagnostic.span.start)
+                    css_declaration_call_edit(self.analyzed_text(), diagnostic.span.start)
             {
                 // E201. The message every migrating program hits, and the two
                 // mechanical cases are the codemod's own rules — so the fix is
@@ -7728,7 +7828,7 @@ impl Document {
                 // and reports at exactly its span, so the fix is that span plus
                 // the whitespace holding it to the value — removing the marker
                 // alone would leave `color(red )`.
-                let start = self.text[..diagnostic.span.start]
+                let start = self.analyzed_text()[..diagnostic.span.start]
                     .trim_end_matches([' ', '\t'])
                     .len();
                 fixes.push(QuickFix {
@@ -7786,7 +7886,7 @@ impl Document {
             }
             if warning.msg.contains(REACH_IS_UNMARKED) {
                 let at = warning.span.start;
-                let leaf = &self.text[warning.span.into_range()];
+                let leaf = &self.analyzed_text()[warning.span.into_range()];
                 fixes.push(QuickFix {
                     title: format!("Import as `#{leaf}`"),
                     span: Span::from(at..at),
@@ -7824,7 +7924,7 @@ impl Document {
                     fixes.push(fix);
                 }
             } else if warning.msg.ends_with(REACH_IS_REDUNDANT)
-                && self.text[..warning.span.start].ends_with('#')
+                && self.analyzed_text()[..warning.span.start].ends_with('#')
             {
                 fixes.push(QuickFix {
                     title: "Delete the `#`".to_string(),
@@ -7832,9 +7932,11 @@ impl Document {
                     replacement: String::new(),
                     target: None,
                 });
-            } else if let Some(fix) =
-                vilan_core::parsing::written_autofocus_fix(&self.text, &warning.msg, warning.span)
-            {
+            } else if let Some(fix) = vilan_core::parsing::written_autofocus_fix(
+                self.analyzed_text(),
+                &warning.msg,
+                warning.span,
+            ) {
                 // A157: a written `autofocus` in an element head — the
                 // analyzer's steer, recognized by its exact message as B520's
                 // foreign spellings are, and rewritten to `.autofocus()` in
@@ -7924,7 +8026,7 @@ impl Document {
         // only on a document whose snapshots agree, so that is also the
         // analyzed text the span came from.
         if declaration.source == self.focus {
-            let at = top_level_item_start(&self.text, declaration.span.start)?;
+            let at = top_level_item_start(self.analyzed_text(), declaration.span.start)?;
             return Some(QuickFix {
                 title,
                 span: Span::from(at..at),
@@ -8298,7 +8400,7 @@ impl Document {
         }
         // B515: the traits a method call needs imported, by the same rule.
         imports.extend(self.unambiguous_trait_imports(program));
-        let mut working = self.text.clone();
+        let mut working = self.analyzed_text().to_string();
         let mut changed = false;
         for (name, module_path) in &imports {
             let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
@@ -8307,7 +8409,7 @@ impl Document {
                 changed = true;
             }
         }
-        changed.then(|| (Span::from(0..self.text.len()), working))
+        changed.then(|| (Span::from(0..self.analyzed_text().len()), working))
     }
 
     /// The outline of the entry file: functions, structs (with their fields),

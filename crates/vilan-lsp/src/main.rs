@@ -35,6 +35,8 @@ mod moved_std_path_tests;
 #[cfg(test)]
 mod organize_duplicate_tests;
 #[cfg(test)]
+mod sticky_span_tests;
+#[cfg(test)]
 mod trait_import_tests;
 #[cfg(test)]
 mod written_autofocus_tests;
@@ -435,7 +437,19 @@ fn fresh_result_id() -> String {
 
 /// Convert a Vilan outline node to an LSP `DocumentSymbol`.
 #[allow(deprecated)]
-fn to_lsp_symbol(symbol: Symbol, line_index: &LineIndex) -> DocumentSymbol {
+/// One outline entry on the wire, its spans carried from the analyzed text
+/// onto the live one (E279). `None` when an edit took the declaration's
+/// extent away; a name an edit is mid-way through keeps the entry, its
+/// selection collapsed to the declaration's start.
+fn to_lsp_symbol(
+    symbol: Symbol,
+    document: &Document,
+    trail: &keystroke::EditTrail<'_>,
+) -> Option<DocumentSymbol> {
+    let range = document.live_range_through(trail, &symbol.full)?;
+    let selection_range = document
+        .live_range_through(trail, &symbol.selection)
+        .unwrap_or(Range::new(range.start, range.start));
     let kind = match symbol.kind {
         VilanSymbolKind::Function => SymbolKind::FUNCTION,
         VilanSymbolKind::Struct => SymbolKind::STRUCT,
@@ -446,22 +460,33 @@ fn to_lsp_symbol(symbol: Symbol, line_index: &LineIndex) -> DocumentSymbol {
     let children = symbol
         .children
         .into_iter()
-        .map(|child| to_lsp_symbol(child, line_index))
+        .filter_map(|child| to_lsp_symbol(child, document, trail))
         .collect::<Vec<_>>();
-    DocumentSymbol {
+    Some(DocumentSymbol {
         name: symbol.name,
         detail: None,
         kind,
         tags: None,
         deprecated: None,
-        range: line_index.range(&symbol.full),
-        selection_range: line_index.range(&symbol.selection),
+        range,
+        selection_range,
         children: if children.is_empty() {
             None
         } else {
             Some(children)
         },
-    }
+    })
+}
+
+/// E279: every open document's edit trail, index-aligned with `open` — built
+/// once per request, so a find-references answering hundreds of spans pays
+/// for each document's trail once.
+fn edit_trails<'a>(
+    open: &'a [dashmap::mapref::multiple::RefMulti<'_, Url, Document>],
+) -> Vec<keystroke::EditTrail<'a>> {
+    open.iter()
+        .map(|entry| entry.value().edit_trail())
+        .collect()
 }
 
 /// An open `vilan.toml`: its text and a line index, which is everything
@@ -3771,8 +3796,9 @@ impl Backend {
         if source == document.focus() {
             return Some(Location {
                 uri: doc_uri.clone(),
-                // A program span indexes the ANALYZED text (S1).
-                range: document.analyzed_range(&span),
+                // A program span indexes the ANALYZED text (S1); E279 carries
+                // it through the edits since, onto the buffer on screen.
+                range: document.live_range_of(&span)?,
             });
         }
         let program = document.program.as_ref()?;
@@ -3790,21 +3816,26 @@ impl Backend {
     /// into an LSP `Location`.
     ///
     /// A path that is an open document's ENTRY converts through that
-    /// document's analyzed index and answers with the URI the client opened it
+    /// document's analyzed text, carried through its edits since onto the
+    /// buffer on screen (E279), and answers with the URI the client opened it
     /// under: the span came from an analysis of exactly that text (S1). Any
     /// other file converts through the session line-index cache, exactly as
     /// [`Backend::location_for`] always has for a non-entry source.
+    ///
+    /// `trails` is index-aligned with `open` — each document's edit trail,
+    /// built once per request ([`edit_trails`]).
     fn location_for_path(
         &self,
         open: &[dashmap::mapref::multiple::RefMulti<'_, Url, Document>],
+        trails: &[keystroke::EditTrail<'_>],
         path: &Path,
         span: Span,
     ) -> Option<Location> {
-        for entry in open {
+        for (entry, trail) in open.iter().zip(trails) {
             if entry.value().entry_path() == Some(path) {
                 return Some(Location {
                     uri: entry.key().clone(),
-                    range: entry.value().analyzed_range(&span),
+                    range: entry.value().live_range_through(trail, &span)?,
                 });
             }
         }
@@ -5124,9 +5155,13 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            // Program-space lookup: the position converts through the ANALYZED
-            // index, so it names the same character the analysis saw there (S1).
-            let offset = document.analyzed_offset(position);
+            // Program-space lookup: the live position carried back through
+            // the edits since the analysis, so it names the character the
+            // analysis saw under the caret (S1, E279). Inside text typed since,
+            // the analysis saw nothing to hover.
+            let Some(offset) = document.request_offset(position) else {
+                return Ok(None);
+            };
             // F27 R3: inside a twin this leg fenced out, the leg that admits
             // it answers.
             Ok(document.answering(offset).hover(offset).map(|label| Hover {
@@ -5180,7 +5215,10 @@ impl LanguageServer for Backend {
             // this is the seam it happens at.
             // F27 R3: inside a twin this leg fenced out, the leg that admits
             // it completes — its live text follows this document's.
-            let answering = document.answering(document.analyzed_offset(position));
+            let answering = match document.request_offset(position) {
+                Some(analyzed) => document.answering(analyzed),
+                None => &document,
+            };
             let items = answering
                 .keystroke_completion(offset, self.schedule.dependency_moved(&uri))
                 .into_iter()
@@ -5204,7 +5242,9 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            let offset = document.analyzed_offset(position);
+            let Some(offset) = document.request_offset(position) else {
+                return Ok(None);
+            };
             // F27 R3 (§8.4 item 4): every leg's answer, the answering leg's
             // first — a call to a twin names the twin each platform compiles.
             // One location (every file without twins) stays a scalar.
@@ -5243,7 +5283,9 @@ impl LanguageServer for Backend {
             let Some(origin) = open.iter().find(|entry| *entry.key() == uri) else {
                 return Ok(None);
             };
-            let offset = origin.value().analyzed_offset(position);
+            let Some(offset) = origin.value().request_offset(position) else {
+                return Ok(None);
+            };
             let entry_world = world
                 .as_ref()
                 .and_then(|entry| self.reference_worlds.get(entry));
@@ -5252,11 +5294,12 @@ impl LanguageServer for Backend {
                 .filter(|entry| *entry.key() != uri)
                 .map(|entry| entry.value())
                 .chain(entry_world.as_ref().map(|world| &world.document));
+            let trails = edit_trails(&open);
             let locations = origin
                 .value()
                 .references_across(offset, neighbors)
                 .into_iter()
-                .filter_map(|(path, span)| self.location_for_path(&open, &path, span))
+                .filter_map(|(path, span)| self.location_for_path(&open, &trails, &path, span))
                 .collect();
             Ok(Some(locations))
         })
@@ -5312,11 +5355,12 @@ impl LanguageServer for Backend {
             // site that is a plain identifier — which is all of them but one —
             // and the struct-init shorthand's expansion (`A { new = x }`) where
             // the one identifier had to become two.
+            let trails = edit_trails(&open);
             for (path, span, new_text) in edits {
                 // An occurrence that cannot be turned into a location would be a
                 // reference this rename silently skips — the partial edit set the
                 // rule forbids — so refuse rather than drop it.
-                let Some(location) = self.location_for_path(&open, &path, span) else {
+                let Some(location) = self.location_for_path(&open, &trails, &path, span) else {
                     return Err(rename_refused(
                         &crate::document::RenameRefusal::Incomplete {
                             what: "this symbol".to_string(),
@@ -5396,10 +5440,14 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
+            // E279: the outline's spans are the analysis's; each follows the
+            // edits since onto the buffer on screen, and one whose code an
+            // edit took away is left out until the analysis lands.
+            let trail = document.edit_trail();
             let symbols = document
                 .document_symbols()
                 .into_iter()
-                .map(|symbol| to_lsp_symbol(symbol, document.analyzed_index()))
+                .filter_map(|symbol| to_lsp_symbol(symbol, &document, &trail))
                 .collect::<Vec<_>>();
             Ok(Some(DocumentSymbolResponse::Nested(symbols)))
         })
@@ -5503,19 +5551,26 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            // S3, quickfix home (E54/E58): every action below returns edits
-            // computed from `program` data — Organize Imports' prune half,
-            // the add-import quickfix's candidate scan, the field-rename
-            // quickfix's diagnostic note, "add all missing imports". Refuse
-            // ALL of them the same way while the snapshots diverge, rather
-            // than hand back a half-informed edit set — the SILENT spelling:
-            // code actions fire automatically (menu population, the on-save
-            // hooks), so this refusal must not toast.
-            if document.is_stale() {
+            // S3, quickfix home (E54/E58): Organize Imports rewrites the whole
+            // import list from `program` data (its prune half), so it is
+            // refused while the snapshots diverge rather than handing back a
+            // half-informed edit set — the SILENT spelling: code actions fire
+            // automatically (menu population, the on-save hooks), so this
+            // refusal must not toast. E279: every other action is answered —
+            // the quick fixes from the analyzed text, each carried onto the
+            // live buffer where no edit since touched it, and the refactors
+            // from the live text they always read.
+            let stale = document.is_stale();
+            if stale
+                && wants_organize
+                && !wants_quickfix
+                && !wants_fix_all_imports
+                && !wants_refactor
+            {
                 return Err(content_modified());
             }
             let mut actions: Vec<CodeActionOrCommand> = Vec::new();
-            if wants_organize {
+            if wants_organize && !stale {
                 let edits = document.organize_import_edits();
                 // No edits = already organized (or nothing to do): offer no
                 // action, so `codeActionsOnSave` is a clean no-op.
@@ -5523,10 +5578,9 @@ impl LanguageServer for Backend {
                     let text_edits: Vec<TextEdit> = edits
                         .into_iter()
                         .map(|(span, new_text)| TextEdit {
-                            // Live-space: these spans come from the formatter's own
-                            // parse of the live text, not from the program (S2). The
-                            // staleness refusal above means the two texts are equal
-                            // here anyway.
+                            // These spans come from the formatter's own parse of
+                            // the analyzed text, not from the program (S2), and the
+                            // staleness gate above means it equals the live text.
                             range: document.line_index.range(&span),
                             new_text,
                         })
@@ -5618,7 +5672,7 @@ impl LanguageServer for Backend {
             if let Some(program) = document.program.as_ref() {
                 if wants_quickfix {
                     let range = live_span(&document, params.range);
-                    for fix in document.quickfixes(program, range) {
+                    for fix in document.live_quickfixes(program, range) {
                         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
                         // E177: a fix may edit ANOTHER file — B318 §4/§5's
                         // "Export `S`" inserts one word in front of a
@@ -5662,7 +5716,8 @@ impl LanguageServer for Backend {
                     }
                 }
                 if wants_fix_all_imports
-                    && let Some((span, new_text)) = document.add_all_missing_imports_edit(program)
+                    && let Some((span, new_text)) =
+                        document.live_add_all_missing_imports_edit(program)
                 {
                     let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
                     changes.insert(
@@ -6034,7 +6089,10 @@ mod snapshot_consistency_tests {
     }
 
     // S3, handler 2 of 2: Organize Imports also returns text edits, and its
-    // prune half reads program data. Its refusal is the SILENT spelling —
+    // prune half reads program data — asked for alone (the on-save hook's
+    // request) it refuses while the buffer is ahead; asked for beside other
+    // kinds it is left out of the answer and the rest is served (E279). Its
+    // refusal is the SILENT spelling —
     // `ContentModified`, which `vscode-languageclient` swallows into the
     // default empty answer — because code actions fire automatically (menu
     // population, the on-save hooks): `RequestFailed` here would pop an error
@@ -6044,8 +6102,10 @@ mod snapshot_consistency_tests {
         let (service, _socket) = backend();
         let backend = service.inner();
         let uri = open_with_live_edit(backend, EDITED);
+        let mut params = code_action_params(&uri);
+        params.context.only = Some(vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS]);
         let error = backend
-            .code_action(code_action_params(&uri))
+            .code_action(params)
             .await
             .expect_err("a stale organize refuses");
         assert_eq!(error.code, ErrorCode::ContentModified);
@@ -6078,60 +6138,30 @@ mod snapshot_consistency_tests {
         );
     }
 
-    // E54/E58 (quickfix home, part a): QUICKFIX and "add all missing
-    // imports" are OFFERED kinds now, so — unlike a kind we never answer at
-    // all — they refuse the SAME way Organize Imports does while the buffer
-    // is ahead of the analysis: their edits are computed from `program` data
-    // too (the diagnostic scan, the candidate search), so a half-informed
-    // edit set is exactly as unsafe here.
+    // E279 (replacing E54/E58's refusal): QUICKFIX, "add all missing
+    // imports" and the refactors are ANSWERED while the buffer is ahead of the
+    // analysis — the fixes from the analyzed text, each carried onto the live
+    // buffer only where no edit since touched it (`sticky_span_tests` pins the
+    // carrying), the refactors from the live text they always read. Only
+    // Organize Imports asked for alone still refuses (above).
     #[tokio::test]
-    async fn a_stale_document_refuses_a_quickfix_request() {
-        let (service, _socket) = backend();
-        let backend = service.inner();
-        let uri = open_with_live_edit(backend, EDITED);
-        let mut params = code_action_params(&uri);
-        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
-        let error = backend
-            .code_action(params)
-            .await
-            .expect_err("a stale quickfix request refuses");
-        assert_eq!(error.code, ErrorCode::ContentModified);
-    }
-
-    // css-block S5: `refactor.rewrite` is an OFFERED kind, so it joins the
-    // group above — and so does the bare `refactor` an editor's refactor menu
-    // asks with, since the kind hierarchy makes it an ancestor. The conversion
-    // itself reads a raw parse rather than `program`, but the handler's
-    // refusal is one answer for the whole request, and half-answering a menu
-    // is not better than refusing it.
-    #[tokio::test]
-    async fn a_stale_document_refuses_a_refactor_request() {
-        for kind in [CodeActionKind::REFACTOR_REWRITE, CodeActionKind::REFACTOR] {
+    async fn a_stale_document_answers_quickfix_refactor_and_fix_all_requests() {
+        for kind in [
+            CodeActionKind::QUICKFIX,
+            CodeActionKind::REFACTOR_REWRITE,
+            CodeActionKind::REFACTOR,
+            super::fix_all_imports_kind(),
+        ] {
             let (service, _socket) = backend();
             let backend = service.inner();
             let uri = open_with_live_edit(backend, EDITED);
             let mut params = code_action_params(&uri);
             params.context.only = Some(vec![kind.clone()]);
-            let error = backend
+            backend
                 .code_action(params)
                 .await
-                .expect_err("a stale refactor request refuses");
-            assert_eq!(error.code, ErrorCode::ContentModified, "{kind:?}");
+                .unwrap_or_else(|error| panic!("{kind:?} is answered, not refused: {error:?}"));
         }
-    }
-
-    #[tokio::test]
-    async fn a_stale_document_refuses_an_add_all_missing_imports_request() {
-        let (service, _socket) = backend();
-        let backend = service.inner();
-        let uri = open_with_live_edit(backend, EDITED);
-        let mut params = code_action_params(&uri);
-        params.context.only = Some(vec![super::fix_all_imports_kind()]);
-        let error = backend
-            .code_action(params)
-            .await
-            .expect_err("a stale fix-all request refuses");
-        assert_eq!(error.code, ErrorCode::ContentModified);
     }
 
     /// Inserts an already-analyzed multi-file `Document` (built with real
@@ -6706,32 +6736,64 @@ mod snapshot_consistency_tests {
         LineIndex::new(text).position(offset)
     }
 
+    /// E279: `position` as it reads after [`apply_wiring_edit`]'s prepended
+    /// line — one line down, same column.
+    fn below(position: Position) -> Position {
+        Position::new(position.line + 1, position.character)
+    }
+
+    /// E279: `range` one line down, as [`apply_wiring_edit`] moves its text.
+    fn range_below(range: Range) -> Range {
+        Range::new(below(range.start), below(range.end))
+    }
+
+    // E279 (the ruled contract that replaced S1's "answer the analyzed
+    // snapshot at the raw position"): a caret request mid-edit is carried back
+    // through the edits since the analysis, so the SAME name, now one line
+    // down, answers the same hover — and the raw old position, which now
+    // holds `value`, answers `value`'s.
     #[tokio::test]
-    async fn hover_answers_the_analyzed_snapshot_while_typing() {
+    async fn hover_follows_its_name_while_typing() {
         let (service, _socket) = backend();
         let backend = service.inner();
         let uri = uri();
         backend
             .documents
             .insert(uri.clone(), document(WIRING_SOURCE));
-        let params = |uri: &Url| HoverParams {
+        let params = |uri: &Url, position: Position| HoverParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: other_decl(),
+                position,
             },
             work_done_progress_params: Default::default(),
         };
-        let baseline = backend.hover(params(&uri)).await.expect("hover");
+        let baseline = backend
+            .hover(params(&uri, other_decl()))
+            .await
+            .expect("hover");
         assert!(baseline.is_some(), "the fixture must hover");
         apply_wiring_edit(backend, &uri, other_decl());
-        let mid_edit = backend.hover(params(&uri)).await.expect("hover mid-edit");
+        let mid_edit = backend
+            .hover(params(&uri, below(other_decl())))
+            .await
+            .expect("hover mid-edit");
         assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+        let raw = backend
+            .hover(params(&uri, other_decl()))
+            .await
+            .expect("hover at the old position");
+        assert_ne!(
+            format!("{baseline:?}"),
+            format!("{raw:?}"),
+            "the old position now holds another name",
+        );
     }
 
     // The member path (E72): a FIELD hover through the handler answers the
-    // house-styled `name: T`, and keeps answering the analyzed snapshot while
-    // an un-analyzed edit is pending — the same wiring pin as above, on the
-    // member fallback the format change routed differently.
+    // house-styled `name: T`, and keeps answering it — at the field's live
+    // position (E279) — while an un-analyzed edit is pending: the same wiring
+    // pin as above, on the member fallback the format change routed
+    // differently.
     #[tokio::test]
     async fn member_hover_answers_the_house_style_while_typing() {
         const MEMBER_SOURCE: &str = "struct Point {\n\tx: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet n = p.x;\n}\n";
@@ -6742,14 +6804,14 @@ mod snapshot_consistency_tests {
             .documents
             .insert(uri.clone(), document(MEMBER_SOURCE));
         let field = position_at(MEMBER_SOURCE, "p.x", 2);
-        let params = |uri: &Url| HoverParams {
+        let params = |uri: &Url, position: Position| HoverParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: field,
+                position,
             },
             work_done_progress_params: Default::default(),
         };
-        let baseline = backend.hover(params(&uri)).await.expect("hover");
+        let baseline = backend.hover(params(&uri, field)).await.expect("hover");
         let rendered = format!("{baseline:?}");
         assert!(
             rendered.contains("x: i32"),
@@ -6772,48 +6834,63 @@ mod snapshot_consistency_tests {
                 "the fixture must skew the inbound conversion",
             );
         }
-        let mid_edit = backend.hover(params(&uri)).await.expect("hover mid-edit");
+        let mid_edit = backend
+            .hover(params(&uri, below(field)))
+            .await
+            .expect("hover mid-edit");
         assert_eq!(rendered, format!("{mid_edit:?}"));
     }
 
+    // E279: the same name one line down resolves the same definition, which
+    // is answered on the line its text sits on now.
     #[tokio::test]
-    async fn goto_definition_answers_the_analyzed_snapshot_while_typing() {
+    async fn goto_definition_follows_its_name_while_typing() {
         let (service, _socket) = backend();
         let backend = service.inner();
         let uri = uri();
         backend
             .documents
             .insert(uri.clone(), document(WIRING_SOURCE));
-        let params = |uri: &Url| GotoDefinitionParams {
+        let params = |uri: &Url, position: Position| GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: other_decl(),
+                position,
             },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         };
-        let baseline = backend.goto_definition(params(&uri)).await.expect("def");
-        assert!(baseline.is_some(), "the fixture must resolve a definition");
+        let baseline = backend
+            .goto_definition(params(&uri, other_decl()))
+            .await
+            .expect("def");
+        let Some(GotoDefinitionResponse::Scalar(baseline)) = baseline else {
+            panic!("the fixture must resolve one definition: {baseline:?}");
+        };
         apply_wiring_edit(backend, &uri, other_decl());
         let mid_edit = backend
-            .goto_definition(params(&uri))
+            .goto_definition(params(&uri, below(other_decl())))
             .await
             .expect("def mid-edit");
-        assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+        let Some(GotoDefinitionResponse::Scalar(mid_edit)) = mid_edit else {
+            panic!("one definition mid-edit: {mid_edit:?}");
+        };
+        assert_eq!(mid_edit.uri, baseline.uri);
+        assert_eq!(mid_edit.range, range_below(baseline.range));
     }
 
+    // E279: every reference of the same name, each on its live line.
     #[tokio::test]
-    async fn references_answer_the_analyzed_snapshot_while_typing() {
+    async fn references_follow_their_name_while_typing() {
         let (service, _socket) = backend();
         let backend = service.inner();
         let uri = uri();
         backend
             .documents
             .insert(uri.clone(), document(WIRING_SOURCE));
-        let params = |uri: &Url| ReferenceParams {
+        let params = |uri: &Url, position: Position| ReferenceParams {
             text_document_position: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: other_decl(),
+                position,
             },
             context: ReferenceContext {
                 include_declaration: true,
@@ -6821,21 +6898,31 @@ mod snapshot_consistency_tests {
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         };
-        let baseline = backend.references(params(&uri)).await.expect("refs");
-        assert!(
-            baseline.as_ref().is_some_and(|refs| !refs.is_empty()),
-            "the fixture must find references",
-        );
+        let baseline = backend
+            .references(params(&uri, other_decl()))
+            .await
+            .expect("refs")
+            .unwrap_or_default();
+        assert!(!baseline.is_empty(), "the fixture must find references");
         apply_wiring_edit(backend, &uri, other_decl());
         let mid_edit = backend
-            .references(params(&uri))
+            .references(params(&uri, below(other_decl())))
             .await
-            .expect("refs mid-edit");
-        assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+            .expect("refs mid-edit")
+            .unwrap_or_default();
+        let expected: Vec<Location> = baseline
+            .into_iter()
+            .map(|location| Location {
+                range: range_below(location.range),
+                ..location
+            })
+            .collect();
+        assert_eq!(mid_edit, expected);
     }
 
+    // E279: the outline follows its text — every range one line down.
     #[tokio::test]
-    async fn document_symbols_answer_the_analyzed_snapshot_while_typing() {
+    async fn document_symbols_follow_their_text_while_typing() {
         let (service, _socket) = backend();
         let backend = service.inner();
         let uri = uri();
@@ -6870,7 +6957,19 @@ mod snapshot_consistency_tests {
             .document_symbol(params(&uri))
             .await
             .expect("symbols mid-edit");
-        assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+        let (
+            Some(DocumentSymbolResponse::Nested(baseline)),
+            Some(DocumentSymbolResponse::Nested(mid_edit)),
+        ) = (baseline, mid_edit)
+        else {
+            panic!("nested outlines");
+        };
+        assert_eq!(baseline.len(), mid_edit.len());
+        for (before, after) in baseline.iter().zip(&mid_edit) {
+            assert_eq!(after.name, before.name);
+            assert_eq!(after.range, range_below(before.range));
+            assert_eq!(after.selection_range, range_below(before.selection_range));
+        }
     }
 
     // E52: completion was the one query left wired to the LIVE index for its

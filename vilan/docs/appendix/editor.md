@@ -403,20 +403,26 @@ statement rather than being discarded whole. `vilan check` answers the same
 way; `vilan build` still stops, because a recovered file is not something
 to emit from.
 
-**Answers stay in the last-analyzed text's coordinates** until the next
-analysis lands, a few dozen milliseconds later. Hover, go-to-definition,
-references, rename, the outline, inlay hints, semantic tokens and
-completion's lookups all convert the cursor through the analyzed text
-first. That is correct for the analyzed program, and therefore visually
-correct everywhere except the line you are actively editing; converting the
-same bytes through the live buffer would be correct for neither. Semantic
-highlighting additionally carries the unchanged tail of the file across an
-analysis, so the colours below your edit do not flash off and back.
+**Answers stick to their text** between a keystroke and the analysis it
+schedules. Every answer the server holds is the last analysis's, and every
+edit since is carried through it: a squiggle, a "see here" note, an inlay
+hint, a reference, a definition, an outline entry and a quick fix all move
+with the code they are about — a line typed above shifts them down, typing
+inside a flagged span stretches it, typing after it leaves it alone — and
+the squiggles are republished at once, without waiting for the analysis. An
+edit across one end of a span takes that span away until the analysis says
+again, and a caret inside text typed since the analysis gets no hover or
+definition: the analysis saw nothing there. Semantic highlighting keeps the
+colours of every unchanged line and paints the edited ones from syntax, and
+carries the unchanged tail of the file across an analysis, so the colours
+below your edit do not flash off and back.
 
 Two requests decline rather than answer wrong while the buffer is ahead of
-the analysis: **rename** ("still analyzing this file; retry in a moment")
-and **code actions**, which refuse silently because editors ask for them
-automatically when a menu opens or a file saves.
+the analysis: **rename** ("still analyzing this file; retry in a moment"),
+because text typed since may hold a reference it would miss, and **Organize
+Imports**, which declines silently because editors ask for it on save. A
+quick fix is offered from the last analysis only where you have not typed
+over the text it would rewrite.
 
 ## What it does not have
 
