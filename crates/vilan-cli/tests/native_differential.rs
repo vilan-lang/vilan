@@ -11364,4 +11364,43 @@ fun main() {
         "a trait default's own generic must bind per call on both backends"
     );
 }
+/// B567: a `for item in self` inside a blanket whose subject is a bare
+/// parameterized trait (`impl Iterator<type T> with Pour<T>`) drives the
+/// receiver's own `next` on both backends. JS reached `Iterator`'s body-less
+/// requirement (an internal error).
+#[test]
+fn a_loop_over_self_in_a_bare_trait_impl_runs_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b567.vl"),
+        r#"import std::io::print;
+import std::iterator::Iterator;
+
+trait Pour<T> {
+    fun pour_into(own self, target: &mut List<T>);
+}
+
+impl Iterator<type T> with Pour<T> {
+    fun pour_into(own self, target: &mut List<T>) {
+        for item in self {
+            target.push(item);
+        }
+    }
+}
+
+fun main() {
+    mut xs = [1, 2];
+    [5, 6].iter().map(|x| x * 10).pour_into(&mut xs);
+    print(xs.len());
+    print(xs[3]);
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b567.vl"),
+        Verdict::Identical,
+        "a loop over self in a bare-trait impl must run on both backends"
+    );
+}
 

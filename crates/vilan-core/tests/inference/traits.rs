@@ -9673,3 +9673,96 @@ fn b566_a_defaults_own_generic_bound_in_the_callers_binders_grounds() {
         "str\ni32\n",
     );
 }
+
+// --- B567: a blanket whose SUBJECT is a parameterized bare trait (B299) ---
+//
+// `impl Iterator<type T> with Pour<T>` means what `impl type I: Iterator<type
+// T> with Pour<T>` means (B299's ruling). Two halves of the body/call did
+// not read it so: a `for item in self` in such a body was driven through the
+// trait-DEFAULT channel, so its `next` was `Iterator`'s body-less requirement
+// (the never-silent internal error); and a member returning `Self` typed as
+// the bare trait at the call, so std's own `it.iter()` was refused "cannot
+// call 'to_list' on a value of bare trait type 'Iterator'".
+
+#[test]
+fn b567_a_loop_over_self_in_a_bare_trait_impl_dispatches_to_the_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+
+        trait Pour<T> {
+            fun pour_into(own self, target: &mut List<T>);
+        }
+
+        impl Iterator<type T> with Pour<T> {
+            fun pour_into(own self, target: &mut List<T>) {
+                for item in self {
+                    target.push(item);
+                }
+            }
+        }
+
+        fun main() {
+            mut xs = [1, 2];
+            [5, 6].iter().map(|x| x * 10).pour_into(&mut xs);
+            print(xs.len());
+            print(xs[3]);
+        }
+
+        main();
+        "#,
+        "4\n60\n",
+    );
+}
+
+#[test]
+fn b567_a_self_return_in_a_parameterized_bare_trait_impl_is_the_receiver() {
+    // std's own `Iterable` is this shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::{ Iterator, Iterable };
+
+        fun main() {
+            let xs = [5, 6].iter().map(|x| x * 10).iter().to_list();
+            print(xs.len());
+            print(xs[1]);
+        }
+
+        main();
+        "#,
+        "2\n60\n",
+    );
+}
+
+#[test]
+fn b567_a_self_nested_in_a_bare_trait_impls_return_is_the_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        trait Wrapped<T> {
+            fun wrapped(self): Option<Self>;
+        }
+
+        impl Iterator<type T> with Wrapped<T> {
+            fun wrapped(self): Option<Self> {
+                Some(self)
+            }
+        }
+
+        fun main() {
+            match [1, 2, 3].iter().wrapped() {
+                Some(let it) => print(it.to_list().len()),
+                None => print(0),
+            }
+        }
+
+        main();
+        "#,
+        "3\n",
+    );
+}

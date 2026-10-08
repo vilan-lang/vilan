@@ -7671,6 +7671,77 @@ impl<'src> Analyzer<'src> {
     /// [`Self::enclosing_bare_trait_impl_subject`] from a SCOPE rather than an
     /// entity — for the deferred queues, whose entries carry the scope they
     /// were walked in and no entity of their own.
+    /// B567: the bare-trait subject a member's `self` is typed as, when the
+    /// member belongs to an `impl` whose subject is a PARAMETERIZED bare trait
+    /// (`impl Iterator<type T> with Iterable<T>`). An argument-less subject is
+    /// `Type::Trait(_, [])`, which the ordinary `Self`-return specialization
+    /// already reads as the receiver; a parameterized one is not, so this is
+    /// the question that specialization cannot ask.
+    fn bare_trait_impl_self(&self, self_parameter_id: Option<Id>) -> Option<TypeId> {
+        let self_parameter_id = self_parameter_id?;
+        let self_type_id = self.parameters.get(&self_parameter_id)?.type_id;
+        if !matches!(
+            self.type_id_to_type_map.get(&self_type_id),
+            Some(Type::Trait(_, arguments)) if !arguments.is_empty()
+        ) {
+            return None;
+        }
+        // A parameter is not mapped to a scope, so the impl is found by its
+        // subject slot — which `self` is typed as (B299's `Self`). Only a
+        // self typed as a parameterized trait reaches this scan, and that is
+        // a bare-trait impl's member and nothing else (a trait default's
+        // `self` is the argument-less `Type::Trait(_, [])`).
+        self.impl_body_subjects
+            .values()
+            .any(|subject_id| *subject_id == self_type_id)
+            .then_some(self_type_id)
+    }
+
+    /// B567: `type_` with every occurrence of the bare-trait subject read as
+    /// the implicit binder it is (`Type::Generic` of the subject's own id —
+    /// B299's constraint), so substitution grounds it to the receiver the call
+    /// bound it to. A written `Self` interns a slot of its own, so an
+    /// occurrence is recognized by its TYPE: inside such an impl a value of
+    /// the subject's bare trait type can only be `Self` (any other is refused
+    /// as a bare trait value).
+    fn bare_trait_subject_as_binder(
+        &mut self,
+        type_: &Type,
+        subject_id: TypeId,
+        depth: usize,
+    ) -> Type {
+        if depth > 24 {
+            return type_.clone();
+        }
+        if self.type_id_to_type_map.get(&subject_id) == Some(type_) {
+            return Type::Generic(subject_id);
+        }
+        let rewrite = |analyzer: &mut Self, type_ids: &[TypeId]| -> Vec<TypeId> {
+            type_ids
+                .iter()
+                .map(|type_id| {
+                    let inner = type_id.get_type(analyzer);
+                    let rewritten =
+                        analyzer.bare_trait_subject_as_binder(&inner, subject_id, depth + 1);
+                    match rewritten == inner {
+                        true => *type_id,
+                        false => rewritten.get_type_id(analyzer),
+                    }
+                })
+                .collect()
+        };
+        match type_ {
+            Type::Struct(id, arguments) => Type::Struct(*id, rewrite(self, &arguments.clone())),
+            Type::Enum(id, arguments) => Type::Enum(*id, rewrite(self, &arguments.clone())),
+            Type::Tuple(elements) => Type::Tuple(rewrite(self, &elements.clone())),
+            Type::Array(element, length) => {
+                let length = *length;
+                Type::Array(rewrite(self, &[*element])[0], length)
+            }
+            _ => type_.clone(),
+        }
+    }
+
     fn bare_trait_impl_subject_in_scope(&self, scope_id: Id) -> Option<TypeId> {
         let mut scope_id = Some(scope_id);
         while let Some(current) = scope_id {
@@ -44181,8 +44252,26 @@ impl<'src> Analyzer<'src> {
                                 exprs_seen,
                             ),
                         };
-                        let return_type =
-                            self.substitute_type(&callee_return_type, &substitution_context);
+                        // B567: a member of a BARE-TRAIT IMPL (B299, `impl
+                        // Iterator<type T> with Iterable<T>`) writes `Self` as
+                        // the subject, which is the implicit binder the call
+                        // bound to its receiver — so `it.iter()` is the
+                        // receiver's type, as under the binder spelling `impl
+                        // type I: Iterator<type T>`, never the bare trait the
+                        // head names (which then refused every call on it).
+                        let return_type = match self.bare_trait_impl_self(self_parameter_id) {
+                            Some(subject_id) => {
+                                let as_binder = self.bare_trait_subject_as_binder(
+                                    &callee_return_type,
+                                    subject_id,
+                                    0,
+                                );
+                                self.substitute_type(&as_binder, &substitution_context)
+                            }
+                            None => {
+                                self.substitute_type(&callee_return_type, &substitution_context)
+                            }
+                        };
                         // B149: a call to a function WRITTEN `async` is
                         // implicitly awaited, and the host assimilates a handle
                         // its body returns — `async fun make(): Task<i32>`
@@ -62802,15 +62891,37 @@ impl<'src> Analyzer<'src> {
                     match self.method_member_in_trait_at(trait_id, &trait_arguments, next_method) {
                         Some((next_id, declaring_trait_id, declaring_arguments)) => {
                             self.for_each_next.insert(for_each_id, next_id);
-                            self.generic_dispatch
-                                .insert(for_each_id, GenericDispatch::OnType(None, next_method));
-                            // B359 (R1): the loop is a call site like any other,
-                            // so `for v in self` in a default body drives the
-                            // TRAIT's protocol member — not an implementor's
-                            // same-named inherent `next`. Same channel as the
-                            // `self.next()` call above.
-                            self.bound_dispatch_traits
-                                .insert(for_each_id, (declaring_trait_id, declaring_arguments));
+                            // B567: inside a BARE-TRAIT IMPL body (B299) `self`
+                            // is the implementing type, an implicit binder whose
+                            // constraint id is the subject's own type id, so the
+                            // loop re-dispatches through the CALLER's binding of
+                            // it — the channel a `self.next()` call there takes
+                            // (`resolve_method_call`'s `Type::Trait` arm). Driven
+                            // through the trait-default channel instead, the
+                            // loop had no specialization to read and its `next`
+                            // was the trait's body-less requirement: the
+                            // never-silent internal error.
+                            let bare_trait_impl_subject = self
+                                .enclosing_bare_trait_impl_subject(for_each_id)
+                                .filter(|_| !self.is_in_trait_default(for_each_id));
+                            if let Some(subject_type_id) = bare_trait_impl_subject {
+                                self.generic_dispatch.insert(
+                                    for_each_id,
+                                    GenericDispatch::OnConstraint(subject_type_id, next_method),
+                                );
+                            } else {
+                                self.generic_dispatch.insert(
+                                    for_each_id,
+                                    GenericDispatch::OnType(None, next_method),
+                                );
+                                // B359 (R1): the loop is a call site like any
+                                // other, so `for v in self` in a default body
+                                // drives the TRAIT's protocol member — not an
+                                // implementor's same-named inherent `next`. Same
+                                // channel as the `self.next()` call above.
+                                self.bound_dispatch_traits
+                                    .insert(for_each_id, (declaring_trait_id, declaring_arguments));
+                            }
                         }
                         None => self.report_uniterable_for_each(
                             for_each_id,
