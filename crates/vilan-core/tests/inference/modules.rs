@@ -7255,3 +7255,127 @@ fn b515_a_trait_in_scope_is_accepted() {
         "#,
     );
 }
+
+// --- B553: an impl written in the ENTRY serves every module -----------------
+//
+// Impls are program-wide (no orphan rule), so an `impl` a module's code calls
+// may sit in any file — the entry included. The two-phase pipeline resolves
+// the loaded modules BEFORE the entry walks (the base cache's pre-entry world),
+// so a module's member lookup ran without the entry's impls and committed
+// `Foo has no method`. The same impl in any module served every module; the
+// entry was the one file for which the language's rule did not hold.
+
+const B553_SHAPES: &str =
+    "export struct Foo {\n\tn: i32,\n}\n\nexport trait Greet {\n\tfun greet(self): str;\n}\n";
+
+/// B553's repro: a TRAIT impl in the entry, called from a module that imports
+/// the trait.
+#[test]
+fn b553_a_trait_impl_written_in_the_entry_serves_a_module() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("shapes.vl", B553_SHAPES),
+            (
+                "user.vl",
+                "import pkg::shapes::{ Foo, Greet };\n\nexport fun use_it(): str {\n\tlet foo = Foo { n = 1 };\n\tfoo.greet()\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::shapes::{ Foo, Greet };\nimport pkg::user::use_it;\n\nimpl Foo with Greet {\n\tfun greet(self): str {\n\t\t\"hi\"\n\t}\n}\n\nfun main() {\n\tprint(use_it());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("an entry impl serves the module that calls it");
+    assert_eq!(stdout, "hi\n");
+}
+
+/// An INHERENT entry impl whose member's return is inferred from its body: the
+/// module's call types through the body the entry walks.
+#[test]
+fn b553_an_inherent_entry_impl_with_an_inferred_return_serves_a_module() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("shapes.vl", B553_SHAPES),
+            (
+                "user.vl",
+                "import pkg::shapes::Foo;\n\nexport fun use_it(): str {\n\tlet foo = Foo { n = 1 };\n\tfoo.shout()\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::shapes::Foo;\nimport pkg::user::use_it;\n\nimpl Foo {\n\tfun shout(self) {\n\t\t\"HI\"\n\t}\n}\n\nfun main() {\n\tprint(use_it());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("an inherent entry impl serves the module that calls it");
+    assert_eq!(stdout, "HI\n");
+}
+
+/// A STATIC member of an entry impl, reached by path from a module.
+#[test]
+fn b553_a_static_member_of_an_entry_impl_serves_a_module() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("shapes.vl", B553_SHAPES),
+            (
+                "user.vl",
+                "import pkg::shapes::Foo;\n\nexport fun use_it(): i32 {\n\tFoo::make().n\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::shapes::Foo;\nimport pkg::user::use_it;\n\nimpl Foo {\n\tfun make(): Foo {\n\t\tFoo { n = 7 }\n\t}\n}\n\nfun main() {\n\tprint(use_it());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("a static of an entry impl serves the module that names it");
+    assert_eq!(stdout, "7\n");
+}
+
+/// The control the two-phase order already answered: an entry impl reached
+/// through an OPERATOR from a module (`==` dispatches through `PartialEq`).
+#[test]
+fn b553_an_entry_operator_impl_serves_a_module() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("shapes.vl", B553_SHAPES),
+            (
+                "user.vl",
+                "import pkg::shapes::Foo;\n\nexport fun same(): bool {\n\tFoo { n = 1 } == Foo { n = 1 }\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport std::compare::PartialEq;\nimport pkg::shapes::Foo;\nimport pkg::user::same;\n\nimpl Foo with PartialEq {\n\tfun eq(self, other: Self): bool {\n\t\tself.n == other.n\n\t}\n}\n\nfun main() {\n\tprint(same());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("an entry operator impl serves the module that uses it");
+    assert_eq!(stdout, "true\n");
+}
+
+/// B553's second shape: a module's `Context::new()` whose only `run` is in the
+/// entry takes its value type from that run. Not an order question: the world
+/// resolved ONCE, after the entry walked (the deferred order the impl half
+/// takes), still reports `T` unbounded, while a `run` in any module — loaded
+/// before or after `c.vl` — grounds it.
+#[test]
+#[ignore = "B553: an entry `run` does not ground a module's `Context::new()` even when the world resolves after the entry walks; the context half is the solver's (incr-48)"]
+fn b553_a_module_context_grounded_only_by_an_entry_run() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "c.vl",
+                "import std::context::Context;\n\nexport let flavor = Context::new();\n\nexport fun read_it(): i32 {\n\tflavor.get() + 1\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::c::{ flavor, read_it };\n\nfun main() {\n\tflavor.run(5, || {\n\t\tprint(read_it());\n\t});\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("an entry run grounds a module's context");
+    assert_eq!(stdout, "6\n");
+}

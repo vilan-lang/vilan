@@ -251,6 +251,74 @@ struct MemberRowIndex {
     unsettled: Vec<usize>,
 }
 
+/// M121 door (b) and B553: every question a world's PRE-STORE resolve asked
+/// of the impl table — a member looked up and a trait asked after, each with
+/// the receiver it was asked for — so the impls that join the world AFTER that
+/// resolve can be tested against it.
+///
+/// The two-phase pipeline resolves the loaded modules before the entry walks
+/// (S3c, the base cache's pre-entry world), and M110 S1 also walks the hot
+/// set after that resolve. Impls are program-wide, so an impl written in the
+/// entry or in a hot module is one a module's resolution could have needed; a
+/// canonical analysis that walked it first would have answered with it. The
+/// log is what says whether the stored world's answers stand: no logged
+/// question that a later impl could answer means the order changed nothing
+/// (`Analyzer::impl_reach`), and the world is used as it is. Otherwise the
+/// analysis is rebuilt in the order that sees every impl before anything
+/// resolves (`analyze_inner`'s `defer_resolve`; a hot-set world is refused).
+///
+/// Receivers are kept as the `Type` they were asked for and tested with the
+/// lookup's own admission (`impl_subject_admits`), so the test is the one the
+/// lookup would have made — not a syntactic stand-in for it (M110 S1's
+/// spelling guard refused every hot set whose inherent members shared a name
+/// with ANY identifier outside it).
+#[derive(Clone, Debug, Default)]
+struct ImplReachLog {
+    /// Whether the resolve now running records.
+    recording: bool,
+    /// Member name -> the receivers it was looked up on, each with whether a
+    /// PACKAGE source asked (as opposed to only std's).
+    members: HashMap<Box<str>, HashMap<Type, bool>>,
+    /// Trait -> the receivers it was asked of, likewise.
+    traits: HashMap<Id, HashMap<Type, bool>>,
+    /// Whether the constraint now resolving is anchored in a std source. A
+    /// question std's own code asks does not make an ENTRY impl reach: the
+    /// two-phase order has always resolved std before the entry walked, and
+    /// what std's lookups answer is std's to decide (the deferred order would
+    /// otherwise put a user's blanket in reach of std's own calls). It still
+    /// counts against a HOT impl, which a canonical analysis would have walked
+    /// before std resolved.
+    asked_by_std: bool,
+    /// How many impls the world held when its recorded resolve ended — every
+    /// impl from this index on joined after it. `None` for a world that never
+    /// resolved before its entry (the deferred order), whose impls were all
+    /// there to be asked.
+    floor: Option<usize>,
+}
+
+/// [`ImplReachLog`]'s insert: `receiver` joins the set, and a package asker
+/// marks it so whoever asked first.
+fn note_receiver(receivers: &mut HashMap<Type, bool>, receiver: &Type, by_package: bool) {
+    match receivers.get_mut(receiver) {
+        Some(asked_by_package) => *asked_by_package |= by_package,
+        None => {
+            receivers.insert(receiver.clone(), by_package);
+        }
+    }
+}
+
+/// Which side of a world an [`ImplReachLog`] hit came from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ImplReached {
+    /// An impl in a hot module (M110 S1) answers a question the stored prefix
+    /// asked.
+    by_hot: bool,
+    /// An impl in the entry file (B553) answers one.
+    by_entry: bool,
+    /// The first hit, for the phase line: `member `name`` or `trait`.
+    first: String,
+}
+
 /// [`Analyzer::impl_subject_bucket`]'s classes (M107).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ImplSubjectBucket {
@@ -4697,6 +4765,12 @@ pub struct Analyzer<'src> {
     // scope, file) — resolved at the next `resolve_world`
     // (`resolve_macro_references`).
     pending_macro_references: Vec<(&'src str, Span, Id, SourceId)>,
+    // M121 / B553: what the pre-store resolve asked of the impl table
+    // ([`ImplReachLog`]). Behind a cell because the questions are asked from
+    // `&self` readers (`type_implements_trait` and its kin) as well as from
+    // the lookups that hold `&mut self`; the log is written only while
+    // `recording`, and never read until the resolve that wrote it has ended.
+    impl_reach: std::cell::RefCell<ImplReachLog>,
     macro_expression_expansions: HashMap<usize, &'static Spanned<Node<'static>>>,
     // Expression sites whose expansion failed — already diagnosed; they walk
     // to an error entity without a second (misleading) message.
@@ -7204,6 +7278,7 @@ impl<'src> Analyzer<'src> {
             macro_item_invocations: HashSet::default(),
             macro_signatures: HashMap::default(),
             pending_macro_references: Vec::new(),
+            impl_reach: std::cell::RefCell::default(),
             macro_expression_expansions: HashMap::default(),
             macro_failed_sites: HashSet::default(),
             module_scope_ids: HashSet::default(),
@@ -9272,6 +9347,7 @@ impl<'src> Analyzer<'src> {
         // [`ImplHeadRows`]) — a scan of every impl in the program per question
         // was quadratic in the package, and this is asked per comparison of a
         // value against a trait-typed slot.
+        self.note_trait_query(subject_type, trait_id);
         let Some(rows) = self.provided_trait_rows.get(&trait_id) else {
             return false;
         };
@@ -9342,6 +9418,7 @@ impl<'src> Analyzer<'src> {
     /// refusal (a `Callable` with no `call`) and the steer on the ordinary "not
     /// callable" message (a `call` with no `Callable`).
     fn declares_call_member(&self, subject_type: &Type) -> bool {
+        self.note_member_query(subject_type, CALL_OPERATOR_MEMBER);
         self.implementations.iter().any(|implementation| {
             implementation
                 .declarations
@@ -20573,6 +20650,7 @@ impl<'src> Analyzer<'src> {
     fn trait_impl_rows(&mut self, subject_type: &Type, traits: &[Id]) -> Vec<usize> {
         let mut rows: Vec<usize> = Vec::new();
         for trait_id in traits {
+            self.note_trait_query(subject_type, *trait_id);
             match self.nominal_rows(subject_type, ImplRowKey::Trait(*trait_id)) {
                 Some(narrowed) => rows.extend(narrowed),
                 None => rows.extend(
@@ -20660,6 +20738,7 @@ impl<'src> Analyzer<'src> {
         // M107: and of that row, only the impls whose subject head can admit
         // this receiver's — the same impls in the same order, without asking
         // the comparison about every other nominal's.
+        self.note_member_query(subject_type, member_name);
         let nominal_rows = self.nominal_member_rows(subject_type, member_name);
         let Some(declaring) = self.implementations_by_member.get(member_name) else {
             return Vec::new();
@@ -20810,6 +20889,7 @@ impl<'src> Analyzer<'src> {
         member_name: &str,
         declared: &[(Id, TypeId, Option<Id>, Vec<TypeId>)],
     ) -> Vec<((Id, TypeId, Option<Id>, Vec<TypeId>), bool)> {
+        self.note_member_query(subject_type, member_name);
         let homes: Vec<Id> = declared
             .iter()
             .filter_map(|(_, _, home_trait, _)| *home_trait)
@@ -24046,6 +24126,7 @@ impl<'src> Analyzer<'src> {
         subject_type: &Type,
         member_name: &str,
     ) -> Vec<(Id, TypeId, Id, Vec<TypeId>)> {
+        self.note_member_query(subject_type, member_name);
         let mut reached: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
         // B401: parallel to `reached` — the providing block's index, and
         // whether the calling file admits the member from it.
@@ -45920,6 +46001,7 @@ impl<'src> Analyzer<'src> {
         if !self.type_is_callable(subject_type) {
             return None;
         }
+        self.note_member_query(subject_type, CALL_OPERATOR_MEMBER);
         let member_id = self.implementations.iter().find_map(|implementation| {
             let member_id = implementation.declarations.get(CALL_OPERATOR_MEMBER)?;
             self.impl_subject_admits(
@@ -48585,6 +48667,138 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// M121 / B553: start recording what this resolve asks of the impl table
+    /// ([`ImplReachLog`]). Called around the PRE-STORE resolve only — the one
+    /// whose answers the impls walked after it (the entry's, a hot set's) must
+    /// not have changed.
+    fn begin_impl_reach_log(&mut self) {
+        *self.impl_reach.get_mut() = ImplReachLog {
+            recording: true,
+            ..ImplReachLog::default()
+        };
+    }
+
+    /// Ends [`Self::begin_impl_reach_log`]'s recording: every impl from here
+    /// on is one the recorded resolve did not see.
+    fn end_impl_reach_log(&mut self) {
+        let floor = self.implementations.len();
+        let log = self.impl_reach.get_mut();
+        log.recording = false;
+        log.floor = Some(floor);
+    }
+
+    /// Records that member `member_name` was looked up on `subject_type`, when
+    /// a pre-store resolve is recording ([`ImplReachLog`]).
+    fn note_member_query(&self, subject_type: &Type, member_name: &str) {
+        let mut log = self.impl_reach.borrow_mut();
+        if !log.recording {
+            return;
+        }
+        let by_package = !log.asked_by_std;
+        let receivers = match log.members.get_mut(member_name) {
+            Some(receivers) => receivers,
+            None => log.members.entry(member_name.into()).or_default(),
+        };
+        note_receiver(receivers, subject_type, by_package);
+    }
+
+    /// Records that `trait_id` was asked of `subject_type`, when a pre-store
+    /// resolve is recording ([`ImplReachLog`]).
+    fn note_trait_query(&self, subject_type: &Type, trait_id: Id) {
+        let mut log = self.impl_reach.borrow_mut();
+        if !log.recording {
+            return;
+        }
+        let by_package = !log.asked_by_std;
+        note_receiver(
+            log.traits.entry(trait_id).or_default(),
+            subject_type,
+            by_package,
+        );
+    }
+
+    /// M121 / B553: whether an impl that joined this world AFTER its recorded
+    /// resolve answers a question that resolve asked ([`ImplReachLog`]) — so a
+    /// canonical analysis, which walks every impl before anything resolves,
+    /// could have answered it differently. Asked once the build has resolved
+    /// those impls' subjects and provided traits.
+    ///
+    /// A late impl answers a member question when it declares the member or a
+    /// trait it provides (closed over supertraits) does, and a trait question
+    /// when it provides the trait; either way only for a receiver its subject
+    /// admits — the lookup's own test. `hot_sources` are the hot modules'
+    /// sources (M110 S1; empty for every other world): an impl in one of them
+    /// is the hot set's, and every other late impl — the entry's, and what the
+    /// entry's expansion generated — is the entry's.
+    fn impl_reach(&mut self, hot_sources: std::ops::Range<u32>) -> Option<ImplReached> {
+        let log = std::mem::take(self.impl_reach.get_mut());
+        let floor = log.floor?;
+        if floor >= self.implementations.len() || (log.members.is_empty() && log.traits.is_empty())
+        {
+            return None;
+        }
+        let mut reached = ImplReached::default();
+        for implementation in &self.implementations[floor..] {
+            let subject = implementation.subject.get_type(self);
+            // An impl the ENTRY walked answers only what a package source
+            // asked ([`ImplReachLog::asked_by_std`]); a hot module's answers
+            // what anyone asked.
+            let entry_side = !hot_sources.contains(&implementation.source.0);
+            let admits = |receivers: &HashMap<Type, bool>| {
+                receivers.iter().any(|(receiver, by_package)| {
+                    (*by_package || !entry_side)
+                        && (matches!(receiver, Type::Unknown)
+                            || self.impl_subject_admits(receiver, &subject, &HashMap::default()))
+                })
+            };
+            let mut traits: Vec<Id> = Vec::new();
+            for (trait_id, _) in implementation
+                .provided_trait_args
+                .iter()
+                .chain(&implementation.trait_args)
+            {
+                for reached_id in self.trait_with_supertraits(*trait_id) {
+                    if !traits.contains(&reached_id) {
+                        traits.push(reached_id);
+                    }
+                }
+            }
+            let declared = implementation.declarations.keys().copied();
+            let inherited = traits
+                .iter()
+                .filter_map(|trait_id| self.traits.get(trait_id))
+                .flat_map(|trait_| trait_.declarations.keys().copied());
+            let mut hit = declared
+                .chain(inherited)
+                .find(|name| log.members.get(*name).is_some_and(admits))
+                .map(|name| format!("member `{name}`"));
+            if hit.is_none() {
+                hit = traits
+                    .iter()
+                    .find(|trait_id| log.traits.get(trait_id).is_some_and(admits))
+                    .map(|trait_id| {
+                        let name = self.traits.get(trait_id).map_or("?", |trait_| trait_.name);
+                        format!("trait `{name}`")
+                    });
+            }
+            let Some(hit) = hit else {
+                continue;
+            };
+            // An impl the entry walked, or one no stored source owns, is the
+            // entry's side: rebuilding in the deferred order is right for it
+            // whatever its source turns out to be.
+            if entry_side {
+                reached.by_entry = true;
+            } else {
+                reached.by_hot = true;
+            }
+            if reached.first.is_empty() {
+                reached.first = hit;
+            }
+        }
+        (reached.by_hot || reached.by_entry).then_some(reached)
+    }
+
     /// M110 S1's third guard: which of `modules` (name, scope) declare a
     /// module-level binding whose type its own declaration does not settle —
     /// one whose initializer minted an element slot (an empty list literal, a
@@ -48912,6 +49126,13 @@ impl<'src> Analyzer<'src> {
                 .expr_id_to_scope_id_map
                 .get(&constraint.anchor())
                 .copied();
+            // M121 / B553: who is asking, for the pre-store resolve's record.
+            if self.impl_reach.get_mut().recording {
+                let by_std = self
+                    .source_of_id(constraint.anchor())
+                    .is_some_and(|source| self.std_sources.contains(&source));
+                self.impl_reach.get_mut().asked_by_std = by_std;
+            }
             // B401: the file whose admission this constraint's method lookups
             // read — asked only when some file restricts anything.
             if self.lookup_admission.is_some() {
@@ -48934,6 +49155,7 @@ impl<'src> Analyzer<'src> {
             self.rigid_binder_scope = None;
             self.lookup_importer = None;
             self.lookup_anchor = None;
+            self.impl_reach.get_mut().asked_by_std = false;
             // Attribute anything this constraint reported to its anchor's file
             // (a type error inside an imported module must publish there, E1).
             self.attribute_diagnostics_to_anchor(diagnostics_before, constraint.anchor());
@@ -50081,6 +50303,7 @@ impl<'src> Analyzer<'src> {
         // nothing about which — §3.1's spelling has no argument slot (B73 R2).
         // The receiver must implement the NAMED trait as well: `Sub::name` on
         // a type that implements only `Base` is still refused below.
+        self.note_trait_query(&receiver_type, trait_id);
         let implements_named_trait = self.implementations.iter().any(|implementation| {
             self.impl_subject_admits(
                 &receiver_type,
@@ -56230,6 +56453,9 @@ impl<'src> Analyzer<'src> {
         // --- A user `Try` impl: recover Try<T, B> through the impl's trait args. ---
         let receiver_type_id = receiver_type.clone().get_type_id(self);
         // Snapshot the Try impls' subjects first (reconcile needs `&mut self`).
+        if let Some(try_id) = self.try_trait_id {
+            self.note_trait_query(&receiver_type, try_id);
+        }
         let candidates: Vec<(usize, TypeId)> = match self.try_trait_id {
             Some(try_id) => self
                 .implementations
@@ -58406,10 +58632,9 @@ impl<'src> Analyzer<'src> {
                         // A149 S4: on a store handle, a field of the struct it
                         // handles reads through its projection —
                         // `app.user.name` is `app.user().name()`.
-                        match self
-                            .field_syntax()
-                            .read(&Type::Struct(struct_id, arguments.clone()), member_name)
-                        {
+                        let handle_type = Type::Struct(struct_id, arguments.clone());
+                        self.note_member_query(&handle_type, member_name);
+                        match self.field_syntax().read(&handle_type, member_name) {
                             crate::field_syntax::Reading::Projection(_) => {
                                 self.read_field_through_projection(id, subject_id, member_name);
                                 return Resolution::Resolved;
@@ -71848,16 +72073,101 @@ fn expand_entry_over_world<'src>(
 /// prefix never registered, or generated code demanding a module the world
 /// never loaded: the caller then builds this analysis canonically, the
 /// expansion hoist's own answer to its own version of the last case.
+/// Why [`load_hot_modules`] could not finish a hot-set world.
+enum HotLoadRefusal {
+    /// A shape the hot-set world cannot take, named for the census.
+    Refused(&'static str),
+    /// The hot modules' GENERATED code — a derive's output — names std modules
+    /// the stored prefix never loaded. The canonical drain loads them for the
+    /// expansion that names them; the prefix loads only what the hot modules'
+    /// WRITTEN syntax requests, which is all [`hot_set_closure`] can read
+    /// before anything expands. Learned once per hot set
+    /// ([`learn_hot_generated_demands`]) and requested from then on, so the
+    /// next prefix carries them.
+    Demands(Vec<&'static str>),
+}
+
+/// M121: the std modules each hot set's generated code was found to demand
+/// ([`HotLoadRefusal::Demands`]), by the hot set's paths — what
+/// [`hot_set_closure`] adds to the prefix's requests (and so to the key).
+/// Bounded the way the checks record is.
+type HotGeneratedDemands = HashMap<Vec<PathBuf>, Vec<&'static str>>;
+static HOT_GENERATED_DEMANDS: std::sync::OnceLock<std::sync::Mutex<HotGeneratedDemands>> =
+    std::sync::OnceLock::new();
+
+/// The std modules this hot set's generated code is known to demand.
+fn hot_generated_demands(paths: &[PathBuf]) -> Vec<&'static str> {
+    HOT_GENERATED_DEMANDS
+        .get()
+        .and_then(|demands| {
+            demands
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(paths)
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
+/// Records `found` against this hot set; answers whether anything was NEW —
+/// a retry that learned nothing would only find the same demand again.
+fn learn_hot_generated_demands(paths: &[PathBuf], found: &[&'static str]) -> bool {
+    let demands = HOT_GENERATED_DEMANDS.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
+    let mut demands = demands
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if demands.len() >= CHECKED_CACHE_KEYS && !demands.contains_key(paths) {
+        demands.clear();
+    }
+    let known = demands.entry(paths.to_vec()).or_default();
+    let before = known.len();
+    for module in found {
+        if !known.contains(module) {
+            known.push(module);
+        }
+    }
+    known.sort_unstable();
+    known.len() > before
+}
+
+/// What a hot-set world that [`load_hot_modules`] could not finish rebuilds
+/// as: the same shape again when it learned a demand the next prefix will
+/// carry, the canonical one (and the key refused) otherwise.
+fn shape_after_hot_load(
+    refusal: HotLoadRefusal,
+    key: &BaseCacheKey,
+    shape: AnalysisShape,
+) -> AnalysisShape {
+    let reason = match refusal {
+        HotLoadRefusal::Demands(found) => {
+            let learned = key
+                .hot
+                .as_ref()
+                .is_some_and(|(paths, _)| learn_hot_generated_demands(paths, &found));
+            if learned {
+                return shape;
+            }
+            "generated-new-module"
+        }
+        HotLoadRefusal::Refused(reason) => reason,
+    };
+    refuse_hot_world(key);
+    crate::incremental::update_census(|census| census.hot_refusal = Some(reason));
+    shape.without_hot()
+}
+
 fn load_hot_modules<'src>(
     world: &mut World<'src>,
     std: &PackageSpec,
+    platform: Platform,
     workspace: &Workspace,
     pkg_root: &Path,
-) -> Result<(), &'static str> {
+) -> Result<(), HotLoadRefusal> {
     let Some(hot) = world.hot.as_mut() else {
         return Ok(());
     };
     let roots: [&Path; 1] = [pkg_root];
+    let std_roots = std.search_roots(platform);
     let analyzer = &mut world.analyzer;
     let global_scope_id = world.global_scope_id;
     let mut reported_parse_errors: HashSet<(PathBuf, Span, String)> = HashSet::default();
@@ -71870,7 +72180,7 @@ fn load_hot_modules<'src>(
     )> = Vec::new();
     for name in hot.modules.clone() {
         let Some(resolution) = resolve_module_in_roots(&roots, name) else {
-            return Err("module-vanished");
+            return Err(HotLoadRefusal::Refused("module-vanished"));
         };
         let directory_holds_a_lib_body = resolution.ambiguous
             || (resolution.relative.file_name() == Some(std::ffi::OsStr::new("lib.vl"))
@@ -71907,7 +72217,7 @@ fn load_hot_modules<'src>(
             });
         }
         let Some(module) = load_package_module(&module_path) else {
-            return Err("module-vanished");
+            return Err(HotLoadRefusal::Refused("module-vanished"));
         };
         let source_id = SourceId(world.sources.len() as u32);
         let diagnostics_before = analyzer.diagnostics.len();
@@ -71968,7 +72278,7 @@ fn load_hot_modules<'src>(
                 // module request, which this shape cannot answer.
                 let Some(parent_id) = hot.module_nodes.get(&(Origin::Pkg, &name[..cut])).copied()
                 else {
-                    return Err("new-parent-module");
+                    return Err(HotLoadRefusal::Refused("new-parent-module"));
                 };
                 module_children_scope(analyzer, parent_id, global_scope_id)
             }
@@ -72018,17 +72328,43 @@ fn load_hot_modules<'src>(
             analyzer.attribute_new_diagnostics(before, defining_source);
         }
         // Generated code demanding a module this world never loaded is a new
-        // load, which the drain would have made and this shape cannot.
+        // load, which the drain would have made and this shape cannot. A std
+        // module is one the NEXT prefix can load on the hot set's behalf
+        // (`HotLoadRefusal::Demands`); a package module is not.
+        //
+        // A generated path names an ITEM (`std::compare::PartialEq`), so it is
+        // resolved to the module it reaches the way the drain seeds it
+        // ([`deepest_module_or_namespace`]) before it is looked for: compared
+        // raw, every derive's own output read as a module the world lacked,
+        // and S1 refused each hot set that derives anything (M121).
+        let mut demanded: Vec<&'static str> = Vec::new();
         for generated in &output.items {
-            let demands_a_new_module = collect_module_paths(generated.nodes, "std")
+            if let Some((module, _)) = collect_module_paths(generated.nodes, "pkg")
                 .into_iter()
-                .any(|(module, _)| !world.module_scopes.contains_key(module))
-                || collect_module_paths(generated.nodes, "pkg")
-                    .into_iter()
-                    .any(|(module, _)| !world.pkg_module_names.contains(module));
-            if demands_a_new_module {
-                return Err("generated-new-module");
+                .find(|(module, _)| {
+                    let resolved = deepest_module_or_namespace(&roots, module)
+                        .unwrap_or_else(|| module.to_string());
+                    !world.pkg_module_names.contains(resolved.as_str())
+                })
+            {
+                if crate::phase_timing_enabled() {
+                    eprintln!("[vilan phase] hot-generated-demand pkg::{module}");
+                }
+                return Err(HotLoadRefusal::Refused("generated-new-module"));
             }
+            for (module, _) in collect_module_paths(generated.nodes, "std") {
+                let resolved = deepest_module_or_namespace(&std_roots, module)
+                    .unwrap_or_else(|| module.to_string());
+                if !world.module_scopes.contains_key(resolved.as_str()) {
+                    if crate::phase_timing_enabled() {
+                        eprintln!("[vilan phase] hot-generated-demand std::{resolved}");
+                    }
+                    demanded.push(interned_display_name(resolved));
+                }
+            }
+        }
+        if !demanded.is_empty() {
+            return Err(HotLoadRefusal::Demands(demanded));
         }
         world
             .generated_by_source
@@ -72152,6 +72488,11 @@ struct World<'src> {
     /// exactly when the analysis that stored it did, and the entry tail reads
     /// the order off the world rather than off its own load.
     entry_is_open_module: bool,
+    /// Whether the pre-entry `resolve_world` was skipped: the open module's
+    /// order above, or B553's deferred order ([`AnalysisShape::defer_resolve`]).
+    /// The post-entry `build()` is then the one resolve, and the entry tail
+    /// waits for it with everything the pre-entry resolve would have bound.
+    resolve_deferred: bool,
     global_scope_id: Id,
     module_scopes: HashMap<&'src str, Id>,
     /// The ENTRY package's own modules this world loaded, by name — `pkg::`
@@ -72342,8 +72683,7 @@ pub fn analyze_cancellable<'src>(
         entry_path,
         platform,
         workspace,
-        true,
-        true,
+        AnalysisShape::FIRST,
     )?;
     for refusal in refusals {
         program.diagnostics.push(refusal);
@@ -72757,6 +73097,15 @@ fn hot_set_closure(
             ));
         }
     }
+    let modules: Vec<&'static str> = hot.iter().copied().collect();
+    let paths: Vec<PathBuf> = modules.iter().map(|name| reached[name].0.clone()).collect();
+    // What this hot set's derives were found to demand (M121): loaded into the
+    // prefix like every request the written syntax makes.
+    requests.extend(
+        hot_generated_demands(&paths)
+            .into_iter()
+            .map(|module| (Origin::Std, module)),
+    );
     requests.sort_unstable();
     requests.dedup();
     let refusal = if hot.iter().any(|name| macro_text.contains(name)) {
@@ -72766,15 +73115,9 @@ fn hot_set_closure(
         .any(|name| entry_module.is_some_and(|entry| reached[name].1.contains(&entry)))
     {
         Some("imports-the-entry")
-    } else if !crate::incremental::planted(crate::incremental::Plant::ImplGuardOff)
-        && !hot_impls_stay_in_the_hot_set(&hot, &reached)
-    {
-        Some("impl")
     } else {
         None
     };
-    let modules: Vec<&'static str> = hot.into_iter().collect();
-    let paths = modules.iter().map(|name| reached[name].0.clone()).collect();
     Some(HotSet {
         modules,
         paths,
@@ -72784,140 +73127,59 @@ fn hot_set_closure(
     })
 }
 
-/// M110 S1's impl guard: whether no module OUTSIDE the hot set can resolve
-/// anything through an `impl` written INSIDE it.
-///
-/// The prefix resolves before the hot set is walked (that is the whole
-/// saving), so an impl the hot set declares is invisible to the prefix's
-/// method resolution — exactly as an impl in the ENTRY is invisible to every
-/// module today (`Foo has no method` from a module whose only impl lives in
-/// the entry file). A canonical analysis walks the hot modules among the rest,
-/// so their impls DO serve the prefix there, and the two would disagree. The
-/// guard makes that impossible rather than detecting it:
-///
-///  - an impl whose subject's head type is DECLARED in the hot set is safe —
-///    no module outside the hot set can name that type (it would have to
-///    import it, which would put it in the hot set), and a generic body that
-///    receives a value of it reaches members only through its bounds;
-///  - an INHERENT impl on a type declared elsewhere (kolt's `impl style::Style
-///    { fun flex_col .. }`) is safe when none of its member names occurs as
-///    an identifier in any package module outside the hot set: a member is
-///    reached by NAME (`.flex_col()`, `Style::flex_col`), and only package code
-///    can name a user's inherent member;
-///  - anything else — a trait impl on a foreign type (operators, `==`,
-///    interpolation and `for` reach trait members without naming them), a
-///    blanket `impl type T` — is not, and the analysis is built canonically.
-fn hot_impls_stay_in_the_hot_set(
-    hot: &std::collections::BTreeSet<&'static str>,
-    reached: &std::collections::BTreeMap<
-        &'static str,
-        (
-            PathBuf,
-            Vec<&'static str>,
-            &'static crate::span::Spanned<NodeList<'static>>,
-        ),
-    >,
-) -> bool {
-    // The item nodes at a module's top level, through the markers that wrap
-    // them (`export`, a derive, `const`) and into inline `mod`s.
-    fn items<'a>(nodes: &'a NodeList<'a>, out: &mut Vec<&'a Node<'a>>) {
-        for item in nodes {
-            let mut node = &item.0;
-            while let Node::Export(_, inner, _)
-            | Node::Derive(_, inner)
-            | Node::Service(_, inner)
-            | Node::MacroAttribute(_, _, _, inner)
-            | Node::Const(inner) = node
-            {
-                node = &inner.0;
-            }
-            match node {
-                Node::Module(_, body) => items(&body.0, out),
-                _ => out.push(node),
-            }
-        }
-    }
-    let mut declared: HashSet<&str> = HashSet::default();
-    let mut hot_impls: Vec<(&Node, &'static str)> = Vec::new();
-    for name in hot {
-        let (_, _, ast) = &reached[name];
-        let mut nodes = Vec::new();
-        items(&ast.0, &mut nodes);
-        for node in nodes {
-            match node {
-                Node::Struct(type_name, ..) | Node::Enum(type_name, ..) => {
-                    declared.insert(type_name.0);
-                }
-                Node::Impl(..) => hot_impls.push((node, name)),
-                _ => {}
-            }
-        }
-    }
-    // The head identifier of an impl's subject, when it is a bare type name
-    // (`Theme`, `Theme<T>`); `None` for a path (`style::Style`) or a binder.
-    fn subject_head<'a>(subject: &Node<'a>) -> Option<&'a str> {
-        match subject {
-            Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
-            _ => None,
-        }
-    }
-    let mut named_members: Vec<&str> = Vec::new();
-    for (node, _) in &hot_impls {
-        let Node::Impl(subject, traits, body, _) = node else {
-            continue;
-        };
-        if subject_head(&subject.0).is_some_and(|head| declared.contains(head)) {
-            continue;
-        }
-        if !traits.is_empty() {
-            return false;
-        }
-        for member in &body.0 {
-            let mut member_node = &member.0;
-            while let Node::Export(_, inner, _) | Node::Const(inner) = member_node {
-                member_node = &inner.0;
-            }
-            match member_node {
-                Node::Func(function) => named_members.push(function.name.0),
-                // Anything but a function in an inherent impl is a shape this
-                // guard has not been taught: refuse rather than guess.
-                _ => return false,
-            }
-        }
-    }
-    if named_members.is_empty() {
-        return true;
-    }
-    // Whether `word` occurs as a whole identifier in `text`.
-    let spells = |text: &str, word: &str| {
-        let identifier = |character: char| character.is_alphanumeric() || character == '_';
-        text.match_indices(word).any(|(at, _)| {
-            !text[..at].chars().next_back().is_some_and(identifier)
-                && !text[at + word.len()..]
-                    .chars()
-                    .next()
-                    .is_some_and(identifier)
-        })
-    };
-    for (name, (path, ..)) in reached {
-        if hot.contains(name) {
-            continue;
-        }
-        let Ok(text) = crate::util::read_source(path) else {
-            return false;
-        };
-        if named_members.iter().any(|member| spells(&text, member)) {
-            return false;
-        }
-    }
-    true
+/// How [`analyze_inner`] may build its world. The first attempt allows
+/// everything; each retry narrows it, and none widens it again, which is what
+/// bounds the retries.
+#[derive(Clone, Copy)]
+struct AnalysisShape {
+    /// The base cache may be read and written, and the entry's expansion is
+    /// hoisted past the store. The derive/macro hoist's fallback — an entry
+    /// whose GENERATED code demands a module the cached world never loaded —
+    /// rebuilds with it off, which restores the load-region entry expansion
+    /// so generated references seed the loader (depth one: the uncached path
+    /// cannot fall back again).
+    cache: bool,
+    /// A hot-set world (M110 S1) may be built.
+    hot: bool,
+    /// B553: the loaded modules do NOT resolve before the entry walks — the
+    /// whole world resolves once, in the post-entry `build()`, with every
+    /// impl in it (the monolithic order, the one B239's open module takes).
+    /// Taken when an impl the entry walks answers a question the pre-entry
+    /// resolve asked ([`ImplReachLog`]); such a world is neither read from nor
+    /// written to the base cache, since what it is keyed by is not what it
+    /// depends on.
+    defer_resolve: bool,
 }
 
-/// `analyze` with the cache switchable: the derive/macro hoist's fallback —
-/// an entry whose GENERATED code demands a module the cached world never
-/// loaded — rebuilds fresh through here with `allow_cache: false`, which
-/// restores the load-region entry expansion so generated references seed
-/// the loader (depth one: the uncached path cannot fall back again).
+impl AnalysisShape {
+    const FIRST: AnalysisShape = AnalysisShape {
+        cache: true,
+        hot: true,
+        defer_resolve: false,
+    };
+
+    fn without_hot(self) -> AnalysisShape {
+        AnalysisShape { hot: false, ..self }
+    }
+
+    fn uncached(self) -> AnalysisShape {
+        AnalysisShape {
+            cache: false,
+            hot: false,
+            ..self
+        }
+    }
+
+    fn deferred(self) -> AnalysisShape {
+        AnalysisShape {
+            hot: false,
+            defer_resolve: true,
+            ..self
+        }
+    }
+}
+
+/// `analyze`, in the shape [`AnalysisShape`] allows.
 fn analyze_inner<'src>(
     nodes: &'src Spanned<NodeList<'src>>,
     entry_source: &'src str,
@@ -72926,8 +73188,7 @@ fn analyze_inner<'src>(
     entry_path: &Path,
     platform: Platform,
     workspace: &Workspace,
-    allow_cache: bool,
-    allow_hot: bool,
+    shape: AnalysisShape,
 ) -> Option<Program<'src>> {
     // The std-tax arc's instrument (proposal/analysis-reuse.md §6): wall-clock
     // marks at the phase boundaries, printed at the end when
@@ -73105,7 +73366,7 @@ fn analyze_inner<'src>(
         entry_open_module: entry_open_module.clone(),
         hot: None,
     };
-    let base_cacheable = allow_cache
+    let base_cacheable = shape.cache
         && !entry_is_inside_std
         // M72: `[service]` entries USED to bypass here. The bypass predated
         // the derive/macro hoist (§6.13): a service expanded inside the
@@ -73149,7 +73410,9 @@ fn analyze_inner<'src>(
     // and in nothing else (the entry expansion stays hoisted, which is what
     // keeps the gensym counter, and so the emitted names, identical).
     let clean = crate::incremental::clean_requested();
-    let reuse_allowed = base_cacheable && !clean;
+    // B553's deferred order is keyed by nothing that says it (see
+    // [`AnalysisShape::defer_resolve`]), so it reuses nothing either.
+    let reuse_allowed = base_cacheable && !clean && !shape.defer_resolve;
     // A clean analysis that keeps the hot-set SHAPE (Q3's differential compares
     // emitted JS against one): no cache, but the world built the way the
     // incremental one is.
@@ -73170,7 +73433,7 @@ fn analyze_inner<'src>(
         crate::incremental::update_census(|census| census.hot_refusal = Some(reason));
     }
     let hot_world: Option<HotSet> = hot_set.filter(|hot| {
-        allow_hot && hot_shape_allowed && hot.refusal.is_none() && !hot.modules.is_empty()
+        shape.hot && hot_shape_allowed && hot.refusal.is_none() && !hot.modules.is_empty()
     });
     base_cache_key.hot = hot_world
         .as_ref()
@@ -73213,9 +73476,7 @@ fn analyze_inner<'src>(
         world.analyzer.entry_phase = true;
         // M110 S1: the hot set, over the served prefix — exactly what the miss
         // below does after its store, so a hit and a miss build one world.
-        if let Err(reason) = load_hot_modules(&mut world, std, workspace, pkg_root) {
-            refuse_hot_world(&base_cache_key);
-            crate::incremental::update_census(|census| census.hot_refusal = Some(reason));
+        if let Err(refusal) = load_hot_modules(&mut world, std, platform, workspace, pkg_root) {
             return analyze_inner(
                 nodes,
                 entry_source,
@@ -73224,8 +73485,7 @@ fn analyze_inner<'src>(
                 entry_path,
                 platform,
                 workspace,
-                allow_cache,
-                false,
+                shape_after_hot_load(refusal, &base_cache_key, shape),
             );
         }
         if expand_entry_over_world(&mut world, nodes, entry_source, entry_path, std, workspace) {
@@ -73239,8 +73499,7 @@ fn analyze_inner<'src>(
                 entry_path,
                 platform,
                 workspace,
-                false,
-                false,
+                shape.uncached(),
             );
         }
         // M19 T1: a HIT is the one shape §2.1 proves id-stable — the clone
@@ -73255,9 +73514,22 @@ fn analyze_inner<'src>(
         // `Analyzer::alias_reaching_sources`, which is where that argument is
         // written — so the key rides on both shapes now.
         let checks_key = Some(base_cache_key.clone());
-        return analyze_over_world(
+        let hot_key = world.hot.is_some().then(|| base_cache_key.clone());
+        return match analyze_over_world(
             world, nodes, std, pkg_root, platform, workspace, checks_key, true,
-        );
+        ) {
+            Ok(program) => program,
+            Err(reached) => analyze_inner(
+                nodes,
+                entry_source,
+                std,
+                pkg_root,
+                entry_path,
+                platform,
+                workspace,
+                shape_after_impl_reach(shape, &reached, hot_key.as_ref()),
+            ),
+        };
     }
     // `sources[0]` is the entry file; std modules are appended as they load.
     // `source_ranges` records the entity-id span each file's walk produced.
@@ -74662,8 +74934,7 @@ fn analyze_inner<'src>(
                 entry_path,
                 platform,
                 workspace,
-                allow_cache,
-                false,
+                shape.without_hot(),
             );
         }
     }
@@ -75298,9 +75569,15 @@ fn analyze_inner<'src>(
     let entry_is_open_module =
         entry_alias_module.is_some() && matches!(workspace.entry_mode, EntryMode::OpenFile { .. });
     let phase_base_start = crate::PhaseClock::now();
-    if !entry_is_module && !entry_is_open_module {
+    let resolve_deferred = entry_is_open_module || shape.defer_resolve;
+    if !entry_is_module && !resolve_deferred {
         analyzer.source_paths = sources.clone();
+        // M121 / B553: what this resolve asks of the impl table is recorded,
+        // so the impls walked after it — the entry's, a hot set's — can be
+        // tested against it once they have resolved (`impl_reach`).
+        analyzer.begin_impl_reach_log();
         analyzer.resolve_world();
+        analyzer.end_impl_reach_log();
     }
     let phase_base = phase_base_start.elapsed();
     let prefix_len = sources.len();
@@ -75387,8 +75664,7 @@ fn analyze_inner<'src>(
                 entry_path,
                 platform,
                 workspace,
-                allow_cache,
-                false,
+                shape.without_hot(),
             );
         }
     }
@@ -75399,6 +75675,7 @@ fn analyze_inner<'src>(
         source_hashes,
         entry_is_module,
         entry_is_open_module,
+        resolve_deferred,
         global_scope_id,
         module_scopes,
         pkg_module_names,
@@ -75449,9 +75726,7 @@ fn analyze_inner<'src>(
     world.analyzer.entry_phase = true;
     // M110 S1: the hot set, over the prefix just stored — what a hit on that
     // world does too, so the two build one world.
-    if let Err(reason) = load_hot_modules(&mut world, std, workspace, pkg_root) {
-        refuse_hot_world(&base_cache_key);
-        crate::incremental::update_census(|census| census.hot_refusal = Some(reason));
+    if let Err(refusal) = load_hot_modules(&mut world, std, platform, workspace, pkg_root) {
         return analyze_inner(
             nodes,
             entry_source,
@@ -75460,8 +75735,7 @@ fn analyze_inner<'src>(
             entry_path,
             platform,
             workspace,
-            allow_cache,
-            false,
+            shape_after_hot_load(refusal, &base_cache_key, shape),
         );
     }
     // The suppressed entry expansion runs here, symmetric with the hit path
@@ -75478,14 +75752,14 @@ fn analyze_inner<'src>(
             entry_path,
             platform,
             workspace,
-            false,
-            false,
+            shape.uncached(),
         );
     }
     // A MISS derives everything and RECORDS it; only a hit replays. The key
     // rides along either way, since the record is keyed by the world it
     // describes.
-    analyze_over_world(
+    let hot_key = world.hot.is_some().then(|| base_cache_key.clone());
+    let answer = analyze_over_world(
         world,
         nodes,
         std,
@@ -75500,7 +75774,60 @@ fn analyze_inner<'src>(
         // on both shapes.
         (reuse_allowed && !entry_is_module).then_some(base_cache_key),
         false,
-    )
+    );
+    match answer {
+        Ok(program) => program,
+        Err(reached) => analyze_inner(
+            nodes,
+            entry_source,
+            std,
+            pkg_root,
+            entry_path,
+            platform,
+            workspace,
+            shape_after_impl_reach(shape, &reached, hot_key.as_ref()),
+        ),
+    }
+}
+
+/// M121 / B553: the shape to rebuild in when an impl walked after a world's
+/// stored resolve answers a question that resolve asked ([`ImplReachLog`]).
+///
+/// A HOT impl (M110 S1) means the hot-set world is not the canonical one: the
+/// key is refused for the keystrokes after this one, and the analysis is built
+/// canonically. An ENTRY impl (B553) means the canonical two-phase order is
+/// not either: the world resolves once, after the entry walks
+/// ([`AnalysisShape::defer_resolve`]) — which sees a hot impl too, so it is
+/// the answer when both reached.
+fn shape_after_impl_reach(
+    shape: AnalysisShape,
+    reached: &ImplReached,
+    hot_key: Option<&BaseCacheKey>,
+) -> AnalysisShape {
+    if reached.by_hot
+        && let Some(key) = hot_key
+    {
+        refuse_hot_world(key);
+    }
+    if !crate::macros::in_macro_world() {
+        crate::incremental::update_census(|census| {
+            if reached.by_hot {
+                census.hot_refusal = Some("impl-reached");
+            }
+            census.resolve_deferred |= reached.by_entry;
+        });
+        if crate::phase_timing_enabled() {
+            eprintln!(
+                "[vilan phase] impl-reached {} (hot {}, entry {})",
+                reached.first, reached.by_hot, reached.by_entry
+            );
+        }
+    }
+    if reached.by_entry {
+        shape.deferred()
+    } else {
+        shape.without_hot()
+    }
 }
 
 /// B265: the declaration an intrinsic may bind to for `name` on this impl —
@@ -75559,7 +75886,7 @@ fn analyze_over_world<'src>(
     workspace: &Workspace,
     checks_key: Option<BaseCacheKey>,
     from_base_cache: bool,
-) -> Option<Program<'src>> {
+) -> Result<Option<Program<'src>>, ImplReached> {
     let World {
         mut analyzer,
         macro_registry: _,
@@ -75567,6 +75894,7 @@ fn analyze_over_world<'src>(
         source_hashes,
         entry_is_module,
         entry_is_open_module,
+        resolve_deferred,
         global_scope_id,
         module_scopes,
         pkg_module_names: _,
@@ -75577,8 +75905,12 @@ fn analyze_over_world<'src>(
         owned_nursery_struct_id,
         phase_marks,
         prefix_len,
-        hot: _,
+        hot,
     } = world;
+    // M110 S1: the hot modules load first past the stored prefix, one source
+    // each (`load_hot_modules`).
+    let hot_sources = prefix_len as u32
+        ..prefix_len as u32 + hot.as_ref().map_or(0, |hot| hot.modules.len() as u32);
     // M110 S1: the sources a checks record may describe — the STORED world's.
     // A hot module's text moves with every keystroke, so it is neither read
     // from a record nor written to one (M19's term 1, re-pointed at the hot
@@ -75636,7 +75968,7 @@ fn analyze_over_world<'src>(
             // once; the entry's set reaching the modules through their parent
             // scope costs nothing, because in file mode the entry and its
             // siblings are the same package and take the same prelude.
-            if !entry_is_open_module {
+            if !resolve_deferred {
                 analyzer.seed_preludes();
             }
         }
@@ -75677,6 +76009,22 @@ fn analyze_over_world<'src>(
     // that landed during the walk stops before it rather than after.
     if !crate::cancel::cancelled() {
         analyzer.build();
+        // M121 / B553: the impls this world walked after its stored resolve —
+        // the entry's, and a hot set's — are resolved now. One that answers a
+        // question that resolve asked means the world's answers are not the
+        // canonical analysis's, and the caller rebuilds in a shape that sees
+        // it (`analyze_inner`). Before the checks, which are most of what the
+        // rebuild would otherwise throw away.
+        if let Some(mut reached) = analyzer.impl_reach(hot_sources) {
+            // The impl guard's plant (M110 S1): a hot impl the prefix needed is
+            // let through, which the edit-replay differential must see.
+            if crate::incremental::planted(crate::incremental::Plant::ImplGuardOff) {
+                reached.by_hot = false;
+            }
+            if reached.by_hot || reached.by_entry {
+                return Err(reached);
+            }
+        }
     }
     let phase_build = phase_build_start.elapsed();
     let phase_checks_start = crate::PhaseClock::now();
@@ -76146,7 +76494,7 @@ fn analyze_over_world<'src>(
     // through with a program nobody can use. The caller drops the entry text
     // and tree it leaked, exactly as it does for the panic path.
     if crate::cancel::cancelled() {
-        return None;
+        return Ok(None);
     }
 
     // Find `Context`'s `new`/`run`/`get` intrinsics (the context threading pass
@@ -77124,7 +77472,7 @@ fn analyze_over_world<'src>(
     // M106: the per-declaration work, ranked — empty unless attribution is on.
     let item_costs = analyzer.ranked_item_costs();
 
-    Some(Program {
+    Ok(Some(Program {
         hidden_impls_pending,
         exported_entities,
         curated_modules,
@@ -77360,7 +77708,7 @@ fn analyze_over_world<'src>(
         bound_selection_memo: std::sync::Mutex::default(),
         selection_memos: crate::impl_select::SelectionMemos::default(),
         trait_subject_memo: std::sync::Mutex::default(),
-    })
+    }))
 }
 
 /// E3's implicit half (B119, view-invalidation.md §7): decide the view sites

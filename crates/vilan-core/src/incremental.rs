@@ -175,8 +175,9 @@ pub enum Plant {
     /// S1: skip the content validation of the stored PREFIX on a hit — serve
     /// the world whatever its modules now say.
     PrefixUnvalidated,
-    /// S1: drop the impl guard — defer a hot set whose impls the prefix can
-    /// reach, so the prefix resolves without them.
+    /// S1 / M121: drop the impl guard — serve a hot-set world even when one of
+    /// its impls answers a question the stored prefix's resolve asked, so the
+    /// prefix keeps the answer it gave without that impl.
     ImplGuardOff,
     /// S1: the hot set is the WHOLE package — every module re-walked per
     /// keystroke. Not wrong, just S1 undone; the re-walk counter pins must see
@@ -228,9 +229,14 @@ pub struct Census {
     /// walked over it.
     pub hot_world: bool,
     /// Why a hot set this analysis measured was NOT built as one — the guard
-    /// that refused it (`impl`, `use-inferred-binding`, `refused-before`, a
-    /// macro, an import of the entry, a module the shape cannot load).
+    /// that refused it (`impl-reached`, `use-inferred-binding`,
+    /// `refused-before`, a macro, an import of the entry, a module the shape
+    /// cannot load).
     pub hot_refusal: Option<&'static str>,
+    /// B553: whether the world was rebuilt to resolve once, after the entry
+    /// walked, because an impl in the entry answers a question the pre-entry
+    /// resolve asked.
+    pub resolve_deferred: bool,
     /// Base-cache lookups this analysis made that HIT, MISSED, and the worlds
     /// it STORED.
     pub base_hits: u64,
@@ -253,6 +259,7 @@ thread_local! {
             package_modules: 0,
             hot_world: false,
             hot_refusal: None,
+            resolve_deferred: false,
             base_hits: 0,
             base_misses: 0,
             base_stores: 0,
@@ -586,9 +593,10 @@ pub fn report(program: &Program) {
         };
         eprintln!(
             "[vilan phase] hot-set {hot_set} interface-moved {interfaces} global-moved {global} \
-             unknown-interfaces {unknown} hot-world {} hot-refusal {}",
+             unknown-interfaces {unknown} hot-world {} hot-refusal {} resolve-deferred {}",
             u8::from(census.hot_world),
             census.hot_refusal.unwrap_or("-"),
+            u8::from(census.resolve_deferred),
         );
         if let Some((_, Some((_, moved)))) = &movement
             && !moved.is_empty()
