@@ -9052,6 +9052,132 @@ fn f28_a_file_importing_only_a_single_platform_module_is_analyzed_as_before() {
     }
 }
 
+/// E286 (E266's other half): the platform a file with no project is analyzed
+/// under, when its only browser evidence is a `pkg::` or `<dependency>::` module
+/// whose FILE declares `[platform("browser")] mod self;` - `infer_platform` read
+/// `std::` imports only, so a `[library]` file importing its own browser-declared
+/// module read "analyzed as: node - default". Returns (platform, kind, reason).
+fn e286_inferred(
+    files: &[(&str, &str)],
+    entry: &str,
+    dependencies: &[(&str, &[(&str, &str)])],
+) -> (Platform, Option<&'static str>, String) {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = scratch::root().join(format!("vilan_e286_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app = root.join("app");
+    for (relative, contents) in files {
+        let path = app.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let mut packages = Vec::new();
+    let mut entry_dependencies = Vec::new();
+    for (index, (name, dependency_files)) in dependencies.iter().enumerate() {
+        let dependency_root = root.join(name);
+        for (relative, contents) in *dependency_files {
+            let path = dependency_root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+        }
+        packages.push(PackageSpec {
+            base_root: dependency_root,
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+            member: false,
+            prelude: Default::default(),
+        });
+        entry_dependencies.push((name.to_string(), index));
+    }
+    let workspace = Workspace {
+        packages,
+        entry_dependencies,
+        ..Workspace::default()
+    };
+    let entry_path = app.join(entry);
+    let source: &'static str = Box::leak(
+        std::fs::read_to_string(&entry_path)
+            .unwrap()
+            .into_boxed_str(),
+    );
+    let (program, _errors) =
+        analyze_source(source, &std_spec(), &app, &entry_path, None, &workspace);
+    let program = program.expect("a program");
+    let answer = (
+        program.platform,
+        program.platform_kind,
+        program.platform_reason.clone().unwrap_or_default(),
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    answer
+}
+
+const E286_BROWSER_MODULE: &str = "[platform(\"browser\")] mod self;\n\n\
+     export fun anchor_of(n: i32): i32 {\n\tn\n}\n";
+const E286_PLAIN_MODULE: &str = "export fun anchor_of(n: i32): i32 {\n\tn\n}\n";
+
+#[test]
+fn e286_a_pkg_module_declaring_the_browser_platform_is_browser_evidence() {
+    let entry = "import pkg::paint::anchor_of;\n\nexport fun measure(): i32 {\n\tanchor_of(1)\n}\n";
+    let (platform, kind, reason) = e286_inferred(
+        &[("measure.vl", entry), ("paint.vl", E286_BROWSER_MODULE)],
+        "measure.vl",
+        &[],
+    );
+    assert_eq!(platform, Platform::Browser, "{reason}");
+    assert_eq!(kind, Some("inferred"), "{reason}");
+    assert!(
+        reason.contains("`pkg::paint`") && reason.contains("declares the `browser` platform"),
+        "the reason names the module: {reason}"
+    );
+    // The control: the same file over a module that declares nothing is the default.
+    let (platform, kind, reason) = e286_inferred(
+        &[("measure.vl", entry), ("paint.vl", E286_PLAIN_MODULE)],
+        "measure.vl",
+        &[],
+    );
+    assert_eq!(platform, Platform::default(), "{reason}");
+    assert_eq!(kind, Some("default"), "{reason}");
+}
+
+#[test]
+fn e286_a_dependency_module_declaring_the_browser_platform_is_browser_evidence() {
+    let entry =
+        "import widgets::paint::anchor_of;\n\nexport fun measure(): i32 {\n\tanchor_of(1)\n}\n";
+    let (platform, kind, reason) = e286_inferred(
+        &[("measure.vl", entry)],
+        "measure.vl",
+        &[(
+            "widgets",
+            &[
+                ("lib.vl", "export fun noop() {}\n"),
+                ("paint.vl", E286_BROWSER_MODULE),
+            ],
+        )],
+    );
+    assert_eq!(platform, Platform::Browser, "{reason}");
+    assert_eq!(kind, Some("inferred"), "{reason}");
+    assert!(
+        reason.contains("`widgets::paint`"),
+        "the reason names the dependency's module: {reason}"
+    );
+    // The control: a dependency whose module declares nothing is no evidence.
+    let (platform, ..) = e286_inferred(
+        &[("measure.vl", entry)],
+        "measure.vl",
+        &[(
+            "widgets",
+            &[
+                ("lib.vl", "export fun noop() {}\n"),
+                ("paint.vl", E286_PLAIN_MODULE),
+            ],
+        )],
+    );
+    assert_eq!(platform, Platform::default());
+}
+
 #[test]
 fn b547_a_with_clause_names_a_reexported_trait_beside_a_same_named_derive() {
     // B547: `std::reactive::store` RE-EXPORTS the `Storable` trait from

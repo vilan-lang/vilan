@@ -106,12 +106,34 @@ leg_clippy() {
 # THE gate command. `VILAN_CI_PARTITION` is nextest's `count:N/M` shard, set by
 # ci.yml's matrix so one runner's cold compile is paid twice in parallel instead
 # of once in series; unset locally, where the whole suite is the point.
+#
+# THE PROFILE (N156). The suite runs under Cargo.toml's `ci-test` profile - the
+# default `dev` with `vilan-core` at opt-level 1, which more than halves the
+# CPU every test pays for its cold std world - and its artifacts land in
+# `target/ci-test/`, apart from the `target/debug/` a lane's edit loop uses
+# (that loop keeps the ~17 s analyzer rebuild; this one pays ~80 s for it).
+# `VILAN_TEST_PROFILE=dev scripts/ci-local.sh test` runs the suite the old way.
+TEST_PROFILE=${VILAN_TEST_PROFILE:-ci-test}
+
+# ONE binary stays on `dev`: `deep_nesting`. Its pins are stack-size claims -
+# "the walk fits libtest's 2 MiB thread" (the Windows canary), "a 490-link chain
+# overruns a DECLARED 2 MiB" - and a frame is exactly what opt-level changes.
+# Unoptimized frames are the worst case the canary exists to hold, and at
+# opt-level 1 the chain's walk fits (~26 KB a level unoptimized, far less
+# optimized), so three declared-stack pins go red there (measured, Order 49).
+# So the suite run leaves the binary out and it runs once, on `dev`, after it -
+# on the first shard only, since it is one binary and not a share of the suite.
 leg_test() {
+    status=0
     if [ -n "${VILAN_CI_PARTITION:-}" ]; then
-        cargo nextest run --workspace --partition "count:$VILAN_CI_PARTITION"
+        cargo nextest run --workspace --cargo-profile "$TEST_PROFILE" -E 'not binary(deep_nesting)' --partition "count:$VILAN_CI_PARTITION" || status=$?
     else
-        cargo nextest run --workspace
+        cargo nextest run --workspace --cargo-profile "$TEST_PROFILE" -E 'not binary(deep_nesting)' || status=$?
     fi
+    case "${VILAN_CI_PARTITION:-1/1}" in
+        1/*) cargo nextest run -p vilan-core --test deep_nesting || status=$? ;;
+    esac
+    return "$status"
 }
 
 # nextest does not run doc-tests. Every doc-test set is empty today; this leg
@@ -119,7 +141,7 @@ leg_test() {
 # it is a leg of its own rather than two lines inside `test`: sharded, `test`
 # runs twice per OS, and a doc-test run twice is a doc-test run once too many.
 leg_doctest() {
-    cargo test --workspace --doc
+    cargo test --workspace --doc --profile "$TEST_PROFILE"
 }
 
 leg_audit() {

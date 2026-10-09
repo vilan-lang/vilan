@@ -1,0 +1,70 @@
+// F116: a GENERIC resource with a `Drop` impl was refused by name ("its
+// teardown is one instance per instantiation"). Each instantiation's Rust
+// `Drop` impl calls the `drop` instance its own arguments bind — the impl's
+// subject (`Guard<T>`) matched against them — so `Guard<str>` and
+// `Guard<i32>` each close, a two-parameter impl reads both, a generic
+// resource holding two others closes before them (reverse field order), and
+// a move into a function or into `drop` closes it there.
+import std::drop::{ Drop, drop };
+import std::io::print;
+
+[resource]
+struct Guard<T> {
+	name: str,
+	value: T,
+}
+
+impl Guard<type T> with Drop {
+	fun drop(&mut self) {
+		print(i"closing {self.name}");
+	}
+}
+
+[resource]
+struct Labelled<K, V> {
+	key: K,
+	value: V,
+}
+
+impl Labelled<type K, type V> with Drop {
+	fun drop(&mut self) {
+		print("closing a labelled");
+		print(self.key);
+		print(self.value);
+	}
+}
+
+[resource]
+struct Pair<T> {
+	first: Guard<T>,
+	second: Guard<T>,
+}
+
+impl Pair<type T> with Drop {
+	fun drop(&mut self) {
+		print("closing the pair");
+	}
+}
+
+fun consume<T>(own guard: Guard<T>) {
+	print(i"consumed {guard.name}");
+}
+
+fun main() {
+	let a = Guard { name = "a", value = "text" };
+	let b = Guard { name = "b", value = 7 };
+	print(a.value);
+	print(b.value);
+	let labelled = Labelled { key = "k", value = 3 };
+	print(labelled.key);
+	let pair = Pair {
+		first = Guard { name = "first", value = 1.5 },
+		second = Guard { name = "second", value = 2.5 },
+	};
+	print(pair.first.value + pair.second.value);
+	let c = Guard { name = "c", value = [1, 2] };
+	consume(c);
+	let d = Guard { name = "d", value = true };
+	drop(d);
+	print("end");
+}

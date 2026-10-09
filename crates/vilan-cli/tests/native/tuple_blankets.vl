@@ -1,0 +1,100 @@
+// F118: std's tuple-family blankets natively — `compare`'s position-by-
+// position `eq`, `hash`'s canonical key and `debug`'s rendering walk the
+// tuple with `self.keys()` and `self.get(key)`, refused at the `TupleKeys`
+// intrinsic before. A `for` over a tuple is unrolled, one body per position
+// at that position's type; `jump break`/`jump continue` leave the walk and
+// the position. A written element `eq` (`Loose`) is the one called, nested
+// tuples recurse, a tuple keys a map and a set, `entries()`, `len()` and a
+// comprehension over `keys()` agree.
+import std::compare::PartialEq;
+import std::debug::Debug;
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::tuple::Tuple;
+
+struct Loose {
+	value: i32,
+	note: str,
+}
+
+impl Loose with PartialEq {
+	fun eq(self, other: Loose): bool {
+		self.value == other.value
+	}
+}
+
+impl Loose with Debug {
+	fun debug(self): str {
+		i"Loose({self.value})"
+	}
+}
+
+fun describe<T: (2..: Debug)>(whole: T): str {
+	mut out = "";
+	for key in whole.keys() {
+		out = out + whole.get(key).debug() + ";";
+	}
+	out
+}
+
+fun first_long<T: (2..: Debug)>(whole: T): str {
+	mut found = "none";
+	for key in whole.keys() {
+		let text = whole.get(key).debug();
+		if text.len() < 3 {
+			jump continue;
+		}
+		found = text;
+		jump break;
+	}
+	found
+}
+
+fun count_entries<T: (2..: Debug)>(whole: T): usize {
+	mut count = 0;
+	for (key, value) in whole.entries() {
+		mut inner = 0;
+		for inner < 5 {
+			inner += 1;
+			if inner == 2 {
+				jump break;
+			}
+		}
+		count = count + value.debug().len() + inner;
+	}
+	count + whole.len()
+}
+
+fun boxed<T: (2..)>(whole: T): (U in T: Option<U>) {
+	(key in whole.keys() => Some(whole.get(key)))
+}
+
+fun main() {
+	print((1, "a") == (1, "a"));
+	print((1, "a", 2.5) == (1, "a", 3.5));
+	print((Loose { value = 1, note = "x" }, 2) == (Loose { value = 1, note = "y" }, 2));
+	print(((1, 2), "n") == ((1, 2), "n"));
+	print(((1, 2), "n") == ((1, 3), "n"));
+	mut counts: HashMap<(i32, str), i32> = HashMap::new();
+	counts.insert((1, "a"), 7);
+	counts.insert((2, "b"), 8);
+	counts.insert((1, "a"), 9);
+	print(counts.get((1, "a")).unwrap_or(0));
+	print(counts.len());
+	mut seen: HashSet<(str, bool)> = HashSet::new();
+	seen.insert(("q", true));
+	print(seen.contains(("q", true)));
+	print(seen.contains(("q", false)));
+	print((1, "a").debug());
+	print((Loose { value = 3, note = "z" }, [1, 2], Some(true)).debug());
+	print(describe((4, "four", 4.5)));
+	print(first_long((1, "ab", "abc", "abcd")));
+	print(count_entries((10, "xy")));
+	print(Some((1, "a")) == Some((1, "a")));
+	print([(1, 2), (3, 4)] == [(1, 2), (3, 5)]);
+	let wrapped = boxed((7, "w"));
+	print(wrapped.1.unwrap_or("none"));
+	print((1, "a").len());
+}

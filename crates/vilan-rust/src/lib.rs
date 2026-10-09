@@ -65,8 +65,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
-    AdaptedInstance, Backing, BackingValue, CopyDecision, DropExtent, Expr, ExprIfBranch,
-    ExprMatchLeg, ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
+    AdaptedInstance, Backing, BackingValue, CopyDecision, Expr, ExprIfBranch, ExprMatchLeg,
+    ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
@@ -76,6 +76,7 @@ use vilan_core::mono;
 use vilan_core::node::{BinaryOp, Convention, ExternBinding};
 use vilan_core::options::BuildOptions;
 use vilan_core::span::Span;
+use vilan_core::teardown;
 use vilan_core::type_::{Type, TypeId};
 
 /// What one emit produced: the Rust source, and the measurement R3 asked for.
@@ -197,7 +198,7 @@ mod dbg;
 /// functions, whose subject names the declaration. A generic resource
 /// (`impl Guard<type T> with Drop`) is one declaration with one `drop`, so the
 /// answer is per declaration, not per instantiation.
-fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, Id> {
+fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, DropImpl> {
     let drop_functions: HashSet<Id> = program
         .drop_method_checks
         .iter()
@@ -220,12 +221,54 @@ fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, Id> {
         }
         match program.type_id_to_type_map.get(&implementation.subject) {
             Some(Type::Struct(id, _)) | Some(Type::Enum(id, _)) => {
-                nominals.insert(*id, function_id);
+                nominals.insert(
+                    *id,
+                    DropImpl {
+                        function: function_id,
+                        subject: implementation.subject,
+                    },
+                );
             }
             _ => {}
         }
     }
     nominals
+}
+
+/// F117: the members of every impl whose subject is a BARE trait, each with
+/// that subject. Such an impl is a blanket over every type implementing the
+/// trait (B567: the subject is the implicit binder the call binds to its
+/// receiver), so a `Self` its members write is the receiver an instance is
+/// minted for — which the analyzer types as the trait itself, and natively a
+/// trait is no value.
+fn bare_trait_impl_members(program: &Program<'_>) -> HashMap<Id, TypeId> {
+    let mut members = HashMap::default();
+    for implementation in &program.implementations {
+        if !matches!(
+            program.type_id_to_type_map.get(&implementation.subject),
+            Some(Type::Trait(..))
+        ) {
+            continue;
+        }
+        for member in implementation.declarations.values() {
+            let function_id = match program.entity_map.get(member) {
+                Some(Expr::Function(function_id)) => *function_id,
+                _ => *member,
+            };
+            members.insert(function_id, implementation.subject);
+        }
+    }
+    members
+}
+
+/// A nominal's `Drop` impl: its `drop` function, and the impl's SUBJECT in
+/// the impl's own generic terms (`Guard<T>` for `impl Guard<type T> with
+/// Drop`), which binds the impl's binders from one instantiation's arguments
+/// (F116).
+#[derive(Clone, Copy)]
+struct DropImpl {
+    function: Id,
+    subject: TypeId,
 }
 
 fn unsupported(what: &str, span: Span) -> Error {
@@ -541,10 +584,26 @@ struct Emitter<'a, 'src> {
     /// vilan types that lower to one Rust type must share one impl.
     object_impls: HashSet<(String, String)>,
     /// F56: the nominal declarations (struct or enum) that implement std's
-    /// `Drop`, each with its `drop` function. F97: a non-generic one is
-    /// emitted with a Rust `Drop` impl calling it; a GENERIC one is still
-    /// refused by name. See [`drop_implementing_nominals`].
-    drop_nominals: HashMap<Id, Id>,
+    /// `Drop`, each with its `drop` impl. F97: one is emitted with a Rust
+    /// `Drop` impl calling it; F116: a GENERIC one calls the `drop` instance
+    /// its instantiation binds. See [`drop_implementing_nominals`].
+    drop_nominals: HashMap<Id, DropImpl>,
+    /// F117: each member of an impl whose subject is a BARE trait
+    /// (`impl Iterator<type T> with Again<T>`), with that subject. See
+    /// [`bare_trait_impl_members`].
+    bare_trait_members: HashMap<Id, TypeId>,
+    /// The call expression an intrinsic is being emitted for, set by
+    /// [`Self::call_expression`] at its dispatch and taken by
+    /// [`Self::emit_intrinsic`] before anything else is walked: `std::tuple`'s
+    /// `get` reads the type its call answers (F118).
+    intrinsic_call: Option<Id>,
+    /// F118: the jump targets of the `for` bodies being walked, innermost
+    /// last — `None` for a real Rust loop, the walk's and the slot's labels
+    /// for a `for` over a tuple, which is UNROLLED and has no loop for an
+    /// unlabeled `break`/`continue` to reach.
+    loop_jumps: Vec<Option<(String, String)>>,
+    /// A counter naming each unrolled tuple walk's labels apart.
+    tuple_walks: usize,
 }
 
 /// One object type's Rust trait: its name and its slots, each slot's
@@ -681,6 +740,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             object_traits: HashMap::default(),
             object_impls: HashSet::new(),
             drop_nominals: drop_implementing_nominals(program),
+            bare_trait_members: bare_trait_impl_members(program),
+            intrinsic_call: None,
+            loop_jumps: Vec::new(),
+            tuple_walks: 0,
         }
     }
 
@@ -1873,6 +1936,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let _ = write!(out, "G{}", constraint_id.0);
             }
             Type::Void => out.push_str("void"),
+            // F119: a function item's own type keys by the item — `describe`
+            // names every one "a function value", and two items of different
+            // signatures are two Rust closure types.
+            Type::Function(function_id) => {
+                let _ = write!(out, "Item{}", function_id.0);
+            }
             other => {
                 let _ = write!(out, "X{}", describe(other));
             }
@@ -2443,6 +2512,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Type::Struct(id, arguments) => self.nominal_struct(id, &arguments, span),
             Type::Enum(id, arguments) => self.nominal_enum(id, &arguments, span),
+            // F119: a function ITEM's own type — `let f = nothing;` binds it
+            // without an annotation, and a blanket over `T` instantiated there
+            // names it. Its value is the counted closure [`Self::function_value`]
+            // builds, so the type is that closure's.
+            Type::Function(function_id) => self.function_item_type(function_id, span),
             // F18 slice 2: `any`. It exists for `std::db`'s bind list, and
             // `vilan_rt::Any` says what its scope is — not a dynamic type
             // system, just the value type a heterogeneous list needs where the
@@ -2635,6 +2709,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // F20: the opaque canonical key (`hash.vl`'s `external struct
             // Hash`). `vilan_rt::Hash` documents why it has four arms.
             "Hash" => Ok("vilan_rt::Hash".to_string()),
+            // F118: `std::tuple`'s key — the position alone at run time.
+            "TupleKey" => Ok("vilan_rt::TupleKey".to_string()),
             "Shared" => Ok(format!(
                 "vilan_rt::Shared<{}>",
                 rendered
@@ -2844,21 +2920,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // F56: a Drop-less resource (A142's pipe nodes) is move-only and
         // nothing more — the analyzer's move checker enforces that on both
         // backends — so it is an ordinary struct. F97: one WITH a `Drop` impl
-        // is a Rust `Drop` impl calling it (below); a generic one is not
-        // emitted yet, because its `drop` would be one instance per
-        // instantiation, reached from the impl's own binders.
-        if self.drop_nominals.contains_key(&id)
-            && !declaration.generic_parameter_constraint_ids.is_empty()
-        {
-            return Err(unsupported(
-                &format!(
-                    "the generic type `{}` with a `Drop` impl (its teardown is one instance \
-                     per instantiation)",
-                    declaration.name
-                ),
-                span,
-            ));
-        }
+        // is a Rust `Drop` impl calling it (below); F116: a generic one calls
+        // the `drop` instance its own arguments bind.
         let entries =
             self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
         let key: Vec<String> = entries
@@ -2882,7 +2945,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             },
         );
 
-        let saved = self.enter_substitution(entries);
+        let saved = self.enter_substitution(entries.clone());
         let rendered_types: Result<Vec<String>, Error> = declaration
             .fields
             .iter()
@@ -2953,16 +3016,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let _ = writeln!(out, "}}");
         // F97: the `Drop` impl's body runs first, then the fields drop.
-        if let Some(&drop_function) = self.drop_nominals.get(&id) {
-            let drop_name = self
-                .ensure_function(drop_function, &HashMap::default())?
-                .name;
-            let _ = writeln!(out, "impl Drop for {type_name} {{");
-            let _ = writeln!(out, "    fn drop(&mut self) {{");
-            let _ = writeln!(out, "        {drop_name}(self);");
-            let _ = writeln!(out, "    }}");
-            let _ = writeln!(out, "}}");
-        }
+        out.push_str(&self.drop_impl(id, &type_name, &entries)?);
         if reaches_a_closure {
             let comparisons: Vec<String> = declaration
                 .fields
@@ -3040,23 +3094,64 @@ impl<'a, 'src> Emitter<'a, 'src> {
         })
     }
 
+    /// Whether `type_id` (resolved) is a struct or an enum with a `Drop` impl.
+    fn has_a_drop_impl(&self, type_id: Option<TypeId>) -> bool {
+        type_id
+            .and_then(|type_id| self.resolve(self.concrete(type_id)))
+            .is_some_and(|resolved| {
+                matches!(resolved, Type::Struct(id, _) | Type::Enum(id, _)
+                    if self.drop_nominals.contains_key(id))
+            })
+    }
+
+    /// F97/F116: the Rust `Drop` impl of one instantiation of a nominal with
+    /// a `Drop` impl — empty for one without. The body calls the `drop`
+    /// instance the instantiation binds: the impl's subject (`Guard<T>`, in
+    /// the impl's own binders) is matched against the declaration's
+    /// arguments (`entries`, the declaration's parameters bound for this
+    /// instance), so `impl Guard<type T> with Drop` reaches `drop` at `T =
+    /// str` for a `Guard<str>`.
+    fn drop_impl(
+        &mut self,
+        id: Id,
+        type_name: &str,
+        entries: &[(TypeId, TypeId)],
+    ) -> Result<String, Error> {
+        let Some(drop_impl) = self.drop_nominals.get(&id).copied() else {
+            return Ok(String::new());
+        };
+        let mut substitution = HashMap::default();
+        if let Some(Type::Struct(_, pattern) | Type::Enum(_, pattern)) =
+            self.program.type_id_to_type_map.get(&drop_impl.subject)
+        {
+            for (pattern_argument, (_, concrete)) in pattern.iter().zip(entries) {
+                impl_select::bind_subject(
+                    self.program,
+                    *pattern_argument,
+                    self.concrete(*concrete),
+                    &mut substitution,
+                );
+            }
+        }
+        let drop_name = self
+            .ensure_function(drop_impl.function, &substitution)?
+            .name;
+        let mut out = String::new();
+        let _ = writeln!(out, "impl Drop for {type_name} {{");
+        let _ = writeln!(out, "    fn drop(&mut self) {{");
+        let _ = writeln!(out, "        {drop_name}(self);");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "}}");
+        Ok(out)
+    }
+
     fn ensure_enum(&mut self, id: Id, arguments: &[TypeId], span: Span) -> Result<Reserved, Error> {
         let declaration = self.program.enums.get(&id).cloned().unwrap();
         self.refuse_an_any_argument(arguments, span)?;
-        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown. F97
-        // emitted the struct half; an enum's `Drop` (a body before a
-        // variant's payloads, which Rust drops in declaration order) is not
-        // emitted yet.
-        if self.drop_nominals.contains_key(&id) {
-            return Err(unsupported(
-                &format!(
-                    "the enum `{}` with a `Drop` impl (its body runs before the variant's \
-                     payloads, which drop in reverse)",
-                    declaration.name
-                ),
-                span,
-            ));
-        }
+        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown. F116:
+        // an enum's `Drop` impl is a Rust one calling the body, which runs
+        // before the payloads drop (the variant's ORDER is the aggregate
+        // rule's, see [`Self::refuse_an_unordered_drop`]).
         let entries =
             self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
         let key: Vec<String> = entries
@@ -3080,7 +3175,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             },
         );
 
-        let saved = self.enter_substitution(entries);
+        let saved = self.enter_substitution(entries.clone());
         let mut rendered: Result<Vec<String>, Error> = Ok(Vec::new());
         // The payload types per variant, kept beside the rendered declaration
         // because `PartialEq`, `Js` and `Json` all have to ask the same question
@@ -3138,6 +3233,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = writeln!(out, "{variant}");
         }
         let _ = writeln!(out, "}}");
+        out.push_str(&self.drop_impl(id, &type_name, &entries)?);
         if reaches_a_closure {
             let mut legs = String::new();
             for (index, variant) in declaration.variants.iter().enumerate() {
@@ -3670,6 +3766,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// been hoisted: the view is taken last, once nothing but the call itself
     /// is left to run. That is the evaluation order spec §6.9's native note
     /// states. `None` for a place that does not live in a boxed cell.
+    ///
+    /// `through_shared_views` admits a spine over a `Shared` VIEW call as well
+    /// (F114: `cell.read().items.len()`), for a position that runs no user
+    /// code under the view — a reading intrinsic. The cell's handle is
+    /// settled with the subscripts, so the receiver is still evaluated before
+    /// the arguments; only the borrow waits for the call. A user call cannot
+    /// take one: a callee reaching the same cell through another handle (F39's
+    /// runtime half) would meet the borrow.
     fn cell_view_place(
         &mut self,
         id: Id,
@@ -3677,13 +3781,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         settled_lets: &mut String,
         borrows: &mut String,
         views: &mut usize,
+        through_shared_views: bool,
     ) -> Result<Option<String>, Error> {
         let place = match self.program.entity_map.get(&id) {
             Some(&Expr::Reference(operand, false)) => operand,
             _ => id,
         };
-        let Some((CellRoot::Boxed(binding), steps)) = self.cell_spine(place) else {
-            return Ok(None);
+        let (cell_text, steps) = match self.cell_spine(place) {
+            Some((CellRoot::Boxed(binding), steps)) => (self.binding_name(binding), steps),
+            Some((CellRoot::View(cell), steps)) if through_shared_views => {
+                let handle = self.expecting_nothing(|emitter| emitter.expression(cell, depth))?;
+                let name = format!("__cell{views}");
+                let _ = write!(settled_lets, "let {name} = &({handle}); ");
+                (name, steps)
+            }
+            _ => return Ok(None),
         };
         let view = format!("__view{views}");
         *views += 1;
@@ -3695,11 +3807,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             settled_lets,
             &mut 0,
         )?;
-        let _ = write!(
-            borrows,
-            "let {view} = ({}).borrow(); ",
-            self.binding_name(binding)
-        );
+        let _ = write!(borrows, "let {view} = ({cell_text}).borrow(); ");
         Ok(Some(path))
     }
 
@@ -3726,6 +3834,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let elements = self
                 .settled_value_type(*source)
                 .and_then(|type_id| self.tuple_family(type_id))
+                .or_else(|| self.tuple_reader_family(*source))
                 .ok_or_else(|| {
                     unsupported(
                         "a tuple comprehension over a source of unresolved arity",
@@ -3797,7 +3906,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
             return;
         };
-        match (self.resolve(declared), self.resolve(concrete)) {
+        // The DECLARED side is read as written, not through the substitution
+        // in force: an unrolled walk nested in another (F118: a tuple
+        // blanket's instance reached from inside an outer walk's slot) runs
+        // under the outer slot's binding of the same binder, and reading
+        // through it found no generic left to rebind.
+        match (self.type_entry(&declared), self.resolve(concrete)) {
             (Some(Type::Generic(constraint_id)), _) => {
                 entries.push((declared, concrete));
                 entries.push((*constraint_id, concrete));
@@ -4034,9 +4148,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
         let saved = self.enter_substitution(entries);
         let saved_instance = self.enter_instance(id, bits.to_vec());
+        // F117: a member of a bare-trait impl reads its `Self` — typed as the
+        // trait, in a type id of its own beside the subject's — as the
+        // receiver the subject is bound to, the rewrite a trait default's
+        // `Self` takes ([`Self::default_instance`]).
+        let bare_trait_self = self.bare_trait_members.get(&id).and_then(|subject| {
+            let bound = self.current_substitution.get(subject).copied()?;
+            match self.type_entry(subject) {
+                Some(Type::Trait(trait_id, _)) => Some((*trait_id, self.concrete(bound))),
+                _ => None,
+            }
+        });
+        let saved_self = bare_trait_self.map(|(trait_id, receiver)| {
+            (
+                self.current_self_type.replace(receiver),
+                std::mem::replace(&mut self.current_self_traits, HashSet::from([trait_id])),
+            )
+        });
         let emitted = self
             .function_body(&function, span, is_main, &name)
             .map_err(|error| self.locate_refusal(error, function.id));
+        if let Some((self_type, self_traits)) = saved_self {
+            self.current_self_type = self_type;
+            self.current_self_traits = self_traits;
+        }
         self.restore_instance(saved_instance);
         self.current_substitution = saved;
         let out = emitted?;
@@ -4552,6 +4687,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) -> Result<(), Error> {
         let pad = Self::indent(depth);
         let early_drops = self.early_drops(statements);
+        for statement in statements {
+            for binding in teardown::statement_teardown(self.program, *statement) {
+                if let Some(type_id) = self
+                    .program
+                    .variables
+                    .get(&binding)
+                    .map(|variable| variable.type_id)
+                {
+                    let span = self.span_of(*statement);
+                    self.refuse_an_unordered_drop(type_id, span, &mut HashSet::new())?;
+                }
+            }
+        }
         for (index, statement) in statements.iter().enumerate() {
             let rendered = self.statement(*statement, depth)?;
             if !rendered.is_empty() {
@@ -4606,19 +4754,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// declaration order — which is the law at every extent that reaches the
     /// block's end, a `ret`, a `jump` and a panic included — so only an
     /// extent short of the end owes an explicit `std::mem::drop`, written
-    /// after the statement the analyzer's [`DropExtent`] names.
+    /// after the statement the analyzer's [`vilan_core::analyzer::DropExtent`] names.
     ///
-    /// The extents are resolved exactly as the JS transformer resolves them
-    /// (`walk_scope_body`, `teardown_extent`, `widen_over_declarations` in
-    /// `transformer.rs`): a region is widened over the last reads of the
-    /// names declared inside it, and a region nested in another is cut at the
-    /// outer one's end, inner drops first. The two backends print their
-    /// teardowns in one order only if they agree on where each region ends.
+    /// The extents are the JS transformer's, from the one resolution both
+    /// emitters call (N154: [`vilan_core::teardown::region_end`]): a region is
+    /// widened over the last reads of the names declared inside it, and a
+    /// region nested in another is cut at the outer one's end, inner drops
+    /// first. The two backends print their teardowns in one order only if
+    /// they agree on where each region ends.
     fn early_drops(&self, statements: &[Id]) -> HashMap<usize, Vec<Id>> {
         let mut plan: HashMap<usize, Vec<Id>> = HashMap::default();
         if statements
             .iter()
-            .all(|statement| self.statement_teardown(*statement).is_empty())
+            .all(|statement| teardown::statement_teardown(self.program, *statement).is_empty())
         {
             return plan;
         }
@@ -4636,13 +4784,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) {
         let mut index = start;
         while index < end {
-            let bindings = self.statement_teardown(statements[index]);
+            let bindings = teardown::statement_teardown(self.program, statements[index]);
             if bindings.is_empty() {
                 index += 1;
                 continue;
             }
-            let own = self.own_teardown_extent(&bindings, statements, index + 1, end);
-            let extent = self.widen_over_declarations(own, statements, index + 1, end);
+            let extent = teardown::region_end(self.program, &bindings, statements, index + 1, end);
             self.plan_teardowns(statements, index + 1, extent, plan);
             // A binding the program hands to the `drop` sink itself (B150)
             // keeps its region — it shapes the regions nested in it exactly
@@ -4659,28 +4806,107 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// What a direct statement of a block owes a teardown for: a resource
-    /// `let`, or the resource captures of a destructuring `let` (B62), in
-    /// declaration order — the transformer's `statement_teardown`.
-    fn statement_teardown(&self, statement: Id) -> Vec<Id> {
-        match self.program.entity_map.get(&statement) {
-            Some(Expr::Variable(variable_id))
-                if self.program.dropped_bindings.contains(variable_id)
-                    && self.binding_drops_nontrivially(*variable_id) =>
-            {
-                vec![*variable_id]
+    /// Refuses, by name, a binding this block DROPS WHOLE (it owes a
+    /// teardown at its scope's end or its last use) whose type holds an
+    /// aggregate whose members' teardown ORDER is visible and that this
+    /// backend cannot declare reversed: two or more members that owe a
+    /// teardown in a tuple, a fixed array or one enum variant's payloads, at
+    /// any depth. vilan drops an aggregate's members in REVERSE
+    /// (destruction.md §5), Rust drops a tuple's, an array's and a variant's
+    /// in declaration order, and only a struct's fields can be declared the
+    /// other way round ([`Self::ensure_struct`]) — so the base printed the
+    /// teardowns in the opposite order to the JS backend, silently. A value
+    /// CONSUMED instead (a `match` moving its payloads out, resource_take.vl's
+    /// `Couple::Two`) never runs Rust's glue over the aggregate, and builds.
+    fn refuse_an_unordered_drop(
+        &mut self,
+        type_id: TypeId,
+        span: Span,
+        visiting: &mut HashSet<Id>,
+    ) -> Result<(), Error> {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return Ok(());
+        };
+        let concrete = self.concrete(type_id);
+        match self.resolve(concrete).cloned() {
+            Some(Type::Tuple(elements)) => {
+                self.refuse_an_unordered_teardown(&elements, "a tuple", span)?;
+                for element in elements {
+                    self.refuse_an_unordered_drop(element, span, visiting)?;
+                }
             }
-            Some(Expr::Destructure(_, pattern)) => {
-                let mut captures = Vec::new();
-                collect_pattern_bindings(pattern, &mut captures);
-                captures.retain(|capture| {
-                    self.program.dropped_bindings.contains(capture)
-                        && self.binding_drops_nontrivially(*capture)
+            Some(Type::Array(element, length)) => {
+                if length > 1 {
+                    self.refuse_an_unordered_teardown(&[element, element], "a fixed array", span)?;
+                }
+                self.refuse_an_unordered_drop(element, span, visiting)?;
+            }
+            Some(Type::Struct(id, arguments)) => {
+                let Some(declaration) = self.program.structs.get(&id).cloned() else {
+                    return Ok(());
+                };
+                if declaration.external || !visiting.insert(id) {
+                    return Ok(());
+                }
+                let entries =
+                    self.nominal_entries(&declaration.generic_parameter_constraint_ids, &arguments);
+                let saved = self.enter_substitution(entries);
+                let checked = declaration.fields.iter().try_for_each(|field| {
+                    self.refuse_an_unordered_drop(field.type_id, span, visiting)
                 });
-                captures
+                self.current_substitution = saved;
+                checked?;
             }
-            _ => Vec::new(),
+            Some(Type::Enum(id, arguments)) => {
+                let Some(declaration) = self.program.enums.get(&id).cloned() else {
+                    return Ok(());
+                };
+                if !visiting.insert(id) {
+                    return Ok(());
+                }
+                let entries =
+                    self.nominal_entries(&declaration.generic_parameter_constraint_ids, &arguments);
+                let saved = self.enter_substitution(entries);
+                let checked = declaration.variants.iter().try_for_each(|variant| {
+                    self.refuse_an_unordered_teardown(
+                        &variant.data_type_ids,
+                        &format!("the variant `{}::{}`", declaration.name, variant.name),
+                        span,
+                    )?;
+                    variant.data_type_ids.iter().try_for_each(|payload| {
+                        self.refuse_an_unordered_drop(*payload, span, visiting)
+                    })
+                });
+                self.current_substitution = saved;
+                checked?;
+            }
+            _ => {}
         }
+        Ok(())
+    }
+
+    /// One aggregate's members: two or more that owe a teardown are refused
+    /// ([`Self::refuse_an_unordered_drop`]).
+    fn refuse_an_unordered_teardown(
+        &self,
+        members: &[TypeId],
+        what: &str,
+        span: Span,
+    ) -> Result<(), Error> {
+        let owing = members
+            .iter()
+            .filter(|member| self.owes_a_teardown(**member, &mut HashSet::new()))
+            .count();
+        if owing > 1 {
+            return Err(unsupported(
+                &format!(
+                    "{what} holding two or more values that owe a teardown (vilan drops them \
+                     in reverse, Rust in declaration order; hold them in a struct's fields)"
+                ),
+                span,
+            ));
+        }
+        Ok(())
     }
 
     /// F97: whether dropping a value of `type_id` runs a `Drop` body
@@ -4743,67 +4969,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .any(|element| self.owes_a_teardown(*element, visiting)),
             Some(Type::Array(element, _)) => self.owes_a_teardown(element, visiting),
             _ => false,
-        }
-    }
-
-    /// Whether a binding's type destroys something: a `Drop` impl or a
-    /// resource member.
-    fn binding_drops_nontrivially(&self, variable_id: Id) -> bool {
-        self.program
-            .variables
-            .get(&variable_id)
-            .and_then(|variable| self.program.drop_glue.get(&variable.type_id))
-            .is_some_and(|glue| glue.drop_method.is_some() || !glue.members.is_empty())
-    }
-
-    /// The transformer's `own_teardown_extent`: the exclusive statement index
-    /// the group's last read sits at, `start` when nothing reads it, `end` for
-    /// every refusal (a binding the dataflow does not answer for).
-    fn own_teardown_extent(
-        &self,
-        bindings: &[Id],
-        statements: &[Id],
-        start: usize,
-        end: usize,
-    ) -> usize {
-        let mut extent = start.min(end);
-        for binding in bindings {
-            let Some(binding_extent) = self.program.drop_extents.get(binding) else {
-                return end;
-            };
-            extent = extent.max(resolve_extent(binding_extent, statements, start, end));
-        }
-        extent.min(end)
-    }
-
-    /// The transformer's `widen_over_declarations`: grow `extent` until every
-    /// name declared in `statements[start..extent]` has its last read inside
-    /// it — monotone, bounded by `end`.
-    fn widen_over_declarations(
-        &self,
-        mut extent: usize,
-        statements: &[Id],
-        start: usize,
-        end: usize,
-    ) -> usize {
-        loop {
-            let mut widened = extent;
-            for index in start..extent {
-                let Some(declared) = self
-                    .program
-                    .declared_binding_extents
-                    .get(&statements[index])
-                else {
-                    continue;
-                };
-                for binding_extent in declared {
-                    widened = widened.max(resolve_extent(binding_extent, statements, index, end));
-                }
-            }
-            if widened == extent {
-                return extent;
-            }
-            extent = widened;
         }
     }
 
@@ -4968,7 +5133,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Match(subject, legs) => self.match_expr(subject, &legs, depth, span)?,
             Expr::For(condition, (statements, tail)) => {
                 let mut body = String::new();
-                self.emit_block(&statements, tail, &mut body, depth + 1)?;
+                self.loop_jumps.push(None);
+                let emitted = self.emit_block(&statements, tail, &mut body, depth + 1);
+                self.loop_jumps.pop();
+                emitted?;
                 let pad = Self::indent(depth);
                 match condition {
                     Some(condition) => {
@@ -4979,12 +5147,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
             }
             Expr::ForEach(iterable, item, (statements, tail)) => {
-                self.for_each(id, iterable, item, &statements, tail, depth, span)?
+                // F118: a tuple is walked unrolled, and its jumps are labelled.
+                let family = self
+                    .settled_value_type(iterable)
+                    .and_then(|type_id| self.tuple_family(type_id))
+                    .or_else(|| self.tuple_reader_family(iterable));
+                match family {
+                    Some(family) => {
+                        self.for_each_tuple(iterable, family, item, &statements, tail, depth)?
+                    }
+                    None => {
+                        self.loop_jumps.push(None);
+                        let emitted =
+                            self.for_each(id, iterable, item, &statements, tail, depth, span);
+                        self.loop_jumps.pop();
+                        emitted?
+                    }
+                }
             }
-            Expr::Jump(keyword) => match keyword {
-                "break" => "break".to_string(),
-                "continue" => "continue".to_string(),
-                other => return Err(unsupported(&format!("`jump {other}`"), span)),
+            Expr::Jump(keyword) => match (keyword, self.loop_jumps.last()) {
+                ("break", Some(Some((walk, _)))) => format!("break {walk}"),
+                ("continue", Some(Some((_, slot)))) => format!("break {slot}"),
+                ("break", _) => "break".to_string(),
+                ("continue", _) => "continue".to_string(),
+                (other, _) => return Err(unsupported(&format!("`jump {other}`"), span)),
             },
             Expr::FunctionReturn(value) => match value {
                 Some(value) if self.current_returns_view => {
@@ -5159,7 +5345,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // by-value ARGUMENT takes, so there is one of it — and it knows
                 // not to copy a binding that holds a view.
                 let value = self.expression(subject, depth)?;
-                let value = self.copy_a_consumed_place_read(subject, value);
+                let value = if self.is_a_view_call(subject) {
+                    // F113: a `borrows` call's value is a reference, and the
+                    // pattern binds out of its pointee.
+                    self.copy_a_pattern_subject(subject, value)
+                } else {
+                    self.copy_a_consumed_place_read(subject, value)
+                };
                 format!("let {bound} = {value}")
             }
             // The variant's declaration itself: the constructor's rule, as
@@ -5429,18 +5621,46 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// written `&place`, or a call to a `borrows` function. Both answer a
     /// reference natively and a value is what the position wants.
     fn reads_through_a_view(&self, id: Id) -> bool {
-        match self.program.entity_map.get(&id) {
-            Some(Expr::Reference(_, _)) => true,
-            Some(&Expr::Call(call_id)) => self
-                .program
-                .function_calls
-                .get(&call_id)
-                .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
-                    Some(Expr::Local(target)) => self.program.functions.get(target),
-                    _ => None,
-                })
-                .is_some_and(|function| function.returns_view || function.returns_mut_view),
-            _ => false,
+        matches!(
+            self.program.entity_map.get(&id),
+            Some(Expr::Reference(_, _))
+        ) || self.is_a_view_call(id)
+    }
+
+    /// Whether `id` is a call to a `borrows` function whose return is a view
+    /// at the top (`&T` / `&mut T`, not a view wrapped in a payload) — so
+    /// its Rust value is a REFERENCE to storage the callee's owner holds.
+    fn is_a_view_call(&self, id: Id) -> bool {
+        let Some(&Expr::Call(call_id)) = self.program.entity_map.get(&id) else {
+            return false;
+        };
+        self.program
+            .function_calls
+            .get(&call_id)
+            .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                Some(Expr::Local(target)) => self.program.functions.get(target),
+                _ => None,
+            })
+            .is_some_and(|function| function.returns_view || function.returns_mut_view)
+    }
+
+    /// A pattern subject as the pattern consumes it: a copy where the subject
+    /// names storage, so every capture binds a value (rule 1) rather than a
+    /// reference under Rust's default binding modes (F20).
+    ///
+    /// Two shapes name storage: a PLACE ([`Self::subject_is_a_place`]) and a
+    /// call to a `borrows` function (F113) — its value is a reference into
+    /// the owner's storage, so `if cell.slot() is (let cells, let weight)`
+    /// bound `weight: &mut i32` and `.. + weight` was rustc's E0277. The
+    /// copy is the pointee's (`(*call).clone()`, F88's rule for a block's
+    /// view), taken before the pattern reads it.
+    fn copy_a_pattern_subject(&self, subject: Id, text: String) -> String {
+        if self.subject_is_a_place(subject) {
+            format!("({text}).clone()")
+        } else if self.is_a_view_call(subject) {
+            format!("(*{text}).clone()")
+        } else {
+            text
         }
     }
 
@@ -6157,6 +6377,60 @@ impl<'a, 'src> Emitter<'a, 'src> {
         )))
     }
 
+    /// F119: the Rust type of a function item's VALUE — the counted closure
+    /// over its signature, each parameter in its receiving form, as
+    /// [`Self::function_value`] builds it. A function whose value is built
+    /// another way (generic, `async`, reshaped by a `lazy`, spread or context
+    /// parameter) is refused by name, as naming it as a value is.
+    fn function_item_type(&mut self, function_id: Id, span: Span) -> Result<String, Error> {
+        let Some(function) = self.program.functions.get(&function_id).cloned() else {
+            return Err(unsupported("an unresolved function", span));
+        };
+        let reshaped = !function.generic_parameter_constraint_ids.is_empty()
+            || function.is_async
+            || self.program.async_functions.contains(&function_id)
+            || function.parameters.iter().any(|parameter| {
+                self.program
+                    .context_hidden_parameters
+                    .contains_key(parameter)
+                    || self
+                        .program
+                        .parameters
+                        .get(parameter)
+                        .is_some_and(|declared| declared.lazy || declared.spread)
+            });
+        if reshaped {
+            return Err(unsupported(
+                &format!(
+                    "a value of the function `{}`'s own type (a generic, `async` or reshaped \
+                     signature)",
+                    function.name
+                ),
+                span,
+            ));
+        }
+        let mut parts = Vec::new();
+        for parameter_id in &function.parameters {
+            let Some(parameter) = self.program.parameters.get(parameter_id).cloned() else {
+                return Err(unsupported("an unresolved parameter", span));
+            };
+            let rendered = self.rust_type(parameter.type_id, span)?;
+            parts.push(match self.receiving_form(&parameter) {
+                Receiving::RefMut => format!("&mut {rendered}"),
+                Receiving::Ref => format!("&{rendered}"),
+                Receiving::ByValue => rendered,
+            });
+        }
+        let returned = match function.return_type_id {
+            Some(return_type) => self.rust_type(return_type, span)?,
+            None => "()".to_string(),
+        };
+        Ok(format!(
+            "std::rc::Rc<dyn Fn({}) -> {returned}>",
+            parts.join(", ")
+        ))
+    }
+
     fn function_value(&mut self, function_id: Id, span: Span) -> Result<String, Error> {
         let Some(function) = self.program.functions.get(&function_id).cloned() else {
             return Err(unsupported("an unresolved function", span));
@@ -6204,7 +6478,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(adapted) = self.context_adapted_function(function_id, &instance.name, span)? {
             return Ok(adapted);
         }
-        Ok(format!("std::rc::Rc::new({})", instance.name))
+        // F119: typed as the closure it is, so a binding without an
+        // annotation (`let f = nothing;`) holds the same `Rc<dyn Fn>` a
+        // position typed by the item's own type ([`Self::function_item_type`])
+        // takes — a `&` of it cannot coerce later.
+        let closure = self.function_item_type(function_id, span)?;
+        Ok(format!(
+            "(std::rc::Rc::new({}) as {closure})",
+            instance.name
+        ))
     }
 
     /// Emits the `thread_local!` for one module-level binding, once, and
@@ -6437,6 +6719,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
         )
     }
 
+    /// Whether an operator over `type_id` IS the Rust operator — a scalar
+    /// (the numbers, `str`, `BigInt`), `bool` or a backed enum, whose
+    /// operators are the language's own (the JS emitter's
+    /// `compares_natively`). Every other type re-dispatches a generic
+    /// operator to its member.
+    fn compares_natively(&self, type_id: TypeId) -> bool {
+        match self.resolve(type_id) {
+            Some(Type::Struct(id, _)) => self.program.structs.get(id).is_some_and(|declaration| {
+                scalar_type(declaration.name).is_some() || declaration.name == "BigInt"
+            }),
+            Some(Type::Enum(id, _)) => {
+                Some(*id) == self.program.bool_enum_id
+                    || self
+                        .program
+                        .enums
+                        .get(id)
+                        .is_some_and(|declaration| declaration.backing.is_some())
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a type is one of the numeric scalar primitives — the set
     /// [`Emitter::number_literal`] lets a declared POSITION override a
     /// literal's own record for.
@@ -6610,6 +6914,42 @@ impl<'a, 'src> Emitter<'a, 'src> {
             } else {
                 call
             });
+        }
+        // An operator over a GENERIC operand (`a != b` with `a: T`, `T:
+        // PartialEq`) is a re-dispatch the analyzer recorded on the binary
+        // expression — on the constraint, or on the type a trait default is
+        // specialized for — exactly as the JS emitter reads it. Where the
+        // concrete type's member is a FUNCTION (a struct's `eq`, written or
+        // derived) it is called: Rust's own `==` over the emitted struct is
+        // its derived structural equality, which is not the program's when the
+        // impl is written (`impl Loose with PartialEq` comparing one field —
+        // the base answered `true` where JS answered `false`, through every
+        // generic `==`, a `List`'s, an `Option`'s and a tuple's). A scalar's
+        // member is an intrinsic or a host binding, and keeps the operator.
+        let generic = match self.program.generic_dispatch.get(&id).copied() {
+            Some(GenericDispatch::OnConstraint(constraint_id, member)) => {
+                Some((self.concrete(constraint_id), member))
+            }
+            Some(GenericDispatch::OnType(recorded, member)) => recorded
+                .or(self.current_self_type)
+                .map(|type_id| (self.concrete(type_id), member)),
+            None => None,
+        };
+        if let Some((concrete, member)) = generic
+            && self.is_grounded(concrete)
+            && !self.compares_natively(concrete)
+        {
+            let preferred = self.program.bound_dispatch_traits.get(&id).cloned();
+            if let Some(dispatch @ NativeDispatch::Call(_)) =
+                self.resolve_dispatch(concrete, member, &[], preferred, span)?
+            {
+                let call = self.emit_dispatch(dispatch, &[left, right], depth, span)?;
+                return Ok(if matches!(op, BinaryOp::NotEq) {
+                    format!("!({call})")
+                } else {
+                    call
+                });
+            }
         }
         // `str + str` is a concatenation, which is a runtime call natively
         // rather than an operator — and an INTERPOLATION is a chain of them
@@ -6840,10 +7180,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // The same copy `if let` takes (F20): a pattern over a PLACE binds its
         // captures by reference under Rust's default binding modes, and a
         // capture is a copy by rule 1.
-        let mut subject_text = self.expression(subject, depth)?;
-        if self.subject_is_a_place(subject) {
-            subject_text = format!("({subject_text}).clone()");
-        }
+        let subject_text = self.expression(subject, depth)?;
+        let subject_text = self.copy_a_pattern_subject(subject, subject_text);
         let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(&pattern, subject_type, self.span_of(first))?;
         for binding in &bindings {
@@ -7325,7 +7663,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let captured = self.is_condition_captures(*condition);
                 let head = match &captured {
                     Some((subject, pattern, bindings)) => {
-                        let mut subject_text = self.expression(*subject, depth)?;
+                        let subject_text = self.expression(*subject, depth)?;
                         // The same copy a destructuring `match` takes (F20): an
                         // `if let` over a PLACE binds its captures by REFERENCE
                         // under Rust's default binding modes, so
@@ -7333,9 +7671,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         // `&Option<i32>` bound `x: &i32` and `x == y` had no
                         // `PartialEq` across the reference. A capture is a copy
                         // (rule 1), and copying the subject is how it binds one.
-                        if self.subject_is_a_place(*subject) {
-                            subject_text = format!("({subject_text}).clone()");
-                        }
+                        let subject_text = self.copy_a_pattern_subject(*subject, subject_text);
                         let subject_type = self.settled_value_type(*subject);
                         let pattern_text =
                             self.pattern(pattern, subject_type, self.span_of(*condition))?;
@@ -7395,11 +7731,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
             collect_pattern_bindings(&leg.pattern, &mut bindings);
             !bindings.is_empty()
         });
-        if destructures
-            && self.subject_is_a_place(subject)
-            && !self.moves_an_owned_resource(subject)
-        {
-            subject_text = format!("({subject_text}).clone()");
+        // F116: a match CONSUMING a value whose type has a `Drop` impl (R6:
+        // the subject's teardown is suppressed, each capture owns its
+        // payload) moves the payloads out of it — which Rust refuses for a
+        // `Drop` type (E0509). The subject is held undropped
+        // (`ManuallyDrop`), the pattern binds through a reference to it, and
+        // each leg reads its captures out by value: one owner per payload,
+        // and the value's own `drop` never runs, as on the JS backend.
+        let consumes_a_drop_value = destructures && self.has_a_drop_impl(subject_type);
+        if consumes_a_drop_value {
+            if let Some(leg) = legs.iter().find(|leg| leg.guard.is_some()) {
+                return Err(unsupported(
+                    "a guarded leg of a `match` that consumes a value with a `Drop` impl (the \
+                     guard would read its captures through the undropped value)",
+                    self.span_of(leg.body),
+                ));
+            }
+            subject_text = format!("&*std::mem::ManuallyDrop::new({subject_text})");
+        } else if destructures && !self.moves_an_owned_resource(subject) {
+            subject_text = self.copy_a_pattern_subject(subject, subject_text);
         }
         // A `str` subject is matched as a `&str`, which is the only form a
         // string LITERAL pattern has natively — see [`Emitter::pattern`]. The
@@ -7466,6 +7816,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             } else {
                 let expecting = self.expected_type;
                 self.consumed_value_of_expecting(leg.body, expecting, depth + 1)?
+            };
+            let body = if consumes_a_drop_value {
+                let mut bindings = Vec::new();
+                collect_pattern_bindings(&leg.pattern, &mut bindings);
+                let reads: String = bindings
+                    .iter()
+                    .map(|binding| {
+                        let name = self.binding_name(*binding);
+                        format!("let {name} = unsafe {{ std::ptr::read({name}) }}; ")
+                    })
+                    .collect();
+                if reads.is_empty() {
+                    body
+                } else {
+                    format!("{{ {reads}{body} }}")
+                }
+            } else {
+                body
             };
             let _ = writeln!(out, "{leg_pad}{pattern} => {body},");
         }
@@ -8806,7 +9174,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         }
-        let body = self.expression(closure.return_, depth)?;
+        let mut body = self.expression(closure.return_, depth)?;
+        // F120: a body whose value is itself a HANDLE — `async { async { "s"
+        // } }`, or a call answering a `Task` — is assimilated: the JS host's
+        // promise adoption hands back the payload, and the analyzer types the
+        // block by it (`assimilated_task_payload`). Natively each layer is
+        // one more `.await` inside the block, as F107 awaits a written-async
+        // call's declared handle.
+        for _ in 0..self.task_layers(closure.return_) {
+            body = Self::awaited(&body);
+        }
         let origin = rust_string(self.current_origin.unwrap_or("top level"));
         let prelude = self.async_capture_prelude(closure.return_);
         let Some(&(source_entity, is_option)) = self.program.spawn_nursery_sources.get(&spawn_id)
@@ -9381,12 +9758,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 ));
             }
         };
-        let mut subject = self.expression(step, depth)?;
+        let subject = self.expression(step, depth)?;
         // A pattern over a PLACE binds by reference under Rust's default
         // binding modes; the payload is a copy by rule 1, as an `if let`'s is.
-        if self.subject_is_a_place(step) {
-            subject = format!("({subject}).clone()");
-        }
+        let subject = self.copy_a_pattern_subject(step, subject);
         let name = self.binding_name(binder);
         Ok(if is_result {
             format!("match {subject} {{ Ok({name}) => {good}, Err(error) => Err(error) }}")
@@ -10833,6 +11208,57 @@ impl<'a, 'src> Emitter<'a, 'src> {
         (current, layers)
     }
 
+    /// F120: how many `Task` layers wrap the value `id` answers — the
+    /// handles an `async` block's body owes an `.await` each. An `async`
+    /// block nested as the value carries no type of its own, and is one.
+    fn task_layers(&self, id: Id) -> usize {
+        let tail = self.value_tail(id);
+        if matches!(self.program.entity_map.get(&tail), Some(Expr::Async(_))) {
+            return 1;
+        }
+        let Some(type_id) = self.type_of(tail).or_else(|| self.type_of(id)) else {
+            return 0;
+        };
+        let mut layers = 0;
+        let mut seen = HashSet::new();
+        let mut current = type_id;
+        while seen.insert(current) {
+            match self.resolve(current) {
+                Some(Type::Struct(struct_id, arguments))
+                    if self
+                        .program
+                        .structs
+                        .get(struct_id)
+                        .is_some_and(|declaration| {
+                            declaration.name == "Task" && declaration.external
+                        }) =>
+                {
+                    let Some(&inner) = arguments.first() else {
+                        break;
+                    };
+                    layers += 1;
+                    current = inner;
+                }
+                _ => break,
+            }
+        }
+        layers
+    }
+
+    /// The expression whose value a block answers — its tail, through nested
+    /// blocks — or `id` itself.
+    fn value_tail(&self, id: Id) -> Id {
+        let mut current = id;
+        let mut seen = HashSet::new();
+        while seen.insert(current) {
+            match self.program.entity_map.get(&current) {
+                Some(Expr::Block((_, tail))) => current = *tail,
+                _ => break,
+            }
+        }
+        current
+    }
+
     /// [`Self::assimilated_return`]'s layer count for a call — the `.await`s
     /// its handle owes beyond the call's own.
     fn assimilated_task_layers(&self, call_id: Id) -> usize {
@@ -10981,6 +11407,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 if let Some(dispatch) =
                     self.resolve_dispatch(concrete, member, &own_values, preferred, span)?
                 {
+                    self.intrinsic_call = Some(call_expr_id);
                     return self.emit_dispatch(dispatch, &function_call.argument_ids, depth, span);
                 }
                 return Err(unsupported(
@@ -11011,6 +11438,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if let Some(dispatch) =
                 self.resolve_dispatch(concrete, member, &own_values, preferred, span)?
             {
+                self.intrinsic_call = Some(call_expr_id);
                 return self.emit_dispatch(dispatch, &function_call.argument_ids, depth, span);
             }
             return Err(unsupported(
@@ -11084,6 +11512,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(format!("{receiver}.push({item})"));
         }
         if let Some(intrinsic) = self.program.intrinsics.get(&target).copied() {
+            self.intrinsic_call = Some(call_expr_id);
             return self.emit_intrinsic(intrinsic, &function_call.argument_ids, depth, span);
         }
         if let Some(external) = self.program.external_functions.get(&target) {
@@ -11340,8 +11769,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 continue;
             }
             if takes_a_view.get(index).copied().unwrap_or(false)
-                && let Some(path) =
-                    self.cell_view_place(*argument, depth, prelude, &mut view_borrows, &mut views)?
+                && let Some(path) = self.cell_view_place(
+                    *argument,
+                    depth,
+                    prelude,
+                    &mut view_borrows,
+                    &mut views,
+                    false,
+                )?
             {
                 rendered.push(format!("&{path}"));
                 continue;
@@ -11711,6 +12146,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         !self.is_natively_copy(place) && self.boxed_place_root(place).is_some()
     }
 
+    /// [`Self::is_a_cell_view_place`] widened to a spine over a `Shared` VIEW
+    /// call (F114) — the receiver a reading intrinsic reads through the cell
+    /// instead of copying out.
+    fn is_a_cell_read_place(&self, id: Id) -> bool {
+        let place = match self.program.entity_map.get(&id) {
+            Some(&Expr::Reference(operand, false)) => operand,
+            _ => id,
+        };
+        !self.is_natively_copy(place) && self.cell_spine(place).is_some()
+    }
+
     /// Whether the `&` argument at `index` is taken as a VIEW of its boxed
     /// binding's cell (F49): it is a cell view place, and no other argument
     /// carries a closure that WRITES the binding — that write would meet the
@@ -12029,11 +12475,33 @@ impl<'a, 'src> Emitter<'a, 'src> {
         argument_ids: &[Id],
         depth: usize,
     ) -> Result<Vec<String>, Error> {
-        let views = callee_type
+        let callee = callee_type
             .map(|type_id| self.concrete(type_id))
             .and_then(|type_id| self.type_entry(&type_id))
-            .map(|type_| self.program.closure_parameter_views(type_))
-            .unwrap_or_default();
+            .cloned();
+        let views = match callee {
+            // F119: a binding of a function ITEM's own type (`let b = bump;`)
+            // calls the item's closure, whose parameters take the item's
+            // receiving forms ([`Self::function_item_type`]).
+            Some(Type::Function(function_id)) => self
+                .program
+                .functions
+                .get(&function_id)
+                .map(|function| function.parameters.clone())
+                .unwrap_or_default()
+                .iter()
+                .map(|parameter| {
+                    let parameter = self.program.parameters.get(parameter)?.clone();
+                    match self.receiving_form(&parameter) {
+                        Receiving::RefMut => Some(true),
+                        Receiving::Ref => Some(false),
+                        Receiving::ByValue => None,
+                    }
+                })
+                .collect(),
+            Some(type_) => self.program.closure_parameter_views(&type_),
+            None => Vec::new(),
+        };
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
             let already_a_reference = matches!(
@@ -13139,6 +13607,220 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(name)
     }
 
+    /// F118: `std::tuple`'s readers natively, against the receiver's
+    /// concrete arity in this instance — the JS emitter's
+    /// `emit_tuple_intrinsic` over a real Rust tuple. `len` is the arity, `keys`
+    /// a [`vilan_rt::TupleKey`] per position, `entries` a `(key, copy)` pair
+    /// per position, and `get` a copy of the element a key names at the type
+    /// the call answers ([`vilan_rt::tuple_get`]: a key is a VALUE, so the
+    /// position is read at run time). The receiver is read through a
+    /// reference, evaluated once.
+    fn tuple_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        argument_ids: &[Id],
+        call: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let Some(&receiver) = argument_ids.first() else {
+            return Err(unsupported("a tuple reader with no receiver", span));
+        };
+        let receiver_text =
+            self.expecting_nothing(|emitter| emitter.expression(receiver, depth))?;
+        if matches!(intrinsic, Intrinsic::TupleGet) {
+            let Some(&key) = argument_ids.get(1) else {
+                return Err(unsupported("a tuple `get` with no key", span));
+            };
+            let key_text = self.expecting_nothing(|emitter| emitter.value_of(key, depth))?;
+            // The element's type, as the call answers it under this instance —
+            // `get<U>`'s own `U`, which the analyzer records per call (a call
+            // through a tuple-bounded generic records no type of its own) —
+            // named when it renders, else left to rustc's inference from the
+            // position.
+            let call_id = call.and_then(|call| match self.program.entity_map.get(&call) {
+                Some(&Expr::Call(call_id)) => Some(call_id),
+                _ => None,
+            });
+            let element = call_id
+                .and_then(|call_id| self.program.own_generic_call_bindings.get(&call_id))
+                .and_then(|values| values.first().copied())
+                .or_else(|| call.and_then(|call| self.type_of(call)))
+                .map(|type_id| self.deeply_resolved(type_id))
+                .filter(|type_id| self.is_grounded(*type_id))
+                .and_then(|type_id| self.rust_type(type_id, span).ok());
+            let turbofish = element
+                .map(|element| format!("::<{element}>"))
+                .unwrap_or_default();
+            return Ok(format!(
+                "vilan_rt::tuple_get{turbofish}(&({receiver_text}), {key_text})"
+            ));
+        }
+        // A tuple LITERAL records no type of its own; its arity is its
+        // element count where no element spreads.
+        let literal_arity = match self.program.entity_map.get(&receiver) {
+            Some(Expr::Tuple(elements))
+                if !elements
+                    .iter()
+                    .any(|element| self.program.spread_elements.contains(element)) =>
+            {
+                Some(elements.len())
+            }
+            _ => None,
+        };
+        let arity = self
+            .settled_value_type(receiver)
+            .and_then(|type_id| self.tuple_family(type_id))
+            .map(|family| family.len())
+            .or(literal_arity)
+            .ok_or_else(|| {
+                unsupported("a tuple reader over a receiver of unresolved arity", span)
+            })?;
+        Ok(match intrinsic {
+            Intrinsic::TupleLen => format!("{{ let _ = &({receiver_text}); {arity}usize }}"),
+            Intrinsic::TupleKeys => {
+                let keys: Vec<String> = (0..arity)
+                    .map(|at| format!("vilan_rt::TupleKey({at})"))
+                    .collect();
+                format!("{{ let _ = &({receiver_text}); ({},) }}", keys.join(", "))
+            }
+            _ => {
+                let pairs: Vec<String> = (0..arity)
+                    .map(|at| format!("(vilan_rt::TupleKey({at}), (__tuple.{at}).clone())"))
+                    .collect();
+                format!(
+                    "{{ let __tuple = &({receiver_text}); ({},) }}",
+                    pairs.join(", ")
+                )
+            }
+        })
+    }
+
+    /// F118: the slots of what `keys()` or `entries()` answers over a
+    /// tuple receiver, where the call itself carries no type — a call
+    /// through a tuple-bounded generic (`self.keys()` in std's blankets)
+    /// records none. Slot `i` is `TupleKey<T, E_i>` (or `(TupleKey<T, E_i>,
+    /// E_i)`), `E_i` the receiver's element there — the signature
+    /// `(U in Self: TupleKey<Self, U>)` mapped over this instance's tuple.
+    fn tuple_reader_family(
+        &mut self,
+        iterable: Id,
+    ) -> Option<Vec<(TypeId, Vec<(TypeId, TypeId)>)>> {
+        let Some(&Expr::Call(call_id)) = self.program.entity_map.get(&iterable) else {
+            return None;
+        };
+        let call = self.program.function_calls.get(&call_id)?.clone();
+
+        let member = match self.program.generic_dispatch.get(&call_id) {
+            Some(GenericDispatch::OnConstraint(_, member) | GenericDispatch::OnType(_, member)) => {
+                *member
+            }
+            None => match self.program.entity_map.get(&call.subject_id) {
+                Some(Expr::Local(target)) => match self.program.intrinsics.get(target) {
+                    Some(Intrinsic::TupleKeys) => "keys",
+                    Some(Intrinsic::TupleEntries) => "entries",
+                    _ => return None,
+                },
+                _ => return None,
+            },
+        };
+        let entries = match member {
+            "keys" => false,
+            "entries" => true,
+            _ => return None,
+        };
+        let receiver = *call.argument_ids.first()?;
+        let receiver_type = self.settled_value_type(receiver)?;
+        let receiver_type = self.deeply_resolved(receiver_type);
+        let family = self.tuple_family(receiver_type)?;
+        let key_struct = self
+            .program
+            .structs
+            .iter()
+            .find(|(_, declaration)| declaration.name == "TupleKey" && declaration.external)
+            .map(|(id, _)| *id)?;
+        Some(
+            family
+                .into_iter()
+                .map(|(element, bindings)| {
+                    let key = self.mint(Type::Struct(key_struct, vec![receiver_type, element]));
+                    let slot = if entries {
+                        self.mint(Type::Tuple(vec![key, element]))
+                    } else {
+                        key
+                    };
+                    (slot, bindings)
+                })
+                .collect(),
+        )
+    }
+
+    /// F118: a `for` over a TUPLE — `for key in self.keys()`, the walk std's
+    /// tuple blankets (`compare`, `debug`) take — UNROLLED, one body per
+    /// position, each emitted with the binder bound at that position's own
+    /// type, as [`Self::tuple_comprehension`] unrolls a comprehension: a tuple
+    /// is heterogeneous and the body was checked once, at the element
+    /// template. The walk is a labelled block and each position's body one
+    /// inside it, so `jump break` leaves the walk and `jump continue` the
+    /// position ([`Self::loop_jumps`]).
+    fn for_each_tuple(
+        &mut self,
+        iterable: Id,
+        family: Vec<(TypeId, Vec<(TypeId, TypeId)>)>,
+        item: Option<Id>,
+        statements: &[Id],
+        tail: Id,
+        depth: usize,
+    ) -> Result<String, Error> {
+        let source = self.consumed_value_of(iterable, depth)?;
+        let walk = self.tuple_walks;
+        self.tuple_walks += 1;
+        let walk_label = format!("'__walk{walk}");
+        let pad = Self::indent(depth);
+        let inner_pad = Self::indent(depth + 1);
+        let mut out = format!(
+            "{walk_label}: {{
+{inner_pad}let __walked{walk} = {source};
+"
+        );
+        for (slot, (element, family_bindings)) in family.into_iter().enumerate() {
+            let mut entries = family_bindings;
+            let binds = match item {
+                Some(item) => {
+                    if let Some(binder_type) = self
+                        .program
+                        .variables
+                        .get(&item)
+                        .map(|variable| variable.type_id)
+                    {
+                        entries.push((binder_type, element));
+                        self.bind_generics_against(binder_type, element, &mut entries);
+                    }
+                    format!("let {} = __walked{walk}.{slot}; ", self.binding_name(item))
+                }
+                None => String::new(),
+            };
+            let slot_label = format!("'__walk{walk}_{slot}");
+            let saved = self.enter_substitution(entries);
+            self.loop_jumps
+                .push(Some((walk_label.clone(), slot_label.clone())));
+            let mut body = String::new();
+            let emitted = self.emit_block(statements, tail, &mut body, depth + 2);
+            self.loop_jumps.pop();
+            self.current_substitution = saved;
+            emitted?;
+            let _ = write!(
+                out,
+                "{inner_pad}{slot_label}: {{
+{inner_pad}    {binds}
+{body}{inner_pad}}}
+"
+            );
+        }
+        let _ = write!(out, "{pad}}}");
+        Ok(out)
+    }
+
     fn emit_intrinsic(
         &mut self,
         intrinsic: Intrinsic,
@@ -13146,6 +13828,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
+        let call = self.intrinsic_call.take();
+        if matches!(
+            intrinsic,
+            Intrinsic::TupleLen
+                | Intrinsic::TupleKeys
+                | Intrinsic::TupleEntries
+                | Intrinsic::TupleGet
+        ) {
+            return self.tuple_intrinsic(intrinsic, argument_ids, call, depth, span);
+        }
         // Argument 0 of an intrinsic is its RECEIVER, and every arm below
         // renders it as a place (`&`, `&mut`, or a method receiver). The rest
         // are values.
@@ -13188,11 +13880,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // the cell for the call ([`Self::cell_view_place`]) instead of copying
         // the whole value out of it first. The other arguments are values,
         // hoisted ahead of the view; none of these intrinsics runs user code.
+        //
+        // F114: the same view serves a spine over a `Shared` VIEW —
+        // `cell.read().items.len()` had copied the whole list out of the
+        // cell's borrow (`read_with(|view| view.items.clone())`) to count it.
         if !mutating
             && reads_its_receiver_in_place(intrinsic)
             && argument_ids
                 .first()
-                .is_some_and(|receiver| self.is_a_cell_view_place(*receiver))
+                .is_some_and(|receiver| self.is_a_cell_read_place(*receiver))
         {
             let mut prelude = String::new();
             let mut view_borrows = String::new();
@@ -13204,6 +13900,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 &mut prelude,
                 &mut view_borrows,
                 &mut views,
+                true,
             )?
             else {
                 return Err(unsupported("a cell view over no boxed binding", span));
@@ -13910,28 +14607,6 @@ fn collect_pattern_bindings_into(pattern: &ExprPattern, out: &mut HashSet<Id>) {
     let mut bindings = Vec::new();
     collect_pattern_bindings(pattern, &mut bindings);
     out.extend(bindings);
-}
-
-/// One [`DropExtent`] resolved against a statement range — the transformer's
-/// `resolve_extent`: the exclusive index its last read sits at, `start` when
-/// nothing reads it, and `end` for an explicit scope end or a chain naming no
-/// statement of the range.
-fn resolve_extent(extent: &DropExtent, statements: &[Id], start: usize, end: usize) -> usize {
-    let start = start.min(end);
-    match extent {
-        DropExtent::ScopeEnd => end,
-        DropExtent::Declaration => start,
-        DropExtent::Statement(chain) => {
-            let region = &statements[start..end];
-            match chain
-                .iter()
-                .find_map(|holder| region.iter().position(|statement| statement == holder))
-            {
-                Some(offset) => start + offset + 1,
-                None => end,
-            }
-        }
-    }
 }
 
 fn collect_if_children(branch: &ExprIfBranch, children: &mut Vec<Id>) {

@@ -1,0 +1,69 @@
+// F117: a member of a blanket whose subject is a PARAMETERIZED bare trait
+// (`impl Iterator<type T> with Again<T>`) that writes `Self` was refused
+// natively ("does not emit a value of type `a trait object`"): the analyzer
+// types that `Self` as the trait, and the instance now reads it as the
+// receiver the subject is bound to. `Self` as the return, a parameter, an
+// annotation in the body and nested in `Option<Self>`, over std's list
+// iterator and a user iterator.
+import std::io::print;
+import std::iterator::Iterator;
+import std::option::Option::{ self, None, Some };
+
+trait Again<T> {
+	fun again(self): Self;
+	fun first_of(self, other: Self): Option<T>;
+	fun label(&self): str;
+	fun maybe(self): Option<Self>;
+}
+
+impl Iterator<type T> with Again<T> {
+	fun again(self): Self {
+		let copy: Self = self;
+		copy
+	}
+
+	fun first_of(self, other: Self): Option<T> {
+		mut mine = self;
+		mut theirs = other;
+		match mine.next() {
+			Some(let value) => Some(value),
+			None => theirs.next(),
+		}
+	}
+
+	fun label(&self): str {
+		"an iterator"
+	}
+
+	fun maybe(self): Option<Self> {
+		Some(self)
+	}
+}
+
+struct Countdown {
+	from: i32,
+}
+
+impl Countdown with Iterator<i32> {
+	fun next(&mut self): Option<i32> {
+		if self.from == 0 {
+			None
+		} else {
+			self.from -= 1;
+			Some(self.from + 1)
+		}
+	}
+}
+
+fun main() {
+	print([5, 6].iter().map(|x| x * 10).again().to_list().len());
+	print(Countdown { from = 3 }.again().to_list());
+	print(Countdown { from = 0 }.first_of(Countdown { from = 2 }));
+	print(["a", "b"].iter().first_of(["c"].iter()));
+	print(Countdown { from = 1 }.label());
+	print(Countdown { from = 2 }.maybe().unwrap().to_list());
+	match [7].iter().maybe() {
+		Some(let inner) => print(inner.to_list()),
+		None => print("none"),
+	}
+}

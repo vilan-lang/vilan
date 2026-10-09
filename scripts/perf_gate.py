@@ -3,7 +3,7 @@
 
     scripts/perf_gate.py gate      --vilan target/release/vilan [--class ci] [--counter auto] [--json OUT]
     scripts/perf_gate.py measure   --vilan BIN [--json OUT]                     # the table, no verdict
-    scripts/perf_gate.py ratchet   --from MEASURED.json [--release]             # the seal's ceiling ratchet
+    scripts/perf_gate.py ratchet   --from MEASURED.json [--release [--ci-from CI.json | --ci-run-of SHA]]   # the seal's ceiling ratchet
     scripts/perf_gate.py seal      --vilan TIP --base RELEASE --kolt DIR [--tip-kolt MIGRATED] [--lsp-json BASE.json TIP.json]
     scripts/perf_gate.py calibrate --vilan BIN --kolt DIR                       # S4: genapp vs kolt phase split
     scripts/perf_gate.py report    --verdict perf-<sha>.json --out perf/report-vX.Y.Z.md
@@ -304,21 +304,18 @@ def command_gate(options):
 # ---------------------------------------------------------------------------- the seal's ratchet
 
 
-def command_ratchet(options):
-    """Set or lower ceilings from a measured JSON or a seal's verdict (Q5): a row with no ceiling for the
-    measurement's class and counter is adopted at measured x 1 (the tolerance rides on top at judgement); a
-    row more than 2% under its ceiling is lowered to the new count. `--release` ABSORBS the bumps (N146): a
-    bumped row's ceiling becomes its measured count and the bump rows reset (they live one release). From a
-    verdict, the E121 counts the seal advanced are written too — the release commit is where they land."""
-    data = load_budgets(options.budgets)
-    with open(options.source) as handle:
-        measured = json.load(handle)
+def ratchet_source(data, measured, options, absorbed, note=""):
+    """One measurement (a measured JSON or a seal's verdict) applied to the budgets. Returns the change lines;
+    `absorbed` collects the classes whose bumps this measurement settled, for `--release`'s reset."""
     # A seal's VERDICT (`perf-<sha>.json`) reads like a measurement: its T2 results, plus the E121 count the
     # seal advanced (N146: the cut ratchets from the verdict it checked, in the release commit).
     verdict = "t2" in measured
     results = measured["t2"]["results"] if verdict else measured["results"]
     counter, klass = measured["counter"], measured["class"]
-    stamp = options.stamp or measured.get("vilan") or f"the seal's verdict at {str(measured.get('sha'))[:10]}"
+    absorbed.add(klass)
+    stamp = options.stamp or measured.get("vilan") or (
+        f"the seal's verdict at {str(measured.get('sha'))[:10]}" if verdict else "a measured JSON")
+    stamp += note
     bumped = {(bump["subject"], bump.get("class")) for bump in data["bump"]}
     changes = []
     for subject, result in results.items():
@@ -349,10 +346,92 @@ def command_ratchet(options):
     if verdict and measured.get("e121_after") is not None:
         data["e121"] = measured["e121_after"]
         changes.append("E121's counts advanced as the seal recorded them")
+    return changes
+
+
+def bump_settled(data, bump, classes):
+    """Whether a measurement of `classes` has absorbed this bump. A bump names a class, or none, in which case
+    it multiplies EVERY class's row of its subject (`effective_ceiling`) and is settled only when every class
+    that has such a row was measured."""
+    if bump.get("class") is not None:
+        return bump["class"] in classes
+    owners = {row["class"] for row in data["row"] if row["subject"] == bump["subject"]}
+    return owners <= classes
+
+
+def fetch_ci_measured(sha, repo, scratch):
+    """N161: the `perf-measured` artifact of the latest GREEN `ci.yml` run at `sha` (the commit the cut
+    tags from; the release commit changes versions and prose, not code). Returns (path, "") or (None, why).
+    Needs `gh` on PATH and authenticated; anything short of the file is a reason, never an exception."""
+    if shutil.which("gh") is None:
+        return None, "gh is not installed"
+    repo_args = ["-R", repo] if repo else []
+    listed = subprocess.run(
+        ["gh", "run", "list", *repo_args, "--workflow", "ci.yml", "--commit", sha, "--limit", "20",
+         "--json", "databaseId,status,conclusion,headSha",
+         "--jq", f'[.[] | select(.headSha == "{sha}" and .conclusion == "success")] | first | .databaseId // empty'],
+        capture_output=True, text=True)
+    run_id = listed.stdout.strip()
+    if listed.returncode != 0:
+        return None, "could not read ci.yml's runs (offline, or gh unauthenticated?)"
+    if not run_id:
+        return None, f"ci.yml has no green run at {sha[:10]}"
+    downloaded = subprocess.run(["gh", "run", "download", run_id, *repo_args, "-n", "perf-measured",
+                                 "-D", scratch], capture_output=True, text=True)
+    path = os.path.join(scratch, "measured.json")
+    if downloaded.returncode != 0 or not os.path.exists(path):
+        return None, f"run {run_id} has no `perf-measured` artifact (its perf job skipped, or the artifact expired)"
+    return path, ""
+
+
+def command_ratchet(options):
+    """Set or lower ceilings from a measured JSON or a seal's verdict (Q5): a row with no ceiling for the
+    measurement's class and counter is adopted at measured x 1 (the tolerance rides on top at judgement); a
+    row more than 2% under its ceiling is lowered to the new count. `--release` ABSORBS the bumps (N146): a
+    bumped row's ceiling becomes its measured count and the bump rows reset (they live one release). From a
+    verdict, the E121 counts the seal advanced are written too — the release commit is where they land.
+
+    N161: `--release` resets only the bumps of the classes it MEASURED. The verdict measures one class (the
+    seal's `reference`); a `ci` bump is measured by CI's own `perf` job, so resetting it with nothing absorbed
+    turned the release commit's own CI red (v0.46.0: math, watch and todo). A bump of a class nothing here
+    measured stays, and is printed. `--ci-from FILE` is the second measurement (a `ci` measured JSON, the CI
+    job's `perf-measured` artifact) and `--ci-run-of SHA` fetches the latest green one with `gh` for the
+    cut — either absorbs the `ci` bumps the way the verdict absorbs the `reference` ones."""
+    data = load_budgets(options.budgets)
+    with open(options.source) as handle:
+        measured = json.load(handle)
+    absorbed, changes = set(), []
+    changes += ratchet_source(data, measured, options, absorbed)
+    extra = options.ci_from
+    left_note = ""
+    scratch = None
+    if options.release and not extra and options.ci_run_of:
+        # Only when a bump is waiting on a class the verdict did not measure; no gh call otherwise.
+        waiting = [b for b in data["bump"] if not bump_settled(data, b, absorbed)]
+        if waiting:
+            scratch = tempfile.mkdtemp(prefix="vilan-ci-measured-")
+            extra, why = fetch_ci_measured(options.ci_run_of, options.ci_repo, scratch)
+            if extra is None:
+                left_note = f" ({why})"
+    if extra:
+        with open(extra) as handle:
+            second = json.load(handle)
+        if second["class"] in absorbed:
+            sys.exit(f"perf_gate: --ci-from is a {second['class']!r} measurement, the same class as {options.source}")
+        where = f"CI's perf job at {options.ci_run_of[:10]}" if options.ci_run_of and not options.ci_from else extra
+        changes += ratchet_source(data, second, options, absorbed, note=f" ({second['class']} rows from {where})")
+    if scratch:
+        shutil.rmtree(scratch, ignore_errors=True)
     if options.release:
-        if data["bump"]:
-            changes.append(f"reset {len(data['bump'])} bump row(s) at the release")
-        data["bump"] = []
+        kept = [b for b in data["bump"] if not bump_settled(data, b, absorbed)]
+        reset = len(data["bump"]) - len(kept)
+        if reset:
+            changes.append(f"reset {reset} bump row(s) at the release (classes measured: {', '.join(sorted(absorbed))})")
+        for bump in kept:
+            changes.append(f"KEPT the bump on {bump['subject']} x{bump['ratio']} (class {bump.get('class', 'all')}): "
+                           f"nothing measured it here{left_note} - pass --ci-from a green CI run's "
+                           f"perf-measured/measured.json to absorb it, or it rides to the next release")
+        data["bump"] = kept
     if options.dry_run:
         print("\n".join(changes) or "nothing to ratchet")
         return 0
@@ -869,6 +948,11 @@ def main():
     p = sub.add_parser("ratchet")
     p.add_argument("--from", dest="source", required=True)
     p.add_argument("--release", action="store_true")
+    p.add_argument("--ci-from", help="N161: a second measured JSON of the OTHER class (CI's `perf-measured` "
+                   "artifact): `--release` absorbs the bumps of its class from it")
+    p.add_argument("--ci-run-of", metavar="SHA", help="N161: with --release and no --ci-from, fetch the latest "
+                   "green ci.yml run's `perf-measured` at this commit with `gh`, when a bump is waiting on it")
+    p.add_argument("--ci-repo", help="OWNER/REPO for --ci-run-of's gh calls (gh's own default otherwise)")
     p.add_argument("--stamp")
     p.add_argument("--tolerance", type=float,
                    help="a tolerance for the rows this adopts, in place of the file's (M114: 0.005 for `ci`)")

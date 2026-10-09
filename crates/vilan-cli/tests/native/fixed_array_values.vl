@@ -1,0 +1,59 @@
+// F121: a struct with a fixed-array field did not build natively — the
+// struct's emitted `Js` impl reads every field, and vilan-rt had no `Js`
+// for `[T; N]`. With it, `[T; n]` values print as node prints them: whole,
+// in a struct, in an `Option`, through a generic. F109's repro (a list
+// literal under `[i32; 3]` handed to a `[i32; 3]` parameter) is the first
+// lines: F100 already lowered it to a Rust array.
+import std::io::print;
+
+fun first(values: [i32; 3]): i32 {
+	values[0]
+}
+
+struct Holder {
+	cells: [str; 2],
+}
+
+fun echo<T>(value: T): T {
+	value
+}
+
+struct Pixel {
+	rgba: [u8; 4],
+}
+
+fun pair(): [i32; 2] {
+	[4, 5]
+}
+
+fun main() {
+	let fixed: [i32; 3] = [1, 2, 3];
+	print(first(fixed));
+	print(fixed.len());
+	dbg(fixed);
+	print(first([7, 8, 9]));
+	let holder = Holder { cells = ["a", "b"] };
+	print(holder.cells[1]);
+	print(pair()[1]);
+	let nested: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+	print(nested[1][0]);
+	mut grid: [i32; 2] = [0, 0];
+	grid[1] = 9;
+	print(grid[1]);
+	let empty: [i32; 0] = [];
+	print(empty.len());
+	print(fixed);
+	print(holder);
+	print(holder.cells);
+	print(echo(fixed)[2]);
+	let maybe: Option<[i32; 2]> = Some([1, 2]);
+	print(maybe);
+	for item in fixed {
+		print(item);
+	}
+	let strings: [str; 2] = ["x", "y"];
+	print(strings);
+	let p = Pixel { rgba = [255u8, 0u8, 0u8, 255u8] };
+	print(p.rgba[0]);
+	print(p);
+}

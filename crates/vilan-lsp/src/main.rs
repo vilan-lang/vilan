@@ -2740,6 +2740,37 @@ async fn publish_closed_world(context: &AnalysisContext, root_path: &Path) {
     }
 }
 
+/// E280: whether the open document at `uri` needs a further world (the other
+/// platform's entry, for a module both reach) that no kept world and no open
+/// entry document holds - the worlds [`reanalyze_dependents`]'s sweep would
+/// create, and the only ones an open that analyzed nothing owes.
+fn lacks_a_further_world(context: &AnalysisContext, uri: &Url) -> bool {
+    let Some(document) = context.documents.get(uri) else {
+        return false;
+    };
+    document.further_worlds().iter().any(|root| {
+        !context.worlds.contains_key(root) && open_document_uri(&context.documents, root).is_none()
+    })
+}
+
+/// E280: the open document and kept world [`reanalyze_dependents`] is to leave
+/// ALONE - all of them. Handed as the sweep's `already` answered set, it
+/// narrows the sweep to the worlds that should exist and do not: an open
+/// changed no file's content, so nothing already analyzed is stale.
+fn everything_but_missing_worlds(context: &AnalysisContext) -> Answered {
+    let mut worlds: Vec<PathBuf> = context
+        .worlds
+        .iter()
+        .map(|world| world.key().clone())
+        .collect();
+    let mut documents = Vec::new();
+    for document in context.documents.iter() {
+        documents.push(document.key().clone());
+        worlds.extend(document.world_root().map(Path::to_path_buf));
+    }
+    Answered { documents, worlds }
+}
+
 /// M104: the worlds still in use — each open document's own (when it is
 /// served from one) and the further worlds that report its diagnostics under
 /// another platform.
@@ -4490,6 +4521,20 @@ impl LanguageServer for Backend {
             // served from that world — no analysis — when the world read every
             // open buffer as it stands, this one included.
             if serve_from_held_world(&context, &uri, &text).await {
+                // E280: served is not swept. The held world is one platform's;
+                // a module both platforms reach has FURTHER worlds (the node
+                // entry's, when the browser entry's serves it), and none of
+                // them was analyzed by an open that analyzed nothing. Open in
+                // the other order, the analysis path below runs this sweep.
+                if lacks_a_further_world(&context, &uri) {
+                    reanalyze_dependents(
+                        &context,
+                        &uri,
+                        None,
+                        everything_but_missing_worlds(&context),
+                    )
+                    .await;
+                }
                 schedule_package_union(&context, &uri);
                 send_refreshes(&context.client, refresh_plan(true)).await;
                 return;
