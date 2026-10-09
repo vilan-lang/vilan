@@ -4428,6 +4428,12 @@ pub struct Analyzer<'src> {
     source_range_index: std::cell::RefCell<RangeIndex>,
     // M107: `derived_origins` the same way, for the same reason.
     derived_origin_index: std::cell::RefCell<RangeIndex>,
+    // `std::tuple`'s `Tuple` members by id, with the impl count they were
+    // read at (`tuple_member_name`): a cell for the same reason, rebuilt when
+    // an impl registers after it was read.
+    // (Each member maps to the impl index declaring it, `None` for the trait:
+    // the name is read back from there, which keeps `'src` out of the cell.)
+    tuple_member_index: std::cell::RefCell<Option<(usize, HashMap<Id, Option<usize>>)>>,
     // M19 T0 (`per-module-analysis-reuse.md` §3.3): the source each `TypeId`
     // was minted in, indexed by the id's own dense counter. `Id`s get this
     // through `source_ranges`; `TypeId`s are a separate counter and had
@@ -7314,6 +7320,7 @@ impl<'src> Analyzer<'src> {
             drop_nominals_world_digest: 0,
             sorted_source_ranges: Vec::new(),
             source_range_index: std::cell::RefCell::new(RangeIndex::default()),
+            tuple_member_index: std::cell::RefCell::new(None),
             derived_origin_index: std::cell::RefCell::new(RangeIndex::default()),
             type_id_sources: Vec::new(),
             reuse_derived: HashMap::default(),
@@ -36431,25 +36438,50 @@ impl<'src> Analyzer<'src> {
 
     /// The name of `member_id` when it is one of `std::tuple`'s `Tuple`
     /// members — the trait's requirement or the blanket's intrinsic.
+    ///
+    /// Asked of every method call's member once `std::tuple` is loaded —
+    /// which since B443 is every program, `std::compare` importing `Tuple` —
+    /// so the members are indexed once (per impl count) rather than found by
+    /// a scan of every impl per call: that scan was +11% of a plain package's
+    /// `vilan check` (perf gate `plain:160`).
     fn tuple_member_name(&self, member_id: Id) -> Option<&'src str> {
         let tuple_trait_id = self.tuple_trait_id?;
-        let declared_in = |declarations: &IndexMap<&'src str, Id>| {
-            declarations
-                .iter()
-                .find(|(_, declared)| **declared == member_id)
-                .map(|(name, _)| *name)
-        };
-        if let Some(name) = self
-            .traits
-            .get(&tuple_trait_id)
-            .and_then(|trait_| declared_in(&trait_.declarations))
-        {
-            return Some(name);
+        let registered = self.implementations.len();
+        let stale = self
+            .tuple_member_index
+            .borrow()
+            .as_ref()
+            .is_none_or(|(built_at, _)| *built_at != registered);
+        if stale {
+            let mut index: HashMap<Id, Option<usize>> = HashMap::default();
+            for (position, implementation) in self.implementations.iter().enumerate() {
+                if implementation.trait_ids.contains(&tuple_trait_id) {
+                    for declared in implementation.declarations.values() {
+                        index.entry(*declared).or_insert(Some(position));
+                    }
+                }
+            }
+            // The trait's own declaration answers first, as it always did.
+            if let Some(trait_) = self.traits.get(&tuple_trait_id) {
+                for declared in trait_.declarations.values() {
+                    index.insert(*declared, None);
+                }
+            }
+            *self.tuple_member_index.borrow_mut() = Some((registered, index));
         }
-        self.implementations
+        let home = self
+            .tuple_member_index
+            .borrow()
+            .as_ref()
+            .and_then(|(_, index)| index.get(&member_id).copied())?;
+        let declarations = match home {
+            None => &self.traits.get(&tuple_trait_id)?.declarations,
+            Some(position) => &self.implementations.get(position)?.declarations,
+        };
+        declarations
             .iter()
-            .filter(|implementation| implementation.trait_ids.contains(&tuple_trait_id))
-            .find_map(|implementation| declared_in(&implementation.declarations))
+            .find(|(_, declared)| **declared == member_id)
+            .map(|(name, _)| *name)
     }
 
     /// A122 §3 — `t.map(|x| e)` over a tuple family IS the comprehension `(x in
