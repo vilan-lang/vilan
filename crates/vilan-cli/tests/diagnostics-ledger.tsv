@@ -688,3 +688,4 @@ row	flagship	key
 664	-	`dbg` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
 665	-	`dbg` takes no type arguments: it prints each argument at the type it already has
 666	-	Both are pipe stages, and two stages of different types meet only as one erased flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the function's return), with `T` the value they carry, and each erases to it
+NEW	-	this element's class is written twice — `{earlier}` and then `{later}` — and `{earlier}` is a binding, so the two take turns: `{later}` writes last when the element is built, `{earlier}` writes again whenever its source changes, and the element shows whichever wrote last. Compose them into one writer (two styles add: `.styled(a + b)`), or drop one

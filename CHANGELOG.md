@@ -53,6 +53,11 @@ written down.
 <!-- family: fix -->
 **`dbg` spells a closure's type as vilan writes it — `<closure |i32, i32| i32>` — where it wrote `<closure |i32, i32| -> i32>`, a spelling the parser refuses ("`->` is not how vilan writes a closure type").** The printer's labels are meant to be vilan's own syntax; a pipe's label (`<pipe Derive<..>>`) that names a closure type follows. The committed `native/dbg_printer.stderr` moves by its last line. Pins: the re-read `inference::debugging::s1_dbg_breaks_past_80_columns_and_cuts_a_long_list` and `native_differential::s1_dbg_writes_the_same_bytes_on_both_backends`. Found by debug-48 probing the printer.
 
+---
+
+<!-- family: diagnostics -->
+**A159 + A160: the class-written-twice warning counts `.bind_attr("class", ..)` and `.toggle_attr("class", ..)` as class writers, and tells the truth when the EARLIER writer is a binding.** Both write the element's class on both ui twins (`toggle_attr` REMOVES it while its flag is false), so `<div .styled(card) .toggle_attr("class", flag) />` lost `card`'s classes with no warning; they now count under the same literal-`"class"` test `.attr` gets (a computed name is not judged). When the earlier writer follows a source — a `bind_*`, a `toggle_attr`, or an `attr("class", ..)`/element-head `class(..)` whose value is not a `str` or an `Option<str>` — the old sentence ("only the last write stays") was false in the browser, where the binding writes again on every change; it now reads "`class(label)` is a binding, so the two take turns: `.styled(card)` writes last when the element is built, `class(label)` writes again whenever its source changes, and the element shows whichever wrote last", with the same steer. Pins: `inference::styling::a159_bind_attr_and_toggle_attr_on_class_are_class_writers`, `a159_bind_attr_and_toggle_attr_on_other_names_are_not_class_writers`, `a160_an_earlier_binding_writer_is_reported_as_taking_turns` (six earlier bindings), `a160_an_earlier_static_writer_keeps_the_last_write_sentence`; red before. One new ledger row. Tracker A159, A160 (class-writes.md G1, G2).
+
 ## v0.45.0 — 2026-10-08
 
 <!-- family: breaking -->

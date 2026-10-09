@@ -55412,11 +55412,18 @@ impl<'src> Analyzer<'src> {
 
     /// A155: one element whose class is written twice in one chain — an element
     /// head's `class("x")` and a `.styled(card)`, two `.styled`s, a `.class` and
-    /// a `.bind_styled` — keeps only the LAST write: every one of std's `View`
-    /// class writers SETS the attribute, on both ui twins, so the earlier write is
-    /// silently lost (`<div class("x") .styled(card) />` renders only `card`'s
-    /// classes, and the reverse order only `x`). A WARNING naming both writers,
-    /// at the one that wins.
+    /// a `.bind_styled`, a `.bind_attr("class", ..)` or a `.toggle_attr("class",
+    /// ..)` (A159) — keeps only the LAST write: every one of std's `View` class
+    /// writers SETS the attribute (or, `toggle_attr`, removes it), on both ui
+    /// twins, so the earlier write is silently lost (`<div class("x")
+    /// .styled(card) />` renders only `card`'s classes, and the reverse order
+    /// only `x`). A WARNING naming both writers, at the later one.
+    ///
+    /// A160: when the EARLIER writer is a binding — a `bind_*`, a
+    /// `toggle_attr`, or an `attr("class", ..)` over a source — the later write
+    /// does not stay: the binding writes again on every change of its source,
+    /// so the two take turns and the element shows whichever fired last. The
+    /// sentence says that instead (`class_writer_is_binding`).
     ///
     /// Statically visible means one receiver chain: from each writer, the walk
     /// follows the receiver while it is a dotted call of one of std's `View`
@@ -55426,8 +55433,9 @@ impl<'src> Analyzer<'src> {
     /// of the program's own is not. Whether the writers should APPEND instead is
     /// an open design question (census first); this pass does not change them.
     fn check_class_written_twice(&mut self) {
-        // Each class writer: its call, its receiver entity, its source.
-        let mut writers: HashMap<Id, (Id, SourceId)> = HashMap::default();
+        // Each class writer: its call, its receiver entity, its source, and
+        // whether it is a binding (A160).
+        let mut writers: HashMap<Id, (Id, SourceId, bool)> = HashMap::default();
         // Every dotted call of a std `View` method, by its CALL ENTITY, with its
         // receiver entity: the links the walk may cross.
         let mut links: HashMap<Id, (Id, Id)> = HashMap::default();
@@ -55457,20 +55465,28 @@ impl<'src> Analyzer<'src> {
             if let Some(&entity) = call_entities.get(call_id) {
                 links.insert(entity, (*call_id, receiver));
             }
-            let writes_class = match self.callable_name(*member_id) {
-                Some("class" | "styled" | "bind_class" | "bind_styled") => true,
-                Some("attr") => matches!(
+            // A159: the named-attribute writers count when the name is the
+            // literal `"class"` — `toggle_attr` too, which REMOVES the class
+            // while its flag is false.
+            let names_class = || {
+                matches!(
                     function_call
                         .argument_ids
                         .get(1)
                         .and_then(|name| self.expr_id_to_expr_map.get(name)),
                     Some(Expr::String("class"))
-                ),
-                _ => false,
+                )
             };
-            if !writes_class {
-                continue;
-            }
+            let is_binding = match self.callable_name(*member_id) {
+                Some("class" | "styled") => false,
+                Some("bind_class" | "bind_styled") => true,
+                Some("bind_attr" | "toggle_attr") if names_class() => true,
+                Some("attr") if names_class() => function_call
+                    .argument_ids
+                    .get(2)
+                    .is_some_and(|value| self.class_value_is_binding(*call_id, *value)),
+                _ => continue,
+            };
             let Some(source) = self.source_of_id(*call_id) else {
                 continue;
             };
@@ -55480,51 +55496,104 @@ impl<'src> Analyzer<'src> {
             {
                 continue;
             }
-            writers.insert(*call_id, (receiver, source));
+            writers.insert(*call_id, (receiver, source, is_binding));
         }
         if writers.len() < 2 {
             return;
         }
         // From each writer, the nearest writer BELOW it on its receiver chain:
         // the write it overrides. Reported once per pair, at the later writer.
-        let mut pairs: Vec<(SourceId, Id, Id)> = Vec::new();
-        for (call_id, (receiver, source)) in &writers {
+        let mut pairs: Vec<(SourceId, Id, Id, bool)> = Vec::new();
+        for (call_id, (receiver, source, _)) in &writers {
             let mut current = *receiver;
             while let Some(&(inner_call, inner_receiver)) = links.get(&current) {
-                if writers.contains_key(&inner_call) {
-                    pairs.push((*source, inner_call, *call_id));
+                if let Some(&(_, _, earlier_is_binding)) = writers.get(&inner_call) {
+                    pairs.push((*source, inner_call, *call_id, earlier_is_binding));
                     break;
                 }
                 current = inner_receiver;
             }
         }
-        let mut sites: Vec<(SourceId, Span, String, String, Span)> = pairs
+        let mut sites: Vec<(SourceId, Span, String, String, Span, bool)> = pairs
             .into_iter()
-            .filter_map(|(source, earlier, later)| {
+            .filter_map(|(source, earlier, later, earlier_is_binding)| {
                 let (earlier_text, earlier_span) = self.class_writer_text(earlier, source)?;
                 let (later_text, later_span) = self.class_writer_text(later, source)?;
-                Some((source, later_span, earlier_text, later_text, earlier_span))
+                Some((
+                    source,
+                    later_span,
+                    earlier_text,
+                    later_text,
+                    earlier_span,
+                    earlier_is_binding,
+                ))
             })
             .collect();
         sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
         sites.dedup_by_key(|(source, span, ..)| (source.0, span.start, span.end));
-        for (source, span, earlier, later, earlier_span) in sites {
-            self.warnings.push(Error {
-                trace: Vec::new(),
-                note: Some(Note::here(
-                    earlier_span,
-                    format!("`{earlier}` writes this element's class first"),
-                )),
-                span,
-                msg: format!(
-                    "this element's class is written twice — `{earlier}` and then \
-                     `{later}` — and only the last write stays: `{later}` replaces \
-                     what `{earlier}` wrote. Compose them into one writer (two styles \
-                     add: `.styled(a + b)`), or drop one"
-                ),
-            });
+        for (source, span, earlier, later, earlier_span, earlier_is_binding) in sites {
+            let note = Some(Note::here(
+                earlier_span,
+                format!("`{earlier}` writes this element's class first"),
+            ));
+            let error = match earlier_is_binding {
+                // A160: the binding writes again on every change of its source,
+                // so the later write does not stay.
+                true => Error {
+                    trace: Vec::new(),
+                    note,
+                    span,
+                    msg: format!(
+                        "this element's class is written twice — `{earlier}` and then \
+                         `{later}` — and `{earlier}` is a binding, so the two take turns: \
+                         `{later}` writes last when the element is built, `{earlier}` \
+                         writes again whenever its source changes, and the element shows \
+                         whichever wrote last. Compose them into one writer (two styles \
+                         add: `.styled(a + b)`), or drop one"
+                    ),
+                },
+                false => Error {
+                    trace: Vec::new(),
+                    note,
+                    span,
+                    msg: format!(
+                        "this element's class is written twice — `{earlier}` and then \
+                         `{later}` — and only the last write stays: `{later}` replaces \
+                         what `{earlier}` wrote. Compose them into one writer (two styles \
+                         add: `.styled(a + b)`), or drop one"
+                    ),
+                },
+            };
+            self.warnings.push(error);
             self.warning_sources.push(source);
         }
+    }
+
+    /// A160: whether an `attr("class", value)` writer is a BINDING — whether its
+    /// value is a source the writer follows, rather than a `str` (or an
+    /// `Option<str>`, A115) it writes once. `AttrValue`'s arms are exactly those
+    /// two static types and the `Flow` blankets over them, so anything that is
+    /// not one of the two is followed.
+    ///
+    /// The value's type is the call's binding of `attr<V>`'s own `V` (a call
+    /// result's type lives there, not on the argument), else the argument's
+    /// own. A value whose type is not known is taken as static: the check then
+    /// says what it always said.
+    fn class_value_is_binding(&self, call_id: Id, value: Id) -> bool {
+        let value_type = match self
+            .own_generic_call_bindings
+            .get(&call_id)
+            .and_then(|bindings| bindings.first())
+        {
+            Some(bound) => bound.get_type(self),
+            None => match self.place_value_type(value) {
+                Some(value_type) => value_type,
+                None => return false,
+            },
+        };
+        let is_static = self.is_str_type(&value_type)
+            || matches!(value_type, Type::Enum(id, _) if Some(id) == self.option_enum_id);
+        !is_static
     }
 
     /// A157: a WRITTEN `autofocus` attribute in an element head —
