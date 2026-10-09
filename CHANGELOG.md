@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**E280: a file opened into a world another open document already holds still gets its FURTHER worlds analyzed.** Opening `shared.vl` (a module both the browser entry and the node entry reach) with `client.vl` open and settled served it from the held browser world, which analyzes nothing and used to return before the sweep that creates the node entry's world — so the module showed only the browser leg's verdict, with no node-leg diagnostics (E113) and no twin legs, until its next edit; opened the other way round the sweep ran. The served open now schedules that sweep for the further worlds nothing holds, and only those: the held world and every open document are left alone.
+
+---
+
 <!-- family: tooling -->
 **N160: the parser's doc comment on what `export` admits spells a derived export the way an author writes it — `[derive(Wire)] export struct S { .. }` — and says the rotated `export [derive(Wire)]` form is the parser's own, which B485 S3 refuses as source.** A comment only; no behavior moved.
 
