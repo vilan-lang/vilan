@@ -265,6 +265,12 @@ impl Permuted {
     }
 }
 
+/// `text` with every `\` read as `/` — the one spelling the comparison uses
+/// for a path, whichever the host wrote.
+fn slashed(text: &str) -> String {
+    text.replace('\\', "/")
+}
+
 /// A diagnostic row with its trace hops sorted. A requirement trace (E78)
 /// orders its hops by depth and, at one depth, by id — the C1 rule, a ruled
 /// positional answer the reversed world is allowed to change — so the
@@ -294,7 +300,14 @@ fn sort_trace_hops(row: &str) -> String {
 /// identifier mapped back through `permuted` when there is one, and the rows
 /// of each section sorted.
 fn normalize(rendering: &str, root: &Path, permuted: Option<&Permuted>) -> String {
-    let root = format!("{}/", root.display());
+    // Separator-agnostic: a Windows host renders `D:\a\…\pkg\main.vl`, and
+    // the package's files are keyed by their `/`-spelled relative paths, so
+    // every path the rows carry is read with `\` as `/` before it is
+    // compared (the raw root is replaced in prose too, for a host that spells
+    // it either way).
+    let backslashed_root = format!("{}\\", root.display());
+    let raw_root = format!("{}/", root.display());
+    let root = format!("{}/", slashed(&root.display().to_string()));
     let mut out = String::new();
     let mut section: Vec<String> = Vec::new();
     let flush = |section: &mut Vec<String>, out: &mut String| {
@@ -322,7 +335,8 @@ fn normalize(rendering: &str, root: &Path, permuted: Option<&Permuted>) -> Strin
         let mut names_the_nesting = false;
         while index < tokens.len() {
             let token = tokens[index];
-            if let Some(file) = token.strip_prefix(root.as_str()) {
+            let token_slashed = slashed(token);
+            if let Some(file) = token_slashed.strip_prefix(root.as_str()) {
                 let range = tokens.get(index + 1).copied().unwrap_or("");
                 let (file, range) = match permuted {
                     Some(permuted) => {
@@ -369,7 +383,13 @@ fn normalize(rendering: &str, root: &Path, permuted: Option<&Permuted>) -> Strin
         }
         // A message may spell the package's directory in prose too (a const
         // read's resolved path): every occurrence maps to the same spelling.
-        let row = sort_trace_hops(&rebuilt.join(" ").replace(root.as_str(), "<pkg>/"));
+        let row = sort_trace_hops(
+            &rebuilt
+                .join(" ")
+                .replace(backslashed_root.as_str(), "<pkg>/")
+                .replace(raw_root.as_str(), "<pkg>/")
+                .replace(root.as_str(), "<pkg>/"),
+        );
         section.push(match permuted {
             Some(permuted) => permuted.canonical(&row),
             None => row,
@@ -624,4 +644,45 @@ fn the_differential_sees_a_changed_answer_through_the_normalization() {
             "{file}'s text does not round-trip"
         );
     }
+}
+
+/// The normalizer reads a Windows host's rows — the package root spelled
+/// with backslashes, in a path token and in prose — as it reads this host's:
+/// the root relativized, the nesting dropped, the renaming undone, the offsets
+/// mapped. (CI's windows shards read the whole binary red before this: the
+/// `/`-only prefix never matched, so every row kept its leg's directory.)
+#[test]
+fn the_normalizer_reads_a_windows_hosts_rows() {
+    let files: Vec<(String, String)> = vec![
+        (
+            "main.vl".to_string(),
+            "import pkg::model::leaf;\n\nfun main() {\n\tprint(leaf());\n}\n".to_string(),
+        ),
+        (
+            "model.vl".to_string(),
+            "export fun leaf(): i32 {\n\t1\n}\n".to_string(),
+        ),
+    ];
+    let permuted = permute(&files, &[], Permutation::NestedReversed).expect("permutable");
+    let (model_file, model_text) = permuted
+        .files
+        .iter()
+        .find(|(file, _)| file.ends_with("model.vl"))
+        .expect("the model module");
+    assert_eq!(model_file, "deep/pa_model.vl");
+    let leaf_at = model_text.find("leaf").expect("the function");
+    let root = Path::new("D:\\a\\vilan\\vilan\\target\\tmp\\vilan_m110_perm_x_1_0");
+    let rendering = format!(
+        "# diagnostics\nD:\\a\\vilan\\vilan\\target\\tmp\\vilan_m110_perm_x_1_0\\deep\\pa_model.vl {leaf_at}..{} cannot read `x` (resolved against the package root to `D:\\a\\vilan\\vilan\\target\\tmp\\vilan_m110_perm_x_1_0\\x`)\n# warnings\n# editor tables\ndeclaration D:\\a\\vilan\\vilan\\target\\tmp\\vilan_m110_perm_x_1_0\\deep\\pa_model.vl {leaf_at}..{} fun leaf(): i32\n",
+        leaf_at + 4,
+        leaf_at + 4
+    );
+    let normalized = normalize(&rendering, root, Some(&permuted));
+    let canonical_leaf_at = files[1].1.find("leaf").unwrap();
+    let expected = format!(
+        "# diagnostics\n<pkg>/model.vl {canonical_leaf_at}..{} cannot read `x` (resolved against the package root to `<pkg>/x`)\n# warnings\n# editor tables\ndeclaration <pkg>/model.vl {canonical_leaf_at}..{} fun leaf(): i32\n",
+        canonical_leaf_at + 4,
+        canonical_leaf_at + 4
+    );
+    assert_eq!(normalized, expected);
 }
