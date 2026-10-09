@@ -5620,6 +5620,74 @@ fn m118_a_derive_on_a_trait_object_costs_what_its_annotated_form_does() {
     );
 }
 
+/// M124: a `.derive` on a `dyn Source<X>` asks what the object provides
+/// `Flow` at — `Flow` is `Source`'s SUPERTRAIT, not the object's own trait, so
+/// M118's fast path did not answer, and the provider scan reconciled the object
+/// against every `Flow` implementor through the erasure arm (~4.4k type slots
+/// per attempt, each nominal implementor minting its instantiation). The rule
+/// (`object_trait_arguments`): an object provides its trait's supertraits at
+/// the arguments the `with` clauses thread from its own, and any other trait
+/// only through a blanket — a nominal implementor is never selected for an
+/// object, so it is no evidence and is not asked.
+#[test]
+fn m124_a_derive_on_a_subtrait_object_reads_the_supertrait_from_the_object() {
+    let source = r#"
+        import std::reactive::{ Flow, MemoCell, Source, SignalCell };
+
+        enum St<T> {
+            Pending,
+            Ready(T),
+            Failed(str, Option<T>),
+            Absent,
+        }
+
+        fun upstream(): dyn Source<St<Option<i32>>> {
+            let state: dyn Source<St<Option<i32>>> = Source::constant(St::Pending);
+            state
+        }
+
+        fun probe(): MemoCell<i32> {
+            upstream().derive(|x: St<Option<i32>>| 1).memo()
+        }
+
+        fun main() {
+            let m = probe();
+        }
+    "#;
+    let (work, _) = m118_costs(source.to_string(), false);
+    let slots = work
+        .iter()
+        .find(|(name, _)| name == "probe")
+        .map(|(_, work)| work.slots)
+        .expect("`probe` is charged work");
+    assert!(
+        slots < 1_000,
+        "`probe` minted {slots} type slots: the object's supertrait arguments were re-derived \
+         from every `Flow` implementor (M124)"
+    );
+}
+
+#[test]
+fn m124_a_subtrait_objects_derive_runs_at_the_threaded_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Flow, Signal, SignalCell, Source, comp };
+
+        fun main() {
+            let cell: SignalCell<i32> = Signal::new(2);
+            let object: dyn Source<i32> = cell;
+            let (doubled, scope) = comp(|| object.derive(|x: i32| x * 2).memo());
+            print(doubled.get());
+            cell.set(5);
+            print(doubled.get());
+            scope.dispose();
+        }
+        "#,
+        "4\n10\n",
+    );
+}
+
 /// M118's second half: `--explain-cost`'s `selections` column read 0 for every
 /// declaration, because the solver's per-constraint attribution ends at the
 /// fixpoint and implementation selection happens after it. The emission walk

@@ -1525,6 +1525,13 @@ implements is reachable — not an inherent member, not another trait's
 member, and not another trait's bound: `dyn Shape` does not satisfy `T:
 Named` because the value it holds happens to.
 
+The ARGUMENTS an object provides a trait at follow the same lines. `dyn
+Trait<A>` provides `Trait` at `A`, and each supertrait at the arguments the
+`with` clauses pass down from `A` (`dyn Source<i32>` is a `Flow<i32>` under
+`trait Source<T> with Flow<T>`). Any other trait it provides only through a
+blanket, at what that blanket provides with its binder bound to the object;
+a concrete implementor of the trait says nothing about an object.
+
 **Copies.** A trait object is a value, and copying one copies what it
 erased (§6.1, rule 1), exactly as the concrete value would be copied.
 

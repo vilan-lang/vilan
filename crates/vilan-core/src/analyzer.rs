@@ -45401,15 +45401,36 @@ impl<'src> Analyzer<'src> {
     /// arguments: ~11k type slots per attempt for one `.derive` on a
     /// `dyn Flow`, re-paid on every re-queue while a closure's types were
     /// still open.
+    ///
+    /// M124 (the rule — what a trait object `dyn Tr<A>` provides a trait `U`
+    /// at):
+    ///
+    /// 1. `U = Tr`: at `A`, the one instantiation the object was erased at.
+    /// 2. `U` a SUPERTRAIT of `Tr`: at the arguments `Tr`'s `with` clauses
+    ///    thread from `A` (`dyn Source<X>` is a `Flow<X>`) — the object's
+    ///    table carries the supertrait's members at exactly those.
+    /// 3. any other `U`: only through a BLANKET whose binder admits the
+    ///    object (A124 R3 — nothing concrete applies to an object), its
+    ///    provided arguments grounded through the binder's bounds at what the
+    ///    object provides there (rules 1 and 2). A NOMINAL implementor is
+    ///    never selected for an object, so its arguments are no evidence for
+    ///    one (`trait_args_candidates` skips it); disagreeing blankets are
+    ///    B533's ambiguity, as for any receiver.
+    ///
+    /// Rules 1 and 2 answer here, with no scan.
     fn object_trait_arguments(&mut self, concrete: &Type, trait_id: Id) -> Option<Vec<TypeId>> {
-        match concrete {
-            Type::Dyn(object_trait_id, object_arguments)
-                if *object_trait_id == trait_id && !object_arguments.is_empty() =>
-            {
-                Some(object_arguments.clone())
-            }
-            _ => None,
+        let Type::Dyn(object_trait_id, object_arguments) = concrete else {
+            return None;
+        };
+        if *object_trait_id == trait_id {
+            return (!object_arguments.is_empty()).then(|| object_arguments.clone());
         }
+        let (object_trait_id, object_arguments) = (*object_trait_id, object_arguments.clone());
+        self.trait_with_supertraits_at(object_trait_id, &object_arguments)
+            .into_iter()
+            .find(|(reached, _)| *reached == trait_id)
+            .map(|(_, arguments)| arguments)
+            .filter(|arguments| !arguments.is_empty())
     }
 
     /// [`Self::trait_args_for`] for a caller holding the bound that asks — its
@@ -45566,10 +45587,19 @@ impl<'src> Analyzer<'src> {
         // The generics the receiver itself carries (B479, below).
         let mut receiver_generics = Vec::new();
         self.collect_generics(concrete, 0, &mut receiver_generics);
+        let object_receiver = matches!(concrete, Type::Dyn(..));
         for (subject_id, arguments) in candidates {
             let subject = subject_id.get_type(self);
             // B390: a refused subject provides nothing (`impl_subject_admits`).
             if matches!(subject, Type::Unknown | Type::Unresolved) {
+                continue;
+            }
+            // M124's rule 3: an object is provided for by a blanket (or an
+            // impl over objects) and never by a nominal implementor —
+            // `impl_subject_admits`' A124 R3 rule — so reconciling it with one
+            // through the erasure arm (minting every instantiation on the
+            // way) could only produce an echo that is no evidence.
+            if object_receiver && !matches!(subject, Type::Generic(_) | Type::Dyn(..)) {
                 continue;
             }
             if let Some((_, bindings)) = self.reconcile_declaration(concrete, &subject, &subject) {
