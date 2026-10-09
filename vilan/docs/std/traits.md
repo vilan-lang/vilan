@@ -32,6 +32,9 @@ trait Ord with Eq + PartialOrd {
 
 - `==`/`!=` dispatch through `PartialEq`; `<`/`<=`/`>`/`>=` through
   `PartialOrd`. Numbers, `str`, and `bool` implement them in std.
+- A tuple is `PartialEq` when its elements are, compared position by
+  position at any arity: `(1, "a") == (1, "a")`, and a `T: PartialEq`
+  takes a pair. Ordering a tuple is not provided.
 - For your own types, `[derive(PartialEq)]` gives structural equality,
   the usual path. Implement `PartialOrd`/`Ord` by hand when ordering is
   meaningful (`Instant` does this in std).

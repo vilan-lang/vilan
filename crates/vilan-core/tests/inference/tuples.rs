@@ -6237,14 +6237,18 @@ fn b210_a_tuple_impls_method_is_not_reachable_at_another_arity() {
 #[test]
 fn b210_a_tuple_with_no_impl_at_all_still_has_no_methods() {
     // Probe R27's control: admitting the receiver shape must not invent a
-    // member surface. A tuple has no built-in methods, `len` included.
+    // member surface. A tuple has no built-in methods, `len` included: its
+    // `len` is std's `Tuple`'s, and a file that does not import the trait
+    // does not reach it (B535). std's `compare` imports `Tuple` since B443
+    // (the position-by-position `eq`), so the trait is loaded in every
+    // program and the refusal names the import rather than "no method".
     assert_fails_with(
         r#"
         fun main() {
             print((1, 2).len());
         }
         "#,
-        "(i32, i32) has no method 'len'",
+        "`len` is `Tuple`'s, and this file does not import `Tuple`",
     );
 }
 
@@ -8570,5 +8574,126 @@ fn b543_entries_and_get_on_a_mapped_tuple_read_the_mapped_element() {
         }
         "#,
         "true\nfalse\ntrue\nfalse\ntrue\nfalse\n3\n",
+    );
+}
+
+// --- B443: a tuple of `PartialEq` / `Hashable` elements is one itself ---
+//
+// std's `compare.vl` and `hash.vl` carry the two tuple-family blankets
+// (`impl type T: (2..: PartialEq) with PartialEq`, position by position;
+// `impl type T: (2..: Hashable) with Hashable`, the canonical hash) that
+// solver-47 wrote and held back on B557. A pack bounded `(2..: PartialEq)`
+// holds a PAIR, `==` reads a tuple the way it reads its elements, and a tuple
+// is a map key.
+
+#[test]
+fn b443_tuples_compare_position_by_position() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let pair = (1, "a");
+            print(pair == (1, "a"));
+            print(pair == (1, "b"));
+            print(pair != (2, "a"));
+            print((1, 2.5, true) == (1, 2.5, true));
+            print(((1, 2), "x") == ((1, 2), "x"));
+            print(((1, 2), "x") == ((1, 3), "x"));
+        }
+
+        main();
+        "#,
+        "true\nfalse\ntrue\ntrue\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn b443_a_pack_bounded_partial_eq_holds_a_pair() {
+    // The filed exhibit: `((1, 2), (3, 4))` at a `(2..: PartialEq)` bound.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+        import std::tuple::Tuple;
+
+        fun width<T: (2..: PartialEq)>(values: T): usize { values.len() }
+        fun same<T: PartialEq>(a: T, b: T): bool { a == b }
+
+        fun main() {
+            print(width(((1, 2), (3, 4))));
+            print(same((1, "a"), (1, "a")));
+            print(same(((1, 2), (3, 4)), ((1, 2), (3, 5))));
+        }
+
+        main();
+        "#,
+        "2\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn b443_a_non_tuple_reaching_eq_through_a_generic_body_is_unaffected() {
+    // solver-47's regression: with the blanket in std, `==` on an
+    // `Option<usize>` reached through a generic body was refused "'Option<usize>'
+    // is not a tuple" — the family blanket was admitted for it (B557).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+        import std::option::Option::{ self, Some, None };
+
+        fun same<T: PartialEq>(a: T, b: T): bool { a == b }
+
+        fun main() {
+            let x: Option<usize> = Some(1);
+            print(same(x, Some(1)));
+            print(same("a", "b"));
+        }
+
+        main();
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b443_a_tuple_of_an_element_without_equality_is_refused() {
+    assert_fails(
+        r#"
+        struct Opaque { tag: i32 }
+        fun main() {
+            let _same = (Opaque { tag = 1 }, 2) == (Opaque { tag = 1 }, 2);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b443_a_tuple_is_a_map_key() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+        import std::option::Option;
+
+        fun main() {
+            mut counts: HashMap<(i32, str), i32> = HashMap::new();
+            counts.insert((1, "a"), 5);
+            counts.insert((1, "b"), 6);
+            counts.insert((1, "a"), 7);
+            print(counts.len());
+            print(counts.get((1, "a")).unwrap_or(0));
+            mut seen: HashSet<(i32, i32)> = HashSet::new();
+            seen.insert((1, 2));
+            seen.insert((1, 2));
+            print(seen.len());
+            print(seen.contains((1, 2)));
+        }
+
+        main();
+        "#,
+        "2\n7\n1\ntrue\n",
     );
 }

@@ -233,8 +233,9 @@ fun main() {
 
 An **unbacked** enum (`enum Plain { A, B }`) is not a key on its own: without a
 backing value it lowers to an array, like a struct, so it needs the derive along
-with every other aggregate. A struct, an unbacked or payload-carrying enum, or a
-`List` key works as long as it is `Hashable`. Derive it:
+with every other aggregate. A tuple of `Hashable` elements is a key as it
+stands (`HashMap<(i32, str), V>`). A struct, an unbacked or payload-carrying
+enum, or a `List` key works as long as it is `Hashable`. Derive it:
 
 ```vilan
 import std::hash_map::HashMap;

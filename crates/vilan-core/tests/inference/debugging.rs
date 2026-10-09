@@ -625,11 +625,10 @@ fn s4_debug_covers_every_container_the_printer_prints() {
     );
 }
 
-/// E260's tuple case waits on the lane's find B?4: a blanket over the tuple
-/// family is admitted for a non-tuple at the bound check, so std cannot ship
-/// `impl type T: (2..: Debug) with Debug` without making every type `Debug`.
+/// E260's tuple case: std's `impl type T: (2..: Debug) with Debug`, which
+/// waited on B557 (a blanket over the tuple family was admitted for a
+/// non-tuple at the bound check, so it would have made every type `Debug`).
 #[test]
-#[ignore = "E260: the tuple case waits on the lane's find B?4 (a tuple-family blanket impl admitted for a non-tuple subject)"]
 fn s4_debug_covers_a_tuple() {
     assert_compiles_and_runs(
         "import std::debug::Debug;\nfun show<T: Debug>(value: T): str { value.debug() }\nfun main() { print(show((1, \"two\", 2.5))); }\n",

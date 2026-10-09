@@ -1,4 +1,5 @@
 import pkg::option::Option::{ self, None, Some };
+import pkg::tuple::Tuple;
 
 export *;
 
@@ -282,4 +283,18 @@ macro fun PartialEq(item: Item): Source {
 	// reflection cannot distinguish it from a field-less one, which derives
 	// `true`-equality — deriving on an external struct was never meaningful.)
 	source("")
+}
+
+/// B443: two tuples of one type are equal when every position is, at any arity
+/// — so a pack bounded `(2..: PartialEq)` holds a PAIR, and `==` reads a tuple
+/// the way it reads its elements.
+export impl type T: (2..: PartialEq) with PartialEq {
+	fun eq(self, b: T): bool {
+		for key in self.keys() {
+			if self.get(key) != b.get(key) {
+				ret false;
+			}
+		}
+		true
+	}
 }
