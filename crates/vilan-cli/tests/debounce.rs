@@ -347,6 +347,65 @@ fn b277_a_debounce_survives_a_callback_that_throws_and_the_failure_is_reported()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- N155: a deadline already past reaches the host timer as 0 ---------------
+
+/// A host that stalls past a deadline between `run` and the loop's first
+/// `now()` (a loaded Windows runner, a preempted process) used to hand
+/// `setTimeout` a NEGATIVE delay, and node answered on stderr with
+/// `TimeoutNegativeWarning: -1 is a negative number` - which the exhibit's
+/// empty-stderr assertion (right, and kept) reported as red. A stall cannot be
+/// scheduled, so the pin makes the deadline already past on purpose: a negative
+/// `Duration` is a deadline before `run` was even called, a negative `Timer::after`
+/// and `sleep` are the same number arriving by the other two doors. Every one
+/// must fire, in order, with nothing on stderr.
+const DEBOUNCE_DEADLINE_ALREADY_PAST: &str = r#"import std::io::print;
+import std::time::{ Debounce, Duration, Timer, sleep };
+
+async fun main() {
+	// 1. A timer whose delay is already past fires, and says so.
+	let late = Timer::after(-5);
+	print(late.wait());
+	print("mark-a");
+
+	// 2. A sleep whose delay is already past ends.
+	sleep(-5);
+	print("mark-b");
+
+	// 3. A debounce whose deadline is before the call fires, once, with the
+	//    last callback: the driving loop computes a negative time left.
+	let past = Debounce::new(Duration::millis(-5));
+	past.run(|| print("past-first"));
+	past.run(|| print("past-last"));
+	sleep(500);
+	print("mark-c");
+}
+"#;
+
+#[test]
+fn n155_a_deadline_already_past_fires_and_writes_nothing_to_stderr() {
+    let dir = temp_project("deadline_past");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", DEBOUNCE_DEADLINE_ALREADY_PAST);
+    // `run_project` asserts stderr is empty: node's TimeoutNegativeWarning
+    // is exactly what this pin exists to keep out of it.
+    let stdout = run_project(&dir);
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        ["true", "mark-a", "mark-b", "past-last", "mark-c"],
+        "the past-deadline exhibit printed the wrong sequence; got:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- A73: `flush` fires the pending callback now -----------------------------
 
 /// Six phases. `flush` is the LEADING half of an explicit save — a blur, a Save

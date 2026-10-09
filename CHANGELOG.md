@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**N155: a delay already past reaches the host timer as 0, not as a negative number — `std::time`'s `sleep` and `Timer::after` clamp it, and the debounce's loop clamps the time it has left.** A host that stalled past a `Debounce`'s deadline between `run` and the loop's first `now()` (a loaded runner) handed `setTimeout` `-1`, and node answered on stderr with `TimeoutNegativeWarning: -1 is a negative number. Timeout duration was set to 1.` — which failed the debounce exhibit's empty-stderr check once on a slow Windows runner. A past deadline now fires on the next turn, as `0` does; the timer is never given a number node would warn about.
+
+---
+
 <!-- family: tooling -->
 **N161: `perf_gate.py ratchet --release` resets only the bumps of the classes the verdict measured, and the cut absorbs a `ci`-class bump from CI's own measurement.** The seal's verdict measures the `reference` class; the `ci` class is measured by CI's `perf` job, so the cut used to reset a `ci` bump with nothing absorbed and the release commit's own CI went red on the rows it covered (v0.46.0: math x1.019, watch x1.019, todo x1.005). Now a bump of a class nothing measured is kept and printed; `--ci-from FILE` absorbs it from a `ci` measured JSON, and `--ci-run-of SHA` (which `cut-release.sh` passes, with the repository) fetches the `perf-measured` artifact of the latest green `ci.yml` run at the commit the cut tags from with `gh` — only when a bump is waiting on it — and without `gh`, or without that artifact, the bump stays in `perf/budgets.toml` and the ratchet says why.
 

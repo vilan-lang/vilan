@@ -187,8 +187,22 @@ async external fun __sleep(ms: i32, signal: Option<CancelSignal>): void;
 /// Async — a caller awaits it implicitly. Inside a nursery's dynamic extent the
 /// sleep carries the ambient cancel signal (the structural bridge), so cancellation
 /// cuts it short instead of waiting the timer out.
+///
+/// A delay already past (`ms < 0`: a deadline a slow host overshot before the call
+/// got to run) is `0`, not an error: the sleep ends on the next turn. The host
+/// timer is never handed a negative number, which node answers with a
+/// `TimeoutNegativeWarning` on stderr (N155).
 export fun sleep(ms: i32) {
-	__sleep(ms, ambient_signal());
+	__sleep(clamp_delay(ms), ambient_signal());
+}
+
+/// A delay for the host timer: a negative one (a deadline already past) is `0`.
+fun clamp_delay(ms: i32): i32 {
+	if ms < 0 {
+		0
+	} else {
+		ms
+	}
 }
 
 /// `sleep`, taking a `Duration` (the K6 backoff shape). Spans beyond i32
@@ -252,9 +266,9 @@ export struct Timer {
 export impl Timer {
 	/// Start a timer that fires in `ms` milliseconds. The clock starts here,
 	/// not at the first `wait` — nothing has to be awaiting it for it to run
-	/// out.
+	/// out. A delay already past (`ms < 0`) fires on the next turn, as `0` does.
 	fun after(ms: i32): Timer {
-		Timer { handle = __timer(ms) }
+		Timer { handle = __timer(clamp_delay(ms)) }
 	}
 
 	/// `after`, taking a `Duration` (the `sleep_for` shape). Spans beyond i32
@@ -378,7 +392,16 @@ export impl Debounce {
 			async {
 				with_finally_async(|| {
 					for self.pending.read() is Some(let (deadline, _)) {
-						let timer = Timer::after_for(deadline.since(now()));
+						// The time left, never negative: a host that stalled past
+						// the deadline between `run` and this line (a loaded
+						// runner) has none left, and the timer fires at once
+						// (N155).
+						let remaining = deadline.since(now());
+						let timer = Timer::after_for(if remaining.millis < 0i53 {
+							Duration::millis(0i53)
+						} else {
+							remaining
+						});
 						self.timer.write() = Some(timer);
 						if timer.wait() {
 							self.timer.write() = None;
