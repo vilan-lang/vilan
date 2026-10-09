@@ -591,6 +591,18 @@ struct Emitter<'a, 'src> {
     /// (`impl Iterator<type T> with Again<T>`), with that subject. See
     /// [`bare_trait_impl_members`].
     bare_trait_members: HashMap<Id, TypeId>,
+    /// The call expression an intrinsic is being emitted for, set by
+    /// [`Self::call_expression`] at its dispatch and taken by
+    /// [`Self::emit_intrinsic`] before anything else is walked: `std::tuple`'s
+    /// `get` reads the type its call answers (F118).
+    intrinsic_call: Option<Id>,
+    /// F118: the jump targets of the `for` bodies being walked, innermost
+    /// last — `None` for a real Rust loop, the walk's and the slot's labels
+    /// for a `for` over a tuple, which is UNROLLED and has no loop for an
+    /// unlabeled `break`/`continue` to reach.
+    loop_jumps: Vec<Option<(String, String)>>,
+    /// A counter naming each unrolled tuple walk's labels apart.
+    tuple_walks: usize,
 }
 
 /// One object type's Rust trait: its name and its slots, each slot's
@@ -728,6 +740,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             object_impls: HashSet::new(),
             drop_nominals: drop_implementing_nominals(program),
             bare_trait_members: bare_trait_impl_members(program),
+            intrinsic_call: None,
+            loop_jumps: Vec::new(),
+            tuple_walks: 0,
         }
     }
 
@@ -2686,6 +2701,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // F20: the opaque canonical key (`hash.vl`'s `external struct
             // Hash`). `vilan_rt::Hash` documents why it has four arms.
             "Hash" => Ok("vilan_rt::Hash".to_string()),
+            // F118: `std::tuple`'s key — the position alone at run time.
+            "TupleKey" => Ok("vilan_rt::TupleKey".to_string()),
             "Shared" => Ok(format!(
                 "vilan_rt::Shared<{}>",
                 rendered
@@ -3817,6 +3834,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let elements = self
                 .settled_value_type(*source)
                 .and_then(|type_id| self.tuple_family(type_id))
+                .or_else(|| self.tuple_reader_family(*source))
                 .ok_or_else(|| {
                     unsupported(
                         "a tuple comprehension over a source of unresolved arity",
@@ -3888,7 +3906,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
             return;
         };
-        match (self.resolve(declared), self.resolve(concrete)) {
+        // The DECLARED side is read as written, not through the substitution
+        // in force: an unrolled walk nested in another (F118: a tuple
+        // blanket's instance reached from inside an outer walk's slot) runs
+        // under the outer slot's binding of the same binder, and reading
+        // through it found no generic left to rebind.
+        match (self.type_entry(&declared), self.resolve(concrete)) {
             (Some(Type::Generic(constraint_id)), _) => {
                 entries.push((declared, concrete));
                 entries.push((*constraint_id, concrete));
@@ -5110,7 +5133,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Match(subject, legs) => self.match_expr(subject, &legs, depth, span)?,
             Expr::For(condition, (statements, tail)) => {
                 let mut body = String::new();
-                self.emit_block(&statements, tail, &mut body, depth + 1)?;
+                self.loop_jumps.push(None);
+                let emitted = self.emit_block(&statements, tail, &mut body, depth + 1);
+                self.loop_jumps.pop();
+                emitted?;
                 let pad = Self::indent(depth);
                 match condition {
                     Some(condition) => {
@@ -5121,12 +5147,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
             }
             Expr::ForEach(iterable, item, (statements, tail)) => {
-                self.for_each(id, iterable, item, &statements, tail, depth, span)?
+                // F118: a tuple is walked unrolled, and its jumps are labelled.
+                let family = self
+                    .settled_value_type(iterable)
+                    .and_then(|type_id| self.tuple_family(type_id))
+                    .or_else(|| self.tuple_reader_family(iterable));
+                match family {
+                    Some(family) => {
+                        self.for_each_tuple(iterable, family, item, &statements, tail, depth)?
+                    }
+                    None => {
+                        self.loop_jumps.push(None);
+                        let emitted =
+                            self.for_each(id, iterable, item, &statements, tail, depth, span);
+                        self.loop_jumps.pop();
+                        emitted?
+                    }
+                }
             }
-            Expr::Jump(keyword) => match keyword {
-                "break" => "break".to_string(),
-                "continue" => "continue".to_string(),
-                other => return Err(unsupported(&format!("`jump {other}`"), span)),
+            Expr::Jump(keyword) => match (keyword, self.loop_jumps.last()) {
+                ("break", Some(Some((walk, _)))) => format!("break {walk}"),
+                ("continue", Some(Some((_, slot)))) => format!("break {slot}"),
+                ("break", _) => "break".to_string(),
+                ("continue", _) => "continue".to_string(),
+                (other, _) => return Err(unsupported(&format!("`jump {other}`"), span)),
             },
             Expr::FunctionReturn(value) => match value {
                 Some(value) if self.current_returns_view => {
@@ -11232,6 +11276,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 if let Some(dispatch) =
                     self.resolve_dispatch(concrete, member, &own_values, preferred, span)?
                 {
+                    self.intrinsic_call = Some(call_expr_id);
                     return self.emit_dispatch(dispatch, &function_call.argument_ids, depth, span);
                 }
                 return Err(unsupported(
@@ -11262,6 +11307,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if let Some(dispatch) =
                 self.resolve_dispatch(concrete, member, &own_values, preferred, span)?
             {
+                self.intrinsic_call = Some(call_expr_id);
                 return self.emit_dispatch(dispatch, &function_call.argument_ids, depth, span);
             }
             return Err(unsupported(
@@ -11335,6 +11381,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(format!("{receiver}.push({item})"));
         }
         if let Some(intrinsic) = self.program.intrinsics.get(&target).copied() {
+            self.intrinsic_call = Some(call_expr_id);
             return self.emit_intrinsic(intrinsic, &function_call.argument_ids, depth, span);
         }
         if let Some(external) = self.program.external_functions.get(&target) {
@@ -13407,6 +13454,220 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(name)
     }
 
+    /// F118: `std::tuple`'s readers natively, against the receiver's
+    /// concrete arity in this instance — the JS emitter's
+    /// `emit_tuple_intrinsic` over a real Rust tuple. `len` is the arity, `keys`
+    /// a [`vilan_rt::TupleKey`] per position, `entries` a `(key, copy)` pair
+    /// per position, and `get` a copy of the element a key names at the type
+    /// the call answers ([`vilan_rt::tuple_get`]: a key is a VALUE, so the
+    /// position is read at run time). The receiver is read through a
+    /// reference, evaluated once.
+    fn tuple_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        argument_ids: &[Id],
+        call: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let Some(&receiver) = argument_ids.first() else {
+            return Err(unsupported("a tuple reader with no receiver", span));
+        };
+        let receiver_text =
+            self.expecting_nothing(|emitter| emitter.expression(receiver, depth))?;
+        if matches!(intrinsic, Intrinsic::TupleGet) {
+            let Some(&key) = argument_ids.get(1) else {
+                return Err(unsupported("a tuple `get` with no key", span));
+            };
+            let key_text = self.expecting_nothing(|emitter| emitter.value_of(key, depth))?;
+            // The element's type, as the call answers it under this instance —
+            // `get<U>`'s own `U`, which the analyzer records per call (a call
+            // through a tuple-bounded generic records no type of its own) —
+            // named when it renders, else left to rustc's inference from the
+            // position.
+            let call_id = call.and_then(|call| match self.program.entity_map.get(&call) {
+                Some(&Expr::Call(call_id)) => Some(call_id),
+                _ => None,
+            });
+            let element = call_id
+                .and_then(|call_id| self.program.own_generic_call_bindings.get(&call_id))
+                .and_then(|values| values.first().copied())
+                .or_else(|| call.and_then(|call| self.type_of(call)))
+                .map(|type_id| self.deeply_resolved(type_id))
+                .filter(|type_id| self.is_grounded(*type_id))
+                .and_then(|type_id| self.rust_type(type_id, span).ok());
+            let turbofish = element
+                .map(|element| format!("::<{element}>"))
+                .unwrap_or_default();
+            return Ok(format!(
+                "vilan_rt::tuple_get{turbofish}(&({receiver_text}), {key_text})"
+            ));
+        }
+        // A tuple LITERAL records no type of its own; its arity is its
+        // element count where no element spreads.
+        let literal_arity = match self.program.entity_map.get(&receiver) {
+            Some(Expr::Tuple(elements))
+                if !elements
+                    .iter()
+                    .any(|element| self.program.spread_elements.contains(element)) =>
+            {
+                Some(elements.len())
+            }
+            _ => None,
+        };
+        let arity = self
+            .settled_value_type(receiver)
+            .and_then(|type_id| self.tuple_family(type_id))
+            .map(|family| family.len())
+            .or(literal_arity)
+            .ok_or_else(|| {
+                unsupported("a tuple reader over a receiver of unresolved arity", span)
+            })?;
+        Ok(match intrinsic {
+            Intrinsic::TupleLen => format!("{{ let _ = &({receiver_text}); {arity}usize }}"),
+            Intrinsic::TupleKeys => {
+                let keys: Vec<String> = (0..arity)
+                    .map(|at| format!("vilan_rt::TupleKey({at})"))
+                    .collect();
+                format!("{{ let _ = &({receiver_text}); ({},) }}", keys.join(", "))
+            }
+            _ => {
+                let pairs: Vec<String> = (0..arity)
+                    .map(|at| format!("(vilan_rt::TupleKey({at}), (__tuple.{at}).clone())"))
+                    .collect();
+                format!(
+                    "{{ let __tuple = &({receiver_text}); ({},) }}",
+                    pairs.join(", ")
+                )
+            }
+        })
+    }
+
+    /// F118: the slots of what `keys()` or `entries()` answers over a
+    /// tuple receiver, where the call itself carries no type — a call
+    /// through a tuple-bounded generic (`self.keys()` in std's blankets)
+    /// records none. Slot `i` is `TupleKey<T, E_i>` (or `(TupleKey<T, E_i>,
+    /// E_i)`), `E_i` the receiver's element there — the signature
+    /// `(U in Self: TupleKey<Self, U>)` mapped over this instance's tuple.
+    fn tuple_reader_family(
+        &mut self,
+        iterable: Id,
+    ) -> Option<Vec<(TypeId, Vec<(TypeId, TypeId)>)>> {
+        let Some(&Expr::Call(call_id)) = self.program.entity_map.get(&iterable) else {
+            return None;
+        };
+        let call = self.program.function_calls.get(&call_id)?.clone();
+
+        let member = match self.program.generic_dispatch.get(&call_id) {
+            Some(GenericDispatch::OnConstraint(_, member) | GenericDispatch::OnType(_, member)) => {
+                *member
+            }
+            None => match self.program.entity_map.get(&call.subject_id) {
+                Some(Expr::Local(target)) => match self.program.intrinsics.get(target) {
+                    Some(Intrinsic::TupleKeys) => "keys",
+                    Some(Intrinsic::TupleEntries) => "entries",
+                    _ => return None,
+                },
+                _ => return None,
+            },
+        };
+        let entries = match member {
+            "keys" => false,
+            "entries" => true,
+            _ => return None,
+        };
+        let receiver = *call.argument_ids.first()?;
+        let receiver_type = self.settled_value_type(receiver)?;
+        let receiver_type = self.deeply_resolved(receiver_type);
+        let family = self.tuple_family(receiver_type)?;
+        let key_struct = self
+            .program
+            .structs
+            .iter()
+            .find(|(_, declaration)| declaration.name == "TupleKey" && declaration.external)
+            .map(|(id, _)| *id)?;
+        Some(
+            family
+                .into_iter()
+                .map(|(element, bindings)| {
+                    let key = self.mint(Type::Struct(key_struct, vec![receiver_type, element]));
+                    let slot = if entries {
+                        self.mint(Type::Tuple(vec![key, element]))
+                    } else {
+                        key
+                    };
+                    (slot, bindings)
+                })
+                .collect(),
+        )
+    }
+
+    /// F118: a `for` over a TUPLE — `for key in self.keys()`, the walk std's
+    /// tuple blankets (`compare`, `debug`) take — UNROLLED, one body per
+    /// position, each emitted with the binder bound at that position's own
+    /// type, as [`Self::tuple_comprehension`] unrolls a comprehension: a tuple
+    /// is heterogeneous and the body was checked once, at the element
+    /// template. The walk is a labelled block and each position's body one
+    /// inside it, so `jump break` leaves the walk and `jump continue` the
+    /// position ([`Self::loop_jumps`]).
+    fn for_each_tuple(
+        &mut self,
+        iterable: Id,
+        family: Vec<(TypeId, Vec<(TypeId, TypeId)>)>,
+        item: Option<Id>,
+        statements: &[Id],
+        tail: Id,
+        depth: usize,
+    ) -> Result<String, Error> {
+        let source = self.consumed_value_of(iterable, depth)?;
+        let walk = self.tuple_walks;
+        self.tuple_walks += 1;
+        let walk_label = format!("'__walk{walk}");
+        let pad = Self::indent(depth);
+        let inner_pad = Self::indent(depth + 1);
+        let mut out = format!(
+            "{walk_label}: {{
+{inner_pad}let __walked{walk} = {source};
+"
+        );
+        for (slot, (element, family_bindings)) in family.into_iter().enumerate() {
+            let mut entries = family_bindings;
+            let binds = match item {
+                Some(item) => {
+                    if let Some(binder_type) = self
+                        .program
+                        .variables
+                        .get(&item)
+                        .map(|variable| variable.type_id)
+                    {
+                        entries.push((binder_type, element));
+                        self.bind_generics_against(binder_type, element, &mut entries);
+                    }
+                    format!("let {} = __walked{walk}.{slot}; ", self.binding_name(item))
+                }
+                None => String::new(),
+            };
+            let slot_label = format!("'__walk{walk}_{slot}");
+            let saved = self.enter_substitution(entries);
+            self.loop_jumps
+                .push(Some((walk_label.clone(), slot_label.clone())));
+            let mut body = String::new();
+            let emitted = self.emit_block(statements, tail, &mut body, depth + 2);
+            self.loop_jumps.pop();
+            self.current_substitution = saved;
+            emitted?;
+            let _ = write!(
+                out,
+                "{inner_pad}{slot_label}: {{
+{inner_pad}    {binds}
+{body}{inner_pad}}}
+"
+            );
+        }
+        let _ = write!(out, "{pad}}}");
+        Ok(out)
+    }
+
     fn emit_intrinsic(
         &mut self,
         intrinsic: Intrinsic,
@@ -13414,6 +13675,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
+        let call = self.intrinsic_call.take();
+        if matches!(
+            intrinsic,
+            Intrinsic::TupleLen
+                | Intrinsic::TupleKeys
+                | Intrinsic::TupleEntries
+                | Intrinsic::TupleGet
+        ) {
+            return self.tuple_intrinsic(intrinsic, argument_ids, call, depth, span);
+        }
         // Argument 0 of an intrinsic is its RECEIVER, and every arm below
         // renders it as a place (`&`, `&mut`, or a method receiver). The rest
         // are values.

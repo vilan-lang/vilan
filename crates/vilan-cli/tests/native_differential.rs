@@ -10452,30 +10452,22 @@ fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
 
 /// A152: `zip_some`'s mapped-tuple stage (start, pull and attach over every
 /// input flow) and `unzip`'s split of a tuple-valued cell, at arity two and
-/// three. The claim is the differential's own — a refusal by name, never a
-/// different answer. F101 lowered the mapped tuple and its comprehension;
-/// `unzip`'s next wall is the walk by position (`for key in current.keys()`,
-/// a `TupleKey` per element type), refused as the `TupleKeys` intrinsic.
+/// three. F101 lowered the mapped tuple and its comprehension; F118 the walk
+/// by position (`for key in current.keys()`, a `TupleKey` per element type),
+/// the program's last wall — so the claim is the differential's own now.
 #[test]
-fn zip_some_and_unzip_are_never_a_different_answer_natively() {
+fn zip_some_and_unzip_are_identical_natively() {
     let staged = stage();
     std::fs::write(
         staged.join("native_probe_zip_some_unzip.vl"),
         include_str!("native/zip_some_unzip.vl"),
     )
     .expect("write the probe program");
-    let verdict = compare(&staged, "native_probe_zip_some_unzip.vl");
-    match &verdict {
-        Verdict::Identical => {}
-        Verdict::Refused(reason) => assert!(
-            reason.contains("the intrinsic `TupleKeys`"),
-            "refused for another reason than the walk by position: {reason}"
-        ),
-        other => panic!(
-            "the native backend must refuse this program by name or print what node prints: \
-             {other:?}"
-        ),
-    }
+    assert_eq!(
+        compare(&staged, "native_probe_zip_some_unzip.vl"),
+        Verdict::Identical,
+        "`zip_some` and `unzip` must print what node prints"
+    );
 }
 
 /// F68 + B503: `print` lays a value out by ONE rule on both backends — node's
@@ -11803,5 +11795,22 @@ fn a_generic_operator_calls_the_written_impl_on_both_backends() {
         compare(&staged, file),
         Verdict::Identical,
         "a generic operator must call the concrete type's written impl natively"
+    );
+}
+
+/// F118: std's tuple-family blankets (B443: `compare`'s `eq`, `hash`'s key,
+/// `debug`'s rendering) build natively — `TupleKeys`, `TupleEntries`,
+/// `TupleLen` and `TupleGet` against the instance's tuple, and a `for` over
+/// a tuple unrolled one body per position (its jumps labelled).
+#[test]
+fn f118_the_tuple_blankets_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f118_tuple_blankets.vl";
+    std::fs::write(staged.join(file), include_str!("native/tuple_blankets.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "tuple `==`, a tuple key and a tuple's `debug` must agree natively"
     );
 }
