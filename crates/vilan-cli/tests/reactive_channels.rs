@@ -5673,3 +5673,653 @@ fn a136_a_memo_maker_that_builds_cell_global_survives_its_first_caller() {
          `.cell_global()`; got:\n{stdout}"
     );
 }
+
+// --- A153 S1: the mirrored store's server half (`mirrored-store.md` §3–§5) ---
+
+/// A server's `Store<Global>` mirrored over one connection, the replies wired by
+/// hand through `std::rpc::mirror`'s repliers (what the `[service]` expansion
+/// writes for a `Store`/`StoreSome` return), the client end reading raw frames.
+const MIRROR_WIRE: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ SequenceCell, batch };
+import std::reactive::store::{ Storable, Store, store_census, store_wire_census };
+import std::rpc::{ Dispatcher, DuplexTransport, RpcRequest, drop_session, duplex_pair, encode_request, local_rpc, register_session };
+import std::rpc::mirror::{ reply_store, reply_store_some };
+import std::wire::{ Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	author: str,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Room {
+	id: u53,
+	name: str,
+	messages: List<u53>,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+	messages: HashMap<u53, Message>,
+	motd: str,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun census(label: str, global: Store<Global>) {
+	let (slots, nodes) = store_census(global);
+	print(i"{label}: slots={slots} nodes={nodes} wire={store_wire_census(global)}");
+}
+
+fun main() {
+	let codec = json_codec();
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(0, Room { id = 0, name = "general", messages = [7] });
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, author = "bob", content = "hello" });
+	messages.insert(8, Message { id = 8, author = "amy", content = "hi" });
+	let global = Store::new(Global { rooms, messages, motd = "welcome" });
+	census("before", global);
+	let (client_end, server_end) = duplex_pair();
+	register_session(7, server_end, codec);
+	client_end.on_frame(|frame| print(i"down {text(frame)}"));
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global))
+		.on("message", |request: RpcRequest| reply_store_some(request, global.messages().at(7).some()));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	print(i"reply {text((local.handler)(encode_request(codec, "global", [])))}");
+	print(i"reply {text((local.handler)(encode_request(codec, "message", [])))}");
+	census("granted", global);
+	print("-- a write inside the root's boundary");
+	global.motd().set("bye");
+	print("-- a write inside the message's boundary");
+	let _edited = global.messages().at(7).some().content().patch("goodbye");
+	print("-- a write under a key nobody watches");
+	let _other = global.messages().at(8).some().content().patch("ho");
+	print("-- two slots in one Subscribe");
+	client_end.send(Frame::Text("{\"Subscribe\":[0,[[0,-1,[0,0]],[1,-1,[1,8]]]]}"));
+	census("subscribed", global);
+	print("-- one turn, many writes");
+	batch(|| {
+		let _renamed = global.rooms().at(0).some().name().patch("lobby");
+		global.rooms().at(0).some().messages().push(9);
+		let _again = global.rooms().at(0).some().name().patch("lounge");
+		global.motd().set("one turn");
+		let _content = global.messages().at(8).some().content().patch("x");
+		let _author = global.messages().at(8).some().author().patch("zed");
+	});
+	print("-- a write above a boundary covers the writes inside it");
+	batch(|| {
+		let _inside = global.messages().at(7).some().content().patch("inside");
+		global.messages().at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
+	});
+	print("-- the same value");
+	global.motd().set("one turn");
+	global.messages().at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
+	print("-- a key removed, then back");
+	global.rooms().at(0).set(None);
+	global.rooms().at(0).set(Some(Room { id = 0, name = "again", messages = [] }));
+	print("-- the message's payload gone");
+	global.messages().at(7).set(None);
+	print("-- a whole-root write");
+	global.set(Global { rooms = HashMap::new(), messages = HashMap::new(), motd = "reset" });
+	print("-- release the client slots, then the bases");
+	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[0,1,-2]]}"));
+	census("bases only", global);
+	global.motd().set("still the root's");
+	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[-1]]}"));
+	census("released", global);
+	global.motd().set("nobody");
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s1_a_mirrored_store_seeds_once_and_patches_at_the_writers_paths() {
+    // §3–§5, the server half. The reply is `[channel, base, seed]`, and two
+    // replies into one root share the channel (one per root per connection, Q4);
+    // the root's seed carries its maps EMPTY (their keys are boundaries, §2.2). A
+    // write inside a boundary is a `Set` at its own path (Q6); a write under a
+    // key nobody watches sends nothing; one `Subscribe` frame with two slots is
+    // answered with ONE patch of their seeds; one turn's writes are ONE patch,
+    // the last value per path, and a write above a boundary re-seeds it and
+    // covers the writes inside it (Q7); a write of the value held sends nothing;
+    // a removed key re-seeds `null`, a through-variant grant whose payload went is
+    // `Gone`; a whole-root write re-seeds exactly the slots whose value moved.
+    // Releasing every slot and then the grants revokes the channel, and the store
+    // keeps no slot and no write log after it. Red on the base: `std::rpc::mirror`
+    // does not exist.
+    let stdout = run_program("mirror_wire", MIRROR_WIRE);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "before: slots=0 nodes=1 wire=0",
+            "reply {\"Success\":[0,-1,{\"rooms\":[],\"messages\":[],\"motd\":\"welcome\"}]}",
+            "reply {\"Success\":[0,-2,{\"id\":7,\"author\":\"bob\",\"content\":\"hello\"}]}",
+            "granted: slots=2 nodes=4 wire=1",
+            "-- a write inside the root's boundary",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"bye\"]}]]}",
+            "-- a write inside the message's boundary",
+            "down {\"Patch\":[0,[{\"Set\":[-2,[2],\"goodbye\"]}]]}",
+            "-- a write under a key nobody watches",
+            "-- two slots in one Subscribe",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":0,\"name\":\"general\",\"messages\":[7]}]},{\"Seed\":[1,{\"id\":8,\"author\":\"amy\",\"content\":\"ho\"}]}]]}",
+            "subscribed: slots=4 nodes=7 wire=1",
+            "-- one turn, many writes",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"one turn\"]},{\"Set\":[0,[1,1],\"lounge\"]},{\"Set\":[0,[1,2],[7,9]]},{\"Set\":[1,[1,2],\"x\"]},{\"Set\":[1,[1,1],\"zed\"]}]]}",
+            "-- a write above a boundary covers the writes inside it",
+            "down {\"Patch\":[0,[{\"Seed\":[-2,{\"id\":7,\"author\":\"bob\",\"content\":\"whole\"}]}]]}",
+            "-- the same value",
+            "-- a key removed, then back",
+            "down {\"Patch\":[0,[{\"Seed\":[0,null]}]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":0,\"name\":\"again\",\"messages\":[]}]}]]}",
+            "-- the message's payload gone",
+            "down {\"Patch\":[0,[{\"Gone\":-2}]]}",
+            "-- a whole-root write",
+            "down {\"Patch\":[0,[{\"Seed\":[-1,{\"rooms\":[],\"messages\":[],\"motd\":\"reset\"}]},{\"Seed\":[0,null]},{\"Seed\":[1,null]}]]}",
+            "-- release the client slots, then the bases",
+            "bases only: slots=1 nodes=1 wire=1",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"still the root's\"]}]]}",
+            "released: slots=0 nodes=1 wire=0",
+            "done",
+        ],
+        "the mirrored store's frames went differently:\n{stdout}"
+    );
+}
+
+/// Grants are the capability (§4.3, Q12): a subscription path is read at the
+/// grant's type, and a grant outlives the replies that handed it out.
+const MIRROR_GRANTS: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::batch;
+import std::reactive::store::{ Storable, Store, store_census, store_wire_census };
+import std::rpc::{ Dispatcher, DuplexTransport, RpcRequest, drop_session, duplex_pair, encode_request, local_rpc, register_session };
+import std::rpc::mirror::{ reply_store, reply_store_some };
+import std::wire::{ Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+enum Presence {
+	Offline,
+	Online(str),
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	presence: Presence,
+	motd: str,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun census(label: str, store: Store<Global>) {
+	let (slots, nodes) = store_census(store);
+	print(i"{label}: slots={slots} nodes={nodes} wire={store_wire_census(store)}");
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	let global = Store::new(Global { messages, presence = Presence::Online("desk"), motd = "hi" });
+	let other = Store::new(Global { messages = HashMap::new(), presence = Presence::Offline, motd = "other" });
+	let (client_end, server_end) = duplex_pair();
+	register_session(7, server_end, codec);
+	client_end.on_frame(|frame| print(i"down {text(frame)}"));
+	let dispatcher = Dispatcher::new()
+		.on("message", |request: RpcRequest| reply_store(request, global.messages().at(7)))
+		.on("other", |request: RpcRequest| reply_store(request, other))
+		.on("online", |request: RpcRequest| reply_store_some(request, global.presence().online()));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	print(i"reply {text((local.handler)(encode_request(codec, "message", [])))}");
+	print(i"reply again {text((local.handler)(encode_request(codec, "message", [])))}");
+	print(i"reply other {text((local.handler)(encode_request(codec, "other", [])))}");
+	print(i"reply online {text((local.handler)(encode_request(codec, "online", [])))}");
+	census("granted", global);
+	print("-- a path that names a variant's flag is dropped");
+	client_end.send(Frame::Text("{\"Subscribe\":[1,[[3,-1,[1,0]]]]}"));
+	print("-- an unknown base is dropped, and the rest of the frame with it");
+	client_end.send(Frame::Text("{\"Subscribe\":[0,[[4,-9,[]],[5,-1,[]]]]}"));
+	print("-- a malformed step is dropped");
+	client_end.send(Frame::Text("{\"Subscribe\":[0,[[6,-1,[\"x\"]]]]}"));
+	print("-- a grant can only reach below itself: the message's payload");
+	client_end.send(Frame::Text("{\"Subscribe\":[0,[[7,-1,[1]]]]}"));
+	census("probed", global);
+	let _landed = global.messages().at(7).some().content().patch("edited");
+	print("-- the variant ends: the through-variant grant is gone");
+	global.presence().set(Presence::Offline);
+	print("-- and comes back");
+	global.presence().set(Presence::Online("phone"));
+	print("-- the deduped grant needs both releases");
+	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[7,-1]]}"));
+	let _landed = global.messages().at(7).some().content().patch("once");
+	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[-1]]}"));
+	let _landed = global.messages().at(7).some().content().patch("twice");
+	census("one grant left", global);
+	print("-- the session ends: every mirror torn down");
+	drop_session(7);
+	census("dropped", global);
+	census("other dropped", other);
+	global.presence().set(Presence::Online("gone"));
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s1_a_subscription_reaches_only_below_a_grant_and_a_grant_counts_its_replies() {
+    // Q12: the capability is the grant. A path is read at its grant's type, so a
+    // step naming a variant's flag, an unknown base, or a malformed key drops the
+    // frame (and the rest of it: the steps after it can no longer be read), and
+    // nothing can name a path outside the grant. Two replies at one path are ONE
+    // grant held twice (A92's dedup by identity), released by two `Unsubscribe`s;
+    // a second root is a second channel; a through-variant grant goes `Gone` and
+    // is re-seeded when its variant returns; and the session's end tears every
+    // mirror down — no slot, no node, no write log left on either store.
+    let stdout = run_program("mirror_grants", MIRROR_GRANTS);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "reply {\"Success\":[0,-1,{\"id\":7,\"content\":\"hello\"}]}",
+            "reply again {\"Success\":[0,-1,{\"id\":7,\"content\":\"hello\"}]}",
+            "reply other {\"Success\":[1,-1,{\"messages\":[],\"presence\":\"Offline\",\"motd\":\"other\"}]}",
+            "reply online {\"Success\":[0,-2,\"desk\"]}",
+            "granted: slots=2 nodes=5 wire=1",
+            "-- a path that names a variant's flag is dropped",
+            "-- an unknown base is dropped, and the rest of the frame with it",
+            "-- a malformed step is dropped",
+            "-- a grant can only reach below itself: the message's payload",
+            "down {\"Patch\":[0,[{\"Seed\":[7,{\"id\":7,\"content\":\"hello\"}]}]]}",
+            "probed: slots=3 nodes=6 wire=1",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[1,1],\"edited\"]},{\"Set\":[7,[1],\"edited\"]}]]}",
+            "-- the variant ends: the through-variant grant is gone",
+            "down {\"Patch\":[0,[{\"Gone\":-2}]]}",
+            "-- and comes back",
+            "down {\"Patch\":[0,[{\"Seed\":[-2,\"phone\"]}]]}",
+            "-- the deduped grant needs both releases",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[1,1],\"once\"]}]]}",
+            "one grant left: slots=1 nodes=3 wire=1",
+            "-- the session ends: every mirror torn down",
+            "dropped: slots=0 nodes=1 wire=0",
+            "other dropped: slots=0 nodes=1 wire=0",
+            "done",
+        ],
+        "the grants went differently:\n{stdout}"
+    );
+}
+
+/// A turn that writes more than the root's write log keeps.
+const MIRROR_LAG: &str = r##"import std::io::print;
+import std::json::json_codec;
+import std::reactive::batch;
+import std::reactive::store::{ Storable, Store };
+import std::rpc::{ Dispatcher, DuplexTransport, RpcRequest, duplex_pair, encode_request, local_rpc, register_session };
+import std::rpc::mirror::reply_store;
+import std::wire::{ Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Board {
+	motd: str,
+	count: i32,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	let board = Store::new(Board { motd = "hi", count = 0 });
+	let (client_end, server_end) = duplex_pair();
+	register_session(3, server_end, codec);
+	client_end.on_frame(|frame| print(i"down {text(frame)}"));
+	let dispatcher = Dispatcher::new().on("board", |request: RpcRequest| reply_store(request, board));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(3));
+	print(i"reply {text((local.handler)(encode_request(codec, "board", [])))}");
+	print("-- more writes in one turn than the log keeps");
+	batch(|| {
+		mut n = 0;
+		for n < 1100 {
+			board.count().set(n);
+			n += 1;
+		}
+	});
+	print("-- the next turn is told by path again");
+	board.motd().set("caught up");
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s1_a_log_that_outran_its_ceiling_reseeds_the_slot() {
+    // The root's write log is a `DeltaLog`: past its ceiling it drops its
+    // history, and a forward whose cursor fell behind cannot say what moved — so
+    // it re-seeds the slot whole, once, and the next turn is told by path again.
+    let stdout = run_program("mirror_lag", MIRROR_LAG);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "reply {\"Success\":[0,-1,{\"motd\":\"hi\",\"count\":0}]}",
+            "-- more writes in one turn than the log keeps",
+            "down {\"Patch\":[0,[{\"Seed\":[-1,{\"motd\":\"hi\",\"count\":1099}]}]]}",
+            "-- the next turn is told by path again",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[0],\"caught up\"]}]]}",
+            "done",
+        ],
+        "the lagging forward went differently:\n{stdout}"
+    );
+}
+
+// --- A153 S2: the mirrored store's client half (`mirrored-store.md` §6) -------
+
+/// A store mirror minted UNLEASED and wired by hand (`mint_store` over a local
+/// transport: what the generated stub writes), the frames traced both ways.
+const MIRROR_CLIENT: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Source, run_with_owner };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::rpc::{ Dispatcher, DuplexTransport, ReactiveClient, RpcRequest, call_reading, duplex_pair, local_rpc, register_session };
+import std::time::{ Duration, sleep_for };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+enum Presence {
+	Offline,
+	Online(str),
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	presence: Presence,
+	motd: str,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	let global = Store::new(Global { messages, presence = Presence::Online("desk"), motd = "welcome" });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		client_relay.send(frame);
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new().on("global", |request: RpcRequest| {
+		print("  rpc  global");
+		reply_store(request, global)
+	});
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	print(i"unleased: {g.get().is_some()}");
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		g.presence().online().effect(|place| print(i"online {place.unwrap_or("-")}"));
+		g.presence().is_online().effect(|on| print(i"is online {on}"));
+		g.messages().at(7).some().content().effect(|content| print(i"seven {content.unwrap_or("-")}"));
+		g.messages().at(7).some().id().effect(|id| print(i"seven's id {id.unwrap_or(0)}"));
+	});
+	sleep_for(Duration::millis(0));
+	print("-- server writes");
+	global.motd().set("bye");
+	global.presence().set(Presence::Offline);
+	let _edited = global.messages().at(7).some().content().patch("goodbye");
+	print("-- the page goes: the grant is let go");
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	global.motd().set("unwatched");
+	print(i"held: {g.get().map(|value: Global| value.motd).unwrap_or("-")}");
+	print(i"the released key left the replica: {g.messages().at(7).get().flatten().is_none()}");
+	print("-- a new lease mints again");
+	let again = Owner::new();
+	run_with_owner(again, || {
+		g.motd().effect(|motd| print(i"again {motd.unwrap_or("-")}"));
+	});
+	sleep_for(Duration::millis(0));
+	again.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s2_a_store_mirror_mints_on_its_first_hold_and_patches_its_replica() {
+    // §6. Unleased, the mirror asked nothing (`unleased: false` holds no value);
+    // the first hold issues the call, and the reply's seed lands in the replica
+    // as a comparing write (the root is a maybe until then, Q10). A projection
+    // reads the replica; a hold under a map key puts that key's slot on the wire
+    // with the turn's ONE `Subscribe` — two handles under key 7 share one slot —
+    // and its seed and `Set`s land through the key's own handle. A variant's flag
+    // and its through-variant handle follow the server's switch. The page's
+    // disposal releases the key's slot (and the key leaves the replica: memory
+    // follows demand) and then the grant's base; the replica keeps its last value
+    // (`held: bye`), and a new hold mints again — on a fresh channel, since the
+    // server revoked the old one with its last grant — and the re-seed is a
+    // comparing write (`again bye`, then the write it missed).
+    let stdout = run_program("mirror_client", MIRROR_CLIENT);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "unleased: false",
+            "rpc  global",
+            "motd -",
+            "online -",
+            "is online false",
+            "seven -",
+            "seven's id 0",
+            "motd welcome",
+            "online desk",
+            "is online true",
+            "seven -",
+            "seven's id 0",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,7]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":7,\"content\":\"hello\"}]}]]}",
+            "seven hello",
+            "seven's id 7",
+            "-- server writes",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"bye\"]}]]}",
+            "motd bye",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[1],\"Offline\"]}]]}",
+            "online -",
+            "is online false",
+            "down {\"Patch\":[0,[{\"Set\":[0,[1,1],\"goodbye\"]}]]}",
+            "seven goodbye",
+            "-- the page goes: the grant is let go",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "held: bye",
+            "the released key left the replica: true",
+            "-- a new lease mints again",
+            "rpc  global",
+            "again bye",
+            "again unwatched",
+            "up   {\"Unsubscribe\":[1,[-1]]}",
+            "done",
+        ],
+        "the store mirror went differently:\n{stdout}"
+    );
+}
+
+/// A `[service]` whose `[rpc]`s return a `Store<T>` and a `StoreSome<P>`, reached
+/// through its GENERATED client — the stub, the origin table and the replier the
+/// expansion writes.
+const MIRROR_STUB: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Source, run_with_owner };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store, StoreSome };
+import std::rpc::{ DuplexEnd, DuplexTransport, ReactiveClient, duplex_pair, local_rpc, register_session };
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	motd: str,
+}
+
+fun seeded(): Global {
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	Global { messages, motd = "welcome" }
+}
+
+let shared: Store<Global> = Store::new(seeded());
+
+[service(BoardClient)]
+struct Board {}
+
+impl Board {
+	[rpc]
+	fun global(self): Store<Global> {
+		shared
+	}
+
+	[rpc]
+	fun message(self, id: u53): StoreSome<Message> {
+		shared.messages().at(id).some()
+	}
+
+	[rpc]
+	fun edit(self, id: u53, content: str): bool {
+		shared.messages().at(id).some().content().patch(content)
+	}
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun traced_pair(): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		client_relay.send(frame);
+	});
+	(client_end, server_end)
+}
+
+fun main() {
+	let (client_end, server_end) = traced_pair();
+	register_session(7, server_end, json_codec());
+	let transport = local_rpc(Board {}.dispatcher().into_protocol(json_codec()).for_connection(7));
+	let client = BoardClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	let g: RemoteStoreSome<Global> = client.global();
+	let m: RemoteStoreSome<Message> = client.message(7);
+	print(i"one origin, one mirror: {client.global().identity() == g.identity()}");
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		m.content().effect(|content| print(i"message {content.unwrap_or("-")}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"edit: {client.edit(7, "goodbye").unwrap_or(false)}");
+	shared.motd().set("bye");
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+#[ignore = "A153: an `[rpc]` returning `Store<T>` is refused as not Wire until the analyzer's element rule reads the store's handle spellings and a service reaching `std::reactive::store` seeds `std::rpc::mirror` (store-49's patch, sweeps/order49/store-49/a153-analyzer-admission.patch; the analyzer core was incr-49's this order)"]
+fn a153_s2_a_generated_store_stub_mints_on_its_first_hold_and_lets_go_with_its_last() {
+    // §3.1 + §6 through the expansion: `client.global()` and `client.message(7)`
+    // are SYNC stubs answering `RemoteStoreSome<..>` (Q10), deduped per origin
+    // (A134: two `global()` calls are one mirror). The first holds issue the
+    // calls; both grants land on ONE channel (one per root, Q4), bases -1 and
+    // -2; an `[rpc]` write inside the message's boundary is a `Set` on its base,
+    // a server write to the root's field a `Set` on the root's; the page's
+    // disposal lets both grants go. Verified green on store-49's tree with the
+    // patch applied, on both backends.
+    let stdout = run_program("mirror_stub", MIRROR_STUB);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "one origin, one mirror: true",
+            "motd -",
+            "message -",
+            "motd welcome",
+            "message hello",
+            "down {\"Patch\":[0,[{\"Set\":[-2,[1],\"goodbye\"]}]]}",
+            "message goodbye",
+            "edit: true",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[1],\"bye\"]}]]}",
+            "motd bye",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "up   {\"Unsubscribe\":[0,[-2]]}",
+            "done",
+        ],
+        "the generated store stub went differently:\n{stdout}"
+    );
+}

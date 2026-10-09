@@ -72,6 +72,7 @@
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::hash_set::HashSet;
+import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::delta::{
 	CollFlow,
@@ -92,6 +93,7 @@ import pkg::reactive::delta::{
 };
 import pkg::reactive::store_core::{
 	Spine,
+	StoreFlag,
 	attach_feed,
 	deliver,
 	detach_feed,
@@ -99,14 +101,15 @@ import pkg::reactive::store_core::{
 	keyed_hashes,
 	lent_value,
 	spine,
+	store_identity_at,
 	store_keyed,
 	store_touch,
 	touch_spine,
 	watch_at,
 };
-import pkg::reactive::{ Signal, Source, Subscriber };
+import pkg::reactive::{ Signal, Source, Subscriber, Subscription, also_releasing };
 import pkg::shared::{ Shared, fresh_identity };
-import pkg::wire::Keyed;
+import pkg::wire::{ Deserialize, Deserializer, Keyed, Serialize, Serializer, Wire };
 
 // The core — the handle types, the slot tree, the write — is `store_core.vl`,
 // re-exported here whole: `std::reactive::store` is the one module a program imports.
@@ -129,6 +132,7 @@ export import pkg::reactive::store_core::{
 	store_switch,
 	store_wake_all,
 	store_wake_me,
+	store_wire_census,
 };
 
 // === The declared shapes (§2.7, A149 S3) =====================================
@@ -389,7 +393,7 @@ fun splice_at<T: Storable + StoreKey>(
 	removed: usize,
 	inserted: List<T>,
 ) {
-	let found = spine(root, path);
+	let found = spine(root, &path);
 	let node = found.node;
 	mut woken = StoreWoken { slots = [], feeds = [] };
 	mut reached = false;
@@ -443,6 +447,10 @@ fun splice_at<T: Storable + StoreKey>(
 	store_wake_me(node, true, &mut woken);
 	for slot in found.ancestors {
 		woken.slots.push(slot);
+	}
+	match found.wire {
+		Some(let log) => log.record(path),
+		None => {},
 	}
 	deliver(woken.slots);
 }
@@ -976,6 +984,805 @@ export impl Store<List<type T: StoreKey>> with RowFeed<T> {
 	}
 }
 
+// === The wire walkers (A153 S1, `mirrored-store.md` §3–§4) =====================
+//
+// A mirrored store crosses the wire BY PATH: the server describes the value at a
+// path below a handle it granted, and reads a client's subscription path off the
+// frame at the types the path walks through; the client applies a value at a path
+// of its replica. Every store type answers all three through `StoreWire`, by the
+// same child indices the slot tree uses (§3.1): `[derive(Storable)]` writes it for
+// a struct or an enum, `Option`, `HashMap`, `HashSet` and `List` answer by their
+// shape, and every other type is a LEAF, described and rebuilt whole by its `Wire`
+// impl.
+//
+// A described value is a BOUNDARY'S SUBTREE (§2.2): a keyed collection inside it —
+// a `HashMap` or a `HashSet` — is described EMPTY, because its keys are boundaries
+// of their own. A key's value crosses when that key is subscribed (`at(k)`,
+// `contains(x)`), never with its parent, which is what keeps a root that holds a
+// database from shipping it on connect (§2.3). The format is otherwise `Wire`'s,
+// call for call: a struct is `begin_struct` and its fields by name, an enum its
+// tagged variant, so a value with no keyed collection inside describes exactly as
+// its `[derive(Wire)]` impl would.
+
+/// How a walk to a path went (A153 S1).
+[derive(Debug, PartialEq)]
+export enum StoreReach {
+	/// The path reached a value, and it was described (or would have been).
+	Described,
+	/// The path reached a KEYED collection, which a boundary's subtree carries
+	/// empty: its keys cross as boundaries of their own.
+	Keyed,
+	/// The path reached nothing: a variant on the way is not live, an `Option` on
+	/// the way is `None`, or a step names no child.
+	Absent,
+}
+
+/// A store type the wire can walk (A153 S1). Every type answers: a derived type
+/// field by field, the declared shapes by their shape, everything else whole
+/// (`StoreWireLeaf`).
+export trait StoreWire {
+	/// Walk `path[from..]` below this value and, when `write`, describe what it
+	/// reaches into `serializer` — the target's subtree, keyed collections empty.
+	/// Answers how the walk went whether or not it wrote, so a caller can ask first
+	/// and frame the answer after.
+	fun store_describe_at(
+		&self,
+		path: &List<StoreStep>,
+		from: usize,
+		serializer: &mut Serializer,
+		write: bool,
+	): StoreReach;
+
+	/// Apply what `deserializer` holds at `path[from..]` below this value, in
+	/// place: the twin of `store_describe_at`, which a replica lands a frame with.
+	/// A keyed collection on the way is KEPT — the frame carried it empty — so
+	/// the keys a replica holds are not thrown away by a write to their parent.
+	fun store_apply_at(
+		&mut self,
+		path: &List<StoreStep>,
+		from: usize,
+		deserializer: &mut Deserializer,
+	): StoreReach;
+
+	/// Read `remaining` steps of a subscription path off `deserializer`, at the
+	/// types they walk through, into `into`: a field's step is its child index, a
+	/// key's is the key described at its own type, read here and kept as its
+	/// `Hash`. Answers whether every step named a child a subscription can stand
+	/// at.
+	fun store_read_path(
+		deserializer: &mut Deserializer,
+		remaining: i32,
+		into: &mut List<StoreStep>,
+	): bool;
+
+	/// A fresh value read off `deserializer` — what `store_apply_at` lands where
+	/// there was nothing to merge into (a variant that changed, a `None` that
+	/// became `Some`).
+	fun store_fresh(deserializer: &mut Deserializer): Self;
+}
+
+/// A value the wire carries WHOLE — `StoreWire`'s leaf tier, as `StoreLeaf` is
+/// `Storable`'s: a `Wire` type is described and rebuilt by its `Wire` impl, and a
+/// type with none cannot cross at all (the `[rpc]` element rule refuses it before a
+/// frame is ever written).
+export trait StoreWireLeaf {
+	fun store_wire_describe(&self, serializer: &mut Serializer);
+	fun store_wire_rebuild(deserializer: &mut Deserializer): Self;
+}
+
+/// A type with no `Wire` impl: nothing a mirror can carry.
+export impl type T with StoreWireLeaf {
+	fun store_wire_describe(&self, serializer: &mut Serializer) {
+		panic("a mirrored store reached a value with no `Wire` impl: a store crosses the wire only when every value in it is `Wire`");
+	}
+
+	fun store_wire_rebuild(deserializer: &mut Deserializer): T {
+		panic("a mirrored store reached a value with no `Wire` impl: a store crosses the wire only when every value in it is `Wire`")
+	}
+}
+
+/// A `Wire` value, described and rebuilt by its own impl.
+export impl type T: Wire with StoreWireLeaf {
+	fun store_wire_describe(&self, serializer: &mut Serializer) {
+		(*self).describe(serializer);
+	}
+
+	fun store_wire_rebuild(deserializer: &mut Deserializer): T {
+		T::rebuild(deserializer)
+	}
+}
+
+/// Every type the shapes and the derive do not answer is a leaf: it ends a path,
+/// and it is described and rebuilt whole.
+export impl type T: StoreWireLeaf with StoreWire {
+	fun store_describe_at(
+		&self,
+		path: &List<StoreStep>,
+		from: usize,
+		serializer: &mut Serializer,
+		write: bool,
+	): StoreReach {
+		if from != path.len() {
+			ret StoreReach::Absent;
+		}
+		if write {
+			self.store_wire_describe(serializer);
+		}
+		StoreReach::Described
+	}
+
+	fun store_apply_at(
+		&mut self,
+		path: &List<StoreStep>,
+		from: usize,
+		deserializer: &mut Deserializer,
+	): StoreReach {
+		if from != path.len() {
+			ret StoreReach::Absent;
+		}
+		self = T::store_wire_rebuild(deserializer);
+		StoreReach::Described
+	}
+
+	fun store_read_path(
+		deserializer: &mut Deserializer,
+		remaining: i32,
+		into: &mut List<StoreStep>,
+	): bool {
+		remaining == 0
+	}
+
+	fun store_fresh(deserializer: &mut Deserializer): T {
+		T::store_wire_rebuild(deserializer)
+	}
+}
+
+/// `T::store_read_path`, spelled as a call the derive can write over any field's
+/// TYPE: a static call naming a concrete type that only a blanket answers
+/// (`str::store_read_path(..)`) does not resolve, and a generic call does.
+[internal("the derive's static step (A153 S1)")]
+export fun store_read_path_of<T: StoreWire>(
+	deserializer: &mut Deserializer,
+	remaining: i32,
+	into: &mut List<StoreStep>,
+): bool {
+	T::store_read_path(deserializer, remaining, into)
+}
+
+/// `T::store_fresh` over any field's type (`store_read_path_of`'s reason).
+[internal("the derive's static step (A153 S1)")]
+export fun store_fresh_of<T: StoreWire>(deserializer: &mut Deserializer): T {
+	T::store_fresh(deserializer)
+}
+
+/// `T::store_wire_rebuild` over any type — a backed enum's fresh value.
+[internal("the derive's static step (A153 S1)")]
+export fun store_wire_rebuild_of<T: StoreWireLeaf>(deserializer: &mut Deserializer): T {
+	T::store_wire_rebuild(deserializer)
+}
+
+/// What the derive writes where a closure-typed field would cross: nothing can.
+[internal("the derive's refusal at a closure field (A153 S1)")]
+export fun store_wire_closure<T>(): T {
+	panic("a mirrored store reached a closure: a closure never crosses the wire")
+}
+
+/// An `Option` is walked through its `Some`: child 1, the payload (§4).
+export impl Option<type P: StoreWire> with StoreWire {
+	fun store_describe_at(
+		&self,
+		path: &List<StoreStep>,
+		from: usize,
+		serializer: &mut Serializer,
+		write: bool,
+	): StoreReach {
+		if from == path.len() {
+			if write {
+				match self {
+					Some(let held) => {
+						serializer.some_value();
+						let _described = held.store_describe_at(path, from, serializer, true);
+					},
+					None => serializer.null_value(),
+				}
+			}
+			ret StoreReach::Described;
+		}
+		match path[from] {
+			StoreStep::Field(let index) => {
+				if index != 1 {
+					ret StoreReach::Absent;
+				}
+				match self {
+					Some(let held) => held.store_describe_at(path, from + 1, serializer, write),
+					None => StoreReach::Absent,
+				}
+			},
+			StoreStep::Key(let _hash) => StoreReach::Absent,
+		}
+	}
+
+	fun store_apply_at(
+		&mut self,
+		path: &List<StoreStep>,
+		from: usize,
+		deserializer: &mut Deserializer,
+	): StoreReach {
+		if from == path.len() {
+			if deserializer.is_null() {
+				deserializer.null_value();
+				self = None;
+				ret StoreReach::Described;
+			}
+			match &mut self {
+				Some(let held) => {
+					let _applied = held.store_apply_at(path, from, deserializer);
+				},
+				None => {
+					self = Some(P::store_fresh(deserializer));
+				},
+			}
+			ret StoreReach::Described;
+		}
+		match path[from] {
+			StoreStep::Field(let index) => {
+				if index != 1 {
+					ret StoreReach::Absent;
+				}
+				match &mut self {
+					Some(let held) => held.store_apply_at(path, from + 1, deserializer),
+					None => StoreReach::Absent,
+				}
+			},
+			StoreStep::Key(let _hash) => StoreReach::Absent,
+		}
+	}
+
+	fun store_read_path(
+		deserializer: &mut Deserializer,
+		remaining: i32,
+		into: &mut List<StoreStep>,
+	): bool {
+		if remaining == 0 {
+			ret true;
+		}
+		if deserializer.i32_value() != 1 {
+			ret false;
+		}
+		into.push(StoreStep::Field(1));
+		P::store_read_path(deserializer, remaining - 1, into)
+	}
+
+	fun store_fresh(deserializer: &mut Deserializer): Option<P> {
+		if deserializer.is_null() {
+			deserializer.null_value();
+			ret None;
+		}
+		Some(P::store_fresh(deserializer))
+	}
+}
+
+/// Read an elided keyed collection off the wire: it arrives EMPTY, and a frame that
+/// carries keys there is a protocol fault.
+fun read_elided(deserializer: &mut Deserializer) {
+	let count = deserializer.begin_list();
+	if count != 0 {
+		deserializer.fail("a keyed collection inside a mirrored value arrives empty: its keys cross as boundaries of their own");
+	}
+	deserializer.end_list();
+}
+
+/// Describe an elided keyed collection: an empty list, `HashMap`'s own `Wire` form
+/// with nothing in it.
+fun describe_elided(serializer: &mut Serializer) {
+	serializer.begin_list(0);
+	serializer.end_list();
+}
+
+/// A map's keys are boundaries: the map itself is described empty, and a key's step
+/// reaches the `Option<V>` that key holds — `at(key)`'s value.
+export impl HashMap<type K: Hashable + Wire, type V: StoreWire> with StoreWire {
+	fun store_describe_at(
+		&self,
+		path: &List<StoreStep>,
+		from: usize,
+		serializer: &mut Serializer,
+		write: bool,
+	): StoreReach {
+		if from == path.len() {
+			if write {
+				describe_elided(serializer);
+			}
+			ret StoreReach::Keyed;
+		}
+		match path[from] {
+			StoreStep::Key(let hash) => {
+				let value = value_at(self, hash);
+				value.store_describe_at(path, from + 1, serializer, write)
+			},
+			StoreStep::Field(let _index) => StoreReach::Absent,
+		}
+	}
+
+	fun store_apply_at(
+		&mut self,
+		path: &List<StoreStep>,
+		from: usize,
+		deserializer: &mut Deserializer,
+	): StoreReach {
+		if from == path.len() {
+			read_elided(deserializer);
+			ret StoreReach::Keyed;
+		}
+		// A key's value lands through its own boundary's handle, which holds the
+		// key itself: a path carries only its hash.
+		StoreReach::Absent
+	}
+
+	fun store_read_path(
+		deserializer: &mut Deserializer,
+		remaining: i32,
+		into: &mut List<StoreStep>,
+	): bool {
+		if remaining == 0 {
+			ret true;
+		}
+		let key = K::rebuild(deserializer);
+		into.push(StoreStep::Key(key.hash()));
+		store_read_path_of<Option<V>>(deserializer, remaining - 1, into)
+	}
+
+	fun store_fresh(deserializer: &mut Deserializer): HashMap<K, V> {
+		read_elided(deserializer);
+		HashMap::new()
+	}
+}
+
+/// A set's members are boundaries: the set is described empty, and a member's step
+/// reaches whether the set holds it — `contains(member)`'s value.
+export impl HashSet<type T: Hashable + Wire> with StoreWire {
+	fun store_describe_at(
+		&self,
+		path: &List<StoreStep>,
+		from: usize,
+		serializer: &mut Serializer,
+		write: bool,
+	): StoreReach {
+		if from == path.len() {
+			if write {
+				describe_elided(serializer);
+			}
+			ret StoreReach::Keyed;
+		}
+		match path[from] {
+			StoreStep::Key(let hash) => {
+				let present = self.table.contains_key(hash);
+				present.store_describe_at(path, from + 1, serializer, write)
+			},
+			StoreStep::Field(let _index) => StoreReach::Absent,
+		}
+	}
+
+	fun store_apply_at(
+		&mut self,
+		path: &List<StoreStep>,
+		from: usize,
+		deserializer: &mut Deserializer,
+	): StoreReach {
+		if from == path.len() {
+			read_elided(deserializer);
+			ret StoreReach::Keyed;
+		}
+		StoreReach::Absent
+	}
+
+	fun store_read_path(
+		deserializer: &mut Deserializer,
+		remaining: i32,
+		into: &mut List<StoreStep>,
+	): bool {
+		if remaining == 0 {
+			ret true;
+		}
+		let member = T::rebuild(deserializer);
+		into.push(StoreStep::Key(member.hash()));
+		store_read_path_of<bool>(deserializer, remaining - 1, into)
+	}
+
+	fun store_fresh(deserializer: &mut Deserializer): HashSet<T> {
+		read_elided(deserializer);
+		HashSet::new()
+	}
+}
+
+/// A list is a sequence INSIDE its boundary: described element by element, and no
+/// subscription stands below it (a position is not an address, Q11; a `by_key`
+/// element crosses with its list).
+export impl List<type T: StoreWire> with StoreWire {
+	fun store_describe_at(
+		&self,
+		path: &List<StoreStep>,
+		from: usize,
+		serializer: &mut Serializer,
+		write: bool,
+	): StoreReach {
+		if from != path.len() {
+			ret StoreReach::Absent;
+		}
+		if write {
+			serializer.begin_list(self.len().as_i32());
+			for element in self {
+				let _described = element.store_describe_at(path, from, serializer, true);
+			}
+			serializer.end_list();
+		}
+		StoreReach::Described
+	}
+
+	fun store_apply_at(
+		&mut self,
+		path: &List<StoreStep>,
+		from: usize,
+		deserializer: &mut Deserializer,
+	): StoreReach {
+		if from != path.len() {
+			ret StoreReach::Absent;
+		}
+		self = List<T>::store_fresh(deserializer);
+		StoreReach::Described
+	}
+
+	fun store_read_path(
+		deserializer: &mut Deserializer,
+		remaining: i32,
+		into: &mut List<StoreStep>,
+	): bool {
+		remaining == 0
+	}
+
+	fun store_fresh(deserializer: &mut Deserializer): List<T> {
+		let length = deserializer.begin_list();
+		mut items: List<T> = [];
+		mut index = 0;
+		for index < length {
+			items.push(T::store_fresh(deserializer));
+			index += 1;
+		}
+		deserializer.end_list();
+		items
+	}
+}
+
+// === The client's face: remote handles (A153 S2, `mirrored-store.md` §6) ==========
+//
+// A mirrored store's client holds a REPLICA — a local `Store` whose value is the
+// union of the subtrees it was seeded with — and hands out a READ-ONLY face over it
+// (Q8): `RemoteStore<T>`, `RemoteStoreSome<P>` and `RemoteStoreFlag`, the three
+// handle shapes of the local store, each carrying where it hangs on the wire
+// (`MirrorAt`). Reading is the replica's; SUBSCRIBING is the replica's too, plus a
+// counted hold on the handle's nearest demand BOUNDARY (§2.2, §6.2) — the grant's
+// base or a keyed child (`at(k)`, `contains(x)`) — which is what puts the
+// boundary's slot on the wire. A frame for that slot lands in the replica through
+// the boundary's typed applier as an ordinary comparing write, so what wakes is the
+// store's own diff: exactly the local slots whose value changed.
+//
+// The face is std's alone to build: its fields are internal, the derive writes its
+// projections through `narrow`, and `std::rpc::mirror` mints the base.
+
+/// One step of a remote handle's WIRE path from its grant's base: a field's child
+/// index, or a key — described at its own type when a `Subscribe` is written, and
+/// hashed for the replica's own path (A153 S2).
+export enum MirrorStep {
+	Field(usize),
+	Key(|&mut Serializer| void),
+}
+
+/// A demand boundary a remote handle stands under (§2.2): its wire path from the
+/// grant's base, the identity of its place in the replica (two handles on one
+/// boundary share one slot), and how a frame for its slot lands — `apply` at a path
+/// below it, `gone` when the server says it is no longer reachable.
+export struct MirrorBoundary {
+	path: List<MirrorStep>,
+	identity: i32,
+	apply: |List<StoreStep>, Deserializer| void,
+	gone: || void,
+}
+
+/// The connection a remote handle subscribes through, erased to what a handle
+/// needs from it: hold a boundary, answer the release. Made by `std::rpc::mirror`,
+/// which owns the channel, its slots and its frames.
+export struct MirrorLink {
+	hold: |MirrorBoundary| (|| void),
+}
+
+/// Where a remote handle hangs: the link, its wire path from the grant's base, and
+/// its nearest boundary.
+export struct MirrorAt {
+	link: MirrorLink,
+	path: List<MirrorStep>,
+	boundary: MirrorBoundary,
+}
+
+impl MirrorAt {
+	/// One step further from the boundary: the same boundary, a longer path.
+	fun below(self, step: MirrorStep): MirrorAt {
+		mut path = self.path;
+		path.push(step);
+		MirrorAt { link = self.link, path, boundary = self.boundary }
+	}
+
+	/// Hold this handle's boundary for as long as `handle` is not disposed.
+	fun hold_for(self, handle: Subscription) {
+		let release = (self.link.hold)(self.boundary);
+		also_releasing(handle, release);
+	}
+}
+
+/// The typed applier of a boundary whose replica handle is `local`: a frame's value
+/// lands at `rel` below it on a copy, and the copy is written back — a comparing
+/// write, so only what changed wakes.
+[internal("the mirrored store's client half (A153 S2)")]
+export fun mirror_boundary<T: StoreWire + Storable>(
+	local: Store<T>,
+	path: List<MirrorStep>,
+	gone: || void,
+): MirrorBoundary {
+	MirrorBoundary {
+		path,
+		identity = store_identity_at(local.root, local.path),
+		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
+			mut reader = deserializer;
+			mut copy = local.get();
+			let _landed = copy.store_apply_at(&rel, 0, &mut reader);
+			local.set(copy);
+		},
+		gone,
+	}
+}
+
+/// A remote handle at a path (A153 S2): a read-only `Source<T>` over the replica,
+/// whose subscription also holds its boundary on the wire.
+[hint(Source<T>)]
+export struct RemoteStore<T> {
+	[internal("the replica's handle; reach it through `get`")] local: Store<T>,
+	[internal("where the handle hangs on the wire")] at: MirrorAt,
+}
+
+/// A remote handle THROUGH a variant or an `Option`: `StoreSome`'s face.
+[hint(Source<Option<P>>)]
+export struct RemoteStoreSome<P> {
+	[internal("the replica's handle; reach it through `get`")] local: StoreSome<P>,
+	[internal("where the handle hangs on the wire")] at: MirrorAt,
+}
+
+/// A variant's flag on a remote handle: `StoreFlag`'s face.
+[hint(Source<bool>)]
+export struct RemoteStoreFlag {
+	[internal("the replica's handle; reach it through `get`")] local: StoreFlag,
+	[internal("where the handle hangs on the wire")] at: MirrorAt,
+}
+
+/// A remote handle made from its replica handle and its place (`std::rpc::mirror`).
+[internal("the mirrored store's client half (A153 S2)")]
+export fun remote_store<T>(local: Store<T>, at: MirrorAt): RemoteStore<T> {
+	RemoteStore { local, at }
+}
+
+[internal("the mirrored store's client half (A153 S2)")]
+export fun remote_store_some<P>(local: StoreSome<P>, at: MirrorAt): RemoteStoreSome<P> {
+	RemoteStoreSome { local, at }
+}
+
+export impl RemoteStore<type T> {
+	/// One step below this handle — what every projection the derive writes for a
+	/// remote handle calls: the replica's own projection (`step`), the wire path
+	/// one field longer.
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow<F>(self, index: usize, step: |Store<T>| Store<F>): RemoteStore<F> {
+		RemoteStore { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
+	}
+
+	/// A step through a variant (or `Some`).
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow_some<F>(self, index: usize, step: |Store<T>| StoreSome<F>): RemoteStoreSome<F> {
+		RemoteStoreSome { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
+	}
+
+	/// A variant's flag.
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow_flag(self, step: |Store<T>| StoreFlag): RemoteStoreFlag {
+		RemoteStoreFlag { local = step(self.local), at = self.at }
+	}
+}
+
+export impl RemoteStoreSome<type P> {
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow<F>(self, index: usize, step: |StoreSome<P>| StoreSome<F>): RemoteStoreSome<F> {
+		RemoteStoreSome { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
+	}
+
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow_some<F>(self, index: usize, step: |StoreSome<P>| StoreSome<F>): RemoteStoreSome<F> {
+		RemoteStoreSome { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
+	}
+
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow_flag(self, step: |StoreSome<P>| StoreFlag): RemoteStoreFlag {
+		RemoteStoreFlag { local = step(self.local), at = self.at }
+	}
+
+	/// Whether every variant on this handle's path is live — `StoreSome::live`'s
+	/// face, holding the boundary while it is watched, so the payload's arrival is
+	/// what wakes it.
+	fun live(self): RemoteStoreFlag {
+		RemoteStoreFlag { local = self.local.live(), at = self.at }
+	}
+
+	/// This handle as a plain `RemoteStore<P>`, for a body that runs only while the
+	/// variant is live (`StoreSome::assume`'s face, and its last-value rule, B526).
+	fun assume(self): RemoteStore<P> {
+		RemoteStore { local = self.local.assume(), at = self.at }
+	}
+}
+
+/// `Option` is structural on the face as in the replica.
+export impl RemoteStore<Option<type P>> {
+	fun some(self): RemoteStoreSome<P> {
+		self.narrow_some(1, |local: Store<Option<P>>| local.some())
+	}
+
+	fun is_some(self): RemoteStoreFlag {
+		self.narrow_flag(|local: Store<Option<P>>| local.is_some())
+	}
+}
+
+export impl RemoteStoreSome<Option<type P>> {
+	fun some(self): RemoteStoreSome<P> {
+		self.narrow_some(1, |local: StoreSome<Option<P>>| local.some())
+	}
+
+	fun is_some(self): RemoteStoreFlag {
+		self.narrow_flag(|local: StoreSome<Option<P>>| local.is_some())
+	}
+}
+
+/// A map's key is a BOUNDARY (§2.2): `at(key)` on a remote map is a handle whose
+/// subscription puts that key's own slot on the wire, seeded with the key's value
+/// and patched under it; the replica holds the key while the slot does.
+export impl RemoteStore<HashMap<type K: Hashable + Wire, type V: StoreWire + Storable>> {
+	fun at(self, key: K): RemoteStore<Option<V>> {
+		let local = self.local.at(key);
+		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| key.describe(serializer)));
+		RemoteStore {
+			local,
+			at = MirrorAt {
+				link = at.link,
+				path = at.path,
+				boundary = mirror_boundary(local, at.path, || local.set(None)),
+			},
+		}
+	}
+}
+
+export impl RemoteStoreSome<HashMap<type K: Hashable + Wire, type V: StoreWire + Storable>> {
+	fun at(self, key: K): RemoteStoreSome<Option<V>> {
+		let local = self.local.at(key);
+		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| key.describe(serializer)));
+		// Through a variant the key's handle is a `StoreSome`: its applier writes
+		// only while the variant is live, through `patch`.
+		RemoteStoreSome {
+			local,
+			at = MirrorAt {
+				link = at.link,
+				path = at.path,
+				boundary = mirror_boundary_some(local, at.path),
+			},
+		}
+	}
+}
+
+/// `mirror_boundary` for a boundary reached through a variant: the frame lands
+/// through `patch`, and lands nowhere while the variant is not live.
+[internal("the mirrored store's client half (A153 S2)")]
+export fun mirror_boundary_some<P: StoreWire + Storable>(
+	local: StoreSome<Option<P>>,
+	path: List<MirrorStep>,
+): MirrorBoundary {
+	MirrorBoundary {
+		path,
+		identity = store_identity_at(local.root, local.path),
+		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
+			mut reader = deserializer;
+			match local.get() {
+				Some(let held) => {
+					mut copy = held;
+					let _landed = copy.store_apply_at(&rel, 0, &mut reader);
+					let _patched = local.patch(copy);
+				},
+				None => {},
+			}
+		},
+		gone = || {
+			let _patched = local.patch(None);
+		},
+	}
+}
+
+export impl RemoteStore<type T> with Source<T> {
+	fun get(self): T {
+		self.local.get()
+	}
+
+	fun identity(self): Option<i32> {
+		self.local.identity()
+	}
+
+	/// Attach to the replica's slot, then hold the boundary: the hold is what puts
+	/// the boundary's slot on the wire, and its seed is a change from what the
+	/// replica held when the subscriber attached.
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		let handle = self.local.on_settle(subscriber);
+		self.at.hold_for(handle);
+		handle
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |T| void, immediately: bool): Subscription {
+		let handle = self.local.attach_observer(observer, immediately);
+		self.at.hold_for(handle);
+		handle
+	}
+}
+
+export impl RemoteStoreSome<type P> with Source<Option<P>> {
+	fun get(self): Option<P> {
+		self.local.get()
+	}
+
+	fun identity(self): Option<i32> {
+		self.local.identity()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		let handle = self.local.on_settle(subscriber);
+		self.at.hold_for(handle);
+		handle
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |Option<P>| void, immediately: bool): Subscription {
+		let handle = self.local.attach_observer(observer, immediately);
+		self.at.hold_for(handle);
+		handle
+	}
+}
+
+export impl RemoteStoreFlag with Source<bool> {
+	fun get(self): bool {
+		self.local.get()
+	}
+
+	fun identity(self): Option<i32> {
+		self.local.identity()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		let handle = self.local.on_settle(subscriber);
+		self.at.hold_for(handle);
+		handle
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |bool| void, immediately: bool): Subscription {
+		let handle = self.local.attach_observer(observer, immediately);
+		self.at.hold_for(handle);
+		handle
+	}
+}
+
 // === `[derive(Storable)]` (§3.1, Q3, Q4, Q9, Q10) =============================
 //
 // Everything per type is emitted here — the macro door. A derive sees one item at a
@@ -1130,6 +1937,20 @@ macro fun store_projection(
 	i"fun {method}(self): {handle}<{written}> \{\n\tself.project({index}, {read}, {write})\n" + "}"
 }
 
+/// One projection on a REMOTE handle (A153 S2): the replica's projection, through
+/// `narrow`, and the wire path one child longer.
+macro fun store_remote_projection(
+	handle: str,
+	local: str,
+	subject: str,
+	method: str,
+	index: usize,
+	written: str,
+): str {
+	let returned = if handle == "RemoteStore" { "RemoteStore" } else { "RemoteStoreSome" };
+	i"fun {method}(self): {returned}<{written}> \{\n\tself.narrow({index}, |local: {local}<{subject}>| local.{method}())\n" + "}"
+}
+
 export macro fun store_struct_impls(target: StructItem): str {
 	import macro_std::build::{ impl_of, fun_of };
 	import macro_std::panic;
@@ -1147,6 +1968,8 @@ export macro fun store_struct_impls(target: StructItem): str {
 		.line("mut changed = false;");
 	mut store_impl = impl_of(i"Store<{target.name}{store_bare_binders(target.generics)}>");
 	mut some_impl = impl_of(i"StoreSome<{target.name}{store_bare_binders(target.generics)}>");
+	mut remote_impl = impl_of(i"RemoteStore<{target.name}{store_bare_binders(target.generics)}>");
+	mut remote_some_impl = impl_of(i"RemoteStoreSome<{target.name}{store_bare_binders(target.generics)}>");
 	mut index: usize = 0;
 	for field in target.fields {
 		let method = if field.reactive_name != "" { field.reactive_name } else { field.name };
@@ -1165,6 +1988,8 @@ export macro fun store_struct_impls(target: StructItem): str {
 		diff = diff.line(i"changed = self.{field.name}.{step}(&other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
 		store_impl = store_impl.member(store_projection("Store", subject, method, field.name, index, field.type_));
 		some_impl = some_impl.member(store_projection("StoreSome", subject, method, field.name, index, field.type_));
+		remote_impl = remote_impl.member(store_remote_projection("RemoteStore", "Store", subject, method, index, field.type_.render()));
+		remote_some_impl = remote_some_impl.member(store_remote_projection("RemoteStoreSome", "StoreSome", subject, method, index, field.type_.render()));
 		index = index + 1;
 	}
 	diff = diff.line("store_wake_me(node, changed, woken);").expr("changed");
@@ -1174,7 +1999,11 @@ export macro fun store_struct_impls(target: StructItem): str {
 		.method(diff)
 		.render();
 	if target.fields.len() > 0 {
-		out = out + store_impl.render() + some_impl.render();
+		out = out
+			+ store_impl.render()
+			+ some_impl.render()
+			+ remote_impl.render()
+			+ remote_some_impl.render();
 	}
 	out
 }
@@ -1206,6 +2035,8 @@ export macro fun store_enum_impls(target: EnumItem): str {
 	mut self_arms = match_of("self");
 	mut store_impl = impl_of(i"Store<{name}{store_bare_binders(target.generics)}>");
 	mut some_impl = impl_of(i"StoreSome<{name}{store_bare_binders(target.generics)}>");
+	mut remote_impl = impl_of(i"RemoteStore<{name}{store_bare_binders(target.generics)}>");
+	mut remote_some_impl = impl_of(i"RemoteStoreSome<{name}{store_bare_binders(target.generics)}>");
 	mut seen: List<str> = [];
 	index = 0;
 	for variant in target.variants {
@@ -1241,6 +2072,8 @@ export macro fun store_enum_impls(target: EnumItem): str {
 		let flag_method = i"fun {flag}(self): StoreFlag \{\n\tself.tag({child}, {test})\n" + "}";
 		store_impl = store_impl.member(flag_method);
 		some_impl = some_impl.member(flag_method);
+		remote_impl = remote_impl.member(i"fun {flag}(self): RemoteStoreFlag \{\n\tself.narrow_flag(|local: Store<{subject}>| local.{flag}())\n" + "}");
+		remote_some_impl = remote_some_impl.member(i"fun {flag}(self): RemoteStoreFlag \{\n\tself.narrow_flag(|local: StoreSome<{subject}>| local.{flag}())\n" + "}");
 		if arity == 0 {
 			self_arms = self_arms.arm(bare, match_of("other")
 				.arm(bare, "false")
@@ -1319,6 +2152,8 @@ export macro fun store_enum_impls(target: EnumItem): str {
 			let through = i"fun {snake}(self): StoreSome<{payload}> \{\n\tself.variant({child}, {read}, {write})\n" + "}";
 			store_impl = store_impl.member(through);
 			some_impl = some_impl.member(through);
+			remote_impl = remote_impl.member(i"fun {snake}(self): RemoteStoreSome<{payload}> \{\n\tself.narrow_some({child}, |local: Store<{subject}>| local.{snake}())\n" + "}");
+			remote_some_impl = remote_some_impl.member(i"fun {snake}(self): RemoteStoreSome<{payload}> \{\n\tself.narrow_some({child}, |local: StoreSome<{subject}>| local.{snake}())\n" + "}");
 		}
 		index = index + 1;
 	}
@@ -1342,6 +2177,468 @@ export macro fun store_enum_impls(target: EnumItem): str {
 		.render()
 		+ store_impl.render()
 		+ some_impl.render()
+		+ remote_impl.render()
+		+ remote_some_impl.render()
+}
+
+/// The parameter lists of `StoreWire`'s three walking methods, as the derive writes
+/// them.
+macro fun store_wire_describe_parameters(): str {
+	"&self, path: &List<StoreStep>, from: usize, serializer: &mut Serializer, write: bool"
+}
+
+macro fun store_wire_apply_parameters(): str {
+	"&mut self, path: &List<StoreStep>, from: usize, deserializer: &mut Deserializer"
+}
+
+macro fun store_wire_read_parameters(): str {
+	"deserializer: &mut Deserializer, remaining: i32, into: &mut List<StoreStep>"
+}
+
+/// `if {test} {\n\t{body}\n}`, the shape every step arm takes.
+macro fun store_wire_if(test: str, body: List<str>): str {
+	import macro_std::build::{ join, indent };
+
+	"if " + test + " {\n" + indent(join(body, "\n"), 1) + "\n}"
+}
+
+/// A step arm's tail: the field steps tried in order, then `Absent`; a key step
+/// names nothing below a struct or an enum.
+macro fun store_wire_step_match(arms: List<str>, absent: str): str {
+	import macro_std::build::{ join, indent };
+
+	let binder = if arms.len() == 0 { "_index" } else { "index" };
+	mut body = arms;
+	body.push(absent);
+	"match path[from] {\n"
+		+ indent(i"StoreStep::Field(let {binder}) => " + "{\n" + indent(join(body, "\n"), 1) + "\n},", 1)
+		+ "\n"
+		+ indent(i"StoreStep::Key(let _hash) => {absent},", 1)
+		+ "\n}"
+}
+
+/// The struct's `StoreWire` (A153 S1): its fields by name at the end of a path,
+/// and a field step by the field's child index — the slot tree's.
+export macro fun store_struct_wire(target: StructItem): str {
+	import macro_std::build::{ impl_of, fun_of, init_of, quote };
+
+	let subject = target.subject();
+	mut whole: List<str> = [];
+	mut steps: List<str> = [];
+	mut apply_whole: List<str> = [];
+	mut apply_steps: List<str> = [];
+	mut reads: List<str> = [];
+	mut fresh: List<str> = [];
+	mut literal = init_of(target.name);
+	mut index: usize = 0;
+	for field in target.fields {
+		let label = quote(field.name);
+		let written = field.type_.render();
+		whole.push(i"serializer.field({label});");
+		apply_whole.push(i"deserializer.field({label});");
+		fresh.push(i"deserializer.field({label});");
+		if store_is_closure(field.type_) {
+			// A closure never crosses: the `[rpc]` element rule refuses the type
+			// before a frame is written, so these lines only keep the impl whole.
+			whole.push("let _closure: bool = store_wire_closure();");
+			apply_whole.push("let _closure: bool = store_wire_closure();");
+			fresh.push(i"let __{field.name}: {written} = store_wire_closure();");
+		} else {
+			whole.push(i"let _f{index} = self.{field.name}.store_describe_at(path, from, serializer, true);");
+			steps.push(store_wire_if(i"index == {index}", [
+				i"ret self.{field.name}.store_describe_at(path, from + 1, serializer, write);",
+			]));
+			apply_whole.push(i"let _f{index} = self.{field.name}.store_apply_at(path, from, deserializer);");
+			apply_steps.push(store_wire_if(i"index == {index}", [
+				i"ret self.{field.name}.store_apply_at(path, from + 1, deserializer);",
+			]));
+			reads.push(store_wire_if(i"index == {index}", [
+				i"into.push(StoreStep::Field({index}));",
+				i"ret store_read_path_of<{written}>(deserializer, remaining - 1, into);",
+			]));
+			fresh.push(i"let __{field.name} = store_fresh_of<{written}>(deserializer);");
+		}
+		literal = literal.field(field.name, i"__{field.name}");
+		index = index + 1;
+	}
+	mut wrote: List<str> = [i"serializer.begin_struct({target.fields.len()});"];
+	for line in whole {
+		wrote.push(line);
+	}
+	wrote.push("serializer.end_struct();");
+	let describe = fun_of("store_describe_at")
+		.parameter(store_wire_describe_parameters())
+		.returns("StoreReach")
+		.line(store_wire_if("from == path.len()", [
+			store_wire_if("write", wrote),
+			"ret StoreReach::Described;",
+		]))
+		.expr(store_wire_step_match(steps, "StoreReach::Absent"));
+	mut landed: List<str> = ["deserializer.begin_struct();"];
+	for line in apply_whole {
+		landed.push(line);
+	}
+	landed.push("deserializer.end_struct();");
+	landed.push("ret StoreReach::Described;");
+	let apply = fun_of("store_apply_at")
+		.parameter(store_wire_apply_parameters())
+		.returns("StoreReach")
+		.line(store_wire_if("from == path.len()", landed))
+		.expr(store_wire_step_match(apply_steps, "StoreReach::Absent"));
+	mut read = fun_of("store_read_path")
+		.parameter(store_wire_read_parameters())
+		.returns("bool")
+		.line("if remaining == 0 {\n\tret true;\n}")
+		.line(if reads.len() == 0 {
+			"let _index = deserializer.i32_value();"
+		} else {
+			"let index = deserializer.i32_value();"
+		});
+	for arm in reads {
+		read = read.line(arm);
+	}
+	read = read.expr("false");
+	mut built = fun_of("store_fresh")
+		.parameter("deserializer: &mut Deserializer")
+		.returns(subject)
+		.line("deserializer.begin_struct();");
+	for line in fresh {
+		built = built.line(line);
+	}
+	built = built.line("deserializer.end_struct();").expr(literal.render());
+	impl_of(target.name)
+		.generics(target.binders("StoreWire"))
+		.implements("StoreWire")
+		.method(describe)
+		.method(apply)
+		.method(read)
+		.method(built)
+		.render()
+}
+
+/// `m0`, `m1`, .. — the names a gathered payload is spread back from.
+macro fun spread_names(arity: usize): List<str> {
+	mut names: List<str> = [];
+	mut position: usize = 0;
+	for position < arity {
+		names.push(i"m{position}");
+		position = position + 1;
+	}
+	names
+}
+
+/// The enum's `StoreWire` (A153 S1): at the end of a path its tagged variant, as
+/// `[derive(Wire)]` writes it (a backed enum its backing value, whole); a step
+/// `1 + i` reaches variant `i`'s payload while it is the live one — one payload
+/// directly, several by their position one step further, the slot tree's numbering
+/// (`store_enum_impls`).
+export macro fun store_enum_wire(target: EnumItem): str {
+	import macro_std::build::{ impl_of, fun_of, match_of, quote, join, indent };
+
+	let subject = target.subject();
+	let name = target.name;
+	if target.backing_type != "" {
+		// A backed enum crosses as its backing value and has no payload to walk.
+		let describe = fun_of("store_describe_at")
+			.parameter(store_wire_describe_parameters())
+			.returns("StoreReach")
+			.line(store_wire_if("from != path.len()", ["ret StoreReach::Absent;"]))
+			.line(store_wire_if("write", ["self.store_wire_describe(serializer);"]))
+			.expr("StoreReach::Described");
+		let apply = fun_of("store_apply_at")
+			.parameter(store_wire_apply_parameters())
+			.returns("StoreReach")
+			.line(store_wire_if("from != path.len()", ["ret StoreReach::Absent;"]))
+			.line(i"self = store_wire_rebuild_of<{subject}>(deserializer);")
+			.expr("StoreReach::Described");
+		let read = fun_of("store_read_path")
+			.parameter(store_wire_read_parameters())
+			.returns("bool")
+			.expr("remaining == 0");
+		let built = fun_of("store_fresh")
+			.parameter("deserializer: &mut Deserializer")
+			.returns(subject)
+			.expr(i"store_wire_rebuild_of<{subject}>(deserializer)");
+		ret impl_of(name)
+			.generics(target.binders("StoreWire"))
+			.implements("StoreWire")
+			.method(describe)
+			.method(apply)
+			.method(read)
+			.method(built)
+			.render();
+	}
+	mut whole = match_of("self");
+	mut steps: List<str> = [];
+	mut apply_tags: List<str> = [];
+	mut apply_steps: List<str> = [];
+	mut reads: List<str> = [];
+	mut fresh_tags: List<str> = [];
+	mut index: usize = 0;
+	for variant in target.variants {
+		let child = index + 1;
+		let arity = variant.payload.len();
+		let tag = quote(variant.name);
+		// The variant's pattern, binding each payload `p{i}` — a closure's as
+		// `_p{i}`, since nothing reads it: a closure never crosses.
+		mut binds: List<str> = [];
+		mut position: usize = 0;
+		for type_ in variant.payload {
+			if store_is_closure(type_) {
+				binds.push(i"let _p{position}");
+			} else {
+				binds.push(i"let p{position}");
+			}
+			position = position + 1;
+		}
+		let bound = if arity == 0 {
+			i"{name}::{variant.name}"
+		} else {
+			i"{name}::{variant.name}({join(binds, ", ")})"
+		};
+		// The whole value, tagged.
+		mut described: List<str> = [i"serializer.begin_variant({tag}, {arity});"];
+		// A fresh payload, read in order.
+		mut payload_reads: List<str> = [];
+		mut fresh_parts: List<str> = [];
+		position = 0;
+		for type_ in variant.payload {
+			if store_is_closure(type_) {
+				described.push("let _closure: bool = store_wire_closure();");
+				payload_reads.push(i"let __p{position}: {type_.render()} = store_wire_closure();");
+			} else {
+				described.push(i"let _p{position} = p{position}.store_describe_at(path, from, serializer, true);");
+				payload_reads.push(i"let __p{position} = store_fresh_of<{type_.render()}>(deserializer);");
+			}
+			fresh_parts.push(i"__p{position}");
+			position = position + 1;
+		}
+		described.push("serializer.end_variant();");
+		whole = whole.arm_block(bound, described);
+		let constructed = if arity == 0 {
+			i"{name}::{variant.name}"
+		} else {
+			i"{name}::{variant.name}({join(fresh_parts, ", ")})"
+		};
+		mut fresh_arm: List<str> = [i"deserializer.begin_variant({tag}, {arity});"];
+		for line in payload_reads {
+			fresh_arm.push(line);
+		}
+		fresh_arm.push("deserializer.end_variant();");
+		fresh_arm.push(i"ret {constructed};");
+		fresh_tags.push(store_wire_if(i"tag == {tag}", fresh_arm));
+		// Applied in place: the live variant's payload MERGES (its keyed
+		// collections kept), another variant is built fresh.
+		mut applied: List<str> = [i"deserializer.begin_variant({tag}, {arity});"];
+		mut rebuilt = payload_reads;
+		rebuilt.push(i"self = {constructed};");
+		if arity == 0 {
+			applied.push(i"self = {constructed};");
+		} else if arity == 1 && !store_is_closure(variant.payload[0]) {
+			// One payload merges IN PLACE: under `match &mut self` its capture is a
+			// writable view (B509, the projection's write).
+			applied.push(match_of("&mut self")
+				.arm_block(i"{name}::{variant.name}(let p0)", [
+					"let _p0 = p0.store_apply_at(path, from, deserializer);",
+				])
+				.arm_block("_", rebuilt)
+				.render());
+		} else {
+			// Several are gathered, merged and spread back — a tuple of views
+			// cannot be formed (the projection's Q6).
+			mut merged: List<str> = [];
+			mut spread: List<str> = [];
+			position = 0;
+			for type_ in variant.payload {
+				if store_is_closure(type_) {
+					merged.push(i"let m{position}: {type_.render()} = store_wire_closure();");
+				} else {
+					merged.push(i"mut m{position} = p{position};");
+					merged.push(i"let _m{position} = m{position}.store_apply_at(path, from, deserializer);");
+				}
+				spread.push(i"m{position}");
+				position = position + 1;
+			}
+			merged.push(i"self = {name}::{variant.name}({join(spread, ", ")});");
+			applied.push(match_of("self")
+				.arm_block(bound, merged)
+				.arm_block("_", rebuilt)
+				.render());
+		}
+		applied.push("deserializer.end_variant();");
+		applied.push("ret StoreReach::Described;");
+		apply_tags.push(store_wire_if(i"tag == {tag}", applied));
+		// The steps into this variant's payload.
+		if arity == 1 && !store_is_closure(variant.payload[0]) {
+			steps.push(store_wire_if(i"index == {child}", [
+				"ret " + match_of("self")
+					.arm(bound, "p0.store_describe_at(path, from + 1, serializer, write)")
+					.arm("_", "StoreReach::Absent")
+					.render()
+					+ ";",
+			]));
+			apply_steps.push(store_wire_if(i"index == {child}", [
+				"ret " + match_of("&mut self")
+					.arm(i"{name}::{variant.name}(let p0)", "p0.store_apply_at(path, from + 1, deserializer)")
+					.arm("_", "StoreReach::Absent")
+					.render()
+					+ ";",
+			]));
+			reads.push(store_wire_if(i"index == {child}", [
+				i"into.push(StoreStep::Field({child}));",
+				i"ret store_read_path_of<{variant.payload[0].render()}>(deserializer, remaining - 1, into);",
+			]));
+		} else if arity > 1 {
+			// The payload node is the tuple of payloads and its children are the
+			// positions: described whole as a list, each walked by its own walker.
+			mut listed: List<str> = [i"serializer.begin_list({arity});"];
+			mut positions: List<str> = [];
+			mut read_positions: List<str> = [];
+			position = 0;
+			for type_ in variant.payload {
+				if !store_is_closure(type_) {
+					listed.push(i"let _p{position} = p{position}.store_describe_at(path, from + 1, serializer, true);");
+					positions.push(store_wire_if(i"position == {position}", [
+						i"ret p{position}.store_describe_at(path, from + 2, serializer, write);",
+					]));
+					read_positions.push(store_wire_if(i"position == {position}", [
+						i"into.push(StoreStep::Field({position}));",
+						i"ret store_read_path_of<{type_.render()}>(deserializer, remaining - 2, into);",
+					]));
+				}
+				position = position + 1;
+			}
+			listed.push("serializer.end_list();");
+			let binder = if positions.len() == 0 { "_position" } else { "position" };
+			mut position_arm = positions;
+			position_arm.push("StoreReach::Absent");
+			let walked = [
+				store_wire_if("from + 1 == path.len()", [
+					store_wire_if("write", listed),
+					"ret StoreReach::Described;",
+				]),
+				"match path[from + 1] {\n"
+					+ indent(i"StoreStep::Field(let {binder}) => " + "{\n" + indent(join(position_arm, "\n"), 1) + "\n},", 1)
+					+ "\n"
+					+ indent("StoreStep::Key(let _hash) => StoreReach::Absent,", 1)
+					+ "\n}",
+			];
+			steps.push(store_wire_if(i"index == {child}", [
+				"ret " + match_of("self")
+					.arm_block(bound, walked)
+					.arm("_", "StoreReach::Absent")
+					.render()
+					+ ";",
+			]));
+			// Applied: the payloads gathered, the one the path names merged (or all
+			// of them, at the payload node), and spread back.
+			mut gathered: List<str> = [];
+			mut spread: List<str> = [];
+			mut listed_in: List<str> = ["let _count = deserializer.begin_list();"];
+			mut apply_positions: List<str> = [];
+			position = 0;
+			for type_ in variant.payload {
+				if store_is_closure(type_) {
+					gathered.push(i"let m{position}: {type_.render()} = store_wire_closure();");
+				} else {
+					gathered.push(i"mut m{position} = p{position};");
+					listed_in.push(i"let _m{position} = m{position}.store_apply_at(path, from + 1, deserializer);");
+					apply_positions.push(store_wire_if(i"position == {position}", [
+						i"let landed = m{position}.store_apply_at(path, from + 2, deserializer);",
+						i"self = {name}::{variant.name}(" + join(spread_names(arity), ", ") + ");",
+						"ret landed;",
+					]));
+				}
+				spread.push(i"m{position}");
+				position = position + 1;
+			}
+			listed_in.push("deserializer.end_list();");
+			listed_in.push(i"self = {name}::{variant.name}({join(spread, ", ")});");
+			listed_in.push("ret StoreReach::Described;");
+			let apply_binder = if apply_positions.len() == 0 { "_position" } else { "position" };
+			mut apply_position_arm = apply_positions;
+			apply_position_arm.push("StoreReach::Absent");
+			mut merged_walk = gathered;
+			merged_walk.push(store_wire_if("from + 1 == path.len()", listed_in));
+			merged_walk.push("ret match path[from + 1] {\n"
+				+ indent(i"StoreStep::Field(let {apply_binder}) => " + "{\n" + indent(join(apply_position_arm, "\n"), 1) + "\n},", 1)
+				+ "\n"
+				+ indent("StoreStep::Key(let _hash) => StoreReach::Absent,", 1)
+				+ "\n};");
+			apply_steps.push(store_wire_if(i"index == {child}", [
+				match_of("self")
+					.arm_block(bound, merged_walk)
+					.arm_block("_", ["ret StoreReach::Absent;"])
+					.render(),
+			]));
+			mut read_arm: List<str> = [
+				i"into.push(StoreStep::Field({child}));",
+				"if remaining == 1 {\n\tret true;\n}",
+				if read_positions.len() == 0 {
+					"let _position = deserializer.i32_value();"
+				} else {
+					"let position = deserializer.i32_value();"
+				},
+			];
+			for line in read_positions {
+				read_arm.push(line);
+			}
+			read_arm.push("ret false;");
+			reads.push(store_wire_if(i"index == {child}", read_arm));
+		}
+		index = index + 1;
+	}
+	let unknown = i"deserializer.fail(i\"unknown variant '\{tag\}' of {name}\");";
+	let describe = fun_of("store_describe_at")
+		.parameter(store_wire_describe_parameters())
+		.returns("StoreReach")
+		.line(store_wire_if("from == path.len()", [
+			store_wire_if("write", [whole.render()]),
+			"ret StoreReach::Described;",
+		]))
+		.expr(store_wire_step_match(steps, "StoreReach::Absent"));
+	mut at_end: List<str> = ["let tag = deserializer.variant_tag();"];
+	for arm in apply_tags {
+		at_end.push(arm);
+	}
+	at_end.push(unknown);
+	at_end.push("ret StoreReach::Absent;");
+	let apply = fun_of("store_apply_at")
+		.parameter(store_wire_apply_parameters())
+		.returns("StoreReach")
+		.line(store_wire_if("from == path.len()", at_end))
+		.expr(store_wire_step_match(apply_steps, "StoreReach::Absent"));
+	mut read = fun_of("store_read_path")
+		.parameter(store_wire_read_parameters())
+		.returns("bool")
+		.line("if remaining == 0 {\n\tret true;\n}")
+		.line(if reads.len() == 0 {
+			"let _index = deserializer.i32_value();"
+		} else {
+			"let index = deserializer.i32_value();"
+		});
+	for arm in reads {
+		read = read.line(arm);
+	}
+	read = read.expr("false");
+	mut built = fun_of("store_fresh")
+		.parameter("deserializer: &mut Deserializer")
+		.returns(subject)
+		.line("let tag = deserializer.variant_tag();");
+	for arm in fresh_tags {
+		built = built.line(arm);
+	}
+	// An unknown tag poisons the deserializer, and `Wire`'s own rebuild then
+	// answers its zero value — the sticky-error contract.
+	built = built.line(unknown).expr(i"store_wire_rebuild_of<{subject}>(deserializer)");
+	impl_of(name)
+		.generics(target.binders("StoreWire"))
+		.implements("StoreWire")
+		.method(describe)
+		.method(apply)
+		.method(read)
+		.method(built)
+		.render()
 }
 
 /// `[derive(Storable)]`: the struct's or enum's store surface (§3.1). Its output
@@ -1354,12 +2651,13 @@ export macro fun Storable(item: Item): Source {
 
 	let header = "import std::option::Option;\n"
 		+ "import std::shared::Shared;\n"
-		+ "import std::reactive::store::{ Storable, StoreFlag, StoreLeaf, StoreNode, StoreSlot, StoreWoken, Store, StoreSome, store_has_me, store_kid, store_switch, store_wake_me };\n";
+		+ "import std::reactive::store::{ RemoteStore, RemoteStoreFlag, RemoteStoreSome, Storable, StoreFlag, StoreLeaf, StoreNode, StoreReach, StoreSlot, StoreStep, StoreWire, StoreWireLeaf, StoreWoken, Store, StoreSome, store_fresh_of, store_has_me, store_kid, store_read_path_of, store_switch, store_wake_me, store_wire_closure, store_wire_rebuild_of };\n"
+		+ "import std::wire::{ Deserialize, Deserializer, Serialize, Serializer };\n";
 	if item.as_struct() is Some(let target) {
-		ret source(header + store_struct_impls(target));
+		ret source(header + store_struct_impls(target) + store_struct_wire(target));
 	}
 	if item.as_enum() is Some(let target) {
-		ret source(header + store_enum_impls(target));
+		ret source(header + store_enum_impls(target) + store_enum_wire(target));
 	}
 	source("")
 }

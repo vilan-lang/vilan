@@ -416,8 +416,9 @@ export impl Region {
 /// type-directed half of `child`: the value's type carries the static-vs-tracked
 /// distinction; on this twin every arm reads once.
 ///
-/// THE CHILD CONTRACT (B268), the same six arms the browser twin declares — a
-/// `str`, a `View`, a `List<View>`, and a `Source` of each. The name stays `Slot`
+/// THE CHILD CONTRACT (B268), the same arms the browser twin declares — a `str`,
+/// a `View`, a `List<View>`, a `Source` of each, an `Option` of any child and a
+/// `Source<Option<View>>` (A165). The name stays `Slot`
 /// and not `Child` for the reason this file makes plainest: `Child` is the ENUM
 /// `render` walks, three declarations above. KEEP IN STEP with the browser twin's
 /// copy (browser/ui.vl).
@@ -489,6 +490,33 @@ fun place_views_flow<F: Flow<List<View>>>(own flow: F, parent: View) {
 	let items: List<View> = read_once(flow);
 	for item in items {
 		parent.children.write().push(Child::Element(item));
+	}
+}
+
+/// An optional child (A165): `Some(child)` places the child, `None` places nothing.
+/// KEEP IN STEP with the browser twin.
+export impl Option<type V: Slot> with Slot {
+	fun place(own self, parent: View) {
+		match self {
+			Some(let child) => child.place(parent),
+			None => {},
+		}
+	}
+}
+
+/// A reactive optional element child, read once: the view the source holds at
+/// render time, or nothing. KEEP IN STEP with the browser twin.
+export impl type S: Flow<Option<View>> with Slot {
+	fun place(own self, parent: View) {
+		place_optional_view_flow(self, parent);
+	}
+}
+
+fun place_optional_view_flow<F: Flow<Option<View>>>(own flow: F, parent: View) {
+	let held: Option<View> = read_once(flow);
+	match held {
+		Some(let view) => parent.children.write().push(Child::Element(view)),
+		None => {},
 	}
 }
 // === The positional value forms (A85), server side =========================

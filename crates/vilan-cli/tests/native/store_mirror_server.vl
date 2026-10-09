@@ -1,0 +1,124 @@
+// A153 S1 on both backends: the mirrored store's server half — the reply's
+// channel, base slot and seed (maps empty), Set ops at the writer's paths, one
+// Patch per subscribe frame and per turn, re-seeds for writes above a boundary,
+// Gone for an unreachable grant, and the teardown that leaves no slot and no
+// write log (`proposal/mirrored-store.md` §3–§5).
+
+import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ Storable, Store, store_census, store_wire_census };
+import std::reactive::{ SequenceCell, batch };
+import std::rpc::mirror::{ reply_store, reply_store_some };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	RpcRequest,
+	drop_session,
+	duplex_pair,
+	encode_request,
+	local_rpc,
+	register_session,
+};
+import std::wire::{ Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	author: str,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Room {
+	id: u53,
+	name: str,
+	messages: List<u53>,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+	messages: HashMap<u53, Message>,
+	motd: str,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun census(label: str, global: Store<Global>) {
+	let (slots, nodes) = store_census(global);
+	print(i"{label}: slots={slots} nodes={nodes} wire={store_wire_census(global)}");
+}
+
+fun main() {
+	let codec = json_codec();
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(0, Room { id = 0, name = "general", messages = [7] });
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, author = "bob", content = "hello" });
+	messages.insert(8, Message { id = 8, author = "amy", content = "hi" });
+	let global = Store::new(Global { rooms, messages, motd = "welcome" });
+	census("before", global);
+	let (client_end, server_end) = duplex_pair();
+	register_session(7, server_end, codec);
+	client_end.on_frame(|frame| print(i"down {text(frame)}"));
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global))
+		.on("message", |request: RpcRequest| reply_store_some(request, global
+			.messages()
+			.at(7)
+			.some()));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	print(i"reply {text((local.handler)(encode_request(codec, "global", [])))}");
+	print(i"reply {text((local.handler)(encode_request(codec, "message", [])))}");
+	census("granted", global);
+	print("-- a write inside the root's boundary");
+	global.motd().set("bye");
+	print("-- a write inside the message's boundary");
+	let _edited = global.messages().at(7).some().content().patch("goodbye");
+	print("-- a write under a key nobody watches");
+	let _other = global.messages().at(8).some().content().patch("ho");
+	print("-- two slots in one Subscribe");
+	client_end.send(Frame::Text("{\"Subscribe\":[0,[[0,-1,[0,0]],[1,-1,[1,8]]]]}"));
+	census("subscribed", global);
+	print("-- one turn, many writes");
+	batch(|| {
+		let _renamed = global.rooms().at(0).some().name().patch("lobby");
+		global.rooms().at(0).some().messages().push(9);
+		let _again = global.rooms().at(0).some().name().patch("lounge");
+		global.motd().set("one turn");
+		let _content = global.messages().at(8).some().content().patch("x");
+		let _author = global.messages().at(8).some().author().patch("zed");
+	});
+	print("-- a write above a boundary covers the writes inside it");
+	batch(|| {
+		let _inside = global.messages().at(7).some().content().patch("inside");
+		global.messages().at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
+	});
+	print("-- the same value");
+	global.motd().set("one turn");
+	global.messages().at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
+	print("-- a key removed, then back");
+	global.rooms().at(0).set(None);
+	global.rooms().at(0).set(Some(Room { id = 0, name = "again", messages = [] }));
+	print("-- the message's payload gone");
+	global.messages().at(7).set(None);
+	print("-- a whole-root write");
+	global.set(Global { rooms = HashMap::new(), messages = HashMap::new(), motd = "reset" });
+	print("-- release the client slots, then the bases");
+	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[0,1,-2]]}"));
+	census("bases only", global);
+	global.motd().set("still the root's");
+	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[-1]]}"));
+	census("released", global);
+	global.motd().set("nobody");
+	print("done");
+}
+
+main();
