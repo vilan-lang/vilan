@@ -67,6 +67,11 @@ written down.
 <!-- family: fix -->
 **F120: an `async` block whose body is itself a handle — `async { async { "s" } }`, nested deeper, or a call answering a `Task` — builds natively and answers its payload; rustc refused the emitted Rust (E0308).** The analyzer types such a block by the payload (`assimilated_task_payload`), as the JS host's promise adoption answers it; the native block handed the inner handle back as its value, one `Task` layer deeper than its type. Each layer the body's value carries is now one more `.await` inside the block, the way F107 awaits a written-async call's declared handle. Pre-existing (the plain `fun deeper(): Task<str> { async { async { "s" } } }` failed the same way), and B559's written `Task<Task<str>>` reaches it too. Pin: `native_differential::f120_a_nested_async_block_is_assimilated_on_both_backends` (`native/nested_async_blocks.vl`: two and three deep with a capture, a relayed `Task` call, a written-async `Task<Task<str>>`, a plain block). Tracker F120.
 
+---
+
+<!-- family: fix -->
+**F121: a struct with a fixed-array field builds natively — `struct Pixel { rgba: [u8; 4] }` was refused by rustc (E0277) before the program printed anything, because the struct's emitted `Js` impl reads every field and vilan-rt had no `Js` for `[T; N]`.** It has one now, laid out as a `List` is (node prints both as arrays), so an array prints whole, in a struct, in an `Option` and through a generic as on JS. vilan-rt's other per-type traits already covered arrays (`Json`; `Clone` and `PartialEq` are Rust's). F109's own repro — a list literal under `[i32; 3]` handed to a `[i32; 3]` parameter — already ran on 0.46.0 (F100 lowered the directed literal to a Rust array); it heads this pin. Pin: `native_differential::f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends` (`native/fixed_array_values.vl`, red on 0.46.0 at the struct). Tracker F121 (papers-49's find), F109 (closed as fixed by F100).
+
 
 ## v0.46.0 — 2026-10-09
 

@@ -11857,3 +11857,25 @@ fn f120_a_nested_async_block_is_assimilated_on_both_backends() {
         "a nested `async` block must answer its payload natively"
     );
 }
+
+/// F121: a struct with a fixed-array field emits a `Js` impl that reads it,
+/// and vilan-rt had none for `[T; N]`, so the struct did not build natively
+/// whether or not it was printed (rustc E0277). The probe prints arrays
+/// whole, in a struct, in an `Option`, through a generic, by element and by
+/// loop. F109's repro is its head: a list literal under `[i32; 3]`, which
+/// F100 had already lowered to a Rust array.
+#[test]
+fn f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f121_fixed_array_values.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/fixed_array_values.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a fixed array and a struct holding one must print the same natively"
+    );
+}

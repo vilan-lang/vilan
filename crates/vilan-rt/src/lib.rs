@@ -295,6 +295,25 @@ impl<T: Js> Js for Vec<T> {
     }
 }
 
+/// A fixed array (`[T; n]`) is a JS array too, laid out as a `List` is
+/// (F121: every struct holding an array field emits a `Js` impl that reads
+/// it, printed or not, so the struct did not build).
+impl<T: Js, const N: usize> Js for [T; N] {
+    fn js(&self) -> String {
+        self.js_hosted()
+    }
+    fn js_nested(&self) -> String {
+        inspect::array(self.iter().map(|item| item as &dyn Js), |item| {
+            item.js_nested()
+        })
+    }
+    fn js_hosted(&self) -> String {
+        inspect::array(self.iter().map(|item| item as &dyn Js), |item| {
+            item.js_hosted()
+        })
+    }
+}
+
 impl<T: Js> Js for Option<T> {
     /// An `Option` is a vilan ENUM, and an enum's runtime value on the JS
     /// backend is `[index, ...data]` — so `Some(5)` prints `[ 0, 5 ]` and `None`
