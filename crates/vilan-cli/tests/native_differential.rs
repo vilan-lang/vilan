@@ -1382,6 +1382,31 @@ fn compare(staged: &Path, program: &str) -> Verdict {
         .args(["run", "--backend", "rust", program])
         .output()
         .expect("run the native backend");
+    // A `main` that answers its EXIT CODE (`fun main(): i32`, resource_exit.vl)
+    // exits with it on both backends: a code other than 0 and 1 (node's and
+    // the runtime's failure) is the program's own, and the two legs must agree
+    // on it as they agree on stdout.
+    let chosen_code = native.status.code().filter(|code| *code != 0 && *code != 1);
+    if let Some(code) = chosen_code {
+        let javascript = vilan(staged)
+            .args(["run", program])
+            .output()
+            .expect("run the JS backend");
+        if javascript.status.code() != Some(code) {
+            return Verdict::Broken(format!(
+                "the native leg exited {code}, the JS leg {:?}",
+                javascript.status.code()
+            ));
+        }
+        if native.stdout == javascript.stdout {
+            return Verdict::Identical;
+        }
+        return Verdict::Broken(format!(
+            "stdout differs.\n  js:   {:?}\n  rust: {:?}",
+            String::from_utf8_lossy(&javascript.stdout),
+            String::from_utf8_lossy(&native.stdout),
+        ));
+    }
     if !native.status.success() {
         let message = String::from_utf8_lossy(&native.stderr).into_owned();
         if message.contains("does not emit") {
@@ -9109,6 +9134,30 @@ fn an_option_of_a_shared_view_consumed_in_place_is_identical_on_both_backends() 
         compare(&staged, "arena.vl"),
         Verdict::Identical,
         "arena.vl: F99 was its first wall"
+    );
+}
+
+/// A `main` that answers its EXIT CODE (`fun main(): i32`, resource_exit.vl's
+/// shape) emitted its tail followed by the event loop's turn, which rustc
+/// refused ("expected `;`"). It exits with the code natively now, after its
+/// frame — and its teardowns — have ended, as `process.exit(main())` does.
+/// The differential compares a program-chosen code (one other than 0 and 1)
+/// as it compares stdout.
+#[test]
+fn a_main_answering_its_exit_code_exits_with_it_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_exit_code_main.vl";
+    std::fs::write(staged.join(file), include_str!("native/exit_code_main.vl"))
+        .expect("write the probe program");
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", file])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(native.status.code(), Some(7), "the program's own exit code");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an exit-code `main` must answer the same code and stdout on both backends"
     );
 }
 

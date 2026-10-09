@@ -3967,6 +3967,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // F25: whether `main`'s body was opened inside a `main_guard` closure
         // that has to be closed after it.
         let mut closes_a_guard = false;
+        let answers_an_exit_code = is_main && returned != "()";
+        if answers_an_exit_code && (is_async || returned != "i32") {
+            return Err(unsupported(
+                &format!(
+                    "a{} `main` answering a `{returned}` exit code",
+                    if is_async { "n async" } else { "" }
+                ),
+                span,
+            ));
+        }
         if is_main {
             if is_async {
                 // `async fun main` — `main` itself cannot be async, so the real
@@ -3984,6 +3994,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 );
                 let _ = writeln!(out, "}}");
                 let _ = writeln!(out, "async fn {ASYNC_MAIN_BODY}() {{");
+            } else if answers_an_exit_code {
+                // A `main` answering its exit code (`fun main(): i32`): the
+                // JS backend writes `process.exit(main())`. The body is the
+                // closure's value, so its frame — and every teardown in it —
+                // has ended before the code is handed to the process.
+                let _ = writeln!(out, "fn main() {{");
+                let _ = writeln!(out, "    vilan_rt::main_guard_exiting(|| -> i32 {{");
+                closes_a_guard = true;
             } else {
                 let _ = writeln!(out, "fn main() {{");
                 let _ = writeln!(out, "    vilan_rt::main_guard(|| {{");
@@ -4008,7 +4026,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // order: a panic raised by a microtask this turn is the program
         // failing, and it owes node's exit code and node's stderr like any
         // other.
-        if is_main && !is_async {
+        if is_main && !is_async && !answers_an_exit_code {
             let _ = writeln!(out, "    vilan_rt::executor::run_pending();");
         }
         if closes_a_guard {

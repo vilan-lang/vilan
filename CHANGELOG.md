@@ -56,6 +56,11 @@ written down.
 ---
 
 <!-- family: fix -->
+**Natively, a `main` that answers its exit code (`fun main(): i32`) builds and exits with it.** The emitted `main` wrote the body's tail value and then the event loop's turn after it, which rustc refused ("expected `;`"); the JS backend writes `process.exit(main())`. The body is now the value of a closure `vilan_rt::main_guard_exiting` runs under F25's failure shape, so its frame — every teardown in it — has ended before the code goes to the process, and, as on JS, no microtask the body left runs after it; a `main` answering any other integer type, or an `async` one, is refused by name. The native differential compares a program-chosen exit code (other than 0 and 1) as it compares stdout. Found behind F97: resource_exit.vl's second wall. Pin: `native_differential`'s `a_main_answering_its_exit_code_exits_with_it_on_both_backends` (`native/exit_code_main.vl`).
+
+---
+
+<!-- family: fix -->
 **F99 (its first half): natively, an `Option` whose payload is a shared view, consumed where it stands, builds — `numbers.get(a).unwrap_or(-1)` over std's `Arena`.** `Arena::get` answers `Option<&T>`, a reference natively, and anywhere but a `match` subject it was refused by name, because `unwrap_or` and every other generic over the option is monomorphised at the pointee (`Option<i32>`). A by-value or `&` argument that IS such a call now reads the payload out (`.cloned()`), which is rule 1's copy of a view read as a value, taken at the only moment the view is read. A `let` holding the option, and an `Option<&mut T>`, stay refused by name; so does F99's other half, a view binding aliasing another (transparent-references.vl). arena.vl runs natively. Pin: `native_differential`'s `an_option_of_a_shared_view_consumed_in_place_is_identical_on_both_backends` (`native/payload_view_reads.vl`: `unwrap_or`, `is_some`, `map`, a struct payload, a user function taking the option; plus arena.vl). Tracker F99.
 
 ---

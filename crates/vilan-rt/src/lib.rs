@@ -446,6 +446,18 @@ pub fn main_guard(body: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// [`main_guard`] for a `main` that answers its EXIT CODE (`fun main(): i32`):
+/// the JS backend writes `process.exit(main())`, so the code is the process's
+/// and no microtask the body left runs after it. The body's own frame — its
+/// resources' teardowns among them (destruction.md §5/§7) — has ended by the
+/// time the code is read; `std::process::exit` runs no destructor itself.
+pub fn main_guard_exiting(body: impl FnOnce() -> i32 + Send + 'static) {
+    let code = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let answered = std::sync::Arc::clone(&code);
+    main_guard(move || answered.store(body(), std::sync::atomic::Ordering::Relaxed));
+    std::process::exit(code.load(std::sync::atomic::Ordering::Relaxed));
+}
+
 /// [`main_guard`]'s body under node's failure shape; answers whether it
 /// failed.
 fn run_guarded_main(body: impl FnOnce()) -> bool {
