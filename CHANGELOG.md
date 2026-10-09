@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**N161: `perf_gate.py ratchet --release` resets only the bumps of the classes the verdict measured, and the cut absorbs a `ci`-class bump from CI's own measurement.** The seal's verdict measures the `reference` class; the `ci` class is measured by CI's `perf` job, so the cut used to reset a `ci` bump with nothing absorbed and the release commit's own CI went red on the rows it covered (v0.46.0: math x1.019, watch x1.019, todo x1.005). Now a bump of a class nothing measured is kept and printed; `--ci-from FILE` absorbs it from a `ci` measured JSON, and `--ci-run-of SHA` (which `cut-release.sh` passes, with the repository) fetches the `perf-measured` artifact of the latest green `ci.yml` run at the commit the cut tags from with `gh` — only when a bump is waiting on it — and without `gh`, or without that artifact, the bump stays in `perf/budgets.toml` and the ratchet says why.
+
+---
+
+<!-- family: tooling -->
 **N156: the suite runs under a `ci-test` cargo profile that builds `vilan-core` at opt-level 1 — CI's test legs (`scripts/ci-local.sh test` and `doctest`), the release gate and the seal — and the default dev/test profile is unchanged.** nextest starts a process per test and every process pays a cold std world, so an analysis is the unit the suite is made of: at opt-level 0 it costs ~3.2x its opt-level-1 CPU (the `inference` binary's 41-test sample: 25.3 CPU-s against 7.9), which the suite-48 measurement puts at roughly half of its ~13,000 CPU-s. The price is the edit tax, which is why this is a separate profile: a build after an `analyzer.rs` edit is ~17 s at opt-level 0 and ~80 s at 1, so a lane's `cargo nextest run -p vilan-core ..` keeps the fast default and only the machines that run the whole suite pay for the build once. The artifacts land in `target/ci-test/`; `VILAN_TEST_PROFILE=dev scripts/ci-local.sh test` runs the old way, and a cache keyed on `target/debug` must learn the new directory.
 
 ---
