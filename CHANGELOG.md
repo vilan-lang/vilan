@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B586: `vilan check <file>` on a nested module of a `[library]` resolves `pkg::` from the library's layer root, as the editor does.** `vilan check src/deep/pair.vl` rooted `pkg::` at `src/deep/` — the file's own directory — so `import pkg::util::unit` reported "cannot find 'util' in the imported path", and so did std's own `vilan check vilan/std/src/web/dom.vl` (`pkg::reactive`). A file under a `[library]` is now rooted at the deepest of the library's layer roots containing it, else its base root; it still gets no platform, no entries and no dependency workspace.
+
+---
+
+<!-- family: fix -->
 **E286: a `pkg::` or dependency import of a module whose file declares `[platform("browser")] mod self;` is browser evidence for a file with no project to colour it, as a `std::` one is (E266).** The editor's platform inference read `std::` imports only, so a `[library]` file importing its own browser-declared module — or a dependency's — was analyzed as node ("analyzed as: node — default") and its `Region` was the process twin's, while the module itself was analyzed as browser. It now reads the entry package's root and the workspace's dependencies for the same file declaration (and a dependency's browser-only layer); a dependency's surface re-exports are not followed.
 
 ---
