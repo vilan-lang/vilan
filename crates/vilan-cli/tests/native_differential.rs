@@ -1357,13 +1357,100 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 fn vilan(staged: &Path) -> Command {
+    vilan_in(staged, &shared_target())
+}
+
+/// [`vilan`] building into `target` — a WORKER's own cargo target directory
+/// ([`worker_target`]) where legs run concurrently.
+fn vilan_in(staged: &Path, target: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
     command
         .current_dir(staged)
         .env("VILAN_STD", std_dir())
         .env("VILAN_RT", runtime_dir())
-        .env("CARGO_TARGET_DIR", shared_target());
+        .env("CARGO_TARGET_DIR", target);
     command
+}
+
+/// N158: one worker's own cargo target directory, beside [`shared_target`],
+/// keyed by the TEST (`tag`) as well as the worker. Cargo LOCKS a target
+/// directory for a whole build, so legs sharing one would build one at a
+/// time however many threads ran them — and the binary lands at
+/// `<target>/debug/<program>`, so two tests building one corpus program into
+/// one directory could run each other's binary mid-write (the reason every
+/// native test builds its own program name). `vilan-rt` is built once per
+/// directory (about 3 s cold), and the directories persist under
+/// `CARGO_TARGET_TMPDIR` like the shared one.
+fn worker_target(tag: &str, worker: usize) -> PathBuf {
+    let target =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("native-differential-{tag}-w{worker}"));
+    std::fs::create_dir_all(&target).expect("create a worker's cargo target directory");
+    target
+}
+
+/// N158: how many legs of one test run at once — four, or fewer on a
+/// smaller machine. A leg is a vilan compile, a cargo build, two runs: half
+/// the cores keeps a test from starving the suite's others.
+fn leg_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| (cores.get() / 2).clamp(1, 4))
+        .unwrap_or(1)
+}
+
+/// N158: `leg` over every item, at most [`leg_workers`] at once
+/// (`std::thread::scope`), each worker with its own cargo target directory
+/// ([`worker_target`], under the test's `tag`);
+/// the answers come back in the ITEMS' order, so a test's report reads as
+/// the serial loop's did. A leg that panics (an assertion inside it) is
+/// resumed on the test's own thread once every worker has stopped, so the
+/// test fails with the leg's own message.
+fn legs_in_parallel<T, R, F>(tag: &str, items: Vec<T>, leg: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T, &Path) -> R + Sync,
+{
+    let count = items.len();
+    let queue = std::sync::Mutex::new(items.into_iter().enumerate());
+    let answers: std::sync::Mutex<Vec<Option<R>>> =
+        std::sync::Mutex::new((0..count).map(|_| None).collect());
+    let workers = leg_workers().min(count.max(1));
+    let panics: Vec<Box<dyn std::any::Any + Send>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let (queue, answers, leg) = (&queue, &answers, &leg);
+                scope.spawn(move || {
+                    let target = worker_target(tag, worker);
+                    loop {
+                        let next = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .next();
+                        let Some((index, item)) = next else {
+                            break;
+                        };
+                        let answer = leg(item, &target);
+                        answers
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] = Some(answer);
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().err())
+            .collect()
+    });
+    if let Some(panic) = panics.into_iter().next() {
+        std::panic::resume_unwind(panic);
+    }
+    answers
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .into_iter()
+        .map(|answer| answer.expect("every leg answered"))
+        .collect()
 }
 
 /// What one program did.
@@ -1378,6 +1465,12 @@ enum Verdict {
 }
 
 fn compare(staged: &Path, program: &str) -> Verdict {
+    compare_in(staged, program, &shared_target())
+}
+
+/// [`compare`] building into `target` ([`legs_in_parallel`]).
+fn compare_in(staged: &Path, program: &str, target: &Path) -> Verdict {
+    let vilan = |staged: &Path| vilan_in(staged, target);
     let native = vilan(staged)
         .args(["run", "--backend", "rust", program])
         .output()
@@ -1444,8 +1537,11 @@ fn compare(staged: &Path, program: &str) -> Verdict {
 fn the_default_suite_is_byte_identical_on_both_backends() {
     let staged = stage();
     let mut broken = Vec::new();
-    for program in DEFAULT_SUITE {
-        match compare(&staged, program) {
+    let verdicts = legs_in_parallel("suite", DEFAULT_SUITE.to_vec(), |program, target| {
+        compare_in(&staged, program, target)
+    });
+    for (program, verdict) in DEFAULT_SUITE.iter().zip(verdicts) {
+        match verdict {
             Verdict::Identical => {}
             Verdict::Refused(reason) => broken.push(format!(
                 "{program}: the default suite must be programs the backend ACCEPTS, and this one \
@@ -6567,18 +6663,15 @@ fn the_native_leak_census_matches_its_table() {
         CAPTURED_CYCLE_PROBE,
     )
     .expect("write the captured-cycle probe");
-    let mut rows = Vec::new();
-    for program in DEFAULT_SUITE
+    let programs: Vec<&str> = DEFAULT_SUITE
         .iter()
         .copied()
         .chain(["native_probe_board.vl", "native_probe_captured_cycle.vl"])
-    {
-        let (minted, live) = leak_census_of(&staged, program);
-        rows.push(format!(
-            "{}\t{minted}\t{live}",
-            program.trim_end_matches(".vl")
-        ));
-    }
+        .collect();
+    let rows = legs_in_parallel("leaks", programs, |program, target| {
+        let (minted, live) = leak_census_of_in(&staged, program, target);
+        format!("{}\t{minted}\t{live}", program.trim_end_matches(".vl"))
+    });
     let measured = format!(
         "{}{}\n",
         concat!(
@@ -6630,7 +6723,12 @@ const CAPTURED_CYCLE_PROBE: &str = concat!(
 /// Runs `program` natively under `VILAN_NATIVE_LEAK_CENSUS=1` and answers
 /// `(minted, live)` from the line the runtime prints on stderr.
 fn leak_census_of(staged: &Path, program: &str) -> (u64, u64) {
-    let output = vilan(staged)
+    leak_census_of_in(staged, program, &shared_target())
+}
+
+/// [`leak_census_of`] building into `target` ([`legs_in_parallel`]).
+fn leak_census_of_in(staged: &Path, program: &str, target: &Path) -> (u64, u64) {
+    let output = vilan_in(staged, target)
         .env("VILAN_NATIVE_LEAK_CENSUS", "1")
         .args(["run", "--backend", "rust", program])
         .output()
@@ -7526,18 +7624,20 @@ fn the_native_copy_census_matches_its_table() {
     let staged = stage();
     std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
         .expect("write the board probe");
-    let mut rows = Vec::new();
-    for program in DEFAULT_SUITE
+    let programs: Vec<&str> = DEFAULT_SUITE
         .iter()
         .copied()
         .chain(std::iter::once("native_probe_board.vl"))
-    {
+        .collect();
+    // An emission (`build --stdout`) runs no cargo: the worker's target is
+    // never written.
+    let rows = legs_in_parallel("copies", programs, |program, _| {
         let (copied, elided, captured) = copy_census_line_of(&staged, program);
-        rows.push(format!(
+        format!(
             "{}\t{copied}\t{elided}\t{captured}",
             program.trim_end_matches(".vl")
-        ));
-    }
+        )
+    });
     let measured = format!(
         "{}{}\n",
         concat!(
@@ -10944,7 +11044,12 @@ struct Run {
 }
 
 fn run_on(staged: &Path, backend: Option<&str>, program: &str) -> Run {
-    let mut command = vilan(staged);
+    run_on_in(staged, backend, program, &shared_target())
+}
+
+/// [`run_on`] building into `target` ([`legs_in_parallel`]).
+fn run_on_in(staged: &Path, backend: Option<&str>, program: &str, target: &Path) -> Run {
+    let mut command = vilan_in(staged, target);
     command.arg("run");
     if let Some(backend) = backend {
         command.args(["--backend", backend]);
@@ -11054,31 +11159,36 @@ fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
             "from the closure",
         ),
     ];
-    let mut wrong = Vec::new();
-    for (path, location, message) in cases {
+    // One program per path, each under its OWN file name (N158: the legs
+    // run at once, and a native binary is named by its program), so a site
+    // names that file.
+    let legs = legs_in_parallel("panics", cases, |(path, location, message), target| {
+        let file = format!("native_probe_panic_locations_{path}.vl");
+        let location = location.replacen(PANIC_LOCATIONS_FILE, &file, 1);
         let expected = format!("panicked at {location}: {message}");
-        // One program per path, all under the same FILE name so the sites
-        // read the same; each is written over the last.
         std::fs::write(
-            staged.join(PANIC_LOCATIONS_FILE),
+            staged.join(&file),
             PANIC_LOCATIONS.replace("\"PATH\"", &format!("{path:?}")),
         )
         .expect("write the probe program");
-        let native = run_on(&staged, Some("rust"), PANIC_LOCATIONS_FILE);
+        let mut wrong = Vec::new();
+        let native = run_on_in(&staged, Some("rust"), &file, target);
         if native.code != Some(1) || native.stderr != format!("{expected}\n") {
             wrong.push(format!(
                 "{path}: native exited {:?} with stderr {:?}, expected exit 1 and {expected:?}",
                 native.code, native.stderr
             ));
         }
-        let javascript = run_on(&staged, None, PANIC_LOCATIONS_FILE);
+        let javascript = run_on_in(&staged, None, &file, target);
         if javascript.code != Some(1) || !javascript.stderr.lines().any(|line| line == expected) {
             wrong.push(format!(
                 "{path}: node exited {:?} with stderr {:?}, expected exit 1 and the line {expected:?}",
                 javascript.code, javascript.stderr
             ));
         }
-    }
+        wrong
+    });
+    let wrong: Vec<String> = legs.into_iter().flatten().collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
@@ -11088,10 +11198,10 @@ fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
 /// `error.message`, the native payload's message) — identical on both backends.
 #[test]
 fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
-    // Its OWN program name. The native binary lands at `<shared target>/debug/<name>`, and the
-    // sibling test above builds `PANIC_LOCATIONS_FILE` fifteen times with other paths; two tests
-    // building one name at once run each other's binary (the Order 47 seal: this test read the
-    // `"panic"` build's exit 1 under load).
+    // Its OWN program name. The native binary lands at `<target>/debug/<name>`, and the
+    // sibling test above built `PANIC_LOCATIONS_FILE` fifteen times with other paths until N158
+    // gave each path its own name; two tests building one name at once run each other's binary
+    // (the Order 47 seal: this test read the `"panic"` build's exit 1 under load).
     const CALLER_FILE: &str = "native_probe_panic_caller.vl";
     let staged = stage();
     std::fs::write(
@@ -11885,5 +11995,38 @@ fn f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends() 
         compare(&staged, file),
         Verdict::Identical,
         "a fixed array and a struct holding one must print the same natively"
+    );
+}
+
+/// N158: the four longest legs run under [`legs_in_parallel`], whose two
+/// claims are the serial loop's: answers come back in the ITEMS' order
+/// whatever order the workers finish in, and a leg's panic fails the test
+/// with the leg's own payload once every worker has stopped.
+#[test]
+fn parallel_legs_answer_in_order_and_resume_a_legs_panic() {
+    let items: Vec<usize> = (0..23).collect();
+    let answers = legs_in_parallel("order-check", items.clone(), |item, _| {
+        // Later items finish first, so completion order is not item order.
+        std::thread::sleep(std::time::Duration::from_millis((23 - item as u64) % 5));
+        item * 10
+    });
+    assert_eq!(
+        answers,
+        items.iter().map(|item| item * 10).collect::<Vec<_>>()
+    );
+    let caught = std::panic::catch_unwind(|| {
+        legs_in_parallel("panic-check", (0..9).collect(), |item: usize, _| {
+            assert_ne!(item, 6, "leg six fails");
+            item
+        })
+    });
+    let payload = caught.expect_err("a leg's panic fails the call");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        message.contains("leg six fails"),
+        "the leg's own message: {message:?}"
     );
 }

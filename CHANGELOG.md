@@ -77,6 +77,11 @@ written down.
 <!-- family: tooling -->
 **N154: the teardown EXTENT resolution is written once — `vilan_core::teardown` — and both emitters call it.** The JS transformer's `walk_scope_body` and the native emitter's teardown plan (F97, which had copied `teardown_extent`, `widen_over_declarations`, `own_teardown_extent` and `resolve_extent` into vilan-rust) both ask `teardown::region_end` where a declaration's region closes and `teardown::statement_teardown` what a statement owes, so the two backends print their teardowns in one order because there is one answer rather than two copies that agree. A mechanical move, no behaviour change: no corpus golden moved, F97's and F116's teardown pins and resource*.vl are identical as before. The pass map is unchanged (no pass added, removed or moved: the module is emitter-side, pure over `Program`). Tracker N154.
 
+---
+
+<!-- family: tooling -->
+**N158: `native_differential`'s four longest legs run their programs concurrently — the default suite, the panic-path sites, the leak census and the copy census — about 2.4x shorter in wall each (86/78/53/30 s serially against 37/34/25/18 s under a heavier load, measured alone on this machine).** Each test's loop is `legs_in_parallel`: a `std::thread::scope` of up to four workers (half the cores), each building into its OWN cargo target directory keyed by the test and the worker (cargo locks a target directory for a whole build, and a binary lands under its program's name, so two tests sharing one could run each other's binary); answers come back in the list's order and a leg's panic is resumed on the test's thread with its own message. The panic-path test gives each of its fifteen programs its own file name (it had written one name fifteen times). Every assertion is the serial loop's. Pin: `native_differential::parallel_legs_answer_in_order_and_resume_a_legs_panic`. Tracker N158.
+
 
 ## v0.46.0 — 2026-10-09
 
