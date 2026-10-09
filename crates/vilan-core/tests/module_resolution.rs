@@ -9244,3 +9244,37 @@ fn b560_the_import_steer_spells_a_nested_std_modules_full_path() {
         "{errors:#?}"
     );
 }
+
+/// B576's platform half (B573's root): a MODULE's diagnostic note names the
+/// platform the build analyzes it under. The pre-entry resolve ran on the
+/// analyzer's default platform, so a browser package's module was told it is
+/// "analyzed under node" where the same call in the entry said "browser".
+#[test]
+fn b576_a_modules_twin_note_names_the_builds_platform() {
+    let errors = analyze_package_raw(
+        &[
+            (
+                "m.vl",
+                "import std::web::ui::{ View, view };\n\nexport fun show(): str {\n\tlet v: View = view(\"div\");\n\tv.render()\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::m::show;\n\nfun main() {\n\tprint(show());\n}\n",
+            ),
+        ],
+        "main.vl",
+        Platform::Browser,
+    );
+    let notes: Vec<&str> = errors
+        .iter()
+        .filter_map(|error| error.note.as_ref().map(|note| note.msg.as_str()))
+        .filter(|note| note.contains("this file is analyzed under"))
+        .collect();
+    assert!(
+        !notes.is_empty()
+            && notes
+                .iter()
+                .all(|note| note.contains("analyzed under browser")),
+        "the module's note names the browser: {errors:#?}"
+    );
+}

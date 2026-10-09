@@ -549,19 +549,43 @@ const ENTRY_IMPL_EDITS: &[Edit] = &[
     },
 ];
 
-const PLATFORM_MAIN: &str = "import pkg::shared::label;\n\nfun main() {\n\tprint(label());\n}\n";
+const PLATFORM_MAIN: &str = "import pkg::shared::label;\nimport pkg::twin::place;\n\nfun main() {\n\tprint(label());\n\tprint(place());\n}\n";
+
+// B573: a module with `[platform(..)]` twins, in the browser package — the twin
+// a hot-set walk over the stored world selects is the build platform's.
+const PLATFORM_TWIN: &str = "[platform(\"browser\")]\nexport fun place(): str {\n\t\"browser twin\"\n}\n\n[platform(\"@process\")]\nexport fun place(): str {\n\t\"process twin\"\n}\n";
 
 const PLATFORM_SHARED: &str = "export fun label(): str {\n\t\"x\"\n}\n";
 
-const PLATFORM_EDITS: &[Edit] = &[Edit {
-    label: "a browser entry reaches a node-only call (i5)",
-    file: "shared.vl",
-    seed: None,
-    replacements: &[(
-        "export fun label(): str {\n\t\"x\"\n}\n",
-        "import std::process;\n\nexport fun label(): str {\n\ti\"x{process::args().len()}\"\n}\n",
-    )],
-}];
+const PLATFORM_EDITS: &[Edit] = &[
+    Edit {
+        label: "a twinned module edited in a browser world (B573)",
+        file: "twin.vl",
+        seed: None,
+        replacements: &[("\t\"browser twin\"", "\t\"browser twin!\"")],
+    },
+    Edit {
+        label: "a browser entry reaches a node-only call (i5)",
+        file: "shared.vl",
+        seed: None,
+        replacements: &[(
+            "export fun label(): str {\n\t\"x\"\n}\n",
+            "import std::process;\n\nexport fun label(): str {\n\ti\"x{process::args().len()}\"\n}\n",
+        )],
+    },
+];
+
+fn platform_package() -> Package {
+    Package::write(
+        "platform",
+        Platform::Browser,
+        &[
+            ("main.vl", PLATFORM_MAIN),
+            ("shared.vl", PLATFORM_SHARED),
+            ("twin.vl", PLATFORM_TWIN),
+        ],
+    )
+}
 
 /// The package the re-walk pins measure, with nothing a guard refuses: the
 /// hot-set world is built for every module of it, so the edits below run
@@ -665,11 +689,7 @@ fn replay_the_classes() -> Replayed {
     }
     censuses.extend(entry_impl.iter().copied());
     package.remove();
-    let mut package = Package::write(
-        "platform",
-        Platform::Browser,
-        &[("main.vl", PLATFORM_MAIN), ("shared.vl", PLATFORM_SHARED)],
-    );
+    let mut package = platform_package();
     for edit in PLATFORM_EDITS {
         censuses.extend(replay(&mut package, edit, &mut divergences));
     }
@@ -985,6 +1005,36 @@ fn the_differential_sees_a_binding_the_hot_set_should_have_decided() {
             .iter()
             .any(|divergence| divergence.contains("from the module loaded first")),
         "the use-inferred plant must turn the module-binding push red; it found: {divergences:#?}"
+    );
+}
+
+/// B573: a keystroke in a twinned module of a BROWSER package, served from the
+/// stored world (a hot-set hit), walks the module's twins under the browser —
+/// the stored world carries the platform it was built for. Before B573 the
+/// canonical and the hot-set world chose the `@process` twin alike, so the
+/// differential agreed with itself; this asserts the twin.
+#[test]
+fn a_hot_twin_module_keeps_its_platforms_twin() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let package = platform_package();
+    let seed = vec![package.path("twin.vl")];
+    let _ = observe(&package, seed.clone(), Leg::Incremental);
+    let warm = observe(&package, seed, Leg::Incremental);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        warm.census.hot_world && warm.census.base_hits == 1,
+        "the twin module's keystroke is a hot-set hit: {:?}",
+        warm.census
+    );
+    let javascript = warm.javascript.expect("the browser package emits");
+    assert!(
+        javascript.contains("browser twin") && !javascript.contains("process twin"),
+        "the browser world holds the browser twin:\n{javascript}"
     );
 }
 

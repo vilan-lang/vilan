@@ -73540,6 +73540,16 @@ fn analyze_inner<'src>(
     let mut sources: Vec<PathBuf> = vec![entry_path.to_path_buf()];
     let mut source_hashes: Vec<u64> = vec![crate::content_hash(entry_source)];
     let mut analyzer = Analyzer::new();
+    // B573: the platform BEFORE anything walks. The load drain below walks every
+    // module and selects its `[platform(..)]` twins (`select_platform_twins`
+    // reads `self.platform`), and so does a hot set's walk over the stored
+    // world (`load_hot_modules`); set only in `analyze_over_world`, a module's
+    // twins were chosen for `Analyzer::new()`'s default host and a browser
+    // bundle shipped the `@process` twin. The platform is in the base cache's
+    // key, so a stored world carries the one it was built for. (The
+    // assignment in `analyze_over_world` stays: a world can come from the
+    // cache, and the color is that call's.)
+    analyzer.platform = platform;
     // The entry file's text, registered first so SourceId(0) always resolves
     // (element-syntax S4 — the source-inspecting diagnostics read it).
     analyzer.source_texts.push((SourceId(0), entry_source));

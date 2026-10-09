@@ -3747,6 +3747,11 @@ struct PackageOutcome {
 }
 
 fn analyze_package(files: &[(&str, &str)], entry: &str) -> PackageOutcome {
+    analyze_package_on(files, entry, Platform::default())
+}
+
+/// [`analyze_package`] for a chosen target platform.
+fn analyze_package_on(files: &[(&str, &str)], entry: &str, platform: Platform) -> PackageOutcome {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -3769,7 +3774,7 @@ fn analyze_package(files: &[(&str, &str)], entry: &str) -> PackageOutcome {
                     &std_spec(),
                     &directory,
                     &entry_path,
-                    Some(Platform::default()),
+                    Some(platform),
                     &Workspace::default(),
                 );
                 // `errors` is the entry's own parse errors followed by the
@@ -7378,4 +7383,37 @@ fn b553_a_module_context_grounded_only_by_an_entry_run() {
     )
     .expect("an entry run grounds a module's context");
     assert_eq!(stdout, "6\n");
+}
+
+// --- B573: a MODULE's platform twins are chosen for the build's platform ------
+
+const B573_PLACE: &str = "[platform(\"browser\")]\nexport fun place(): str {\n\t\"browser twin\"\n}\n\n[platform(\"@process\")]\nexport fun place(): str {\n\t\"process twin\"\n}\n";
+
+const B573_MAIN: &str =
+    "import std::io::print;\nimport pkg::place::place;\n\nfun main() {\n\tprint(place());\n}\n";
+
+/// B573 (a miscompile): the loaded modules were walked — and their
+/// `[platform(..)]` twins selected — before the analysis took its platform, so a
+/// module's twins were chosen for the analyzer's default host and a browser
+/// bundle shipped the `@process` twin. Each platform's bundle holds its own
+/// twin and not the other; the entry's twins were always right.
+#[test]
+fn b573_a_modules_platform_twins_are_chosen_for_the_builds_platform() {
+    for (platform, kept, dropped) in [
+        (Platform::Browser, "browser twin", "process twin"),
+        (Platform::default(), "process twin", "browser twin"),
+    ] {
+        let outcome = analyze_package_on(
+            &[("place.vl", B573_PLACE), ("main.vl", B573_MAIN)],
+            "main.vl",
+            platform,
+        );
+        let javascript = outcome.javascript.unwrap_or_else(|| {
+            panic!("the {platform:?} build compiles: {:?}", outcome.diagnostics)
+        });
+        assert!(
+            javascript.contains(kept) && !javascript.contains(dropped),
+            "the {platform:?} bundle holds the {kept} and not the {dropped}:\n{javascript}"
+        );
+    }
 }
