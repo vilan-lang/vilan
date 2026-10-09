@@ -14473,3 +14473,46 @@ fn b557_a_tuple_family_member_does_not_conform_a_structs_impl() {
         "missing 'show'",
     );
 }
+
+// --- M123: the bound audit memoizes its inner proofs (the tabling rule) ---
+//
+// A NO reached through a cycle that closes on an OUTER open question is
+// provisional — it is that outer question's assumption, not the inner one's
+// answer — and must not be remembered: here `X: A` tries the blanket `T: B
+// with A` first, whose `X: B` needs `X: A` again (the cycle, cut NO), and only
+// then finds `X`'s own `A`. Remembering that inner `X: B` = NO refused
+// `needs_b(X {})`, whose `X: B` holds through `X: A`.
+
+#[test]
+fn m123_a_no_under_an_outer_cycle_is_not_remembered() {
+    for calls in [
+        "print(needs_a(X {}));\n print(needs_b(X {}));",
+        "print(needs_b(X {}));\n print(needs_a(X {}));",
+    ] {
+        let expected = if calls.starts_with("print(needs_a") {
+            "x's own a\nb via a\n"
+        } else {
+            "b via a\nx's own a\n"
+        };
+        assert_compiles_and_runs(
+            &format!(
+                r#"
+                import std::io::print;
+                trait A {{ fun a(self): str; }}
+                trait B {{ fun b(self): str; }}
+                struct X {{}}
+                impl type T: B with A {{ fun a(self): str {{ "a via b" }} }}
+                impl X with A {{ fun a(self): str {{ "x's own a" }} }}
+                impl type T: A with B {{ fun b(self): str {{ "b via a" }} }}
+                fun needs_a<T: A>(value: T): str {{ value.a() }}
+                fun needs_b<T: B>(value: T): str {{ value.b() }}
+                fun main() {{
+                    {calls}
+                }}
+                main();
+                "#
+            ),
+            expected,
+        );
+    }
+}

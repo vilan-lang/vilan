@@ -4359,6 +4359,22 @@ pub struct Analyzer<'src> {
     // itself as a provider of `Base` for ANY type, on the condition that the
     // type is already a `Base` — which is the question being asked.
     bound_proofs_in_progress: Vec<(TypeId, Id, Vec<TypeId>)>,
+    // M123: the bound audit's INNER proofs, memoized while
+    // `check_generic_bound_satisfaction` runs (`None` otherwise — during the
+    // fixpoint an answer may still move as types resolve). Keyed on the
+    // resolved value type, the trait and its resolved arguments, as the
+    // audit's own per-site memo is (ids are minted per occurrence).
+    bound_proof_memo: Option<HashMap<(Type, Id, Vec<Type>), bool>>,
+    // M123: `bound_providers`' rows per required trait, for the same window.
+    bound_provider_memo: Option<HashMap<Id, std::sync::Arc<[(TypeId, Option<Vec<TypeId>>)]>>>,
+    // M123: the shallowest open question (its index in
+    // `bound_proofs_in_progress`) a CUT below the current question reached —
+    // a proof that reached itself, or the depth cap (index 0) — `usize::MAX`
+    // when none did. A NO is the question's own exactly when every cut below
+    // it reached the question itself or something deeper: a cut that reached
+    // an OUTER open question answered NO only provisionally, on that outer
+    // question's behalf (the tabling rule).
+    bound_proof_cut_floor: usize,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -7285,6 +7301,9 @@ impl<'src> Analyzer<'src> {
             literal_let_expectations: HashMap::default(),
             literal_types: HashMap::default(),
             bound_proofs_in_progress: Vec::new(),
+            bound_proof_memo: None,
+            bound_provider_memo: None,
+            bound_proof_cut_floor: usize::MAX,
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reused_sources: Vec::new(),
@@ -7829,6 +7848,7 @@ impl<'src> Analyzer<'src> {
         // for a chain that grows without repeating.
         const MAX_DEPTH: u32 = 32;
         if depth > MAX_DEPTH {
+            self.bound_proof_cut_floor = 0;
             return false;
         }
         // An ABSTRACT value's declared bounds are the ONLY answer — never an
@@ -7890,7 +7910,7 @@ impl<'src> Analyzer<'src> {
         // STRUCTURALLY: the recursion re-substitutes the bound's arguments on
         // every round, which mints fresh ids for the same type, so an id
         // comparison never sees the question come back.
-        let reached_itself = self.bound_proofs_in_progress.iter().any(
+        let reached_itself = self.bound_proofs_in_progress.iter().position(
             |(open_value, open_trait_id, open_arguments)| {
                 *open_trait_id == question.1
                     && open_arguments.len() == question.2.len()
@@ -7901,9 +7921,38 @@ impl<'src> Analyzer<'src> {
                         .all(|(open, asked)| self.same_type_structure(*open, *asked, 0))
             },
         );
-        if reached_itself {
+        if let Some(open_index) = reached_itself {
+            self.bound_proof_cut_floor = self.bound_proof_cut_floor.min(open_index);
             return false;
         }
+        // M123: the audit re-proved the same inner questions — a blanket
+        // chain's bounds — once per outer question that reached them (~2 M
+        // instructions per computed check on kolt). YES is stored always (a
+        // cut can only reject, so a YES never rests on one); NO only when
+        // every cut below reached this question or a deeper one
+        // (`bound_proof_cut_floor`), where it is the question's own.
+        let memo_key = match self.bound_proof_memo.is_some() {
+            true => Some((
+                value_type.clone(),
+                required_trait_id,
+                required_arguments
+                    .iter()
+                    .map(|argument| argument.get_type(self))
+                    .collect::<Vec<Type>>(),
+            )),
+            false => None,
+        };
+        if let Some(key) = &memo_key
+            && let Some(answer) = self
+                .bound_proof_memo
+                .as_ref()
+                .and_then(|memo| memo.get(key))
+                .copied()
+        {
+            return answer;
+        }
+        let index = self.bound_proofs_in_progress.len();
+        let enclosing_floor = std::mem::replace(&mut self.bound_proof_cut_floor, usize::MAX);
         self.bound_proofs_in_progress.push(question);
         let satisfied = self.satisfies_trait_bound_by_impls(
             value_type,
@@ -7912,6 +7961,19 @@ impl<'src> Analyzer<'src> {
             depth,
         );
         self.bound_proofs_in_progress.pop();
+        let floor = self.bound_proof_cut_floor;
+        // A cut that reached THIS question is settled here; one that reached
+        // an outer question still qualifies every answer up to it.
+        self.bound_proof_cut_floor = match floor < index {
+            true => enclosing_floor.min(floor),
+            false => enclosing_floor,
+        };
+        if let Some(key) = memo_key
+            && (satisfied || floor >= index)
+            && let Some(memo) = self.bound_proof_memo.as_mut()
+        {
+            memo.insert(key, satisfied);
+        }
         satisfied
     }
 
@@ -7963,6 +8025,61 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The impls that provide `required_trait_id` — naming it or a subtrait of
+    /// it — each with its subject and the arguments it provides the trait at
+    /// (threaded through the supertrait chain when the clause names a
+    /// subtrait, B275), in registration order.
+    ///
+    /// A property of the impl table and the trait, never of the value asked
+    /// about, so while the bound audit runs (`bound_proof_memo` is set, the
+    /// types settled) it is computed once per trait: M123's profile named this
+    /// scan — the supertrait closure of every impl's every clause, and the
+    /// threaded arguments of every candidate, re-derived per inner question —
+    /// as the larger part of each one's ~1.5 M instructions.
+    fn bound_providers(
+        &mut self,
+        required_trait_id: Id,
+    ) -> std::sync::Arc<[(TypeId, Option<Vec<TypeId>>)]> {
+        if let Some(rows) = self
+            .bound_provider_memo
+            .as_ref()
+            .and_then(|memo| memo.get(&required_trait_id))
+        {
+            return rows.clone();
+        }
+        let matching: Vec<(TypeId, Vec<(Id, Vec<TypeId>)>)> = self
+            .implementations
+            .iter()
+            .filter(|implementation| {
+                implementation.trait_ids.iter().any(|implemented| {
+                    self.trait_with_supertraits(*implemented)
+                        .contains(&required_trait_id)
+                })
+            })
+            .map(|implementation| (implementation.subject, implementation.trait_args.clone()))
+            .collect();
+        let rows: std::sync::Arc<[(TypeId, Option<Vec<TypeId>>)]> = matching
+            .into_iter()
+            .map(|(subject, trait_args)| {
+                let provided = trait_args.iter().find_map(|(provided_trait, arguments)| {
+                    match *provided_trait == required_trait_id {
+                        true => Some(arguments.clone()),
+                        false => self
+                            .trait_with_supertraits_at(*provided_trait, arguments)
+                            .into_iter()
+                            .find(|(reached, _)| *reached == required_trait_id)
+                            .map(|(_, reached_arguments)| reached_arguments),
+                    }
+                });
+                (subject, provided)
+            })
+            .collect();
+        if let Some(memo) = self.bound_provider_memo.as_mut() {
+            memo.insert(required_trait_id, rows.clone());
+        }
+        rows
+    }
+
     /// [`Self::satisfies_trait_bound`]'s impl scan, run with the question
     /// held open on `bound_proofs_in_progress`.
     fn satisfies_trait_bound_by_impls(
@@ -7993,34 +8110,8 @@ impl<'src> Analyzer<'src> {
         // `Signal<T_impl>`'s `Source<T>` comes back as `Source<T_impl>` and the
         // impl's own binding (`T_impl := Panel`) grounds it at the comparison.
         // Collected in two steps because the walk takes `&mut self`.
-        let matching: Vec<(TypeId, Vec<(Id, Vec<TypeId>)>)> = self
-            .implementations
-            .iter()
-            .filter(|implementation| {
-                implementation.trait_ids.iter().any(|implemented| {
-                    self.trait_with_supertraits(*implemented)
-                        .contains(&required_trait_id)
-                })
-            })
-            .map(|implementation| (implementation.subject, implementation.trait_args.clone()))
-            .collect();
-        let candidates: Vec<(TypeId, Option<Vec<TypeId>>)> = matching
-            .into_iter()
-            .map(|(subject, trait_args)| {
-                let provided = trait_args.iter().find_map(|(provided_trait, arguments)| {
-                    match *provided_trait == required_trait_id {
-                        true => Some(arguments.clone()),
-                        false => self
-                            .trait_with_supertraits_at(*provided_trait, arguments)
-                            .into_iter()
-                            .find(|(reached, _)| *reached == required_trait_id)
-                            .map(|(_, reached_arguments)| reached_arguments),
-                    }
-                });
-                (subject, provided)
-            })
-            .collect();
-        'candidates: for (subject_id, provided_arguments) in candidates {
+        let candidates = self.bound_providers(required_trait_id);
+        'candidates: for (subject_id, provided_arguments) in candidates.iter().cloned() {
             let subject_type = subject_id.get_type(self);
             // B390: a refused subject provides nothing (`impl_subject_admits`).
             if matches!(subject_type, Type::Unknown | Type::Unresolved) {
@@ -8267,6 +8358,18 @@ impl<'src> Analyzer<'src> {
     /// explicit `f<Cat>()` arguments, method own-generics, impl-subject and
     /// trait-parameter bindings).
     fn check_generic_bound_satisfaction(&mut self) {
+        // M123: the inner proofs memoize for the length of the audit — the
+        // types are settled, so an answer cannot move under it.
+        let enclosing = self.bound_proof_memo.replace(HashMap::default());
+        let enclosing_providers = self.bound_provider_memo.replace(HashMap::default());
+        self.check_generic_bound_satisfaction_sites();
+        self.bound_proof_memo = enclosing;
+        self.bound_provider_memo = enclosing_providers;
+    }
+
+    /// [`Self::check_generic_bound_satisfaction`]'s walk over every recorded
+    /// call site.
+    fn check_generic_bound_satisfaction_sites(&mut self) {
         // Each entry carries the entity its span came from: the check runs over
         // every file at once, after `build()`, so nothing else can say which file
         // the span indexes (B112) — and the sort below needs the file to lead.
