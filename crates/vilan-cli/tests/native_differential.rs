@@ -11764,3 +11764,21 @@ fn an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered() {
         "one teardown per aggregate, or a struct's fields, keep building and agreeing"
     );
 }
+
+/// F117: a `Self` written in a member of a bare-trait impl is the receiver
+/// the instance is minted for — the analyzer types it as the trait (B567
+/// made the CALL read the receiver), and natively a trait is no value, so
+/// the member was refused as "a trait object". The rewrite is a trait
+/// default's (`current_self_type`), scoped to the impl's subject trait.
+#[test]
+fn f117_a_self_in_a_bare_trait_impl_member_is_the_receiver_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f117_bare_trait_self.vl";
+    std::fs::write(staged.join(file), include_str!("native/bare_trait_self.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a bare-trait impl member's `Self` must be its receiver natively"
+    );
+}

@@ -234,6 +234,32 @@ fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, DropImpl> {
     nominals
 }
 
+/// F117: the members of every impl whose subject is a BARE trait, each with
+/// that subject. Such an impl is a blanket over every type implementing the
+/// trait (B567: the subject is the implicit binder the call binds to its
+/// receiver), so a `Self` its members write is the receiver an instance is
+/// minted for — which the analyzer types as the trait itself, and natively a
+/// trait is no value.
+fn bare_trait_impl_members(program: &Program<'_>) -> HashMap<Id, TypeId> {
+    let mut members = HashMap::default();
+    for implementation in &program.implementations {
+        if !matches!(
+            program.type_id_to_type_map.get(&implementation.subject),
+            Some(Type::Trait(..))
+        ) {
+            continue;
+        }
+        for member in implementation.declarations.values() {
+            let function_id = match program.entity_map.get(member) {
+                Some(Expr::Function(function_id)) => *function_id,
+                _ => *member,
+            };
+            members.insert(function_id, implementation.subject);
+        }
+    }
+    members
+}
+
 /// A nominal's `Drop` impl: its `drop` function, and the impl's SUBJECT in
 /// the impl's own generic terms (`Guard<T>` for `impl Guard<type T> with
 /// Drop`), which binds the impl's binders from one instantiation's arguments
@@ -561,6 +587,10 @@ struct Emitter<'a, 'src> {
     /// `Drop` impl calling it; F116: a GENERIC one calls the `drop` instance
     /// its instantiation binds. See [`drop_implementing_nominals`].
     drop_nominals: HashMap<Id, DropImpl>,
+    /// F117: each member of an impl whose subject is a BARE trait
+    /// (`impl Iterator<type T> with Again<T>`), with that subject. See
+    /// [`bare_trait_impl_members`].
+    bare_trait_members: HashMap<Id, TypeId>,
 }
 
 /// One object type's Rust trait: its name and its slots, each slot's
@@ -697,6 +727,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             object_traits: HashMap::default(),
             object_impls: HashSet::new(),
             drop_nominals: drop_implementing_nominals(program),
+            bare_trait_members: bare_trait_impl_members(program),
         }
     }
 
@@ -4094,9 +4125,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
         let saved = self.enter_substitution(entries);
         let saved_instance = self.enter_instance(id, bits.to_vec());
+        // F117: a member of a bare-trait impl reads its `Self` — typed as the
+        // trait, in a type id of its own beside the subject's — as the
+        // receiver the subject is bound to, the rewrite a trait default's
+        // `Self` takes ([`Self::default_instance`]).
+        let bare_trait_self = self.bare_trait_members.get(&id).and_then(|subject| {
+            let bound = self.current_substitution.get(subject).copied()?;
+            match self.type_entry(subject) {
+                Some(Type::Trait(trait_id, _)) => Some((*trait_id, self.concrete(bound))),
+                _ => None,
+            }
+        });
+        let saved_self = bare_trait_self.map(|(trait_id, receiver)| {
+            (
+                self.current_self_type.replace(receiver),
+                std::mem::replace(&mut self.current_self_traits, HashSet::from([trait_id])),
+            )
+        });
         let emitted = self
             .function_body(&function, span, is_main, &name)
             .map_err(|error| self.locate_refusal(error, function.id));
+        if let Some((self_type, self_traits)) = saved_self {
+            self.current_self_type = self_type;
+            self.current_self_traits = self_traits;
+        }
         self.restore_instance(saved_instance);
         self.current_substitution = saved;
         let out = emitted?;

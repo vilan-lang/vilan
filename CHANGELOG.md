@@ -42,6 +42,11 @@ written down.
 <!-- family: miscompile -->
 **A tuple, a fixed array or one enum variant holding TWO values that owe a teardown is refused by name natively, where it printed the teardowns in the opposite order to JS.** vilan drops an aggregate's members in reverse (destruction.md §5); Rust drops a tuple's, an array's and a variant's in declaration order, and only a struct's fields can be declared reversed (F97), so `let pair = (Handle { .. }, Handle { .. })` closed `a` then `b` natively and `b` then `a` on JS, silently. The refusal names the aggregate and the steer (hold them in a struct's fields); one teardown per aggregate, and a struct holding two, build and agree as before. Pin: `native_differential::an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered` (the variant, the tuple and the array refused, a struct and a one-resource variant and tuple identical; red on 0.46.0). Found building F116.
 
+---
+
+<!-- family: fix -->
+**F117: a member of a blanket over a parameterized BARE trait (`impl Iterator<type T> with Again<T>`) that writes `Self` builds natively; it was refused as "a value of type `a trait object`".** B567 made the call read the bare-trait subject as the binder bound to the receiver, so `[5, 6].iter().map(..).again()` typed and ran on JS; the analyzer still types the member's own `Self` as the trait, in a type id of its own beside the subject's, and the native instance rendered it as one. An instance of such a member now reads a `Self` of its subject trait as the receiver the subject is bound to — the rewrite a trait default's `Self` already takes — in the signature, the body and nested positions (`Option<Self>`). Pin: `native_differential::f117_a_self_in_a_bare_trait_impl_member_is_the_receiver_on_both_backends` (`native/bare_trait_self.vl`: std's list iterator and a user one; `Self` returned, taken, annotated and nested). Tracker F117.
+
 
 ## v0.46.0 — 2026-10-09
 
