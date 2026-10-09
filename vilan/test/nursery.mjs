@@ -117,19 +117,28 @@ class __Task {
 function __task(run, origin, nursery) {
 	return new __Task(run, origin, nursery);
 }
-function ambient_signal($d) {
-	const $e = $d;
-	let $f = null;
-	if ($e[0] === 0) {
-		const n = $e[1];
-		$f = [ 0, n.signal_of() ];
+function ambient_signal($e) {
+	const $f = $e;
+	let $g = null;
+	if ($f[0] === 0) {
+		const n = $f[1];
+		$g = [ 0, n.signal_of() ];
 	} else {
-		$f = [ 1 ];
+		$g = [ 1 ];
 	}
-	return $f;
+	return $g;
 }
 async function sleep(ms, $c) {
-	await (__sleep(ms, ambient_signal($c)));
+	await (__sleep(clamp_delay(ms), ambient_signal($c)));
+}
+function clamp_delay(ms) {
+	let $d = null;
+	if (ms < 0) {
+		$d = 0;
+	} else {
+		$d = ms;
+	}
+	return $d;
 }
 function spawn_step(label, ms, $b) {
 	__task(async () => {
@@ -138,11 +147,11 @@ function spawn_step(label, ms, $b) {
 		return;
 	}, "spawn_step", __nursery_of($b));
 }
-async function nursery(body, $g) {
-	const n = __nursery_new($g);
-	return await ((async ($h) => {
+async function nursery(body, $h) {
+	const n = __nursery_new($h);
+	return await ((async ($i) => {
 		return await (__nursery_run(n, () => {
-			return body(n, $h);
+			return body(n, $i);
 		}));
 	})(n));
 }
@@ -159,7 +168,7 @@ async function nursery(body, $g) {
 		return 7;
 	}, [ 1 ]));
 	console.log(String(value));
-})().catch(($i) => {
-	console.error(String($i));
+})().catch(($j) => {
+	console.error(String($j));
 	process.exit(1);
 });

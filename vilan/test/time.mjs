@@ -1049,7 +1049,16 @@ function partial_compare3(self, b) {
 	return partial_compare(self[0], b[0]);
 }
 async function sleep(ms, $ap) {
-	await (__sleep(ms, ambient_signal($ap)));
+	await (__sleep(clamp_delay(ms), ambient_signal($ap)));
+}
+function clamp_delay(ms) {
+	let $aq = null;
+	if (ms < 0) {
+		$aq = 0;
+	} else {
+		$aq = ms;
+	}
+	return $aq;
 }
 async function sleep_for(duration, $ao) {
 	await (sleep(as_i32(duration[0]), $ao));
@@ -1057,16 +1066,16 @@ async function sleep_for(duration, $ao) {
 function eq(self, other) {
 	return self[0] === other[0];
 }
-function ambient_signal($aq) {
-	const $ar = $aq;
-	let $as = null;
-	if ($ar[0] === 0) {
-		const n = $ar[1];
-		$as = [ 0, n.signal_of() ];
+function ambient_signal($ar) {
+	const $as = $ar;
+	let $at = null;
+	if ($as[0] === 0) {
+		const n = $as[1];
+		$at = [ 0, n.signal_of() ];
 	} else {
-		$as = [ 1 ];
+		$at = [ 1 ];
 	}
-	return $as;
+	return $at;
 }
 function begin_struct5(self, fields) {
 	self[0](fields);
@@ -1256,7 +1265,7 @@ function decode2(codec, frame) {
 	$an;
 	await (sleep_for(millis(10), [ 1 ]));
 	console.log("slept");
-})().catch(($at) => {
-	console.error(String($at));
+})().catch(($au) => {
+	console.error(String($au));
 	process.exit(1);
 });
