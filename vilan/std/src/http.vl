@@ -6,6 +6,8 @@
 // `ServerBuilder.services` and folds it in at `build()` (`fullstack-dx.md` §4), so
 // a plain HTTP app never has to know the type exists.
 
+[platform("@process")] mod self;
+
 import pkg::build::{ BuildAsset, LegBuild, asset_body, asset_for, load_build };
 import pkg::bytes::{ Bytes, new_text_decoder };
 import pkg::crypto::sha256;

@@ -98,9 +98,10 @@ anywhere a value is, which [views](#view) are not.
 <a id="lang-item"></a>**lang item**: a std declaration the language itself depends on, like
 `Option` for `?.` or `Add` for `+`. [Spec appendix](../spec/appendix.md).
 
-<a id="layer"></a>**layer**: the platform-specific part of the standard library. Base is
-everywhere; the browser layer is browser-only; the process layer is
-server-only. [Platforms](../tour/platforms.md).
+<a id="layer"></a>**layer**: a library's per-platform source root, serving a module a
+different file per platform — how std serves `std::web::ui`. A module
+that only needs ONE platform declares it in its own file instead
+(`[platform("browser")] mod self;`). [Platforms](../tour/platforms.md).
 
 <a id="local-first"></a>**local-first**: updating local state immediately and syncing in the
 background, instead of waiting on the network. What [drafts](#draft)

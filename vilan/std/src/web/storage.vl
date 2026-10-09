@@ -1,5 +1,5 @@
 // Web Storage (proposal/kolt-migration.md §2.4): `localStorage` / `sessionStorage`
-// on the browser layer. Values are strings; encode structured data through a codec
+// in the browser. Values are strings; encode structured data through a codec
 // (`std::json`'s `Json`/`FromJson` for a scalar, or `encode_json`/`decode_json` for
 // a `Wire` type).
 //
@@ -22,10 +22,12 @@
 // touches `window` (a crash on the server) and an in-memory map that answers
 // every read with a value the browser never wrote — and the second is worse,
 // because it turns a layer mistake into a silent divergence between the two
-// renders of one component. Importing `std::web::storage` from a process module is
-// a hard cross-platform error at analysis instead, which names the mistake at
-// the import. Persisted server state is `std::db`; state that must reach the
+// renders of one component. Reaching `std::web::storage` from a process build is
+// a hard cross-platform error at analysis instead, which names the mistake and
+// the chain to it. Persisted server state is `std::db`; state that must reach the
 // browser rides the render or an rpc call.
+
+[platform("browser")] mod self;
 
 import pkg::option::Option::{ self, None, Some };
 import pkg::web::dom::Window;

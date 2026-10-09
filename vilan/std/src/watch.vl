@@ -1,5 +1,5 @@
-// `std::watch` — the process layer's dev-mode surface (`dev-refresh.md` §5 item 2).
-// Named apart from the browser's `std::web::dev` (`std/src/browser/web/dev.vl`) on
+// `std::watch` — the process platforms' dev-mode surface (`dev-refresh.md` §5 item 2).
+// Named apart from the browser's `std::web::dev` (`std/src/web/dev.vl`) on
 // purpose: `std_twin_parity.rs`'s `TWINNED_MODULES` documents `dev` as deliberately
 // single-platform (browser-only, no counterpart to hold it against — the same
 // reasoning `db`/`fs`/`http`/`process`/`rpc_server` already get on the process
@@ -12,6 +12,8 @@
 // current bytes over the existing push routes. A no-op outside `vilan run --watch`
 // — importing this module costs nothing in a shipped process.
 //
+[platform("@process")] mod self;
+
 import pkg::fetch::post;
 import pkg::option::Option::{ self, None, Some };
 import pkg::process::env;
@@ -25,7 +27,7 @@ export *;
 /// branches on it without knowing how it was started. `std::web::dev` is the
 /// browser's answer to the same question and is browser-only by construction (HMR
 /// swaps the browser leg in place; the node leg restarts), so this is the process
-/// layer's own.
+/// platforms' own.
 ///
 /// What it is for is FRESHNESS, not code: a server that restarts on every code
 /// change can still serve week-old bytes for a file it read once at the top of

@@ -1,7 +1,7 @@
 // `std::rpc::server` — the server half of `std::rpc`, mounted on `std::http`:
 // where a protocol (a frame handler) meets a real listening socket. The client
 // halves live in platform-neutral `std::rpc` (`HttpTransport`, `connect_split`);
-// this module is their process-layer counterpart, and the two must agree on the
+// this module is their process counterpart, and the two must agree on the
 // wire format (the SSE `data:` framing, the `__conn:<id>` handshake, and the
 // `/send?c=<id>` addressing that `SplitDuplex` speaks).
 //
@@ -9,6 +9,8 @@
 // STREAMING response (`ResponseBuilder::streaming` — partial writes over a
 // held-open response), the binary RPC reply is a bytes body, and the WebSocket
 // handshake mounts through `ServerBuilder::on_upgrade`.
+
+[platform("@process")] mod self;
 
 import pkg::bytes::Bytes;
 import pkg::compare::Ordering;

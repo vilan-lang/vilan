@@ -51,7 +51,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// The std surface whose table this gates.
-const BUILD_SOURCE: &str = "vilan/std/src/process/build.vl";
+const BUILD_SOURCE: &str = "vilan/std/src/build.vl";
 
 /// The dataset the table is generated from.
 const DATASET: &str = "crates/vilan-core/tests/mime-table.tsv";

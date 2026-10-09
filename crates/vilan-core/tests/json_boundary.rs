@@ -62,7 +62,7 @@ fn json_usage_stays_within_the_sanctioned_sites() {
         // the WS handshake's header read (`str::from_json_value` — JsonValue
         // as the documented dynamic-object accessor) and the throughput
         // benchmark's deliberate `to_json` (it MEASURES the derive path).
-        ("std/src/process/rpc/server.vl", 1),
+        ("std/src/rpc/server.vl", 1),
         ("benchmarks/src/throughput.vl", 1),
     ]);
     let mut files = Vec::new();

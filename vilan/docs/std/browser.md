@@ -1,7 +1,8 @@
 # Browser modules reference
 
-The browser layer of std: `std::web::dom`, `std::web::ui`, `std::web::router`,
-`std::web::storage`. Available only for browser builds. Concepts:
+The browser modules of std: `std::web::dom`, `std::web::ui`, `std::web::router`,
+`std::web::storage`. Available only for browser builds (`std::web::ui` has a
+process twin for server rendering). Concepts:
 [Building UI](../guide/ui.md), [Routing](../guide/routing.md).
 
 ## std::web::dom

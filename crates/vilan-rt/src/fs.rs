@@ -3,7 +3,7 @@
 //!
 //! # What this is a twin OF
 //!
-//! `vilan/std/src/process/fs.vl` binds `node:fs/promises`. The bindings that
+//! `vilan/std/src/fs.vl` binds `node:fs/promises`. The bindings that
 //! take no options object are here — read, write, append, copy, rename,
 //! remove, list, make and remove a directory — because each is one call into
 //! Rust's own `std::fs` and because `serve_build`'s dev-mode freshness read

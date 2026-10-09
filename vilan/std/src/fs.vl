@@ -30,6 +30,8 @@
 // that cannot suspend, in a form a later reader can look up and find missing in one
 // grep.
 
+[platform("@process")] mod self;
+
 import pkg::bytes::Bytes;
 import pkg::crypto::random_uuid;
 import pkg::drop::Drop;

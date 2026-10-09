@@ -15,6 +15,8 @@
 // `ServerBuilder::serve_build` is its first consumer, and turns the whole ceremony
 // into one line.
 
+[platform("@process")] mod self;
+
 import pkg::bytes::Bytes;
 import pkg::fs;
 import pkg::io::{ panic, print };

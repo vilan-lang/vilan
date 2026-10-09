@@ -1,6 +1,6 @@
 # Process modules reference
 
-The process layer (Node/Deno/Bun builds): `std::db`, `std::http`,
+The process modules (Node/Deno/Bun builds): `std::db`, `std::http`,
 `std::fs`, `std::process`, `std::rpc::server`, `std::watch`. Task-oriented
 usage: [Persistence and the server](../guide/persistence.md).
 

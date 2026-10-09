@@ -195,7 +195,7 @@ Rust workspace, eleven crates, plus the language's own tree:
   and settings (D18/D19).
 - **`serve_build`'s content-type table is GENERATED too** — the third fragment in
   this tree that must never be hand-edited. The rows in `content_type_of`
-  (`vilan/std/src/process/build.vl`) sit between `GENERATED(mime-table)` markers
+  (`vilan/std/src/build.vl`) sit between `GENERATED(mime-table)` markers
   and are generated from `crates/vilan-core/tests/mime-table.tsv`, itself derived
   from the `mime-db` registry data by `scripts/regen-mime-table.py`.
   `crates/vilan-core/tests/mime_table_sync.rs` byte-holds the arms to the dataset

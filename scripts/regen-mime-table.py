@@ -19,7 +19,7 @@ Reads   mime-db's `db.json` (PINNED_MIME_DB below).
 Writes  crates/vilan-core/tests/mime-table.tsv  (checked into git).
 
 That TSV is a DATASET, not the table: the vilan `match` arms in
-`vilan/std/src/process/build.vl` are generated FROM it, in Rust, by the gate
+`vilan/std/src/build.vl` are generated FROM it, in Rust, by the gate
 `crates/vilan-core/tests/mime_table_sync.rs` -- which is also what regenerates
 them and what fails when they drift. So this script runs rarely (when mime-db
 publishes) and that gate runs on every `cargo test`. After running this, eyeball
@@ -137,7 +137,7 @@ def render(rows: list[tuple[str, str, str, str]]) -> str:
         "#            `mrmime` is generated from too.",
         "# refresh:   python3 scripts/regen-mime-table.py",
         "# consumer:  crates/vilan-core/tests/mime_table_sync.rs generates the vilan",
-        "#            `match` arms in vilan/std/src/process/build.vl from these rows",
+        "#            `match` arms in vilan/std/src/build.vl from these rows",
         "#            and fails when they drift. It also owns the charset rule: a",
         "#            `text/*` row is served `; charset=utf-8`, everything else bare.",
         "#",

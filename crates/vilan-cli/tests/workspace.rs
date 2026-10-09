@@ -209,7 +209,8 @@ fn a_package_dependency_is_allowed_and_colors_inferentially() {
     assert!(!output.status.success(), "expected a coloring violation");
     let text = combined(&output);
     assert!(
-        text.contains("requires the `process` layer of `std`") && text.contains("main → save"),
+        text.contains("requires the `@process` platform its file declares")
+            && text.contains("main → save"),
         "expected the chain diagnostic: {text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -559,7 +560,7 @@ fn check_colors_each_entry_against_its_own_target() {
     );
     let text = combined(&violating);
     assert!(
-        text.contains("requires the `process` layer of `std`")
+        text.contains("requires the `@process` platform its file declares")
             && text.contains("cannot run on `browser`"),
         "unexpected output: {text}"
     );
@@ -1593,6 +1594,45 @@ fn file_mode_resolves_pkg_siblings_and_dependencies_through_the_manifest() {
         output.status.success(),
         "`pkg::` resolves against the declared root, not the file's directory:\n{text}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f28_vilan_check_checks_a_declared_module_no_leg_admits() {
+    // A build reports nothing from inside a module its platform excludes (spec
+    // §11.3: only the entries a file admits type-check it) — so a node-only
+    // package importing a `[platform("browser")] mod self;` file would leave
+    // that file checked by NOTHING. `vilan check` checks it as the file itself,
+    // under its declared platform: its type error is reported once, in its file.
+    let dir = temp_project("f28_declared_leg");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(
+        &dir,
+        "src/main.vl",
+        "import pkg::widget::width;\n\nfun main() {}\n",
+    );
+    write(
+        &dir,
+        "src/widget.vl",
+        "[platform(\"browser\")] mod self;\n\nexport fun width(): i32 {\n\t\"wide\"\n}\n",
+    );
+    let output = vilan_plain(&["check", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert_eq!(
+        text.matches("Error: Expected i32, but got str").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("widget.vl"), "{text}");
+    // …and the fixed file checks clean.
+    write(
+        &dir,
+        "src/widget.vl",
+        "[platform(\"browser\")] mod self;\n\nexport fun width(): i32 {\n\t1\n}\n",
+    );
+    let output = vilan_plain(&["check", dir.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

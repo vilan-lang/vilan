@@ -1,11 +1,13 @@
 // SQLite over the host's built-in `node:sqlite` (proposal/kolt-migration.md §2.2):
 // the server-only storage seam. Node 22.5+ ships it; Deno 2 serves it through
 // node-compat — no package-manager dependency at all. The client physically cannot
-// import this module (it lives in the @process platform layer), which is Kolt's
+// reach this module (it declares the @process platform), which is Kolt's
 // server-only-database principle made structural.
 //
 // Minimal by design: exec / prepare / run / first / all, with rows read through
 // typed column accessors. No ORM ambitions — grow from real call sites.
+
+[platform("@process")] mod self;
 
 import pkg::drop::Drop;
 import pkg::hash_set::HashSet;
