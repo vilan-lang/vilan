@@ -9087,14 +9087,16 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
     );
     let module = staged.join("native_probe_f108_module");
     std::fs::create_dir_all(&module).expect("make the package");
+    // The module's refusal is F25's, which is by design and stays: `print`
+    // of a value holding a function.
     std::fs::write(
         module.join("util.vl"),
-        "export fun banner(): str {\n\t\"\"\"\n\thello\n\t\"\"\"\n}\n",
+        "import std::io::print;\n\nexport fun banner() {\n\tlet shown = || 1;\n\tprint(shown);\n}\n",
     )
     .expect("write the module");
     std::fs::write(
         module.join("main.vl"),
-        "import std::io::print;\nimport pkg::util::banner;\n\nfun main() {\n\tprint(banner());\n}\n",
+        "import pkg::util::banner;\n\nfun main() {\n\tbanner();\n}\n",
     )
     .expect("write the entry");
     let output = vilan(&module)
@@ -9103,7 +9105,7 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
         .expect("build the package");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("util.vl:2:2"),
+        stderr.contains("util.vl:5:2") && stderr.contains("print(shown)"),
         "a user module's refusal is drawn in that module:\n{stderr}"
     );
 }
@@ -10452,10 +10454,10 @@ fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
 
 /// A152: `zip_some`'s mapped-tuple stage (start, pull and attach over every
 /// input flow) and `unzip`'s split of a tuple-valued cell, at arity two and
-/// three. Both are mapped tuples, which the native backend refuses by name
-/// today (`combine`'s state, B397's pin above); the claim is the
-/// differential's own — a refusal now, never a different answer, and the same
-/// bytes once it lowers comprehensions.
+/// three. The claim is the differential's own — a refusal by name, never a
+/// different answer. F101 lowered the mapped tuple and its comprehension;
+/// `unzip`'s next wall is the walk by position (`for key in current.keys()`,
+/// a `TupleKey` per element type), refused as the `TupleKeys` intrinsic.
 #[test]
 fn zip_some_and_unzip_are_never_a_different_answer_natively() {
     let staged = stage();
@@ -10468,8 +10470,8 @@ fn zip_some_and_unzip_are_never_a_different_answer_natively() {
     match &verdict {
         Verdict::Identical => {}
         Verdict::Refused(reason) => assert!(
-            reason.contains("a mapped tuple"),
-            "refused for another reason than the mapped tuple: {reason}"
+            reason.contains("the intrinsic `TupleKeys`"),
+            "refused for another reason than the walk by position: {reason}"
         ),
         other => panic!(
             "the native backend must refuse this program by name or print what node prints: \
