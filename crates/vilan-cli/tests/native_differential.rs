@@ -8987,6 +8987,42 @@ fn a_generic_call_as_a_pattern_subject_is_identical_on_both_backends() {
     );
 }
 
+/// F92: a GENERIC call's own type was read UNSUBSTITUTED where the call is
+/// used in place — a field read off it (`b.unwrap().v`, a trait default's
+/// `Self` in `c.twice().value`) and a field read under a `?.` lift
+/// (`find("hit")?.title`, whose binder had no type at all) were refused "a
+/// field read of an unresolved subject". Three corpus programs had this as
+/// their first wall (generic-method-return.vl, lift-chain.vl,
+/// self-return.vl). The probe: a generic method, a generic free function, a
+/// nested field, a trait default returning `Self`, and lifts over a plain
+/// and a generic call, hit and miss.
+#[test]
+fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_generic_call_fields.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_call_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a field read off a generic call must name the call's own struct"
+    );
+    for program in [
+        "generic-method-return.vl",
+        "lift-chain.vl",
+        "self-return.vl",
+    ] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F92 was its first wall"
+        );
+    }
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,

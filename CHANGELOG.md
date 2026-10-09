@@ -56,6 +56,11 @@ written down.
 ---
 
 <!-- family: fix -->
+**F92: natively, a field read off a generic call used in place builds — `b.unwrap().v`, a trait default's `Self` in `c.twice().value`, and a field under a `?.` lift (`find("hit")?.title`).** The call records its callee's declared return (`T`, `Self` as the trait), and the field read asked that record for its struct, so each was refused "a field read of an unresolved subject" where the same call bound to a `let` built; a `?.` lift's binder, an entity of its own with no `let`, had no type for the emitter at all. The field read now names its struct through the call's own substitution (or, for `Self`, the receiver's type), and a lift binder reads the payload type the analyzer gave it. Three corpus programs flip from refused to identical natively: generic-method-return.vl, lift-chain.vl, self-return.vl. Pin: `native_differential`'s `a_field_read_off_a_generic_call_is_identical_on_both_backends` (`native/generic_call_fields.vl`: a generic method, a generic free function, a nested field, a trait default returning `Self`, and lifts over a plain and a generic call, hit and miss; plus the three corpus programs). Tracker F92 (its `is` half is F106's).
+
+---
+
+<!-- family: fix -->
 **F106: natively, a generic call used directly as a pattern subject builds — `match wrap(3) { Maybe::Just(let v) => .. }`, `if wrap("deep") is Maybe::Just(let s)`.** The call records its callee's declared return (`Maybe<T>`), and the `match`, `is`, conjunction and destructuring-`let` subjects read that record raw, so a user generic enum was refused as "an unbound generic type parameter (parameter 1 of `wrap`)" where the same call bound to a `let` first, or returning std's `Option`, built. A call's value type is now its record rebuilt under the call's own substitution wherever that closes it — F36's `settled_value_type`, which answered only a bare parameter, widened to the whole type — and every pattern subject reads it. Pin: `native_differential`'s `a_generic_call_as_a_pattern_subject_is_identical_on_both_backends` (`native/generic_call_subjects.vl`: each subject form over a free call, a method, a nested call and a call inside a generic instance). Tracker F106 (and the `is` half of F92).
 
 ---

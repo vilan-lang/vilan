@@ -3262,7 +3262,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         .parameters
                         .get(binding)
                         .map(|parameter| parameter.type_id)
-                }),
+                })
+                // F92: a `?` lift's BINDER is an entity of its own, typed by
+                // the analyzer as the subject's payload, and no `let` — so
+                // `find("hit")?.title` read its subject's type as nothing.
+                .or_else(|| self.program.expr_type_ids.get(binding).copied()),
             Expr::Parameter(binding) => self
                 .program
                 .parameters
@@ -6459,7 +6463,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// substitution, when that closes it: the one place a pattern subject
     /// (`match`, `is`, a conjunction, a destructure) reads a call's type
     /// through, so a generic call used in place is typed as it is bound to a
-    /// `let`.
+    /// `let`. A field subject asks only for the head, without minting
+    /// ([`Self::call_value_head`], F92).
     fn settled_value_type(&mut self, id: Id) -> Option<TypeId> {
         let recorded = self.type_of(id)?;
         let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id).cloned() else {
@@ -6490,6 +6495,52 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Some(head);
         }
         Some(recorded)
+    }
+
+    /// F92: the HEAD of a generic call's value type where its record is the
+    /// callee's own parameter — `b.unwrap()` recording `T` — read through the
+    /// call's substitution without minting anything, or a trait member's
+    /// `Self` read off the receiver: what a field read needs to name its
+    /// struct ([`Self::field_name`]), the head being the whole of that
+    /// question. `None` for anything else.
+    fn call_value_head(&self, id: Id) -> Option<TypeId> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id) else {
+            return None;
+        };
+        let call = self.program.function_calls.get(call_id)?;
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id) else {
+            return None;
+        };
+        let recorded = self.type_of(id)?;
+        // `Self` in a trait member's return, which the analyzer types as the
+        // trait itself (self-return.vl's `c.combine_twice().value`): the
+        // receiver's own type is what this call's `Self` is.
+        if matches!(self.resolve(recorded), Some(Type::Trait(..)))
+            && let Some(function) = self.program.functions.get(target)
+            && let Some(first) = function.parameters.first()
+            && self
+                .program
+                .parameters
+                .get(first)
+                .is_some_and(|parameter| parameter.name == "self")
+        {
+            let receiver = self.concrete(self.type_of(*call.argument_ids.first()?)?);
+            return (!matches!(
+                self.resolve(receiver),
+                Some(Type::Trait(..) | Type::Dyn(..) | Type::Generic(_))
+            ))
+            .then_some(receiver);
+        }
+        let substitution = self.call_substitution(*call_id, *target, &call.generic_argument_ids);
+        let bound =
+            substitution
+                .get(&recorded)
+                .copied()
+                .or_else(|| match self.type_entry(&recorded) {
+                    Some(Type::Generic(constraint_id)) => substitution.get(constraint_id).copied(),
+                    _ => None,
+                })?;
+        Some(self.concrete(bound))
     }
 
     fn if_branch(&mut self, branch: &ExprIfBranch, depth: usize) -> Result<String, Error> {
@@ -7246,13 +7297,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn field_name(&self, subject: Id, index: usize, span: Span) -> Result<String, Error> {
+        let struct_of = |type_id: TypeId| match self.resolve(type_id) {
+            Some(Type::Struct(id, _)) => Some(*id),
+            _ => None,
+        };
         let struct_id = self
             .type_of(subject)
-            .and_then(|type_id| self.resolve(type_id))
-            .and_then(|resolved| match resolved {
-                Type::Struct(id, _) => Some(*id),
-                _ => None,
-            })
+            .and_then(struct_of)
+            .or_else(|| self.call_value_head(subject).and_then(struct_of))
             .ok_or_else(|| unsupported("a field read of an unresolved subject", span))?;
         let declaration = self
             .program
