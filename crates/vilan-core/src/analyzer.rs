@@ -54957,13 +54957,14 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
-    fn import_steer_inner(&self, name: &str) -> Option<String> {
-        // B560: every loaded module's FULL path from its root — `std`'s and
-        // `pkg`'s scopes, then each module's children (A65/A154 namespaces),
-        // breadth-first — because the import the steer writes must be one the
-        // loader accepts. The module's own `name` is its LEAF, which spelled
-        // `pkg::lib::thing` as `pkg::thing` and `std::reactive::delta` as
-        // `pkg::delta`, imports that resolve nowhere.
+    /// B560: every loaded module's FULL import path from its root — `std`'s
+    /// and `pkg`'s scopes, then each module's children (A65/A154 namespaces),
+    /// breadth-first — because an import the compiler writes into a message
+    /// must be one the loader accepts. The module's own `name` is its LEAF,
+    /// which spelled `pkg::lib::thing` as `pkg::thing` and
+    /// `std::reactive::delta` as `pkg::delta`, imports that resolve nowhere.
+    /// The B4 steer and B535's trait-scope refusal (B561) both read it.
+    fn module_import_paths(&self) -> HashMap<Id, String> {
         let mut paths: HashMap<Id, String> = HashMap::default();
         let mut pending: std::collections::VecDeque<(Id, String)> =
             std::collections::VecDeque::new();
@@ -54999,6 +55000,11 @@ impl<'src> Analyzer<'src> {
             }
             paths.insert(module_id, path);
         }
+        paths
+    }
+
+    fn import_steer_inner(&self, name: &str) -> Option<String> {
+        let paths = self.module_import_paths();
         // Hits are compared by that PATH, not by leaf name: two modules sharing
         // a leaf in different directories are two homes (ambiguous, no steer),
         // while one path loaded twice — a module's platform twins — is one.
@@ -55620,16 +55626,14 @@ impl<'src> Analyzer<'src> {
     /// The import path that names `entity` from the module DECLARING it —
     /// `std::display::Display` — found by the entity rather than by its name,
     /// so a name two modules declare (`std::web::style`'s `Display` beside
-    /// `std::display`'s) still answers. `None` for an entity no top-level
-    /// module of `std` or of the package declares.
+    /// `std::display`'s) still answers. `None` for an entity no module a root
+    /// reaches declares.
+    ///
+    /// B561: the module's FULL path ([`Self::module_import_paths`], B560's
+    /// walk) — a trait in `pkg::geo::shapes` was spelled `pkg::shapes::Area`,
+    /// from the module's leaf name, an import that resolves nowhere.
     fn import_path_of(&self, entity: Id) -> Option<String> {
-        let std_members: HashSet<Id> = self
-            .module_id_by_name
-            .get("std")
-            .and_then(|std_id| self.modules.get(std_id))
-            .and_then(|module| self.scopes.get(&module.body.1))
-            .map(|scope| scope.name_to_id_map.values().copied().collect())
-            .unwrap_or_default();
+        let paths = self.module_import_paths();
         self.modules.values().find_map(|module| {
             if module.name == "pkg" || module.name == "std" {
                 return None;
@@ -55639,11 +55643,7 @@ impl<'src> Analyzer<'src> {
                 .declaration_order
                 .iter()
                 .find(|(_, id)| *id == entity)?;
-            let root = match std_members.contains(&module.id) {
-                true => "std",
-                false => "pkg",
-            };
-            Some(format!("{root}::{}::{name}", module.name))
+            Some(format!("{}::{name}", paths.get(&module.id)?))
         })
     }
 

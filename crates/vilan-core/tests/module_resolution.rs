@@ -9278,3 +9278,45 @@ fn b576_a_modules_twin_note_names_the_builds_platform() {
         "the module's note names the browser: {errors:#?}"
     );
 }
+
+/// B561: B535's trait-scope refusal spells a trait in a NESTED package
+/// module at its full path (`pkg::geo::shapes::Area`) — `import_path_of` read
+/// the module's leaf and wrote `pkg::shapes::Area`, an import that resolves
+/// nowhere — and the statement it names compiles when pasted.
+#[test]
+fn b561_a_nested_package_traits_import_is_spelled_at_its_full_path() {
+    const SHAPES: &str = "export trait Area {\n\tfun area(self): i32;\n}\n\nexport impl i32 with Area {\n\tfun area(self): i32 {\n\t\tself * self\n\t}\n}\n";
+    const HELPER: &str =
+        "import pkg::geo::shapes::Area;\n\nexport fun twice(x: i32): i32 {\n\tx.area() * 2\n}\n";
+    let entry = "import pkg::helper::twice;\n\nfun main() {\n\tlet _ = twice(2) + 3.area();\n}\n";
+    let errors = analyze_package(
+        &[
+            ("geo/shapes.vl", SHAPES),
+            ("helper.vl", HELPER),
+            ("main.vl", entry),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("Import it (`import pkg::geo::shapes::Area;`)")),
+        "{errors:#?}"
+    );
+    let pasted = format!("import pkg::geo::shapes::Area;\n{entry}");
+    let pasted: &'static str = Box::leak(pasted.into_boxed_str());
+    let errors = analyze_package(
+        &[
+            ("geo/shapes.vl", SHAPES),
+            ("helper.vl", HELPER),
+            ("main.vl", pasted),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "the refusal's import compiles: {errors:#?}"
+    );
+}

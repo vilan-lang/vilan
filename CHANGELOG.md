@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**B561: B535's trait-scope refusal spells a trait in a NESTED package module at its full path — `import pkg::geo::shapes::Area;`, where it wrote `import pkg::shapes::Area;`, an import that resolves nowhere.** `import_path_of` built the statement from the declaring module's LEAF name; it now reads every loaded module's full path from B560's walk, factored out of the import steer as `module_import_paths` so the two messages spell one path. (A std trait was already spelled from std's export index.) Pin: `module_resolution::b561_a_nested_package_traits_import_is_spelled_at_its_full_path` (the refusal's statement, and the program compiling with it pasted). Tracker B561.
+
+---
+
 <!-- family: tooling -->
 **E274: member completion on a generic receiver offers the methods of the impls that apply to ITS type arguments — after `store.` on a `Store<App>`, the derive's `impl Store<Address>` projections (`city`, `path`) are no longer offered beside `App`'s own, and accepting one was refused.** The member table grouped every impl by the nominal its subject names and offered them all; each member now carries its impl's subject, and a request with a typed receiver keeps the members of the impls the solver selects for it (`impl_select::applying_implementations`, scoped to the file — the selection emission dispatches through), one per name, so a name two instantiations both declare is offered once, as the receiver's. A receiver no walk could type, a `Type::` path, and a receiver whose arguments select none of the nominal's impls keep every impl's members, as before. Pins: `vilan-ide`'s `completion::tests::e274_a_store_handle_is_not_offered_another_instantiations_projections` and `e274_an_inherent_impl_at_other_arguments_is_not_offered` (an impl at `Box<i32>`, one at `Box<str>`, a generic one, and a name both declare), red with the filter planted off. Tracker E274.
 
