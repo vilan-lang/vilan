@@ -9248,6 +9248,42 @@ fn the_small_lowerings_are_identical_on_both_backends() {
     }
 }
 
+/// F98: a `const` value that is not plain data was refused by name — the
+/// first wall of css-block.vl, preflight.vl, style-when.vl, style.vl and
+/// theme.vl. The value arrives in the JS layout and the declared type reads
+/// it back. The probe: a struct with a nested struct, a list, a nested tuple
+/// and two options; a list of enum values with payloads; a `HashMap` and a
+/// `HashSet`; a `Style` (whose CSS sidecar both runs write and report); and
+/// a `const` call of a `void` function. Plus the five corpus programs.
+#[test]
+fn a_const_aggregate_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_const_aggregates.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/const_aggregates.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a const aggregate must read back the same natively"
+    );
+    for program in [
+        "css-block.vl",
+        "preflight.vl",
+        "style-when.vl",
+        "style.vl",
+        "theme.vl",
+    ] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F98 was its first wall"
+        );
+    }
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,

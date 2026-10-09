@@ -6670,10 +6670,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// A computed `const` value as a Rust expression of `type_id`'s type.
     ///
-    /// Plain data only: a string, a boolean, a number at the declared width,
-    /// and a `List` of those. Everything else a const result can be — a
-    /// `Map`/`Set`, `undefined`, a `BigInt`, G24's closure snapshot — is refused
-    /// by name until a program on the native path reaches one.
+    /// The value arrives in the JS backend's LAYOUT, because the const world
+    /// computed it there, and the declared type is what reads it back: a
+    /// string, a boolean, a number at the declared width, a `List` of those —
+    /// and (F98) every aggregate built of them. A struct is the array of its
+    /// fields, a tuple the flat run of its slots (a nested tuple spliced in),
+    /// an enum `[variant, ..payload]` (`Option`'s `Some` is variant 0), and
+    /// std's `NativeMap` — the table under `HashMap`/`HashSet`, and so under
+    /// `std::web::style`'s `Style` — a JS `Map` keyed by canonical `Hash`es.
+    /// A `Map`/`Set` const, `undefined`, a `BigInt` and G24's closure
+    /// snapshot are refused by name until a program on the native path
+    /// reaches one.
     fn const_value(
         &mut self,
         value: &vilan_core::interpreter::ConstValue,
@@ -6681,14 +6688,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
         span: Span,
     ) -> Result<String, Error> {
         use vilan_core::interpreter::ConstValue;
-        match value {
-            ConstValue::Str(text) => Ok(format!("vilan_rt::str_new({text:?})")),
-            ConstValue::Bool(value) => Ok(value.to_string()),
-            ConstValue::Number(number) => {
+        let resolved = type_id.map(|type_id| self.deeply_resolved(type_id));
+        let shape = resolved.and_then(|type_id| self.resolve(type_id)).cloned();
+        match (value, shape) {
+            // A `const` call of a `void` function — `const preflight()`, run
+            // for the assets it mints — answers `undefined` on JS: the unit.
+            (ConstValue::Undefined, _)
+                if resolved.is_none_or(|type_id| {
+                    self.rust_type(type_id, span)
+                        .is_ok_and(|rendered| rendered == "()")
+                }) =>
+            {
+                Ok("()".to_string())
+            }
+            (ConstValue::Str(text), _) => Ok(format!("vilan_rt::str_new({text:?})")),
+            (ConstValue::Bool(value), _) => Ok(value.to_string()),
+            (ConstValue::Number(number), _) => {
                 // With no type anywhere, the literal's own default: an integral
                 // value is an `i32` and a fractional one an `f64`, as an
                 // unsuffixed literal is.
-                let rendered = match type_id {
+                let rendered = match resolved {
                     Some(type_id) => self.rust_type(type_id, span)?,
                     None if number.fract() == 0.0 => "i32".to_string(),
                     None => "f64".to_string(),
@@ -6702,25 +6721,198 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 Ok(format!("(({number:?}f64) as {rendered})"))
             }
-            ConstValue::Array(items) => {
-                let element =
-                    type_id
-                        .and_then(|type_id| self.resolve(type_id))
-                        .and_then(|resolved| match resolved {
-                            Type::Struct(_, arguments) => arguments.first().copied(),
-                            _ => None,
-                        });
+            (ConstValue::Array(items), Some(Type::Tuple(elements))) => {
+                let mut cursor = 0;
+                let rendered = self.const_tuple(items, &mut cursor, &elements, span)?;
+                Ok(rendered)
+            }
+            (ConstValue::Array(items), Some(Type::Array(element, _))) => {
                 let mut parts = Vec::new();
                 for item in items {
-                    parts.push(self.const_value(item, element, span)?);
+                    parts.push(self.const_value(item, Some(element), span)?);
+                }
+                Ok(format!("[{}]", parts.join(", ")))
+            }
+            (ConstValue::Array(items), Some(Type::Struct(struct_id, arguments))) => {
+                let Some(declaration) = self.program.structs.get(&struct_id).cloned() else {
+                    return Err(unsupported("a `const` value of an unresolved struct", span));
+                };
+                if declaration.external {
+                    if declaration.name != "List" {
+                        return Err(unsupported(
+                            &format!("a `const` value of the host type `{}`", declaration.name),
+                            span,
+                        ));
+                    }
+                    let element = arguments.first().copied();
+                    let mut parts = Vec::new();
+                    for item in items {
+                        parts.push(self.const_value(item, element, span)?);
+                    }
+                    return Ok(format!("vec![{}]", parts.join(", ")));
+                }
+                self.const_struct(struct_id, &arguments, items, span)
+            }
+            (ConstValue::Array(items), Some(Type::Enum(enum_id, arguments))) => {
+                self.const_variant(enum_id, &arguments, items, span)
+            }
+            (ConstValue::Array(items), None) => {
+                let mut parts = Vec::new();
+                for item in items {
+                    parts.push(self.const_value(item, None, span)?);
                 }
                 Ok(format!("vec![{}]", parts.join(", ")))
             }
+            (ConstValue::Map(entries), Some(Type::Struct(struct_id, arguments)))
+                if self
+                    .program
+                    .structs
+                    .get(&struct_id)
+                    .is_some_and(|declaration| {
+                        declaration.external && declaration.name == "NativeMap"
+                    }) =>
+            {
+                let element = arguments.first().copied();
+                let mut inserts = String::new();
+                for (key, item) in entries {
+                    let key = match key {
+                        ConstValue::Str(text) => {
+                            format!("vilan_rt::Hash::Text(vilan_rt::str_new({text:?}))")
+                        }
+                        ConstValue::Number(number) => {
+                            format!("vilan_rt::Hash::Number({number:?}f64)")
+                        }
+                        ConstValue::Bool(value) => format!("vilan_rt::Hash::Bool({value})"),
+                        ConstValue::Null => "vilan_rt::Hash::Null".to_string(),
+                        _ => return Err(unsupported("a `const` map keyed by a non-scalar", span)),
+                    };
+                    let item = self.const_value(item, element, span)?;
+                    let _ = write!(inserts, "__table.insert({key}, {item}); ");
+                }
+                Ok(format!(
+                    "{{ let mut __table = vilan_rt::Map::new(); {inserts}__table }}"
+                ))
+            }
             _ => Err(unsupported(
-                "a `const` value that is not plain data (a string, a boolean, a number or a list of those)",
+                "a `const` value that is not plain data or an aggregate of it (a `Map`/`Set` \
+                 const, `undefined`, a `BigInt`, a closure snapshot)",
                 span,
             )),
         }
+    }
+
+    /// F98: a `const` struct — its fields, in declaration order, are the
+    /// array's slots, each read at the field's type under the instance.
+    fn const_struct(
+        &mut self,
+        struct_id: Id,
+        arguments: &[TypeId],
+        items: &[vilan_core::interpreter::ConstValue],
+        span: Span,
+    ) -> Result<String, Error> {
+        let declaration = self
+            .program
+            .structs
+            .get(&struct_id)
+            .cloned()
+            .ok_or_else(|| unsupported("a `const` value of an unresolved struct", span))?;
+        if items.len() != declaration.fields.len() {
+            return Err(unsupported(
+                &format!(
+                    "a `const` `{}` whose layout this backend cannot read",
+                    declaration.name
+                ),
+                span,
+            ));
+        }
+        let name = self.ensure_struct(struct_id, arguments, span)?.name;
+        let entries =
+            self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
+        let saved = self.enter_substitution(entries);
+        let mut fields = Vec::new();
+        let mut failed = None;
+        for (field, item) in declaration.fields.iter().zip(items) {
+            match self.const_value(item, Some(field.type_id), span) {
+                Ok(value) => fields.push(format!("{}: {value}", sanitize(field.name))),
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+        self.current_substitution = saved;
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        Ok(format!("{name} {{ {} }}", fields.join(", ")))
+    }
+
+    /// F98: a `const` tuple — the flat run of its slots from `cursor`, a
+    /// nested tuple element consuming its own slots (the JS layout splices
+    /// it).
+    fn const_tuple(
+        &mut self,
+        items: &[vilan_core::interpreter::ConstValue],
+        cursor: &mut usize,
+        elements: &[TypeId],
+        span: Span,
+    ) -> Result<String, Error> {
+        let mut parts = Vec::new();
+        for element in elements {
+            let element = self.deeply_resolved(*element);
+            if let Some(Type::Tuple(inner)) = self.resolve(element).cloned() {
+                parts.push(self.const_tuple(items, cursor, &inner, span)?);
+                continue;
+            }
+            let Some(item) = items.get(*cursor) else {
+                return Err(unsupported("a `const` tuple shorter than its type", span));
+            };
+            *cursor += 1;
+            parts.push(self.const_value(item, Some(element), span)?);
+        }
+        Ok(format!("({},)", parts.join(", ")))
+    }
+
+    /// F98: a `const` enum value — `[variant, ..payload]`, the payload read
+    /// at the variant's types under the instance. `bool` and a backed enum
+    /// never arrive here: their values are the literal itself.
+    fn const_variant(
+        &mut self,
+        enum_id: Id,
+        arguments: &[TypeId],
+        items: &[vilan_core::interpreter::ConstValue],
+        span: Span,
+    ) -> Result<String, Error> {
+        use vilan_core::interpreter::ConstValue;
+        let Some(ConstValue::Number(index)) = items.first() else {
+            return Err(unsupported(
+                "a `const` enum value with no variant tag",
+                span,
+            ));
+        };
+        let index = *index as usize;
+        let payload_types = self.variant_payload_types(enum_id, index, arguments);
+        let path = self.variant_path(enum_id, index, arguments, span)?;
+        if payload_types.is_empty() {
+            return Ok(path);
+        }
+        let mut cursor = 1;
+        let mut parts = Vec::new();
+        for payload in payload_types {
+            if let Some(Type::Tuple(inner)) = self.resolve(payload).cloned() {
+                parts.push(self.const_tuple(items, &mut cursor, &inner, span)?);
+                continue;
+            }
+            let Some(item) = items.get(cursor) else {
+                return Err(unsupported(
+                    "a `const` enum value shorter than its variant",
+                    span,
+                ));
+            };
+            cursor += 1;
+            parts.push(self.const_value(item, Some(payload), span)?);
+        }
+        Ok(format!("{path}({})", parts.join(", ")))
     }
 
     /// Whether an expression is a `str` — by its resolved type where it has
