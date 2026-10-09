@@ -177,6 +177,14 @@ const CENSUS: &[(&str, usize, &str)] = &[
          and by `dispose`).",
     ),
     (
+        "rpc/mirror.vl",
+        9,
+        "R + E: the open mirror channels (a module binding), and per channel and \
+         grant the cells every copy of its record reaches — the grants, the slots, \
+         the turn's dirty and seeding lists and its pending flush, the next base \
+         slot, and each grant's and slot's hold count (A153 S1)",
+    ),
+    (
         "rpc/server.vl",
         6,
         "R + O: the registry, the server's stats",
@@ -303,7 +311,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 197,
+        total, 206,
         "the total number of `Shared` construction sites in std changed"
     );
 

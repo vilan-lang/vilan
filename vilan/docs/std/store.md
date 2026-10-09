@@ -348,6 +348,72 @@ for an element changed in place) — never handed a copy to diff. A push builds
 one row. Each flow keeps its own op log at the collection, recorded only while
 the flow is open.
 
+## Over the wire
+
+A store is MIRRORED over a service's socket by path (`std::rpc::mirror`): the
+server describes the value at a path below a handle it handed out, and the
+client applies what arrives at the same path of its replica. `[derive(Storable)]`
+writes what that needs beside the diff — `StoreWire`: describe the value a path
+reaches, apply a frame at a path, and read a subscription path off a frame at
+the types it walks through. `Option`, `HashMap`, `HashSet` and `List` answer by
+their shape, and every other type crosses whole through its `Wire` impl.
+
+What crosses is `Wire`'s own format, call for call, with one exception: a
+keyed collection inside a described value — a `HashMap` or a `HashSet` field —
+is described EMPTY. Its keys are boundaries of their own, each subscribed and
+seeded on its own (`at(k)`, `contains(x)`), so a root that holds a database
+never ships it whole.
+
+```vilan
+import std::display::Display;
+import std::hash::Hashable;
+import std::hash_map::HashMap;
+import std::json::json_codec;
+import std::reactive::store::{ Storable, StoreStep, StoreWire };
+import std::wire::{ Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	author: str,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	motd: str,
+	messages: HashMap<u53, Message>,
+}
+
+fun described(global: Global, path: List<StoreStep>): str {
+	let codec = json_codec();
+	let (record, finish) = (codec.writer)();
+	mut serializer = record;
+	let _reach = global.store_describe_at(&path, 0, &mut serializer, true);
+	match finish() {
+		Frame::Text(let written) => written,
+		Frame::Binary(let _bytes) => "",
+	}
+}
+
+fun main() {
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { author = "bob", content = "hello" });
+	let id: u53 = 7;
+	let global = Global { motd = "hi", messages };
+	print(described(global, []));                       // {"motd":"hi","messages":[]}
+	print(described(global, [StoreStep::Field(1), StoreStep::Key(id.hash())]));
+	// {"author":"bob","content":"hello"} — key 7's value, its own boundary
+}
+```
+
+On the server, a reply into a store opens one channel per store root per
+connection and adds a GRANT for the handle's path; the reply carries the
+grant's base slot and its seed. The client subscribes the boundaries it
+watches under a grant, and each turn's writes reach it as ONE patch: a write
+inside a boundary as a `Set` at the writer's own path, a write at or above it as
+a fresh `Seed`, an unreachable boundary as `Gone`. A store nobody mirrors
+records nothing for the wire.
+
 ## What it costs
 
 - **A derive line per type**, and a knob per coarse field.

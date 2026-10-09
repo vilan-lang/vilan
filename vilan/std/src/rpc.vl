@@ -1874,7 +1874,8 @@ fun reply_source<T: Wire>(request: RpcRequest, source: SignalCell<T>): RpcOutcom
 /// and refusing it would refuse every working handle service; `local_rpc`,
 /// which really can be wired with no connection at all, refuses at wiring time
 /// instead.
-fun no_connection_for_handle(request: RpcRequest): RpcOutcome {
+[internal("the handle replies' refusal, shared with `std::rpc::mirror` (A153 S1)")]
+export fun no_connection_for_handle(request: RpcRequest): RpcOutcome {
 	RpcOutcome::Failure(RpcError::Remote("`"
 		+ request.method
 		+ "` returns a signal handle, and this request arrived on no connection: a handle's reply is a channel id minted in the CONNECTION's capability table, and the connectionless legs — the `{mount}rpc` POST route, and a `local_rpc` transport no `for_connection` stamped — have none. Reach this method over the socket transport, which is what every generated `Client::connect` uses"))
@@ -2315,6 +2316,19 @@ export struct Capability {
 	/// minted, so a getter two views call is one capability and one forward rather
 	/// than two of each.
 	identity: i32,
+	/// A channel whose control frames its OWNER reads (A153 S1): a mirrored store's
+	/// channel speaks `Subscribe`/`Unsubscribe` with lists of slots and paths that
+	/// only the mirror can read, at the types its grants walk. `None` on every
+	/// channel this module mints itself.
+	control: Option<ChannelControl>,
+}
+
+/// What a controlled channel's owner answers (A153 S1): its control frames, read
+/// past the channel id (`receive`, handed the frame's tag), and its teardown, run
+/// when the channel is revoked or its session disposed.
+export struct ChannelControl {
+	receive: |str, Deserializer| void,
+	teardown: || void,
 }
 
 export impl Capability {
@@ -2436,7 +2450,7 @@ export impl ReactiveServer {
 		});
 		self.sources
 			.write()
-			.push((channel, Capability { start = starter, resolve = None, dynamic = false, identity = 0 - 1 }));
+			.push((channel, Capability { start = starter, resolve = None, dynamic = false, identity = 0 - 1, control = None }));
 		channel
 	}
 
@@ -2486,7 +2500,7 @@ export impl ReactiveServer {
 				});
 				self.sources
 					.write()
-					.push((channel, Capability { start = starter, resolve = None, dynamic = true, identity = cell_identity(source) }));
+					.push((channel, Capability { start = starter, resolve = None, dynamic = true, identity = cell_identity(source), control = None }));
 				channel
 			},
 		}
@@ -2515,7 +2529,7 @@ export impl ReactiveServer {
 				});
 				self.sources
 					.write()
-					.push((channel, Capability { start = starter, resolve = None, dynamic = true, identity }));
+					.push((channel, Capability { start = starter, resolve = None, dynamic = true, identity, control = None }));
 				channel
 			},
 		}
@@ -2536,10 +2550,39 @@ export impl ReactiveServer {
 	fun dynamic_channel_for(self, identity: i32, keyed: bool): Option<i32> {
 		for entry in self.sources.read() {
 			let (id, capability) = entry;
-			if capability.dynamic && capability.identity == identity {
+			if capability.dynamic && capability.identity == identity && capability.control.is_none() {
 				if capability.keyed() == keyed {
 					ret Some(id);
 				}
+			}
+		}
+		None
+	}
+
+	/// Open a CONTROLLED channel (A153 S1): one whose control frames the control
+	/// `make` builds for the minted id reads, carrying the source whose identity is
+	/// `identity` — a mirrored store's root, so a second reply into the same root
+	/// finds the channel the first opened (`controlled_channel_for`). Dynamic, like
+	/// every channel a reply mints: revoking it runs the control's teardown.
+	fun open_controlled(self, identity: i32, make: |i32| ChannelControl): i32 {
+		let channel = fresh_channel();
+		// Never started: a controlled channel's frames all go to its control.
+		let start = || Subscription::teardown(|| {});
+		let control = make(channel);
+		self.sources
+			.write()
+			.push((channel, Capability { start, resolve = None, dynamic = true, identity, control = Some(control) }));
+		channel
+	}
+
+	/// The controlled channel carrying the source with this identity, if this
+	/// connection has one — `dynamic_channel_for`'s twin for controlled channels,
+	/// which a plain or keyed channel never answers.
+	fun controlled_channel_for(self, identity: i32): Option<i32> {
+		for entry in self.sources.read() {
+			let (id, capability) = entry;
+			if capability.identity == identity && capability.control.is_some() {
+				ret Some(id);
 			}
 		}
 		None
@@ -2606,7 +2649,7 @@ export impl ReactiveServer {
 		};
 		self.sources
 			.write()
-			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false, identity = 0 - 1 }));
+			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false, identity = 0 - 1, control = None }));
 		channel
 	}
 
@@ -2642,7 +2685,7 @@ export impl ReactiveServer {
 		};
 		self.sources
 			.write()
-			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false, identity = 0 - 1 }));
+			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false, identity = 0 - 1, control = None }));
 		channel
 	}
 
@@ -2675,7 +2718,7 @@ export impl ReactiveServer {
 				};
 				self.sources
 					.write()
-					.push((channel, Capability { start, resolve = Some(resolve), dynamic = true, identity = cell_identity(cell.elements) }));
+					.push((channel, Capability { start, resolve = Some(resolve), dynamic = true, identity = cell_identity(cell.elements), control = None }));
 				channel
 			},
 		}
@@ -2882,13 +2925,22 @@ export impl ReactiveServer {
 		}
 		self.live.write() = kept;
 		mut remaining: List<(i32, Capability)> = [];
+		mut torn: List<ChannelControl> = [];
 		for entry in self.sources.read() {
 			let (id, capability) = entry;
 			if id != channel {
 				remaining.push((id, capability));
+			} else {
+				match capability.control {
+					Some(let control) => torn.push(control),
+					None => {},
+				}
 			}
 		}
 		self.sources.write() = remaining;
+		for control in torn {
+			(control.teardown)();
+		}
 	}
 
 	/// One inbound control frame: `Subscribe`/`Unsubscribe` route to
@@ -2904,6 +2956,17 @@ export impl ReactiveServer {
 		match (deserializer.failed)() {
 			Some(let _reason) => {},
 			None => {
+				// A controlled channel reads the rest of its own frames (A153 S1).
+				match self.capability_of(channel) {
+					Some(let capability) => match capability.control {
+						Some(let control) => {
+							(control.receive)(tag, deserializer);
+							ret;
+						},
+						None => {},
+					},
+					None => {},
+				}
 				if (deserializer.is_null)() {
 					(deserializer.null_value)();
 					match tag {
@@ -3270,7 +3333,15 @@ export impl ReactiveServer with Disposable {
 			forward.subscription.dispose();
 		}
 		self.live.write() = [];
+		let held = self.sources.read();
 		self.sources.write() = [];
+		for entry in held {
+			let (_id, capability) = entry;
+			match capability.control {
+				Some(let control) => (control.teardown)(),
+				None => {},
+			}
+		}
 		(self.transport).clear_on_frame();
 		// And what this connection's handlers built under its owner (A135): a
 		// per-call `.cell()`'s registration on the store's cell goes here, with the

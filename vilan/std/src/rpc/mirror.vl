@@ -1,0 +1,746 @@
+// `std::rpc::mirror` — the MIRRORED store (tracker A153,
+// `proposal/mirrored-store.md`): a server's `Store<T>` crossing the reactive
+// protocol as ONE seed, then patches at the writer's own paths.
+//
+// **The server half (S1).** An `[rpc]` that returns a `Store<T>` or a
+// `StoreSome<P>` answers through `reply_store`/`reply_store_some`: the connection's
+// channel for the handle's ROOT is found or opened (one per root per connection,
+// deduped by the root's identity, §3.1/Q4), a GRANT is added for the handle's path,
+// and the reply is `[channel, base, seed]` — the grant's BASE SLOT, which the
+// server names from the negatives so neither side waits for the other, and the
+// base's subtree, so the call that mints the handle is already its subscription
+// (Q5).
+//
+// **Slots (§2.2, Q1/Q2).** A client watches demand BOUNDARIES — a grant's base, a
+// map's key (`at(k)`), a set's member (`contains(x)`) — and names each with a slot of
+// its own (non-negative). It subscribes them in one frame per turn,
+//
+//     {"Subscribe":[channel, [[slot, base, [step, ..]], ..]]}
+//     {"Unsubscribe":[channel, [slot, ..]]}
+//
+// a path running from a grant's base to the boundary: a field's step is its child
+// index, a key's step is the key at its own type. The path is read at the GRANT's
+// type (`StoreWire::store_read_path`), so a subscription can never reach outside
+// what a reply handed out: the capability is the grant (§4.3, Q12), and a path a
+// grant cannot walk drops the rest of the frame.
+//
+// **Patches (§3.2, §5, Q6/Q7).** A slot is a store subscription at its boundary's node
+// (`store_watch`), so the server's slot tree grows and prunes with client demand as
+// it does with local demand. Every write that changes something records its PATH in
+// the root's wire log while a mirror stands on the store (`store_core`'s `wire`).
+// When a turn settles, each channel reads the paths past its cursor once and sends
+// ONE frame,
+//
+//     {"Patch":[channel, [op, ..]]}
+//     op := {"Seed":[slot, value]}         // the boundary's subtree (a new slot, or a write above it)
+//         | {"Set":[slot, [index, ..], value]}   // a write inside the boundary, at its own path
+//         | {"Gone":[slot]}                // the boundary is not reachable any more
+//
+// for the slots whose value changed: a write at or above a boundary re-seeds it, a
+// write inside it sets the written path (its descendants' writes dropped, the value
+// read once, at the flush — the last one wins). A relative path holds only field
+// steps: a keyed child is a boundary of its own, and a value describes its keyed
+// collections EMPTY (`StoreWire`), so a write under a key the client does not watch
+// sends that client nothing.
+
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::store::{ Store, StoreReach, StoreSome, StoreStep, StoreWire };
+import pkg::reactive::store_core::{
+	StoreNode,
+	store_identity_at,
+	store_watch,
+	store_wire_attach,
+	store_wire_detach,
+	store_wire_since,
+};
+import pkg::reactive::{ DeltaCursor, Disposable, Subscription, at_settle, fresh_id, turn_scope };
+import pkg::rpc::{
+	ChannelControl,
+	DuplexTransport,
+	ReactiveServer,
+	RpcOutcome,
+	RpcRequest,
+	encode_patch,
+	no_connection_for_handle,
+	session_of,
+};
+import pkg::shared::Shared;
+import pkg::wire::{ Deserialize, Deserializer, Serialize, Serializer };
+
+// === The server half (A153 S1) ===============================================
+
+/// A grant's three typed walkers, made where the handle's type is known (`walkers`)
+/// and kept as closures, because one channel carries grants of many types.
+struct MirrorWalkers {
+	/// Describe the value `at` steps below the base into the serializer; how it
+	/// went.
+	describe: |List<StoreStep>, Serializer| StoreReach,
+	/// How a walk `at` steps below the base goes, describing nothing.
+	reach: |List<StoreStep>| StoreReach,
+	/// Read a subscription path of `count` steps below the base off the frame.
+	read_path: |Deserializer, i32| Option<List<StoreStep>>,
+}
+
+/// One GRANT (§4.3): a base path a reply handed out on this connection, the slot
+/// that names it, how many replies handed it out (less the base's `Unsubscribe`s),
+/// and its walkers.
+struct MirrorGrant {
+	base: i32,
+	path: List<StoreStep>,
+	identity: i32,
+	holds: Shared<i32>,
+	walkers: MirrorWalkers,
+}
+
+/// One subscribed BOUNDARY: its slot, the grant it stands under, its path below the
+/// grant's base and from the root, the store subscription at its node, and how many
+/// `Subscribe`s hold it.
+struct MirrorSlot {
+	slot: i32,
+	base: i32,
+	rel: List<StoreStep>,
+	path: List<StoreStep>,
+	watch: Subscription,
+	holds: Shared<i32>,
+}
+
+/// What one frame's op says, planned before the frame is written.
+enum MirrorOpKind {
+	Seed,
+	Set,
+	Gone,
+}
+
+/// One planned op: its kind, its slot, and — for a seed or a set — the value's
+/// walker and where it walks (`at`, below the base) and the path the op names
+/// (`rel`, below the slot).
+struct MirrorOp {
+	kind: MirrorOpKind,
+	slot: i32,
+	describe: |List<StoreStep>, Serializer| StoreReach,
+	at: List<StoreStep>,
+	rel: List<StoreStep>,
+}
+
+/// One store ROOT mirrored on one connection: the channel, its grants and slots,
+/// the cursor into the root's wire log, and the turn's bookkeeping — the slots
+/// woken (`dirty`), the slots owed a seed (`seeding`), and the pending flush's id
+/// (`pending`, `-1` when none is).
+struct MirrorChannel {
+	channel: i32,
+	session: ReactiveServer,
+	root: Shared<StoreNode>,
+	cursor: DeltaCursor,
+	grants: Shared<List<MirrorGrant>>,
+	slots: Shared<List<MirrorSlot>>,
+	dirty: Shared<List<i32>>,
+	seeding: Shared<List<i32>>,
+	pending: Shared<i32>,
+	next_base: Shared<i32>,
+}
+
+/// Every open mirror channel, by channel id — what a settled turn's flush finds its
+/// channel in, so a slot's wake closure holds numbers and two cells and never the
+/// slot tree it stands on (A132's loop, one level down).
+let mirror_channels: Shared<List<MirrorChannel>> = Shared::new([]);
+
+fun mirror_of(channel: i32): Option<MirrorChannel> {
+	for held in mirror_channels.read() {
+		if held.channel == channel {
+			ret Some(held);
+		}
+	}
+	None
+}
+
+/// This connection's channel for `root`, opened with its first grant.
+fun mirror_channel(session: ReactiveServer, root: Shared<StoreNode>): MirrorChannel {
+	let identity = store_identity_at(root, []);
+	match session.controlled_channel_for(identity) {
+		Some(let channel) => match mirror_of(channel) {
+			Some(let held) => {
+				ret held;
+			},
+			None => {},
+		},
+		None => {},
+	}
+	let cursor = store_wire_attach(root);
+	let grants: Shared<List<MirrorGrant>> = Shared::new([]);
+	let slots: Shared<List<MirrorSlot>> = Shared::new([]);
+	let dirty: Shared<List<i32>> = Shared::new([]);
+	let seeding: Shared<List<i32>> = Shared::new([]);
+	// Made with NO turn ambient, so neither closure captures the turn of the call
+	// that opened the channel (a closure captures its context at creation, spec
+	// §8.4): each answers to the turn that is settling when it runs.
+	let channel = turn_scope.clear(|| session
+		.open_controlled(identity, |minted: i32| ChannelControl {
+			receive = |tag: str, deserializer: Deserializer| match mirror_of(minted) {
+				Some(let held) => held.receive(tag, deserializer),
+				None => {},
+			},
+			teardown = || match mirror_of(minted) {
+				Some(let held) => held.teardown(),
+				None => {},
+			},
+		}));
+	let opened = MirrorChannel {
+		channel,
+		session,
+		root,
+		cursor,
+		grants,
+		slots,
+		dirty,
+		seeding,
+		pending = Shared::new(0 - 1),
+		next_base = Shared::new(0 - 1),
+	};
+	mirror_channels.write().push(opened);
+	opened
+}
+
+/// The walkers of a handle whose in-place read is `lend`.
+fun walkers<T: StoreWire>(lend: |(|&T| void)| void): MirrorWalkers {
+	MirrorWalkers {
+		describe = |at: List<StoreStep>, serializer: Serializer| {
+			mut writer = serializer;
+			mut reach = StoreReach::Absent;
+			lend(|value: &T| {
+				reach = value.store_describe_at(&at, 0, &mut writer, true);
+			});
+			reach
+		},
+		reach = |at: List<StoreStep>| {
+			mut writer = inert_serializer();
+			mut reach = StoreReach::Absent;
+			lend(|value: &T| {
+				reach = value.store_describe_at(&at, 0, &mut writer, false);
+			});
+			reach
+		},
+		read_path = |deserializer: Deserializer, count: i32| {
+			mut reader = deserializer;
+			mut into: List<StoreStep> = [];
+			if T::store_read_path(&mut reader, count, &mut into) {
+				Some(into)
+			} else {
+				None
+			}
+		},
+	}
+}
+
+/// A serializer that writes nothing — what a walk that only asks how it goes is
+/// handed, since it never writes.
+fun inert_serializer(): Serializer {
+	Serializer {
+		begin_struct = |_fields: i32| {},
+		field = |_name: str| {},
+		end_struct = || {},
+		begin_list = |_length: i32| {},
+		end_list = || {},
+		begin_variant = |_name: str, _arity: i32| {},
+		end_variant = || {},
+		null_value = || {},
+		some_value = || {},
+		str_value = |_value: str| {},
+		i32_value = |_value: i32| {},
+		u32_value = |_value: u32| {},
+		i53_value = |_value: i53| {},
+		f64_value = |_value: f64| {},
+		bool_value = |_value: bool| {},
+	}
+}
+
+/// The reply of an `[rpc]` returning `Store<T>` (§3.1): `[channel, base, seed]`,
+/// the seed being the handle's value — the subtree of the grant's base, keyed
+/// collections empty. Described when the reply is written, after the route's turn
+/// settled, so it carries every write that turn made.
+[internal("the `[service]` expansion's replier for a `Store<T>` return (A153 S1)")]
+export fun reply_store<T: StoreWire>(request: RpcRequest, handle: Store<T>): RpcOutcome {
+	match session_of(request.connection) {
+		None => no_connection_for_handle(request),
+		Some(let session) => {
+			let lend = handle.lend;
+			let mirror = mirror_channel(session, handle.root);
+			let base = mirror.grant(handle.path, walkers(lend));
+			let channel = mirror.channel;
+			RpcOutcome::Success(|mut serializer: Serializer| {
+				serializer.begin_list(3);
+				serializer.i32_value(channel);
+				serializer.i32_value(base);
+				let here: List<StoreStep> = [];
+				mut wrote = false;
+				lend(|value: &T| {
+					wrote = true;
+					let _seed = value.store_describe_at(&here, 0, &mut serializer, true);
+				});
+				if !wrote {
+					serializer.null_value();
+				}
+				serializer.end_list();
+			})
+		},
+	}
+}
+
+/// The reply of an `[rpc]` returning `StoreSome<P>`: `reply_store`'s, with the seed
+/// an `Option<P>` — `null` while a variant on the handle's path is not live, and
+/// the base subscribed either way, so the payload arrives as a `Seed` when it
+/// comes.
+[internal("the `[service]` expansion's replier for a `StoreSome<P>` return (A153 S1)")]
+export fun reply_store_some<P: StoreWire>(request: RpcRequest, handle: StoreSome<P>): RpcOutcome {
+	match session_of(request.connection) {
+		None => no_connection_for_handle(request),
+		Some(let session) => {
+			let lend = handle.lend;
+			let mirror = mirror_channel(session, handle.root);
+			let base = mirror.grant(handle.path, walkers(lend));
+			let channel = mirror.channel;
+			RpcOutcome::Success(|mut serializer: Serializer| {
+				serializer.begin_list(3);
+				serializer.i32_value(channel);
+				serializer.i32_value(base);
+				let here: List<StoreStep> = [];
+				mut wrote = false;
+				lend(|value: &P| {
+					wrote = true;
+					serializer.some_value();
+					let _seed = value.store_describe_at(&here, 0, &mut serializer, true);
+				});
+				if !wrote {
+					serializer.null_value();
+				}
+				serializer.end_list();
+			})
+		},
+	}
+}
+
+/// Whether `prefix` is a prefix of `path` (or the path itself).
+fun starts_with(path: List<StoreStep>, prefix: List<StoreStep>): bool {
+	if prefix.len() > path.len() {
+		ret false;
+	}
+	mut index: usize = 0;
+	for index < prefix.len() {
+		if !same_step(path[index], prefix[index]) {
+			ret false;
+		}
+		index += 1;
+	}
+	true
+}
+
+fun same_step(a: StoreStep, b: StoreStep): bool {
+	match a {
+		StoreStep::Field(let left) => match b {
+			StoreStep::Field(let right) => left == right,
+			StoreStep::Key(let _hash) => false,
+		},
+		StoreStep::Key(let left) => match b {
+			StoreStep::Key(let right) => left == right,
+			StoreStep::Field(let _index) => false,
+		},
+	}
+}
+
+/// The steps of `path` past its first `from`, cut at the first KEY step: a value
+/// below a key crosses with its own boundary (a map's key) or with the keyed list
+/// that holds it (`by_key`), never at a path through the key.
+fun below_to_key(path: List<StoreStep>, from: usize): List<StoreStep> {
+	mut rel: List<StoreStep> = [];
+	mut index = from;
+	for index < path.len() {
+		match path[index] {
+			StoreStep::Field(let _field) => rel.push(path[index]),
+			StoreStep::Key(let _hash) => {
+				ret rel;
+			},
+		}
+		index += 1;
+	}
+	rel
+}
+
+/// `head` then `tail`.
+fun joined(head: List<StoreStep>, tail: List<StoreStep>): List<StoreStep> {
+	mut out = head;
+	for step in tail {
+		out.push(step);
+	}
+	out
+}
+
+/// Wake `slot` of `channel` for the turn, and owe the channel one flush at its
+/// settle: the slot's subscription runs this, holding no part of the slot tree.
+fun mark(channel: i32, slot: i32, dirty: Shared<List<i32>>, pending: Shared<i32>) {
+	if !dirty.read().contains(slot) {
+		dirty.write().push(slot);
+	}
+	schedule(channel, pending);
+}
+
+/// Owe `channel` one flush when the turn settles. The flush's id is minted at the
+/// first owe of the turn, so it sorts after every wake already queued in the turn
+/// and runs once, after them all (`at_settle` dedups by id).
+fun schedule(channel: i32, pending: Shared<i32>) {
+	if pending.read() < 0 {
+		let id = fresh_id();
+		pending.write() = id;
+		at_settle(id, || match mirror_of(channel) {
+			Some(let held) => held.flush(),
+			None => {},
+		});
+	}
+}
+
+impl MirrorChannel {
+	/// Add a grant for `path`, or hold the one already there (two replies at one
+	/// path are one grant, A92's dedup by identity), and answer its base slot. The
+	/// base is subscribed from the reply on: its seed rides in the reply.
+	fun grant(self, path: List<StoreStep>, made: MirrorWalkers): i32 {
+		let identity = store_identity_at(self.root, path);
+		for held in self.grants.read() {
+			if held.identity == identity {
+				held.holds.write() = held.holds.read() + 1;
+				ret held.base;
+			}
+		}
+		let base = self.next_base.read();
+		self.next_base.write() = base - 1;
+		self.grants
+			.write()
+			.push(MirrorGrant { base, path, identity, holds = Shared::new(1), walkers = made });
+		self.open_slot(base, base, [], path);
+		base
+	}
+
+	fun grant_of(self, base: i32): Option<MirrorGrant> {
+		for held in self.grants.read() {
+			if held.base == base {
+				ret Some(held);
+			}
+		}
+		None
+	}
+
+	/// Stand a boundary forward: a store subscription at `path` that marks `slot`
+	/// woken when the value there changes.
+	fun open_slot(self, slot: i32, base: i32, rel: List<StoreStep>, path: List<StoreStep>) {
+		let channel = self.channel;
+		let dirty = self.dirty;
+		let pending = self.pending;
+		// Made with no turn ambient, like the control's closures: the wake runs in
+		// the WRITER's turn, as it settles, and owes the flush to that turn — never
+		// to the turn that happened to be open when the slot was stood.
+		let root = self.root;
+		let watch = turn_scope
+			.clear(|| store_watch(root, path, || mark(channel, slot, dirty, pending)));
+		self.slots
+			.write()
+			.push(MirrorSlot { slot, base, rel, path, watch, holds = Shared::new(1) });
+	}
+
+	/// One control frame, past the channel id.
+	fun receive(self, tag: str, deserializer: Deserializer) {
+		match tag {
+			"Subscribe" => self.subscribe(deserializer),
+			"Unsubscribe" => self.unsubscribe(deserializer),
+			_ => {},
+		}
+	}
+
+	/// `[[slot, base, [step, ..]], ..]`: each slot stood at the boundary its path
+	/// names below its grant's base, and the frame answered with ONE patch of their
+	/// seeds — the frame is the client's turn (§5). A slot the client already holds
+	/// is held once more and sent nothing (the client counts its leases, A92). A
+	/// path no grant can walk — an unknown base, a step that names no boundary, a
+	/// malformed key — drops the rest of the frame: the steps after it can no
+	/// longer be read at any type.
+	fun subscribe(self, deserializer: Deserializer) {
+		mut reader = deserializer;
+		let count = reader.begin_list();
+		mut index = 0;
+		for index < count {
+			let _entry = reader.begin_list();
+			let slot = reader.i32_value();
+			let base = reader.i32_value();
+			let steps = reader.begin_list();
+			let found = match self.grant_of(base) {
+				Some(let held) => (held.walkers.read_path)(reader, steps),
+				None => None,
+			};
+			match found {
+				None => jump break,
+				Some(let rel) => {
+					reader.end_list();
+					reader.end_list();
+					match reader.failed() {
+						Some(let _reason) => jump break,
+						None => {},
+					}
+					if slot >= 0 {
+						self.hold_slot(slot, base, rel);
+					}
+				},
+			}
+			index += 1;
+		}
+		self.flush();
+	}
+
+	fun hold_slot(self, slot: i32, base: i32, rel: List<StoreStep>) {
+		for held in self.slots.read() {
+			if held.slot == slot {
+				held.holds.write() = held.holds.read() + 1;
+				ret;
+			}
+		}
+		match self.grant_of(base) {
+			Some(let held) => {
+				self.open_slot(slot, base, rel, joined(held.path, rel));
+				self.seeding.write().push(slot);
+			},
+			None => {},
+		}
+	}
+
+	/// `[slot, ..]`: each released once. A base's release is its grant's: with the
+	/// grant's last hold the grant goes, and every slot under it; with the
+	/// channel's last grant the channel is revoked (the teardown below).
+	fun unsubscribe(self, deserializer: Deserializer) {
+		mut reader = deserializer;
+		let count = reader.begin_list();
+		mut released: List<i32> = [];
+		mut index = 0;
+		for index < count {
+			released.push(reader.i32_value());
+			index += 1;
+		}
+		reader.end_list();
+		match reader.failed() {
+			Some(let _reason) => {
+				ret;
+			},
+			None => {},
+		}
+		for slot in released {
+			if slot < 0 {
+				self.release_grant(slot);
+			} else {
+				self.release_slot(slot);
+			}
+		}
+		if self.grants.read().is_empty() {
+			self.session.revoke(self.channel);
+		}
+	}
+
+	fun release_slot(self, slot: i32) {
+		mut kept: List<MirrorSlot> = [];
+		for held in self.slots.read() {
+			if held.slot == slot {
+				let left = held.holds.read() - 1;
+				held.holds.write() = left;
+				if left <= 0 {
+					held.watch.dispose();
+					jump continue;
+				}
+			}
+			kept.push(held);
+		}
+		self.slots.write() = kept;
+	}
+
+	fun release_grant(self, base: i32) {
+		mut kept: List<MirrorGrant> = [];
+		mut gone = false;
+		for held in self.grants.read() {
+			if held.base == base {
+				let left = held.holds.read() - 1;
+				held.holds.write() = left;
+				if left <= 0 {
+					gone = true;
+					jump continue;
+				}
+			}
+			kept.push(held);
+		}
+		self.grants.write() = kept;
+		if gone {
+			mut slots: List<MirrorSlot> = [];
+			for held in self.slots.read() {
+				if held.base == base {
+					held.watch.dispose();
+				} else {
+					slots.push(held);
+				}
+			}
+			self.slots.write() = slots;
+		}
+	}
+
+	/// The channel is gone — revoked, or its session disposed: every slot's store
+	/// subscription released, the cursor off the root's wire log (the last one
+	/// takes the log with it), and the channel out of the table.
+	fun teardown(self) {
+		for held in self.slots.read() {
+			held.watch.dispose();
+		}
+		self.slots.write() = [];
+		self.grants.write() = [];
+		store_wire_detach(self.root, self.cursor);
+		mut kept: List<MirrorChannel> = [];
+		for held in mirror_channels.read() {
+			if held.channel != self.channel {
+				kept.push(held);
+			}
+		}
+		mirror_channels.write() = kept;
+	}
+
+	/// The turn settled: read the paths written past the cursor once, plan one op
+	/// list over the slots that woke or are owed a seed, and send it as ONE frame.
+	fun flush(self) {
+		self.pending.write() = 0 - 1;
+		let dirty = self.dirty.read();
+		self.dirty.write() = [];
+		let seeding = self.seeding.read();
+		self.seeding.write() = [];
+		let written = store_wire_since(self.root, self.cursor);
+		mut ops: List<MirrorOp> = [];
+		for held in self.slots.read() {
+			let grant = match self.grant_of(held.base) {
+				Some(let found) => found,
+				None => {
+					jump continue;
+				},
+			};
+			if seeding.contains(held.slot) {
+				ops.push(seed_or_gone(grant, held));
+				jump continue;
+			}
+			if !dirty.contains(held.slot) {
+				jump continue;
+			}
+			match written {
+				// The log outran its ceiling: what moved is unknown, so the slot is
+				// seeded again.
+				None => ops.push(seed_or_gone(grant, held)),
+				Some(let paths) => plan(&mut ops, grant, held, paths),
+			}
+		}
+		if ops.is_empty() {
+			ret;
+		}
+		let session = self.session;
+		session.transport.send(encode_patch(session.codec, self.channel, |mut serializer: Serializer| {
+			serializer.begin_list(ops.len().as_i32());
+			for op in ops {
+				match op.kind {
+					MirrorOpKind::Seed => {
+						serializer.begin_variant("Seed", 2);
+						serializer.i32_value(op.slot);
+						let _seed = (op.describe)(op.at, serializer);
+						serializer.end_variant();
+					},
+					MirrorOpKind::Set => {
+						serializer.begin_variant("Set", 3);
+						serializer.i32_value(op.slot);
+						describe_steps(op.rel, &mut serializer);
+						let _set = (op.describe)(op.at, serializer);
+						serializer.end_variant();
+					},
+					MirrorOpKind::Gone => {
+						serializer.begin_variant("Gone", 1);
+						serializer.i32_value(op.slot);
+						serializer.end_variant();
+					},
+				}
+			}
+			serializer.end_list();
+		}));
+	}
+}
+
+/// A relative path's field steps, as the indices they are.
+fun describe_steps(rel: List<StoreStep>, serializer: &mut Serializer) {
+	serializer.begin_list(rel.len().as_i32());
+	for step in rel {
+		match step {
+			StoreStep::Field(let index) => serializer.i32_value(index.as_i32()),
+			// Never reached: `below_to_key` cut the path at its first key.
+			StoreStep::Key(let _hash) => serializer.null_value(),
+		}
+	}
+	serializer.end_list();
+}
+
+/// A slot's whole subtree, or `Gone` when its boundary is not reachable.
+fun seed_or_gone(grant: MirrorGrant, held: MirrorSlot): MirrorOp {
+	let kind = match (grant.walkers.reach)(held.rel) {
+		StoreReach::Absent => MirrorOpKind::Gone,
+		_ => MirrorOpKind::Seed,
+	};
+	MirrorOp { kind, slot = held.slot, describe = grant.walkers.describe, at = held.rel, rel = [] }
+}
+
+/// What a woken slot is owed for the turn's written `paths` (§4.1, §5): a write at
+/// or above its boundary re-seeds it; writes inside it set their own paths, cut at
+/// a key and with every path another one covers dropped; and a slot no write
+/// explains (a `notify` from below a key, a write whose own path is gone) is
+/// seeded.
+fun plan(
+	ops: &mut List<MirrorOp>,
+	grant: MirrorGrant,
+	held: MirrorSlot,
+	paths: List<List<StoreStep>>,
+) {
+	mut rels: List<List<StoreStep>> = [];
+	for path in paths {
+		if starts_with(held.path, path) {
+			ops.push(seed_or_gone(grant, held));
+			ret;
+		}
+		if starts_with(path, held.path) {
+			rels.push(below_to_key(path, held.path.len()));
+		}
+	}
+	if rels.is_empty() {
+		ops.push(seed_or_gone(grant, held));
+		ret;
+	}
+	mut index: usize = 0;
+	for index < rels.len() {
+		let rel = rels[index];
+		mut covered = false;
+		mut other: usize = 0;
+		for other < rels.len() {
+			if other != index && starts_with(rel, rels[other]) {
+				// A shorter path covers this one; an equal one earlier is it.
+				if rels[other].len() < rel.len() || other < index {
+					covered = true;
+				}
+			}
+			other += 1;
+		}
+		if !covered {
+			let at = joined(held.rel, rel);
+			match (grant.walkers.reach)(at) {
+				StoreReach::Described => ops.push(MirrorOp {
+					kind = MirrorOpKind::Set,
+					slot = held.slot,
+					describe = grant.walkers.describe,
+					at,
+					rel,
+				}),
+				// A keyed collection crosses by its keys, and a path a later write
+				// made unreachable is covered by that write's own op.
+				_ => {},
+			}
+		}
+		index += 1;
+	}
+}

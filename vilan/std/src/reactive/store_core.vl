@@ -14,6 +14,8 @@ import pkg::io::panic;
 import pkg::js::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
+	DeltaCursor,
+	DeltaLog,
 	Signal,
 	SignalCell,
 	Source,
@@ -90,18 +92,25 @@ export struct StoreWoken {
 /// ever asked about, minted on the first ask and kept — an identity must not change
 /// while anything holds it, and a node comes and goes with its subscriptions, so
 /// the table hangs off the one node that never goes. Every other node's is `None`.
+///
+/// And, while a WIRE forward stands on the store (A153 S1, `mirrored-store.md`
+/// §4.1), the root's `wire` log: the path of every write that changed something,
+/// which each mirrored connection reads past its own cursor when its turn settles.
+/// Made by the first forward and dropped with the last, so a store nobody mirrors
+/// records nothing.
 export struct StoreNode {
 	me: Option<StoreSlot>,
 	kids: List<Option<Shared<StoreNode>>>,
 	keyed: Option<Shared<NativeMap<Shared<StoreNode>>>>,
 	feeds: List<StoreFeed>,
 	ids: Option<NativeMap<i32>>,
+	wire: Option<DeltaLog<List<StoreStep>>>,
 }
 
 fun empty_node(): Shared<StoreNode> {
 	mut kids: List<Option<Shared<StoreNode>>> = [];
 	mut feeds: List<StoreFeed> = [];
-	Shared::new(StoreNode { me = None, kids, keyed = None, feeds, ids = None })
+	Shared::new(StoreNode { me = None, kids, keyed = None, feeds, ids = None, wire = None })
 }
 
 /// The identity of the path `path` under `root` (A146): one number for every handle
@@ -127,6 +136,13 @@ fun identity_at(root: Shared<StoreNode>, path: List<StoreStep>): i32 {
 	ids.insert(key, minted);
 	root.write().ids = Some(ids);
 	minted
+}
+
+/// `identity_at`, for the mirror's dedup (A153 S1): one channel per store root,
+/// one grant per path.
+[internal("the mirrored store's dedup (A153 S1)")]
+export fun store_identity_at(root: Shared<StoreNode>, path: List<StoreStep>): i32 {
+	identity_at(root, path)
 }
 
 /// The child of `node` at `index`, if anything ever watched below it — the diff's
@@ -345,10 +361,12 @@ export struct Spine {
 	ancestors: List<StoreSlot>,
 	touches: List<(StoreFeed, StoreTouch)>,
 	node: Option<Shared<StoreNode>>,
+	/// The root's wire log, while a mirror forward stands on the store.
+	wire: Option<DeltaLog<List<StoreStep>>>,
 }
 
 [internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
-export fun spine(root: Shared<StoreNode>, path: List<StoreStep>): Spine {
+export fun spine(root: Shared<StoreNode>, path: &List<StoreStep>): Spine {
 	mut ancestors: List<StoreSlot> = [];
 	mut touches: List<(StoreFeed, StoreTouch)> = [];
 	mut at: Option<Shared<StoreNode>> = Some(root);
@@ -371,7 +389,7 @@ export fun spine(root: Shared<StoreNode>, path: List<StoreStep>): Spine {
 		}
 		at = step_kid(at, step);
 	}
-	Spine { ancestors, touches, node = at }
+	Spine { ancestors, touches, node = at, wire = root.read().wire }
 }
 
 /// Notify every collected slot, inside ONE `batch` when there are several: the diff
@@ -431,6 +449,58 @@ export fun watch_at(
 	let handle = slot.signal.on_settle(subscriber);
 	counted(root, path, slot, handle);
 	handle
+}
+
+/// Attach a WAKE to the slot at `path`, counted: `wake` runs when the value there
+/// changed, and reads nothing — the mirror's boundary forward (A153 S1), which
+/// reads what it sends when its turn settles.
+[internal("the mirrored store's boundary forward (A153 S1)")]
+export fun store_watch(
+	root: Shared<StoreNode>,
+	path: List<StoreStep>,
+	wake: || void,
+): Subscription {
+	observe_at(root, path, wake)
+}
+
+/// Stand one mirror forward on `root`'s wire log, made with the first (A153 S1):
+/// the cursor names the writes the forward has not read yet.
+[internal("the mirrored store's write log (A153 S1)")]
+export fun store_wire_attach(root: Shared<StoreNode>): DeltaCursor {
+	let log: DeltaLog<List<StoreStep>> = match root.read().wire {
+		Some(let held) => held,
+		None => DeltaLog::new(),
+	};
+	root.write().wire = Some(log);
+	log.cursor()
+}
+
+/// The paths written past `cursor`, and advance it — `None` when the log lost them
+/// (it outran its ceiling), which a forward answers by re-seeding.
+[internal("the mirrored store's write log (A153 S1)")]
+export fun store_wire_since(
+	root: Shared<StoreNode>,
+	cursor: DeltaCursor,
+): Option<List<List<StoreStep>>> {
+	match root.read().wire {
+		Some(let log) => log.since(cursor),
+		None => None,
+	}
+}
+
+/// Take one mirror forward off `root`'s wire log; with the last, the log goes and
+/// the store records nothing again.
+[internal("the mirrored store's write log (A153 S1)")]
+export fun store_wire_detach(root: Shared<StoreNode>, cursor: DeltaCursor) {
+	match root.read().wire {
+		Some(let log) => {
+			log.drop_cursor(cursor);
+			if log.cursors.read().is_empty() {
+				root.write().wire = None;
+			}
+		},
+		None => {},
+	}
 }
 
 /// Attach an OBSERVER to the slot at `path`, counted. The subscriber is minted
@@ -537,7 +607,7 @@ fun write_at<T: Storable>(
 	modify: |(|&mut T| void)| void,
 	value: T,
 ): bool {
-	let found = spine(root, path);
+	let found = spine(root, &path);
 	let need = !found.ancestors.is_empty() || !found.touches.is_empty();
 	let node = found.node;
 	mut woken = StoreWoken { slots = [], feeds = [] };
@@ -566,6 +636,12 @@ fun write_at<T: Storable>(
 		for slot in found.ancestors {
 			woken.slots.push(slot);
 		}
+		// Inline rather than a helper: an argument is a copy, and a store nobody
+		// mirrors must not pay one per write for a log it does not keep.
+		match found.wire {
+			Some(let log) => log.record(path),
+			None => {},
+		}
 	}
 	deliver(woken.slots);
 	true
@@ -575,9 +651,13 @@ fun write_at<T: Storable>(
 /// body, the escape hatch for a change the store cannot see. No feed records
 /// anything: nothing it can name happened.
 fun notify_at(root: Shared<StoreNode>, path: List<StoreStep>) {
-	let found = spine(root, path);
+	let found = spine(root, &path);
 	mut woken = StoreWoken { slots = found.ancestors, feeds = [] };
 	store_wake_me(found.node, true, &mut woken);
+	match found.wire {
+		Some(let log) => log.record(path),
+		None => {},
+	}
 	deliver(woken.slots);
 }
 
@@ -1174,6 +1254,16 @@ fun count_tree(node: Shared<StoreNode>): (usize, usize) {
 		nodes += kid_nodes;
 	}
 	(slots, nodes)
+}
+
+/// How many mirror forwards stand on `store`'s wire log — `0` when it keeps none,
+/// which is when it records nothing (A153 S1). It counts; it decides nothing.
+[internal("an instrument for the mirror-lifetime pins (A153 S1); it counts, it decides nothing")]
+export fun store_wire_census<T>(store: Store<T>): usize {
+	match store.root.read().wire {
+		Some(let log) => log.cursors.read().len(),
+		None => 0,
+	}
 }
 
 /// How many open flows' feeds stand anywhere in `store`'s slot tree — the
