@@ -135,7 +135,7 @@ fn post_build(directory: &str) -> PostBuild {
             expected_stdout: concat!(
                 "ok: found ada (@ada)\n",
                 "ok: no such user\n",
-                "raw error: Remote(\"unknown method: delete_everything\")\n",
+                "raw error: RpcError::Remote(\"unknown method: delete_everything\")\n",
                 "--- reactive: a remote Source<i32> ---\n",
                 "count = 0\n",
                 "count = 1\n",
@@ -159,10 +159,10 @@ fn post_build(directory: &str) -> PostBuild {
                 // channel and seeds the mirror with what the server holds THEN
                 // — `edit_note` was in flight with the mint, so the seed is
                 // already the edited text and one `note =` line prints, not two.
-                "note status = Waiting\n",
+                "note status = Status::Waiting\n",
                 "note = hello, ada\n",
                 "edit -> true\n",
-                "note status = Ready\n",
+                "note status = Status::Ready\n",
             ),
         },
         "browser" => PostBuild::Artifacts(&["client.js"]),

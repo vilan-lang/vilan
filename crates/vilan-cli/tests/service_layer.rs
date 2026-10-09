@@ -1611,7 +1611,7 @@ fn a_refused_vilan_client_is_told_its_refusal_in_one_frame() {
 /// Proven red first by planting the pre-A47 server (no refusal ever takes the
 /// frame path), which is the exact behaviour this item was filed against: the
 /// same program answers
-/// `refused:Transport("could not reach ws://localhost:44659/")`, and the run
+/// `refused:RpcError::Transport("could not reach ws://localhost:44659/")`, and the run
 /// takes 34.0 s where the fixed one takes 11.2 s — both figures including the
 /// build.
 #[test]
@@ -1663,7 +1663,7 @@ fun run(port: i32) {
         .expect("run the refused-client program");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        stdout.contains("refused:Unauthorized"),
+        stdout.contains("refused:RpcError::Unauthorized"),
         "a refused connect must report RpcError::Unauthorized; stdout was:\n{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -2093,7 +2093,7 @@ fun run(port: i32) {
         .expect("run the unavailable-client program");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     for expected in [
-        "refused:Unavailable",
+        "refused:RpcError::Unavailable",
         "is-unavailable:true",
         "is-unauthorized:false",
     ] {
@@ -3736,12 +3736,12 @@ fn a_handle_returning_method_hands_the_client_a_mirror_and_hashes_as_the_mapped_
     // it through a lease.
     assert_eq!(
         line_of("before:"),
-        "Waiting",
+        "Status::Waiting",
         "a minted mirror opened its channel before anything watched it:\n{stdout}"
     );
     assert_eq!(
         line_of("after:"),
-        "Ready",
+        "Status::Ready",
         "the lease did not seed the mirror from the server's updates:\n{stdout}"
     );
     for expected in ["m3:hello", "edit:true", "held:hello"] {
@@ -4185,7 +4185,7 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     assert_eq!(
         line_of("find-missing:"),
-        "Absent",
+        "Status::Absent",
         "a `None` reply to an Option-written handle method must read as \
          `Absent`, not as a `Waiting` that never resolves:\n{stdout}"
     );
@@ -4207,7 +4207,7 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     assert_eq!(
         line_of("find-found-status:"),
-        "Ready",
+        "Status::Ready",
         "a present Option-form mirror reads `Ready` like any other:\n{stdout}"
     );
     assert!(
@@ -5513,13 +5513,13 @@ fn a_keyed_handle_return_hands_the_client_a_patched_mirror_minted_at_its_first_l
     };
     assert_eq!(
         line_of("minted:"),
-        "sources=1 live=0 asks=0 status=Waiting",
+        "sources=1 live=0 asks=0 status=Status::Waiting",
         "a keyed handle nothing watches must cost nothing — no call, no \
          capability, no forward:\n{stdout}"
     );
     assert_eq!(
         line_of("leased:"),
-        "sources=2 live=1 asks=1 status=Ready",
+        "sources=2 live=1 asks=1 status=Status::Ready",
         "the first lease must issue the call, mint the channel and seed the \
          mirror:\n{stdout}"
     );

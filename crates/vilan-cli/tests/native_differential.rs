@@ -5039,7 +5039,7 @@ fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_b
         "a per-key subscription sees ITS key and no other:\n{}",
         native.1
     );
-    assert_eq!(native.2.trim(), "err:Unauthorized");
+    assert_eq!(native.2.trim(), "err:RpcError::Unauthorized");
 }
 
 /// Replaces every session token in `exchanges`' bodies — a run of exactly 64

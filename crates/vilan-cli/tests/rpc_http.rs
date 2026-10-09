@@ -1069,7 +1069,7 @@ fun run_clients(port: i32) {
 ///
 /// Since A92 the stub is SYNC and makes no call, so the failure arrives one
 /// step later and in the mirror's own vocabulary: the first LEASE is what asks,
-/// and what it was told is `status()` — `Failed(Remote("`note` returns a signal
+/// and what it was told is `status()` — `Status::Failed(RpcError::Remote("`note` returns a signal
 /// handle, …"))`. The message is unchanged; where a caller reads it is not.
 ///
 /// A handle's reply is a channel id minted in the connection's capability
@@ -1158,7 +1158,7 @@ fun run_client(url: str) {
 	// answered on the transport's own turn, not on this one, so what makes the
 	// failure readable here is a round-trip — and one round-trip was enough on
 	// a quiet box and not enough under lane load, where this printed
-	// `note err Waiting` and nothing in the pin could tell that from a real
+	// `note err Status::Waiting` and nothing in the pin could tell that from a real
 	// regression. Round-trip until the status leaves `Waiting`, bounded: a
 	// genuine hang still fails the assertions below, with the state it is
 	// stuck in printed rather than with a timeout nobody can read.
@@ -1186,7 +1186,7 @@ fun run_client(url: str) {
          the handle's, not the mount's:\n{stdout}"
     );
     assert!(
-        stdout.contains("note err Failed("),
+        stdout.contains("note err Status::Failed("),
         "a handle method over the POST leg must fail at its first lease, not \
          answer a channel id that names nothing:\n{stdout}"
     );

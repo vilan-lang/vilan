@@ -493,7 +493,7 @@ fn a_dropped_connection_reconnects_and_resyncs() {
     let server = fixture.server("1", "none");
     server.await_line("listening 1", wait);
     let client = fixture.client();
-    client.await_line("state:Connected", wait);
+    client.await_line("state:ConnectionState::Connected", wait);
     client.await_line("mirror:1", wait);
 
     // Phase 2: freeze the server so the next call hangs in flight, then kill.
@@ -508,7 +508,7 @@ fn a_dropped_connection_reconnects_and_resyncs() {
     // pending rejection on stdout), and the in-flight call REJECTS (typed,
     // never dangling). `await_line` consumes skipped lines, so the order
     // here mirrors the client's emission order.
-    client.await_line("state:Reconnecting", wait);
+    client.await_line("state:ConnectionState::Reconnecting", wait);
     let fast = client.await_line("fast:err", wait);
     assert!(
         fast.contains("not connected"),
@@ -524,7 +524,7 @@ fn a_dropped_connection_reconnects_and_resyncs() {
     // the hook re-attaches, the mirror resyncs, calls work again.
     let revived = fixture.server("2", "none");
     revived.await_line("listening 2", wait);
-    client.await_line("state:Connected", wait);
+    client.await_line("state:ConnectionState::Connected", wait);
     client.await_line("mirror:2", wait);
     // A30's load-bearing negative: an ordinary redial disposes NOTHING. The
     // two terminal siblings below are the only paths that may.
@@ -558,12 +558,12 @@ fn a_refused_reattach_closes_the_socket_instead_of_wedging_the_mirrors() {
     let server = fixture.server("1", "none");
     server.await_line("listening 1", wait);
     let client = fixture.client();
-    client.await_line("state:Connected", wait);
+    client.await_line("state:ConnectionState::Connected", wait);
     client.await_line("mirror:1", wait);
 
     server.signal("-KILL");
     drop(server);
-    client.await_line("state:Reconnecting", wait);
+    client.await_line("state:ConnectionState::Reconnecting", wait);
 
     // Same surface (so the contract re-check passes), no session registry (so
     // the attach it reaches next fails).
@@ -574,8 +574,8 @@ fn a_refused_reattach_closes_the_socket_instead_of_wedging_the_mirrors() {
     // The state flips to Connected a beat before the hooks run — by design
     // (§2.5: the re-attach's own rpc call needs a usable transport). What must
     // NOT happen is that it stays there.
-    client.await_line("state:Connected", wait);
-    let settled = client.collect_until("state:Closed", wait);
+    client.await_line("state:ConnectionState::Connected", wait);
+    let settled = client.collect_until("state:ConnectionState::Closed", wait);
     assert!(
         !settled.iter().any(|line| line.contains("mirror:2")),
         "nothing was rebound, so no mirror can have resynced: {settled:?}"
@@ -607,18 +607,18 @@ fn a_server_that_redeploys_a_different_surface_closes_the_socket() {
     let server = fixture.server("1", "none");
     server.await_line("listening 1", wait);
     let client = fixture.client();
-    client.await_line("state:Connected", wait);
+    client.await_line("state:ConnectionState::Connected", wait);
     client.await_line("mirror:1", wait);
 
     server.signal("-KILL");
     drop(server);
-    client.await_line("state:Reconnecting", wait);
+    client.await_line("state:ConnectionState::Reconnecting", wait);
 
     let revived = fixture.server("2", "drift");
     revived.await_line("listening 2", wait);
 
-    client.await_line("state:Connected", wait);
-    let settled = client.collect_until("state:Closed", wait);
+    client.await_line("state:ConnectionState::Connected", wait);
+    let settled = client.collect_until("state:ConnectionState::Closed", wait);
     assert!(
         !settled.iter().any(|line| line.contains("mirror:2")),
         "a drifted surface must not feed the mirrors: {settled:?}"
@@ -656,18 +656,20 @@ fn a_spent_retry_budget_closes_for_good_and_disposes_the_client() {
     let server = fixture.server("1", "none");
     server.await_line("listening 1", wait);
     let client = fixture.client();
-    client.await_line("state:Connected", wait);
+    client.await_line("state:ConnectionState::Connected", wait);
     client.await_line("mirror:1", wait);
 
     // The one difference from every other leg in this file: nothing takes the
     // dead server's place. The port stays unbound for the whole budget.
     server.signal("-KILL");
     drop(server);
-    client.await_line("state:Reconnecting", wait);
+    client.await_line("state:ConnectionState::Reconnecting", wait);
 
-    let settled = client.collect_until("state:Closed", wait);
+    let settled = client.collect_until("state:ConnectionState::Closed", wait);
     assert!(
-        !settled.iter().any(|line| line.contains("state:Connected")),
+        !settled
+            .iter()
+            .any(|line| line.contains("state:ConnectionState::Connected")),
         "nothing came back, so no attempt can have reconnected: {settled:?}"
     );
     // A31's uniform law: the terminal state disposes on this arm exactly as it
@@ -773,7 +775,7 @@ fn a_dirty_draft_repushes_itself_on_reconnect() {
     let server = fixture.server("1", "none");
     server.await_line("listening 1", wait);
     let client = fixture.client();
-    client.await_line("state:Connected", wait);
+    client.await_line("state:ConnectionState::Connected", wait);
     client.await_line("ready", wait);
     client.await_line("mirror:1", wait);
 
@@ -782,7 +784,7 @@ fn a_dirty_draft_repushes_itself_on_reconnect() {
     // stranded in `local` with `synced` behind it.
     server.signal("-KILL");
     drop(server);
-    client.await_line("state:Reconnecting", wait);
+    client.await_line("state:ConnectionState::Reconnecting", wait);
     let stranded = client.await_line("commit:1:", wait);
     assert!(
         stranded.contains("err"),
@@ -794,7 +796,7 @@ fn a_dirty_draft_repushes_itself_on_reconnect() {
     // app's reconnect hook re-pushes the stranded 7.
     let revived = fixture.server("2", "none");
     revived.await_line("listening 2", wait);
-    client.await_line("state:Connected", wait);
+    client.await_line("state:ConnectionState::Connected", wait);
     client.await_line("mirror:2", wait);
 
     let repushed = client.await_line("commit:2:", wait);
@@ -1087,7 +1089,7 @@ fn a_dynamically_minted_mirror_is_invalidated_by_a_reconnect_and_can_be_remade()
     client.await_line("minted:", wait);
     client.await_line("dynamic:1", wait);
     // The mirror is live on this connection.
-    client.await_line("tick:Ready", wait);
+    client.await_line("tick:Status::Ready", wait);
 
     // The connection is replaced under it.
     drop(server);
@@ -1096,7 +1098,7 @@ fn a_dynamically_minted_mirror_is_invalidated_by_a_reconnect_and_can_be_remade()
 
     // What the reconnect must produce: the mirror says it knows nothing,
     // rather than reporting the old connection's value forever.
-    client.await_line("tick:Waiting", wait);
+    client.await_line("tick:Status::Waiting", wait);
     // And the documented recovery works on the fresh session's own id.
     client.await_line("remade:2", wait);
 
