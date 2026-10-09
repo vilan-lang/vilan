@@ -285,9 +285,9 @@ macro fun PartialEq(item: Item): Source {
 	source("")
 }
 
-/// B443: two tuples of one type are equal when every position is, at any arity
-/// — so a pack bounded `(2..: PartialEq)` holds a PAIR, and `==` reads a tuple
-/// the way it reads its elements.
+/// B443: two tuples of one type are equal when every position is, at any arity — so
+/// a pack bounded `(2..: PartialEq)` holds a PAIR, and `==` reads a tuple the way
+/// it reads its elements.
 export impl type T: (2..: PartialEq) with PartialEq {
 	fun eq(self, b: T): bool {
 		for key in self.keys() {

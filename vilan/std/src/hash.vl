@@ -137,8 +137,8 @@ export impl List<type T: Hashable> with Hashable {
 	}
 }
 
-/// B443: a tuple of `Hashable` elements is `Hashable`, at any arity — the
-/// canonical hash of the whole value, as a `List`'s is.
+/// B443: a tuple of `Hashable` elements is `Hashable`, at any arity — the canonical
+/// hash of the whole value, as a `List`'s is.
 export impl type T: (2..: Hashable) with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
