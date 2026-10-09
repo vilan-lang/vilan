@@ -50237,6 +50237,90 @@ impl<'src> Analyzer<'src> {
         Some(kept)
     }
 
+    /// B558: the impl-binder bindings a static path WROTE (`Cell<str>::new`)
+    /// for binders that are rigid at the call — the enclosing block's own,
+    /// when the call stands inside the impl that declares the static. The
+    /// reconciliation will not bind a rigid binder, and the written argument
+    /// is no inference to make: it is the instantiation. `None` when the path
+    /// wrote none (a bare path's `Self` reading binds each binder to itself).
+    fn written_rigid_path_bindings(&self, subject_id: Id) -> Option<SubstitutionContext> {
+        let bindings = self.static_subject_bindings.get(&subject_id)?;
+        let written: SubstitutionContext = bindings
+            .iter()
+            .filter(|(generic, bound)| {
+                self.generic_is_rigid_here(**generic)
+                    && !matches!(bound.get_type(self), Type::Generic(itself) if itself == **generic)
+            })
+            .map(|(generic, bound)| (*generic, *bound))
+            .collect();
+        (!written.is_empty()).then_some(written)
+    }
+
+    /// B558: the refusal of an argument at a parameter written in the impl's
+    /// own binder, when the call is a bare `Type::f(..)` inside the block that
+    /// declares `f` — B403 reads it as `Self::f(..)`, so the binder is this
+    /// block's own and RIGID, and the argument cannot instantiate it. The
+    /// refusal is right; rendered through the call's working context, which
+    /// had bound the binder to the argument, it read "Expected str, but got
+    /// str". It names the binder as written and steers to the spelling that
+    /// instantiates fresh (`Cell<str>::new(..)`, B542). `None` for any other
+    /// mismatch.
+    fn rigid_self_reading_mismatch(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        target_id: Id,
+        parameter_type: &Type,
+        argument_type: &Type,
+    ) -> Option<String> {
+        // The `Self` reading binds each impl binder the path leaves open to
+        // ITSELF (`{T: T}`), and a binder of the enclosing block is rigid in
+        // the body, so the argument could not have instantiated it.
+        let Some(reading) = self.static_subject_bindings.get(&subject_id) else {
+            return None;
+        };
+        let mut generics = Vec::new();
+        self.collect_generics(parameter_type, 0, &mut generics);
+        let read_as_self = generics.iter().any(|generic| {
+            reading.get(generic).is_some_and(
+                |bound| matches!(bound.get_type(self), Type::Generic(itself) if itself == *generic),
+            ) && self.generic_is_enclosing_binder(*generic, call_id)
+        });
+        if !read_as_self {
+            return None;
+        }
+        let expected = self.pretty_print_type(parameter_type, &HashMap::default());
+        let got = self.pretty_print_type(argument_type, &HashMap::default());
+        let member = self.functions.get(&target_id).map(|function| function.name);
+        let subject = self
+            .implementations
+            .iter()
+            .find(|implementation| {
+                implementation
+                    .declarations
+                    .values()
+                    .any(|id| *id == target_id)
+            })
+            .map(|implementation| implementation.subject);
+        let (Some(member), Some(subject)) = (member, subject) else {
+            return Some(format!("Expected {expected}, but got {got} instead."));
+        };
+        // The instantiation the argument asks for: the binder the parameter IS
+        // bound to the argument, in the impl's subject.
+        let mut wanted = SubstitutionContext::default();
+        if let Type::Generic(binder) = parameter_type {
+            wanted.insert(*binder, argument_type.clone().get_type_id(self));
+        }
+        let written = self.pretty_print_type(&subject.get_type(self), &HashMap::default());
+        let path = written.split('<').next().unwrap_or(&written).to_string();
+        let suggested = self.pretty_print_type(&subject.get_type(self), &wanted);
+        Some(format!(
+            "Expected {expected}, but got {got} instead: inside the impl that declares it, a bare \
+             `{path}::{member}(..)` is `Self::{member}(..)`, whose `{expected}` is this block's \
+             own. Write `{suggested}::{member}(..)` to call it at another instantiation"
+        ))
+    }
+
     /// B541: an argument at a MAPPED parameter (`(U in T: Option<U>)`) whose
     /// family `T` nothing else binds, and one of whose elements gives the
     /// family no evidence — `None` names no payload type, so `T`'s element
@@ -51535,6 +51619,14 @@ impl<'src> Analyzer<'src> {
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
                         let parameter_type = parameter.type_id.get_type(self);
+                        // B558: `Cell<str>::new(label)` inside the impl that
+                        // declares `new` WROTE the instantiation; the block's
+                        // binder is rigid in the body, so the path's binding is
+                        // applied to the parameter rather than asked of it.
+                        let parameter_type = match self.written_rigid_path_bindings(subject_id) {
+                            Some(written) => self.substitute_type(&parameter_type, &written),
+                            None => parameter_type,
+                        };
                         let argument_id = *argument_ids.get(index).unwrap();
                         // B501: a CALL standing at a parameter the call has
                         // already decided (`counted(source("x"))` under `let
@@ -51682,21 +51774,30 @@ impl<'src> Analyzer<'src> {
                                     &substitution_context,
                                 ) {
                                     Some(msg) => (msg, None),
-                                    None => {
-                                        let (msg, note) = self.argument_mismatch(
-                                            parameter_name,
-                                            *parameter_id,
-                                            &parameter_type,
-                                            &argument_type,
-                                            &substitution_context,
-                                        );
-                                        let msg = self.with_fragment_steer(
-                                            msg,
-                                            argument_id,
-                                            &parameter_type,
-                                        );
-                                        (msg, note)
-                                    }
+                                    None => match self.rigid_self_reading_mismatch(
+                                        call_id,
+                                        subject_id,
+                                        target_id,
+                                        &parameter_type,
+                                        &argument_type,
+                                    ) {
+                                        Some(msg) => (msg, None),
+                                        None => {
+                                            let (msg, note) = self.argument_mismatch(
+                                                parameter_name,
+                                                *parameter_id,
+                                                &parameter_type,
+                                                &argument_type,
+                                                &substitution_context,
+                                            );
+                                            let msg = self.with_fragment_steer(
+                                                msg,
+                                                argument_id,
+                                                &parameter_type,
+                                            );
+                                            (msg, note)
+                                        }
+                                    },
                                 };
                                 let span = **self.span_map.get(&argument_id).unwrap();
                                 self.calls_with_refused_arguments.insert(call_id);

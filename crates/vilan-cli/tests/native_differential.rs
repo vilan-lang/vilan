@@ -11453,4 +11453,45 @@ fun main() {
         "a method on a scalar view must auto-deref on both backends"
     );
 }
+/// B558: a static path that WRITES its instantiation (`Cell<str>::new(..)`)
+/// inside the impl that declares the static runs on both backends.
+#[test]
+fn a_written_instantiation_inside_the_declaring_impl_runs_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b558.vl"),
+        r#"import std::io::print;
+
+struct Cell<T> {
+    value: T,
+}
+
+impl Cell<type T> {
+    fun new(value: T): Cell<T> {
+        Cell { value = value }
+    }
+
+    fun get(self): T {
+        self.value
+    }
+
+    fun relabel(self, label: str): Cell<str> {
+        Cell<str>::new(label)
+    }
+}
+
+fun main() {
+    let cell = Cell::new(1);
+    print(cell.relabel("x").get());
+    print(cell.get());
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b558.vl"),
+        Verdict::Identical,
+        "a written instantiation inside the declaring impl must run on both backends"
+    );
+}
 
