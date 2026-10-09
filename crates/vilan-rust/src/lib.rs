@@ -9176,7 +9176,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         }
-        let body = self.expression(closure.return_, depth)?;
+        let mut body = self.expression(closure.return_, depth)?;
+        // F120: a body whose value is itself a HANDLE — `async { async { "s"
+        // } }`, or a call answering a `Task` — is assimilated: the JS host's
+        // promise adoption hands back the payload, and the analyzer types the
+        // block by it (`assimilated_task_payload`). Natively each layer is
+        // one more `.await` inside the block, as F107 awaits a written-async
+        // call's declared handle.
+        for _ in 0..self.task_layers(closure.return_) {
+            body = Self::awaited(&body);
+        }
         let origin = rust_string(self.current_origin.unwrap_or("top level"));
         let prelude = self.async_capture_prelude(closure.return_);
         let Some(&(source_entity, is_option)) = self.program.spawn_nursery_sources.get(&spawn_id)
@@ -11199,6 +11208,57 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
         }
         (current, layers)
+    }
+
+    /// F120: how many `Task` layers wrap the value `id` answers — the
+    /// handles an `async` block's body owes an `.await` each. An `async`
+    /// block nested as the value carries no type of its own, and is one.
+    fn task_layers(&self, id: Id) -> usize {
+        let tail = self.value_tail(id);
+        if matches!(self.program.entity_map.get(&tail), Some(Expr::Async(_))) {
+            return 1;
+        }
+        let Some(type_id) = self.type_of(tail).or_else(|| self.type_of(id)) else {
+            return 0;
+        };
+        let mut layers = 0;
+        let mut seen = HashSet::new();
+        let mut current = type_id;
+        while seen.insert(current) {
+            match self.resolve(current) {
+                Some(Type::Struct(struct_id, arguments))
+                    if self
+                        .program
+                        .structs
+                        .get(struct_id)
+                        .is_some_and(|declaration| {
+                            declaration.name == "Task" && declaration.external
+                        }) =>
+                {
+                    let Some(&inner) = arguments.first() else {
+                        break;
+                    };
+                    layers += 1;
+                    current = inner;
+                }
+                _ => break,
+            }
+        }
+        layers
+    }
+
+    /// The expression whose value a block answers — its tail, through nested
+    /// blocks — or `id` itself.
+    fn value_tail(&self, id: Id) -> Id {
+        let mut current = id;
+        let mut seen = HashSet::new();
+        while seen.insert(current) {
+            match self.program.entity_map.get(&current) {
+                Some(Expr::Block((_, tail))) => current = *tail,
+                _ => break,
+            }
+        }
+        current
     }
 
     /// [`Self::assimilated_return`]'s layer count for a call — the `.await`s

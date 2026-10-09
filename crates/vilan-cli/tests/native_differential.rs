@@ -11836,3 +11836,24 @@ fn f119_a_blanket_method_on_a_function_item_is_identical_on_both_backends() {
         "a blanket method on a function item must answer the same natively"
     );
 }
+
+/// F120: an `async` block whose body is itself a handle (`async { async {
+/// "s" } }`, nested three deep, or a call answering a `Task`) is one
+/// `Task<payload>`, as the analyzer types it and JS's promise adoption
+/// answers: natively each layer is one more `.await` inside the block, where
+/// the base handed the inner handle back as the value and rustc refused it.
+#[test]
+fn f120_a_nested_async_block_is_assimilated_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f120_nested_async_blocks.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/nested_async_blocks.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested `async` block must answer its payload natively"
+    );
+}

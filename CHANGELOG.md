@@ -62,6 +62,11 @@ written down.
 <!-- family: fix -->
 **F119: a blanket method on an unannotated FUNCTION ITEM — `let f = nothing; f.leaf()`, which B565 made resolve — builds natively; it was refused as "a value of type `a function value`".** The blanket's `T` binds the item's own type, and the native backend now renders that type as what the item's value is: the counted closure over its signature (`Rc<dyn Fn(..) -> ..>`, each parameter in its receiving form), keyed per item so two items of different signatures are two instances. The item's value is built at that type, so an unannotated binding of it is the same closure a typed position takes, and a binding of an item that takes a view calls it with the view (`let b = bump; b(&mut count)` was rustc's E0308). The fix is the native one the item's second door named; the analyzer's recorded substitution is untouched. Pin: `native_differential::f119_a_blanket_method_on_a_function_item_is_identical_on_both_backends` (`native/function_item_receivers.vl`: a bare and a bound item, `&self` and `self` blankets, a one-parameter item, a `&mut` one, an item through a generic, a field). Tracker F119.
 
+---
+
+<!-- family: fix -->
+**F120: an `async` block whose body is itself a handle — `async { async { "s" } }`, nested deeper, or a call answering a `Task` — builds natively and answers its payload; rustc refused the emitted Rust (E0308).** The analyzer types such a block by the payload (`assimilated_task_payload`), as the JS host's promise adoption answers it; the native block handed the inner handle back as its value, one `Task` layer deeper than its type. Each layer the body's value carries is now one more `.await` inside the block, the way F107 awaits a written-async call's declared handle. Pre-existing (the plain `fun deeper(): Task<str> { async { async { "s" } } }` failed the same way), and B559's written `Task<Task<str>>` reaches it too. Pin: `native_differential::f120_a_nested_async_block_is_assimilated_on_both_backends` (`native/nested_async_blocks.vl`: two and three deep with a capture, a relayed `Task` call, a written-async `Task<Task<str>>`, a plain block). Tracker F120.
+
 
 ## v0.46.0 — 2026-10-09
 
