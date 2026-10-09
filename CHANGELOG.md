@@ -51,6 +51,11 @@ written down.
 ---
 
 <!-- family: tooling -->
+**`scripts/lsp-latency.py`'s `shared.vl keystroke` row runs: its completion anchor is `self.uuid.hash()` after the indent, which survives the row's own edit, and the preflight checks every hover and completion anchor against the text AFTER the scenario's edit.** N145 anchored the edit and the completion on the same `\t\tself.uuid.hash()`; the edit inserts a space inside the `\t\t`, and the keystroke-path requests are asked against the edited buffer, so every run stopped mid-scenario ("the completion anchor … is not in src/shared.vl") and the seal's verdict carried no `shared.vl` row. `anchor_problems` now applies each scenario's edit and refuses, before the server starts, an anchor the edit destroys. Tracker N150.
+
+---
+
+<!-- family: tooling -->
 **`analyzer.rs`'s comments spell a deprecated re-export and a derived export the way the parser accepts them — `[deprecated(..)] export import …`, `[derive(Wire)] export struct` — finishing N142.** Seven comments (B472's alias re-exports, B382's deprecated leaves and their check, B318 S6's transparent wrappers) still wrote the pre-B485 order the parser refuses; they are respelled from docs-47's ready patch. Comments only. Tracker N142.
 
 ---
