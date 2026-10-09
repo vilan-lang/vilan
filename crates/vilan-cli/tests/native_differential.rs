@@ -8894,6 +8894,31 @@ fn a_closure_under_a_mut_view_the_compiler_cannot_see_stops_with_the_runtimes_se
     assert_eq!(String::from_utf8_lossy(&javascript.stdout), "102\n");
 }
 
+/// F107 (B149's native half): a call to a function WRITTEN `async` whose
+/// declared return is itself a `Task` answers the task's VALUE — the JS host
+/// assimilates the handle the body returns, and B149 types the call as the
+/// payload. Natively the call awaited its own future once and kept the inner
+/// handle: `make() + 1` was rustc's E0369 ("cannot add `i32` to `Task<i32>`")
+/// and `print(make())` was refused as a `print` of the host handle. The
+/// probe: a plain handle, a generic payload, a method, the call used in place,
+/// bound and printed, beside a plain `async fun` and an interleaving task
+/// whose prints keep their order against the extra await.
+#[test]
+fn an_async_function_returning_a_task_answers_the_value_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_async_task_returns.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/async_task_returns.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a call to an `async fun` returning a `Task` must answer its payload natively"
+    );
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,

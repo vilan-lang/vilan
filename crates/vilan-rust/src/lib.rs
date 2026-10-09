@@ -3623,7 +3623,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// nothing, so a field read straight off such a call (`fetch_row().id`) had
     /// no subject type at all and was refused. The declaration is the answer at
     /// exactly those sites.
+    ///
+    /// F107: a function WRITTEN `async` whose return is itself a `Task`
+    /// answers the task's payload ([`Self::assimilated_return`]).
     fn declared_return_type(&self, call_id: Id) -> Option<TypeId> {
+        let returned = self.signature_return_type(call_id)?;
+        Some(self.assimilated_return(call_id, returned).0)
+    }
+
+    /// The callee's return as its SIGNATURE says it — what
+    /// [`Self::declared_return_type`] reads before B149's assimilation.
+    fn signature_return_type(&self, call_id: Id) -> Option<TypeId> {
         let call = self.program.function_calls.get(&call_id)?;
         let target = match self.program.entity_map.get(&call.subject_id) {
             Some(Expr::Local(target)) | Some(Expr::Parameter(target)) => *target,
@@ -9476,9 +9486,67 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let rendered = self.call_expression(call_expr_id, call_id, depth, span)?;
         if self.call_awaits(call_expr_id, call_id) {
-            return Ok(Self::awaited(&rendered));
+            let mut awaited = Self::awaited(&rendered);
+            for _ in 0..self.assimilated_task_layers(call_id) {
+                awaited = Self::awaited(&awaited);
+            }
+            return Ok(awaited);
         }
         Ok(rendered)
+    }
+
+    /// F107 (B149's native half): a call to a function WRITTEN `async` whose
+    /// signature returns a `Task` — the payload the call answers, and how
+    /// many `Task` layers its awaited future hands back beyond it. `async fun
+    /// make(): Task<i32>` answers a `Task<i32>` when its future is awaited,
+    /// and the JS host ASSIMILATES that handle — the caller's `await` adopts
+    /// the promise the body returned — so the call types as the `i32`
+    /// (`assimilated_task_payload`, the analyzer's reading of the same
+    /// layers). Natively each layer is one more `.await` of the handle. A
+    /// function async only by inference keeps its declared type, as the
+    /// analyzer does, and owes none.
+    fn assimilated_return(&self, call_id: Id, returned: TypeId) -> (TypeId, usize) {
+        let written_async = self
+            .program
+            .function_calls
+            .get(&call_id)
+            .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                Some(Expr::Local(target)) => self.program.functions.get(target),
+                _ => None,
+            })
+            .is_some_and(|function| function.is_async);
+        if !written_async {
+            return (returned, 0);
+        }
+        let mut layers = 0;
+        let mut seen = HashSet::new();
+        let mut current = returned;
+        while seen.insert(current) {
+            match self.resolve(current) {
+                Some(Type::Struct(struct_id, arguments))
+                    if self
+                        .program
+                        .structs
+                        .get(struct_id)
+                        .is_some_and(|declaration| declaration.name == "Task") =>
+                {
+                    let Some(&inner) = arguments.first() else {
+                        break;
+                    };
+                    layers += 1;
+                    current = inner;
+                }
+                _ => break,
+            }
+        }
+        (current, layers)
+    }
+
+    /// [`Self::assimilated_return`]'s layer count for a call — the `.await`s
+    /// its handle owes beyond the call's own.
+    fn assimilated_task_layers(&self, call_id: Id) -> usize {
+        self.signature_return_type(call_id)
+            .map_or(0, |returned| self.assimilated_return(call_id, returned).1)
     }
 
     fn call_expression(
