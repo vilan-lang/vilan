@@ -49591,12 +49591,28 @@ impl<'src> Analyzer<'src> {
     /// hides a copy, and a view closure cannot stand where a value closure
     /// writes its own copy. `None` unless both are closure types of one arity
     /// whose modes disagree at a parameter where both are settled.
+    ///
+    /// E273: a NAMED FUNCTION handed where a closure type is expected is read
+    /// as the closure type it coerces to (`function_closure_type_recorded`,
+    /// whose modes are its parameters' conventions), so `apply(count)` with
+    /// `fun count(s: str)` against `|&str| i32` gets this refusal too — named
+    /// as the function's, and steering to the adapter alone, since a declared
+    /// function cannot be rewritten at the call.
     fn closure_mode_mismatch_message(
         &self,
         expected_type: &Type,
         got_type: &Type,
         substitution_context: &SubstitutionContext,
     ) -> Option<String> {
+        let function = match got_type {
+            Type::Function(function_id) => Some((
+                self.functions.get(function_id)?.name,
+                self.function_closure_type_recorded(*function_id)?,
+            )),
+            _ => None,
+        };
+        let got_type = function.as_ref().map_or(got_type, |(_, coerced)| coerced);
+        let function_name = function.as_ref().map(|(name, _)| *name);
         let (
             Type::Closure(expected_parameters, _, _, expected_modes),
             Type::Closure(got_parameters, _, _, got_modes),
@@ -49632,7 +49648,48 @@ impl<'src> Analyzer<'src> {
             Mode::View => format!("a view `&{pointee}`"),
             Mode::MutView => format!("a writable view `&mut {pointee}`"),
         };
-        let which = if expected_parameters.len() == 1 {
+        let single = expected_parameters.len() == 1;
+        if let Some(name) = function_name {
+            let which = if single {
+                format!("the function `{name}` takes")
+            } else {
+                format!("the function `{name}`'s parameter {} takes", index + 1)
+            };
+            // The adapter spells the call; only a one-parameter function's is
+            // written out whole (the others are passed on as they come).
+            let adapter = |lend: &str| {
+                if single {
+                    format!(": `|c| {name}({lend}c)`")
+                } else {
+                    format!(
+                        ", passing parameter {} as `{lend}c` and the others as they come",
+                        index + 1
+                    )
+                }
+            };
+            let adapt = match (expected_mode, got_mode) {
+                (Mode::View, Mode::Value) => format!(
+                    "a declared function is not rewritten at the call: adapt it with a closure that copies the view's value out{}",
+                    adapter("*")
+                ),
+                (Mode::Value, Mode::View | Mode::MutView) => format!(
+                    "a declared function is not rewritten at the call: adapt it with a closure that lends it the value{}",
+                    adapter(if got_mode == Mode::View { "&" } else { "&mut " })
+                ),
+                (Mode::MutView, Mode::Value) => format!(
+                    "a function that takes a value writes only its own copy, never the caller's place: declare `{name}`'s parameter `&mut {pointee}`"
+                ),
+                _ => format!(
+                    "declare `{name}`'s parameter with the view the type takes (`&` and `&mut` are different views)"
+                ),
+            };
+            return Some(format!(
+                "{which} {} where its type takes {}: a value closure and a view closure are different types, and no adapter is inserted; {adapt}.",
+                describe(got_mode),
+                describe(expected_mode),
+            ));
+        }
+        let which = if single {
             "this closure takes".to_string()
         } else {
             format!("this closure's parameter {} takes", index + 1)
