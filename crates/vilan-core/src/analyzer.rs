@@ -4725,7 +4725,7 @@ pub struct Analyzer<'src> {
     /// pass refuses it by name: `(member, implementation index, member name)`
     /// by call anchor. A declared member needs no record; the pass finds its
     /// block by its declarations.
-    declined_default_calls: HashMap<Id, (Id, usize, String)>,
+    declined_default_calls: HashMap<Id, (Id, Id, String)>,
     /// The loaded files' paths by `SourceId`, handed in by the driver before
     /// each resolve: [`Analyzer::build_lookup_admission`] reads a module's
     /// ANCESTOR files off them (`ancestor_module_sources`), as the post-build
@@ -4938,7 +4938,7 @@ pub struct Analyzer<'src> {
     for_each_next: HashMap<Id, Id>,
     // B481: a for-each loop whose `next` is an INHERITED default → the index of
     // the implementation that provides it, for the post-build admission pass.
-    for_each_next_providers: HashMap<Id, usize>,
+    for_each_next_providers: HashMap<Id, Id>,
     // For-each loops → the type the iterable INFERRED to, by loop id. The
     // transformer's native lowerings are chosen by that type, and it cannot
     // recover it on its own: an iterable written as a parameter (`self` above
@@ -22004,7 +22004,13 @@ impl<'src> Analyzer<'src> {
     /// The specificity order over two impls of ONE home (§13.4(a)): subject
     /// shape first, then the binders' bounds when the shapes are equal.
     fn impl_outranks(&self, candidate: &ImplMemberCandidate, other: &ImplMemberCandidate) -> bool {
-        let (subject, other_subject) = (candidate.impl_subject, other.impl_subject);
+        self.impl_subject_outranks(candidate.impl_subject, other.impl_subject)
+    }
+
+    /// [`Self::impl_outranks`] over the two blocks' SUBJECTS — the whole of
+    /// the specificity order, which the call-operator coercion asks without a
+    /// member candidate in hand (M128).
+    fn impl_subject_outranks(&self, subject: TypeId, other_subject: TypeId) -> bool {
         if subject == other_subject {
             return false;
         }
@@ -24528,9 +24534,10 @@ impl<'src> Analyzer<'src> {
     ) -> Vec<(Id, TypeId, Id, Vec<TypeId>)> {
         self.note_member_query(subject_type, member_name);
         let mut reached: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
-        // B401: parallel to `reached` — the providing block's index, and
-        // whether the calling file admits the member from it.
-        let mut providers: Vec<(usize, bool)> = Vec::new();
+        // B401: parallel to `reached` — the providing block (by its own id,
+        // M128: never its index), and whether the calling file admits the
+        // member from it.
+        let mut providers: Vec<(Id, bool)> = Vec::new();
         // Per trait, whether it has a method of this name — asked once per
         // trait rather than once per impl that provides it.
         // M103: the trait test before the subject comparison, for
@@ -24552,10 +24559,10 @@ impl<'src> Analyzer<'src> {
         providing_traits.sort_unstable_by_key(|trait_id| trait_id.0);
         let rows = self.trait_impl_rows(subject_type, &providing_traits);
         count_impl_rows(rows.len());
-        for (index, implementation) in rows
+        for implementation in rows
             .iter()
-            .map(|index| (*index, &self.implementations[*index]))
-            .filter(|(_, implementation)| {
+            .map(|index| &self.implementations[*index])
+            .filter(|implementation| {
                 INHERITED_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
                 self.impl_subject_admits(
                     subject_type,
@@ -24590,13 +24597,16 @@ impl<'src> Analyzer<'src> {
                     *trait_id,
                     trait_arguments,
                 ));
-                providers.push((index, self.lookup_admits(implementation, member_name)));
+                providers.push((
+                    implementation.impl_id,
+                    self.lookup_admits(implementation, member_name),
+                ));
             }
         }
         // B401: the calling file's admission narrows first, and never empties
         // (`impl_member_candidates`' rule): two defaults of one name, one of
         // them through a block the file declined, are ONE candidate.
-        let mut reached: Vec<((Id, TypeId, Id, Vec<TypeId>), (usize, bool))> =
+        let mut reached: Vec<((Id, TypeId, Id, Vec<TypeId>), (Id, bool))> =
             reached.into_iter().zip(providers).collect();
         if reached.iter().any(|(_, (_, admitted))| *admitted) {
             reached.retain(|(_, (_, admitted))| *admitted);
@@ -24607,7 +24617,7 @@ impl<'src> Analyzer<'src> {
                 applying.push(candidate.clone());
             }
         }
-        let mut candidates: Vec<((Id, TypeId, Id, Vec<TypeId>), (usize, bool))> = Vec::new();
+        let mut candidates: Vec<((Id, TypeId, Id, Vec<TypeId>), (Id, bool))> = Vec::new();
         for candidate in match applying.is_empty() {
             true => reached,
             false => applying,
@@ -24619,11 +24629,11 @@ impl<'src> Analyzer<'src> {
         // B401: one candidate, and the file declined the block it comes
         // through — the answer stands (a lookup never empties), and the
         // post-build pass refuses the call by name.
-        if let [((member_id, ..), (index, false))] = candidates.as_slice()
+        if let [((member_id, ..), (block, false))] = candidates.as_slice()
             && let Some(anchor) = self.lookup_anchor
         {
             self.declined_default_calls
-                .insert(anchor, (*member_id, *index, member_name.to_string()));
+                .insert(anchor, (*member_id, *block, member_name.to_string()));
         }
         candidates
             .into_iter()
@@ -46543,15 +46553,55 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         self.note_member_query(subject_type, CALL_OPERATOR_MEMBER);
-        let member_id = self.implementations.iter().find_map(|implementation| {
-            let member_id = implementation.declarations.get(CALL_OPERATOR_MEMBER)?;
-            self.impl_subject_admits(
-                subject_type,
-                implementation.subject.borrow_type(self),
-                &HashMap::default(),
-            )
-            .then_some(*member_id)
-        })?;
+        // M128: RANKED, never the first block in load order. Every block that
+        // declares `call` and admits the subject is a candidate; a concrete
+        // subject outranks a blanket (B456's rule, as `rank_member_candidates`
+        // ranks an inherent member) and between blankets the most specific
+        // wins (B477); two that do not rank offer NO coercion — the ordinary
+        // method path, which ranks the same way, reports the ambiguity at the
+        // call. The answer is a function of the impl set, not of which block
+        // registered first.
+        let candidates: Vec<(Id, TypeId)> = self
+            .implementations
+            .iter()
+            .filter_map(|implementation| {
+                let member_id = implementation.declarations.get(CALL_OPERATOR_MEMBER)?;
+                self.impl_subject_admits(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+                .then_some((*member_id, implementation.subject))
+            })
+            .collect();
+        let blanket =
+            |subject: TypeId| matches!(self.borrow_type_by_type_id(subject), Type::Generic(_));
+        let concrete: Vec<&(Id, TypeId)> = candidates
+            .iter()
+            .filter(|(_, subject)| !blanket(*subject))
+            .collect();
+        let blankets: Vec<&(Id, TypeId)> = candidates
+            .iter()
+            .filter(|(_, subject)| blanket(*subject))
+            .collect();
+        let member_id = match concrete.as_slice() {
+            [(member_id, _)] => *member_id,
+            [] => {
+                let most_specific: Vec<&&(Id, TypeId)> = blankets
+                    .iter()
+                    .filter(|(_, subject)| {
+                        !blankets
+                            .iter()
+                            .any(|(_, other)| self.impl_subject_outranks(*other, *subject))
+                    })
+                    .collect();
+                match most_specific.as_slice() {
+                    [(member_id, _)] => *member_id,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
         let function_id = self.resolve_member_function_id(member_id);
         let function = self.functions.get(&function_id)?;
         let mut parameter_type_ids = Vec::with_capacity(function.parameters.len());
@@ -47936,8 +47986,26 @@ impl<'src> Analyzer<'src> {
             .filter(|id| is_marker(self, id))
             .or_else(|| {
                 // The macro NAMESPACE: same-module and prelude macros resolve
-                // here even when an item owns the plain name.
+                // here even when an item owns the plain name. M128: the SCOPE
+                // CHAIN, never the first module in load order — the
+                // referencing scope's own chain up to its module's namespace
+                // (the expansion's highest precedence, `macros::scope_for`),
+                // then std's namespaces (the expansion's prelude, always in
+                // the prefix). An unimported package module's macro is not
+                // what the expansion used, whatever position it loaded in.
+                let mut current = Some(scope_id);
+                while let Some(id) = current {
+                    let scope = self.scopes.get(&id)?;
+                    if let Some(marker) = scope.macro_name_to_id.get(name) {
+                        return Some(*marker);
+                    }
+                    current = scope.parent_id;
+                }
                 self.modules.values().find_map(|module| {
+                    let file = self.scope_file(module.body.1)?;
+                    if !self.std_sources.contains(&file) {
+                        return None;
+                    }
                     self.scopes
                         .get(&module.body.1)
                         .and_then(|scope| scope.macro_name_to_id.get(name).copied())
@@ -56562,6 +56630,15 @@ impl<'src> Analyzer<'src> {
     /// B561: the module's FULL path ([`Self::module_import_paths`], B560's
     /// walk) — a trait in `pkg::geo::shapes` was spelled `pkg::shapes::Area`,
     /// from the module's leaf name, an import that resolves nowhere.
+    ///
+    /// M128: a first match over `modules` in load order, and the one such
+    /// site that is NOT positional — an entity sits in exactly one module
+    /// scope's `declaration_order` (`declare_scope_item`'s callers are the
+    /// walk's item declarations and the generated-declaration hoist, each
+    /// into the declaring module's own scope; an import or a re-export binds
+    /// a name and declares nothing), so the first match is the only match
+    /// under any load order. The permutation differential's `import_path`
+    /// fixture holds it to that.
     fn import_path_of(&self, entity: Id) -> Option<String> {
         let paths = self.module_import_paths();
         self.modules.values().find_map(|module| {
@@ -63415,6 +63492,17 @@ impl<'src> Analyzer<'src> {
             if self.tuple_walk_views.contains_key(&iterable_id) {
                 continue;
             }
+            // B401 / M128: the loop's `next` lookup is admitted under the
+            // LOOPING file's imports, as a call's is under its constraint's
+            // anchor (`resolve_constraints`) — this runs outside that loop,
+            // and without the importer the lookup narrowed nothing, so two
+            // blocks providing the default (one admitted, one declined) were
+            // one candidate by MEMBER, the first registered: the post-build
+            // refusal then followed the load order.
+            if self.lookup_admission.is_some() {
+                self.lookup_anchor = Some(for_each_id);
+                self.lookup_importer = self.admitting_source_of(for_each_id);
+            }
             let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::default());
             // Keep it: emission picks its native lowering by this same type, and
             // it is the only place the type is known. A `for x in <expr>` whose
@@ -63518,14 +63606,32 @@ impl<'src> Analyzer<'src> {
                         }
                         self.for_each_next.insert(for_each_id, next_id);
                         // B481: the block that provides the default, for the
-                        // admission pass — the loop's `next` is no call.
-                        if let Some(index) =
-                            self.implementations.iter().position(|implementation| {
+                        // admission pass — the loop's `next` is no call. M128:
+                        // the block's own id, never its INDEX in
+                        // `implementations` (an index into a load-ordered
+                        // table is no stored value).
+                        // The block is the one whose trait ARGUMENTS the
+                        // candidate carries: `impl Box with Counting<i32> {}`
+                        // beside `impl Box with Counting<str> {}` share the
+                        // subject and the trait, and only the arguments say
+                        // which one the lookup took.
+                        if let Some(block) = self
+                            .implementations
+                            .iter()
+                            .find(|implementation| {
                                 implementation.subject == impl_subject_id
                                     && implementation.trait_ids.contains(&trait_id)
+                                    && implementation
+                                        .trait_args
+                                        .iter()
+                                        .find(|(id, _)| *id == trait_id)
+                                        .map(|(_, arguments)| arguments.as_slice())
+                                        .unwrap_or(&[])
+                                        == trait_arguments.as_slice()
                             })
+                            .map(|implementation| implementation.impl_id)
                         {
-                            self.for_each_next_providers.insert(for_each_id, index);
+                            self.for_each_next_providers.insert(for_each_id, block);
                         }
                         let receiver_type_id = iterable_type.clone().get_type_id(self);
                         self.generic_dispatch.insert(
@@ -63679,6 +63785,10 @@ impl<'src> Analyzer<'src> {
                 _ => {}
             }
         }
+        // The admission context is a per-lookup fact (`resolve_constraints`
+        // clears it after every constraint); nothing after the loop reads it.
+        self.lookup_importer = None;
+        self.lookup_anchor = None;
 
         // --- Resolve operator overloading --- an arithmetic `a <op> b` whose
         // left operand's type implements the matching operator trait
@@ -67129,7 +67239,7 @@ pub struct Program<'src> {
     /// (into `implementations`) of the block that provides it — what the
     /// post-build admission pass checks against the loop's file, as it checks
     /// a call's.
-    pub for_each_next_providers: HashMap<Id, usize>,
+    pub for_each_next_providers: HashMap<Id, Id>,
     /// Per `for x in iterable` loop: the type the ITERABLE inferred to. The
     /// native lowerings are chosen by it (`HashSet` walks its backing map's values,
     /// everything else is a plain `for...of`), and emission cannot recover it —
@@ -67211,7 +67321,7 @@ pub struct Program<'src> {
     /// block their file did not admit (`Analyzer::declined_default_calls`),
     /// read by [`check_call_site_admission`] — a default's block is not found
     /// by its declarations.
-    pub declined_default_calls: HashMap<Id, (Id, usize, String)>,
+    pub declined_default_calls: HashMap<Id, (Id, Id, String)>,
     /// E224 (R-j): every `import`/`use` statement's span, by file. An import
     /// line names what it binds, and a name row inside one is not a USE: the
     /// labels pass warns at uses only (`labels::check`).
@@ -80014,6 +80124,14 @@ pub fn check_call_site_admission(program: &mut Program) {
         }
     }
     let mut violations: Vec<(Error, SourceId)> = Vec::new();
+    // M128: a recorded provider is a block's ID (an index into the
+    // load-ordered table is no stored value); its index is this pass's own.
+    let index_of_block: HashMap<Id, usize> = program
+        .implementations
+        .iter()
+        .enumerate()
+        .map(|(index, implementation)| (implementation.impl_id, index))
+        .collect();
     // The SITES that resolved a member through an implementation: every wired
     // call, and (B481) every `for` loop over a custom iterator — whose `next`
     // is the lookup's answer exactly as a call's is, but is no call, so the
@@ -80032,7 +80150,9 @@ pub fn check_call_site_admission(program: &mut Program) {
                 *call_id,
                 *member_id,
                 function_call.argument_ids.first().copied(),
-                declined.get(call_id).cloned(),
+                declined.get(call_id).and_then(|(member, block, name)| {
+                    Some((*member, *index_of_block.get(block)?, name.clone()))
+                }),
             ))
         })
         .collect();
@@ -80040,6 +80160,7 @@ pub fn check_call_site_admission(program: &mut Program) {
         let provided = program
             .for_each_next_providers
             .get(&loop_id)
+            .and_then(|block| index_of_block.get(block))
             .map(|index| (next_id, *index, "next".to_string()));
         // Anchored at the ITERABLE — the `box` of `for item in box`, the
         // receiver the loop calls `next` on — rather than the whole loop.

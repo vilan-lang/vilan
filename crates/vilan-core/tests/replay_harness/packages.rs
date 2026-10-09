@@ -879,3 +879,118 @@ pub const LEAF_FIXTURE: Fixture = Fixture {
     ],
     edits: LEAF_EDITS,
 };
+
+// --- M128: answers chosen by first match over a load-ordered table (§5.6) ---------
+//
+// Each fixture puts TWO candidates for one of the four sites in different
+// load positions, so the reversed world meets the other one first. The
+// ranking (or the scope chain) has to choose the same candidate either way.
+
+/// `callable_call_signature`: a concrete `impl Foo with Callable` beside a
+/// blanket over a marker trait `Foo` implements, in modules at the two ends
+/// of the load order; a `Callable` value coerced where a closure is wanted
+/// takes the concrete block's `call` (B456's rule), whichever registered
+/// first.
+const M128_CALLABLE_SHAPES: &str =
+    "export struct Foo {\n\tn: i32,\n}\n\nexport trait Marker {}\n\nimpl Foo with Marker {}\n";
+
+const M128_CALLABLE_A: &str = "import std::operators::Callable;\nimport pkg::shapes::Foo;\n\nexport impl Foo with Callable {\n\tfun call(self, n: i32): i32 {\n\t\tself.n + n\n\t}\n}\n";
+
+const M128_CALLABLE_Z: &str = "import std::operators::Callable;\nimport pkg::shapes::Marker;\n\nexport impl type T: Marker with Callable {\n\tfun call(self, n: i32): str {\n\t\t\"blanket\"\n\t}\n}\n";
+
+const M128_CALLABLE_USER: &str = "import pkg::a_call;\nimport pkg::z_call;\nimport pkg::shapes::Foo;\n\nfun apply(f: |i32| i32): i32 {\n\tf(1)\n}\n\nexport fun used(): i32 {\n\tlet foo = Foo { n = 2 };\n\tapply(foo)\n}\n";
+
+const M128_CALLABLE_MAIN: &str = "import pkg::user::used;\n\nfun main() {\n\tprint(used());\n}\n";
+
+/// `resolve_macro_reference`'s fallback: two modules each declare a `macro
+/// fun Tagged` beside a `trait Tagged` (the derive convention: the plain name
+/// is the trait's, so the reference takes the macro-namespace fallback) and
+/// each applies its own macro to its own struct; the reference each
+/// `[derive(Tagged)]` records (go-to-definition) is its own module's marker —
+/// the scope chain — not the first module's in load order.
+const M128_MACRO_A: &str = "macro fun Tagged(item: Item): Source {\n\timport macro_std::source;\n\timport macro_std::meta::{ Item, Source, StructItem };\n\timport macro_std::option::Option::{ self, Some, None };\n\n\tlet target = match item.as_struct() {\n\t\tSome(let found) => found,\n\t\tNone => StructItem { name = \"?\", fields = [], generics = [] },\n\t};\n\tsource(\"impl \" + target.name + \" with Tagged {\\nfun tag(self): str {\\n\\\"a:\" + target.name + \"\\\"\\n}\\n}\\n\")\n}\n\nexport trait Tagged {\n\tfun tag(self): str;\n}\n\n[derive(Tagged)]\nexport struct Widget {\n\tsize: i32,\n}\n\nexport fun widget_tag(): str {\n\tWidget { size = 1 }.tag()\n}\n";
+
+const M128_MACRO_Z: &str = "macro fun Tagged(item: Item): Source {\n\timport macro_std::source;\n\timport macro_std::meta::{ Item, Source, StructItem };\n\timport macro_std::option::Option::{ self, Some, None };\n\n\tlet target = match item.as_struct() {\n\t\tSome(let found) => found,\n\t\tNone => StructItem { name = \"?\", fields = [], generics = [] },\n\t};\n\tsource(\"impl \" + target.name + \" with Tagged {\\nfun tag(self): str {\\n\\\"z:\" + target.name + \"\\\"\\n}\\n}\\n\")\n}\n\nexport trait Tagged {\n\tfun tag(self): str;\n}\n\n[derive(Tagged)]\nexport struct Gadget {\n\tsize: i32,\n}\n\nexport fun gadget_tag(): str {\n\tGadget { size = 1 }.tag()\n}\n";
+
+const M128_MACRO_MAIN: &str = "import pkg::a_macros::widget_tag;\nimport pkg::z_macros::gadget_tag;\n\nfun main() {\n\tprint(widget_tag());\n\tprint(gadget_tag());\n}\n";
+
+/// `import_path_of`: a trait method called without the trait imported — the
+/// B515 steer spells the declaring module's path, found by the entity; the
+/// site is the one first match that is not positional (an entity is declared
+/// in one module scope), held to it here.
+const M128_IMPORT_PATH_SHAPES: &str = "export trait Area {\n\tfun area(self): i32;\n}\n\nexport struct Sq {\n\ts: i32,\n}\n\nexport impl Sq with Area {\n\tfun area(self): i32 {\n\t\tself.s * self.s\n\t}\n}\n";
+
+const M128_IMPORT_PATH_USER: &str =
+    "import pkg::shapes::Sq;\n\nexport fun used(): i32 {\n\tSq { s = 2 }.area()\n}\n";
+
+/// `for_each_next_providers`: two blocks provide a loop's inherited `next`
+/// for one subject — `impl Box with Counting<i32> {}` and `impl Box with
+/// Counting<str> {}` — in modules at the two ends of the load order, and the
+/// looping file admits one of them; the recorded provider has to be the block
+/// the lookup took, whichever registered first (the index stood in for it).
+const M128_FOR_EACH_B: &str = "export struct Box {\n\tn: i32,\n}\n";
+
+const M128_FOR_EACH_T: &str = "import std::option::Option::{ self, None, Some };\n\nexport trait Counting<T> {\n\tfun next(mut self): Option<T> {\n\t\tNone\n\t}\n}\n";
+
+const M128_FOR_EACH_P1: &str =
+    "import pkg::b::Box;\nimport pkg::t::Counting;\n\nexport impl Box with Counting<i32> {}\n";
+
+const M128_FOR_EACH_P9: &str =
+    "import pkg::b::Box;\nimport pkg::t::Counting;\n\nexport impl Box with Counting<str> {}\n";
+
+const M128_FOR_EACH_MAIN: &str = "import pkg::b::Box;\nimport pkg::p1;\nimport pkg::p9 only;\n\nfun main() {\n\tmut box = Box { n = 1 };\n\tfor item in box {\n\t\tprint(item);\n\t}\n\tprint(\"done\");\n}\n";
+
+pub const M128_FIXTURES: &[Fixture] = &[
+    Fixture {
+        name: "m128_callable",
+        platform: NODE,
+        files: &[
+            ("main.vl", M128_CALLABLE_MAIN),
+            ("shapes.vl", M128_CALLABLE_SHAPES),
+            ("a_call.vl", M128_CALLABLE_A),
+            ("z_call.vl", M128_CALLABLE_Z),
+            ("user.vl", M128_CALLABLE_USER),
+        ],
+        edits: &[],
+    },
+    Fixture {
+        name: "m128_macro",
+        platform: NODE,
+        files: &[
+            ("main.vl", M128_MACRO_MAIN),
+            ("a_macros.vl", M128_MACRO_A),
+            ("z_macros.vl", M128_MACRO_Z),
+        ],
+        edits: &[],
+    },
+    Fixture {
+        name: "m128_import_path",
+        platform: NODE,
+        files: &[
+            ("main.vl", M128_CALLABLE_MAIN),
+            ("shapes.vl", M128_IMPORT_PATH_SHAPES),
+            ("user.vl", M128_IMPORT_PATH_USER),
+        ],
+        edits: &[],
+    },
+    Fixture {
+        name: "m128_for_each",
+        platform: NODE,
+        files: &[
+            ("main.vl", M128_FOR_EACH_MAIN),
+            ("b.vl", M128_FOR_EACH_B),
+            ("t.vl", M128_FOR_EACH_T),
+            ("p1.vl", M128_FOR_EACH_P1),
+            ("p9.vl", M128_FOR_EACH_P9),
+        ],
+        edits: &[Edit {
+            label: "the looping file admits the other block instead",
+            file: "main.vl",
+            seed: None,
+            replacements: &[(
+                "import pkg::p1;\nimport pkg::p9 only;\n",
+                "import pkg::p1 only;\nimport pkg::p9;\n",
+            )],
+        }],
+    },
+];

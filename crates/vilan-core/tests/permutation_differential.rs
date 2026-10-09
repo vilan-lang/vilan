@@ -367,7 +367,9 @@ fn normalize(rendering: &str, root: &Path, permuted: Option<&Permuted>) -> Strin
         if names_the_nesting && line.starts_with("type-reference ") {
             continue;
         }
-        let row = sort_trace_hops(&rebuilt.join(" "));
+        // A message may spell the package's directory in prose too (a const
+        // read's resolved path): every occurrence maps to the same spelling.
+        let row = sort_trace_hops(&rebuilt.join(" ").replace(root.as_str(), "<pkg>/"));
         section.push(match permuted {
             Some(permuted) => permuted.canonical(&row),
             None => row,
@@ -474,15 +476,16 @@ fn the_classes_package_answers_the_same_under_every_permutation() {
 }
 
 /// **The gate, the other fixtures.** B553's entry impl, B573's browser twins,
-/// the re-walk pins' leaf package and the four post-pass packages, in every
-/// state, under every permutation.
+/// the re-walk pins' leaf package, the four post-pass packages and M128's
+/// four first-match sites (two candidates in different load positions), in
+/// every state, under every permutation.
 #[test]
 fn every_other_fixture_answers_the_same_under_every_permutation() {
     let mut divergences = Vec::new();
     for fixture in [&ENTRY_IMPL_FIXTURE, &PLATFORM_FIXTURE, &LEAF_FIXTURE] {
         divergences.extend(compare_fixture(fixture, &[]));
     }
-    for fixture in POST_PASS_FIXTURES {
+    for fixture in POST_PASS_FIXTURES.iter().chain(M128_FIXTURES) {
         divergences.extend(compare_fixture(fixture, &[]));
     }
     assert!(
