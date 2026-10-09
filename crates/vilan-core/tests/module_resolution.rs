@@ -9518,6 +9518,159 @@ fn b576_a_modules_twin_note_names_the_builds_platform() {
     );
 }
 
+/// Analyzes `entry` twice against the same package directory — the second
+/// time under `second`, with the first analysis's world in the base cache —
+/// and answers both diagnostic lists and the second analysis's census (B576:
+/// a stored world may not render a fact that is the serving call's).
+fn analyze_twice_under(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+    first: Workspace,
+    second: Workspace,
+) -> (Vec<Error>, Vec<Error>, vilan_core::incremental::Census) {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!(
+        "vilan_modres_twice_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    vilan_core::analyzer::base_cache_clear();
+    let (_, first_errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &first,
+    );
+    let (_, second_errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &second,
+    );
+    let census = vilan_core::incremental::census();
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&dir);
+    (first_errors, second_errors, census)
+}
+
+/// B576: the twin note's REASON clause is the serving call's. A module's note
+/// is produced by the pre-entry resolve, which a stored world carries; the
+/// call served that world renders its own `platform_reason` — never the one
+/// the storing call had, and never none.
+#[test]
+fn b576_a_stored_worlds_twin_note_renders_the_serving_calls_reason() {
+    let files = [
+        (
+            "m.vl",
+            "import std::web::ui::{ View, view };\n\nexport fun show(): str {\n\tlet v: View = view(\"div\");\n\tv.render()\n}\n",
+        ),
+        (
+            "main.vl",
+            "import std::io::print;\nimport pkg::m::show;\n\nfun main() {\n\tprint(show());\n}\n",
+        ),
+    ];
+    let reasoned = |reason: &str| Workspace {
+        platform_reason: Some(reason.to_string()),
+        ..Workspace::default()
+    };
+    let (first, second, census) = analyze_twice_under(
+        &files,
+        "main.vl",
+        Platform::Browser,
+        reasoned("the first call's reason"),
+        reasoned("the second call's reason"),
+    );
+    assert!(
+        census.base_hits == 1,
+        "the second analysis is served the stored world: {census:?}"
+    );
+    let twin_note = |errors: &[Error]| -> String {
+        errors
+            .iter()
+            .filter_map(|error| error.note.as_ref().map(|note| note.msg.clone()))
+            .find(|note| note.contains("this file is analyzed under"))
+            .unwrap_or_else(|| panic!("no twin note: {errors:#?}"))
+    };
+    let (first, second) = (twin_note(&first), twin_note(&second));
+    assert!(
+        first.contains("analyzed under browser: the first call's reason"),
+        "the storing call renders its reason: {first}"
+    );
+    assert!(
+        second.contains("analyzed under browser: the second call's reason")
+            && !second.contains("first call"),
+        "the served call renders ITS reason, not the stored world's: {second}"
+    );
+    assert!(
+        !first.contains('\u{1}') && !second.contains('\u{1}'),
+        "no publish mark leaks: {first} / {second}"
+    );
+}
+
+/// B576's other unkeyed fact: the web-set steer names the REPAIR the serving
+/// front end can take. A module's steer is the pre-entry resolve's; served
+/// from a stored world to a toggle front end, it asks for the toggle.
+#[test]
+fn b576_a_stored_worlds_web_set_steer_names_the_serving_calls_repair() {
+    let files = [
+        (
+            "m.vl",
+            "export fun probe(): i32 {\n\tlet s = Signal::new(0);\n\t1\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::m::probe;\n\nfun main() {\n\tprint(probe());\n}\n",
+        ),
+    ];
+    let repaired = |repair: PreludeRepair| Workspace {
+        entry_prelude: base_prelude(),
+        prelude_repair: repair,
+        ..Workspace::default()
+    };
+    let (first, second, census) = analyze_twice_under(
+        &files,
+        "main.vl",
+        Platform::Browser,
+        repaired(PreludeRepair::Manifest),
+        repaired(PreludeRepair::Toggle),
+    );
+    assert!(
+        census.base_hits == 1,
+        "the second analysis is served the stored world: {census:?}"
+    );
+    let steer = |errors: &[Error]| -> String {
+        errors
+            .iter()
+            .map(|error| error.msg.clone())
+            .find(|msg| msg.contains("in the prelude of the web set"))
+            .unwrap_or_else(|| panic!("no web-set steer: {errors:#?}"))
+    };
+    let (first, second) = (steer(&first), steer(&second));
+    assert!(
+        first.contains("set `prelude = \"std::web::prelude\"` in vilan.toml"),
+        "the manifest front end is told the manifest line: {first}"
+    );
+    assert!(
+        second.contains("switch the playground's prelude to the web set")
+            && !second.contains("vilan.toml"),
+        "the toggle front end is told the toggle, from the same stored world: {second}"
+    );
+}
+
 /// B572: a std name a facade re-exports is steered to the facade, not to the
 /// internal module that declares it — `Store` and `StoreSome` are declared in
 /// `std::reactive::store_core` and re-exported by `std::reactive::store`, the

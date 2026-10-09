@@ -31703,13 +31703,14 @@ impl<'src> Analyzer<'src> {
         let layer = self.std_layer_sources.get(&source)?;
         let span = **self.span_map.get(&definition_id)?;
         let platform = self.platform.runtime_name();
-        let head = format!(
-            "`{type_name}` here is std's {layer} twin — this file is analyzed under {platform}"
+        // B576: the platform is the stored world's own (it is in the base cache
+        // key); WHY the analysis runs under it is the serving call's
+        // (`Workspace::platform_reason`, deliberately out of the key), so the
+        // clause is rendered when the diagnostic is published, never here.
+        let mut msg = format!(
+            "`{type_name}` here is std's {layer} twin — this file is analyzed under \
+             {platform}{PLATFORM_REASON_MARK}"
         );
-        let mut msg = match &self.platform_reason {
-            Some(reason) => format!("{head}: {reason}"),
-            None => head,
-        };
         // F27 R6: the third fact. The reader now knows which twin this is and
         // why the file is under it; what they asked for is a member, and the
         // answer that settles it is that the OTHER twin has one by that name.
@@ -55468,12 +55469,27 @@ impl<'src> Analyzer<'src> {
         if !self.web_prelude_index.as_ref()?.contains(name) {
             return None;
         }
+        // B576: WHETHER the steer fires is the stored world's own answer (the
+        // entry's prelude is in the base cache key); WHICH repair it names is
+        // the serving front end's (`Workspace::prelude_repair`, out of the
+        // key), so the sentence is rendered when the diagnostic is published
+        // ([`Self::web_prelude_repair`]), never into a world another call may
+        // be served.
+        Some(format!(
+            "{PUBLISH_MARK}{WEB_PRELUDE_MARK}{name}{PUBLISH_MARK}"
+        ))
+    }
+
+    /// The web-set steer's sentence for `name`, in the repair THIS call's front
+    /// end can take — the rendering [`Self::web_prelude_steer`] defers to
+    /// publish (B576).
+    fn web_prelude_repair(&mut self, name: &str) -> String {
         // Each arm spells its whole sentence, rather than sharing a factored-out
         // head: `diagnostics_ledger.rs`'s appendix gate greps the tree for the
         // text the errors appendix quotes, so a message composed from two
         // literals is a message it can no longer hold to its documentation. The
         // shared clause is nine words; the guarantee is worth them.
-        Some(match self.prelude_repair {
+        match self.prelude_repair {
             PreludeRepair::Manifest => format!(
                 "; `{name}` is in the prelude of the web set — set \
                  `prelude = \"{}\"` in vilan.toml",
@@ -55497,7 +55513,68 @@ impl<'src> Analyzer<'src> {
                      playground's prelude to the web set{import}"
                 )
             }
-        })
+        }
+    }
+
+    /// B576: renders every publish mark in the diagnostics and warnings —
+    /// the facts a stored world may not carry rendered, because they are
+    /// the SERVING call's and not the world's key's: `platform_reason`'s
+    /// clause and the web-set steer's repair. Runs once, where the lists
+    /// leave the analyzer for the `Program`, after M19's record is taken (so
+    /// a record replays the mark, and the call that replays it renders its
+    /// own facts) and after every pass that could push one.
+    fn render_publish_marks(&mut self) {
+        let has_mark = |text: &str| text.contains(PUBLISH_MARK);
+        let mut diagnostics = std::mem::take(&mut self.diagnostics);
+        let mut warnings = std::mem::take(&mut self.warnings);
+        for error in diagnostics.iter_mut().chain(warnings.iter_mut()) {
+            if has_mark(&error.msg) {
+                error.msg = self.render_marks(&error.msg);
+            }
+            if let Some(note) = &mut error.note
+                && has_mark(&note.msg)
+            {
+                note.msg = self.render_marks(&note.msg);
+            }
+            for hop in &mut error.trace {
+                if has_mark(&hop.note.msg) {
+                    hop.note.msg = self.render_marks(&hop.note.msg);
+                }
+            }
+        }
+        self.diagnostics = diagnostics;
+        self.warnings = warnings;
+    }
+
+    /// `text` with each `PUBLISH_MARK…PUBLISH_MARK` segment rendered.
+    fn render_marks(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find(PUBLISH_MARK) {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + PUBLISH_MARK.len()..];
+            let Some(close) = after.find(PUBLISH_MARK) else {
+                out.push_str(&rest[open..]);
+                return out;
+            };
+            let mark = &after[..close];
+            if mark == PLATFORM_REASON_MARK_NAME {
+                if let Some(reason) = &self.platform_reason {
+                    out.push_str(": ");
+                    out.push_str(reason);
+                }
+            } else if let Some(name) = mark.strip_prefix(WEB_PRELUDE_MARK) {
+                let repair = self.web_prelude_repair(name);
+                out.push_str(&repair);
+            } else {
+                // An unknown mark is left as written rather than dropped: a
+                // reader sees it, a silent omission nobody would.
+                out.push_str(&rest[open..open + PUBLISH_MARK.len() + close + PUBLISH_MARK.len()]);
+            }
+            rest = &after[close + PUBLISH_MARK.len()..];
+        }
+        out.push_str(rest);
+        out
     }
 
     /// Reads `std::web::prelude`'s importable names off disk, once, on the first failed
@@ -66547,6 +66624,19 @@ pub struct SourceLayer {
 /// features that key on a file (the outline, go-to-definition, position lookup)
 /// skip them instead of pointing into the user's text at a bogus offset.
 pub const DERIVED_SOURCE: SourceId = SourceId(u32::MAX);
+
+/// B576: the delimiter of a PUBLISH MARK — a placeholder in a diagnostic's
+/// text for a fact the serving call owns and a stored world may not render
+/// (`Workspace::platform_reason`, `Workspace::prelude_repair`, both out of
+/// the base cache key). `Analyzer::render_publish_marks` replaces every
+/// `PUBLISH_MARK<name>PUBLISH_MARK` where the lists leave the analyzer. A
+/// control character no message spells.
+const PUBLISH_MARK: &str = "\u{1}";
+const PLATFORM_REASON_MARK_NAME: &str = "platform-reason";
+/// The mark `overlaid_std_type_note` writes: `: <reason>` when the call has one.
+const PLATFORM_REASON_MARK: &str = "\u{1}platform-reason\u{1}";
+/// The web-set steer's mark, followed by the unresolved name.
+const WEB_PRELUDE_MARK: &str = "web-prelude:";
 
 /// How one `expr!` site lowers (proposal/try-and-lift.md §4): the std pair gets
 /// the inline tag-branch fast path; any other `Try` type dispatches to its
@@ -78807,6 +78897,9 @@ fn analyze_over_world<'src>(
 
     // M106: the per-declaration work, ranked — empty unless attribution is on.
     let item_costs = analyzer.ranked_item_costs();
+
+    // B576: the serving call's facts into the diagnostics, last.
+    analyzer.render_publish_marks();
 
     Ok(Some(Program {
         hidden_impls_pending,
