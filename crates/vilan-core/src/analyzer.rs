@@ -30922,10 +30922,28 @@ impl<'src> Analyzer<'src> {
                     let Some(parameter_ids) = parameter_ids else {
                         continue;
                     };
-                    for (parameter_id, argument_id) in
-                        parameter_ids.iter().zip(function_call.argument_ids.iter())
+                    for (index, (parameter_id, argument_id)) in parameter_ids
+                        .iter()
+                        .zip(function_call.argument_ids.iter())
+                        .enumerate()
                     {
                         if self.binding_or_param_is_view(*parameter_id) {
+                            continue;
+                        }
+                        // B562 (transparent-references R4, RULED): a method's
+                        // RECEIVER auto-derefs — `n.abs()` with `n: &i32` reads
+                        // the referent place, as `p.get()` on an aggregate view
+                        // always has. The `*` R6 asks for is for a view used as
+                        // a plain value; the receiver is no such use, and both
+                        // emitters read a scalar view through at a by-value
+                        // `self` (B444's seam). Only the receiver: a scalar view
+                        // at any later by-value parameter still wants its `*`.
+                        if index == 0
+                            && self
+                                .parameters
+                                .get(parameter_id)
+                                .is_some_and(|parameter| parameter.name == "self")
+                        {
                             continue;
                         }
                         if self.is_scalar_view_read(*argument_id, &view_bindings) {

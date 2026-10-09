@@ -253,7 +253,10 @@ branch of a value `if` handing either back — at a binding as at an
 assignment, so `let v = if c { &a } else { &b }` initializes no view
 binding, and as an argument or operand) is a compile error, never
 a silent coercion to the pointee (so the `(base, key)` representation of a
-scalar view can't leak); write `*v` to copy the value out. A closure's view
+scalar view can't leak); write `*v` to copy the value out. A method call's
+RECEIVER is not a value position: `v.method(..)` reads through the view to
+the referent place, a scalar's as an aggregate's (`n.abs()` with `n: &i32`,
+`s.len()` with `s: &str`). A closure's view
 parameter is a view by the same rule, whether the literal spells it
 (`|&mut list|`) or takes it from the closure type it is handed to: `|c|`
 passed where `|&str| void` is expected receives a `&str`, and reads it as

@@ -11403,4 +11403,54 @@ fun main() {
         "a loop over self in a bare-trait impl must run on both backends"
     );
 }
+/// B562: a method called on a SCALAR view (`n.abs()` with `n: &i32`, `s.len()`
+/// with `s: &str`, a trait member through `&T`) auto-derefs on both backends.
+#[test]
+fn a_method_on_a_scalar_view_auto_derefs_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b562.vl"),
+        r#"import std::io::print;
+
+trait Show {
+    fun show(self): str;
+}
+
+impl i32 with Show {
+    fun show(self): str {
+        "i" + self
+    }
+}
+
+fun through<T: Show>(t: &T): str {
+    t.show()
+}
+
+fun magnitude(n: &mut i32): i32 {
+    n.abs()
+}
+
+fun width(s: &str): usize {
+    s.len()
+}
+
+fun main() {
+    mut x = -4;
+    print(magnitude(&mut x));
+    print(width(&"abc"));
+    print(through(&3));
+    let words = ["a", "bb"];
+    for w in &words {
+        print(w.len());
+    }
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b562.vl"),
+        Verdict::Identical,
+        "a method on a scalar view must auto-deref on both backends"
+    );
+}
 

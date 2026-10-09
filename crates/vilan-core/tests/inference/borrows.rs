@@ -13170,3 +13170,112 @@ fn b545_a_tuple_leaf_capture_under_a_view_subject_is_refused_with_the_whole_tupl
         "13\n",
     );
 }
+
+// --- B562: a method on a SCALAR view auto-derefs (transparent-references R4) ---
+//
+// `n.abs()` with `n: &i32`, `s.len()` with `s: &str` (a parameter's or a
+// closure's) were refused "a view can't be read as a value here; write `*`",
+// while the same call on an aggregate view (`p.get()`) projects the place.
+// RULED a bug (2026-10-05): R4 reads `e.method(args)` for any `e: &[mut] U`
+// as an auto-deref to the referent place; R6's `*` is for a view used as a
+// VALUE, which a receiver is not.
+
+#[test]
+fn b562_a_method_on_a_scalar_view_parameter_auto_derefs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct P { x: i32 }
+        impl P {
+            fun get(self): i32 { self.x }
+        }
+
+        fun f(p: &P, n: &i32, xs: &List<i32>): i32 {
+            p.get() + xs.len().as_i32() + n.abs()
+        }
+        fun width(s: &str): usize { s.len() }
+        fun magnitude(n: &mut i32): i32 { n.abs() }
+
+        fun main() {
+            print(f(&P { x = 1 }, &-2, &[1]));
+            print(width(&"abc"));
+            mut x = -4;
+            print(magnitude(&mut x));
+        }
+
+        main();
+        "#,
+        "4\n3\n4\n",
+    );
+}
+
+#[test]
+fn b562_a_method_on_a_closures_scalar_view_parameter_auto_derefs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let width = |s: &str| s.len();
+            print(width(&"hello"));
+            let words = ["a", "bb"];
+            for w in &words {
+                print(w.len());
+            }
+        }
+
+        main();
+        "#,
+        "5\n1\n2\n",
+    );
+}
+
+#[test]
+fn b562_a_trait_method_on_a_scalar_view_auto_derefs_concrete_and_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Show { fun show(self): str; }
+        impl i32 with Show { fun show(self): str { "i" + self } }
+        struct P { x: i32 }
+        impl P with Show { fun show(self): str { "p" + self.x } }
+
+        fun through<T: Show>(t: &T): str { t.show() }
+        fun concrete(n: &i32): str { n.show() }
+
+        fun main() {
+            print(through(&3));
+            print(through(&P { x = 4 }));
+            print(concrete(&5));
+            let m = 6;
+            let r = &m;
+            print(r.show());
+        }
+
+        main();
+        "#,
+        "i3\np4\ni5\ni6\n",
+    );
+}
+
+#[test]
+fn b562_a_scalar_view_at_a_later_by_value_parameter_still_wants_its_star() {
+    // Only the receiver auto-derefs: the view as an ARGUMENT is a value use.
+    assert_fails_with(
+        r#"
+        fun add(a: i32, b: i32): i32 { a + b }
+        fun f(n: &i32): i32 { add(1, n) }
+        fun main() {}
+        "#,
+        "a view can't be read as a value here; write `*`",
+    );
+    assert_fails_with(
+        r#"
+        fun f(n: &i32): i32 { 5.max(n) }
+        fun main() {}
+        "#,
+        "a view can't be read as a value here; write `*`",
+    );
+}
