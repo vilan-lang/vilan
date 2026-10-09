@@ -55417,21 +55417,24 @@ impl<'src> Analyzer<'src> {
     /// writers SETS the attribute (or, `toggle_attr`, removes it), on both ui
     /// twins, so the earlier write is silently lost (`<div class("x")
     /// .styled(card) />` renders only `card`'s classes, and the reverse order
-    /// only `x`). A WARNING naming both writers, at the later one.
+    /// only `x`). A REFUSAL naming both writers, at the later one (A162, v0.46.0:
+    /// class-writes.md's door C — the writers stay last-wins and never append,
+    /// and the double write nobody means is an error; it was a warning in
+    /// v0.45.0).
     ///
     /// A160: when the EARLIER writer is a binding — a `bind_*`, a
     /// `toggle_attr`, or an `attr("class", ..)` over a source — the later write
     /// does not stay: the binding writes again on every change of its source,
     /// so the two take turns and the element shows whichever fired last. The
-    /// sentence says that instead (`class_writer_is_binding`).
+    /// sentence says that instead (`class_value_is_binding`).
     ///
     /// Statically visible means one receiver chain: from each writer, the walk
     /// follows the receiver while it is a dotted call of one of std's `View`
     /// methods (every one of which hands back the element it was called on), so
     /// an element head — which lowers to exactly such a chain — and a written
     /// chain over `view("..")` are both seen, and a chain broken by a function
-    /// of the program's own is not. Whether the writers should APPEND instead is
-    /// an open design question (census first); this pass does not change them.
+    /// of the program's own is not: that remainder stays last-wins and silent
+    /// (class-writes.md §5). std, dependencies and generated code are skipped.
     fn check_class_written_twice(&mut self) {
         // Each class writer: its call, its receiver entity, its source, and
         // whether it is a binding (A160).
@@ -55564,8 +55567,7 @@ impl<'src> Analyzer<'src> {
                     ),
                 },
             };
-            self.warnings.push(error);
-            self.warning_sources.push(source);
+            self.push_in_source(error, source);
         }
     }
 

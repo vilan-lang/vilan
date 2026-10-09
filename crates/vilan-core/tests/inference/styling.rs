@@ -7850,11 +7850,13 @@ fn b471_a_css_call_on_a_style_names_the_rename() {
     assert_fails_with(source, CSS_RENAME_NOTE);
 }
 
-// --- A155: one element's class written twice ----------------------------------
+// --- A155 / A162: one element's class written twice ---------------------------
 //
 // RULED (2026-10-03): a WARNING naming both writers when one element sets its
 // class twice where it is statically visible in one chain. Every one of std's
 // `View` class writers SETS the attribute, so the earlier write is lost.
+// A162 (RULED 2026-10-05 on class-writes.md, R-a): a REFUSAL from v0.46.0, with
+// the same sentence and steer; the writers stay last-wins.
 
 const A155_HEAD: &str = concat!(
     "import std::reactive::{ Signal, SignalCell };\n",
@@ -7871,7 +7873,7 @@ const A155_HEAD: &str = concat!(
 /// `.bind_class` across links that are not writers (`.attr("title", ..)`, a
 /// `.child`), and a hand-written `.attr("class", ..)` before a `.bind_styled`.
 #[test]
-fn a155_an_element_that_writes_its_class_twice_warns_naming_both_writers() {
+fn a162_an_element_that_writes_its_class_twice_is_refused_naming_both_writers() {
     let cases = [
         (
             "\tlet v = <div class(\"x\") .styled(card) />;\n",
@@ -7901,25 +7903,30 @@ fn a155_an_element_that_writes_its_class_twice_warns_naming_both_writers() {
     ];
     for (body, spanning, writers) in cases {
         let source = format!("{A155_HEAD}fun main() {{\n{body}\tprint(render(v));\n}}\n");
-        let warnings = warning_diagnostics(&source);
-        let matching: Vec<_> = warnings
+        let failures = failure_diagnostics(&source);
+        let matching: Vec<_> = failures
             .iter()
             .filter(|(message, _)| message.contains("this element's class is written twice"))
             .collect();
         assert_eq!(
             matching.len(),
             1,
-            "one warning per overridden write in {body:?}; got: {warnings:#?}"
+            "one refusal per overridden write in {body:?}; got: {failures:#?}"
+        );
+        assert_eq!(
+            failures.len(),
+            1,
+            "the refusal is the program's only error; got: {failures:#?}"
         );
         let (message, range) = matching[0];
         assert!(
             message.contains(writers),
-            "the warning must name both writers ({writers}); got: {message}"
+            "the refusal must name both writers ({writers}); got: {message}"
         );
         assert_eq!(
             &source[range.clone()],
             spanning,
-            "the warning stands at the writer that wins; got: {message}"
+            "the refusal stands at the writer that wins; got: {message}"
         );
     }
 }
@@ -7927,7 +7934,8 @@ fn a155_an_element_that_writes_its_class_twice_warns_naming_both_writers() {
 /// Silent where one element writes its class once: composed styles, a class
 /// and other attributes, a nested element writing its OWN class, two elements
 /// built apart, and a chain broken by a function of the program's own (not
-/// statically one element).
+/// statically one element — class-writes.md §5's remainder, last-wins and
+/// silent after A162 too). It compiles and runs, and warns about nothing.
 #[test]
 fn a155_one_class_write_per_element_is_silent() {
     let source = format!(
@@ -7956,6 +7964,7 @@ fn a155_one_class_write_per_element_is_silent() {
             .all(|(message, _)| !message.contains("written twice")),
         "no element here writes its class twice; got: {warnings:#?}"
     );
+    assert_compiles(&source);
 }
 
 // --- A159 / A160: the class writers the A155 check missed, and its sentence ---
@@ -7968,9 +7977,10 @@ fn a155_one_class_write_per_element_is_silent() {
 // source, and the element shows whichever writer fired last
 // (class-writes.md §2.1, probes a11/a13).
 
-/// The class-written-twice reports in `source`: (message, span).
+/// The class-written-twice reports in `source`: (message, span). Refusals
+/// since A162.
 fn class_written_twice_sites(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
-    warning_diagnostics(source)
+    failure_diagnostics(source)
         .into_iter()
         .filter(|(message, _)| message.contains("this element's class is written twice"))
         .collect()
@@ -8045,6 +8055,7 @@ fn a159_bind_attr_and_toggle_attr_on_other_names_are_not_class_writers() {
         sites.is_empty(),
         "no element here writes its class twice by name; got: {sites:#?}"
     );
+    assert_compiles(&source);
 }
 
 /// A160: an EARLIER writer that is a binding — an element head's `class(..)`

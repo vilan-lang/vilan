@@ -14,7 +14,7 @@
 //!      every text node has to survive with its value, and a LAST-WINS pair
 //!      that crossed shows up as a different value rather than a different
 //!      order. `ORDER_SENSITIVE` is written so that a wrong BARRIER rule flips
-//!      `class="from-attribute"` to `class="from-link"` and this assertion says
+//!      `title="from-attribute"` to `title="from-link"` and this assertion says
 //!      so.
 //!
 //!   2. **Nothing was added or dropped.** (1) compares what the program PRINTS,
@@ -71,16 +71,17 @@ const ELEMENT_SOURCES: &[&str] = &["vilan/test/element-syntax.vl"];
 ///
 /// Every line is a shape where a wrong rule would change the document:
 ///
-///   * the BARRIER, in both directions — an undotted `class` on either side of
-///     a `.class(…)` link. The link and the attribute write the same slot, the
-///     formatter knows nothing about what a dotted link writes, and the one
-///     written LAST wins. Let either cross the other and the rendered class
-///     flips;
+///   * the BARRIER, in both directions — an undotted `title` on either side of
+///     an `.attr("title", …)` link. The link and the attribute write the same
+///     slot, the formatter knows nothing about what a dotted link writes, and
+///     the one written LAST wins. Let either cross the other and the rendered
+///     title flips. (Not `class`: two class writers on one element are refused
+///     since A162, so the slot every writer shares is a plain attribute's);
 ///   * two dotted links whose order IS the document (`.child` appends), with
 ///     sortable attributes on both sides of them, so the runs sort while the
 ///     links hold their positions;
-///   * a LAST-WINS pair — the same attribute name twice — which a STABLE sort
-///     must keep in written order;
+///   * a LAST-WINS pair — the same attribute name twice (`title`, for the
+///     reason above) — which a STABLE sort must keep in written order;
 ///   * every leading name in [the canonical order] written backwards, mixed
 ///     with a keyword-spelled name (`for`, `type`) and hyphenated ones
 ///     (`data-x`, `aria-y`), which are several tokens each;
@@ -95,8 +96,8 @@ const ORDER_SENSITIVE: &str = concat!(
     "fun main() {\n",
     // The barrier, both ways round. As written the attribute wins the first and
     // the link wins the second; a crossing swaps them.
-    "\tprint(render(<div .class(\"from-link\") class(\"from-attribute\")>\"a\"</div>));\n",
-    "\tprint(render(<div class(\"from-attribute\") .class(\"from-link\")>\"b\"</div>));\n",
+    "\tprint(render(<div .attr(\"title\", \"from-link\") title(\"from-attribute\")>\"a\"</div>));\n",
+    "\tprint(render(<div title(\"from-attribute\") .attr(\"title\", \"from-link\")>\"b\"</div>));\n",
     // Two links whose order is the document, with a run on either side.
     "\tprint(render(<ul title(\"t\") .child(<li>\"one\"</li>) .child(<li>\"two\"</li>) ",
     "id(\"i\")>\"c\"</ul>));\n",
@@ -110,7 +111,7 @@ const ORDER_SENSITIVE: &str = concat!(
     "\tprint(render(<label for(\"f\") data-x(\"1\") aria-y(\"2\") src(\"s\") name(\"n\") ",
     "href(\"h\") type(\"t\") id(\"i\")>\"l\"</label>));\n",
     // The last-wins pair: `second` renders, and only a stable sort keeps it so.
-    "\tprint(render(<div class(\"first\") class(\"second\")>\"dup\"</div>));\n",
+    "\tprint(render(<div title(\"first\") title(\"second\")>\"dup\"</div>));\n",
     "}\n",
     "main();\n",
 );
