@@ -2440,6 +2440,20 @@ fn a46_a_fragment_is_a_list_and_not_a_view() {
     );
 }
 
+// --- B555: `std::js::null` cannot be named in an import, and needs no import --
+
+#[test]
+fn b555_importing_the_null_module_is_refused_once_with_the_steer() {
+    let source = "import std::js::null;\n\nfun main() {\n\tlet _nothing = null;\n}\n";
+    assert_fails_once_with(
+        source,
+        "`null` is a keyword, so no import path can name `std::js::null`",
+    );
+    assert_fails_without(source, "`::`-separated NAMES");
+    // What the steer promises: the value and its type are there with no import.
+    assert_compiles("fun main() {\n\tlet _nothing = null;\n}\n");
+}
+
 // --- E272: a fragment where ONE view is wanted says it is a fragment --------
 //
 // The book (Building UI, Fragments) promises "a type error that says so". The
