@@ -8547,75 +8547,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .filter(|binding| !declared_inside.contains(binding))
             .copied()
             .collect();
-        // Every capture gets a handle of its own, not only the boxed ones: a
-        // `move` closure takes the whole binding whatever the body does with it
-        // (Rust 2021 captures the PATH, and `&item` inside a `move` closure
-        // still captures `item` by value), so the enclosing frame loses it —
-        // `Owner::take` hands `item` to a cleanup closure and then RETURNS it.
-        //
-        // Two shapes are skipped because `.clone()` would change their type
-        // rather than copy them: a parameter received by reference (a `&T` is
-        // `Copy`, so the frame keeps it, and `(&T).clone()` derefs to `T`), and
-        // a binding that holds a view, for the same reason.
-        let mut captures: Vec<Id> = captured
-            .iter()
-            .copied()
-            .filter(|binding| {
-                // A module-level binding is read through its own `thread_local!`
-                // cell and has no local name to shadow; a `Local` naming an enum
-                // VARIANT is not a place at all.
-                if self.module_bindings.contains(binding) {
-                    return false;
-                }
-                if self.boxed.contains(binding) {
-                    return true;
-                }
-                if self.binding_holds_a_view(*binding) {
-                    return false;
-                }
-                if self.program.context_hidden_parameters.contains_key(binding) {
-                    return true;
-                }
-                match self.program.parameters.get(binding) {
-                    Some(parameter) => {
-                        self.receiving_form(parameter) == Receiving::ByValue
-                            || self.is_a_value_received_by_reference(parameter)
-                    }
-                    None => self.program.variables.contains_key(binding),
-                }
-            })
-            .collect();
-        captures.sort_by_key(|binding| binding.0);
+        let captures = self.closure_capture_handles(&captured);
         self.closure_captures.push(captured);
         let body = self.closure_body(&closure, depth);
         self.closure_captures.pop();
         let body = body?;
-        self.capture_copies += captures
-            .iter()
-            .filter(|binding| self.capture_is_a_copy(**binding))
-            .count();
-        let prelude: String = captures
-            .iter()
-            .map(|binding| {
-                let name = self.binding_name(*binding);
-                // A plain `self` arrives as a `&T` natively, and a closure the
-                // counted `Rc<dyn Fn>` stores cannot hold a borrow of the
-                // caller's frame — `ListCell::set` hands `SignalCell::update` a
-                // closure that records into `self.log`, and rustc refused the
-                // `'static` it needs. The receiver is a VALUE in vilan (a bare
-                // `self` is a copy), so the capture takes a copy of it, which is
-                // what capturing a by-value parameter already does.
-                if self
-                    .program
-                    .parameters
-                    .get(binding)
-                    .is_some_and(|parameter| self.is_a_value_received_by_reference(parameter))
-                {
-                    return format!("let {name} = (*{name}).clone(); ");
-                }
-                format!("let {name} = {name}.clone(); ")
-            })
-            .collect();
+        let prelude = self.capture_prelude(&captures);
         // A future-answering closure answers `Boxed<R>` on every call, so its
         // body is an `async move` block behind `pin_future`. The captures are
         // cloned a SECOND time inside the closure: the block is `move` and takes
@@ -8661,6 +8598,83 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "{{ {prelude}std::rc::Rc::new(move |{}|{written_return} {{ {body} }}){as_counted} }}",
             parameters.join(", ")
         ))
+    }
+
+    /// The bindings a `move` closure over `captured` takes a HANDLE of
+    /// (`let name = name.clone();` ahead of it), in a stable order — shared by
+    /// a closure literal and F96's synthesized continuation closures.
+    fn closure_capture_handles(&self, captured: &HashSet<Id>) -> Vec<Id> {
+        // Every capture gets a handle of its own, not only the boxed ones: a
+        // `move` closure takes the whole binding whatever the body does with it
+        // (Rust 2021 captures the PATH, and `&item` inside a `move` closure
+        // still captures `item` by value), so the enclosing frame loses it —
+        // `Owner::take` hands `item` to a cleanup closure and then RETURNS it.
+        //
+        // Two shapes are skipped because `.clone()` would change their type
+        // rather than copy them: a parameter received by reference (a `&T` is
+        // `Copy`, so the frame keeps it, and `(&T).clone()` derefs to `T`), and
+        // a binding that holds a view, for the same reason.
+        let mut captures: Vec<Id> = captured
+            .iter()
+            .copied()
+            .filter(|binding| {
+                // A module-level binding is read through its own `thread_local!`
+                // cell and has no local name to shadow; a `Local` naming an enum
+                // VARIANT is not a place at all.
+                if self.module_bindings.contains(binding) {
+                    return false;
+                }
+                if self.boxed.contains(binding) {
+                    return true;
+                }
+                if self.binding_holds_a_view(*binding) {
+                    return false;
+                }
+                if self.program.context_hidden_parameters.contains_key(binding) {
+                    return true;
+                }
+                match self.program.parameters.get(binding) {
+                    Some(parameter) => {
+                        self.receiving_form(parameter) == Receiving::ByValue
+                            || self.is_a_value_received_by_reference(parameter)
+                    }
+                    None => self.program.variables.contains_key(binding),
+                }
+            })
+            .collect();
+        captures.sort_by_key(|binding| binding.0);
+        captures
+    }
+
+    /// The capture prelude for [`Self::closure_capture_handles`]' answer,
+    /// counting the copies F50's census column reads.
+    fn capture_prelude(&mut self, captures: &[Id]) -> String {
+        self.capture_copies += captures
+            .iter()
+            .filter(|binding| self.capture_is_a_copy(**binding))
+            .count();
+        captures
+            .iter()
+            .map(|binding| {
+                let name = self.binding_name(*binding);
+                // A plain `self` arrives as a `&T` natively, and a closure the
+                // counted `Rc<dyn Fn>` stores cannot hold a borrow of the
+                // caller's frame — `ListCell::set` hands `SignalCell::update` a
+                // closure that records into `self.log`, and rustc refused the
+                // `'static` it needs. The receiver is a VALUE in vilan (a bare
+                // `self` is a copy), so the capture takes a copy of it, which is
+                // what capturing a by-value parameter already does.
+                if self
+                    .program
+                    .parameters
+                    .get(binding)
+                    .is_some_and(|parameter| self.is_a_value_received_by_reference(parameter))
+                {
+                    return format!("let {name} = (*{name}).clone(); ");
+                }
+                format!("let {name} = {name}.clone(); ")
+            })
+            .collect()
     }
 
     /// Whether a closure's capture prelude COPIES `binding`'s value (F50's
@@ -9424,6 +9438,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
+        if let Some(vilan_core::analyzer::LiftDispatch::Trait { .. }) =
+            self.program.lift_dispatch.get(&id)
+        {
+            return self.user_lift(&[(subject, binder, true)], &[id], continuation, depth, span);
+        }
         if !matches!(
             self.program.lift_dispatch.get(&id),
             Some(vilan_core::analyzer::LiftDispatch::Std { .. }) | None
@@ -9440,6 +9459,150 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.lift_split(subject, binder, good, fallback, depth, span)
     }
 
+    /// F96: a `?` lift over a USER `Lift` container — one step
+    /// (`boxed? * 2`) or a region of them (`left? + right?`) — through the
+    /// container's own `map`/`and_then` (try-and-lift.md §4's trait path):
+    /// each split is a call to the member the analyzer chose, its receiver
+    /// the step and its continuation a closure binding the step's element,
+    /// the rest of the region nested inside, so a later receiver runs only
+    /// when the container's member calls on. An EVAL step is a `let`.
+    /// `dispatch_keys[i]` is where step `i`'s dispatch is recorded: the lift
+    /// itself for one step, each split's binder in a region.
+    fn user_lift(
+        &mut self,
+        steps: &[(Id, Id, bool)],
+        dispatch_keys: &[Id],
+        body: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        for (_, binder, _) in steps {
+            self.is_captures.insert(*binder);
+        }
+        let rendered = self.user_lift_steps(steps, dispatch_keys, body, depth, span);
+        for (_, binder, _) in steps {
+            self.is_captures.remove(binder);
+        }
+        rendered
+    }
+
+    /// One step of [`Self::user_lift`], the rest inside it.
+    fn user_lift_steps(
+        &mut self,
+        steps: &[(Id, Id, bool)],
+        dispatch_keys: &[Id],
+        body: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let Some((&(step, binder, is_split), rest)) = steps.split_first() else {
+            return self.consumed_value_of(body, depth);
+        };
+        let rest_keys = dispatch_keys.get(1..).unwrap_or(&[]);
+        if !is_split {
+            let value = self.value_of(step, depth)?;
+            let inner = self.user_lift_steps(rest, rest_keys, body, depth, span)?;
+            return Ok(format!(
+                "{{ let {} = {value}; {inner} }}",
+                self.binding_name(binder)
+            ));
+        }
+        let Some(vilan_core::analyzer::LiftDispatch::Trait {
+            member_id,
+            impl_subject,
+            subject_type_id,
+            own_generic_value,
+        }) = dispatch_keys
+            .first()
+            .and_then(|key| self.program.lift_dispatch.get(key))
+            .cloned()
+        else {
+            return Err(unsupported(
+                "a `?` lift step with no recorded dispatch",
+                span,
+            ));
+        };
+        // The impl's parameters off the subject's type; the member's own
+        // `U` off the analyzer's record.
+        let subject_type = self.deeply_resolved(subject_type_id);
+        let mut entries = Vec::new();
+        self.bind_generics_against(impl_subject, subject_type, &mut entries);
+        let member = self
+            .program
+            .functions
+            .get(&member_id)
+            .cloned()
+            .ok_or_else(|| unsupported("a `Lift` member that did not resolve", span))?;
+        if let Some(&own) = member.generic_parameter_constraint_ids.first() {
+            let own_value = self.deeply_resolved(own_generic_value);
+            entries.push((own, own_value));
+        }
+        let substitution: HashMap<TypeId, TypeId> = entries.into_iter().collect();
+        let name = self.ensure_function(member_id, &substitution)?.name;
+        // The continuation's closure type is the member's second parameter
+        // under that binding: `|T| U` for `map`, `|T| Boxy<U>` for `and_then`.
+        let continuation_type = member
+            .parameters
+            .get(1)
+            .and_then(|parameter| self.program.parameters.get(parameter))
+            .map(|parameter| parameter.type_id)
+            .ok_or_else(|| unsupported("a `Lift` member with no continuation", span))?;
+        let resolved_entries = self.resolved_entries(&substitution);
+        let continuation_type = self.substituted(continuation_type, &resolved_entries);
+        let continuation_type = self.deeply_resolved(continuation_type);
+        let Some(Type::Closure(parameters, returns, _, _)) =
+            self.resolve(continuation_type).cloned()
+        else {
+            return Err(unsupported(
+                "a `Lift` member whose continuation is no closure",
+                span,
+            ));
+        };
+        let element = parameters
+            .first()
+            .copied()
+            .ok_or_else(|| unsupported("a `Lift` continuation with no parameter", span))?;
+        let element = self.rust_type(element, span)?;
+        let answer = self.rust_type(returns, span)?;
+        let receiver = self.receiver_argument(member_id, step, depth)?;
+        // What the closure captures: everything its region reads that it does
+        // not declare — the outer splits' binders among them, which are no
+        // `let`s and so are named here rather than by the closure filter.
+        let mut declared: HashSet<Id> = HashSet::from_iter([binder]);
+        let mut referenced = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut roots: Vec<Id> = rest.iter().map(|(step, _, _)| *step).collect();
+        roots.push(body);
+        for (_, inner_binder, _) in rest {
+            declared.insert(*inner_binder);
+        }
+        for root in roots {
+            self.scan_closure(root, &mut declared, &mut referenced, &mut visited);
+        }
+        let captured: HashSet<Id> = referenced
+            .into_iter()
+            .filter(|binding| !declared.contains(binding))
+            .collect();
+        let mut handles = self.closure_capture_handles(&captured);
+        let mut outer_binders: Vec<Id> = captured
+            .iter()
+            .copied()
+            .filter(|binding| self.is_captures.contains(binding) && !handles.contains(binding))
+            .collect();
+        outer_binders.sort_by_key(|binding| binding.0);
+        handles.extend(outer_binders);
+        self.closure_captures.push(captured);
+        let inner = self.user_lift_steps(rest, rest_keys, body, depth, span);
+        self.closure_captures.pop();
+        let inner = inner?;
+        let prelude = self.capture_prelude(&handles);
+        let binder_name = self.binding_name(binder);
+        Ok(format!(
+            "{name}({receiver}, {{ {prelude}std::rc::Rc::new(move |{binder_name}: {element}| -> \
+             {answer} {{ {inner} }}) as std::rc::Rc<dyn Fn({element}) -> {answer}> }})"
+        ))
+    }
+
     /// An expression-lifting region over `Option`/`Result`: its steps as
     /// nested splits (an EVAL step a plain `let`), the body in the innermost
     /// good arm, wrapped once.
@@ -9451,6 +9614,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
+        if let Some(vilan_core::analyzer::LiftDispatch::TraitRegion) =
+            self.program.lift_dispatch.get(&id)
+        {
+            // Each split's own dispatch is recorded under its BINDER.
+            let keys: Vec<Id> = steps.iter().map(|(_, binder, _)| *binder).collect();
+            return self.user_lift(steps, &keys, body, depth, span);
+        }
         if !matches!(
             self.program.lift_dispatch.get(&id),
             Some(vilan_core::analyzer::LiftDispatch::Std { .. }) | None
@@ -9523,14 +9693,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
-        if !matches!(
-            self.program.try_dispatch.get(&id),
-            Some(TryDispatch::Std) | None
-        ) {
-            return Err(unsupported(
-                "a `!` assertion through a user `Try` impl (the `Option`/`Result` form is emitted)",
+        if let Some(TryDispatch::Trait {
+            verdict_id,
+            from_bad_id,
+            impl_subject,
+            receiver_type_id,
+        }) = self.program.try_dispatch.get(&id).cloned()
+        {
+            return self.user_try_assert(
+                id,
+                receiver,
+                (verdict_id, from_bad_id),
+                (impl_subject, receiver_type_id),
+                depth,
                 span,
-            ));
+            );
         }
         let Some(Type::Enum(enum_id, _)) = self
             .type_of(receiver)
@@ -9564,6 +9741,74 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "a `!` assertion on something that is neither an `Option` nor a `Result`",
                 span,
             )),
+        }
+    }
+
+    /// F96: `receiver!` through a USER `Try` impl — `verdict(receiver)`, the
+    /// good half the value and the bad half returned through `from_bad`
+    /// (try-and-lift.md §4), as the JS backend branches on the `Verdict`'s
+    /// tag. The impl's own parameters are bound off the receiver's type.
+    fn user_try_assert(
+        &mut self,
+        id: Id,
+        receiver: Id,
+        (verdict_id, from_bad_id): (Id, Id),
+        (impl_subject, receiver_type): (TypeId, TypeId),
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let receiver_type = self.deeply_resolved(receiver_type);
+        let mut entries = Vec::new();
+        self.bind_generics_against(impl_subject, receiver_type, &mut entries);
+        let substitution: HashMap<TypeId, TypeId> = entries.into_iter().collect();
+        let verdict = self.ensure_function(verdict_id, &substitution)?.name;
+        let from_bad = self.ensure_function(from_bad_id, &substitution)?.name;
+        let verdict_type = self
+            .program
+            .functions
+            .get(&verdict_id)
+            .cloned()
+            .and_then(|function| self.return_type_of(&function))
+            .ok_or_else(|| unsupported("a `Try` impl whose `verdict` answers nothing", span))?;
+        let verdict_type = self.substituted(verdict_type, &self.resolved_entries(&substitution));
+        let verdict_type = self.deeply_resolved(verdict_type);
+        let Some(Type::Enum(verdict_enum, arguments)) = self.resolve(verdict_type).cloned() else {
+            return Err(unsupported(
+                "a `Try` impl whose `verdict` answers no `Verdict`",
+                span,
+            ));
+        };
+        let good_path = self.variant_path(verdict_enum, 0, &arguments, span)?;
+        let bad_path = self.variant_path(verdict_enum, 1, &arguments, span)?;
+        let subject = self.receiver_argument(verdict_id, receiver, depth)?;
+        let good = format!("try_good_{}", id.0);
+        let bad = format!("try_bad_{}", id.0);
+        Ok(format!(
+            "match {verdict}({subject}) {{ {good_path}({good}) => {good}, \
+             {bad_path}({bad}) => return {from_bad}({bad}) }}"
+        ))
+    }
+
+    /// The receiver of a member called by an emitter-written call (F96's
+    /// `verdict`, `map`, `and_then`), at the member's own convention for its
+    /// first parameter: a value, or a borrow of the place.
+    fn receiver_argument(
+        &mut self,
+        member: Id,
+        receiver: Id,
+        depth: usize,
+    ) -> Result<String, Error> {
+        let convention = self
+            .program
+            .functions
+            .get(&member)
+            .and_then(|function| function.parameters.first().copied())
+            .and_then(|parameter| self.program.parameters.get(&parameter).cloned())
+            .map(|parameter| self.receiving_form(&parameter));
+        match convention {
+            Some(Receiving::Ref) => Ok(format!("&{}", self.expression(receiver, depth)?)),
+            Some(Receiving::RefMut) => Ok(format!("&mut {}", self.mutable_place(receiver, depth)?)),
+            _ => self.consumed_value_of(receiver, depth),
         }
     }
 

@@ -1,0 +1,114 @@
+// F96: a `?` lift over a USER `Lift` container (expression-lift.vl) and a
+// `!` assertion through a USER `Try` impl (try-assert.vl) were refused
+// natively by name; the `Option`/`Result` forms were emitted. A user lift
+// calls the container's own `map`/`and_then` — the analyzer's choice — with
+// the continuation as a closure over the step's element, a region nesting
+// its later receivers inside (so they run only when the container calls
+// on); a user `!` is `verdict(receiver)`, the good half its value and the
+// bad half returned through `from_bad`. The shapes: one step, a step whose
+// continuation reads outer state, a region of two receivers (the second
+// skipped by a container that never calls on), a flattening body, and a
+// `Try` impl's good and bad paths in one function.
+import std::io::print;
+import std::operators::{ Lift, Try, Verdict };
+
+struct Tagged<T> {
+	items: List<T>,
+	tag: str,
+}
+
+impl Tagged<type T> with Lift {}
+
+impl Tagged<type T> {
+	fun map<U>(self, fn: |T| U): Tagged<U> {
+		mut out: List<U> = [];
+		for item in self.items {
+			out.push(fn(item));
+		}
+		Tagged { items = out, tag = self.tag + ".map" }
+	}
+
+	fun and_then<U>(self, fn: |T| Tagged<U>): Tagged<U> {
+		mut out: List<U> = [];
+		mut tag = self.tag;
+		for item in self.items {
+			let inner = fn(item);
+			tag = tag + "+" + inner.tag;
+			for each in inner.items {
+				out.push(each);
+			}
+		}
+		Tagged { items = out, tag }
+	}
+}
+
+mut fetched = 0;
+
+fun fetch(value: i32, live: bool): Tagged<i32> {
+	fetched += 1;
+	if live {
+		Tagged { items = [value], tag = i"f{value}" }
+	} else {
+		Tagged { items = [], tag = i"f{value}" }
+	}
+}
+
+fun show_tagged(tagged: Tagged<i32>): str {
+	mut shown = "";
+	for item in tagged.items {
+		shown = shown + i"{item} ";
+	}
+	shown + tagged.tag
+}
+
+enum Gate {
+	Open(i32),
+	Shut(str),
+}
+
+impl Gate with Try<i32, str> {
+	fun verdict(self): Verdict<i32, str> {
+		match self {
+			Gate::Open(let lane) => Verdict::Good(lane),
+			Gate::Shut(let why) => Verdict::Bad(why),
+		}
+	}
+
+	fun from_bad(bad: str): Gate {
+		Gate::Shut(bad)
+	}
+}
+
+fun through(first: Gate, second: Gate): Gate {
+	let a = first!;
+	let b = second!;
+	Gate::Open(a + b)
+}
+
+fun show(gate: Gate): str {
+	match gate {
+		Gate::Open(let lane) => i"open {lane}",
+		Gate::Shut(let why) => i"shut {why}",
+	}
+}
+
+fun main() {
+	let one: Tagged<i32> = fetch(4, true)? * 10;
+	print(show_tagged(one));
+	let factor = 3;
+	let scaled: Tagged<i32> = fetch(5, true)? * factor;
+	print(show_tagged(scaled));
+	let both: Tagged<i32> = fetch(40, true)? + fetch(2, true)?;
+	print(i"{show_tagged(both)} fetched={fetched}");
+	let dead: Tagged<i32> = fetch(1, false)? + fetch(9, true)?;
+	print(i"{show_tagged(dead)} fetched={fetched}");
+	let nested: Tagged<List<Tagged<i32>>> = Tagged {
+		items = [[Tagged { items = [7], tag = "inner" }]],
+		tag = "outer",
+	};
+	let flat: Tagged<i32> = nested?[0];
+	print(show_tagged(flat));
+	print(show(through(Gate::Open(1), Gate::Open(2))));
+	print(show(through(Gate::Open(1), Gate::Shut("second"))));
+	print(show(through(Gate::Shut("first"), Gate::Open(2))));
+}

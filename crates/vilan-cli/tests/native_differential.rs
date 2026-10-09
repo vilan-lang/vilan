@@ -9376,6 +9376,39 @@ fn a_mapped_tuple_and_its_comprehension_are_identical_on_both_backends() {
     }
 }
 
+/// F96: a `?` lift over a USER `Lift` container and a `!` through a USER
+/// `Try` impl were refused by name — the walls of expression-lift.vl and
+/// try-assert.vl. A user lift calls the container's own `map`/`and_then`
+/// with the continuation as a closure over the step's element (a region's
+/// later receivers nested inside, so they run only when the container calls
+/// on); a user `!` is `verdict(receiver)` with the bad half returned through
+/// `from_bad`. The probe: one step, a continuation reading outer state, a
+/// region of two receivers, one skipped by a container that never calls on
+/// (the fetch count says so), a flattening body, and a `Try` impl's good and
+/// bad paths; plus the two corpus programs.
+#[test]
+fn a_user_lift_container_and_a_user_try_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_user_lift_and_try.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/user_lift_and_try.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a user `Lift` and a user `Try` must agree natively"
+    );
+    for program in ["expression-lift.vl", "try-assert.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F96 was its wall"
+        );
+    }
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,
