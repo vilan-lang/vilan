@@ -344,6 +344,20 @@ impl<'src> Transformer<'src> {
                 }
                 call("__dbg_set", arguments)
             }
+            Shape::Object { label } => {
+                // `value[1].$show(value[0])`: the pair's table prints the
+                // value it erased (S1b).
+                let show = js::Node::Call(
+                    Box::new(js::Node::Property(Box::new(slot(1)), "$show".to_string())),
+                    vec![slot(0)],
+                );
+                group(
+                    &format!("{label}("),
+                    ")",
+                    false,
+                    vec![(String::new(), show)],
+                )
+            }
             Shape::Enum { variants, bindings } => {
                 let saved = self.current_substitution.clone();
                 self.current_substitution.extend(bindings);
@@ -425,6 +439,15 @@ impl<'src> Transformer<'src> {
         }
         let call = self.emit_dispatch(dispatch, vec![js::Node::Local("value".to_string())], None);
         Some(vec![js::Node::Return(Box::new(call))])
+    }
+
+    /// S1b: the `show` slot of the table for one `(type, trait)` pair — the
+    /// type's printer — when the program's tables carry one, else `None`.
+    pub(super) fn object_show_slot(&mut self, type_id: TypeId) -> Option<js::Node<'src>> {
+        if !crate::printer::tables_carry_show(self.program, self.dbg_policy) {
+            return None;
+        }
+        Some(js::Node::Local(self.printer_for(type_id)))
     }
 
     /// N136/N149: whether `argument` is a number of the language's own (an

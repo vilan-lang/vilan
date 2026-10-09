@@ -43,6 +43,11 @@ written down.
 <!-- family: fix -->
 **N149: `print(value)` with `value: T` at a number instance prints negative zero as `0` on JS, as natively — it printed `-0`, because N136's wrap (`String(x)`) came from a static recording that cannot see `T`.** The JS emitter also reads the argument's type under the instance's substitution, so the number instances share a wrapped body and a string instance keeps the bare `console.log`; the same reading catches a closure parameter whose type is inferred from its use (`xs.for_each(|n| print(n))`), which the recording also missed. Corpus: `list-methods.mjs` and `reactive.mjs` move runtime-identically (three closure-parameter prints gain the wrap). Pins: `inference::debugging::n149_print_of_a_generic_number_is_wrapped_per_instance`, `native_differential::n149_a_generic_print_of_negative_zero_is_identical_on_both_backends`. Tracker N149.
 
+---
+
+<!-- family: feature -->
+**debugging.md S1b, the rest: a `dyn` value prints the value it holds — `dyn Area(Square { side = 2 })`, `dyn Label<str>(..)` — where `dbg` printed `<dyn Area>`.** In a program whose build prints a `dbg`, every trait-object table carries the erased value's printer: a `$show` entry on the JS table (no vilan name starts with `$`), a `dbg_show` method on the native object trait (named clear of the trait's own members, so a member called `show` or `dbg_show` is untouched). The `dyn`'s printer calls it, so the value prints as its own type would — a written `Debug` included. A program that never calls `dbg` (or strips it) carries no slot: no corpus golden moves. Pins: `inference::debugging::s1b_a_dyn_value_prints_what_it_holds` (alone, in a list, in an option, trait arguments; no `$show` without a `dbg`), `native_differential::s1b_a_dyn_value_prints_what_it_holds_on_both_backends` (`native/dbg_dyn.*`). Tracker E257 (S1b).
+
 ## v0.45.0 — 2026-10-08
 
 <!-- family: breaking -->

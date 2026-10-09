@@ -10542,6 +10542,20 @@ fn e277_scalar_lists_fill_their_lines_on_both_backends() {
     );
 }
 
+/// S1b: a `dyn` value prints the value it erased through its table's `show`
+/// slot — alone, in a list, nested in a struct, in an option, with trait
+/// arguments, through a written `Debug` — and a trait whose members are
+/// named `show` and `dbg_show` keeps them (`native/dbg_dyn.*`).
+#[test]
+fn s1b_a_dyn_value_prints_what_it_holds_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_dyn.vl",
+        include_str!("native/dbg_dyn.vl"),
+        "4\nrect\nalso rect\n",
+        include_str!("native/dbg_dyn.stderr"),
+    );
+}
+
 /// E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an
 /// `f32`, one inside a list — and `.debug()` agrees, while `print` keeps
 /// N136's `0`; the same bytes on both backends.

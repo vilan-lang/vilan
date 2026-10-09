@@ -239,6 +239,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     sanitize(&field)
                 )
             }
+            Shape::Object { label } => {
+                let Some(Type::Dyn(trait_id, arguments)) = self.resolve(type_id).cloned() else {
+                    return Err(unsupported("printing an object that did not resolve", span));
+                };
+                let object = self.ensure_object_trait(trait_id, &arguments, span)?;
+                match object.show {
+                    Some(show) => format!(
+                        "vilan_rt::show::Doc::group({}, \")\", false, vec![(String::new(), {}::{show}(value.object()))])",
+                        rust_literal(&format!("{label}(")),
+                        object.name
+                    ),
+                    None => format!(
+                        "vilan_rt::show::Doc::text({})",
+                        rust_literal(&format!("<{label}>"))
+                    ),
+                }
+            }
             Shape::Enum { variants, bindings } => {
                 let Some(Type::Enum(enum_id, arguments)) = self.resolve(type_id).cloned() else {
                     return Err(unsupported("printing an enum that did not resolve", span));

@@ -11213,6 +11213,12 @@ impl<'src> Transformer<'src> {
             };
             entries.push((member_name.to_string(), slot));
         }
+        // S1b: in a program that prints a `dbg`, the table also carries the
+        // value's printer, so a `dyn` prints what it holds. `$show` cannot
+        // collide with a member: no vilan name starts with `$`.
+        if let Some(show) = self.object_show_slot(type_id) {
+            entries.push(("$show".to_string(), show));
+        }
         // M89: a table whose every slot names a function is a function of its
         // slot set, so a second pair answering every member with the same
         // functions — a blanket's members over two stage types, say — names

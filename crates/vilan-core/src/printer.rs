@@ -89,6 +89,12 @@ pub enum Shape {
         field: (usize, String),
         element: TypeId,
     },
+    /// S1b: a trait object — `dyn Area(Square { side = 2 })`, its value
+    /// printed by the `show` slot its table carries in a program that calls
+    /// `dbg` (debugging.md §2.2). `label` is the object's type as written.
+    Object {
+        label: String,
+    },
 }
 
 impl Shape {
@@ -118,6 +124,14 @@ fn is_integer_name(name: &str) -> bool {
         name,
         "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i53" | "u53" | "usize"
     )
+}
+
+/// S1b: whether a program's `dyn` tables carry the `show` slot — any program
+/// whose build prints a `dbg` (a stripped build has no printers to point at).
+/// The slot is one function reference per (trait, type) table, so a program
+/// that never calls `dbg` pays nothing (§2.3).
+pub fn tables_carry_show(program: &Program, policy: crate::options::DbgPolicy) -> bool {
+    policy != crate::options::DbgPolicy::Strip && !program.dbg_calls.is_empty()
 }
 
 /// E275: the trait a WRITTEN `Debug` impl for `type_id` is reached through —
@@ -207,14 +221,9 @@ pub fn shape_of(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> 
         }
         Type::Struct(struct_id, arguments) => struct_shape(program, *struct_id, arguments),
         Type::Enum(enum_id, arguments) => enum_shape(program, *enum_id, arguments),
-        Type::Dyn(trait_id, _) => Shape::Text(format!(
-            "<dyn {}>",
-            program
-                .traits
-                .get(trait_id)
-                .map(|declaration| declaration.name)
-                .unwrap_or("trait")
-        )),
+        Type::Dyn(..) => Shape::Object {
+            label: type_text(program, type_id, resolve),
+        },
         Type::Generic(_) => Shape::Text(format!("<{}>", type_text(program, type_id, resolve))),
         _ => Shape::Text(format!("<{}>", type_text(program, type_id, resolve))),
     }

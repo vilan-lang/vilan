@@ -41,7 +41,8 @@ fun main() {
   (and negative zero shows as `-0.0`, where `print` writes `0`), a string is quoted and escaped, a closure prints its type
   (`<closure |i32| -> i32>`). std's handles print as themselves: `HashMap {
   "ada" => 36 }`, `HashSet { 1, 2 }`, `Shared(..)`, `SignalCell(3)` (read
-  without subscribing), a pipe by its type (sampling it would run it), and a
+  without subscribing), a `dyn` value as `dyn Area(Square { side = 2 })`, a
+  pipe by its type (sampling it would run it), and a
   cycle through a `Shared` as `<cycle>`. A value that fits in 80 columns stays on one line;
   a longer one breaks one entry per line, two spaces deeper, with a trailing
   comma — except a list or set of numbers, strings or other scalars, which

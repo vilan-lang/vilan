@@ -546,6 +546,48 @@ fn e276_dbg_shows_negative_zero_and_print_keeps_zero() {
     );
 }
 
+/// S1b: a `dyn` value prints the value it erased — `dyn Area(Square { side
+/// = 2 })`, through the `show` slot its table carries — alone, in a list, in
+/// an option and with trait arguments; a value whose type has a written
+/// `Debug` prints through it there too. A table keeps its members' names
+/// (`show` is a member here), and a program that never calls `dbg` carries no
+/// slot at all.
+#[test]
+fn s1b_a_dyn_value_prints_what_it_holds() {
+    let source = concat!(
+        "trait Area { fun area(self): i32; }\n",
+        "trait Named { fun show(self): str; }\n",
+        "trait Label<T> { fun label(self): T; }\n",
+        "struct Square { side: i32 }\n",
+        "impl Square with Area { fun area(self): i32 { self.side * self.side } }\n",
+        "impl Square with Named { fun show(self): str { \"square\" } }\n",
+        "impl Square with Label<str> { fun label(self): str { \"sq\" } }\n",
+        "fun main() {\n",
+        "\tlet one: dyn Area = Square { side = 2 };\n",
+        "\tlet shapes: List<dyn Area> = [Square { side = 3 }];\n",
+        "\tlet named: dyn Named = Square { side = 4 };\n",
+        "\tlet labelled: dyn Label<str> = Square { side = 5 };\n",
+        "\tdbg(one, shapes, Some(one), named, labelled);\n",
+        "\tprint(named.show());\n",
+        "}\n",
+    );
+    assert_dbg_runs(
+        source,
+        "square\n",
+        concat!(
+            "[test.vl:13:2] one = dyn Area(Square { side = 2 })\n",
+            "[test.vl:13:2] shapes = [dyn Area(Square { side = 3 })]\n",
+            "[test.vl:13:2] Some(one) = Some(dyn Area(Square { side = 2 }))\n",
+            "[test.vl:13:2] named = dyn Named(Square { side = 4 })\n",
+            "[test.vl:13:2] labelled = dyn Label<str>(Square { side = 5 })\n",
+        ),
+    );
+    let without_dbg = source.replace("\tdbg(one, shapes, Some(one), named, labelled);\n", "");
+    let javascript = compile(&without_dbg).expect("a clean compile");
+    assert!(!javascript.contains("$show"), "{javascript}");
+    assert!(compile(source).expect("a clean compile").contains("$show:"));
+}
+
 // --- S4: `Debug` through the printer (E260) -----------------------------
 
 /// E260: `[derive(Debug)]` on a struct with a `List` and an `Option` field

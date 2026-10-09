@@ -29,7 +29,8 @@ generates for each type a `dbg` reaches, the same on both backends:
 | a `Shared`, a `SignalCell` | `Shared(Point { x = 7, y = 8 })`, `SignalCell(3)` (read without tracking) |
 | a pipe | `<pipe Derive<SignalCell<i32>, i32, i32>>`: sampling one would run it |
 | a cycle | `Shared(Link { next = Some(<cycle>) })`: a cell met again is not entered |
-| a trait object, a host handle | `<dyn Area>`, `<Task>` |
+| a trait object | `dyn Area(Square { side = 2 })`: the value it holds |
+| a host handle | `<Task>` |
 
 A value that fits in 80 columns from where it starts stays on one line;
 otherwise each entry takes a line of its own, two spaces deeper, with a

@@ -538,6 +538,9 @@ struct Emitter<'a, 'src> {
 struct ObjectTrait {
     name: String,
     slots: Vec<ObjectSlot>,
+    /// S1b: the method printing the erased value for `dbg`, in a program
+    /// that prints one — named clear of every slot.
+    show: Option<String>,
 }
 
 #[derive(Clone)]
@@ -10562,6 +10565,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ObjectTrait {
                 name: name.clone(),
                 slots: Vec::new(),
+                show: None,
             },
         );
         let mut members: Vec<&'src str> = self
@@ -10597,9 +10601,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         for slot in &slots {
             let _ = writeln!(out, "    {};", slot.signature);
         }
+        // S1b: the `dbg` printer of the value the object erased, in a program
+        // that prints one — the JS table's `$show`. Named clear of the slots,
+        // which are the vilan members' own names.
+        let show =
+            vilan_core::printer::tables_carry_show(self.program, self.dbg_policy).then(|| {
+                let mut show = "dbg_show".to_string();
+                while slots.iter().any(|slot| sanitize(&slot.member) == show) {
+                    show.push('_');
+                }
+                show
+            });
+        if let Some(show) = &show {
+            let _ = writeln!(out, "    fn {show}(&self) -> vilan_rt::show::Doc;");
+        }
         let _ = writeln!(out, "}}");
         self.types.insert(slot, out);
-        let object = ObjectTrait { name, slots };
+        let object = ObjectTrait { name, slots, show };
         self.object_traits.insert((trait_id, key), object.clone());
         Ok(object)
     }
@@ -10833,6 +10851,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = writeln!(out, "    {} {{", slot.signature);
             let _ = writeln!(out, "        {function_name}({})", forwarded.join(", "));
             let _ = writeln!(out, "    }}");
+        }
+        if let Some(show) = &object.show {
+            let printer = self.native_printer_for(subject, span)?;
+            let _ = writeln!(
+                out,
+                "    fn {show}(&self) -> vilan_rt::show::Doc {{\n        {printer}(self)\n    }}"
+            );
         }
         let _ = writeln!(out, "}}");
         let slot = self.next_type_slot;
