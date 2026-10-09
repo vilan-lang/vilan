@@ -9689,8 +9689,12 @@ fn b501_an_expectation_reaches_a_generic_calls_generic_argument() {
     );
 }
 
+/// B501's remainder: a call nested at ANOTHER call's parameter. The argument
+/// call waits for its direction (it would bind `S` to `source`'s still-open
+/// `Src<T>`), and the outer call tells it the parameter's type before typing
+/// it — a free call's concrete parameter, a method's, each of two arguments,
+/// and a generic outer call whose own parameter its expectation decides.
 #[test]
-#[ignore = "B501: the expectation does not yet reach a call nested at ANOTHER call's parameter (`takes(counted(source(..)))`): the inner call resolves before the outer is typed toward its parameter"]
 fn b501_an_expectation_reaches_through_a_call_at_another_calls_parameter() {
     assert_compiles_and_runs(
         r#"
@@ -9701,11 +9705,38 @@ fn b501_an_expectation_reaches_through_a_call_at_another_calls_parameter() {
         struct Counted<S> { inner: S }
         fun counted<S>(inner: S): Counted<S> { Counted { inner } }
         fun takes(counted: Counted<Src<i32>>): bool { counted.inner.value.is_none() }
+        struct Sink {}
+        impl Sink {
+            fun takes(self, counted: Counted<Src<i32>>): bool { counted.inner.value.is_none() }
+        }
+        fun pair(a: Counted<Src<str>>, b: Counted<Src<bool>>): bool {
+            a.inner.value.is_none() && b.inner.value.is_none()
+        }
         fun main() {
             print(takes(counted(source("y"))));
+            print(Sink {}.takes(counted(source("y"))));
+            print(pair(counted(source("a")), counted(source("b"))));
+            let deep: Counted<Counted<Src<i32>>> = counted(counted(source("z")));
+            print(deep.inner.inner.value.is_none());
         }
         "#,
-        "true\n",
+        "true\ntrue\ntrue\ntrue\n",
+    );
+    // A nested call nothing directs still refuses, once.
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::wire::Wire;
+        struct Src<T> { value: Option<T> }
+        fun source<T: Wire>(name: str): Src<T> { Src { value = None } }
+        struct Counted<S> { inner: S }
+        fun counted<S>(inner: S): Counted<S> { Counted { inner } }
+        fun opens<S>(counted: Counted<S>): bool { true }
+        fun main() {
+            let _ = opens(counted(source("y")));
+        }
+        "#,
+        "cannot infer 'T' for this call",
     );
 }
 

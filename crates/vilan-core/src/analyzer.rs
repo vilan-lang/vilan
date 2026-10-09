@@ -50020,18 +50020,24 @@ impl<'src> Analyzer<'src> {
     /// type holding a generic that is neither the callee's nor a binder in
     /// scope at the call — another call's own parameter left open — when the
     /// call carries an expectation the step after this one can read.
+    ///
+    /// Answers whether the call should WAIT instead (B501's remainder): such
+    /// a binding and no expectation yet, while the fixpoint still moves. A
+    /// call standing at ANOTHER call's parameter (`takes(counted(source(..)))`)
+    /// receives its expectation only when that outer call is typed — the
+    /// outer seeds it (`seed_call_argument_expectations`) — and resolving
+    /// first committed the foreign binding, so `source`'s `T` was "cannot be
+    /// checked". A call nothing ever directs resolves at the stall, as before.
     fn release_bindings_to_foreign_generics(
         &mut self,
         call_id: Id,
         callee_id: Id,
         substitution: &mut SubstitutionContext,
-    ) {
-        if !self.expected_types.contains_key(&call_id) {
-            return;
-        }
+    ) -> bool {
         let Some((_, own_generics)) = self.method_signature(callee_id) else {
-            return;
+            return false;
         };
+        let expected = self.expected_types.contains_key(&call_id);
         for generic in own_generics {
             let Some(bound) = substitution.get(&generic).copied() else {
                 continue;
@@ -50041,8 +50047,49 @@ impl<'src> Analyzer<'src> {
             let foreign = mentioned.iter().any(|mentioned| {
                 *mentioned != generic && !self.generic_is_enclosing_binder(*mentioned, call_id)
             });
-            if foreign {
-                substitution.remove(&generic);
+            if !foreign {
+                continue;
+            }
+            if !expected {
+                return !self.fixpoint_stalled;
+            }
+            substitution.remove(&generic);
+        }
+        false
+    }
+
+    /// B501's remainder: a CALL standing at a parameter whose type this call
+    /// has already decided — a concrete declared type, or a generic the
+    /// substitution grounds — is told that type as its expectation before it
+    /// is typed, as an annotated `let` tells its initializer. The argument
+    /// call waits for it (`release_bindings_to_foreign_generics`); seeded
+    /// here, its next attempt binds from it.
+    fn seed_call_argument_expectations(
+        &mut self,
+        parameters: &[Id],
+        argument_ids: &[Id],
+        substitution_context: &SubstitutionContext,
+    ) {
+        for (parameter_id, argument_id) in parameters.iter().zip(argument_ids) {
+            if !matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Call(_))
+            ) || self.expected_types.contains_key(argument_id)
+            {
+                continue;
+            }
+            let Some(parameter_type_id) = self
+                .parameters
+                .get(parameter_id)
+                .map(|parameter| parameter.type_id)
+            else {
+                continue;
+            };
+            let parameter_type = parameter_type_id.get_type(self);
+            let decided = self.substitute_type(&parameter_type, substitution_context);
+            let decided_id = decided.get_type_id(self);
+            if self.type_is_ground(decided_id) {
+                self.expected_types.insert(*argument_id, decided_id);
             }
         }
     }
@@ -51381,6 +51428,20 @@ impl<'src> Analyzer<'src> {
                             && self
                                 .an_argument_type_is_unresolved(argument_ids, &substitution_context)
                         {
+                            // B501: an argument call waiting for its direction
+                            // gets it from what the expectation decides, or the
+                            // two would wait on each other to the stall.
+                            let mut decided = substitution_context.clone();
+                            self.bind_callee_own_generics_from_expectation(
+                                call_id,
+                                target_id,
+                                &mut decided,
+                            );
+                            self.seed_call_argument_expectations(
+                                &parameters,
+                                argument_ids,
+                                &decided,
+                            );
                             return Resolution::Deferred;
                         }
                         // B501: an argument whose own type still holds ANOTHER
@@ -51390,11 +51451,13 @@ impl<'src> Analyzer<'src> {
                         // argument waiting to be told. Under an expectation the
                         // parameter is released, so the expectation decides it
                         // and the argument is then typed toward it.
-                        self.release_bindings_to_foreign_generics(
+                        if self.release_bindings_to_foreign_generics(
                             call_id,
                             target_id,
                             &mut substitution_context,
-                        );
+                        ) {
+                            return Resolution::Deferred;
+                        }
                         // The method path's third binding source, shared (B125):
                         // the call site's expectation fixes what the non-closure
                         // arguments left open, before any closure is typed.
@@ -51404,6 +51467,11 @@ impl<'src> Analyzer<'src> {
                             &mut substitution_context,
                         );
                     }
+                    self.seed_call_argument_expectations(
+                        &parameters,
+                        argument_ids,
+                        &substitution_context,
+                    );
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
@@ -52682,12 +52750,25 @@ impl<'src> Analyzer<'src> {
                 // binds nothing, the bounded generic freezes abstract, and the
                 // call monomorphizes to the trait's empty member — the
                 // silent-stub misrender.
+                // B501: an argument CALL at a parameter this call decides is
+                // told that type as its expectation (the free path's rule).
+                let explicit_parameters: Vec<Id> = self
+                    .method_signature_ref(member_id)
+                    .map(|(parameters, _)| parameters.iter().skip(1).copied().collect())
+                    .unwrap_or_default();
                 if self.own_generics_unbound(member_id, &substitution)
                     && (self.an_argument_type_is_unresolved(argument_ids, &substitution)
                         || argument_ids
                             .iter()
                             .any(|argument_id| self.is_unknown_closure_parameter(*argument_id)))
                 {
+                    let mut decided = substitution.clone();
+                    self.bind_callee_own_generics_from_expectation(id, member_id, &mut decided);
+                    self.seed_call_argument_expectations(
+                        &explicit_parameters,
+                        argument_ids,
+                        &decided,
+                    );
                     self.unwired_method_calls.insert(id, member_id);
                     return Resolution::Deferred;
                 }
@@ -52697,6 +52778,11 @@ impl<'src> Analyzer<'src> {
                 // (B125/P21). After the defer above on purpose: the expectation
                 // fills generics, it does not decide readiness.
                 self.bind_callee_own_generics_from_expectation(id, member_id, &mut substitution);
+                self.seed_call_argument_expectations(
+                    &explicit_parameters,
+                    argument_ids,
+                    &substitution,
+                );
                 self.infer_closure_args_against_params(member_id, argument_ids, &substitution);
                 // Then bind generics fixed by a closure's return (`derive<U>`'s `U`),
                 // now that the closures are typed.
