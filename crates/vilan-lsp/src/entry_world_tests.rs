@@ -892,3 +892,114 @@ async fn m104_the_switch_both_ways_leaves_no_stale_diagnostics() {
     at_rest(server).await;
     assert_eq!(errors(&shown(server, &model)), Vec::<String>::new());
 }
+
+// --- E254: a file carrying platform-fenced twins is served from the worlds --
+
+const TWIN_MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+     [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+const TWIN_CLIENT: &str = "import pkg::place::place;\n\nfun main() {\n\tlet _ = place();\n}\n";
+const TWIN_SERVER: &str = "import pkg::place::place;\n\nfun main() {\n\tlet _ = place();\n}\n";
+/// Both entries reach it; the browser entry (first in build order) serves
+/// it, and the `@process` twin is the one its world fences out.
+const TWIN_PLACE: &str = "[platform(\"browser\")]\n\
+     export fun place(): str {\n\tlet spot = \"browser\";\n\tspot\n}\n\n\
+     [platform(\"@process\")]\n\
+     export fun place(): str {\n\tlet count = 7;\n\ti\"process {count}\"\n}\n";
+
+fn twin_package(tag: &str, place: &str) -> Package {
+    let directory = std::env::temp_dir().join(format!(
+        "vilan-e254-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(directory.join("src")).expect("a scratch package");
+    for (relative, contents) in [
+        ("vilan.toml", TWIN_MANIFEST),
+        ("src/client.vl", TWIN_CLIENT),
+        ("src/server.vl", TWIN_SERVER),
+        ("src/place.vl", place),
+    ] {
+        std::fs::write(directory.join(relative), contents).expect("a source file");
+    }
+    Package { directory }
+}
+
+/// E254: with the browser entry open beside it, the twin file is a VIEW of
+/// the browser world — it kept its own analysis (and its own worlds' cost)
+/// before — and the `@process` twin that world fences out is answered by a
+/// leg from the server world: hover inside it, and the colour and hints.
+#[tokio::test]
+async fn e254_a_twin_file_is_served_from_the_world_that_admits_each_twin() {
+    let package = twin_package("served", TWIN_PLACE);
+    let (service, _socket) = backend();
+    let server = service.inner();
+    open_all(
+        server,
+        &package,
+        &[("place.vl", TWIN_PLACE), ("client.vl", TWIN_CLIENT)],
+    )
+    .await;
+    let place = package.uri("place.vl");
+    let document = server.documents.get(&place).expect("open");
+    assert_eq!(
+        document.world_root(),
+        Some(package.canonical("client.vl").as_path()),
+        "served from the browser entry's world"
+    );
+    assert_eq!(
+        document.further_worlds(),
+        [package.canonical("server.vl")],
+        "the server entry reaches it too"
+    );
+    // The browser twin is the world's own.
+    let spot = TWIN_PLACE.find("spot =").expect("the browser local") + 1;
+    assert!(
+        document
+            .hover(spot)
+            .is_some_and(|hover| hover.contains("let spot: str")),
+        "{:?}",
+        document.hover(spot)
+    );
+    // The process twin is the server world's, through its leg.
+    let count = TWIN_PLACE.find("count =").expect("the process local") + 1;
+    assert_eq!(
+        document.hover(count),
+        None,
+        "the browser world never collected it"
+    );
+    let answered = document.answering(count).hover(count).unwrap_or_default();
+    assert!(answered.contains("let count: i32"), "{answered:?}");
+    let count_end = TWIN_PLACE.find("count =").expect("the local") + "count".len();
+    assert!(
+        document
+            .keystroke_hints(false)
+            .iter()
+            .any(|(offset, label)| *offset == count_end && label == ": i32"),
+        "the process twin's binding is hinted from its leg: {:?}",
+        document.keystroke_hints(false)
+    );
+}
+
+/// E254's other half: a twin NO reaching entry's platform admits (a
+/// `deno` twin in a package with a browser and a node server entry) has no
+/// world to be served from, so the file keeps its own analysis and its kept
+/// legs, as before.
+#[tokio::test]
+async fn e254_a_twin_no_entry_admits_keeps_the_files_own_analysis() {
+    let place = TWIN_PLACE.replace("[platform(\"@process\")]", "[platform(\"deno\")]");
+    let package = twin_package("own", &place);
+    let (service, _socket) = backend();
+    let server = service.inner();
+    open_all(
+        server,
+        &package,
+        &[("client.vl", TWIN_CLIENT), ("place.vl", &place)],
+    )
+    .await;
+    let document = server
+        .documents
+        .get(&package.uri("place.vl"))
+        .expect("open");
+    assert_eq!(document.world_root(), None, "its own analysis");
+}

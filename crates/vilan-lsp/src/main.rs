@@ -2451,6 +2451,11 @@ async fn land_world(
             landed.push(uri);
         }
     }
+    // E254: the world just landed may be the further world a twin-carrying
+    // view's legs come from — or the primary world, whose fresh views carry
+    // none yet. Before the publish and the retention pass below, while the
+    // world still holds its program.
+    attach_twin_legs(&context.documents, &context.worlds);
     if landed.is_empty() && root_uri.is_some() {
         context.analyses.record_dropped();
         return WorldOutcome {
@@ -2526,6 +2531,53 @@ async fn land_world(
         outcome: AnalysisOutcome::Landed,
         landed,
         root: Some(root_path),
+    }
+}
+
+/// E254: give every open VIEW of a file carrying platform-fenced twins
+/// (`Document::wants_twin_legs`) a leg from each further world that admits a
+/// twin its own world fenced out — the further entry's open document, or the
+/// world kept for it while the entry is closed. The seam is
+/// `analyze_world`'s, unchanged: the primary world serves the file as a view
+/// (`world::RootResolver::roots` routes a twin file to it now), each further
+/// world is the analysis the dependency sweep already runs for E113's
+/// diagnostics, and this reads both after they land. A leg is built only from
+/// a world that read the view's analyzed text and still holds its program
+/// (`Document::twin_leg_from`); every other leaves the twin unanswered until
+/// that world lands again.
+fn attach_twin_legs(documents: &DashMap<Url, Document>, worlds: &DashMap<PathBuf, WorldEntry>) {
+    let wanting: Vec<(Url, PathBuf, String, Vec<PathBuf>)> = documents
+        .iter()
+        .filter(|document| document.wants_twin_legs())
+        .filter_map(|document| {
+            Some((
+                document.key().clone(),
+                document.entry_path()?.to_path_buf(),
+                document.analyzed_text().to_string(),
+                document.further_worlds().to_vec(),
+            ))
+        })
+        .collect();
+    for (uri, path, text, further) in wanting {
+        let mut legs = Vec::new();
+        for root in &further {
+            let leg = match worlds.get(root) {
+                Some(world) => Document::twin_leg_from(&world.document, root, &path, &text),
+                None => documents
+                    .iter()
+                    .find(|document| {
+                        document.world_root().is_none()
+                            && document.entry_path() == Some(root.as_path())
+                    })
+                    .and_then(|entry| Document::twin_leg_from(&entry, root, &path, &text)),
+            };
+            legs.extend(leg);
+        }
+        if let Some(mut document) = documents.get_mut(&uri)
+            && document.analyzed_text() == text
+        {
+            document.install_twin_legs(legs);
+        }
     }
 }
 

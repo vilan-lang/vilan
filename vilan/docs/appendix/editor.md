@@ -171,7 +171,12 @@ editor keeps every one of those analyses: inside the twin the file's own
 platform excludes, hover, completion, inlay hints and colour come from the
 analysis that admits it, as they do everywhere else. Go-to-definition on a
 call to a twin offers both twins, the one the file's platform compiles
-first.
+first. Such a file is served from the entries' worlds like any other once
+two files of its world are open: the browser entry's world answers it, and
+the twin that world excludes is answered from the world of the entry whose
+platform admits it. Only a twin no entry's platform admits (a `deno` twin in
+a package whose entries are a browser and a node one) keeps the file on its
+own analyses.
 
 **A generic `<` closes itself.** `List<`, `HashMap<`, `fun pair<` and a
 generic call's own argument list each get their `>` as you type the `<`.

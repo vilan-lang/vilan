@@ -2609,7 +2609,15 @@ impl Document {
             package_reach: None,
             landed: LandedSnapshot::default(),
             released: None,
-            twin_fenced_out: Vec::new(),
+            // E254: a file carrying platform-fenced twins is served from the
+            // world too; the twins this world's platform fences out are
+            // answered by the legs `install_twin_legs` attaches, views of the
+            // further worlds whose platforms admit them.
+            twin_fenced_out: if text.contains("platform(") {
+                twins_fenced_out(text, program.platform)
+            } else {
+                Vec::new()
+            },
             twin_legs: Vec::new(),
             focus,
             world_root: Some(vilan_core::util::canonical_path(world_root)),
@@ -2620,6 +2628,66 @@ impl Document {
         document.landed = document.capture_landed(path, Some(&world.landed.index.completion));
         document.index_time = started.elapsed().wall;
         Some(document)
+    }
+
+    /// E254: the twin leg a FURTHER world gives the file at `path`, whose
+    /// analyzed text is `text` — a view of `further`, the world of the entry
+    /// whose platform admits a twin the primary world fenced out. `None` when
+    /// `further` did not read this text (it describes an older buffer, and the
+    /// leg waits for the world that reads this one) or holds no program.
+    pub fn twin_leg_from(
+        further: &Document,
+        further_root: &Path,
+        path: &Path,
+        text: &str,
+    ) -> Option<TwinLeg> {
+        let platform = further.program.as_ref()?.platform;
+        let document = Document::view_of(further, further_root, path, text, Vec::new())?;
+        Some(TwinLeg {
+            fenced_out: twins_fenced_out(text, platform),
+            document: Box::new(document),
+        })
+    }
+
+    /// E254: whether this document is a world's VIEW of a file carrying
+    /// twins its world fenced out — the documents that take legs from the
+    /// further worlds.
+    pub fn wants_twin_legs(&self) -> bool {
+        self.world_root.is_some() && !self.twin_fenced_out.is_empty() && self.holds_program()
+    }
+
+    /// E254: the twins this view's world fenced out, answered by `legs` —
+    /// one per further world that admits one of them, each a view of that
+    /// world ([`Document::twin_leg_from`]). The tokens and hints inside each
+    /// twin are re-merged from the leg that admits it, as an own analysis's
+    /// kept legs are (F27 R3). A leg that admits none of them is dropped.
+    pub fn install_twin_legs(&mut self, legs: Vec<TwinLeg>) {
+        let legs: Vec<TwinLeg> = legs
+            .into_iter()
+            .filter(|leg| {
+                self.twin_fenced_out
+                    .iter()
+                    .any(|twin| !leg.fenced_out.contains(twin))
+            })
+            .collect();
+        if legs.is_empty() && self.twin_legs.is_empty() {
+            return;
+        }
+        self.twin_legs = legs;
+        // The legs were analyzed over this document's analyzed text; the live
+        // one may have moved since, and a leg follows it as the document does.
+        if self.live_edits.as_deref() != Some(&[]) {
+            let live = self.text.clone();
+            for leg in &mut self.twin_legs {
+                leg.document.set_text(&live);
+            }
+        }
+        let mut tokens = self.semantic_tokens();
+        let mut hints = self.landed_hints();
+        self.merge_twin_answers(&mut tokens, &mut hints);
+        self.landed.tokens = tokens;
+        self.landed.hints = hints;
+        self.landed.index_token_lines(&self.analyzed_index);
     }
 
     /// One further leg's verdict on this file: analyze it under `platform` and
