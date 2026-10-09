@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**N153: `VILAN_PHASE_TIMING`'s `resolve_world` split names what it times.** `binder-bounds` closes after the binder-bound inheritance alone; `locals` is the desugar-minted std items and the first-part locals (it was timed as `binder-bounds`); `assignments` is the assignment drain (it was `locals`); `context-clauses` is `resolve_context_clauses` (it was inside `conformance`); `admission` is `build_lookup_admission` (it was `contexts`). The pass map's §3.2 rows follow. Tracker N153.
+
 <!-- family: fix -->
 **B576: the two facts a stored world may not carry — `platform_reason` (why the analysis runs under its platform) and `prelude_repair` (which control changes the ambient scope) — are rendered when a diagnostic is PUBLISHED, never into the world.** Both are the front end's, deliberately out of the base cache key; the pre-entry resolve read them anyway, so a module's twin note ("`View` here is std's browser twin — this file is analyzed under browser: <reason>") and the web-set steer ("; `Signal` is in the prelude of the web set — set `prelude = …` in vilan.toml" / "— switch the playground's prelude …") baked the STORING call's wording into a world a later call — another reason, a toggle front end — was served. The resolve now writes a publish mark (`\u{1}platform-reason\u{1}`, `\u{1}web-prelude:<name>\u{1}`) and `render_publish_marks` renders every mark where the lists leave the analyzer for the `Program` — after M19's record is taken (a record replays the mark; the replaying call renders its own facts) and after every pass that could push one. The rule (pass map §5.5, Q5, RULED): a stored world holds only what its key determines. Pins: `module_resolution::b576_a_stored_worlds_twin_note_renders_the_serving_calls_reason` (red with the old rendering: the hit repeated the first call's reason), `b576_a_stored_worlds_web_set_steer_names_the_serving_calls_repair`. Tracker B576.
 

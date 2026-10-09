@@ -61023,6 +61023,10 @@ impl<'src> Analyzer<'src> {
             self.generic_bounds.insert(binder_constraint_id, bounds);
         }
 
+        if split_on {
+            split.push(("binder-bounds", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // B222: the drain runs in two parts. A guard clause publishes its
         // condition's false-path captures into the enclosing scope only once
         // the divergence leaves have settled — `panic(…)` is an ending the walk
@@ -61049,7 +61053,7 @@ impl<'src> Analyzer<'src> {
         }
 
         if split_on {
-            split.push(("binder-bounds", split_mark.elapsed()));
+            split.push(("locals", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
         // --- Wire assignments to their variables ---
@@ -61074,7 +61078,7 @@ impl<'src> Analyzer<'src> {
         }
 
         if split_on {
-            split.push(("locals", split_mark.elapsed()));
+            split.push(("assignments", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
 
@@ -62628,6 +62632,10 @@ impl<'src> Analyzer<'src> {
         // closure type carries is part of that type for every substitution and
         // reconcile the solver performs.
         self.resolve_context_clauses();
+        if split_on {
+            split.push(("context-clauses", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Check trait conformance for `impl Subject with Trait` ---
         for check in std::mem::take(&mut self.prepped_trait_impls) {
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
@@ -63179,7 +63187,7 @@ impl<'src> Analyzer<'src> {
         self.build_lookup_admission();
 
         if split_on {
-            split.push(("contexts", split_mark.elapsed()));
+            split.push(("admission", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
         // --- Constraint solving loop ---
