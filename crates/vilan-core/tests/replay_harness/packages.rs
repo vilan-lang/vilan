@@ -994,3 +994,66 @@ pub const M128_FIXTURES: &[Fixture] = &[
         }],
     },
 ];
+
+// --- M110 S2a: the bound audit's verdicts at prefix sites -----------------------
+//
+// A PREFIX module whose generic call fails its bound (`need(Bar { .. })` with
+// `T: Shine` and no `impl Bar with Shine`) beside one that passes it through
+// an impl in ANOTHER module the prefix does not import (the ENTRY loads it,
+// as `ext`/`reader` load theirs), so the prefix stays prefix while the impl's
+// module is hot; the leaf and the entry are typed around, and the impl is
+// moved to the other type (its module hot, its question reaching the prefix:
+// the real guard refuses the hot set; with the guard off the record is served
+// stale). The audit's record is replayed for the prefix on every hit: a
+// record served without the record (the `BoundAuditUnrecorded` plant) drops
+// the refusal, a record served over a moved impl table (`ImplGuardOff`)
+// keeps an answer the world no longer gives.
+
+const BOUND_SHAPES: &str = "export struct Foo {\n\tn: i32,\n}\n\nexport struct Bar {\n\tn: i32,\n}\n\nexport trait Shine {\n\tfun shine(self): i32;\n}\n\nexport trait Marker {}\n";
+
+/// Two foreign trait impls, so the module keeps the reach filter's "asks for
+/// everything" shape — and the base-cache key — when the edit moves `Shine`
+/// from `Foo` to `Bar`.
+const BOUND_SHINE: &str = "import pkg::shapes::{ Bar, Foo, Marker, Shine };\n\nexport impl Bar with Marker {}\n\nexport impl Foo with Shine {\n\tfun shine(self): i32 {\n\t\tself.n\n\t}\n}\n";
+
+const BOUND_BOUNDED: &str = "import pkg::shapes::{ Bar, Foo, Shine };\n\nfun need<type T: Shine>(t: T): i32 {\n\tt.shine()\n}\n\nexport fun bounded(): i32 {\n\tneed(Foo { n = 7 }) + need(Bar { n = 1 })\n}\n";
+
+const BOUND_MAIN: &str = "import pkg::bounded::bounded;\nimport pkg::shine;\nimport pkg::views::render;\n\nfun main() {\n\tprint(bounded());\n\tprint(render());\n}\n";
+
+pub const BOUND_FIXTURES: &[Fixture] = &[Fixture {
+    name: "bound_audit",
+    platform: NODE,
+    files: &[
+        ("main.vl", BOUND_MAIN),
+        ("shapes.vl", BOUND_SHAPES),
+        ("shine.vl", BOUND_SHINE),
+        ("bounded.vl", BOUND_BOUNDED),
+        ("views.vl", POST_PASS_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a statement typed into the leaf beside the prefix module's bound refusal",
+            file: "views.vl",
+            seed: None,
+            replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
+        },
+        Edit {
+            label: "a statement typed into the entry beside the prefix module's bound refusal",
+            file: "main.vl",
+            seed: None,
+            replacements: &[(
+                "\tprint(render());\n",
+                "\tprint(render());\n\tlet extra = 1;\n",
+            )],
+        },
+        Edit {
+            label: "the impl a prefix module's bound is satisfied through, moved to the other type",
+            file: "shine.vl",
+            seed: None,
+            replacements: &[(
+                "export impl Foo with Shine {",
+                "export impl Bar with Shine {",
+            )],
+        },
+    ],
+}];

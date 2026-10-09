@@ -195,9 +195,10 @@ fn replay_the_classes() -> Replayed {
         censuses.extend(replay(&mut package, edit, &mut divergences));
     }
     package.remove();
-    // The post-pass class (pass map §6 "does not prove" 2; B575): a prefix
-    // module's verdict a POST pass decides, under keystrokes elsewhere.
-    for fixture in POST_PASS_FIXTURES {
+    // M110 S2a: the bound audit's verdicts at PREFIX sites are recorded and
+    // replayed; the plants that serve a stale record (the audit skipped
+    // without recording, the impl guard off) must turn this package red.
+    for fixture in BOUND_FIXTURES {
         let mut package = fixture.write();
         for edit in fixture.edits {
             censuses.extend(replay(&mut package, edit, &mut divergences));
@@ -228,6 +229,20 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
         served,
         entry_impl,
     } = replay_the_classes();
+    let mut divergences = divergences;
+    let mut censuses = censuses;
+    // The post-pass class (pass map §6 "does not prove" 2; B575): a prefix
+    // module's verdict a POST pass decides, under keystrokes elsewhere. In
+    // the gate only: no plant targets a post pass, and each replay of them
+    // is 48 analyses.
+    for fixture in POST_PASS_FIXTURES {
+        let mut package = fixture.write();
+        for edit in fixture.edits {
+            censuses.extend(replay(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+    }
+    vilan_core::analyzer::base_cache_clear();
     assert!(
         divergences.is_empty(),
         "{} step(s) of the edit script observe incremental analysis:\n{}",
@@ -275,6 +290,23 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
             .step_by(2)
             .all(|census| census.base_hits > 0),
         "the warm keystrokes reuse the stored prefix: {served:#?}"
+    );
+    // M110 S2a: the bound audit served PREFIX sites from the record on the
+    // warm keystrokes (the undo of every edit is one) — or the comparison
+    // above said nothing about the record.
+    let bound_served: u64 = censuses
+        .iter()
+        .map(|census| census.bound_sites_served)
+        .sum();
+    let bound_checked: u64 = censuses
+        .iter()
+        .map(|census| census.bound_sites_checked)
+        .sum();
+    eprintln!("bound audit: {bound_served} sites served from records, {bound_checked} checked");
+    assert!(
+        bound_served > 0 && bound_checked > 0,
+        "the classes leg must serve bound-audit sites from a reused module's record \
+         (served {bound_served}, checked {bound_checked})"
     );
     // M110 S4: the const cache served sites — or every comparison above said
     // nothing about it.
@@ -590,6 +622,44 @@ fn the_differential_sees_a_const_key_without_its_callees() {
             .iter()
             .any(|divergence| divergence.contains(STD_EDIT_LABEL)),
         "the callee-blind key plant must turn the std edit red; it found: {divergences:#?}"
+    );
+}
+
+/// S2a's plant: the bound audit skips a reused module's sites and records
+/// nothing for them. A prefix module's bound refusal is then dropped on the
+/// hit — the gate must see it.
+#[test]
+fn the_differential_sees_a_bound_audit_served_without_its_record() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::BoundAuditUnrecorded);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("bound refusal")),
+        "the unrecorded-audit plant must turn the bound package red; it found: {divergences:#?}"
+    );
+}
+
+/// S2a's second plant: a module's recorded audit replayed without asking
+/// whether a LATE impl answers one of its questions. The impl a prefix
+/// module's bound is satisfied through is moved to another type in a hot
+/// module, and the record keeps the answer the world no longer gives. (S1's
+/// impl guard is not what protects the record — the audit's questions are
+/// asked after the store, so the record carries its own test — which is why
+/// `ImplGuardOff` leaves this package green.)
+#[test]
+fn the_differential_sees_a_bound_record_kept_over_a_moved_impl() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::BoundRecordUnguarded);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("bound is satisfied through, moved")),
+        "the unguarded-record plant must turn the moved-impl edit red; it found: {divergences:#?}"
     );
 }
 

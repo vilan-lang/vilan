@@ -4375,6 +4375,20 @@ pub struct Analyzer<'src> {
     // an OUTER open question answered NO only provisionally, on that outer
     // question's behalf (the tabling rule).
     bound_proof_cut_floor: usize,
+    /// M110 S2a: the bound audit's questions filed per package source during
+    /// THIS analysis (call, the callee's constraint, the trait), taken into
+    /// the module's record by `take_reuse_record`.
+    bound_questions_derived: HashMap<u32, Vec<(Id, TypeId, Id)>>,
+    /// M110 S2a: the id ranges of reused sources whose audit must RE-RUN this
+    /// analysis — a late impl answers one of their recorded questions, or
+    /// their record carries no audit. Sorted, disjoint.
+    bound_recompute_ranges: Vec<(u32, u32)>,
+    /// M110 S2a: how many impls the STORED world holds — every one past it
+    /// arrived after the store (the hot set's, the entry's) and is "late" to
+    /// the audit's record. `None` when no late file could write an impl a
+    /// module's bound question names (the reach filter's reading, in which
+    /// case no log was kept).
+    prefix_impl_count: Option<usize>,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -7310,6 +7324,9 @@ impl<'src> Analyzer<'src> {
             bound_proof_memo: None,
             bound_provider_memo: None,
             bound_proof_cut_floor: usize::MAX,
+            bound_questions_derived: HashMap::default(),
+            bound_recompute_ranges: Vec::new(),
+            prefix_impl_count: None,
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reused_sources: Vec::new(),
@@ -8369,7 +8386,18 @@ impl<'src> Analyzer<'src> {
         // types are settled, so an answer cannot move under it.
         let enclosing = self.bound_proof_memo.replace(HashMap::default());
         let enclosing_providers = self.bound_provider_memo.replace(HashMap::default());
+        // M110 S2a: the recorded-sites walk is a Class A window of its own —
+        // what it derives for a module is recorded per source
+        // (`record_bound_window`), a reused module's sites are skipped and
+        // its record replayed (`replay_world_diagnostics`), unless a LATE
+        // impl answers one of the module's recorded questions, in which case
+        // the module is re-audited (`bound_recompute_ranges`). The
+        // declaration walks below it stay Class C: small, and their errors
+        // would otherwise be replayed AND re-derived.
+        let diagnostics_before = self.diagnostics.len();
         self.check_generic_bound_satisfaction_sites();
+        self.record_bound_window(diagnostics_before);
+        self.check_generic_bound_satisfaction_declarations();
         self.bound_proof_memo = enclosing;
         self.bound_provider_memo = enclosing_providers;
     }
@@ -8385,11 +8413,34 @@ impl<'src> Analyzer<'src> {
         // carry no "the bound is declared here" note, since the bound is on a
         // `child` the author never wrote.
         let mut hole_refusals: HashSet<(Id, Span)> = HashSet::default();
+        // M110 S2a: a REUSED module's sites are not asked — their verdicts
+        // were recorded with the module's Class A output and replayed before
+        // this ran (`replay_world_diagnostics`). Sound because a prefix
+        // site's (value type, bound) pair is settled in the stored world and
+        // a hot or entry impl that could move a bound's answer refuses the
+        // hot set or defers the world (M121's reach record notes every
+        // `type_implements_trait` question), so the answer is a function of
+        // the world the record is keyed by. A std site (frozen) has no
+        // diagnostic to find. The slots the skipped questions would have
+        // minted are not minted: no reader depends on a post-settle
+        // `TypeId`'s VALUE (the census in the S2a entry of the CHANGELOG).
+        let mut served: u64 = 0;
         let recorded: Vec<(Id, SubstitutionContext)> = self
             .method_call_substitution
             .iter()
+            .filter(|(call_id, _)| {
+                let reused =
+                    self.reusable_entity(**call_id) && !self.bound_recompute_site(**call_id);
+                served += u64::from(reused);
+                !reused
+            })
             .map(|(call_id, substitution)| (*call_id, substitution.clone()))
             .collect();
+        let checked = recorded.len() as u64;
+        crate::incremental::update_census(|census| {
+            census.bound_sites_served += served;
+            census.bound_sites_checked += checked;
+        });
         // --- M19, tranche 1: the answers are keyed on RESOLVED TYPES. ---
         //
         // This loop is whole-program: it walks every recorded call site of the
@@ -8490,6 +8541,12 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 for (required_trait_id, required_arguments) in &bound_traits {
+                    // M110 S2a: the question this site asks of the impl table,
+                    // filed with its module's record so a later analysis can
+                    // tell whether an impl that arrived after the stored
+                    // world answers it (ids the stored world minted: the
+                    // call, the callee's constraint, the trait).
+                    self.note_bound_question(call_id, constraint_id, *required_trait_id);
                     // A parameterized bound's arguments are written in the
                     // callee's generic terms (`F: Feed<T>`) — the same call's
                     // substitution grounds them.
@@ -8659,6 +8716,15 @@ impl<'src> Analyzer<'src> {
         // --- trait's abstract (empty) member — a silent misrender the  ---
         // --- loop above never sees, since it iterates what WAS         ---
         // --- recorded. Make that state a diagnostic.                   ---
+        self.push_bound_refusals(errors, &hole_refusals);
+    }
+
+    /// [`Self::check_generic_bound_satisfaction`]'s walks over the DECLARATION
+    /// channels — a wired call's own generics, struct literals, variant
+    /// calls, tuple constructions. Class C: every module, every analysis.
+    fn check_generic_bound_satisfaction_declarations(&mut self) {
+        let mut errors: Vec<(Id, Span, String, TypeId)> = Vec::new();
+        let hole_refusals: HashSet<(Id, Span)> = HashSet::default();
         let wired_calls: Vec<(Id, Id)> = self
             .function_calls
             .iter()
@@ -8985,6 +9051,17 @@ impl<'src> Analyzer<'src> {
             }
         }
 
+        self.push_bound_refusals(errors, &hole_refusals);
+    }
+
+    /// Sorts, dedups and pushes a bound-audit walk's refusals, each with the
+    /// "declared here" note of its constraint; `hole_refusals` (E271) carry
+    /// none.
+    fn push_bound_refusals(
+        &mut self,
+        errors: Vec<(Id, Span, String, TypeId)>,
+        hole_refusals: &HashSet<(Id, Span)>,
+    ) {
         // The substitution maps iterate in hash order — sort for deterministic
         // diagnostics, and dedup: one call can bind the same constraint along
         // several recorded routes.
@@ -49305,6 +49382,7 @@ impl<'src> Analyzer<'src> {
     /// on is one the recorded resolve did not see.
     fn end_impl_reach_log(&mut self) {
         let floor = self.implementations.len();
+        self.prefix_impl_count = Some(floor);
         let log = self.impl_reach.get_mut();
         log.recording = false;
         log.floor = Some(floor);
@@ -49362,6 +49440,8 @@ impl<'src> Analyzer<'src> {
     /// is the hot set's, and every other late impl — the entry's, and what the
     /// entry's expansion generated — is the entry's.
     fn impl_reach(&mut self, hot_sources: std::ops::Range<u32>) -> Option<ImplReached> {
+        // M110 S2a reads the floor after the verdict took the log.
+        self.prefix_impl_count = self.impl_reach.get_mut().floor;
         let log = std::mem::take(self.impl_reach.get_mut());
         let floor = log.floor?;
         if floor >= self.implementations.len() || (log.members.is_empty() && log.traits.is_empty())
@@ -49637,6 +49717,103 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// M110 S2a: files the bound audit's refusals pushed since
+    /// `diagnostics_from` under their modules' records (the sites walk's
+    /// window), as [`Self::record_reusable_window`] files a Class A check's.
+    fn record_bound_window(&mut self, diagnostics_from: usize) {
+        for index in diagnostics_from..self.diagnostics.len() {
+            let source = self.diagnostic_source_at(index);
+            if source == SourceId(0) || source == DERIVED_SOURCE {
+                continue;
+            }
+            if self.reaches_outside_the_world(&self.diagnostics[index]) {
+                self.reuse_unrecordable.insert(source.0);
+                continue;
+            }
+            self.reuse_derived
+                .entry(source.0)
+                .or_default()
+                .bound_diagnostics
+                .push(self.diagnostics[index].clone());
+        }
+    }
+
+    /// M110 S2a: files a bound question a site asked, under its module.
+    fn note_bound_question(&mut self, call_id: Id, constraint_id: TypeId, trait_id: Id) {
+        let Some(source) = self.source_of_id(call_id) else {
+            return;
+        };
+        if source == SourceId(0) || source == DERIVED_SOURCE {
+            return;
+        }
+        self.bound_questions_derived
+            .entry(source.0)
+            .or_default()
+            .push((call_id, constraint_id, trait_id));
+    }
+
+    /// M110 S2a: whether a reused site's module is one this analysis
+    /// re-audits ([`Analyzer::bound_recompute_ranges`]).
+    fn bound_recompute_site(&self, id: Id) -> bool {
+        let index = self
+            .bound_recompute_ranges
+            .partition_point(|(start, _)| *start <= id.0);
+        index > 0 && id.0 < self.bound_recompute_ranges[index - 1].1
+    }
+
+    /// M110 S2a: whether an impl that arrived AFTER the stored world (the
+    /// hot set's, the entry's — every row past `prefix_impl_count`) answers
+    /// one of `questions`: it provides the question's trait (or a trait whose
+    /// supertraits reach it) and its subject admits the value the site bound
+    /// the constraint to. The same test M121's reach verdict applies to the
+    /// resolve's questions; the audit's are asked after the store, which is
+    /// why they need their own.
+    fn late_impl_answers(&self, questions: &[(Id, TypeId, Id)]) -> bool {
+        if crate::incremental::planted(crate::incremental::Plant::BoundRecordUnguarded) {
+            return false;
+        }
+        let Some(floor) = self.prefix_impl_count else {
+            return false;
+        };
+        if floor >= self.implementations.len() || questions.is_empty() {
+            return false;
+        }
+        let late: Vec<(Type, Vec<Id>)> = self.implementations[floor..]
+            .iter()
+            .map(|implementation| {
+                let mut traits: Vec<Id> = Vec::new();
+                for (trait_id, _) in implementation
+                    .provided_trait_args
+                    .iter()
+                    .chain(&implementation.trait_args)
+                {
+                    for reached in self.trait_with_supertraits(*trait_id) {
+                        if !traits.contains(&reached) {
+                            traits.push(reached);
+                        }
+                    }
+                }
+                (implementation.subject.get_type(self), traits)
+            })
+            .collect();
+        questions.iter().any(|(call_id, constraint_id, trait_id)| {
+            let Some(value_type_id) = self
+                .method_call_substitution
+                .get(call_id)
+                .and_then(|substitution| substitution.get(constraint_id))
+            else {
+                // A site the stored world no longer records: nothing to
+                // compare, so the module is re-audited.
+                return true;
+            };
+            let value_type = value_type_id.get_type(self);
+            late.iter().any(|(subject, traits)| {
+                traits.contains(trait_id)
+                    && self.impl_subject_admits(&value_type, subject, &HashMap::default())
+            })
+        })
+    }
+
     /// Whether a module's diagnostic points at the ENTRY — a `Note.source` or
     /// a trace hop naming `SourceId(0)`.
     ///
@@ -49712,6 +49889,28 @@ impl<'src> Analyzer<'src> {
                     .push((closure_id, reference_id));
             }
         }
+        // M110 S2a: the audit's questions, and whether its verdicts may be
+        // replayed at all — not when a late impl answered one of them now
+        // (the plant records the questions and drops the refusals).
+        let questions = std::mem::take(&mut self.bound_questions_derived);
+        let unrecorded_plant =
+            crate::incremental::planted(crate::incremental::Plant::BoundAuditUnrecorded);
+        for (source, asked) in questions {
+            let answered = self.late_impl_answers(&asked);
+            let module = derived.entry(source).or_default();
+            module.bound_questions = asked;
+            module.bound_recordable = !answered;
+            if unrecorded_plant {
+                module.bound_diagnostics.clear();
+            }
+        }
+        // A module that asked nothing recorded no questions above: its
+        // (empty) audit is replayable.
+        for module in derived.values_mut() {
+            if module.bound_questions.is_empty() && module.bound_diagnostics.is_empty() {
+                module.bound_recordable = true;
+            }
+        }
         let mut record = HashMap::default();
         for index in 1..source_count as u32 {
             let source = SourceId(index);
@@ -49724,7 +49923,15 @@ impl<'src> Analyzer<'src> {
             {
                 continue;
             }
-            let mut module = derived.get(&index).cloned().unwrap_or_default();
+            let mut module = derived
+                .get(&index)
+                .cloned()
+                .unwrap_or_else(|| ModuleDiagnostics {
+                    // Nothing derived for this module: its audit asked nothing
+                    // and found nothing, which is replayable.
+                    bound_recordable: true,
+                    ..ModuleDiagnostics::default()
+                });
             // M19 T1d: the keys arrive in the order R10's three tiers reached
             // them, which is a fact about the walk. Sorted and deduplicated so
             // the record is a function of the module (C1, determinism).
@@ -49744,10 +49951,27 @@ impl<'src> Analyzer<'src> {
     /// — so where in the phase this lands cannot be observed.
     fn replay_world_diagnostics(&mut self, records: &HashMap<u32, ModuleDiagnostics>) {
         let reused = self.reused_sources.clone();
+        self.bound_recompute_ranges.clear();
         for source in reused {
             let Some(record) = records.get(&source.0) else {
                 continue;
             };
+            // M110 S2a: the audit's refusals, replayed only while their
+            // condition holds; otherwise the module's sites are re-audited.
+            if record.bound_recordable && !self.late_impl_answers(&record.bound_questions) {
+                let from = self.diagnostics.len();
+                self.diagnostics
+                    .extend(record.bound_diagnostics.iter().cloned());
+                self.attribute_new_diagnostics(from, source);
+            } else {
+                let ranges: Vec<(u32, u32)> = self
+                    .source_ranges
+                    .iter()
+                    .filter(|range| range.source == source)
+                    .map(|range| (range.start, range.end))
+                    .collect();
+                self.bound_recompute_ranges.extend(ranges);
+            }
             let from = self.diagnostics.len();
             self.diagnostics.extend(record.diagnostics.iter().cloned());
             self.attribute_new_diagnostics(from, source);
@@ -49791,6 +50015,7 @@ impl<'src> Analyzer<'src> {
                     .push((closure_id, reference_id, name));
             }
         }
+        self.bound_recompute_ranges.sort_unstable();
     }
 
     fn resolve_constraints(&mut self) -> bool {
@@ -72530,6 +72755,18 @@ struct ModuleDiagnostics {
     suspension_crossings: Vec<(Id, Id, Id, Option<Id>)>,
     suspension_signatures: Vec<(Id, Id, &'static str)>,
     suspension_captures: Vec<(Id, Id)>,
+    /// M110 S2a: the bound audit's refusals at this module's call sites,
+    /// kept apart from `diagnostics` because their validity has a condition
+    /// of their own: `bound_questions` are the (call, constraint, trait)
+    /// questions the sites asked, and the refusals are replayed only while no
+    /// impl that arrived after the stored world answers one of them
+    /// (`Analyzer::late_impl_answers`); otherwise the module is re-audited.
+    /// `bound_recordable` is false when a late impl answered one at RECORD
+    /// time (the verdict then depended on an impl the key does not fix) or
+    /// when no analysis has recorded the audit for this module yet.
+    bound_diagnostics: Vec<crate::error::Error>,
+    bound_questions: Vec<(Id, TypeId, Id)>,
+    bound_recordable: bool,
 }
 
 /// One reused module's rows in the class D tables, kept in ascending id order
@@ -77864,6 +78101,9 @@ fn analyze_over_world<'src>(
         // E227: every name has resolved and every impl's provided set is
         // closed, so a `[hint(..)]` can be checked against the impl table.
         analyzer.resolve_hint_attributes();
+        // M110 S2a: the audit's recorded-sites walk is a record window of its
+        // own (inside the call: a reused module's sites are replayed from its
+        // record or re-audited when a late impl answers one of its questions).
         analyzer.check_generic_bound_satisfaction();
         // B161's binding-position twin of the bound check above, in the same place
         // and for the same reason: every binding's type has settled by here.
