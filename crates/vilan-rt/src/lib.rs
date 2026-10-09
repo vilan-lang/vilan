@@ -554,9 +554,15 @@ pub struct Shared<T> {
 /// object; safe Rust has no second view of storage under mutation to answer
 /// with, so the program stops, and says why, instead of printing Rust's
 /// `already mutably borrowed`.
-pub const REENTRANT_READ: &str = "a cell was read while it is being updated: a read inside \
-    `update` reached the same cell through another handle (the JS backend answers the \
-    in-progress value; the native backend cannot)";
+///
+/// F102: the same collision through §6.9's capture cell — a call holding a
+/// view of a captured `mut` binding runs a closure that touches the binding,
+/// one the compiler could not see arrive (a closure in a list the call was
+/// handed). The sentence names both.
+pub const REENTRANT_READ: &str = "a cell was read while it is being updated: a second path \
+    reached a cell under a live view of it (a read inside `update` through another handle, or \
+    a closure touching a captured binding a call holds a view of; the JS backend answers the \
+    in-progress value, and the native backend cannot)";
 
 /// What a [`Shared`] handle points at: the value, and the identity stamp
 /// [`Shared::identity`] takes on the first ask (`0` until then).

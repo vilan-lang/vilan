@@ -9926,6 +9926,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let borrows_a_cell = borrows_a_cell || borrows_a_read_place || views_a_cell;
         let mut view_borrows = String::new();
         let mut views = 0;
+        self.refuse_a_closure_beside_a_cell_view(&conventions, argument_ids)?;
         // The callee's WHOLE parameter list, hidden context parameters
         // included (they have no `parameters` record, so `declared` omits
         // them). A call can carry MORE arguments than that: the context pass
@@ -10061,6 +10062,70 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         prelude.push_str(&view_borrows);
         Ok(rendered)
+    }
+
+    /// F102 (closure-captures.md Q3, RULED: refused at compile time, as F39
+    /// was): a call that holds a `&mut` view of a boxed binding's cell while
+    /// another of its arguments carries a closure that reaches the same
+    /// binding.
+    ///
+    /// A `&mut` argument over a boxed binding (a `&mut self` receiver among
+    /// them) holds the cell's `borrow_mut` for the call, so a closure the
+    /// callee runs that READS or WRITES the binding meets it — `apply(&mut n,
+    /// || { n += 1; })` and `c.bump_then(poke)` with `poke` writing `c.n` died
+    /// with the runtime's reentrancy sentence, where the JS backend (whose view
+    /// is a plain reference) answers the in-progress value. Safe Rust has no
+    /// second path to a place under a live `&mut`, so the shape is refused by
+    /// name, the span the offending touch inside the closure. The closures
+    /// seen are the literals written in the other arguments and the
+    /// `let`-bound closures they name (aliases followed, as F39 follows them),
+    /// each walked through the closures it calls by name, and the closures a
+    /// `let`-bound value holds (`Hook { run = || .. }`); a closure that
+    /// arrives any other way — a parameter, a list it was pushed into — still
+    /// stops at run time with the sentence.
+    ///
+    /// A `&` view (F49) is never refused: a call whose other arguments carry a
+    /// closure that WRITES the binding hands the callee a copy, as before F49
+    /// ([`Self::takes_a_cell_view`]).
+    fn refuse_a_closure_beside_a_cell_view(
+        &self,
+        conventions: &[Receiving],
+        argument_ids: &[Id],
+    ) -> Result<(), Error> {
+        for (index, argument) in argument_ids.iter().enumerate() {
+            if !matches!(conventions.get(index), Some(Receiving::RefMut)) {
+                continue;
+            }
+            let Some(binding) = self.boxed_place_root(*argument) else {
+                continue;
+            };
+            let Some(touch) = self.carried_closure_touch(argument_ids, index, binding, false)
+            else {
+                continue;
+            };
+            let name = self
+                .program
+                .variables
+                .get(&binding)
+                .map(|variable| variable.name)
+                .or_else(|| {
+                    self.program
+                        .parameters
+                        .get(&binding)
+                        .map(|parameter| parameter.name)
+                })
+                .unwrap_or("the binding");
+            return Err(unsupported(
+                &format!(
+                    "a closure that reaches `{name}` handed to a call that holds a `&mut` view \
+                     of `{name}` (natively a captured `mut` binding is a cell, the view borrows \
+                     it for the whole call, and the closure's touch is a second path to it; the \
+                     JS backend answers the in-progress value, and safe Rust cannot)"
+                ),
+                self.span_of(touch),
+            ));
+        }
+        Ok(())
     }
 
     /// The boxed binding a place argument (or the place a `&`/`&mut` the

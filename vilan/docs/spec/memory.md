@@ -1073,7 +1073,15 @@ on JavaScript, whose view is the binding's object itself. The view ends
 when the call returns. A call that holds a view while another of its
 arguments carries a closure that writes the same binding hands its `&`
 callee a copy taken at the call instead, the order every `&` argument over
-a captured binding had before the view.
+a captured binding had before the view. A `&mut` argument over a captured
+binding (a `&mut self` receiver among them) holds the cell for the call
+the same way, and a closure that reaches the binding during that call is
+a second path to a place under a live `&mut` view, the aliasing §6.4
+exists to refuse: the native backend refuses a call that hands such a
+closure beside the view (written in the call, bound by a `let`, or held by
+a value a `let` built), and a closure that arrives any other way stops the
+program with the runtime's reentrancy sentence when it touches the
+binding. JavaScript answers the in-progress value in both cases.
 
 ## 6.10 `lazy` — a binding initialized at first use
 

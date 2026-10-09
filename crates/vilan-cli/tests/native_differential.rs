@@ -8780,6 +8780,120 @@ fn a_shared_loan_of_a_boxed_binding_reads_through_its_cell_on_both_backends() {
     );
 }
 
+/// F102 (closure-captures.md Q3, RULED: refused at compile time, as F39 was):
+/// a closure that reaches a captured binding, handed to a call that holds a
+/// `&mut` view of that binding. Natively the binding is a cell (§6.9, R3), the
+/// view borrows it for the whole call, and the closure's read or write met
+/// the borrow: `apply(&mut n, || { n += 1; })` and `c.bump_then(poke)` (with
+/// `poke` writing `c.n`) exited 1 with the runtime's reentrancy sentence
+/// where the JS backend prints 11 and 102. The shape is refused by name, the
+/// span the touch inside the closure — through a `let`-bound closure, an
+/// alias of one, a closure the literal calls by name, and a READ as well as a
+/// write. The control (`native/closure_beside_a_mut_view.vl`): closures
+/// touching other bindings beside the same views build and agree.
+#[test]
+fn a_closure_reaching_a_binding_under_its_mut_view_is_refused_by_name() {
+    let staged = stage();
+    let counter = concat!(
+        "struct Counter {\n\tn: i32,\n}\n\nimpl Counter {\n",
+        "\tfun bump_then(&mut self, f: || void) {\n\t\tself.n += 1;\n\t\tf();\n\t\tself.n += 1;\n\t}\n\n",
+        "\tfun bump_all(&mut self, hooks: &List<|| void>) {\n\t\tself.n += 1;\n\t\tfor hook in hooks {\n\t\t\thook();\n\t\t}\n\t\tself.n += 1;\n\t}\n}\n\n",
+        "fun apply(x: &mut i32, f: || void) {\n\tf();\n\tx += 10;\n}\n",
+    );
+    for (name, body) in [
+        (
+            "native_probe_f102_literal.vl",
+            "\tmut n = 0;\n\tapply(&mut n, || {\n\t\tn += 1;\n\t});\n\tprint(n);\n",
+        ),
+        (
+            "native_probe_f102_receiver.vl",
+            "\tmut c = Counter { n = 0 };\n\tlet poke = || {\n\t\tc.n += 100;\n\t};\n\tc.bump_then(poke);\n\tprint(c.n);\n",
+        ),
+        (
+            "native_probe_f102_alias.vl",
+            "\tmut c = Counter { n = 0 };\n\tlet poke = || {\n\t\tc.n += 100;\n\t};\n\tlet again = poke;\n\tc.bump_then(again);\n\tprint(c.n);\n",
+        ),
+        (
+            "native_probe_f102_called.vl",
+            "\tmut n = 0;\n\tlet inc = || {\n\t\tn += 1;\n\t};\n\tapply(&mut n, || inc());\n\tprint(n);\n",
+        ),
+        (
+            "native_probe_f102_read.vl",
+            "\tmut n = 0;\n\tlet reset = || {\n\t\tn = 0;\n\t};\n\treset();\n\tapply(&mut n, || print(n));\n\tprint(n);\n",
+        ),
+        (
+            "native_probe_f102_held.vl",
+            "\tmut c = Counter { n = 0 };\n\tlet hooks = [|| {\n\t\tc.n += 100;\n\t}];\n\tc.bump_all(&hooks);\n\tprint(c.n);\n",
+        ),
+    ] {
+        std::fs::write(
+            staged.join(name),
+            format!("import std::io::print;\n\n{counter}\nfun main() {{\n{body}}}\n"),
+        )
+        .expect("write the probe");
+        match compare(&staged, name) {
+            Verdict::Refused(reason) => assert!(
+                reason.contains("handed to a call that holds a `&mut` view"),
+                "{name}: refused, and for this reason: {reason}"
+            ),
+            other => panic!("{name}: a closure under a `&mut` view must be refused: {other:?}"),
+        }
+    }
+    let control = "native_probe_closure_beside_a_mut_view.vl";
+    std::fs::write(
+        staged.join(control),
+        include_str!("native/closure_beside_a_mut_view.vl"),
+    )
+    .expect("write the control");
+    assert_eq!(
+        compare(&staged, control),
+        Verdict::Identical,
+        "closures touching other bindings beside a `&mut` view build and agree"
+    );
+}
+
+/// F102's runtime half: a closure the static walk cannot see arrive — pushed
+/// into a list after the list was built — that writes a captured binding
+/// while a call holds a `&mut` view of it still stops natively, with the
+/// runtime's own sentence and node's exit code. Outside the differential by
+/// construction: the JS backend answers the in-progress value (102).
+#[test]
+fn a_closure_under_a_mut_view_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
+    let staged = stage();
+    let file = "native_probe_f102_runtime.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::io::print;\n\n",
+            "struct Counter {\n\tn: i32,\n}\n\nimpl Counter {\n",
+            "\tfun bump_all(&mut self, hooks: &List<|| void>) {\n\t\tself.n += 1;\n",
+            "\t\tfor hook in hooks {\n\t\t\thook();\n\t\t}\n\t\tself.n += 1;\n\t}\n}\n\n",
+            "fun main() {\n\tmut c = Counter { n = 0 };\n\tmut hooks: List<|| void> = [];\n",
+            "\thooks.push(|| {\n\t\tc.n += 100;\n\t});\n\tc.bump_all(&hooks);\n\tprint(c.n);\n}\n",
+        ),
+    )
+    .expect("write the probe");
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", file])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        native.status.code(),
+        Some(1),
+        "node's exit code for a throw"
+    );
+    let stderr = String::from_utf8_lossy(&native.stderr);
+    assert!(
+        stderr.contains("a closure touching a captured binding a call holds a view of"),
+        "the runtime names the shape:\n{stderr}"
+    );
+    let javascript = vilan(&staged)
+        .args(["run", file])
+        .output()
+        .expect("run the JS backend");
+    assert_eq!(String::from_utf8_lossy(&javascript.stdout), "102\n");
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,
