@@ -19,6 +19,31 @@
 //! safe direction: a stretched sleep only ever waits longer. The one phase that
 //! measures a gap uses a 2 s window and a 100 ms gap, so it would take a 20x
 //! overshoot of that sleep to split the window.
+//!
+//! **The margins, audited (N139).** There are exactly two kinds of claim in
+//! this file, and the 50 ms windows are only ever the first:
+//!
+//! 1. *"It fired before the marker"* - a window (50 ms) against the fixed
+//!    `sleep(1000)` that follows. The window's timer is registered BEFORE the
+//!    sleep's and expires 950 ms sooner, and a host that stalls runs expired
+//!    timers in expiry order when it wakes, so the stall cannot reorder them:
+//!    the fire lands first however long the box stalls. What a stall used to do
+//!    to this phase was not reorder it but hand `setTimeout` a negative
+//!    remaining delay and make node print to stderr (N155: the window had
+//!    already run out before the loop's first `now()`); the clamp in
+//!    `std::time` is the fix, and `n155_*` below is its pin. Widening these
+//!    windows would NOT help and would cost: the wait that proves the fire
+//!    happened is the same `sleep(1000)`, so a 500 ms window leaves half the
+//!    proof.
+//! 2. *"It had not fired yet"* - a call, cancel or flush made some time after
+//!    `run`, which the window must outlast. These are the only margin-bound
+//!    claims, and each is wide: the pushed deadline's second `run` comes 100 ms
+//!    into a 2 s window (20x); the nursery cancel comes 10 ms into a 1 s window
+//!    (100x, widened from 50 ms by the order-45 `windows-latest` find); the
+//!    flush exhibit's `flush` and the cancel/run races are dispatched in the
+//!    SAME tick as the `run`, so no stall can come between them at all; and the
+//!    window `renewing` re-arms from inside a flushed callback (200 ms) is
+//!    followed by a 2 s sleep (10x).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

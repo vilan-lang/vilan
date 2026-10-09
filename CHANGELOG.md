@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**N139: the `Debounce` pins' timing margins are audited and written down.** Every burst in `debounce.rs` and the `Draft` debounce pins is dispatched in ONE tick and every wait is a timer that expires after the one it waits on, so a stalled host can only make them wait longer; the two pins that do hold a window against a gap (the pushed deadline's 100 ms in a 2 s window, the nursery cancel's 10 ms in 1 s) keep 20x and 100x, and the reason is now in the file. Widening the 50 ms windows would shrink the wait that proves they fired, so they stay; the stall that did split a 50 ms window (a negative remaining delay) is N155's clamp.
+
+---
+
 <!-- family: fix -->
 **N155: a delay already past reaches the host timer as 0, not as a negative number — `std::time`'s `sleep` and `Timer::after` clamp it, and the debounce's loop clamps the time it has left.** A host that stalled past a `Debounce`'s deadline between `run` and the loop's first `now()` (a loaded runner) handed `setTimeout` `-1`, and node answered on stderr with `TimeoutNegativeWarning: -1 is a negative number. Timeout duration was set to 1.` — which failed the debounce exhibit's empty-stderr check once on a slow Windows runner. A past deadline now fires on the next turn, as `0` does; the timer is never given a number node would warn about.
 

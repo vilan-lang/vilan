@@ -3572,6 +3572,13 @@ fn draft_repush_rides_the_reconnect_hook_shape() {
 // edge, over a real `std::time::Timer` — cancelling settles the verdict and
 // clears the host timeout. Local-first is untouched: the value and the
 // Dirty state still land synchronously; only the commit waits.
+//
+// The margins (N139): each pin pushes its whole burst in ONE tick (a host stall
+// cannot come between two pushes) and then waits 150 ms for a 30 ms window. The
+// window's timer is registered before the sleep's and expires 120 ms sooner, so
+// a stalled host runs it first when it wakes; "nothing was sent yet" is asserted
+// in the same tick as the push. A claim that needed a gap between a push and an
+// observation would widen the window, as `tests/debounce.rs` does for its own.
 
 #[test]
 fn draft_debounce_coalesces_a_burst_into_one_commit() {
