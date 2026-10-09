@@ -8049,6 +8049,20 @@ impl<'src> Analyzer<'src> {
                 self.bound_argument_grounding_depth -= 1;
             }
             for (binder_constraint_id, argument_type_id) in bindings {
+                // B557: a binder's TUPLE bound is part of what the impl
+                // requires of it — arity and element bound alike — so a
+                // tuple-family blanket proves its trait for the tuples it
+                // covers and for nothing else.
+                if let Some(requirement) = self.tuple_bounds.get(&binder_constraint_id).cloned() {
+                    let argument_type = argument_type_id.get_type(self);
+                    if !matches!(argument_type, Type::Any | Type::Unknown | Type::Unresolved)
+                        && !self
+                            .tuple_bound_violations(&requirement, &argument_type, &binding_context)
+                            .is_empty()
+                    {
+                        continue 'candidates;
+                    }
+                }
                 let binder_traits = self.generic_bound_traits(binder_constraint_id);
                 if binder_traits.is_empty() {
                     continue;
@@ -9591,7 +9605,47 @@ impl<'src> Analyzer<'src> {
         {
             return false;
         }
+        // B557: a binder subject's TUPLE bound filters admission as its trait
+        // bounds rank it — `impl type T: (2..: Show) with Show` is a blanket
+        // over tuples, not over every type. `compare_type` admits anything
+        // against a bare binder, so the family blanket answered for a struct,
+        // an `Option`, a scalar.
+        if let Type::Generic(constraint_id) = impl_subject
+            && !self.tuple_bound_admits_shape(*constraint_id, subject_type)
+        {
+            return false;
+        }
         self.compare_type(subject_type, impl_subject, substitution_context)
+    }
+
+    /// B557: whether a value of `value_type` can bind a binder whose TUPLE
+    /// bound (`type T: (2..)`) is `constraint_id`'s — by SHAPE alone: a tuple,
+    /// or a type that may still be one (a mapped tuple, a parameter, an
+    /// unresolved slot). A nominal type, an array, a closure, a function item,
+    /// an object or a bare trait (a bound, never a value) is never a tuple.
+    /// True when the binder has no tuple bound.
+    ///
+    /// The ARITY and the element bound are deliberately not asked here: a
+    /// tuple outside the arity is a candidate whose bound check then refuses
+    /// it naming the bound ("the bound '(3..)' requires at least 3"), which
+    /// says more than a missing member would. [`Self::tuple_bound_violations`]
+    /// is that check; the emission side's twin is
+    /// `impl_select::tuple_bound_holds`.
+    fn tuple_bound_admits_shape(&self, constraint_id: TypeId, value_type: &Type) -> bool {
+        if !self.tuple_bounds.contains_key(&constraint_id) {
+            return true;
+        }
+        !matches!(
+            value_type,
+            Type::Struct(..)
+                | Type::Enum(..)
+                | Type::Array(..)
+                | Type::Closure(..)
+                | Type::Dyn(..)
+                | Type::Function(..)
+                | Type::Trait(..)
+                | Type::Void
+        )
     }
 
     /// Whether the CALL OPERATOR reaches a value of this type (B340): its type
@@ -62284,13 +62338,16 @@ impl<'src> Analyzer<'src> {
                         (implementation.subject, implementation.trait_ids.clone())
                     })
                     .collect();
+                // B557: asked as ADMISSION, so a blanket whose binder carries
+                // a tuple bound provides for the tuples it covers only — a
+                // tuple-family `eq` is no `eq` for a struct's impl.
                 let provided_elsewhere = candidates.iter().any(|(subject_id, trait_ids)| {
                     trait_ids.iter().any(|implemented| {
                         self.trait_with_supertraits(*implemented)
                             .contains(&declaring_trait_id)
                     }) && {
                         let candidate_subject = subject_id.get_type(self);
-                        self.compare_type(
+                        self.impl_subject_admits(
                             &check_subject_type,
                             &candidate_subject,
                             &HashMap::default(),

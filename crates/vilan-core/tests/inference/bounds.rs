@@ -14385,3 +14385,91 @@ fun plain(callback: (|i32| void) context current) {
         "8\n1 none\n",
     );
 }
+
+// --- B557: a tuple-FAMILY blanket covers tuples and nothing else ---
+//
+// `impl type T: (2..: Show) with Show` satisfied a `T: Show` bound for a
+// NON-tuple at the bound check — `compare_type` admits anything against a
+// bare binder and the binder's TUPLE bound was never read there (only the
+// emission side's `impl_select` applied it) — and emission then died with
+// "internal: a call resolved to `Show`'s requirement `show`, which has no
+// body". A binder's tuple bound now filters admission (shape) and the bound
+// proof (arity and element bound), as its trait bounds do.
+
+const B557_SHOW: &str = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        trait Show {
+            fun show(self): str;
+        }
+        impl type T: (2..: Show) with Show {
+            fun show(self): str { "tuple" }
+        }
+        impl i32 with Show {
+            fun show(self): str { "i32" }
+        }
+        struct Opaque { tag: i32 }
+        fun needs<T: Show>(value: T): str { value.show() }
+"#;
+
+#[test]
+fn b557_a_tuple_family_blanket_answers_for_a_tuple() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B557_SHOW}\nfun main() {{ print(needs((1, 2))); print(needs((1, 2, 3))); }}\nmain();\n"
+        ),
+        "tuple\ntuple\n",
+    );
+}
+
+#[test]
+fn b557_a_tuple_family_blanket_does_not_satisfy_a_bound_for_a_non_tuple() {
+    // A struct, an enum, a fixed array, a closure: each is refused at the
+    // call naming the bound, where each compiled and died at emission.
+    for argument in ["Opaque { tag = 1 }", "Some(1)", "[1, 2]", "|x: i32| x"] {
+        assert_fails_with(
+            &format!("{B557_SHOW}\nfun main() {{ print(needs({argument})); }}\n"),
+            "does not implement trait 'Show', required by a generic bound of this call",
+        );
+    }
+}
+
+#[test]
+fn b557_a_tuple_family_blanket_reads_its_element_bound_and_arity() {
+    // A pair of non-`Show` elements is a tuple the blanket does not cover.
+    assert_fails_with(
+        &format!("{B557_SHOW}\nfun main() {{ print(needs((Opaque {{ tag = 1 }}, 2))); }}\n"),
+        "does not implement trait 'Show'",
+    );
+    // An arity outside the family is refused too.
+    assert_fails_with(
+        r#"
+        trait Wide { fun wide(self): str; }
+        impl type T: (3..) with Wide {
+            fun wide(self): str { "wide" }
+        }
+        fun needs<T: Wide>(value: T): str { value.wide() }
+        fun main() { let _ = needs((1, 2)); }
+        "#,
+        "does not implement trait 'Wide'",
+    );
+}
+
+#[test]
+fn b557_a_trait_annotation_is_not_met_by_a_tuple_family_blanket() {
+    assert_fails_with(
+        &format!("{B557_SHOW}\nfun main() {{ let _o: Show = Opaque {{ tag = 1 }}; }}\n"),
+        "'Opaque' does not implement trait 'Show', required by the annotation",
+    );
+}
+
+#[test]
+fn b557_a_tuple_family_member_does_not_conform_a_structs_impl() {
+    // The conformance check's "provided by another impl" asks admission too:
+    // the tuple family's `show` is no `show` for `Opaque`.
+    assert_fails_with(
+        &format!("{B557_SHOW}\nimpl Opaque with Show {{ }}\nfun main() {{}}\n"),
+        "missing 'show'",
+    );
+}
