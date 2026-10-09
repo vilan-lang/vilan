@@ -177,6 +177,19 @@ const CENSUS: &[(&str, usize, &str)] = &[
          and by `dispose`).",
     ),
     (
+        "rpc/mirror.vl",
+        25,
+        "R + E: the open mirror channels and the client's views (two module \
+         bindings), and the cells every copy of a record reaches — on the server \
+         per channel the grants, the slots, the turn's dirty and seeding lists, \
+         its pending flush and the next base slot, and each grant's and slot's \
+         hold count (A153 S1); on the client per view its route cell, slots, \
+         retired readers, next slot, the turn's subscribe and unsubscribe lists \
+         and its pending flush, each slot's hold count, and per store mirror its \
+         binding, its call in flight, its holds, each hold's release and its \
+         retire list (A153 S2)",
+    ),
+    (
         "rpc/server.vl",
         6,
         "R + O: the registry, the server's stats",
@@ -303,7 +316,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 197,
+        total, 222,
         "the total number of `Shared` construction sites in std changed"
     );
 
