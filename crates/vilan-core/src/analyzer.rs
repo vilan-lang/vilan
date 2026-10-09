@@ -79258,6 +79258,26 @@ fn analyze_over_world<'src>(
 
     // B576: the serving call's facts into the diagnostics, last.
     analyzer.render_publish_marks();
+    // M110 S2b's measurement: what the editor's label tables weigh, in rows
+    // and string bytes — the figure a per-module record of them would cost
+    // per stored world (printed under `VILAN_COUNTERS` only).
+    if crate::counters::counters_enabled() {
+        let weigh = |table: &HashMap<Id, String>| -> (usize, usize) {
+            (table.len(), table.values().map(String::len).sum())
+        };
+        let (expr_rows, expr_bytes) = weigh(&expr_types);
+        let (declaration_rows, declaration_bytes) = weigh(&declaration_labels);
+        let (member_rows, member_bytes) = weigh(&member_headers);
+        eprintln!(
+            "[vilan counters] labels expr-types={expr_rows}/{expr_bytes}B \
+             declarations={declaration_rows}/{declaration_bytes}B \
+             member-headers={member_rows}/{member_bytes}B patterns={} reference-hovers={} \
+             hints={}",
+            pattern_labels.len(),
+            reference_hovers.len(),
+            hint_labels.len(),
+        );
+    }
 
     Ok(Some(Program {
         hidden_impls_pending,
