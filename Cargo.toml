@@ -108,6 +108,9 @@ codegen-units = 1
 # Selected by `scripts/ci-local.sh test`/`doctest` (`VILAN_TEST_PROFILE`, which
 # names this profile unless set) and the seal's union; the artifacts land in
 # `target/ci-test/`, so a cache keyed on `target/debug` does not hold them.
+# One binary is deliberately NOT run on it: `vilan-core`'s `deep_nesting` pins stack
+# claims about unoptimized frames, and three of its declared-stack pins go red at
+# opt-level 1 - `scripts/ci-local.sh test` runs it on `dev` beside the suite.
 [profile.ci-test]
 inherits = "dev"
 

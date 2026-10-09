@@ -311,4 +311,16 @@ fn n156_the_suite_legs_run_under_ci_test_and_the_default_profile_is_untouched() 
             "`{leg}` selects the suite profile with `{flag}`:\n{body}"
         );
     }
+    // The stack binary's pins are claims about unoptimized frames (three go red
+    // at opt-level 1): out of the profiled run, in on `dev` beside it.
+    let test_leg = script
+        .split("leg_test() {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("leg_test in ci-local.sh");
+    assert!(
+        test_leg.contains("-E 'not binary(deep_nesting)'")
+            && test_leg.contains("cargo nextest run -p vilan-core --test deep_nesting"),
+        "deep_nesting leaves the ci-test run and runs on the default profile:\n{test_leg}"
+    );
 }

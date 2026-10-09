@@ -115,12 +115,25 @@ leg_clippy() {
 # `VILAN_TEST_PROFILE=dev scripts/ci-local.sh test` runs the suite the old way.
 TEST_PROFILE=${VILAN_TEST_PROFILE:-ci-test}
 
+# ONE binary stays on `dev`: `deep_nesting`. Its pins are stack-size claims -
+# "the walk fits libtest's 2 MiB thread" (the Windows canary), "a 490-link chain
+# overruns a DECLARED 2 MiB" - and a frame is exactly what opt-level changes.
+# Unoptimized frames are the worst case the canary exists to hold, and at
+# opt-level 1 the chain's walk fits (~26 KB a level unoptimized, far less
+# optimized), so three declared-stack pins go red there (measured, Order 49).
+# So the suite run leaves the binary out and it runs once, on `dev`, after it -
+# on the first shard only, since it is one binary and not a share of the suite.
 leg_test() {
+    status=0
     if [ -n "${VILAN_CI_PARTITION:-}" ]; then
-        cargo nextest run --workspace --cargo-profile "$TEST_PROFILE" --partition "count:$VILAN_CI_PARTITION"
+        cargo nextest run --workspace --cargo-profile "$TEST_PROFILE" -E 'not binary(deep_nesting)' --partition "count:$VILAN_CI_PARTITION" || status=$?
     else
-        cargo nextest run --workspace --cargo-profile "$TEST_PROFILE"
+        cargo nextest run --workspace --cargo-profile "$TEST_PROFILE" -E 'not binary(deep_nesting)' || status=$?
     fi
+    case "${VILAN_CI_PARTITION:-1/1}" in
+        1/*) cargo nextest run -p vilan-core --test deep_nesting || status=$? ;;
+    esac
+    return "$status"
 }
 
 # nextest does not run doc-tests. Every doc-test set is empty today; this leg
