@@ -94,3 +94,17 @@ fn a_named_value_closure_is_adapted() {
     );
     assert!(after.contains("apply(|c| g(*c))"), "{after}");
 }
+
+// E273: a named FUNCTION with the other mode gets the same refusal, and its
+// one fix — the adapter at the call, since the declaration is not the call's
+// to rewrite.
+#[test]
+fn a_named_function_is_adapted() {
+    let after = fixed_clean(
+        &format!(
+            "{APPLY}fun count(s: str): i32 {{\n\ts.len().as_i32()\n}}\n\nfun main() {{\n\tprint(apply(count));\n}}\n"
+        ),
+        "Adapt it: `|c| count(*c)`",
+    );
+    assert!(after.contains("apply(|c| count(*c))"), "{after}");
+}

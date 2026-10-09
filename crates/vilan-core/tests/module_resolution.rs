@@ -9227,7 +9227,10 @@ fn b560_two_modules_sharing_a_leaf_name_are_ambiguous() {
 }
 
 /// B560's std half: a type in a NESTED std module (`std::reactive::delta`'s
-/// `ListCell`), loaded through another module, steers to its full path.
+/// `ListCell`), loaded through another module, steers to a full path — since
+/// B572 its shortest PUBLIC one, `std::reactive::ListCell`, which
+/// `std::reactive` re-exports and the book writes (it said
+/// `std::reactive::delta::ListCell`, the declaring module, before).
 #[test]
 fn b560_the_import_steer_spells_a_nested_std_modules_full_path() {
     const HELPER: &str = "import std::reactive::delta::ListCell;\n\nexport fun make(): ListCell<i32> {\n\tListCell::new()\n}\n";
@@ -9238,9 +9241,9 @@ fn b560_the_import_steer_spells_a_nested_std_modules_full_path() {
         Platform::default(),
     );
     assert!(
-        errors.iter().any(|error| {
-            error.contains("import it first (`import std::reactive::delta::ListCell;`)")
-        }),
+        errors
+            .iter()
+            .any(|error| { error.contains("import it first (`import std::reactive::ListCell;`)") }),
         "{errors:#?}"
     );
 }
@@ -9276,5 +9279,87 @@ fn b576_a_modules_twin_note_names_the_builds_platform() {
                 .iter()
                 .all(|note| note.contains("analyzed under browser")),
         "the module's note names the browser: {errors:#?}"
+    );
+}
+
+/// B572: a std name a facade re-exports is steered to the facade, not to the
+/// internal module that declares it — `Store` and `StoreSome` are declared in
+/// `std::reactive::store_core` and re-exported by `std::reactive::store`, the
+/// one module a program imports. Both when the declaring module is LOADED
+/// (through another module's import) and when nothing loaded it, and the
+/// statement the steer names compiles when pasted.
+#[test]
+fn b572_a_reexported_std_name_is_steered_to_its_public_module() {
+    const HELPER: &str = "import std::reactive::store::Store;\n\nexport fun make(): Store<i32> {\n\tStore::new(1)\n}\n";
+    let loaded = "import pkg::helper::make;\n\nfun main() {\n\tlet store: Store<i32> = make();\n\tlet _ = store;\n}\n";
+    let unloaded = "fun take(handle: StoreSome<i32>) {\n\tlet _ = handle;\n}\n\nfun main() {}\n";
+    for (entry, name) in [(loaded, "Store"), (unloaded, "StoreSome")] {
+        let errors = analyze_package(
+            &[("helper.vl", HELPER), ("main.vl", entry)],
+            "main.vl",
+            Platform::default(),
+        );
+        let steer = format!("import it first (`import std::reactive::store::{name};`)");
+        assert!(
+            errors.iter().any(|error| error.contains(&steer)),
+            "`{name}`: {errors:#?}"
+        );
+        assert!(
+            !errors.iter().any(|error| error.contains("store_core")),
+            "never the internal module: {errors:#?}"
+        );
+        let pasted = format!("import std::reactive::store::{name};\n{entry}");
+        let pasted: &'static str = Box::leak(pasted.into_boxed_str());
+        let errors = analyze_package(
+            &[("helper.vl", HELPER), ("main.vl", pasted)],
+            "main.vl",
+            Platform::default(),
+        );
+        assert!(
+            errors.is_empty(),
+            "the steer's import compiles: {errors:#?}"
+        );
+    }
+}
+
+/// B561: B535's trait-scope refusal spells a trait in a NESTED package
+/// module at its full path (`pkg::geo::shapes::Area`) — `import_path_of` read
+/// the module's leaf and wrote `pkg::shapes::Area`, an import that resolves
+/// nowhere — and the statement it names compiles when pasted.
+#[test]
+fn b561_a_nested_package_traits_import_is_spelled_at_its_full_path() {
+    const SHAPES: &str = "export trait Area {\n\tfun area(self): i32;\n}\n\nexport impl i32 with Area {\n\tfun area(self): i32 {\n\t\tself * self\n\t}\n}\n";
+    const HELPER: &str =
+        "import pkg::geo::shapes::Area;\n\nexport fun twice(x: i32): i32 {\n\tx.area() * 2\n}\n";
+    let entry = "import pkg::helper::twice;\n\nfun main() {\n\tlet _ = twice(2) + 3.area();\n}\n";
+    let errors = analyze_package(
+        &[
+            ("geo/shapes.vl", SHAPES),
+            ("helper.vl", HELPER),
+            ("main.vl", entry),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("Import it (`import pkg::geo::shapes::Area;`)")),
+        "{errors:#?}"
+    );
+    let pasted = format!("import pkg::geo::shapes::Area;\n{entry}");
+    let pasted: &'static str = Box::leak(pasted.into_boxed_str());
+    let errors = analyze_package(
+        &[
+            ("geo/shapes.vl", SHAPES),
+            ("helper.vl", HELPER),
+            ("main.vl", pasted),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "the refusal's import compiles: {errors:#?}"
     );
 }

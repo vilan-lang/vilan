@@ -452,6 +452,13 @@ to publish. A module with no marker anywhere is **uncurated** and offers
 everything, which is what keeps a package that has never thought about
 visibility compiling exactly as it did.
 
+A name a std module re-exports is offered at its **shortest public
+path**: the "import it first" steer, the trait-scope refusal and the
+add-import fix all write `import std::reactive::store::Store;` — the module
+that re-exports `Store` and that a program is meant to import — and not
+the module that happens to declare it. Where two re-exports tie at the
+shortest, the declaring module is named.
+
 **Visibility never blocks access.** The bit is consulted by completion,
 by the add-import fix, by the "import it first" steer and by the
 per-importer method namespace (§4.6) — and by nothing in name resolution.

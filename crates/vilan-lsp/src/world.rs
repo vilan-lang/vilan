@@ -107,13 +107,16 @@ impl RootResolver {
     /// - Otherwise the FIRST entry in build order whose import graph reaches
     ///   the file serves it, and the first reaching entry of each other
     ///   platform reports its diagnostics too — E113's legs, one per platform.
-    /// - A file carrying platform-fenced TWINS keeps its own analysis for now:
-    ///   its legs are kept whole per platform (F27 R3), and serving each from
-    ///   a different entry's world is the follow-up this order files, not
-    ///   builds.
+    /// - A file carrying platform-fenced TWINS is served like any other
+    ///   (E254): its primary entry's world answers it, and each twin that
+    ///   world fences out is answered by the world of the further entry whose
+    ///   platform admits it (`Document::install_twin_legs`). A twin NO
+    ///   reaching entry's platform admits has no world to be served from, and
+    ///   the file keeps its own analysis with its kept legs (F27 R3), as
+    ///   before E254.
     pub fn roots(&self, file: &Path, text: &str) -> WorldRoots {
         let file = vilan_core::util::canonical_path(file);
-        if self.legs.iter().any(|(entry, _)| *entry == file) || has_twins(text) {
+        if self.legs.iter().any(|(entry, _)| *entry == file) {
             return WorldRoots::default();
         }
         let mut roots = WorldRoots::default();
@@ -130,6 +133,9 @@ impl RootResolver {
                 None => roots.primary = Some(entry.clone()),
                 Some(_) => roots.further.push(entry.clone()),
             }
+        }
+        if has_twins(text) && !vilan_core::platform_color::twin_legs(text, &platforms).is_empty() {
+            return WorldRoots::default();
         }
         roots
     }

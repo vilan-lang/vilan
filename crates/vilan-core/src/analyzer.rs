@@ -49591,12 +49591,28 @@ impl<'src> Analyzer<'src> {
     /// hides a copy, and a view closure cannot stand where a value closure
     /// writes its own copy. `None` unless both are closure types of one arity
     /// whose modes disagree at a parameter where both are settled.
+    ///
+    /// E273: a NAMED FUNCTION handed where a closure type is expected is read
+    /// as the closure type it coerces to (`function_closure_type_recorded`,
+    /// whose modes are its parameters' conventions), so `apply(count)` with
+    /// `fun count(s: str)` against `|&str| i32` gets this refusal too — named
+    /// as the function's, and steering to the adapter alone, since a declared
+    /// function cannot be rewritten at the call.
     fn closure_mode_mismatch_message(
         &self,
         expected_type: &Type,
         got_type: &Type,
         substitution_context: &SubstitutionContext,
     ) -> Option<String> {
+        let function = match got_type {
+            Type::Function(function_id) => Some((
+                self.functions.get(function_id)?.name,
+                self.function_closure_type_recorded(*function_id)?,
+            )),
+            _ => None,
+        };
+        let got_type = function.as_ref().map_or(got_type, |(_, coerced)| coerced);
+        let function_name = function.as_ref().map(|(name, _)| *name);
         let (
             Type::Closure(expected_parameters, _, _, expected_modes),
             Type::Closure(got_parameters, _, _, got_modes),
@@ -49632,7 +49648,48 @@ impl<'src> Analyzer<'src> {
             Mode::View => format!("a view `&{pointee}`"),
             Mode::MutView => format!("a writable view `&mut {pointee}`"),
         };
-        let which = if expected_parameters.len() == 1 {
+        let single = expected_parameters.len() == 1;
+        if let Some(name) = function_name {
+            let which = if single {
+                format!("the function `{name}` takes")
+            } else {
+                format!("the function `{name}`'s parameter {} takes", index + 1)
+            };
+            // The adapter spells the call; only a one-parameter function's is
+            // written out whole (the others are passed on as they come).
+            let adapter = |lend: &str| {
+                if single {
+                    format!(": `|c| {name}({lend}c)`")
+                } else {
+                    format!(
+                        ", passing parameter {} as `{lend}c` and the others as they come",
+                        index + 1
+                    )
+                }
+            };
+            let adapt = match (expected_mode, got_mode) {
+                (Mode::View, Mode::Value) => format!(
+                    "a declared function is not rewritten at the call: adapt it with a closure that copies the view's value out{}",
+                    adapter("*")
+                ),
+                (Mode::Value, Mode::View | Mode::MutView) => format!(
+                    "a declared function is not rewritten at the call: adapt it with a closure that lends it the value{}",
+                    adapter(if got_mode == Mode::View { "&" } else { "&mut " })
+                ),
+                (Mode::MutView, Mode::Value) => format!(
+                    "a function that takes a value writes only its own copy, never the caller's place: declare `{name}`'s parameter `&mut {pointee}`"
+                ),
+                _ => format!(
+                    "declare `{name}`'s parameter with the view the type takes (`&` and `&mut` are different views)"
+                ),
+            };
+            return Some(format!(
+                "{which} {} where its type takes {}: a value closure and a view closure are different types, and no adapter is inserted; {adapt}.",
+                describe(got_mode),
+                describe(expected_mode),
+            ));
+        }
+        let which = if single {
             "this closure takes".to_string()
         } else {
             format!("this closure's parameter {} takes", index + 1)
@@ -54786,6 +54843,10 @@ impl<'src> Analyzer<'src> {
         let mut method_index: HashMap<(String, String), (String, String)> = HashMap::default();
         let mut ambiguous_methods: HashSet<(String, String)> = HashSet::default();
         let mut deprecated_aliases: HashMap<String, (String, String)> = HashMap::default();
+        // B572: the modules that RE-EXPORT a name a sibling declares — a
+        // facade (`std::reactive::store` over `store_core`, `std::reactive`
+        // over `delta`) is the path a program is meant to import from.
+        let mut facades: HashMap<String, Vec<String>> = HashMap::default();
         let files = self.std_module_files.clone();
         for (module_name, path) in &files {
             // A154: a NESTED prelude (`web::prelude`, `web::style::prelude`) is
@@ -54836,6 +54897,23 @@ impl<'src> Analyzer<'src> {
                     },
                 }
             }
+            // A prelude at ANY depth is a surface of the names it makes
+            // ambient, never the path a steer writes (`std::prelude::Option`
+            // would beat `std::option::Option` on length).
+            if module_leaf_name(module_name) != "prelude" {
+                let mut importables = Vec::new();
+                collect_importables(&loaded.ast.0, &mut importables);
+                for importable in importables {
+                    if importable.kind == ImportableKind::Reexport
+                        && importable.exported.is_exported()
+                    {
+                        facades
+                            .entry(importable.name.to_string())
+                            .or_default()
+                            .push(module_name.clone());
+                    }
+                }
+            }
             let declared: HashSet<&str> = names.into_iter().collect();
             let mut steers = Vec::new();
             collect_impl_method_steers(&loaded.ast.0, &declared, &mut steers);
@@ -54859,6 +54937,30 @@ impl<'src> Analyzer<'src> {
         }
         for key in ambiguous_methods {
             method_index.remove(&key);
+        }
+        // B572: each name's import is spelled at its SHORTEST public path —
+        // the declaring module or a module that re-exports it, by segment
+        // count, a re-export winning a tie (it exists to be imported from:
+        // `std::reactive::store::Store`, not `store_core`'s). Two different
+        // re-exports tied at the shortest are a guess, and the declaring
+        // module stands.
+        for (name, module) in export_index.iter_mut() {
+            let Some(reexports) = facades.get(name) else {
+                continue;
+            };
+            let depth = |path: &str| path.split("::").count();
+            let shortest = reexports.iter().map(|facade| depth(facade)).min();
+            let Some(shortest) = shortest.filter(|shortest| *shortest <= depth(module)) else {
+                continue;
+            };
+            let mut at_shortest: Vec<&String> = reexports
+                .iter()
+                .filter(|facade| depth(facade) == shortest)
+                .collect();
+            at_shortest.dedup();
+            if let [facade] = at_shortest.as_slice() {
+                *module = (*facade).clone();
+            }
         }
         self.std_export_index = Some(export_index);
         self.std_deprecated_alias_index = Some(deprecated_aliases);
@@ -54900,13 +55002,14 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
-    fn import_steer_inner(&self, name: &str) -> Option<String> {
-        // B560: every loaded module's FULL path from its root — `std`'s and
-        // `pkg`'s scopes, then each module's children (A65/A154 namespaces),
-        // breadth-first — because the import the steer writes must be one the
-        // loader accepts. The module's own `name` is its LEAF, which spelled
-        // `pkg::lib::thing` as `pkg::thing` and `std::reactive::delta` as
-        // `pkg::delta`, imports that resolve nowhere.
+    /// B560: every loaded module's FULL import path from its root — `std`'s
+    /// and `pkg`'s scopes, then each module's children (A65/A154 namespaces),
+    /// breadth-first — because an import the compiler writes into a message
+    /// must be one the loader accepts. The module's own `name` is its LEAF,
+    /// which spelled `pkg::lib::thing` as `pkg::thing` and
+    /// `std::reactive::delta` as `pkg::delta`, imports that resolve nowhere.
+    /// The B4 steer and B535's trait-scope refusal (B561) both read it.
+    fn module_import_paths(&self) -> HashMap<Id, String> {
         let mut paths: HashMap<Id, String> = HashMap::default();
         let mut pending: std::collections::VecDeque<(Id, String)> =
             std::collections::VecDeque::new();
@@ -54942,6 +55045,11 @@ impl<'src> Analyzer<'src> {
             }
             paths.insert(module_id, path);
         }
+        paths
+    }
+
+    fn import_steer_inner(&self, name: &str) -> Option<String> {
+        let paths = self.module_import_paths();
         // Hits are compared by that PATH, not by leaf name: two modules sharing
         // a leaf in different directories are two homes (ambiguous, no steer),
         // while one path loaded twice — a module's platform twins — is one.
@@ -54980,6 +55088,21 @@ impl<'src> Analyzer<'src> {
             }
         }
         if let Some(path) = hit {
+            // B572: a std name is spelled at its shortest public path — the
+            // index's answer, a facade that re-exports it where there is one —
+            // and not at the internal module that happens to declare it. The
+            // index holds a name only when ONE std module declares it, so its
+            // answer is about this very declaration.
+            if path.starts_with("std::")
+                && let Some(module) = self
+                    .std_export_index
+                    .as_ref()
+                    .and_then(|index| index.get(name))
+            {
+                return Some(format!(
+                    "; import it first (`import std::{module}::{name};`)"
+                ));
+            }
             return Some(format!("; import it first (`import {path}::{name};`)"));
         }
         if let Some(module) = self
@@ -55563,16 +55686,14 @@ impl<'src> Analyzer<'src> {
     /// The import path that names `entity` from the module DECLARING it —
     /// `std::display::Display` — found by the entity rather than by its name,
     /// so a name two modules declare (`std::web::style`'s `Display` beside
-    /// `std::display`'s) still answers. `None` for an entity no top-level
-    /// module of `std` or of the package declares.
+    /// `std::display`'s) still answers. `None` for an entity no module a root
+    /// reaches declares.
+    ///
+    /// B561: the module's FULL path ([`Self::module_import_paths`], B560's
+    /// walk) — a trait in `pkg::geo::shapes` was spelled `pkg::shapes::Area`,
+    /// from the module's leaf name, an import that resolves nowhere.
     fn import_path_of(&self, entity: Id) -> Option<String> {
-        let std_members: HashSet<Id> = self
-            .module_id_by_name
-            .get("std")
-            .and_then(|std_id| self.modules.get(std_id))
-            .and_then(|module| self.scopes.get(&module.body.1))
-            .map(|scope| scope.name_to_id_map.values().copied().collect())
-            .unwrap_or_default();
+        let paths = self.module_import_paths();
         self.modules.values().find_map(|module| {
             if module.name == "pkg" || module.name == "std" {
                 return None;
@@ -55582,11 +55703,7 @@ impl<'src> Analyzer<'src> {
                 .declaration_order
                 .iter()
                 .find(|(_, id)| *id == entity)?;
-            let root = match std_members.contains(&module.id) {
-                true => "std",
-                false => "pkg",
-            };
-            Some(format!("{root}::{}::{name}", module.name))
+            Some(format!("{}::{name}", paths.get(&module.id)?))
         })
     }
 

@@ -12272,6 +12272,69 @@ fn b495_a_value_closure_and_a_view_closure_are_different_types() {
     );
 }
 
+/// E273: a NAMED FUNCTION handed where a closure type takes its parameter in
+/// the other mode gets B495's refusal too — read as the closure type it
+/// coerces to, whose modes are its parameters' conventions — named as the
+/// function's, and steered to the adapter, the one fix a declared function
+/// has at the call. It said "Expected |&str| i32, but got fn count(str): i32
+/// instead." before, with no word about modes.
+#[test]
+fn e273_a_named_function_with_the_other_mode_gets_the_mode_steer() {
+    assert_fails_with(
+        r#"
+        fun apply(f: |&str| i32): i32 { f(&"hi") }
+        fun count(s: str): i32 { 1 }
+        fun main() {
+            let n = apply(count);
+        }
+        "#,
+        "the function `count` takes `str` by value where its type takes a view `&str`: a value closure and a view closure are different types, and no adapter is inserted; a declared function is not rewritten at the call: adapt it with a closure that copies the view's value out: `|c| count(*c)`.",
+    );
+    assert_fails_with(
+        r#"
+        fun apply(f: |str| i32): i32 { f("hi") }
+        fun peek(s: &str): i32 { 1 }
+        fun main() {
+            let n = apply(peek);
+        }
+        "#,
+        "the function `peek` takes a view `&str` where its type takes `str` by value: a value closure and a view closure are different types, and no adapter is inserted; a declared function is not rewritten at the call: adapt it with a closure that lends it the value: `|c| peek(&c)`.",
+    );
+    assert_fails_with(
+        r#"
+        fun apply(f: |i32, &mut i32| void) {}
+        fun pair(a: i32, b: i32) {}
+        fun main() {
+            apply(pair);
+        }
+        "#,
+        "the function `pair`'s parameter 2 takes `i32` by value where its type takes a writable view `&mut i32`: a value closure and a view closure are different types, and no adapter is inserted; a function that takes a value writes only its own copy, never the caller's place: declare `pair`'s parameter `&mut i32`.",
+    );
+    assert_fails_with(
+        r#"
+        fun apply(f: |&i32, i32| i32): i32 { f(&1, 2) }
+        fun add(a: i32, b: i32): i32 { a + b }
+        fun main() {
+            let n = apply(add);
+        }
+        "#,
+        "the function `add`'s parameter 1 takes `i32` by value where its type takes a view `&i32`: a value closure and a view closure are different types, and no adapter is inserted; a declared function is not rewritten at the call: adapt it with a closure that copies the view's value out, passing parameter 1 as `*c` and the others as they come.",
+    );
+    // The adapter the steer names compiles and runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun apply(f: |&str| i32): i32 { f(&"hi") }
+        fun count(s: str): i32 { s.len().as_i32() }
+        fun main() {
+            print(apply(|c| count(*c)));
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
 /// B495: the mode is part of the closure type's printed form — a mismatch,
 /// a hover and an inlay hint say `|&str| void`, not `|str| void`.
 #[test]

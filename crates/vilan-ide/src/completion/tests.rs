@@ -371,3 +371,58 @@ fn a149_s4_a_field_named_like_a_handle_internal_types_as_the_projection() {
         labels(&items)
     );
 }
+
+// --- E274: a generic receiver is offered the impls at ITS arguments -------
+
+#[test]
+fn e274_a_store_handle_is_not_offered_another_instantiations_projections() {
+    // `[derive(Storable)]` writes `impl Store<Address>` with `city` and `path`;
+    // on a `Store<App>` neither is a member (accepting one was refused).
+    let source = format!(
+        "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.¦\n}}\n"
+    );
+    let (_, items) = completions(&source);
+    for other in ["city", "path"] {
+        assert!(
+            !items.iter().any(|item| item.label == other),
+            "`{other}` is `Store<Address>`'s, not `Store<App>`'s: {:?}",
+            labels(&items)
+        );
+    }
+    assert!(
+        items.iter().any(|item| item.label == "get"),
+        "the handle's own generic members stay: {:?}",
+        labels(&items)
+    );
+}
+
+const BOXES: &str = "struct Box<type T> {\n\tvalue: T,\n}\n\nimpl Box<i32> {\n\tfun only_int(self): i32 {\n\t\tself.value\n\t}\n\n\tfun show(self): i32 {\n\t\tself.value\n\t}\n}\n\nimpl Box<str> {\n\tfun only_str(self): str {\n\t\tself.value\n\t}\n\n\tfun show(self): str {\n\t\tself.value\n\t}\n}\n\nimpl Box<type T> {\n\tfun any(self): T {\n\t\tself.value\n\t}\n}\n\n";
+
+#[test]
+fn e274_an_inherent_impl_at_other_arguments_is_not_offered() {
+    let source =
+        format!("{BOXES}fun main() {{\n\tlet b = Box {{ value = 1 }};\n\tlet _x = b.¦\n}}\n");
+    let (_, items) = completions(&source);
+    let offered = labels(&items);
+    assert!(offered.contains(&"only_int"), "{offered:?}");
+    assert!(
+        offered.contains(&"any"),
+        "the generic impl applies: {offered:?}"
+    );
+    assert!(!offered.contains(&"only_str"), "{offered:?}");
+    // A name both instantiations declare is offered once, as the receiver's.
+    let source =
+        format!("{BOXES}fun main() {{\n\tlet b = Box {{ value = \"s\" }};\n\tlet _x = b.¦\n}}\n");
+    let (_, items) = completions(&source);
+    let shows: Vec<&Completion> = items.iter().filter(|item| item.label == "show").collect();
+    assert_eq!(shows.len(), 1, "{:?}", labels(&items));
+    assert!(
+        shows[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("str")),
+        "`Box<str>`'s `show`: {:?}",
+        shows[0].detail
+    );
+    assert!(!labels(&items).contains(&"only_int"));
+}

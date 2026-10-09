@@ -97,12 +97,23 @@ fn described_mode(description: &str) -> Option<Mode> {
     }
 }
 
-/// The refusal's facts, when `message` is B495's mode mismatch.
+/// The refusal's facts, when `message` is B495's mode mismatch — about a
+/// closure ("this closure takes …") or, since E273, a named function ("the
+/// function `count` takes …"), whose one-parameter form gets the same
+/// adapter: a declared function is not rewritten at the call, so the adapter
+/// is its only fix.
 fn mismatch(message: &str) -> Option<Mismatch> {
-    let (index, single, rest) = if let Some(rest) = message.strip_prefix("this closure takes ") {
+    let subject = match message.strip_prefix("the function `") {
+        Some(rest) => {
+            let (_, rest) = rest.split_once('`')?;
+            rest
+        }
+        None => message.strip_prefix("this closure")?,
+    };
+    let (index, single, rest) = if let Some(rest) = subject.strip_prefix(" takes ") {
         (0, true, rest)
     } else {
-        let rest = message.strip_prefix("this closure's parameter ")?;
+        let rest = subject.strip_prefix("'s parameter ")?;
         let (number, rest) = rest.split_once(" takes ")?;
         (number.parse::<usize>().ok()?.checked_sub(1)?, false, rest)
     };
@@ -363,6 +374,43 @@ mod tests {
             applied("apply(shapes::c)", "shapes::c", message).as_deref(),
             Some("apply(|value| shapes::c(&value))")
         );
+    }
+
+    // E273: a named FUNCTION's refusal is read the same way, and its
+    // one-parameter form is adapted at the call — the only fix there is, since
+    // the declaration is not the call's to rewrite.
+    #[test]
+    fn a_named_functions_refusal_is_read_and_adapted() {
+        let message = "the function `count` takes `str` by value where its type takes a view \
+             `&str`: a value closure and a view closure are different types, and no adapter is \
+             inserted; a declared function is not rewritten at the call: adapt it with a closure \
+             that copies the view's value out: `|c| count(*c)`.";
+        assert_eq!(
+            mismatch(message),
+            Some(Mismatch {
+                index: 0,
+                single: true,
+                got: Mode::Value,
+                expected: Mode::View
+            })
+        );
+        assert_eq!(
+            applied("apply(count)", "count", message).as_deref(),
+            Some("apply(|c| count(*c))")
+        );
+        let message = "the function `pair`'s parameter 2 takes a view `&i32` where its type \
+             takes `i32` by value: a value closure and a view closure are different types";
+        assert_eq!(
+            mismatch(message),
+            Some(Mismatch {
+                index: 1,
+                single: false,
+                got: Mode::View,
+                expected: Mode::Value
+            })
+        );
+        // Several parameters: the adapter would have to spell them all.
+        assert_eq!(applied("apply(pair)", "pair", message), None);
     }
 
     #[test]

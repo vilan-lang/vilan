@@ -171,7 +171,12 @@ editor keeps every one of those analyses: inside the twin the file's own
 platform excludes, hover, completion, inlay hints and colour come from the
 analysis that admits it, as they do everywhere else. Go-to-definition on a
 call to a twin offers both twins, the one the file's platform compiles
-first.
+first. Such a file is served from the entries' worlds like any other once
+two files of its world are open: the browser entry's world answers it, and
+the twin that world excludes is answered from the world of the entry whose
+platform admits it. Only a twin no entry's platform admits (a `deno` twin in
+a package whose entries are a browser and a node one) keeps the file on its
+own analyses.
 
 **A generic `<` closes itself.** `List<`, `HashMap<`, `fun pair<` and a
 generic call's own argument list each get their `>` as you type the `<`.
@@ -339,7 +344,7 @@ Twenty-three, each attached to the diagnostic that earns it:
 | ``Write all 2 declaration heads in the order`` | a declaration head written out of THE order — ``a declaration's attributes are written in one order — …`` or ``a declaration's markers are written in one order — …`` (a keyword ahead of an attribute, or two keywords inverted); both are refused — when the file carries more than one. Each head also carries its own fix, titled with the head in the order (``Write `[deprecated(..)] [must_use] fun` ``); this action takes every head in the file in ONE edit. Each head's attributes and keywords move exactly as written, and what stood between them — the blanks, a line break, a comment — stays where it stood |
 | ``Import all 2 traits this file calls`` | either trait-method diagnostic above, when the file needs more than one trait — every one of them imported in ONE edit, a trait called twice imported once. A trait more than one module declares is left to its own fix |
 | ``Take the parameter as `&str` `` | ``this closure takes `str` by value where its type takes a view `&str` …`` — a closure LITERAL whose parameter is written in the other mode from the closure type it meets (a value closure and a view closure are different types, and no adapter is inserted). The edit rewrites that parameter's type in the type's mode — `&`, `&mut` or by value — and nothing else; a body that read the value may then want a `*` |
-| ``Adapt it: `\|c\| g(*c)` `` | the same refusal on a NAMED one-parameter closure (`apply(g)`): the adapter the refusal names, written around it — `\|c\| g(*c)` copies a view's value out for a value closure, `\|c\| g(&c)` lends a view closure the value. Only around a plain name or path, since around any other expression the adapter would evaluate it on every call; a writable view meeting a value closure has none |
+| ``Adapt it: `\|c\| g(*c)` `` | the same refusal on a NAMED one-parameter closure (`apply(g)`), or on a named one-parameter FUNCTION (``the function `count` takes …``), which a call cannot rewrite: the adapter the refusal names, written around it — `\|c\| g(*c)` copies a view's value out for a value closure, `\|c\| g(&c)` lends a view closure the value. Only around a plain name or path, since around any other expression the adapter would evaluate it on every call; a writable view meeting a value closure has none |
 
 and two source actions:
 
@@ -403,20 +408,26 @@ statement rather than being discarded whole. `vilan check` answers the same
 way; `vilan build` still stops, because a recovered file is not something
 to emit from.
 
-**Answers stay in the last-analyzed text's coordinates** until the next
-analysis lands, a few dozen milliseconds later. Hover, go-to-definition,
-references, rename, the outline, inlay hints, semantic tokens and
-completion's lookups all convert the cursor through the analyzed text
-first. That is correct for the analyzed program, and therefore visually
-correct everywhere except the line you are actively editing; converting the
-same bytes through the live buffer would be correct for neither. Semantic
-highlighting additionally carries the unchanged tail of the file across an
-analysis, so the colours below your edit do not flash off and back.
+**Answers stick to their text** between a keystroke and the analysis it
+schedules. Every answer the server holds is the last analysis's, and every
+edit since is carried through it: a squiggle, a "see here" note, an inlay
+hint, a reference, a definition, an outline entry and a quick fix all move
+with the code they are about — a line typed above shifts them down, typing
+inside a flagged span stretches it, typing after it leaves it alone — and
+the squiggles are republished at once, without waiting for the analysis. An
+edit across one end of a span takes that span away until the analysis says
+again, and a caret inside text typed since the analysis gets no hover or
+definition: the analysis saw nothing there. Semantic highlighting keeps the
+colours of every unchanged line and paints the edited ones from syntax, and
+carries the unchanged tail of the file across an analysis, so the colours
+below your edit do not flash off and back.
 
 Two requests decline rather than answer wrong while the buffer is ahead of
-the analysis: **rename** ("still analyzing this file; retry in a moment")
-and **code actions**, which refuse silently because editors ask for them
-automatically when a menu opens or a file saves.
+the analysis: **rename** ("still analyzing this file; retry in a moment"),
+because text typed since may hold a reference it would miss, and **Organize
+Imports**, which declines silently because editors ask for it on save. A
+quick fix is offered from the last analysis only where you have not typed
+over the text it would rewrite.
 
 ## What it does not have
 
