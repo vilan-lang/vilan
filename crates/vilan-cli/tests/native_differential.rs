@@ -11610,4 +11610,3 @@ fun main() {
         "a one-slot tuple leaf under a view subject must write in place on both backends"
     );
 }
-
