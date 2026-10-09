@@ -63,7 +63,7 @@ bindings that write back (`bind_value`, `bind_draft`) need a real signal.
 ## Text children and mixed content
 
 `child` takes more than a `View`. Anything that can fill a child
-position works — the value's type decides what lands in the DOM. Three
+position works — the value's type decides what lands in the DOM. Four
 static arms, and a reactive twin for each:
 
 - a `View` appends as an element; a `Source<View>` appends the view it
@@ -72,11 +72,16 @@ static arms, and a reactive twin for each:
   node kept in sync;
 - a `List<View>` appends every view, in order; a `Source<List<View>>`
   appends the run and replaces the whole run on every change. `<>…</>`
-  is the literal for one (see [Fragments](#fragments)).
+  is the literal for one (see [Fragments](#fragments));
+- an `Option` of any of them places its payload when it is `Some` and
+  nothing when it is `None` — the static twin of `when`, so
+  `<p>"item"{badge}</p>` over a `badge: Option<View>` needs no `match`;
+  a `Source<Option<View>>` places the view it holds, replaces it, and
+  takes it out when the source turns `None`.
 
 That pairing is the whole contract: whatever may be a child statically
 may be a child reactively, and `{expr}` in element syntax means the same
-thing either way. A number or a `bool` is none of the three, so
+thing either way. A number or a `bool` is none of these, so
 `<p>{count}</p>` over a `Signal<i32>` is refused at the hole, with the
 text form written out: `{count.derive(|value| i"{value}")}`, or `{i"{5}"}`
 for a plain value. The reactive arms register one subscription with the

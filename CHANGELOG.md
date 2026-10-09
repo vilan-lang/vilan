@@ -33,6 +33,11 @@ written down.
 <!-- family: performance -->
 **C15's option S: a store write's three out-parameters are one captured struct, so natively a write boxes once where it boxed three times — 300 fewer instructions per write (about 7.8%).** `write_at`'s lend closure wrote `woken`, `reached` and `changed`, three captured `mut` bindings, and a captured binding is a box natively (`closure-captures.md` §3.2, Q5 RULED: offered to the lane that builds the mirrored store's server half). They are one `Lent { reached, changed, woken }` now, read back into locals after the lend. Measured with callgrind on C15's probe (20,000 `user.visits().set(n)`, release build): 77,010,288 Ir before, 71,007,268 after (−6.0 M, −300 Ir per write); against the v0.46.0 base, 76,452,679 → 71,007,268 with A153 S1's write log included. Behaviour unchanged: every store pin, both backends. Tracker A153 (C15 Q5).
 
+---
+
+<!-- family: feature -->
+**A165: an `Option` of a child is a child — `Some(view)` places the view, `None` places nothing — and a `Source<Option<View>>` places the view it holds, replaces it, and takes it out at `None`.** `<p>"item"{badge}</p>` over `badge: Option<View>` was refused by E271 ("a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one") and written as a `match` in the hole or a `when`; it is the static twin of `when` now, on both ui twins (`impl Option<type V: Slot> with Slot`, so an `Option<str>` or `Option<List<View>>` reads the same way). The ruling expected the reactive form to follow from the blanket, and it did not — no blanket covers a `Flow<Option<View>>` — so it is its own arm (`impl type S: Flow<Option<View>> with Slot`, B268's pairing), keeping the hole's place through a `Region` as the single-view arm does; the process twin reads it once. Additive. Docs: `guide/ui.md` (the child contract), `std/browser.md`. **Pins:** `ui_rows::a165_an_optional_child_places_its_view_or_nothing_and_its_source_follows`, `ui_rows::a165_the_process_twin_renders_an_optional_child_once`. Tracker A165.
+
 ## v0.46.0 — 2026-10-09
 
 <!-- family: breaking -->
