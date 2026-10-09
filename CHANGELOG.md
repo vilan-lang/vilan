@@ -72,6 +72,11 @@ written down.
 <!-- family: fix -->
 **F121: a struct with a fixed-array field builds natively — `struct Pixel { rgba: [u8; 4] }` was refused by rustc (E0277) before the program printed anything, because the struct's emitted `Js` impl reads every field and vilan-rt had no `Js` for `[T; N]`.** It has one now, laid out as a `List` is (node prints both as arrays), so an array prints whole, in a struct, in an `Option` and through a generic as on JS. vilan-rt's other per-type traits already covered arrays (`Json`; `Clone` and `PartialEq` are Rust's). F109's own repro — a list literal under `[i32; 3]` handed to a `[i32; 3]` parameter — already ran on 0.46.0 (F100 lowered the directed literal to a Rust array); it heads this pin. Pin: `native_differential::f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends` (`native/fixed_array_values.vl`, red on 0.46.0 at the struct). Tracker F121 (papers-49's find), F109 (closed as fixed by F100).
 
+---
+
+<!-- family: tooling -->
+**N154: the teardown EXTENT resolution is written once — `vilan_core::teardown` — and both emitters call it.** The JS transformer's `walk_scope_body` and the native emitter's teardown plan (F97, which had copied `teardown_extent`, `widen_over_declarations`, `own_teardown_extent` and `resolve_extent` into vilan-rust) both ask `teardown::region_end` where a declaration's region closes and `teardown::statement_teardown` what a statement owes, so the two backends print their teardowns in one order because there is one answer rather than two copies that agree. A mechanical move, no behaviour change: no corpus golden moved, F97's and F116's teardown pins and resource*.vl are identical as before. The pass map is unchanged (no pass added, removed or moved: the module is emitter-side, pure over `Program`). Tracker N154.
+
 
 ## v0.46.0 — 2026-10-09
 

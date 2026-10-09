@@ -1,6 +1,6 @@
 use crate::analyzer::{
-    BackingValue, CopyDecision, DropExtent, Expr, ExprIfBranch, ExprPattern, Function,
-    GenericDispatch, Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
+    BackingValue, CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch,
+    Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
 };
 use crate::call_graph::{CallTarget, IndirectReason};
 use crate::error::{Error, Note};
@@ -11,6 +11,7 @@ use crate::interpreter::ConstValue;
 use crate::node::{BinaryOp, Convention, ExternBinding};
 use crate::options::BuildOptions;
 use crate::span::Span;
+use crate::teardown;
 use crate::type_::{SCALAR_PRIMITIVE_NAMES, Type, TypeId};
 use indexmap::IndexMap;
 use std::borrow::Cow;
@@ -3965,7 +3966,7 @@ impl<'src> Transformer<'src> {
         node: js::Node<'src>,
         block: &mut Vec<js::Node<'src>>,
     ) -> js::Node<'src> {
-        if !self.type_drops_nontrivially(type_id) {
+        if !teardown::drops_nontrivially(self.program, type_id) {
             return node;
         }
         let name = self.ng.next_name();
@@ -10541,13 +10542,12 @@ impl<'src> Transformer<'src> {
             return None;
         }
         let statements = &function.body.0;
-        let teardown = ScopeTeardown::Captures(parameters.iter().map(|(id, _)| *id).collect());
+        let bindings: Vec<Id> = parameters.iter().map(|(id, _)| *id).collect();
         // The parameters' region starts at the body's entry rather than after a
         // declaration statement, and — like any region — must cover every
         // teardown declared inside it.
         let end = statements.len();
-        let own = self.own_teardown_extent(&teardown, statements, 0, end);
-        let extent = self.widen_over_declarations(own, statements, 0, end);
+        let extent = teardown::region_end(self.program, &bindings, statements, 0, end);
         (extent < end).then_some(extent)
     }
 
@@ -10560,7 +10560,7 @@ impl<'src> Transformer<'src> {
             .filter(|parameter_id| self.program.dropped_bindings.contains(parameter_id))
             .filter_map(|parameter_id| {
                 let type_id = self.program.parameters.get(parameter_id)?.type_id;
-                self.type_drops_nontrivially(type_id)
+                teardown::drops_nontrivially(self.program, type_id)
                     .then_some((*parameter_id, type_id))
             })
             .collect()
@@ -11619,18 +11619,17 @@ impl<'src> Transformer<'src> {
     /// `let`'s teardown, or — B62 — the resource payloads a `let`-pattern
     /// captured out of a consumed subject. Nothing for every other statement.
     fn statement_teardown(&self, statement: Id) -> ScopeTeardown {
+        // N154: what a statement owes is `teardown::statement_teardown`'s
+        // answer, which the native emitter reads too; the shape (one `let`, or
+        // a destructure's captures) is this emitter's, since it decides how
+        // the drop is written.
+        let bindings = teardown::statement_teardown(self.program, statement);
+        if bindings.is_empty() {
+            return ScopeTeardown::None;
+        }
         match self.program.entity_map.get(&statement) {
-            Some(Expr::Variable(variable_id))
-                if self.program.dropped_bindings.contains(variable_id)
-                    && self.binding_drops_nontrivially(*variable_id) =>
-            {
-                ScopeTeardown::Binding(*variable_id)
-            }
-            Some(Expr::Destructure(_, pattern)) => match self.droppable_pattern_captures(pattern) {
-                captures if captures.is_empty() => ScopeTeardown::None,
-                captures => ScopeTeardown::Captures(captures),
-            },
-            _ => ScopeTeardown::None,
+            Some(Expr::Variable(variable_id)) => ScopeTeardown::Binding(*variable_id),
+            _ => ScopeTeardown::Captures(bindings),
         }
     }
 
@@ -11642,7 +11641,7 @@ impl<'src> Transformer<'src> {
             .into_iter()
             .filter(|capture_id| {
                 self.program.dropped_bindings.contains(capture_id)
-                    && self.binding_drops_nontrivially(*capture_id)
+                    && teardown::binding_drops_nontrivially(self.program, *capture_id)
             })
             .collect()
     }
@@ -11673,23 +11672,6 @@ impl<'src> Transformer<'src> {
             }
         }
         drops
-    }
-
-    /// Whether a dropped binding's type actually destroys something (a `Drop` impl
-    /// or a resource member) — as opposed to a bare `resource external` leaf with
-    /// no destructor, whose scope-end drop is a no-op.
-    fn binding_drops_nontrivially(&self, variable_id: Id) -> bool {
-        self.program
-            .variables
-            .get(&variable_id)
-            .is_some_and(|variable| self.type_drops_nontrivially(variable.type_id))
-    }
-
-    fn type_drops_nontrivially(&self, type_id: TypeId) -> bool {
-        self.program
-            .drop_glue
-            .get(&type_id)
-            .is_some_and(|glue| glue.drop_method.is_some() || !glue.members.is_empty())
     }
 
     /// Emit a scope body (statements + tail) with per-resource `try`/`finally`
@@ -11770,7 +11752,8 @@ impl<'src> Transformer<'src> {
     /// Where a declaration's teardown region ends — an EXCLUSIVE index into
     /// `statements`, never past `end` and never before `declaration + 1`.
     ///
-    /// The analyzer answers per BINDING ([`DropExtent`], `lifetimes.md` §6) with
+    /// The analyzer answers per BINDING ([`crate::analyzer::DropExtent`],
+    /// `lifetimes.md` §6) with
     /// the chain of statements enclosing the last read, outermost first; this
     /// picks the chain element that is a direct statement of the range being
     /// emitted. Three refusals all fall back to `end`, which is the scope-end
@@ -11804,98 +11787,12 @@ impl<'src> Transformer<'src> {
         declaration: usize,
         end: usize,
     ) -> usize {
-        let own = self.own_teardown_extent(teardown, statements, declaration + 1, end);
-        self.widen_over_declarations(own, statements, declaration + 1, end)
-    }
-
-    /// Grow `extent` until every name declared in `statements[start..extent]`
-    /// has its last read inside it. Monotone and bounded by `end`.
-    ///
-    /// `statements[index]` is a DIRECT statement of the region being emitted,
-    /// which is exactly how `liveness::LastUse::declared_binding_extents` keys
-    /// its map: the innermost statement enclosing each declaration. The two
-    /// sides must agree, and `statements` is whatever range this call owns — an
-    /// `if` arm's, a `match` leg's, a loop body's — so a key measured from the
-    /// enclosing function instead would match only at a body's top level and
-    /// silently skip every nested region (B159).
-    fn widen_over_declarations(
-        &self,
-        mut extent: usize,
-        statements: &[Id],
-        start: usize,
-        end: usize,
-    ) -> usize {
-        loop {
-            let mut widened = extent;
-            for index in start..extent {
-                let Some(declared) = self
-                    .program
-                    .declared_binding_extents
-                    .get(&statements[index])
-                else {
-                    continue;
-                };
-                for binding_extent in declared {
-                    // Measured from the declaring statement itself, not after
-                    // it: a `for` item or an `is` capture has its last read
-                    // INSIDE the statement that declares it, and resolving from
-                    // the next one would find no chain element and refuse.
-                    widened =
-                        widened.max(Self::resolve_extent(binding_extent, statements, index, end));
-                }
-            }
-            if widened == extent {
-                return extent;
-            }
-            extent = widened;
-        }
-    }
-
-    /// One [`DropExtent`] resolved against a statement range: the exclusive
-    /// index its last read sits at, `start` when nothing reads it, and `end`
-    /// for every refusal (an explicit scope end, or a chain naming no statement
-    /// of this range — the read is in the scope's tail).
-    fn resolve_extent(extent: &DropExtent, statements: &[Id], start: usize, end: usize) -> usize {
-        let start = start.min(end);
-        match extent {
-            DropExtent::ScopeEnd => end,
-            DropExtent::Declaration => start,
-            DropExtent::Statement(chain) => {
-                let region = &statements[start..end];
-                match chain
-                    .iter()
-                    .find_map(|holder| region.iter().position(|s| s == holder))
-                {
-                    Some(offset) => start + offset + 1,
-                    None => end,
-                }
-            }
-        }
-    }
-
-    /// One teardown's own extent, before nesting is taken into account: the
-    /// exclusive statement index its last use sits at, `start` when nothing
-    /// reads it, and `end` for every refusal.
-    fn own_teardown_extent(
-        &self,
-        teardown: &ScopeTeardown,
-        statements: &[Id],
-        start: usize,
-        end: usize,
-    ) -> usize {
         let bindings: &[Id] = match teardown {
             ScopeTeardown::None => return end,
             ScopeTeardown::Binding(binding) => std::slice::from_ref(binding),
             ScopeTeardown::Captures(captures) => captures.as_slice(),
         };
-        let mut extent = start.min(end);
-        for binding in bindings {
-            let Some(binding_extent) = self.program.drop_extents.get(binding) else {
-                return end;
-            };
-            extent = extent.max(Self::resolve_extent(binding_extent, statements, start, end));
-        }
-        extent.min(end)
+        teardown::region_end(self.program, bindings, statements, declaration + 1, end)
     }
 
     /// Emit a loop body's nodes (statements + discarded tail), with per-resource

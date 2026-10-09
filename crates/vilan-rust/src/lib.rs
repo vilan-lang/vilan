@@ -65,8 +65,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
-    AdaptedInstance, Backing, BackingValue, CopyDecision, DropExtent, Expr, ExprIfBranch,
-    ExprMatchLeg, ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
+    AdaptedInstance, Backing, BackingValue, CopyDecision, Expr, ExprIfBranch, ExprMatchLeg,
+    ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
@@ -76,6 +76,7 @@ use vilan_core::mono;
 use vilan_core::node::{BinaryOp, Convention, ExternBinding};
 use vilan_core::options::BuildOptions;
 use vilan_core::span::Span;
+use vilan_core::teardown;
 use vilan_core::type_::{Type, TypeId};
 
 /// What one emit produced: the Rust source, and the measurement R3 asked for.
@@ -4752,19 +4753,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// declaration order — which is the law at every extent that reaches the
     /// block's end, a `ret`, a `jump` and a panic included — so only an
     /// extent short of the end owes an explicit `std::mem::drop`, written
-    /// after the statement the analyzer's [`DropExtent`] names.
+    /// after the statement the analyzer's [`vilan_core::analyzer::DropExtent`] names.
     ///
-    /// The extents are resolved exactly as the JS transformer resolves them
-    /// (`walk_scope_body`, `teardown_extent`, `widen_over_declarations` in
-    /// `transformer.rs`): a region is widened over the last reads of the
-    /// names declared inside it, and a region nested in another is cut at the
-    /// outer one's end, inner drops first. The two backends print their
-    /// teardowns in one order only if they agree on where each region ends.
+    /// The extents are the JS transformer's, from the one resolution both
+    /// emitters call (N154: [`vilan_core::teardown::region_end`]): a region is
+    /// widened over the last reads of the names declared inside it, and a
+    /// region nested in another is cut at the outer one's end, inner drops
+    /// first. The two backends print their teardowns in one order only if
+    /// they agree on where each region ends.
     fn early_drops(&self, statements: &[Id]) -> HashMap<usize, Vec<Id>> {
         let mut plan: HashMap<usize, Vec<Id>> = HashMap::default();
         if statements
             .iter()
-            .all(|statement| self.statement_teardown(*statement).is_empty())
+            .all(|statement| teardown::statement_teardown(self.program, *statement).is_empty())
         {
             return plan;
         }
@@ -4782,13 +4783,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) {
         let mut index = start;
         while index < end {
-            let bindings = self.statement_teardown(statements[index]);
+            let bindings = teardown::statement_teardown(self.program, statements[index]);
             if bindings.is_empty() {
                 index += 1;
                 continue;
             }
-            let own = self.own_teardown_extent(&bindings, statements, index + 1, end);
-            let extent = self.widen_over_declarations(own, statements, index + 1, end);
+            let extent = teardown::region_end(self.program, &bindings, statements, index + 1, end);
             self.plan_teardowns(statements, index + 1, extent, plan);
             // A binding the program hands to the `drop` sink itself (B150)
             // keeps its region — it shapes the regions nested in it exactly
@@ -4802,30 +4802,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 );
             }
             index = extent;
-        }
-    }
-
-    /// What a direct statement of a block owes a teardown for: a resource
-    /// `let`, or the resource captures of a destructuring `let` (B62), in
-    /// declaration order — the transformer's `statement_teardown`.
-    fn statement_teardown(&self, statement: Id) -> Vec<Id> {
-        match self.program.entity_map.get(&statement) {
-            Some(Expr::Variable(variable_id))
-                if self.program.dropped_bindings.contains(variable_id)
-                    && self.binding_drops_nontrivially(*variable_id) =>
-            {
-                vec![*variable_id]
-            }
-            Some(Expr::Destructure(_, pattern)) => {
-                let mut captures = Vec::new();
-                collect_pattern_bindings(pattern, &mut captures);
-                captures.retain(|capture| {
-                    self.program.dropped_bindings.contains(capture)
-                        && self.binding_drops_nontrivially(*capture)
-                });
-                captures
-            }
-            _ => Vec::new(),
         }
     }
 
@@ -4919,67 +4895,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .any(|element| self.owes_a_teardown(*element, visiting)),
             Some(Type::Array(element, _)) => self.owes_a_teardown(element, visiting),
             _ => false,
-        }
-    }
-
-    /// Whether a binding's type destroys something: a `Drop` impl or a
-    /// resource member.
-    fn binding_drops_nontrivially(&self, variable_id: Id) -> bool {
-        self.program
-            .variables
-            .get(&variable_id)
-            .and_then(|variable| self.program.drop_glue.get(&variable.type_id))
-            .is_some_and(|glue| glue.drop_method.is_some() || !glue.members.is_empty())
-    }
-
-    /// The transformer's `own_teardown_extent`: the exclusive statement index
-    /// the group's last read sits at, `start` when nothing reads it, `end` for
-    /// every refusal (a binding the dataflow does not answer for).
-    fn own_teardown_extent(
-        &self,
-        bindings: &[Id],
-        statements: &[Id],
-        start: usize,
-        end: usize,
-    ) -> usize {
-        let mut extent = start.min(end);
-        for binding in bindings {
-            let Some(binding_extent) = self.program.drop_extents.get(binding) else {
-                return end;
-            };
-            extent = extent.max(resolve_extent(binding_extent, statements, start, end));
-        }
-        extent.min(end)
-    }
-
-    /// The transformer's `widen_over_declarations`: grow `extent` until every
-    /// name declared in `statements[start..extent]` has its last read inside
-    /// it — monotone, bounded by `end`.
-    fn widen_over_declarations(
-        &self,
-        mut extent: usize,
-        statements: &[Id],
-        start: usize,
-        end: usize,
-    ) -> usize {
-        loop {
-            let mut widened = extent;
-            for index in start..extent {
-                let Some(declared) = self
-                    .program
-                    .declared_binding_extents
-                    .get(&statements[index])
-                else {
-                    continue;
-                };
-                for binding_extent in declared {
-                    widened = widened.max(resolve_extent(binding_extent, statements, index, end));
-                }
-            }
-            if widened == extent {
-                return extent;
-            }
-            extent = widened;
         }
     }
 
@@ -14609,28 +14524,6 @@ fn collect_pattern_bindings_into(pattern: &ExprPattern, out: &mut HashSet<Id>) {
     let mut bindings = Vec::new();
     collect_pattern_bindings(pattern, &mut bindings);
     out.extend(bindings);
-}
-
-/// One [`DropExtent`] resolved against a statement range — the transformer's
-/// `resolve_extent`: the exclusive index its last read sits at, `start` when
-/// nothing reads it, and `end` for an explicit scope end or a chain naming no
-/// statement of the range.
-fn resolve_extent(extent: &DropExtent, statements: &[Id], start: usize, end: usize) -> usize {
-    let start = start.min(end);
-    match extent {
-        DropExtent::ScopeEnd => end,
-        DropExtent::Declaration => start,
-        DropExtent::Statement(chain) => {
-            let region = &statements[start..end];
-            match chain
-                .iter()
-                .find_map(|holder| region.iter().position(|statement| statement == holder))
-            {
-                Some(offset) => start + offset + 1,
-                None => end,
-            }
-        }
-    }
 }
 
 fn collect_if_children(branch: &ExprIfBranch, children: &mut Vec<Id>) {
