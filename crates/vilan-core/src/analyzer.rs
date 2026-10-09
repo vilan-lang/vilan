@@ -29172,7 +29172,14 @@ impl<'src> Analyzer<'src> {
             );
             Self::record_pending_crossings(&mut pending, &view_origins, state);
         }
-        self.view_suspension_checks = pending;
+        // Extended, not assigned: a reused module's rows were replayed from
+        // its record before this window ran (B575).
+        self.view_suspension_checks
+            .crossings
+            .extend(pending.crossings);
+        self.view_suspension_checks
+            .signatures
+            .extend(pending.signatures);
         self.check_closure_view_capture_ban(&view_bindings);
         for violation in violations {
             let (anchor, msg) = match violation {
@@ -29372,7 +29379,7 @@ impl<'src> Analyzer<'src> {
                 pending.push((argument_id, reference_id, name));
             }
         }
-        self.view_suspension_checks.captures = pending;
+        self.view_suspension_checks.captures.extend(pending);
         for (reference_id, name) in errors {
             self.push_anchored(
                 Error {
@@ -49599,8 +49606,43 @@ impl<'src> Analyzer<'src> {
         &mut self,
         source_count: usize,
     ) -> (HashMap<u32, ModuleDiagnostics>, HashSet<u32>) {
-        let derived = std::mem::take(&mut self.reuse_derived);
+        let mut derived = std::mem::take(&mut self.reuse_derived);
         let unrecordable = std::mem::take(&mut self.reuse_unrecordable);
+        // B575: the enrolment rows, filed under the module whose body
+        // enrolled them (the anchor, the function, the closure — each an id
+        // that module minted). Rows a replay put here are filed again under
+        // their own module, which the loop below skips as reused.
+        let file_of = |analyzer: &Self, id: Id| -> Option<u32> {
+            let source = analyzer.source_of_id(id)?;
+            (source != SourceId(0) && source != DERIVED_SOURCE).then_some(source.0)
+        };
+        for &(anchor, call, view, root) in &self.view_suspension_checks.crossings {
+            if let Some(source) = file_of(self, anchor) {
+                derived
+                    .entry(source)
+                    .or_default()
+                    .suspension_crossings
+                    .push((anchor, call, view, root));
+            }
+        }
+        for &(function_id, parameter_id, form) in &self.view_suspension_checks.signatures {
+            if let Some(source) = file_of(self, function_id) {
+                derived
+                    .entry(source)
+                    .or_default()
+                    .suspension_signatures
+                    .push((function_id, parameter_id, form));
+            }
+        }
+        for &(closure_id, reference_id, _) in &self.view_suspension_checks.captures {
+            if let Some(source) = file_of(self, closure_id) {
+                derived
+                    .entry(source)
+                    .or_default()
+                    .suspension_captures
+                    .push((closure_id, reference_id));
+            }
+        }
         let mut record = HashMap::default();
         for index in 1..source_count as u32 {
             let source = SourceId(index);
@@ -49656,6 +49698,28 @@ impl<'src> Analyzer<'src> {
             // skipped is indistinguishable, to both checks, from one that ran.
             for key in &record.container_structures {
                 self.reported_container_structures.insert(key.clone());
+            }
+            // B575: the module's pending suspension checks, enrolled again for
+            // the post pass to decide against THIS analysis's async set — the
+            // bodies they name are skipped by the Class A window below.
+            self.view_suspension_checks
+                .crossings
+                .extend(record.suspension_crossings.iter().copied());
+            self.view_suspension_checks
+                .signatures
+                .extend(record.suspension_signatures.iter().copied());
+            for &(closure_id, reference_id) in &record.suspension_captures {
+                let name = match self.expr_id_to_expr_map.get(&reference_id) {
+                    Some(Expr::Local(binding_id)) => self
+                        .variables
+                        .get(binding_id)
+                        .map(|variable| variable.name)
+                        .unwrap_or("the view"),
+                    _ => "the view",
+                };
+                self.view_suspension_checks
+                    .captures
+                    .push((closure_id, reference_id, name));
             }
         }
     }
@@ -72245,6 +72309,19 @@ struct ModuleDiagnostics {
     /// [`Analyzer::take_reuse_record`] so a record is a function of the module
     /// and not of the walk.
     container_structures: Vec<String>,
+    /// B575: E3's PENDING suspension checks this module's bodies enrolled —
+    /// `check_invalidation`'s crossings and signatures and the capture ban's
+    /// captures ([`ViewSuspensionChecks`]) — which `check_view_suspensions`
+    /// decides once the async set is known, in a post pass that runs after
+    /// the record is taken and so is never recorded itself. A Class A check
+    /// may skip a reused body only if every table it writes for a later pass
+    /// is recorded or recomputed (pass map §5.4); this is the record. Ids the
+    /// module minted, the same §2.1 guarantee [`ModuleTables`] rests on; the
+    /// capture's view NAME is re-read from the module's own binding at replay
+    /// rather than carried.
+    suspension_crossings: Vec<(Id, Id, Id, Option<Id>)>,
+    suspension_signatures: Vec<(Id, Id, &'static str)>,
+    suspension_captures: Vec<(Id, Id)>,
 }
 
 /// One reused module's rows in the class D tables, kept in ascending id order
