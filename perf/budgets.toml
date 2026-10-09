@@ -270,14 +270,14 @@ blocking = false
 [[bump]]
 subject = "example:math"
 class = "ci"
-ratio = 1.01
+ratio = 1.025
 reason = "layout-48's platform fences (std's single-platform modules declare `[platform] mod self;`; the fence walk's twin stand-in rule; the declared-module leg) cost the smallest programs +0.5-0.6%: x1.0056 at the layout-48 merge (263,195,415 -> 264,677,058) on top of the order's earlier +0.1%."
 item = "F28"
 
 [[bump]]
 subject = "example:watch"
 class = "ci"
-ratio = 1.01
+ratio = 1.025
 reason = "the same fence cost on the other small program: x1.0061 at the layout-48 merge (330,268,645 -> 332,275,226)."
 item = "F28"
 
@@ -287,3 +287,17 @@ class = "ci"
 ratio = 1.01
 reason = "x1.0052 at the layout-48 merge (5,485,862,397 -> 5,514,603,202): the fence rules on a program with a server leg."
 item = "F28"
+
+[[bump]]
+subject = "example:math"
+class = "reference"
+ratio = 1.025
+reason = "the smallest program carries Order 48's fixed cost: layout-48's platform fences, debug-48's larger debug.vl and E275's derive, solver-48's tuple impls (+1.4% there); x1.0199 at the Order 48 seal (251,513,271 -> 256,506,997) while every larger program is 0.90-0.98 of its ceiling."
+item = "M120"
+
+[[bump]]
+subject = "example:watch"
+class = "reference"
+ratio = 1.025
+reason = "the same fixed cost on the other small program; x1.0205 at the Order 48 seal (316,712,608 -> 323,203,198)."
+item = "M120"
