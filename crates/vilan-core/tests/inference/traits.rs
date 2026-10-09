@@ -9841,3 +9841,50 @@ fn b563_an_impl_writing_the_traits_clause_conforms() {
         "
     ));
 }
+
+// --- B564 / B565: a blanket's reach to closures and function items ---
+//
+// B508 routed a CLOSURE receiver through the impl-member route, so a bare
+// blanket answered it — one tier deep. A blanket whose BOUND the closure meets
+// through another blanket (`impl type T: Leaf with Shape` over `impl type T
+// with Leaf`) did not: `compare_type` admitted only the nominal shapes against
+// a trait-typed slot (B564). And a FUNCTION ITEM bound without an annotation
+// (`let f = nothing`) keeps the item's type, which the route did not take at
+// all (B565).
+
+const B564_TIERS: &str = r#"
+        import std::io::print;
+
+        trait Leaf {
+            fun leaf(&self): str;
+        }
+        trait Shape {
+            fun shape(&self): str;
+        }
+        impl type T with Leaf {
+            fun leaf(&self): str { "leaf" }
+        }
+        impl type T: Leaf with Shape {
+            fun shape(&self): str { i"shape over {self.leaf()}" }
+        }
+"#;
+
+#[test]
+fn b564_a_two_tier_blanket_reaches_a_closure() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B564_TIERS}
+        fun main() {{
+            let g = |k: str| k == \"x\";
+            print(g.leaf());
+            print(3.shape());
+            print(g.shape());
+        }}
+
+        main();
+        "
+        ),
+        "leaf\nshape over leaf\nshape over leaf\n",
+    );
+}
+

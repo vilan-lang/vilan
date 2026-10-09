@@ -47228,9 +47228,22 @@ impl<'src> Analyzer<'src> {
             // `T: PartialEq`, or a trait-typed parameter) when it implements the
             // trait — so a conditional impl `impl Option<T: PartialEq>` matches a
             // concrete `Option<i32>`. (Mirrors the same arm in `reconcile_type`.)
-            (Type::Struct(..) | Type::Enum(..), Type::Trait(trait_id, _)) => {
-                self.type_implements_trait(a, *trait_id)
-            }
+            //
+            // B564: a CLOSURE and a FUNCTION ITEM are such values too, and a
+            // tuple and an array (B210/B220, which `reconcile_type`'s arm already
+            // lists). Only the nominal shapes were here, so a blanket whose
+            // BOUND a closure meets through another blanket (`impl type T:
+            // Leaf with Shape` over `impl type T with Leaf`) did not admit the
+            // closure: one tier deep reached it (B508), two did not.
+            (
+                Type::Struct(..)
+                | Type::Enum(..)
+                | Type::Tuple(..)
+                | Type::Array(..)
+                | Type::Closure(..)
+                | Type::Function(..),
+                Type::Trait(trait_id, _),
+            ) => self.type_implements_trait(a, *trait_id),
             // Arity first, like the closure arm below and like `reconcile_type`'s
             // tuple arm: a bare `zip` compares the common prefix and calls
             // `(i32, str)` compatible with `(i32, str, bool)`.

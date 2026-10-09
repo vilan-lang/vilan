@@ -11494,4 +11494,48 @@ fun main() {
         "a written instantiation inside the declaring impl must run on both backends"
     );
 }
+/// B564: a blanket whose bound a closure meets through another blanket (two
+/// tiers) answers the closure on both backends.
+#[test]
+fn a_two_tier_blanket_reaches_a_closure_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b564.vl"),
+        r#"import std::io::print;
+
+trait Leaf {
+    fun leaf(&self): str;
+}
+
+trait Shape {
+    fun shape(&self): str;
+}
+
+impl type T with Leaf {
+    fun leaf(&self): str {
+        "leaf"
+    }
+}
+
+impl type T: Leaf with Shape {
+    fun shape(&self): str {
+        i"shape over {self.leaf()}"
+    }
+}
+
+fun main() {
+    let g = |k: str| k == "x";
+    print(g.leaf());
+    print(3.shape());
+    print(g.shape());
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b564.vl"),
+        Verdict::Identical,
+        "a two-tier blanket must reach a closure on both backends"
+    );
+}
 
