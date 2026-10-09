@@ -8006,6 +8006,10 @@ impl<'src> Analyzer<'src> {
         // every file at once, after `build()`, so nothing else can say which file
         // the span indexes (B112) — and the sort below needs the file to lead.
         let mut errors: Vec<(Id, Span, String, TypeId)> = Vec::new();
+        // E271: the element holes refused below, by (call, hole span) — they
+        // carry no "the bound is declared here" note, since the bound is on a
+        // `child` the author never wrote.
+        let mut hole_refusals: HashSet<(Id, Span)> = HashSet::default();
         let recorded: Vec<(Id, SubstitutionContext)> = self
             .method_call_substitution
             .iter()
@@ -8238,6 +8242,15 @@ impl<'src> Analyzer<'src> {
                             .rpc_refused_key_types
                             .contains(&without_spaces(&type_label))
                     {
+                        continue;
+                    }
+                    // E271: an element-syntax HOLE refused at `child`'s
+                    // `Slot` bound is said about the hole, at the hole.
+                    if let Some((hole_span, msg)) =
+                        self.element_hole_refusal(call_id, &value_type, *required_trait_id)
+                    {
+                        hole_refusals.insert((call_id, hole_span));
+                        errors.push((call_id, hole_span, msg, constraint_id));
                         continue;
                     }
                     // A generic argument fails by MISSING the bound on its own
@@ -8672,6 +8685,9 @@ impl<'src> Analyzer<'src> {
         let bound_declarations: Vec<(Id, Span, String, Option<crate::error::Note>)> = errors
             .into_iter()
             .map(|(_, anchor, span, msg, constraint_id)| {
+                if hole_refusals.contains(&(anchor, span)) {
+                    return (anchor, span, msg, None);
+                }
                 let declaration = self
                     .expr_id_to_expr_map
                     .iter()
@@ -49197,6 +49213,154 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// E271: the refusal for an element-syntax HOLE whose value is not a
+    /// `Slot` — `<p>{count}</p>` over a `SignalCell<i32>`, `<p>{5}</p>`.
+    ///
+    /// `{expr}` lowers to `.child(expr)` before analysis (`elements.rs`), so
+    /// the value failed the desugared call's bound: "'SignalCell<i32>' does not
+    /// implement trait 'Slot', required by a generic bound of this call",
+    /// spanned from the element's `<` and noting std's `child` — a call the
+    /// author never wrote. This says what a hole takes, at the hole's own
+    /// expression, and for a number or a bool (anything that renders into a
+    /// string, `str` aside) writes the hole as an i-string; for a `Source` of
+    /// one, the `.derive` that makes it text. A generated `.child` link is told
+    /// from a written one by its ZERO-WIDTH member span (the desugar's
+    /// scaffolding, as A157 tells a head's `attr`): a written `.child(5)` keeps
+    /// the bound's sentence. `None` for anything else.
+    fn element_hole_refusal(
+        &mut self,
+        call_id: Id,
+        value_type: &Type,
+        trait_id: Id,
+    ) -> Option<(Span, String)> {
+        let is_std_trait = |analyzer: &Self, name: &str, id: Id| {
+            analyzer.traits.get(&id).is_some_and(|trait_| {
+                trait_.name == name
+                    && analyzer
+                        .source_of_id(trait_.id)
+                        .is_some_and(|source| analyzer.std_sources.contains(&source))
+            })
+        };
+        if !is_std_trait(self, "Slot", trait_id) {
+            return None;
+        }
+        let member_span = self.member_name_spans.get(&call_id)?;
+        if member_span.start != member_span.end {
+            return None;
+        }
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(member_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        if self.callable_name(*member_id) != Some("child") || !self.is_std_view_member(*member_id) {
+            return None;
+        }
+        let hole = *function_call.argument_ids.get(1)?;
+        let span = **self.span_map.get(&hole)?;
+        let written = self.written_text_of(hole)?;
+        let type_label = self.pretty_print_type(value_type, &HashMap::default());
+        let is_text = |analyzer: &Self, type_: &Type| {
+            analyzer.renders_into_a_string(type_) && !analyzer.is_str_type(type_)
+        };
+        let steer = if is_text(self, value_type) {
+            format!(": show it as text, `{{i\"{{{written}}}\"}}`")
+        } else if self.is_source_of_text(value_type, &is_std_trait, &is_text) {
+            // A receiver that is not already a postfix operand is wrapped, so
+            // the `.derive` reads off the whole hole.
+            let receiver = match self.expr_id_to_expr_map.get(&hole) {
+                Some(
+                    Expr::Local(_)
+                    | Expr::Call(_)
+                    | Expr::Field(..)
+                    | Expr::TupleIndex(..)
+                    | Expr::Index(..),
+                ) => written.to_string(),
+                _ => format!("({written})"),
+            };
+            format!(": show it as text, `{{{receiver}.derive(|value| i\"{{value}}\")}}`")
+        } else {
+            String::new()
+        };
+        Some((
+            span,
+            format!(
+                "a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` \
+                 of one, and `{written}` is `{type_label}`{steer}"
+            ),
+        ))
+    }
+
+    /// E271's `Source` case: whether `value_type` is one of std's flows whose
+    /// item renders into a string. The item is not read off the type's own
+    /// arguments (a stage's arguments are its whole recipe —
+    /// `Derive<SignalCell<i32>, i32, Point>` is a flow of `Point`); each text
+    /// type the value's type mentions is a CANDIDATE, and the flow bound is
+    /// asked at it.
+    fn is_source_of_text(
+        &mut self,
+        value_type: &Type,
+        is_std_trait: &dyn Fn(&Self, &str, Id) -> bool,
+        is_text: &dyn Fn(&Self, &Type) -> bool,
+    ) -> bool {
+        let Some(flow) = self
+            .traits
+            .keys()
+            .copied()
+            .find(|id| is_std_trait(self, "Flow", *id))
+        else {
+            return false;
+        };
+        let mut candidates: Vec<TypeId> = Vec::new();
+        let mut pending: Vec<TypeId> = match value_type {
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => arguments.clone(),
+            _ => return false,
+        };
+        while let Some(argument) = pending.pop() {
+            let argument_type = argument.get_type(self);
+            if is_text(self, &argument_type) {
+                candidates.push(argument);
+            } else if let Type::Struct(_, inner) | Type::Enum(_, inner) = argument_type {
+                pending.extend(inner);
+            }
+        }
+        candidates
+            .into_iter()
+            .any(|candidate| self.satisfies_trait_bound(value_type, flow, &[candidate], 0))
+    }
+
+    /// E272: a mismatch whose refused value is a FRAGMENT (`<>…</>`) in a
+    /// position that wants std's `View` gains the sentence the book promises
+    /// (Building UI, Fragments): a fragment is a `List<View>`, not one view, and
+    /// the two fixes. The desugar lowers a fragment to a list literal, so the
+    /// plain mismatch read as if the author had written a list; a fragment is
+    /// told from a written `[..]` by its markup — the literal's own span opens
+    /// with `<`, which no written list literal does. Any other message, value
+    /// or position comes back unchanged.
+    fn with_fragment_steer(&self, msg: String, value_id: Id, expected: &Type) -> String {
+        let expects_view = match expected {
+            Type::Struct(struct_id, _) => self.structs.get(struct_id).is_some_and(|struct_| {
+                struct_.name == "View"
+                    && self
+                        .source_of_id(struct_.id)
+                        .is_some_and(|source| self.std_sources.contains(&source))
+            }),
+            _ => false,
+        };
+        let is_fragment = expects_view
+            && matches!(self.expr_id_to_expr_map.get(&value_id), Some(Expr::List(_)))
+            && self
+                .written_text_of(value_id)
+                .is_some_and(|written| written.starts_with('<'));
+        match is_fragment {
+            true => format!(
+                "{msg} A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children \
+                 in one element (`<div>…</div>`), or make this position a `List<View>`"
+            ),
+            false => msg,
+        }
+    }
+
     /// B495 Q2: the refusal for a closure whose parameter's MODE differs
     /// from the mode its type position wrote — a value closure where the type
     /// takes a view, or the reverse. The two are different calling
@@ -50836,13 +51000,21 @@ impl<'src> Analyzer<'src> {
                                     &substitution_context,
                                 ) {
                                     Some(msg) => (msg, None),
-                                    None => self.argument_mismatch(
-                                        parameter_name,
-                                        *parameter_id,
-                                        &parameter_type,
-                                        &argument_type,
-                                        &substitution_context,
-                                    ),
+                                    None => {
+                                        let (msg, note) = self.argument_mismatch(
+                                            parameter_name,
+                                            *parameter_id,
+                                            &parameter_type,
+                                            &argument_type,
+                                            &substitution_context,
+                                        );
+                                        let msg = self.with_fragment_steer(
+                                            msg,
+                                            argument_id,
+                                            &parameter_type,
+                                        );
+                                        (msg, note)
+                                    }
                                 };
                                 let span = **self.span_map.get(&argument_id).unwrap();
                                 self.calls_with_refused_arguments.insert(call_id);
@@ -52782,6 +52954,7 @@ impl<'src> Analyzer<'src> {
                             &value_type,
                             &substitution_context,
                         );
+                        let msg = self.with_fragment_steer(msg, first_value_id, &variable_type);
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,
@@ -53630,7 +53803,9 @@ impl<'src> Analyzer<'src> {
                 "Expected {expected}, but got void instead: an `if` with no `else` produces void."
             )
         } else {
-            self.type_mismatch_message(target_return_type, &body_type, substitution_context)
+            let msg =
+                self.type_mismatch_message(target_return_type, &body_type, substitution_context);
+            self.with_fragment_steer(msg, body_id, target_return_type)
         };
         ReturnPositionCheck::Mismatched(msg)
     }
@@ -57804,11 +57979,13 @@ impl<'src> Analyzer<'src> {
         match self.reconcile_type(&value_type, field_type, substitution_context) {
             Some((_unified, bindings)) => FieldValueVerdict::Accepted(bindings),
             None => {
+                let msg = self.type_mismatch_message(field_type, &value_type, substitution_context);
+                let msg = self.with_fragment_steer(msg, value_id, field_type);
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: value_span,
-                    msg: self.type_mismatch_message(field_type, &value_type, substitution_context),
+                    msg,
                 });
                 FieldValueVerdict::Refused
             }
