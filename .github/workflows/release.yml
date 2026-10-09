@@ -144,14 +144,21 @@ jobs:
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
+      # The SCRIPT, exactly as ci.yml's `test` leg runs it (`release_gate.rs`
+      # holds the two to the same commands): `VILAN_CI_PARTITION` is nextest's
+      # `count:N/M` shard.
       - name: The suite is green
-        run: cargo nextest run --workspace --partition count:${{ matrix.partition }}/${{ matrix.shards }}
+        shell: bash
+        env:
+          VILAN_CI_PARTITION: ${{ matrix.partition }}/${{ matrix.shards }}
+        run: scripts/ci-local.sh test
       # nextest does not run doc-tests. Every doc-test set is empty today;
       # this leg exists so a future doc-test cannot silently stop running.
       # ONCE per OS, as ci.yml does it: the shards split the suite, not this.
       - name: The doc-tests are green
         if: matrix.partition == 1
-        run: cargo test --workspace --doc
+        shell: bash
+        run: scripts/ci-local.sh doctest
 
   # ── ci.yml's other three legs, on the release side ──────────────────────────
   #
