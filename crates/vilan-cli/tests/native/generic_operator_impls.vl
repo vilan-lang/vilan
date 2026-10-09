@@ -1,0 +1,79 @@
+// A generic operator over a type whose impl is WRITTEN dispatches to that
+// impl natively: Rust's own `==` over the emitted struct is its derived
+// structural equality, and the base answered with it through every generic
+// `==`/`!=` (a `List`'s, an `Option`'s) where JS called the program's `eq`.
+// `Loose` compares one field; `Backwards` orders in reverse; `Money` adds
+// through a generic `+`; a derived impl and a scalar agree either way.
+import std::compare::{ Ordering, PartialEq, PartialOrd };
+import std::io::print;
+import std::number::Add;
+import std::option::Option::{ self, None, Some };
+
+struct Loose {
+	value: i32,
+	note: str,
+}
+
+impl Loose with PartialEq {
+	fun eq(self, other: Loose): bool {
+		self.value == other.value
+	}
+}
+
+struct Backwards {
+	rank: i32,
+}
+
+impl Backwards with PartialEq {
+	fun eq(self, other: Backwards): bool {
+		self.rank == other.rank
+	}
+}
+
+impl Backwards with PartialOrd {
+	fun partial_compare(self, other: Backwards): Option<Ordering> {
+		other.rank.partial_compare(self.rank)
+	}
+}
+
+[derive(PartialEq)]
+struct Plain {
+	value: i32,
+}
+
+struct Money {
+	cents: i32,
+}
+
+impl Money with Add {
+	fun add(self, other: Money): Money {
+		Money { cents = self.cents + other.cents + 1 }
+	}
+}
+
+fun differ<T: PartialEq>(a: T, b: T): bool {
+	a != b
+}
+
+fun less<T: PartialOrd>(a: T, b: T): bool {
+	a < b
+}
+
+fun total<T: Add>(a: T, b: T): T {
+	a + b
+}
+
+fun main() {
+	let x = Loose { value = 1, note = "x" };
+	let y = Loose { value = 1, note = "y" };
+	print(differ(x, y));
+	print(x != y);
+	print([x] == [y]);
+	print(Some(x) == Some(y));
+	print(less(Backwards { rank = 2 }, Backwards { rank = 1 }));
+	print(less(1, 2));
+	print(differ(Plain { value = 1 }, Plain { value = 2 }));
+	print(differ("a", "a"));
+	print(total(Money { cents = 1 }, Money { cents = 2 }).cents);
+	print(total(1, 2));
+}

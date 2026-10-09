@@ -47,6 +47,11 @@ written down.
 <!-- family: fix -->
 **F117: a member of a blanket over a parameterized BARE trait (`impl Iterator<type T> with Again<T>`) that writes `Self` builds natively; it was refused as "a value of type `a trait object`".** B567 made the call read the bare-trait subject as the binder bound to the receiver, so `[5, 6].iter().map(..).again()` typed and ran on JS; the analyzer still types the member's own `Self` as the trait, in a type id of its own beside the subject's, and the native instance rendered it as one. An instance of such a member now reads a `Self` of its subject trait as the receiver the subject is bound to — the rewrite a trait default's `Self` already takes — in the signature, the body and nested positions (`Option<Self>`). Pin: `native_differential::f117_a_self_in_a_bare_trait_impl_member_is_the_receiver_on_both_backends` (`native/bare_trait_self.vl`: std's list iterator and a user one; `Self` returned, taken, annotated and nested). Tracker F117.
 
+---
+
+<!-- family: miscompile -->
+**A generic operator whose concrete type has a WRITTEN impl calls that impl natively — `a != b` with `a: T`, `T: PartialEq`, over `struct Loose` whose `eq` compares one field, answered `true` natively and `false` on JS, and so did a `List`'s `==` and an `Option`'s over it.** The analyzer records the operator's re-dispatch on the binary expression (on the constraint, or on the type a trait default is specialized for), and the JS emitter has always read it; the native emitter emitted Rust's own operator, whose `==` over an emitted struct is the derived STRUCTURAL equality. It now reads the same record: where the concrete type's member is a function (a written `eq`, `partial_compare`, `add`, or the derive's) it is called, and a scalar's member, an intrinsic or a host binding, keeps the operator. Pin: `native_differential::a_generic_operator_calls_the_written_impl_on_both_backends` (`native/generic_operator_impls.vl`: a one-field `eq` through a generic `!=`, a `List`, an `Option`; a reversed `PartialOrd` through a generic `<`; an `Add` through a generic `+`; a derived impl and scalars; red on 0.46.0). Found building F118.
+
 
 ## v0.46.0 — 2026-10-09
 

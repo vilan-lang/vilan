@@ -11782,3 +11782,26 @@ fn f117_a_self_in_a_bare_trait_impl_member_is_the_receiver_on_both_backends() {
         "a bare-trait impl member's `Self` must be its receiver natively"
     );
 }
+
+/// A generic operator (`a != b` with `a: T`, `T: PartialEq`; `<` over
+/// `PartialOrd`; `+` over `Add`) whose concrete type has a WRITTEN impl
+/// calls that impl natively, as the JS emitter re-dispatches it. The base
+/// emitted Rust's own operator, whose `==` over an emitted struct is the
+/// derived structural one: `Loose`'s one-field `eq` answered `true` through
+/// a generic `!=`, a `List`'s `==` and an `Option`'s, where JS answered with
+/// the program's impl.
+#[test]
+fn a_generic_operator_calls_the_written_impl_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_generic_operator_impls.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_operator_impls.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a generic operator must call the concrete type's written impl natively"
+    );
+}

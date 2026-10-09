@@ -6801,6 +6801,41 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 call
             });
         }
+        // An operator over a GENERIC operand (`a != b` with `a: T`, `T:
+        // PartialEq`) is a re-dispatch the analyzer recorded on the binary
+        // expression — on the constraint, or on the type a trait default is
+        // specialized for — exactly as the JS emitter reads it. Where the
+        // concrete type's member is a FUNCTION (a struct's `eq`, written or
+        // derived) it is called: Rust's own `==` over the emitted struct is
+        // its derived structural equality, which is not the program's when the
+        // impl is written (`impl Loose with PartialEq` comparing one field —
+        // the base answered `true` where JS answered `false`, through every
+        // generic `==`, a `List`'s, an `Option`'s and a tuple's). A scalar's
+        // member is an intrinsic or a host binding, and keeps the operator.
+        let generic = match self.program.generic_dispatch.get(&id).copied() {
+            Some(GenericDispatch::OnConstraint(constraint_id, member)) => {
+                Some((self.concrete(constraint_id), member))
+            }
+            Some(GenericDispatch::OnType(recorded, member)) => recorded
+                .or(self.current_self_type)
+                .map(|type_id| (self.concrete(type_id), member)),
+            None => None,
+        };
+        if let Some((concrete, member)) = generic
+            && self.is_grounded(concrete)
+        {
+            let preferred = self.program.bound_dispatch_traits.get(&id).cloned();
+            if let Some(dispatch @ NativeDispatch::Call(_)) =
+                self.resolve_dispatch(concrete, member, &[], preferred, span)?
+            {
+                let call = self.emit_dispatch(dispatch, &[left, right], depth, span)?;
+                return Ok(if matches!(op, BinaryOp::NotEq) {
+                    format!("!({call})")
+                } else {
+                    call
+                });
+            }
+        }
         // `str + str` is a concatenation, which is a runtime call natively
         // rather than an operator — and an INTERPOLATION is a chain of them
         // whose right halves are whatever was interpolated, rendered. The
