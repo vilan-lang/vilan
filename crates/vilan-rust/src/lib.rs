@@ -1634,6 +1634,52 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.mint(rebuilt)
     }
 
+    /// F101: the element types of a tuple-family type in this instance — a
+    /// tuple's own elements, or a mapped tuple's `(U in T: F<U>)` template
+    /// with `U` bound to each element of `T` (itself a family, so a mapped
+    /// tuple over a mapped tuple expands too). `None` for anything that is
+    /// not a tuple family, or whose source is still open.
+    fn tuple_elements(&mut self, type_id: TypeId) -> Option<Vec<TypeId>> {
+        Some(
+            self.tuple_family(type_id)?
+                .into_iter()
+                .map(|(element, _)| element)
+                .collect(),
+        )
+    }
+
+    /// [`Self::tuple_elements`] with the binder bindings that type each
+    /// element — `(U, i32)` for a `(U in T: SignalCell<U>)` slot whose `T`
+    /// element is `i32` — the transformer's `tuple_family_elements`: what a
+    /// comprehension's body is emitted under, since it may name `U` itself.
+    fn tuple_family(&mut self, type_id: TypeId) -> Option<Vec<(TypeId, Vec<(TypeId, TypeId)>)>> {
+        let _guard = vilan_core::util::RecursionGuard::enter()?;
+        let concrete = self.concrete(type_id);
+        match self.type_entry(&concrete).cloned()? {
+            Type::Tuple(elements) => Some(
+                elements
+                    .into_iter()
+                    .map(|element| (element, Vec::new()))
+                    .collect(),
+            ),
+            Type::Mapped(binder, family, template) => {
+                let family = self.tuple_family(family)?;
+                Some(
+                    family
+                        .into_iter()
+                        .map(|(element, mut bindings)| {
+                            let element = self.deeply_resolved(element);
+                            bindings.push((binder, element));
+                            let mapped = self.substituted(template, &bindings);
+                            (self.deeply_resolved(mapped), bindings)
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+
     /// A type the program's table does not hold, in the minted-type overlay
     /// ([`Self::type_entry`] reads it).
     fn mint(&mut self, rebuilt: Type) -> TypeId {
@@ -2304,6 +2350,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         match resolved {
             Type::Void => Ok("()".to_string()),
+            // F101: a mapped tuple `(U in T: F<U>)` is a tuple per
+            // instantiation — `T = (i32, str)` gives `(F<i32>, F<str>)` — so
+            // it renders as the tuple its family expands to here.
+            Type::Mapped(..) => {
+                let Some(elements) = self.tuple_elements(type_id) else {
+                    return Err(unsupported(
+                        "a mapped tuple whose source tuple did not resolve",
+                        span,
+                    ));
+                };
+                let tuple = self.mint(Type::Tuple(elements));
+                self.rust_type(tuple, span)
+            }
             Type::Tuple(elements) => {
                 let mut parts = Vec::new();
                 for element in &elements {
@@ -3644,6 +3703,122 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Some(path))
     }
 
+    /// F101: a tuple comprehension `(value in values => body)` — zipped over
+    /// several sources alike — UNROLLED, one body per slot. A tuple is
+    /// heterogeneous, so each slot's body is emitted under the binder bound
+    /// to that slot's own type (`value: i32` in one, `value: str` in the
+    /// next), which is the instance a monomorphising backend owes; the JS
+    /// backend's `source.map(..)` is the same walk over one array. Each
+    /// source is evaluated once, in order, before any body runs, and each
+    /// binder is a copy of its slot (rule 1).
+    fn tuple_comprehension(
+        &mut self,
+        bindings: &[(Id, Id)],
+        body: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let mut prelude = String::new();
+        let mut families = Vec::new();
+        for (index, (_, source)) in bindings.iter().enumerate() {
+            let value = self.consumed_value_of(*source, depth)?;
+            let _ = write!(prelude, "let __source{index} = {value}; ");
+            let elements = self
+                .settled_value_type(*source)
+                .and_then(|type_id| self.tuple_family(type_id))
+                .ok_or_else(|| {
+                    unsupported(
+                        "a tuple comprehension over a source of unresolved arity",
+                        span,
+                    )
+                })?;
+            families.push(elements);
+        }
+        let arity = families.first().map_or(0, Vec::len);
+        if families.iter().any(|family| family.len() != arity) {
+            return Err(unsupported(
+                "a zipped tuple comprehension over sources of different arities",
+                span,
+            ));
+        }
+        // One column per slot: each source's element there, with the binder
+        // bindings that type it.
+        let columns: Vec<Vec<(TypeId, Vec<(TypeId, TypeId)>)>> = (0..arity)
+            .map(|slot| families.iter().map(|family| family[slot].clone()).collect())
+            .collect();
+        let mut slots = Vec::new();
+        for (slot, column) in columns.into_iter().enumerate() {
+            let mut entries = Vec::new();
+            let mut binds = String::new();
+            for (index, ((binder, _), (element, family_bindings))) in
+                bindings.iter().zip(column).enumerate()
+            {
+                entries.extend(family_bindings);
+                // The binder's own declared type may name a generic of its
+                // own (`source: SignalCell<U'>` over a `(U in T:
+                // SignalCell<U>)` slot), which the slot's type binds.
+                if let Some(binder_type) = self
+                    .program
+                    .variables
+                    .get(binder)
+                    .map(|variable| variable.type_id)
+                {
+                    entries.push((binder_type, element));
+                    self.bind_generics_against(binder_type, element, &mut entries);
+                }
+                let _ = write!(
+                    binds,
+                    "let {} = __source{index}.{slot}; ",
+                    self.binding_name(*binder)
+                );
+            }
+            let saved = self.enter_substitution(entries);
+            let value = self.consumed_value_of(body, depth);
+            self.current_substitution = saved;
+            slots.push(format!("{{ {binds}{} }}", value?));
+        }
+        let tuple = match slots.len() {
+            0 => "()".to_string(),
+            _ => format!("({},)", slots.join(", ")),
+        };
+        Ok(format!("{{ {prelude}{tuple} }}"))
+    }
+
+    /// F101: every generic a declared type names, bound to the matching part
+    /// of a concrete one — `SignalCell<U>` against `SignalCell<i32>` binds
+    /// `U` to `i32` — walked structurally, keyed both ways a substitution is
+    /// read ([`Self::concrete`]).
+    fn bind_generics_against(
+        &self,
+        declared: TypeId,
+        concrete: TypeId,
+        entries: &mut Vec<(TypeId, TypeId)>,
+    ) {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return;
+        };
+        match (self.resolve(declared), self.resolve(concrete)) {
+            (Some(Type::Generic(constraint_id)), _) => {
+                entries.push((declared, concrete));
+                entries.push((*constraint_id, concrete));
+            }
+            (
+                Some(Type::Struct(left_id, left) | Type::Enum(left_id, left)),
+                Some(Type::Struct(right_id, right) | Type::Enum(right_id, right)),
+            ) if left_id == right_id && left.len() == right.len() => {
+                for (declared, concrete) in left.clone().into_iter().zip(right.clone()) {
+                    self.bind_generics_against(declared, concrete, entries);
+                }
+            }
+            (Some(Type::Tuple(left)), Some(Type::Tuple(right))) if left.len() == right.len() => {
+                for (declared, concrete) in left.clone().into_iter().zip(right.clone()) {
+                    self.bind_generics_against(declared, concrete, entries);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// F94: a tuple literal with SPREAD elements — `(..pair, 3)`, and the
     /// pack a call collects for a spread parameter (`width(..items)`,
     /// `need2(..pair, 7)`) — is the CONCATENATION of its parts, one level
@@ -4710,6 +4885,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "vilan_rt::str_new({})",
                 rust_literal(&vilan_core::util::trim_multiline_string(text).unwrap_or_default())
             ),
+            Expr::TupleComprehension(bindings, body) => {
+                self.tuple_comprehension(&bindings, body, depth, span)?
+            }
             // F100: `arr.len()` of a fixed array is its type's length. The
             // JS backend folds a pure subject to the constant and reads a
             // call's or a subscript's `.length` in place, so the subject is
@@ -13535,7 +13713,6 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
         Expr::TryAssert(_) => "a `!` assertion",
         Expr::Lift(_, _, _) | Expr::LiftBinder | Expr::LiftRegion(_, _) => "a `?` lift",
         Expr::Destructure(_, _) => "a destructuring binding",
-        Expr::TupleComprehension(_, _) => "a tuple comprehension",
         Expr::Generic(_) => "a generic type reference",
         Expr::Macro => "a macro name",
         _ => "an unsupported form",

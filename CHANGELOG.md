@@ -56,6 +56,11 @@ written down.
 ---
 
 <!-- family: feature -->
+**F101: natively, a mapped-tuple parameter (`values: (U in T: U)`) and a tuple comprehension (`(value in values => ..)`) build.** The parameter was refused by name ("a value of type `a mapped tuple`") and the comprehension behind it too; they were side-effect-let.vl's first wall and spread-parameters.vl's after F94. A mapped tuple is a tuple per instantiation, so it renders as the tuple its family expands to here (`T = (i32, str)` makes `(U in T: Labelled<U>)` `(Labelled<i32>, Labelled<str>)`, a mapped tuple over a mapped tuple expanding too). A comprehension over a heterogeneous tuple is UNROLLED: each source is evaluated once and in order, and each slot's body is emitted under the binder — and any generic the binder's own declared type names — bound to that slot's type, so a method on the binder dispatches at each slot's instance; a zipped comprehension walks its sources together. side-effect-let.vl and spread-parameters.vl run natively. Pin: `native_differential`'s `a_mapped_tuple_and_its_comprehension_are_identical_on_both_backends` (`native/mapped_tuples.vl`; plus the two corpus programs). Tracker F101.
+
+---
+
+<!-- family: feature -->
 **F94: natively, a spread parameter (`fun middle(...items: (i32, i32, i32))`) and a tuple spread (`(..pair, 3)`) build.** The spread parameter was refused by name, the first wall of spread-parameters.vl and tuple-spread.vl; it is a call convention over an ordinary tuple parameter (variadic-generics.md §S), and the analyzer already collects a call's arguments into the one tuple, so natively the parameter is that tuple. Behind it, tuple-spread.vl's own walls: a tuple literal with SPREAD elements is the concatenation of its parts, one level deep, each part evaluated once and in order (`width(..items)` forwards the pack itself rather than a one-element pack of it); the empty pack is the unit (`()`, not `(,)`); and a one-element tuple type is `(T,)`, not a parenthesised `T`. tuple-spread.vl runs natively; spread-parameters.vl's next wall is F101's mapped tuple. Pin: `native_differential`'s `a_spread_parameter_and_a_tuple_spread_are_identical_on_both_backends` (`native/spread_packs.vl`; plus tuple-spread.vl). Tracker F94.
 
 ---

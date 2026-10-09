@@ -9347,6 +9347,35 @@ fn a_spread_parameter_and_a_tuple_spread_are_identical_on_both_backends() {
     );
 }
 
+/// F101: a function over a MAPPED-TUPLE parameter was refused by name ("a
+/// value of type `a mapped tuple`"), and the tuple comprehension behind it
+/// too — side-effect-let.vl's first wall, and spread-parameters.vl's next
+/// after F94. A mapped tuple renders as the tuple its family expands to per
+/// instantiation, and a comprehension is unrolled, each slot's body emitted
+/// with the binder (and the binder's own generics) at that slot's type. The
+/// probe: a field read through the binder, an identity body, a template
+/// wrapping each element, per-slot side effects in order, a zipped
+/// comprehension, results read by slot; plus the two corpus programs.
+#[test]
+fn a_mapped_tuple_and_its_comprehension_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_mapped_tuples.vl";
+    std::fs::write(staged.join(file), include_str!("native/mapped_tuples.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a mapped tuple must expand per instantiation natively"
+    );
+    for program in ["side-effect-let.vl", "spread-parameters.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F101 was its wall"
+        );
+    }
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,
