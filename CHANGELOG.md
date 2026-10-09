@@ -51,6 +51,11 @@ written down.
 ---
 
 <!-- family: tooling -->
+**`analyzer.rs`'s comments spell a deprecated re-export and a derived export the way the parser accepts them — `[deprecated(..)] export import …`, `[derive(Wire)] export struct` — finishing N142.** Seven comments (B472's alias re-exports, B382's deprecated leaves and their check, B318 S6's transparent wrappers) still wrote the pre-B485 order the parser refuses; they are respelled from docs-47's ready patch. Comments only. Tracker N142.
+
+---
+
+<!-- family: tooling -->
 **E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an `f32`, one inside a list or an option — where it printed `0.0`; `print` keeps N136's `0`.** `dbg` is the tool that shows the real value, so it no longer follows `print`'s `String(x)` rule for this one value; `.debug()` on `f32`/`f64` answers `"-0.0"` too, so a derived `Debug` and `dbg` still agree. Identical bytes on both backends (`__dbg_float`, `vilan_rt::show::float`). The committed `native/dbg_printer.stderr` moves by its one `0.0 * -1.0` line, and `s4_debug_covers_every_container_the_printer_prints`'s `(0.0 * -1.0).debug()` reads `-0.0`. Pins: `inference::debugging::e276_dbg_shows_negative_zero_and_print_keeps_zero`, `native_differential::e276_dbg_shows_negative_zero_on_both_backends`, `vilan_rt::show`'s `floats_keep_their_point_and_strings_their_quotes`. Tracker E276.
 
 ---
