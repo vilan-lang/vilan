@@ -58026,6 +58026,9 @@ impl<'src> Analyzer<'src> {
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();
         let struct_fields = struct_.fields.clone();
         let struct_name_span = struct_.name_span;
+        if self.refuse_internal_field_write(constraint, struct_id, &struct_fields) {
+            return Resolution::Failed;
+        }
         if constraint.fields.len() != struct_fields.len() {
             let (msg, span) = self.struct_field_count_message(
                 constraint.struct_name,
@@ -58594,6 +58597,61 @@ impl<'src> Analyzer<'src> {
                 Resolution::Failed
             }
         }
+    }
+
+    /// B568 (R-b, v0.46.0): a struct literal outside std may not write a field
+    /// std marks `[internal]` — the construction half of A149 S4's read rule,
+    /// under the same shared rule (`labels::internal_field_out_of_reach`) and
+    /// with the label's reason. A literal names every field (there are no
+    /// defaults), so such a struct has no literal outside std at all: the
+    /// refusal stands at the first internal field the literal WRITES, or at the
+    /// struct's name in the literal when it writes none (the field-count
+    /// message would otherwise list the internal fields as missing, steering
+    /// the author to write them). One refusal per literal. Answers whether it
+    /// refused.
+    ///
+    /// No pattern reaches here: a pattern names no field (vilan's patterns are
+    /// bindings, variants, tuples, arrays and literals — there is no struct
+    /// pattern), so destructuring cannot read an internal field either.
+    fn refuse_internal_field_write(
+        &mut self,
+        constraint: &StructInitializerConstraint<'src>,
+        struct_id: Id,
+        struct_fields: &[Field<'src>],
+    ) -> bool {
+        let initializer_id = constraint.initializer_id;
+        let hidden: Vec<(usize, &'src str)> = (0..struct_fields.len())
+            .filter_map(|index| {
+                self.internal_field_hidden(struct_id, index, initializer_id)
+                    .map(|reason| (index, reason))
+            })
+            .collect();
+        let Some(&(first_index, first_reason)) = hidden.first() else {
+            return false;
+        };
+        let written = constraint
+            .fields
+            .iter()
+            .find_map(|(name, _, _, name_span)| {
+                hidden
+                    .iter()
+                    .find(|(index, _)| struct_fields[*index].name == *name)
+                    .map(|(index, reason)| (*index, *reason, *name_span))
+            });
+        let (index, reason, span) =
+            written.unwrap_or((first_index, first_reason, constraint.struct_name_span));
+        let field_name = struct_fields[index].name;
+        let struct_name = constraint.struct_name;
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: format!(
+                "`{field_name}` is an `[internal]` field of std's `{struct_name}`, and a \
+                 struct literal outside std cannot write an internal std field: {reason}"
+            ),
+        });
+        true
     }
 
     /// A149 S4 (R-e): the `[internal("reason")]` label of field `index` of the

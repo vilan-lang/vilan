@@ -1787,6 +1787,151 @@ fn a149_s4_an_assignment_through_field_syntax_steers_to_set() {
     assert_fails_without(&source, "Expected Store<str>");
 }
 
+// --- B568: a struct literal outside std writes no std-`[internal]` field ------
+//
+// RULED (R-b, v0.46.0): A149 S4 refused a READ of a field std marks
+// `[internal]` from code outside std; the CONSTRUCTION half is refused too,
+// under the same rule (`labels::internal_field_out_of_reach`) and with the
+// label's reason. A literal names every field, so such a struct has no
+// literal outside std at all.
+
+const B568_HEAD: &str = r#"
+import std::io::{ panic, print };
+import std::reactive::store::{ Storable, Store, StoreFlag };
+
+[derive(Storable)]
+struct App {
+    name: str,
+}
+"#;
+
+fn b568_program(body: &str) -> String {
+    format!("{B568_HEAD}\nfun main() {{\n{body}\n}}\n\nmain();\n")
+}
+
+#[test]
+fn b568_a_struct_literal_writing_an_internal_std_field_is_refused() {
+    // Red on the base, where every one of these compiled (the first ran until
+    // its `panic`). The refusal stands at the FIRST internal field the literal
+    // writes, in the literal's order, once per literal.
+    let reason = |field: &str, owner: &str, why: &str| {
+        format!(
+            "`{field}` is an `[internal]` field of std's `{owner}`, and a struct literal outside \
+             std cannot write an internal std field: {why}"
+        )
+    };
+    let cases = [
+        (
+            "    let _store: Store<App> = Store { root = panic(\"no\"), path = [], lend = |_read| {}, modify = |_write| {} };",
+            "root",
+            reason(
+                "root",
+                "Store",
+                "the store's slot tree; reach it through the handle",
+            ),
+        ),
+        (
+            "    let _store: Store<App> = Store { path = [], root = panic(\"no\"), lend = |_read| {}, modify = |_write| {} };",
+            "path",
+            reason(
+                "path",
+                "Store",
+                "the store's path; reach it through the handle",
+            ),
+        ),
+        (
+            "    let _flag = StoreFlag { root = panic(\"no\"), path = [], read = || true };",
+            "root",
+            reason(
+                "root",
+                "StoreFlag",
+                "the store's slot tree; reach it through the handle",
+            ),
+        ),
+        // The shorthand writes the field as surely as `root = root` does.
+        (
+            "    let root = panic(\"no\");\n    let _flag = StoreFlag { root, path = [], read = || true };",
+            "root",
+            reason(
+                "root",
+                "StoreFlag",
+                "the store's slot tree; reach it through the handle",
+            ),
+        ),
+    ];
+    for (body, spanning, message) in cases {
+        let source = b568_program(body);
+        assert_fails_once_with(&source, &message);
+        let failures = failure_diagnostics(&source);
+        let refusal = failures
+            .iter()
+            .find(|(text, _)| text.contains(&message))
+            .expect("the refusal");
+        let at = &source[refusal.1.clone()];
+        assert_eq!(
+            at, spanning,
+            "the refusal stands at the written field's name"
+        );
+    }
+}
+
+#[test]
+fn b568_a_literal_that_writes_no_internal_field_is_refused_at_the_struct_name() {
+    // Short of the internal fields, the field-count message would list them
+    // as missing — steering the author to write them. The refusal comes
+    // first, at the literal's name, naming the first internal field declared.
+    let source = b568_program("    let _flag = StoreFlag { };");
+    let message = "`root` is an `[internal]` field of std's `StoreFlag`, and a struct literal \
+                   outside std cannot write an internal std field";
+    assert_fails_once_with(&source, message);
+    assert_fails_without(&source, "missing");
+    let failures = failure_diagnostics(&source);
+    assert_eq!(failures.len(), 1, "one refusal; got: {failures:#?}");
+    assert_eq!(&source[failures[0].1.clone()], "StoreFlag");
+}
+
+#[test]
+fn b568_a_packages_own_internal_field_is_constructed_as_before() {
+    // The rule is std's `[internal]`: a field a package labels in its own code
+    // stays writable by a literal everywhere (A149 S4's read rule likewise).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Ledger {
+            [internal("the ledger's own cursor")] cursor: i32,
+            name: str,
+        }
+
+        fun main() {
+            let ledger = Ledger { cursor = 3, name = "a" };
+            print(ledger.cursor + 1);
+        }
+
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b568_no_pattern_names_a_field_so_none_reads_an_internal_one() {
+    // What a destructuring pattern naming an internal field does: there is no
+    // struct pattern in vilan (a pattern is a binding, a variant, a tuple, an
+    // array or a literal; grammar.md §3.10), so `let Store { root, .. } = s`
+    // and a `Store { root = let r }` match leg are refused by the PARSER, and
+    // no pattern can reach `root` — the read rule and the literal rule are the
+    // whole surface.
+    let binder = b568_program(
+        "    let store = Store::new(App { name = \"a\" });\n    let Store { root, .. } = store;",
+    );
+    assert_fails_with(&binder, "expected `;` to end this statement");
+    let leg = b568_program(
+        "    let store = Store::new(App { name = \"a\" });\n    match store {\n        Store { root = let r } => {},\n    }",
+    );
+    assert_fails_with(&leg, "expected '=>'");
+}
+
 #[test]
 fn a149_a_closure_payload_is_a_leaf_with_no_equality() {
     // `store_opaque` is gone: a closure-typed field or payload is diffed through
