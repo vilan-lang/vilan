@@ -41,8 +41,11 @@ impl Drop for Scratch {
 }
 
 /// `python3 scripts/perf_gate.py --budgets <budgets> --work <scratch> <arguments>`.
+/// Without bytecode: perf_gate.py imports its siblings, and a run would leave
+/// an untracked `scripts/__pycache__/` in the checkout.
 fn perf_gate(budgets: &Path, work: &Path, arguments: &[&str]) -> (bool, String) {
     let output = Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .arg(repository_root().join("scripts/perf_gate.py"))
         .arg("--budgets")
         .arg(budgets)
@@ -802,6 +805,67 @@ print("spanning:", "\n".join(latency.anchor_problems(root, [spanning])))
             "the completion anchor '\\t\\tself.uuid.hash()' is not in src/shared.vl after the scenario's edit"
         ),
         "an anchor the edit destroys is refused before anything runs: {text}"
+    );
+}
+
+/// N148: `measure --subject` measures any subject `subject_dir` builds, not
+/// only the budgets' — the filter used to drop every subject no row named, so
+/// `--subject plain:640` (M113's size) or a typo measured nothing and exited
+/// 0 — and it refuses an unparseable subject by name before running anything.
+#[test]
+fn measure_takes_any_buildable_subject_and_refuses_an_unparseable_one_by_name() {
+    let scratch = Scratch::new("measure-subjects");
+    let budgets = scratch.path("budgets.toml");
+    fs::write(&budgets, HEADER).expect("write the fixture budgets");
+    let vilan = fake_vilan(&scratch);
+    let (ok, report) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &[
+            "measure",
+            "--vilan",
+            vilan.to_str().expect("utf-8"),
+            "--subject",
+            "plain:many",
+            "--subject",
+            "exmaple:canvas",
+        ],
+    );
+    assert!(
+        !ok,
+        "an unparseable subject measured nothing and passed:\n{report}"
+    );
+    assert!(
+        report.contains("--subject 'plain:many': plain's argument is a module count"),
+        "{report}"
+    );
+    assert!(
+        report.contains("--subject 'exmaple:canvas': unknown subject kind 'exmaple'"),
+        "{report}"
+    );
+    // The selection itself, asked without a counter: a size no budget row
+    // names is measured, in the order the flags gave, once.
+    let probe = r#"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("perf_gate", sys.argv[1])
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
+data = gate.load_budgets(sys.argv[2])
+print("selected:", " ".join(gate.selected_subjects(data, ["plain:640", "example:canvas", "plain:640"])))
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-B", "-c"])
+        .arg(probe)
+        .arg(repository_root().join("scripts/perf_gate.py"))
+        .arg(&budgets)
+        .output()
+        .expect("run the selection probe");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("selected: plain:640 example:canvas\n"),
+        "{text}"
     );
 }
 

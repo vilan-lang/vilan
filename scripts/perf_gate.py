@@ -178,12 +178,41 @@ def all_subjects(data):
     return seen
 
 
+def subject_problem(subject):
+    """Why `subject` names no package `subject_dir` can build, in words (None: it does)."""
+    kind, colon, argument = subject.partition(":")
+    if not colon:
+        return "a subject is KIND:ARGUMENT (example:NAME, genapp:SEED, plain:MODULES)"
+    if kind == "example":
+        if argument and os.path.isdir(os.path.join(REPO, "vilan", "examples", argument)):
+            return None
+        return f"no example named {argument!r} under vilan/examples"
+    if kind == "genapp":
+        return None if argument == "" or argument.isdigit() else "genapp's argument is a seed (an integer)"
+    if kind == "plain":
+        if argument.isdigit() and int(argument) > 0:
+            return None
+        return "plain's argument is a module count (a positive integer)"
+    return f"unknown subject kind {kind!r} (example, genapp, plain)"
+
+
+def selected_subjects(data, only=None):
+    """The subjects a run measures: every budgeted one (`all_subjects`), or exactly the ones `--subject`
+    names, in the order named. N148: the filter used to keep only the budgets' subjects, so `measure
+    --subject plain:640` (a size no row names) or a typo measured NOTHING and exited 0. Any subject
+    `subject_dir` builds is measured now, and an unparseable one is refused by name before anything runs."""
+    if not only:
+        return all_subjects(data)
+    problems = [f"--subject {subject!r}: {why}" for subject in only if (why := subject_problem(subject))]
+    if problems:
+        sys.exit("perf_gate: " + "\n  ".join(problems))
+    return list(dict.fromkeys(only))
+
+
 def measure_all(vilan, data, work, counter, only=None):
     counter = resolve_counter(counter)
     results = {}
-    for subject in all_subjects(data):
-        if only and subject not in only:
-            continue
+    for subject in selected_subjects(data, only):
         results[subject] = measure_subject(vilan, subject, work, counter)
         r = results[subject]
         print(f"  {subject:24} {r['instructions']:>16,}  {counter}  exit {r['exit']}", flush=True)

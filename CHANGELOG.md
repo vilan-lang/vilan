@@ -51,6 +51,11 @@ written down.
 ---
 
 <!-- family: tooling -->
+**`perf_gate.py measure --subject` measures any subject it can build — `plain:640`, `genapp:7`, any `example:` — and refuses one it cannot parse by name, where an unknown subject was dropped silently and the run measured nothing and exited 0.** The filter kept only the subjects `perf/budgets.toml` names, so M113's 640-module row needed a hand-written driver and a typo passed. The subjects named are measured in the order given, once each; `plain:many`, `exmaple:canvas` or a missing example stop the run before anything is measured. Tracker N148.
+
+---
+
+<!-- family: tooling -->
 **`scripts/lsp-latency.py`'s `shared.vl keystroke` row runs: its completion anchor is `self.uuid.hash()` after the indent, which survives the row's own edit, and the preflight checks every hover and completion anchor against the text AFTER the scenario's edit.** N145 anchored the edit and the completion on the same `\t\tself.uuid.hash()`; the edit inserts a space inside the `\t\t`, and the keystroke-path requests are asked against the edited buffer, so every run stopped mid-scenario ("the completion anchor … is not in src/shared.vl") and the seal's verdict carried no `shared.vl` row. `anchor_problems` now applies each scenario's edit and refuses, before the server starts, an anchor the edit destroys. Tracker N150.
 
 ---
