@@ -414,6 +414,40 @@ inside a boundary as a `Set` at the writer's own path, a write at or above it as
 a fresh `Seed`, an unreachable boundary as `Gone`. A store nobody mirrors
 records nothing for the wire.
 
+The client holds a REPLICA of what it was seeded with and reads it through a
+read-only face — `RemoteStore<T>`, `RemoteStoreSome<P>` and `RemoteStoreFlag`,
+the three handle shapes of a local store, with the same projections (the derive
+writes both). A subscription on a face holds its nearest BOUNDARY: the grant's
+base, or a map key reached with `at(k)`. The first hold on a key puts that key's
+slot on the wire with the turn's one `Subscribe`; the last one takes it off, and
+the key leaves the replica. A frame lands in the replica as an ordinary
+comparing write, so a client observer wakes only when its own value changed.
+
+A service method returning a store hands the client a `RemoteStoreSome<T>`
+minted UNLEASED, as every handle stub is: nothing is asked until something
+holds it, the first hold issues the call, and the root reads `None` until its
+seed lands — it is a maybe at the client, whatever the server wrote.
+
+```vilan,fragment
+[service(BoardClient)]
+struct Board {}
+
+impl Board {
+	[rpc]
+	fun global(self): Store<Global> {
+		shared
+	}
+}
+
+// at the client
+let global: RemoteStoreSome<Global> = client.global();
+global.messages().at(7).some().content().effect(|content| print(content.unwrap_or("")));
+```
+
+The `[rpc]` spelling waits on the compiler reading `Store<T>` and `StoreSome<P>`
+as handle returns (tracker A153); std's half — the repliers, the stub, the
+replica — is in place.
+
 ## What it costs
 
 - **A derive line per type**, and a knob per coarse field.

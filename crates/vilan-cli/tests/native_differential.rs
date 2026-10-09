@@ -10940,6 +10940,24 @@ fn a153_s1_a_mirrored_store_sends_the_same_frames_on_both_backends() {
     );
 }
 
+/// A153 S2: the mirrored store's client half — mint on the first hold, the
+/// replica's seed and patches, a key's slot on and off the wire, a re-mint —
+/// behaves the same on both backends.
+#[test]
+fn a153_s2_a_store_mirror_behaves_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_client.vl"),
+        include_str!("native/store_mirror_client.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_client.vl"),
+        Verdict::Identical,
+        "a store mirror must behave the same on both backends"
+    );
+}
+
 /// B436 + B437: a trait object prints as its value, alone, and as the pair a
 /// list holds; two applications of one trait over one type dispatch through
 /// their own tables — identical on both backends (the JS leg printed the pair

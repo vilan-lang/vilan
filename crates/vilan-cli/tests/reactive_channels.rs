@@ -6038,3 +6038,288 @@ fn a153_s1_a_log_that_outran_its_ceiling_reseeds_the_slot() {
         "the lagging forward went differently:\n{stdout}"
     );
 }
+
+// --- A153 S2: the mirrored store's client half (`mirrored-store.md` §6) -------
+
+/// A store mirror minted UNLEASED and wired by hand (`mint_store` over a local
+/// transport: what the generated stub writes), the frames traced both ways.
+const MIRROR_CLIENT: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Source, run_with_owner };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::rpc::{ Dispatcher, DuplexTransport, ReactiveClient, RpcRequest, call_reading, duplex_pair, local_rpc, register_session };
+import std::time::{ Duration, sleep_for };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+enum Presence {
+	Offline,
+	Online(str),
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	presence: Presence,
+	motd: str,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	let global = Store::new(Global { messages, presence = Presence::Online("desk"), motd = "welcome" });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		client_relay.send(frame);
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new().on("global", |request: RpcRequest| {
+		print("  rpc  global");
+		reply_store(request, global)
+	});
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	print(i"unleased: {g.get().is_some()}");
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		g.presence().online().effect(|place| print(i"online {place.unwrap_or("-")}"));
+		g.presence().is_online().effect(|on| print(i"is online {on}"));
+		g.messages().at(7).some().content().effect(|content| print(i"seven {content.unwrap_or("-")}"));
+		g.messages().at(7).some().id().effect(|id| print(i"seven's id {id.unwrap_or(0)}"));
+	});
+	sleep_for(Duration::millis(0));
+	print("-- server writes");
+	global.motd().set("bye");
+	global.presence().set(Presence::Offline);
+	let _edited = global.messages().at(7).some().content().patch("goodbye");
+	print("-- the page goes: the grant is let go");
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	global.motd().set("unwatched");
+	print(i"held: {g.get().map(|value: Global| value.motd).unwrap_or("-")}");
+	print(i"the released key left the replica: {g.messages().at(7).get().flatten().is_none()}");
+	print("-- a new lease mints again");
+	let again = Owner::new();
+	run_with_owner(again, || {
+		g.motd().effect(|motd| print(i"again {motd.unwrap_or("-")}"));
+	});
+	sleep_for(Duration::millis(0));
+	again.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s2_a_store_mirror_mints_on_its_first_hold_and_patches_its_replica() {
+    // §6. Unleased, the mirror asked nothing (`unleased: false` holds no value);
+    // the first hold issues the call, and the reply's seed lands in the replica
+    // as a comparing write (the root is a maybe until then, Q10). A projection
+    // reads the replica; a hold under a map key puts that key's slot on the wire
+    // with the turn's ONE `Subscribe` — two handles under key 7 share one slot —
+    // and its seed and `Set`s land through the key's own handle. A variant's flag
+    // and its through-variant handle follow the server's switch. The page's
+    // disposal releases the key's slot (and the key leaves the replica: memory
+    // follows demand) and then the grant's base; the replica keeps its last value
+    // (`held: bye`), and a new hold mints again — on a fresh channel, since the
+    // server revoked the old one with its last grant — and the re-seed is a
+    // comparing write (`again bye`, then the write it missed).
+    let stdout = run_program("mirror_client", MIRROR_CLIENT);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "unleased: false",
+            "rpc  global",
+            "motd -",
+            "online -",
+            "is online false",
+            "seven -",
+            "seven's id 0",
+            "motd welcome",
+            "online desk",
+            "is online true",
+            "seven -",
+            "seven's id 0",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,7]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":7,\"content\":\"hello\"}]}]]}",
+            "seven hello",
+            "seven's id 7",
+            "-- server writes",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"bye\"]}]]}",
+            "motd bye",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[1],\"Offline\"]}]]}",
+            "online -",
+            "is online false",
+            "down {\"Patch\":[0,[{\"Set\":[0,[1,1],\"goodbye\"]}]]}",
+            "seven goodbye",
+            "-- the page goes: the grant is let go",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "held: bye",
+            "the released key left the replica: true",
+            "-- a new lease mints again",
+            "rpc  global",
+            "again bye",
+            "again unwatched",
+            "up   {\"Unsubscribe\":[1,[-1]]}",
+            "done",
+        ],
+        "the store mirror went differently:\n{stdout}"
+    );
+}
+
+/// A `[service]` whose `[rpc]`s return a `Store<T>` and a `StoreSome<P>`, reached
+/// through its GENERATED client — the stub, the origin table and the replier the
+/// expansion writes.
+const MIRROR_STUB: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Source, run_with_owner };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store, StoreSome };
+import std::rpc::{ DuplexEnd, DuplexTransport, ReactiveClient, duplex_pair, local_rpc, register_session };
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	motd: str,
+}
+
+fun seeded(): Global {
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	Global { messages, motd = "welcome" }
+}
+
+let shared: Store<Global> = Store::new(seeded());
+
+[service(BoardClient)]
+struct Board {}
+
+impl Board {
+	[rpc]
+	fun global(self): Store<Global> {
+		shared
+	}
+
+	[rpc]
+	fun message(self, id: u53): StoreSome<Message> {
+		shared.messages().at(id).some()
+	}
+
+	[rpc]
+	fun edit(self, id: u53, content: str): bool {
+		shared.messages().at(id).some().content().patch(content)
+	}
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun traced_pair(): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		client_relay.send(frame);
+	});
+	(client_end, server_end)
+}
+
+fun main() {
+	let (client_end, server_end) = traced_pair();
+	register_session(7, server_end, json_codec());
+	let transport = local_rpc(Board {}.dispatcher().into_protocol(json_codec()).for_connection(7));
+	let client = BoardClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	let g: RemoteStoreSome<Global> = client.global();
+	let m: RemoteStoreSome<Message> = client.message(7);
+	print(i"one origin, one mirror: {client.global().identity() == g.identity()}");
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		m.content().effect(|content| print(i"message {content.unwrap_or("-")}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"edit: {client.edit(7, "goodbye").unwrap_or(false)}");
+	shared.motd().set("bye");
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+#[ignore = "A153: an `[rpc]` returning `Store<T>` is refused as not Wire until the analyzer's element rule reads the store's handle spellings and a service reaching `std::reactive::store` seeds `std::rpc::mirror` (store-49's patch, sweeps/order49/store-49/a153-analyzer-admission.patch; the analyzer core was incr-49's this order)"]
+fn a153_s2_a_generated_store_stub_mints_on_its_first_hold_and_lets_go_with_its_last() {
+    // §3.1 + §6 through the expansion: `client.global()` and `client.message(7)`
+    // are SYNC stubs answering `RemoteStoreSome<..>` (Q10), deduped per origin
+    // (A134: two `global()` calls are one mirror). The first holds issue the
+    // calls; both grants land on ONE channel (one per root, Q4), bases -1 and
+    // -2; an `[rpc]` write inside the message's boundary is a `Set` on its base,
+    // a server write to the root's field a `Set` on the root's; the page's
+    // disposal lets both grants go. Verified green on store-49's tree with the
+    // patch applied, on both backends.
+    let stdout = run_program("mirror_stub", MIRROR_STUB);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "one origin, one mirror: true",
+            "motd -",
+            "message -",
+            "motd welcome",
+            "message hello",
+            "down {\"Patch\":[0,[{\"Set\":[-2,[1],\"goodbye\"]}]]}",
+            "message goodbye",
+            "edit: true",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[1],\"bye\"]}]]}",
+            "motd bye",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "up   {\"Unsubscribe\":[0,[-2]]}",
+            "done",
+        ],
+        "the generated store stub went differently:\n{stdout}"
+    );
+}

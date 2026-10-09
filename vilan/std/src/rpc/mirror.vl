@@ -43,8 +43,22 @@
 // collections EMPTY (`StoreWire`), so a write under a key the client does not watch
 // sends that client nothing.
 
+import pkg::hash::Hash;
 import pkg::option::Option::{ self, None, Some };
-import pkg::reactive::store::{ Store, StoreReach, StoreSome, StoreStep, StoreWire };
+import pkg::reactive::store::{
+	MirrorAt,
+	MirrorBoundary,
+	MirrorLink,
+	MirrorStep,
+	RemoteStoreSome,
+	Storable,
+	Store,
+	StoreReach,
+	StoreSome,
+	StoreStep,
+	StoreWire,
+	remote_store_some,
+};
 import pkg::reactive::store_core::{
 	StoreNode,
 	store_identity_at,
@@ -53,19 +67,34 @@ import pkg::reactive::store_core::{
 	store_wire_detach,
 	store_wire_since,
 };
-import pkg::reactive::{ DeltaCursor, Disposable, Subscription, at_settle, fresh_id, turn_scope };
+import pkg::reactive::{
+	DeltaCursor,
+	Disposable,
+	SignalCell,
+	Subscription,
+	at_settle,
+	fresh_id,
+	turn_scope,
+};
+import pkg::result::Result::{ self, Err, Ok };
 import pkg::rpc::{
 	ChannelControl,
+	DuplexEnd,
 	DuplexTransport,
+	MirrorRoute,
+	MirrorTable,
+	ReactiveClient,
 	ReactiveServer,
+	RpcError,
 	RpcOutcome,
 	RpcRequest,
 	encode_patch,
+	encode_request,
 	no_connection_for_handle,
 	session_of,
 };
 import pkg::shared::Shared;
-import pkg::wire::{ Deserialize, Deserializer, Serialize, Serializer };
+import pkg::wire::{ Codec, Deserialize, Deserializer, Frame, Serialize, Serializer };
 
 // === The server half (A153 S1) ===============================================
 
@@ -742,5 +771,639 @@ fun plan(
 			}
 		}
 		index += 1;
+	}
+}
+
+// === The client half (A153 S2) ===============================================
+//
+// One `MirrorView` per (client, channel): the slots the client named under its
+// grants, the boundary each one is — and how a frame for it lands in the replica —
+// and the turn's demand. A remote handle's subscription HOLDS its boundary
+// (`MirrorLink::hold`); a boundary's 0→1 owes the turn a `Subscribe` entry and its
+// flushed 1→0 an `Unsubscribe` (a 0→1 in the same turn cancels it: the slot never
+// closed), and the turn's entries go up as ONE frame of each (§5). The base of a
+// grant needs no `Subscribe`: the reply that minted it was its subscription.
+
+/// One slot the client named: the grant it stands under, the boundary it
+/// subscribes, and how many holds it has.
+struct ClientSlot {
+	slot: i32,
+	base: i32,
+	boundary: MirrorBoundary,
+	holds: Shared<i32>,
+}
+
+/// The client's end of one mirrored channel.
+struct MirrorView {
+	channel: i32,
+	/// The client route's channel cell — what names the route to take down when the
+	/// view's last slot goes.
+	route: Shared<i32>,
+	/// The client's routes table.
+	routes: Shared<List<MirrorRoute>>,
+	transport: DuplexEnd,
+	codec: Codec,
+	slots: Shared<List<ClientSlot>>,
+	/// Released slots whose frames may still be in flight: a frame's values are
+	/// read at their own types, so a slot the client let go of still needs its
+	/// reader until the server stops naming it. They land in nothing.
+	retired: Shared<List<ClientSlot>>,
+	next_slot: Shared<i32>,
+	subscribing: Shared<List<i32>>,
+	unsubscribing: Shared<List<i32>>,
+	pending: Shared<i32>,
+}
+
+/// Every client's open mirror views, by channel and by the client's routes table
+/// identity (two clients may hear one channel id from two servers).
+let mirror_views: Shared<List<(i32, MirrorView)>> = Shared::new([]);
+
+fun view_of(client: i32, channel: i32): Option<MirrorView> {
+	for entry in mirror_views.read() {
+		let (owner, view) = entry;
+		if owner == client && view.channel == channel {
+			ret Some(view);
+		}
+	}
+	None
+}
+
+/// The client's view of `channel`, made with its first grant and routed by the
+/// client's own receive loop.
+fun mirror_view(client: ReactiveClient, channel: i32): MirrorView {
+	let owner = client.routes.identity();
+	match view_of(owner, channel) {
+		Some(let held) => {
+			ret held;
+		},
+		None => {},
+	}
+	let route = Shared::new(channel);
+	let made = MirrorView {
+		channel,
+		route,
+		routes = client.routes,
+		transport = client.transport,
+		codec = client.codec,
+		slots = Shared::new([]),
+		retired = Shared::new([]),
+		next_slot = Shared::new(0),
+		subscribing = Shared::new([]),
+		unsubscribing = Shared::new([]),
+		pending = Shared::new(0 - 1),
+	};
+	mirror_views.write().push((owner, made));
+	turn_scope.clear(|| client.routes.write().push(MirrorRoute {
+		channel = route,
+		deliver = |frame: Frame| match view_of(owner, channel) {
+			Some(let held) => held.receive(frame),
+			None => {},
+		},
+		snapshot = || None,
+		key_snapshot = |_key: Hash| None,
+	}));
+	made
+}
+
+/// A reply into a `Store<T>` as it arrives — `[channel, base, seed]`, the seed a
+/// `T` — read FRESH (its keyed collections empty, as the server described them).
+export struct StoreReply<T> {
+	channel: i32,
+	base: i32,
+	seed: Option<T>,
+}
+
+/// Read a `Store<T>` reply's `[channel, base, seed]`.
+[internal("the mirrored store's client half (A153 S2)")]
+export fun read_store_reply<T: StoreWire>(
+	deserializer: Deserializer,
+	wrapped: bool,
+): StoreReply<T> {
+	mut reader = deserializer;
+	let _length = reader.begin_list();
+	let channel = reader.i32_value();
+	let base = reader.i32_value();
+	let seed: Option<T> = if wrapped {
+		Option<T>::store_fresh(&mut reader)
+	} else {
+		Some(T::store_fresh(&mut reader))
+	};
+	reader.end_list();
+	StoreReply { channel, base, seed }
+}
+
+/// The step a key or a field writes into a `Subscribe` path.
+fun describe_wire_path(path: List<MirrorStep>, serializer: &mut Serializer) {
+	serializer.begin_list(path.len().as_i32());
+	for step in path {
+		match step {
+			MirrorStep::Field(let index) => serializer.i32_value(index.as_i32()),
+			MirrorStep::Key(let describe) => describe(serializer),
+		}
+	}
+	serializer.end_list();
+}
+
+impl MirrorView {
+	/// The grant's base is a slot of its own, subscribed by the reply.
+	fun adopt_base(self, base: i32, boundary: MirrorBoundary) {
+		for held in self.slots.read() {
+			if held.slot == base {
+				held.holds.write() = held.holds.read() + 1;
+				ret;
+			}
+		}
+		self.slots.write().push(ClientSlot { slot = base, base, boundary, holds = Shared::new(1) });
+	}
+
+	/// Hold `boundary`, a boundary under the grant whose base is `base`, and answer
+	/// the release. The base is held by its grant and a hold on it costs nothing;
+	/// any other boundary is a client slot, named on its first hold and subscribed
+	/// with the turn.
+	fun hold(self, boundary: MirrorBoundary, base: i32): || void {
+		if boundary.path.is_empty() {
+			ret || {};
+		}
+		for held in self.slots.read() {
+			if held.boundary.identity == boundary.identity {
+				held.holds.write() = held.holds.read() + 1;
+				let slot = held.slot;
+				let view = self;
+				ret || view.release(slot);
+			}
+		}
+		let slot = self.next_slot.read();
+		self.next_slot.write() = slot + 1;
+		self.slots.write().push(ClientSlot { slot, base, boundary, holds = Shared::new(1) });
+		self.subscribing.write().push(slot);
+		self.schedule();
+		let view = self;
+		|| view.release(slot)
+	}
+
+	/// The grant's last hold went: its base is released with the turn's
+	/// `Unsubscribe`, after the client slots under it, and the server lets the
+	/// grant go (and the channel with its last grant).
+	fun release_base(self, base: i32) {
+		for held in self.slots.read() {
+			if held.slot == base {
+				held.holds.write() = 0;
+			}
+		}
+		self.unsubscribing.write().push(base);
+		self.schedule();
+	}
+
+	fun release(self, slot: i32) {
+		for held in self.slots.read() {
+			if held.slot == slot {
+				let left = held.holds.read() - 1;
+				held.holds.write() = left;
+				if left == 0 {
+					self.unsubscribing.write().push(slot);
+					self.schedule();
+				}
+			}
+		}
+	}
+
+	fun schedule(self) {
+		if self.pending.read() < 0 {
+			let id = fresh_id();
+			self.pending.write() = id;
+			let slots = self.slots;
+			at_settle(id, || match find_view(slots) {
+				Some(let held) => held.flush(),
+				None => {},
+			});
+		}
+	}
+
+	/// The turn settled: one `Subscribe` for the slots named this turn and still
+	/// held, one `Unsubscribe` for the slots that reached zero and stayed there.
+	fun flush(self) {
+		self.pending.write() = 0 - 1;
+		let opened = self.subscribing.read();
+		self.subscribing.write() = [];
+		let closed = self.unsubscribing.read();
+		self.unsubscribing.write() = [];
+		mut subscribe: List<ClientSlot> = [];
+		mut unsubscribe: List<i32> = [];
+		mut kept: List<ClientSlot> = [];
+		for held in self.slots.read() {
+			let alive = held.holds.read() > 0;
+			if opened.contains(held.slot) && alive {
+				subscribe.push(held);
+			}
+			if closed.contains(held.slot) && !alive {
+				// The key leaves the replica with its last hold: memory follows
+				// demand (§6.2) — but a base keeps its last value for the next mint
+				// to compare against.
+				if held.slot >= 0 {
+					(held.boundary.gone)();
+				}
+				// A slot whose `Subscribe` went out is told off, and its reader
+				// stays for the frames still in flight — until the view closes: no
+				// frame says the server has stopped naming it. One opened and
+				// closed within the turn never reached the wire.
+				if !opened.contains(held.slot) {
+					unsubscribe.push(held.slot);
+					self.retired.write().push(held);
+				}
+				jump continue;
+			}
+			kept.push(held);
+		}
+		self.slots.write() = kept;
+		let codec = self.codec;
+		let channel = self.channel;
+		if !subscribe.is_empty() {
+			let (record, finish) = (codec.writer)();
+			mut serializer = record;
+			serializer.begin_variant("Subscribe", 2);
+			serializer.i32_value(channel);
+			serializer.begin_list(subscribe.len().as_i32());
+			for held in subscribe {
+				serializer.begin_list(3);
+				serializer.i32_value(held.slot);
+				serializer.i32_value(held.base);
+				describe_wire_path(held.boundary.path, &mut serializer);
+				serializer.end_list();
+			}
+			serializer.end_list();
+			serializer.end_variant();
+			self.transport.send(finish());
+		}
+		if !unsubscribe.is_empty() {
+			self.send_unsubscribe(unsubscribe);
+		}
+		// The channel's last grant went: the server revoked the channel, and the
+		// view and its route go with it.
+		if self.slots.read().is_empty() {
+			self.close();
+		}
+	}
+
+	/// Take the view and its route off the client.
+	fun close(self) {
+		let route = self.route.identity();
+		mut routes: List<MirrorRoute> = [];
+		for held in self.routes.read() {
+			if held.channel.identity() != route {
+				routes.push(held);
+			}
+		}
+		self.routes.write() = routes;
+		let slots = self.slots.identity();
+		mut views: List<(i32, MirrorView)> = [];
+		for entry in mirror_views.read() {
+			let (_owner, view) = entry;
+			if view.slots.identity() != slots {
+				views.push(entry);
+			}
+		}
+		mirror_views.write() = views;
+	}
+
+	fun send_unsubscribe(self, unsubscribe: List<i32>) {
+		let (record, finish) = (self.codec.writer)();
+		mut serializer = record;
+		serializer.begin_variant("Unsubscribe", 2);
+		serializer.i32_value(self.channel);
+		serializer.begin_list(unsubscribe.len().as_i32());
+		for slot in unsubscribe {
+			serializer.i32_value(slot);
+		}
+		serializer.end_list();
+		serializer.end_variant();
+		self.transport.send(finish());
+	}
+
+	fun slot_named(self, slot: i32): Option<ClientSlot> {
+		for held in self.slots.read() {
+			if held.slot == slot {
+				ret Some(held);
+			}
+		}
+		for held in self.retired.read() {
+			if held.slot == slot {
+				ret Some(held);
+			}
+		}
+		None
+	}
+
+	/// One `Patch`: each op lands through its slot's boundary, in order, inside the
+	/// frame's turn (the client's receive loop batches it), so the replica's
+	/// subscribers see one consistent state. A slot the client never named stops
+	/// the frame: its value cannot be read at any type.
+	fun receive(self, frame: Frame) {
+		mut reader = (self.codec.reader)(frame);
+		let tag = reader.variant_tag();
+		if tag != "Patch" {
+			ret;
+		}
+		reader.begin_variant(tag, 2);
+		let _channel = reader.i32_value();
+		let count = reader.begin_list();
+		mut index = 0;
+		for index < count {
+			let op = reader.variant_tag();
+			match op {
+				"Seed" => {
+					reader.begin_variant(op, 2);
+					let slot = reader.i32_value();
+					match self.slot_named(slot) {
+						Some(let held) => (held.boundary.apply)([], reader),
+						None => {
+							ret;
+						},
+					}
+					reader.end_variant();
+				},
+				"Set" => {
+					reader.begin_variant(op, 3);
+					let slot = reader.i32_value();
+					let steps = reader.begin_list();
+					mut rel: List<StoreStep> = [];
+					mut step = 0;
+					for step < steps {
+						rel.push(StoreStep::Field(reader.i32_value().as_usize()));
+						step += 1;
+					}
+					reader.end_list();
+					match self.slot_named(slot) {
+						Some(let held) => (held.boundary.apply)(rel, reader),
+						None => {
+							ret;
+						},
+					}
+					reader.end_variant();
+				},
+				"Gone" => {
+					reader.begin_variant(op, 1);
+					let slot = reader.i32_value();
+					match self.slot_named(slot) {
+						Some(let held) => (held.boundary.gone)(),
+						None => {},
+					}
+					reader.end_variant();
+				},
+				_ => {
+					ret;
+				},
+			}
+			match reader.failed() {
+				Some(let _reason) => {
+					ret;
+				},
+				None => {},
+			}
+			index += 1;
+		}
+	}
+}
+
+/// The view whose slot table is `slots` — how a closure that holds only the table
+/// finds its view again.
+fun find_view(slots: Shared<List<ClientSlot>>): Option<MirrorView> {
+	let identity = slots.identity();
+	for entry in mirror_views.read() {
+		let (_owner, view) = entry;
+		if view.slots.identity() == identity {
+			ret Some(view);
+		}
+	}
+	None
+}
+
+// --- Minting: the stub's mirror (A92's shape, for a store) -------------------
+//
+// A generated stub is SYNC and makes no call: it hands back a mirror minted
+// UNLEASED — a replica holding `None` and a face over it — and the mirror's first
+// hold is what issues the call. The reply binds it: the replica takes the seed (a
+// comparing write, so only what changed wakes), and every hold taken while the call
+// was in flight goes onto the channel. Its last hold released, the mirror lets the
+// grant go (`Unsubscribe` of its base, which the server revokes with), and the next
+// hold mints afresh — the replica keeps its last value meanwhile.
+
+/// What a store mirror's last mint said when it did not bind (A92's vocabulary).
+[derive(Debug, PartialEq)]
+export enum StoreMintStatus {
+	/// No call yet, or one in flight.
+	Waiting,
+	/// Bound to the channel the last reply named.
+	Bound,
+	/// The call failed: this is what it said. The next hold asks again.
+	Failed(RpcError),
+}
+
+/// One hold taken through a mirror's link: its boundary, and — once the mirror is
+/// bound — the channel's release for it.
+struct MintHold {
+	id: i32,
+	boundary: MirrorBoundary,
+	release: Shared<Option<|| void>>,
+}
+
+/// A store mirror's mint: the call, the binding, the holds.
+struct StoreMint<T> {
+	client: ReactiveClient,
+	replica: Store<Option<T>>,
+	call: async || Result<StoreReply<T>, RpcError>,
+	bound: Shared<Option<(MirrorView, i32)>>,
+	asking: Shared<bool>,
+	holds: Shared<List<MintHold>>,
+	status: SignalCell<StoreMintStatus>,
+	settle_id: i32,
+	/// What to run when the mirror lets its grant go: the origin table drops its
+	/// entry, so the next stub call mints afresh (A134).
+	retire: Shared<List<|| void>>,
+}
+
+impl StoreMint<type T: StoreWire + Storable> {
+	/// Hold `boundary`; the first hold of an unbound mirror asks.
+	fun hold(self, boundary: MirrorBoundary): || void {
+		let id = fresh_id();
+		let release: Shared<Option<|| void>> = Shared::new(None);
+		self.holds.write().push(MintHold { id, boundary, release });
+		match self.bound.read() {
+			Some(let binding) => {
+				let (view, base) = binding;
+				release.write() = Some(view.hold(boundary, base));
+			},
+			None => self.ask(),
+		}
+		let mint = self;
+		|| mint.release(id)
+	}
+
+	fun release(self, id: i32) {
+		mut kept: List<MintHold> = [];
+		for held in self.holds.read() {
+			if held.id == id {
+				match held.release.read() {
+					Some(let release) => release(),
+					None => {},
+				}
+			} else {
+				kept.push(held);
+			}
+		}
+		self.holds.write() = kept;
+		if kept.is_empty() {
+			// At the settle, so a release and a re-hold in one turn keep the grant.
+			let mint = self;
+			at_settle(self.settle_id, || mint.let_go());
+		}
+	}
+
+	/// The last hold went and none came back this turn: the grant goes.
+	fun let_go(self) {
+		if !self.holds.read().is_empty() {
+			ret;
+		}
+		match self.bound.read() {
+			Some(let binding) => {
+				let (view, base) = binding;
+				self.bound.write() = None;
+				view.release_base(base);
+				self.status.set(StoreMintStatus::Waiting);
+				for retire in self.retire.read() {
+					retire();
+				}
+				self.retire.write() = [];
+			},
+			None => {},
+		}
+	}
+
+	fun ask(self) {
+		if self.asking.read() {
+			ret;
+		}
+		self.asking.write() = true;
+		let mint = self;
+		let _asking = async {
+			let answered = (mint.call)();
+			mint.asking.write() = false;
+			match answered {
+				Err(let failure) => mint.status.set(StoreMintStatus::Failed(failure)),
+				Ok(let reply) => mint.bind(reply),
+			}
+		};
+	}
+
+	/// The reply landed: adopt the base, seed the replica, and put every hold taken
+	/// meanwhile onto the channel — unless every hold went while the call was in
+	/// flight, when the grant is let go at once.
+	fun bind(self, reply: StoreReply<T>) {
+		let view = mirror_view(self.client, reply.channel);
+		view.adopt_base(reply.base, base_boundary(self.replica));
+		self.replica.set(reply.seed);
+		self.bound.write() = Some((view, reply.base));
+		self.status.set(StoreMintStatus::Bound);
+		for held in self.holds.read() {
+			held.release.write() = Some(view.hold(held.boundary, reply.base));
+		}
+		if self.holds.read().is_empty() {
+			self.let_go();
+		}
+	}
+}
+
+/// The base's boundary over a replica `Store<Option<T>>`: a frame for it lands at a
+/// path below the GRANT's value, which the replica holds under its `Some`.
+fun base_boundary<T: StoreWire + Storable>(replica: Store<Option<T>>): MirrorBoundary {
+	MirrorBoundary {
+		path = [],
+		identity = store_identity_at(replica.root, []),
+		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
+			mut reader = deserializer;
+			match replica.get() {
+				Some(let held) => {
+					mut copy = held;
+					let _landed = copy.store_apply_at(&rel, 0, &mut reader);
+					replica.set(Some(copy));
+				},
+				None => {
+					if rel.is_empty() {
+						replica.set(Some(T::store_fresh(&mut reader)));
+					}
+				},
+			}
+		},
+		gone = || replica.set(None),
+	}
+}
+
+/// A store mirror minted unleased (A92's shape): the replica, the face, and the
+/// call its first hold issues. What a generated stub hands back, deduped per origin
+/// by `origin_store`.
+[internal("the `[service]` expansion's store stub (A153 S2)")]
+export fun mint_store<T: StoreWire + Storable>(
+	client: ReactiveClient,
+	call: async || Result<StoreReply<T>, RpcError>,
+): RemoteStoreSome<T> {
+	minted_store(client, call, Shared::new([]))
+}
+
+fun minted_store<T: StoreWire + Storable>(
+	client: ReactiveClient,
+	call: async || Result<StoreReply<T>, RpcError>,
+	retire: Shared<List<|| void>>,
+): RemoteStoreSome<T> {
+	let replica: Store<Option<T>> = Store::new(None);
+	let mint = StoreMint {
+		client,
+		replica,
+		call,
+		bound = Shared::new(None),
+		asking = Shared::new(false),
+		holds = Shared::new([]),
+		status = SignalCell::new(StoreMintStatus::Waiting),
+		settle_id = fresh_id(),
+		retire,
+	};
+	let link = turn_scope.clear(|| MirrorLink {
+		hold = |boundary: MirrorBoundary| mint.hold(boundary),
+	});
+	remote_store_some(replica.some(), MirrorAt {
+		link,
+		path = [],
+		boundary = base_boundary(replica),
+	})
+}
+
+/// `mint_store`, deduped per ORIGIN (A134's rule): two stub calls with the same
+/// method and arguments on one client answer one mirror, so a stub inside a cold
+/// select is idempotent. `call` issues the method; the table is the stub's, typed
+/// at its element, beside the generated client.
+[internal("the `[service]` expansion's store stub (A153 S2)")]
+export fun origin_store<T: StoreWire + Storable>(
+	client: ReactiveClient,
+	table: MirrorTable<RemoteStoreSome<T>>,
+	method: str,
+	describers: List<|Serializer| void>,
+	call: async |str, List<|Serializer| void>| Result<StoreReply<T>, RpcError>,
+): RemoteStoreSome<T> {
+	let key = client.origin_prefix() + match encode_request(client.codec, method, describers) {
+		Frame::Text(let text) => text,
+		Frame::Binary(let bytes) => bytes.to_hex(),
+	};
+	match table.entries.read().get(key) {
+		Some(let held) => {
+			let (_stamp, mirror) = held;
+			mirror
+		},
+		None => {
+			let retire: Shared<List<|| void>> = Shared::new([]);
+			let mirror: RemoteStoreSome<T> = minted_store(client, || call(method, describers), retire);
+			let stamp = retire.identity();
+			table.entries.write().insert(key, (stamp, mirror));
+			retire.write().push(|| table.forget(key, stamp));
+			client.enrol(table.entries.identity(), || table.forget_prefix(client.origin_prefix()));
+			mirror
+		},
 	}
 }

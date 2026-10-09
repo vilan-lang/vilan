@@ -1689,6 +1689,43 @@ export fun call<T: Wire, Tx: Transport>(
 	}
 }
 
+/// `call`, with the reply's value read by `read` instead of a `Wire` rebuild — for
+/// a reply whose reading needs more than the type (a mirrored store's
+/// `[channel, base, seed]`, whose seed is read FRESH through its walker, A153 S2).
+export fun call_reading<T, Tx: Transport>(
+	transport: Tx,
+	codec: Codec,
+	method: str,
+	args: List<|Serializer| void>,
+	read: |Deserializer| T,
+): Result<T, RpcError> {
+	let outcome = await transport.call(encode_request(codec, method, args));
+	match outcome {
+		Err(let reason) => Err(RpcError::Transport(reason)),
+		Ok(let reply_frame) => {
+			mut deserializer = (codec.reader)(reply_frame);
+			let tag = (deserializer.variant_tag)();
+			match tag {
+				"Success" => {
+					(deserializer.begin_variant)("Success", 1);
+					let value = read(deserializer);
+					match (deserializer.failed)() {
+						None => Ok(value),
+						Some(let reason) => Err(RpcError::Decode(reason)),
+					}
+				},
+				"Failure" => {
+					(deserializer.begin_variant)("Failure", 1);
+					let error: RpcError = RpcError::rebuild(&mut deserializer);
+					(deserializer.end_variant)();
+					Err(error)
+				},
+				_ => Err(RpcError::Decode("unrecognized reply envelope")),
+			}
+		},
+	}
+}
+
 /// Pull the NEXT argument at the parameter's type (`index` documents the position
 /// at the call site — reads are positional and once-each; see `RpcRequest`). A
 /// missing/garbled argument poisons the request's deserializer; check
@@ -6453,6 +6490,22 @@ export macro fun handle_element(type_: TypeExpr): str {
 	}
 }
 
+/// The mirrored-store kind of a return type (A153): `"store"` for `Store<T>`,
+/// `"store_some"` for `StoreSome<P>`, `""` for every other return. The analyzer's
+/// element rule reads the same two spellings (`is_store_handle_spelling`).
+export macro fun store_handle_kind(type_: TypeExpr): str {
+	if type_.arguments.len() != 1 {
+		ret "";
+	}
+	if type_.name == "Store" {
+		ret "store";
+	}
+	if type_.name == "StoreSome" {
+		ret "store_some";
+	}
+	""
+}
+
 /// Whether a handle return is WRITTEN as the read-only seal — `MemoCell<T>` or
 /// `Option<MemoCell<T>>` (A145) — which is what picks the route's `_memo` replier.
 export macro fun handle_is_memo(type_: TypeExpr): bool {
@@ -6648,7 +6701,16 @@ export macro fun service(item: Item): Source {
 		mut key = "";
 		mut element = handle_element(method.return_type);
 		let written_key = handle_key(method.return_type);
-		if written_key != "" {
+		let store_kind = store_handle_kind(method.return_type);
+		if store_kind != "" {
+			// A153: a mirrored store's handle; its element is the value at the
+			// handle's path, the replica's at the client.
+			kind = store_kind;
+			element = match method.return_type.arguments.get(0) {
+				Some(let found) => found.render(),
+				None => "",
+			};
+		} else if written_key != "" {
 			kind = "keyed";
 			key = written_key;
 		} else if element != "" {
@@ -6693,6 +6755,10 @@ export macro fun service(item: Item): Source {
 		// `MessageBody`.
 		if kind == "" {
 			handle_returns.push(method.return_type.render());
+		} else if kind == "store" || kind == "store_some" {
+			// A153 (Q10): the client's root is always a maybe until its seed, so
+			// both server spellings mint a `RemoteStoreSome<T>`.
+			handle_returns.push(i"RemoteStoreSome<{element}>");
 		} else if kind == "keyed" {
 			// The keyed mapping (A79): `KeyedCell<K, T>` on the server is
 			// `KeyedSource<K, T>` at the client — the same element-grained mirror a
@@ -6716,8 +6782,15 @@ export macro fun service(item: Item): Source {
 		// the other and read a `null` as a channel. The `?` says "the reply may be
 		// absent": it moves the `Option` form's hash off what it was, keeps the two
 		// forms apart, and leaves the plain form's bytes exactly where they were.
-		if kind == "option" {
-			surface_returns.push(i"RemoteSource<{element}>?");
+		if kind == "option" || kind == "store_some" {
+			// The two store spellings decode their seed differently (a `T`, an
+			// `Option<P>`), so the `?` keeps them apart as it keeps the `Option`
+			// handle form apart.
+			let mapped_return = match handle_returns.get(handle_returns.len() - 1) {
+				Some(let rendered) => rendered,
+				None => method.return_type.render(),
+			};
+			surface_returns.push(mapped_return + "?");
 		} else {
 			surface_returns.push(match handle_returns.get(handle_returns.len() - 1) {
 				Some(let rendered) => rendered,
@@ -6899,6 +6972,10 @@ export macro fun service(item: Item): Source {
 			"rpc::reply_source_option(__request, "
 		} else if kind == "keyed" {
 			"rpc::reply_source_keyed(__request, "
+		} else if kind == "store" {
+			"mirror::reply_store(__request, "
+		} else if kind == "store_some" {
+			"mirror::reply_store_some(__request, "
 		} else {
 			"rpc::reply("
 		};
@@ -7156,6 +7233,22 @@ export macro fun service(item: Item): Source {
 			stub = stub
 				.returns(i"Result<{mapped}, RpcError>")
 				.expr(i"rpc::call(self.transport, self.codec, {label}, [{describer_list}])");
+		} else if kind == "store" || kind == "store_some" {
+			// A153 S2: SYNC like every handle stub, and it makes no call — the
+			// mirror is minted unleased and its first hold issues the method;
+			// deduped per origin in this method's table (A134).
+			let table_name = i"__stores_{target.client_name}_{method.name}";
+			origin_tables.push(i"let {table_name}: MirrorTable<RemoteStoreSome<{element}>> = MirrorTable::new();");
+			let wrapped = if kind == "store_some" { "true" } else { "false" };
+			let issue = "|handle_method: str, handle_args: List<|Serializer| void>| rpc::call_reading(self.transport, self.codec, handle_method, handle_args, |handle_reply: Deserializer| mirror::read_store_reply<"
+				+ element
+				+ ">(handle_reply, "
+				+ wrapped
+				+ "))";
+			stub = stub
+				.returns(mapped)
+				.line(i"let handle_store: RemoteStoreSome<{element}> = mirror::origin_store(self.reactive, {table_name}, {label}, [{describer_list}], {issue});")
+				.expr("handle_store");
 		} else {
 			// The HANDLE stub (§9.2, as A92 reshaped it): SYNC, and it makes
 			// no call. It hands back a mirror minted UNLEASED — carrying the
@@ -7484,5 +7577,20 @@ export macro fun service(item: Item): Source {
 		+ "import std::result::Result;\n"
 		+ "import std::option::Option;\n"
 		+ "import std::reactive::FlushPolicy;\n";
-	source(imports + service_impl + service_trait_impl + client_source + proxy_source)
+	// A mirrored store's replier and stub live in `std::rpc::mirror`, which only a
+	// service that returns a store loads (A153).
+	mut store_imports = "";
+	for kind in handle_kinds {
+		if (kind == "store" || kind == "store_some") && store_imports == "" {
+			store_imports = "import std::rpc::mirror;\n"
+				+ "import std::reactive::store::RemoteStoreSome;\n"
+				+ "import std::wire::Deserializer;\n";
+		}
+	}
+	source(imports
+		+ store_imports
+		+ service_impl
+		+ service_trait_impl
+		+ client_source
+		+ proxy_source)
 }

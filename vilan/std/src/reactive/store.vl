@@ -93,6 +93,7 @@ import pkg::reactive::delta::{
 };
 import pkg::reactive::store_core::{
 	Spine,
+	StoreFlag,
 	attach_feed,
 	deliver,
 	detach_feed,
@@ -100,12 +101,13 @@ import pkg::reactive::store_core::{
 	keyed_hashes,
 	lent_value,
 	spine,
+	store_identity_at,
 	store_keyed,
 	store_touch,
 	touch_spine,
 	watch_at,
 };
-import pkg::reactive::{ Signal, Source, Subscriber };
+import pkg::reactive::{ Signal, Source, Subscriber, Subscription, also_releasing };
 import pkg::shared::{ Shared, fresh_identity };
 import pkg::wire::{ Deserialize, Deserializer, Keyed, Serialize, Serializer, Wire };
 
@@ -1451,6 +1453,336 @@ export impl List<type T: StoreWire> with StoreWire {
 	}
 }
 
+// === The client's face: remote handles (A153 S2, `mirrored-store.md` §6) ==========
+//
+// A mirrored store's client holds a REPLICA — a local `Store` whose value is the
+// union of the subtrees it was seeded with — and hands out a READ-ONLY face over it
+// (Q8): `RemoteStore<T>`, `RemoteStoreSome<P>` and `RemoteStoreFlag`, the three
+// handle shapes of the local store, each carrying where it hangs on the wire
+// (`MirrorAt`). Reading is the replica's; SUBSCRIBING is the replica's too, plus a
+// counted hold on the handle's nearest demand BOUNDARY (§2.2, §6.2) — the grant's
+// base or a keyed child (`at(k)`, `contains(x)`) — which is what puts the
+// boundary's slot on the wire. A frame for that slot lands in the replica through
+// the boundary's typed applier as an ordinary comparing write, so what wakes is the
+// store's own diff: exactly the local slots whose value changed.
+//
+// The face is std's alone to build: its fields are internal, the derive writes its
+// projections through `narrow`, and `std::rpc::mirror` mints the base.
+
+/// One step of a remote handle's WIRE path from its grant's base: a field's child
+/// index, or a key — described at its own type when a `Subscribe` is written, and
+/// hashed for the replica's own path (A153 S2).
+export enum MirrorStep {
+	Field(usize),
+	Key(|&mut Serializer| void),
+}
+
+/// A demand boundary a remote handle stands under (§2.2): its wire path from the
+/// grant's base, the identity of its place in the replica (two handles on one
+/// boundary share one slot), and how a frame for its slot lands — `apply` at a path
+/// below it, `gone` when the server says it is no longer reachable.
+export struct MirrorBoundary {
+	path: List<MirrorStep>,
+	identity: i32,
+	apply: |List<StoreStep>, Deserializer| void,
+	gone: || void,
+}
+
+/// The connection a remote handle subscribes through, erased to what a handle
+/// needs from it: hold a boundary, answer the release. Made by `std::rpc::mirror`,
+/// which owns the channel, its slots and its frames.
+export struct MirrorLink {
+	hold: |MirrorBoundary| (|| void),
+}
+
+/// Where a remote handle hangs: the link, its wire path from the grant's base, and
+/// its nearest boundary.
+export struct MirrorAt {
+	link: MirrorLink,
+	path: List<MirrorStep>,
+	boundary: MirrorBoundary,
+}
+
+impl MirrorAt {
+	/// One step further from the boundary: the same boundary, a longer path.
+	fun below(self, step: MirrorStep): MirrorAt {
+		mut path = self.path;
+		path.push(step);
+		MirrorAt { link = self.link, path, boundary = self.boundary }
+	}
+
+	/// Hold this handle's boundary for as long as `handle` is not disposed.
+	fun hold_for(self, handle: Subscription) {
+		let release = (self.link.hold)(self.boundary);
+		also_releasing(handle, release);
+	}
+}
+
+/// The typed applier of a boundary whose replica handle is `local`: a frame's value
+/// lands at `rel` below it on a copy, and the copy is written back — a comparing
+/// write, so only what changed wakes.
+[internal("the mirrored store's client half (A153 S2)")]
+export fun mirror_boundary<T: StoreWire + Storable>(
+	local: Store<T>,
+	path: List<MirrorStep>,
+	gone: || void,
+): MirrorBoundary {
+	MirrorBoundary {
+		path,
+		identity = store_identity_at(local.root, local.path),
+		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
+			mut reader = deserializer;
+			mut copy = local.get();
+			let _landed = copy.store_apply_at(&rel, 0, &mut reader);
+			local.set(copy);
+		},
+		gone,
+	}
+}
+
+/// A remote handle at a path (A153 S2): a read-only `Source<T>` over the replica,
+/// whose subscription also holds its boundary on the wire.
+[hint(Source<T>)]
+export struct RemoteStore<T> {
+	[internal("the replica's handle; reach it through `get`")] local: Store<T>,
+	[internal("where the handle hangs on the wire")] at: MirrorAt,
+}
+
+/// A remote handle THROUGH a variant or an `Option`: `StoreSome`'s face.
+[hint(Source<Option<P>>)]
+export struct RemoteStoreSome<P> {
+	[internal("the replica's handle; reach it through `get`")] local: StoreSome<P>,
+	[internal("where the handle hangs on the wire")] at: MirrorAt,
+}
+
+/// A variant's flag on a remote handle: `StoreFlag`'s face.
+[hint(Source<bool>)]
+export struct RemoteStoreFlag {
+	[internal("the replica's handle; reach it through `get`")] local: StoreFlag,
+	[internal("where the handle hangs on the wire")] at: MirrorAt,
+}
+
+/// A remote handle made from its replica handle and its place (`std::rpc::mirror`).
+[internal("the mirrored store's client half (A153 S2)")]
+export fun remote_store<T>(local: Store<T>, at: MirrorAt): RemoteStore<T> {
+	RemoteStore { local, at }
+}
+
+[internal("the mirrored store's client half (A153 S2)")]
+export fun remote_store_some<P>(local: StoreSome<P>, at: MirrorAt): RemoteStoreSome<P> {
+	RemoteStoreSome { local, at }
+}
+
+export impl RemoteStore<type T> {
+	/// One step below this handle — what every projection the derive writes for a
+	/// remote handle calls: the replica's own projection (`step`), the wire path
+	/// one field longer.
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow<F>(self, index: usize, step: |Store<T>| Store<F>): RemoteStore<F> {
+		RemoteStore { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
+	}
+
+	/// A step through a variant (or `Some`).
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow_some<F>(self, index: usize, step: |Store<T>| StoreSome<F>): RemoteStoreSome<F> {
+		RemoteStoreSome { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
+	}
+
+	/// A variant's flag.
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow_flag(self, step: |Store<T>| StoreFlag): RemoteStoreFlag {
+		RemoteStoreFlag { local = step(self.local), at = self.at }
+	}
+}
+
+export impl RemoteStoreSome<type P> {
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow<F>(self, index: usize, step: |StoreSome<P>| StoreSome<F>): RemoteStoreSome<F> {
+		RemoteStoreSome { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
+	}
+
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow_some<F>(self, index: usize, step: |StoreSome<P>| StoreSome<F>): RemoteStoreSome<F> {
+		RemoteStoreSome { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
+	}
+
+	[internal("the derive's remote projection step (A153 S2)")]
+	fun narrow_flag(self, step: |StoreSome<P>| StoreFlag): RemoteStoreFlag {
+		RemoteStoreFlag { local = step(self.local), at = self.at }
+	}
+
+	/// Whether every variant on this handle's path is live — `StoreSome::live`'s
+	/// face, holding the boundary while it is watched, so the payload's arrival is
+	/// what wakes it.
+	fun live(self): RemoteStoreFlag {
+		RemoteStoreFlag { local = self.local.live(), at = self.at }
+	}
+
+	/// This handle as a plain `RemoteStore<P>`, for a body that runs only while the
+	/// variant is live (`StoreSome::assume`'s face, and its last-value rule, B526).
+	fun assume(self): RemoteStore<P> {
+		RemoteStore { local = self.local.assume(), at = self.at }
+	}
+}
+
+/// `Option` is structural on the face as in the replica.
+export impl RemoteStore<Option<type P>> {
+	fun some(self): RemoteStoreSome<P> {
+		self.narrow_some(1, |local: Store<Option<P>>| local.some())
+	}
+
+	fun is_some(self): RemoteStoreFlag {
+		self.narrow_flag(|local: Store<Option<P>>| local.is_some())
+	}
+}
+
+export impl RemoteStoreSome<Option<type P>> {
+	fun some(self): RemoteStoreSome<P> {
+		self.narrow_some(1, |local: StoreSome<Option<P>>| local.some())
+	}
+
+	fun is_some(self): RemoteStoreFlag {
+		self.narrow_flag(|local: StoreSome<Option<P>>| local.is_some())
+	}
+}
+
+/// A map's key is a BOUNDARY (§2.2): `at(key)` on a remote map is a handle whose
+/// subscription puts that key's own slot on the wire, seeded with the key's value
+/// and patched under it; the replica holds the key while the slot does.
+export impl RemoteStore<HashMap<type K: Hashable + Wire, type V: StoreWire + Storable>> {
+	fun at(self, key: K): RemoteStore<Option<V>> {
+		let local = self.local.at(key);
+		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| key.describe(serializer)));
+		RemoteStore {
+			local,
+			at = MirrorAt {
+				link = at.link,
+				path = at.path,
+				boundary = mirror_boundary(local, at.path, || local.set(None)),
+			},
+		}
+	}
+}
+
+export impl RemoteStoreSome<HashMap<type K: Hashable + Wire, type V: StoreWire + Storable>> {
+	fun at(self, key: K): RemoteStoreSome<Option<V>> {
+		let local = self.local.at(key);
+		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| key.describe(serializer)));
+		// Through a variant the key's handle is a `StoreSome`: its applier writes
+		// only while the variant is live, through `patch`.
+		RemoteStoreSome {
+			local,
+			at = MirrorAt {
+				link = at.link,
+				path = at.path,
+				boundary = mirror_boundary_some(local, at.path),
+			},
+		}
+	}
+}
+
+/// `mirror_boundary` for a boundary reached through a variant: the frame lands
+/// through `patch`, and lands nowhere while the variant is not live.
+[internal("the mirrored store's client half (A153 S2)")]
+export fun mirror_boundary_some<P: StoreWire + Storable>(
+	local: StoreSome<Option<P>>,
+	path: List<MirrorStep>,
+): MirrorBoundary {
+	MirrorBoundary {
+		path,
+		identity = store_identity_at(local.root, local.path),
+		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
+			mut reader = deserializer;
+			match local.get() {
+				Some(let held) => {
+					mut copy = held;
+					let _landed = copy.store_apply_at(&rel, 0, &mut reader);
+					let _patched = local.patch(copy);
+				},
+				None => {},
+			}
+		},
+		gone = || {
+			let _patched = local.patch(None);
+		},
+	}
+}
+
+export impl RemoteStore<type T> with Source<T> {
+	fun get(self): T {
+		self.local.get()
+	}
+
+	fun identity(self): Option<i32> {
+		self.local.identity()
+	}
+
+	/// Attach to the replica's slot, then hold the boundary: the hold is what puts
+	/// the boundary's slot on the wire, and its seed is a change from what the
+	/// replica held when the subscriber attached.
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		let handle = self.local.on_settle(subscriber);
+		self.at.hold_for(handle);
+		handle
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |T| void, immediately: bool): Subscription {
+		let handle = self.local.attach_observer(observer, immediately);
+		self.at.hold_for(handle);
+		handle
+	}
+}
+
+export impl RemoteStoreSome<type P> with Source<Option<P>> {
+	fun get(self): Option<P> {
+		self.local.get()
+	}
+
+	fun identity(self): Option<i32> {
+		self.local.identity()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		let handle = self.local.on_settle(subscriber);
+		self.at.hold_for(handle);
+		handle
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |Option<P>| void, immediately: bool): Subscription {
+		let handle = self.local.attach_observer(observer, immediately);
+		self.at.hold_for(handle);
+		handle
+	}
+}
+
+export impl RemoteStoreFlag with Source<bool> {
+	fun get(self): bool {
+		self.local.get()
+	}
+
+	fun identity(self): Option<i32> {
+		self.local.identity()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		let handle = self.local.on_settle(subscriber);
+		self.at.hold_for(handle);
+		handle
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |bool| void, immediately: bool): Subscription {
+		let handle = self.local.attach_observer(observer, immediately);
+		self.at.hold_for(handle);
+		handle
+	}
+}
+
 // === `[derive(Storable)]` (§3.1, Q3, Q4, Q9, Q10) =============================
 //
 // Everything per type is emitted here — the macro door. A derive sees one item at a
@@ -1605,6 +1937,20 @@ macro fun store_projection(
 	i"fun {method}(self): {handle}<{written}> \{\n\tself.project({index}, {read}, {write})\n" + "}"
 }
 
+/// One projection on a REMOTE handle (A153 S2): the replica's projection, through
+/// `narrow`, and the wire path one child longer.
+macro fun store_remote_projection(
+	handle: str,
+	local: str,
+	subject: str,
+	method: str,
+	index: usize,
+	written: str,
+): str {
+	let returned = if handle == "RemoteStore" { "RemoteStore" } else { "RemoteStoreSome" };
+	i"fun {method}(self): {returned}<{written}> \{\n\tself.narrow({index}, |local: {local}<{subject}>| local.{method}())\n" + "}"
+}
+
 export macro fun store_struct_impls(target: StructItem): str {
 	import macro_std::build::{ impl_of, fun_of };
 	import macro_std::panic;
@@ -1622,6 +1968,8 @@ export macro fun store_struct_impls(target: StructItem): str {
 		.line("mut changed = false;");
 	mut store_impl = impl_of(i"Store<{target.name}{store_bare_binders(target.generics)}>");
 	mut some_impl = impl_of(i"StoreSome<{target.name}{store_bare_binders(target.generics)}>");
+	mut remote_impl = impl_of(i"RemoteStore<{target.name}{store_bare_binders(target.generics)}>");
+	mut remote_some_impl = impl_of(i"RemoteStoreSome<{target.name}{store_bare_binders(target.generics)}>");
 	mut index: usize = 0;
 	for field in target.fields {
 		let method = if field.reactive_name != "" { field.reactive_name } else { field.name };
@@ -1640,6 +1988,8 @@ export macro fun store_struct_impls(target: StructItem): str {
 		diff = diff.line(i"changed = self.{field.name}.{step}(&other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
 		store_impl = store_impl.member(store_projection("Store", subject, method, field.name, index, field.type_));
 		some_impl = some_impl.member(store_projection("StoreSome", subject, method, field.name, index, field.type_));
+		remote_impl = remote_impl.member(store_remote_projection("RemoteStore", "Store", subject, method, index, field.type_.render()));
+		remote_some_impl = remote_some_impl.member(store_remote_projection("RemoteStoreSome", "StoreSome", subject, method, index, field.type_.render()));
 		index = index + 1;
 	}
 	diff = diff.line("store_wake_me(node, changed, woken);").expr("changed");
@@ -1649,7 +1999,11 @@ export macro fun store_struct_impls(target: StructItem): str {
 		.method(diff)
 		.render();
 	if target.fields.len() > 0 {
-		out = out + store_impl.render() + some_impl.render();
+		out = out
+			+ store_impl.render()
+			+ some_impl.render()
+			+ remote_impl.render()
+			+ remote_some_impl.render();
 	}
 	out
 }
@@ -1681,6 +2035,8 @@ export macro fun store_enum_impls(target: EnumItem): str {
 	mut self_arms = match_of("self");
 	mut store_impl = impl_of(i"Store<{name}{store_bare_binders(target.generics)}>");
 	mut some_impl = impl_of(i"StoreSome<{name}{store_bare_binders(target.generics)}>");
+	mut remote_impl = impl_of(i"RemoteStore<{name}{store_bare_binders(target.generics)}>");
+	mut remote_some_impl = impl_of(i"RemoteStoreSome<{name}{store_bare_binders(target.generics)}>");
 	mut seen: List<str> = [];
 	index = 0;
 	for variant in target.variants {
@@ -1716,6 +2072,8 @@ export macro fun store_enum_impls(target: EnumItem): str {
 		let flag_method = i"fun {flag}(self): StoreFlag \{\n\tself.tag({child}, {test})\n" + "}";
 		store_impl = store_impl.member(flag_method);
 		some_impl = some_impl.member(flag_method);
+		remote_impl = remote_impl.member(i"fun {flag}(self): RemoteStoreFlag \{\n\tself.narrow_flag(|local: Store<{subject}>| local.{flag}())\n" + "}");
+		remote_some_impl = remote_some_impl.member(i"fun {flag}(self): RemoteStoreFlag \{\n\tself.narrow_flag(|local: StoreSome<{subject}>| local.{flag}())\n" + "}");
 		if arity == 0 {
 			self_arms = self_arms.arm(bare, match_of("other")
 				.arm(bare, "false")
@@ -1794,6 +2152,8 @@ export macro fun store_enum_impls(target: EnumItem): str {
 			let through = i"fun {snake}(self): StoreSome<{payload}> \{\n\tself.variant({child}, {read}, {write})\n" + "}";
 			store_impl = store_impl.member(through);
 			some_impl = some_impl.member(through);
+			remote_impl = remote_impl.member(i"fun {snake}(self): RemoteStoreSome<{payload}> \{\n\tself.narrow_some({child}, |local: Store<{subject}>| local.{snake}())\n" + "}");
+			remote_some_impl = remote_some_impl.member(i"fun {snake}(self): RemoteStoreSome<{payload}> \{\n\tself.narrow_some({child}, |local: StoreSome<{subject}>| local.{snake}())\n" + "}");
 		}
 		index = index + 1;
 	}
@@ -1817,6 +2177,8 @@ export macro fun store_enum_impls(target: EnumItem): str {
 		.render()
 		+ store_impl.render()
 		+ some_impl.render()
+		+ remote_impl.render()
+		+ remote_some_impl.render()
 }
 
 /// The parameter lists of `StoreWire`'s three walking methods, as the derive writes
@@ -2289,7 +2651,7 @@ export macro fun Storable(item: Item): Source {
 
 	let header = "import std::option::Option;\n"
 		+ "import std::shared::Shared;\n"
-		+ "import std::reactive::store::{ Storable, StoreFlag, StoreLeaf, StoreNode, StoreReach, StoreSlot, StoreStep, StoreWire, StoreWireLeaf, StoreWoken, Store, StoreSome, store_fresh_of, store_has_me, store_kid, store_read_path_of, store_switch, store_wake_me, store_wire_closure, store_wire_rebuild_of };\n"
+		+ "import std::reactive::store::{ RemoteStore, RemoteStoreFlag, RemoteStoreSome, Storable, StoreFlag, StoreLeaf, StoreNode, StoreReach, StoreSlot, StoreStep, StoreWire, StoreWireLeaf, StoreWoken, Store, StoreSome, store_fresh_of, store_has_me, store_kid, store_read_path_of, store_switch, store_wake_me, store_wire_closure, store_wire_rebuild_of };\n"
 		+ "import std::wire::{ Deserialize, Deserializer, Serialize, Serializer };\n";
 	if item.as_struct() is Some(let target) {
 		ret source(header + store_struct_impls(target) + store_struct_wire(target));
