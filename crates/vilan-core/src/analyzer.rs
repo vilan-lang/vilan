@@ -54843,6 +54843,10 @@ impl<'src> Analyzer<'src> {
         let mut method_index: HashMap<(String, String), (String, String)> = HashMap::default();
         let mut ambiguous_methods: HashSet<(String, String)> = HashSet::default();
         let mut deprecated_aliases: HashMap<String, (String, String)> = HashMap::default();
+        // B572: the modules that RE-EXPORT a name a sibling declares — a
+        // facade (`std::reactive::store` over `store_core`, `std::reactive`
+        // over `delta`) is the path a program is meant to import from.
+        let mut facades: HashMap<String, Vec<String>> = HashMap::default();
         let files = self.std_module_files.clone();
         for (module_name, path) in &files {
             // A154: a NESTED prelude (`web::prelude`, `web::style::prelude`) is
@@ -54893,6 +54897,23 @@ impl<'src> Analyzer<'src> {
                     },
                 }
             }
+            // A prelude at ANY depth is a surface of the names it makes
+            // ambient, never the path a steer writes (`std::prelude::Option`
+            // would beat `std::option::Option` on length).
+            if module_leaf_name(module_name) != "prelude" {
+                let mut importables = Vec::new();
+                collect_importables(&loaded.ast.0, &mut importables);
+                for importable in importables {
+                    if importable.kind == ImportableKind::Reexport
+                        && importable.exported.is_exported()
+                    {
+                        facades
+                            .entry(importable.name.to_string())
+                            .or_default()
+                            .push(module_name.clone());
+                    }
+                }
+            }
             let declared: HashSet<&str> = names.into_iter().collect();
             let mut steers = Vec::new();
             collect_impl_method_steers(&loaded.ast.0, &declared, &mut steers);
@@ -54916,6 +54937,30 @@ impl<'src> Analyzer<'src> {
         }
         for key in ambiguous_methods {
             method_index.remove(&key);
+        }
+        // B572: each name's import is spelled at its SHORTEST public path —
+        // the declaring module or a module that re-exports it, by segment
+        // count, a re-export winning a tie (it exists to be imported from:
+        // `std::reactive::store::Store`, not `store_core`'s). Two different
+        // re-exports tied at the shortest are a guess, and the declaring
+        // module stands.
+        for (name, module) in export_index.iter_mut() {
+            let Some(reexports) = facades.get(name) else {
+                continue;
+            };
+            let depth = |path: &str| path.split("::").count();
+            let shortest = reexports.iter().map(|facade| depth(facade)).min();
+            let Some(shortest) = shortest.filter(|shortest| *shortest <= depth(module)) else {
+                continue;
+            };
+            let mut at_shortest: Vec<&String> = reexports
+                .iter()
+                .filter(|facade| depth(facade) == shortest)
+                .collect();
+            at_shortest.dedup();
+            if let [facade] = at_shortest.as_slice() {
+                *module = (*facade).clone();
+            }
         }
         self.std_export_index = Some(export_index);
         self.std_deprecated_alias_index = Some(deprecated_aliases);
@@ -55043,6 +55088,21 @@ impl<'src> Analyzer<'src> {
             }
         }
         if let Some(path) = hit {
+            // B572: a std name is spelled at its shortest public path — the
+            // index's answer, a facade that re-exports it where there is one —
+            // and not at the internal module that happens to declare it. The
+            // index holds a name only when ONE std module declares it, so its
+            // answer is about this very declaration.
+            if path.starts_with("std::")
+                && let Some(module) = self
+                    .std_export_index
+                    .as_ref()
+                    .and_then(|index| index.get(name))
+            {
+                return Some(format!(
+                    "; import it first (`import std::{module}::{name};`)"
+                ));
+            }
             return Some(format!("; import it first (`import {path}::{name};`)"));
         }
         if let Some(module) = self

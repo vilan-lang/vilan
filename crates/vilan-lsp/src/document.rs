@@ -7074,6 +7074,10 @@ impl Document {
                 }
             }
             let mut seen_modules: HashSet<String> = HashSet::new();
+            // B572: std's modules that RE-EXPORT the name (a facade:
+            // `std::reactive::store` over `store_core`), each by its path.
+            let mut facades: Vec<Vec<String>> = Vec::new();
+            let declared_from = candidates.len();
             for root in &module_roots {
                 // A154: std's modules sit under namespaces (`std::web::dom`),
                 // so std is listed at every depth — and so is every other
@@ -7101,18 +7105,46 @@ impl Document {
                     // Nobody should ever be told to `import std::web::prelude::view`.
                     let importables = vilan_core::analyzer::module_importables(&module_path);
                     let curated = vilan_core::analyzer::module_is_curated(&importables);
+                    let path = || -> Vec<String> {
+                        std::iter::once(origin.clone())
+                            .chain(module_name.split("::").map(str::to_string))
+                            .collect()
+                    };
                     if importables.iter().any(|importable| {
                         importable.name == name
                             && importable.kind != vilan_core::analyzer::ImportableKind::Reexport
                             && (!curated || importable.exported.is_exported())
                     }) {
-                        candidates.push(
-                            std::iter::once(origin.clone())
-                                .chain(module_name.split("::").map(str::to_string))
-                                .collect(),
-                        );
+                        candidates.push(path());
+                    } else if origin == "std"
+                        && module_name != "prelude"
+                        && importables.iter().any(|importable| {
+                            importable.name == name
+                                && importable.kind == vilan_core::analyzer::ImportableKind::Reexport
+                                && importable.exported.is_exported()
+                        })
+                    {
+                        facades.push(path());
                     }
                 }
+            }
+            // B572, the analyzer's rule for the steer (`build_std_indexes_if_needed`):
+            // a std name ONE module declares is imported at its shortest public
+            // path — a facade re-exporting it where one is no longer, a facade
+            // winning the tie, and two facades tied at the shortest a guess the
+            // declaring module stands against.
+            if let [declaring] = &candidates[declared_from..]
+                && let Some(shortest) = facades.iter().map(Vec::len).min()
+                && shortest <= declaring.len()
+                && let [facade] = facades
+                    .iter()
+                    .filter(|facade| facade.len() == shortest)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            {
+                let facade = (*facade).clone();
+                candidates.truncate(declared_from);
+                candidates.push(facade);
             }
         }
         candidates

@@ -245,11 +245,12 @@ impl Drop for Package {
 
 /// A trait in a NESTED std module (`std::reactive::delta`'s `SequenceCell`),
 /// reached through a sibling that imports its module: the warning's own
-/// statement names `pkg::delta::SequenceCell`, which resolves nowhere (filed
-/// from editor-47). The fix writes the path the candidate scan finds, which
-/// is the one that resolves.
+/// statement named `pkg::delta::SequenceCell`, which resolves nowhere (filed
+/// from editor-47). The fix writes the path the candidate scan finds — since
+/// B572 the shortest PUBLIC one, `std::reactive`, which re-exports it (the
+/// book's spelling), where it wrote the declaring `std::reactive::delta`.
 #[test]
-fn a_nested_std_trait_is_imported_from_where_it_is_declared() {
+fn a_nested_std_trait_is_imported_from_its_public_module() {
     let package = Package::new(
         "nested-std",
         &[(
@@ -282,7 +283,7 @@ fn a_nested_std_trait_is_imported_from_where_it_is_declared() {
             .iter()
             .map(|fix| fix.title.as_str())
             .collect::<Vec<_>>(),
-        ["Import `SequenceCell` from std::reactive::delta"]
+        ["Import `SequenceCell` from std::reactive"]
     );
     let mut after = source.to_string();
     after.replace_range(fixes[0].span.into_range(), &fixes[0].replacement);
@@ -344,4 +345,22 @@ fn a_nested_package_trait_is_imported_from_where_it_is_declared() {
             .map(|diagnostic| diagnostic.msg.clone())
             .collect::<Vec<_>>()
     );
+}
+
+/// B572's editor half: a std name a facade re-exports is imported from the
+/// facade — the add-import fix for an unresolved `Store` writes
+/// `std::reactive::store`, the module the steer names and the book imports
+/// from, not `store_core`, the internal module that declares it.
+#[test]
+fn a_reexported_std_name_is_imported_from_its_public_module() {
+    let package = Package::new("facade", &[]);
+    let source = "fun main() {\n\tlet store = Store::new(1);\n\tlet _ = store;\n}\n";
+    let path = package.path("main.vl");
+    let document = Document::analyze(source, &std_root(), &path);
+    let titles: Vec<String> = offered(&document)
+        .into_iter()
+        .map(|fix| fix.title)
+        .filter(|title| title.starts_with("Import `Store` from "))
+        .collect();
+    assert_eq!(titles, ["Import `Store` from std::reactive::store"]);
 }
