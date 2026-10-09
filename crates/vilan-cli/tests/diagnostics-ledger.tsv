@@ -679,8 +679,8 @@ row	flagship	key
 655	-	a hard line break (two trailing spaces) — outside the census grammar
 656	-	a backslash line break — outside the census grammar
 657	-	cannot infer `{family_label}`'s element {}: {written} is `{element}` and names no type for it, and nothing else at this call binds `{family_label}` — annotate the argument, or bind `{family_label}` through another parameter
-658	-	`mut {name}` would bind a COPY of a tuple element, and its write would not reach `{place}`: a capture inside a tuple pattern is a copy even under a view subject (tuples store flat) — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
-659	-	cannot mutate '{name}': a capture inside a tuple pattern is a COPY of its element even under a view subject (tuples store flat), so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
+658	-	`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
+659	-	cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
 660	-	`{member_name}` is an `[internal]` field of std's `{struct_name}`, and an internal std field is not a member outside std: {reason}
 661	-	`{member_name}` is a field of `{subject_name}`, and this `{struct_name}<{subject_name}>` has no projection named `{member_name}` to read it through: `{subject_name}` does not `[derive(Storable)]`, or the field's projection is renamed
 662	-	`[track_caller]` is not supported on a trait method: a call through a trait is dispatched, so no call site knows to pass its location
@@ -692,3 +692,4 @@ row	flagship	key
 668	-	`{field_name}` is an `[internal]` field of std's `{struct_name}`, and a struct literal outside std cannot write an internal std field: {reason}
 669	-	a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one, and `{written}` is `{type_label}`{steer}
 670	-	A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children in one element (`<div>…</div>`), or make this position a `List<View>`
+671	-	Expected {expected}, but got {got} instead: inside the impl that declares it, a bare `{path}::{member}(..)` is `Self::{member}(..)`, whose `{expected}` is this block's own. Write `{suggested}::{member}(..)` to call it at another instantiation

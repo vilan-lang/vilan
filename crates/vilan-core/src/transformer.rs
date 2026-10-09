@@ -5905,8 +5905,16 @@ impl<'src> Transformer<'src> {
                     // DEFAULTS share a name both resolve to whichever the
                     // by-name lookup reaches first.
                     let preferred = self.program.bound_dispatch_traits.get(id).cloned();
+                    // B566: the call's own-generic values cross to the
+                    // default it lands on, as on the bounded route above.
+                    let own_values = self
+                        .program
+                        .own_generic_call_bindings
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_default();
                     if let Some(dispatch) =
-                        self.resolve_dispatch_with(type_id, member_name, &[], preferred)
+                        self.resolve_dispatch_with(type_id, member_name, &own_values, preferred)
                     {
                         return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                     }
@@ -10953,7 +10961,7 @@ impl<'src> Transformer<'src> {
             {
                 let is_async = self.program.async_functions.contains(&default_id);
                 return Some(Dispatch::Call(
-                    self.emit_default_instance(default_id, type_id),
+                    self.emit_default_instance(default_id, type_id, own_generic_values),
                     is_async,
                 ));
             }
@@ -10976,7 +10984,7 @@ impl<'src> Transformer<'src> {
         )?;
         let is_async = self.program.async_functions.contains(&default_id);
         Some(Dispatch::Call(
-            self.emit_default_instance(default_id, type_id),
+            self.emit_default_instance(default_id, type_id, own_generic_values),
             is_async,
         ))
     }
@@ -11458,8 +11466,40 @@ impl<'src> Transformer<'src> {
     /// generic parameters to the arguments this type implements it at (B58) —
     /// so a `T`-typed value's bound-member call grounds the same way it does
     /// in a generic function's body.
-    fn emit_default_instance(&mut self, default_id: Id, type_id: TypeId) -> String {
-        let key = (default_id, self.type_key(type_id));
+    ///
+    /// B566: a default with generic parameters of its OWN (`fun shown<S:
+    /// Show>(self, item: S)`) is one instance per binding of them as well as
+    /// per receiver type — `own_generic_values` is the call's binding of them
+    /// in declaration order (positional, as every re-dispatch carries them;
+    /// the native emitter's F34 rule). Keyed by the type alone, the default
+    /// ran with `S` unbound, so its `item.show()` reached `Show`'s body-less
+    /// requirement: the never-silent internal error, from a program the
+    /// inherent spelling of the same member built.
+    fn emit_default_instance(
+        &mut self,
+        default_id: Id,
+        type_id: TypeId,
+        own_generic_values: &[TypeId],
+    ) -> String {
+        let own_entries: Vec<(TypeId, TypeId)> = self
+            .program
+            .functions
+            .get(&default_id)
+            .map(|function| {
+                function
+                    .generic_parameter_constraint_ids
+                    .iter()
+                    .copied()
+                    .zip(own_generic_values.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut key_text = self.type_key(type_id);
+        for (_, value) in &own_entries {
+            key_text.push('|');
+            key_text.push_str(&self.type_key(*value));
+        }
+        let key = (default_id, key_text);
         if let Some(name) = self.default_instances.get(&key) {
             let name = name.clone();
             self.record_hit(|recorder| recorder.defaults.get(&key).copied());
@@ -11492,6 +11532,13 @@ impl<'src> Transformer<'src> {
             }
             let mut mentioned = Vec::new();
             crate::mono::collect_type_generics(self.program, type_id, 0, &mut mentioned);
+            // B566: the default's own generics, resolved the same way — a
+            // value written in the CALLER's binders (`Option<U>`) keeps
+            // those binders' bindings beside it.
+            for (constraint_id, value) in &own_entries {
+                substitution.insert(*constraint_id, self.resolve_type_id(*value));
+                crate::mono::collect_type_generics(self.program, *value, 0, &mut mentioned);
+            }
             for generic in mentioned {
                 if !substitution.contains_key(&generic)
                     && let Some(bound) = self.current_substitution.get(&generic).copied()

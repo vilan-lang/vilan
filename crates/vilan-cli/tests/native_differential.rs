@@ -11301,3 +11301,312 @@ fn e276_dbg_shows_negative_zero_on_both_backends() {
         ),
     );
 }
+/// B566: a trait DEFAULT with a generic parameter of its OWN, bounded, calling
+/// the bound's member — bound per call (two bindings, two instances) on both
+/// backends. JS reached `Show`'s body-less requirement (an internal error).
+#[test]
+fn a_trait_default_with_its_own_generic_binds_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b566.vl"),
+        r#"import std::io::print;
+
+trait Show {
+    fun show(self): str;
+}
+
+impl i32 with Show {
+    fun show(self): str {
+        "i32"
+    }
+}
+
+impl str with Show {
+    fun show(self): str {
+        "str"
+    }
+}
+
+trait Bag<T> {
+    fun size(self): usize;
+
+    fun shown<S: Show>(self, item: S): str {
+        item.show()
+    }
+}
+
+struct Box {
+    held: List<i32>,
+}
+
+impl Box with Bag<i32> {
+    fun size(self): usize {
+        self.held.len()
+    }
+}
+
+fun through<B: Bag<i32>>(bag: B): str {
+    bag.shown("x")
+}
+
+fun main() {
+    let bag = Box { held = [1, 2] };
+    print(bag.shown(3));
+    print(bag.shown("y"));
+    print(through(bag));
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b566.vl"),
+        Verdict::Identical,
+        "a trait default's own generic must bind per call on both backends"
+    );
+}
+/// B567: a `for item in self` inside a blanket whose subject is a bare
+/// parameterized trait (`impl Iterator<type T> with Pour<T>`) drives the
+/// receiver's own `next` on both backends. JS reached `Iterator`'s body-less
+/// requirement (an internal error).
+#[test]
+fn a_loop_over_self_in_a_bare_trait_impl_runs_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b567.vl"),
+        r#"import std::io::print;
+import std::iterator::Iterator;
+
+trait Pour<T> {
+    fun pour_into(own self, target: &mut List<T>);
+}
+
+impl Iterator<type T> with Pour<T> {
+    fun pour_into(own self, target: &mut List<T>) {
+        for item in self {
+            target.push(item);
+        }
+    }
+}
+
+fun main() {
+    mut xs = [1, 2];
+    [5, 6].iter().map(|x| x * 10).pour_into(&mut xs);
+    print(xs.len());
+    print(xs[3]);
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b567.vl"),
+        Verdict::Identical,
+        "a loop over self in a bare-trait impl must run on both backends"
+    );
+}
+/// B562: a method called on a SCALAR view (`n.abs()` with `n: &i32`, `s.len()`
+/// with `s: &str`, a trait member through `&T`) auto-derefs on both backends.
+#[test]
+fn a_method_on_a_scalar_view_auto_derefs_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b562.vl"),
+        r#"import std::io::print;
+
+trait Show {
+    fun show(self): str;
+}
+
+impl i32 with Show {
+    fun show(self): str {
+        "i" + self
+    }
+}
+
+fun through<T: Show>(t: &T): str {
+    t.show()
+}
+
+fun magnitude(n: &mut i32): i32 {
+    n.abs()
+}
+
+fun width(s: &str): usize {
+    s.len()
+}
+
+fun main() {
+    mut x = -4;
+    print(magnitude(&mut x));
+    print(width(&"abc"));
+    print(through(&3));
+    let words = ["a", "bb"];
+    for w in &words {
+        print(w.len());
+    }
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b562.vl"),
+        Verdict::Identical,
+        "a method on a scalar view must auto-deref on both backends"
+    );
+}
+/// B558: a static path that WRITES its instantiation (`Cell<str>::new(..)`)
+/// inside the impl that declares the static runs on both backends.
+#[test]
+fn a_written_instantiation_inside_the_declaring_impl_runs_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b558.vl"),
+        r#"import std::io::print;
+
+struct Cell<T> {
+    value: T,
+}
+
+impl Cell<type T> {
+    fun new(value: T): Cell<T> {
+        Cell { value = value }
+    }
+
+    fun get(self): T {
+        self.value
+    }
+
+    fun relabel(self, label: str): Cell<str> {
+        Cell<str>::new(label)
+    }
+}
+
+fun main() {
+    let cell = Cell::new(1);
+    print(cell.relabel("x").get());
+    print(cell.get());
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b558.vl"),
+        Verdict::Identical,
+        "a written instantiation inside the declaring impl must run on both backends"
+    );
+}
+/// B564: a blanket whose bound a closure meets through another blanket (two
+/// tiers) answers the closure on both backends.
+#[test]
+fn a_two_tier_blanket_reaches_a_closure_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b564.vl"),
+        r#"import std::io::print;
+
+trait Leaf {
+    fun leaf(&self): str;
+}
+
+trait Shape {
+    fun shape(&self): str;
+}
+
+impl type T with Leaf {
+    fun leaf(&self): str {
+        "leaf"
+    }
+}
+
+impl type T: Leaf with Shape {
+    fun shape(&self): str {
+        i"shape over {self.leaf()}"
+    }
+}
+
+fun main() {
+    let g = |k: str| k == "x";
+    print(g.leaf());
+    print(3.shape());
+    print(g.shape());
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b564.vl"),
+        Verdict::Identical,
+        "a two-tier blanket must reach a closure on both backends"
+    );
+}
+/// B545: a one-slot tuple leaf under `match &mut place` is a writable view
+/// into its slot of the payload's tuple on both backends (scalar, nested,
+/// aggregate, and the `is` form).
+#[test]
+fn a_one_slot_tuple_leaf_under_a_view_subject_writes_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b545.vl"),
+        r#"import std::io::print;
+import std::option::Option::{ self, Some, None };
+
+struct P {
+    x: i32,
+}
+
+fun main() {
+    mut held = Some((1, 2));
+    match &mut held {
+        Some((let a, let b)) => {
+            a += 10;
+            b = 20;
+        },
+        None => {},
+    }
+    match &held {
+        Some((let a, let b)) => print(*a + *b),
+        None => {},
+    }
+    mut nested = Some(((1, 2), 3));
+    match &mut nested {
+        Some(((let a, _), let c)) => {
+            a += 100;
+            c += 1;
+        },
+        None => {},
+    }
+    match nested {
+        Some(((let a, let b), let c)) => print(a + b + c),
+        None => {},
+    }
+    mut agg = Some((P { x = 1 }, "s"));
+    match &mut agg {
+        Some((let p, let s)) => {
+            p.x = 5;
+            s = "t";
+        },
+        None => {},
+    }
+    match agg {
+        Some((let p, let s)) => {
+            print(p.x);
+            print(s);
+        },
+        None => {},
+    }
+    if &mut held is Some((let a, _)) {
+        a += 1;
+    }
+    match held {
+        Some((let a, let b)) => print(a + b),
+        None => {},
+    }
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b545.vl"),
+        Verdict::Identical,
+        "a one-slot tuple leaf under a view subject must write in place on both backends"
+    );
+}

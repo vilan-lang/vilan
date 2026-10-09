@@ -7101,15 +7101,9 @@ fn a_tuple_left_operand_of_the_sibling_operators_is_rejected() {
     // models a trait skipped its no-impl refusal for these shapes and emitted
     // the host's: `(1, 2) == (1, 2)` was `false` (JS compares references),
     // `(1, 2) < (1, 3)` was `true` (JS compares `"1,2" < "1,3"`), and
-    // `(1, 2) - 1` was `NaN`.
-    assert_fails_with(
-        r#"
-        fun main() {
-            let _same = (1, 2) == (1, 2);
-        }
-        "#,
-        "type '(i32, i32)' does not implement the `PartialEq` operator",
-    );
+    // `(1, 2) - 1` was `NaN`. (`==` left this list with B443: a tuple of
+    // `PartialEq` elements is `PartialEq` through std's position-by-position
+    // blanket — `tuples::b443_*` pins it.)
     assert_fails_with(
         r#"
         fun main() {
