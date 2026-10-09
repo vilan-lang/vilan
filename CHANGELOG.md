@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**N160: the parser's doc comment on what `export` admits spells a derived export the way an author writes it — `[derive(Wire)] export struct S { .. }` — and says the rotated `export [derive(Wire)]` form is the parser's own, which B485 S3 refuses as source.** A comment only; no behavior moved.
+
+---
+
+<!-- family: tooling -->
 **N139: the `Debounce` pins' timing margins are audited and written down.** Every burst in `debounce.rs` and the `Draft` debounce pins is dispatched in ONE tick and every wait is a timer that expires after the one it waits on, so a stalled host can only make them wait longer; the two pins that do hold a window against a gap (the pushed deadline's 100 ms in a 2 s window, the nursery cancel's 10 ms in 1 s) keep 20x and 100x, and the reason is now in the file. Widening the 50 ms windows would shrink the wait that proves they fired, so they stay; the stall that did split a 50 ms window (a negative remaining delay) is N155's clamp.
 
 ---
