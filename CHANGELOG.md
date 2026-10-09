@@ -22,7 +22,8 @@ than a band: ..."). Two entries tripped this in one cycle before it was
 written down.
 -->
 
----
+
+## Unreleased
 
 <!-- family: fix -->
 **F113: a pattern over the view a `borrows` call hands back binds copies natively — `if cell.slot() is (let cells, let weight)` bound `weight` as a `&mut i32`, and `cells.len().as_i32() + weight` was refused by rustc (E0277); JS printed 5.** A capture is a copy (rule 1), and a pattern over a PLACE already copies its subject first (F20); a call to a `borrows` function names storage the same way, but its native value is a reference, so Rust's default binding modes bound every capture through it. The subject is now the pointee's copy (`(*call).clone()`, F88's rule for a view) at every pattern position: an `is` test, a `match`, a read view (`&T`), an `Option` behind a view, and a destructuring `let`. A view WRAPPED in a payload (`Option<&mut T>`, the wrapped-view capture) is a value natively and is untouched. Pin: `native_differential::f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends` (`native/view_call_subjects.vl`, red on 0.46.0). capture-clones.vl's `called_component` is the corpus site; that program's first wall is still B579 (mixed integer widths). Tracker F113.
