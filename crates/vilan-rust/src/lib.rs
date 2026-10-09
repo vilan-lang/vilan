@@ -7694,11 +7694,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 parameters.join(", ")
             ));
         }
+        // F104: a body that DIVERGES — `|| panic("x")`, a block ending in a
+        // `panic` — is typed `!` by rustc when the return is left to
+        // inference, and a `!`-returning closure is no `dyn Fn() -> ()` (E0271).
+        // Its return is written instead: the position's, which every path
+        // that does not diverge would have answered.
+        let written_return = if returns != "_"
+            && vilan_core::analyzer::Divergence::of_program(self.program).expr(closure.return_)
+        {
+            format!(" -> {returns}")
+        } else {
+            String::new()
+        };
         // F16: a closure VALUE is counted, because the emitter cannot see from
         // here whether the position it lands in stores it. `Rc::new` is the
         // shape the probe's R-1 finding forced.
         Ok(format!(
-            "{{ {prelude}std::rc::Rc::new(move |{}| {{ {body} }}){as_counted} }}",
+            "{{ {prelude}std::rc::Rc::new(move |{}|{written_return} {{ {body} }}){as_counted} }}",
             parameters.join(", ")
         ))
     }

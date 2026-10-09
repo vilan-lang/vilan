@@ -8919,6 +8919,28 @@ fn an_async_function_returning_a_task_answers_the_value_on_both_backends() {
     );
 }
 
+/// F104: a closure whose body only DIVERGES — `|| panic("x")`, a block
+/// ending in a `panic`, a `match` whose every leg panics — did not build
+/// natively: rustc typed the body `!` with the return left to inference, and
+/// a `!`-returning closure is no `Rc<dyn Fn() -> ()>` (E0271; five errors on
+/// 0.45.0 over this probe). The diverging closure writes its return. The
+/// probe builds and holds each shape, beside a block that `ret`s early.
+#[test]
+fn a_closure_whose_body_diverges_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_diverging_closures.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/diverging_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a closure that only panics must build natively"
+    );
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,

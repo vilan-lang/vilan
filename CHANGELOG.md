@@ -56,6 +56,11 @@ written down.
 ---
 
 <!-- family: fix -->
+**F104: natively, a closure whose body only diverges builds — `let run: || void = || panic("x");`, a block ending in a `panic`, a `match` whose every leg panics.** The emitted closure left its return to rustc's inference, which typed the diverging body `!`, and a `!`-returning closure is no `Rc<dyn Fn() -> ()>` (E0271); the JS backend ran it. A closure whose body diverges (the analyzer's own divergence reading: a `panic`, a `ret`, an endless `for`, a block, `if` or `match` all of whose paths do) now writes its return type. Pin: `native_differential`'s `a_closure_whose_body_diverges_builds_on_both_backends` (`native/diverging_closures.vl`: an expression body, a block, a value-returning closure, one handed straight to a callee, an all-panicking `match`, and an early `ret`; five rustc errors on 0.45.0). Tracker F104.
+
+---
+
+<!-- family: fix -->
 **F107: natively, a call to a function written `async` whose declared return is itself a `Task` answers the task's value, as B149 types it.** `async fun make(): Task<i32>` hands its caller the `i32` on JS (the host assimilates the handle the body returns), and B149 made the call type as it; the native backend awaited the call's own future once and kept the inner handle, so `make() + 1` was rustc's E0369 ("cannot add `i32` to `Task<i32>`") and `print(make())` was refused as a `print` of the host handle. Each `Task` layer the written-`async` callee's signature returns is now one more await of the handle, and the call's type is read as the payload wherever the emitter asks for it (a function async only by inference keeps its declared type, as in the analyzer). Pin: `native_differential`'s `an_async_function_returning_a_task_answers_the_value_on_both_backends` (`native/async_task_returns.vl`: a plain handle, a generic payload, a method, the call in place, bound and printed, and an interleaving task whose prints keep their order). Tracker F107.
 
 ---

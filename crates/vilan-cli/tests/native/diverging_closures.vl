@@ -1,0 +1,40 @@
+// F104: a closure whose body only DIVERGES did not build natively: rustc
+// types the body `!` when the return is left to inference, and a closure
+// returning `!` is no `Rc<dyn Fn() -> ()>` (E0271). Each shape is built and
+// held — called only on a path the program never takes, since a panic ends
+// the run — beside the ones that do run: an expression body, a block ending
+// in a `panic`, a value-returning closure, a closure handed straight to a
+// callee, a `match` whose every leg panics, and a block that `ret`s early.
+import std::io::panic;
+import std::io::print;
+
+fun hold(f: || void, run: bool) {
+	if run {
+		f();
+	}
+}
+
+fun main() {
+	let run: || void = || panic("x");
+	let block: || void = || {
+		panic("y");
+	};
+	let number: || i32 = || panic("n");
+	let pick: |i32| str = |k| match k {
+		0 => panic("zero"),
+		_ => panic("other"),
+	};
+	let early: |i32| i32 = |k| {
+		ret k * 2;
+	};
+	hold(|| panic("z"), false);
+	hold(run, false);
+	hold(block, false);
+	print(early(21));
+	let go = early(0) > 0;
+	if go {
+		print(number());
+		print(pick(1));
+	}
+	print("built");
+}
