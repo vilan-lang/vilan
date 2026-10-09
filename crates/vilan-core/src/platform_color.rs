@@ -62,8 +62,10 @@ use crate::type_::{Type, TypeId};
 /// (E35): this pass writes nothing but diagnostics, so its view of the program
 /// is bit-for-bit the one it used to build.
 pub fn check(program: &mut Program, platform: Platform, graph: &CallGraph) {
-    // Declared fences check on EVERY compile, entry or not — fencing library
-    // code is their point (platform-coloring.md §3.7).
+    // Declared fences check on EVERY compile of the package that wrote them,
+    // entry or not — fencing library code is their point (platform-coloring.md
+    // §3.7); a consumer's build leaves a dependency's promises to the
+    // dependency (`check_fences`).
     let mut diagnostics = check_fences(program, graph);
     if let Some(entry) = entry_function(program) {
         let mut traversal = Traversal::new(program, graph, Some(platform));
@@ -137,7 +139,8 @@ fn known_hosts() -> [Platform; 4] {
     ]
 }
 
-/// Checks every `[platform("…")]` fence: for each concrete host matching a
+/// Checks every `[platform("…")]` fence the user's own code makes (F28: not
+/// std's, not an external dependency's): for each concrete host matching a
 /// declared pattern, everything reachable from the fenced function must admit
 /// that host. Runs regardless of the build target and needs no entry —
 /// violations land at the fence with the chain, not at some distant entry in
@@ -147,6 +150,21 @@ fn known_hosts() -> [Platform; 4] {
 fn check_fences(program: &Program, graph: &CallGraph) -> Vec<Violation> {
     let mut diagnostics = Vec::new();
     for (id, function) in &program.functions {
+        // F28: a promise is checked where its AUTHOR compiles. Code the user
+        // did not write — std, an external dependency (`std_sources`,
+        // `dependency_sources`, the set context coverage demotes, C3a) — made
+        // its promises in its own package's compiles; re-walking them in every
+        // consumer's build reported nothing the consumer could act on, and
+        // once std's single-platform modules declared their platform in their
+        // file (a fence on each of their functions) it was 6 % of kolt's
+        // check. What a consumer's entry REACHES in that code is still the
+        // entry walk's to judge, anchored in the consumer's own call.
+        let source = program.source_of(*id);
+        if source.is_some_and(|source| {
+            program.std_sources.contains(&source) || program.dependency_sources.contains(&source)
+        }) {
+            continue;
+        }
         // F27 R1: a function under a file's or an impl's declaration makes
         // that declaration's promise, exactly as its own fence would; its own
         // fence, when it writes one, is the promise it makes.
@@ -465,6 +483,14 @@ impl<'a, 'src> Traversal<'a, 'src> {
                 .patterns
                 .iter()
                 .any(|pattern| platform.matches(*pattern).is_some());
+            if !admitted && twin_stands_in(self.program, node, platform) {
+                // B548: the build bound its OWN platform's twin of this
+                // module, and `platform` has a twin of its own. The body
+                // reached is not `platform`'s code — a build for it binds the
+                // other file — so it is neither charged nor descended into.
+                self.trail.pop();
+                return;
+            }
             if !admitted {
                 // Report the BOUNDARY — the first off-platform function
                 // reached from admissible code — and do not descend:
@@ -702,7 +728,7 @@ fn edges(program: &Program, graph: &CallGraph, node: Id) -> Vec<(Id, Option<(Spa
 /// like
 ///
 /// ```text
-/// requires the `process` layer of `std` (via `load (server::store) → stat (std::fs)`)
+/// requires the `@process` platform its file declares (via `load (server::store) → stat (std::fs)`)
 /// ```
 ///
 /// Unlike [`check`] this is **entry-independent** — a library function nobody
@@ -789,6 +815,109 @@ pub fn requirements(program: &Program) -> HashMap<Id, String> {
 struct Requirement<'program> {
     label: &'program str,
     patterns: &'program [crate::target::PlatformPattern],
+}
+
+// ── Code a build's own platform excludes (F28, B548/B549) ──────────────────
+
+/// The sources whose own platform this build's excludes: a file leading with
+/// `[platform(..)] mod self;` that admits none of the build's hosts, or a
+/// library module served only by a layer that does not serve it (a layer is the
+/// same promise spelled as a directory). The entry is never one of them — the
+/// file a program is built FROM is checked under whatever it was built for, and
+/// a mismatch there is the colouring error the entry walk reports.
+///
+/// Such a module is loaded so its names bind (an `import` of it is legal, and a
+/// call into it is ONE colouring error at the caller), but its bodies are not
+/// this build's to judge: one program has one platform, so every import of a
+/// platform TWIN (`std::web::ui`) inside it binds THIS build's side, never the
+/// side the file was written against. A browser-declared module in a node build
+/// would be checked against the process `ui` and an `@process` one in a browser
+/// build against the browser `ui` — B548's and B549's spurious refusals inside
+/// std. In every build its declaration admits, its imports bind its own side by
+/// construction; there, and in the editor (which analyzes a file under its
+/// declared platform, F27 R1), it is checked in full — platform-coloring.md
+/// §8.5's invariant ("every item is type-checked under at least one platform it
+/// admits"), carried from fenced twins to fenced files.
+pub fn sources_outside_the_build(program: &Program) -> HashSet<SourceId> {
+    let platform = program.platform;
+    let mut outside = HashSet::default();
+    // `none` is `vilan check`'s host-less platform: no side is bound, so
+    // nothing is anyone else's.
+    if platform.is_none() {
+        return outside;
+    }
+    let admits = |patterns: &[crate::target::PlatformPattern]| {
+        patterns
+            .iter()
+            .any(|pattern| platform.matches(*pattern).is_some())
+    };
+    for (source, written) in &program.module_platforms {
+        if source.0 == 0 {
+            continue;
+        }
+        let patterns: Vec<crate::target::PlatformPattern> = written
+            .iter()
+            .filter_map(|(text, _)| crate::target::PlatformPattern::parse(text))
+            .flatten()
+            .collect();
+        // An unknown pattern is refused where it is written; a file whose
+        // declaration parses to nothing excludes nothing.
+        if !patterns.is_empty() && !admits(&patterns) {
+            outside.insert(*source);
+        }
+    }
+    for (index, layer) in program.source_layers.iter().enumerate().skip(1) {
+        let source = SourceId(index as u32);
+        // A file's own declaration outranks its layer (F27 R1), as it does
+        // for the requirement it seeds.
+        if program.module_platforms.contains_key(&source) {
+            continue;
+        }
+        if let Some(requiring) = layer.requiring
+            && let Some((.., patterns)) = program.layer_platforms.get(requiring as usize)
+            && !admits(patterns)
+        {
+            outside.insert(source);
+        }
+    }
+    outside
+}
+
+/// Drops every diagnostic and warning attributed to a source
+/// [`sources_outside_the_build`] names. Run where the analysis hands its
+/// program to the post passes (so no pass reads them — the const pass and the
+/// initializer-cycle check stand down for a program with errors) and again
+/// after the last pass that pushes one.
+pub fn drop_diagnostics_outside_the_build(program: &mut Program) {
+    let outside = sources_outside_the_build(program);
+    if outside.is_empty() {
+        return;
+    }
+    fn retain(entries: &mut Vec<Error>, sources: &mut Vec<SourceId>, outside: &HashSet<SourceId>) {
+        // `push_diagnostic` pads lazily: an entry past the attribution
+        // vector's end is the entry file's.
+        sources.resize(entries.len(), SourceId(0));
+        let mut kept_sources = Vec::with_capacity(sources.len());
+        let mut kept = Vec::with_capacity(entries.len());
+        for (entry, source) in entries.drain(..).zip(sources.drain(..)) {
+            if !outside.contains(&source) {
+                kept.push(entry);
+                kept_sources.push(source);
+            }
+        }
+        *entries = kept;
+        *sources = kept_sources;
+    }
+    retain(
+        &mut program.diagnostics,
+        &mut program.diagnostic_sources,
+        &outside,
+    );
+    retain(
+        &mut program.warnings,
+        &mut program.warning_sources,
+        &outside,
+    );
 }
 
 // ── What a file, or an impl in it, DECLARES (F27 R1) ────────────────────────
@@ -983,6 +1112,82 @@ fn requirement_of<'program>(program: &'program Program, node: Id) -> Option<Requ
     let index = program.source_layers.get(source.0 as usize)?.requiring? as usize;
     let (_root, _library, label, patterns) = program.layer_platforms.get(index)?;
     Some(Requirement { label, patterns })
+}
+
+/// Whether `node` is defined in one platform's TWIN of a layered library
+/// module — and `platform` is served by another file of the same module
+/// (B548). One program has one platform, so a twin import binds the BUILD's
+/// side: a fence walk for another host (`[platform("browser")]` checked in a
+/// node build) reaches the process `std::web::ui` where a browser build would
+/// reach the browser one. Such a reach says nothing about the host; a module
+/// only one layer serves (`std::fs` before F28, a library's single-platform
+/// layer module) has no twin and is still charged. A declaration's requirement
+/// is the code's own promise and never stands in for anything.
+fn twin_stands_in(program: &Program, node: Id, platform: Platform) -> bool {
+    if program
+        .declared_requirements
+        .covering(program, node)
+        .is_some()
+    {
+        return false;
+    }
+    let Some(source) = program.source_of(node) else {
+        return false;
+    };
+    let Some(layer) = program
+        .source_layers
+        .get(source.0 as usize)
+        .and_then(|layer| layer.requiring)
+    else {
+        return false;
+    };
+    let layer = layer as usize;
+    let (Some(canonical), Some((root, ..))) = (
+        program.canonical_sources.get(source.0 as usize),
+        program.layer_platforms.get(layer),
+    ) else {
+        return false;
+    };
+    let Ok(relative) = canonical.strip_prefix(root) else {
+        return false;
+    };
+    // The module's two spellings below a root: `web/ui.vl` and `web/ui/lib.vl`.
+    let spellings: Vec<PathBuf> = if relative.file_name() == Some(std::ffi::OsStr::new("lib.vl")) {
+        let directory = relative.parent().unwrap_or(Path::new(""));
+        vec![relative.to_path_buf(), directory.with_extension("vl")]
+    } else {
+        vec![
+            relative.to_path_buf(),
+            relative.with_extension("").join("lib.vl"),
+        ]
+    };
+    // The library's roots: `layer_platforms` records each library's layers and
+    // then its base (empty patterns), so the library is the run of entries
+    // between two bases.
+    let roots = &program.layer_platforms;
+    let start = roots[..layer]
+        .iter()
+        .rposition(|(.., patterns)| patterns.is_empty())
+        .map_or(0, |base| base + 1);
+    let end = roots[layer..]
+        .iter()
+        .position(|(.., patterns)| patterns.is_empty())
+        .map_or(roots.len(), |base| layer + base + 1);
+    roots[start..end]
+        .iter()
+        .enumerate()
+        .filter(|(index, (.., patterns))| {
+            start + index != layer
+                && (patterns.is_empty()
+                    || patterns
+                        .iter()
+                        .any(|pattern| platform.matches(*pattern).is_some()))
+        })
+        .any(|(_, (other_root, ..))| {
+            spellings
+                .iter()
+                .any(|spelling| other_root.join(spelling).is_file())
+        })
 }
 
 /// A frame's display name: bare for user code, `name (lib::module)` for

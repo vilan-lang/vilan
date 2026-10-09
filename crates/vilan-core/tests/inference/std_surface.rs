@@ -6202,7 +6202,7 @@ fn b178_process_args_is_refused_on_the_browser_leg() {
         import std::process;
         fun main() { print(process::args().len()); }
         "#,
-        "requires the `process` layer of `std` and cannot run on `browser`",
+        "requires the `@process` platform its file declares and cannot run on `browser`",
     );
 }
 

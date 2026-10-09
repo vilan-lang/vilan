@@ -4119,7 +4119,7 @@ fn a_process_needing_drop_colors_its_owning_scope() {
             use_it();
         }
         "#,
-        "requires the `process` layer of `std`",
+        "requires the `@process` platform its file declares",
     );
 }
 
@@ -4171,7 +4171,7 @@ fn a_drop_sink_call_colors_its_owning_function() {
             use_it();
         }
         "#,
-        "requires the `process` layer of `std`",
+        "requires the `@process` platform its file declares",
     );
 }
 
@@ -5823,7 +5823,7 @@ fn opening_a_file_on_a_browser_build_is_refused_by_coloring() {
             let file = File::open("data.txt");
         }
         "#,
-        "`open` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → open (std::fs)",
+        "`open` requires the `@process` platform its file declares and cannot run on `browser`\n  reachable from the entry: main → open (std::fs)",
     );
 }
 
@@ -6035,7 +6035,7 @@ fn a_reader_on_a_browser_build_is_refused_by_coloring() {
             let reader = Reader::of(File::open("data.txt"));
         }
         "#,
-        "`open` requires the `process` layer of `std` and cannot run on `browser`",
+        "`open` requires the `@process` platform its file declares and cannot run on `browser`",
     );
 }
 
@@ -6301,7 +6301,7 @@ fn starting_a_watch_on_a_browser_build_is_refused_by_coloring() {
             let watcher = Watcher::watch("src");
         }
         "#,
-        "`watch` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → watch (std::fs)",
+        "`watch` requires the `@process` platform its file declares and cannot run on `browser`\n  reachable from the entry: main → watch (std::fs)",
     );
 }
 
@@ -6316,7 +6316,7 @@ fn a_recursive_watch_on_a_browser_build_is_refused_too() {
             let watcher = Watcher::watch_all("src");
         }
         "#,
-        "`watch_all` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → watch_all (std::fs)",
+        "`watch_all` requires the `@process` platform its file declares and cannot run on `browser`\n  reachable from the entry: main → watch_all (std::fs)",
     );
 }
 

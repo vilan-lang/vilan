@@ -12,6 +12,8 @@
 // VALUE (`Routable`), so every link's path comes from the enum. Only available when
 // building for the browser.
 
+[platform("browser")] mod self;
+
 import pkg::hash_map::HashMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{ FlushPolicy, SignalCell, turn };

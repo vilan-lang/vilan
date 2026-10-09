@@ -32,6 +32,8 @@
 // cannot work is worse than one that does not start. `check_shell` returns a
 // `Result`, so an application that genuinely means it says so, once, in code.
 
+[platform("@process")] mod self;
+
 import pkg::build::LegBuild;
 import pkg::fs;
 import pkg::io::panic;

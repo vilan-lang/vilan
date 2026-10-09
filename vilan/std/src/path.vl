@@ -43,8 +43,8 @@
 // functions here — which is precisely what `std::web::document`'s `file_name_of`
 // does today, and why it can be two lines.
 //
-// **Color: none.** This module is in std's base `root` layer, not
-// `src/process`, so it is seeded no platform (`std/vilan.toml`); every
+// **Color: none.** This module declares no platform (no `[platform(..)] mod
+// self;`, unlike `std::fs`), so it is seeded none; every
 // function is a `str` -> `str` computation with no host call in it. That is
 // deliberate rather than incidental — a browser build routes URL paths, an
 // SSR build routes the same ones, and a `@process`-colored `path` would have

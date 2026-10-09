@@ -3396,7 +3396,7 @@ fn ssr_std_dom_import_fails_on_a_process_build() {
             print("built");
         }
         "#,
-        "requires the `browser` layer",
+        "requires the `browser` platform its file declares",
     );
 }
 

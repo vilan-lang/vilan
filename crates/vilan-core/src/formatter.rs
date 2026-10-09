@@ -11584,7 +11584,7 @@ mod chain_splitting {
     /// MEASURED, not assumed. `raw.map(|entry| Entry { … })` is 156 columns and
     /// breaks — but at the struct literal, where the descent already reaches,
     /// under a `raw.map(` that fits. Splitting the chain first would put `raw`
-    /// alone on a line and buy nothing. (`vilan/std/src/process/fs.vl`.)
+    /// alone on a line and buy nothing. (`vilan/std/src/fs.vl`.)
     #[test]
     fn a_single_link_whose_argument_breaks_in_place_keeps_the_link_inline() {
         let source = "fun scan() {\n\

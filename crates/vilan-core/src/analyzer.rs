@@ -61755,15 +61755,22 @@ impl<'src> Analyzer<'src> {
                             });
                         }
                         None => {
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                                msg: format!(
-                                    "cannot find '{}' in module '{}'",
-                                    member_name, module_name
-                                ),
-                            });
+                            // `resolve_world` runs after every walk has closed,
+                            // so the access's file is found from the access,
+                            // not inherited: it was the entry's, and a miss in
+                            // a module rendered against the entry's text.
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "cannot find '{}' in module '{}'",
+                                        member_name, module_name
+                                    ),
+                                },
+                                id,
+                            );
                             self.expr_id_to_expr_map.insert(id, Expr::Error);
                         }
                     }
@@ -70074,6 +70081,31 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
             };
             render_module_parse_errors(&mut diagnostics, &path, &loaded);
             let ast = loaded.ast;
+            // F28: a file that declares its platform (`[platform("@process")]
+            // mod self;`) promises exactly that, wherever it sits — the same
+            // promise a layer makes for its directory, so it is held to it the
+            // same way rather than to every platform its root serves.
+            let declared: Option<Vec<Platform>> = match ast.0.first() {
+                Some((Node::ModulePlatform(patterns), _)) if !patterns.is_empty() => {
+                    let patterns: Vec<PlatformPattern> = patterns
+                        .iter()
+                        .filter_map(|(text, _)| PlatformPattern::parse(text))
+                        .flatten()
+                        .collect();
+                    Some(
+                        Platform::all_hosts()
+                            .into_iter()
+                            .filter(|host| {
+                                patterns
+                                    .iter()
+                                    .any(|pattern| host.matches(*pattern).is_some())
+                            })
+                            .collect(),
+                    )
+                }
+                _ => None,
+            };
+            let served: &[Platform] = declared.as_deref().unwrap_or(served.as_slice());
             for (module, span) in collect_module_paths(&ast.0, "pkg") {
                 if longest_module_prefix(&all_roots, module).is_none() {
                     continue; // not a module file anywhere — an item re-export or a typo

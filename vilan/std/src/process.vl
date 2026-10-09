@@ -1,5 +1,7 @@
-// `std::process` — the Node platform layer's process surface (stdin, arguments,
+// `std::process` — the process platforms' process surface (stdin, arguments,
 // environment, exit). Not available when building for the browser.
+
+[platform("@process")] mod self;
 
 import pkg::option::Option::{ self, None, Some };
 

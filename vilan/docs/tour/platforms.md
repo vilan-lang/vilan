@@ -15,10 +15,15 @@ runtime crash. That's the whole idea of this chapter.
   `Option`/`Result`, strings, numbers, `reactive`, `shared`, `time`,
   json/wire/binary, the rpc client machinery, `style`, `fetch`,
   `crypto`, and friends).
-- **Browser layer**: `std::web::dom`, `std::web::ui`, `std::web::router`,
+- **Browser modules**: `std::web::dom`, `std::web::ui`, `std::web::router`,
   `std::web::storage`. Browser builds only.
-- **Process layer** (Node/Deno/Bun): `std::db`, `std::http`, `std::fs`,
+- **Process modules** (Node/Deno/Bun): `std::db`, `std::http`, `std::fs`,
   `std::process`, `std::rpc::server`. Server builds only.
+
+Each of these declares its platform in its own file, as yours can
+(`[platform("browser")] mod self;`, below). `std::web::ui` is the one
+module with a file per platform: the browser's builds live DOM, the
+process one builds an HTML string, and each build takes its own.
 
 > **Going deeper.** The check is on *reachable code*, not on imports. A
 > file may import `std::fs` and compile for the browser, as long as no
@@ -89,15 +94,15 @@ resources (see [Services](../guide/services.md)).
 
 > **Going deeper.** Where a team wants an explicit boundary,
 > `[platform("browser")]` on a function declares the platforms it
-> promises to run on. The compiler checks the promise on every compile
-> (entry or not, whatever the build target), and a violation lands at the
+> promises to run on. The compiler checks the promise on every compile of
+> your package (entry or not, whatever the build target), and a violation lands at the
 > fence with its chain instead of at some distant entry in a dependent
 > build. Patterns use the manifest layers' vocabulary: `"node"`,
 > `"browser"`, families like `"@process"`, or several at once for code
 > that must stay neutral. The editor shows the same information as you
 > write: violations appear as live diagnostics at the offending call, and
 > hovering a function shows its inferred requirement and how it got it,
-> e.g. ``requires the `process` layer of `std` (via `save → write_file
+> e.g. ``requires the `@process` platform its file declares (via `save → write_file
 > (std::fs)`)``.
 >
 > When the SAME function (or the same trait `impl`) needs a different body
@@ -185,5 +190,6 @@ shape.
 > same way. The styling
 > system's `const style()` chains call it to write CSS rules. Libraries
 > can also declare platform overlays of their own (a base root plus
-> per-platform roots in `[library.layer]`), which is how std itself is
-> layered; most libraries never need this.
+> per-platform roots in `[library.layer]`), which is how std serves
+> `std::web::ui` a file per platform; most libraries never need this —
+> a file's own `[platform(..)] mod self;` is the usual spelling.

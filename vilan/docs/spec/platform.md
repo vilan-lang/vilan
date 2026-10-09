@@ -8,16 +8,25 @@ capability its platform lacks.
 
 ## 11.1 Layers
 
-The standard library is layered:
+The standard library is one platform-neutral base in which a module that
+needs a platform declares it in its own file (§11.3):
 
-- the **base** layer: platform-neutral, available everywhere;
-- the **browser** layer (`std::web::dom`, `std::web::ui`, `std::web::router`,
-  `std::web::storage`): browser builds only;
-- the **process** layer (`std::fs`, `std::http`, `std::db`,
-  `std::process`, `std::rpc::server`): `@process` builds only.
+- the **browser** modules (`std::web::dom`, `std::web::router`,
+  `std::web::storage`, `std::web::dev`) lead with
+  `[platform("browser")] mod self;`: browser builds only;
+- the **process** modules (`std::fs`, `std::http`, `std::db`,
+  `std::process`, `std::build`, `std::watch`, `std::web::document`,
+  `std::rpc::server`) lead with `[platform("@process")] mod self;`:
+  `@process` builds only;
+- one module, `std::web::ui`, is a **twin**: one import path served by a
+  different file per platform — the browser **layer**'s (live DOM) and the
+  process layer's (an HTML string tree) — and each build resolves the file
+  its platform admits.
 
-A library may declare the same shape for itself (`[library.layer]`,
-§11.4): a neutral root plus per-platform overlay roots.
+A library may declare the same shape for itself: a file's own
+`[platform(..)] mod self;`, or, for a module that needs a different FILE
+per platform, per-platform overlay roots (`[library.layer]`, §11.4) beside
+a neutral root.
 
 ## 11.2 Coloring and the reachability check
 
@@ -42,10 +51,13 @@ initializers evaluate at build time (§9) and never color anything.
 
 `[platform("browser")]` (one platform, a family like `"@process"`, or
 several) on a function declares the platforms it promises to run on.
-The promise is checked on **every** compile, whatever the build's
-entries: if code the fenced function reaches requires a layer one of
-the fenced platforms lacks, the error lands **at the fence** with the
-offending chain, not at some distant entry in a dependent build.
+The promise is checked on **every** compile of the package that
+declares it, whatever the build's entries: if code the fenced function
+reaches requires a layer one of the fenced platforms lacks, the error
+lands **at the fence** with the offending chain, not at some distant
+entry in a dependent build. A package that only depends on the fenced
+code (std, or a dependency) does not re-check the promise; what its own
+entries reach is checked as always.
 Fences add no runtime behavior; they are checked declarations.
 
 A fence is also the platform its body is **analyzed under**. One
@@ -68,7 +80,13 @@ on each of the file's functions, checked the same way. And it is the
 platform the file is analyzed under: it outranks inference and the
 `default-entry` colour outright, and of the entries that reach the file
 only those it admits type-check it — reaching it from another is the
-error. The same attribute on an `impl` block does this for the block's
+error. A build its declaration excludes still loads the file, so an
+`import` of it is legal and a call into it is that one error at the
+caller, but reports nothing from inside it: one program has one platform,
+so a twin the file imports (`std::web::ui`) binds the BUILD's side there,
+not the side the file was written against. A module a library layer
+serves to other platforms only is the same promise and is treated the
+same way. The same attribute on an `impl` block does this for the block's
 members; on a struct, an enum or a trait it takes part in choosing the
 platform the file is analyzed under. A type has no platform of its own
 (§11.2's requirement is on code), so a label on one requires nothing.

@@ -996,7 +996,7 @@ pub struct Document {
     /// `usize::MAX` when nothing is retained.
     retained_tail_start: usize,
     /// Per-function platform requirements (`platform_color::requirements`),
-    /// rendered lines like ``requires the `process` layer of `std` (via `…`)``
+    /// rendered lines like ``requires the `@process` platform its file declares (via `…`)``
     /// — appended to the hover of any function that carries one.
     platform_requirements: Arc<HashMap<Id, String>>,
     /// The `vilan.toml` failure behind this analysis, if any — published as one
@@ -14815,7 +14815,7 @@ pub(crate) mod tests {
             .iter()
             .find(|item| {
                 item.message
-                    .contains("requires the `process` layer of `std`")
+                    .contains("requires the `@process` platform its file declares")
             })
             .unwrap_or_else(|| {
                 panic!(
@@ -14885,7 +14885,7 @@ pub(crate) mod tests {
         assert!(
             published.iter().any(|item| {
                 item.message
-                    .contains("requires the `process` layer of `std`")
+                    .contains("requires the `@process` platform its file declares")
                     && item.message.contains("cannot run on `browser`")
             }),
             "{:?}",
@@ -14916,7 +14916,7 @@ pub(crate) mod tests {
         assert!(
             client.published_diagnostics().iter().any(|item| {
                 item.message
-                    .contains("requires the `process` layer of `std`")
+                    .contains("requires the `@process` platform its file declares")
                     && item.message.contains("cannot run on `browser`")
             }),
             "the client entry should color: {:?}",
@@ -14952,7 +14952,7 @@ pub(crate) mod tests {
             .hover(text.find("load").unwrap())
             .expect("hover on `load` should produce a label");
         assert!(
-            hover.contains("requires the `process` layer of `std`"),
+            hover.contains("requires the `@process` platform its file declares"),
             "{hover}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -15637,7 +15637,9 @@ pub(crate) mod tests {
         )
         .expect("hovering `save` should produce a label");
         assert!(
-            hover.contains("requires the `process` layer of `std` (via `write_file (std::fs)`)"),
+            hover.contains(
+                "requires the `@process` platform its file declares (via `write_file (std::fs)`)"
+            ),
             "{hover}"
         );
     }
@@ -15676,9 +15678,9 @@ pub(crate) mod tests {
             "import std::fs;\n\nfun sa|ve() {\n\tfs::write_file(\"state\", \"data\");\n}\n\nfun main() {\n\tsave();\n}\n",
         );
         assert!(
-            hover
-                .as_deref()
-                .is_some_and(|hover| { hover.contains("requires the `process` layer of `std`") }),
+            hover.as_deref().is_some_and(|hover| {
+                hover.contains("requires the `@process` platform its file declares")
+            }),
             "hover on the declaration name should carry the requirement: {hover:?}"
         );
     }
@@ -15692,7 +15694,9 @@ pub(crate) mod tests {
         )
         .expect("hovering `persist` should produce a label");
         assert!(
-            hover.contains("requires the `process` layer of `std` (via `write_file (std::fs)`)"),
+            hover.contains(
+                "requires the `@process` platform its file declares (via `write_file (std::fs)`)"
+            ),
             "{hover}"
         );
     }
@@ -15706,7 +15710,7 @@ pub(crate) mod tests {
         );
         assert!(
             hover.as_deref().is_some_and(|hover| hover.contains(
-                "requires the `process` layer of `std` (via `read_file_to_str (std::fs)`)"
+                "requires the `@process` platform its file declares (via `read_file_to_str (std::fs)`)"
             )),
             "{hover:?}"
         );
@@ -21191,11 +21195,11 @@ pub(crate) mod tests {
                 "`std::{module}` is a module: {labels:?}"
             );
         }
-        // A layer directory is not a path segment: `src/process/fs.vl` is
-        // `std::fs`, and `process` is a module in its own right, not a namespace.
+        // F28: a module that declares its platform (`src/fs.vl`, `@process`)
+        // lists like any other — and `process` is a module in its own right.
         assert!(
             labels.contains(&"fs".to_string()),
-            "a layered module lists under its own name: {labels:?}"
+            "a platform-declared module lists under its own name: {labels:?}"
         );
         // `lib.vl` is the package SURFACE, not a module of it.
         assert!(
@@ -24753,7 +24757,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         assert_eq!(blocks[1], "```vilan\nasync fun save()\n```", "{hover}");
         assert_eq!(blocks[2], "Writes the state.", "{hover}");
         assert!(
-            blocks[3].starts_with("requires the `process` layer of `std`"),
+            blocks[3].starts_with("requires the `@process` platform its file declares"),
             "{hover}"
         );
         assert_eq!(blocks.len(), 4, "{hover}");

@@ -4733,8 +4733,9 @@ fn check_single(
     // reason, so two colors' answers are two errors.
     let _round = RoundReports::arm();
     let mut ok = true;
+    let mut loaded: Vec<(Platform, Vec<PathBuf>)> = Vec::new();
     for platform in platforms {
-        ok &= compile_unit(
+        match compile_unit(
             unit,
             *platform,
             Backend::Js,
@@ -4743,8 +4744,16 @@ fn check_single(
             false,
             None,
             None,
-        )
-        .is_ok();
+        ) {
+            Ok(compiled) => loaded.push((
+                *platform,
+                compiled.sources.into_iter().map(|(path, _)| path).collect(),
+            )),
+            Err(_) => ok = false,
+        }
+    }
+    if ok {
+        ok = check_declared_modules_no_leg_admits(&[unit], &loaded, emit_debug);
     }
     if !ok {
         return RoundOutcome::Failed;
@@ -4755,6 +4764,104 @@ fn check_single(
         paint::out(paint::Style::GREEN, "no errors")
     );
     RoundOutcome::Succeeded
+}
+
+/// The other half of a build reporting nothing from inside a module its
+/// platform excludes (F28, B548; spec §11.3: "of the entries that reach the
+/// file only those it admits type-check it"): `vilan check` still checks every
+/// such module of the user's own packages under a platform it admits. A module
+/// some leg of this round loads AND admits was checked there; one that only
+/// excluding legs load — a `[platform("browser")] mod self;` file a node-only
+/// package imports — is checked here, as the file itself under its declared
+/// platform, exactly as `vilan check <file>` and the editor check it.
+///
+/// `loaded` is each leg's platform with the sources it compiled. Library
+/// modules (std, a dependency) are their own package's to check.
+fn check_declared_modules_no_leg_admits(
+    units: &[&Unit],
+    loaded: &[(Platform, Vec<PathBuf>)],
+    emit_debug: bool,
+) -> bool {
+    let roots: Vec<PathBuf> = units
+        .iter()
+        .map(|unit| vilan_core::util::canonical_path(&unit.pkg_root))
+        .collect();
+    let entries: Vec<PathBuf> = units
+        .iter()
+        .map(|unit| vilan_core::util::canonical_path(&unit.entry))
+        .collect();
+    // Each declared user module with the platforms of the legs that loaded
+    // it, keyed by its canonical path so two spellings are one file.
+    let mut declared: BTreeMap<
+        PathBuf,
+        (
+            PathBuf,
+            vilan_core::platform_color::DeclaredPlatform,
+            Vec<Platform>,
+        ),
+    > = BTreeMap::new();
+    for (platform, sources) in loaded {
+        for source in sources {
+            let canonical = vilan_core::util::canonical_path(source);
+            if entries.contains(&canonical) || !roots.iter().any(|root| canonical.starts_with(root))
+            {
+                continue;
+            }
+            if let Some((_, _, platforms)) = declared.get_mut(&canonical) {
+                platforms.push(*platform);
+                continue;
+            }
+            // Through the content-keyed parse cache the compile itself filled:
+            // a hit for every file the leg just loaded, so the question costs a
+            // hash, not a second parse of the package. A file that does not
+            // parse clean is read through the salvaging parse — its errors are
+            // its own leg's to report, so it must still get one.
+            let Some(declaration) = vilan_core::util::read_source(source)
+                .ok()
+                .and_then(|text| match vilan_core::parse_clean_cached(&text) {
+                    Some((tree, _)) => vilan_core::platform_color::declared_platform_in(&tree.0),
+                    None => vilan_core::platform_color::declared_platform(&text),
+                })
+                .filter(|declaration| declaration.module_level)
+            else {
+                continue;
+            };
+            declared.insert(canonical, (source.clone(), declaration, vec![*platform]));
+        }
+    }
+    let mut ok = true;
+    for (_, (path, declaration, platforms)) in declared {
+        if platforms
+            .iter()
+            .any(|platform| declaration.admits(*platform))
+        {
+            continue;
+        }
+        let project = match file_project(path.clone()) {
+            Ok(project) => project,
+            Err(message) => {
+                eprintln!("{} {message}", paint::error_prefix());
+                ok = false;
+                continue;
+            }
+        };
+        let Project::Single { unit, platform, .. } = project else {
+            continue;
+        };
+        let platform = platform.unwrap_or(declaration.hosts[0]);
+        ok &= compile_unit(
+            &unit,
+            platform,
+            Backend::Js,
+            CompileGoal::CheckModule,
+            emit_debug,
+            false,
+            None,
+            None,
+        )
+        .is_ok();
+    }
+    ok
 }
 
 /// Builds and runs a lone package's entry with Node, forwarding `args`.
@@ -5560,8 +5667,19 @@ fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
             None,
             None,
         )
-        .is_ok()
+        .ok()
+        .map(|compiled| {
+            (
+                platform,
+                compiled
+                    .sources
+                    .into_iter()
+                    .map(|(path, _)| path)
+                    .collect::<Vec<PathBuf>>(),
+            )
+        })
     };
+    let units: Vec<&Unit> = members.iter().map(|(unit, _)| unit).collect();
 
     // M100: every member starts at once, one thread each, capturing its
     // diagnostics. M35 ran the FIRST member alone to warm the process-global
@@ -5592,43 +5710,60 @@ fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
         }
     }
     if members.len() == 1 || sequential_check() {
-        let mut ok = check(first_unit, *first_platform);
-        for (unit, platform) in rest {
-            ok &= check(unit, *platform);
+        let mut loaded = Vec::new();
+        let mut ok = true;
+        for (unit, platform) in std::iter::once((first_unit, first_platform))
+            .chain(rest.iter().map(|(unit, platform)| (unit, platform)))
+        {
+            match check(unit, *platform) {
+                Some(leg) => loaded.push(leg),
+                None => ok = false,
+            }
+        }
+        if ok {
+            ok = check_declared_modules_no_leg_admits(&units, &loaded, debug);
         }
         return outcome(ok);
     }
     let mut ok = true;
 
-    let captured: Vec<(bool, Vec<CapturedReport>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = members
-            .iter()
-            .map(|(unit, platform)| {
-                spawn_scoped_compiler_thread(scope, || {
-                    capture_arm();
-                    let ok = check(unit, *platform);
-                    (ok, capture_take())
+    let captured: Vec<(Option<(Platform, Vec<PathBuf>)>, Vec<CapturedReport>)> =
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = members
+                .iter()
+                .map(|(unit, platform)| {
+                    spawn_scoped_compiler_thread(scope, || {
+                        capture_arm();
+                        let leg = check(unit, *platform);
+                        (leg, capture_take())
+                    })
+                    .expect("spawn a check worker")
                 })
-                .expect("spawn a check worker")
-            })
-            .collect();
-        workers
-            .into_iter()
-            .map(|worker| {
-                worker
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect()
-    });
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect()
+        });
 
     // MEMBER order, which is the order a sequential round reported in — the
     // members arrive alphabetically (a `BTreeMap`), and the B182 ledger is
     // applied here rather than on the workers so the same member claims the
     // same shared-module diagnostic whatever the scheduler did.
-    for (member_ok, reports) in captured {
-        ok &= member_ok;
+    let mut loaded = Vec::new();
+    for (leg, reports) in captured {
+        match leg {
+            Some(leg) => loaded.push(leg),
+            None => ok = false,
+        }
         replay_captured(reports);
+    }
+    if ok {
+        ok = check_declared_modules_no_leg_admits(&units, &loaded, debug);
     }
     outcome(ok)
 }
@@ -5768,13 +5903,50 @@ fn run_workspace(
 }
 
 /// Walks up from `start` for the nearest directory containing a `vilan.toml`.
+///
+/// B556: the walk goes up the FILESYSTEM, not up the spelling. `start` is
+/// often relative — `Path::parent` of a bare `main.vl` is `""`, of `../main.vl`
+/// is `..` — and a purely lexical walk stopped where the spelling ran out:
+/// `cd src && vilan check main.vl` asked only `src/` and compiled the file as
+/// belonging to no package, and from `src/deeper`, `../main.vl` asked `src/`
+/// and then the working directory, which is not above it at all. So where the
+/// spelling has no named directory left to drop, the walk climbs through
+/// `..`, and it ends where climbing no longer moves (the filesystem root).
+/// The answer keeps the caller's spelling (`..`, not an absolute path), so a
+/// diagnostic in the package renders against the path the user wrote.
 fn find_project_root(start: &Path) -> Option<PathBuf> {
-    let mut directory = start;
+    use std::path::Component;
+    // Where `directory` is on disk, for the walk's one stopping question; the
+    // empty spelling is the working directory.
+    fn on_disk(directory: &Path) -> Option<PathBuf> {
+        let spelled = if directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            directory
+        };
+        spelled.canonicalize().ok()
+    }
+    let mut directory = start.to_path_buf();
     loop {
         if directory.join("vilan.toml").is_file() {
-            return Some(directory.to_path_buf());
+            return Some(directory);
         }
-        directory = directory.parent()?;
+        directory = match directory.components().next_back() {
+            // A named directory: drop it, as the walk always has.
+            Some(Component::Normal(_)) => directory.parent()?.to_path_buf(),
+            // The filesystem root (or a Windows prefix): nothing above.
+            Some(Component::RootDir | Component::Prefix(_)) => return None,
+            // `""`, `.` or `..`: the spelling has nothing left to drop, so
+            // climb — until climbing stops moving.
+            Some(Component::CurDir | Component::ParentDir) | None => {
+                let up = directory.join("..");
+                let here = on_disk(&directory)?;
+                if on_disk(&up).is_none_or(|above| above == here) {
+                    return None;
+                }
+                up
+            }
+        };
     }
 }
 

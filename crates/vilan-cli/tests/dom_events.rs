@@ -417,9 +417,9 @@ require("./app.js");
 /// declaration between `impl` blocks cannot fake a pass.
 fn event_surface_externs() -> Vec<(String, String, bool)> {
     let source = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src/browser/web/dom.vl"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src/web/dom.vl"),
     )
-    .expect("read std/src/browser/web/dom.vl");
+    .expect("read std/src/web/dom.vl");
 
     let mut found = Vec::new();
     for (index, _) in source.match_indices("[extern(") {

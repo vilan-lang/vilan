@@ -23,13 +23,16 @@ fn vilan_root() -> PathBuf {
 fn the_table_carries_the_expected_packages() {
     let keys: Vec<&str> = FILES.iter().map(|(key, _)| *key).collect();
     // Both package manifests (resolve_std needs them for the platform layers),
-    // a base module, a layer module, and macro_std's entry.
+    // a base module, a platform-declared module of each kind (F28), both
+    // layer files of the `ui` twin, and macro_std's entry.
     for expected in [
         "std/vilan.toml",
         "std/src/lib.vl",
         "std/src/reactive.vl",
-        "std/src/browser/web/dom.vl",
-        "std/src/process/fs.vl",
+        "std/src/web/dom.vl",
+        "std/src/fs.vl",
+        "std/src/browser/web/ui.vl",
+        "std/src/process/web/ui.vl",
         "macro_std/vilan.toml",
         "macro_std/src/lib.vl",
     ] {

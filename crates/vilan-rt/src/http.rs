@@ -11,7 +11,7 @@
 //!
 //! # What this is a twin OF
 //!
-//! `vilan/std/src/process/http.vl` binds `node:http` — `createServer`, the
+//! `vilan/std/src/http.vl` binds `node:http` — `createServer`, the
 //! request's `url`/`method`/`headers`, the response's `statusCode`/`setHeader`/
 //! `write`/`end`, the server's `listen`/`address`/`close`, and the raw socket a
 //! protocol upgrade hands over. Those bindings ARE the contract: every item here

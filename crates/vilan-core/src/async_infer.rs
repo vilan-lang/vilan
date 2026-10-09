@@ -762,17 +762,40 @@ pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
             // back to every same-named member in the program, so a generic
             // `p.start()` reached `std::http`'s `Server::start` and colored a
             // browser build that never touches a server (collections-44's find).
-            let precise = trait_of(program, constraint_id)
-                .map(|trait_id| {
-                    declaring_traits_in_chain(program, trait_id, member)
-                        .into_iter()
-                        .flat_map(|declaring| trait_method_candidates(program, declaring, member))
-                        .collect::<Vec<Id>>()
-                })
-                .unwrap_or_default();
-            // A multi-bound parameter records only its first bound, so a member
-            // from another bound finds nothing precise — fall back to every
-            // same-named member (over-approximate but sound).
+            //
+            // F28: a MULTI-bound parameter (`T: Wire + Keyed<K>`) names its
+            // bounds in `generic_bounds`, and the member is looked up in each
+            // of them. The dispatch record carries one bound, and reading only
+            // that one found `key` in none of `Wire`'s chain, so `element.key()`
+            // in `std::rpc` fell back to every `key` in the program —
+            // `std::web::dom`'s `Event::key` among them — and the fence std's
+            // `rpc::server` declares refused kolt's server for a DOM call
+            // nothing can make.
+            let mut bounds: Vec<Id> = program
+                .generic_bounds
+                .get(&constraint_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|bound| trait_of(program, *bound))
+                .collect();
+            if let Some(trait_id) = trait_of(program, constraint_id)
+                && !bounds.contains(&trait_id)
+            {
+                bounds.push(trait_id);
+            }
+            let mut precise: Vec<Id> = Vec::new();
+            for trait_id in bounds {
+                for declaring in declaring_traits_in_chain(program, trait_id, member) {
+                    for candidate in trait_method_candidates(program, declaring, member) {
+                        if !precise.contains(&candidate) {
+                            precise.push(candidate);
+                        }
+                    }
+                }
+            }
+            // A parameter whose bounds declare no such member (a bound the
+            // record cannot name) falls back to every same-named member —
+            // over-approximate but sound.
             if precise.is_empty() {
                 members_named(program, member)
             } else {

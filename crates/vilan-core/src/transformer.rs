@@ -1459,7 +1459,7 @@ fn helper_source(name: &str) -> &'static str {
         // The array IS the struct's runtime form — a struct is an array in
         // FIELD ORDER — so this builds a `DomRect` the same way `__parse_i32`
         // builds an `Option`. Its order is `left, top, width, height`, and
-        // `DomRect`'s field order in `vilan/std/src/browser/web/dom.vl` must match;
+        // `DomRect`'s field order in `vilan/std/src/web/dom.vl` must match;
         // `ui_rows.rs`'s `a59_bounding_rect_reads_the_host_box` asserts the
         // four values by name, so a reorder is a red test rather than silence.
         "__dom_bounding_rect" => {

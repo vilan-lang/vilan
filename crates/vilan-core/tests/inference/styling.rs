@@ -5310,7 +5310,7 @@ fn platform_requirement_flows_through_trait_dispatch() {
             save_it(DiskStore { path = "s.txt" });
         }
         "#,
-        "requires the `process` layer of `std`",
+        "requires the `@process` platform its file declares",
     );
 }
 
@@ -5332,7 +5332,7 @@ fn a_closures_platform_charges_its_creator() {
             let _saver = make_saver("s.txt");
         }
         "#,
-        "requires the `process` layer of `std`",
+        "requires the `@process` platform its file declares",
     );
 }
 

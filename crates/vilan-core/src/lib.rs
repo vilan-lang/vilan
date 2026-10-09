@@ -99,8 +99,9 @@ struct InferredPlatform {
 /// Infers a build platform for editor analysis (which has no `--platform`) from
 /// a file's own text. Evidence, per `import std::<module>` reference:
 ///
-/// - a module served ONLY by a browser layer (`std::web::dom`) is browser evidence —
-///   the file cannot mean anything else;
+/// - a module served ONLY by a browser layer, or whose file declares the
+///   browser platform alone (`std::web::dom`'s `[platform("browser")] mod
+///   self;`, E266), is browser evidence — the file cannot mean anything else;
 /// - a module served by a browser layer AND another root — a platform TWIN,
 ///   like `std::web::ui` — is evidence through the NAMES imported from it: a
 ///   name declared by just the browser twin (`mount`) says browser, one
@@ -209,6 +210,30 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         };
         tree.0.iter().any(|node| node_declares(&node.0, name))
     }
+    // Whether the module at `path` leads with `[platform(..)] mod self;`
+    // admitting the browser and nothing else (E266). Read through the parse
+    // cache as `declares` is, and as forgiving: a file that fails to read or
+    // parse declares nothing.
+    fn declares_only_browser(path: &Path) -> bool {
+        let Ok(source) = util::read_source(path) else {
+            return false;
+        };
+        let Some((tree, _)) = parse_clean_cached(&source) else {
+            return false;
+        };
+        let Some((Node::ModulePlatform(patterns), _)) = tree.0.first() else {
+            return false;
+        };
+        let parsed: Vec<Pattern> = patterns
+            .iter()
+            .filter_map(|(text, _)| Pattern::parse(text))
+            .flatten()
+            .collect();
+        !parsed.is_empty()
+            && parsed
+                .iter()
+                .all(|pattern| matches!(pattern, Pattern::Browser))
+    }
     /// The MEMBER names the module at `path` declares (F27 R2): a struct's
     /// fields, an `impl` block's functions, a trait's members — the names that
     /// can follow a dot on one of this module's values. Free functions are not
@@ -290,6 +315,20 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
             ImportBranch::Path(segment, _, sub) => {
                 let module = &joined(prefix, segment);
                 let Some(browser_file) = module_file(browser_root, module) else {
+                    // E266 (F28): a module whose FILE declares the browser
+                    // platform alone (`[platform("browser")] mod self;`) is the
+                    // evidence a browser-layer-only module is — one promise,
+                    // spelled as an attribute rather than a directory.
+                    if other_roots
+                        .iter()
+                        .filter_map(|root| module_file(root, module))
+                        .any(|file| declares_only_browser(&file))
+                    {
+                        return Some(format!(
+                            "it imports `std::{module}`, whose file declares the `browser` \
+                             platform"
+                        ));
+                    }
                     // A154: not a browser module, and not a module anywhere —
                     // a namespace (`web`), so the evidence is below it.
                     if let ImportTail::Continue(sub) = sub
@@ -1136,6 +1175,9 @@ pub fn post_analysis_passes(
     // both. Zero the accumulator here — the top of the only region that calls
     // it — so the `dispatch-refine` bucket is this analysis's total.
     dispatch_refine::reset_refine_time();
+    // F28 (B548/B549): a module whose own platform this build excludes is not
+    // this build's to judge — dropped before any pass below reads the list.
+    platform_color::drop_diagnostics_outside_the_build(program);
     // B318 S4: the per-importer method namespace, resolved against the FINISHED
     // program because the question a selector asks is
     // `impl_select::subject_applies`, which reads one — and resolved HERE,
@@ -1286,6 +1328,9 @@ pub fn post_analysis_passes(
     let phase_init_start = PhaseClock::now();
     init_order::check_cycles(program);
     let phase_init = phase_init_start.elapsed();
+    // ...and again for what the passes above pushed (a fence walk, the const
+    // pass) inside such a module.
+    platform_color::drop_diagnostics_outside_the_build(program);
     // THE seam for diagnostic order (E38, diagnostics-standard.md C1). Nothing
     // after this point adds to either list, and both pipelines run this
     // function, so normalizing here is what every consumer reads — including
