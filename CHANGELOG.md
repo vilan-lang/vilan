@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**E286: a `pkg::` or dependency import of a module whose file declares `[platform("browser")] mod self;` is browser evidence for a file with no project to colour it, as a `std::` one is (E266).** The editor's platform inference read `std::` imports only, so a `[library]` file importing its own browser-declared module — or a dependency's — was analyzed as node ("analyzed as: node — default") and its `Region` was the process twin's, while the module itself was analyzed as browser. It now reads the entry package's root and the workspace's dependencies for the same file declaration (and a dependency's browser-only layer); a dependency's surface re-exports are not followed.
+
+---
+
+<!-- family: fix -->
 **E280: a file opened into a world another open document already holds still gets its FURTHER worlds analyzed.** Opening `shared.vl` (a module both the browser entry and the node entry reach) with `client.vl` open and settled served it from the held browser world, which analyzes nothing and used to return before the sweep that creates the node entry's world — so the module showed only the browser leg's verdict, with no node-leg diagnostics (E113) and no twin legs, until its next edit; opened the other way round the sweep ran. The served open now schedules that sweep for the further worlds nothing holds, and only those: the held world and every open document are left alone.
 
 ---
