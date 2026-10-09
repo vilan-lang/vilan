@@ -24,7 +24,7 @@ generates for each type a `dbg` reaches, the same on both backends:
 | a tuple, a list | `(1, "two", 3.0)`, `[1, 2, 3]` |
 | a string | `"a \"quoted\" line\n"` |
 | a float, an integer | `3.0`, `0.25`, `1e+21`, `-0.0`; `7`, `-3` |
-| a closure | `<closure |i32, i32| -> i32>` |
+| a closure | `<closure |i32, i32| i32>` |
 | a `HashMap`, a `HashSet` | `HashMap { "ada" => 36 }`, `HashSet { "a", "b" }`, in insertion order |
 | a `Shared`, a `SignalCell` | `Shared(Point { x = 7, y = 8 })`, `SignalCell(3)` (read without tracking) |
 | a pipe | `<pipe Derive<SignalCell<i32>, i32, i32>>`: sampling one would run it |

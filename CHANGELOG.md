@@ -48,6 +48,11 @@ written down.
 <!-- family: feature -->
 **debugging.md S1b, the rest: a `dyn` value prints the value it holds — `dyn Area(Square { side = 2 })`, `dyn Label<str>(..)` — where `dbg` printed `<dyn Area>`.** In a program whose build prints a `dbg`, every trait-object table carries the erased value's printer: a `$show` entry on the JS table (no vilan name starts with `$`), a `dbg_show` method on the native object trait (named clear of the trait's own members, so a member called `show` or `dbg_show` is untouched). The `dyn`'s printer calls it, so the value prints as its own type would — a written `Debug` included. A program that never calls `dbg` (or strips it) carries no slot: no corpus golden moves. Pins: `inference::debugging::s1b_a_dyn_value_prints_what_it_holds` (alone, in a list, in an option, trait arguments; no `$show` without a `dbg`), `native_differential::s1b_a_dyn_value_prints_what_it_holds_on_both_backends` (`native/dbg_dyn.*`). Tracker E257 (S1b).
 
+---
+
+<!-- family: fix -->
+**`dbg` spells a closure's type as vilan writes it — `<closure |i32, i32| i32>` — where it wrote `<closure |i32, i32| -> i32>`, a spelling the parser refuses ("`->` is not how vilan writes a closure type").** The printer's labels are meant to be vilan's own syntax; a pipe's label (`<pipe Derive<..>>`) that names a closure type follows. The committed `native/dbg_printer.stderr` moves by its last line. Pins: the re-read `inference::debugging::s1_dbg_breaks_past_80_columns_and_cuts_a_long_list` and `native_differential::s1_dbg_writes_the_same_bytes_on_both_backends`. Found by debug-48 probing the printer.
+
 ## v0.45.0 — 2026-10-08
 
 <!-- family: breaking -->

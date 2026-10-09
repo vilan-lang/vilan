@@ -7,7 +7,7 @@
 //! printer per concrete type a `dbg` reaches (`__show_*` functions on JS,
 //! `show_*` functions natively), and each asks THIS module what the type is
 //! for printing: [`shape_of`] classifies it, and the labels it carries (the
-//! qualified variant names, a closure's `<closure |i32| -> i32>`) are spelled
+//! qualified variant names, a closure's `<closure |i32| i32>`) are spelled
 //! here, once. What the emitters add is only how a value of that shape is
 //! READ on their backend: a JS struct is its field array, a native one has
 //! named fields.
@@ -375,7 +375,8 @@ fn enum_shape(program: &Program, enum_id: Id, arguments: &[TypeId]) -> Shape {
     }
 }
 
-/// `|i32, str| -> bool`: a closure type as `dbg` prints it.
+/// `|i32, str| bool`: a closure type as `dbg` prints it — vilan's own type
+/// syntax, the result directly after the parameters.
 fn closure_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> String {
     match program.type_id_to_type_map.get(&resolve(type_id)) {
         Some(Type::Closure(parameters, return_type, _, _)) => {
@@ -384,7 +385,7 @@ fn closure_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> 
                 .map(|parameter| type_text(program, *parameter, resolve))
                 .collect();
             format!(
-                "|{}| -> {}",
+                "|{}| {}",
                 parameters.join(", "),
                 type_text(program, *return_type, resolve)
             )
@@ -398,7 +399,7 @@ fn closure_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> 
     }
 }
 
-/// A type as vilan writes it — `List<Point>`, `(i32, str)`, `|i32| -> bool`.
+/// A type as vilan writes it — `List<Point>`, `(i32, str)`, `|i32| bool`.
 pub fn type_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> String {
     let Some(_guard) = crate::util::RecursionGuard::enter() else {
         return "..".to_string();

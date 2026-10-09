@@ -258,7 +258,7 @@ fn s1_dbg_breaks_past_80_columns_and_cuts_a_long_list() {
         ),
         "103\n",
         &format!(
-            "[test.vl:4:2] long = Line {{\n  from = (1, 2),\n  to = (3, 4),\n  label = \"a label long enough to break\",\n}}\n[test.vl:9:13] many = [\n{}  98, 99, \u{2026} 3 more,\n]\n[test.vl:12:2] add = <closure |i32, i32| -> i32>\n",
+            "[test.vl:4:2] long = Line {{\n  from = (1, 2),\n  to = (3, 4),\n  label = \"a label long enough to break\",\n}}\n[test.vl:9:13] many = [\n{}  98, 99, \u{2026} 3 more,\n]\n[test.vl:12:2] add = <closure |i32, i32| i32>\n",
             FILLED_ZERO_TO_97
         ),
     );
