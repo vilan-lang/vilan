@@ -247,8 +247,15 @@ fn unsupported(what: &str, span: Span) -> Error {
 enum Step {
     Field(Id, usize),
     Slot(String),
-    /// A subscript, by its index expression (F90).
-    Index(Id),
+    /// A subscript: the subscript expression and its index expression (F90).
+    Index(Id, Id),
+}
+
+/// What a [`Step`] spine reads through: a `Shared` view call's cell, or a
+/// boxed binding's capture cell (F103).
+enum CellRoot {
+    View(Id),
+    Boxed(Id),
 }
 
 /// Where in the emitted file one reserved slot's text goes, and under what name.
@@ -409,6 +416,10 @@ struct Emitter<'a, 'src> {
     /// into a future rather than handed over with the wrong type.
     /// `Server::builder()`'s default handler is the shape.
     expects_async_value: bool,
+    /// Set while a call's arguments are rendered for a caller that renders
+    /// its receiver itself ([`Emitter::object_call`]): no argument is taken
+    /// as a cell VIEW there (F49), since the receiver's text is discarded.
+    no_cell_views: bool,
     /// The DECLARED return type of the function being emitted, threaded to its
     /// return positions so a generic aggregate built there instantiates at the
     /// signature's arguments rather than at the ones its own site recorded.
@@ -644,6 +655,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             declaring_a_view: false,
             expects_async: false,
             expects_async_value: false,
+            no_cell_views: false,
             current_return_type: None,
             reaches_sqlite: false,
             reaches_crypto: false,
@@ -3361,20 +3373,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     /// Whether `id` is a spine of fields, tuple slots and subscripts read
-    /// through a `Shared` view — what [`Self::shared_view_field_read`] renders.
+    /// through a `Shared` view or over a boxed binding (F103) — what
+    /// [`Self::shared_view_field_read`] renders, a copy out of the cell.
     fn reads_through_a_shared_view(&self, id: Id) -> bool {
-        let mut current = id;
-        let mut stepped = false;
-        loop {
-            match self.program.entity_map.get(&current) {
-                Some(&Expr::Field(subject, _, _))
-                | Some(&Expr::TupleIndex(subject, _, _))
-                | Some(&Expr::Index(subject, _)) => {
-                    stepped = true;
-                    current = subject;
-                }
-                _ => return stepped && self.shared_view_of(current).is_some(),
+        self.cell_spine(id)
+            .is_some_and(|(_, steps)| !steps.is_empty())
+    }
+
+    /// The BOXED binding `id` names, when it is a bare read of one (R3's
+    /// capture cell) — the root a field spine reads through by a scoped
+    /// borrow rather than a whole-value copy (F103).
+    fn boxed_root(&self, id: Id) -> Option<Id> {
+        match self.program.entity_map.get(&id)? {
+            Expr::Local(binding) | Expr::Parameter(binding) if self.boxed.contains(binding) => {
+                Some(*binding)
             }
+            _ => None,
         }
     }
 
@@ -3423,35 +3437,91 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// field, while the `write()` one had none. The borrow ends with the read,
     /// so a write of the same cell later in the statement —
     /// `a.write().n = a.write().n + 1` — finds no live borrow to collide with.
+    ///
+    /// F103: a spine over a BOXED binding (R3's capture cell) is read the same
+    /// way — `log.lines` had been `log.get().lines`, a copy of the whole value,
+    /// every list in it, to read one field.
     fn shared_view_field_read(&mut self, id: Id, depth: usize) -> Result<Option<String>, Error> {
+        let Some((root, steps)) = self.cell_spine(id) else {
+            return Ok(None);
+        };
+        if steps.is_empty() {
+            return Ok(None);
+        }
+        let mut subscripts = String::new();
+        let mut settled = 0;
+        let path = self.spine_path(
+            "view".to_string(),
+            &steps,
+            id,
+            (depth, "__index"),
+            &mut subscripts,
+            &mut settled,
+        )?;
+        let cell_text = match root {
+            CellRoot::View(cell) => {
+                self.expecting_nothing(|emitter| emitter.expression(cell, depth))?
+            }
+            CellRoot::Boxed(binding) => self.binding_name(binding),
+        };
+        let copied = if self.is_natively_copy(id) {
+            ""
+        } else {
+            ".clone()"
+        };
+        let read = format!("({cell_text}).read_with(|view| {path}{copied})");
+        if subscripts.is_empty() {
+            return Ok(Some(read));
+        }
+        Ok(Some(format!("{{ {subscripts}{read} }}")))
+    }
+
+    /// A spine of fields, tuple slots and subscripts over a CELL — a `Shared`
+    /// view call (`cell.read().a[i]`, F62/F90) or a boxed binding (`log.a[i]`,
+    /// F103) — as its root and its steps, outermost last. A bare boxed
+    /// binding is a spine with no steps; a bare view call is none.
+    fn cell_spine(&self, id: Id) -> Option<(CellRoot, Vec<Step>)> {
         let mut steps = Vec::new();
         let mut current = id;
-        let cell = loop {
-            match self.program.entity_map.get(&current) {
-                Some(&Expr::Field(subject, _, index)) => {
+        loop {
+            match *self.program.entity_map.get(&current)? {
+                Expr::Field(subject, _, index) => {
                     steps.push(Step::Field(subject, index));
                     current = subject;
                 }
-                Some(&Expr::TupleIndex(subject, offset, width)) => {
-                    let Some(path) = self.tuple_slot_path(current, offset, width) else {
-                        return Ok(None);
-                    };
-                    steps.push(Step::Slot(path));
+                Expr::TupleIndex(subject, offset, width) => {
+                    steps.push(Step::Slot(self.tuple_slot_path(current, offset, width)?));
                     current = subject;
                 }
-                Some(&Expr::Index(subject, index)) => {
-                    steps.push(Step::Index(index));
+                Expr::Index(subject, index) => {
+                    steps.push(Step::Index(current, index));
                     current = subject;
                 }
-                _ => match self.shared_view_of(current) {
-                    Some((cell, _)) if !steps.is_empty() => break cell,
-                    _ => return Ok(None),
-                },
+                _ => {
+                    if let Some(binding) = self.boxed_root(current) {
+                        return Some((CellRoot::Boxed(binding), steps));
+                    }
+                    let (cell, _) = self.shared_view_of(current)?;
+                    return (!steps.is_empty()).then_some((CellRoot::View(cell), steps));
+                }
             }
-        };
-        let mut path = String::new();
-        let mut subscripts = String::new();
-        let mut settled = 0;
+        }
+    }
+
+    /// A spine's steps rendered over `root` (the view's name inside the
+    /// borrow), each subscript's index settled in a `let` written to
+    /// `subscripts`, root first — the order the source evaluates them in — so
+    /// the borrow covers the element read alone.
+    fn spine_path(
+        &mut self,
+        root: String,
+        steps: &[Step],
+        id: Id,
+        (depth, prefix): (usize, &str),
+        subscripts: &mut String,
+        settled: &mut usize,
+    ) -> Result<String, Error> {
+        let mut path = root;
         for step in steps.iter().rev() {
             match *step {
                 Step::Field(subject, index) => {
@@ -3459,27 +3529,66 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     let _ = write!(path, ".{field}");
                 }
                 Step::Slot(ref slot) => path.push_str(slot),
-                Step::Index(index) => {
+                Step::Index(node, index) => {
                     let index_text =
                         self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
-                    let name = format!("__index{settled}");
-                    settled += 1;
+                    let name = format!("{prefix}{settled}");
+                    *settled += 1;
                     let _ = write!(subscripts, "let {name} = {index_text}; ");
-                    let _ = write!(path, "[({name}) as usize]");
+                    // The checked read (debugging.md S0), as the plain
+                    // subscript arm writes it: an out-of-bounds index through
+                    // a cell panics in vilan's words at its vilan site.
+                    let location = self.subscript_location(node, depth)?;
+                    path = format!("(*({path}).vilan_at(({name}) as usize, {location}))");
                 }
             }
         }
-        let cell_text = self.expecting_nothing(|emitter| emitter.expression(cell, depth))?;
-        let copied = if self.is_natively_copy(id) {
-            ""
-        } else {
-            ".clone()"
+        Ok(path)
+    }
+
+    /// A place over a BOXED binding taken as a VIEW for one call (F49): the
+    /// cell's shared borrow, held by a `let` the call's block drops when the
+    /// call returns, and the place read through it — `writer.result()` is `{
+    /// let __view0 = (writer).borrow(); result_N(&(*__view0)) }` where it had
+    /// been `result_N(&writer.get())`, a copy of the whole value (the JSON
+    /// codec's writer, buffer included, once per frame).
+    ///
+    /// The subscripts are settled into `settled_lets` and the borrow into
+    /// `borrows`, which the caller writes AFTER every by-value argument has
+    /// been hoisted: the view is taken last, once nothing but the call itself
+    /// is left to run. That is the evaluation order spec §6.9's native note
+    /// states. `None` for a place that does not live in a boxed cell.
+    fn cell_view_place(
+        &mut self,
+        id: Id,
+        depth: usize,
+        settled_lets: &mut String,
+        borrows: &mut String,
+        views: &mut usize,
+    ) -> Result<Option<String>, Error> {
+        let place = match self.program.entity_map.get(&id) {
+            Some(&Expr::Reference(operand, false)) => operand,
+            _ => id,
         };
-        let read = format!("({cell_text}).read_with(|view| view{path}{copied})");
-        if subscripts.is_empty() {
-            return Ok(Some(read));
-        }
-        Ok(Some(format!("{{ {subscripts}{read} }}")))
+        let Some((CellRoot::Boxed(binding), steps)) = self.cell_spine(place) else {
+            return Ok(None);
+        };
+        let view = format!("__view{views}");
+        *views += 1;
+        let path = self.spine_path(
+            format!("(*{view})"),
+            &steps,
+            place,
+            (depth, &format!("{view}_index")),
+            settled_lets,
+            &mut 0,
+        )?;
+        let _ = write!(
+            borrows,
+            "let {view} = ({}).borrow(); ",
+            self.binding_name(binding)
+        );
+        Ok(Some(path))
     }
 
     /// The type an `await` produces (J6): a `Task<T>`'s payload.
@@ -4635,8 +4744,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let text = self.expression(id, depth)?;
         // F62: a field read through a `Shared` view is already a copy out of
-        // the cell's scoped borrow, so rule 1's copy has been taken.
-        if self.reads_through_a_shared_view(id) {
+        // the cell's scoped borrow, so rule 1's copy has been taken — and so
+        // is a read of a BOXED binding, whose `get()` hands back a copy of the
+        // cell's value (F103: a second `.clone()` copied it twice).
+        if self.reads_through_a_shared_view(id) || self.boxed_root(id).is_some() {
             return Ok(text);
         }
         if self.copy_applies(self.program.clone_sites.get(&id)) {
@@ -4718,7 +4829,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// out of the cell's scoped borrow ([`Self::shared_view_field_read`]).
     fn subject_is_a_place(&self, id: Id) -> bool {
         match self.program.entity_map.get(&id) {
-            Some(Expr::Local(_) | Expr::Parameter(_)) => true,
+            Some(Expr::Local(_) | Expr::Parameter(_)) => self.boxed_root(id).is_none(),
             Some(Expr::Field(..) | Expr::TupleIndex(..) | Expr::Index(..)) => {
                 !self.reads_through_a_shared_view(id)
             }
@@ -7251,6 +7362,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let iteration = match self.program.for_each_views.get(&item.unwrap_or(Id(0))) {
             Some(true) => format!("({iterable_text}).iter_mut()"),
             Some(false) => format!("({iterable_text}).iter()"),
+            // A read out of a cell — a boxed binding, or a spine over one or
+            // over a `Shared` view — is already the copy (F103).
+            None if self.boxed_root(iterable).is_some()
+                || self.reads_through_a_shared_view(iterable) =>
+            {
+                format!("({iterable_text}).into_iter()")
+            }
             None => format!("({iterable_text}).clone().into_iter()"),
         };
         Ok(format!("for {binder} in {iteration} {{\n{body}{pad}}}"))
@@ -9791,7 +9909,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         })
                 })
         });
-        let borrows_a_cell = borrows_a_cell || borrows_a_read_place;
+        // F49: a `&` argument over a BOXED binding is a VIEW of its cell for
+        // the call (see [`Emitter::cell_view_place`]), taken after every
+        // by-value argument has been evaluated — the same hoist.
+        let views_allowed = !self.no_cell_views && self.views_its_arguments(target, callee_bits);
+        let takes_a_view: Vec<bool> = argument_ids
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| {
+                views_allowed
+                    && matches!(conventions.get(index), Some(Receiving::Ref))
+                    && self.takes_a_cell_view(argument_ids, index, *argument)
+            })
+            .collect();
+        let views_a_cell = takes_a_view.contains(&true);
+        let borrows_a_cell = borrows_a_cell || borrows_a_read_place || views_a_cell;
+        let mut view_borrows = String::new();
+        let mut views = 0;
         // The callee's WHOLE parameter list, hidden context parameters
         // included (they have no `parameters` record, so `declared` omits
         // them). A call can carry MORE arguments than that: the context pass
@@ -9824,6 +9958,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // value — see [`Emitter::lazy_argument`].
             if let Some(cell) = self.lazy_argument(*argument, depth) {
                 rendered.push(cell?);
+                continue;
+            }
+            if takes_a_view.get(index).copied().unwrap_or(false)
+                && let Some(path) =
+                    self.cell_view_place(*argument, depth, prelude, &mut view_borrows, &mut views)?
+            {
+                rendered.push(format!("&{path}"));
                 continue;
             }
             let wants_a_place = !matches!(conventions.get(index), None | Some(Receiving::ByValue));
@@ -9918,7 +10059,199 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             rendered.push(text);
         }
+        prelude.push_str(&view_borrows);
         Ok(rendered)
+    }
+
+    /// The boxed binding a place argument (or the place a `&`/`&mut` the
+    /// source wrote names) is rooted at, through its fields, tuple slots and
+    /// subscripts.
+    fn boxed_place_root(&self, id: Id) -> Option<Id> {
+        let place = match self.program.entity_map.get(&id) {
+            Some(&Expr::Reference(operand, _)) => operand,
+            _ => id,
+        };
+        match self.cell_spine(place)? {
+            (CellRoot::Boxed(binding), _) => Some(binding),
+            (CellRoot::View(_), _) => None,
+        }
+    }
+
+    /// The first touch of `binding` — with `writes_only`, the first write —
+    /// inside a closure that one of a call's arguments other than `index`
+    /// carries ([`Self::closure_touch`]).
+    fn carried_closure_touch(
+        &self,
+        argument_ids: &[Id],
+        index: usize,
+        binding: Id,
+        writes_only: bool,
+    ) -> Option<Id> {
+        argument_ids
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .find_map(|(_, carried)| {
+                self.closure_touch(*carried, binding, writes_only, &mut HashSet::new(), false)
+            })
+    }
+
+    /// The first place inside a closure carried by `id` that touches
+    /// `binding` — any read or write, or with `writes_only` a write alone
+    /// ([`Self::writes_binding_at`]) — for F102's refusal. `inside` is whether
+    /// the walk is already in a closure's body: outside one, only closure
+    /// literals and the closures `let`-bound names hold are entered, since an
+    /// argument's other reads are evaluated before the view is taken.
+    fn closure_touch(
+        &self,
+        id: Id,
+        binding: Id,
+        writes_only: bool,
+        visited: &mut HashSet<Id>,
+        inside: bool,
+    ) -> Option<Id> {
+        if !visited.insert(id) {
+            return None;
+        }
+        match self.program.entity_map.get(&id)? {
+            Expr::Closure(closure_id) => {
+                let body = self.program.closures.get(closure_id)?.return_;
+                return self.closure_touch(body, binding, writes_only, visited, true);
+            }
+            &Expr::Local(named) => {
+                if inside && named == binding && !writes_only {
+                    return Some(id);
+                }
+                // A `let` hands on what its initializer built: a closure, or
+                // a value holding closures (`Hook { run = || .. }`). The
+                // initializer itself ran before the call, so only the
+                // closures in it are entered.
+                let initial = self
+                    .program
+                    .variables
+                    .get(&named)
+                    .and_then(|variable| variable.initial)?;
+                return self.closure_touch(initial, binding, writes_only, visited, false);
+            }
+            Expr::Parameter(named) if inside && *named == binding && !writes_only => {
+                return Some(id);
+            }
+            &Expr::Variable(declared) if inside => {
+                let initial = self.program.variables.get(&declared)?.initial?;
+                return self.closure_touch(initial, binding, writes_only, visited, inside);
+            }
+            _ => {}
+        }
+        if inside && writes_only && self.writes_binding_at(id, binding) {
+            return Some(id);
+        }
+        self.children_of(id)
+            .into_iter()
+            .find_map(|child| self.closure_touch(child, binding, writes_only, visited, inside))
+    }
+
+    /// Whether the expression `id` itself WRITES a place rooted at `binding`:
+    /// an assignment to it, a `&mut` of it the source wrote, a `&mut`
+    /// argument (a `&mut self` receiver among them) or a mutating intrinsic's
+    /// receiver over it. A call whose conventions cannot be read is taken as
+    /// writing what it is handed, which can only refuse.
+    fn writes_binding_at(&self, id: Id, binding: Id) -> bool {
+        let rooted = |place: Id| {
+            let place = match self.program.entity_map.get(&place) {
+                Some(&Expr::Reference(operand, _)) => operand,
+                _ => place,
+            };
+            matches!(self.cell_spine(place), Some((CellRoot::Boxed(root), _)) if root == binding)
+        };
+        match self.program.entity_map.get(&id) {
+            Some(&Expr::Assignment(target, _)) => rooted(target),
+            Some(&Expr::Reference(operand, true)) => rooted(operand),
+            Some(Expr::Call(call_id)) => {
+                let Some(call) = self.program.function_calls.get(call_id) else {
+                    return false;
+                };
+                let target = match self.program.entity_map.get(&call.subject_id) {
+                    Some(Expr::Local(target)) => Some(*target),
+                    _ => None,
+                };
+                if let Some(intrinsic) =
+                    target.and_then(|target| self.program.intrinsics.get(&target))
+                {
+                    let mutating = mutates_its_receiver(*intrinsic)
+                        || matches!(
+                            intrinsic,
+                            Intrinsic::ListPush | Intrinsic::OptionTake | Intrinsic::OptionReplace
+                        );
+                    return mutating
+                        && call
+                            .argument_ids
+                            .first()
+                            .is_some_and(|receiver| rooted(*receiver));
+                }
+                let declared = target.and_then(|target| self.program.functions.get(&target));
+                call.argument_ids
+                    .iter()
+                    .enumerate()
+                    .any(|(index, argument)| {
+                        if !rooted(*argument) {
+                            return false;
+                        }
+                        let Some(function) = declared else {
+                            return true;
+                        };
+                        function
+                            .parameters
+                            .get(index)
+                            .and_then(|parameter| self.program.parameters.get(parameter))
+                            .is_none_or(|parameter| {
+                                self.receiving_form(parameter) == Receiving::RefMut
+                            })
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a call to `target` may take its `&` arguments over boxed
+    /// bindings as cell VIEWS (F49): the borrow must end when the call
+    /// returns, so the callee hands back an owned value — no view, no
+    /// projection of one (`borrows`) — and answers it now, not as a future
+    /// that would carry the borrow past the call's block.
+    fn views_its_arguments(&self, target: Id, callee_bits: &[Id]) -> bool {
+        callee_bits.is_empty()
+            && !self.program.async_functions.contains(&target)
+            && !self.program.async_values.contains(&target)
+            && self.program.functions.get(&target).is_some_and(|function| {
+                !function.is_async
+                    && function.borrows.is_empty()
+                    && !function.returns_view
+                    && !function.returns_mut_view
+            })
+    }
+
+    /// Whether `id` (or the place a `&` the source wrote names) is a place
+    /// over a BOXED binding whose value is not `Copy` — what a `&` position
+    /// reads through the cell instead of copying out (F49). A `Copy` value
+    /// costs nothing to copy, and is left as it was.
+    fn is_a_cell_view_place(&self, id: Id) -> bool {
+        let place = match self.program.entity_map.get(&id) {
+            Some(&Expr::Reference(operand, false)) => operand,
+            _ => id,
+        };
+        !self.is_natively_copy(place) && self.boxed_place_root(place).is_some()
+    }
+
+    /// Whether the `&` argument at `index` is taken as a VIEW of its boxed
+    /// binding's cell (F49): it is a cell view place, and no other argument
+    /// carries a closure that WRITES the binding — that write would meet the
+    /// view's borrow, so the callee is handed a copy taken at the call, which
+    /// is what every `&` argument over a boxed binding was handed before.
+    fn takes_a_cell_view(&self, argument_ids: &[Id], index: usize, argument: Id) -> bool {
+        self.is_a_cell_view_place(argument)
+            && self.boxed_place_root(argument).is_some_and(|binding| {
+                self.carried_closure_touch(argument_ids, index, binding, true)
+                    .is_none()
+            })
     }
 
     /// The type a call's argument is rendered at: its parameter's declared
@@ -10278,6 +10611,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// VIEW — `(&mut T).clone()` derefs rather than copies.
     fn copy_a_consumed_place_read(&mut self, id: Id, rendered: String) -> String {
         if rendered.ends_with(".clone()") {
+            return rendered;
+        }
+        // A read out of a cell — a spine through a `Shared` view or over a
+        // boxed binding, or the boxed binding itself — is a copy already
+        // (F62, F103); a second one copied it twice.
+        if self.reads_through_a_shared_view(id) || self.boxed_root(id).is_some() {
             return rendered;
         }
         let reads_a_place = match self.program.entity_map.get(&id) {
@@ -10909,8 +11248,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         let receiver = self.expression(*receiver_id, depth)?;
         let mut prelude = String::new();
-        let mut rendered =
-            self.call_arguments(slot.declaration, argument_ids, depth, &mut prelude)?;
+        let saved_views = std::mem::replace(&mut self.no_cell_views, true);
+        let rendered = self.call_arguments(slot.declaration, argument_ids, depth, &mut prelude);
+        self.no_cell_views = saved_views;
+        let mut rendered = rendered?;
         if !rendered.is_empty() {
             rendered.remove(0);
         }
@@ -11358,6 +11699,42 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let rendered = self.intrinsic(intrinsic, arguments, span)?;
             return Ok(format!("{{ {prelude}{rendered} }}"));
         }
+        // F49/F103: a READING intrinsic over a place in a boxed binding —
+        // `log.lines.len()`, `seen.contains(x)` — reads it through a VIEW of
+        // the cell for the call ([`Self::cell_view_place`]) instead of copying
+        // the whole value out of it first. The other arguments are values,
+        // hoisted ahead of the view; none of these intrinsics runs user code.
+        if !mutating
+            && reads_its_receiver_in_place(intrinsic)
+            && argument_ids
+                .first()
+                .is_some_and(|receiver| self.is_a_cell_view_place(*receiver))
+        {
+            let mut prelude = String::new();
+            let mut view_borrows = String::new();
+            let mut views = 0;
+            let mut arguments = Vec::new();
+            let Some(receiver) = self.cell_view_place(
+                argument_ids[0],
+                depth,
+                &mut prelude,
+                &mut view_borrows,
+                &mut views,
+            )?
+            else {
+                return Err(unsupported("a cell view over no boxed binding", span));
+            };
+            arguments.push(receiver);
+            for (index, argument) in argument_ids.iter().enumerate().skip(1) {
+                let expecting = self.intrinsic_argument_expectation(intrinsic, index);
+                let value = self.value_of_expecting(*argument, expecting, depth)?;
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {value}; ");
+                arguments.push(name);
+            }
+            let rendered = self.intrinsic(intrinsic, arguments, span)?;
+            return Ok(format!("{{ {prelude}{view_borrows}{rendered} }}"));
+        }
         // F42: the expectation in force here is the one for the intrinsic's
         // RESULT, and an argument is not its result. Rendered under it, the
         // argument of `Shared::new(Map::new())` in a field typed
@@ -11723,6 +12100,37 @@ fn mutates_its_receiver(intrinsic: Intrinsic) -> bool {
             | Intrinsic::MapRemove
             | Intrinsic::SetInsert
             | Intrinsic::SetRemove
+    )
+}
+
+/// The intrinsics that only READ their receiver, through a `&` (every arm
+/// renders it `&{receiver}` or as a `&self` method's) and answer an owned
+/// value, and take no closure: a receiver in a boxed binding is read through
+/// a view of its cell for the call rather than copied out whole (F49/F103).
+fn reads_its_receiver_in_place(intrinsic: Intrinsic) -> bool {
+    matches!(
+        intrinsic,
+        Intrinsic::StrLen
+            | Intrinsic::StrTrim
+            | Intrinsic::StrToLowercase
+            | Intrinsic::StrToUppercase
+            | Intrinsic::StrContains
+            | Intrinsic::StrStartsWith
+            | Intrinsic::StrEndsWith
+            | Intrinsic::StrReplace
+            | Intrinsic::StrRepeat
+            | Intrinsic::StrSplit
+            | Intrinsic::StrSubstring
+            | Intrinsic::ParseI32
+            | Intrinsic::ParseF64
+            | Intrinsic::ListLen
+            | Intrinsic::ListGet
+            | Intrinsic::SetContains
+            | Intrinsic::SetLen
+            | Intrinsic::MapGet
+            | Intrinsic::MapContainsKey
+            | Intrinsic::MapLen
+            | Intrinsic::CanonicalHash
     )
 }
 

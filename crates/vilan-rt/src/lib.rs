@@ -667,6 +667,21 @@ impl<T> Shared<T> {
         }
     }
 
+    /// A shared VIEW of the cell for the length of one call (F49): a `&self`
+    /// call or a `&` argument over a boxed binding reads the value in place
+    /// instead of copying all of it out ([`Shared::get`]). The emitter holds
+    /// the guard in a `let` of the call's own block, taken after every
+    /// by-value argument is evaluated, so it ends when the call does. A write
+    /// of the same cell while it is live — a closure the callee runs that
+    /// writes the binding — panics here as an aliasing read does in
+    /// [`Shared::get`], with the runtime's own sentence.
+    pub fn borrow(&self) -> std::cell::Ref<'_, T> {
+        match self.inner.value.try_borrow() {
+            Ok(value) => value,
+            Err(_) => panic_with(REENTRANT_READ),
+        }
+    }
+
     /// `Shared::write()` USED AS A PLACE — `cell.write().push(x)`,
     /// `cell.write().field = y` (F20).
     ///

@@ -8691,6 +8691,95 @@ fn a_compound_write_at_a_subscript_through_a_shared_view_is_identical_on_both_ba
     );
 }
 
+/// The emitted Rust of `file`'s `main`, from `fn main()` on — what a pin on
+/// the native emission reads, apart from the std functions the crate carries.
+fn emitted_main(staged: &Path, file: &str) -> String {
+    let output = vilan(staged)
+        .args(["build", "--backend", "rust", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    assert!(
+        output.status.success(),
+        "{file} must build natively:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let emitted = String::from_utf8_lossy(&output.stdout).into_owned();
+    let start = emitted
+        .find("fn main()")
+        .expect("the emitted crate has a `main`");
+    emitted[start..].to_string()
+}
+
+/// F103: a FIELD read on a BOXED binding (a `mut` local a closure captures,
+/// spec §6.9) copied the WHOLE value first — `log.lines.len()` was
+/// `log.get().lines.len()`, every list in `log` cloned to read one of them,
+/// and std's `write_at` paid six whole-`StoreWoken` copies per `Store` write.
+/// A field, a nested field, a tuple slot and a subscript (its index reading
+/// the same cell) now read through the cell's scoped borrow, and so do a
+/// pattern subject, a `for` iterable and a field handed on by value; the
+/// program prints the same on both backends. The emission pin: the only
+/// whole-value copy left in `main` is the program's own `let whole = log;`.
+#[test]
+fn a_field_read_on_a_boxed_binding_copies_the_field_alone_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_boxed_field_reads.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/boxed_field_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a field read on a boxed binding must read the same on both backends"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches(".get()").count(),
+        1,
+        "only `let whole = log;` copies the whole boxed value:\n{main}"
+    );
+    assert!(
+        !main.contains(".clone()).clone()"),
+        "a read out of a cell is not copied twice:\n{main}"
+    );
+}
+
+/// F49: a `&self` METHOD CALL — any `&` argument — on a BOXED binding
+/// deep-copied the whole value first: `writer.result()` was
+/// `result(&writer.get())`, so std's JSON codec cloned its writer, buffer
+/// included, on every encoded frame. The call takes a VIEW of the cell for
+/// its own length, after its by-value arguments are evaluated — which also
+/// fixes the order: `writer.measured(writer.add("c"))` printed 5 natively and
+/// 6 on JS, because the copy was taken before the argument wrote the binding.
+/// The probe: a `&self` call, a `&` parameter, a field and a subscript handed
+/// by `&`, a reading intrinsic, an argument that writes the binding first, a
+/// closure argument reading the binding under the view, one writing a field
+/// the callee does not read (handed a copy, as before), and a `dyn` object.
+/// The emission pin: the two whole-value copies left in `main` are that
+/// writing closure's call and the object's construction.
+#[test]
+fn a_shared_loan_of_a_boxed_binding_reads_through_its_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_boxed_self_calls.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/boxed_self_calls.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `&self` call on a boxed binding must answer the same on both backends"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches(".get()").count(),
+        2,
+        "only the writing closure's call and the object copy the whole value:\n{main}"
+    );
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,
