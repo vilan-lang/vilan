@@ -8120,32 +8120,31 @@ fn a_resource_is_moved_not_copied_at_its_move_sites_natively() {
     }
 }
 
-/// F56's other half: a resource WITH a `Drop` impl is still refused by name —
-/// its teardown is F1's later slice — as a struct and as an enum.
+/// F56's other half, as F97 left it: a resource ENUM with a `Drop` impl is
+/// still refused by name (its body before the variant's payloads is not
+/// emitted), and the STRUCT that was refused beside it builds and agrees.
 #[test]
-fn a_resource_with_drop_is_still_refused_by_name_natively() {
+fn a_resource_enum_with_drop_is_refused_by_name_and_its_struct_twin_builds_natively() {
     let staged = stage();
-    for (program, source, named) in [
-        (
-            "native_probe_drop_struct.vl",
-            DROP_STRUCT_PROBE,
-            "the `resource` type `Guard`",
+    std::fs::write(staged.join("native_probe_drop_enum.vl"), DROP_ENUM_PROBE)
+        .expect("write the probe program");
+    match compare(&staged, "native_probe_drop_enum.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("the enum `Slot` with a `Drop` impl"),
+            "refused for another reason: {reason}"
         ),
-        (
-            "native_probe_drop_enum.vl",
-            DROP_ENUM_PROBE,
-            "the `resource` enum `Slot`",
-        ),
-    ] {
-        std::fs::write(staged.join(program), source).expect("write the probe program");
-        match compare(&staged, program) {
-            Verdict::Refused(reason) => assert!(
-                reason.contains(named),
-                "{program} refused for another reason: {reason}"
-            ),
-            other => panic!("{program}: expected a refusal by name, got {other:?}"),
-        }
+        other => panic!("expected a refusal by name, got {other:?}"),
     }
+    std::fs::write(
+        staged.join("native_probe_drop_struct.vl"),
+        DROP_STRUCT_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_drop_struct.vl"),
+        Verdict::Identical,
+        "a resource struct with a `Drop` impl builds natively (F97)"
+    );
 }
 
 const PIPE_FUSED_MAIN: &str = concat!(
@@ -9159,6 +9158,37 @@ fn a_main_answering_its_exit_code_exits_with_it_on_both_backends() {
         Verdict::Identical,
         "an exit-code `main` must answer the same code and stdout on both backends"
     );
+}
+
+/// F97: a `[resource]` type WITH a `Drop` impl was refused by name
+/// ("destruction.md's teardown is a later slice"). Its `drop` is a Rust
+/// `Drop` impl now, its resource fields drop after the body in reverse, and
+/// a binding drops after the statement holding its last read, at the extent
+/// the JS backend closes its `finally` at (regions widened and nested
+/// alike). The probe prints every teardown, so the ORDER is the claim; the
+/// corpus programs resource.vl and resource_exit.vl had it as their first
+/// wall (resource_take.vl's next is F93's guarded leg).
+#[test]
+fn a_resource_with_a_drop_impl_tears_down_in_the_same_order_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_resource_teardown.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/resource_teardown.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a resource's teardowns must run in the same order on both backends"
+    );
+    for program in ["resource.vl", "resource_exit.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F97 was its first wall"
+        );
+    }
 }
 
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The

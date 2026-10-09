@@ -65,8 +65,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
-    AdaptedInstance, Backing, BackingValue, CopyDecision, Expr, ExprIfBranch, ExprMatchLeg,
-    ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
+    AdaptedInstance, Backing, BackingValue, CopyDecision, DropExtent, Expr, ExprIfBranch,
+    ExprMatchLeg, ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
@@ -188,7 +188,8 @@ use vilan_rt::Subscript as _;
 
 mod dbg;
 
-/// F56: every nominal declaration (struct or enum) with an `impl … with Drop`.
+/// F56: every nominal declaration (struct or enum) with an `impl … with Drop`,
+/// mapped to that impl's `drop` function (F97 emits it as the Rust `Drop`).
 ///
 /// Read off `drop_method_checks`, which the analyzer fills with each impl's
 /// `drop` function keyed on the RESOLVED std `Drop` entity — so a user's own
@@ -196,13 +197,13 @@ mod dbg;
 /// functions, whose subject names the declaration. A generic resource
 /// (`impl Guard<type T> with Drop`) is one declaration with one `drop`, so the
 /// answer is per declaration, not per instantiation.
-fn drop_implementing_nominals(program: &Program<'_>) -> HashSet<Id> {
+fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, Id> {
     let drop_functions: HashSet<Id> = program
         .drop_method_checks
         .iter()
         .map(|(function_id, _, _)| *function_id)
         .collect();
-    let mut nominals = HashSet::new();
+    let mut nominals = HashMap::default();
     if drop_functions.is_empty() {
         return nominals;
     }
@@ -219,7 +220,7 @@ fn drop_implementing_nominals(program: &Program<'_>) -> HashSet<Id> {
         }
         match program.type_id_to_type_map.get(&implementation.subject) {
             Some(Type::Struct(id, _)) | Some(Type::Enum(id, _)) => {
-                nominals.insert(*id);
+                nominals.insert(*id, function_id);
             }
             _ => {}
         }
@@ -540,11 +541,10 @@ struct Emitter<'a, 'src> {
     /// vilan types that lower to one Rust type must share one impl.
     object_impls: HashSet<(String, String)>,
     /// F56: the nominal declarations (struct or enum) that implement std's
-    /// `Drop`. A `[resource]` type among them owes a teardown this backend
-    /// does not emit yet (F1's later slice) and is refused; a `[resource]`
-    /// type NOT among them is emitted as an ordinary type. See
-    /// [`drop_implementing_nominals`].
-    drop_nominals: HashSet<Id>,
+    /// `Drop`, each with its `drop` function. F97: a non-generic one is
+    /// emitted with a Rust `Drop` impl calling it; a GENERIC one is still
+    /// refused by name. See [`drop_implementing_nominals`].
+    drop_nominals: HashMap<Id, Id>,
 }
 
 /// One object type's Rust trait: its name and its slots, each slot's
@@ -2777,17 +2777,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // The refusal comes BEFORE the once-only mark, or a first call that
         // swallowed the error would let a second one through on the mark alone
         // and emit a reference to a type nothing declared.
-        // F56: only a resource with a `Drop` impl owes a teardown. A Drop-less
-        // one (A142's pipe nodes) is move-only and nothing more — the
-        // analyzer's move checker enforces that on both backends — so it is
-        // emitted as an ordinary struct. Its resource MEMBERS still ask this
-        // question for themselves when their field types are rendered below,
-        // so a Drop-less wrapper around a `Drop` resource is still refused, at
-        // the member that owes the teardown.
-        if declaration.resource && self.drop_nominals.contains(&id) {
+        // F56: a Drop-less resource (A142's pipe nodes) is move-only and
+        // nothing more — the analyzer's move checker enforces that on both
+        // backends — so it is an ordinary struct. F97: one WITH a `Drop` impl
+        // is a Rust `Drop` impl calling it (below); a generic one is not
+        // emitted yet, because its `drop` would be one instance per
+        // instantiation, reached from the impl's own binders.
+        if self.drop_nominals.contains_key(&id)
+            && !declaration.generic_parameter_constraint_ids.is_empty()
+        {
             return Err(unsupported(
                 &format!(
-                    "the `resource` type `{}` (destruction.md's teardown is a later slice)",
+                    "the generic type `{}` with a `Drop` impl (its teardown is one instance \
+                     per instantiation)",
                     declaration.name
                 ),
                 span,
@@ -2829,6 +2831,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 rendered
             })
             .collect();
+        // F97: a value's resource fields drop in REVERSE declaration order
+        // (destruction.md §5/§7), after its `Drop` body; Rust drops fields in
+        // the order the struct declares them, so a struct with two or more
+        // fields whose teardown is visible declares its fields reversed.
+        // Construction and access are by name, and the printed and JSON
+        // renderings below keep the source order.
+        let teardown_fields = declaration
+            .fields
+            .iter()
+            .filter(|field| self.owes_a_teardown(field.type_id, &mut HashSet::new()))
+            .count();
+        let holds_a_resource = teardown_fields > 1;
         self.current_substitution = saved;
         let rendered_types = rendered_types?;
         // Two questions, not one. `PartialEq` needs to know which FIELDS are
@@ -2861,10 +2875,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = writeln!(out, "#[derive(Clone, PartialEq)]");
         }
         let _ = writeln!(out, "struct {type_name} {{");
-        for (field, rendered) in declaration.fields.iter().zip(rendered_types.iter()) {
-            let _ = writeln!(out, "    {}: {rendered},", sanitize(field.name));
+        let mut declared: Vec<(&str, &String)> = declaration
+            .fields
+            .iter()
+            .zip(rendered_types.iter())
+            .map(|(field, rendered)| (field.name, rendered))
+            .collect();
+        if holds_a_resource {
+            declared.reverse();
+        }
+        for (name, rendered) in declared {
+            let _ = writeln!(out, "    {}: {rendered},", sanitize(name));
         }
         let _ = writeln!(out, "}}");
+        // F97: the `Drop` impl's body runs first, then the fields drop.
+        if let Some(&drop_function) = self.drop_nominals.get(&id) {
+            let drop_name = self
+                .ensure_function(drop_function, &HashMap::default())?
+                .name;
+            let _ = writeln!(out, "impl Drop for {type_name} {{");
+            let _ = writeln!(out, "    fn drop(&mut self) {{");
+            let _ = writeln!(out, "        {drop_name}(self);");
+            let _ = writeln!(out, "    }}");
+            let _ = writeln!(out, "}}");
+        }
         if reaches_a_closure {
             let comparisons: Vec<String> = declaration
                 .fields
@@ -2945,11 +2979,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn ensure_enum(&mut self, id: Id, arguments: &[TypeId], span: Span) -> Result<Reserved, Error> {
         let declaration = self.program.enums.get(&id).cloned().unwrap();
         self.refuse_an_any_argument(arguments, span)?;
-        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown.
-        if declaration.resource && self.drop_nominals.contains(&id) {
+        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown. F97
+        // emitted the struct half; an enum's `Drop` (a body before a
+        // variant's payloads, which Rust drops in declaration order) is not
+        // emitted yet.
+        if self.drop_nominals.contains_key(&id) {
             return Err(unsupported(
                 &format!(
-                    "the `resource` enum `{}` (destruction.md's teardown is a later slice)",
+                    "the enum `{}` with a `Drop` impl (its body runs before the variant's \
+                     payloads, which drop in reverse)",
                     declaration.name
                 ),
                 span,
@@ -4295,10 +4333,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
     ) -> Result<(), Error> {
         let pad = Self::indent(depth);
-        for statement in statements {
+        let early_drops = self.early_drops(statements);
+        for (index, statement) in statements.iter().enumerate() {
             let rendered = self.statement(*statement, depth)?;
             if !rendered.is_empty() {
                 let _ = writeln!(out, "{pad}{rendered}");
+            }
+            for binding in early_drops.get(&index).into_iter().flatten() {
+                let _ = writeln!(out, "{pad}std::mem::drop({});", self.binding_name(*binding));
             }
         }
         if !matches!(self.program.entity_map.get(&tail), Some(Expr::Void) | None) {
@@ -4333,6 +4375,218 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = writeln!(out, "{pad}{rendered}");
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------- teardown ----
+
+    /// F97: the resource bindings a block destroys BEFORE its end, keyed by
+    /// the index of the statement they drop after, each list in drop order.
+    ///
+    /// destruction.md §5/§7 as amended by `lifetimes.md` §6: an owned
+    /// resource drops after the statement holding its LAST read, not at its
+    /// scope's end. Rust drops a binding at its scope's end, in reverse
+    /// declaration order — which is the law at every extent that reaches the
+    /// block's end, a `ret`, a `jump` and a panic included — so only an
+    /// extent short of the end owes an explicit `std::mem::drop`, written
+    /// after the statement the analyzer's [`DropExtent`] names.
+    ///
+    /// The extents are resolved exactly as the JS transformer resolves them
+    /// (`walk_scope_body`, `teardown_extent`, `widen_over_declarations` in
+    /// `transformer.rs`): a region is widened over the last reads of the
+    /// names declared inside it, and a region nested in another is cut at the
+    /// outer one's end, inner drops first. The two backends print their
+    /// teardowns in one order only if they agree on where each region ends.
+    fn early_drops(&self, statements: &[Id]) -> HashMap<usize, Vec<Id>> {
+        let mut plan: HashMap<usize, Vec<Id>> = HashMap::default();
+        if statements
+            .iter()
+            .all(|statement| self.statement_teardown(*statement).is_empty())
+        {
+            return plan;
+        }
+        self.plan_teardowns(statements, 0, statements.len(), &mut plan);
+        plan
+    }
+
+    /// One range of [`Self::early_drops`]: `walk_scope_body`'s recursion.
+    fn plan_teardowns(
+        &self,
+        statements: &[Id],
+        start: usize,
+        end: usize,
+        plan: &mut HashMap<usize, Vec<Id>>,
+    ) {
+        let mut index = start;
+        while index < end {
+            let bindings = self.statement_teardown(statements[index]);
+            if bindings.is_empty() {
+                index += 1;
+                continue;
+            }
+            let own = self.own_teardown_extent(&bindings, statements, index + 1, end);
+            let extent = self.widen_over_declarations(own, statements, index + 1, end);
+            self.plan_teardowns(statements, index + 1, extent, plan);
+            // A binding the program hands to the `drop` sink itself (B150)
+            // keeps its region — it shapes the regions nested in it exactly
+            // as on JS — but owes no second drop: the sink moved it.
+            if extent < statements.len() {
+                plan.entry(extent - 1).or_default().extend(
+                    bindings
+                        .into_iter()
+                        .rev()
+                        .filter(|binding| !self.program.explicit_drop_bindings.contains(binding)),
+                );
+            }
+            index = extent;
+        }
+    }
+
+    /// What a direct statement of a block owes a teardown for: a resource
+    /// `let`, or the resource captures of a destructuring `let` (B62), in
+    /// declaration order — the transformer's `statement_teardown`.
+    fn statement_teardown(&self, statement: Id) -> Vec<Id> {
+        match self.program.entity_map.get(&statement) {
+            Some(Expr::Variable(variable_id))
+                if self.program.dropped_bindings.contains(variable_id)
+                    && self.binding_drops_nontrivially(*variable_id) =>
+            {
+                vec![*variable_id]
+            }
+            Some(Expr::Destructure(_, pattern)) => {
+                let mut captures = Vec::new();
+                collect_pattern_bindings(pattern, &mut captures);
+                captures.retain(|capture| {
+                    self.program.dropped_bindings.contains(capture)
+                        && self.binding_drops_nontrivially(*capture)
+                });
+                captures
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// F97: whether dropping a value of `type_id` runs a `Drop` body
+    /// somewhere inside it — its own nominal's, a field's or a payload's, an
+    /// element's. Only such fields' order is visible, so only a struct with
+    /// two of them declares its fields reversed. `visiting` cuts recursion.
+    fn owes_a_teardown(&self, type_id: TypeId, visiting: &mut HashSet<Id>) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return false;
+        };
+        let concrete = self.concrete(type_id);
+        match self.resolve(concrete).cloned() {
+            Some(Type::Struct(struct_id, arguments)) => {
+                if self.drop_nominals.contains_key(&struct_id) {
+                    return true;
+                }
+                if arguments
+                    .iter()
+                    .any(|argument| self.owes_a_teardown(*argument, visiting))
+                {
+                    return true;
+                }
+                if !visiting.insert(struct_id) {
+                    return false;
+                }
+                self.program
+                    .structs
+                    .get(&struct_id)
+                    .is_some_and(|declaration| {
+                        declaration
+                            .fields
+                            .iter()
+                            .any(|field| self.owes_a_teardown(field.type_id, visiting))
+                    })
+            }
+            Some(Type::Enum(enum_id, arguments)) => {
+                if self.drop_nominals.contains_key(&enum_id) {
+                    return true;
+                }
+                if arguments
+                    .iter()
+                    .any(|argument| self.owes_a_teardown(*argument, visiting))
+                {
+                    return true;
+                }
+                if !visiting.insert(enum_id) {
+                    return false;
+                }
+                self.program.enums.get(&enum_id).is_some_and(|declaration| {
+                    declaration.variants.iter().any(|variant| {
+                        variant
+                            .data_type_ids
+                            .iter()
+                            .any(|payload| self.owes_a_teardown(*payload, visiting))
+                    })
+                })
+            }
+            Some(Type::Tuple(elements)) => elements
+                .iter()
+                .any(|element| self.owes_a_teardown(*element, visiting)),
+            Some(Type::Array(element, _)) => self.owes_a_teardown(element, visiting),
+            _ => false,
+        }
+    }
+
+    /// Whether a binding's type destroys something: a `Drop` impl or a
+    /// resource member.
+    fn binding_drops_nontrivially(&self, variable_id: Id) -> bool {
+        self.program
+            .variables
+            .get(&variable_id)
+            .and_then(|variable| self.program.drop_glue.get(&variable.type_id))
+            .is_some_and(|glue| glue.drop_method.is_some() || !glue.members.is_empty())
+    }
+
+    /// The transformer's `own_teardown_extent`: the exclusive statement index
+    /// the group's last read sits at, `start` when nothing reads it, `end` for
+    /// every refusal (a binding the dataflow does not answer for).
+    fn own_teardown_extent(
+        &self,
+        bindings: &[Id],
+        statements: &[Id],
+        start: usize,
+        end: usize,
+    ) -> usize {
+        let mut extent = start.min(end);
+        for binding in bindings {
+            let Some(binding_extent) = self.program.drop_extents.get(binding) else {
+                return end;
+            };
+            extent = extent.max(resolve_extent(binding_extent, statements, start, end));
+        }
+        extent.min(end)
+    }
+
+    /// The transformer's `widen_over_declarations`: grow `extent` until every
+    /// name declared in `statements[start..extent]` has its last read inside
+    /// it — monotone, bounded by `end`.
+    fn widen_over_declarations(
+        &self,
+        mut extent: usize,
+        statements: &[Id],
+        start: usize,
+        end: usize,
+    ) -> usize {
+        loop {
+            let mut widened = extent;
+            for index in start..extent {
+                let Some(declared) = self
+                    .program
+                    .declared_binding_extents
+                    .get(&statements[index])
+                else {
+                    continue;
+                };
+                for binding_extent in declared {
+                    widened = widened.max(resolve_extent(binding_extent, statements, index, end));
+                }
+            }
+            if widened == extent {
+                return extent;
+            }
+            extent = widened;
+        }
     }
 
     /// One statement, which is an expression plus a `;` for every form that
@@ -11074,6 +11328,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => return None,
         };
         loop {
+            // F97: a field cannot leave a value whose type has a `Drop` impl
+            // (rustc E0509) — the value still owes its whole teardown.
+            if self
+                .type_of(current)
+                .and_then(|type_id| self.resolve(type_id))
+                .is_some_and(|resolved| {
+                    matches!(resolved, Type::Struct(struct_id, _) | Type::Enum(struct_id, _)
+                        if self.drop_nominals.contains_key(struct_id))
+                })
+            {
+                return None;
+            }
             match self.program.entity_map.get(&current)? {
                 Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => current = *subject,
                 Expr::Local(binding) | Expr::Parameter(binding) => {
@@ -12789,6 +13055,28 @@ fn collect_pattern_bindings_into(pattern: &ExprPattern, out: &mut HashSet<Id>) {
     let mut bindings = Vec::new();
     collect_pattern_bindings(pattern, &mut bindings);
     out.extend(bindings);
+}
+
+/// One [`DropExtent`] resolved against a statement range — the transformer's
+/// `resolve_extent`: the exclusive index its last read sits at, `start` when
+/// nothing reads it, and `end` for an explicit scope end or a chain naming no
+/// statement of the range.
+fn resolve_extent(extent: &DropExtent, statements: &[Id], start: usize, end: usize) -> usize {
+    let start = start.min(end);
+    match extent {
+        DropExtent::ScopeEnd => end,
+        DropExtent::Declaration => start,
+        DropExtent::Statement(chain) => {
+            let region = &statements[start..end];
+            match chain
+                .iter()
+                .find_map(|holder| region.iter().position(|statement| statement == holder))
+            {
+                Some(offset) => start + offset + 1,
+                None => end,
+            }
+        }
+    }
 }
 
 fn collect_if_children(branch: &ExprIfBranch, children: &mut Vec<Id>) {
