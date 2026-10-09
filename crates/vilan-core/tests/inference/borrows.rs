@@ -13123,21 +13123,117 @@ fn b544_a_whole_write_to_an_is_capture_in_its_block_steers_to_the_view_subject()
 /// `mut` payload capture. Before, the write was refused with "declare it
 /// mut", and `mut a` compiled and its write never landed.
 #[test]
-fn b545_a_tuple_leaf_capture_under_a_view_subject_is_refused_with_the_whole_tuple_steer() {
+fn b545_a_multi_slot_tuple_leaf_under_a_view_subject_is_refused_with_the_whole_tuple_steer() {
+    // A SUB-TUPLE leaf spans several slots of the flat tuple, so it is a
+    // reslice — a copy — whatever the subject; the write is refused, and so
+    // is `mut` on it.
     assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut nested = Some(((1, 2), 3));
+            match &mut nested {
+                Some((let pair, let c)) => { pair.0 += 1; },
+                None => {},
+            }
+        }
+        "#,
+        "cannot mutate 'pair': a capture of a sub-tuple (or of an element still generic) inside \
+         a tuple pattern is a COPY even under a view subject",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut nested = Some(((1, 2), 3));
+            match &mut nested {
+                Some((mut pair, let c)) => { pair.0 += 1; },
+                None => {},
+            }
+        }
+        "#,
+        "`mut pair` would bind a COPY of a sub-tuple, and its write would not reach `nested`",
+    );
+    // The steered spelling writes in place.
+    assert_compiles_and_runs(
         r#"
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut held = Some((1, 2));
             match &mut held {
-                Some((let a, let b)) => { a += 1; },
+                Some(let pair) => { pair.0 += 10; },
+                None => {},
+            }
+            match held {
+                Some((let a, let b)) => print(a + b),
                 None => {},
             }
         }
         "#,
-        "cannot mutate 'a': a capture inside a tuple pattern is a COPY of its element even \
-         under a view subject",
+        "13\n",
     );
+}
+
+/// B545's view half (payload-views.md's one-slot tuple leaf): under `match
+/// &mut place`, a capture inside a payload's TUPLE pattern that is one slot
+/// of the flat tuple is a writable view into that slot — the `(tuple, offset)`
+/// pair for a scalar on JS, the element's own reference for an aggregate, a
+/// `&mut` by Rust's binding modes — as a payload capture is into the enum. It
+/// was a copy whose write was refused (solver-47's refusal half). Nested
+/// tuples, an aggregate leaf and the `is` form, run.
+#[test]
+fn b545_a_one_slot_tuple_leaf_under_a_view_subject_is_a_writable_view() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct P { x: i32 }
+        fun main() {
+            mut held = Some((1, 2));
+            match &mut held {
+                Some((let a, let b)) => { a += 10; b = 20; },
+                None => {},
+            }
+            match &held {
+                Some((let a, let b)) => print(*a + *b),
+                None => {},
+            }
+            mut nested = Some(((1, 2), 3));
+            match &mut nested {
+                Some(((let a, _), let c)) => { a += 100; c += 1; },
+                None => {},
+            }
+            match nested {
+                Some(((let a, let b), let c)) => print(a + b + c),
+                None => {},
+            }
+            mut agg = Some((P { x = 1 }, "s"));
+            match &mut agg {
+                Some((let p, let s)) => { p.x = 5; s = "t"; },
+                None => {},
+            }
+            match agg {
+                Some((let p, let s)) => { print(p.x); print(s); },
+                None => {},
+            }
+            if &mut held is Some((let a, _)) {
+                a += 1;
+            }
+            match held {
+                Some((let a, let b)) => print(a + b),
+                None => {},
+            }
+        }
+        main();
+        "#,
+        "31\n107\n5\nt\n32\n",
+    );
+}
+
+#[test]
+fn b545_a_one_slot_tuple_leaf_follows_the_payload_view_rules() {
+    // `mut` on it is B509 Q4's refusal; under `&place` it is a readonly view;
+    // its value is read with `*`.
     assert_fails_once_with(
         r#"
         import std::option::Option::{ self, Some, None };
@@ -13149,25 +13245,34 @@ fn b545_a_tuple_leaf_capture_under_a_view_subject_is_refused_with_the_whole_tupl
             }
         }
         "#,
-        "`mut a` would bind a COPY of a tuple element, and its write would not reach `held`",
+        "`mut a` would bind a COPY of the payload, but this matches a view (`&mut held`)",
     );
-    // The steered spelling writes in place; a read of a tuple leaf is fine.
-    assert_compiles_and_runs(
+    assert_fails_once_with(
         r#"
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut held = Some((1, 2));
-            match &mut held {
-                Some(let pair) => { pair.0 += 10; },
+            match &held {
+                Some((let a, let b)) => { a += 1; },
                 None => {},
             }
+        }
+        "#,
+        "cannot write through 'a': this matches `&held`, a readonly view",
+    );
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held = Some((1, 2));
             match &held {
                 Some((let a, let b)) => print(a + b),
                 None => {},
             }
         }
         "#,
-        "13\n",
+        "a view can't be read as a value here; write `*`",
     );
 }
 

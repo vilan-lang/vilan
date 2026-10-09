@@ -11538,4 +11538,76 @@ fun main() {
         "a two-tier blanket must reach a closure on both backends"
     );
 }
+/// B545: a one-slot tuple leaf under `match &mut place` is a writable view
+/// into its slot of the payload's tuple on both backends (scalar, nested,
+/// aggregate, and the `is` form).
+#[test]
+fn a_one_slot_tuple_leaf_under_a_view_subject_writes_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b545.vl"),
+        r#"import std::io::print;
+import std::option::Option::{ self, Some, None };
+
+struct P {
+    x: i32,
+}
+
+fun main() {
+    mut held = Some((1, 2));
+    match &mut held {
+        Some((let a, let b)) => {
+            a += 10;
+            b = 20;
+        },
+        None => {},
+    }
+    match &held {
+        Some((let a, let b)) => print(*a + *b),
+        None => {},
+    }
+    mut nested = Some(((1, 2), 3));
+    match &mut nested {
+        Some(((let a, _), let c)) => {
+            a += 100;
+            c += 1;
+        },
+        None => {},
+    }
+    match nested {
+        Some(((let a, let b), let c)) => print(a + b + c),
+        None => {},
+    }
+    mut agg = Some((P { x = 1 }, "s"));
+    match &mut agg {
+        Some((let p, let s)) => {
+            p.x = 5;
+            s = "t";
+        },
+        None => {},
+    }
+    match agg {
+        Some((let p, let s)) => {
+            print(p.x);
+            print(s);
+        },
+        None => {},
+    }
+    if &mut held is Some((let a, _)) {
+        a += 1;
+    }
+    match held {
+        Some((let a, let b)) => print(a + b),
+        None => {},
+    }
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b545.vl"),
+        Verdict::Identical,
+        "a one-slot tuple leaf under a view subject must write in place on both backends"
+    );
+}
 

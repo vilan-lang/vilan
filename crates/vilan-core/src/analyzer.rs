@@ -28472,10 +28472,20 @@ impl<'src> Analyzer<'src> {
                 Self::collect_payload_captures(pattern, &mut captures);
                 Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
             }
-            // B545: under a view subject a tuple leaf is still a copy of its
-            // element; the steer is the tuple bound whole, which is a view.
-            if tuple_leaves.contains(&capture_id)
-                && self.reference_subject_mode(subject_id).is_some()
+            // B545: under a view subject a ONE-slot tuple leaf is a view into
+            // its slot, as a payload capture is; a leaf spanning several slots
+            // (a sub-tuple, which tuples store flat) is a reslice — a COPY —
+            // and the steer is the tuple bound whole, which is a view.
+            let view_subject = self.reference_subject_mode(subject_id).is_some();
+            if view_subject
+                && tuple_leaves.contains(&capture_id)
+                && self.tuple_leaf_is_one_slot(capture_id)
+            {
+                captures.push(capture_id);
+            }
+            if view_subject
+                && tuple_leaves.contains(&capture_id)
+                && !self.tuple_leaf_is_one_slot(capture_id)
             {
                 let place = match self.expr_id_to_expr_map.get(&subject_id) {
                     Some(Expr::Reference(operand, _)) => {
@@ -28484,7 +28494,7 @@ impl<'src> Analyzer<'src> {
                     _ => "place",
                 };
                 return Some(format!(
-                    "cannot mutate '{name}': a capture inside a tuple pattern is a COPY of its element even under a view subject (tuples store flat), so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                    "cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
                 ));
             }
             if !captures.contains(&capture_id) {
@@ -28547,14 +28557,16 @@ impl<'src> Analyzer<'src> {
                 Self::collect_payload_captures(pattern, &mut captures);
                 Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
             }
+            // B545: a one-slot tuple leaf is a payload view like any capture;
+            // only a multi-slot one (a reslice, a copy) keeps the tuple steer.
+            let tuple_leaves: Vec<(Id, bool)> = tuple_leaves
+                .into_iter()
+                .map(|capture_id| (capture_id, !self.tuple_leaf_is_one_slot(capture_id)))
+                .collect();
             for (capture_id, in_tuple) in captures
                 .into_iter()
                 .map(|capture_id| (capture_id, false))
-                .chain(
-                    tuple_leaves
-                        .into_iter()
-                        .map(|capture_id| (capture_id, true)),
-                )
+                .chain(tuple_leaves)
             {
                 if let Some(variable) = self.variables.get(&capture_id)
                     && variable.mutable
@@ -28568,15 +28580,16 @@ impl<'src> Analyzer<'src> {
         for (capture_id, name, place, mutable, in_tuple) in refusals {
             let place = place.unwrap_or("place");
             if in_tuple {
-                // B545: a tuple leaf is a copy under any subject; `mut` on it
-                // under a view subject reads as the in-place write it is not.
+                // B545: a multi-slot tuple leaf is a copy under any subject;
+                // `mut` on it under a view subject reads as the in-place write
+                // it is not.
                 self.push_anchored(
                     Error {
                         trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&capture_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "`mut {name}` would bind a COPY of a tuple element, and its write would not reach `{place}`: a capture inside a tuple pattern is a copy even under a view subject (tuples store flat) — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                            "`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
                         ),
                     },
                     capture_id,
@@ -28620,6 +28633,26 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+    }
+
+    /// B545: whether a capture inside a payload's tuple pattern is ONE slot of
+    /// the flat tuple — its type is no tuple — so it can be a view into that
+    /// slot: the `(tuple, offset)` pair for a scalar on JS, the element's own
+    /// reference for an aggregate, a `&mut` by Rust's binding modes natively.
+    /// A sub-tuple leaf spans several slots and is a reslice; a generic or
+    /// still-open leaf may instantiate at a tuple, so it is treated as one.
+    fn tuple_leaf_is_one_slot(&self, capture_id: Id) -> bool {
+        self.variables.get(&capture_id).is_some_and(|variable| {
+            !matches!(
+                variable.type_id.get_type(self),
+                Type::Tuple(_)
+                    | Type::Mapped(..)
+                    | Type::Generic(_)
+                    | Type::Unknown
+                    | Type::Unresolved
+                    | Type::Any
+            )
+        })
     }
 
     /// B545: the bindings a variant pattern reaches INSIDE a tuple sub-pattern
@@ -28754,9 +28787,18 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             let mut captures = Vec::new();
+            let mut tuple_leaves = Vec::new();
             for pattern in patterns {
                 Self::collect_payload_captures(pattern, &mut captures);
+                Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
             }
+            // B545: a ONE-slot leaf of a payload's tuple pattern is a view into
+            // its slot of the tuple, as a payload capture is into the enum's.
+            captures.extend(
+                tuple_leaves
+                    .into_iter()
+                    .filter(|capture_id| self.tuple_leaf_is_one_slot(*capture_id)),
+            );
             // A `mut` capture is refused under a view subject (Q4); it is not
             // made a view as well, so the refusal stands alone.
             found.extend(

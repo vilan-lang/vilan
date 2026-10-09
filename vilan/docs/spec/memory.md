@@ -276,7 +276,10 @@ variant — and `match &place` binds readonly views, while a bare
 `match place` copies, as it always has. A `mut` capture under a view
 subject is refused (it would be a copy that looks like a write). Rule 4
 guards the subject place, and every prefix of it, from the arm's start to
-the capture's LAST use. A binding inside a tuple sub-pattern stays a copy.
+the capture's LAST use. A binding inside a payload's tuple sub-pattern
+(`Some((let a, let b))`) is a view into its slot of the tuple when it is one
+slot of it; a binding of a whole sub-tuple spans several slots of the flat
+tuple and stays a copy (bind the tuple whole to write it).
 The parameter conventions:
 
 | Convention | Written | Data | Resource |
