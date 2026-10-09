@@ -263,6 +263,10 @@ pub struct Census {
     /// the ones it evaluated (`crate::const_cache`).
     pub const_cache_hits: u64,
     pub const_cache_misses: u64,
+    /// M121 / B553: the impl-table questions the pre-entry resolve recorded —
+    /// zero when no late file writes an impl on a type it does not declare
+    /// (`analyzer::ReachFilter`), and on every base-cache hit.
+    pub reach_questions: u64,
 }
 
 thread_local! {
@@ -281,6 +285,7 @@ thread_local! {
             functions_checked: 0,
             const_cache_hits: 0,
             const_cache_misses: 0,
+            reach_questions: 0,
         })
     };
 }
@@ -634,7 +639,7 @@ pub fn report(program: &Program) {
         eprintln!(
             "[vilan counters] incremental base-hits={} base-misses={} base-stores={} \
              hot-world={} sources-walked={} records-replayed={} functions-checked={} \
-             const-hits={} const-misses={}",
+             const-hits={} const-misses={} reach-questions={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -644,6 +649,7 @@ pub fn report(program: &Program) {
             census.functions_checked,
             census.const_cache_hits,
             census.const_cache_misses,
+            census.reach_questions,
         );
     }
 }

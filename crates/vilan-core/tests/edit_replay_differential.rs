@@ -1158,6 +1158,45 @@ fn the_differential_sees_a_const_key_without_its_callees() {
     );
 }
 
+/// M121 / B553's cost: a check whose late files write no impl on a type they
+/// do not declare RECORDS NOTHING — the pre-entry resolve asks the impl table
+/// thousands of questions and none of them is kept (`reach_questions` 0), which
+/// is every `vilan check` of the gate's examples. An entry that does write one
+/// (B553's package) records, or the zero says nothing.
+#[test]
+fn a_check_whose_late_files_write_no_foreign_impl_records_nothing() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let package = leaf_package();
+    let check = observe(&package, Vec::new(), Leg::Incremental);
+    package.remove();
+    let package = Package::write(
+        "entry_impl_census",
+        Platform::default(),
+        &[
+            ("main.vl", ENTRY_IMPL_MAIN),
+            ("shapes.vl", ENTRY_IMPL_SHAPES),
+            ("waver.vl", ENTRY_IMPL_WAVER),
+        ],
+    );
+    let foreign = observe(&package, Vec::new(), Leg::Incremental);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        check.census.base_misses == 1 && check.census.reach_questions == 0,
+        "a check with no foreign impl in its entry records nothing: {:?}",
+        check.census
+    );
+    assert!(
+        foreign.census.reach_questions > 0,
+        "an entry impl on a module's type is recorded against: {:?}",
+        foreign.census
+    );
+}
+
 // --- the re-walk counter pins (Q9) ------------------------------------------------
 
 const PINS_MAIN: &str = "import pkg::views::render;\nimport pkg::cycle_a::ring;\nimport pkg::hub::base;\n\nfun main() {\n\tprint(render());\n\tprint(ring(1));\n\tprint(base());\n}\n";
