@@ -106,11 +106,20 @@ leg_clippy() {
 # THE gate command. `VILAN_CI_PARTITION` is nextest's `count:N/M` shard, set by
 # ci.yml's matrix so one runner's cold compile is paid twice in parallel instead
 # of once in series; unset locally, where the whole suite is the point.
+#
+# THE PROFILE (N156). The suite runs under Cargo.toml's `ci-test` profile - the
+# default `dev` with `vilan-core` at opt-level 1, which more than halves the
+# CPU every test pays for its cold std world - and its artifacts land in
+# `target/ci-test/`, apart from the `target/debug/` a lane's edit loop uses
+# (that loop keeps the ~17 s analyzer rebuild; this one pays ~80 s for it).
+# `VILAN_TEST_PROFILE=dev scripts/ci-local.sh test` runs the suite the old way.
+TEST_PROFILE=${VILAN_TEST_PROFILE:-ci-test}
+
 leg_test() {
     if [ -n "${VILAN_CI_PARTITION:-}" ]; then
-        cargo nextest run --workspace --partition "count:$VILAN_CI_PARTITION"
+        cargo nextest run --workspace --cargo-profile "$TEST_PROFILE" --partition "count:$VILAN_CI_PARTITION"
     else
-        cargo nextest run --workspace
+        cargo nextest run --workspace --cargo-profile "$TEST_PROFILE"
     fi
 }
 
@@ -119,7 +128,7 @@ leg_test() {
 # it is a leg of its own rather than two lines inside `test`: sharded, `test`
 # runs twice per OS, and a doc-test run twice is a doc-test run once too many.
 leg_doctest() {
-    cargo test --workspace --doc
+    cargo test --workspace --doc --profile "$TEST_PROFILE"
 }
 
 leg_audit() {

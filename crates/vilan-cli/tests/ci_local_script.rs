@@ -238,3 +238,77 @@ fn every_declared_leg_has_a_function() {
         );
     }
 }
+
+// --- N156: the suite's cargo profile ---------------------------------------------
+
+/// The profile the suite legs run under, and that the default one is left alone.
+///
+/// `vilan-core` built at opt-level 1 more than halves the CPU every test pays
+/// for its cold std world (an `inference` test 617 -> 192 ms), and costs an
+/// analyzer edit ~60 s more to rebuild. The second is why the lever is a
+/// SEPARATE profile: a lane's edit loop runs `cargo nextest run -p vilan-core ..`
+/// under the default test profile and keeps its ~17 s rebuild, while CI, the
+/// release gate and the seal - machines that build once and run the whole
+/// suite - select `ci-test` through `scripts/ci-local.sh`.
+#[test]
+fn n156_the_suite_legs_run_under_ci_test_and_the_default_profile_is_untouched() {
+    let manifest = std::fs::read_to_string(repository_root().join("Cargo.toml"))
+        .expect("read the workspace Cargo.toml");
+    // The body of one `[table]` header: its lines up to the next header. Read
+    // as text - vilan-cli carries no TOML parser, and this is two keys.
+    let table = |header: &str| -> Option<Vec<&str>> {
+        let mut lines = manifest.lines().skip_while(|line| line.trim() != header);
+        lines.next()?;
+        Some(
+            lines
+                .take_while(|line| !line.trim_start().starts_with('['))
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect(),
+        )
+    };
+    assert_eq!(
+        table("[profile.ci-test]").as_deref(),
+        Some(&["inherits = \"dev\""][..]),
+        "`ci-test` is `dev` plus its one lever"
+    );
+    assert_eq!(
+        table("[profile.ci-test.package.vilan-core]").as_deref(),
+        Some(&["opt-level = 1"][..]),
+        "`ci-test` builds vilan-core at opt-level 1"
+    );
+    for default in [
+        "[profile.dev.package.vilan-core]",
+        "[profile.test.package.vilan-core]",
+        "[profile.dev]",
+        "[profile.test]",
+    ] {
+        assert!(
+            table(default).is_none(),
+            "the default profiles stay unchanged (a lane's analyzer rebuild is ~17 s there, \
+             ~80 s at opt-level 1): `{default}` must not exist"
+        );
+    }
+
+    let script = script();
+    assert!(
+        script.contains("TEST_PROFILE=${VILAN_TEST_PROFILE:-ci-test}"),
+        "the suite legs default to `ci-test`, overridable with VILAN_TEST_PROFILE"
+    );
+    for leg in ["leg_test", "leg_doctest"] {
+        let body = script
+            .split(&format!("{leg}() {{"))
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .unwrap_or_else(|| panic!("{leg} in ci-local.sh"));
+        let flag = if leg == "leg_test" {
+            "--cargo-profile \"$TEST_PROFILE\""
+        } else {
+            "--profile \"$TEST_PROFILE\""
+        };
+        assert!(
+            body.contains(flag),
+            "`{leg}` selects the suite profile with `{flag}`:\n{body}"
+        );
+    }
+}

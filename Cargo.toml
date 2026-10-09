@@ -95,6 +95,25 @@ strip = true
 # `--release` with no codegen override.
 codegen-units = 1
 
+# The suite's profile in CI and at the seal (N156, RULED 2026-10-09): `dev`, with
+# `vilan-core` - the analyzer - built at opt-level 1. nextest starts a process
+# per test and every process pays a cold std world, so one analysis is the unit
+# the suite is made of, and at opt-level 0 it costs ~3.15x its opt-level-1 CPU
+# (an `inference` test 967 ms against 307 ms; suite-48's N151 measurement). It
+# changes nothing a test asserts. The price is the edit tax: a build after an
+# `analyzer.rs` edit is ~17 s at opt-level 0 and ~80 s at 1, which is why this
+# is a SEPARATE profile and the default dev/test profile is unchanged - a lane's
+# edit loop (`cargo nextest run -p vilan-core ...`) keeps the fast rebuild, and
+# the machines that run the whole suite from a clean tree pay the build once.
+# Selected by `scripts/ci-local.sh test`/`doctest` (`VILAN_TEST_PROFILE`, which
+# names this profile unless set) and the seal's union; the artifacts land in
+# `target/ci-test/`, so a cache keyed on `target/debug` does not hold them.
+[profile.ci-test]
+inherits = "dev"
+
+[profile.ci-test.package.vilan-core]
+opt-level = 1
+
 # Release performance with debug symbols, for profilers (perf, callgrind):
 # `cargo build --profile profiling`.
 [profile.profiling]
