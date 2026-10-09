@@ -6823,10 +6823,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let entries =
             self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
         let saved = self.enter_substitution(entries);
+        // F105: the WHOLE payload type, not its head — `Node(List<Tree<T>>)`
+        // under `Tree<i32>` is `List<Tree<i32>>`, and a head-only resolution
+        // left `List<Tree<T>>`, open, so the position handed the list nothing
+        // and each element was minted at `any`.
         let resolved = variant
             .data_type_ids
             .iter()
-            .map(|type_id| self.concrete(*type_id))
+            .map(|type_id| self.deeply_resolved(*type_id))
             .collect();
         self.current_substitution = saved;
         resolved

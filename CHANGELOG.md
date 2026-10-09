@@ -56,6 +56,11 @@ written down.
 ---
 
 <!-- family: fix -->
+**F105: natively, a generic enum's variant built inside a list inside another variant builds — `let t: Tree<i32> = Tree::Node([Tree::Leaf(1), Tree::Node([Tree::Leaf(2)])]);`.** It was refused as "a generic type instantiated at `any`", annotation or not: the inner constructor's `T` is grounded only through the outer constructor's payload, and that payload's type (`List<Tree<T>>` under `Tree<i32>`) was resolved at its head alone, so the position stayed open, handed the list nothing, and each element was minted at `any`. The payload type is now resolved whole. Pin: `native_differential`'s `a_generic_variant_nested_in_a_variants_list_builds_on_both_backends` (`native/nested_generic_variants.vl`: an annotated `let`, a struct field, a call argument, three levels deep, a two-parameter enum and an `Option` around the tree, each walked). Tracker F105.
+
+---
+
+<!-- family: fix -->
 **F104: natively, a closure whose body only diverges builds — `let run: || void = || panic("x");`, a block ending in a `panic`, a `match` whose every leg panics.** The emitted closure left its return to rustc's inference, which typed the diverging body `!`, and a `!`-returning closure is no `Rc<dyn Fn() -> ()>` (E0271); the JS backend ran it. A closure whose body diverges (the analyzer's own divergence reading: a `panic`, a `ret`, an endless `for`, a block, `if` or `match` all of whose paths do) now writes its return type. Pin: `native_differential`'s `a_closure_whose_body_diverges_builds_on_both_backends` (`native/diverging_closures.vl`: an expression body, a block, a value-returning closure, one handed straight to a callee, an all-panicking `match`, and an early `ret`; five rustc errors on 0.45.0). Tracker F104.
 
 ---

@@ -1,0 +1,71 @@
+// F105: a generic enum's variant built inside a LIST inside another variant
+// — `Tree::Node([Tree::Leaf(1)])` — was refused natively as "a generic type
+// instantiated at `any`", even under an annotation: the inner constructor's
+// `T` is grounded only through the outer one's payload, and the payload
+// position was resolved at its head alone (`List<Tree<T>>`, still open), so
+// it handed the list nothing. The shapes: an annotated `let`, a struct
+// field, a call argument, two levels deep, a two-parameter enum, and an
+// `Option` around the tree; each is walked to print what it holds.
+import std::io::print;
+
+enum Tree<T> {
+	Leaf(T),
+	Node(List<Tree<T>>),
+}
+
+enum Either<A, B> {
+	Left(A),
+	Right(B),
+	Many(List<Either<A, B>>),
+}
+
+struct Wrapper<T> {
+	inner: T,
+	tags: List<str>,
+}
+
+fun total(tree: Tree<i32>): i32 {
+	match tree {
+		Tree::Leaf(let value) => value,
+		Tree::Node(let children) => {
+			mut sum = 0;
+			for child in children {
+				sum += total(child);
+			}
+			sum
+		},
+	}
+}
+
+fun lefts(value: Either<i32, str>): i32 {
+	match value {
+		Either::Left(let n) => n,
+		Either::Right(_) => 0,
+		Either::Many(let items) => {
+			mut sum = 0;
+			for item in items {
+				sum += lefts(item);
+			}
+			sum
+		},
+	}
+}
+
+fun main() {
+	let w = Wrapper { inner = Tree::Node([Tree::Leaf(1), Tree::Leaf(2)]), tags = ["a"] };
+	print(w.tags.len());
+	print(total(w.inner));
+	let t: Tree<i32> = Tree::Node([Tree::Leaf(1), Tree::Node([Tree::Leaf(2)])]);
+	print(total(t));
+	print(total(Tree::Node([Tree::Node([Tree::Node([Tree::Leaf(7)])]), Tree::Leaf(3)])));
+	let e: Either<i32, str> = Either::Many([
+		Either::Left(4),
+		Either::Right("r"),
+		Either::Many([Either::Left(5)]),
+	]);
+	print(lefts(e));
+	let maybe: Option<Tree<i32>> = Some(Tree::Node([Tree::Leaf(9)]));
+	if maybe is Some(let tree) {
+		print(total(tree));
+	}
+}

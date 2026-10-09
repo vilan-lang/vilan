@@ -8941,6 +8941,29 @@ fn a_closure_whose_body_diverges_builds_on_both_backends() {
     );
 }
 
+/// F105: a generic enum's variant built inside a LIST inside another
+/// variant — `Tree::Node([Tree::Leaf(1)])` — was refused natively as "a
+/// generic type instantiated at `any`", even under an annotation: the inner
+/// constructor's `T` is grounded only through the outer one's payload, whose
+/// type was resolved at its head alone (`List<Tree<T>>`, still open). The
+/// probe: an annotated `let`, a struct field, a call argument, three levels
+/// deep, a two-parameter enum and an `Option` around the tree, each walked.
+#[test]
+fn a_generic_variant_nested_in_a_variants_list_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_nested_generic_variants.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/nested_generic_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested generic variant must build at its position's instance"
+    );
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,
