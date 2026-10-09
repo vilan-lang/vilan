@@ -59,9 +59,22 @@ jobs:
       # letting the other leg finish buys is the complete failure list on the
       # day it matters most.
       fail-fast: false
+      # SHARDED like ci.yml's `test` (L17): at v0.45.0 the two unsharded gate
+      # legs ran 55 and 110 minutes and every build and publish job waited on
+      # them. Same `count:N/M` shards as ci.yml, so each OS's shards are the
+      # whole suite once. The ubuntu shards run on the owner's self-hosted
+      # runner (`vilan-linux`): only a tag push or a dispatch by someone with
+      # write access can start this workflow, so there is no fork to keep off
+      # it. The windows shards move to `vilan-windows` once that runner exists.
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - { os: ubuntu-latest, partition: 1, shards: 2 }
+          - { os: ubuntu-latest, partition: 2, shards: 2 }
+          - { os: windows-latest, partition: 1, shards: 4 }
+          - { os: windows-latest, partition: 2, shards: 4 }
+          - { os: windows-latest, partition: 3, shards: 4 }
+          - { os: windows-latest, partition: 4, shards: 4 }
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'vilan-linux' || matrix.os }}
     # The suite runs against current stable, exactly as ci.yml's `test` job
     # declares it: rust-toolchain.toml is the formatter's pin (N21), and it
     # would otherwise outrank the toolchain dtolnay/rust-toolchain sets.
@@ -132,10 +145,12 @@ jobs:
         with:
           tool: cargo-nextest
       - name: The suite is green
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --partition count:${{ matrix.partition }}/${{ matrix.shards }}
       # nextest does not run doc-tests. Every doc-test set is empty today;
       # this leg exists so a future doc-test cannot silently stop running.
+      # ONCE per OS, as ci.yml does it: the shards split the suite, not this.
       - name: The doc-tests are green
+        if: matrix.partition == 1
         run: cargo test --workspace --doc
 
   # ── ci.yml's other three legs, on the release side ──────────────────────────
