@@ -2433,7 +2433,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.rust_type(tuple, span)
             }
             Type::Tuple(elements) => {
-                self.refuse_an_unordered_teardown(&elements, "a tuple", span)?;
                 let mut parts = Vec::new();
                 for element in &elements {
                     parts.push(self.rust_type(*element, span)?);
@@ -2446,9 +2445,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 Ok(format!("({})", parts.join(", ")))
             }
             Type::Array(element, length) => {
-                if length > 1 {
-                    self.refuse_an_unordered_teardown(&[element, element], "a fixed array", span)?;
-                }
                 let element = self.rust_type(element, span)?;
                 Ok(format!("[{element}; {length}]"))
             }
@@ -3155,7 +3151,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // F56: as `ensure_struct` — only a `Drop` impl owes a teardown. F116:
         // an enum's `Drop` impl is a Rust one calling the body, which runs
         // before the payloads drop (the variant's ORDER is the aggregate
-        // rule's, see [`Self::refuse_an_unordered_teardown`]).
+        // rule's, see [`Self::refuse_an_unordered_drop`]).
         let entries =
             self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
         let key: Vec<String> = entries
@@ -3186,14 +3182,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // of them that a struct asks of its fields: is a closure reachable?
         let mut payload_types: Vec<Vec<String>> = Vec::new();
         for variant in &declaration.variants {
-            if let Err(error) = self.refuse_an_unordered_teardown(
-                &variant.data_type_ids,
-                &format!("the variant `{}::{}`", declaration.name, variant.name),
-                span,
-            ) {
-                rendered = Err(error);
-                break;
-            }
             let mut payload = Vec::new();
             for data_type_id in &variant.data_type_ids {
                 match self.rust_type(*data_type_id, span) {
@@ -4699,6 +4687,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) -> Result<(), Error> {
         let pad = Self::indent(depth);
         let early_drops = self.early_drops(statements);
+        for statement in statements {
+            for binding in teardown::statement_teardown(self.program, *statement) {
+                if let Some(type_id) = self
+                    .program
+                    .variables
+                    .get(&binding)
+                    .map(|variable| variable.type_id)
+                {
+                    let span = self.span_of(*statement);
+                    self.refuse_an_unordered_drop(type_id, span, &mut HashSet::new())?;
+                }
+            }
+        }
         for (index, statement) in statements.iter().enumerate() {
             let rendered = self.statement(*statement, depth)?;
             if !rendered.is_empty() {
@@ -4805,14 +4806,87 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// Refuses, by name, an aggregate whose members' teardown ORDER is
-    /// visible and that this backend cannot declare reversed: two or more
-    /// members that owe a teardown in a tuple, a fixed array or one enum
-    /// variant's payloads. vilan drops an aggregate's members in REVERSE
+    /// Refuses, by name, a binding this block DROPS WHOLE (it owes a
+    /// teardown at its scope's end or its last use) whose type holds an
+    /// aggregate whose members' teardown ORDER is visible and that this
+    /// backend cannot declare reversed: two or more members that owe a
+    /// teardown in a tuple, a fixed array or one enum variant's payloads, at
+    /// any depth. vilan drops an aggregate's members in REVERSE
     /// (destruction.md §5), Rust drops a tuple's, an array's and a variant's
     /// in declaration order, and only a struct's fields can be declared the
     /// other way round ([`Self::ensure_struct`]) — so the base printed the
-    /// teardowns in the opposite order to the JS backend, silently.
+    /// teardowns in the opposite order to the JS backend, silently. A value
+    /// CONSUMED instead (a `match` moving its payloads out, resource_take.vl's
+    /// `Couple::Two`) never runs Rust's glue over the aggregate, and builds.
+    fn refuse_an_unordered_drop(
+        &mut self,
+        type_id: TypeId,
+        span: Span,
+        visiting: &mut HashSet<Id>,
+    ) -> Result<(), Error> {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return Ok(());
+        };
+        let concrete = self.concrete(type_id);
+        match self.resolve(concrete).cloned() {
+            Some(Type::Tuple(elements)) => {
+                self.refuse_an_unordered_teardown(&elements, "a tuple", span)?;
+                for element in elements {
+                    self.refuse_an_unordered_drop(element, span, visiting)?;
+                }
+            }
+            Some(Type::Array(element, length)) => {
+                if length > 1 {
+                    self.refuse_an_unordered_teardown(&[element, element], "a fixed array", span)?;
+                }
+                self.refuse_an_unordered_drop(element, span, visiting)?;
+            }
+            Some(Type::Struct(id, arguments)) => {
+                let Some(declaration) = self.program.structs.get(&id).cloned() else {
+                    return Ok(());
+                };
+                if declaration.external || !visiting.insert(id) {
+                    return Ok(());
+                }
+                let entries =
+                    self.nominal_entries(&declaration.generic_parameter_constraint_ids, &arguments);
+                let saved = self.enter_substitution(entries);
+                let checked = declaration.fields.iter().try_for_each(|field| {
+                    self.refuse_an_unordered_drop(field.type_id, span, visiting)
+                });
+                self.current_substitution = saved;
+                checked?;
+            }
+            Some(Type::Enum(id, arguments)) => {
+                let Some(declaration) = self.program.enums.get(&id).cloned() else {
+                    return Ok(());
+                };
+                if !visiting.insert(id) {
+                    return Ok(());
+                }
+                let entries =
+                    self.nominal_entries(&declaration.generic_parameter_constraint_ids, &arguments);
+                let saved = self.enter_substitution(entries);
+                let checked = declaration.variants.iter().try_for_each(|variant| {
+                    self.refuse_an_unordered_teardown(
+                        &variant.data_type_ids,
+                        &format!("the variant `{}::{}`", declaration.name, variant.name),
+                        span,
+                    )?;
+                    variant.data_type_ids.iter().try_for_each(|payload| {
+                        self.refuse_an_unordered_drop(*payload, span, visiting)
+                    })
+                });
+                self.current_substitution = saved;
+                checked?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// One aggregate's members: two or more that owe a teardown are refused
+    /// ([`Self::refuse_an_unordered_drop`]).
     fn refuse_an_unordered_teardown(
         &self,
         members: &[TypeId],
@@ -5163,12 +5237,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .and_then(|type_id| self.resolve(type_id))
                     .is_some_and(|resolved| matches!(resolved, Type::Array(..)));
                 if fixed {
-                    // As a tuple literal: the elements' teardown order.
-                    let members: Vec<TypeId> = elements
-                        .iter()
-                        .filter_map(|element| self.type_of(*element))
-                        .collect();
-                    self.refuse_an_unordered_teardown(&members, "a fixed array", span)?;
                     format!("[{}]", parts.join(", "))
                 } else {
                     format!("vec![{}]", parts.join(", "))
@@ -5181,14 +5249,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 {
                     return self.spread_tuple(&elements, depth, span);
                 }
-                // A tuple literal names no type a position renders (nor does
-                // the analyzer record one on it), so the teardown order is
-                // asked of its elements' own records.
-                let members: Vec<TypeId> = elements
-                    .iter()
-                    .filter_map(|element| self.type_of(*element))
-                    .collect();
-                self.refuse_an_unordered_teardown(&members, "a tuple", span)?;
                 let mut parts = Vec::new();
                 for element in &elements {
                     let expecting = self.expected_type;
@@ -6659,6 +6719,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
         )
     }
 
+    /// Whether an operator over `type_id` IS the Rust operator — a scalar
+    /// (the numbers, `str`, `BigInt`), `bool` or a backed enum, whose
+    /// operators are the language's own (the JS emitter's
+    /// `compares_natively`). Every other type re-dispatches a generic
+    /// operator to its member.
+    fn compares_natively(&self, type_id: TypeId) -> bool {
+        match self.resolve(type_id) {
+            Some(Type::Struct(id, _)) => self.program.structs.get(id).is_some_and(|declaration| {
+                scalar_type(declaration.name).is_some() || declaration.name == "BigInt"
+            }),
+            Some(Type::Enum(id, _)) => {
+                Some(*id) == self.program.bool_enum_id
+                    || self
+                        .program
+                        .enums
+                        .get(id)
+                        .is_some_and(|declaration| declaration.backing.is_some())
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a type is one of the numeric scalar primitives — the set
     /// [`Emitter::number_literal`] lets a declared POSITION override a
     /// literal's own record for.
@@ -6855,6 +6937,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         if let Some((concrete, member)) = generic
             && self.is_grounded(concrete)
+            && !self.compares_natively(concrete)
         {
             let preferred = self.program.bound_dispatch_traits.get(&id).cloned();
             if let Some(dispatch @ NativeDispatch::Call(_)) =

@@ -11682,8 +11682,10 @@ fn f116_a_generic_resource_and_an_enum_with_drop_tear_down_alike_on_both_backend
 /// silently: vilan drops an aggregate's members in reverse (destruction.md
 /// §5), Rust drops a tuple's, an array's and a variant's in declaration
 /// order, and only a struct's fields can be declared reversed (F97). Each
-/// is refused by name now; ONE such member, or a struct holding two, still
-/// builds and agrees.
+/// is refused by name now where Rust's glue would drop it WHOLE; ONE such
+/// member, a struct holding two, and a variant CONSUMED by a `match` (its
+/// captures drop on their own, resource_take.vl's `Couple::Two`) still build
+/// and agree.
 #[test]
 fn an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered() {
     let staged = stage();
@@ -11742,7 +11744,13 @@ fn an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered() {
         format!(
             "{handle}[resource]\nstruct Both {{\n\tfirst: Handle,\n\tsecond: Handle,\n}}\n\n\
              [resource]\nenum One {{\n\tNone,\n\tHeld(Handle, i32),\n}}\n\n\
+             [resource]\nenum Couple {{\n\tTwo(Handle, Handle),\n\tNeither,\n}}\n\n\
              fun main() {{\n\
+             \tlet consumed = Couple::Two(Handle {{ name = \"e\" }}, Handle {{ name = \"f\" }});\n\
+             \tmatch consumed {{\n\
+             \t\tCouple::Two(let left, let right) => print(left.name + right.name),\n\
+             \t\tCouple::Neither => print(\"neither\"),\n\
+             \t}}\n\
              \tlet both = Both {{ first = Handle {{ name = \"a\" }}, second = Handle {{ name = \"b\" }} }};\n\
              \tlet one = One::Held(Handle {{ name = \"c\" }}, 1);\n\
              \tlet pair = (Handle {{ name = \"d\" }}, 2);\n\
