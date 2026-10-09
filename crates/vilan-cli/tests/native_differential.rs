@@ -9284,6 +9284,42 @@ fn a_const_aggregate_is_identical_on_both_backends() {
     }
 }
 
+/// F93: a GUARDED `match` leg was refused by name — the first wall of
+/// match-patterns.vl and capture-clones.vl, and the last of resource_take.vl
+/// (behind F97). A leg's guard is Rust's guard, and a `str`-backed variant
+/// nested in a payload or a tuple is a guard over a binder (match-patterns'
+/// next wall). capture-clones.vl's next wall is an operator over two numeric
+/// widths the analyzer admits, now refused by name rather than by rustc. The
+/// probe: guarded bindings, variants and tuples, a guard on outer state, a
+/// guarded wildcard, a string capture compared in a guard, the nested
+/// backed variant beside a guard; plus the two programs F93 completes.
+#[test]
+fn a_guarded_match_leg_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_guarded_legs.vl";
+    std::fs::write(staged.join(file), include_str!("native/guarded_legs.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a guarded leg must choose the same leg natively"
+    );
+    for program in ["match-patterns.vl", "resource_take.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F93 was its last wall"
+        );
+    }
+    match compare(&staged, "capture-clones.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("an operator over two numeric types"),
+            "capture-clones.vl's next wall is the mixed-width operator: {reason}"
+        ),
+        other => panic!("capture-clones.vl must be refused by name: {other:?}"),
+    }
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,

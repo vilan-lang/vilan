@@ -6483,6 +6483,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             emitter.numeric_type_of(partner)
         };
+        // Two operands of DIFFERENT numeric widths — `cells.len() * weight`,
+        // a `usize` beside an `i32` — are no Rust operator at all, and rustc
+        // refused the build. The analyzer admits the pair (filed with Order
+        // 48's finds; capture-clones.vl is the corpus program), so the shape
+        // is refused here by name until it is the analyzer's refusal too.
+        if !is_shift
+            && let (Some(left_type), Some(right_type)) =
+                (self.numeric_type_of(left), self.numeric_type_of(right))
+        {
+            let left_rendered = self.rust_type(left_type, span)?;
+            let right_rendered = self.rust_type(right_type, span)?;
+            if left_rendered != right_rendered {
+                return Err(unsupported(
+                    &format!(
+                        "an operator over two numeric types (`{left_rendered}` and \
+                         `{right_rendered}`), which the analyzer admitted without a conversion"
+                    ),
+                    span,
+                ));
+            }
+        }
         let left_position = partner_position(self, right);
         let right_position = partner_position(self, left);
         let left_text = match left_position {
@@ -7170,20 +7191,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut out = format!("match {subject_text} {{\n");
         let mut has_catch_all = false;
         for leg in legs {
-            if leg.guard.is_some() {
-                return Err(unsupported("a guarded `match` leg", span));
-            }
             let saved_guards = self.literal_guards.replace(Vec::new());
             let pattern = self.pattern(&leg.pattern, subject_type, span);
-            let guards =
+            let mut guards =
                 std::mem::replace(&mut self.literal_guards, saved_guards).unwrap_or_default();
+            // F93: a leg's own guard is Rust's guard, after the nested string
+            // literals' (which test the pattern's own shape first). Inside it
+            // Rust reads a capture through a shared borrow of the subject, and
+            // the leg moves it only once the guard has accepted — the JS
+            // backend's accessor, which a rejecting guard leaves untouched for
+            // the next leg.
+            if let Some(guard) = leg.guard {
+                let condition =
+                    self.expecting_nothing(|emitter| emitter.expression(guard, depth + 1))?;
+                guards.push(format!("({condition})"));
+            }
             let pattern = if guards.is_empty() {
                 pattern?
             } else {
                 format!("{} if {}", pattern?, guards.join(" && "))
             };
-            if matches!(leg.pattern, ExprPattern::Wildcard | ExprPattern::Binding(_))
-                || self.pattern_is_bool(&leg.pattern)
+            if leg.guard.is_none()
+                && (matches!(leg.pattern, ExprPattern::Wildcard | ExprPattern::Binding(_))
+                    || self.pattern_is_bool(&leg.pattern))
             {
                 // A `bool` match with both legs is exhaustive natively too, and
                 // an extra arm after it is an `unreachable_patterns` lint rather
@@ -7287,18 +7317,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ExprPattern::Literal(id) if Self::string_pattern_text(self.program, *id).is_some() => {
                 let literal =
                     rust_string(Self::string_pattern_text(self.program, *id).expect("just tested"));
-                if self.pattern_nesting == 0 {
-                    return Ok(literal);
-                }
-                let Some(guards) = self.literal_guards.as_mut() else {
-                    return Err(unsupported(
-                        "a `str` literal nested inside a pattern anywhere but a `match` leg",
-                        span,
-                    ));
-                };
-                let name = format!("__literal{}", guards.len());
-                guards.push(format!("&*{name} == {literal}"));
-                Ok(name)
+                self.str_literal_pattern(literal, span)
             }
             // A literal pattern is written at the SUBJECT's type, never at the
             // expectation around the `match`: `std::base64`'s `match rest { 2
@@ -7319,9 +7338,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     let _ = payload;
                     return Ok(match declaration.backing {
                         // A `str`-backed variant matches as a `&str` literal;
-                        // the subject is deref'd by `match_expr`.
+                        // the subject is deref'd by `match_expr`. NESTED in a
+                        // payload or a tuple (`Pair::Of(Align::Start)`,
+                        // `(Align::Start, true)`) it is a guard over a binder,
+                        // as a nested string literal is (F93's neighbour in
+                        // match-patterns.vl).
                         Some(Backing::Str) => match &declaration.variants[*index].backing_value {
-                            BackingValue::Str(text) => rust_string(text),
+                            BackingValue::Str(text) => {
+                                return self.str_literal_pattern(rust_string(text), span);
+                            }
                             BackingValue::Int(discriminant) => format!("{discriminant}"),
                         },
                         // An integer pattern carries no suffix: the subject's
@@ -7387,6 +7412,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 Ok(format!("[{}]", parts.join(", ")))
             }
         }
+    }
+
+    /// A `str` literal in a pattern: the bare `&str` literal at the top of a
+    /// leg (the subject is matched as a `&str`), and nested inside a payload
+    /// or a tuple a binder the leg's guard compares — an `Rc<str>` slot has no
+    /// literal pattern.
+    fn str_literal_pattern(&mut self, literal: String, span: Span) -> Result<String, Error> {
+        if self.pattern_nesting == 0 {
+            return Ok(literal);
+        }
+        let Some(guards) = self.literal_guards.as_mut() else {
+            return Err(unsupported(
+                "a `str` literal nested inside a pattern anywhere but a `match` leg",
+                span,
+            ));
+        };
+        let name = format!("__literal{}", guards.len());
+        guards.push(format!("&*{name} == {literal}"));
+        Ok(name)
     }
 
     /// The arguments `enum_id` is instantiated at, from a known subject type.
