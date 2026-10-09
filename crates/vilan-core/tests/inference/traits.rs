@@ -9888,3 +9888,32 @@ fn b564_a_two_tier_blanket_reaches_a_closure() {
     );
 }
 
+#[test]
+fn b565_a_blanket_reaches_an_unannotated_function_item() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B564_TIERS}
+        trait Runs {{
+            fun twice(&self): i32;
+        }}
+        impl (|| i32) with Runs {{
+            fun twice(&self): i32 {{ self() + self() }}
+        }}
+        fun nothing() {{}}
+        fun seven(): i32 {{ 7 }}
+
+        fun main() {{
+            let f = nothing;
+            print(f.leaf());
+            print(nothing.leaf());
+            print(f.shape());
+            let s = seven;
+            print(s.twice());
+        }}
+
+        main();
+        "
+        ),
+        "leaf\nleaf\nshape over leaf\n14\n",
+    );
+}

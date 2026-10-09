@@ -52266,11 +52266,16 @@ impl<'src> Analyzer<'src> {
             // shapes and the blankets (`impl type T with Named`) exactly as a
             // nominal one does — it fell to `NotCallable` before, so `f.named()`
             // on a `|| void` was "cannot call method".
+            //
+            // B565: and so does a FUNCTION ITEM — `let f = nothing; f.leaf()`
+            // keeps the item's own type, which only an annotation (`let f: ||
+            // void`) turned into the closure type B508 reached.
             Type::Struct(_, _)
             | Type::Enum(_, _)
             | Type::Tuple(_)
             | Type::Array(_, _)
             | Type::Closure(..)
+            | Type::Function(_)
             | Type::Dyn(_, _)
                 if !object_declares_member =>
             {
