@@ -12,14 +12,14 @@
   stop: red,
 )
 [native_probe_dbg_debug_impls.vl:66:2] value = 3.0°C
-[native_probe_dbg_debug_impls.vl:77:2] reading = Reading {
+[native_probe_dbg_debug_impls.vl:81:2] reading = Reading {
   place = "a \"quoted\"\tplace",
   temperature = 4.5°C,
   shape = Shape::Circle(1.5),
 }
-[native_probe_dbg_debug_impls.vl:81:2] Shape::Rect(2, 3) = Shape::Rect(2, 3)
-[native_probe_dbg_debug_impls.vl:81:2] Shape::Empty = Shape::Empty
-[native_probe_dbg_debug_impls.vl:83:2] wide = Wide {
+[native_probe_dbg_debug_impls.vl:85:2] Shape::Rect(2, 3) = Shape::Rect(2, 3)
+[native_probe_dbg_debug_impls.vl:85:2] Shape::Empty = Shape::Empty
+[native_probe_dbg_debug_impls.vl:91:2] wide = Wide {
   first_label = "the first label",
   second_label = "the second label",
   numbers = [1, 2, 3],

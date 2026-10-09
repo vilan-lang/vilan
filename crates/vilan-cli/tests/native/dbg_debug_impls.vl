@@ -73,13 +73,21 @@ fun main() {
 	dbg(Boxed { inner = 7 }, Boxed { inner = Opaque { tag = 1 } });
 	dbg(Signal::Go, Some(Signal::Stop("red")));
 	show(Celsius { degrees = 3.0 });
-	let reading = Reading { place = "a \"quoted\"\tplace", temperature = Celsius { degrees = 4.5 }, shape = Shape::Circle(1.5) };
+	let reading = Reading {
+		place = "a \"quoted\"\tplace",
+		temperature = Celsius { degrees = 4.5 },
+		shape = Shape::Circle(1.5),
+	};
 	dbg(reading);
 	print(reading.debug());
 	print(Shape::Rect(2, 3).debug());
 	print(Shape::Empty.debug());
 	dbg(Shape::Rect(2, 3), Shape::Empty);
-	let wide = Wide { first_label = "the first label", second_label = "the second label", numbers = [1, 2, 3] };
+	let wide = Wide {
+		first_label = "the first label",
+		second_label = "the second label",
+		numbers = [1, 2, 3],
+	};
 	dbg(wide);
 	print(wide.debug());
 }

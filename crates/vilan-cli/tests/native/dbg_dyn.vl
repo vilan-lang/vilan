@@ -76,7 +76,10 @@ fun main() {
 	dbg(one);
 	let shapes: List<dyn Area> = [Square { side = 3 }, Rect { width = 2, height = 5 }, Dot {}];
 	dbg(shapes);
-	dbg(Scene { name = "scene", shapes = [Rect { width = 10, height = 20 }, Square { side = 30 }] });
+	dbg(Scene {
+		name = "scene",
+		shapes = [Rect { width = 10, height = 20 }, Square { side = 30 }],
+	});
 	let named: dyn Label<str> = Square { side = 4 };
 	dbg(named);
 	dbg(Some(one));

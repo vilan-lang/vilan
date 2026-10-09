@@ -26,7 +26,18 @@ fun main() {
 		next = next + 1;
 	}
 	dbg(numbers);
-	let words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa"];
+	let words = [
+		"alpha",
+		"beta",
+		"gamma",
+		"delta",
+		"epsilon",
+		"zeta",
+		"eta",
+		"theta",
+		"iota",
+		"kappa",
+	];
 	dbg(words);
 	let points = [Point { x = 1, y = 2 }, Point { x = 3, y = 4 }, Point { x = 5, y = 6 }];
 	dbg(points);

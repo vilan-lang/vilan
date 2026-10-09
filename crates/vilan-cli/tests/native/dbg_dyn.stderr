@@ -4,15 +4,15 @@
   dyn Area(Rect { width = 2, height = 5 }),
   dyn Area(.),
 ]
-[native_probe_dbg_dyn.vl:79:2] Scene { name = "scene", shapes = [Rect { width = 10, height = 20 }, Square { side = 30 }] } = Scene {
+[native_probe_dbg_dyn.vl:79:2] Scene { name = "scene", shapes = [Rect { width = 10, height = 20 }, Square { side = 30 }], } = Scene {
   name = "scene",
   shapes = [
     dyn Area(Rect { width = 10, height = 20 }),
     dyn Area(Square { side = 30 }),
   ],
 }
-[native_probe_dbg_dyn.vl:81:2] named = dyn Label<str>(Square { side = 4 })
-[native_probe_dbg_dyn.vl:82:2] Some(one) = Some(dyn Area(Square { side = 2 }))
-[native_probe_dbg_dyn.vl:84:2] named_rect = dyn Named(
+[native_probe_dbg_dyn.vl:84:2] named = dyn Label<str>(Square { side = 4 })
+[native_probe_dbg_dyn.vl:85:2] Some(one) = Some(dyn Area(Square { side = 2 }))
+[native_probe_dbg_dyn.vl:87:2] named_rect = dyn Named(
   Rect { width = 1, height = 1 },
 )
