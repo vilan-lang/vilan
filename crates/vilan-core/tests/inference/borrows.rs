@@ -12272,6 +12272,69 @@ fn b495_a_value_closure_and_a_view_closure_are_different_types() {
     );
 }
 
+/// E273: a NAMED FUNCTION handed where a closure type takes its parameter in
+/// the other mode gets B495's refusal too — read as the closure type it
+/// coerces to, whose modes are its parameters' conventions — named as the
+/// function's, and steered to the adapter, the one fix a declared function
+/// has at the call. It said "Expected |&str| i32, but got fn count(str): i32
+/// instead." before, with no word about modes.
+#[test]
+fn e273_a_named_function_with_the_other_mode_gets_the_mode_steer() {
+    assert_fails_with(
+        r#"
+        fun apply(f: |&str| i32): i32 { f(&"hi") }
+        fun count(s: str): i32 { 1 }
+        fun main() {
+            let n = apply(count);
+        }
+        "#,
+        "the function `count` takes `str` by value where its type takes a view `&str`: a value closure and a view closure are different types, and no adapter is inserted; a declared function is not rewritten at the call: adapt it with a closure that copies the view's value out: `|c| count(*c)`.",
+    );
+    assert_fails_with(
+        r#"
+        fun apply(f: |str| i32): i32 { f("hi") }
+        fun peek(s: &str): i32 { 1 }
+        fun main() {
+            let n = apply(peek);
+        }
+        "#,
+        "the function `peek` takes a view `&str` where its type takes `str` by value: a value closure and a view closure are different types, and no adapter is inserted; a declared function is not rewritten at the call: adapt it with a closure that lends it the value: `|c| peek(&c)`.",
+    );
+    assert_fails_with(
+        r#"
+        fun apply(f: |i32, &mut i32| void) {}
+        fun pair(a: i32, b: i32) {}
+        fun main() {
+            apply(pair);
+        }
+        "#,
+        "the function `pair`'s parameter 2 takes `i32` by value where its type takes a writable view `&mut i32`: a value closure and a view closure are different types, and no adapter is inserted; a function that takes a value writes only its own copy, never the caller's place: declare `pair`'s parameter `&mut i32`.",
+    );
+    assert_fails_with(
+        r#"
+        fun apply(f: |&i32, i32| i32): i32 { f(&1, 2) }
+        fun add(a: i32, b: i32): i32 { a + b }
+        fun main() {
+            let n = apply(add);
+        }
+        "#,
+        "the function `add`'s parameter 1 takes `i32` by value where its type takes a view `&i32`: a value closure and a view closure are different types, and no adapter is inserted; a declared function is not rewritten at the call: adapt it with a closure that copies the view's value out, passing parameter 1 as `*c` and the others as they come.",
+    );
+    // The adapter the steer names compiles and runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun apply(f: |&str| i32): i32 { f(&"hi") }
+        fun count(s: str): i32 { s.len().as_i32() }
+        fun main() {
+            print(apply(|c| count(*c)));
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
 /// B495: the mode is part of the closure type's printed form — a mismatch,
 /// a hover and an inlay hint say `|&str| void`, not `|str| void`.
 #[test]
@@ -13060,21 +13123,117 @@ fn b544_a_whole_write_to_an_is_capture_in_its_block_steers_to_the_view_subject()
 /// `mut` payload capture. Before, the write was refused with "declare it
 /// mut", and `mut a` compiled and its write never landed.
 #[test]
-fn b545_a_tuple_leaf_capture_under_a_view_subject_is_refused_with_the_whole_tuple_steer() {
+fn b545_a_multi_slot_tuple_leaf_under_a_view_subject_is_refused_with_the_whole_tuple_steer() {
+    // A SUB-TUPLE leaf spans several slots of the flat tuple, so it is a
+    // reslice — a copy — whatever the subject; the write is refused, and so
+    // is `mut` on it.
     assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut nested = Some(((1, 2), 3));
+            match &mut nested {
+                Some((let pair, let c)) => { pair.0 += 1; },
+                None => {},
+            }
+        }
+        "#,
+        "cannot mutate 'pair': a capture of a sub-tuple (or of an element still generic) inside \
+         a tuple pattern is a COPY even under a view subject",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut nested = Some(((1, 2), 3));
+            match &mut nested {
+                Some((mut pair, let c)) => { pair.0 += 1; },
+                None => {},
+            }
+        }
+        "#,
+        "`mut pair` would bind a COPY of a sub-tuple, and its write would not reach `nested`",
+    );
+    // The steered spelling writes in place.
+    assert_compiles_and_runs(
         r#"
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut held = Some((1, 2));
             match &mut held {
-                Some((let a, let b)) => { a += 1; },
+                Some(let pair) => { pair.0 += 10; },
+                None => {},
+            }
+            match held {
+                Some((let a, let b)) => print(a + b),
                 None => {},
             }
         }
         "#,
-        "cannot mutate 'a': a capture inside a tuple pattern is a COPY of its element even \
-         under a view subject",
+        "13\n",
     );
+}
+
+/// B545's view half (payload-views.md's one-slot tuple leaf): under `match
+/// &mut place`, a capture inside a payload's TUPLE pattern that is one slot
+/// of the flat tuple is a writable view into that slot — the `(tuple, offset)`
+/// pair for a scalar on JS, the element's own reference for an aggregate, a
+/// `&mut` by Rust's binding modes — as a payload capture is into the enum. It
+/// was a copy whose write was refused (solver-47's refusal half). Nested
+/// tuples, an aggregate leaf and the `is` form, run.
+#[test]
+fn b545_a_one_slot_tuple_leaf_under_a_view_subject_is_a_writable_view() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct P { x: i32 }
+        fun main() {
+            mut held = Some((1, 2));
+            match &mut held {
+                Some((let a, let b)) => { a += 10; b = 20; },
+                None => {},
+            }
+            match &held {
+                Some((let a, let b)) => print(*a + *b),
+                None => {},
+            }
+            mut nested = Some(((1, 2), 3));
+            match &mut nested {
+                Some(((let a, _), let c)) => { a += 100; c += 1; },
+                None => {},
+            }
+            match nested {
+                Some(((let a, let b), let c)) => print(a + b + c),
+                None => {},
+            }
+            mut agg = Some((P { x = 1 }, "s"));
+            match &mut agg {
+                Some((let p, let s)) => { p.x = 5; s = "t"; },
+                None => {},
+            }
+            match agg {
+                Some((let p, let s)) => { print(p.x); print(s); },
+                None => {},
+            }
+            if &mut held is Some((let a, _)) {
+                a += 1;
+            }
+            match held {
+                Some((let a, let b)) => print(a + b),
+                None => {},
+            }
+        }
+        main();
+        "#,
+        "31\n107\n5\nt\n32\n",
+    );
+}
+
+#[test]
+fn b545_a_one_slot_tuple_leaf_follows_the_payload_view_rules() {
+    // `mut` on it is B509 Q4's refusal; under `&place` it is a readonly view;
+    // its value is read with `*`.
     assert_fails_once_with(
         r#"
         import std::option::Option::{ self, Some, None };
@@ -13086,24 +13245,142 @@ fn b545_a_tuple_leaf_capture_under_a_view_subject_is_refused_with_the_whole_tupl
             }
         }
         "#,
-        "`mut a` would bind a COPY of a tuple element, and its write would not reach `held`",
+        "`mut a` would bind a COPY of the payload, but this matches a view (`&mut held`)",
     );
-    // The steered spelling writes in place; a read of a tuple leaf is fine.
-    assert_compiles_and_runs(
+    assert_fails_once_with(
         r#"
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut held = Some((1, 2));
-            match &mut held {
-                Some(let pair) => { pair.0 += 10; },
+            match &held {
+                Some((let a, let b)) => { a += 1; },
                 None => {},
             }
+        }
+        "#,
+        "cannot write through 'a': this matches `&held`, a readonly view",
+    );
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held = Some((1, 2));
             match &held {
                 Some((let a, let b)) => print(a + b),
                 None => {},
             }
         }
         "#,
-        "13\n",
+        "a view can't be read as a value here; write `*`",
+    );
+}
+
+// --- B562: a method on a SCALAR view auto-derefs (transparent-references R4) ---
+//
+// `n.abs()` with `n: &i32`, `s.len()` with `s: &str` (a parameter's or a
+// closure's) were refused "a view can't be read as a value here; write `*`",
+// while the same call on an aggregate view (`p.get()`) projects the place.
+// RULED a bug (2026-10-05): R4 reads `e.method(args)` for any `e: &[mut] U`
+// as an auto-deref to the referent place; R6's `*` is for a view used as a
+// VALUE, which a receiver is not.
+
+#[test]
+fn b562_a_method_on_a_scalar_view_parameter_auto_derefs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct P { x: i32 }
+        impl P {
+            fun get(self): i32 { self.x }
+        }
+
+        fun f(p: &P, n: &i32, xs: &List<i32>): i32 {
+            p.get() + xs.len().as_i32() + n.abs()
+        }
+        fun width(s: &str): usize { s.len() }
+        fun magnitude(n: &mut i32): i32 { n.abs() }
+
+        fun main() {
+            print(f(&P { x = 1 }, &-2, &[1]));
+            print(width(&"abc"));
+            mut x = -4;
+            print(magnitude(&mut x));
+        }
+
+        main();
+        "#,
+        "4\n3\n4\n",
+    );
+}
+
+#[test]
+fn b562_a_method_on_a_closures_scalar_view_parameter_auto_derefs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let width = |s: &str| s.len();
+            print(width(&"hello"));
+            let words = ["a", "bb"];
+            for w in &words {
+                print(w.len());
+            }
+        }
+
+        main();
+        "#,
+        "5\n1\n2\n",
+    );
+}
+
+#[test]
+fn b562_a_trait_method_on_a_scalar_view_auto_derefs_concrete_and_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Show { fun show(self): str; }
+        impl i32 with Show { fun show(self): str { "i" + self } }
+        struct P { x: i32 }
+        impl P with Show { fun show(self): str { "p" + self.x } }
+
+        fun through<T: Show>(t: &T): str { t.show() }
+        fun concrete(n: &i32): str { n.show() }
+
+        fun main() {
+            print(through(&3));
+            print(through(&P { x = 4 }));
+            print(concrete(&5));
+            let m = 6;
+            let r = &m;
+            print(r.show());
+        }
+
+        main();
+        "#,
+        "i3\np4\ni5\ni6\n",
+    );
+}
+
+#[test]
+fn b562_a_scalar_view_at_a_later_by_value_parameter_still_wants_its_star() {
+    // Only the receiver auto-derefs: the view as an ARGUMENT is a value use.
+    assert_fails_with(
+        r#"
+        fun add(a: i32, b: i32): i32 { a + b }
+        fun f(n: &i32): i32 { add(1, n) }
+        fun main() {}
+        "#,
+        "a view can't be read as a value here; write `*`",
+    );
+    assert_fails_with(
+        r#"
+        fun f(n: &i32): i32 { 5.max(n) }
+        fun main() {}
+        "#,
+        "a view can't be read as a value here; write `*`",
     );
 }

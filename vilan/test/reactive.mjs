@@ -882,7 +882,7 @@ const doubled = memo(derive(__clone(count), (n, $a, $b, $c) => {
 	return n * 2;
 }), [ 1 ], [ 1 ]);
 take(owner, sub(__clone(doubled), (n, $aJ) => {
-	return console.log(n);
+	return console.log(String(n));
 }), [ 1 ]);
 set(count, 1, [ 1 ]);
 set_with(count, (n) => {
@@ -890,6 +890,6 @@ set_with(count, (n) => {
 }, [ 1 ]);
 console.log(String(get2(doubled)));
 take(owner, sub2(__clone(count), (n, $aN) => {
-	return console.log(n);
+	return console.log(String(n));
 }), [ 1 ]);
 set(count, 20, [ 1 ]);

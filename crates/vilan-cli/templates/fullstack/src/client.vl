@@ -3,10 +3,15 @@
 // serves. Nothing here reaches a node-only module, so it compiles for the
 // browser.
 //
+// The view is markup: `<main …>…</main>` is element syntax, which lowers to the
+// `view("main")` method chain it stands for — a quoted string is a text child,
+// `{expr}` a hole holding any child value, `.styled(card)` a chain call on the
+// element, `on:click(..)` its event.
+//
 // `Signal::new(0)` hands back a `SignalCell`: `Signal` is the writable TRAIT
 // and the cell is the canonical impl, so the constructor spelling stays put
 // while a component is free to take any signal. `count.derive(..)` derives a
-// reactive pipe and `bind_text` keeps the text in step with it; the i-string
+// reactive pipe and the hole holding it keeps the text in step; the i-string
 // renders the number by host coercion.
 //
 // The `const` style chain is evaluated at build time into dist/client.css,
@@ -14,8 +19,8 @@
 //
 // `Signal`, `SignalCell`, `view` and `View` are ambient: `prelude = "std::web::prelude"` in
 // vilan.toml puts them in scope with no import, along with the MODULES `style`
-// and `ui` — which is why the chain below writes `style::Display::Flex` and
-// the mount writes `ui::mount_root`. The prelude carries the module, not its
+// and `ui` — which is why the style chain below writes `style::Display::Flex`
+// and the mount writes `ui::mount_root`. The prelude carries the module, not its
 // members, so you qualify, in type position (`style::Style`) exactly as in
 // value position; import a member explicitly wherever you would rather write it
 // bare, since an explicit import always beats the prelude.
@@ -36,10 +41,10 @@ fun main() {
 	let card = const card_style();
 	let _root = ui::mount_root("app", || {
 		let count = Signal::new(0);
-		view("main")
-			.styled(card)
-			.child(view("h1").text(greeting()))
-			.child(view("p").bind_text(count.derive(|n| i"clicked {n} times")))
-			.child(view("button").text("click me").on("click", || count.set_with(|n| n + 1)))
+		<main .styled(card)>
+			<h1>{greeting()}</h1>
+			<p>{count.derive(|n| i"clicked {n} times")}</p>
+			<button on:click(|| count.set_with(|n| n + 1))>"click me"</button>
+		</main>
 	});
 }

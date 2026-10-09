@@ -76,7 +76,10 @@ static arms, and a reactive twin for each:
 
 That pairing is the whole contract: whatever may be a child statically
 may be a child reactively, and `{expr}` in element syntax means the same
-thing either way. The reactive arms register one subscription with the
+thing either way. A number or a `bool` is none of the three, so
+`<p>{count}</p>` over a `Signal<i32>` is refused at the hole, with the
+text form written out: `{count.derive(|value| i"{value}")}`, or `{i"{5}"}`
+for a plain value. The reactive arms register one subscription with the
 nearest boundary, so a `{signal}` child inside an `each` row stops
 replacing anything when the row is disposed — but the views themselves
 arrive already built, so each one's own bindings belong to the scope

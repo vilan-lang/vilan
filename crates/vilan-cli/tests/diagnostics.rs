@@ -532,6 +532,94 @@ fn a_macro_registration_diagnostic_renders_once_at_the_entry_and_leads() {
     );
 }
 
+/// The `Error:` headlines of a rendering, in the order they printed.
+fn headlines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("Error: "))
+        .collect()
+}
+
+/// N147: the terminal prints the analyzer's diagnostics in their ONE canonical
+/// order (diagnostics-standard.md C1) — a note-carrying error is not hoisted
+/// above a plain one. It was: the noted ones rendered as the loop met them and
+/// the plain ones were held to the end, so the missing `area` (line 11, its
+/// note at the trait) printed ahead of the unresolved call on line 8.
+#[test]
+fn n147_a_noted_error_prints_in_its_place_not_ahead_of_every_plain_one() {
+    let dir = temp_package(
+        "n147_order",
+        "trait Shape {\n\tfun area(self): i32;\n}\n\nstruct Square { side: i32 }\n\n\
+         fun main() {\n\tnope();\n}\n\nimpl Square with Shape {}\n",
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    let printed = headlines(&stderr);
+    assert_eq!(printed.len(), 2, "{stderr}");
+    assert!(
+        printed[0].starts_with("cannot find 'nope'"),
+        "line 8's plain error first: {stderr}"
+    );
+    assert!(
+        printed[1].starts_with("'Square' does not implement trait 'Shape'"),
+        "then line 11's noted one: {stderr}"
+    );
+}
+
+/// N147: a copy of std with no `macro_std` beside it, under a program that
+/// derives nothing itself. std's own derives produce nothing, so `Instant` and
+/// `Duration` fail their `PartialOrd` conformance — errors noted into std's
+/// `compare.vl` — and those printed AHEAD of the split-toolchain refusal,
+/// which is what names the mistake. The refusal is first now.
+#[test]
+fn n147_a_split_toolchain_refusal_leads_the_terminal_rendering() {
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create the copy");
+        for entry in std::fs::read_dir(from).expect("read std") {
+            let path = entry.expect("an entry").path();
+            let target = to.join(path.file_name().expect("a name"));
+            if path.is_dir() {
+                copy_tree(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).expect("copy a std file");
+            }
+        }
+    }
+    let dir = temp_package(
+        "n147_split",
+        "import std::time::Instant;\n\nfun main() {\n\tprint(Instant::now() < Instant::now());\n}\n",
+    );
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"),
+        &dir.join("copy/std"),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(&dir)
+        .args(["check", "."])
+        .env("NO_COLOR", "1")
+        .env("VILAN_STD", dir.join("copy/std"))
+        .output()
+        .expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    let printed = headlines(&stderr);
+    assert!(
+        printed
+            .first()
+            .is_some_and(|first| first.starts_with("the `macro_std` package was not found")),
+        "the refusal leads: {printed:#?}"
+    );
+    assert_eq!(
+        printed
+            .iter()
+            .filter(|headline| headline.starts_with("the `macro_std` package"))
+            .count(),
+        1,
+        "once: {printed:#?}"
+    );
+}
+
 #[test]
 fn the_codegen_failure_renders_in_the_entry_that_lacks_main() {
     // `transform`'s ONE failure — a program with no `main` — and E16's recorded

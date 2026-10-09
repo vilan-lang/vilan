@@ -6,7 +6,7 @@
 #            `mrmime` is generated from too.
 # refresh:   python3 scripts/regen-mime-table.py
 # consumer:  crates/vilan-core/tests/mime_table_sync.rs generates the vilan
-#            `match` arms in vilan/std/src/process/build.vl from these rows
+#            `match` arms in vilan/std/src/build.vl from these rows
 #            and fails when they drift. It also owns the charset rule: a
 #            `text/*` row is served `; charset=utf-8`, everything else bare.
 #

@@ -1,10 +1,12 @@
-// `std::web::dom` — the browser (DOM) platform layer: a minimal binding to the host
+// `std::web::dom` — the browser (DOM) platform: a minimal binding to the host
 // document, elements, and events. Only available when building for the browser
 // (`vilan build --target browser`).
 //
 // An `Element` is an opaque handle to a live DOM node — like `Shared`, it is a
 // reference, not a value: methods mutate the node in place and binding/passing it
 // shares the one node rather than snapshotting it.
+
+[platform("browser")] mod self;
 
 import pkg::compare::Ord;
 import pkg::option::Option::{ None, Some };

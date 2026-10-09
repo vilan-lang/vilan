@@ -905,7 +905,7 @@ fn a_lazy_initializer_colors_its_binding() {
             print(config);
         }
         "#,
-        "requires the `process` layer of `std` and cannot run on `browser`",
+        "requires the `@process` platform its file declares and cannot run on `browser`",
     );
 }
 

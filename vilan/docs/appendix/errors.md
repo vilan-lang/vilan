@@ -61,10 +61,13 @@ spelling isn't supported. Import the module, then qualify through its
 name: `import std::math;` and `math::min(1, 2)`.
 → [Hello Vilan](../tour/hello-vilan.md)
 
-**"`…` requires the `…` layer of `std` and cannot run on `…`"**
+**"`…` requires … and cannot run on `…`"**
 Code reachable from this build's entry calls into a module the platform
 doesn't have: `std::fs` from a browser build, `std::web::dom` from a Node
-build. The error lists the call chain from `main` to the crossing.
+build. The requirement is named as "the `browser` platform its file
+declares" (a module says its platform in its own file,
+`[platform("browser")] mod self;`) or "the `process` layer of `…`" (a
+library serving the module from a platform layer). The error lists the call chain from `main` to the crossing.
 Importing the module is not the problem (imports are free); reaching it
 is. Move the call behind the right entry, or check the package's
 `target`.
@@ -73,7 +76,8 @@ is. Move the call behind the right entry, or check the package's
 **"`…` requires … and cannot run on `…` / reachable from `…`, fenced `[platform(…)]`"**
 A function declared a platform fence and something it (transitively)
 reaches requires a layer one of the fenced platforms doesn't serve. The
-chain shows the path from the fence. Fences check on every compile.
+chain shows the path from the fence. Fences check on every compile of the
+package that declares them.
 Narrowing the fence, or moving the colored call out from behind it, are
 the two fixes.
 → [Platforms](../tour/platforms.md)

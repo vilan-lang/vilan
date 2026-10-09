@@ -89,7 +89,10 @@ CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
 # The fixed edit script. `edit` is (anchor, offset into it): the edit inserts
 # `text` there. `hover` and `completion` are (anchor, offset) too, resolved in
 # the CURRENT text of the document each time they are asked, so an edit on the
-# same line does not move them. `repair` measures the undo as its own row.
+# same line does not move them — and so they must be found in the EDITED text as
+# well as the original one (N150; `anchor_problems` checks both). `references`
+# is asked once every edit is undone, against the original text. `repair`
+# measures the undo as its own row.
 SCENARIOS = [
     {
         "name": "leaf keystroke",
@@ -127,13 +130,16 @@ SCENARIOS = [
         # v0.44.0 seal's base) and the v0.44.0-migrated tree both hold once. The
         # first anchors (`Transient`'s `ready`/`latest`) left shared.vl with the
         # A150 migration, and the preflight refused the scenario on every tree
-        # after it.
+        # after it. N150: the completion anchor is the text AFTER the indent —
+        # the edit inserts its space inside `\t\t`, and the keystroke-path
+        # requests are resolved in the EDITED buffer, so an anchor spanning the
+        # insertion point stopped every run mid-scenario.
         "name": "shared.vl keystroke",
         "file": "src/shared.vl",
         "edit": ("\t\tself.uuid.hash()", 2),
         "text": " ",
         "hover": ("self.uuid.hash()", 10),
-        "completion": ("\t\tself.uuid.hash()", len("\t\tself.")),
+        "completion": ("self.uuid.hash()", len("self.")),
     },
     {
         # The owner's case: an edit to the client MODEL re-analyses the whole
@@ -504,11 +510,18 @@ def anchor_offset(text, anchor, scenario, what):
 
 ANCHOR_KINDS = ("edit", "hover", "completion", "references")
 
+# The anchors asked while the scenario's edit is still in the buffer (`measure_edit`'s keystroke-path and
+# settled requests), which must therefore survive the edit.
+EDITED_ANCHOR_KINDS = ("hover", "completion")
+
 
 def anchor_problems(root, scenarios):
     """Every anchor of `scenarios` checked against the tree at `root` before anything runs: a missing
-    anchor, or an EDIT anchor that occurs more than once (the edit lands on the first occurrence, which may
-    not be the place the script means). Answers the problems in words (empty: every anchor lands)."""
+    anchor, an EDIT anchor that occurs more than once (the edit lands on the first occurrence, which may
+    not be the place the script means), or a hover/completion anchor the scenario's own edit destroys —
+    those are resolved in the EDITED buffer (N150: the `shared.vl` row's completion anchor spanned its
+    insertion point, so the preflight passed and every run died mid-scenario). Answers the problems in
+    words (empty: every anchor lands)."""
     problems = []
     for scenario in scenarios:
         path = root / scenario["file"]
@@ -527,6 +540,18 @@ def anchor_problems(root, scenarios):
             elif count > 1 and kind == "edit":
                 problems.append(f"{scenario['name']}: the edit anchor {needle!r} occurs {count} times in "
                                 f"{scenario['file']} - the edit would land on the first")
+        edit_needle, edit_delta = scenario["edit"]
+        at = text.find(edit_needle)
+        if at < 0:
+            continue
+        edited = text[: at + edit_delta] + scenario["text"] + text[at + edit_delta :]
+        for kind in EDITED_ANCHOR_KINDS:
+            if kind not in scenario:
+                continue
+            needle = scenario[kind][0]
+            if needle in text and needle not in edited:
+                problems.append(f"{scenario['name']}: the {kind} anchor {needle!r} is not in {scenario['file']} "
+                                f"after the scenario's edit - it is asked against the edited text")
     return problems
 
 

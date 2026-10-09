@@ -3,7 +3,7 @@
 //!
 //! # What this is a twin OF
 //!
-//! `vilan/std/src/process/db.vl` binds `node:sqlite`'s `DatabaseSync`:
+//! `vilan/std/src/db.vl` binds `node:sqlite`'s `DatabaseSync`:
 //! `open`/`exec`/`prepare` on the database, `run`/`all`/`get` on a prepared
 //! statement, `row[name]` through the typed column accessors, a guarded
 //! `exec`/`run` for the migrator, and `close()` from `Database`'s `Drop`.

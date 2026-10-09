@@ -70,6 +70,16 @@
 # refuses either marker outright; shipped deprecations not yet removed are
 # reported at every cut. The stranding rule above applies to these markers
 # too.
+#
+# What it needs (N152 - the self-hosted runner's first run found both by
+# failing): a POSIX `sh`, and ANY POSIX `awk` - mawk 1.3.4 20200120 (Ubuntu
+# 22.04) as much as mawk 2025, gawk or busybox. That mawk knows no regex
+# intervals (`{3,}`), so the awk programs here spell repetition without them;
+# `release_scripts` refuses an interval in this file. `git` and `gh` (the CI
+# check). And `python3` 3.11 or newer (`tomllib`, perf_gate.py's own floor)
+# whenever the cut applies over a performance verdict - checked with the other
+# reds BEFORE anything changes, never skipped: a missing or older Python used
+# to leave a cut half-applied (bumped, with no perf report and no ratchet).
 set -eu
 
 VERSION=""
@@ -332,7 +342,11 @@ stage == 1 {
     # Past the markers, only a bold head may follow a marker. Anything else -
     # a rule, a blank line, prose, the heading above - strands it.
     if (substr($0, 1, 2) != "**") strand_pending()
-    if ($0 ~ /^-{3,}[ \t]*$/) {
+    # A rule is three or more dashes. Spelled `---+`, not `-{3,}`: mawk before
+    # 20200717 has no regex intervals, read `{3,}` as literal text, and so
+    # kept every rule inside the entry above it - the rewrite then printed it
+    # beside its own separator, doubling `---` between entries (N152).
+    if ($0 ~ /^---+[ \t]*$/) {
         close_entry()
         boundary = 1
         next
@@ -657,8 +671,31 @@ if [ "$REFUSED" != 3 ]; then
     say ""
 fi
 
+# ---------------------------------------------------------------------------
+# The tools the apply step will call (N152). The perf report and the ratchet
+# run perf_gate.py, which needs Python 3.11+ (`tomllib`) and refuses below it.
+# Asked here, with the other reds, so a machine without it refuses the cut
+# before anything changes - the apply step used to SKIP both when `python3`
+# was missing and die after the version bump when it was too old.
+# ---------------------------------------------------------------------------
+TOOLS_RED=0
+if [ "$DRY_RUN" = 0 ] && [ -f "$PERF_FILE" ] && [ -f scripts/perf_gate.py ]; then
+    say "tools (N152) — what applying over the performance verdict runs"
+    say ""
+    if ! command -v python3 > /dev/null 2>&1; then
+        say "  RED   python3 is not installed - the release's perf report and ratchet (scripts/perf_gate.py) need Python 3.11+"
+        TOOLS_RED=1
+    elif ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' > /dev/null 2>&1; then
+        say "  RED   $(python3 --version 2>&1) is older than 3.11 - scripts/perf_gate.py needs Python 3.11+ (tomllib) for the perf report and ratchet"
+        TOOLS_RED=1
+    else
+        say "  ok    $(python3 --version 2>&1)"
+    fi
+    say ""
+fi
+
 if [ "$REFUSED" = 3 ] || [ "$SWEEP_RED" != 0 ] || [ "$LIFE_RED" != 0 ] || [ "$CI_RED" != 0 ] ||
-    [ "$PERF_RED" != 0 ]; then
+    [ "$PERF_RED" != 0 ] || [ "$TOOLS_RED" != 0 ]; then
     fail "refusing to cut - fix the reds above (nothing was changed)"
 fi
 
@@ -703,7 +740,7 @@ say ""
 # seal's verdict for this commit, rendered beside the release - the T2 table,
 # the kolt rows, E121's targets, the growth figure and the bumps. Written when
 # there is a verdict to render (an overridden cut may have none).
-if [ -f "$PERF_FILE" ] && [ -f scripts/perf_gate.py ] && command -v python3 > /dev/null 2>&1; then
+if [ -f "$PERF_FILE" ] && [ -f scripts/perf_gate.py ]; then
     run python3 scripts/perf_gate.py report --verdict "$PERF_FILE" --title "v$VERSION" \
         --out "perf/report-v$VERSION.md"
     say ""

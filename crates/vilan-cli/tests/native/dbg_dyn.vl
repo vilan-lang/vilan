@@ -1,0 +1,91 @@
+// S1b: a `dyn` value prints the value it erased, through its table's `show`
+// slot — the same bytes on both backends.
+import std::debug::Debug;
+
+trait Area {
+	fun area(self): i32;
+}
+
+struct Square {
+	side: i32,
+}
+
+impl Square with Area {
+	fun area(self): i32 {
+		self.side * self.side
+	}
+}
+
+struct Rect {
+	width: i32,
+	height: i32,
+}
+
+impl Rect with Area {
+	fun area(self): i32 {
+		self.width * self.height
+	}
+}
+
+struct Dot {}
+
+impl Dot with Area {
+	fun area(self): i32 {
+		0
+	}
+}
+
+impl Dot with Debug {
+	fun debug(self): str {
+		"."
+	}
+}
+
+trait Label<T> {
+	fun label(self): T;
+}
+
+impl Square with Label<str> {
+	fun label(self): str {
+		"square"
+	}
+}
+
+trait Named {
+	fun show(self): str;
+	fun dbg_show(self): str;
+}
+
+impl Rect with Named {
+	fun show(self): str {
+		"rect"
+	}
+
+	fun dbg_show(self): str {
+		"also rect"
+	}
+}
+
+struct Scene {
+	name: str,
+	shapes: List<dyn Area>,
+}
+
+fun main() {
+	let one: dyn Area = Square { side = 2 };
+	dbg(one);
+	let shapes: List<dyn Area> = [Square { side = 3 }, Rect { width = 2, height = 5 }, Dot {}];
+	dbg(shapes);
+	dbg(Scene {
+		name = "scene",
+		shapes = [Rect { width = 10, height = 20 }, Square { side = 30 }],
+	});
+	let named: dyn Label<str> = Square { side = 4 };
+	dbg(named);
+	dbg(Some(one));
+	let named_rect: dyn Named = Rect { width = 1, height = 1 };
+	dbg(named_rect);
+	print(one.area());
+	print(named_rect.show());
+	print(named_rect.dbg_show());
+}

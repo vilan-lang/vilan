@@ -4493,9 +4493,9 @@ fn path_relative_is_none_where_there_is_no_lexical_answer() {
 #[test]
 fn std_path_is_colorless_and_serves_a_browser_build() {
     // The coloring call, verified rather than assumed. `std::fs` and friends
-    // are seeded `@process` by living in `src/process` (`std/vilan.toml`'s
-    // `[library.layer.process]`), and a browser build that reaches one is
-    // refused. `std::path` is in the base `root` layer and has no host call
+    // are seeded `@process` by their files' `[platform("@process")] mod self;`
+    // (F28; `src/process`, `std/vilan.toml`'s `[library.layer.process]`,
+    // before it), and a browser build that reaches one is refused. `std::path` is in the base `root` layer and has no host call
     // in it, so it serves both — which is the point: a browser router and an
     // SSR render manipulate the same `/`-separated strings, and a
     // `@process`-colored path module would have put that shared half out of

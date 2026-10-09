@@ -135,7 +135,7 @@ fn post_build(directory: &str) -> PostBuild {
             expected_stdout: concat!(
                 "ok: found ada (@ada)\n",
                 "ok: no such user\n",
-                "raw error: Remote(\"unknown method: delete_everything\")\n",
+                "raw error: RpcError::Remote(\"unknown method: delete_everything\")\n",
                 "--- reactive: a remote Source<i32> ---\n",
                 "count = 0\n",
                 "count = 1\n",
@@ -159,10 +159,10 @@ fn post_build(directory: &str) -> PostBuild {
                 // channel and seeds the mirror with what the server holds THEN
                 // — `edit_note` was in flight with the mint, so the seed is
                 // already the edited text and one `note =` line prints, not two.
-                "note status = Waiting\n",
+                "note status = Status::Waiting\n",
                 "note = hello, ada\n",
                 "edit -> true\n",
-                "note status = Ready\n",
+                "note status = Status::Ready\n",
             ),
         },
         "browser" => PostBuild::Artifacts(&["client.js"]),
@@ -333,49 +333,67 @@ fn unlinked_stylesheets(directory: &str, staged: &std::path::Path) -> Option<Str
     })
 }
 
+/// One example staged, built and checked: its failure, or `None` when it holds.
+fn build_example(directory: &str) -> Option<String> {
+    let staged = stage(directory);
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", staged.to_str().expect("utf-8 temp path")])
+        .output()
+        .expect("run vilan");
+
+    if !output.status.success() {
+        // The staged tree is deliberately left behind for a failure: it is
+        // the exact input that broke, and reproducing by hand means getting
+        // the tracked-files-only staging right.
+        return Some(format!(
+            "--- {directory} (staged at {})\n{}{}",
+            staged.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    if let Some(failure) = check_post_build(directory, &staged) {
+        return Some(failure);
+    }
+    if let Some(failure) = unlinked_stylesheets(directory, &staged) {
+        return Some(failure);
+    }
+    // B519: a bundle that reads an A134 mirror table it never declares
+    // builds clean and throws `ReferenceError` at the first handle-stub
+    // call, so no example may ship one.
+    let dangling = support::mirror_tables::dangling_in_tree(&staged);
+    if !dangling.is_empty() {
+        return Some(format!(
+            "{directory}: emitted code reads mirror tables it never declares:\n{}",
+            dangling.join("\n")
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&staged);
+    None
+}
+
+/// Every example builds and holds its post-build check. The examples are built
+/// CONCURRENTLY (N151 door (c)) — each in its own staged copy, through its own
+/// `vilan` — and their failures reported in directory order, as the serial loop
+/// reported them; one after another they made this a 110 s straggler on 57 s of
+/// CPU.
 #[test]
 fn every_example_builds() {
-    let mut failures = Vec::new();
-    for directory in example_directories() {
-        let staged = stage(&directory);
-        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
-            .args(["build", staged.to_str().expect("utf-8 temp path")])
-            .output()
-            .expect("run vilan");
-
-        if output.status.success() {
-            if let Some(failure) = check_post_build(&directory, &staged) {
-                failures.push(failure);
-                continue;
-            }
-            if let Some(failure) = unlinked_stylesheets(&directory, &staged) {
-                failures.push(failure);
-                continue;
-            }
-            // B519: a bundle that reads an A134 mirror table it never declares
-            // builds clean and throws `ReferenceError` at the first handle-stub
-            // call, so no example may ship one.
-            let dangling = support::mirror_tables::dangling_in_tree(&staged);
-            if !dangling.is_empty() {
-                failures.push(format!(
-                    "{directory}: emitted code reads mirror tables it never declares:\n{}",
-                    dangling.join("\n")
-                ));
-                continue;
-            }
-            let _ = std::fs::remove_dir_all(&staged);
-        } else {
-            // The staged tree is deliberately left behind for a failure: it is
-            // the exact input that broke, and reproducing by hand means getting
-            // the tracked-files-only staging right.
-            failures.push(format!(
-                "--- {directory} (staged at {})\n{}{}",
-                staged.display(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            ));
-        }
-    }
+    let directories = example_directories();
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        let workers: Vec<_> = directories
+            .iter()
+            .map(|directory| scope.spawn(move || build_example(directory)))
+            .collect();
+        workers
+            .into_iter()
+            .filter_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
     assert!(
         failures.is_empty(),
         "examples that no longer build:\n\n{}",

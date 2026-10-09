@@ -327,15 +327,18 @@ theme dims; hover leads with the reason. A **field** is the case
 declaration visibility cannot serve at all, since vilan has no per-field
 visibility, and it is the case the attribute was asked for.
 
-One reach is refused, and it is std's: a field **std** labels
-`[internal(..)]` is not a member outside std (A149 S4). It is std's
-machinery — a store handle's slot tree and path, a region's end marker —
-and as a member it would shadow what a reader writes: field syntax on a
-store handle reads the handled struct's fields (`app.user.name`), and a
-`path` there must be the struct's `path`, not the handle's. Reading one is
+Two reaches are refused, and both are std's: a field **std** labels
+`[internal(..)]` is not a member outside std (A149 S4), and a struct literal
+outside std cannot write one (B568). It is std's machinery — a
+store handle's slot tree and path, a region's end marker — and as a
+member it would shadow what a reader writes: field syntax on a store
+handle reads the handled struct's fields (`app.user.name`), and a `path`
+there must be the struct's `path`, not the handle's. Reading one is
 refused with the reason; what a program legitimately needs is a method
-(`Region::end`). A field a package labels in its own code stays a member
-everywhere, as above.
+(`Region::end`), and a value of such a struct comes from std's own
+constructors (`Store::new(..)`), never a literal. No pattern reaches one
+either: a pattern names no field (§3.10). A field a package labels in its
+own code stays a member, and writable by a literal, everywhere, as above.
 
 The same label rides every other declaration a reader may be steered
 away from: a **struct**, an **enum**, one enum **variant**, a **trait**

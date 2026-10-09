@@ -719,8 +719,8 @@ await settle();
 check(lateTransmits.length === 0, "swap: no transmit on a socket that is not OPEN");
 // (b) The old duplex is closed for good, so `onclose` finds a state that stops
 // it: no rejection wave, no redial.
-check(marks["A:state:Closed"] === 1, "swap: the old duplex reached Closed");
-check(marks["A:state:Reconnecting"] === undefined, "swap: the old duplex never went Reconnecting");
+check(marks["A:state:ConnectionState::Closed"] === 1, "swap: the old duplex reached Closed");
+check(marks["A:state:ConnectionState::Reconnecting"] === undefined, "swap: the old duplex never went Reconnecting");
 // The dial counter: bundle B's dial and nothing else.
 check(sockets.length === 2, "swap: exactly one fresh dial (the new bundle's)");
 // (c) One connection left standing, not the zombie pair.

@@ -1,0 +1,77 @@
+// F92: a GENERIC call's own type was read UNSUBSTITUTED where the call is
+// used in place: a field read off it (`b.unwrap().v`, a trait default's
+// `Self` in `c.twice().value`) and a field read under a `?.` lift
+// (`find("hit")?.title`, whose binder had no type at all) were refused "a
+// field read of an unresolved subject", where the same call bound to a `let`
+// built. (Its `is` subject half is F106's.) The shapes: a generic method, a
+// generic free function, a nested field, a trait default returning `Self`, a
+// lift over a plain and over a generic call, and a lift chain.
+import std::io::print;
+
+struct Box<T> {
+	value: T,
+}
+
+impl Box<type T> {
+	fun unwrap(self): T {
+		self.value
+	}
+}
+
+struct Inner {
+	label: str,
+}
+
+struct Node {
+	v: i32,
+	inner: Inner,
+}
+
+trait Doubling {
+	fun doubled(self): Self;
+	fun twice(self): Self {
+		self.doubled().doubled()
+	}
+}
+
+struct Counter {
+	value: i32,
+}
+
+impl Counter with Doubling {
+	fun doubled(self): Counter {
+		Counter { value = self.value * 2 }
+	}
+}
+
+fun first<T>(items: List<T>): T {
+	items[0]
+}
+
+fun find(key: str): Option<Node> {
+	if key == "hit" {
+		ret Some(Node { v = 1, inner = Inner { label = "found" } });
+	}
+	None
+}
+
+fun lookup<T>(value: T, hit: bool): Option<T> {
+	if hit {
+		ret Some(value);
+	}
+	None
+}
+
+fun main() {
+	let b = Box { value = Node { v = 5, inner = Inner { label = "boxed" } } };
+	print(b.unwrap().v);
+	print(b.unwrap().inner.label);
+	print(first([Node { v = 6, inner = Inner { label = "listed" } }]).inner.label);
+	let c = Counter { value = 3 };
+	print(c.twice().value);
+	print((find("hit")?.v).unwrap_or(-1));
+	print((find("miss")?.v).unwrap_or(-1));
+	print((find("hit")?.inner.label).unwrap_or("?"));
+	print((lookup(Inner { label = "generic" }, true)?.label).unwrap_or("?"));
+	print((lookup(Inner { label = "generic" }, false)?.label).unwrap_or("?"));
+}

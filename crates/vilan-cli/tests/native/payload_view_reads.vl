@@ -1,0 +1,39 @@
+// F99 (its first half): an `Option` whose payload is a shared VIEW —
+// `Arena::get`'s `Option<&T>` — read anywhere but as a `match` subject was
+// refused by name: `arena.get(a).unwrap_or(-1)` hands it to a generic
+// monomorphised at the POINTEE (`Option<i32>`), where natively it is an
+// `Option<&i32>`. A position that consumes the option where it stands reads
+// its payload out — the copy rule 1 owes a view read as a value — by value
+// or by `&`: `unwrap_or`, `is_some`, `map`, a struct payload, and a user
+// function taking the option.
+import std::arena::{ Arena, Handle };
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Point {
+	x: i32,
+	label: str,
+}
+
+fun describe(found: Option<Point>): str {
+	match found {
+		Some(let point) => i"{point.label} at {point.x}",
+		None => "gone",
+	}
+}
+
+fun main() {
+	mut numbers: Arena<i32> = Arena::new();
+	let a = numbers.insert(10);
+	let b = numbers.insert(20);
+	print(numbers.get(a).unwrap_or(-1));
+	print(numbers.get(b).is_some());
+	print(numbers.get(a).map(|value| value * 3).unwrap_or(0));
+	numbers.remove(b);
+	print(numbers.get(b).is_some());
+	print(numbers.get(b).unwrap_or(-1));
+	mut points: Arena<Point> = Arena::new();
+	let p = points.insert(Point { x = 3, label = "p" });
+	print(describe(points.get(p)));
+	print(points.get(p).map(|point| point.label).unwrap_or("?"));
+}

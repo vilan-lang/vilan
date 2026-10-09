@@ -1,0 +1,73 @@
+// F94: a SPREAD parameter (`fun middle(...items: (i32, i32, i32))`) was
+// refused natively by name. It is a call convention over an ordinary tuple
+// parameter (variadic-generics.md §S): the analyzer collects a call's
+// arguments into one tuple, so natively the parameter is the tuple and the
+// call hands it over. Behind it, tuple-spread.vl's walls: a tuple literal
+// with SPREAD elements is the concatenation of its parts, one level deep
+// (`(..pair, 3)`), a forwarded pack is the pack itself (`width(..items)`),
+// and the empty pack is the unit. The shapes: fixed and generic packs, a
+// pack after a leading parameter, a `mut` pack, a pack handed on as a tuple,
+// a tuple argument kept whole, the empty and one-element packs, spreads at
+// every position, a nested operand kept nested, and a forwarded pack.
+import std::io::print;
+
+fun middle(...items: (i32, i32, i32)): i32 {
+	items.1
+}
+
+fun count<T: (..)>(...items: T): i32 {
+	1
+}
+
+fun after<T: (..)>(head: i32, ...rest: T): i32 {
+	head
+}
+
+fun swap_pack(mut ...items: (i32, i32)): i32 {
+	items = (8, 9);
+	items.0
+}
+
+fun first(items: (i32, i32)): i32 {
+	items.0
+}
+
+fun outer(...items: (i32, i32)): i32 {
+	first(items)
+}
+
+fun pack<T: (..)>(...items: T): T {
+	items
+}
+
+fun last_of(...items: (i32, i32, i32)): i32 {
+	items.2
+}
+
+fun forward<T: (..)>(...items: T): T {
+	pack(..items)
+}
+
+fun main() {
+	print(middle(4, 5, 6));
+	print(count());
+	print(count(1));
+	print(after(2, 3, 4));
+	print(swap_pack(1, 2));
+	print(outer(3, 4));
+	let inner = (10, 11);
+	print(count(inner, 12));
+	let pair = (1, 2);
+	let lead = (..pair, 3);
+	let mid = (0, ..pair, 9);
+	let twice = (..pair, ..pair);
+	print(i"{lead.2} {mid.3} {twice.3}");
+	let outer_pair = (pair, 3);
+	let kept = (..outer_pair, 4);
+	print(i"{kept.0.1} {kept.2}");
+	let none = pack();
+	print((..none, 7).0);
+	print(last_of(..pair, 5));
+	let forwarded = forward(1, "two", 3);
+	print(forwarded.1);
+}

@@ -209,7 +209,8 @@ fn a_package_dependency_is_allowed_and_colors_inferentially() {
     assert!(!output.status.success(), "expected a coloring violation");
     let text = combined(&output);
     assert!(
-        text.contains("requires the `process` layer of `std`") && text.contains("main → save"),
+        text.contains("requires the `@process` platform its file declares")
+            && text.contains("main → save"),
         "expected the chain diagnostic: {text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -559,7 +560,7 @@ fn check_colors_each_entry_against_its_own_target() {
     );
     let text = combined(&violating);
     assert!(
-        text.contains("requires the `process` layer of `std`")
+        text.contains("requires the `@process` platform its file declares")
             && text.contains("cannot run on `browser`"),
         "unexpected output: {text}"
     );
@@ -1592,6 +1593,116 @@ fn file_mode_resolves_pkg_siblings_and_dependencies_through_the_manifest() {
     assert!(
         output.status.success(),
         "`pkg::` resolves against the declared root, not the file's directory:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f28_vilan_check_checks_a_declared_module_no_leg_admits() {
+    // A build reports nothing from inside a module its platform excludes (spec
+    // §11.3: only the entries a file admits type-check it) — so a node-only
+    // package importing a `[platform("browser")] mod self;` file would leave
+    // that file checked by NOTHING. `vilan check` checks it as the file itself,
+    // under its declared platform: its type error is reported once, in its file.
+    let dir = temp_project("f28_declared_leg");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(
+        &dir,
+        "src/main.vl",
+        "import pkg::widget::width;\n\nfun main() {}\n",
+    );
+    write(
+        &dir,
+        "src/widget.vl",
+        "[platform(\"browser\")] mod self;\n\nexport fun width(): i32 {\n\t\"wide\"\n}\n",
+    );
+    let output = vilan_plain(&["check", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert_eq!(
+        text.matches("Error: Expected i32, but got str").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("widget.vl"), "{text}");
+    // …and the fixed file checks clean.
+    write(
+        &dir,
+        "src/widget.vl",
+        "[platform(\"browser\")] mod self;\n\nexport fun width(): i32 {\n\t1\n}\n",
+    );
+    let output = vilan_plain(&["check", dir.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Runs `vilan` from `directory` with `NO_COLOR=1`.
+fn vilan_plain_in(directory: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(args)
+        .current_dir(directory)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run vilan")
+}
+
+#[test]
+fn b556_a_file_addressed_from_inside_its_package_finds_the_package() {
+    // B556: `cd src && vilan check main.vl` — `Path::parent` of a bare
+    // `main.vl` is `""`, and the manifest walk stopped there, so the file
+    // compiled as belonging to NO package: the package's prelude was ignored
+    // and the steer named the edit already made. The same from a directory
+    // deeper (`../main.vl`), which asked `src/` and then the working directory.
+    let dir = temp_project("b556_inside");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"browser\"\nprelude = \"std::web::prelude\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "fun main() { let v = view(\"div\"); }\n",
+    );
+    write(&dir, "src/deeper/keep.vl", "export fun keep(): i32 { 1 }\n");
+    for (working, file) in [
+        ("src", "main.vl"),
+        ("src/deeper", "../main.vl"),
+        ("src", "./main.vl"),
+    ] {
+        let output = vilan_plain_in(&dir.join(working), &["check", file]);
+        let text = combined(&output);
+        assert!(
+            output.status.success() && !text.contains("prelude of the web set"),
+            "`vilan check {file}` from `{working}` resolves under the package:\n{text}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn b556_a_file_outside_the_working_package_is_not_claimed_by_it() {
+    // The lexical walk's other face: from inside a package, `../scratch/x.vl`
+    // asked `../scratch`, then `..`, then `""` — the WORKING directory, which
+    // is not above the file at all — and compiled the scratch file under the
+    // working package's manifest (here `prelude = false`, so `print` vanished).
+    let dir = temp_project("b556_outside");
+    write(
+        &dir,
+        "app/vilan.toml",
+        "[package]\nname = \"app\"\nprelude = false\n",
+    );
+    write(&dir, "app/src/main.vl", "fun main() {}\n");
+    write(
+        &dir,
+        "scratch/x.vl",
+        "fun main() { print(\"hi\") }\nmain();\n",
+    );
+    let output = vilan_plain_in(&dir.join("app"), &["check", "../scratch/x.vl"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "a file no manifest is above keeps its manifest-less context:\n{text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

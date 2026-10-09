@@ -1,0 +1,18 @@
+[native_probe_dbg_dyn.vl:76:2] one = dyn Area(Square { side = 2 })
+[native_probe_dbg_dyn.vl:78:2] shapes = [
+  dyn Area(Square { side = 3 }),
+  dyn Area(Rect { width = 2, height = 5 }),
+  dyn Area(.),
+]
+[native_probe_dbg_dyn.vl:79:2] Scene { name = "scene", shapes = [Rect { width = 10, height = 20 }, Square { side = 30 }], } = Scene {
+  name = "scene",
+  shapes = [
+    dyn Area(Rect { width = 10, height = 20 }),
+    dyn Area(Square { side = 30 }),
+  ],
+}
+[native_probe_dbg_dyn.vl:84:2] named = dyn Label<str>(Square { side = 4 })
+[native_probe_dbg_dyn.vl:85:2] Some(one) = Some(dyn Area(Square { side = 2 }))
+[native_probe_dbg_dyn.vl:87:2] named_rect = dyn Named(
+  Rect { width = 1, height = 1 },
+)

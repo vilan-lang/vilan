@@ -507,6 +507,15 @@ const IMPORT_PATH_IS_NAMES_AND_SETS: &str = "an `import`/`use` path is `::`-sepa
      optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins \
      none of those";
 
+/// B555: an import path that stops at the keyword `null` — `import
+/// std::js::null;`, the one std module whose name is a keyword. No spelling
+/// names it (`std::js::null::{ .. }` stops at the same token), and none needs
+/// to: the module declares only the core type of the `null` value, which is
+/// bound in every file without an import. Said at the keyword in place of the general path rule.
+const NULL_MODULE_IS_NOT_IMPORTED: &str = "`null` is a keyword, so no import path can name \
+     `std::js::null` — and none needs to: that module declares only the type of the `null` \
+     value, which every file has without an import. Drop the import";
+
 /// REWRITTEN for B318 (§7.4): every sentence of the old text became false on
 /// the day the marker gained meaning. It said "a module's items are importable
 /// as they stand … so the fix is to delete the word", and the fix is not to
@@ -3369,6 +3378,17 @@ impl<'a, 'src> Parser<'a, 'src> {
         ) && let Some(stopped) = self.import_path_failure
             && stopped > position
         {
+            // B555: stopped at the keyword `null` — `std::js::null`, the one
+            // std module no path can name.
+            if matches!(self.tokens.get(stopped), Some((Token::Null, _))) {
+                self.errors.push(ParseError {
+                    span: self.token_span(stopped),
+                    reason: ParseErrorReason::Rule(NULL_MODULE_IS_NOT_IMPORTED),
+                    context,
+                    hint: None,
+                });
+                return;
+            }
             self.errors.push(ParseError {
                 span: self.token_span(stopped),
                 reason: ParseErrorReason::Rule(IMPORT_PATH_IS_NAMES_AND_SETS),
@@ -13301,6 +13321,37 @@ mod tests {
         );
         assert_eq!(
             rendered_errors("use a::{ !hidden };\n"),
+            vec![IMPORT_PATH_IS_NAMES_AND_SETS.to_string()]
+        );
+    }
+
+    #[test]
+    fn b555_an_import_of_the_null_module_is_steered_at_the_keyword() {
+        // `null` is a keyword, so the path grammar stops at it in every
+        // spelling — bare, braced, under `use`, and at the old `std::null`
+        // path — and the refusal says why and that nothing is lost.
+        for source in [
+            "import std::js::null;\n",
+            "import std::js::null::{ null };\n",
+            "import std::null;\n",
+            "use std::js::null;\n",
+        ] {
+            let (_tree, errors) = parse(source);
+            assert_eq!(errors.len(), 1, "one diagnostic for {source:?}: {errors:?}");
+            assert_eq!(
+                render(&errors[0]),
+                NULL_MODULE_IS_NOT_IMPORTED,
+                "the null steer, for {source:?}"
+            );
+            assert_eq!(
+                &source[errors[0].span.into_range()],
+                "null",
+                "anchored on the keyword, for {source:?}"
+            );
+        }
+        // A `null` that is not where the path stopped keeps the general rule.
+        assert_eq!(
+            rendered_errors("import a::{ !hidden };\n"),
             vec![IMPORT_PATH_IS_NAMES_AND_SETS.to_string()]
         );
     }

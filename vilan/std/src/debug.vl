@@ -1,10 +1,12 @@
 // `std::debug` — `[derive(Debug)]` synthesizes `debug(self): str`, a developer
-// representation `Type { field = value, … }` built from the fields. Scalars format
-// via the host `JSON.stringify` (numbers/bools raw, strings quoted and escaped);
-// nested derived structs recurse through their own `debug`.
+// representation `Type { field = value, … }` / `Type::Variant(..)` built from the
+// fields: the `dbg` printer's spelling on one line (E275), so the two agree. Numbers
+// and bools format raw, a string quoted and escaped as vilan writes it, and a field
+// recurses through its own `debug` — a written impl's, when the field's type has one.
 
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
+import pkg::tuple::Tuple;
 
 export *;
 
@@ -13,8 +15,18 @@ trait Debug {
 }
 
 impl str with Debug {
-	[extern("JSON.stringify")]
-	external fun debug(self): str;
+	/// Quoted, with `\\`, `\"`, `\n`, `\t`, `\r` and `\0` escaped: the `dbg`
+	/// printer's spelling (E275).
+	fun debug(self): str {
+		let escaped = self
+			.replace("\\", "\\\\")
+			.replace("\"", "\\\"")
+			.replace("\n", "\\n")
+			.replace("\t", "\\t")
+			.replace("\r", "\\r")
+			.replace("\0", "\\0");
+		"\"" + escaped + "\""
+	}
 }
 
 impl i32 with Debug {
@@ -29,8 +41,12 @@ impl u32 with Debug {
 
 impl f64 with Debug {
 	/// The language's number text, keeping the `.0` an integral value drops (`3.0`,
-	/// not `3`): `dbg`'s rule (debugging.md S4, E260).
+	/// not `3`), and negative zero as `-0.0`: `dbg`'s rule (debugging.md S4, E260,
+	/// E276).
 	fun debug(self): str {
+		if self == 0.0 && 1.0 / self < 0.0 {
+			ret "-0.0";
+		}
 		let text = "" + self;
 		if text.contains(".") || text.contains("e") || text.contains("N") || text.contains("I") {
 			text
@@ -47,10 +63,8 @@ impl bool with Debug {
 
 // Every container the `dbg` printer prints is `Debug` when its elements are
 // (debugging.md S4, E260), so a struct with a `List` or `Option` field derives it
-// and `T: Debug` takes a list, an option or a result. The rendering is the
-// printer's, on one line. A TUPLE is not covered yet: a blanket over the tuple
-// family (`impl type T: (2..: Debug)`) is admitted for a non-tuple at the bound
-// check, which made every type `Debug` (the lane's find B?4).
+// and `T: Debug` takes a list, an option, a result or a tuple. The rendering is the
+// printer's, on one line.
 
 impl List<type T: Debug> with Debug {
 	fun debug(self): str {
@@ -82,6 +96,23 @@ impl Result<type T: Debug, type E: Debug> with Debug {
 			Ok(let value) => "Ok(" + value.debug() + ")",
 			Err(let error) => "Err(" + error.debug() + ")",
 		}
+	}
+}
+
+/// A tuple of `Debug` elements, at any arity: `(1, "two", 2.5)`. The blanket covers
+/// the tuple family and nothing else (B557).
+impl type T: (2..: Debug) with Debug {
+	fun debug(self): str {
+		mut out = "(";
+		mut first = true;
+		for key in self.keys() {
+			if !first {
+				out = out + ", ";
+			}
+			first = false;
+			out = out + self.get(key).debug();
+		}
+		out + ")"
 	}
 }
 
@@ -120,13 +151,13 @@ macro fun Debug(item: Item): Source {
 			.render());
 	}
 	if item.as_enum() is Some(let target) {
-		// `match self { E::V(let p0,..) => "V(" + p0.debug() + ", " + .. +
-		// ")", E::W => "W" }`.
+		// `match self { E::V(let p0,..) => "E::V(" + p0.debug() + ", " + .. +
+		// ")", E::W => "E::W" }` — qualified, as `dbg` prints a variant (E275).
 		mut arms = match_of("self");
 		for variant in target.variants {
 			let arity = variant.payload.len();
 			if arity == 0 {
-				arms = arms.arm(i"{target.name}::{variant.name}", quote(variant.name));
+				arms = arms.arm(i"{target.name}::{variant.name}", quote(i"{target.name}::{variant.name}"));
 			} else {
 				mut binds: List<str> = [];
 				mut parts: List<str> = [];
@@ -137,7 +168,7 @@ macro fun Debug(item: Item): Source {
 					index = index + 1;
 				}
 				let bind_pattern = join(binds, ", ");
-				let rendering = quote(i"{variant.name}(")
+				let rendering = quote(i"{target.name}::{variant.name}(")
 					+ " + "
 					+ join(parts, glued_comma)
 					+ " + "
@@ -256,8 +287,12 @@ impl usize with Debug {
 
 impl f32 with Debug {
 	/// The language's number text, keeping the `.0` an integral value drops (`3.0`,
-	/// not `3`): `dbg`'s rule (debugging.md S4, E260).
+	/// not `3`), and negative zero as `-0.0`: `dbg`'s rule (debugging.md S4, E260,
+	/// E276).
 	fun debug(self): str {
+		if self == 0.0 && 1.0 / self < 0.0 {
+			ret "-0.0";
+		}
 		let text = "" + self;
 		if text.contains(".") || text.contains("e") || text.contains("N") || text.contains("I") {
 			text

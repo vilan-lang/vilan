@@ -1,0 +1,58 @@
+// F107 (B149's native half): a call to a function WRITTEN `async` whose
+// declared return is itself a `Task` is the task's VALUE — the JS host
+// assimilates the handle the body returns, and the call types as the payload
+// (B149). Natively the call awaited its own future once and kept the inner
+// handle, so `make() + 1` was rustc's E0369 ("cannot add `i32` to
+// `Task<i32>`"), and `print(make())` was refused as a `print` of the host
+// handle. The layer is one more await: a plain handle, a generic payload, a
+// method, and the call used in place, bound and printed, beside a plain
+// `async fun` and a task interleaving with them.
+import std::io::print;
+import std::task::Task;
+
+struct Maker {
+	base: i32,
+}
+
+impl Maker {
+	async fun task(self): Task<i32> {
+		let base = self.base;
+		async {
+			base * 2
+		}
+	}
+}
+
+async fun make(): Task<i32> {
+	async {
+		7
+	}
+}
+
+async fun wrapped<T>(value: T): Task<T> {
+	async {
+		value
+	}
+}
+
+async fun plain(): i32 {
+	3
+}
+
+fun main() {
+	let side = async {
+		print("side 1");
+		plain();
+		print("side 2");
+		0
+	};
+	let result = make();
+	print(result);
+	let value: i32 = make();
+	print(value + 1);
+	print(make() + plain());
+	print(wrapped("w"));
+	print(wrapped(5) * 3);
+	print(Maker { base = 4 }.task() + 1);
+	print(await side);
+}

@@ -9552,3 +9552,368 @@ fn b500_an_rpc_signature_written_with_a_module_path_is_the_bare_contract() {
         "true\n",
     );
 }
+
+// --- B566: a trait DEFAULT with generic parameters of its OWN ---
+//
+// `fun shown<S: Show>(self, item: S): str { item.show() }` declared as a
+// default in `trait Bag<T>` was an INTERNAL error at emission ("a call
+// resolved to `Show`'s requirement `show`, which has no body"): the JS
+// emitter keyed a default's instance by (default, receiver type) and bound
+// only the trait's parameters, so the default's own `S` was unbound in its
+// body. The same member written inherent built. The native emitter has bound
+// them since F34.
+
+const B566_BAG: &str = r#"
+        import std::io::print;
+
+        trait Show {
+            fun show(self): str;
+        }
+        impl i32 with Show {
+            fun show(self): str { "i32" }
+        }
+        impl str with Show {
+            fun show(self): str { "str" }
+        }
+
+        trait Bag<T> {
+            fun size(self): usize;
+
+            fun shown<S: Show>(self, item: S): str {
+                item.show()
+            }
+        }
+
+        struct Box {
+            held: List<i32>,
+        }
+        impl Box with Bag<i32> {
+            fun size(self): usize { self.held.len() }
+        }
+"#;
+
+#[test]
+fn b566_a_default_with_its_own_generic_binds_it_on_a_concrete_receiver() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B566_BAG}
+        fun main() {{
+            let bag = Box {{ held = [1, 2] }};
+            print(bag.shown(3));
+        }}
+
+        main();
+        "
+        ),
+        "i32\n",
+    );
+}
+
+#[test]
+fn b566_each_binding_of_a_defaults_own_generic_is_its_own_instance() {
+    // Keyed by the receiver alone, the second call would reuse the first's
+    // instance and print `i32` twice.
+    assert_compiles_and_runs(
+        &format!(
+            "{B566_BAG}
+        fun main() {{
+            let bag = Box {{ held = [1, 2] }};
+            print(bag.shown(3));
+            print(bag.shown(\"x\"));
+        }}
+
+        main();
+        "
+        ),
+        "i32\nstr\n",
+    );
+}
+
+#[test]
+fn b566_a_default_with_its_own_generic_binds_it_through_a_bound() {
+    // The bounded route (`b: B` with `B: Bag<i32>`) re-dispatches to the
+    // default with the call's own-generic values too.
+    assert_compiles_and_runs(
+        &format!(
+            "{B566_BAG}
+        fun through<B: Bag<i32>>(bag: B): str {{
+            bag.shown(\"x\")
+        }}
+
+        fun main() {{
+            print(through(Box {{ held = [1] }}));
+        }}
+
+        main();
+        "
+        ),
+        "str\n",
+    );
+}
+
+#[test]
+fn b566_a_defaults_own_generic_bound_in_the_callers_binders_grounds() {
+    // The value is written in the CALLER's parameter (`U`), bound at the
+    // caller's own instantiation.
+    assert_compiles_and_runs(
+        &format!(
+            "{B566_BAG}
+        fun relay<U: Show>(bag: Box, item: U): str {{
+            bag.shown(item)
+        }}
+
+        fun main() {{
+            print(relay(Box {{ held = [1] }}, \"x\"));
+            print(relay(Box {{ held = [1] }}, 4));
+        }}
+
+        main();
+        "
+        ),
+        "str\ni32\n",
+    );
+}
+
+// --- B567: a blanket whose SUBJECT is a parameterized bare trait (B299) ---
+//
+// `impl Iterator<type T> with Pour<T>` means what `impl type I: Iterator<type
+// T> with Pour<T>` means (B299's ruling). Two halves of the body/call did
+// not read it so: a `for item in self` in such a body was driven through the
+// trait-DEFAULT channel, so its `next` was `Iterator`'s body-less requirement
+// (the never-silent internal error); and a member returning `Self` typed as
+// the bare trait at the call, so std's own `it.iter()` was refused "cannot
+// call 'to_list' on a value of bare trait type 'Iterator'".
+
+#[test]
+fn b567_a_loop_over_self_in_a_bare_trait_impl_dispatches_to_the_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+
+        trait Pour<T> {
+            fun pour_into(own self, target: &mut List<T>);
+        }
+
+        impl Iterator<type T> with Pour<T> {
+            fun pour_into(own self, target: &mut List<T>) {
+                for item in self {
+                    target.push(item);
+                }
+            }
+        }
+
+        fun main() {
+            mut xs = [1, 2];
+            [5, 6].iter().map(|x| x * 10).pour_into(&mut xs);
+            print(xs.len());
+            print(xs[3]);
+        }
+
+        main();
+        "#,
+        "4\n60\n",
+    );
+}
+
+#[test]
+fn b567_a_self_return_in_a_parameterized_bare_trait_impl_is_the_receiver() {
+    // std's own `Iterable` is this shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::{ Iterator, Iterable };
+
+        fun main() {
+            let xs = [5, 6].iter().map(|x| x * 10).iter().to_list();
+            print(xs.len());
+            print(xs[1]);
+        }
+
+        main();
+        "#,
+        "2\n60\n",
+    );
+}
+
+#[test]
+fn b567_a_self_nested_in_a_bare_trait_impls_return_is_the_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        trait Wrapped<T> {
+            fun wrapped(self): Option<Self>;
+        }
+
+        impl Iterator<type T> with Wrapped<T> {
+            fun wrapped(self): Option<Self> {
+                Some(self)
+            }
+        }
+
+        fun main() {
+            match [1, 2, 3].iter().wrapped() {
+                Some(let it) => print(it.to_list().len()),
+                None => print(0),
+            }
+        }
+
+        main();
+        "#,
+        "3\n",
+    );
+}
+
+// --- B563: conformance compares a callback's `context` clause ---
+//
+// The clause is part of a closure's TYPE (B309), and unification ignores it
+// on purpose (a literal takes its position's clause) — so the member-signature
+// comparison, which unifies, accepted an impl that dropped the trait's clause
+// or added one the trait does not declare. A call through the trait then
+// threads contexts the impl's body does not receive, or the reverse.
+
+const B563_PLAIN: &str = r#"
+        import std::reactive::{ Subscription, tracking };
+
+        trait Plain {
+            fun watch(own self, observer: (|i32| void) context tracking): Subscription;
+        }
+        trait Bare {
+            fun watch(own self, observer: |i32| void): Subscription;
+        }
+        struct Bag {}
+"#;
+
+#[test]
+fn b563_an_impl_dropping_the_traits_context_clause_is_refused() {
+    assert_fails_with(
+        &format!(
+            "{B563_PLAIN}
+        impl Bag with Plain {{
+            fun watch(own self, observer: |i32| void): Subscription {{
+                Subscription::teardown(|| {{}})
+            }}
+        }}
+        fun main() {{}}
+        "
+        ),
+        "parameter 1 of `Bag`'s `watch` is `|i32| void`, but `Plain` declares \
+         `(|i32| void) context tracking`",
+    );
+}
+
+#[test]
+fn b563_an_impl_adding_a_context_clause_is_refused() {
+    assert_fails_with(
+        &format!(
+            "{B563_PLAIN}
+        impl Bag with Bare {{
+            fun watch(own self, observer: (|i32| void) context tracking): Subscription {{
+                Subscription::teardown(|| {{}})
+            }}
+        }}
+        fun main() {{}}
+        "
+        ),
+        "parameter 1 of `Bag`'s `watch` is `(|i32| void) context tracking`, but `Bare` declares \
+         `|i32| void`",
+    );
+}
+
+#[test]
+fn b563_an_impl_writing_the_traits_clause_conforms() {
+    assert_compiles(&format!(
+        "{B563_PLAIN}
+        impl Bag with Plain {{
+            fun watch(own self, observer: (|i32| void) context tracking): Subscription {{
+                Subscription::teardown(|| {{}})
+            }}
+        }}
+        impl Bag with Bare {{
+            fun watch(own self, observer: |i32| void): Subscription {{
+                Subscription::teardown(|| {{}})
+            }}
+        }}
+        fun main() {{}}
+        "
+    ));
+}
+
+// --- B564 / B565: a blanket's reach to closures and function items ---
+//
+// B508 routed a CLOSURE receiver through the impl-member route, so a bare
+// blanket answered it — one tier deep. A blanket whose BOUND the closure meets
+// through another blanket (`impl type T: Leaf with Shape` over `impl type T
+// with Leaf`) did not: `compare_type` admitted only the nominal shapes against
+// a trait-typed slot (B564). And a FUNCTION ITEM bound without an annotation
+// (`let f = nothing`) keeps the item's type, which the route did not take at
+// all (B565).
+
+const B564_TIERS: &str = r#"
+        import std::io::print;
+
+        trait Leaf {
+            fun leaf(&self): str;
+        }
+        trait Shape {
+            fun shape(&self): str;
+        }
+        impl type T with Leaf {
+            fun leaf(&self): str { "leaf" }
+        }
+        impl type T: Leaf with Shape {
+            fun shape(&self): str { i"shape over {self.leaf()}" }
+        }
+"#;
+
+#[test]
+fn b564_a_two_tier_blanket_reaches_a_closure() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B564_TIERS}
+        fun main() {{
+            let g = |k: str| k == \"x\";
+            print(g.leaf());
+            print(3.shape());
+            print(g.shape());
+        }}
+
+        main();
+        "
+        ),
+        "leaf\nshape over leaf\nshape over leaf\n",
+    );
+}
+
+#[test]
+fn b565_a_blanket_reaches_an_unannotated_function_item() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B564_TIERS}
+        trait Runs {{
+            fun twice(&self): i32;
+        }}
+        impl (|| i32) with Runs {{
+            fun twice(&self): i32 {{ self() + self() }}
+        }}
+        fun nothing() {{}}
+        fun seven(): i32 {{ 7 }}
+
+        fun main() {{
+            let f = nothing;
+            print(f.leaf());
+            print(nothing.leaf());
+            print(f.shape());
+            let s = seven;
+            print(s.twice());
+        }}
+
+        main();
+        "
+        ),
+        "leaf\nleaf\nshape over leaf\n14\n",
+    );
+}

@@ -65,8 +65,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
-    AdaptedInstance, Backing, BackingValue, CopyDecision, Expr, ExprIfBranch, ExprMatchLeg,
-    ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
+    AdaptedInstance, Backing, BackingValue, CopyDecision, DropExtent, Expr, ExprIfBranch,
+    ExprMatchLeg, ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
@@ -188,7 +188,8 @@ use vilan_rt::Subscript as _;
 
 mod dbg;
 
-/// F56: every nominal declaration (struct or enum) with an `impl … with Drop`.
+/// F56: every nominal declaration (struct or enum) with an `impl … with Drop`,
+/// mapped to that impl's `drop` function (F97 emits it as the Rust `Drop`).
 ///
 /// Read off `drop_method_checks`, which the analyzer fills with each impl's
 /// `drop` function keyed on the RESOLVED std `Drop` entity — so a user's own
@@ -196,13 +197,13 @@ mod dbg;
 /// functions, whose subject names the declaration. A generic resource
 /// (`impl Guard<type T> with Drop`) is one declaration with one `drop`, so the
 /// answer is per declaration, not per instantiation.
-fn drop_implementing_nominals(program: &Program<'_>) -> HashSet<Id> {
+fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, Id> {
     let drop_functions: HashSet<Id> = program
         .drop_method_checks
         .iter()
         .map(|(function_id, _, _)| *function_id)
         .collect();
-    let mut nominals = HashSet::new();
+    let mut nominals = HashMap::default();
     if drop_functions.is_empty() {
         return nominals;
     }
@@ -219,7 +220,7 @@ fn drop_implementing_nominals(program: &Program<'_>) -> HashSet<Id> {
         }
         match program.type_id_to_type_map.get(&implementation.subject) {
             Some(Type::Struct(id, _)) | Some(Type::Enum(id, _)) => {
-                nominals.insert(*id);
+                nominals.insert(*id, function_id);
             }
             _ => {}
         }
@@ -247,8 +248,15 @@ fn unsupported(what: &str, span: Span) -> Error {
 enum Step {
     Field(Id, usize),
     Slot(String),
-    /// A subscript, by its index expression (F90).
-    Index(Id),
+    /// A subscript: the subscript expression and its index expression (F90).
+    Index(Id, Id),
+}
+
+/// What a [`Step`] spine reads through: a `Shared` view call's cell, or a
+/// boxed binding's capture cell (F103).
+enum CellRoot {
+    View(Id),
+    Boxed(Id),
 }
 
 /// Where in the emitted file one reserved slot's text goes, and under what name.
@@ -409,6 +417,10 @@ struct Emitter<'a, 'src> {
     /// into a future rather than handed over with the wrong type.
     /// `Server::builder()`'s default handler is the shape.
     expects_async_value: bool,
+    /// Set while a call's arguments are rendered for a caller that renders
+    /// its receiver itself ([`Emitter::object_call`]): no argument is taken
+    /// as a cell VIEW there (F49), since the receiver's text is discarded.
+    no_cell_views: bool,
     /// The DECLARED return type of the function being emitted, threaded to its
     /// return positions so a generic aggregate built there instantiates at the
     /// signature's arguments rather than at the ones its own site recorded.
@@ -480,6 +492,11 @@ struct Emitter<'a, 'src> {
     /// Taken by the call arm that reads it, so only the outermost call of the
     /// subject is affected.
     matching_the_subject: bool,
+    /// F99: set while a by-value or `&` argument that IS a call handing back
+    /// an `Option<&T>` is rendered — the position consumes the option at
+    /// once, so its payload is read out (a copy, rule 1's) and the option
+    /// arrives at the pointee type every generic over it is monomorphised at.
+    copying_a_payload_view: bool,
     /// F22 (async-polymorphism.md A.1): the ADAPTED INSTANCE being emitted —
     /// which of the callee's closure parameters arrive async at this instance,
     /// and the emission decisions the analyzer already made for that pairing.
@@ -524,11 +541,10 @@ struct Emitter<'a, 'src> {
     /// vilan types that lower to one Rust type must share one impl.
     object_impls: HashSet<(String, String)>,
     /// F56: the nominal declarations (struct or enum) that implement std's
-    /// `Drop`. A `[resource]` type among them owes a teardown this backend
-    /// does not emit yet (F1's later slice) and is refused; a `[resource]`
-    /// type NOT among them is emitted as an ordinary type. See
-    /// [`drop_implementing_nominals`].
-    drop_nominals: HashSet<Id>,
+    /// `Drop`, each with its `drop` function. F97: a non-generic one is
+    /// emitted with a Rust `Drop` impl calling it; a GENERIC one is still
+    /// refused by name. See [`drop_implementing_nominals`].
+    drop_nominals: HashMap<Id, Id>,
 }
 
 /// One object type's Rust trait: its name and its slots, each slot's
@@ -538,6 +554,9 @@ struct Emitter<'a, 'src> {
 struct ObjectTrait {
     name: String,
     slots: Vec<ObjectSlot>,
+    /// S1b: the method printing the erased value for `dbg`, in a program
+    /// that prints one — named clear of every slot.
+    show: Option<String>,
 }
 
 #[derive(Clone)]
@@ -641,6 +660,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             declaring_a_view: false,
             expects_async: false,
             expects_async_value: false,
+            no_cell_views: false,
             current_return_type: None,
             reaches_sqlite: false,
             reaches_crypto: false,
@@ -649,6 +669,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             closure_captures: Vec::new(),
             expects_payload_view: None,
             matching_the_subject: false,
+            copying_a_payload_view: false,
             current_adapted_bits: Vec::new(),
             current_instance: None,
             last_uses: HashSet::new(),
@@ -1613,6 +1634,52 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.mint(rebuilt)
     }
 
+    /// F101: the element types of a tuple-family type in this instance — a
+    /// tuple's own elements, or a mapped tuple's `(U in T: F<U>)` template
+    /// with `U` bound to each element of `T` (itself a family, so a mapped
+    /// tuple over a mapped tuple expands too). `None` for anything that is
+    /// not a tuple family, or whose source is still open.
+    fn tuple_elements(&mut self, type_id: TypeId) -> Option<Vec<TypeId>> {
+        Some(
+            self.tuple_family(type_id)?
+                .into_iter()
+                .map(|(element, _)| element)
+                .collect(),
+        )
+    }
+
+    /// [`Self::tuple_elements`] with the binder bindings that type each
+    /// element — `(U, i32)` for a `(U in T: SignalCell<U>)` slot whose `T`
+    /// element is `i32` — the transformer's `tuple_family_elements`: what a
+    /// comprehension's body is emitted under, since it may name `U` itself.
+    fn tuple_family(&mut self, type_id: TypeId) -> Option<Vec<(TypeId, Vec<(TypeId, TypeId)>)>> {
+        let _guard = vilan_core::util::RecursionGuard::enter()?;
+        let concrete = self.concrete(type_id);
+        match self.type_entry(&concrete).cloned()? {
+            Type::Tuple(elements) => Some(
+                elements
+                    .into_iter()
+                    .map(|element| (element, Vec::new()))
+                    .collect(),
+            ),
+            Type::Mapped(binder, family, template) => {
+                let family = self.tuple_family(family)?;
+                Some(
+                    family
+                        .into_iter()
+                        .map(|(element, mut bindings)| {
+                            let element = self.deeply_resolved(element);
+                            bindings.push((binder, element));
+                            let mapped = self.substituted(template, &bindings);
+                            (self.deeply_resolved(mapped), bindings)
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+
     /// A type the program's table does not hold, in the minted-type overlay
     /// ([`Self::type_entry`] reads it).
     fn mint(&mut self, rebuilt: Type) -> TypeId {
@@ -2283,10 +2350,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         match resolved {
             Type::Void => Ok("()".to_string()),
+            // F101: a mapped tuple `(U in T: F<U>)` is a tuple per
+            // instantiation — `T = (i32, str)` gives `(F<i32>, F<str>)` — so
+            // it renders as the tuple its family expands to here.
+            Type::Mapped(..) => {
+                let Some(elements) = self.tuple_elements(type_id) else {
+                    return Err(unsupported(
+                        "a mapped tuple whose source tuple did not resolve",
+                        span,
+                    ));
+                };
+                let tuple = self.mint(Type::Tuple(elements));
+                self.rust_type(tuple, span)
+            }
             Type::Tuple(elements) => {
                 let mut parts = Vec::new();
                 for element in &elements {
                     parts.push(self.rust_type(*element, span)?);
+                }
+                // F94: a ONE-element tuple — the pack `count(1)` collects — is
+                // `(T,)`; `(T)` is only a parenthesised `T`.
+                if parts.len() == 1 {
+                    return Ok(format!("({},)", parts[0]));
                 }
                 Ok(format!("({})", parts.join(", ")))
             }
@@ -2756,17 +2841,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // The refusal comes BEFORE the once-only mark, or a first call that
         // swallowed the error would let a second one through on the mark alone
         // and emit a reference to a type nothing declared.
-        // F56: only a resource with a `Drop` impl owes a teardown. A Drop-less
-        // one (A142's pipe nodes) is move-only and nothing more — the
-        // analyzer's move checker enforces that on both backends — so it is
-        // emitted as an ordinary struct. Its resource MEMBERS still ask this
-        // question for themselves when their field types are rendered below,
-        // so a Drop-less wrapper around a `Drop` resource is still refused, at
-        // the member that owes the teardown.
-        if declaration.resource && self.drop_nominals.contains(&id) {
+        // F56: a Drop-less resource (A142's pipe nodes) is move-only and
+        // nothing more — the analyzer's move checker enforces that on both
+        // backends — so it is an ordinary struct. F97: one WITH a `Drop` impl
+        // is a Rust `Drop` impl calling it (below); a generic one is not
+        // emitted yet, because its `drop` would be one instance per
+        // instantiation, reached from the impl's own binders.
+        if self.drop_nominals.contains_key(&id)
+            && !declaration.generic_parameter_constraint_ids.is_empty()
+        {
             return Err(unsupported(
                 &format!(
-                    "the `resource` type `{}` (destruction.md's teardown is a later slice)",
+                    "the generic type `{}` with a `Drop` impl (its teardown is one instance \
+                     per instantiation)",
                     declaration.name
                 ),
                 span,
@@ -2808,6 +2895,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 rendered
             })
             .collect();
+        // F97: a value's resource fields drop in REVERSE declaration order
+        // (destruction.md §5/§7), after its `Drop` body; Rust drops fields in
+        // the order the struct declares them, so a struct with two or more
+        // fields whose teardown is visible declares its fields reversed.
+        // Construction and access are by name, and the printed and JSON
+        // renderings below keep the source order.
+        let teardown_fields = declaration
+            .fields
+            .iter()
+            .filter(|field| self.owes_a_teardown(field.type_id, &mut HashSet::new()))
+            .count();
+        let holds_a_resource = teardown_fields > 1;
         self.current_substitution = saved;
         let rendered_types = rendered_types?;
         // Two questions, not one. `PartialEq` needs to know which FIELDS are
@@ -2840,10 +2939,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = writeln!(out, "#[derive(Clone, PartialEq)]");
         }
         let _ = writeln!(out, "struct {type_name} {{");
-        for (field, rendered) in declaration.fields.iter().zip(rendered_types.iter()) {
-            let _ = writeln!(out, "    {}: {rendered},", sanitize(field.name));
+        let mut declared: Vec<(&str, &String)> = declaration
+            .fields
+            .iter()
+            .zip(rendered_types.iter())
+            .map(|(field, rendered)| (field.name, rendered))
+            .collect();
+        if holds_a_resource {
+            declared.reverse();
+        }
+        for (name, rendered) in declared {
+            let _ = writeln!(out, "    {}: {rendered},", sanitize(name));
         }
         let _ = writeln!(out, "}}");
+        // F97: the `Drop` impl's body runs first, then the fields drop.
+        if let Some(&drop_function) = self.drop_nominals.get(&id) {
+            let drop_name = self
+                .ensure_function(drop_function, &HashMap::default())?
+                .name;
+            let _ = writeln!(out, "impl Drop for {type_name} {{");
+            let _ = writeln!(out, "    fn drop(&mut self) {{");
+            let _ = writeln!(out, "        {drop_name}(self);");
+            let _ = writeln!(out, "    }}");
+            let _ = writeln!(out, "}}");
+        }
         if reaches_a_closure {
             let comparisons: Vec<String> = declaration
                 .fields
@@ -2924,11 +3043,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn ensure_enum(&mut self, id: Id, arguments: &[TypeId], span: Span) -> Result<Reserved, Error> {
         let declaration = self.program.enums.get(&id).cloned().unwrap();
         self.refuse_an_any_argument(arguments, span)?;
-        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown.
-        if declaration.resource && self.drop_nominals.contains(&id) {
+        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown. F97
+        // emitted the struct half; an enum's `Drop` (a body before a
+        // variant's payloads, which Rust drops in declaration order) is not
+        // emitted yet.
+        if self.drop_nominals.contains_key(&id) {
             return Err(unsupported(
                 &format!(
-                    "the `resource` enum `{}` (destruction.md's teardown is a later slice)",
+                    "the enum `{}` with a `Drop` impl (its body runs before the variant's \
+                     payloads, which drop in reverse)",
                     declaration.name
                 ),
                 span,
@@ -3247,7 +3370,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         .parameters
                         .get(binding)
                         .map(|parameter| parameter.type_id)
-                }),
+                })
+                // F92: a `?` lift's BINDER is an entity of its own, typed by
+                // the analyzer as the subject's payload, and no `let` — so
+                // `find("hit")?.title` read its subject's type as nothing.
+                .or_else(|| self.program.expr_type_ids.get(binding).copied()),
             Expr::Parameter(binding) => self
                 .program
                 .parameters
@@ -3358,20 +3485,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     /// Whether `id` is a spine of fields, tuple slots and subscripts read
-    /// through a `Shared` view — what [`Self::shared_view_field_read`] renders.
+    /// through a `Shared` view or over a boxed binding (F103) — what
+    /// [`Self::shared_view_field_read`] renders, a copy out of the cell.
     fn reads_through_a_shared_view(&self, id: Id) -> bool {
-        let mut current = id;
-        let mut stepped = false;
-        loop {
-            match self.program.entity_map.get(&current) {
-                Some(&Expr::Field(subject, _, _))
-                | Some(&Expr::TupleIndex(subject, _, _))
-                | Some(&Expr::Index(subject, _)) => {
-                    stepped = true;
-                    current = subject;
-                }
-                _ => return stepped && self.shared_view_of(current).is_some(),
+        self.cell_spine(id)
+            .is_some_and(|(_, steps)| !steps.is_empty())
+    }
+
+    /// The BOXED binding `id` names, when it is a bare read of one (R3's
+    /// capture cell) — the root a field spine reads through by a scoped
+    /// borrow rather than a whole-value copy (F103).
+    fn boxed_root(&self, id: Id) -> Option<Id> {
+        match self.program.entity_map.get(&id)? {
+            Expr::Local(binding) | Expr::Parameter(binding) if self.boxed.contains(binding) => {
+                Some(*binding)
             }
+            _ => None,
         }
     }
 
@@ -3420,35 +3549,91 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// field, while the `write()` one had none. The borrow ends with the read,
     /// so a write of the same cell later in the statement —
     /// `a.write().n = a.write().n + 1` — finds no live borrow to collide with.
+    ///
+    /// F103: a spine over a BOXED binding (R3's capture cell) is read the same
+    /// way — `log.lines` had been `log.get().lines`, a copy of the whole value,
+    /// every list in it, to read one field.
     fn shared_view_field_read(&mut self, id: Id, depth: usize) -> Result<Option<String>, Error> {
+        let Some((root, steps)) = self.cell_spine(id) else {
+            return Ok(None);
+        };
+        if steps.is_empty() {
+            return Ok(None);
+        }
+        let mut subscripts = String::new();
+        let mut settled = 0;
+        let path = self.spine_path(
+            "view".to_string(),
+            &steps,
+            id,
+            (depth, "__index"),
+            &mut subscripts,
+            &mut settled,
+        )?;
+        let cell_text = match root {
+            CellRoot::View(cell) => {
+                self.expecting_nothing(|emitter| emitter.expression(cell, depth))?
+            }
+            CellRoot::Boxed(binding) => self.binding_name(binding),
+        };
+        let copied = if self.is_natively_copy(id) {
+            ""
+        } else {
+            ".clone()"
+        };
+        let read = format!("({cell_text}).read_with(|view| {path}{copied})");
+        if subscripts.is_empty() {
+            return Ok(Some(read));
+        }
+        Ok(Some(format!("{{ {subscripts}{read} }}")))
+    }
+
+    /// A spine of fields, tuple slots and subscripts over a CELL — a `Shared`
+    /// view call (`cell.read().a[i]`, F62/F90) or a boxed binding (`log.a[i]`,
+    /// F103) — as its root and its steps, outermost last. A bare boxed
+    /// binding is a spine with no steps; a bare view call is none.
+    fn cell_spine(&self, id: Id) -> Option<(CellRoot, Vec<Step>)> {
         let mut steps = Vec::new();
         let mut current = id;
-        let cell = loop {
-            match self.program.entity_map.get(&current) {
-                Some(&Expr::Field(subject, _, index)) => {
+        loop {
+            match *self.program.entity_map.get(&current)? {
+                Expr::Field(subject, _, index) => {
                     steps.push(Step::Field(subject, index));
                     current = subject;
                 }
-                Some(&Expr::TupleIndex(subject, offset, width)) => {
-                    let Some(path) = self.tuple_slot_path(current, offset, width) else {
-                        return Ok(None);
-                    };
-                    steps.push(Step::Slot(path));
+                Expr::TupleIndex(subject, offset, width) => {
+                    steps.push(Step::Slot(self.tuple_slot_path(current, offset, width)?));
                     current = subject;
                 }
-                Some(&Expr::Index(subject, index)) => {
-                    steps.push(Step::Index(index));
+                Expr::Index(subject, index) => {
+                    steps.push(Step::Index(current, index));
                     current = subject;
                 }
-                _ => match self.shared_view_of(current) {
-                    Some((cell, _)) if !steps.is_empty() => break cell,
-                    _ => return Ok(None),
-                },
+                _ => {
+                    if let Some(binding) = self.boxed_root(current) {
+                        return Some((CellRoot::Boxed(binding), steps));
+                    }
+                    let (cell, _) = self.shared_view_of(current)?;
+                    return (!steps.is_empty()).then_some((CellRoot::View(cell), steps));
+                }
             }
-        };
-        let mut path = String::new();
-        let mut subscripts = String::new();
-        let mut settled = 0;
+        }
+    }
+
+    /// A spine's steps rendered over `root` (the view's name inside the
+    /// borrow), each subscript's index settled in a `let` written to
+    /// `subscripts`, root first — the order the source evaluates them in — so
+    /// the borrow covers the element read alone.
+    fn spine_path(
+        &mut self,
+        root: String,
+        steps: &[Step],
+        id: Id,
+        (depth, prefix): (usize, &str),
+        subscripts: &mut String,
+        settled: &mut usize,
+    ) -> Result<String, Error> {
+        let mut path = root;
         for step in steps.iter().rev() {
             match *step {
                 Step::Field(subject, index) => {
@@ -3456,27 +3641,223 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     let _ = write!(path, ".{field}");
                 }
                 Step::Slot(ref slot) => path.push_str(slot),
-                Step::Index(index) => {
+                Step::Index(node, index) => {
                     let index_text =
                         self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
-                    let name = format!("__index{settled}");
-                    settled += 1;
+                    let name = format!("{prefix}{settled}");
+                    *settled += 1;
                     let _ = write!(subscripts, "let {name} = {index_text}; ");
-                    let _ = write!(path, "[({name}) as usize]");
+                    // The checked read (debugging.md S0), as the plain
+                    // subscript arm writes it: an out-of-bounds index through
+                    // a cell panics in vilan's words at its vilan site.
+                    let location = self.subscript_location(node, depth)?;
+                    path = format!("(*({path}).vilan_at(({name}) as usize, {location}))");
                 }
             }
         }
-        let cell_text = self.expecting_nothing(|emitter| emitter.expression(cell, depth))?;
-        let copied = if self.is_natively_copy(id) {
-            ""
-        } else {
-            ".clone()"
+        Ok(path)
+    }
+
+    /// A place over a BOXED binding taken as a VIEW for one call (F49): the
+    /// cell's shared borrow, held by a `let` the call's block drops when the
+    /// call returns, and the place read through it — `writer.result()` is `{
+    /// let __view0 = (writer).borrow(); result_N(&(*__view0)) }` where it had
+    /// been `result_N(&writer.get())`, a copy of the whole value (the JSON
+    /// codec's writer, buffer included, once per frame).
+    ///
+    /// The subscripts are settled into `settled_lets` and the borrow into
+    /// `borrows`, which the caller writes AFTER every by-value argument has
+    /// been hoisted: the view is taken last, once nothing but the call itself
+    /// is left to run. That is the evaluation order spec §6.9's native note
+    /// states. `None` for a place that does not live in a boxed cell.
+    fn cell_view_place(
+        &mut self,
+        id: Id,
+        depth: usize,
+        settled_lets: &mut String,
+        borrows: &mut String,
+        views: &mut usize,
+    ) -> Result<Option<String>, Error> {
+        let place = match self.program.entity_map.get(&id) {
+            Some(&Expr::Reference(operand, false)) => operand,
+            _ => id,
         };
-        let read = format!("({cell_text}).read_with(|view| view{path}{copied})");
-        if subscripts.is_empty() {
-            return Ok(Some(read));
+        let Some((CellRoot::Boxed(binding), steps)) = self.cell_spine(place) else {
+            return Ok(None);
+        };
+        let view = format!("__view{views}");
+        *views += 1;
+        let path = self.spine_path(
+            format!("(*{view})"),
+            &steps,
+            place,
+            (depth, &format!("{view}_index")),
+            settled_lets,
+            &mut 0,
+        )?;
+        let _ = write!(
+            borrows,
+            "let {view} = ({}).borrow(); ",
+            self.binding_name(binding)
+        );
+        Ok(Some(path))
+    }
+
+    /// F101: a tuple comprehension `(value in values => body)` — zipped over
+    /// several sources alike — UNROLLED, one body per slot. A tuple is
+    /// heterogeneous, so each slot's body is emitted under the binder bound
+    /// to that slot's own type (`value: i32` in one, `value: str` in the
+    /// next), which is the instance a monomorphising backend owes; the JS
+    /// backend's `source.map(..)` is the same walk over one array. Each
+    /// source is evaluated once, in order, before any body runs, and each
+    /// binder is a copy of its slot (rule 1).
+    fn tuple_comprehension(
+        &mut self,
+        bindings: &[(Id, Id)],
+        body: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let mut prelude = String::new();
+        let mut families = Vec::new();
+        for (index, (_, source)) in bindings.iter().enumerate() {
+            let value = self.consumed_value_of(*source, depth)?;
+            let _ = write!(prelude, "let __source{index} = {value}; ");
+            let elements = self
+                .settled_value_type(*source)
+                .and_then(|type_id| self.tuple_family(type_id))
+                .ok_or_else(|| {
+                    unsupported(
+                        "a tuple comprehension over a source of unresolved arity",
+                        span,
+                    )
+                })?;
+            families.push(elements);
         }
-        Ok(Some(format!("{{ {subscripts}{read} }}")))
+        let arity = families.first().map_or(0, Vec::len);
+        if families.iter().any(|family| family.len() != arity) {
+            return Err(unsupported(
+                "a zipped tuple comprehension over sources of different arities",
+                span,
+            ));
+        }
+        // One column per slot: each source's element there, with the binder
+        // bindings that type it.
+        let columns: Vec<Vec<(TypeId, Vec<(TypeId, TypeId)>)>> = (0..arity)
+            .map(|slot| families.iter().map(|family| family[slot].clone()).collect())
+            .collect();
+        let mut slots = Vec::new();
+        for (slot, column) in columns.into_iter().enumerate() {
+            let mut entries = Vec::new();
+            let mut binds = String::new();
+            for (index, ((binder, _), (element, family_bindings))) in
+                bindings.iter().zip(column).enumerate()
+            {
+                entries.extend(family_bindings);
+                // The binder's own declared type may name a generic of its
+                // own (`source: SignalCell<U'>` over a `(U in T:
+                // SignalCell<U>)` slot), which the slot's type binds.
+                if let Some(binder_type) = self
+                    .program
+                    .variables
+                    .get(binder)
+                    .map(|variable| variable.type_id)
+                {
+                    entries.push((binder_type, element));
+                    self.bind_generics_against(binder_type, element, &mut entries);
+                }
+                let _ = write!(
+                    binds,
+                    "let {} = __source{index}.{slot}; ",
+                    self.binding_name(*binder)
+                );
+            }
+            let saved = self.enter_substitution(entries);
+            let value = self.consumed_value_of(body, depth);
+            self.current_substitution = saved;
+            slots.push(format!("{{ {binds}{} }}", value?));
+        }
+        let tuple = match slots.len() {
+            0 => "()".to_string(),
+            _ => format!("({},)", slots.join(", ")),
+        };
+        Ok(format!("{{ {prelude}{tuple} }}"))
+    }
+
+    /// F101: every generic a declared type names, bound to the matching part
+    /// of a concrete one — `SignalCell<U>` against `SignalCell<i32>` binds
+    /// `U` to `i32` — walked structurally, keyed both ways a substitution is
+    /// read ([`Self::concrete`]).
+    fn bind_generics_against(
+        &self,
+        declared: TypeId,
+        concrete: TypeId,
+        entries: &mut Vec<(TypeId, TypeId)>,
+    ) {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return;
+        };
+        match (self.resolve(declared), self.resolve(concrete)) {
+            (Some(Type::Generic(constraint_id)), _) => {
+                entries.push((declared, concrete));
+                entries.push((*constraint_id, concrete));
+            }
+            (
+                Some(Type::Struct(left_id, left) | Type::Enum(left_id, left)),
+                Some(Type::Struct(right_id, right) | Type::Enum(right_id, right)),
+            ) if left_id == right_id && left.len() == right.len() => {
+                for (declared, concrete) in left.clone().into_iter().zip(right.clone()) {
+                    self.bind_generics_against(declared, concrete, entries);
+                }
+            }
+            (Some(Type::Tuple(left)), Some(Type::Tuple(right))) if left.len() == right.len() => {
+                for (declared, concrete) in left.clone().into_iter().zip(right.clone()) {
+                    self.bind_generics_against(declared, concrete, entries);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// F94: a tuple literal with SPREAD elements — `(..pair, 3)`, and the
+    /// pack a call collects for a spread parameter (`width(..items)`,
+    /// `need2(..pair, 7)`) — is the CONCATENATION of its parts, one level
+    /// deep (variadic-generics.md §T): each element is evaluated once, in
+    /// order, and a spread one contributes its own slots.
+    fn spread_tuple(&mut self, elements: &[Id], depth: usize, span: Span) -> Result<String, Error> {
+        let mut prelude = String::new();
+        let mut slots = Vec::new();
+        for (index, element) in elements.iter().enumerate() {
+            let value = self.consumed_value_of(*element, depth)?;
+            let name = format!("__part{index}");
+            let _ = write!(prelude, "let {name} = {value}; ");
+            if !self.program.spread_elements.contains(element) {
+                slots.push(name);
+                continue;
+            }
+            let arity = match self
+                .settled_value_type(*element)
+                .map(|type_id| self.concrete(type_id))
+                .and_then(|type_id| self.resolve(type_id))
+            {
+                Some(Type::Tuple(parts)) => parts.len(),
+                _ => {
+                    return Err(unsupported(
+                        "a spread element whose tuple type did not resolve",
+                        span,
+                    ));
+                }
+            };
+            for slot in 0..arity {
+                slots.push(format!("{name}.{slot}"));
+            }
+        }
+        let tuple = if slots.is_empty() {
+            "()".to_string()
+        } else {
+            format!("({},)", slots.join(", "))
+        };
+        Ok(format!("{{ {prelude}{tuple} }}"))
     }
 
     /// The type an `await` produces (J6): a `Task<T>`'s payload.
@@ -3511,7 +3892,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// nothing, so a field read straight off such a call (`fetch_row().id`) had
     /// no subject type at all and was refused. The declaration is the answer at
     /// exactly those sites.
+    ///
+    /// F107: a function WRITTEN `async` whose return is itself a `Task`
+    /// answers the task's payload ([`Self::assimilated_return`]).
     fn declared_return_type(&self, call_id: Id) -> Option<TypeId> {
+        let returned = self.signature_return_type(call_id)?;
+        Some(self.assimilated_return(call_id, returned).0)
+    }
+
+    /// The callee's return as its SIGNATURE says it — what
+    /// [`Self::declared_return_type`] reads before B149's assimilation.
+    fn signature_return_type(&self, call_id: Id) -> Option<TypeId> {
         let call = self.program.function_calls.get(&call_id)?;
         let target = match self.program.entity_map.get(&call.subject_id) {
             Some(Expr::Local(target)) | Some(Expr::Parameter(target)) => *target,
@@ -3643,7 +4034,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
         let saved = self.enter_substitution(entries);
         let saved_instance = self.enter_instance(id, bits.to_vec());
-        let emitted = self.function_body(&function, span, is_main, &name);
+        let emitted = self
+            .function_body(&function, span, is_main, &name)
+            .map_err(|error| self.locate_refusal(error, function.id));
         self.restore_instance(saved_instance);
         self.current_substitution = saved;
         let out = emitted?;
@@ -3833,6 +4226,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // F25: whether `main`'s body was opened inside a `main_guard` closure
         // that has to be closed after it.
         let mut closes_a_guard = false;
+        let answers_an_exit_code = is_main && returned != "()";
+        if answers_an_exit_code && (is_async || returned != "i32") {
+            return Err(unsupported(
+                &format!(
+                    "a{} `main` answering a `{returned}` exit code",
+                    if is_async { "n async" } else { "" }
+                ),
+                span,
+            ));
+        }
         if is_main {
             if is_async {
                 // `async fun main` — `main` itself cannot be async, so the real
@@ -3850,6 +4253,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 );
                 let _ = writeln!(out, "}}");
                 let _ = writeln!(out, "async fn {ASYNC_MAIN_BODY}() {{");
+            } else if answers_an_exit_code {
+                // A `main` answering its exit code (`fun main(): i32`): the
+                // JS backend writes `process.exit(main())`. The body is the
+                // closure's value, so its frame — and every teardown in it —
+                // has ended before the code is handed to the process.
+                let _ = writeln!(out, "fn main() {{");
+                let _ = writeln!(out, "    vilan_rt::main_guard_exiting(|| -> i32 {{");
+                closes_a_guard = true;
             } else {
                 let _ = writeln!(out, "fn main() {{");
                 let _ = writeln!(out, "    vilan_rt::main_guard(|| {{");
@@ -3874,7 +4285,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // order: a panic raised by a microtask this turn is the program
         // failing, and it owes node's exit code and node's stderr like any
         // other.
-        if is_main && !is_async {
+        if is_main && !is_async && !answers_an_exit_code {
             let _ = writeln!(out, "    vilan_rt::executor::run_pending();");
         }
         if closes_a_guard {
@@ -4004,9 +4415,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
             )
         {
             parameter.type_id = positioned;
-        }
-        if parameter.spread {
-            return Err(unsupported("a spread parameter", span));
         }
         // F20: a `lazy` parameter carries the memo cell, by value — one handle
         // per call, and a FORWARD passes the same cell on so a chain memoizes
@@ -4143,10 +4551,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
     ) -> Result<(), Error> {
         let pad = Self::indent(depth);
-        for statement in statements {
+        let early_drops = self.early_drops(statements);
+        for (index, statement) in statements.iter().enumerate() {
             let rendered = self.statement(*statement, depth)?;
             if !rendered.is_empty() {
                 let _ = writeln!(out, "{pad}{rendered}");
+            }
+            for binding in early_drops.get(&index).into_iter().flatten() {
+                let _ = writeln!(out, "{pad}std::mem::drop({});", self.binding_name(*binding));
             }
         }
         if !matches!(self.program.entity_map.get(&tail), Some(Expr::Void) | None) {
@@ -4181,6 +4593,218 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = writeln!(out, "{pad}{rendered}");
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------- teardown ----
+
+    /// F97: the resource bindings a block destroys BEFORE its end, keyed by
+    /// the index of the statement they drop after, each list in drop order.
+    ///
+    /// destruction.md §5/§7 as amended by `lifetimes.md` §6: an owned
+    /// resource drops after the statement holding its LAST read, not at its
+    /// scope's end. Rust drops a binding at its scope's end, in reverse
+    /// declaration order — which is the law at every extent that reaches the
+    /// block's end, a `ret`, a `jump` and a panic included — so only an
+    /// extent short of the end owes an explicit `std::mem::drop`, written
+    /// after the statement the analyzer's [`DropExtent`] names.
+    ///
+    /// The extents are resolved exactly as the JS transformer resolves them
+    /// (`walk_scope_body`, `teardown_extent`, `widen_over_declarations` in
+    /// `transformer.rs`): a region is widened over the last reads of the
+    /// names declared inside it, and a region nested in another is cut at the
+    /// outer one's end, inner drops first. The two backends print their
+    /// teardowns in one order only if they agree on where each region ends.
+    fn early_drops(&self, statements: &[Id]) -> HashMap<usize, Vec<Id>> {
+        let mut plan: HashMap<usize, Vec<Id>> = HashMap::default();
+        if statements
+            .iter()
+            .all(|statement| self.statement_teardown(*statement).is_empty())
+        {
+            return plan;
+        }
+        self.plan_teardowns(statements, 0, statements.len(), &mut plan);
+        plan
+    }
+
+    /// One range of [`Self::early_drops`]: `walk_scope_body`'s recursion.
+    fn plan_teardowns(
+        &self,
+        statements: &[Id],
+        start: usize,
+        end: usize,
+        plan: &mut HashMap<usize, Vec<Id>>,
+    ) {
+        let mut index = start;
+        while index < end {
+            let bindings = self.statement_teardown(statements[index]);
+            if bindings.is_empty() {
+                index += 1;
+                continue;
+            }
+            let own = self.own_teardown_extent(&bindings, statements, index + 1, end);
+            let extent = self.widen_over_declarations(own, statements, index + 1, end);
+            self.plan_teardowns(statements, index + 1, extent, plan);
+            // A binding the program hands to the `drop` sink itself (B150)
+            // keeps its region — it shapes the regions nested in it exactly
+            // as on JS — but owes no second drop: the sink moved it.
+            if extent < statements.len() {
+                plan.entry(extent - 1).or_default().extend(
+                    bindings
+                        .into_iter()
+                        .rev()
+                        .filter(|binding| !self.program.explicit_drop_bindings.contains(binding)),
+                );
+            }
+            index = extent;
+        }
+    }
+
+    /// What a direct statement of a block owes a teardown for: a resource
+    /// `let`, or the resource captures of a destructuring `let` (B62), in
+    /// declaration order — the transformer's `statement_teardown`.
+    fn statement_teardown(&self, statement: Id) -> Vec<Id> {
+        match self.program.entity_map.get(&statement) {
+            Some(Expr::Variable(variable_id))
+                if self.program.dropped_bindings.contains(variable_id)
+                    && self.binding_drops_nontrivially(*variable_id) =>
+            {
+                vec![*variable_id]
+            }
+            Some(Expr::Destructure(_, pattern)) => {
+                let mut captures = Vec::new();
+                collect_pattern_bindings(pattern, &mut captures);
+                captures.retain(|capture| {
+                    self.program.dropped_bindings.contains(capture)
+                        && self.binding_drops_nontrivially(*capture)
+                });
+                captures
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// F97: whether dropping a value of `type_id` runs a `Drop` body
+    /// somewhere inside it — its own nominal's, a field's or a payload's, an
+    /// element's. Only such fields' order is visible, so only a struct with
+    /// two of them declares its fields reversed. `visiting` cuts recursion.
+    fn owes_a_teardown(&self, type_id: TypeId, visiting: &mut HashSet<Id>) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return false;
+        };
+        let concrete = self.concrete(type_id);
+        match self.resolve(concrete).cloned() {
+            Some(Type::Struct(struct_id, arguments)) => {
+                if self.drop_nominals.contains_key(&struct_id) {
+                    return true;
+                }
+                if arguments
+                    .iter()
+                    .any(|argument| self.owes_a_teardown(*argument, visiting))
+                {
+                    return true;
+                }
+                if !visiting.insert(struct_id) {
+                    return false;
+                }
+                self.program
+                    .structs
+                    .get(&struct_id)
+                    .is_some_and(|declaration| {
+                        declaration
+                            .fields
+                            .iter()
+                            .any(|field| self.owes_a_teardown(field.type_id, visiting))
+                    })
+            }
+            Some(Type::Enum(enum_id, arguments)) => {
+                if self.drop_nominals.contains_key(&enum_id) {
+                    return true;
+                }
+                if arguments
+                    .iter()
+                    .any(|argument| self.owes_a_teardown(*argument, visiting))
+                {
+                    return true;
+                }
+                if !visiting.insert(enum_id) {
+                    return false;
+                }
+                self.program.enums.get(&enum_id).is_some_and(|declaration| {
+                    declaration.variants.iter().any(|variant| {
+                        variant
+                            .data_type_ids
+                            .iter()
+                            .any(|payload| self.owes_a_teardown(*payload, visiting))
+                    })
+                })
+            }
+            Some(Type::Tuple(elements)) => elements
+                .iter()
+                .any(|element| self.owes_a_teardown(*element, visiting)),
+            Some(Type::Array(element, _)) => self.owes_a_teardown(element, visiting),
+            _ => false,
+        }
+    }
+
+    /// Whether a binding's type destroys something: a `Drop` impl or a
+    /// resource member.
+    fn binding_drops_nontrivially(&self, variable_id: Id) -> bool {
+        self.program
+            .variables
+            .get(&variable_id)
+            .and_then(|variable| self.program.drop_glue.get(&variable.type_id))
+            .is_some_and(|glue| glue.drop_method.is_some() || !glue.members.is_empty())
+    }
+
+    /// The transformer's `own_teardown_extent`: the exclusive statement index
+    /// the group's last read sits at, `start` when nothing reads it, `end` for
+    /// every refusal (a binding the dataflow does not answer for).
+    fn own_teardown_extent(
+        &self,
+        bindings: &[Id],
+        statements: &[Id],
+        start: usize,
+        end: usize,
+    ) -> usize {
+        let mut extent = start.min(end);
+        for binding in bindings {
+            let Some(binding_extent) = self.program.drop_extents.get(binding) else {
+                return end;
+            };
+            extent = extent.max(resolve_extent(binding_extent, statements, start, end));
+        }
+        extent.min(end)
+    }
+
+    /// The transformer's `widen_over_declarations`: grow `extent` until every
+    /// name declared in `statements[start..extent]` has its last read inside
+    /// it — monotone, bounded by `end`.
+    fn widen_over_declarations(
+        &self,
+        mut extent: usize,
+        statements: &[Id],
+        start: usize,
+        end: usize,
+    ) -> usize {
+        loop {
+            let mut widened = extent;
+            for index in start..extent {
+                let Some(declared) = self
+                    .program
+                    .declared_binding_extents
+                    .get(&statements[index])
+                else {
+                    continue;
+                };
+                for binding_extent in declared {
+                    widened = widened.max(resolve_extent(binding_extent, statements, index, end));
+                }
+            }
+            if widened == extent {
+                return extent;
+            }
+            extent = widened;
+        }
     }
 
     /// One statement, which is an expression plus a `;` for every form that
@@ -4254,8 +4878,43 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "vilan_rt::Location({})",
                 rust_literal(&self.program.site_location(anchor))
             ),
-            Expr::MultilineString(_) => {
-                return Err(unsupported("a triple-quoted string", span));
+            // F100: a triple-quoted string is RAW (no escape is interpreted)
+            // and trimmed to its content by spec §2's rule — the value the JS
+            // emitter writes, written here as a Rust literal of that value.
+            Expr::MultilineString(text) => format!(
+                "vilan_rt::str_new({})",
+                rust_literal(&vilan_core::util::trim_multiline_string(text).unwrap_or_default())
+            ),
+            Expr::TupleComprehension(bindings, body) => {
+                self.tuple_comprehension(&bindings, body, depth, span)?
+            }
+            // F100: `arr.len()` of a fixed array is its type's length. The
+            // JS backend folds a pure subject to the constant and reads a
+            // call's or a subscript's `.length` in place, so the subject is
+            // evaluated exactly when it is written; natively `len()` of the
+            // `[T; n]` it renders as is both, the subject read in place.
+            Expr::ArrayLen(subject, _) => {
+                let subject =
+                    self.expecting_nothing(|emitter| emitter.expression(subject, depth))?;
+                format!("({subject}).len()")
+            }
+            // F100: `[value; n]` evaluates the value ONCE and copies it into
+            // each slot — the JS backend's `__repeat`, which fills a scalar and
+            // clones an aggregate per slot.
+            Expr::Repeat(value, length) => {
+                let element = self
+                    .type_of(id)
+                    .or(self.expected_type)
+                    .and_then(|type_id| self.resolve(type_id))
+                    .and_then(|resolved| match resolved {
+                        Type::Array(element, _) => Some(*element),
+                        _ => None,
+                    });
+                let value = self.consumed_value_of_expecting(value, element, depth)?;
+                format!(
+                    "{{ let __repeated = {value}; \
+                     std::array::from_fn::<_, {length}, _>(|_| __repeated.clone()) }}"
+                )
             }
             // B462: a tuple variant standing for a closure is its
             // eta-expansion, one per instantiation (the closure type the
@@ -4384,15 +5043,38 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 for element in &elements {
                     parts.push(self.consumed_value_of_expecting(*element, element_type, depth)?);
                 }
-                format!("vec![{}]", parts.join(", "))
+                // A literal a fixed-array position directs (`mut buf: [i32; 3] =
+                // [1, 2, 3]`) is the `[T; n]` that position renders as.
+                let fixed = self
+                    .type_of(id)
+                    .or(self.expected_type)
+                    .and_then(|type_id| self.resolve(type_id))
+                    .is_some_and(|resolved| matches!(resolved, Type::Array(..)));
+                if fixed {
+                    format!("[{}]", parts.join(", "))
+                } else {
+                    format!("vec![{}]", parts.join(", "))
+                }
             }
             Expr::Tuple(elements) => {
+                if elements
+                    .iter()
+                    .any(|element| self.program.spread_elements.contains(element))
+                {
+                    return self.spread_tuple(&elements, depth, span);
+                }
                 let mut parts = Vec::new();
                 for element in &elements {
                     let expecting = self.expected_type;
                     parts.push(self.consumed_value_of_expecting(*element, expecting, depth)?);
                 }
-                format!("({},)", parts.join(", "))
+                // F94: the EMPTY pack — `pack()` against a spread parameter —
+                // is the unit, which `(,)` does not spell.
+                if parts.is_empty() {
+                    "()".to_string()
+                } else {
+                    format!("({},)", parts.join(", "))
+                }
             }
             Expr::TupleIndex(subject, offset, width) => {
                 let Some(path) = self.tuple_slot_path(id, offset, width) else {
@@ -4466,7 +5148,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // Rust too. `std::http`'s response loop is the customer:
             // `for header in response.headers { let (name, value) = header; .. }`.
             Expr::Destructure(subject, pattern) => {
-                let subject_type = self.type_of(subject);
+                let subject_type = self.settled_value_type(subject);
                 let bound = self.pattern(&pattern, subject_type, span)?;
                 // A destructure CONSUMES what it binds, so a destructure of a
                 // PLACE is a copy by rule 1 and has to be written as one:
@@ -4504,7 +5186,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Error => return Err(unsupported("an expression that did not analyze", span)),
             other => {
                 return Err(unsupported(
-                    &format!("the expression form `{}`", form_name(&other)),
+                    &format!("the expression form {}", form_name(&other)),
                     span,
                 ));
             }
@@ -4632,8 +5314,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let text = self.expression(id, depth)?;
         // F62: a field read through a `Shared` view is already a copy out of
-        // the cell's scoped borrow, so rule 1's copy has been taken.
-        if self.reads_through_a_shared_view(id) {
+        // the cell's scoped borrow, so rule 1's copy has been taken — and so
+        // is a read of a BOXED binding, whose `get()` hands back a copy of the
+        // cell's value (F103: a second `.clone()` copied it twice).
+        if self.reads_through_a_shared_view(id) || self.boxed_root(id).is_some() {
             return Ok(text);
         }
         if self.copy_applies(self.program.clone_sites.get(&id)) {
@@ -4715,7 +5399,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// out of the cell's scoped borrow ([`Self::shared_view_field_read`]).
     fn subject_is_a_place(&self, id: Id) -> bool {
         match self.program.entity_map.get(&id) {
-            Some(Expr::Local(_) | Expr::Parameter(_)) => true,
+            Some(Expr::Local(_) | Expr::Parameter(_)) => self.boxed_root(id).is_none(),
             Some(Expr::Field(..) | Expr::TupleIndex(..) | Expr::Index(..)) => {
                 !self.reads_through_a_shared_view(id)
             }
@@ -6032,6 +6716,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             emitter.numeric_type_of(partner)
         };
+        // Two operands of DIFFERENT numeric widths — `cells.len() * weight`,
+        // a `usize` beside an `i32` — are no Rust operator at all, and rustc
+        // refused the build. The analyzer admits the pair (filed with Order
+        // 48's finds; capture-clones.vl is the corpus program), so the shape
+        // is refused here by name until it is the analyzer's refusal too.
+        if !is_shift
+            && let (Some(left_type), Some(right_type)) =
+                (self.numeric_type_of(left), self.numeric_type_of(right))
+        {
+            let left_rendered = self.rust_type(left_type, span)?;
+            let right_rendered = self.rust_type(right_type, span)?;
+            if left_rendered != right_rendered {
+                return Err(unsupported(
+                    &format!(
+                        "an operator over two numeric types (`{left_rendered}` and \
+                         `{right_rendered}`), which the analyzer admitted without a conversion"
+                    ),
+                    span,
+                ));
+            }
+        }
         let left_position = partner_position(self, right);
         let right_position = partner_position(self, left);
         let left_text = match left_position {
@@ -6139,7 +6844,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.subject_is_a_place(subject) {
             subject_text = format!("({subject_text}).clone()");
         }
-        let subject_type = self.type_of(subject);
+        let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(&pattern, subject_type, self.span_of(first))?;
         for binding in &bindings {
             self.is_captures.insert(*binding);
@@ -6219,10 +6924,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// A computed `const` value as a Rust expression of `type_id`'s type.
     ///
-    /// Plain data only: a string, a boolean, a number at the declared width,
-    /// and a `List` of those. Everything else a const result can be — a
-    /// `Map`/`Set`, `undefined`, a `BigInt`, G24's closure snapshot — is refused
-    /// by name until a program on the native path reaches one.
+    /// The value arrives in the JS backend's LAYOUT, because the const world
+    /// computed it there, and the declared type is what reads it back: a
+    /// string, a boolean, a number at the declared width, a `List` of those —
+    /// and (F98) every aggregate built of them. A struct is the array of its
+    /// fields, a tuple the flat run of its slots (a nested tuple spliced in),
+    /// an enum `[variant, ..payload]` (`Option`'s `Some` is variant 0), and
+    /// std's `NativeMap` — the table under `HashMap`/`HashSet`, and so under
+    /// `std::web::style`'s `Style` — a JS `Map` keyed by canonical `Hash`es.
+    /// A `Map`/`Set` const, `undefined`, a `BigInt` and G24's closure
+    /// snapshot are refused by name until a program on the native path
+    /// reaches one.
     fn const_value(
         &mut self,
         value: &vilan_core::interpreter::ConstValue,
@@ -6230,14 +6942,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
         span: Span,
     ) -> Result<String, Error> {
         use vilan_core::interpreter::ConstValue;
-        match value {
-            ConstValue::Str(text) => Ok(format!("vilan_rt::str_new({text:?})")),
-            ConstValue::Bool(value) => Ok(value.to_string()),
-            ConstValue::Number(number) => {
+        let resolved = type_id.map(|type_id| self.deeply_resolved(type_id));
+        let shape = resolved.and_then(|type_id| self.resolve(type_id)).cloned();
+        match (value, shape) {
+            // A `const` call of a `void` function — `const preflight()`, run
+            // for the assets it mints — answers `undefined` on JS: the unit.
+            (ConstValue::Undefined, _)
+                if resolved.is_none_or(|type_id| {
+                    self.rust_type(type_id, span)
+                        .is_ok_and(|rendered| rendered == "()")
+                }) =>
+            {
+                Ok("()".to_string())
+            }
+            (ConstValue::Str(text), _) => Ok(format!("vilan_rt::str_new({text:?})")),
+            (ConstValue::Bool(value), _) => Ok(value.to_string()),
+            (ConstValue::Number(number), _) => {
                 // With no type anywhere, the literal's own default: an integral
                 // value is an `i32` and a fractional one an `f64`, as an
                 // unsuffixed literal is.
-                let rendered = match type_id {
+                let rendered = match resolved {
                     Some(type_id) => self.rust_type(type_id, span)?,
                     None if number.fract() == 0.0 => "i32".to_string(),
                     None => "f64".to_string(),
@@ -6251,25 +6975,198 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 Ok(format!("(({number:?}f64) as {rendered})"))
             }
-            ConstValue::Array(items) => {
-                let element =
-                    type_id
-                        .and_then(|type_id| self.resolve(type_id))
-                        .and_then(|resolved| match resolved {
-                            Type::Struct(_, arguments) => arguments.first().copied(),
-                            _ => None,
-                        });
+            (ConstValue::Array(items), Some(Type::Tuple(elements))) => {
+                let mut cursor = 0;
+                let rendered = self.const_tuple(items, &mut cursor, &elements, span)?;
+                Ok(rendered)
+            }
+            (ConstValue::Array(items), Some(Type::Array(element, _))) => {
                 let mut parts = Vec::new();
                 for item in items {
-                    parts.push(self.const_value(item, element, span)?);
+                    parts.push(self.const_value(item, Some(element), span)?);
+                }
+                Ok(format!("[{}]", parts.join(", ")))
+            }
+            (ConstValue::Array(items), Some(Type::Struct(struct_id, arguments))) => {
+                let Some(declaration) = self.program.structs.get(&struct_id).cloned() else {
+                    return Err(unsupported("a `const` value of an unresolved struct", span));
+                };
+                if declaration.external {
+                    if declaration.name != "List" {
+                        return Err(unsupported(
+                            &format!("a `const` value of the host type `{}`", declaration.name),
+                            span,
+                        ));
+                    }
+                    let element = arguments.first().copied();
+                    let mut parts = Vec::new();
+                    for item in items {
+                        parts.push(self.const_value(item, element, span)?);
+                    }
+                    return Ok(format!("vec![{}]", parts.join(", ")));
+                }
+                self.const_struct(struct_id, &arguments, items, span)
+            }
+            (ConstValue::Array(items), Some(Type::Enum(enum_id, arguments))) => {
+                self.const_variant(enum_id, &arguments, items, span)
+            }
+            (ConstValue::Array(items), None) => {
+                let mut parts = Vec::new();
+                for item in items {
+                    parts.push(self.const_value(item, None, span)?);
                 }
                 Ok(format!("vec![{}]", parts.join(", ")))
             }
+            (ConstValue::Map(entries), Some(Type::Struct(struct_id, arguments)))
+                if self
+                    .program
+                    .structs
+                    .get(&struct_id)
+                    .is_some_and(|declaration| {
+                        declaration.external && declaration.name == "NativeMap"
+                    }) =>
+            {
+                let element = arguments.first().copied();
+                let mut inserts = String::new();
+                for (key, item) in entries {
+                    let key = match key {
+                        ConstValue::Str(text) => {
+                            format!("vilan_rt::Hash::Text(vilan_rt::str_new({text:?}))")
+                        }
+                        ConstValue::Number(number) => {
+                            format!("vilan_rt::Hash::Number({number:?}f64)")
+                        }
+                        ConstValue::Bool(value) => format!("vilan_rt::Hash::Bool({value})"),
+                        ConstValue::Null => "vilan_rt::Hash::Null".to_string(),
+                        _ => return Err(unsupported("a `const` map keyed by a non-scalar", span)),
+                    };
+                    let item = self.const_value(item, element, span)?;
+                    let _ = write!(inserts, "__table.insert({key}, {item}); ");
+                }
+                Ok(format!(
+                    "{{ let mut __table = vilan_rt::Map::new(); {inserts}__table }}"
+                ))
+            }
             _ => Err(unsupported(
-                "a `const` value that is not plain data (a string, a boolean, a number or a list of those)",
+                "a `const` value that is not plain data or an aggregate of it (a `Map`/`Set` \
+                 const, `undefined`, a `BigInt`, a closure snapshot)",
                 span,
             )),
         }
+    }
+
+    /// F98: a `const` struct — its fields, in declaration order, are the
+    /// array's slots, each read at the field's type under the instance.
+    fn const_struct(
+        &mut self,
+        struct_id: Id,
+        arguments: &[TypeId],
+        items: &[vilan_core::interpreter::ConstValue],
+        span: Span,
+    ) -> Result<String, Error> {
+        let declaration = self
+            .program
+            .structs
+            .get(&struct_id)
+            .cloned()
+            .ok_or_else(|| unsupported("a `const` value of an unresolved struct", span))?;
+        if items.len() != declaration.fields.len() {
+            return Err(unsupported(
+                &format!(
+                    "a `const` `{}` whose layout this backend cannot read",
+                    declaration.name
+                ),
+                span,
+            ));
+        }
+        let name = self.ensure_struct(struct_id, arguments, span)?.name;
+        let entries =
+            self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
+        let saved = self.enter_substitution(entries);
+        let mut fields = Vec::new();
+        let mut failed = None;
+        for (field, item) in declaration.fields.iter().zip(items) {
+            match self.const_value(item, Some(field.type_id), span) {
+                Ok(value) => fields.push(format!("{}: {value}", sanitize(field.name))),
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+        self.current_substitution = saved;
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        Ok(format!("{name} {{ {} }}", fields.join(", ")))
+    }
+
+    /// F98: a `const` tuple — the flat run of its slots from `cursor`, a
+    /// nested tuple element consuming its own slots (the JS layout splices
+    /// it).
+    fn const_tuple(
+        &mut self,
+        items: &[vilan_core::interpreter::ConstValue],
+        cursor: &mut usize,
+        elements: &[TypeId],
+        span: Span,
+    ) -> Result<String, Error> {
+        let mut parts = Vec::new();
+        for element in elements {
+            let element = self.deeply_resolved(*element);
+            if let Some(Type::Tuple(inner)) = self.resolve(element).cloned() {
+                parts.push(self.const_tuple(items, cursor, &inner, span)?);
+                continue;
+            }
+            let Some(item) = items.get(*cursor) else {
+                return Err(unsupported("a `const` tuple shorter than its type", span));
+            };
+            *cursor += 1;
+            parts.push(self.const_value(item, Some(element), span)?);
+        }
+        Ok(format!("({},)", parts.join(", ")))
+    }
+
+    /// F98: a `const` enum value — `[variant, ..payload]`, the payload read
+    /// at the variant's types under the instance. `bool` and a backed enum
+    /// never arrive here: their values are the literal itself.
+    fn const_variant(
+        &mut self,
+        enum_id: Id,
+        arguments: &[TypeId],
+        items: &[vilan_core::interpreter::ConstValue],
+        span: Span,
+    ) -> Result<String, Error> {
+        use vilan_core::interpreter::ConstValue;
+        let Some(ConstValue::Number(index)) = items.first() else {
+            return Err(unsupported(
+                "a `const` enum value with no variant tag",
+                span,
+            ));
+        };
+        let index = *index as usize;
+        let payload_types = self.variant_payload_types(enum_id, index, arguments);
+        let path = self.variant_path(enum_id, index, arguments, span)?;
+        if payload_types.is_empty() {
+            return Ok(path);
+        }
+        let mut cursor = 1;
+        let mut parts = Vec::new();
+        for payload in payload_types {
+            if let Some(Type::Tuple(inner)) = self.resolve(payload).cloned() {
+                parts.push(self.const_tuple(items, &mut cursor, &inner, span)?);
+                continue;
+            }
+            let Some(item) = items.get(cursor) else {
+                return Err(unsupported(
+                    "a `const` enum value shorter than its variant",
+                    span,
+                ));
+            };
+            cursor += 1;
+            parts.push(self.const_value(item, Some(payload), span)?);
+        }
+        Ok(format!("{path}({})", parts.join(", ")))
     }
 
     /// Whether an expression is a `str` — by its resolved type where it has
@@ -6329,14 +7226,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `cell.get()` records `SignalCell<T>::get`'s `T` — in which case it is
     /// that parameter as this call binds it, through the same substitution the
     /// call itself is emitted under ([`Self::call_substitution`]).
+    ///
+    /// F106: a record that NAMES the callee's parameter anywhere inside it —
+    /// `wrap(3)` recording `Maybe<T>` — is the whole type rebuilt under that
+    /// substitution, when that closes it: the one place a pattern subject
+    /// (`match`, `is`, a conjunction, a destructure) reads a call's type
+    /// through, so a generic call used in place is typed as it is bound to a
+    /// `let`. A field subject asks only for the head, without minting
+    /// ([`Self::call_value_head`], F92).
     fn settled_value_type(&mut self, id: Id) -> Option<TypeId> {
         let recorded = self.type_of(id)?;
-        if !matches!(self.resolve(recorded), Some(Type::Generic(_))) {
-            return Some(recorded);
-        }
         let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id).cloned() else {
             return Some(recorded);
         };
+        if self.is_grounded(recorded) {
+            return Some(recorded);
+        }
         let Some(call) = self.program.function_calls.get(&call_id) else {
             return Some(recorded);
         };
@@ -6346,10 +7251,65 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Some(recorded);
         };
         let substitution = self.call_substitution(call_id, target, &generic_arguments);
+        let entries = self.resolved_entries(&substitution);
         let saved = self.enter_substitution(substitution.into_iter().collect());
-        let settled = self.concrete(recorded);
+        let head = self.concrete(recorded);
         self.current_substitution = saved;
-        Some(settled)
+        let rebuilt = self.substituted(recorded, &entries);
+        let rebuilt = self.deeply_resolved(rebuilt);
+        if self.is_grounded(rebuilt) {
+            return Some(rebuilt);
+        }
+        if matches!(self.resolve(recorded), Some(Type::Generic(_))) {
+            return Some(head);
+        }
+        Some(recorded)
+    }
+
+    /// F92: the HEAD of a generic call's value type where its record is the
+    /// callee's own parameter — `b.unwrap()` recording `T` — read through the
+    /// call's substitution without minting anything, or a trait member's
+    /// `Self` read off the receiver: what a field read needs to name its
+    /// struct ([`Self::field_name`]), the head being the whole of that
+    /// question. `None` for anything else.
+    fn call_value_head(&self, id: Id) -> Option<TypeId> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id) else {
+            return None;
+        };
+        let call = self.program.function_calls.get(call_id)?;
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id) else {
+            return None;
+        };
+        let recorded = self.type_of(id)?;
+        // `Self` in a trait member's return, which the analyzer types as the
+        // trait itself (self-return.vl's `c.combine_twice().value`): the
+        // receiver's own type is what this call's `Self` is.
+        if matches!(self.resolve(recorded), Some(Type::Trait(..)))
+            && let Some(function) = self.program.functions.get(target)
+            && let Some(first) = function.parameters.first()
+            && self
+                .program
+                .parameters
+                .get(first)
+                .is_some_and(|parameter| parameter.name == "self")
+        {
+            let receiver = self.concrete(self.type_of(*call.argument_ids.first()?)?);
+            return (!matches!(
+                self.resolve(receiver),
+                Some(Type::Trait(..) | Type::Dyn(..) | Type::Generic(_))
+            ))
+            .then_some(receiver);
+        }
+        let substitution = self.call_substitution(*call_id, *target, &call.generic_argument_ids);
+        let bound =
+            substitution
+                .get(&recorded)
+                .copied()
+                .or_else(|| match self.type_entry(&recorded) {
+                    Some(Type::Generic(constraint_id)) => substitution.get(constraint_id).copied(),
+                    _ => None,
+                })?;
+        Some(self.concrete(bound))
     }
 
     fn if_branch(&mut self, branch: &ExprIfBranch, depth: usize) -> Result<String, Error> {
@@ -6376,7 +7336,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         if self.subject_is_a_place(*subject) {
                             subject_text = format!("({subject_text}).clone()");
                         }
-                        let subject_type = self.type_of(*subject);
+                        let subject_type = self.settled_value_type(*subject);
                         let pattern_text =
                             self.pattern(pattern, subject_type, self.span_of(*condition))?;
                         for binding in bindings {
@@ -6419,7 +7379,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let rendered_subject = self.expression(subject, depth);
         self.matching_the_subject = saved_matching;
         let mut subject_text = rendered_subject?;
-        let subject_type = self.type_of(subject);
+        let subject_type = self.settled_value_type(subject);
         // A leg that DESTRUCTURES moves the payload out of the subject, so a
         // subject that is a PLACE has to be copied first (F20). On the JS
         // backend a capture is an accessor into the value the subject names and
@@ -6464,20 +7424,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut out = format!("match {subject_text} {{\n");
         let mut has_catch_all = false;
         for leg in legs {
-            if leg.guard.is_some() {
-                return Err(unsupported("a guarded `match` leg", span));
-            }
             let saved_guards = self.literal_guards.replace(Vec::new());
             let pattern = self.pattern(&leg.pattern, subject_type, span);
-            let guards =
+            let mut guards =
                 std::mem::replace(&mut self.literal_guards, saved_guards).unwrap_or_default();
+            // F93: a leg's own guard is Rust's guard, after the nested string
+            // literals' (which test the pattern's own shape first). Inside it
+            // Rust reads a capture through a shared borrow of the subject, and
+            // the leg moves it only once the guard has accepted — the JS
+            // backend's accessor, which a rejecting guard leaves untouched for
+            // the next leg.
+            if let Some(guard) = leg.guard {
+                let condition =
+                    self.expecting_nothing(|emitter| emitter.expression(guard, depth + 1))?;
+                guards.push(format!("({condition})"));
+            }
             let pattern = if guards.is_empty() {
                 pattern?
             } else {
                 format!("{} if {}", pattern?, guards.join(" && "))
             };
-            if matches!(leg.pattern, ExprPattern::Wildcard | ExprPattern::Binding(_))
-                || self.pattern_is_bool(&leg.pattern)
+            if leg.guard.is_none()
+                && (matches!(leg.pattern, ExprPattern::Wildcard | ExprPattern::Binding(_))
+                    || self.pattern_is_bool(&leg.pattern))
             {
                 // A `bool` match with both legs is exhaustive natively too, and
                 // an extra arm after it is an `unreachable_patterns` lint rather
@@ -6581,18 +7550,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ExprPattern::Literal(id) if Self::string_pattern_text(self.program, *id).is_some() => {
                 let literal =
                     rust_string(Self::string_pattern_text(self.program, *id).expect("just tested"));
-                if self.pattern_nesting == 0 {
-                    return Ok(literal);
-                }
-                let Some(guards) = self.literal_guards.as_mut() else {
-                    return Err(unsupported(
-                        "a `str` literal nested inside a pattern anywhere but a `match` leg",
-                        span,
-                    ));
-                };
-                let name = format!("__literal{}", guards.len());
-                guards.push(format!("&*{name} == {literal}"));
-                Ok(name)
+                self.str_literal_pattern(literal, span)
             }
             // A literal pattern is written at the SUBJECT's type, never at the
             // expectation around the `match`: `std::base64`'s `match rest { 2
@@ -6613,9 +7571,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     let _ = payload;
                     return Ok(match declaration.backing {
                         // A `str`-backed variant matches as a `&str` literal;
-                        // the subject is deref'd by `match_expr`.
+                        // the subject is deref'd by `match_expr`. NESTED in a
+                        // payload or a tuple (`Pair::Of(Align::Start)`,
+                        // `(Align::Start, true)`) it is a guard over a binder,
+                        // as a nested string literal is (F93's neighbour in
+                        // match-patterns.vl).
                         Some(Backing::Str) => match &declaration.variants[*index].backing_value {
-                            BackingValue::Str(text) => rust_string(text),
+                            BackingValue::Str(text) => {
+                                return self.str_literal_pattern(rust_string(text), span);
+                            }
                             BackingValue::Int(discriminant) => format!("{discriminant}"),
                         },
                         // An integer pattern carries no suffix: the subject's
@@ -6663,8 +7627,43 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 Ok(format!("({},)", parts.join(", ")))
             }
-            ExprPattern::Array(_) => Err(unsupported("an array pattern", span)),
+            // F100's neighbour in fixed-arrays.vl: `let [a, b] = arr` is
+            // irrefutable (the count is the type's length), and Rust's array
+            // pattern is the same text.
+            ExprPattern::Array(elements) => {
+                let element_type = match subject_type.and_then(|type_id| self.resolve(type_id)) {
+                    Some(Type::Array(element, _)) => Some(*element),
+                    _ => None,
+                };
+                let mut parts = Vec::new();
+                for element in elements {
+                    self.pattern_nesting += 1;
+                    let part = self.pattern(element, element_type, span);
+                    self.pattern_nesting -= 1;
+                    parts.push(part?);
+                }
+                Ok(format!("[{}]", parts.join(", ")))
+            }
         }
+    }
+
+    /// A `str` literal in a pattern: the bare `&str` literal at the top of a
+    /// leg (the subject is matched as a `&str`), and nested inside a payload
+    /// or a tuple a binder the leg's guard compares — an `Rc<str>` slot has no
+    /// literal pattern.
+    fn str_literal_pattern(&mut self, literal: String, span: Span) -> Result<String, Error> {
+        if self.pattern_nesting == 0 {
+            return Ok(literal);
+        }
+        let Some(guards) = self.literal_guards.as_mut() else {
+            return Err(unsupported(
+                "a `str` literal nested inside a pattern anywhere but a `match` leg",
+                span,
+            ));
+        };
+        let name = format!("__literal{}", guards.len());
+        guards.push(format!("&*{name} == {literal}"));
+        Ok(name)
     }
 
     /// The arguments `enum_id` is instantiated at, from a known subject type.
@@ -6699,10 +7698,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let entries =
             self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
         let saved = self.enter_substitution(entries);
+        // F105: the WHOLE payload type, not its head — `Node(List<Tree<T>>)`
+        // under `Tree<i32>` is `List<Tree<i32>>`, and a head-only resolution
+        // left `List<Tree<T>>`, open, so the position handed the list nothing
+        // and each element was minted at `any`.
         let resolved = variant
             .data_type_ids
             .iter()
-            .map(|type_id| self.concrete(*type_id))
+            .map(|type_id| self.deeply_resolved(*type_id))
             .collect();
         self.current_substitution = saved;
         resolved
@@ -6716,7 +7719,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         span: Span,
     ) -> Result<String, Error> {
         let subject_text = self.expression(subject, depth)?;
-        let subject_type = self.type_of(subject);
+        let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(pattern, subject_type, span)?;
         Ok(format!("matches!({subject_text}, {pattern_text})"))
     }
@@ -7102,13 +8105,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn field_name(&self, subject: Id, index: usize, span: Span) -> Result<String, Error> {
+        let struct_of = |type_id: TypeId| match self.resolve(type_id) {
+            Some(Type::Struct(id, _)) => Some(*id),
+            _ => None,
+        };
         let struct_id = self
             .type_of(subject)
-            .and_then(|type_id| self.resolve(type_id))
-            .and_then(|resolved| match resolved {
-                Type::Struct(id, _) => Some(*id),
-                _ => None,
-            })
+            .and_then(struct_of)
+            .or_else(|| self.call_value_head(subject).and_then(struct_of))
             .ok_or_else(|| unsupported("a field read of an unresolved subject", span))?;
         let declaration = self
             .program
@@ -7225,8 +8229,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // refuse the commonest loop in the corpus.
                 _ => false,
             });
+        // F95: a `HashSet` iterates its members in INSERTION order on both
+        // backends — std stores each value beside its canonical hash in the
+        // set's `table`, and the JS backend's `__set_iter` walks that table's
+        // values. Natively the table is the runtime's insertion-ordered map,
+        // and `values()` is the walk: a copy of each member (rule 1's element
+        // copy), taken before the body runs, as JS's array iterator takes it.
+        if self.for_each_iterates_a_set(id) {
+            let set_text = self.expression(iterable_place, depth)?;
+            let binder = match item {
+                Some(item) => self.binding_name(item),
+                None => "_".to_string(),
+            };
+            let mut body = String::new();
+            self.emit_block(statements, tail, &mut body, depth + 1)?;
+            let pad = Self::indent(depth);
+            return Ok(format!(
+                "for {binder} in ({set_text}).table.values().into_iter() {{\n{body}{pad}}}"
+            ));
+        }
         if iterates_something_else {
-            return self.for_each_iterator(id, iterable_place, item, statements, tail, depth, span);
+            return self.for_each_iterator(id, iterable, item, statements, tail, depth, span);
         }
         let iterable_text = self.expression(iterable, depth)?;
         let binder = match item {
@@ -7248,6 +8271,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let iteration = match self.program.for_each_views.get(&item.unwrap_or(Id(0))) {
             Some(true) => format!("({iterable_text}).iter_mut()"),
             Some(false) => format!("({iterable_text}).iter()"),
+            // A read out of a cell — a boxed binding, or a spine over one or
+            // over a `Shared` view — is already the copy (F103).
+            None if self.boxed_root(iterable).is_some()
+                || self.reads_through_a_shared_view(iterable) =>
+            {
+                format!("({iterable_text}).into_iter()")
+            }
             None => format!("({iterable_text}).clone().into_iter()"),
         };
         Ok(format!("for {binder} in {iteration} {{\n{body}{pad}}}"))
@@ -7276,6 +8306,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// An iterator whose `next` resolves to an intrinsic or to a host binding
     /// is refused by name rather than guessed at — no `Iterator` impl in std is
     /// either, and one that were would need its own arm.
+    /// F95: whether a `for` walks a `HashSet` — read off the loop's own
+    /// recorded iterable type, as the JS transformer's
+    /// `for_each_iterates_a_set` reads it.
+    fn for_each_iterates_a_set(&self, for_each_id: Id) -> bool {
+        self.program
+            .for_each_iterable_types
+            .get(&for_each_id)
+            .map(|type_id| self.concrete(*type_id))
+            .and_then(|type_id| self.resolve(type_id))
+            .is_some_and(|resolved| match resolved {
+                Type::Struct(struct_id, _) => self
+                    .program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| declaration.name == "HashSet"),
+                _ => false,
+            })
+    }
+
     fn for_each_iterator(
         &mut self,
         id: Id,
@@ -7286,7 +8335,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
-        let Some(_next_id) = self.program.for_each_next.get(&id).copied() else {
+        let Some(next_id) = self.program.for_each_next.get(&id).copied() else {
             return Err(unsupported(
                 concat!(
                     "a `for` over anything but a `List` ",
@@ -7295,24 +8344,54 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         };
-        let Some(subject) = self.type_of(iterable).map(|type_id| self.concrete(type_id)) else {
+        let iterable_place = match self.program.entity_map.get(&iterable) {
+            Some(&Expr::Reference(place, _)) => place,
+            _ => iterable,
+        };
+        let Some(subject) = self
+            .type_of(iterable_place)
+            .map(|type_id| self.concrete(type_id))
+        else {
             return Err(unsupported(
                 "a `for` over an iterator of unresolved type",
                 span,
             ));
         };
         let preferred = self.program.bound_dispatch_traits.get(&id).cloned();
+        // F95: the member the analyzer recorded — `next`, or `next_mut` for a
+        // `for e in &mut c` loop — by its own name.
+        let member = self
+            .program
+            .functions
+            .get(&next_id)
+            .map_or("next", |function| function.name);
         let Some(NativeDispatch::Call(next)) =
-            self.resolve_dispatch(subject, "next", &[], preferred, span)?
+            self.resolve_dispatch(subject, member, &[], preferred, span)?
         else {
             return Err(unsupported(
                 "a `for` over an iterator whose `next` is not an ordinary member",
                 span,
             ));
         };
+        // F95: `for e in &mut c` drives `next_mut` on the container ITSELF —
+        // each element a writable view into it — so the place is borrowed
+        // for every step rather than copied.
+        if let Some(&Expr::Reference(place, true)) = self.program.entity_map.get(&iterable) {
+            let place_text = self.mutable_place(place, depth)?;
+            let binder = match item {
+                Some(item) => self.binding_name(item),
+                None => "_".to_string(),
+            };
+            let mut body = String::new();
+            self.emit_block(statements, tail, &mut body, depth + 1)?;
+            let pad = Self::indent(depth);
+            return Ok(format!(
+                "while let Some({binder}) = {next}(&mut {place_text}) {{\n{body}{pad}}}"
+            ));
+        }
         // The iterable is CONSUMED by the loop (the iterator is advanced), so a
         // read of a place copies — rule 1's answer at a consuming position.
-        let iterable_text = self.consumed_value_of(iterable, depth)?;
+        let iterable_text = self.consumed_value_of(iterable_place, depth)?;
         let binder = match item {
             Some(item) => self.binding_name(item),
             None => "_".to_string(),
@@ -7468,6 +8547,63 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .filter(|binding| !declared_inside.contains(binding))
             .copied()
             .collect();
+        let captures = self.closure_capture_handles(&captured);
+        self.closure_captures.push(captured);
+        let body = self.closure_body(&closure, depth);
+        self.closure_captures.pop();
+        let body = body?;
+        let prelude = self.capture_prelude(&captures);
+        // A future-answering closure answers `Boxed<R>` on every call, so its
+        // body is an `async move` block behind `pin_future`. The captures are
+        // cloned a SECOND time inside the closure: the block is `move` and takes
+        // them, which would make the closure itself `FnOnce` and no
+        // `Rc<dyn Fn>` at all.
+        if wants_a_future {
+            let inner =
+                self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
+            return Ok(format!(
+                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::pin_future(async move {{ {body} }}) }}){as_counted} }}",
+                parameters.join(", ")
+            ));
+        }
+        // The floating body: the same `async move` block, spawned rather than
+        // handed back, so the closure's own type is the synchronous one the
+        // position declares. The origin is the enclosing function's, as it is
+        // for a written spawn.
+        if floats {
+            let inner =
+                self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
+            let origin = rust_string(self.current_origin.unwrap_or("a floating handler"));
+            return Ok(format!(
+                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::spawn(async move {{ {body} }}, {origin}); }}){as_counted} }}",
+                parameters.join(", ")
+            ));
+        }
+        // F104: a body that DIVERGES — `|| panic("x")`, a block ending in a
+        // `panic` — is typed `!` by rustc when the return is left to
+        // inference, and a `!`-returning closure is no `dyn Fn() -> ()` (E0271).
+        // Its return is written instead: the position's, which every path
+        // that does not diverge would have answered.
+        let written_return = if returns != "_"
+            && vilan_core::analyzer::Divergence::of_program(self.program).expr(closure.return_)
+        {
+            format!(" -> {returns}")
+        } else {
+            String::new()
+        };
+        // F16: a closure VALUE is counted, because the emitter cannot see from
+        // here whether the position it lands in stores it. `Rc::new` is the
+        // shape the probe's R-1 finding forced.
+        Ok(format!(
+            "{{ {prelude}std::rc::Rc::new(move |{}|{written_return} {{ {body} }}){as_counted} }}",
+            parameters.join(", ")
+        ))
+    }
+
+    /// The bindings a `move` closure over `captured` takes a HANDLE of
+    /// (`let name = name.clone();` ahead of it), in a stable order — shared by
+    /// a closure literal and F96's synthesized continuation closures.
+    fn closure_capture_handles(&self, captured: &HashSet<Id>) -> Vec<Id> {
         // Every capture gets a handle of its own, not only the boxed ones: a
         // `move` closure takes the whole binding whatever the body does with it
         // (Rust 2021 captures the PATH, and `&item` inside a `move` closure
@@ -7507,15 +8643,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             })
             .collect();
         captures.sort_by_key(|binding| binding.0);
-        self.closure_captures.push(captured);
-        let body = self.closure_body(&closure, depth);
-        self.closure_captures.pop();
-        let body = body?;
+        captures
+    }
+
+    /// The capture prelude for [`Self::closure_capture_handles`]' answer,
+    /// counting the copies F50's census column reads.
+    fn capture_prelude(&mut self, captures: &[Id]) -> String {
         self.capture_copies += captures
             .iter()
             .filter(|binding| self.capture_is_a_copy(**binding))
             .count();
-        let prelude: String = captures
+        captures
             .iter()
             .map(|binding| {
                 let name = self.binding_name(*binding);
@@ -7536,40 +8674,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 format!("let {name} = {name}.clone(); ")
             })
-            .collect();
-        // A future-answering closure answers `Boxed<R>` on every call, so its
-        // body is an `async move` block behind `pin_future`. The captures are
-        // cloned a SECOND time inside the closure: the block is `move` and takes
-        // them, which would make the closure itself `FnOnce` and no
-        // `Rc<dyn Fn>` at all.
-        if wants_a_future {
-            let inner =
-                self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
-            return Ok(format!(
-                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::pin_future(async move {{ {body} }}) }}){as_counted} }}",
-                parameters.join(", ")
-            ));
-        }
-        // The floating body: the same `async move` block, spawned rather than
-        // handed back, so the closure's own type is the synchronous one the
-        // position declares. The origin is the enclosing function's, as it is
-        // for a written spawn.
-        if floats {
-            let inner =
-                self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
-            let origin = rust_string(self.current_origin.unwrap_or("a floating handler"));
-            return Ok(format!(
-                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::spawn(async move {{ {body} }}, {origin}); }}){as_counted} }}",
-                parameters.join(", ")
-            ));
-        }
-        // F16: a closure VALUE is counted, because the emitter cannot see from
-        // here whether the position it lands in stores it. `Rc::new` is the
-        // shape the probe's R-1 finding forced.
-        Ok(format!(
-            "{{ {prelude}std::rc::Rc::new(move |{}| {{ {body} }}){as_counted} }}",
-            parameters.join(", ")
-        ))
+            .collect()
     }
 
     /// Whether a closure's capture prelude COPIES `binding`'s value (F50's
@@ -8333,6 +9438,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
+        if let Some(vilan_core::analyzer::LiftDispatch::Trait { .. }) =
+            self.program.lift_dispatch.get(&id)
+        {
+            return self.user_lift(&[(subject, binder, true)], &[id], continuation, depth, span);
+        }
         if !matches!(
             self.program.lift_dispatch.get(&id),
             Some(vilan_core::analyzer::LiftDispatch::Std { .. }) | None
@@ -8349,6 +9459,150 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.lift_split(subject, binder, good, fallback, depth, span)
     }
 
+    /// F96: a `?` lift over a USER `Lift` container — one step
+    /// (`boxed? * 2`) or a region of them (`left? + right?`) — through the
+    /// container's own `map`/`and_then` (try-and-lift.md §4's trait path):
+    /// each split is a call to the member the analyzer chose, its receiver
+    /// the step and its continuation a closure binding the step's element,
+    /// the rest of the region nested inside, so a later receiver runs only
+    /// when the container's member calls on. An EVAL step is a `let`.
+    /// `dispatch_keys[i]` is where step `i`'s dispatch is recorded: the lift
+    /// itself for one step, each split's binder in a region.
+    fn user_lift(
+        &mut self,
+        steps: &[(Id, Id, bool)],
+        dispatch_keys: &[Id],
+        body: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        for (_, binder, _) in steps {
+            self.is_captures.insert(*binder);
+        }
+        let rendered = self.user_lift_steps(steps, dispatch_keys, body, depth, span);
+        for (_, binder, _) in steps {
+            self.is_captures.remove(binder);
+        }
+        rendered
+    }
+
+    /// One step of [`Self::user_lift`], the rest inside it.
+    fn user_lift_steps(
+        &mut self,
+        steps: &[(Id, Id, bool)],
+        dispatch_keys: &[Id],
+        body: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let Some((&(step, binder, is_split), rest)) = steps.split_first() else {
+            return self.consumed_value_of(body, depth);
+        };
+        let rest_keys = dispatch_keys.get(1..).unwrap_or(&[]);
+        if !is_split {
+            let value = self.value_of(step, depth)?;
+            let inner = self.user_lift_steps(rest, rest_keys, body, depth, span)?;
+            return Ok(format!(
+                "{{ let {} = {value}; {inner} }}",
+                self.binding_name(binder)
+            ));
+        }
+        let Some(vilan_core::analyzer::LiftDispatch::Trait {
+            member_id,
+            impl_subject,
+            subject_type_id,
+            own_generic_value,
+        }) = dispatch_keys
+            .first()
+            .and_then(|key| self.program.lift_dispatch.get(key))
+            .cloned()
+        else {
+            return Err(unsupported(
+                "a `?` lift step with no recorded dispatch",
+                span,
+            ));
+        };
+        // The impl's parameters off the subject's type; the member's own
+        // `U` off the analyzer's record.
+        let subject_type = self.deeply_resolved(subject_type_id);
+        let mut entries = Vec::new();
+        self.bind_generics_against(impl_subject, subject_type, &mut entries);
+        let member = self
+            .program
+            .functions
+            .get(&member_id)
+            .cloned()
+            .ok_or_else(|| unsupported("a `Lift` member that did not resolve", span))?;
+        if let Some(&own) = member.generic_parameter_constraint_ids.first() {
+            let own_value = self.deeply_resolved(own_generic_value);
+            entries.push((own, own_value));
+        }
+        let substitution: HashMap<TypeId, TypeId> = entries.into_iter().collect();
+        let name = self.ensure_function(member_id, &substitution)?.name;
+        // The continuation's closure type is the member's second parameter
+        // under that binding: `|T| U` for `map`, `|T| Boxy<U>` for `and_then`.
+        let continuation_type = member
+            .parameters
+            .get(1)
+            .and_then(|parameter| self.program.parameters.get(parameter))
+            .map(|parameter| parameter.type_id)
+            .ok_or_else(|| unsupported("a `Lift` member with no continuation", span))?;
+        let resolved_entries = self.resolved_entries(&substitution);
+        let continuation_type = self.substituted(continuation_type, &resolved_entries);
+        let continuation_type = self.deeply_resolved(continuation_type);
+        let Some(Type::Closure(parameters, returns, _, _)) =
+            self.resolve(continuation_type).cloned()
+        else {
+            return Err(unsupported(
+                "a `Lift` member whose continuation is no closure",
+                span,
+            ));
+        };
+        let element = parameters
+            .first()
+            .copied()
+            .ok_or_else(|| unsupported("a `Lift` continuation with no parameter", span))?;
+        let element = self.rust_type(element, span)?;
+        let answer = self.rust_type(returns, span)?;
+        let receiver = self.receiver_argument(member_id, step, depth)?;
+        // What the closure captures: everything its region reads that it does
+        // not declare — the outer splits' binders among them, which are no
+        // `let`s and so are named here rather than by the closure filter.
+        let mut declared: HashSet<Id> = HashSet::from_iter([binder]);
+        let mut referenced = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut roots: Vec<Id> = rest.iter().map(|(step, _, _)| *step).collect();
+        roots.push(body);
+        for (_, inner_binder, _) in rest {
+            declared.insert(*inner_binder);
+        }
+        for root in roots {
+            self.scan_closure(root, &mut declared, &mut referenced, &mut visited);
+        }
+        let captured: HashSet<Id> = referenced
+            .into_iter()
+            .filter(|binding| !declared.contains(binding))
+            .collect();
+        let mut handles = self.closure_capture_handles(&captured);
+        let mut outer_binders: Vec<Id> = captured
+            .iter()
+            .copied()
+            .filter(|binding| self.is_captures.contains(binding) && !handles.contains(binding))
+            .collect();
+        outer_binders.sort_by_key(|binding| binding.0);
+        handles.extend(outer_binders);
+        self.closure_captures.push(captured);
+        let inner = self.user_lift_steps(rest, rest_keys, body, depth, span);
+        self.closure_captures.pop();
+        let inner = inner?;
+        let prelude = self.capture_prelude(&handles);
+        let binder_name = self.binding_name(binder);
+        Ok(format!(
+            "{name}({receiver}, {{ {prelude}std::rc::Rc::new(move |{binder_name}: {element}| -> \
+             {answer} {{ {inner} }}) as std::rc::Rc<dyn Fn({element}) -> {answer}> }})"
+        ))
+    }
+
     /// An expression-lifting region over `Option`/`Result`: its steps as
     /// nested splits (an EVAL step a plain `let`), the body in the innermost
     /// good arm, wrapped once.
@@ -8360,6 +9614,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
+        if let Some(vilan_core::analyzer::LiftDispatch::TraitRegion) =
+            self.program.lift_dispatch.get(&id)
+        {
+            // Each split's own dispatch is recorded under its BINDER.
+            let keys: Vec<Id> = steps.iter().map(|(_, binder, _)| *binder).collect();
+            return self.user_lift(steps, &keys, body, depth, span);
+        }
         if !matches!(
             self.program.lift_dispatch.get(&id),
             Some(vilan_core::analyzer::LiftDispatch::Std { .. }) | None
@@ -8432,14 +9693,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
-        if !matches!(
-            self.program.try_dispatch.get(&id),
-            Some(TryDispatch::Std) | None
-        ) {
-            return Err(unsupported(
-                "a `!` assertion through a user `Try` impl (the `Option`/`Result` form is emitted)",
+        if let Some(TryDispatch::Trait {
+            verdict_id,
+            from_bad_id,
+            impl_subject,
+            receiver_type_id,
+        }) = self.program.try_dispatch.get(&id).cloned()
+        {
+            return self.user_try_assert(
+                id,
+                receiver,
+                (verdict_id, from_bad_id),
+                (impl_subject, receiver_type_id),
+                depth,
                 span,
-            ));
+            );
         }
         let Some(Type::Enum(enum_id, _)) = self
             .type_of(receiver)
@@ -8473,6 +9741,74 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "a `!` assertion on something that is neither an `Option` nor a `Result`",
                 span,
             )),
+        }
+    }
+
+    /// F96: `receiver!` through a USER `Try` impl — `verdict(receiver)`, the
+    /// good half the value and the bad half returned through `from_bad`
+    /// (try-and-lift.md §4), as the JS backend branches on the `Verdict`'s
+    /// tag. The impl's own parameters are bound off the receiver's type.
+    fn user_try_assert(
+        &mut self,
+        id: Id,
+        receiver: Id,
+        (verdict_id, from_bad_id): (Id, Id),
+        (impl_subject, receiver_type): (TypeId, TypeId),
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let receiver_type = self.deeply_resolved(receiver_type);
+        let mut entries = Vec::new();
+        self.bind_generics_against(impl_subject, receiver_type, &mut entries);
+        let substitution: HashMap<TypeId, TypeId> = entries.into_iter().collect();
+        let verdict = self.ensure_function(verdict_id, &substitution)?.name;
+        let from_bad = self.ensure_function(from_bad_id, &substitution)?.name;
+        let verdict_type = self
+            .program
+            .functions
+            .get(&verdict_id)
+            .cloned()
+            .and_then(|function| self.return_type_of(&function))
+            .ok_or_else(|| unsupported("a `Try` impl whose `verdict` answers nothing", span))?;
+        let verdict_type = self.substituted(verdict_type, &self.resolved_entries(&substitution));
+        let verdict_type = self.deeply_resolved(verdict_type);
+        let Some(Type::Enum(verdict_enum, arguments)) = self.resolve(verdict_type).cloned() else {
+            return Err(unsupported(
+                "a `Try` impl whose `verdict` answers no `Verdict`",
+                span,
+            ));
+        };
+        let good_path = self.variant_path(verdict_enum, 0, &arguments, span)?;
+        let bad_path = self.variant_path(verdict_enum, 1, &arguments, span)?;
+        let subject = self.receiver_argument(verdict_id, receiver, depth)?;
+        let good = format!("try_good_{}", id.0);
+        let bad = format!("try_bad_{}", id.0);
+        Ok(format!(
+            "match {verdict}({subject}) {{ {good_path}({good}) => {good}, \
+             {bad_path}({bad}) => return {from_bad}({bad}) }}"
+        ))
+    }
+
+    /// The receiver of a member called by an emitter-written call (F96's
+    /// `verdict`, `map`, `and_then`), at the member's own convention for its
+    /// first parameter: a value, or a borrow of the place.
+    fn receiver_argument(
+        &mut self,
+        member: Id,
+        receiver: Id,
+        depth: usize,
+    ) -> Result<String, Error> {
+        let convention = self
+            .program
+            .functions
+            .get(&member)
+            .and_then(|function| function.parameters.first().copied())
+            .and_then(|parameter| self.program.parameters.get(&parameter).cloned())
+            .map(|parameter| self.receiving_form(&parameter));
+        match convention {
+            Some(Receiving::Ref) => Ok(format!("&{}", self.expression(receiver, depth)?)),
+            Some(Receiving::RefMut) => Ok(format!("&mut {}", self.mutable_place(receiver, depth)?)),
+            _ => self.consumed_value_of(receiver, depth),
         }
     }
 
@@ -9038,6 +10374,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.value_argument(argument_ids, 0, depth)?
                 )
             }
+            // F100: `f64::is_finite` is `Number.isFinite(x)`, which over a
+            // number is exactly Rust's `is_finite` (neither NaN nor ±∞).
+            Some(ExternBinding::Function {
+                module: None,
+                symbol: "Number.isFinite",
+            }) if name == "is_finite" => format!(
+                "(({}) as f64).is_finite()",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
             Some(ExternBinding::Method {
                 symbol: Some("charCodeAt"),
             }) if name == "code_at" => format!(
@@ -9328,6 +10673,81 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     // ----------------------------------------------------------- the call --
 
+    /// F108: a refusal raised inside a function's BODY carries the file its
+    /// span indexes, as the note the CLI attributes a refusal by (E190's
+    /// channel): a span into std rendered against the entry printed one bare
+    /// `Error:` line, no file and no line. Only the innermost body says so —
+    /// an error that already names its file is passed through.
+    fn locate_refusal(&self, mut error: Error, function: Id) -> Error {
+        if error.note.is_some() {
+            return error;
+        }
+        let Some(source) = self.program.note_source_of(function) else {
+            return error;
+        };
+        if source == vilan_core::analyzer::SourceId(0) {
+            return error;
+        }
+        let name = self
+            .program
+            .functions
+            .get(&function)
+            .map_or("a function", |function| function.name);
+        error.note = Some(vilan_core::error::Note {
+            span: error.span,
+            msg: format!("in `{name}`'s body"),
+            source: Some(source),
+        });
+        error
+    }
+
+    /// F108: a refusal located in a LIBRARY file (std, a dependency) that a
+    /// call in the user's own code reached, re-anchored AT that call: the
+    /// library's line is not one the reader can act on, and the call that
+    /// instantiated it is — `names.push_many([])` on a `List<str>`, whose `[]`
+    /// stays open (`List<unknown>`) and is refused as a value of an
+    /// unresolved type inside `push_many`. The sentence gains where the
+    /// construct was found (the body and its file).
+    fn anchor_refusal_at_call(&self, mut error: Error, call_expr_id: Id) -> Error {
+        let Some(note) = &error.note else {
+            return error;
+        };
+        let Some(found_in) = note.source else {
+            return error;
+        };
+        let is_library = |source: vilan_core::analyzer::SourceId| {
+            self.program
+                .source_layers
+                .get(source.0 as usize)
+                .is_some_and(|layer| layer.containing.is_some())
+        };
+        let Some(call_source) = self.program.note_source_of(call_expr_id) else {
+            return error;
+        };
+        if !is_library(found_in) || is_library(call_source) {
+            return error;
+        }
+        let file = self
+            .program
+            .source_path(found_in)
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "a library file".to_string());
+        let call_span = self.span_of(call_expr_id);
+        let found = format!("{} (`{file}`)", note.msg);
+        error.msg = format!(
+            "{} The construct is {found}, which this call instantiates.",
+            error.msg
+        );
+        error.note = Some(vilan_core::error::Note {
+            span: call_span,
+            msg: format!("{found}, reached from this call"),
+            source: Some(call_source),
+        });
+        error.span = call_span;
+        error
+    }
+
     /// One call, plus the `.await` an async callee owes (J6).
     fn call(
         &mut self,
@@ -9353,11 +10773,71 @@ impl<'a, 'src> Emitter<'a, 'src> {
         {
             return Ok(rendered);
         }
-        let rendered = self.call_expression(call_expr_id, call_id, depth, span)?;
+        let rendered = self
+            .call_expression(call_expr_id, call_id, depth, span)
+            .map_err(|error| self.anchor_refusal_at_call(error, call_expr_id))?;
         if self.call_awaits(call_expr_id, call_id) {
-            return Ok(Self::awaited(&rendered));
+            let mut awaited = Self::awaited(&rendered);
+            for _ in 0..self.assimilated_task_layers(call_id) {
+                awaited = Self::awaited(&awaited);
+            }
+            return Ok(awaited);
         }
         Ok(rendered)
+    }
+
+    /// F107 (B149's native half): a call to a function WRITTEN `async` whose
+    /// signature returns a `Task` — the payload the call answers, and how
+    /// many `Task` layers its awaited future hands back beyond it. `async fun
+    /// make(): Task<i32>` answers a `Task<i32>` when its future is awaited,
+    /// and the JS host ASSIMILATES that handle — the caller's `await` adopts
+    /// the promise the body returned — so the call types as the `i32`
+    /// (`assimilated_task_payload`, the analyzer's reading of the same
+    /// layers). Natively each layer is one more `.await` of the handle. A
+    /// function async only by inference keeps its declared type, as the
+    /// analyzer does, and owes none.
+    fn assimilated_return(&self, call_id: Id, returned: TypeId) -> (TypeId, usize) {
+        let written_async = self
+            .program
+            .function_calls
+            .get(&call_id)
+            .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                Some(Expr::Local(target)) => self.program.functions.get(target),
+                _ => None,
+            })
+            .is_some_and(|function| function.is_async);
+        if !written_async {
+            return (returned, 0);
+        }
+        let mut layers = 0;
+        let mut seen = HashSet::new();
+        let mut current = returned;
+        while seen.insert(current) {
+            match self.resolve(current) {
+                Some(Type::Struct(struct_id, arguments))
+                    if self
+                        .program
+                        .structs
+                        .get(struct_id)
+                        .is_some_and(|declaration| declaration.name == "Task") =>
+                {
+                    let Some(&inner) = arguments.first() else {
+                        break;
+                    };
+                    layers += 1;
+                    current = inner;
+                }
+                _ => break,
+            }
+        }
+        (current, layers)
+    }
+
+    /// [`Self::assimilated_return`]'s layer count for a call — the `.await`s
+    /// its handle owes beyond the call's own.
+    fn assimilated_task_layers(&self, call_id: Id) -> usize {
+        self.signature_return_type(call_id)
+            .map_or(0, |returned| self.assimilated_return(call_id, returned).1)
     }
 
     fn call_expression(
@@ -9656,20 +11136,34 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &function_call.argument_ids,
         );
         // F21: an `Option` whose payload is a VIEW is a `&`/`&mut` natively,
-        // and the only position that carries it today is a `match` subject,
-        // where the leg binds the reference and reads through it. Anywhere else
-        // it meets code written against the payload's POINTEE — `arena.vl`
-        // hands one to `unwrap_or`, a generic monomorphised at `Option<i32>` —
-        // so it is named rather than emitted. The general answer is a
-        // monomorphisation keyed on viewness, which is its own slice.
+        // and a `match` subject carries it as one, the leg binding the
+        // reference and reading through it. F99: a by-value or `&` argument
+        // that consumes a SHARED one where it stands reads its payload out
+        // (`arena.get(a).unwrap_or(-1)`: `unwrap_or` is monomorphised at the
+        // pointee, `Option<i32>`), which is rule 1's copy of a view read as a
+        // value, taken at the only moment the view is read. Anywhere else —
+        // a `let` holding it, a `&mut` payload — it is named rather than
+        // emitted; the general answer is a monomorphisation keyed on
+        // viewness, which is its own slice.
         let carries_a_payload_view = self
             .program
             .functions
             .get(&target)
             .is_some_and(|function| self.payload_view_of(function).is_some());
-        if carries_a_payload_view && !std::mem::take(&mut self.matching_the_subject) {
+        let payload_view = self
+            .program
+            .functions
+            .get(&target)
+            .and_then(|function| self.payload_view_of(function));
+        let copies_the_payload =
+            payload_view == Some(false) && std::mem::take(&mut self.copying_a_payload_view);
+        if carries_a_payload_view
+            && !copies_the_payload
+            && !std::mem::take(&mut self.matching_the_subject)
+        {
             return self.host_gap(
-                "an `Option` with a VIEW payload read anywhere but as a `match` subject (the \
+                "an `Option` with a VIEW payload held anywhere but where it is read at once \
+                 (a `match` subject, or a by-value or `&` argument of a shared view: the \
                  payload is a reference natively, and a generic over it monomorphises at the \
                  pointee)"
                     .to_string(),
@@ -9695,10 +11189,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         );
         self.argument_substitution = None;
         let arguments = arguments?;
-        Ok(Self::with_argument_prelude(
-            prelude,
-            format!("{name}({})", arguments.join(", ")),
-        ))
+        let rendered =
+            Self::with_argument_prelude(prelude, format!("{name}({})", arguments.join(", ")));
+        // F99: the option is consumed where it stands, so its payload is read
+        // out now — the copy rule 1 owes a view read as a value — and the
+        // option is the pointee's (`arena.get(a).unwrap_or(-1)`).
+        if copies_the_payload {
+            return Ok(format!("({rendered}).cloned()"));
+        }
+        Ok(rendered)
     }
 
     // ------------------------------------------------- arguments by position --
@@ -9788,7 +11287,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         })
                 })
         });
-        let borrows_a_cell = borrows_a_cell || borrows_a_read_place;
+        // F49: a `&` argument over a BOXED binding is a VIEW of its cell for
+        // the call (see [`Emitter::cell_view_place`]), taken after every
+        // by-value argument has been evaluated — the same hoist.
+        let views_allowed = !self.no_cell_views && self.views_its_arguments(target, callee_bits);
+        let takes_a_view: Vec<bool> = argument_ids
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| {
+                views_allowed
+                    && matches!(conventions.get(index), Some(Receiving::Ref))
+                    && self.takes_a_cell_view(argument_ids, index, *argument)
+            })
+            .collect();
+        let views_a_cell = takes_a_view.contains(&true);
+        let borrows_a_cell = borrows_a_cell || borrows_a_read_place || views_a_cell;
+        let mut view_borrows = String::new();
+        let mut views = 0;
+        self.refuse_a_closure_beside_a_cell_view(&conventions, argument_ids)?;
         // The callee's WHOLE parameter list, hidden context parameters
         // included (they have no `parameters` record, so `declared` omits
         // them). A call can carry MORE arguments than that: the context pass
@@ -9823,6 +11339,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 rendered.push(cell?);
                 continue;
             }
+            if takes_a_view.get(index).copied().unwrap_or(false)
+                && let Some(path) =
+                    self.cell_view_place(*argument, depth, prelude, &mut view_borrows, &mut views)?
+            {
+                rendered.push(format!("&{path}"));
+                continue;
+            }
             let wants_a_place = !matches!(conventions.get(index), None | Some(Receiving::ByValue));
             // A `&mut` parameter (a `&mut self` receiver among them) takes a
             // place the callee WRITES, so a binding that lives in a cell has to
@@ -9844,7 +11367,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.program.async_values.contains(&parameter.id)
                     || callee_bits.contains(&parameter.id)
             });
-            let mut text = if wants_a_place {
+            // F99: an argument that IS a call handing back an `Option<&T>`,
+            // at a position that reads it (by value, or by `&`), takes the
+            // option with its payload read out ([`Emitter::copying_a_payload_view`]).
+            let copies_a_payload =
+                !wants_a_mutable_place && self.hands_back_a_shared_payload_view(*argument);
+            let saved_copying =
+                std::mem::replace(&mut self.copying_a_payload_view, copies_a_payload);
+            let text = if wants_a_place {
                 // The declared type is threaded even for a PLACE, because a
                 // numeric LITERAL at a `&`/`&mut` position still has to be
                 // written at the width the signature names — `as_f32(self)`
@@ -9858,14 +11388,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 };
                 self.expected_type = saved;
                 self.expects_async_value = false;
-                place?
+                place
             } else {
                 // A by-value parameter CONSUMES its argument, so a plain read
                 // of a place copies — see [`Emitter::copy_a_consumed_place_read`].
                 let value = self.value_of_expecting(*argument, expecting, depth);
                 self.expects_async_value = false;
-                self.copy_a_consumed_place_read(*argument, value?)
+                value.map(|value| self.copy_a_consumed_place_read(*argument, value))
             };
+            self.copying_a_payload_view = saved_copying;
+            let mut text = text?;
             // H9: a `mut` parameter of aggregate type is copied at BODY ENTRY
             // on the JS backend (`parameter_entry_clones`), because there the
             // callee and the caller share one array and the copy has to happen
@@ -9915,7 +11447,281 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             rendered.push(text);
         }
+        prelude.push_str(&view_borrows);
         Ok(rendered)
+    }
+
+    /// F102 (closure-captures.md Q3, RULED: refused at compile time, as F39
+    /// was): a call that holds a `&mut` view of a boxed binding's cell while
+    /// another of its arguments carries a closure that reaches the same
+    /// binding.
+    ///
+    /// A `&mut` argument over a boxed binding (a `&mut self` receiver among
+    /// them) holds the cell's `borrow_mut` for the call, so a closure the
+    /// callee runs that READS or WRITES the binding meets it — `apply(&mut n,
+    /// || { n += 1; })` and `c.bump_then(poke)` with `poke` writing `c.n` died
+    /// with the runtime's reentrancy sentence, where the JS backend (whose view
+    /// is a plain reference) answers the in-progress value. Safe Rust has no
+    /// second path to a place under a live `&mut`, so the shape is refused by
+    /// name, the span the offending touch inside the closure. The closures
+    /// seen are the literals written in the other arguments and the
+    /// `let`-bound closures they name (aliases followed, as F39 follows them),
+    /// each walked through the closures it calls by name, and the closures a
+    /// `let`-bound value holds (`Hook { run = || .. }`); a closure that
+    /// arrives any other way — a parameter, a list it was pushed into — still
+    /// stops at run time with the sentence.
+    ///
+    /// A `&` view (F49) is never refused: a call whose other arguments carry a
+    /// closure that WRITES the binding hands the callee a copy, as before F49
+    /// ([`Self::takes_a_cell_view`]).
+    fn refuse_a_closure_beside_a_cell_view(
+        &self,
+        conventions: &[Receiving],
+        argument_ids: &[Id],
+    ) -> Result<(), Error> {
+        for (index, argument) in argument_ids.iter().enumerate() {
+            if !matches!(conventions.get(index), Some(Receiving::RefMut)) {
+                continue;
+            }
+            let Some(binding) = self.boxed_place_root(*argument) else {
+                continue;
+            };
+            let Some(touch) = self.carried_closure_touch(argument_ids, index, binding, false)
+            else {
+                continue;
+            };
+            let name = self
+                .program
+                .variables
+                .get(&binding)
+                .map(|variable| variable.name)
+                .or_else(|| {
+                    self.program
+                        .parameters
+                        .get(&binding)
+                        .map(|parameter| parameter.name)
+                })
+                .unwrap_or("the binding");
+            return Err(unsupported(
+                &format!(
+                    "a closure that reaches `{name}` handed to a call that holds a `&mut` view \
+                     of `{name}` (natively a captured `mut` binding is a cell, the view borrows \
+                     it for the whole call, and the closure's touch is a second path to it; the \
+                     JS backend answers the in-progress value, and safe Rust cannot)"
+                ),
+                self.span_of(touch),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The boxed binding a place argument (or the place a `&`/`&mut` the
+    /// source wrote names) is rooted at, through its fields, tuple slots and
+    /// subscripts.
+    fn boxed_place_root(&self, id: Id) -> Option<Id> {
+        let place = match self.program.entity_map.get(&id) {
+            Some(&Expr::Reference(operand, _)) => operand,
+            _ => id,
+        };
+        match self.cell_spine(place)? {
+            (CellRoot::Boxed(binding), _) => Some(binding),
+            (CellRoot::View(_), _) => None,
+        }
+    }
+
+    /// The first touch of `binding` — with `writes_only`, the first write —
+    /// inside a closure that one of a call's arguments other than `index`
+    /// carries ([`Self::closure_touch`]).
+    fn carried_closure_touch(
+        &self,
+        argument_ids: &[Id],
+        index: usize,
+        binding: Id,
+        writes_only: bool,
+    ) -> Option<Id> {
+        argument_ids
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .find_map(|(_, carried)| {
+                self.closure_touch(*carried, binding, writes_only, &mut HashSet::new(), false)
+            })
+    }
+
+    /// The first place inside a closure carried by `id` that touches
+    /// `binding` — any read or write, or with `writes_only` a write alone
+    /// ([`Self::writes_binding_at`]) — for F102's refusal. `inside` is whether
+    /// the walk is already in a closure's body: outside one, only closure
+    /// literals and the closures `let`-bound names hold are entered, since an
+    /// argument's other reads are evaluated before the view is taken.
+    fn closure_touch(
+        &self,
+        id: Id,
+        binding: Id,
+        writes_only: bool,
+        visited: &mut HashSet<Id>,
+        inside: bool,
+    ) -> Option<Id> {
+        if !visited.insert(id) {
+            return None;
+        }
+        match self.program.entity_map.get(&id)? {
+            Expr::Closure(closure_id) => {
+                let body = self.program.closures.get(closure_id)?.return_;
+                return self.closure_touch(body, binding, writes_only, visited, true);
+            }
+            &Expr::Local(named) => {
+                if inside && named == binding && !writes_only {
+                    return Some(id);
+                }
+                // A `let` hands on what its initializer built: a closure, or
+                // a value holding closures (`Hook { run = || .. }`). The
+                // initializer itself ran before the call, so only the
+                // closures in it are entered.
+                let initial = self
+                    .program
+                    .variables
+                    .get(&named)
+                    .and_then(|variable| variable.initial)?;
+                return self.closure_touch(initial, binding, writes_only, visited, false);
+            }
+            Expr::Parameter(named) if inside && *named == binding && !writes_only => {
+                return Some(id);
+            }
+            &Expr::Variable(declared) if inside => {
+                let initial = self.program.variables.get(&declared)?.initial?;
+                return self.closure_touch(initial, binding, writes_only, visited, inside);
+            }
+            _ => {}
+        }
+        if inside && writes_only && self.writes_binding_at(id, binding) {
+            return Some(id);
+        }
+        self.children_of(id)
+            .into_iter()
+            .find_map(|child| self.closure_touch(child, binding, writes_only, visited, inside))
+    }
+
+    /// Whether the expression `id` itself WRITES a place rooted at `binding`:
+    /// an assignment to it, a `&mut` of it the source wrote, a `&mut`
+    /// argument (a `&mut self` receiver among them) or a mutating intrinsic's
+    /// receiver over it. A call whose conventions cannot be read is taken as
+    /// writing what it is handed, which can only refuse.
+    fn writes_binding_at(&self, id: Id, binding: Id) -> bool {
+        let rooted = |place: Id| {
+            let place = match self.program.entity_map.get(&place) {
+                Some(&Expr::Reference(operand, _)) => operand,
+                _ => place,
+            };
+            matches!(self.cell_spine(place), Some((CellRoot::Boxed(root), _)) if root == binding)
+        };
+        match self.program.entity_map.get(&id) {
+            Some(&Expr::Assignment(target, _)) => rooted(target),
+            Some(&Expr::Reference(operand, true)) => rooted(operand),
+            Some(Expr::Call(call_id)) => {
+                let Some(call) = self.program.function_calls.get(call_id) else {
+                    return false;
+                };
+                let target = match self.program.entity_map.get(&call.subject_id) {
+                    Some(Expr::Local(target)) => Some(*target),
+                    _ => None,
+                };
+                if let Some(intrinsic) =
+                    target.and_then(|target| self.program.intrinsics.get(&target))
+                {
+                    let mutating = mutates_its_receiver(*intrinsic)
+                        || matches!(
+                            intrinsic,
+                            Intrinsic::ListPush | Intrinsic::OptionTake | Intrinsic::OptionReplace
+                        );
+                    return mutating
+                        && call
+                            .argument_ids
+                            .first()
+                            .is_some_and(|receiver| rooted(*receiver));
+                }
+                let declared = target.and_then(|target| self.program.functions.get(&target));
+                call.argument_ids
+                    .iter()
+                    .enumerate()
+                    .any(|(index, argument)| {
+                        if !rooted(*argument) {
+                            return false;
+                        }
+                        let Some(function) = declared else {
+                            return true;
+                        };
+                        function
+                            .parameters
+                            .get(index)
+                            .and_then(|parameter| self.program.parameters.get(parameter))
+                            .is_none_or(|parameter| {
+                                self.receiving_form(parameter) == Receiving::RefMut
+                            })
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// F99: whether `id` is a call to a function whose return carries a
+    /// SHARED view in its payload (`Option<&T>`, `Arena::get`).
+    fn hands_back_a_shared_payload_view(&self, id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id) else {
+            return false;
+        };
+        let Some(call) = self.program.function_calls.get(call_id) else {
+            return false;
+        };
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id) else {
+            return false;
+        };
+        self.program
+            .functions
+            .get(target)
+            .is_some_and(|function| self.payload_view_of(function) == Some(false))
+    }
+
+    /// Whether a call to `target` may take its `&` arguments over boxed
+    /// bindings as cell VIEWS (F49): the borrow must end when the call
+    /// returns, so the callee hands back an owned value — no view, no
+    /// projection of one (`borrows`) — and answers it now, not as a future
+    /// that would carry the borrow past the call's block.
+    fn views_its_arguments(&self, target: Id, callee_bits: &[Id]) -> bool {
+        callee_bits.is_empty()
+            && !self.program.async_functions.contains(&target)
+            && !self.program.async_values.contains(&target)
+            && self.program.functions.get(&target).is_some_and(|function| {
+                !function.is_async
+                    && function.borrows.is_empty()
+                    && !function.returns_view
+                    && !function.returns_mut_view
+            })
+    }
+
+    /// Whether `id` (or the place a `&` the source wrote names) is a place
+    /// over a BOXED binding whose value is not `Copy` — what a `&` position
+    /// reads through the cell instead of copying out (F49). A `Copy` value
+    /// costs nothing to copy, and is left as it was.
+    fn is_a_cell_view_place(&self, id: Id) -> bool {
+        let place = match self.program.entity_map.get(&id) {
+            Some(&Expr::Reference(operand, false)) => operand,
+            _ => id,
+        };
+        !self.is_natively_copy(place) && self.boxed_place_root(place).is_some()
+    }
+
+    /// Whether the `&` argument at `index` is taken as a VIEW of its boxed
+    /// binding's cell (F49): it is a cell view place, and no other argument
+    /// carries a closure that WRITES the binding — that write would meet the
+    /// view's borrow, so the callee is handed a copy taken at the call, which
+    /// is what every `&` argument over a boxed binding was handed before.
+    fn takes_a_cell_view(&self, argument_ids: &[Id], index: usize, argument: Id) -> bool {
+        self.is_a_cell_view_place(argument)
+            && self.boxed_place_root(argument).is_some_and(|binding| {
+                self.carried_closure_touch(argument_ids, index, binding, true)
+                    .is_none()
+            })
     }
 
     /// The type a call's argument is rendered at: its parameter's declared
@@ -10277,6 +12083,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if rendered.ends_with(".clone()") {
             return rendered;
         }
+        // A read out of a cell — a spine through a `Shared` view or over a
+        // boxed binding, or the boxed binding itself — is a copy already
+        // (F62, F103); a second one copied it twice.
+        if self.reads_through_a_shared_view(id) || self.boxed_root(id).is_some() {
+            return rendered;
+        }
         let reads_a_place = match self.program.entity_map.get(&id) {
             Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => {
                 let binding = *binding;
@@ -10366,6 +12178,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => return None,
         };
         loop {
+            // F97: a field cannot leave a value whose type has a `Drop` impl
+            // (rustc E0509) — the value still owes its whole teardown.
+            if self
+                .type_of(current)
+                .and_then(|type_id| self.resolve(type_id))
+                .is_some_and(|resolved| {
+                    matches!(resolved, Type::Struct(struct_id, _) | Type::Enum(struct_id, _)
+                        if self.drop_nominals.contains_key(struct_id))
+                })
+            {
+                return None;
+            }
             match self.program.entity_map.get(&current)? {
                 Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => current = *subject,
                 Expr::Local(binding) | Expr::Parameter(binding) => {
@@ -10562,6 +12386,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ObjectTrait {
                 name: name.clone(),
                 slots: Vec::new(),
+                show: None,
             },
         );
         let mut members: Vec<&'src str> = self
@@ -10597,9 +12422,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         for slot in &slots {
             let _ = writeln!(out, "    {};", slot.signature);
         }
+        // S1b: the `dbg` printer of the value the object erased, in a program
+        // that prints one — the JS table's `$show`. Named clear of the slots,
+        // which are the vilan members' own names.
+        let show =
+            vilan_core::printer::tables_carry_show(self.program, self.dbg_policy).then(|| {
+                let mut show = "dbg_show".to_string();
+                while slots.iter().any(|slot| sanitize(&slot.member) == show) {
+                    show.push('_');
+                }
+                show
+            });
+        if let Some(show) = &show {
+            let _ = writeln!(out, "    fn {show}(&self) -> vilan_rt::show::Doc;");
+        }
         let _ = writeln!(out, "}}");
         self.types.insert(slot, out);
-        let object = ObjectTrait { name, slots };
+        let object = ObjectTrait { name, slots, show };
         self.object_traits.insert((trait_id, key), object.clone());
         Ok(object)
     }
@@ -10834,6 +12673,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = writeln!(out, "        {function_name}({})", forwarded.join(", "));
             let _ = writeln!(out, "    }}");
         }
+        if let Some(show) = &object.show {
+            let printer = self.native_printer_for(subject, span)?;
+            let _ = writeln!(
+                out,
+                "    fn {show}(&self) -> vilan_rt::show::Doc {{\n        {printer}(self)\n    }}"
+            );
+        }
         let _ = writeln!(out, "}}");
         let slot = self.next_type_slot;
         self.next_type_slot += 1;
@@ -10884,8 +12730,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         let receiver = self.expression(*receiver_id, depth)?;
         let mut prelude = String::new();
-        let mut rendered =
-            self.call_arguments(slot.declaration, argument_ids, depth, &mut prelude)?;
+        let saved_views = std::mem::replace(&mut self.no_cell_views, true);
+        let rendered = self.call_arguments(slot.declaration, argument_ids, depth, &mut prelude);
+        self.no_cell_views = saved_views;
+        let mut rendered = rendered?;
         if !rendered.is_empty() {
             rendered.remove(0);
         }
@@ -11281,7 +13129,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let self_traits = self.self_traits_of(default_id);
         let saved_traits = std::mem::replace(&mut self.current_self_traits, self_traits);
         let saved = std::mem::replace(&mut self.current_substitution, substitution);
-        let emitted = self.function_body(&function, function.name_span, false, &name);
+        let emitted = self
+            .function_body(&function, function.name_span, false, &name)
+            .map_err(|error| self.locate_refusal(error, function.id));
         self.current_substitution = saved;
         self.current_self_traits = saved_traits;
         self.current_self_type = saved_self;
@@ -11332,6 +13182,42 @@ impl<'a, 'src> Emitter<'a, 'src> {
             arguments.insert(0, receiver);
             let rendered = self.intrinsic(intrinsic, arguments, span)?;
             return Ok(format!("{{ {prelude}{rendered} }}"));
+        }
+        // F49/F103: a READING intrinsic over a place in a boxed binding —
+        // `log.lines.len()`, `seen.contains(x)` — reads it through a VIEW of
+        // the cell for the call ([`Self::cell_view_place`]) instead of copying
+        // the whole value out of it first. The other arguments are values,
+        // hoisted ahead of the view; none of these intrinsics runs user code.
+        if !mutating
+            && reads_its_receiver_in_place(intrinsic)
+            && argument_ids
+                .first()
+                .is_some_and(|receiver| self.is_a_cell_view_place(*receiver))
+        {
+            let mut prelude = String::new();
+            let mut view_borrows = String::new();
+            let mut views = 0;
+            let mut arguments = Vec::new();
+            let Some(receiver) = self.cell_view_place(
+                argument_ids[0],
+                depth,
+                &mut prelude,
+                &mut view_borrows,
+                &mut views,
+            )?
+            else {
+                return Err(unsupported("a cell view over no boxed binding", span));
+            };
+            arguments.push(receiver);
+            for (index, argument) in argument_ids.iter().enumerate().skip(1) {
+                let expecting = self.intrinsic_argument_expectation(intrinsic, index);
+                let value = self.value_of_expecting(*argument, expecting, depth)?;
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {value}; ");
+                arguments.push(name);
+            }
+            let rendered = self.intrinsic(intrinsic, arguments, span)?;
+            return Ok(format!("{{ {prelude}{view_borrows}{rendered} }}"));
         }
         // F42: the expectation in force here is the one for the intrinsic's
         // RESULT, and an argument is not its result. Rendered under it, the
@@ -11701,6 +13587,37 @@ fn mutates_its_receiver(intrinsic: Intrinsic) -> bool {
     )
 }
 
+/// The intrinsics that only READ their receiver, through a `&` (every arm
+/// renders it `&{receiver}` or as a `&self` method's) and answer an owned
+/// value, and take no closure: a receiver in a boxed binding is read through
+/// a view of its cell for the call rather than copied out whole (F49/F103).
+fn reads_its_receiver_in_place(intrinsic: Intrinsic) -> bool {
+    matches!(
+        intrinsic,
+        Intrinsic::StrLen
+            | Intrinsic::StrTrim
+            | Intrinsic::StrToLowercase
+            | Intrinsic::StrToUppercase
+            | Intrinsic::StrContains
+            | Intrinsic::StrStartsWith
+            | Intrinsic::StrEndsWith
+            | Intrinsic::StrReplace
+            | Intrinsic::StrRepeat
+            | Intrinsic::StrSplit
+            | Intrinsic::StrSubstring
+            | Intrinsic::ParseI32
+            | Intrinsic::ParseF64
+            | Intrinsic::ListLen
+            | Intrinsic::ListGet
+            | Intrinsic::SetContains
+            | Intrinsic::SetLen
+            | Intrinsic::MapGet
+            | Intrinsic::MapContainsKey
+            | Intrinsic::MapLen
+            | Intrinsic::CanonicalHash
+    )
+}
+
 /// How a parameter is received natively.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Receiving {
@@ -11978,7 +13895,12 @@ fn collect_pattern_bindings(pattern: &ExprPattern, out: &mut Vec<Id>) {
                 collect_pattern_bindings(element, out);
             }
         }
-        ExprPattern::Wildcard | ExprPattern::Literal(_) | ExprPattern::Array(_) => {}
+        ExprPattern::Array(elements) => {
+            for element in elements {
+                collect_pattern_bindings(element, out);
+            }
+        }
+        ExprPattern::Wildcard | ExprPattern::Literal(_) => {}
     }
 }
 
@@ -11988,6 +13910,28 @@ fn collect_pattern_bindings_into(pattern: &ExprPattern, out: &mut HashSet<Id>) {
     let mut bindings = Vec::new();
     collect_pattern_bindings(pattern, &mut bindings);
     out.extend(bindings);
+}
+
+/// One [`DropExtent`] resolved against a statement range — the transformer's
+/// `resolve_extent`: the exclusive index its last read sits at, `start` when
+/// nothing reads it, and `end` for an explicit scope end or a chain naming no
+/// statement of the range.
+fn resolve_extent(extent: &DropExtent, statements: &[Id], start: usize, end: usize) -> usize {
+    let start = start.min(end);
+    match extent {
+        DropExtent::ScopeEnd => end,
+        DropExtent::Declaration => start,
+        DropExtent::Statement(chain) => {
+            let region = &statements[start..end];
+            match chain
+                .iter()
+                .find_map(|holder| region.iter().position(|statement| statement == holder))
+            {
+                Some(offset) => start + offset + 1,
+                None => end,
+            }
+        }
+    }
 }
 
 fn collect_if_children(branch: &ExprIfBranch, children: &mut Vec<Id>) {
@@ -12014,9 +13958,6 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
         Expr::TryAssert(_) => "a `!` assertion",
         Expr::Lift(_, _, _) | Expr::LiftBinder | Expr::LiftRegion(_, _) => "a `?` lift",
         Expr::Destructure(_, _) => "a destructuring binding",
-        Expr::TupleComprehension(_, _) => "a tuple comprehension",
-        Expr::Repeat(_, _) => "a `[value; n]` literal",
-        Expr::ArrayLen(_, _) => "a fixed-array `len()`",
         Expr::Generic(_) => "a generic type reference",
         Expr::Macro => "a macro name",
         _ => "an unsupported form",

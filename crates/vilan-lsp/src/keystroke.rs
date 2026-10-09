@@ -951,6 +951,100 @@ impl EditTrail<'_> {
             EditTrail::Region(edit) => follow_edit(name, edit),
         }
     }
+
+    /// The edits of the trail, in application order.
+    fn edits(&self) -> &[EditDelta] {
+        match self {
+            EditTrail::Log(log) => log,
+            EditTrail::Region(edit) => std::slice::from_ref(edit),
+        }
+    }
+
+    /// E279: an ANALYZED-space span carried into the live text by E242's rule
+    /// (`publish::follow_span`) — an edit before it shifts it, an edit inside
+    /// it grows or truncates it, an edit after it leaves it, and an edit
+    /// across one of its ends drops it. The rule a published diagnostic
+    /// follows, so a reference, a definition or an outline entry moves with
+    /// its text exactly as the squiggle beside it does.
+    ///
+    /// A [`EditTrail::Region`] is not an edit but the hull of however many
+    /// there were, so "inside" means nothing about it: a span the region
+    /// touches is dropped ([`EditTrail::follow_untouched`]'s rule), since
+    /// keeping its start would ignore an edit before it within the hull.
+    pub fn follow_span(&self, span: Span) -> Option<Span> {
+        match self {
+            EditTrail::Log(log) => log.iter().try_fold(span, crate::publish::follow_span),
+            EditTrail::Region(_) => self.follow_untouched(span),
+        }
+    }
+
+    /// E279: an ANALYZED-space span carried into the live text only where no
+    /// edit touched its bytes — the rule for a span an EDIT is written into
+    /// (a quick fix). Growing it would overwrite what was typed inside it, so
+    /// an edit inside, across or onto a non-empty span drops it; an edit
+    /// wholly before shifts it and one wholly after leaves it. An empty span —
+    /// an insertion point — belongs to the text on BOTH its sides (`Insert ;`
+    /// follows the byte before it, an import precedes the item after it), so
+    /// any edit reaching the point, an insertion at it included, drops it.
+    pub fn follow_untouched(&self, span: Span) -> Option<Span> {
+        self.edits().iter().try_fold(span, |span, edit| {
+            let old_end = edit.start + edit.old_len;
+            if span.start == span.end && edit.start <= span.start && span.start <= old_end {
+                None
+            } else if old_end <= span.start {
+                Some(Span {
+                    start: span.start + edit.new_len - edit.old_len,
+                    end: span.end + edit.new_len - edit.old_len,
+                })
+            } else if edit.start >= span.end {
+                Some(span)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// E279: a LIVE span carried back into the analyzed text, widened rather
+    /// than refused — an end inside text typed since the analysis goes to the
+    /// edge of the bytes that text replaced. The inbound rule for a RANGE a
+    /// request asks about (a code action's), where the question is "which
+    /// analyzed findings does this overlap" and the typed text overlaps
+    /// whatever it replaced.
+    pub fn back_span(&self, span: Span) -> Span {
+        self.edits().iter().rev().fold(span, |span, edit| {
+            let new_end = edit.start + edit.new_len;
+            let back = |offset: usize, inside: usize| {
+                if offset <= edit.start {
+                    offset
+                } else if offset >= new_end {
+                    offset - edit.new_len + edit.old_len
+                } else {
+                    inside
+                }
+            };
+            let start = back(span.start, edit.start);
+            let end = back(span.end, edit.start + edit.old_len).max(start);
+            Span { start, end }
+        })
+    }
+
+    /// E279: a LIVE offset carried back into the analyzed text — the inbound
+    /// half, so a caret request names the byte the analysis saw under the
+    /// cursor. `None` when the offset lies strictly inside text typed since
+    /// the analysis: nothing analyzed stands there, and an answer about the
+    /// bytes it replaced would be about code that is gone.
+    pub fn back(&self, offset: usize) -> Option<usize> {
+        self.edits().iter().rev().try_fold(offset, |offset, edit| {
+            let new_end = edit.start + edit.new_len;
+            if offset <= edit.start {
+                Some(offset)
+            } else if offset >= new_end {
+                Some(offset - edit.new_len + edit.old_len)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// The single region `analyzed` and `live` differ in: their common byte
@@ -1193,6 +1287,94 @@ mod tests {
         assert_eq!(follow_edit(first, &replace(3, 7, 0)), None);
         // The point strictly inside replaced bytes: no image.
         assert_eq!(follow_edit(first, &replace(7, 4, 1)), None);
+    }
+
+    // --- E279: the trail in both directions, and the quick-fix rule ---------
+
+    #[test]
+    fn e279_a_live_offset_goes_back_through_each_edit() {
+        // Two bytes typed at 4, then three deleted at 10 (live after the first).
+        let log = [replace(4, 0, 2), replace(10, 3, 0)];
+        let trail = EditTrail::Log(&log);
+        // Before every edit: unchanged.
+        assert_eq!(trail.back(3), Some(3));
+        assert_eq!(trail.back(4), Some(4), "at the insertion's start");
+        // Inside the typed bytes: nothing analyzed stands there.
+        assert_eq!(trail.back(5), None);
+        // Past the insertion, before the deletion: back by two.
+        assert_eq!(trail.back(6), Some(4));
+        assert_eq!(trail.back(9), Some(7));
+        // At and past the deletion: back by two, then forward by three.
+        assert_eq!(trail.back(10), Some(8));
+        assert_eq!(trail.back(12), Some(13));
+    }
+
+    #[test]
+    fn e279_a_live_range_goes_back_widened_to_what_the_typed_text_replaced() {
+        // `ab` (4..6 analyzed) replaced by `xyz` (4..7 live).
+        let log = [replace(4, 2, 3)];
+        let trail = EditTrail::Log(&log);
+        assert_eq!(trail.back_span(name(0, 3)), name(0, 3));
+        assert_eq!(
+            trail.back_span(name(5, 6)),
+            name(4, 6),
+            "inside: the whole replaced pair"
+        );
+        assert_eq!(trail.back_span(name(2, 9)), name(2, 8));
+    }
+
+    #[test]
+    fn e279_a_fix_span_survives_only_edits_that_do_not_reach_it() {
+        let fix = name(10, 14);
+        let follow = |edit: EditDelta| EditTrail::Log(&[edit]).follow_untouched(fix);
+        assert_eq!(
+            follow(replace(0, 0, 3)),
+            Some(name(13, 17)),
+            "before: shifted"
+        );
+        assert_eq!(
+            follow(replace(8, 2, 0)),
+            Some(name(8, 12)),
+            "ending at its start"
+        );
+        assert_eq!(follow(replace(14, 0, 5)), Some(fix), "at its end: after it");
+        assert_eq!(follow(replace(20, 1, 1)), Some(fix), "after: unchanged");
+        assert_eq!(
+            follow(replace(11, 0, 1)),
+            None,
+            "typed inside: it would overwrite"
+        );
+        assert_eq!(follow(replace(9, 2, 0)), None, "across its start");
+        assert_eq!(follow(replace(13, 3, 0)), None, "across its end");
+        // An insertion point is touched from either side.
+        let point = name(10, 10);
+        let follow = |edit: EditDelta| EditTrail::Log(&[edit]).follow_untouched(point);
+        assert_eq!(follow(replace(10, 0, 1)), None, "typed at the point");
+        assert_eq!(
+            follow(replace(9, 1, 2)),
+            None,
+            "the byte before it replaced"
+        );
+        assert_eq!(follow(replace(10, 1, 0)), None, "the byte after it deleted");
+        assert_eq!(follow(replace(2, 1, 0)), Some(name(9, 9)));
+        assert_eq!(follow(replace(11, 1, 0)), Some(point));
+    }
+
+    #[test]
+    fn e279_a_region_is_a_hull_so_a_span_inside_it_is_dropped_not_grown() {
+        // Two edits far apart read as one region 4..20; a span between them
+        // has no exact image (its start moved by the first edit).
+        let region = EditTrail::Region(replace(4, 16, 18));
+        assert_eq!(region.follow_span(name(10, 12)), None);
+        // The same span through the LOG of a single edit inside it grows.
+        let log = [replace(11, 0, 2)];
+        assert_eq!(
+            EditTrail::Log(&log).follow_span(name(10, 12)),
+            Some(name(10, 14))
+        );
+        // Outside the region: exact.
+        assert_eq!(region.follow_span(name(0, 3)), Some(name(0, 3)));
+        assert_eq!(region.follow_span(name(22, 25)), Some(name(24, 27)));
     }
 
     #[test]

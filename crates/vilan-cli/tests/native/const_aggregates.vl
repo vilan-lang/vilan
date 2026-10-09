@@ -1,0 +1,88 @@
+// F98: a `const` value that is not plain data — a `Style`, a struct — was
+// refused natively by name; five corpus programs had it as their first wall
+// (css-block, preflight, style-when, style, theme). The const channel hands
+// the emitter the value in the JS backend's layout, and the declared type
+// reads it back: a struct is its fields, a tuple its flat slots, an enum its
+// variant and payload, std's `HashMap`/`HashSet` a table keyed by canonical
+// hashes. A `const` call of a `void` function is the unit, and a native run
+// writes the CSS sidecar a `const` style mints, as the JS run does.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::web::style::{ Color, Style, style };
+
+struct Inner {
+	label: str,
+	weights: List<f64>,
+}
+
+struct Config {
+	name: str,
+	count: i32,
+	inner: Inner,
+	pair: (i32, (str, bool)),
+	maybe: Option<str>,
+	nothing: Option<i32>,
+}
+
+enum Shape {
+	Dot,
+	Circle(f64),
+	Box(i32, i32),
+}
+
+fun build(): Config {
+	Config {
+		name = "cfg",
+		count = 3,
+		inner = Inner { label = "in", weights = [0.5, 1.5] },
+		pair = (7, ("seven", true)),
+		maybe = Some("here"),
+		nothing = None,
+	}
+}
+
+fun table(): HashMap<str, i32> {
+	mut map: HashMap<str, i32> = HashMap::new();
+	map.insert("a", 1);
+	map.insert("b", 2);
+	map
+}
+
+fun members(): HashSet<i32> {
+	mut set: HashSet<i32> = HashSet::new();
+	set.insert(4);
+	set.insert(2);
+	set
+}
+
+fun announce() {
+	print("never at run time");
+}
+
+let config: Config = const build();
+let shapes: List<Shape> = const [Shape::Dot, Shape::Circle(2.5), Shape::Box(3, 4)];
+let counts: HashMap<str, i32> = const table();
+let set: HashSet<i32> = const members();
+let muted: Style = const style().color(Color::gray(400));
+
+fun main() {
+	let _nothing = const announce();
+	print(i"{config.name} {config.count} {config.inner.label} {config.inner.weights.len()}");
+	print(i"{config.pair.0} {config.pair.1.0} {config.pair.1.1}");
+	print(config.maybe.unwrap_or("none"));
+	print(config.nothing.unwrap_or(-1));
+	for shape in shapes {
+		match shape {
+			Shape::Dot => print("dot"),
+			Shape::Circle(let radius) => print(i"circle {radius}"),
+			Shape::Box(let width, let height) => print(i"box {width}x{height}"),
+		}
+	}
+	print(counts.get("b").unwrap_or(0));
+	print(set.contains(4));
+	for member in set {
+		print(member);
+	}
+	print(muted.class_list());
+}

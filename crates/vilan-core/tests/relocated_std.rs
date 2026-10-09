@@ -97,7 +97,11 @@ const DERIVING: &str = "[derive(PartialEq)]\nstruct Point { x: i32, y: i32 }\n\n
 /// Analyzes [`DERIVING`] against `std` and returns every diagnostic, in the
 /// order the compiler prints them.
 fn errors_against(std: &PackageSpec) -> Vec<vilan_core::error::Error> {
-    let leaked: &'static str = Box::leak(DERIVING.to_string().into_boxed_str());
+    errors_of(DERIVING, std)
+}
+
+fn errors_of(source: &str, std: &PackageSpec) -> Vec<vilan_core::error::Error> {
+    let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
     let (_program, errors) = analyze_source(
         leaked,
         std,
@@ -250,6 +254,41 @@ fn the_split_toolchain_refusal_is_one_sentence_and_it_leads() {
         (anchor.start, anchor.end),
         (0, 0),
         "the refusal points at the entry, not at a `macro fun` in std"
+    );
+}
+
+/// N147: the same refusal leads a program that derives NOTHING itself. Over a
+/// split toolchain std's OWN derives produce nothing either — `Instant` and
+/// `Duration` lose their derived `PartialEq` — and the conformance errors that
+/// follow (`'Instant' does not implement trait 'PartialOrd': missing 'eq'`,
+/// noted into std's `compare.vl`) printed AHEAD of the refusal, so the reader
+/// met two errors in a file they did not write before the sentence that names
+/// the mistake.
+const COMPARING: &str =
+    "import std::time::Instant;\n\nfun main() {\n\tprint(Instant::now() < Instant::now());\n}\n";
+
+#[test]
+fn n147_the_split_toolchain_refusal_leads_a_program_that_derives_nothing() {
+    let root = scratch("n147");
+    let std_dir = root.join("std");
+    stage_tree(&toolchain_root().join("std"), &std_dir);
+    assert!(
+        !root.join("macro_std").exists(),
+        "the copy's root holds no macro_std"
+    );
+
+    let std = vilan_core::manifest::resolve_std(&std_dir);
+    let errors = errors_of(COMPARING, &std);
+    let messages: Vec<String> = errors.iter().map(|error| error.msg.clone()).collect();
+    let _ = std::fs::remove_dir_all(&root);
+
+    let (first, count) = split_refusal(&messages);
+    assert_eq!(count, 1, "one sentence: {messages:#?}");
+    assert_eq!(
+        first,
+        Some(0),
+        "the refusal leads, ahead of the conformance errors std's unexpanded derives \
+         cause: {messages:#?}"
     );
 }
 

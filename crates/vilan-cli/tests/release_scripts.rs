@@ -1363,6 +1363,87 @@ fn the_release_commit_stages_every_workspace_members_manifest() {
     );
 }
 
+/// N152: the cut's awk programs run under EVERY awk the release tooling may
+/// meet, and the one construct that split them is a regex interval: mawk
+/// 1.3.4 20200120 (Ubuntu 22.04, the self-hosted runner's image) reads `{3,}`
+/// as literal text, so `/^-{3,}[ \t]*$/` never matched a `---` rule, the rule
+/// stayed inside the entry above it, and the rewrite doubled every separator.
+/// The pins above run under whichever awk this machine has; this one reads
+/// the script and refuses an interval anywhere but a `grep -E` line, so a
+/// newer awk on the developer's box cannot hide one again.
+#[test]
+fn the_cuts_awk_programs_use_no_regex_interval() {
+    let script = fs::read_to_string(repository_root().join("scripts").join("cut-release.sh"))
+        .expect("read scripts/cut-release.sh");
+    let interval_at = |line: &str| -> Option<usize> {
+        let bytes = line.as_bytes();
+        (0..bytes.len()).find(|&start| {
+            if bytes[start] != b'{' || (start > 0 && bytes[start - 1] == b'$') {
+                return false;
+            }
+            let rest = &line[start + 1..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 {
+                return false;
+            }
+            let tail = rest[digits..].trim_start_matches(|c: char| c == ',' || c.is_ascii_digit());
+            tail.starts_with('}')
+        })
+    };
+    let offenders: Vec<String> = script
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with('#') && !line.contains("grep -E"))
+        .filter(|(_, line)| interval_at(line).is_some())
+        .map(|(number, line)| format!("{}: {line}", number + 1))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "a regex interval in cut-release.sh outside `grep -E` - mawk 1.3.4 20200120 reads it as \
+         literal text (N152); spell the repetition out (`---+` for `-{{3,}}`):\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// N152: an applying cut over a performance verdict runs perf_gate.py, which
+/// needs Python 3.11+ — and an older one is refused with the other reds,
+/// BEFORE anything changes. The apply step used to call it after the version
+/// bump (and to skip it silently when `python3` was missing), so a stale
+/// Python left a cut half-applied.
+#[test]
+fn an_applying_cut_refuses_a_python_older_than_3_11_before_changing_anything() {
+    let fixture = Fixture::new("old-python", SCRAMBLED);
+    fs::write(
+        fixture.root.join("scripts/perf_gate.py"),
+        "raise SystemExit(1)\n",
+    )
+    .expect("write the perf_gate stand-in");
+    write_shim(
+        &fixture.bin.join("python3"),
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Python 3.10.12'; exit 0; fi\nexit 1\n",
+    );
+    let before = fixture.read("CHANGELOG.md");
+    let (ok, report) = fixture.script("cut-release.sh", &["--date", "2026-01-02", "9.9.9"]);
+    assert!(!ok, "the cut applied under Python 3.10:\n{report}");
+    assert!(
+        report.contains("Python 3.10.12 is older than 3.11"),
+        "the refusal names the Python it found and the floor:\n{report}"
+    );
+    assert!(report.contains("refusing to cut"), "{report}");
+    assert_eq!(
+        fixture.read("CHANGELOG.md"),
+        before,
+        "nothing changed before the refusal"
+    );
+    // A dry run renders nothing, so it needs no Python and says nothing of it.
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &["--date", "2026-01-02", "--dry-run", "9.9.9"],
+    );
+    assert!(ok, "a dry run needs no Python:\n{report}");
+    assert!(!report.contains("tools (N152)"), "{report}");
+}
+
 /// N146: the cut runs the hygiene pin's home-path check on what it WROTE
 /// before anything is staged — the v0.44.0 cut wrote two machine paths into
 /// tracked files and they were removed by hand. The pin runs the script's own

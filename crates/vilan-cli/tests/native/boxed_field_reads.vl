@@ -1,0 +1,72 @@
+// F103: a FIELD read on a BOXED binding (a `mut` local a closure captures,
+// spec §6.9) copied the WHOLE value first — `log.lines.len()` emitted
+// `log.get().lines.len()`, cloning every list in `log` to read one of them,
+// and std's `write_at` paid six whole-`StoreWoken` copies per `Store` write.
+// Each shape reads through the cell's scoped borrow now: a field, a nested
+// field, a tuple slot, a subscript (its index settled first, reading the
+// same cell), a pattern over a field, a `for` over one, a field handed on by
+// value, and a read beside a write of the same binding in one statement.
+import std::io::print;
+
+struct Inner {
+	label: str,
+	tags: List<str>,
+}
+
+struct Log {
+	lines: List<str>,
+	count: i32,
+	inner: Inner,
+	pair: (i32, List<i32>),
+	last: Option<str>,
+}
+
+fun total(lines: List<str>): usize {
+	lines.len()
+}
+
+fun main() {
+	mut log = Log {
+		lines = ["a", "b"],
+		count = 2,
+		inner = Inner { label = "in", tags = ["t"] },
+		pair = (7, [1, 2, 3]),
+		last = None,
+	};
+	let add = |line: str| {
+		log.lines.push(line);
+		log.count += 1;
+		log.last = Some(line);
+	};
+	add("c");
+	print(log.lines.len());
+	print(log.count);
+	print(log.inner.label);
+	print(log.inner.tags.len());
+	print(log.pair.0);
+	print(log.pair.1.len());
+	print(log.lines[log.lines.len() - 1]);
+	print(log.pair.1[0]);
+	match log.last {
+		Some(let line) => print(i"last {line}"),
+		None => print("none"),
+	}
+	if log.last is Some(let line) {
+		print(line);
+	}
+	for line in log.lines {
+		print(line);
+	}
+	print(total(log.lines));
+	let kept = log.lines;
+	print(kept.len());
+	log.count = log.count + log.lines.len().as_i32();
+	print(log.count);
+	let whole = log;
+	print(whole.count);
+	mut xs = [10, 20, 30];
+	let grow = || xs.push(40);
+	grow();
+	print(xs[xs.len() - 1]);
+	print(xs.len());
+}

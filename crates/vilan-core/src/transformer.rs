@@ -1459,7 +1459,7 @@ fn helper_source(name: &str) -> &'static str {
         // The array IS the struct's runtime form — a struct is an array in
         // FIELD ORDER — so this builds a `DomRect` the same way `__parse_i32`
         // builds an `Option`. Its order is `left, top, width, height`, and
-        // `DomRect`'s field order in `vilan/std/src/browser/web/dom.vl` must match;
+        // `DomRect`'s field order in `vilan/std/src/web/dom.vl` must match;
         // `ui_rows.rs`'s `a59_bounding_rect_reads_the_host_box` asserts the
         // four values by name, so a reorder is a red test rather than silence.
         "__dom_bounding_rect" => {
@@ -1892,11 +1892,13 @@ fn helper_source(name: &str) -> &'static str {
         // `dbg(..)`'s runtime (debugging.md S1): the layout and the scalar
         // spellings every generated `__show_*` printer builds on, written to
         // agree byte for byte with `vilan_rt::show`. A document is a string or
-        // a group `{ o, c, p, e }`: open text, close text, whether the entries
-        // are padded by a space (`Point { x = 1 }` against `[1, 2]`), and
-        // `[label, document]` entries. It lays out on one line when that fits
-        // 80 columns from where it starts, else one entry per line, two spaces
-        // deeper, each with a trailing comma (Q1). Widths count characters.
+        // a group `{ o, c, p, e, f }`: open text, close text, whether the
+        // entries are padded by a space (`Point { x = 1 }` against `[1, 2]`),
+        // `[label, document]` entries, and whether a broken group FILLS its
+        // lines (a list or set of scalars, E277). It lays out on one line when
+        // that fits 80 columns from where it starts, else one entry per line
+        // (or as many as fit, filled), two spaces deeper, each with a trailing
+        // comma (Q1). Widths count characters.
         "__dbg" => {
             "function __dbg(write, location, entries) {\n\
              \tif (entries.length === 0) {\n\
@@ -1916,15 +1918,15 @@ fn helper_source(name: &str) -> &'static str {
              \t__dbg(write, location, values.map((value, index) => [ texts[index], shows[index](value) ]));\n\
              \treturn spread ? values.flatMap((value, index) => spread[index] ? value : [ value ]) : values;\n\
              }\n\
-             function __dbg_group(open, close, padded, entries) {\n\
-             \treturn { o: open, c: close, p: padded, e: entries };\n\
+             function __dbg_group(open, close, padded, entries, fill) {\n\
+             \treturn { o: open, c: close, p: padded, e: entries, f: fill === true };\n\
              }\n\
-             function __dbg_list(items, show) {\n\
+             function __dbg_list(items, show, fill) {\n\
              \tconst entries = [];\n\
              \tconst shown = Math.min(items.length, 100);\n\
              \tfor (let index = 0; index < shown; index++) entries.push([ \"\", show(items[index]) ]);\n\
              \tif (items.length > shown) entries.push([ \"\", \"\u{2026} \" + (items.length - shown) + \" more\" ]);\n\
-             \treturn __dbg_group(\"[\", \"]\", false, entries);\n\
+             \treturn __dbg_group(\"[\", \"]\", false, entries, fill);\n\
              }\n\
              const __dbg_seen = [];\n\
              function __dbg_shared(cell, show) {\n\
@@ -1936,7 +1938,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\t__dbg_seen.pop();\n\
              \t}\n\
              }\n\
-             function __dbg_members(open, items, show) {\n\
+             function __dbg_members(open, items, show, fill) {\n\
              \tconst entries = [];\n\
              \tfor (const item of items) {\n\
              \t\tif (entries.length === 100) {\n\
@@ -1945,7 +1947,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\t}\n\
              \t\tentries.push(show(item));\n\
              \t}\n\
-             \treturn __dbg_group(open, \"}\", true, entries);\n\
+             \treturn __dbg_group(open, \"}\", true, entries, fill);\n\
              }\n\
              function __dbg_map(open, table, showKey, showValue, keyWidth, valueWidth) {\n\
              \tconst items = Array.from(table.values());\n\
@@ -1955,8 +1957,8 @@ fn helper_source(name: &str) -> &'static str {
              \t\treturn [ __dbg_flat(showKey(key)) + \" => \", showValue(value) ];\n\
              \t});\n\
              }\n\
-             function __dbg_set(open, table, show) {\n\
-             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ]);\n\
+             function __dbg_set(open, table, show, fill) {\n\
+             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ], fill);\n\
              }\n\
              function __dbg_str(text) {\n\
              \tlet out = \"\\\"\";\n\
@@ -1972,6 +1974,7 @@ fn helper_source(name: &str) -> &'static str {
              \treturn out + \"\\\"\";\n\
              }\n\
              function __dbg_float(value) {\n\
+             \tif (Object.is(value, -0)) return \"-0.0\";\n\
              \tconst text = String(value);\n\
              \treturn Number.isInteger(value) && !text.includes(\"e\") ? text + \".0\" : text;\n\
              }\n\
@@ -1991,6 +1994,18 @@ fn helper_source(name: &str) -> &'static str {
              \tif (typeof document === \"string\" || document.e.length === 0 || column + __dbg_width(flat) <= 80) return flat;\n\
              \tconst pad = \" \".repeat(indent + 2);\n\
              \tlet out = document.o + \"\\n\";\n\
+             \tif (document.f) {\n\
+             \t\tlet line = \"\";\n\
+             \t\tfor (const entry of document.e) {\n\
+             \t\t\tconst text = entry[0] + __dbg_flat(entry[1]) + \",\";\n\
+             \t\t\tif (line === \"\") line = pad + text;\n\
+             \t\t\telse if (__dbg_width(line) + 1 + __dbg_width(text) > 80) {\n\
+             \t\t\t\tout += line + \"\\n\";\n\
+             \t\t\t\tline = pad + text;\n\
+             \t\t\t} else line += \" \" + text;\n\
+             \t\t}\n\
+             \t\treturn out + line + \"\\n\" + \" \".repeat(indent) + document.c;\n\
+             \t}\n\
              \tfor (const entry of document.e) out += pad + entry[0] + __dbg_layout(entry[1], __dbg_width(pad + entry[0]), indent + 2) + \",\\n\";\n\
              \treturn out + \" \".repeat(indent) + document.c;\n\
              }"
@@ -5258,6 +5273,14 @@ impl<'src> Transformer<'src> {
     /// own conversion, `String(x)` — the one an i-string and the native
     /// backend use — so negative zero prints `0`, where `console.log`'s
     /// inspect wrote `-0`. Every other `print` is untouched.
+    ///
+    /// N149: the analyzer's recording is STATIC, so it cannot see a generic
+    /// body's `print(value)` with `value: T` at a number. The argument's
+    /// type is therefore also read under the ACTIVE substitution: the
+    /// instance where `T` is a number is wrapped and the one where it is a
+    /// string is not — two bodies, which instance emission already keeps
+    /// apart. (The recording stays: the emitter's own type table does not
+    /// cover every argument expression the analyzer typed.)
     fn number_print_arguments(
         &self,
         target_id: Id,
@@ -5265,9 +5288,10 @@ impl<'src> Transformer<'src> {
         args: Vec<js::Node<'src>>,
     ) -> Vec<js::Node<'src>> {
         if target_id != self.print_fn_id
-            || !argument_ids
-                .first()
-                .is_some_and(|argument| self.program.number_print_arguments.contains(argument))
+            || !argument_ids.first().is_some_and(|argument| {
+                self.program.number_print_arguments.contains(argument)
+                    || self.prints_a_number(*argument)
+            })
         {
             return args;
         }
@@ -5881,8 +5905,16 @@ impl<'src> Transformer<'src> {
                     // DEFAULTS share a name both resolve to whichever the
                     // by-name lookup reaches first.
                     let preferred = self.program.bound_dispatch_traits.get(id).cloned();
+                    // B566: the call's own-generic values cross to the
+                    // default it lands on, as on the bounded route above.
+                    let own_values = self
+                        .program
+                        .own_generic_call_bindings
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_default();
                     if let Some(dispatch) =
-                        self.resolve_dispatch_with(type_id, member_name, &[], preferred)
+                        self.resolve_dispatch_with(type_id, member_name, &own_values, preferred)
                     {
                         return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                     }
@@ -10929,7 +10961,7 @@ impl<'src> Transformer<'src> {
             {
                 let is_async = self.program.async_functions.contains(&default_id);
                 return Some(Dispatch::Call(
-                    self.emit_default_instance(default_id, type_id),
+                    self.emit_default_instance(default_id, type_id, own_generic_values),
                     is_async,
                 ));
             }
@@ -10952,7 +10984,7 @@ impl<'src> Transformer<'src> {
         )?;
         let is_async = self.program.async_functions.contains(&default_id);
         Some(Dispatch::Call(
-            self.emit_default_instance(default_id, type_id),
+            self.emit_default_instance(default_id, type_id, own_generic_values),
             is_async,
         ))
     }
@@ -11188,6 +11220,12 @@ impl<'src> Transformer<'src> {
                 }
             };
             entries.push((member_name.to_string(), slot));
+        }
+        // S1b: in a program that prints a `dbg`, the table also carries the
+        // value's printer, so a `dyn` prints what it holds. `$show` cannot
+        // collide with a member: no vilan name starts with `$`.
+        if let Some(show) = self.object_show_slot(type_id) {
+            entries.push(("$show".to_string(), show));
         }
         // M89: a table whose every slot names a function is a function of its
         // slot set, so a second pair answering every member with the same
@@ -11428,8 +11466,40 @@ impl<'src> Transformer<'src> {
     /// generic parameters to the arguments this type implements it at (B58) —
     /// so a `T`-typed value's bound-member call grounds the same way it does
     /// in a generic function's body.
-    fn emit_default_instance(&mut self, default_id: Id, type_id: TypeId) -> String {
-        let key = (default_id, self.type_key(type_id));
+    ///
+    /// B566: a default with generic parameters of its OWN (`fun shown<S:
+    /// Show>(self, item: S)`) is one instance per binding of them as well as
+    /// per receiver type — `own_generic_values` is the call's binding of them
+    /// in declaration order (positional, as every re-dispatch carries them;
+    /// the native emitter's F34 rule). Keyed by the type alone, the default
+    /// ran with `S` unbound, so its `item.show()` reached `Show`'s body-less
+    /// requirement: the never-silent internal error, from a program the
+    /// inherent spelling of the same member built.
+    fn emit_default_instance(
+        &mut self,
+        default_id: Id,
+        type_id: TypeId,
+        own_generic_values: &[TypeId],
+    ) -> String {
+        let own_entries: Vec<(TypeId, TypeId)> = self
+            .program
+            .functions
+            .get(&default_id)
+            .map(|function| {
+                function
+                    .generic_parameter_constraint_ids
+                    .iter()
+                    .copied()
+                    .zip(own_generic_values.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut key_text = self.type_key(type_id);
+        for (_, value) in &own_entries {
+            key_text.push('|');
+            key_text.push_str(&self.type_key(*value));
+        }
+        let key = (default_id, key_text);
         if let Some(name) = self.default_instances.get(&key) {
             let name = name.clone();
             self.record_hit(|recorder| recorder.defaults.get(&key).copied());
@@ -11462,6 +11532,13 @@ impl<'src> Transformer<'src> {
             }
             let mut mentioned = Vec::new();
             crate::mono::collect_type_generics(self.program, type_id, 0, &mut mentioned);
+            // B566: the default's own generics, resolved the same way — a
+            // value written in the CALLER's binders (`Option<U>`) keeps
+            // those binders' bindings beside it.
+            for (constraint_id, value) in &own_entries {
+                substitution.insert(*constraint_id, self.resolve_type_id(*value));
+                crate::mono::collect_type_generics(self.program, *value, 0, &mut mentioned);
+            }
             for generic in mentioned {
                 if !substitution.contains_key(&generic)
                     && let Some(bound) = self.current_substitution.get(&generic).copied()

@@ -10,6 +10,8 @@
 // reached only behind an `hmr_active()` guard, so a shim-less build never evaluates
 // one.
 
+[platform("browser")] mod self;
+
 import pkg::option::Option::{ self, None, Some };
 
 /// True only while a dev shim is present — i.e. inside a `run --watch` browser

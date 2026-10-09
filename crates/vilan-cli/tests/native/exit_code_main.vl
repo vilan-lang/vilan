@@ -1,0 +1,17 @@
+// A `main` that answers its EXIT CODE (`fun main(): i32`) emitted a body
+// whose tail was followed by the event loop's turn, which rustc refused
+// ("expected `;`"). The JS backend writes `process.exit(main())`: the code
+// is the process's, and no microtask the body left runs after it.
+import std::io::print;
+
+fun answer(base: i32): i32 {
+	base * 3
+}
+
+fun main(): i32 {
+	print("body");
+	if answer(2) > 5 {
+		print("big");
+	}
+	answer(2) + 1
+}

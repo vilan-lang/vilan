@@ -72,9 +72,10 @@ fn std_dir() -> PathBuf {
     repo_root().join("vilan/std")
 }
 
-/// The assets a build produced, split into the stylesheet(s) and everything
-/// else. Each is the concatenation of the files, keyed by name and sorted, so a
-/// project emitting several bundles compares as one string.
+/// The assets a build produced: everything else (the JavaScript bundles), then
+/// the stylesheet(s) — `.0` and `.1`, in [`sorted_assets`]'s order. Each is the
+/// concatenation of the files, keyed by name and sorted, so a project emitting
+/// several bundles compares as one string.
 type Assets = (String, String);
 
 /// Reads every EMITTED asset under `dir` (recursively) into `css` (stylesheets)
@@ -350,12 +351,34 @@ fn build_both_ways(relative: &str) -> Twins {
     Twins { written, sorted }
 }
 
+/// [`build_both_ways`] for every [`STYLE_SOURCES`] fixture, the fixtures built
+/// CONCURRENTLY and answered in the list's order (N151 door (c)). Each fixture
+/// builds in its own scratch copy through its own `vilan` processes, so nothing
+/// is shared between them; built one after another, the sixteen builds made
+/// each of the two tests below a 220 s straggler under load on 72 s of CPU. A
+/// build failure still panics with the fixture's own message.
+fn every_fixture_built_both_ways() -> Vec<(&'static str, Twins)> {
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = STYLE_SOURCES
+            .iter()
+            .map(|relative| scope.spawn(move || (*relative, build_both_ways(relative))))
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
 /// The headline invariant. Sorting a chain cannot change one byte of the
 /// stylesheet it renders.
 #[test]
 fn sorting_a_style_chain_leaves_the_emitted_css_byte_identical() {
-    for relative in STYLE_SOURCES {
-        let twins = build_both_ways(relative);
+    for (relative, twins) in every_fixture_built_both_ways() {
         assert_eq!(
             twins.written.1, twins.sorted.1,
             "{relative}: the canonical order changed the emitted CSS. Class names are content \
@@ -370,8 +393,7 @@ fn sorting_a_style_chain_leaves_the_emitted_css_byte_identical() {
 /// attribute, which CSS reads as a set — may differ.
 #[test]
 fn sorting_a_style_chain_resolves_the_same_slots() {
-    for relative in STYLE_SOURCES {
-        let twins = build_both_ways(relative);
+    for (relative, twins) in every_fixture_built_both_ways() {
         let written = sort_map_entries(&twins.written.0);
         let sorted = sort_map_entries(&twins.sorted.0);
         assert_eq!(

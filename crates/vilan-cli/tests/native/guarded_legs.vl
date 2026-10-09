@@ -1,0 +1,81 @@
+// F93: a GUARDED `match` leg (`let x if x <= 2 => ..`) was refused natively
+// by name — the first wall of match-patterns.vl and capture-clones.vl. A
+// leg's guard is Rust's guard: a capture is read through a borrow of the
+// subject inside it, and moved only once the guard accepts, so a rejecting
+// guard leaves the subject whole for the next leg. Beside it, a `str`-backed
+// variant NESTED in a payload or a tuple (match-patterns.vl's next wall) is
+// a guard over a binder, as a nested string literal is. The shapes: a
+// binding, a variant and a tuple under guards, a guard reading outer state,
+// a guarded wildcard (not a catch-all), a string capture compared in a
+// guard, and both nested-literal forms combined with a guard.
+import std::io::print;
+
+enum Signal {
+	Finished,
+	Value(i32),
+	Named(str, i32),
+}
+
+enum Align {
+	Start = "start",
+	End = "end",
+}
+
+enum Wrapped {
+	Of(Align),
+}
+
+fun size(n: i32): str {
+	match n {
+		let x if x <= 2 => "small",
+		let x if x <= 10 => i"medium {x}",
+		_ => "large",
+	}
+}
+
+fun describe(signal: Signal, count: i32): str {
+	match signal {
+		Signal::Finished if count > 0 => i"finished after {count}",
+		Signal::Finished => "finished early",
+		Signal::Value(let v) if v < 0 => "negative",
+		Signal::Value(let v) => i"value {v}",
+		Signal::Named(let name, _) if name == "skip" => "skipped",
+		Signal::Named(let name, let v) => i"{name}={v}",
+	}
+}
+
+fun place(pair: (str, i32)): str {
+	match pair {
+		(let label, let n) if label.len() > 3 && n > 0 => i"long {label}",
+		("x", _) => "an x",
+		_ if pair.1 < 0 => "negative pair",
+		_ => "other pair",
+	}
+}
+
+fun aligned(value: Wrapped, strict: bool): str {
+	match value {
+		Wrapped::Of(Align::Start) if strict => "start, strictly",
+		Wrapped::Of(Align::Start) => "start",
+		Wrapped::Of(Align::End) => "end",
+	}
+}
+
+fun main() {
+	print(size(1));
+	print(size(5));
+	print(size(50));
+	print(describe(Signal::Finished, 3));
+	print(describe(Signal::Finished, 0));
+	print(describe(Signal::Value(-4), 0));
+	print(describe(Signal::Value(4), 0));
+	print(describe(Signal::Named("skip", 1), 0));
+	print(describe(Signal::Named("keep", 2), 0));
+	print(place(("label", 1)));
+	print(place(("x", 1)));
+	print(place(("ab", -1)));
+	print(place(("ab", 1)));
+	print(aligned(Wrapped::Of(Align::Start), true));
+	print(aligned(Wrapped::Of(Align::Start), false));
+	print(aligned(Wrapped::Of(Align::End), true));
+}

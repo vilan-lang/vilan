@@ -450,7 +450,7 @@ write the boilerplate:
 | Derive | Gives you |
 |---|---|
 | `PartialEq` | structural `==` |
-| `Debug` | `.debug()`: a developer-facing rendering (to just look at a value, `dbg(value)` needs no derive) |
+| `Debug` | `.debug()`: a developer-facing rendering, the one `dbg` prints (to just look at a value, `dbg(value)` needs no derive) |
 | `Default` | `Default::default()` built from the fields' defaults |
 | `Hashable` | usability as a `HashMap` key or `HashSet` member (`std::hash`) — a backed enum already has it |
 | `Json` | JSON encode/decode (`std::json`) |

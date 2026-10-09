@@ -37,14 +37,20 @@ fun main() {
   through, as it would into any function, and a list or struct comes back as a
   copy.
 - **The format is vilan's.** A struct prints its fields, an enum variant its
-  qualified name (`Some`, `None`, `Ok` and `Err` bare), a float keeps its `.0`,
-  a string is quoted and escaped, a closure prints its type
-  (`<closure |i32| -> i32>`). std's handles print as themselves: `HashMap {
+  qualified name (`Some`, `None`, `Ok` and `Err` bare), a float keeps its `.0`
+  (and negative zero shows as `-0.0`, where `print` writes `0`), a string is quoted and escaped, a closure prints its type
+  (`<closure |i32| i32>`). std's handles print as themselves: `HashMap {
   "ada" => 36 }`, `HashSet { 1, 2 }`, `Shared(..)`, `SignalCell(3)` (read
-  without subscribing), a pipe by its type (sampling it would run it), and a
+  without subscribing), a `dyn` value as `dyn Area(Square { side = 2 })`, a
+  pipe by its type (sampling it would run it), and a
   cycle through a `Shared` as `<cycle>`. A value that fits in 80 columns stays on one line;
   a longer one breaks one entry per line, two spaces deeper, with a trailing
-  comma. A list shows its first 100 entries and then `… N more`.
+  comma — except a list or set of numbers, strings or other scalars, which
+  fills each line to the 80 columns. A list shows its first 100 entries and
+  then `… N more`.
+- **Your own `Debug` impl decides.** A type with a `Debug` impl you wrote
+  prints through it, wherever the value sits; a `[derive(Debug)]` spells
+  exactly what `dbg` prints (`Shape::Circle(1.0)`), so it changes nothing.
 - **Generic code prints the real type.** In `fun show<T>(value: T)`, `dbg(value)`
   prints a `Point` as a `Point` and an `i32` as an `i32`.
 - **Both backends print the same bytes**, to stderr (`console.log` in the

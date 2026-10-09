@@ -357,7 +357,7 @@ fn none_platform_rejects_reaching_platform_std() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("requires the `process` layer of `std`")),
+            .any(|error| error.contains("requires the `@process` platform its file declares")),
         "expected a platform-coloring violation, got: {errors:#?}"
     );
 }
@@ -674,14 +674,15 @@ fn cross_platform_std_import_does_not_cascade() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("`read_file_to_str` requires the `process` layer of `std`")),
+            .any(|e| e
+                .contains("`read_file_to_str` requires the `@process` platform its file declares")),
         "missing the fs boundary violation: {errors:#?}"
     );
     assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("requires the `process` layer of `std`")
-                && e.contains("main → builder")),
+        errors.iter().any(
+            |e| e.contains("requires the `@process` platform its file declares")
+                && e.contains("main → builder")
+        ),
         "missing the http boundary violation: {errors:#?}"
     );
     assert!(
@@ -698,7 +699,10 @@ fn cross_platform_diagnostic_is_spanned() {
     let errors = analyze_package_raw(&[("main.vl", entry)], "main.vl", Platform::Browser);
     let http = errors
         .iter()
-        .find(|e| e.msg.contains("requires the `process` layer of `std`"))
+        .find(|e| {
+            e.msg
+                .contains("requires the `@process` platform its file declares")
+        })
         .expect("a platform-coloring violation");
     let range = http.span.into_range();
     assert!(
@@ -1003,8 +1007,8 @@ fn browser_layer_std_is_cross_platform_for_deno() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("requires the `browser` layer of `std`")),
-        "reaching the browser layer should violate for deno: {errors:#?}"
+            .any(|e| e.contains("requires the `browser` platform its file declares")),
+        "reaching the browser module should violate for deno: {errors:#?}"
     );
 }
 
@@ -1209,6 +1213,43 @@ fn contract_flags_process_module_reaching_into_the_browser_layer() {
             .iter()
             .any(|m| m.contains("service") && m.contains("widget")),
         "expected a violation for the process→browser import, got: {violations:#?}"
+    );
+}
+
+/// F28: a base file that DECLARES its platform (`[platform("@process")] mod
+/// self;`) promises that platform, exactly as the layer directory it replaces
+/// did — so it may import a process-layer module, and importing a
+/// browser-layer one is still the violation.
+#[test]
+fn f28_contract_holds_a_declared_base_file_to_its_own_platform() {
+    let clean = contract_violations(
+        &[
+            ("lib.vl", ""),
+            (
+                "service.vl",
+                "[platform(\"@process\")] mod self;\n\nimport pkg::feature::feature;\nfun service(): i32 { feature() }\n",
+            ),
+        ],
+        &[("feature.vl", "fun feature(): i32 { 1 }\n")],
+        &[],
+    );
+    assert!(clean.is_empty(), "{clean:#?}");
+    let violations = contract_violations(
+        &[
+            ("lib.vl", ""),
+            (
+                "service.vl",
+                "[platform(\"@process\")] mod self;\n\nimport pkg::widget::widget;\nfun service(): i32 { widget() }\n",
+            ),
+        ],
+        &[],
+        &[("widget.vl", "fun widget(): i32 { 1 }\n")],
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|m| m.contains("service") && m.contains("widget") && m.contains("node")),
+        "{violations:#?}"
     );
 }
 
@@ -3143,11 +3184,11 @@ fn the_std_listing_comes_from_the_std_tree() {
             "`std::{expected}` is a std module: {names:?}"
         );
     }
-    // A layer's directory is NOT a path segment: `src/process/fs.vl` is
-    // `std::fs`, and the layer name never appears in an import.
+    // F28: a module that declares its platform (`src/fs.vl`, `@process`)
+    // lists like any other.
     assert!(
         names.contains(&"fs".to_string()),
-        "a layered module lists under its own name: {names:?}"
+        "a platform-declared module lists under its own name: {names:?}"
     );
     assert!(
         !names.contains(&"lib".to_string()),
@@ -8828,19 +8869,19 @@ fn b455_a_selector_with_a_non_trait_is_refused() {
     );
 }
 
-// --- F28's first half: the single-platform modules leave the layer directories ---
+// --- F28: the single-platform modules declare their platform in their file ---
 //
-// The three facts the layer gives and the file-level `[platform(..)] mod self;`
-// fence must give the same way before a module moves (std's manifest names the
-// layers; these pins name the MODULES, so they read the same whichever
-// mechanism serves them). layout-46 ran them over the fenced tree and STOPPED
-// the move: (a) failed for `std::web::router` — fenced `browser`, it imports the
-// `ui` TWIN, which a node build binds to the process side, and the fence walk
-// then reports six of the process twin's functions as unreachable-from-browser
-// violations inside std, on a bare import (the layer reported none); and (b)
-// failed for every browser module, `infer_platform` reading browser evidence off
-// the layer directory only. The modules stay layered under their new paths
-// (`src/browser/web/*`, `src/process/{web,rpc}/*`) until both are answered.
+// The three facts the layer gave and the file-level `[platform(..)] mod self;`
+// gives the same way (these pins name the MODULES, so they read the same
+// whichever mechanism serves them). layout-46 ran them over the fenced tree and
+// stopped the move: (a) failed for `std::web::router` — declared `browser`, it
+// imports the `ui` TWIN, which a node build binds to the process side, and the
+// fence walk reported six of the process twin's functions inside std, on a bare
+// import (B548); and (b) failed for every browser module, `infer_platform`
+// reading browser evidence off the layer directory only (E266). Order 48 moved
+// them (`src/web/{dom,router,storage,dev,document}.vl`, `src/rpc/server.vl`,
+// `src/{fs,http,db,process,watch,build}.vl`) once both were answered; only the
+// `ui` twins stay layered (a twin's NOMINALS differ, F27 R5).
 
 /// One program per single-platform module: it calls one of the module's
 /// functions on the platform the module does NOT serve.
@@ -9138,21 +9179,216 @@ fn b549_a_node_build_importing_the_document_module_checks_clean() {
     );
 }
 
-/// B549, the browser side: the same import in a BROWSER build is refused
-/// inside std — `document.vl` (a process-layer module) imports
-/// `pkg::web::ui::{ render, escape_attribute, escape_text }`, and in a browser
-/// build that import binds the BROWSER twin of `ui`, which declares none of
-/// them. It is B548's fault (a twin import binds the BUILD platform's side,
-/// whatever platform the importing file belongs to), carried to Order 48 with
-/// F28's retry; the pin un-ignores with it.
+/// B549, the browser side: the same import in a BROWSER build. `document.vl`
+/// declares `@process` and imports `pkg::web::ui::{ render, escape_attribute,
+/// escape_text }`; one program has one platform, so in a browser build that
+/// import binds the BROWSER twin, which declares none of them, and the misses
+/// were reported inside std. A file a build's platform excludes is not that
+/// build's to check (B548, spec §11.3): clean.
 #[test]
-#[ignore = "B549: a process-layer std module's twin import binds the browser twin in a browser build (B548's fault, carried to Order 48 with F28)"]
 fn b549_a_browser_build_importing_the_document_module_checks_clean() {
     let entry = "import std::web::document::check_shell;\n\nfun main() {}\n";
     assert_eq!(
         analyze_package(&[("main.vl", entry)], "main.vl", Platform::Browser),
         Vec::<String>::new()
     );
+}
+
+/// B548's shape in user code: a node entry imports a function from a module
+/// that declares `[platform("browser")] mod self;` and builds a `View` through
+/// the `std::web::ui` twin. One program has one platform, so the twin import
+/// binds the PROCESS `ui` in a node build — and the module's own fence was
+/// walked against it, reporting the process twin's `view` as reached from a
+/// browser-fenced body, with nothing reaching the module at all.
+const B548_WIDGET: &str = concat!(
+    "[platform(\"browser\")] mod self;\n\n",
+    "import std::web::ui::{ View, view };\n\n",
+    "export fun card(): View {\n\tview(\"div\")\n}\n",
+);
+
+#[test]
+fn b548_a_browser_declared_module_over_a_twin_checks_clean_in_a_node_build() {
+    let entry = "import pkg::widget::card;\n\nfun main() {}\n";
+    for platform in [Platform::Node { version: 24 }, Platform::Browser] {
+        assert_eq!(
+            analyze_package(
+                &[("main.vl", entry), ("widget.vl", B548_WIDGET)],
+                "main.vl",
+                platform
+            ),
+            Vec::<String>::new(),
+            "{platform:?}"
+        );
+    }
+}
+
+/// …and REACHING it from the node entry is the one colouring error, at the
+/// user's call — the module's own platform, not the twin it bound.
+#[test]
+fn b548_reaching_the_browser_declared_module_is_one_error_at_the_call() {
+    let entry = "import pkg::widget::card;\n\nfun main() {\n\tlet _ = card();\n}\n";
+    let errors = analyze_package_spanned(
+        &[("main.vl", entry), ("widget.vl", B548_WIDGET)],
+        "main.vl",
+        Platform::Node { version: 24 },
+    );
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    let (message, file, range) = &errors[0];
+    assert!(
+        message.starts_with("`card` requires the `browser` platform its file declares"),
+        "{message}"
+    );
+    assert_eq!(file, "main.vl");
+    assert_eq!(&entry[range.clone()], "card()");
+}
+
+/// The same fault through a FUNCTION fence in an undeclared module: the fence
+/// is checked on every compile (spec §11.3), and in a node build the twin it
+/// reaches is the process one. A twin is charged only to the host whose twin
+/// it is — the browser fence is not charged for the process `view`.
+#[test]
+fn b548_a_function_fence_is_not_charged_for_the_builds_own_twin() {
+    let widget = concat!(
+        "import std::web::ui::{ View, view };\n\n",
+        "[platform(\"browser\")]\n",
+        "export fun card(): View {\n\tview(\"div\")\n}\n",
+    );
+    let entry = "import pkg::widget::card;\n\nfun main() {}\n";
+    for platform in [Platform::Node { version: 24 }, Platform::Browser] {
+        assert_eq!(
+            analyze_package(
+                &[("main.vl", entry), ("widget.vl", widget)],
+                "main.vl",
+                platform
+            ),
+            Vec::<String>::new(),
+            "{platform:?}"
+        );
+    }
+}
+
+/// The rule's other edge: a module with NO twin is still charged to every
+/// host the fence names. `std::fs` is `@process` wherever it is loaded, so a
+/// browser fence reaching it is refused in a node build too (spec §11.3's
+/// "on every compile").
+#[test]
+fn b548_a_fence_is_still_charged_for_a_single_platform_module() {
+    let widget = concat!(
+        "import std::fs::stat;\n\n",
+        "[platform(\"browser\")]\n",
+        "export fun probe(): bool {\n\tstat(\"x\").is_some()\n}\n",
+    );
+    let entry = "import pkg::widget::probe;\n\nfun main() {}\n";
+    let errors = analyze_package(
+        &[("main.vl", entry), ("widget.vl", widget)],
+        "main.vl",
+        Platform::Node { version: 24 },
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("reachable from `probe`, fenced")),
+        "{errors:?}"
+    );
+}
+
+/// F28: a declaration's promise is checked where its AUTHOR compiles. A
+/// dependency's browser-declared file whose function reaches `std::fs` breaks
+/// its own promise — reported when the dependency is compiled as the user's
+/// own code, but no longer re-walked in every consumer's build, where it was
+/// nothing the consumer could act on (and, once std's own modules declared
+/// their platforms, 6 % of kolt's check). What the consumer's entry REACHES
+/// is still judged, at the consumer's call.
+#[test]
+fn f28_a_dependencys_promise_is_not_rewalked_in_a_consumers_build() {
+    const PAINT: &str = concat!(
+        "[platform(\"browser\")] mod self;\n\n",
+        "import std::fs::stat;\n\n",
+        "export fun probe(): bool {\n\tstat(\"x\").is_some()\n}\n",
+    );
+    let widgets = || Dep {
+        import_name: "widgets",
+        files: &[
+            ("lib.vl", "export import pkg::paint::probe;\n"),
+            ("paint.vl", PAINT),
+        ],
+    };
+    let import_only = analyze_workspace(
+        "import widgets::probe;\nfun main() {}\n",
+        &[widgets()],
+        Platform::Node { version: 24 },
+    );
+    assert!(import_only.is_empty(), "{import_only:#?}");
+    let reaching = analyze_workspace(
+        "import widgets::probe;\nfun main() {\n\tlet _ = probe();\n}\n",
+        &[widgets()],
+        Platform::Node { version: 24 },
+    );
+    assert_eq!(reaching.len(), 1, "{reaching:#?}");
+    assert!(
+        reaching[0].starts_with("`probe` requires the `browser` platform its file declares"),
+        "{reaching:#?}"
+    );
+    // The author's own compile still holds the promise.
+    let own = analyze_package(
+        &[
+            ("main.vl", "import pkg::paint::probe;\nfun main() {}\n"),
+            ("paint.vl", PAINT),
+        ],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        own.iter()
+            .any(|error| error.contains("which its declaration `[platform(\"browser\")]` fences")),
+        "{own:#?}"
+    );
+}
+
+/// The checking half of spec §11.3 ("of the entries that reach the file only
+/// those it admits type-check it"): a type error inside a browser-declared
+/// module is the browser build's to report, not a node build's that merely
+/// loads it — and the browser build does report it.
+#[test]
+fn f28_a_declared_module_is_checked_by_the_builds_it_admits() {
+    let widget = concat!(
+        "[platform(\"browser\")] mod self;\n\n",
+        "export fun width(): i32 {\n\t\"wide\"\n}\n",
+    );
+    let entry = "import pkg::widget::width;\n\nfun main() {}\n";
+    let files = [("main.vl", entry), ("widget.vl", widget)];
+    assert_eq!(
+        analyze_package(&files, "main.vl", Platform::Node { version: 24 }),
+        Vec::<String>::new()
+    );
+    let browser = analyze_package_spanned(&files, "main.vl", Platform::Browser);
+    assert_eq!(browser.len(), 1, "{browser:#?}");
+    assert_eq!(browser[0].1, "widget.vl");
+    assert!(browser[0].0.contains("Expected i32"), "{browser:#?}");
+}
+
+/// A miss on a module-qualified path (`ui::render`) raised by the world's
+/// resolve is attributed to the file that wrote it — it claimed the entry, so
+/// B549's `cannot find 'render' in module 'ui'` rendered with no location.
+#[test]
+fn a_qualified_module_member_miss_is_anchored_in_its_own_file() {
+    let other = "export fun here(): i32 {\n\t1\n}\n";
+    let user = concat!(
+        "import pkg::other;\n\n",
+        "export fun call(): i32 {\n\tother::missing()\n}\n",
+    );
+    let entry = "import pkg::user::call;\n\nfun main() {\n\tlet _ = call();\n}\n";
+    let errors = analyze_package_spanned(
+        &[("main.vl", entry), ("user.vl", user), ("other.vl", other)],
+        "main.vl",
+        Platform::default(),
+    );
+    let miss = errors
+        .iter()
+        .find(|(message, ..)| message.contains("cannot find 'missing' in module 'other'"))
+        .unwrap_or_else(|| panic!("{errors:#?}"));
+    assert_eq!(miss.1, "user.vl", "{errors:#?}");
+    assert!(user[miss.2.clone()].contains("missing"), "{errors:#?}");
 }
 
 /// B560: the "import it first" steer spells a NESTED module by its full path
@@ -9227,7 +9463,10 @@ fn b560_two_modules_sharing_a_leaf_name_are_ambiguous() {
 }
 
 /// B560's std half: a type in a NESTED std module (`std::reactive::delta`'s
-/// `ListCell`), loaded through another module, steers to its full path.
+/// `ListCell`), loaded through another module, steers to a full path — since
+/// B572 its shortest PUBLIC one, `std::reactive::ListCell`, which
+/// `std::reactive` re-exports and the book writes (it said
+/// `std::reactive::delta::ListCell`, the declaring module, before).
 #[test]
 fn b560_the_import_steer_spells_a_nested_std_modules_full_path() {
     const HELPER: &str = "import std::reactive::delta::ListCell;\n\nexport fun make(): ListCell<i32> {\n\tListCell::new()\n}\n";
@@ -9238,9 +9477,125 @@ fn b560_the_import_steer_spells_a_nested_std_modules_full_path() {
         Platform::default(),
     );
     assert!(
-        errors.iter().any(|error| {
-            error.contains("import it first (`import std::reactive::delta::ListCell;`)")
-        }),
+        errors
+            .iter()
+            .any(|error| { error.contains("import it first (`import std::reactive::ListCell;`)") }),
         "{errors:#?}"
+    );
+}
+
+/// B576's platform half (B573's root): a MODULE's diagnostic note names the
+/// platform the build analyzes it under. The pre-entry resolve ran on the
+/// analyzer's default platform, so a browser package's module was told it is
+/// "analyzed under node" where the same call in the entry said "browser".
+#[test]
+fn b576_a_modules_twin_note_names_the_builds_platform() {
+    let errors = analyze_package_raw(
+        &[
+            (
+                "m.vl",
+                "import std::web::ui::{ View, view };\n\nexport fun show(): str {\n\tlet v: View = view(\"div\");\n\tv.render()\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::m::show;\n\nfun main() {\n\tprint(show());\n}\n",
+            ),
+        ],
+        "main.vl",
+        Platform::Browser,
+    );
+    let notes: Vec<&str> = errors
+        .iter()
+        .filter_map(|error| error.note.as_ref().map(|note| note.msg.as_str()))
+        .filter(|note| note.contains("this file is analyzed under"))
+        .collect();
+    assert!(
+        !notes.is_empty()
+            && notes
+                .iter()
+                .all(|note| note.contains("analyzed under browser")),
+        "the module's note names the browser: {errors:#?}"
+    );
+}
+
+/// B572: a std name a facade re-exports is steered to the facade, not to the
+/// internal module that declares it — `Store` and `StoreSome` are declared in
+/// `std::reactive::store_core` and re-exported by `std::reactive::store`, the
+/// one module a program imports. Both when the declaring module is LOADED
+/// (through another module's import) and when nothing loaded it, and the
+/// statement the steer names compiles when pasted.
+#[test]
+fn b572_a_reexported_std_name_is_steered_to_its_public_module() {
+    const HELPER: &str = "import std::reactive::store::Store;\n\nexport fun make(): Store<i32> {\n\tStore::new(1)\n}\n";
+    let loaded = "import pkg::helper::make;\n\nfun main() {\n\tlet store: Store<i32> = make();\n\tlet _ = store;\n}\n";
+    let unloaded = "fun take(handle: StoreSome<i32>) {\n\tlet _ = handle;\n}\n\nfun main() {}\n";
+    for (entry, name) in [(loaded, "Store"), (unloaded, "StoreSome")] {
+        let errors = analyze_package(
+            &[("helper.vl", HELPER), ("main.vl", entry)],
+            "main.vl",
+            Platform::default(),
+        );
+        let steer = format!("import it first (`import std::reactive::store::{name};`)");
+        assert!(
+            errors.iter().any(|error| error.contains(&steer)),
+            "`{name}`: {errors:#?}"
+        );
+        assert!(
+            !errors.iter().any(|error| error.contains("store_core")),
+            "never the internal module: {errors:#?}"
+        );
+        let pasted = format!("import std::reactive::store::{name};\n{entry}");
+        let pasted: &'static str = Box::leak(pasted.into_boxed_str());
+        let errors = analyze_package(
+            &[("helper.vl", HELPER), ("main.vl", pasted)],
+            "main.vl",
+            Platform::default(),
+        );
+        assert!(
+            errors.is_empty(),
+            "the steer's import compiles: {errors:#?}"
+        );
+    }
+}
+
+/// B561: B535's trait-scope refusal spells a trait in a NESTED package
+/// module at its full path (`pkg::geo::shapes::Area`) — `import_path_of` read
+/// the module's leaf and wrote `pkg::shapes::Area`, an import that resolves
+/// nowhere — and the statement it names compiles when pasted.
+#[test]
+fn b561_a_nested_package_traits_import_is_spelled_at_its_full_path() {
+    const SHAPES: &str = "export trait Area {\n\tfun area(self): i32;\n}\n\nexport impl i32 with Area {\n\tfun area(self): i32 {\n\t\tself * self\n\t}\n}\n";
+    const HELPER: &str =
+        "import pkg::geo::shapes::Area;\n\nexport fun twice(x: i32): i32 {\n\tx.area() * 2\n}\n";
+    let entry = "import pkg::helper::twice;\n\nfun main() {\n\tlet _ = twice(2) + 3.area();\n}\n";
+    let errors = analyze_package(
+        &[
+            ("geo/shapes.vl", SHAPES),
+            ("helper.vl", HELPER),
+            ("main.vl", entry),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("Import it (`import pkg::geo::shapes::Area;`)")),
+        "{errors:#?}"
+    );
+    let pasted = format!("import pkg::geo::shapes::Area;\n{entry}");
+    let pasted: &'static str = Box::leak(pasted.into_boxed_str());
+    let errors = analyze_package(
+        &[
+            ("geo/shapes.vl", SHAPES),
+            ("helper.vl", HELPER),
+            ("main.vl", pasted),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "the refusal's import compiles: {errors:#?}"
     );
 }

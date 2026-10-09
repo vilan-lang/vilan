@@ -1952,7 +1952,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
     fn element_head_completions(&self, chain: bool, tag: &str) -> Vec<Completion> {
         let mut items = Vec::new();
         if let Some(view_id) = self.element_view_nominal_id() {
-            self.push_methods(view_id, true, &mut items);
+            self.push_methods(view_id, true, None, &mut items);
             if !chain {
                 // Undotted: the chain form is offered in its own spelling, dot
                 // included, because an undotted `text(…)` is an ATTRIBUTE named
@@ -2190,7 +2190,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .and_then(|type_id| nominal_type_id(self.program, type_id))
             .or_else(|| self.receiver_nominal_id(tokens, receiver_end));
         let mut items = nominal
-            .map(|type_id| self.nominal_member_completions(type_id))
+            .map(|type_id| self.nominal_member_completions(type_id, receiver_type))
             .unwrap_or_default();
         if let Some(type_id) = receiver_type {
             self.push_blanket_methods(type_id, &mut items);
@@ -2322,7 +2322,14 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// `.` to say less than the one inside a `{ … }`, and `Completion::detail`'s
     /// old "a field's type is not cheaply renderable" was true before E160 gave
     /// the label a reader.
-    fn nominal_member_completions(&self, type_id: Id) -> Vec<Completion> {
+    ///
+    /// E274: `receiver` is the receiver's whole type where it is known
+    /// (`Store<App>`), and the methods offered are those of the impls that
+    /// APPLY to it — the solver's selection
+    /// ([`vilan_core::impl_select::applying_implementations`]), so an inherent
+    /// impl at other type arguments (`impl Store<Address>`'s projections on a
+    /// `Store<App>`) is not offered, where every impl of the nominal was.
+    fn nominal_member_completions(&self, type_id: Id, receiver: Option<TypeId>) -> Vec<Completion> {
         let program = self.program;
         let mut items = Vec::new();
         if let Some(structure) = program.structs.get(&type_id) {
@@ -2353,7 +2360,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 items.push(completion);
             }
         }
-        self.push_methods(type_id, true, &mut items);
+        self.push_methods(type_id, true, receiver, &mut items);
         items
     }
 
@@ -2369,7 +2376,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         let program = self.program;
         // The receiver read from the LIVE tokens (E131), which is where its
         // identity lives while the buffer is ahead of the analysis.
-        if let Some(element) = self
+        if let Some((element, element_type)) = self
             .live_receiver_index(tokens, receiver_end)
             .and_then(|index| self.live_receiver_type_id(tokens, index, 0))
             .and_then(|type_id| match program.type_id_to_type_map.get(&type_id) {
@@ -2378,9 +2385,9 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 }
                 _ => None,
             })
-            .and_then(|element| nominal_type_id(program, element))
+            .and_then(|element| Some((nominal_type_id(program, element)?, element)))
         {
-            return self.nominal_member_completions(element);
+            return self.nominal_member_completions(element, Some(element_type));
         }
         // A bare name (`p?.`): the binding's declared container type. The NAME
         // comes off the live text, but resolving it is a `program` lookup, so
@@ -2416,7 +2423,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     },
                 );
             if let Some(element) = element {
-                return self.nominal_member_completions(element);
+                return self.nominal_member_completions(element, None);
             }
         }
         // A complex receiver (`find(x)?.`): the first type argument of its own
@@ -2455,7 +2462,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
                         })
                 })
             })
-            .map(|type_id| self.nominal_member_completions(type_id))
+            .map(|type_id| self.nominal_member_completions(type_id, None))
             .unwrap_or_default()
     }
 
@@ -2687,8 +2694,8 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .members
             .methods(namespace, false)
             .iter()
-            .find(|(member, _)| member == name)
-            .map(|(_, id)| *id)
+            .find(|member| member.name == name)
+            .map(|member| member.id)
     }
 
     /// The instance member `name` the nominal type `type_id` provides — read
@@ -2700,8 +2707,8 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .members
             .methods(type_id, true)
             .iter()
-            .find(|(member, _)| member == name)
-            .map(|(_, id)| *id)
+            .find(|member| member.name == name)
+            .map(|member| member.id)
     }
 
     /// The result of calling the impl member `member` on a receiver of type
@@ -3189,9 +3196,9 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 completion.internal = variant.internal.map(str::to_string);
                 items.push(completion);
             }
-            self.push_methods(namespace, false, &mut items);
+            self.push_methods(namespace, false, None, &mut items);
         } else if program.structs.contains_key(&namespace) {
-            self.push_methods(namespace, false, &mut items);
+            self.push_methods(namespace, false, None, &mut items);
         } else if let Some(module) = program.modules.get(&namespace)
             && let Some(scope) = program.scopes.get(&module.body.1)
         {
@@ -3517,9 +3524,52 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// [`MemberTable`], whose doc carries them; this reads the answer and
     /// renders it. Deriving them here was a walk over every impl in the program
     /// on every request (M29).
-    fn push_methods(&self, type_id: Id, want_self: bool, items: &mut Vec<Completion>) {
-        for (name, member_id) in self.index.world.members.methods(type_id, want_self) {
-            items.push(self.entity_completion(name.clone(), *member_id, CompletionKind::Method));
+    ///
+    /// E274: with a `receiver` type, only the members of impls that apply to
+    /// it (the solver's selection, scoped to this file); without one — a
+    /// `Type::` path, a receiver no walk could type — every impl's, as before.
+    /// A selection that admits NONE of the nominal's impls (a receiver whose
+    /// arguments are not settled enough to choose) falls back to every impl:
+    /// an offer is never emptier than the analysis would be.
+    fn push_methods(
+        &self,
+        type_id: Id,
+        want_self: bool,
+        receiver: Option<TypeId>,
+        items: &mut Vec<Completion>,
+    ) {
+        let members = &self.index.world.members;
+        let applying: Option<HashSet<TypeId>> = receiver.and_then(|receiver| {
+            let subjects: HashSet<TypeId> = vilan_core::impl_select::applying_implementations(
+                self.program,
+                Some(self.focus),
+                receiver,
+                None,
+            )
+            .into_iter()
+            .map(|implementation| implementation.subject)
+            .collect();
+            members
+                .methods(type_id, want_self)
+                .iter()
+                .any(|member| subjects.contains(&member.subject))
+                .then_some(subjects)
+        });
+        let mut offered: HashSet<&str> = HashSet::new();
+        for member in members.methods(type_id, want_self) {
+            if applying
+                .as_ref()
+                .is_some_and(|subjects| !subjects.contains(&member.subject))
+            {
+                continue;
+            }
+            if offered.insert(&member.name) {
+                items.push(self.entity_completion(
+                    member.name.clone(),
+                    member.id,
+                    CompletionKind::Method,
+                ));
+            }
         }
     }
 
@@ -4274,9 +4324,21 @@ struct MemberTable {
 struct TypeMembers {
     /// `value.method()` — the impls' own `self` methods, then the
     /// default-bodied instance methods their traits inherit.
-    instance: Vec<(String, Id)>,
+    instance: Vec<TableMember>,
     /// `Type::method()` — statics and associated functions.
-    statics: Vec<(String, Id)>,
+    statics: Vec<TableMember>,
+}
+
+/// One member a nominal's impl offers, with the SUBJECT of the impl that
+/// offers it (E274): `impl Store<Address>`'s `city` is a member of
+/// `Store<Address>` and not of every `Store`, and the subject is what a
+/// request compares against the impls that apply to its receiver. A name
+/// may appear once per impl subject; a request keeps the first admitted.
+#[derive(Clone, Debug)]
+struct TableMember {
+    name: String,
+    id: Id,
+    subject: TypeId,
 }
 
 impl MemberTable {
@@ -4298,16 +4360,26 @@ impl MemberTable {
         }
         for (type_id, implementations) in grouped {
             let mut members = TypeMembers::default();
-            let mut instance_names: HashSet<&str> = HashSet::new();
-            let mut static_names: HashSet<&str> = HashSet::new();
+            // Keyed by name AND impl subject (E274): two impls at different
+            // arguments may each offer a name, and which one a receiver sees
+            // is the request's question. Declarations first, so one that
+            // overrides an inherited default keeps its name.
+            let mut instance_names: HashSet<(&str, TypeId)> = HashSet::new();
+            let mut static_names: HashSet<(&str, TypeId)> = HashSet::new();
             for implementation in &implementations {
+                let subject = implementation.subject;
                 for (name, member_id) in &implementation.declarations {
+                    let member = TableMember {
+                        name: name.to_string(),
+                        id: *member_id,
+                        subject,
+                    };
                     if is_self_method(program, *member_id) {
-                        if instance_names.insert(name) {
-                            members.instance.push((name.to_string(), *member_id));
+                        if instance_names.insert((name, subject)) {
+                            members.instance.push(member);
                         }
-                    } else if static_names.insert(name) {
-                        members.statics.push((name.to_string(), *member_id));
+                    } else if static_names.insert((name, subject)) {
+                        members.statics.push(member);
                     }
                 }
             }
@@ -4326,6 +4398,7 @@ impl MemberTable {
             // (`proposal/transport-rpc.md` §3.2), and a static has no inherited
             // path onto a value at all.
             for implementation in &implementations {
+                let subject = implementation.subject;
                 for trait_id in &implementation.trait_ids {
                     for home_id in trait_with_supertraits(program, *trait_id) {
                         let Some(home) = program.traits.get(&home_id) else {
@@ -4335,9 +4408,13 @@ impl MemberTable {
                             if member_has_default_body(program, *member_id)
                                 && !declaration_is_trait_only(program, *member_id)
                                 && is_self_method(program, *member_id)
-                                && instance_names.insert(name)
+                                && instance_names.insert((name, subject))
                             {
-                                members.instance.push((name.to_string(), *member_id));
+                                members.instance.push(TableMember {
+                                    name: name.to_string(),
+                                    id: *member_id,
+                                    subject,
+                                });
                             }
                         }
                     }
@@ -4355,7 +4432,9 @@ impl MemberTable {
 
     /// `type_id`'s instance methods (`want_self`) or its statics, in the order
     /// the impls declare them. Empty for a type with no impl at all.
-    fn methods(&self, type_id: Id, want_self: bool) -> &[(String, Id)] {
+    /// One entry per (name, impl subject); `push_methods`'s
+    /// caller-side pass keeps the first admitted per name.
+    fn methods(&self, type_id: Id, want_self: bool) -> &[TableMember] {
         self.by_type
             .get(&type_id)
             .map(|members| {

@@ -26,9 +26,9 @@ fun main() {
 	print(e == Shape::Empty); // true
 
 	// Debug.
-	print(c.debug()); // Circle(3)
-	print(r.debug()); // Rect(4, 5)
-	print(e.debug()); // Empty
+	print(c.debug()); // Shape::Circle(3)
+	print(r.debug()); // Shape::Rect(4, 5)
+	print(e.debug()); // Shape::Empty
 
 	// Json (externally tagged).
 	print(c.to_json()); // {"Circle":3}

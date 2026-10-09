@@ -251,6 +251,179 @@ struct MemberRowIndex {
     unsettled: Vec<usize>,
 }
 
+/// M121 door (b) and B553: every question a world's PRE-STORE resolve asked
+/// of the impl table — a member looked up and a trait asked after, each with
+/// the receiver it was asked for — so the impls that join the world AFTER that
+/// resolve can be tested against it.
+///
+/// The two-phase pipeline resolves the loaded modules before the entry walks
+/// (S3c, the base cache's pre-entry world), and M110 S1 also walks the hot
+/// set after that resolve. Impls are program-wide, so an impl written in the
+/// entry or in a hot module is one a module's resolution could have needed; a
+/// canonical analysis that walked it first would have answered with it. The
+/// log is what says whether the stored world's answers stand: no logged
+/// question that a later impl could answer means the order changed nothing
+/// (`Analyzer::impl_reach`), and the world is used as it is. Otherwise the
+/// analysis is rebuilt in the order that sees every impl before anything
+/// resolves (`analyze_inner`'s `defer_resolve`; a hot-set world is refused).
+///
+/// Receivers are kept as the `Type` they were asked for and tested with the
+/// lookup's own admission (`impl_subject_admits`), so the test is the one the
+/// lookup would have made — not a syntactic stand-in for it (M110 S1's
+/// spelling guard refused every hot set whose inherent members shared a name
+/// with ANY identifier outside it).
+#[derive(Clone, Debug, Default)]
+struct ImplReachLog {
+    /// Whether the resolve now running records.
+    recording: bool,
+    /// Which questions it records ([`ReachFilter`]).
+    filter: ReachFilter,
+    /// How many questions it recorded — the census's `reach-questions`, zero
+    /// for a world whose late files write no foreign impl.
+    questions: u64,
+    /// Member name -> the receivers it was looked up on, each with whether a
+    /// PACKAGE source asked (as opposed to only std's).
+    members: HashMap<Box<str>, HashMap<Type, bool>>,
+    /// Trait -> the receivers it was asked of, likewise.
+    traits: HashMap<Id, HashMap<Type, bool>>,
+    /// Whether the constraint now resolving is anchored in a std source. A
+    /// question std's own code asks does not make an ENTRY impl reach: the
+    /// two-phase order has always resolved std before the entry walked, and
+    /// what std's lookups answer is std's to decide (the deferred order would
+    /// otherwise put a user's blanket in reach of std's own calls). It still
+    /// counts against a HOT impl, which a canonical analysis would have walked
+    /// before std resolved.
+    asked_by_std: bool,
+    /// How many impls the world held when its recorded resolve ended — every
+    /// impl from this index on joined after it. `None` for a world that never
+    /// resolved before its entry (the deferred order), whose impls were all
+    /// there to be asked.
+    floor: Option<usize>,
+}
+
+/// Which questions an [`ImplReachLog`] keeps, read off the LATE files' syntax
+/// (the entry, and a hot set's modules) before anything resolves.
+///
+/// A late impl can only answer a question the stored world asked about a type
+/// the stored world can NAME: an impl whose subject is a struct or enum the
+/// late files themselves declare is out of every stored module's reach (the
+/// entry cannot be imported, and a module that imports a hot module is hot),
+/// and so are the impls a derive or `[service]` generates — they are written
+/// on the item they decorate. What is left is an impl on a FOREIGN subject: an
+/// inherent one, whose members are reached by name, so only those names are
+/// recorded; or a trait impl (or one whose shape this cannot read), which can
+/// answer a trait or an inherited member anywhere, so everything is. A late
+/// file with none of these records nothing at all, which is every `vilan
+/// check` whose entry writes no impl on another file's type.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct ReachFilter {
+    /// Record every question (a foreign trait impl, an item macro).
+    everything: bool,
+    /// Otherwise, member questions about these names only.
+    members: std::collections::BTreeSet<String>,
+}
+
+impl ReachFilter {
+    /// The filter for these late files, or `None` when no impl in them can
+    /// answer a stored question.
+    fn of<'a>(files: impl IntoIterator<Item = &'a NodeList<'a>>) -> Option<ReachFilter> {
+        // The item nodes at a file's top level, through the markers that wrap
+        // them and into inline `mod`s.
+        fn items<'a>(nodes: &'a NodeList<'a>, out: &mut Vec<&'a Node<'a>>) {
+            for item in nodes {
+                let mut node = &item.0;
+                while let Node::Export(_, inner, _)
+                | Node::Derive(_, inner)
+                | Node::Service(_, inner)
+                | Node::Const(inner) = node
+                {
+                    node = &inner.0;
+                }
+                match node {
+                    Node::Module(_, body) => items(&body.0, out),
+                    _ => out.push(node),
+                }
+            }
+        }
+        let mut nodes: Vec<&Node> = Vec::new();
+        for file in files {
+            items(file, &mut nodes);
+        }
+        let declared: HashSet<&str> = nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Struct(name, ..) | Node::Enum(name, ..) => Some(name.0),
+                _ => None,
+            })
+            .collect();
+        let mut filter = ReachFilter::default();
+        let mut any = false;
+        for node in nodes {
+            match node {
+                // An item macro writes whatever it writes.
+                Node::MacroAttribute(..) => {
+                    filter.everything = true;
+                    any = true;
+                }
+                Node::Impl(subject, traits, body, _) => {
+                    let head = match &subject.0 {
+                        Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
+                        _ => None,
+                    };
+                    if head.is_some_and(|head| declared.contains(head)) {
+                        continue;
+                    }
+                    any = true;
+                    if !traits.is_empty() {
+                        filter.everything = true;
+                        continue;
+                    }
+                    for member in &body.0 {
+                        let mut member_node = &member.0;
+                        while let Node::Export(_, inner, _) | Node::Const(inner) = member_node {
+                            member_node = &inner.0;
+                        }
+                        match member_node {
+                            Node::Func(function) => {
+                                filter.members.insert(function.name.0.to_string());
+                            }
+                            _ => filter.everything = true,
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if filter.everything {
+            filter.members.clear();
+        }
+        any.then_some(filter)
+    }
+}
+
+/// [`ImplReachLog`]'s insert: `receiver` joins the set, and a package asker
+/// marks it so whoever asked first.
+fn note_receiver(receivers: &mut HashMap<Type, bool>, receiver: &Type, by_package: bool) {
+    match receivers.get_mut(receiver) {
+        Some(asked_by_package) => *asked_by_package |= by_package,
+        None => {
+            receivers.insert(receiver.clone(), by_package);
+        }
+    }
+}
+
+/// Which side of a world an [`ImplReachLog`] hit came from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ImplReached {
+    /// An impl in a hot module (M110 S1) answers a question the stored prefix
+    /// asked.
+    by_hot: bool,
+    /// An impl in the entry file (B553) answers one.
+    by_entry: bool,
+    /// The first hit, for the phase line: `member `name`` or `trait`.
+    first: String,
+}
+
 /// [`Analyzer::impl_subject_bucket`]'s classes (M107).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ImplSubjectBucket {
@@ -4186,6 +4359,22 @@ pub struct Analyzer<'src> {
     // itself as a provider of `Base` for ANY type, on the condition that the
     // type is already a `Base` — which is the question being asked.
     bound_proofs_in_progress: Vec<(TypeId, Id, Vec<TypeId>)>,
+    // M123: the bound audit's INNER proofs, memoized while
+    // `check_generic_bound_satisfaction` runs (`None` otherwise — during the
+    // fixpoint an answer may still move as types resolve). Keyed on the
+    // resolved value type, the trait and its resolved arguments, as the
+    // audit's own per-site memo is (ids are minted per occurrence).
+    bound_proof_memo: Option<HashMap<(Type, Id, Vec<Type>), bool>>,
+    // M123: `bound_providers`' rows per required trait, for the same window.
+    bound_provider_memo: Option<HashMap<Id, std::sync::Arc<[(TypeId, Option<Vec<TypeId>>)]>>>,
+    // M123: the shallowest open question (its index in
+    // `bound_proofs_in_progress`) a CUT below the current question reached —
+    // a proof that reached itself, or the depth cap (index 0) — `usize::MAX`
+    // when none did. A NO is the question's own exactly when every cut below
+    // it reached the question itself or something deeper: a cut that reached
+    // an OUTER open question answered NO only provisionally, on that outer
+    // question's behalf (the tabling rule).
+    bound_proof_cut_floor: usize,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -4239,6 +4428,12 @@ pub struct Analyzer<'src> {
     source_range_index: std::cell::RefCell<RangeIndex>,
     // M107: `derived_origins` the same way, for the same reason.
     derived_origin_index: std::cell::RefCell<RangeIndex>,
+    // `std::tuple`'s `Tuple` members by id, with the impl count they were
+    // read at (`tuple_member_name`): a cell for the same reason, rebuilt when
+    // an impl registers after it was read.
+    // (Each member maps to the impl index declaring it, `None` for the trait:
+    // the name is read back from there, which keeps `'src` out of the cell.)
+    tuple_member_index: std::cell::RefCell<Option<(usize, HashMap<Id, Option<usize>>)>>,
     // M19 T0 (`per-module-analysis-reuse.md` §3.3): the source each `TypeId`
     // was minted in, indexed by the id's own dense counter. `Id`s get this
     // through `source_ranges`; `TypeId`s are a separate counter and had
@@ -4697,6 +4892,12 @@ pub struct Analyzer<'src> {
     // scope, file) — resolved at the next `resolve_world`
     // (`resolve_macro_references`).
     pending_macro_references: Vec<(&'src str, Span, Id, SourceId)>,
+    // M121 / B553: what the pre-store resolve asked of the impl table
+    // ([`ImplReachLog`]). Behind a cell because the questions are asked from
+    // `&self` readers (`type_implements_trait` and its kin) as well as from
+    // the lookups that hold `&mut self`; the log is written only while
+    // `recording`, and never read until the resolve that wrote it has ended.
+    impl_reach: std::cell::RefCell<ImplReachLog>,
     macro_expression_expansions: HashMap<usize, &'static Spanned<Node<'static>>>,
     // Expression sites whose expansion failed — already diagnosed; they walk
     // to an error entity without a second (misleading) message.
@@ -4809,7 +5010,7 @@ pub struct Analyzer<'src> {
     // cache, then reused.
     std_module_files: Vec<(String, PathBuf)>,
     std_export_index: Option<HashMap<String, String>>,
-    /// B472: std's DEPRECATED alias re-exports (`export [deprecated(..)] import
+    /// B472: std's DEPRECATED alias re-exports (`[deprecated(..)] export import
     /// pkg::hash_map::HashMap as Map;`), alias → (the name it stands for, that
     /// name's module). Built in the same lazy pass as the export index; an
     /// alias that is NOT deprecated joins the export index itself.
@@ -5499,7 +5700,7 @@ pub struct Analyzer<'src> {
     attributed_declarations: HashSet<Id>,
     // B318 S6: a TRANSPARENT wrapper — `[derive(..)]`, `[service(..)]`, a macro
     // attribute — mints an entity of its own and the DECLARATION under it is
-    // the entity every other reader asks about, so `export [derive(Wire)]
+    // the entity every other reader asks about, so `[derive(Wire)] export
     // struct Handle` recorded the wrapper's id in `exported_entities` and the
     // struct stayed private: the marker parsed, formatted and round-tripped
     // through `Importable.exported` (`item_visibility` walks the wrappers) and
@@ -5761,13 +5962,13 @@ pub struct Analyzer<'src> {
     // entry asks exactly what it asked before, and the one reader that needs the
     // extra bit looks it up by the leaf's own span.
     reach_marked_spans: HashSet<(SourceId, Span)>,
-    // B382: every leaf of an `export [deprecated("…")] import` —
+    // B382: every leaf of an `[deprecated("…")] export import` —
     // `check_deprecated_reexports` warns at every OTHER file's import of a
     // name such a re-export publishes.
     deprecated_import_leaves: Vec<DeprecatedImportLeaf<'src>>,
 }
 
-/// One leaf of an `export [deprecated("…")] import` (B382).
+/// One leaf of an `[deprecated("…")] export import` (B382).
 #[derive(Clone, Debug)]
 struct DeprecatedImportLeaf<'src> {
     source: SourceId,
@@ -7106,6 +7307,9 @@ impl<'src> Analyzer<'src> {
             literal_let_expectations: HashMap::default(),
             literal_types: HashMap::default(),
             bound_proofs_in_progress: Vec::new(),
+            bound_proof_memo: None,
+            bound_provider_memo: None,
+            bound_proof_cut_floor: usize::MAX,
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reused_sources: Vec::new(),
@@ -7116,6 +7320,7 @@ impl<'src> Analyzer<'src> {
             drop_nominals_world_digest: 0,
             sorted_source_ranges: Vec::new(),
             source_range_index: std::cell::RefCell::new(RangeIndex::default()),
+            tuple_member_index: std::cell::RefCell::new(None),
             derived_origin_index: std::cell::RefCell::new(RangeIndex::default()),
             type_id_sources: Vec::new(),
             reuse_derived: HashMap::default(),
@@ -7204,6 +7409,7 @@ impl<'src> Analyzer<'src> {
             macro_item_invocations: HashSet::default(),
             macro_signatures: HashMap::default(),
             pending_macro_references: Vec::new(),
+            impl_reach: std::cell::RefCell::default(),
             macro_expression_expansions: HashMap::default(),
             macro_failed_sites: HashSet::default(),
             module_scope_ids: HashSet::default(),
@@ -7491,6 +7697,77 @@ impl<'src> Analyzer<'src> {
     /// [`Self::enclosing_bare_trait_impl_subject`] from a SCOPE rather than an
     /// entity — for the deferred queues, whose entries carry the scope they
     /// were walked in and no entity of their own.
+    /// B567: the bare-trait subject a member's `self` is typed as, when the
+    /// member belongs to an `impl` whose subject is a PARAMETERIZED bare trait
+    /// (`impl Iterator<type T> with Iterable<T>`). An argument-less subject is
+    /// `Type::Trait(_, [])`, which the ordinary `Self`-return specialization
+    /// already reads as the receiver; a parameterized one is not, so this is
+    /// the question that specialization cannot ask.
+    fn bare_trait_impl_self(&self, self_parameter_id: Option<Id>) -> Option<TypeId> {
+        let self_parameter_id = self_parameter_id?;
+        let self_type_id = self.parameters.get(&self_parameter_id)?.type_id;
+        if !matches!(
+            self.type_id_to_type_map.get(&self_type_id),
+            Some(Type::Trait(_, arguments)) if !arguments.is_empty()
+        ) {
+            return None;
+        }
+        // A parameter is not mapped to a scope, so the impl is found by its
+        // subject slot — which `self` is typed as (B299's `Self`). Only a
+        // self typed as a parameterized trait reaches this scan, and that is
+        // a bare-trait impl's member and nothing else (a trait default's
+        // `self` is the argument-less `Type::Trait(_, [])`).
+        self.impl_body_subjects
+            .values()
+            .any(|subject_id| *subject_id == self_type_id)
+            .then_some(self_type_id)
+    }
+
+    /// B567: `type_` with every occurrence of the bare-trait subject read as
+    /// the implicit binder it is (`Type::Generic` of the subject's own id —
+    /// B299's constraint), so substitution grounds it to the receiver the call
+    /// bound it to. A written `Self` interns a slot of its own, so an
+    /// occurrence is recognized by its TYPE: inside such an impl a value of
+    /// the subject's bare trait type can only be `Self` (any other is refused
+    /// as a bare trait value).
+    fn bare_trait_subject_as_binder(
+        &mut self,
+        type_: &Type,
+        subject_id: TypeId,
+        depth: usize,
+    ) -> Type {
+        if depth > 24 {
+            return type_.clone();
+        }
+        if self.type_id_to_type_map.get(&subject_id) == Some(type_) {
+            return Type::Generic(subject_id);
+        }
+        let rewrite = |analyzer: &mut Self, type_ids: &[TypeId]| -> Vec<TypeId> {
+            type_ids
+                .iter()
+                .map(|type_id| {
+                    let inner = type_id.get_type(analyzer);
+                    let rewritten =
+                        analyzer.bare_trait_subject_as_binder(&inner, subject_id, depth + 1);
+                    match rewritten == inner {
+                        true => *type_id,
+                        false => rewritten.get_type_id(analyzer),
+                    }
+                })
+                .collect()
+        };
+        match type_ {
+            Type::Struct(id, arguments) => Type::Struct(*id, rewrite(self, &arguments.clone())),
+            Type::Enum(id, arguments) => Type::Enum(*id, rewrite(self, &arguments.clone())),
+            Type::Tuple(elements) => Type::Tuple(rewrite(self, &elements.clone())),
+            Type::Array(element, length) => {
+                let length = *length;
+                Type::Array(rewrite(self, &[*element])[0], length)
+            }
+            _ => type_.clone(),
+        }
+    }
+
     fn bare_trait_impl_subject_in_scope(&self, scope_id: Id) -> Option<TypeId> {
         let mut scope_id = Some(scope_id);
         while let Some(current) = scope_id {
@@ -7578,6 +7855,7 @@ impl<'src> Analyzer<'src> {
         // for a chain that grows without repeating.
         const MAX_DEPTH: u32 = 32;
         if depth > MAX_DEPTH {
+            self.bound_proof_cut_floor = 0;
             return false;
         }
         // An ABSTRACT value's declared bounds are the ONLY answer — never an
@@ -7639,7 +7917,7 @@ impl<'src> Analyzer<'src> {
         // STRUCTURALLY: the recursion re-substitutes the bound's arguments on
         // every round, which mints fresh ids for the same type, so an id
         // comparison never sees the question come back.
-        let reached_itself = self.bound_proofs_in_progress.iter().any(
+        let reached_itself = self.bound_proofs_in_progress.iter().position(
             |(open_value, open_trait_id, open_arguments)| {
                 *open_trait_id == question.1
                     && open_arguments.len() == question.2.len()
@@ -7650,9 +7928,38 @@ impl<'src> Analyzer<'src> {
                         .all(|(open, asked)| self.same_type_structure(*open, *asked, 0))
             },
         );
-        if reached_itself {
+        if let Some(open_index) = reached_itself {
+            self.bound_proof_cut_floor = self.bound_proof_cut_floor.min(open_index);
             return false;
         }
+        // M123: the audit re-proved the same inner questions — a blanket
+        // chain's bounds — once per outer question that reached them (~2 M
+        // instructions per computed check on kolt). YES is stored always (a
+        // cut can only reject, so a YES never rests on one); NO only when
+        // every cut below reached this question or a deeper one
+        // (`bound_proof_cut_floor`), where it is the question's own.
+        let memo_key = match self.bound_proof_memo.is_some() {
+            true => Some((
+                value_type.clone(),
+                required_trait_id,
+                required_arguments
+                    .iter()
+                    .map(|argument| argument.get_type(self))
+                    .collect::<Vec<Type>>(),
+            )),
+            false => None,
+        };
+        if let Some(key) = &memo_key
+            && let Some(answer) = self
+                .bound_proof_memo
+                .as_ref()
+                .and_then(|memo| memo.get(key))
+                .copied()
+        {
+            return answer;
+        }
+        let index = self.bound_proofs_in_progress.len();
+        let enclosing_floor = std::mem::replace(&mut self.bound_proof_cut_floor, usize::MAX);
         self.bound_proofs_in_progress.push(question);
         let satisfied = self.satisfies_trait_bound_by_impls(
             value_type,
@@ -7661,6 +7968,19 @@ impl<'src> Analyzer<'src> {
             depth,
         );
         self.bound_proofs_in_progress.pop();
+        let floor = self.bound_proof_cut_floor;
+        // A cut that reached THIS question is settled here; one that reached
+        // an outer question still qualifies every answer up to it.
+        self.bound_proof_cut_floor = match floor < index {
+            true => enclosing_floor.min(floor),
+            false => enclosing_floor,
+        };
+        if let Some(key) = memo_key
+            && (satisfied || floor >= index)
+            && let Some(memo) = self.bound_proof_memo.as_mut()
+        {
+            memo.insert(key, satisfied);
+        }
         satisfied
     }
 
@@ -7712,6 +8032,61 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The impls that provide `required_trait_id` — naming it or a subtrait of
+    /// it — each with its subject and the arguments it provides the trait at
+    /// (threaded through the supertrait chain when the clause names a
+    /// subtrait, B275), in registration order.
+    ///
+    /// A property of the impl table and the trait, never of the value asked
+    /// about, so while the bound audit runs (`bound_proof_memo` is set, the
+    /// types settled) it is computed once per trait: M123's profile named this
+    /// scan — the supertrait closure of every impl's every clause, and the
+    /// threaded arguments of every candidate, re-derived per inner question —
+    /// as the larger part of each one's ~1.5 M instructions.
+    fn bound_providers(
+        &mut self,
+        required_trait_id: Id,
+    ) -> std::sync::Arc<[(TypeId, Option<Vec<TypeId>>)]> {
+        if let Some(rows) = self
+            .bound_provider_memo
+            .as_ref()
+            .and_then(|memo| memo.get(&required_trait_id))
+        {
+            return rows.clone();
+        }
+        let matching: Vec<(TypeId, Vec<(Id, Vec<TypeId>)>)> = self
+            .implementations
+            .iter()
+            .filter(|implementation| {
+                implementation.trait_ids.iter().any(|implemented| {
+                    self.trait_with_supertraits(*implemented)
+                        .contains(&required_trait_id)
+                })
+            })
+            .map(|implementation| (implementation.subject, implementation.trait_args.clone()))
+            .collect();
+        let rows: std::sync::Arc<[(TypeId, Option<Vec<TypeId>>)]> = matching
+            .into_iter()
+            .map(|(subject, trait_args)| {
+                let provided = trait_args.iter().find_map(|(provided_trait, arguments)| {
+                    match *provided_trait == required_trait_id {
+                        true => Some(arguments.clone()),
+                        false => self
+                            .trait_with_supertraits_at(*provided_trait, arguments)
+                            .into_iter()
+                            .find(|(reached, _)| *reached == required_trait_id)
+                            .map(|(_, reached_arguments)| reached_arguments),
+                    }
+                });
+                (subject, provided)
+            })
+            .collect();
+        if let Some(memo) = self.bound_provider_memo.as_mut() {
+            memo.insert(required_trait_id, rows.clone());
+        }
+        rows
+    }
+
     /// [`Self::satisfies_trait_bound`]'s impl scan, run with the question
     /// held open on `bound_proofs_in_progress`.
     fn satisfies_trait_bound_by_impls(
@@ -7742,34 +8117,8 @@ impl<'src> Analyzer<'src> {
         // `Signal<T_impl>`'s `Source<T>` comes back as `Source<T_impl>` and the
         // impl's own binding (`T_impl := Panel`) grounds it at the comparison.
         // Collected in two steps because the walk takes `&mut self`.
-        let matching: Vec<(TypeId, Vec<(Id, Vec<TypeId>)>)> = self
-            .implementations
-            .iter()
-            .filter(|implementation| {
-                implementation.trait_ids.iter().any(|implemented| {
-                    self.trait_with_supertraits(*implemented)
-                        .contains(&required_trait_id)
-                })
-            })
-            .map(|implementation| (implementation.subject, implementation.trait_args.clone()))
-            .collect();
-        let candidates: Vec<(TypeId, Option<Vec<TypeId>>)> = matching
-            .into_iter()
-            .map(|(subject, trait_args)| {
-                let provided = trait_args.iter().find_map(|(provided_trait, arguments)| {
-                    match *provided_trait == required_trait_id {
-                        true => Some(arguments.clone()),
-                        false => self
-                            .trait_with_supertraits_at(*provided_trait, arguments)
-                            .into_iter()
-                            .find(|(reached, _)| *reached == required_trait_id)
-                            .map(|(_, reached_arguments)| reached_arguments),
-                    }
-                });
-                (subject, provided)
-            })
-            .collect();
-        'candidates: for (subject_id, provided_arguments) in candidates {
+        let candidates = self.bound_providers(required_trait_id);
+        'candidates: for (subject_id, provided_arguments) in candidates.iter().cloned() {
             let subject_type = subject_id.get_type(self);
             // B390: a refused subject provides nothing (`impl_subject_admits`).
             if matches!(subject_type, Type::Unknown | Type::Unresolved) {
@@ -7798,6 +8147,20 @@ impl<'src> Analyzer<'src> {
                 self.bound_argument_grounding_depth -= 1;
             }
             for (binder_constraint_id, argument_type_id) in bindings {
+                // B557: a binder's TUPLE bound is part of what the impl
+                // requires of it — arity and element bound alike — so a
+                // tuple-family blanket proves its trait for the tuples it
+                // covers and for nothing else.
+                if let Some(requirement) = self.tuple_bounds.get(&binder_constraint_id).cloned() {
+                    let argument_type = argument_type_id.get_type(self);
+                    if !matches!(argument_type, Type::Any | Type::Unknown | Type::Unresolved)
+                        && !self
+                            .tuple_bound_violations(&requirement, &argument_type, &binding_context)
+                            .is_empty()
+                    {
+                        continue 'candidates;
+                    }
+                }
                 let binder_traits = self.generic_bound_traits(binder_constraint_id);
                 if binder_traits.is_empty() {
                     continue;
@@ -8002,10 +8365,26 @@ impl<'src> Analyzer<'src> {
     /// explicit `f<Cat>()` arguments, method own-generics, impl-subject and
     /// trait-parameter bindings).
     fn check_generic_bound_satisfaction(&mut self) {
+        // M123: the inner proofs memoize for the length of the audit — the
+        // types are settled, so an answer cannot move under it.
+        let enclosing = self.bound_proof_memo.replace(HashMap::default());
+        let enclosing_providers = self.bound_provider_memo.replace(HashMap::default());
+        self.check_generic_bound_satisfaction_sites();
+        self.bound_proof_memo = enclosing;
+        self.bound_provider_memo = enclosing_providers;
+    }
+
+    /// [`Self::check_generic_bound_satisfaction`]'s walk over every recorded
+    /// call site.
+    fn check_generic_bound_satisfaction_sites(&mut self) {
         // Each entry carries the entity its span came from: the check runs over
         // every file at once, after `build()`, so nothing else can say which file
         // the span indexes (B112) — and the sort below needs the file to lead.
         let mut errors: Vec<(Id, Span, String, TypeId)> = Vec::new();
+        // E271: the element holes refused below, by (call, hole span) — they
+        // carry no "the bound is declared here" note, since the bound is on a
+        // `child` the author never wrote.
+        let mut hole_refusals: HashSet<(Id, Span)> = HashSet::default();
         let recorded: Vec<(Id, SubstitutionContext)> = self
             .method_call_substitution
             .iter()
@@ -8238,6 +8617,15 @@ impl<'src> Analyzer<'src> {
                             .rpc_refused_key_types
                             .contains(&without_spaces(&type_label))
                     {
+                        continue;
+                    }
+                    // E271: an element-syntax HOLE refused at `child`'s
+                    // `Slot` bound is said about the hole, at the hole.
+                    if let Some((hole_span, msg)) =
+                        self.element_hole_refusal(call_id, &value_type, *required_trait_id)
+                    {
+                        hole_refusals.insert((call_id, hole_span));
+                        errors.push((call_id, hole_span, msg, constraint_id));
                         continue;
                     }
                     // A generic argument fails by MISSING the bound on its own
@@ -8672,6 +9060,9 @@ impl<'src> Analyzer<'src> {
         let bound_declarations: Vec<(Id, Span, String, Option<crate::error::Note>)> = errors
             .into_iter()
             .map(|(_, anchor, span, msg, constraint_id)| {
+                if hole_refusals.contains(&(anchor, span)) {
+                    return (anchor, span, msg, None);
+                }
                 let declaration = self
                     .expr_id_to_expr_map
                     .iter()
@@ -9272,6 +9663,7 @@ impl<'src> Analyzer<'src> {
         // [`ImplHeadRows`]) — a scan of every impl in the program per question
         // was quadratic in the package, and this is asked per comparison of a
         // value against a trait-typed slot.
+        self.note_trait_query(subject_type, trait_id);
         let Some(rows) = self.provided_trait_rows.get(&trait_id) else {
             return false;
         };
@@ -9323,7 +9715,47 @@ impl<'src> Analyzer<'src> {
         {
             return false;
         }
+        // B557: a binder subject's TUPLE bound filters admission as its trait
+        // bounds rank it — `impl type T: (2..: Show) with Show` is a blanket
+        // over tuples, not over every type. `compare_type` admits anything
+        // against a bare binder, so the family blanket answered for a struct,
+        // an `Option`, a scalar.
+        if let Type::Generic(constraint_id) = impl_subject
+            && !self.tuple_bound_admits_shape(*constraint_id, subject_type)
+        {
+            return false;
+        }
         self.compare_type(subject_type, impl_subject, substitution_context)
+    }
+
+    /// B557: whether a value of `value_type` can bind a binder whose TUPLE
+    /// bound (`type T: (2..)`) is `constraint_id`'s — by SHAPE alone: a tuple,
+    /// or a type that may still be one (a mapped tuple, a parameter, an
+    /// unresolved slot). A nominal type, an array, a closure, a function item,
+    /// an object or a bare trait (a bound, never a value) is never a tuple.
+    /// True when the binder has no tuple bound.
+    ///
+    /// The ARITY and the element bound are deliberately not asked here: a
+    /// tuple outside the arity is a candidate whose bound check then refuses
+    /// it naming the bound ("the bound '(3..)' requires at least 3"), which
+    /// says more than a missing member would. [`Self::tuple_bound_violations`]
+    /// is that check; the emission side's twin is
+    /// `impl_select::tuple_bound_holds`.
+    fn tuple_bound_admits_shape(&self, constraint_id: TypeId, value_type: &Type) -> bool {
+        if !self.tuple_bounds.contains_key(&constraint_id) {
+            return true;
+        }
+        !matches!(
+            value_type,
+            Type::Struct(..)
+                | Type::Enum(..)
+                | Type::Array(..)
+                | Type::Closure(..)
+                | Type::Dyn(..)
+                | Type::Function(..)
+                | Type::Trait(..)
+                | Type::Void
+        )
     }
 
     /// Whether the CALL OPERATOR reaches a value of this type (B340): its type
@@ -9342,6 +9774,7 @@ impl<'src> Analyzer<'src> {
     /// refusal (a `Callable` with no `call`) and the steer on the ordinary "not
     /// callable" message (a `call` with no `Callable`).
     fn declares_call_member(&self, subject_type: &Type) -> bool {
+        self.note_member_query(subject_type, CALL_OPERATOR_MEMBER);
         self.implementations.iter().any(|implementation| {
             implementation
                 .declarations
@@ -11178,12 +11611,19 @@ impl<'src> Analyzer<'src> {
                 self.substitute_member_type(&trait_param_type, self_trait, subject, &context)
             };
             let actual_type = impl_shape.types[position].get_type(self);
+            // B563: a closure's `context` clause is part of its TYPE (B309),
+            // and unification ignores it on purpose (a literal takes its
+            // position's clause). A SIGNATURE is no literal: the impl's
+            // parameter must declare the clause the trait's does, or a call
+            // through the trait threads contexts the impl's body does not
+            // receive (or the reverse).
             if !self.compare_type_rigid(
                 &expected_type,
                 &actual_type,
                 &HashMap::default(),
                 &impl_shape.generic_constraint_ids,
-            ) {
+            ) || !self.context_clauses_agree(&expected_type, &actual_type, 0)
+            {
                 let note = self.conformance_note(check.trait_function_id, &check.member_name);
                 let expected_label = self.pretty_print_type(&expected_type, &HashMap::default());
                 let actual_label = self.pretty_print_type(&actual_type, &HashMap::default());
@@ -11255,7 +11695,8 @@ impl<'src> Analyzer<'src> {
             &actual_return,
             &HashMap::default(),
             &impl_shape.generic_constraint_ids,
-        ) {
+        ) || !self.context_clauses_agree(&expected_return, &actual_return, 0)
+        {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             let expected_label = self.pretty_print_type(&expected_return, &HashMap::default());
             let actual_label = self.pretty_print_type(&actual_return, &HashMap::default());
@@ -11269,6 +11710,57 @@ impl<'src> Analyzer<'src> {
                     check.subject_name, check.member_name, check.trait_name
                 ),
             }, check.impl_function_id);
+        }
+    }
+
+    /// B563: whether two types that already unify carry the same closure
+    /// `context` clauses at every closure position — order-free, since a
+    /// clause names a set of bindings. An unresolved side answers yes (the
+    /// type comparison was lenient there too).
+    fn context_clauses_agree(&self, expected: &Type, actual: &Type, depth: usize) -> bool {
+        if depth > 24 {
+            return true;
+        }
+        let all = |analyzer: &Self, expected: &[TypeId], actual: &[TypeId]| {
+            expected.len() != actual.len()
+                || expected.iter().zip(actual).all(|(expected, actual)| {
+                    analyzer.context_clauses_agree(
+                        &expected.get_type(analyzer),
+                        &actual.get_type(analyzer),
+                        depth + 1,
+                    )
+                })
+        };
+        match (expected, actual) {
+            (
+                Type::Closure(expected_parameters, expected_return, expected_contexts, _),
+                Type::Closure(actual_parameters, actual_return, actual_contexts, _),
+            ) => {
+                expected_contexts.len() == actual_contexts.len()
+                    && expected_contexts
+                        .iter()
+                        .all(|context| actual_contexts.contains(context))
+                    && all(self, expected_parameters, actual_parameters)
+                    && self.context_clauses_agree(
+                        &expected_return.get_type(self),
+                        &actual_return.get_type(self),
+                        depth + 1,
+                    )
+            }
+            (Type::Struct(_, expected_arguments), Type::Struct(_, actual_arguments))
+            | (Type::Enum(_, expected_arguments), Type::Enum(_, actual_arguments))
+            | (Type::Trait(_, expected_arguments), Type::Trait(_, actual_arguments))
+            | (Type::Dyn(_, expected_arguments), Type::Dyn(_, actual_arguments))
+            | (Type::Tuple(expected_arguments), Type::Tuple(actual_arguments)) => {
+                all(self, expected_arguments, actual_arguments)
+            }
+            (Type::Array(expected_element, _), Type::Array(actual_element, _)) => self
+                .context_clauses_agree(
+                    &expected_element.get_type(self),
+                    &actual_element.get_type(self),
+                    depth + 1,
+                ),
+            _ => true,
         }
     }
 
@@ -20573,6 +21065,7 @@ impl<'src> Analyzer<'src> {
     fn trait_impl_rows(&mut self, subject_type: &Type, traits: &[Id]) -> Vec<usize> {
         let mut rows: Vec<usize> = Vec::new();
         for trait_id in traits {
+            self.note_trait_query(subject_type, *trait_id);
             match self.nominal_rows(subject_type, ImplRowKey::Trait(*trait_id)) {
                 Some(narrowed) => rows.extend(narrowed),
                 None => rows.extend(
@@ -20660,6 +21153,7 @@ impl<'src> Analyzer<'src> {
         // M107: and of that row, only the impls whose subject head can admit
         // this receiver's — the same impls in the same order, without asking
         // the comparison about every other nominal's.
+        self.note_member_query(subject_type, member_name);
         let nominal_rows = self.nominal_member_rows(subject_type, member_name);
         let Some(declaring) = self.implementations_by_member.get(member_name) else {
             return Vec::new();
@@ -20674,11 +21168,16 @@ impl<'src> Analyzer<'src> {
             rows.iter()
                 .map(|index| &self.implementations[*index])
                 .filter(|implementation| {
+                    // A122's rule — a blanket over TUPLES is no candidate for
+                    // a receiver that is no tuple (left in, `list.iter().map`
+                    // found `Tuple::map` declared and never reached
+                    // `Iterator::map`'s default) — is admission's own since
+                    // B557 (`tuple_bound_admits_shape`).
                     self.impl_subject_admits(
                         subject_type,
                         implementation.subject.borrow_type(self),
                         &HashMap::default(),
-                    ) && !self.tuple_blanket_excludes(implementation.subject, subject_type)
+                    )
                 })
                 .filter_map(|implementation| {
                     if !allow_trait_only && self.member_is_trait_only(implementation, member_name) {
@@ -20761,26 +21260,6 @@ impl<'src> Analyzer<'src> {
         self.applicable_candidates(subject_type, candidates)
     }
 
-    /// A122: a blanket over TUPLES (`impl type T: (2..)`) is no candidate at all
-    /// for a receiver that is not a tuple — a struct, an enum, an array, a
-    /// closure, an object. Left in the candidate set, it shadowed the tier
-    /// below it: `list.iter().map(..)` found `Tuple::map` DECLARED and never
-    /// reached `Iterator::map`'s inherited default.
-    fn tuple_blanket_excludes(&self, impl_subject: TypeId, subject_type: &Type) -> bool {
-        let Type::Generic(binder_id) = impl_subject.get_type(self) else {
-            return false;
-        };
-        self.tuple_bounds.contains_key(&binder_id)
-            && matches!(
-                subject_type,
-                Type::Struct(..)
-                    | Type::Enum(..)
-                    | Type::Array(..)
-                    | Type::Closure(..)
-                    | Type::Dyn(..)
-            )
-    }
-
     /// Whether the impl with this subject DECLARES `member_id` itself, as
     /// opposed to inheriting it as a trait default (B73 R3, row 17).
     fn declares_member(&self, impl_subject: TypeId, member_id: Id) -> bool {
@@ -20810,6 +21289,7 @@ impl<'src> Analyzer<'src> {
         member_name: &str,
         declared: &[(Id, TypeId, Option<Id>, Vec<TypeId>)],
     ) -> Vec<((Id, TypeId, Option<Id>, Vec<TypeId>), bool)> {
+        self.note_member_query(subject_type, member_name);
         let homes: Vec<Id> = declared
             .iter()
             .filter_map(|(_, _, home_trait, _)| *home_trait)
@@ -24046,6 +24526,7 @@ impl<'src> Analyzer<'src> {
         subject_type: &Type,
         member_name: &str,
     ) -> Vec<(Id, TypeId, Id, Vec<TypeId>)> {
+        self.note_member_query(subject_type, member_name);
         let mut reached: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
         // B401: parallel to `reached` — the providing block's index, and
         // whether the calling file admits the member from it.
@@ -28101,10 +28582,20 @@ impl<'src> Analyzer<'src> {
                 Self::collect_payload_captures(pattern, &mut captures);
                 Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
             }
-            // B545: under a view subject a tuple leaf is still a copy of its
-            // element; the steer is the tuple bound whole, which is a view.
-            if tuple_leaves.contains(&capture_id)
-                && self.reference_subject_mode(subject_id).is_some()
+            // B545: under a view subject a ONE-slot tuple leaf is a view into
+            // its slot, as a payload capture is; a leaf spanning several slots
+            // (a sub-tuple, which tuples store flat) is a reslice — a COPY —
+            // and the steer is the tuple bound whole, which is a view.
+            let view_subject = self.reference_subject_mode(subject_id).is_some();
+            if view_subject
+                && tuple_leaves.contains(&capture_id)
+                && self.tuple_leaf_is_one_slot(capture_id)
+            {
+                captures.push(capture_id);
+            }
+            if view_subject
+                && tuple_leaves.contains(&capture_id)
+                && !self.tuple_leaf_is_one_slot(capture_id)
             {
                 let place = match self.expr_id_to_expr_map.get(&subject_id) {
                     Some(Expr::Reference(operand, _)) => {
@@ -28113,7 +28604,7 @@ impl<'src> Analyzer<'src> {
                     _ => "place",
                 };
                 return Some(format!(
-                    "cannot mutate '{name}': a capture inside a tuple pattern is a COPY of its element even under a view subject (tuples store flat), so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                    "cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
                 ));
             }
             if !captures.contains(&capture_id) {
@@ -28176,14 +28667,16 @@ impl<'src> Analyzer<'src> {
                 Self::collect_payload_captures(pattern, &mut captures);
                 Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
             }
+            // B545: a one-slot tuple leaf is a payload view like any capture;
+            // only a multi-slot one (a reslice, a copy) keeps the tuple steer.
+            let tuple_leaves: Vec<(Id, bool)> = tuple_leaves
+                .into_iter()
+                .map(|capture_id| (capture_id, !self.tuple_leaf_is_one_slot(capture_id)))
+                .collect();
             for (capture_id, in_tuple) in captures
                 .into_iter()
                 .map(|capture_id| (capture_id, false))
-                .chain(
-                    tuple_leaves
-                        .into_iter()
-                        .map(|capture_id| (capture_id, true)),
-                )
+                .chain(tuple_leaves)
             {
                 if let Some(variable) = self.variables.get(&capture_id)
                     && variable.mutable
@@ -28197,15 +28690,16 @@ impl<'src> Analyzer<'src> {
         for (capture_id, name, place, mutable, in_tuple) in refusals {
             let place = place.unwrap_or("place");
             if in_tuple {
-                // B545: a tuple leaf is a copy under any subject; `mut` on it
-                // under a view subject reads as the in-place write it is not.
+                // B545: a multi-slot tuple leaf is a copy under any subject;
+                // `mut` on it under a view subject reads as the in-place write
+                // it is not.
                 self.push_anchored(
                     Error {
                         trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&capture_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "`mut {name}` would bind a COPY of a tuple element, and its write would not reach `{place}`: a capture inside a tuple pattern is a copy even under a view subject (tuples store flat) — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                            "`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
                         ),
                     },
                     capture_id,
@@ -28249,6 +28743,26 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+    }
+
+    /// B545: whether a capture inside a payload's tuple pattern is ONE slot of
+    /// the flat tuple — its type is no tuple — so it can be a view into that
+    /// slot: the `(tuple, offset)` pair for a scalar on JS, the element's own
+    /// reference for an aggregate, a `&mut` by Rust's binding modes natively.
+    /// A sub-tuple leaf spans several slots and is a reslice; a generic or
+    /// still-open leaf may instantiate at a tuple, so it is treated as one.
+    fn tuple_leaf_is_one_slot(&self, capture_id: Id) -> bool {
+        self.variables.get(&capture_id).is_some_and(|variable| {
+            !matches!(
+                variable.type_id.get_type(self),
+                Type::Tuple(_)
+                    | Type::Mapped(..)
+                    | Type::Generic(_)
+                    | Type::Unknown
+                    | Type::Unresolved
+                    | Type::Any
+            )
+        })
     }
 
     /// B545: the bindings a variant pattern reaches INSIDE a tuple sub-pattern
@@ -28383,9 +28897,18 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             let mut captures = Vec::new();
+            let mut tuple_leaves = Vec::new();
             for pattern in patterns {
                 Self::collect_payload_captures(pattern, &mut captures);
+                Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
             }
+            // B545: a ONE-slot leaf of a payload's tuple pattern is a view into
+            // its slot of the tuple, as a payload capture is into the enum's.
+            captures.extend(
+                tuple_leaves
+                    .into_iter()
+                    .filter(|capture_id| self.tuple_leaf_is_one_slot(*capture_id)),
+            );
             // A `mut` capture is refused under a view subject (Q4); it is not
             // made a view as well, so the refusal stands alone.
             found.extend(
@@ -30595,10 +31118,28 @@ impl<'src> Analyzer<'src> {
                     let Some(parameter_ids) = parameter_ids else {
                         continue;
                     };
-                    for (parameter_id, argument_id) in
-                        parameter_ids.iter().zip(function_call.argument_ids.iter())
+                    for (index, (parameter_id, argument_id)) in parameter_ids
+                        .iter()
+                        .zip(function_call.argument_ids.iter())
+                        .enumerate()
                     {
                         if self.binding_or_param_is_view(*parameter_id) {
+                            continue;
+                        }
+                        // B562 (transparent-references R4, RULED): a method's
+                        // RECEIVER auto-derefs — `n.abs()` with `n: &i32` reads
+                        // the referent place, as `p.get()` on an aggregate view
+                        // always has. The `*` R6 asks for is for a view used as
+                        // a plain value; the receiver is no such use, and both
+                        // emitters read a scalar view through at a by-value
+                        // `self` (B444's seam). Only the receiver: a scalar view
+                        // at any later by-value parameter still wants its `*`.
+                        if index == 0
+                            && self
+                                .parameters
+                                .get(parameter_id)
+                                .is_some_and(|parameter| parameter.name == "self")
+                        {
                             continue;
                         }
                         if self.is_scalar_view_read(*argument_id, &view_bindings) {
@@ -35897,25 +36438,50 @@ impl<'src> Analyzer<'src> {
 
     /// The name of `member_id` when it is one of `std::tuple`'s `Tuple`
     /// members — the trait's requirement or the blanket's intrinsic.
+    ///
+    /// Asked of every method call's member once `std::tuple` is loaded —
+    /// which since B443 is every program, `std::compare` importing `Tuple` —
+    /// so the members are indexed once (per impl count) rather than found by
+    /// a scan of every impl per call: that scan was +11% of a plain package's
+    /// `vilan check` (perf gate `plain:160`).
     fn tuple_member_name(&self, member_id: Id) -> Option<&'src str> {
         let tuple_trait_id = self.tuple_trait_id?;
-        let declared_in = |declarations: &IndexMap<&'src str, Id>| {
-            declarations
-                .iter()
-                .find(|(_, declared)| **declared == member_id)
-                .map(|(name, _)| *name)
-        };
-        if let Some(name) = self
-            .traits
-            .get(&tuple_trait_id)
-            .and_then(|trait_| declared_in(&trait_.declarations))
-        {
-            return Some(name);
+        let registered = self.implementations.len();
+        let stale = self
+            .tuple_member_index
+            .borrow()
+            .as_ref()
+            .is_none_or(|(built_at, _)| *built_at != registered);
+        if stale {
+            let mut index: HashMap<Id, Option<usize>> = HashMap::default();
+            for (position, implementation) in self.implementations.iter().enumerate() {
+                if implementation.trait_ids.contains(&tuple_trait_id) {
+                    for declared in implementation.declarations.values() {
+                        index.entry(*declared).or_insert(Some(position));
+                    }
+                }
+            }
+            // The trait's own declaration answers first, as it always did.
+            if let Some(trait_) = self.traits.get(&tuple_trait_id) {
+                for declared in trait_.declarations.values() {
+                    index.insert(*declared, None);
+                }
+            }
+            *self.tuple_member_index.borrow_mut() = Some((registered, index));
         }
-        self.implementations
+        let home = self
+            .tuple_member_index
+            .borrow()
+            .as_ref()
+            .and_then(|(_, index)| index.get(&member_id).copied())?;
+        let declarations = match home {
+            None => &self.traits.get(&tuple_trait_id)?.declarations,
+            Some(position) => &self.implementations.get(position)?.declarations,
+        };
+        declarations
             .iter()
-            .filter(|implementation| implementation.trait_ids.contains(&tuple_trait_id))
-            .find_map(|implementation| declared_in(&implementation.declarations))
+            .find(|(_, declared)| **declared == member_id)
+            .map(|(name, _)| *name)
     }
 
     /// A122 §3 — `t.map(|x| e)` over a tuple family IS the comprehension `(x in
@@ -37166,7 +37732,7 @@ impl<'src> Analyzer<'src> {
                             .to_string(),
                     });
                 }
-                // B382: `export [deprecated("…")] import …;` deprecates each
+                // B382: `[deprecated("…")] export import …;` deprecates each
                 // name the re-export publishes — the alias where it renames,
                 // the leaf where not. Recorded per leaf with the leaf's span,
                 // which is how the statement's own reach (and so the target) is
@@ -37190,7 +37756,7 @@ impl<'src> Analyzer<'src> {
                 }
                 let walked = self.walk_expr_node(inner, scope_id);
                 // A transparent wrapper's own entity is not the declaration's
-                // (`transparent_declarations`): `export [derive(Wire)] struct
+                // (`transparent_declarations`): `[derive(Wire)] export struct
                 // Handle` must mark `Handle`.
                 let declaration_id = self
                     .transparent_declarations
@@ -43979,8 +44545,26 @@ impl<'src> Analyzer<'src> {
                                 exprs_seen,
                             ),
                         };
-                        let return_type =
-                            self.substitute_type(&callee_return_type, &substitution_context);
+                        // B567: a member of a BARE-TRAIT IMPL (B299, `impl
+                        // Iterator<type T> with Iterable<T>`) writes `Self` as
+                        // the subject, which is the implicit binder the call
+                        // bound to its receiver — so `it.iter()` is the
+                        // receiver's type, as under the binder spelling `impl
+                        // type I: Iterator<type T>`, never the bare trait the
+                        // head names (which then refused every call on it).
+                        let return_type = match self.bare_trait_impl_self(self_parameter_id) {
+                            Some(subject_id) => {
+                                let as_binder = self.bare_trait_subject_as_binder(
+                                    &callee_return_type,
+                                    subject_id,
+                                    0,
+                                );
+                                self.substitute_type(&as_binder, &substitution_context)
+                            }
+                            None => {
+                                self.substitute_type(&callee_return_type, &substitution_context)
+                            }
+                        };
                         // B149: a call to a function WRITTEN `async` is
                         // implicitly awaited, and the host assimilates a handle
                         // its body returns — `async fun make(): Task<i32>`
@@ -44952,15 +45536,36 @@ impl<'src> Analyzer<'src> {
     /// arguments: ~11k type slots per attempt for one `.derive` on a
     /// `dyn Flow`, re-paid on every re-queue while a closure's types were
     /// still open.
+    ///
+    /// M124 (the rule — what a trait object `dyn Tr<A>` provides a trait `U`
+    /// at):
+    ///
+    /// 1. `U = Tr`: at `A`, the one instantiation the object was erased at.
+    /// 2. `U` a SUPERTRAIT of `Tr`: at the arguments `Tr`'s `with` clauses
+    ///    thread from `A` (`dyn Source<X>` is a `Flow<X>`) — the object's
+    ///    table carries the supertrait's members at exactly those.
+    /// 3. any other `U`: only through a BLANKET whose binder admits the
+    ///    object (A124 R3 — nothing concrete applies to an object), its
+    ///    provided arguments grounded through the binder's bounds at what the
+    ///    object provides there (rules 1 and 2). A NOMINAL implementor is
+    ///    never selected for an object, so its arguments are no evidence for
+    ///    one (`trait_args_candidates` skips it); disagreeing blankets are
+    ///    B533's ambiguity, as for any receiver.
+    ///
+    /// Rules 1 and 2 answer here, with no scan.
     fn object_trait_arguments(&mut self, concrete: &Type, trait_id: Id) -> Option<Vec<TypeId>> {
-        match concrete {
-            Type::Dyn(object_trait_id, object_arguments)
-                if *object_trait_id == trait_id && !object_arguments.is_empty() =>
-            {
-                Some(object_arguments.clone())
-            }
-            _ => None,
+        let Type::Dyn(object_trait_id, object_arguments) = concrete else {
+            return None;
+        };
+        if *object_trait_id == trait_id {
+            return (!object_arguments.is_empty()).then(|| object_arguments.clone());
         }
+        let (object_trait_id, object_arguments) = (*object_trait_id, object_arguments.clone());
+        self.trait_with_supertraits_at(object_trait_id, &object_arguments)
+            .into_iter()
+            .find(|(reached, _)| *reached == trait_id)
+            .map(|(_, arguments)| arguments)
+            .filter(|arguments| !arguments.is_empty())
     }
 
     /// [`Self::trait_args_for`] for a caller holding the bound that asks — its
@@ -45117,10 +45722,19 @@ impl<'src> Analyzer<'src> {
         // The generics the receiver itself carries (B479, below).
         let mut receiver_generics = Vec::new();
         self.collect_generics(concrete, 0, &mut receiver_generics);
+        let object_receiver = matches!(concrete, Type::Dyn(..));
         for (subject_id, arguments) in candidates {
             let subject = subject_id.get_type(self);
             // B390: a refused subject provides nothing (`impl_subject_admits`).
             if matches!(subject, Type::Unknown | Type::Unresolved) {
+                continue;
+            }
+            // M124's rule 3: an object is provided for by a blanket (or an
+            // impl over objects) and never by a nominal implementor —
+            // `impl_subject_admits`' A124 R3 rule — so reconciling it with one
+            // through the erasure arm (minting every instantiation on the
+            // way) could only produce an echo that is no evidence.
+            if object_receiver && !matches!(subject, Type::Generic(_) | Type::Dyn(..)) {
                 continue;
             }
             if let Some((_, bindings)) = self.reconcile_declaration(concrete, &subject, &subject) {
@@ -45920,6 +46534,7 @@ impl<'src> Analyzer<'src> {
         if !self.type_is_callable(subject_type) {
             return None;
         }
+        self.note_member_query(subject_type, CALL_OPERATOR_MEMBER);
         let member_id = self.implementations.iter().find_map(|implementation| {
             let member_id = implementation.declarations.get(CALL_OPERATOR_MEMBER)?;
             self.impl_subject_admits(
@@ -46805,9 +47420,22 @@ impl<'src> Analyzer<'src> {
             // `T: PartialEq`, or a trait-typed parameter) when it implements the
             // trait — so a conditional impl `impl Option<T: PartialEq>` matches a
             // concrete `Option<i32>`. (Mirrors the same arm in `reconcile_type`.)
-            (Type::Struct(..) | Type::Enum(..), Type::Trait(trait_id, _)) => {
-                self.type_implements_trait(a, *trait_id)
-            }
+            //
+            // B564: a CLOSURE and a FUNCTION ITEM are such values too, and a
+            // tuple and an array (B210/B220, which `reconcile_type`'s arm already
+            // lists). Only the nominal shapes were here, so a blanket whose
+            // BOUND a closure meets through another blanket (`impl type T:
+            // Leaf with Shape` over `impl type T with Leaf`) did not admit the
+            // closure: one tier deep reached it (B508), two did not.
+            (
+                Type::Struct(..)
+                | Type::Enum(..)
+                | Type::Tuple(..)
+                | Type::Array(..)
+                | Type::Closure(..)
+                | Type::Function(..),
+                Type::Trait(trait_id, _),
+            ) => self.type_implements_trait(a, *trait_id),
             // Arity first, like the closure arm below and like `reconcile_type`'s
             // tuple arm: a bare `zip` compares the common prefix and calls
             // `(i32, str)` compatible with `(i32, str, bool)`.
@@ -48585,6 +49213,147 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// M121 / B553: start recording what this resolve asks of the impl table
+    /// ([`ImplReachLog`]). Called around the PRE-STORE resolve only — the one
+    /// whose answers the impls walked after it (the entry's, a hot set's) must
+    /// not have changed.
+    fn begin_impl_reach_log(&mut self, filter: ReachFilter) {
+        *self.impl_reach.get_mut() = ImplReachLog {
+            recording: true,
+            filter,
+            ..ImplReachLog::default()
+        };
+    }
+
+    /// Ends [`Self::begin_impl_reach_log`]'s recording: every impl from here
+    /// on is one the recorded resolve did not see.
+    fn end_impl_reach_log(&mut self) {
+        let floor = self.implementations.len();
+        let log = self.impl_reach.get_mut();
+        log.recording = false;
+        log.floor = Some(floor);
+        let questions = log.questions;
+        if !crate::macros::in_macro_world() {
+            crate::incremental::update_census(|census| census.reach_questions = questions);
+        }
+    }
+
+    /// Records that member `member_name` was looked up on `subject_type`, when
+    /// a pre-store resolve is recording ([`ImplReachLog`]).
+    fn note_member_query(&self, subject_type: &Type, member_name: &str) {
+        let mut log = self.impl_reach.borrow_mut();
+        if !log.recording || (!log.filter.everything && !log.filter.members.contains(member_name)) {
+            return;
+        }
+        log.questions += 1;
+        let by_package = !log.asked_by_std;
+        let receivers = match log.members.get_mut(member_name) {
+            Some(receivers) => receivers,
+            None => log.members.entry(member_name.into()).or_default(),
+        };
+        note_receiver(receivers, subject_type, by_package);
+    }
+
+    /// Records that `trait_id` was asked of `subject_type`, when a pre-store
+    /// resolve is recording ([`ImplReachLog`]).
+    fn note_trait_query(&self, subject_type: &Type, trait_id: Id) {
+        let mut log = self.impl_reach.borrow_mut();
+        // Only a foreign TRAIT impl answers a trait question, and one of those
+        // records everything.
+        if !log.recording || !log.filter.everything {
+            return;
+        }
+        log.questions += 1;
+        let by_package = !log.asked_by_std;
+        note_receiver(
+            log.traits.entry(trait_id).or_default(),
+            subject_type,
+            by_package,
+        );
+    }
+
+    /// M121 / B553: whether an impl that joined this world AFTER its recorded
+    /// resolve answers a question that resolve asked ([`ImplReachLog`]) — so a
+    /// canonical analysis, which walks every impl before anything resolves,
+    /// could have answered it differently. Asked once the build has resolved
+    /// those impls' subjects and provided traits.
+    ///
+    /// A late impl answers a member question when it declares the member or a
+    /// trait it provides (closed over supertraits) does, and a trait question
+    /// when it provides the trait; either way only for a receiver its subject
+    /// admits — the lookup's own test. `hot_sources` are the hot modules'
+    /// sources (M110 S1; empty for every other world): an impl in one of them
+    /// is the hot set's, and every other late impl — the entry's, and what the
+    /// entry's expansion generated — is the entry's.
+    fn impl_reach(&mut self, hot_sources: std::ops::Range<u32>) -> Option<ImplReached> {
+        let log = std::mem::take(self.impl_reach.get_mut());
+        let floor = log.floor?;
+        if floor >= self.implementations.len() || (log.members.is_empty() && log.traits.is_empty())
+        {
+            return None;
+        }
+        let mut reached = ImplReached::default();
+        for implementation in &self.implementations[floor..] {
+            let subject = implementation.subject.get_type(self);
+            // An impl the ENTRY walked answers only what a package source
+            // asked ([`ImplReachLog::asked_by_std`]); a hot module's answers
+            // what anyone asked.
+            let entry_side = !hot_sources.contains(&implementation.source.0);
+            let admits = |receivers: &HashMap<Type, bool>| {
+                receivers.iter().any(|(receiver, by_package)| {
+                    (*by_package || !entry_side)
+                        && (matches!(receiver, Type::Unknown)
+                            || self.impl_subject_admits(receiver, &subject, &HashMap::default()))
+                })
+            };
+            let mut traits: Vec<Id> = Vec::new();
+            for (trait_id, _) in implementation
+                .provided_trait_args
+                .iter()
+                .chain(&implementation.trait_args)
+            {
+                for reached_id in self.trait_with_supertraits(*trait_id) {
+                    if !traits.contains(&reached_id) {
+                        traits.push(reached_id);
+                    }
+                }
+            }
+            let declared = implementation.declarations.keys().copied();
+            let inherited = traits
+                .iter()
+                .filter_map(|trait_id| self.traits.get(trait_id))
+                .flat_map(|trait_| trait_.declarations.keys().copied());
+            let mut hit = declared
+                .chain(inherited)
+                .find(|name| log.members.get(*name).is_some_and(admits))
+                .map(|name| format!("member `{name}`"));
+            if hit.is_none() {
+                hit = traits
+                    .iter()
+                    .find(|trait_id| log.traits.get(trait_id).is_some_and(admits))
+                    .map(|trait_id| {
+                        let name = self.traits.get(trait_id).map_or("?", |trait_| trait_.name);
+                        format!("trait `{name}`")
+                    });
+            }
+            let Some(hit) = hit else {
+                continue;
+            };
+            // An impl the entry walked, or one no stored source owns, is the
+            // entry's side: rebuilding in the deferred order is right for it
+            // whatever its source turns out to be.
+            if entry_side {
+                reached.by_entry = true;
+            } else {
+                reached.by_hot = true;
+            }
+            if reached.first.is_empty() {
+                reached.first = hit;
+            }
+        }
+        (reached.by_hot || reached.by_entry).then_some(reached)
+    }
+
     /// M110 S1's third guard: which of `modules` (name, scope) declare a
     /// module-level binding whose type its own declaration does not settle —
     /// one whose initializer minted an element slot (an empty list literal, a
@@ -48912,6 +49681,13 @@ impl<'src> Analyzer<'src> {
                 .expr_id_to_scope_id_map
                 .get(&constraint.anchor())
                 .copied();
+            // M121 / B553: who is asking, for the pre-store resolve's record.
+            if self.impl_reach.get_mut().recording {
+                let by_std = self
+                    .source_of_id(constraint.anchor())
+                    .is_some_and(|source| self.std_sources.contains(&source));
+                self.impl_reach.get_mut().asked_by_std = by_std;
+            }
             // B401: the file whose admission this constraint's method lookups
             // read — asked only when some file restricts anything.
             if self.lookup_admission.is_some() {
@@ -48934,6 +49710,7 @@ impl<'src> Analyzer<'src> {
             self.rigid_binder_scope = None;
             self.lookup_importer = None;
             self.lookup_anchor = None;
+            self.impl_reach.get_mut().asked_by_std = false;
             // Attribute anything this constraint reported to its anchor's file
             // (a type error inside an imported module must publish there, E1).
             self.attribute_diagnostics_to_anchor(diagnostics_before, constraint.anchor());
@@ -49197,6 +49974,154 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// E271: the refusal for an element-syntax HOLE whose value is not a
+    /// `Slot` — `<p>{count}</p>` over a `SignalCell<i32>`, `<p>{5}</p>`.
+    ///
+    /// `{expr}` lowers to `.child(expr)` before analysis (`elements.rs`), so
+    /// the value failed the desugared call's bound: "'SignalCell<i32>' does not
+    /// implement trait 'Slot', required by a generic bound of this call",
+    /// spanned from the element's `<` and noting std's `child` — a call the
+    /// author never wrote. This says what a hole takes, at the hole's own
+    /// expression, and for a number or a bool (anything that renders into a
+    /// string, `str` aside) writes the hole as an i-string; for a `Source` of
+    /// one, the `.derive` that makes it text. A generated `.child` link is told
+    /// from a written one by its ZERO-WIDTH member span (the desugar's
+    /// scaffolding, as A157 tells a head's `attr`): a written `.child(5)` keeps
+    /// the bound's sentence. `None` for anything else.
+    fn element_hole_refusal(
+        &mut self,
+        call_id: Id,
+        value_type: &Type,
+        trait_id: Id,
+    ) -> Option<(Span, String)> {
+        let is_std_trait = |analyzer: &Self, name: &str, id: Id| {
+            analyzer.traits.get(&id).is_some_and(|trait_| {
+                trait_.name == name
+                    && analyzer
+                        .source_of_id(trait_.id)
+                        .is_some_and(|source| analyzer.std_sources.contains(&source))
+            })
+        };
+        if !is_std_trait(self, "Slot", trait_id) {
+            return None;
+        }
+        let member_span = self.member_name_spans.get(&call_id)?;
+        if member_span.start != member_span.end {
+            return None;
+        }
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(member_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        if self.callable_name(*member_id) != Some("child") || !self.is_std_view_member(*member_id) {
+            return None;
+        }
+        let hole = *function_call.argument_ids.get(1)?;
+        let span = **self.span_map.get(&hole)?;
+        let written = self.written_text_of(hole)?;
+        let type_label = self.pretty_print_type(value_type, &HashMap::default());
+        let is_text = |analyzer: &Self, type_: &Type| {
+            analyzer.renders_into_a_string(type_) && !analyzer.is_str_type(type_)
+        };
+        let steer = if is_text(self, value_type) {
+            format!(": show it as text, `{{i\"{{{written}}}\"}}`")
+        } else if self.is_source_of_text(value_type, &is_std_trait, &is_text) {
+            // A receiver that is not already a postfix operand is wrapped, so
+            // the `.derive` reads off the whole hole.
+            let receiver = match self.expr_id_to_expr_map.get(&hole) {
+                Some(
+                    Expr::Local(_)
+                    | Expr::Call(_)
+                    | Expr::Field(..)
+                    | Expr::TupleIndex(..)
+                    | Expr::Index(..),
+                ) => written.to_string(),
+                _ => format!("({written})"),
+            };
+            format!(": show it as text, `{{{receiver}.derive(|value| i\"{{value}}\")}}`")
+        } else {
+            String::new()
+        };
+        Some((
+            span,
+            format!(
+                "a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` \
+                 of one, and `{written}` is `{type_label}`{steer}"
+            ),
+        ))
+    }
+
+    /// E271's `Source` case: whether `value_type` is one of std's flows whose
+    /// item renders into a string. The item is not read off the type's own
+    /// arguments (a stage's arguments are its whole recipe —
+    /// `Derive<SignalCell<i32>, i32, Point>` is a flow of `Point`); each text
+    /// type the value's type mentions is a CANDIDATE, and the flow bound is
+    /// asked at it.
+    fn is_source_of_text(
+        &mut self,
+        value_type: &Type,
+        is_std_trait: &dyn Fn(&Self, &str, Id) -> bool,
+        is_text: &dyn Fn(&Self, &Type) -> bool,
+    ) -> bool {
+        let Some(flow) = self
+            .traits
+            .keys()
+            .copied()
+            .find(|id| is_std_trait(self, "Flow", *id))
+        else {
+            return false;
+        };
+        let mut candidates: Vec<TypeId> = Vec::new();
+        let mut pending: Vec<TypeId> = match value_type {
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => arguments.clone(),
+            _ => return false,
+        };
+        while let Some(argument) = pending.pop() {
+            let argument_type = argument.get_type(self);
+            if is_text(self, &argument_type) {
+                candidates.push(argument);
+            } else if let Type::Struct(_, inner) | Type::Enum(_, inner) = argument_type {
+                pending.extend(inner);
+            }
+        }
+        candidates
+            .into_iter()
+            .any(|candidate| self.satisfies_trait_bound(value_type, flow, &[candidate], 0))
+    }
+
+    /// E272: a mismatch whose refused value is a FRAGMENT (`<>…</>`) in a
+    /// position that wants std's `View` gains the sentence the book promises
+    /// (Building UI, Fragments): a fragment is a `List<View>`, not one view, and
+    /// the two fixes. The desugar lowers a fragment to a list literal, so the
+    /// plain mismatch read as if the author had written a list; a fragment is
+    /// told from a written `[..]` by its markup — the literal's own span opens
+    /// with `<`, which no written list literal does. Any other message, value
+    /// or position comes back unchanged.
+    fn with_fragment_steer(&self, msg: String, value_id: Id, expected: &Type) -> String {
+        let expects_view = match expected {
+            Type::Struct(struct_id, _) => self.structs.get(struct_id).is_some_and(|struct_| {
+                struct_.name == "View"
+                    && self
+                        .source_of_id(struct_.id)
+                        .is_some_and(|source| self.std_sources.contains(&source))
+            }),
+            _ => false,
+        };
+        let is_fragment = expects_view
+            && matches!(self.expr_id_to_expr_map.get(&value_id), Some(Expr::List(_)))
+            && self
+                .written_text_of(value_id)
+                .is_some_and(|written| written.starts_with('<'));
+        match is_fragment {
+            true => format!(
+                "{msg} A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children \
+                 in one element (`<div>…</div>`), or make this position a `List<View>`"
+            ),
+            false => msg,
+        }
+    }
+
     /// B495 Q2: the refusal for a closure whose parameter's MODE differs
     /// from the mode its type position wrote — a value closure where the type
     /// takes a view, or the reverse. The two are different calling
@@ -49205,12 +50130,28 @@ impl<'src> Analyzer<'src> {
     /// hides a copy, and a view closure cannot stand where a value closure
     /// writes its own copy. `None` unless both are closure types of one arity
     /// whose modes disagree at a parameter where both are settled.
+    ///
+    /// E273: a NAMED FUNCTION handed where a closure type is expected is read
+    /// as the closure type it coerces to (`function_closure_type_recorded`,
+    /// whose modes are its parameters' conventions), so `apply(count)` with
+    /// `fun count(s: str)` against `|&str| i32` gets this refusal too — named
+    /// as the function's, and steering to the adapter alone, since a declared
+    /// function cannot be rewritten at the call.
     fn closure_mode_mismatch_message(
         &self,
         expected_type: &Type,
         got_type: &Type,
         substitution_context: &SubstitutionContext,
     ) -> Option<String> {
+        let function = match got_type {
+            Type::Function(function_id) => Some((
+                self.functions.get(function_id)?.name,
+                self.function_closure_type_recorded(*function_id)?,
+            )),
+            _ => None,
+        };
+        let got_type = function.as_ref().map_or(got_type, |(_, coerced)| coerced);
+        let function_name = function.as_ref().map(|(name, _)| *name);
         let (
             Type::Closure(expected_parameters, _, _, expected_modes),
             Type::Closure(got_parameters, _, _, got_modes),
@@ -49246,7 +50187,48 @@ impl<'src> Analyzer<'src> {
             Mode::View => format!("a view `&{pointee}`"),
             Mode::MutView => format!("a writable view `&mut {pointee}`"),
         };
-        let which = if expected_parameters.len() == 1 {
+        let single = expected_parameters.len() == 1;
+        if let Some(name) = function_name {
+            let which = if single {
+                format!("the function `{name}` takes")
+            } else {
+                format!("the function `{name}`'s parameter {} takes", index + 1)
+            };
+            // The adapter spells the call; only a one-parameter function's is
+            // written out whole (the others are passed on as they come).
+            let adapter = |lend: &str| {
+                if single {
+                    format!(": `|c| {name}({lend}c)`")
+                } else {
+                    format!(
+                        ", passing parameter {} as `{lend}c` and the others as they come",
+                        index + 1
+                    )
+                }
+            };
+            let adapt = match (expected_mode, got_mode) {
+                (Mode::View, Mode::Value) => format!(
+                    "a declared function is not rewritten at the call: adapt it with a closure that copies the view's value out{}",
+                    adapter("*")
+                ),
+                (Mode::Value, Mode::View | Mode::MutView) => format!(
+                    "a declared function is not rewritten at the call: adapt it with a closure that lends it the value{}",
+                    adapter(if got_mode == Mode::View { "&" } else { "&mut " })
+                ),
+                (Mode::MutView, Mode::Value) => format!(
+                    "a function that takes a value writes only its own copy, never the caller's place: declare `{name}`'s parameter `&mut {pointee}`"
+                ),
+                _ => format!(
+                    "declare `{name}`'s parameter with the view the type takes (`&` and `&mut` are different views)"
+                ),
+            };
+            return Some(format!(
+                "{which} {} where its type takes {}: a value closure and a view closure are different types, and no adapter is inserted; {adapt}.",
+                describe(got_mode),
+                describe(expected_mode),
+            ));
+        }
+        let which = if single {
             "this closure takes".to_string()
         } else {
             format!("this closure's parameter {} takes", index + 1)
@@ -49302,18 +50284,24 @@ impl<'src> Analyzer<'src> {
     /// type holding a generic that is neither the callee's nor a binder in
     /// scope at the call — another call's own parameter left open — when the
     /// call carries an expectation the step after this one can read.
+    ///
+    /// Answers whether the call should WAIT instead (B501's remainder): such
+    /// a binding and no expectation yet, while the fixpoint still moves. A
+    /// call standing at ANOTHER call's parameter (`takes(counted(source(..)))`)
+    /// receives its expectation only when that outer call is typed — the
+    /// outer seeds it (`seed_call_argument_expectations`) — and resolving
+    /// first committed the foreign binding, so `source`'s `T` was "cannot be
+    /// checked". A call nothing ever directs resolves at the stall, as before.
     fn release_bindings_to_foreign_generics(
         &mut self,
         call_id: Id,
         callee_id: Id,
         substitution: &mut SubstitutionContext,
-    ) {
-        if !self.expected_types.contains_key(&call_id) {
-            return;
-        }
+    ) -> bool {
         let Some((_, own_generics)) = self.method_signature(callee_id) else {
-            return;
+            return false;
         };
+        let expected = self.expected_types.contains_key(&call_id);
         for generic in own_generics {
             let Some(bound) = substitution.get(&generic).copied() else {
                 continue;
@@ -49323,8 +50311,49 @@ impl<'src> Analyzer<'src> {
             let foreign = mentioned.iter().any(|mentioned| {
                 *mentioned != generic && !self.generic_is_enclosing_binder(*mentioned, call_id)
             });
-            if foreign {
-                substitution.remove(&generic);
+            if !foreign {
+                continue;
+            }
+            if !expected {
+                return !self.fixpoint_stalled;
+            }
+            substitution.remove(&generic);
+        }
+        false
+    }
+
+    /// B501's remainder: a CALL standing at a parameter whose type this call
+    /// has already decided — a concrete declared type, or a generic the
+    /// substitution grounds — is told that type as its expectation before it
+    /// is typed, as an annotated `let` tells its initializer. The argument
+    /// call waits for it (`release_bindings_to_foreign_generics`); seeded
+    /// here, its next attempt binds from it.
+    fn seed_call_argument_expectations(
+        &mut self,
+        parameters: &[Id],
+        argument_ids: &[Id],
+        substitution_context: &SubstitutionContext,
+    ) {
+        for (parameter_id, argument_id) in parameters.iter().zip(argument_ids) {
+            if !matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Call(_))
+            ) || self.expected_types.contains_key(argument_id)
+            {
+                continue;
+            }
+            let Some(parameter_type_id) = self
+                .parameters
+                .get(parameter_id)
+                .map(|parameter| parameter.type_id)
+            else {
+                continue;
+            };
+            let parameter_type = parameter_type_id.get_type(self);
+            let decided = self.substitute_type(&parameter_type, substitution_context);
+            let decided_id = decided.get_type_id(self);
+            if self.type_is_ground(decided_id) {
+                self.expected_types.insert(*argument_id, decided_id);
             }
         }
     }
@@ -49411,6 +50440,88 @@ impl<'src> Analyzer<'src> {
             kept.insert(generic, self_value);
         }
         Some(kept)
+    }
+
+    /// B558: the impl-binder bindings a static path WROTE (`Cell<str>::new`)
+    /// for binders that are rigid at the call — the enclosing block's own,
+    /// when the call stands inside the impl that declares the static. The
+    /// reconciliation will not bind a rigid binder, and the written argument
+    /// is no inference to make: it is the instantiation. `None` when the path
+    /// wrote none (a bare path's `Self` reading binds each binder to itself).
+    fn written_rigid_path_bindings(&self, subject_id: Id) -> Option<SubstitutionContext> {
+        let bindings = self.static_subject_bindings.get(&subject_id)?;
+        let written: SubstitutionContext = bindings
+            .iter()
+            .filter(|(generic, bound)| {
+                self.generic_is_rigid_here(**generic)
+                    && !matches!(bound.get_type(self), Type::Generic(itself) if itself == **generic)
+            })
+            .map(|(generic, bound)| (*generic, *bound))
+            .collect();
+        (!written.is_empty()).then_some(written)
+    }
+
+    /// B558: the refusal of an argument at a parameter written in the impl's
+    /// own binder, when the call is a bare `Type::f(..)` inside the block that
+    /// declares `f` — B403 reads it as `Self::f(..)`, so the binder is this
+    /// block's own and RIGID, and the argument cannot instantiate it. The
+    /// refusal is right; rendered through the call's working context, which
+    /// had bound the binder to the argument, it read "Expected str, but got
+    /// str". It names the binder as written and steers to the spelling that
+    /// instantiates fresh (`Cell<str>::new(..)`, B542). `None` for any other
+    /// mismatch.
+    fn rigid_self_reading_mismatch(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        target_id: Id,
+        parameter_type: &Type,
+        argument_type: &Type,
+    ) -> Option<String> {
+        // The `Self` reading binds each impl binder the path leaves open to
+        // ITSELF (`{T: T}`), and a binder of the enclosing block is rigid in
+        // the body, so the argument could not have instantiated it.
+        let reading = self.static_subject_bindings.get(&subject_id)?;
+        let mut generics = Vec::new();
+        self.collect_generics(parameter_type, 0, &mut generics);
+        let read_as_self = generics.iter().any(|generic| {
+            reading.get(generic).is_some_and(
+                |bound| matches!(bound.get_type(self), Type::Generic(itself) if itself == *generic),
+            ) && self.generic_is_enclosing_binder(*generic, call_id)
+        });
+        if !read_as_self {
+            return None;
+        }
+        let expected = self.pretty_print_type(parameter_type, &HashMap::default());
+        let got = self.pretty_print_type(argument_type, &HashMap::default());
+        let member = self.functions.get(&target_id).map(|function| function.name);
+        let subject = self
+            .implementations
+            .iter()
+            .find(|implementation| {
+                implementation
+                    .declarations
+                    .values()
+                    .any(|id| *id == target_id)
+            })
+            .map(|implementation| implementation.subject);
+        let (Some(member), Some(subject)) = (member, subject) else {
+            return Some(format!("Expected {expected}, but got {got} instead."));
+        };
+        // The instantiation the argument asks for: the binder the parameter IS
+        // bound to the argument, in the impl's subject.
+        let mut wanted = SubstitutionContext::default();
+        if let Type::Generic(binder) = parameter_type {
+            wanted.insert(*binder, argument_type.clone().get_type_id(self));
+        }
+        let written = self.pretty_print_type(&subject.get_type(self), &HashMap::default());
+        let path = written.split('<').next().unwrap_or(&written).to_string();
+        let suggested = self.pretty_print_type(&subject.get_type(self), &wanted);
+        Some(format!(
+            "Expected {expected}, but got {got} instead: inside the impl that declares it, a bare \
+             `{path}::{member}(..)` is `Self::{member}(..)`, whose `{expected}` is this block's \
+             own. Write `{suggested}::{member}(..)` to call it at another instantiation"
+        ))
     }
 
     /// B541: an argument at a MAPPED parameter (`(U in T: Option<U>)`) whose
@@ -50081,6 +51192,7 @@ impl<'src> Analyzer<'src> {
         // nothing about which — §3.1's spelling has no argument slot (B73 R2).
         // The receiver must implement the NAMED trait as well: `Sub::name` on
         // a type that implements only `Base` is still refused below.
+        self.note_trait_query(&receiver_type, trait_id);
         let implements_named_trait = self.implementations.iter().any(|implementation| {
             self.impl_subject_admits(
                 &receiver_type,
@@ -50662,6 +51774,20 @@ impl<'src> Analyzer<'src> {
                             && self
                                 .an_argument_type_is_unresolved(argument_ids, &substitution_context)
                         {
+                            // B501: an argument call waiting for its direction
+                            // gets it from what the expectation decides, or the
+                            // two would wait on each other to the stall.
+                            let mut decided = substitution_context.clone();
+                            self.bind_callee_own_generics_from_expectation(
+                                call_id,
+                                target_id,
+                                &mut decided,
+                            );
+                            self.seed_call_argument_expectations(
+                                &parameters,
+                                argument_ids,
+                                &decided,
+                            );
                             return Resolution::Deferred;
                         }
                         // B501: an argument whose own type still holds ANOTHER
@@ -50671,11 +51797,13 @@ impl<'src> Analyzer<'src> {
                         // argument waiting to be told. Under an expectation the
                         // parameter is released, so the expectation decides it
                         // and the argument is then typed toward it.
-                        self.release_bindings_to_foreign_generics(
+                        if self.release_bindings_to_foreign_generics(
                             call_id,
                             target_id,
                             &mut substitution_context,
-                        );
+                        ) {
+                            return Resolution::Deferred;
+                        }
                         // The method path's third binding source, shared (B125):
                         // the call site's expectation fixes what the non-closure
                         // arguments left open, before any closure is typed.
@@ -50685,10 +51813,23 @@ impl<'src> Analyzer<'src> {
                             &mut substitution_context,
                         );
                     }
+                    self.seed_call_argument_expectations(
+                        &parameters,
+                        argument_ids,
+                        &substitution_context,
+                    );
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
                         let parameter_type = parameter.type_id.get_type(self);
+                        // B558: `Cell<str>::new(label)` inside the impl that
+                        // declares `new` WROTE the instantiation; the block's
+                        // binder is rigid in the body, so the path's binding is
+                        // applied to the parameter rather than asked of it.
+                        let parameter_type = match self.written_rigid_path_bindings(subject_id) {
+                            Some(written) => self.substitute_type(&parameter_type, &written),
+                            None => parameter_type,
+                        };
                         let argument_id = *argument_ids.get(index).unwrap();
                         // B501: a CALL standing at a parameter the call has
                         // already decided (`counted(source("x"))` under `let
@@ -50836,13 +51977,30 @@ impl<'src> Analyzer<'src> {
                                     &substitution_context,
                                 ) {
                                     Some(msg) => (msg, None),
-                                    None => self.argument_mismatch(
-                                        parameter_name,
-                                        *parameter_id,
+                                    None => match self.rigid_self_reading_mismatch(
+                                        call_id,
+                                        subject_id,
+                                        target_id,
                                         &parameter_type,
                                         &argument_type,
-                                        &substitution_context,
-                                    ),
+                                    ) {
+                                        Some(msg) => (msg, None),
+                                        None => {
+                                            let (msg, note) = self.argument_mismatch(
+                                                parameter_name,
+                                                *parameter_id,
+                                                &parameter_type,
+                                                &argument_type,
+                                                &substitution_context,
+                                            );
+                                            let msg = self.with_fragment_steer(
+                                                msg,
+                                                argument_id,
+                                                &parameter_type,
+                                            );
+                                            (msg, note)
+                                        }
+                                    },
                                 };
                                 let span = **self.span_map.get(&argument_id).unwrap();
                                 self.calls_with_refused_arguments.insert(call_id);
@@ -51298,11 +52456,16 @@ impl<'src> Analyzer<'src> {
             // shapes and the blankets (`impl type T with Named`) exactly as a
             // nominal one does — it fell to `NotCallable` before, so `f.named()`
             // on a `|| void` was "cannot call method".
+            //
+            // B565: and so does a FUNCTION ITEM — `let f = nothing; f.leaf()`
+            // keeps the item's own type, which only an annotation (`let f: ||
+            // void`) turned into the closure type B508 reached.
             Type::Struct(_, _)
             | Type::Enum(_, _)
             | Type::Tuple(_)
             | Type::Array(_, _)
             | Type::Closure(..)
+            | Type::Function(_)
             | Type::Dyn(_, _)
                 if !object_declares_member =>
             {
@@ -51955,12 +53118,25 @@ impl<'src> Analyzer<'src> {
                 // binds nothing, the bounded generic freezes abstract, and the
                 // call monomorphizes to the trait's empty member — the
                 // silent-stub misrender.
+                // B501: an argument CALL at a parameter this call decides is
+                // told that type as its expectation (the free path's rule).
+                let explicit_parameters: Vec<Id> = self
+                    .method_signature_ref(member_id)
+                    .map(|(parameters, _)| parameters.iter().skip(1).copied().collect())
+                    .unwrap_or_default();
                 if self.own_generics_unbound(member_id, &substitution)
                     && (self.an_argument_type_is_unresolved(argument_ids, &substitution)
                         || argument_ids
                             .iter()
                             .any(|argument_id| self.is_unknown_closure_parameter(*argument_id)))
                 {
+                    let mut decided = substitution.clone();
+                    self.bind_callee_own_generics_from_expectation(id, member_id, &mut decided);
+                    self.seed_call_argument_expectations(
+                        &explicit_parameters,
+                        argument_ids,
+                        &decided,
+                    );
                     self.unwired_method_calls.insert(id, member_id);
                     return Resolution::Deferred;
                 }
@@ -51970,6 +53146,11 @@ impl<'src> Analyzer<'src> {
                 // (B125/P21). After the defer above on purpose: the expectation
                 // fills generics, it does not decide readiness.
                 self.bind_callee_own_generics_from_expectation(id, member_id, &mut substitution);
+                self.seed_call_argument_expectations(
+                    &explicit_parameters,
+                    argument_ids,
+                    &substitution,
+                );
                 self.infer_closure_args_against_params(member_id, argument_ids, &substitution);
                 // Then bind generics fixed by a closure's return (`derive<U>`'s `U`),
                 // now that the closures are typed.
@@ -52782,6 +53963,7 @@ impl<'src> Analyzer<'src> {
                             &value_type,
                             &substitution_context,
                         );
+                        let msg = self.with_fragment_steer(msg, first_value_id, &variable_type);
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,
@@ -53630,7 +54812,9 @@ impl<'src> Analyzer<'src> {
                 "Expected {expected}, but got void instead: an `if` with no `else` produces void."
             )
         } else {
-            self.type_mismatch_message(target_return_type, &body_type, substitution_context)
+            let msg =
+                self.type_mismatch_message(target_return_type, &body_type, substitution_context);
+            self.with_fragment_steer(msg, body_id, target_return_type)
         };
         ReturnPositionCheck::Mismatched(msg)
     }
@@ -54388,6 +55572,10 @@ impl<'src> Analyzer<'src> {
         let mut method_index: HashMap<(String, String), (String, String)> = HashMap::default();
         let mut ambiguous_methods: HashSet<(String, String)> = HashSet::default();
         let mut deprecated_aliases: HashMap<String, (String, String)> = HashMap::default();
+        // B572: the modules that RE-EXPORT a name a sibling declares — a
+        // facade (`std::reactive::store` over `store_core`, `std::reactive`
+        // over `delta`) is the path a program is meant to import from.
+        let mut facades: HashMap<String, Vec<String>> = HashMap::default();
         let files = self.std_module_files.clone();
         for (module_name, path) in &files {
             // A154: a NESTED prelude (`web::prelude`, `web::style::prelude`) is
@@ -54438,6 +55626,23 @@ impl<'src> Analyzer<'src> {
                     },
                 }
             }
+            // A prelude at ANY depth is a surface of the names it makes
+            // ambient, never the path a steer writes (`std::prelude::Option`
+            // would beat `std::option::Option` on length).
+            if module_leaf_name(module_name) != "prelude" {
+                let mut importables = Vec::new();
+                collect_importables(&loaded.ast.0, &mut importables);
+                for importable in importables {
+                    if importable.kind == ImportableKind::Reexport
+                        && importable.exported.is_exported()
+                    {
+                        facades
+                            .entry(importable.name.to_string())
+                            .or_default()
+                            .push(module_name.clone());
+                    }
+                }
+            }
             let declared: HashSet<&str> = names.into_iter().collect();
             let mut steers = Vec::new();
             collect_impl_method_steers(&loaded.ast.0, &declared, &mut steers);
@@ -54461,6 +55666,30 @@ impl<'src> Analyzer<'src> {
         }
         for key in ambiguous_methods {
             method_index.remove(&key);
+        }
+        // B572: each name's import is spelled at its SHORTEST public path —
+        // the declaring module or a module that re-exports it, by segment
+        // count, a re-export winning a tie (it exists to be imported from:
+        // `std::reactive::store::Store`, not `store_core`'s). Two different
+        // re-exports tied at the shortest are a guess, and the declaring
+        // module stands.
+        for (name, module) in export_index.iter_mut() {
+            let Some(reexports) = facades.get(name) else {
+                continue;
+            };
+            let depth = |path: &str| path.split("::").count();
+            let shortest = reexports.iter().map(|facade| depth(facade)).min();
+            let Some(shortest) = shortest.filter(|shortest| *shortest <= depth(module)) else {
+                continue;
+            };
+            let mut at_shortest: Vec<&String> = reexports
+                .iter()
+                .filter(|facade| depth(facade) == shortest)
+                .collect();
+            at_shortest.dedup();
+            if let [facade] = at_shortest.as_slice() {
+                *module = (*facade).clone();
+            }
         }
         self.std_export_index = Some(export_index);
         self.std_deprecated_alias_index = Some(deprecated_aliases);
@@ -54502,13 +55731,14 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
-    fn import_steer_inner(&self, name: &str) -> Option<String> {
-        // B560: every loaded module's FULL path from its root — `std`'s and
-        // `pkg`'s scopes, then each module's children (A65/A154 namespaces),
-        // breadth-first — because the import the steer writes must be one the
-        // loader accepts. The module's own `name` is its LEAF, which spelled
-        // `pkg::lib::thing` as `pkg::thing` and `std::reactive::delta` as
-        // `pkg::delta`, imports that resolve nowhere.
+    /// B560: every loaded module's FULL import path from its root — `std`'s
+    /// and `pkg`'s scopes, then each module's children (A65/A154 namespaces),
+    /// breadth-first — because an import the compiler writes into a message
+    /// must be one the loader accepts. The module's own `name` is its LEAF,
+    /// which spelled `pkg::lib::thing` as `pkg::thing` and
+    /// `std::reactive::delta` as `pkg::delta`, imports that resolve nowhere.
+    /// The B4 steer and B535's trait-scope refusal (B561) both read it.
+    fn module_import_paths(&self) -> HashMap<Id, String> {
         let mut paths: HashMap<Id, String> = HashMap::default();
         let mut pending: std::collections::VecDeque<(Id, String)> =
             std::collections::VecDeque::new();
@@ -54544,6 +55774,11 @@ impl<'src> Analyzer<'src> {
             }
             paths.insert(module_id, path);
         }
+        paths
+    }
+
+    fn import_steer_inner(&self, name: &str) -> Option<String> {
+        let paths = self.module_import_paths();
         // Hits are compared by that PATH, not by leaf name: two modules sharing
         // a leaf in different directories are two homes (ambiguous, no steer),
         // while one path loaded twice — a module's platform twins — is one.
@@ -54582,6 +55817,21 @@ impl<'src> Analyzer<'src> {
             }
         }
         if let Some(path) = hit {
+            // B572: a std name is spelled at its shortest public path — the
+            // index's answer, a facade that re-exports it where there is one —
+            // and not at the internal module that happens to declare it. The
+            // index holds a name only when ONE std module declares it, so its
+            // answer is about this very declaration.
+            if path.starts_with("std::")
+                && let Some(module) = self
+                    .std_export_index
+                    .as_ref()
+                    .and_then(|index| index.get(name))
+            {
+                return Some(format!(
+                    "; import it first (`import std::{module}::{name};`)"
+                ));
+            }
             return Some(format!("; import it first (`import {path}::{name};`)"));
         }
         if let Some(module) = self
@@ -55165,16 +56415,14 @@ impl<'src> Analyzer<'src> {
     /// The import path that names `entity` from the module DECLARING it —
     /// `std::display::Display` — found by the entity rather than by its name,
     /// so a name two modules declare (`std::web::style`'s `Display` beside
-    /// `std::display`'s) still answers. `None` for an entity no top-level
-    /// module of `std` or of the package declares.
+    /// `std::display`'s) still answers. `None` for an entity no module a root
+    /// reaches declares.
+    ///
+    /// B561: the module's FULL path ([`Self::module_import_paths`], B560's
+    /// walk) — a trait in `pkg::geo::shapes` was spelled `pkg::shapes::Area`,
+    /// from the module's leaf name, an import that resolves nowhere.
     fn import_path_of(&self, entity: Id) -> Option<String> {
-        let std_members: HashSet<Id> = self
-            .module_id_by_name
-            .get("std")
-            .and_then(|std_id| self.modules.get(std_id))
-            .and_then(|module| self.scopes.get(&module.body.1))
-            .map(|scope| scope.name_to_id_map.values().copied().collect())
-            .unwrap_or_default();
+        let paths = self.module_import_paths();
         self.modules.values().find_map(|module| {
             if module.name == "pkg" || module.name == "std" {
                 return None;
@@ -55184,11 +56432,7 @@ impl<'src> Analyzer<'src> {
                 .declaration_order
                 .iter()
                 .find(|(_, id)| *id == entity)?;
-            let root = match std_members.contains(&module.id) {
-                true => "std",
-                false => "pkg",
-            };
-            Some(format!("{root}::{}::{name}", module.name))
+            Some(format!("{}::{name}", paths.get(&module.id)?))
         })
     }
 
@@ -55412,22 +56656,33 @@ impl<'src> Analyzer<'src> {
 
     /// A155: one element whose class is written twice in one chain — an element
     /// head's `class("x")` and a `.styled(card)`, two `.styled`s, a `.class` and
-    /// a `.bind_styled` — keeps only the LAST write: every one of std's `View`
-    /// class writers SETS the attribute, on both ui twins, so the earlier write is
-    /// silently lost (`<div class("x") .styled(card) />` renders only `card`'s
-    /// classes, and the reverse order only `x`). A WARNING naming both writers,
-    /// at the one that wins.
+    /// a `.bind_styled`, a `.bind_attr("class", ..)` or a `.toggle_attr("class",
+    /// ..)` (A159) — keeps only the LAST write: every one of std's `View` class
+    /// writers SETS the attribute (or, `toggle_attr`, removes it), on both ui
+    /// twins, so the earlier write is silently lost (`<div class("x")
+    /// .styled(card) />` renders only `card`'s classes, and the reverse order
+    /// only `x`). A REFUSAL naming both writers, at the later one (A162, v0.46.0:
+    /// class-writes.md's door C — the writers stay last-wins and never append,
+    /// and the double write nobody means is an error; it was a warning in
+    /// v0.45.0).
+    ///
+    /// A160: when the EARLIER writer is a binding — a `bind_*`, a
+    /// `toggle_attr`, or an `attr("class", ..)` over a source — the later write
+    /// does not stay: the binding writes again on every change of its source,
+    /// so the two take turns and the element shows whichever fired last. The
+    /// sentence says that instead (`class_value_is_binding`).
     ///
     /// Statically visible means one receiver chain: from each writer, the walk
     /// follows the receiver while it is a dotted call of one of std's `View`
     /// methods (every one of which hands back the element it was called on), so
     /// an element head — which lowers to exactly such a chain — and a written
     /// chain over `view("..")` are both seen, and a chain broken by a function
-    /// of the program's own is not. Whether the writers should APPEND instead is
-    /// an open design question (census first); this pass does not change them.
+    /// of the program's own is not: that remainder stays last-wins and silent
+    /// (class-writes.md §5). std, dependencies and generated code are skipped.
     fn check_class_written_twice(&mut self) {
-        // Each class writer: its call, its receiver entity, its source.
-        let mut writers: HashMap<Id, (Id, SourceId)> = HashMap::default();
+        // Each class writer: its call, its receiver entity, its source, and
+        // whether it is a binding (A160).
+        let mut writers: HashMap<Id, (Id, SourceId, bool)> = HashMap::default();
         // Every dotted call of a std `View` method, by its CALL ENTITY, with its
         // receiver entity: the links the walk may cross.
         let mut links: HashMap<Id, (Id, Id)> = HashMap::default();
@@ -55457,20 +56712,28 @@ impl<'src> Analyzer<'src> {
             if let Some(&entity) = call_entities.get(call_id) {
                 links.insert(entity, (*call_id, receiver));
             }
-            let writes_class = match self.callable_name(*member_id) {
-                Some("class" | "styled" | "bind_class" | "bind_styled") => true,
-                Some("attr") => matches!(
+            // A159: the named-attribute writers count when the name is the
+            // literal `"class"` — `toggle_attr` too, which REMOVES the class
+            // while its flag is false.
+            let names_class = || {
+                matches!(
                     function_call
                         .argument_ids
                         .get(1)
                         .and_then(|name| self.expr_id_to_expr_map.get(name)),
                     Some(Expr::String("class"))
-                ),
-                _ => false,
+                )
             };
-            if !writes_class {
-                continue;
-            }
+            let is_binding = match self.callable_name(*member_id) {
+                Some("class" | "styled") => false,
+                Some("bind_class" | "bind_styled") => true,
+                Some("bind_attr" | "toggle_attr") if names_class() => true,
+                Some("attr") if names_class() => function_call
+                    .argument_ids
+                    .get(2)
+                    .is_some_and(|value| self.class_value_is_binding(*call_id, *value)),
+                _ => continue,
+            };
             let Some(source) = self.source_of_id(*call_id) else {
                 continue;
             };
@@ -55480,51 +56743,103 @@ impl<'src> Analyzer<'src> {
             {
                 continue;
             }
-            writers.insert(*call_id, (receiver, source));
+            writers.insert(*call_id, (receiver, source, is_binding));
         }
         if writers.len() < 2 {
             return;
         }
         // From each writer, the nearest writer BELOW it on its receiver chain:
         // the write it overrides. Reported once per pair, at the later writer.
-        let mut pairs: Vec<(SourceId, Id, Id)> = Vec::new();
-        for (call_id, (receiver, source)) in &writers {
+        let mut pairs: Vec<(SourceId, Id, Id, bool)> = Vec::new();
+        for (call_id, (receiver, source, _)) in &writers {
             let mut current = *receiver;
             while let Some(&(inner_call, inner_receiver)) = links.get(&current) {
-                if writers.contains_key(&inner_call) {
-                    pairs.push((*source, inner_call, *call_id));
+                if let Some(&(_, _, earlier_is_binding)) = writers.get(&inner_call) {
+                    pairs.push((*source, inner_call, *call_id, earlier_is_binding));
                     break;
                 }
                 current = inner_receiver;
             }
         }
-        let mut sites: Vec<(SourceId, Span, String, String, Span)> = pairs
+        let mut sites: Vec<(SourceId, Span, String, String, Span, bool)> = pairs
             .into_iter()
-            .filter_map(|(source, earlier, later)| {
+            .filter_map(|(source, earlier, later, earlier_is_binding)| {
                 let (earlier_text, earlier_span) = self.class_writer_text(earlier, source)?;
                 let (later_text, later_span) = self.class_writer_text(later, source)?;
-                Some((source, later_span, earlier_text, later_text, earlier_span))
+                Some((
+                    source,
+                    later_span,
+                    earlier_text,
+                    later_text,
+                    earlier_span,
+                    earlier_is_binding,
+                ))
             })
             .collect();
         sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
         sites.dedup_by_key(|(source, span, ..)| (source.0, span.start, span.end));
-        for (source, span, earlier, later, earlier_span) in sites {
-            self.warnings.push(Error {
-                trace: Vec::new(),
-                note: Some(Note::here(
-                    earlier_span,
-                    format!("`{earlier}` writes this element's class first"),
-                )),
-                span,
-                msg: format!(
-                    "this element's class is written twice — `{earlier}` and then \
-                     `{later}` — and only the last write stays: `{later}` replaces \
-                     what `{earlier}` wrote. Compose them into one writer (two styles \
-                     add: `.styled(a + b)`), or drop one"
-                ),
-            });
-            self.warning_sources.push(source);
+        for (source, span, earlier, later, earlier_span, earlier_is_binding) in sites {
+            let note = Some(Note::here(
+                earlier_span,
+                format!("`{earlier}` writes this element's class first"),
+            ));
+            let error = match earlier_is_binding {
+                // A160: the binding writes again on every change of its source,
+                // so the later write does not stay.
+                true => Error {
+                    trace: Vec::new(),
+                    note,
+                    span,
+                    msg: format!(
+                        "this element's class is written twice — `{earlier}` and then \
+                         `{later}` — and `{earlier}` is a binding, so the two take turns: \
+                         `{later}` writes last when the element is built, `{earlier}` \
+                         writes again whenever its source changes, and the element shows \
+                         whichever wrote last. Compose them into one writer (two styles \
+                         add: `.styled(a + b)`), or drop one"
+                    ),
+                },
+                false => Error {
+                    trace: Vec::new(),
+                    note,
+                    span,
+                    msg: format!(
+                        "this element's class is written twice — `{earlier}` and then \
+                         `{later}` — and only the last write stays: `{later}` replaces \
+                         what `{earlier}` wrote. Compose them into one writer (two styles \
+                         add: `.styled(a + b)`), or drop one"
+                    ),
+                },
+            };
+            self.push_in_source(error, source);
         }
+    }
+
+    /// A160: whether an `attr("class", value)` writer is a BINDING — whether its
+    /// value is a source the writer follows, rather than a `str` (or an
+    /// `Option<str>`, A115) it writes once. `AttrValue`'s arms are exactly those
+    /// two static types and the `Flow` blankets over them, so anything that is
+    /// not one of the two is followed.
+    ///
+    /// The value's type is the call's binding of `attr<V>`'s own `V` (a call
+    /// result's type lives there, not on the argument), else the argument's
+    /// own. A value whose type is not known is taken as static: the check then
+    /// says what it always said.
+    fn class_value_is_binding(&self, call_id: Id, value: Id) -> bool {
+        let value_type = match self
+            .own_generic_call_bindings
+            .get(&call_id)
+            .and_then(|bindings| bindings.first())
+        {
+            Some(bound) => bound.get_type(self),
+            None => match self.place_value_type(value) {
+                Some(value_type) => value_type,
+                None => return false,
+            },
+        };
+        let is_static = self.is_str_type(&value_type)
+            || matches!(value_type, Type::Enum(id, _) if Some(id) == self.option_enum_id);
+        !is_static
     }
 
     /// A157: a WRITTEN `autofocus` attribute in an element head —
@@ -55644,7 +56959,7 @@ impl<'src> Analyzer<'src> {
         Some((label, (start..end).into()))
     }
 
-    /// B382: `export [deprecated("use …")] import a::X as Y;` deprecates the
+    /// B382: `[deprecated("use …")] export import a::X as Y;` deprecates the
     /// name `Y` the re-export publishes. Every OTHER file's import of it warns
     /// `` `Y` is deprecated; use … `` — the function attribute's own warning —
     /// at its leaf. (An unexported one never gets here: the parser refuses it,
@@ -56230,6 +57545,9 @@ impl<'src> Analyzer<'src> {
         // --- A user `Try` impl: recover Try<T, B> through the impl's trait args. ---
         let receiver_type_id = receiver_type.clone().get_type_id(self);
         // Snapshot the Try impls' subjects first (reconcile needs `&mut self`).
+        if let Some(try_id) = self.try_trait_id {
+            self.note_trait_query(&receiver_type, try_id);
+        }
         let candidates: Vec<(usize, TypeId)> = match self.try_trait_id {
             Some(try_id) => self
                 .implementations
@@ -57733,11 +59051,13 @@ impl<'src> Analyzer<'src> {
         match self.reconcile_type(&value_type, field_type, substitution_context) {
             Some((_unified, bindings)) => FieldValueVerdict::Accepted(bindings),
             None => {
+                let msg = self.type_mismatch_message(field_type, &value_type, substitution_context);
+                let msg = self.with_fragment_steer(msg, value_id, field_type);
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: value_span,
-                    msg: self.type_mismatch_message(field_type, &value_type, substitution_context),
+                    msg,
                 });
                 FieldValueVerdict::Refused
             }
@@ -57955,6 +59275,9 @@ impl<'src> Analyzer<'src> {
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();
         let struct_fields = struct_.fields.clone();
         let struct_name_span = struct_.name_span;
+        if self.refuse_internal_field_write(constraint, struct_id, &struct_fields) {
+            return Resolution::Failed;
+        }
         if constraint.fields.len() != struct_fields.len() {
             let (msg, span) = self.struct_field_count_message(
                 constraint.struct_name,
@@ -58406,10 +59729,9 @@ impl<'src> Analyzer<'src> {
                         // A149 S4: on a store handle, a field of the struct it
                         // handles reads through its projection —
                         // `app.user.name` is `app.user().name()`.
-                        match self
-                            .field_syntax()
-                            .read(&Type::Struct(struct_id, arguments.clone()), member_name)
-                        {
+                        let handle_type = Type::Struct(struct_id, arguments.clone());
+                        self.note_member_query(&handle_type, member_name);
+                        match self.field_syntax().read(&handle_type, member_name) {
                             crate::field_syntax::Reading::Projection(_) => {
                                 self.read_field_through_projection(id, subject_id, member_name);
                                 return Resolution::Resolved;
@@ -58523,6 +59845,61 @@ impl<'src> Analyzer<'src> {
                 Resolution::Failed
             }
         }
+    }
+
+    /// B568 (R-b, v0.46.0): a struct literal outside std may not write a field
+    /// std marks `[internal]` — the construction half of A149 S4's read rule,
+    /// under the same shared rule (`labels::internal_field_out_of_reach`) and
+    /// with the label's reason. A literal names every field (there are no
+    /// defaults), so such a struct has no literal outside std at all: the
+    /// refusal stands at the first internal field the literal WRITES, or at the
+    /// struct's name in the literal when it writes none (the field-count
+    /// message would otherwise list the internal fields as missing, steering
+    /// the author to write them). One refusal per literal. Answers whether it
+    /// refused.
+    ///
+    /// No pattern reaches here: a pattern names no field (vilan's patterns are
+    /// bindings, variants, tuples, arrays and literals — there is no struct
+    /// pattern), so destructuring cannot read an internal field either.
+    fn refuse_internal_field_write(
+        &mut self,
+        constraint: &StructInitializerConstraint<'src>,
+        struct_id: Id,
+        struct_fields: &[Field<'src>],
+    ) -> bool {
+        let initializer_id = constraint.initializer_id;
+        let hidden: Vec<(usize, &'src str)> = (0..struct_fields.len())
+            .filter_map(|index| {
+                self.internal_field_hidden(struct_id, index, initializer_id)
+                    .map(|reason| (index, reason))
+            })
+            .collect();
+        let Some(&(first_index, first_reason)) = hidden.first() else {
+            return false;
+        };
+        let written = constraint
+            .fields
+            .iter()
+            .find_map(|(name, _, _, name_span)| {
+                hidden
+                    .iter()
+                    .find(|(index, _)| struct_fields[*index].name == *name)
+                    .map(|(index, reason)| (*index, *reason, *name_span))
+            });
+        let (index, reason, span) =
+            written.unwrap_or((first_index, first_reason, constraint.struct_name_span));
+        let field_name = struct_fields[index].name;
+        let struct_name = constraint.struct_name;
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: format!(
+                "`{field_name}` is an `[internal]` field of std's `{struct_name}`, and a \
+                 struct literal outside std cannot write an internal std field: {reason}"
+            ),
+        });
+        true
     }
 
     /// A149 S4 (R-e): the `[internal("reason")]` label of field `index` of the
@@ -59746,6 +61123,23 @@ impl<'src> Analyzer<'src> {
                     let subject_type = match (subject_type, argument_type_ids.is_empty()) {
                         (Type::Enum(id, _), false) => {
                             Type::Enum(id, self.with_defaulted_arguments(id, argument_type_ids))
+                        }
+                        // B559: a WRITTEN handle assimilates as a formed one
+                        // does (`assimilated_task_payload`): `Task<Task<str>>`
+                        // IS `Task<str>` — the host adopts a task's result —
+                        // and kept as two layers it never reconciled with the
+                        // `Task<str>` its body forms.
+                        (Type::Struct(id, _), false) if self.is_task_handle(id) => {
+                            let mut arguments =
+                                self.with_defaulted_arguments(id, argument_type_ids);
+                            if let Some(payload_id) = arguments.first_mut() {
+                                let payload = payload_id.get_type(self);
+                                let assimilated = self.assimilated_task_payload(payload.clone());
+                                if assimilated != payload {
+                                    *payload_id = assimilated.get_type_id(self);
+                                }
+                            }
+                            Type::Struct(id, arguments)
                         }
                         (Type::Struct(id, _), false) => {
                             Type::Struct(id, self.with_defaulted_arguments(id, argument_type_ids))
@@ -60993,15 +62387,22 @@ impl<'src> Analyzer<'src> {
                             });
                         }
                         None => {
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                                msg: format!(
-                                    "cannot find '{}' in module '{}'",
-                                    member_name, module_name
-                                ),
-                            });
+                            // `resolve_world` runs after every walk has closed,
+                            // so the access's file is found from the access,
+                            // not inherited: it was the entry's, and a miss in
+                            // a module rendered against the entry's text.
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "cannot find '{}' in module '{}'",
+                                        member_name, module_name
+                                    ),
+                                },
+                                id,
+                            );
                             self.expr_id_to_expr_map.insert(id, Expr::Error);
                         }
                     }
@@ -61426,13 +62827,16 @@ impl<'src> Analyzer<'src> {
                         (implementation.subject, implementation.trait_ids.clone())
                     })
                     .collect();
+                // B557: asked as ADMISSION, so a blanket whose binder carries
+                // a tuple bound provides for the tuples it covers only — a
+                // tuple-family `eq` is no `eq` for a struct's impl.
                 let provided_elsewhere = candidates.iter().any(|(subject_id, trait_ids)| {
                     trait_ids.iter().any(|implemented| {
                         self.trait_with_supertraits(*implemented)
                             .contains(&declaring_trait_id)
                     }) && {
                         let candidate_subject = subject_id.get_type(self);
-                        self.compare_type(
+                        self.impl_subject_admits(
                             &check_subject_type,
                             &candidate_subject,
                             &HashMap::default(),
@@ -62033,15 +63437,37 @@ impl<'src> Analyzer<'src> {
                     match self.method_member_in_trait_at(trait_id, &trait_arguments, next_method) {
                         Some((next_id, declaring_trait_id, declaring_arguments)) => {
                             self.for_each_next.insert(for_each_id, next_id);
-                            self.generic_dispatch
-                                .insert(for_each_id, GenericDispatch::OnType(None, next_method));
-                            // B359 (R1): the loop is a call site like any other,
-                            // so `for v in self` in a default body drives the
-                            // TRAIT's protocol member — not an implementor's
-                            // same-named inherent `next`. Same channel as the
-                            // `self.next()` call above.
-                            self.bound_dispatch_traits
-                                .insert(for_each_id, (declaring_trait_id, declaring_arguments));
+                            // B567: inside a BARE-TRAIT IMPL body (B299) `self`
+                            // is the implementing type, an implicit binder whose
+                            // constraint id is the subject's own type id, so the
+                            // loop re-dispatches through the CALLER's binding of
+                            // it — the channel a `self.next()` call there takes
+                            // (`resolve_method_call`'s `Type::Trait` arm). Driven
+                            // through the trait-default channel instead, the
+                            // loop had no specialization to read and its `next`
+                            // was the trait's body-less requirement: the
+                            // never-silent internal error.
+                            let bare_trait_impl_subject = self
+                                .enclosing_bare_trait_impl_subject(for_each_id)
+                                .filter(|_| !self.is_in_trait_default(for_each_id));
+                            if let Some(subject_type_id) = bare_trait_impl_subject {
+                                self.generic_dispatch.insert(
+                                    for_each_id,
+                                    GenericDispatch::OnConstraint(subject_type_id, next_method),
+                                );
+                            } else {
+                                self.generic_dispatch.insert(
+                                    for_each_id,
+                                    GenericDispatch::OnType(None, next_method),
+                                );
+                                // B359 (R1): the loop is a call site like any
+                                // other, so `for v in self` in a default body
+                                // drives the TRAIT's protocol member — not an
+                                // implementor's same-named inherent `next`. Same
+                                // channel as the `self.next()` call above.
+                                self.bound_dispatch_traits
+                                    .insert(for_each_id, (declaring_trait_id, declaring_arguments));
+                            }
                         }
                         None => self.report_uniterable_for_each(
                             for_each_id,
@@ -66713,7 +68139,7 @@ impl<'src> Program<'src> {
 
     /// The attribute a GENERATED entity was expanded from: its span, in the
     /// file that WROTE it. `None` for ordinary code.
-    fn derived_origin(&self, id: Id) -> Option<(Span, SourceId)> {
+    pub(crate) fn derived_origin(&self, id: Id) -> Option<(Span, SourceId)> {
         if self.source_of(id) != Some(DERIVED_SOURCE) {
             return None;
         }
@@ -69312,6 +70738,31 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
             };
             render_module_parse_errors(&mut diagnostics, &path, &loaded);
             let ast = loaded.ast;
+            // F28: a file that declares its platform (`[platform("@process")]
+            // mod self;`) promises exactly that, wherever it sits — the same
+            // promise a layer makes for its directory, so it is held to it the
+            // same way rather than to every platform its root serves.
+            let declared: Option<Vec<Platform>> = match ast.0.first() {
+                Some((Node::ModulePlatform(patterns), _)) if !patterns.is_empty() => {
+                    let patterns: Vec<PlatformPattern> = patterns
+                        .iter()
+                        .filter_map(|(text, _)| PlatformPattern::parse(text))
+                        .flatten()
+                        .collect();
+                    Some(
+                        Platform::all_hosts()
+                            .into_iter()
+                            .filter(|host| {
+                                patterns
+                                    .iter()
+                                    .any(|pattern| host.matches(*pattern).is_some())
+                            })
+                            .collect(),
+                    )
+                }
+                _ => None,
+            };
+            let served: &[Platform] = declared.as_deref().unwrap_or(served.as_slice());
             for (module, span) in collect_module_paths(&ast.0, "pkg") {
                 if longest_module_prefix(&all_roots, module).is_none() {
                     continue; // not a module file anywhere — an item re-export or a typo
@@ -70155,6 +71606,12 @@ struct BaseCacheKey {
     /// requests are why a keystroke that adds an import misses: the prefix
     /// loaded what the hot modules asked for, so a new ask is a new prefix.
     hot: Option<(Vec<PathBuf>, Vec<(Origin, &'static str)>)>,
+    /// M121 / B553: what the stored world's resolve RECORDED of the impl
+    /// table ([`ReachFilter`]) — `None` when it recorded nothing. Which
+    /// questions are worth recording is read off the late files' syntax (the
+    /// entry's, a hot set's), so a world recorded for one set of late impls is
+    /// not offered to another.
+    reach: Option<ReachFilter>,
 }
 
 /// One retained base world and the claims that keep its borrows alive (M23).
@@ -71848,16 +73305,101 @@ fn expand_entry_over_world<'src>(
 /// prefix never registered, or generated code demanding a module the world
 /// never loaded: the caller then builds this analysis canonically, the
 /// expansion hoist's own answer to its own version of the last case.
+/// Why [`load_hot_modules`] could not finish a hot-set world.
+enum HotLoadRefusal {
+    /// A shape the hot-set world cannot take, named for the census.
+    Refused(&'static str),
+    /// The hot modules' GENERATED code — a derive's output — names std modules
+    /// the stored prefix never loaded. The canonical drain loads them for the
+    /// expansion that names them; the prefix loads only what the hot modules'
+    /// WRITTEN syntax requests, which is all [`hot_set_closure`] can read
+    /// before anything expands. Learned once per hot set
+    /// ([`learn_hot_generated_demands`]) and requested from then on, so the
+    /// next prefix carries them.
+    Demands(Vec<&'static str>),
+}
+
+/// M121: the std modules each hot set's generated code was found to demand
+/// ([`HotLoadRefusal::Demands`]), by the hot set's paths — what
+/// [`hot_set_closure`] adds to the prefix's requests (and so to the key).
+/// Bounded the way the checks record is.
+type HotGeneratedDemands = HashMap<Vec<PathBuf>, Vec<&'static str>>;
+static HOT_GENERATED_DEMANDS: std::sync::OnceLock<std::sync::Mutex<HotGeneratedDemands>> =
+    std::sync::OnceLock::new();
+
+/// The std modules this hot set's generated code is known to demand.
+fn hot_generated_demands(paths: &[PathBuf]) -> Vec<&'static str> {
+    HOT_GENERATED_DEMANDS
+        .get()
+        .and_then(|demands| {
+            demands
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(paths)
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
+/// Records `found` against this hot set; answers whether anything was NEW —
+/// a retry that learned nothing would only find the same demand again.
+fn learn_hot_generated_demands(paths: &[PathBuf], found: &[&'static str]) -> bool {
+    let demands = HOT_GENERATED_DEMANDS.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
+    let mut demands = demands
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if demands.len() >= CHECKED_CACHE_KEYS && !demands.contains_key(paths) {
+        demands.clear();
+    }
+    let known = demands.entry(paths.to_vec()).or_default();
+    let before = known.len();
+    for module in found {
+        if !known.contains(module) {
+            known.push(module);
+        }
+    }
+    known.sort_unstable();
+    known.len() > before
+}
+
+/// What a hot-set world that [`load_hot_modules`] could not finish rebuilds
+/// as: the same shape again when it learned a demand the next prefix will
+/// carry, the canonical one (and the key refused) otherwise.
+fn shape_after_hot_load(
+    refusal: HotLoadRefusal,
+    key: &BaseCacheKey,
+    shape: AnalysisShape,
+) -> AnalysisShape {
+    let reason = match refusal {
+        HotLoadRefusal::Demands(found) => {
+            let learned = key
+                .hot
+                .as_ref()
+                .is_some_and(|(paths, _)| learn_hot_generated_demands(paths, &found));
+            if learned {
+                return shape;
+            }
+            "generated-new-module"
+        }
+        HotLoadRefusal::Refused(reason) => reason,
+    };
+    refuse_hot_world(key);
+    crate::incremental::update_census(|census| census.hot_refusal = Some(reason));
+    shape.without_hot()
+}
+
 fn load_hot_modules<'src>(
     world: &mut World<'src>,
     std: &PackageSpec,
+    platform: Platform,
     workspace: &Workspace,
     pkg_root: &Path,
-) -> Result<(), &'static str> {
+) -> Result<(), HotLoadRefusal> {
     let Some(hot) = world.hot.as_mut() else {
         return Ok(());
     };
     let roots: [&Path; 1] = [pkg_root];
+    let std_roots = std.search_roots(platform);
     let analyzer = &mut world.analyzer;
     let global_scope_id = world.global_scope_id;
     let mut reported_parse_errors: HashSet<(PathBuf, Span, String)> = HashSet::default();
@@ -71870,7 +73412,7 @@ fn load_hot_modules<'src>(
     )> = Vec::new();
     for name in hot.modules.clone() {
         let Some(resolution) = resolve_module_in_roots(&roots, name) else {
-            return Err("module-vanished");
+            return Err(HotLoadRefusal::Refused("module-vanished"));
         };
         let directory_holds_a_lib_body = resolution.ambiguous
             || (resolution.relative.file_name() == Some(std::ffi::OsStr::new("lib.vl"))
@@ -71907,7 +73449,7 @@ fn load_hot_modules<'src>(
             });
         }
         let Some(module) = load_package_module(&module_path) else {
-            return Err("module-vanished");
+            return Err(HotLoadRefusal::Refused("module-vanished"));
         };
         let source_id = SourceId(world.sources.len() as u32);
         let diagnostics_before = analyzer.diagnostics.len();
@@ -71968,7 +73510,7 @@ fn load_hot_modules<'src>(
                 // module request, which this shape cannot answer.
                 let Some(parent_id) = hot.module_nodes.get(&(Origin::Pkg, &name[..cut])).copied()
                 else {
-                    return Err("new-parent-module");
+                    return Err(HotLoadRefusal::Refused("new-parent-module"));
                 };
                 module_children_scope(analyzer, parent_id, global_scope_id)
             }
@@ -72018,17 +73560,43 @@ fn load_hot_modules<'src>(
             analyzer.attribute_new_diagnostics(before, defining_source);
         }
         // Generated code demanding a module this world never loaded is a new
-        // load, which the drain would have made and this shape cannot.
+        // load, which the drain would have made and this shape cannot. A std
+        // module is one the NEXT prefix can load on the hot set's behalf
+        // (`HotLoadRefusal::Demands`); a package module is not.
+        //
+        // A generated path names an ITEM (`std::compare::PartialEq`), so it is
+        // resolved to the module it reaches the way the drain seeds it
+        // ([`deepest_module_or_namespace`]) before it is looked for: compared
+        // raw, every derive's own output read as a module the world lacked,
+        // and S1 refused each hot set that derives anything (M121).
+        let mut demanded: Vec<&'static str> = Vec::new();
         for generated in &output.items {
-            let demands_a_new_module = collect_module_paths(generated.nodes, "std")
+            if let Some((module, _)) = collect_module_paths(generated.nodes, "pkg")
                 .into_iter()
-                .any(|(module, _)| !world.module_scopes.contains_key(module))
-                || collect_module_paths(generated.nodes, "pkg")
-                    .into_iter()
-                    .any(|(module, _)| !world.pkg_module_names.contains(module));
-            if demands_a_new_module {
-                return Err("generated-new-module");
+                .find(|(module, _)| {
+                    let resolved = deepest_module_or_namespace(&roots, module)
+                        .unwrap_or_else(|| module.to_string());
+                    !world.pkg_module_names.contains(resolved.as_str())
+                })
+            {
+                if crate::phase_timing_enabled() {
+                    eprintln!("[vilan phase] hot-generated-demand pkg::{module}");
+                }
+                return Err(HotLoadRefusal::Refused("generated-new-module"));
             }
+            for (module, _) in collect_module_paths(generated.nodes, "std") {
+                let resolved = deepest_module_or_namespace(&std_roots, module)
+                    .unwrap_or_else(|| module.to_string());
+                if !world.module_scopes.contains_key(resolved.as_str()) {
+                    if crate::phase_timing_enabled() {
+                        eprintln!("[vilan phase] hot-generated-demand std::{resolved}");
+                    }
+                    demanded.push(interned_display_name(resolved));
+                }
+            }
+        }
+        if !demanded.is_empty() {
+            return Err(HotLoadRefusal::Demands(demanded));
         }
         world
             .generated_by_source
@@ -72152,6 +73720,11 @@ struct World<'src> {
     /// exactly when the analysis that stored it did, and the entry tail reads
     /// the order off the world rather than off its own load.
     entry_is_open_module: bool,
+    /// Whether the pre-entry `resolve_world` was skipped: the open module's
+    /// order above, or B553's deferred order ([`AnalysisShape::defer_resolve`]).
+    /// The post-entry `build()` is then the one resolve, and the entry tail
+    /// waits for it with everything the pre-entry resolve would have bound.
+    resolve_deferred: bool,
     global_scope_id: Id,
     module_scopes: HashMap<&'src str, Id>,
     /// The ENTRY package's own modules this world loaded, by name — `pkg::`
@@ -72342,8 +73915,7 @@ pub fn analyze_cancellable<'src>(
         entry_path,
         platform,
         workspace,
-        true,
-        true,
+        AnalysisShape::FIRST,
     )?;
     for refusal in refusals {
         program.diagnostics.push(refusal);
@@ -72757,6 +74329,15 @@ fn hot_set_closure(
             ));
         }
     }
+    let modules: Vec<&'static str> = hot.iter().copied().collect();
+    let paths: Vec<PathBuf> = modules.iter().map(|name| reached[name].0.clone()).collect();
+    // What this hot set's derives were found to demand (M121): loaded into the
+    // prefix like every request the written syntax makes.
+    requests.extend(
+        hot_generated_demands(&paths)
+            .into_iter()
+            .map(|module| (Origin::Std, module)),
+    );
     requests.sort_unstable();
     requests.dedup();
     let refusal = if hot.iter().any(|name| macro_text.contains(name)) {
@@ -72766,15 +74347,9 @@ fn hot_set_closure(
         .any(|name| entry_module.is_some_and(|entry| reached[name].1.contains(&entry)))
     {
         Some("imports-the-entry")
-    } else if !crate::incremental::planted(crate::incremental::Plant::ImplGuardOff)
-        && !hot_impls_stay_in_the_hot_set(&hot, &reached)
-    {
-        Some("impl")
     } else {
         None
     };
-    let modules: Vec<&'static str> = hot.into_iter().collect();
-    let paths = modules.iter().map(|name| reached[name].0.clone()).collect();
     Some(HotSet {
         modules,
         paths,
@@ -72784,140 +74359,59 @@ fn hot_set_closure(
     })
 }
 
-/// M110 S1's impl guard: whether no module OUTSIDE the hot set can resolve
-/// anything through an `impl` written INSIDE it.
-///
-/// The prefix resolves before the hot set is walked (that is the whole
-/// saving), so an impl the hot set declares is invisible to the prefix's
-/// method resolution — exactly as an impl in the ENTRY is invisible to every
-/// module today (`Foo has no method` from a module whose only impl lives in
-/// the entry file). A canonical analysis walks the hot modules among the rest,
-/// so their impls DO serve the prefix there, and the two would disagree. The
-/// guard makes that impossible rather than detecting it:
-///
-///  - an impl whose subject's head type is DECLARED in the hot set is safe —
-///    no module outside the hot set can name that type (it would have to
-///    import it, which would put it in the hot set), and a generic body that
-///    receives a value of it reaches members only through its bounds;
-///  - an INHERENT impl on a type declared elsewhere (kolt's `impl style::Style
-///    { fun flex_col .. }`) is safe when none of its member names occurs as
-///    an identifier in any package module outside the hot set: a member is
-///    reached by NAME (`.flex_col()`, `Style::flex_col`), and only package code
-///    can name a user's inherent member;
-///  - anything else — a trait impl on a foreign type (operators, `==`,
-///    interpolation and `for` reach trait members without naming them), a
-///    blanket `impl type T` — is not, and the analysis is built canonically.
-fn hot_impls_stay_in_the_hot_set(
-    hot: &std::collections::BTreeSet<&'static str>,
-    reached: &std::collections::BTreeMap<
-        &'static str,
-        (
-            PathBuf,
-            Vec<&'static str>,
-            &'static crate::span::Spanned<NodeList<'static>>,
-        ),
-    >,
-) -> bool {
-    // The item nodes at a module's top level, through the markers that wrap
-    // them (`export`, a derive, `const`) and into inline `mod`s.
-    fn items<'a>(nodes: &'a NodeList<'a>, out: &mut Vec<&'a Node<'a>>) {
-        for item in nodes {
-            let mut node = &item.0;
-            while let Node::Export(_, inner, _)
-            | Node::Derive(_, inner)
-            | Node::Service(_, inner)
-            | Node::MacroAttribute(_, _, _, inner)
-            | Node::Const(inner) = node
-            {
-                node = &inner.0;
-            }
-            match node {
-                Node::Module(_, body) => items(&body.0, out),
-                _ => out.push(node),
-            }
-        }
-    }
-    let mut declared: HashSet<&str> = HashSet::default();
-    let mut hot_impls: Vec<(&Node, &'static str)> = Vec::new();
-    for name in hot {
-        let (_, _, ast) = &reached[name];
-        let mut nodes = Vec::new();
-        items(&ast.0, &mut nodes);
-        for node in nodes {
-            match node {
-                Node::Struct(type_name, ..) | Node::Enum(type_name, ..) => {
-                    declared.insert(type_name.0);
-                }
-                Node::Impl(..) => hot_impls.push((node, name)),
-                _ => {}
-            }
-        }
-    }
-    // The head identifier of an impl's subject, when it is a bare type name
-    // (`Theme`, `Theme<T>`); `None` for a path (`style::Style`) or a binder.
-    fn subject_head<'a>(subject: &Node<'a>) -> Option<&'a str> {
-        match subject {
-            Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
-            _ => None,
-        }
-    }
-    let mut named_members: Vec<&str> = Vec::new();
-    for (node, _) in &hot_impls {
-        let Node::Impl(subject, traits, body, _) = node else {
-            continue;
-        };
-        if subject_head(&subject.0).is_some_and(|head| declared.contains(head)) {
-            continue;
-        }
-        if !traits.is_empty() {
-            return false;
-        }
-        for member in &body.0 {
-            let mut member_node = &member.0;
-            while let Node::Export(_, inner, _) | Node::Const(inner) = member_node {
-                member_node = &inner.0;
-            }
-            match member_node {
-                Node::Func(function) => named_members.push(function.name.0),
-                // Anything but a function in an inherent impl is a shape this
-                // guard has not been taught: refuse rather than guess.
-                _ => return false,
-            }
-        }
-    }
-    if named_members.is_empty() {
-        return true;
-    }
-    // Whether `word` occurs as a whole identifier in `text`.
-    let spells = |text: &str, word: &str| {
-        let identifier = |character: char| character.is_alphanumeric() || character == '_';
-        text.match_indices(word).any(|(at, _)| {
-            !text[..at].chars().next_back().is_some_and(identifier)
-                && !text[at + word.len()..]
-                    .chars()
-                    .next()
-                    .is_some_and(identifier)
-        })
-    };
-    for (name, (path, ..)) in reached {
-        if hot.contains(name) {
-            continue;
-        }
-        let Ok(text) = crate::util::read_source(path) else {
-            return false;
-        };
-        if named_members.iter().any(|member| spells(&text, member)) {
-            return false;
-        }
-    }
-    true
+/// How [`analyze_inner`] may build its world. The first attempt allows
+/// everything; each retry narrows it, and none widens it again, which is what
+/// bounds the retries.
+#[derive(Clone, Copy)]
+struct AnalysisShape {
+    /// The base cache may be read and written, and the entry's expansion is
+    /// hoisted past the store. The derive/macro hoist's fallback — an entry
+    /// whose GENERATED code demands a module the cached world never loaded —
+    /// rebuilds with it off, which restores the load-region entry expansion
+    /// so generated references seed the loader (depth one: the uncached path
+    /// cannot fall back again).
+    cache: bool,
+    /// A hot-set world (M110 S1) may be built.
+    hot: bool,
+    /// B553: the loaded modules do NOT resolve before the entry walks — the
+    /// whole world resolves once, in the post-entry `build()`, with every
+    /// impl in it (the monolithic order, the one B239's open module takes).
+    /// Taken when an impl the entry walks answers a question the pre-entry
+    /// resolve asked ([`ImplReachLog`]); such a world is neither read from nor
+    /// written to the base cache, since what it is keyed by is not what it
+    /// depends on.
+    defer_resolve: bool,
 }
 
-/// `analyze` with the cache switchable: the derive/macro hoist's fallback —
-/// an entry whose GENERATED code demands a module the cached world never
-/// loaded — rebuilds fresh through here with `allow_cache: false`, which
-/// restores the load-region entry expansion so generated references seed
-/// the loader (depth one: the uncached path cannot fall back again).
+impl AnalysisShape {
+    const FIRST: AnalysisShape = AnalysisShape {
+        cache: true,
+        hot: true,
+        defer_resolve: false,
+    };
+
+    fn without_hot(self) -> AnalysisShape {
+        AnalysisShape { hot: false, ..self }
+    }
+
+    fn uncached(self) -> AnalysisShape {
+        AnalysisShape {
+            cache: false,
+            hot: false,
+            ..self
+        }
+    }
+
+    fn deferred(self) -> AnalysisShape {
+        AnalysisShape {
+            hot: false,
+            defer_resolve: true,
+            ..self
+        }
+    }
+}
+
+/// `analyze`, in the shape [`AnalysisShape`] allows.
 fn analyze_inner<'src>(
     nodes: &'src Spanned<NodeList<'src>>,
     entry_source: &'src str,
@@ -72926,8 +74420,7 @@ fn analyze_inner<'src>(
     entry_path: &Path,
     platform: Platform,
     workspace: &Workspace,
-    allow_cache: bool,
-    allow_hot: bool,
+    shape: AnalysisShape,
 ) -> Option<Program<'src>> {
     // The std-tax arc's instrument (proposal/analysis-reuse.md §6): wall-clock
     // marks at the phase boundaries, printed at the end when
@@ -73104,8 +74597,9 @@ fn analyze_inner<'src>(
         }),
         entry_open_module: entry_open_module.clone(),
         hot: None,
+        reach: None,
     };
-    let base_cacheable = allow_cache
+    let base_cacheable = shape.cache
         && !entry_is_inside_std
         // M72: `[service]` entries USED to bypass here. The bypass predated
         // the derive/macro hoist (§6.13): a service expanded inside the
@@ -73149,7 +74643,9 @@ fn analyze_inner<'src>(
     // and in nothing else (the entry expansion stays hoisted, which is what
     // keeps the gensym counter, and so the emitted names, identical).
     let clean = crate::incremental::clean_requested();
-    let reuse_allowed = base_cacheable && !clean;
+    // B553's deferred order is keyed by nothing that says it (see
+    // [`AnalysisShape::defer_resolve`]), so it reuses nothing either.
+    let reuse_allowed = base_cacheable && !clean && !shape.defer_resolve;
     // A clean analysis that keeps the hot-set SHAPE (Q3's differential compares
     // emitted JS against one): no cache, but the world built the way the
     // incremental one is.
@@ -73170,11 +74666,22 @@ fn analyze_inner<'src>(
         crate::incremental::update_census(|census| census.hot_refusal = Some(reason));
     }
     let hot_world: Option<HotSet> = hot_set.filter(|hot| {
-        allow_hot && hot_shape_allowed && hot.refusal.is_none() && !hot.modules.is_empty()
+        shape.hot && hot_shape_allowed && hot.refusal.is_none() && !hot.modules.is_empty()
     });
     base_cache_key.hot = hot_world
         .as_ref()
         .map(|hot| (hot.paths.clone(), hot.requests.clone()));
+    // M121 / B553: what the pre-entry resolve must record, from the late files'
+    // syntax ([`ReachFilter`]): the entry, and the hot modules when this is a
+    // hot-set world. Nothing, for a check whose entry writes no foreign impl.
+    base_cache_key.reach = {
+        let hot_files: Vec<&'static crate::span::Spanned<NodeList<'static>>> = hot_world
+            .iter()
+            .flat_map(|hot| hot.paths.iter())
+            .filter_map(|path| load_package_module(path).map(|module| module.ast))
+            .collect();
+        ReachFilter::of(std::iter::once(&nodes.0).chain(hot_files.iter().map(|file| &file.0)))
+    };
     let hot_world = if hot_world.is_some() && hot_world_refused(&base_cache_key) {
         base_cache_key.hot = None;
         crate::incremental::update_census(|census| census.hot_refusal = Some("refused-before"));
@@ -73213,9 +74720,7 @@ fn analyze_inner<'src>(
         world.analyzer.entry_phase = true;
         // M110 S1: the hot set, over the served prefix — exactly what the miss
         // below does after its store, so a hit and a miss build one world.
-        if let Err(reason) = load_hot_modules(&mut world, std, workspace, pkg_root) {
-            refuse_hot_world(&base_cache_key);
-            crate::incremental::update_census(|census| census.hot_refusal = Some(reason));
+        if let Err(refusal) = load_hot_modules(&mut world, std, platform, workspace, pkg_root) {
             return analyze_inner(
                 nodes,
                 entry_source,
@@ -73224,8 +74729,7 @@ fn analyze_inner<'src>(
                 entry_path,
                 platform,
                 workspace,
-                allow_cache,
-                false,
+                shape_after_hot_load(refusal, &base_cache_key, shape),
             );
         }
         if expand_entry_over_world(&mut world, nodes, entry_source, entry_path, std, workspace) {
@@ -73239,8 +74743,7 @@ fn analyze_inner<'src>(
                 entry_path,
                 platform,
                 workspace,
-                false,
-                false,
+                shape.uncached(),
             );
         }
         // M19 T1: a HIT is the one shape §2.1 proves id-stable — the clone
@@ -73255,9 +74758,22 @@ fn analyze_inner<'src>(
         // `Analyzer::alias_reaching_sources`, which is where that argument is
         // written — so the key rides on both shapes now.
         let checks_key = Some(base_cache_key.clone());
-        return analyze_over_world(
+        let hot_key = world.hot.is_some().then(|| base_cache_key.clone());
+        return match analyze_over_world(
             world, nodes, std, pkg_root, platform, workspace, checks_key, true,
-        );
+        ) {
+            Ok(program) => program,
+            Err(reached) => analyze_inner(
+                nodes,
+                entry_source,
+                std,
+                pkg_root,
+                entry_path,
+                platform,
+                workspace,
+                shape_after_impl_reach(shape, &reached, hot_key.as_ref()),
+            ),
+        };
     }
     // `sources[0]` is the entry file; std modules are appended as they load.
     // `source_ranges` records the entity-id span each file's walk produced.
@@ -73268,6 +74784,16 @@ fn analyze_inner<'src>(
     let mut sources: Vec<PathBuf> = vec![entry_path.to_path_buf()];
     let mut source_hashes: Vec<u64> = vec![crate::content_hash(entry_source)];
     let mut analyzer = Analyzer::new();
+    // B573: the platform BEFORE anything walks. The load drain below walks every
+    // module and selects its `[platform(..)]` twins (`select_platform_twins`
+    // reads `self.platform`), and so does a hot set's walk over the stored
+    // world (`load_hot_modules`); set only in `analyze_over_world`, a module's
+    // twins were chosen for `Analyzer::new()`'s default host and a browser
+    // bundle shipped the `@process` twin. The platform is in the base cache's
+    // key, so a stored world carries the one it was built for. (The
+    // assignment in `analyze_over_world` stays: a world can come from the
+    // cache, and the color is that call's.)
+    analyzer.platform = platform;
     // The entry file's text, registered first so SourceId(0) always resolves
     // (element-syntax S4 — the source-inspecting diagnostics read it).
     analyzer.source_texts.push((SourceId(0), entry_source));
@@ -74662,8 +76188,7 @@ fn analyze_inner<'src>(
                 entry_path,
                 platform,
                 workspace,
-                allow_cache,
-                false,
+                shape.without_hot(),
             );
         }
     }
@@ -75298,9 +76823,20 @@ fn analyze_inner<'src>(
     let entry_is_open_module =
         entry_alias_module.is_some() && matches!(workspace.entry_mode, EntryMode::OpenFile { .. });
     let phase_base_start = crate::PhaseClock::now();
-    if !entry_is_module && !entry_is_open_module {
+    let resolve_deferred = entry_is_open_module || shape.defer_resolve;
+    if !entry_is_module && !resolve_deferred {
         analyzer.source_paths = sources.clone();
-        analyzer.resolve_world();
+        // M121 / B553: what this resolve asks of the impl table is recorded,
+        // so the impls walked after it — the entry's, a hot set's — can be
+        // tested against it once they have resolved (`impl_reach`).
+        match &base_cache_key.reach {
+            Some(filter) => {
+                analyzer.begin_impl_reach_log(filter.clone());
+                analyzer.resolve_world();
+                analyzer.end_impl_reach_log();
+            }
+            None => analyzer.resolve_world(),
+        }
     }
     let phase_base = phase_base_start.elapsed();
     let prefix_len = sources.len();
@@ -75387,8 +76923,7 @@ fn analyze_inner<'src>(
                 entry_path,
                 platform,
                 workspace,
-                allow_cache,
-                false,
+                shape.without_hot(),
             );
         }
     }
@@ -75399,6 +76934,7 @@ fn analyze_inner<'src>(
         source_hashes,
         entry_is_module,
         entry_is_open_module,
+        resolve_deferred,
         global_scope_id,
         module_scopes,
         pkg_module_names,
@@ -75449,9 +76985,7 @@ fn analyze_inner<'src>(
     world.analyzer.entry_phase = true;
     // M110 S1: the hot set, over the prefix just stored — what a hit on that
     // world does too, so the two build one world.
-    if let Err(reason) = load_hot_modules(&mut world, std, workspace, pkg_root) {
-        refuse_hot_world(&base_cache_key);
-        crate::incremental::update_census(|census| census.hot_refusal = Some(reason));
+    if let Err(refusal) = load_hot_modules(&mut world, std, platform, workspace, pkg_root) {
         return analyze_inner(
             nodes,
             entry_source,
@@ -75460,8 +76994,7 @@ fn analyze_inner<'src>(
             entry_path,
             platform,
             workspace,
-            allow_cache,
-            false,
+            shape_after_hot_load(refusal, &base_cache_key, shape),
         );
     }
     // The suppressed entry expansion runs here, symmetric with the hit path
@@ -75478,14 +77011,14 @@ fn analyze_inner<'src>(
             entry_path,
             platform,
             workspace,
-            false,
-            false,
+            shape.uncached(),
         );
     }
     // A MISS derives everything and RECORDS it; only a hit replays. The key
     // rides along either way, since the record is keyed by the world it
     // describes.
-    analyze_over_world(
+    let hot_key = world.hot.is_some().then(|| base_cache_key.clone());
+    let answer = analyze_over_world(
         world,
         nodes,
         std,
@@ -75500,7 +77033,60 @@ fn analyze_inner<'src>(
         // on both shapes.
         (reuse_allowed && !entry_is_module).then_some(base_cache_key),
         false,
-    )
+    );
+    match answer {
+        Ok(program) => program,
+        Err(reached) => analyze_inner(
+            nodes,
+            entry_source,
+            std,
+            pkg_root,
+            entry_path,
+            platform,
+            workspace,
+            shape_after_impl_reach(shape, &reached, hot_key.as_ref()),
+        ),
+    }
+}
+
+/// M121 / B553: the shape to rebuild in when an impl walked after a world's
+/// stored resolve answers a question that resolve asked ([`ImplReachLog`]).
+///
+/// A HOT impl (M110 S1) means the hot-set world is not the canonical one: the
+/// key is refused for the keystrokes after this one, and the analysis is built
+/// canonically. An ENTRY impl (B553) means the canonical two-phase order is
+/// not either: the world resolves once, after the entry walks
+/// ([`AnalysisShape::defer_resolve`]) — which sees a hot impl too, so it is
+/// the answer when both reached.
+fn shape_after_impl_reach(
+    shape: AnalysisShape,
+    reached: &ImplReached,
+    hot_key: Option<&BaseCacheKey>,
+) -> AnalysisShape {
+    if reached.by_hot
+        && let Some(key) = hot_key
+    {
+        refuse_hot_world(key);
+    }
+    if !crate::macros::in_macro_world() {
+        crate::incremental::update_census(|census| {
+            if reached.by_hot {
+                census.hot_refusal = Some("impl-reached");
+            }
+            census.resolve_deferred |= reached.by_entry;
+        });
+        if crate::phase_timing_enabled() {
+            eprintln!(
+                "[vilan phase] impl-reached {} (hot {}, entry {})",
+                reached.first, reached.by_hot, reached.by_entry
+            );
+        }
+    }
+    if reached.by_entry {
+        shape.deferred()
+    } else {
+        shape.without_hot()
+    }
 }
 
 /// B265: the declaration an intrinsic may bind to for `name` on this impl —
@@ -75559,7 +77145,7 @@ fn analyze_over_world<'src>(
     workspace: &Workspace,
     checks_key: Option<BaseCacheKey>,
     from_base_cache: bool,
-) -> Option<Program<'src>> {
+) -> Result<Option<Program<'src>>, ImplReached> {
     let World {
         mut analyzer,
         macro_registry: _,
@@ -75567,6 +77153,7 @@ fn analyze_over_world<'src>(
         source_hashes,
         entry_is_module,
         entry_is_open_module,
+        resolve_deferred,
         global_scope_id,
         module_scopes,
         pkg_module_names: _,
@@ -75577,8 +77164,12 @@ fn analyze_over_world<'src>(
         owned_nursery_struct_id,
         phase_marks,
         prefix_len,
-        hot: _,
+        hot,
     } = world;
+    // M110 S1: the hot modules load first past the stored prefix, one source
+    // each (`load_hot_modules`).
+    let hot_sources = prefix_len as u32
+        ..prefix_len as u32 + hot.as_ref().map_or(0, |hot| hot.modules.len() as u32);
     // M110 S1: the sources a checks record may describe — the STORED world's.
     // A hot module's text moves with every keystroke, so it is neither read
     // from a record nor written to one (M19's term 1, re-pointed at the hot
@@ -75636,7 +77227,7 @@ fn analyze_over_world<'src>(
             // once; the entry's set reaching the modules through their parent
             // scope costs nothing, because in file mode the entry and its
             // siblings are the same package and take the same prelude.
-            if !entry_is_open_module {
+            if !resolve_deferred {
                 analyzer.seed_preludes();
             }
         }
@@ -75677,6 +77268,22 @@ fn analyze_over_world<'src>(
     // that landed during the walk stops before it rather than after.
     if !crate::cancel::cancelled() {
         analyzer.build();
+        // M121 / B553: the impls this world walked after its stored resolve —
+        // the entry's, and a hot set's — are resolved now. One that answers a
+        // question that resolve asked means the world's answers are not the
+        // canonical analysis's, and the caller rebuilds in a shape that sees
+        // it (`analyze_inner`). Before the checks, which are most of what the
+        // rebuild would otherwise throw away.
+        if let Some(mut reached) = analyzer.impl_reach(hot_sources) {
+            // The impl guard's plant (M110 S1): a hot impl the prefix needed is
+            // let through, which the edit-replay differential must see.
+            if crate::incremental::planted(crate::incremental::Plant::ImplGuardOff) {
+                reached.by_hot = false;
+            }
+            if reached.by_hot || reached.by_entry {
+                return Err(reached);
+            }
+        }
     }
     let phase_build = phase_build_start.elapsed();
     let phase_checks_start = crate::PhaseClock::now();
@@ -76146,7 +77753,7 @@ fn analyze_over_world<'src>(
     // through with a program nobody can use. The caller drops the entry text
     // and tree it leaked, exactly as it does for the panic path.
     if crate::cancel::cancelled() {
-        return None;
+        return Ok(None);
     }
 
     // Find `Context`'s `new`/`run`/`get` intrinsics (the context threading pass
@@ -77124,7 +78731,7 @@ fn analyze_over_world<'src>(
     // M106: the per-declaration work, ranked — empty unless attribution is on.
     let item_costs = analyzer.ranked_item_costs();
 
-    Some(Program {
+    Ok(Some(Program {
         hidden_impls_pending,
         exported_entities,
         curated_modules,
@@ -77360,7 +78967,7 @@ fn analyze_over_world<'src>(
         bound_selection_memo: std::sync::Mutex::default(),
         selection_memos: crate::impl_select::SelectionMemos::default(),
         trait_subject_memo: std::sync::Mutex::default(),
-    })
+    }))
 }
 
 /// E3's implicit half (B119, view-invalidation.md §7): decide the view sites

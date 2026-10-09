@@ -92,11 +92,13 @@ impl Side {
 /// a second twinned module inherits this gate rather than quietly going
 /// unguarded.
 ///
-/// `ui` is the only twin today. Every other layer module is single-platform
-/// (browser: `dev`, `dom`, `router`, `storage`; process: `db`, `fs`, `http`,
-/// `process`, `rpc_server`) and has no counterpart to be held against — a
-/// missing name there is already a hard cross-platform import error at the use
-/// site, not a silent surface drift. `time` and every other shared module lives
+/// `ui` is the only twin today, and since F28 the only module std still
+/// serves from its layer directories. Every other platform module is
+/// single-platform and declares it in its own file (`[platform(..)] mod
+/// self;`: browser `web::{dev, dom, router, storage}`; process `db`, `fs`,
+/// `http`, `process`, `watch`, `build`, `web::document`, `rpc::server`) and
+/// has no counterpart to be held against — reaching it off its platform is
+/// already a colouring error at the use site, not a silent surface drift. `time` and every other shared module lives
 /// in the base layer, compiled once for both platforms, so it cannot diverge at
 /// all.
 const TWINNED_MODULES: &[&str] = &["web::ui"];

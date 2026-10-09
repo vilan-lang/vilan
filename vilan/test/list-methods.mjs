@@ -54,5 +54,5 @@ console.log(String(filter(xs, (n) => {
 	return n > 5;
 }).length));
 for_each(xs, (n) => {
-	return console.log(n);
+	return console.log(String(n));
 });

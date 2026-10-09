@@ -36,11 +36,6 @@ use std::path::{Path, PathBuf};
 /// `rpc.vl` each construct two cells on one line in places.
 const CENSUS: &[(&str, usize, &str)] = &[
     (
-        "browser/web/router.vl",
-        1,
-        "R: the module-level `wired` latch",
-    ),
-    (
         "browser/web/ui.vl",
         25,
         "O + R: per-boundary row/owner bookkeeping (+3 at Order 39: `when_some`'s \
@@ -54,19 +49,14 @@ const CENSUS: &[(&str, usize, &str)] = &[
          same way",
     ),
     (
-        "memo.vl",
-        1,
-        "E: the memo cache outlives every maker's scope",
-    ),
-    (
-        "process/fs.vl",
+        "fs.vl",
         1,
         "F (blocked: `Reader::next` awaits, so no `&mut self`)",
     ),
     (
-        "process/rpc/server.vl",
-        6,
-        "R + O: the registry, the server's stats",
+        "memo.vl",
+        1,
+        "E: the memo cache outlives every maker's scope",
     ),
     (
         "process/web/ui.vl",
@@ -187,6 +177,11 @@ const CENSUS: &[(&str, usize, &str)] = &[
          and by `dispose`).",
     ),
     (
+        "rpc/server.vl",
+        6,
+        "R + O: the registry, the server's stats",
+    ),
+    (
         "shared.vl",
         1,
         "R: `fresh_identity`'s draw (A147) — a cell made only for the stamp \
@@ -194,6 +189,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
          draws from ONE space; it is dropped at once",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
+    ("web/router.vl", 1, "R: the module-level `wired` latch"),
     ("ws.vl", 4, "O: the frame decoder's state"),
 ];
 
@@ -201,10 +197,10 @@ const CENSUS: &[(&str, usize, &str)] = &[
 /// `mut` local captured by the closures of its own frame IS the shared
 /// storage, so each of these is the cell deleted and nothing put in its place.
 const FRAME_SCOPED_RETIRED: &[(&str, &str)] = &[
-    ("process/rpc/server.vl", "mut settled = false;"),
-    ("process/rpc/server.vl", "mut expired = false;"),
-    ("process/rpc/server.vl", "mut closed = false;"),
-    ("process/rpc/server.vl", "mut greeted = false;"),
+    ("rpc/server.vl", "mut settled = false;"),
+    ("rpc/server.vl", "mut expired = false;"),
+    ("rpc/server.vl", "mut closed = false;"),
+    ("rpc/server.vl", "mut greeted = false;"),
     ("rpc.vl", "mut connection = \"\";"),
     ("rpc.vl", "mut refused = \"\";"),
     ("rpc.vl", "mut fault: Option<str> = None;"),
@@ -235,7 +231,7 @@ const VISITOR_STATE_UNBOXED: &[(&str, &str)] = &[
 /// It is ONE file now. `json.vl`'s six and `binary.vl`'s four left with A108;
 /// this one cannot follow them, and the reason is not the receiver.
 const FRAME_SCOPED_BLOCKED: &[(&str, usize, &str)] = &[(
-    "process/fs.vl",
+    "fs.vl",
     1,
     "`Reader.cursor` is FORCED rather than chosen, and the type's own \
      doc-comment says so: `Reader::next` awaits the read, and a `&mut` view \

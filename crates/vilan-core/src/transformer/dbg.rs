@@ -203,6 +203,10 @@ impl<'src> Transformer<'src> {
         // Recorded BEFORE the body is built: a recursive type's printer
         // calls itself.
         self.printers.insert(key, name.clone());
+        if let Some(body) = self.written_debug_body(type_id) {
+            self.push_printer(&name, body);
+            return name;
+        }
         let document = match shape {
             Shape::Integer | Shape::BigInt | Shape::Bool => js::Node::Binary(
                 BinaryOp::Add,
@@ -262,13 +266,14 @@ impl<'src> Transformer<'src> {
             }
             Shape::List(element) => {
                 let printer = self.printer_for(element);
-                call(
-                    "__dbg_list",
-                    vec![
-                        js::Node::Local("value".to_string()),
-                        js::Node::Local(printer),
-                    ],
-                )
+                let mut arguments = vec![
+                    js::Node::Local("value".to_string()),
+                    js::Node::Local(printer),
+                ];
+                if self.prints_as_a_scalar(element) {
+                    arguments.push(js::Node::Bool(true));
+                }
+                call("__dbg_list", arguments)
             }
             Shape::Shared(inner) => {
                 let printer = self.printer_for(inner);
@@ -329,13 +334,28 @@ impl<'src> Transformer<'src> {
                 element,
             } => {
                 let printer = self.printer_for(element);
-                call(
-                    "__dbg_set",
-                    vec![
-                        text(format!("{label} {{")),
-                        slot(index),
-                        js::Node::Local(printer),
-                    ],
+                let mut arguments = vec![
+                    text(format!("{label} {{")),
+                    slot(index),
+                    js::Node::Local(printer),
+                ];
+                if self.prints_as_a_scalar(element) {
+                    arguments.push(js::Node::Bool(true));
+                }
+                call("__dbg_set", arguments)
+            }
+            Shape::Object { label } => {
+                // `value[1].$show(value[0])`: the pair's table prints the
+                // value it erased (S1b).
+                let show = js::Node::Call(
+                    Box::new(js::Node::Property(Box::new(slot(1)), "$show".to_string())),
+                    vec![slot(0)],
+                );
+                group(
+                    &format!("{label}("),
+                    ")",
+                    false,
+                    vec![(String::new(), show)],
                 )
             }
             Shape::Enum { variants, bindings } => {
@@ -403,6 +423,52 @@ impl<'src> Transformer<'src> {
         };
         self.push_printer(&name, vec![js::Node::Return(Box::new(document))]);
         name
+    }
+
+    /// E275: a printer body that answers the text of the type's WRITTEN
+    /// `Debug` impl (`return debug(value);`), or `None` when the structure
+    /// prints ([`crate::printer::written_debug`] says which). An async
+    /// `debug` answers a promise, not text, so it leaves the structure in
+    /// charge.
+    fn written_debug_body(&mut self, type_id: TypeId) -> Option<Vec<js::Node<'src>>> {
+        let trait_id = crate::printer::written_debug(self.program, type_id)?;
+        let dispatch =
+            self.resolve_dispatch_with(type_id, "debug", &[], Some((trait_id, Vec::new())))?;
+        if matches!(dispatch, super::Dispatch::Call(_, true)) {
+            return None;
+        }
+        let call = self.emit_dispatch(dispatch, vec![js::Node::Local("value".to_string())], None);
+        Some(vec![js::Node::Return(Box::new(call))])
+    }
+
+    /// S1b: the `show` slot of the table for one `(type, trait)` pair — the
+    /// type's printer — when the program's tables carry one, else `None`.
+    pub(super) fn object_show_slot(&mut self, type_id: TypeId) -> Option<js::Node<'src>> {
+        if !crate::printer::tables_carry_show(self.program, self.dbg_policy) {
+            return None;
+        }
+        Some(js::Node::Local(self.printer_for(type_id)))
+    }
+
+    /// N136/N149: whether `argument` is a number of the language's own (an
+    /// integer of any width, `f32`, `f64`; not `BigInt`) under the active
+    /// substitution — what `print` formats by `String(x)`.
+    pub(super) fn prints_a_number(&self, argument: Id) -> bool {
+        let Some(type_id) = self.expr_type_id(argument) else {
+            return false;
+        };
+        let resolve = |type_id| self.ground_printer_type(type_id);
+        matches!(
+            shape_of(self.program, type_id, &resolve),
+            Shape::Integer | Shape::Float
+        )
+    }
+
+    /// Whether an element of `type_id` prints as one short token, so its list
+    /// or set fills its broken lines (E277).
+    fn prints_as_a_scalar(&self, type_id: TypeId) -> bool {
+        let resolve = |type_id| self.ground_printer_type(type_id);
+        shape_of(self.program, type_id, &resolve).is_scalar()
     }
 
     /// `type_id` under the active substitution. A generic enum's payload can

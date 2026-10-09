@@ -253,7 +253,10 @@ branch of a value `if` handing either back — at a binding as at an
 assignment, so `let v = if c { &a } else { &b }` initializes no view
 binding, and as an argument or operand) is a compile error, never
 a silent coercion to the pointee (so the `(base, key)` representation of a
-scalar view can't leak); write `*v` to copy the value out. A closure's view
+scalar view can't leak); write `*v` to copy the value out. A method call's
+RECEIVER is not a value position: `v.method(..)` reads through the view to
+the referent place, a scalar's as an aggregate's (`n.abs()` with `n: &i32`,
+`s.len()` with `s: &str`). A closure's view
 parameter is a view by the same rule, whether the literal spells it
 (`|&mut list|`) or takes it from the closure type it is handed to: `|c|`
 passed where `|&str| void` is expected receives a `&str`, and reads it as
@@ -273,7 +276,10 @@ variant — and `match &place` binds readonly views, while a bare
 `match place` copies, as it always has. A `mut` capture under a view
 subject is refused (it would be a copy that looks like a write). Rule 4
 guards the subject place, and every prefix of it, from the arm's start to
-the capture's LAST use. A binding inside a tuple sub-pattern stays a copy.
+the capture's LAST use. A binding inside a payload's tuple sub-pattern
+(`Some((let a, let b))`) is a view into its slot of the tuple when it is one
+slot of it; a binding of a whole sub-tuple spans several slots of the flat
+tuple and stays a copy (bind the tuple whole to write it).
 The parameter conventions:
 
 | Convention | Written | Data | Resource |
@@ -1060,6 +1066,28 @@ limit §6.7's `Shared` cells already have, for the same reason: a counted
 cell cannot collect a cycle through itself. The program's output is the
 same on both backends; only the memory differs. The native leak census
 pins the shape as a row that is live by design.
+
+**Native note: a view of a captured binding.** A read of a captured
+`mut` binding's field, tuple slot or element reads through the binding's
+cell in place and copies only what it reads. A `&self` call on the binding,
+or any `&` argument over it, takes a view of the cell for the length of
+the call, and the order is the source's: the call's by-value arguments are
+evaluated first, left to right, and the view is taken after them, once
+nothing but the call is left to run. So an argument that writes the
+binding (`w.measured(w.add("c"))`) is seen by the callee, exactly as it is
+on JavaScript, whose view is the binding's object itself. The view ends
+when the call returns. A call that holds a view while another of its
+arguments carries a closure that writes the same binding hands its `&`
+callee a copy taken at the call instead, the order every `&` argument over
+a captured binding had before the view. A `&mut` argument over a captured
+binding (a `&mut self` receiver among them) holds the cell for the call
+the same way, and a closure that reaches the binding during that call is
+a second path to a place under a live `&mut` view, the aliasing §6.4
+exists to refuse: the native backend refuses a call that hands such a
+closure beside the view (written in the call, bound by a `let`, or held by
+a value a `let` built), and a closure that arrives any other way stops the
+program with the runtime's reentrancy sentence when it touches the
+binding. JavaScript answers the in-progress value in both cases.
 
 ## 6.10 `lazy` — a binding initialized at first use
 

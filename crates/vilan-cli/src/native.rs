@@ -191,6 +191,18 @@ fn package_name(unit: &Unit) -> String {
 /// Compiles `unit` with the native emitter and writes the cargo project.
 /// Answers the project directory and the package name.
 fn emit_source(unit: &Unit, platform: Platform, emit_debug: bool) -> Result<String, ExitCode> {
+    emit_source_and_assets(unit, platform, emit_debug).map(|(source, _)| source)
+}
+
+/// [`emit_source`] with the const channel's ASSETS beside it (F98): a native
+/// build writes the CSS sidecar a `const` style mints exactly where the JS
+/// build writes it, `<entry>.css` beside the canonical output, so a native
+/// `run` keeps it fresh and reports it as the JS `run` does.
+fn emit_source_and_assets(
+    unit: &Unit,
+    platform: Platform,
+    emit_debug: bool,
+) -> Result<(String, Vec<vilan_core::const_eval::EmittedAsset>), ExitCode> {
     let compiled = compile_unit(
         unit,
         platform,
@@ -201,7 +213,7 @@ fn emit_source(unit: &Unit, platform: Platform, emit_debug: bool) -> Result<Stri
         None,
         None,
     )?;
-    Ok(compiled.javascript)
+    Ok((compiled.javascript, compiled.assets))
 }
 
 /// Writes the cargo project for `unit`, answering its directory and package
@@ -211,7 +223,11 @@ fn write_project(
     platform: Platform,
     emit_debug: bool,
 ) -> Result<(PathBuf, String), ExitCode> {
-    let source = emit_source(unit, platform, emit_debug)?;
+    let (source, assets) = emit_source_and_assets(unit, platform, emit_debug)?;
+    crate::write_assets(
+        &unit.entry.with_extension(platform.script_extension()),
+        &assets,
+    );
     let runtime = match runtime_crate(unit) {
         Ok(runtime) => runtime,
         Err(reason) => {

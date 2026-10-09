@@ -707,7 +707,7 @@ fn an_unsubscribe_keeps_the_capability_and_revoke_withdraws_it() {
             // forgets it), but `cell.set(4)` reaches nobody.
             "third:3",
             // Invalidated: not `Ready` with a stale 3.
-            "status:Waiting",
+            "status:Status::Waiting",
             "done",
         ],
         "the channel lifecycle went differently:\n{stdout}"
@@ -1113,7 +1113,7 @@ fn a_per_key_lease_releases_its_key_at_zero_and_reseeds_when_demand_returns() {
             "b:1",
             "held-after-seed:1",
             "b:2",
-            "status:Ready",
+            "status:Status::Ready",
             // The lease reached zero: the server released the key.
             "after-release-bytes:0",
             // Demand returned: the re-seed is the value as of NOW, not the
@@ -2041,7 +2041,7 @@ fn an_owner_and_a_reconnect_each_end_a_minted_mirror_the_lease_cannot() {
             "following:third",
             // The origin-less mirror was not replayed, and invalidation is
             // still what says so.
-            "hand:Waiting",
+            "hand:Status::Waiting",
             "done",
         ],
         "the owner hook or the replay went differently:\n{stdout}"
@@ -2717,7 +2717,7 @@ fun main() {
 ///   is why the shape costs nothing to add.
 /// - **`Failed` and `Absent`, and the retry.** A sync stub has no `Result` to
 ///   hand a failure back in, so what the call was told is `status()`:
-///   `Failed(Remote("no route"))` for a call that failed, `Absent` for a
+///   `Status::Failed(RpcError::Remote("no route"))` for a call that failed, `Absent` for a
 ///   `None` reply, with `get()` still empty and no capability minted. Both are
 ///   answers about NOW — the next 0→1 asks again (`asks` 1 → 2 → 3), and the
 ///   third one lands: a channel, a seed, `Ready`.
@@ -2732,11 +2732,11 @@ fn an_unleased_mirrors_first_lease_is_its_mint_and_a_failed_one_retries() {
     assert_eq!(
         lines,
         vec![
-            "minted:asks=0 sources=0 status=Waiting",
-            "failed:asks=1 sources=0 status=Failed(Remote(\"no route\"))",
-            "absent:asks=2 sources=0 status=Absent held=false",
+            "minted:asks=0 sources=0 status=Status::Waiting",
+            "failed:asks=1 sources=0 status=Status::Failed(RpcError::Remote(\"no route\"))",
+            "absent:asks=2 sources=0 status=Status::Absent held=false",
             "value:first",
-            "ready:asks=3 sources=1 status=Ready held=first",
+            "ready:asks=3 sources=1 status=Status::Ready held=first",
             "closed:sources=0",
             // The ask is synchronous in this seam, so `asks` has already moved
             // when the second lease is taken; the two observers are seeded by
@@ -3639,7 +3639,7 @@ fn a139_a_per_key_lease_joining_a_siblings_forward_is_seeded() {
     assert_eq!(
         lines,
         vec![
-            "join: same-channel=true first=one second=one second-status=Ready",
+            "join: same-channel=true first=one second=one second-status=Status::Ready",
             "edit:0",
             "after: first=uno second=uno fault=none",
         ],
@@ -3762,7 +3762,7 @@ fn a139_a_per_key_joiner_is_seeded_over_a_socket() {
     assert_eq!(
         lines,
         vec![
-            "join: same-channel=true first=one second=one second-status=Ready",
+            "join: same-channel=true first=one second=one second-status=Status::Ready",
             "edit:0",
             "after: first=uno second=uno fault=none",
         ],
@@ -5005,7 +5005,7 @@ fn a145_a_memo_cell_is_an_rpc_handle_return_over_a_socket() {
     assert_eq!(
         lines,
         vec![
-            "seed: doubled=2 label=n1 missing=Absent",
+            "seed: doubled=2 label=n1 missing=Status::Absent",
             "bump:5",
             "after: doubled=10 label=n5"
         ],

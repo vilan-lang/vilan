@@ -388,7 +388,7 @@ fn the_router_is_browser_only() {
         }
         "#,
         r#"navigate("/home")"#,
-        "requires the `browser` layer of `std` and cannot run on `node",
+        "requires the `browser` platform its file declares and cannot run on `node",
     );
 }
 
@@ -630,7 +630,7 @@ fn a_library_resource_in_a_browser_build_draws_one_diagnostic() {
             let file = File::open("data.txt");
         }
         "#,
-        "requires the `process` layer of `std`",
+        "requires the `@process` platform its file declares",
     );
 }
 
@@ -645,7 +645,7 @@ fn the_doubling_was_the_resource_class_not_one_type() {
             let db = Database::open("app.db");
         }
         "#,
-        "requires the `process` layer of `std`",
+        "requires the `@process` platform its file declares",
     );
 }
 
@@ -664,7 +664,7 @@ fn an_early_drop_sink_does_not_add_a_second_diagnostic() {
             drop(file);
         }
         "#,
-        "requires the `process` layer of `std`",
+        "requires the `@process` platform its file declares",
     );
 }
 
@@ -687,7 +687,7 @@ fn a_family_fence_draws_one_diagnostic_not_one_per_host() {
     let errors = compile(source).expect_err("the fence is broken");
     let coloring: Vec<_> = errors
         .iter()
-        .filter(|error| error.contains("requires the `browser` layer of `std`"))
+        .filter(|error| error.contains("requires the `browser` platform its file declares"))
         .collect();
     assert_eq!(
         coloring.len(),
@@ -723,7 +723,7 @@ fn two_fences_broken_the_same_way_each_report() {
     let errors = compile(source).expect_err("both fences are broken");
     let coloring = errors
         .iter()
-        .filter(|error| error.contains("requires the `browser` layer of `std`"))
+        .filter(|error| error.contains("requires the `browser` platform its file declares"))
         .count();
     assert_eq!(coloring, 2, "expected one per fence: {errors:#?}");
 }
@@ -743,7 +743,7 @@ fn two_distinct_off_platform_calls_each_report() {
     let errors = compile_browser(source).expect_err("both calls are off platform");
     let coloring = errors
         .iter()
-        .filter(|error| error.contains("requires the `process` layer of `std`"))
+        .filter(|error| error.contains("requires the `@process` platform its file declares"))
         .count();
     assert_eq!(coloring, 2, "expected one per call site: {errors:#?}");
 }
@@ -770,7 +770,7 @@ fn a_drop_only_mistake_still_reports_beside_an_unrelated_one() {
     let errors = compile_browser(source).expect_err("both are off platform");
     let coloring = errors
         .iter()
-        .filter(|error| error.contains("requires the `process` layer of `std`"))
+        .filter(|error| error.contains("requires the `@process` platform its file declares"))
         .count();
     assert_eq!(
         coloring, 2,
@@ -828,7 +828,7 @@ fn a_user_written_drop_anchors_at_its_own_off_platform_call() {
         }
         "#,
         r#"write_file(self.path, "closing")"#,
-        "`write_file` requires the `process` layer of `std`",
+        "`write_file` requires the `@process` platform its file declares",
     );
 }
 
@@ -847,7 +847,7 @@ fn an_optional_library_resource_draws_one_diagnostic() {
             let held = Option::Some(File::open("data.txt"));
         }
         "#,
-        "requires the `process` layer of `std`",
+        "requires the `@process` platform its file declares",
     );
 }
 
@@ -878,7 +878,7 @@ fn a_requirement_line_names_the_layer_and_the_via_chain() {
     .expect("`save` reaches `std::fs` and should carry a requirement");
     assert_eq!(
         line,
-        "requires the `process` layer of `std` (via `write_file (std::fs)`)"
+        "requires the `@process` platform its file declares (via `write_file (std::fs)`)"
     );
 }
 
@@ -903,7 +903,7 @@ fn a_requirement_line_propagates_to_callers_growing_the_chain() {
     .expect("`main` reaches `std::fs` through `save`");
     assert_eq!(
         line,
-        "requires the `process` layer of `std` (via `save → write_file (std::fs)`)"
+        "requires the `@process` platform its file declares (via `save → write_file (std::fs)`)"
     );
 }
 
@@ -922,7 +922,7 @@ fn a_seeded_library_functions_line_has_no_chain() {
         "write_file",
     )
     .expect("`write_file` is defined in the layer");
-    assert_eq!(line, "requires the `process` layer of `std`");
+    assert_eq!(line, "requires the `@process` platform its file declares");
 }
 
 #[test]
@@ -951,7 +951,7 @@ fn the_via_chain_is_a_shortest_path_to_the_layer() {
     .expect("`main` reaches the layer");
     assert_eq!(
         line,
-        "requires the `process` layer of `std` (via `save → write_file (std::fs)`)"
+        "requires the `@process` platform its file declares (via `save → write_file (std::fs)`)"
     );
 }
 
@@ -978,7 +978,7 @@ fn a_created_closures_requirement_lands_on_its_creator_line() {
     .expect("`make_saver` creates the colored closure");
     assert_eq!(
         line,
-        "requires the `process` layer of `std` (via `closure → write_file (std::fs)`)"
+        "requires the `@process` platform its file declares (via `closure → write_file (std::fs)`)"
     );
 }
 
@@ -1017,7 +1017,7 @@ fn a_dispatch_candidates_requirement_reaches_the_bounded_caller_line() {
     .expect("`save_it`'s bound admits the colored impl");
     assert_eq!(
         line,
-        "requires the `process` layer of `std` (via `save → write_file (std::fs)`)"
+        "requires the `@process` platform its file declares (via `save → write_file (std::fs)`)"
     );
 }
 
@@ -1061,7 +1061,7 @@ fn an_unreached_function_still_knows_its_requirement() {
     .expect("`orphan` should be colored without being reachable");
     assert_eq!(
         line,
-        "requires the `process` layer of `std` (via `write_file (std::fs)`)"
+        "requires the `@process` platform its file declares (via `write_file (std::fs)`)"
     );
 }
 
@@ -1089,7 +1089,7 @@ fn a_module_initializers_call_colors_the_referencing_entry() {
             let content = cache;
         }
         "#,
-        "`env` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → cache → env (std::process)",
+        "`env` requires the `@process` platform its file declares and cannot run on `browser`\n  reachable from the entry: main → cache → env (std::process)",
     );
 }
 
@@ -1110,7 +1110,7 @@ fn an_initializer_violation_anchors_at_the_initializer_call() {
         }
         "#,
         r#"get("notes-token")"#,
-        "requires the `browser` layer of `std` and cannot run on `node",
+        "requires the `browser` platform its file declares and cannot run on `node",
     );
 }
 
@@ -1185,7 +1185,7 @@ fn calling_a_global_closure_colors_via_its_binding() {
             saver("boot");
         }
         "#,
-        "requires the `process` layer of `std` and cannot run on `browser`",
+        "requires the `@process` platform its file declares and cannot run on `browser`",
     );
 }
 
@@ -1299,7 +1299,7 @@ fn an_index_expressions_subject_reference_colors() {
             print(cache[0]);
         }
         "#,
-        "requires the `process` layer of `std` and cannot run on `browser`",
+        "requires the `@process` platform its file declares and cannot run on `browser`",
     );
 }
 
@@ -1339,7 +1339,7 @@ fn an_iterator_protocols_next_call_colors_the_loop() {
             }
         }
         "#,
-        "requires the `process` layer of `std` and cannot run on `browser`",
+        "requires the `@process` platform its file declares and cannot run on `browser`",
     );
 }
 
@@ -1406,7 +1406,7 @@ fn a_globals_requirement_line_serves_hover_like_a_functions() {
     .expect("`cache`'s initializer reaches the layer");
     assert_eq!(
         line,
-        "requires the `process` layer of `std` (via `read_file_to_str (std::fs)`)"
+        "requires the `@process` platform its file declares (via `read_file_to_str (std::fs)`)"
     );
 }
 
@@ -1429,7 +1429,7 @@ fn a_function_referencing_a_colored_global_inherits_its_line() {
     .expect("`peek` runs the initializer by referencing the binding");
     assert_eq!(
         line,
-        "requires the `process` layer of `std` (via `cache → read_file_to_str (std::fs)`)"
+        "requires the `@process` platform its file declares (via `cache → read_file_to_str (std::fs)`)"
     );
 }
 
@@ -1455,8 +1455,8 @@ fn a_function_requiring_two_layers_renders_one_line_each_in_label_order() {
     .expect("`torn` requires both layers");
     assert_eq!(
         line,
-        "requires the `browser` layer of `std` (via `navigate (std::web::router)`)\n\
-         requires the `process` layer of `std` (via `write_file (std::fs)`)"
+        "requires the `@process` platform its file declares (via `write_file (std::fs)`)\n\
+         requires the `browser` platform its file declares (via `navigate (std::web::router)`)"
     );
 }
 
@@ -7101,15 +7101,9 @@ fn a_tuple_left_operand_of_the_sibling_operators_is_rejected() {
     // models a trait skipped its no-impl refusal for these shapes and emitted
     // the host's: `(1, 2) == (1, 2)` was `false` (JS compares references),
     // `(1, 2) < (1, 3)` was `true` (JS compares `"1,2" < "1,3"`), and
-    // `(1, 2) - 1` was `NaN`.
-    assert_fails_with(
-        r#"
-        fun main() {
-            let _same = (1, 2) == (1, 2);
-        }
-        "#,
-        "type '(i32, i32)' does not implement the `PartialEq` operator",
-    );
+    // `(1, 2) - 1` was `NaN`. (`==` left this list with B443: a tuple of
+    // `PartialEq` elements is `PartialEq` through std's position-by-position
+    // blanket — `tuples::b443_*` pins it.)
     assert_fails_with(
         r#"
         fun main() {
@@ -10848,6 +10842,30 @@ fn a_supertrait_member_called_through_a_bound_reaches_only_its_implementors() {
             let next = count.derive(|value| value + 1).cell();
             print(next.get());
         }
+        "#,
+    );
+}
+
+/// The same class through a MULTI-bound parameter (F28, kolt's server once
+/// `std::rpc::server` declared `@process`): `T: Wire + Keyed<str>` calling
+/// `key()` reaches the impls of the bound that declares it. The dispatch
+/// record names the FIRST bound, `Wire`, whose chain declares no `key`, so the
+/// candidate set fell back to every `key` in the program — `std::web::dom`'s
+/// `Event::key` among them — and a `@process` fence over the call was refused
+/// for a DOM call nothing can make.
+#[test]
+fn a_member_of_a_second_bound_reaches_only_that_bounds_implementors() {
+    assert_compiles(
+        r#"
+        import std::web::dom::Event;
+        import std::wire::{ Keyed, Wire };
+
+        [platform("@process")]
+        fun first_key<T: Wire + Keyed<str>>(items: List<T>): str {
+            items[0].key()
+        }
+
+        fun main() {}
         "#,
     );
 }

@@ -2440,6 +2440,196 @@ fn a46_a_fragment_is_a_list_and_not_a_view() {
     );
 }
 
+// --- B555: `std::js::null` cannot be named in an import, and needs no import --
+
+#[test]
+fn b555_importing_the_null_module_is_refused_once_with_the_steer() {
+    let source = "import std::js::null;\n\nfun main() {\n\tlet _nothing = null;\n}\n";
+    assert_fails_once_with(
+        source,
+        "`null` is a keyword, so no import path can name `std::js::null`",
+    );
+    assert_fails_without(source, "`::`-separated NAMES");
+    // What the steer promises: the value and its type are there with no import.
+    assert_compiles("fun main() {\n\tlet _nothing = null;\n}\n");
+}
+
+// --- E272: a fragment where ONE view is wanted says it is a fragment --------
+//
+// The book (Building UI, Fragments) promises "a type error that says so". The
+// plain mismatch stays the sentence's head (the A46 pin above reads it); the
+// steer is added where the refused value IS a fragment — the desugar's list
+// literal, told from a written `[..]` by its markup.
+
+const E272_STEER: &str = "A fragment `<>…</>` is a `List<View>`, not one `View`";
+
+#[test]
+fn e272_a_fragment_where_a_view_is_wanted_is_named_with_the_fix() {
+    let head = "import std::io::print;\nimport std::web::ui::{ View, render, view };\n";
+    let cases = [
+        // The find's repro: a declared `View` return.
+        (
+            "fun pair(): View {\n\t<><p>\"a\"</p><p>\"b\"</p></>\n}\nfun main() {\n\tprint(render(pair()));\n}\n",
+            "<><p>\"a\"</p><p>\"b\"</p></>",
+        ),
+        // A `let` annotation.
+        (
+            "fun main() {\n\tlet v: View = <><p>\"a\"</p></>;\n\tprint(render(v));\n}\n",
+            "<><p>\"a\"</p></>",
+        ),
+        // An argument.
+        (
+            "fun main() {\n\tprint(render(<><p>\"a\"</p></>));\n}\n",
+            "<><p>\"a\"</p></>",
+        ),
+        // A struct field.
+        (
+            "struct Card {\n\tbody: View,\n}\nfun main() {\n\tlet card = Card { body = <><p>\"a\"</p></> };\n\tprint(render(card.body));\n}\n",
+            "<><p>\"a\"</p></>",
+        ),
+    ];
+    for (body, spanning) in cases {
+        let source = format!("{head}{body}");
+        let failures = failure_diagnostics(&source);
+        let steered: Vec<_> = failures
+            .iter()
+            .filter(|(message, _)| message.contains(E272_STEER))
+            .collect();
+        assert_eq!(
+            steered.len(),
+            1,
+            "one steered refusal in {body:?}; got: {failures:#?}"
+        );
+        let (message, range) = steered[0];
+        assert!(
+            message.starts_with("Expected View, but got List<View> instead."),
+            "the mismatch stays the head; got: {message}"
+        );
+        assert!(
+            message.contains("wrap its children in one element (`<div>…</div>`)")
+                && message.contains("`List<View>`"),
+            "the fix the book promises; got: {message}"
+        );
+        assert_eq!(&source[range.clone()], spanning, "spanned on the fragment");
+    }
+}
+
+#[test]
+fn e272_a_written_list_where_a_view_is_wanted_is_not_called_a_fragment() {
+    // The steer is the fragment's: a written list literal is a list the author
+    // spelled, and keeps the plain sentence.
+    let source = "import std::web::ui::{ View, view };\nfun pair(): View {\n\t[view(\"p\")]\n}\n";
+    assert_fails_with(source, "Expected View, but got List<View> instead.");
+    assert_fails_without(source, "fragment");
+}
+
+// --- E271: a hole that holds no text says what a hole takes ------------------
+//
+// `{expr}` lowers to `.child(expr)` before analysis, so a value that is not a
+// `Slot` was refused as the desugared call's bound — spanned from the
+// element's `<`, about a `child` the author never wrote. The refusal now
+// stands on the HOLE, says what a hole takes, and for a number, a bool or a
+// `Source` of one, writes the text form.
+
+const E271_HEAD: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Signal, SignalCell };\n",
+    "import std::web::ui::{ View, render, view };\n",
+    "\n",
+    "struct Point {\n\tx: i32,\n}\n",
+    "\n",
+);
+
+const E271_SENTENCE: &str =
+    "a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one";
+
+#[test]
+fn e271_a_hole_holding_no_text_is_refused_at_the_hole_with_the_text_form() {
+    let cases = [
+        // The find's two repros: a signal of a number, and a number.
+        (
+            "\tlet count = Signal::new(0);\n\tprint(render(<p>{count}</p>));\n",
+            "count",
+            "`count` is `SignalCell<i32>`",
+            Some("`{count.derive(|value| i\"{value}\")}`"),
+        ),
+        (
+            "\tprint(render(<p>{5}</p>));\n",
+            "5",
+            "`5` is `i32`",
+            Some("`{i\"{5}\"}`"),
+        ),
+        // A bool, an expression, and a call — the hole's own text in the form.
+        (
+            "\tlet on = true;\n\tprint(render(<p>\"x\"{on}</p>));\n",
+            "on",
+            "`on` is `bool`",
+            Some("`{i\"{on}\"}`"),
+        ),
+        (
+            "\tlet n = 2;\n\tprint(render(<p>{n * 3}</p>));\n",
+            "n * 3",
+            "`n * 3` is `i32`",
+            Some("`{i\"{n * 3}\"}`"),
+        ),
+        (
+            "\tlet count: SignalCell<f64> = Signal::new(1.5);\n\tprint(render(<div><p>{count.derive(|v| v * 2.0)}</p></div>));\n",
+            "count.derive(|v| v * 2.0)",
+            " is `",
+            Some("`{count.derive(|v| v * 2.0).derive(|value| i\"{value}\")}`"),
+        ),
+        // A value with no text form: what a hole takes, and no rewrite.
+        (
+            "\tlet point = Point { x = 1 };\n\tprint(render(<p>{point}</p>));\n",
+            "point",
+            "`point` is `Point`",
+            None,
+        ),
+    ];
+    for (body, spanning, typed, rewrite) in cases {
+        let source = format!("{E271_HEAD}fun main() {{\n{body}}}\n");
+        let failures = failure_diagnostics(&source);
+        let matching: Vec<_> = failures
+            .iter()
+            .filter(|(message, _)| message.contains(E271_SENTENCE))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "one refusal for {body:?}; got: {failures:#?}"
+        );
+        assert_eq!(failures.len(), 1, "and nothing else; got: {failures:#?}");
+        let (message, range) = matching[0];
+        assert_eq!(
+            &source[range.clone()],
+            spanning,
+            "spanned on the hole; got: {message}"
+        );
+        assert!(
+            message.contains(typed),
+            "names the hole's type ({typed}); got: {message}"
+        );
+        match rewrite {
+            Some(rewrite) => assert!(
+                message.contains(rewrite),
+                "writes the text form {rewrite}; got: {message}"
+            ),
+            None => assert!(
+                !message.contains("as text"),
+                "no text form for a value that has none; got: {message}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn e271_a_written_child_call_keeps_the_bound_refusal() {
+    // `.child(5)` is a call the author wrote: the bound's own sentence stays.
+    let source = format!("{E271_HEAD}fun main() {{\n\tprint(render(view(\"p\").child(5)));\n}}\n");
+    assert_fails_with(&source, "'i32' does not implement trait 'Slot'");
+    assert_fails_without(&source, "a hole in element syntax");
+}
+
 #[test]
 fn a46_a_fragment_close_must_be_the_nameless_one() {
     // `<>` opens the nameless head, so only `</>` closes it — a named close
@@ -3206,7 +3396,7 @@ fn ssr_std_dom_import_fails_on_a_process_build() {
             print("built");
         }
         "#,
-        "requires the `browser` layer",
+        "requires the `browser` platform its file declares",
     );
 }
 
@@ -3747,6 +3937,11 @@ struct PackageOutcome {
 }
 
 fn analyze_package(files: &[(&str, &str)], entry: &str) -> PackageOutcome {
+    analyze_package_on(files, entry, Platform::default())
+}
+
+/// [`analyze_package`] for a chosen target platform.
+fn analyze_package_on(files: &[(&str, &str)], entry: &str, platform: Platform) -> PackageOutcome {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -3769,7 +3964,7 @@ fn analyze_package(files: &[(&str, &str)], entry: &str) -> PackageOutcome {
                     &std_spec(),
                     &directory,
                     &entry_path,
-                    Some(Platform::default()),
+                    Some(platform),
                     &Workspace::default(),
                 );
                 // `errors` is the entry's own parse errors followed by the
@@ -7254,4 +7449,161 @@ fn b515_a_trait_in_scope_is_accepted() {
         }
         "#,
     );
+}
+
+// --- B553: an impl written in the ENTRY serves every module -----------------
+//
+// Impls are program-wide (no orphan rule), so an `impl` a module's code calls
+// may sit in any file — the entry included. The two-phase pipeline resolves
+// the loaded modules BEFORE the entry walks (the base cache's pre-entry world),
+// so a module's member lookup ran without the entry's impls and committed
+// `Foo has no method`. The same impl in any module served every module; the
+// entry was the one file for which the language's rule did not hold.
+
+const B553_SHAPES: &str =
+    "export struct Foo {\n\tn: i32,\n}\n\nexport trait Greet {\n\tfun greet(self): str;\n}\n";
+
+/// B553's repro: a TRAIT impl in the entry, called from a module that imports
+/// the trait.
+#[test]
+fn b553_a_trait_impl_written_in_the_entry_serves_a_module() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("shapes.vl", B553_SHAPES),
+            (
+                "user.vl",
+                "import pkg::shapes::{ Foo, Greet };\n\nexport fun use_it(): str {\n\tlet foo = Foo { n = 1 };\n\tfoo.greet()\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::shapes::{ Foo, Greet };\nimport pkg::user::use_it;\n\nimpl Foo with Greet {\n\tfun greet(self): str {\n\t\t\"hi\"\n\t}\n}\n\nfun main() {\n\tprint(use_it());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("an entry impl serves the module that calls it");
+    assert_eq!(stdout, "hi\n");
+}
+
+/// An INHERENT entry impl whose member's return is inferred from its body: the
+/// module's call types through the body the entry walks.
+#[test]
+fn b553_an_inherent_entry_impl_with_an_inferred_return_serves_a_module() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("shapes.vl", B553_SHAPES),
+            (
+                "user.vl",
+                "import pkg::shapes::Foo;\n\nexport fun use_it(): str {\n\tlet foo = Foo { n = 1 };\n\tfoo.shout()\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::shapes::Foo;\nimport pkg::user::use_it;\n\nimpl Foo {\n\tfun shout(self) {\n\t\t\"HI\"\n\t}\n}\n\nfun main() {\n\tprint(use_it());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("an inherent entry impl serves the module that calls it");
+    assert_eq!(stdout, "HI\n");
+}
+
+/// A STATIC member of an entry impl, reached by path from a module.
+#[test]
+fn b553_a_static_member_of_an_entry_impl_serves_a_module() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("shapes.vl", B553_SHAPES),
+            (
+                "user.vl",
+                "import pkg::shapes::Foo;\n\nexport fun use_it(): i32 {\n\tFoo::make().n\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::shapes::Foo;\nimport pkg::user::use_it;\n\nimpl Foo {\n\tfun make(): Foo {\n\t\tFoo { n = 7 }\n\t}\n}\n\nfun main() {\n\tprint(use_it());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("a static of an entry impl serves the module that names it");
+    assert_eq!(stdout, "7\n");
+}
+
+/// The control the two-phase order already answered: an entry impl reached
+/// through an OPERATOR from a module (`==` dispatches through `PartialEq`).
+#[test]
+fn b553_an_entry_operator_impl_serves_a_module() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("shapes.vl", B553_SHAPES),
+            (
+                "user.vl",
+                "import pkg::shapes::Foo;\n\nexport fun same(): bool {\n\tFoo { n = 1 } == Foo { n = 1 }\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport std::compare::PartialEq;\nimport pkg::shapes::Foo;\nimport pkg::user::same;\n\nimpl Foo with PartialEq {\n\tfun eq(self, other: Self): bool {\n\t\tself.n == other.n\n\t}\n}\n\nfun main() {\n\tprint(same());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("an entry operator impl serves the module that uses it");
+    assert_eq!(stdout, "true\n");
+}
+
+/// B553's second shape: a module's `Context::new()` whose only `run` is in the
+/// entry takes its value type from that run. Not an order question: the world
+/// resolved ONCE, after the entry walked (the deferred order the impl half
+/// takes), still reports `T` unbounded, while a `run` in any module — loaded
+/// before or after `c.vl` — grounds it.
+#[test]
+#[ignore = "B553: an entry `run` does not ground a module's `Context::new()` even when the world resolves after the entry walks; the context half is the solver's (incr-48)"]
+fn b553_a_module_context_grounded_only_by_an_entry_run() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "c.vl",
+                "import std::context::Context;\n\nexport let flavor = Context::new();\n\nexport fun read_it(): i32 {\n\tflavor.get() + 1\n}\n",
+            ),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::c::{ flavor, read_it };\n\nfun main() {\n\tflavor.run(5, || {\n\t\tprint(read_it());\n\t});\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("an entry run grounds a module's context");
+    assert_eq!(stdout, "6\n");
+}
+
+// --- B573: a MODULE's platform twins are chosen for the build's platform ------
+
+const B573_PLACE: &str = "[platform(\"browser\")]\nexport fun place(): str {\n\t\"browser twin\"\n}\n\n[platform(\"@process\")]\nexport fun place(): str {\n\t\"process twin\"\n}\n";
+
+const B573_MAIN: &str =
+    "import std::io::print;\nimport pkg::place::place;\n\nfun main() {\n\tprint(place());\n}\n";
+
+/// B573 (a miscompile): the loaded modules were walked — and their
+/// `[platform(..)]` twins selected — before the analysis took its platform, so a
+/// module's twins were chosen for the analyzer's default host and a browser
+/// bundle shipped the `@process` twin. Each platform's bundle holds its own
+/// twin and not the other; the entry's twins were always right.
+#[test]
+fn b573_a_modules_platform_twins_are_chosen_for_the_builds_platform() {
+    for (platform, kept, dropped) in [
+        (Platform::Browser, "browser twin", "process twin"),
+        (Platform::default(), "process twin", "browser twin"),
+    ] {
+        let outcome = analyze_package_on(
+            &[("place.vl", B573_PLACE), ("main.vl", B573_MAIN)],
+            "main.vl",
+            platform,
+        );
+        let javascript = outcome.javascript.unwrap_or_else(|| {
+            panic!("the {platform:?} build compiles: {:?}", outcome.diagnostics)
+        });
+        assert!(
+            javascript.contains(kept) && !javascript.contains(dropped),
+            "the {platform:?} bundle holds the {kept} and not the {dropped}:\n{javascript}"
+        );
+    }
 }

@@ -175,8 +175,9 @@ pub enum Plant {
     /// S1: skip the content validation of the stored PREFIX on a hit — serve
     /// the world whatever its modules now say.
     PrefixUnvalidated,
-    /// S1: drop the impl guard — defer a hot set whose impls the prefix can
-    /// reach, so the prefix resolves without them.
+    /// S1 / M121: drop the impl guard — serve a hot-set world even when one of
+    /// its impls answers a question the stored prefix's resolve asked, so the
+    /// prefix keeps the answer it gave without that impl.
     ImplGuardOff,
     /// S1: the hot set is the WHOLE package — every module re-walked per
     /// keystroke. Not wrong, just S1 undone; the re-walk counter pins must see
@@ -185,6 +186,13 @@ pub enum Plant {
     /// S1: drop the use-inferred-binding guard — defer a hot module that
     /// imports a prefix binding whose type the first use decides.
     UseInferredGuardOff,
+    /// S4: serve a remembered const site without asking its project reads
+    /// again — an edited input file is then served stale.
+    ConstCacheUnvalidated,
+    /// S4: key a const site by its own expression and prelude only, without
+    /// the world declarations it reaches — an edited callee is then served
+    /// stale.
+    ConstKeyWithoutWorld,
 }
 
 impl Plant {
@@ -195,6 +203,8 @@ impl Plant {
             Plant::ImplGuardOff => 3,
             Plant::WholePackageHot => 5,
             Plant::UseInferredGuardOff => 6,
+            Plant::ConstCacheUnvalidated => 7,
+            Plant::ConstKeyWithoutWorld => 8,
         }
     }
 }
@@ -228,9 +238,14 @@ pub struct Census {
     /// walked over it.
     pub hot_world: bool,
     /// Why a hot set this analysis measured was NOT built as one — the guard
-    /// that refused it (`impl`, `use-inferred-binding`, `refused-before`, a
-    /// macro, an import of the entry, a module the shape cannot load).
+    /// that refused it (`impl-reached`, `use-inferred-binding`,
+    /// `refused-before`, a macro, an import of the entry, a module the shape
+    /// cannot load).
     pub hot_refusal: Option<&'static str>,
+    /// B553: whether the world was rebuilt to resolve once, after the entry
+    /// walked, because an impl in the entry answers a question the pre-entry
+    /// resolve asked.
+    pub resolve_deferred: bool,
     /// Base-cache lookups this analysis made that HIT, MISSED, and the worlds
     /// it STORED.
     pub base_hits: u64,
@@ -244,6 +259,14 @@ pub struct Census {
     /// Functions whose Class A checks this analysis ran — every function
     /// outside the frozen (std) and replayed ranges.
     pub functions_checked: usize,
+    /// M110 S4: `const` sites this analysis served from the const cache, and
+    /// the ones it evaluated (`crate::const_cache`).
+    pub const_cache_hits: u64,
+    pub const_cache_misses: u64,
+    /// M121 / B553: the impl-table questions the pre-entry resolve recorded —
+    /// zero when no late file writes an impl on a type it does not declare
+    /// (`analyzer::ReachFilter`), and on every base-cache hit.
+    pub reach_questions: u64,
 }
 
 thread_local! {
@@ -253,12 +276,16 @@ thread_local! {
             package_modules: 0,
             hot_world: false,
             hot_refusal: None,
+            resolve_deferred: false,
             base_hits: 0,
             base_misses: 0,
             base_stores: 0,
             sources_walked: 0,
             records_replayed: 0,
             functions_checked: 0,
+            const_cache_hits: 0,
+            const_cache_misses: 0,
+            reach_questions: 0,
         })
     };
 }
@@ -586,9 +613,10 @@ pub fn report(program: &Program) {
         };
         eprintln!(
             "[vilan phase] hot-set {hot_set} interface-moved {interfaces} global-moved {global} \
-             unknown-interfaces {unknown} hot-world {} hot-refusal {}",
+             unknown-interfaces {unknown} hot-world {} hot-refusal {} resolve-deferred {}",
             u8::from(census.hot_world),
             census.hot_refusal.unwrap_or("-"),
+            u8::from(census.resolve_deferred),
         );
         if let Some((_, Some((_, moved)))) = &movement
             && !moved.is_empty()
@@ -610,7 +638,8 @@ pub fn report(program: &Program) {
     if crate::counters::counters_enabled() {
         eprintln!(
             "[vilan counters] incremental base-hits={} base-misses={} base-stores={} \
-             hot-world={} sources-walked={} records-replayed={} functions-checked={}",
+             hot-world={} sources-walked={} records-replayed={} functions-checked={} \
+             const-hits={} const-misses={} reach-questions={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -618,6 +647,9 @@ pub fn report(program: &Program) {
             census.sources_walked,
             census.records_replayed,
             census.functions_checked,
+            census.const_cache_hits,
+            census.const_cache_misses,
+            census.reach_questions,
         );
     }
 }
