@@ -23,6 +23,12 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: tooling -->
+**M110 P0: the PERMUTATION DIFFERENTIAL — the same package analyzed with its module names reversed and, separately, its modules nested a directory deeper answers what the canonical package answers (`crates/vilan-core/tests/permutation_differential.rs`).** The edit-replay differential proves an incremental analysis answers what a clean one does; it cannot prove the clean analysis is independent of LOAD ORDER, because both of its legs share the drain's name order (`analyzer-pass-map.md` §6). The new gate compares two clean analyses on `render_observation`, normalized back to the canonical spelling (a consistent alpha-renaming of the module names reverses the load order and with it every entity id; byte offsets and the messages' identifiers map back through it; the rows of each section are sorted, since the published order is by id — the C1 rule — and a requirement trace's same-depth hops likewise). Its corpus is the edit-replay differential's: every fixture package in every state its script puts it in, and the corpus programs re-hosted as modules; the fixtures and the observation harness moved to `tests/replay_harness/packages.rs`, shared by both binaries. B554 (an element-type conflict on a module binding blamed on whichever push's module loads later) is its known red, pinned `#[ignore]`d (`b554_an_element_conflicts_blame_is_a_fact_about_the_program`); the normalization is proved non-vacuous by a moved return type showing through it. The edit-replay differential gains the POST-PASS class (§6 "does not prove" 2): four packages whose PREFIX module carries a verdict a post pass decides — E3's implicit-suspension refusal, a `context` coverage refusal, a platform refusal and a const failure — each typed around in the leaf and the entry; the suspension package is B575's pin and is RED at this commit (the reusing analysis drops the module's E3 errors), fixed in the next. Tracker M110, B554, B575.
+
+
 ## v0.46.0 — 2026-10-09
 
 <!-- family: breaking -->
