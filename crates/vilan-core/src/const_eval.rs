@@ -856,6 +856,7 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     PHASE_LOWER.with(|cell| cell.set(crate::PhaseSpan::ZERO));
     PHASE_INTERP.with(|cell| cell.set(crate::PhaseSpan::ZERO));
     FUEL_MAX.with(|cell| cell.set(0));
+    crate::const_cache::reset_counts();
     // A program that already failed analysis skips evaluation entirely: the
     // transformer's entity lookups (used to lower the const world) assume
     // a clean program, exactly as `transform` itself does.
@@ -1636,6 +1637,11 @@ struct State<'p, 'src> {
     /// program a finaliser runs against is a function of registration order
     /// and not of how many times it was asked for.
     scheduled: Vec<(String, Id)>,
+    /// M110 S4: the shared world declarations' hashes for this pass, by
+    /// address — every site reaches into one lowering, so each declaration is
+    /// hashed once however many sites' keys include it
+    /// ([`crate::const_cache::site_key`]).
+    world_hashes: HashMap<usize, u64>,
 }
 
 /// How a const expression's free variable is (or isn't) compile-time-known.
@@ -1670,6 +1676,7 @@ impl<'p, 'src> State<'p, 'src> {
             errors: Vec::new(),
             reader,
             scheduled: Vec::new(),
+            world_hashes: HashMap::default(),
         }
     }
 
@@ -1809,16 +1816,25 @@ impl<'p, 'src> State<'p, 'src> {
                     if let Some(recorder) = self.reader {
                         recorder.enter_site(self.source_of(expr_id), self.span_of(expr_id));
                     }
-                    let reader = self
-                        .reader
-                        .map(|reader| reader as &dyn interpreter::AssetReader);
                     // G24: only a `const let` binding's initializer may
                     // evaluate to a closure (`const-eval.md` §11). Every other
                     // const site keeps §1's plain-data rule, and its refusal
                     // now steers to the declaration that admits one.
                     let snapshots = self.program.const_let_initializers.contains(&expr_id);
-                    let evaluated =
-                        interpreter::eval_const(&site, EXPLICIT_LIMITS, snapshots, reader);
+                    // M110 S4: through the const cache — a remembered run
+                    // of this very program, served when every project read
+                    // it made answers the same again.
+                    let evaluated = match self.reader {
+                        Some(reader) => crate::const_cache::evaluate(
+                            &site,
+                            EXPLICIT_LIMITS,
+                            snapshots,
+                            reader,
+                            &mut self.world_hashes,
+                        ),
+                        None => interpreter::eval_const(&site, EXPLICIT_LIMITS, snapshots, None)
+                            .map(crate::const_cache::run_of),
+                    };
                     phase_add(&PHASE_INTERP, interp_started);
                     match evaluated {
                         Ok(outcome) => {
