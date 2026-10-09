@@ -20981,6 +20981,8 @@ impl<'src> Analyzer<'src> {
                 // `Option<V>`; `V` is what has to be Wire, and the key stays on
                 // the server.
                 ("HashMapEntry" | "MemoEntry", [_key, value]) => Some(*value),
+                // A153: a mirrored store's handle; the value at its path crosses.
+                ("Store" | "StoreSome", [element]) => Some(*element),
                 _ => None,
             },
             Type::Enum(id, arguments) => match (
@@ -20994,7 +20996,8 @@ impl<'src> Analyzer<'src> {
                 // already answers `None` for an absent key.
                 ("Option", [inner])
                     if self.resolved_handle_return_key(*inner).is_none()
-                        && !self.resolved_is_entry_handle(*inner) =>
+                        && !self.resolved_is_entry_handle(*inner)
+                        && !self.resolved_is_store_handle(*inner) =>
                 {
                     self.resolved_handle_return_element(*inner)
                 }
@@ -21014,6 +21017,18 @@ impl<'src> Analyzer<'src> {
             Type::Struct(id, _) => matches!(
                 self.structs.get(&id).map(|struct_| struct_.name),
                 Some("HashMapEntry" | "MemoEntry")
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether a RESOLVED return is a mirrored store's handle (A153) —
+    /// [`is_store_handle_spelling`]'s twin.
+    fn resolved_is_store_handle(&self, type_id: TypeId) -> bool {
+        match type_id.get_type(self) {
+            Type::Struct(id, _) => matches!(
+                self.structs.get(&id).map(|struct_| struct_.name),
+                Some("Store" | "StoreSome")
             ),
             _ => false,
         }
@@ -69937,6 +69952,15 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
                 _ => None,
             }
         }
+        // A153: a MIRRORED store's handle, `Store<T>` or `StoreSome<P>`
+        // (`mirrored-store.md` §3.1) — the client mirrors the store by path, so
+        // the value at the handle's path is what crosses and has to be Wire.
+        Node::AccessorWithGenerics(_, arguments) if is_store_handle_spelling(node) => {
+            match arguments.0.as_slice() {
+                [element] => Some(&element.0),
+                _ => None,
+            }
+        }
         Node::AccessorWithGenerics(name, arguments) if *name == "Option" => {
             match arguments.0.as_slice() {
                 // R4/B326: `Option<KeyedCell<K, T>>` is NOT a handle return,
@@ -69950,7 +69974,8 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
                 // per-source one — is a design item, not this rule's business.
                 [inner]
                     if handle_return_key(&inner.0).is_none()
-                        && !is_entry_handle_spelling(&inner.0) =>
+                        && !is_entry_handle_spelling(&inner.0)
+                        && !is_store_handle_spelling(&inner.0) =>
                 {
                     handle_return_element(&inner.0)
                 }
@@ -69959,6 +69984,17 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
         }
         _ => None,
     }
+}
+
+/// Whether a written return is a MIRRORED store's handle (A153): `Store<T>` or
+/// `StoreSome<P>` — `std::rpc`'s `handle_element` reads the same names. An
+/// `Option` of one is not a handle: a store's absence is `StoreSome`'s to say.
+fn is_store_handle_spelling(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::AccessorWithGenerics(name, arguments)
+            if (*name == "Store" || *name == "StoreSome") && arguments.0.len() == 1
+    )
 }
 
 /// Whether a written return is a map's PER-KEY handle (A138): `HashMapEntry<K, V>`
@@ -70816,6 +70852,25 @@ fn collect_std_item_modules(nodes: &NodeList) -> Vec<&'static str> {
         walk(node, &mut found);
     }
     found.into_iter().map(interned_display_name).collect()
+}
+
+/// The std modules a `[service]` item seeds: `std::rpc`, which hosts the
+/// `service` macro, and — when the same file reaches `std::reactive::store` —
+/// `std::rpc::mirror`, which the expansion names for an `[rpc]` returning a
+/// `Store<T>`/`StoreSome<P>` (A153) and which nothing else loads. Every site
+/// that seeds a service's modules reads this one list, the world key included.
+fn service_seeds(nodes: &NodeList) -> &'static [&'static str] {
+    if !contains_service(nodes) {
+        return &[];
+    }
+    let reaches_store = collect_module_paths(nodes, "std")
+        .iter()
+        .any(|(module, _)| *module == "reactive::store" || module.starts_with("reactive::store::"));
+    if reaches_store {
+        &["rpc", "rpc::mirror"]
+    } else {
+        &["rpc"]
+    }
 }
 
 /// Whether an AST carries a `[service(..)]` item at any depth — the trigger
@@ -74837,8 +74892,8 @@ fn hot_set_closure(
                 .into_iter()
                 .map(|module| (Origin::Std, module)),
         );
-        if contains_service(&ast.0) {
-            requests.push((Origin::Std, "rpc"));
+        for seed in service_seeds(&ast.0) {
+            requests.push((Origin::Std, seed));
         }
         for (dependency, index) in &workspace.entry_dependencies {
             requests.extend(collect_module_paths(&ast.0, dependency).into_iter().map(
@@ -75017,8 +75072,8 @@ fn analyze_inner<'src>(
         // that differs is the one holding the `service` MACRO, so an entry
         // wrote no service could be served a world it never asked for and a
         // service entry could be served one whose registry cannot expand it.
-        if contains_service(&nodes.0) {
-            names.push(seed_module(&std_roots, "rpc"));
+        for seed in service_seeds(&nodes.0) {
+            names.push(seed_module(&std_roots, seed));
         }
         names.sort();
         names.dedup();
@@ -75482,8 +75537,8 @@ fn analyze_inner<'src>(
     // std import (e.g. `std::http` in a browser build) is reported here — once, at
     // its import — but still loaded, so the rest of the file types cleanly (P3).
     // (Skipped when compiling std itself, whose internal imports aren't user code.)
-    if contains_service(&nodes.0) {
-        to_load.push((Origin::Std, "rpc"));
+    for seed in service_seeds(&nodes.0) {
+        to_load.push((Origin::Std, seed));
     }
     // B270: a `css` block or an element in the entry needs its desugar's std
     // module whether or not the author imported anything.
@@ -75727,8 +75782,8 @@ fn analyze_inner<'src>(
             // and the one B21 fell through: without the seed, the registry
             // built without `service` and the `[service]` silently expanded
             // through the stale Rust fallback generator.
-            if contains_service(&lib_ast.0) {
-                to_load.push((Origin::Std, "rpc"));
+            for seed in service_seeds(&lib_ast.0) {
+                to_load.push((Origin::Std, seed));
             }
             for (name, dependency_index) in &spec.dependencies {
                 to_load.extend(
@@ -76419,8 +76474,8 @@ fn analyze_inner<'src>(
             );
             // A `[service]` item means the std `service` macro (hosted in
             // `std::rpc`, too heavy to always-load) must be in the prelude.
-            if contains_service(&ast.0) {
-                to_load.push((Origin::Std, "rpc"));
+            for seed in service_seeds(&ast.0) {
+                to_load.push((Origin::Std, seed));
             }
             // B270, the entry's twin: a loaded module's own `css` blocks and
             // elements seed their std modules, whatever package it belongs to.

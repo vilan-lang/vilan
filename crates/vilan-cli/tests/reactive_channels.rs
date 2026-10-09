@@ -6291,7 +6291,6 @@ fun main() {
 "##;
 
 #[test]
-#[ignore = "A153: an `[rpc]` returning `Store<T>` is refused as not Wire until the analyzer's element rule reads the store's handle spellings and a service reaching `std::reactive::store` seeds `std::rpc::mirror` (store-49's patch, sweeps/order49/store-49/a153-analyzer-admission.patch; the analyzer core was incr-49's this order)"]
 fn a153_s2_a_generated_store_stub_mints_on_its_first_hold_and_lets_go_with_its_last() {
     // §3.1 + §6 through the expansion: `client.global()` and `client.message(7)`
     // are SYNC stubs answering `RemoteStoreSome<..>` (Q10), deduped per origin
