@@ -11630,3 +11630,30 @@ fn f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends() {
         "a destructured view from a `borrows` call must bind copies natively"
     );
 }
+
+/// F114: a reading intrinsic over a spine of a `Shared` VIEW reads through
+/// a view of the cell, as F49's boxed binding does — `cell.read().items.len()`
+/// had copied the whole list out of the borrow to count it. The emission
+/// pin: the three copies left are the std calls (`contains`, `get`,
+/// `contains_key`), which run user `Hash`/`Eq` and are not intrinsics.
+#[test]
+fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f114_shared_view_reading_intrinsics.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_reading_intrinsics.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a reading intrinsic over a `Shared` view's field must answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("read_with(").count(),
+        3,
+        "only the three std calls copy their field out of the cell:\n{main}"
+    );
+}

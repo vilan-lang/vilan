@@ -3670,6 +3670,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// been hoisted: the view is taken last, once nothing but the call itself
     /// is left to run. That is the evaluation order spec §6.9's native note
     /// states. `None` for a place that does not live in a boxed cell.
+    ///
+    /// `through_shared_views` admits a spine over a `Shared` VIEW call as well
+    /// (F114: `cell.read().items.len()`), for a position that runs no user
+    /// code under the view — a reading intrinsic. The cell's handle is
+    /// settled with the subscripts, so the receiver is still evaluated before
+    /// the arguments; only the borrow waits for the call. A user call cannot
+    /// take one: a callee reaching the same cell through another handle (F39's
+    /// runtime half) would meet the borrow.
     fn cell_view_place(
         &mut self,
         id: Id,
@@ -3677,13 +3685,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         settled_lets: &mut String,
         borrows: &mut String,
         views: &mut usize,
+        through_shared_views: bool,
     ) -> Result<Option<String>, Error> {
         let place = match self.program.entity_map.get(&id) {
             Some(&Expr::Reference(operand, false)) => operand,
             _ => id,
         };
-        let Some((CellRoot::Boxed(binding), steps)) = self.cell_spine(place) else {
-            return Ok(None);
+        let (cell_text, steps) = match self.cell_spine(place) {
+            Some((CellRoot::Boxed(binding), steps)) => (self.binding_name(binding), steps),
+            Some((CellRoot::View(cell), steps)) if through_shared_views => {
+                let handle = self.expecting_nothing(|emitter| emitter.expression(cell, depth))?;
+                let name = format!("__cell{views}");
+                let _ = write!(settled_lets, "let {name} = &({handle}); ");
+                (name, steps)
+            }
+            _ => return Ok(None),
         };
         let view = format!("__view{views}");
         *views += 1;
@@ -3695,11 +3711,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             settled_lets,
             &mut 0,
         )?;
-        let _ = write!(
-            borrows,
-            "let {view} = ({}).borrow(); ",
-            self.binding_name(binding)
-        );
+        let _ = write!(borrows, "let {view} = ({cell_text}).borrow(); ");
         Ok(Some(path))
     }
 
@@ -11364,7 +11376,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             if takes_a_view.get(index).copied().unwrap_or(false)
                 && let Some(path) =
-                    self.cell_view_place(*argument, depth, prelude, &mut view_borrows, &mut views)?
+                    self.cell_view_place(
+                        *argument,
+                        depth,
+                        prelude,
+                        &mut view_borrows,
+                        &mut views,
+                        false,
+                    )?
             {
                 rendered.push(format!("&{path}"));
                 continue;
@@ -11732,6 +11751,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => id,
         };
         !self.is_natively_copy(place) && self.boxed_place_root(place).is_some()
+    }
+
+    /// [`Self::is_a_cell_view_place`] widened to a spine over a `Shared` VIEW
+    /// call (F114) — the receiver a reading intrinsic reads through the cell
+    /// instead of copying out.
+    fn is_a_cell_read_place(&self, id: Id) -> bool {
+        let place = match self.program.entity_map.get(&id) {
+            Some(&Expr::Reference(operand, false)) => operand,
+            _ => id,
+        };
+        !self.is_natively_copy(place) && self.cell_spine(place).is_some()
     }
 
     /// Whether the `&` argument at `index` is taken as a VIEW of its boxed
@@ -13211,11 +13241,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // the cell for the call ([`Self::cell_view_place`]) instead of copying
         // the whole value out of it first. The other arguments are values,
         // hoisted ahead of the view; none of these intrinsics runs user code.
+        //
+        // F114: the same view serves a spine over a `Shared` VIEW —
+        // `cell.read().items.len()` had copied the whole list out of the
+        // cell's borrow (`read_with(|view| view.items.clone())`) to count it.
         if !mutating
             && reads_its_receiver_in_place(intrinsic)
             && argument_ids
                 .first()
-                .is_some_and(|receiver| self.is_a_cell_view_place(*receiver))
+                .is_some_and(|receiver| self.is_a_cell_read_place(*receiver))
         {
             let mut prelude = String::new();
             let mut view_borrows = String::new();
@@ -13227,6 +13261,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 &mut prelude,
                 &mut view_borrows,
                 &mut views,
+                true,
             )?
             else {
                 return Err(unsupported("a cell view over no boxed binding", span));

@@ -27,6 +27,11 @@ written down.
 <!-- family: fix -->
 **F113: a pattern over the view a `borrows` call hands back binds copies natively — `if cell.slot() is (let cells, let weight)` bound `weight` as a `&mut i32`, and `cells.len().as_i32() + weight` was refused by rustc (E0277); JS printed 5.** A capture is a copy (rule 1), and a pattern over a PLACE already copies its subject first (F20); a call to a `borrows` function names storage the same way, but its native value is a reference, so Rust's default binding modes bound every capture through it. The subject is now the pointee's copy (`(*call).clone()`, F88's rule for a view) at every pattern position: an `is` test, a `match`, a read view (`&T`), an `Option` behind a view, and a destructuring `let`. A view WRAPPED in a payload (`Option<&mut T>`, the wrapped-view capture) is a value natively and is untouched. Pin: `native_differential::f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends` (`native/view_call_subjects.vl`, red on 0.46.0). capture-clones.vl's `called_component` is the corpus site; that program's first wall is still B579 (mixed integer widths). Tracker F113.
 
+---
+
+<!-- family: performance -->
+**F114: a reading intrinsic over a field of a `Shared` view reads through a view of the cell natively — `cell.read().items.len()` had copied the whole list out of the cell's borrow (`read_with(|view| view.items.clone())`) to count it.** F49 read a boxed binding's receiver this way for the reading intrinsics (`len`, `get`, `contains`, `contains_key`, the `str` readers); the same view serves a spine over a `Shared` view call, fields, tuple slots and subscripts alike. An intrinsic runs no user code, so nothing can meet the borrow (F39's alias through a parameter needs a callee). The cell's handle is settled with the subscripts, ahead of the arguments, and the borrow is taken after them, the order spec §6.9's native note states for F49. A std METHOD over such a field (`HashSet::contains`, `HashMap::get`) is a call, not an intrinsic: it runs the key's `Hash`/`Eq`, and still reads a copy. Pin: `native_differential::f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_backends` (`native/shared_view_reading_intrinsics.vl`: eleven intrinsic reads leave no copy; the three left are the std calls). Tracker F114.
+
 
 ## v0.46.0 — 2026-10-09
 
