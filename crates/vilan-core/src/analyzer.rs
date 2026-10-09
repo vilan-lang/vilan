@@ -276,6 +276,11 @@ struct MemberRowIndex {
 struct ImplReachLog {
     /// Whether the resolve now running records.
     recording: bool,
+    /// Which questions it records ([`ReachFilter`]).
+    filter: ReachFilter,
+    /// How many questions it recorded — the census's `reach-questions`, zero
+    /// for a world whose late files write no foreign impl.
+    questions: u64,
     /// Member name -> the receivers it was looked up on, each with whether a
     /// PACKAGE source asked (as opposed to only std's).
     members: HashMap<Box<str>, HashMap<Type, bool>>,
@@ -294,6 +299,106 @@ struct ImplReachLog {
     /// resolved before its entry (the deferred order), whose impls were all
     /// there to be asked.
     floor: Option<usize>,
+}
+
+/// Which questions an [`ImplReachLog`] keeps, read off the LATE files' syntax
+/// (the entry, and a hot set's modules) before anything resolves.
+///
+/// A late impl can only answer a question the stored world asked about a type
+/// the stored world can NAME: an impl whose subject is a struct or enum the
+/// late files themselves declare is out of every stored module's reach (the
+/// entry cannot be imported, and a module that imports a hot module is hot),
+/// and so are the impls a derive or `[service]` generates — they are written
+/// on the item they decorate. What is left is an impl on a FOREIGN subject: an
+/// inherent one, whose members are reached by name, so only those names are
+/// recorded; or a trait impl (or one whose shape this cannot read), which can
+/// answer a trait or an inherited member anywhere, so everything is. A late
+/// file with none of these records nothing at all, which is every `vilan
+/// check` whose entry writes no impl on another file's type.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct ReachFilter {
+    /// Record every question (a foreign trait impl, an item macro).
+    everything: bool,
+    /// Otherwise, member questions about these names only.
+    members: std::collections::BTreeSet<String>,
+}
+
+impl ReachFilter {
+    /// The filter for these late files, or `None` when no impl in them can
+    /// answer a stored question.
+    fn of<'a>(files: impl IntoIterator<Item = &'a NodeList<'a>>) -> Option<ReachFilter> {
+        // The item nodes at a file's top level, through the markers that wrap
+        // them and into inline `mod`s.
+        fn items<'a>(nodes: &'a NodeList<'a>, out: &mut Vec<&'a Node<'a>>) {
+            for item in nodes {
+                let mut node = &item.0;
+                while let Node::Export(_, inner, _)
+                | Node::Derive(_, inner)
+                | Node::Service(_, inner)
+                | Node::Const(inner) = node
+                {
+                    node = &inner.0;
+                }
+                match node {
+                    Node::Module(_, body) => items(&body.0, out),
+                    _ => out.push(node),
+                }
+            }
+        }
+        let mut nodes: Vec<&Node> = Vec::new();
+        for file in files {
+            items(file, &mut nodes);
+        }
+        let declared: HashSet<&str> = nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Struct(name, ..) | Node::Enum(name, ..) => Some(name.0),
+                _ => None,
+            })
+            .collect();
+        let mut filter = ReachFilter::default();
+        let mut any = false;
+        for node in nodes {
+            match node {
+                // An item macro writes whatever it writes.
+                Node::MacroAttribute(..) => {
+                    filter.everything = true;
+                    any = true;
+                }
+                Node::Impl(subject, traits, body, _) => {
+                    let head = match &subject.0 {
+                        Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
+                        _ => None,
+                    };
+                    if head.is_some_and(|head| declared.contains(head)) {
+                        continue;
+                    }
+                    any = true;
+                    if !traits.is_empty() {
+                        filter.everything = true;
+                        continue;
+                    }
+                    for member in &body.0 {
+                        let mut member_node = &member.0;
+                        while let Node::Export(_, inner, _) | Node::Const(inner) = member_node {
+                            member_node = &inner.0;
+                        }
+                        match member_node {
+                            Node::Func(function) => {
+                                filter.members.insert(function.name.0.to_string());
+                            }
+                            _ => filter.everything = true,
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if filter.everything {
+            filter.members.clear();
+        }
+        any.then_some(filter)
+    }
 }
 
 /// [`ImplReachLog`]'s insert: `receiver` joins the set, and a package asker
@@ -48687,9 +48792,10 @@ impl<'src> Analyzer<'src> {
     /// ([`ImplReachLog`]). Called around the PRE-STORE resolve only — the one
     /// whose answers the impls walked after it (the entry's, a hot set's) must
     /// not have changed.
-    fn begin_impl_reach_log(&mut self) {
+    fn begin_impl_reach_log(&mut self, filter: ReachFilter) {
         *self.impl_reach.get_mut() = ImplReachLog {
             recording: true,
+            filter,
             ..ImplReachLog::default()
         };
     }
@@ -48701,15 +48807,20 @@ impl<'src> Analyzer<'src> {
         let log = self.impl_reach.get_mut();
         log.recording = false;
         log.floor = Some(floor);
+        let questions = log.questions;
+        if !crate::macros::in_macro_world() {
+            crate::incremental::update_census(|census| census.reach_questions = questions);
+        }
     }
 
     /// Records that member `member_name` was looked up on `subject_type`, when
     /// a pre-store resolve is recording ([`ImplReachLog`]).
     fn note_member_query(&self, subject_type: &Type, member_name: &str) {
         let mut log = self.impl_reach.borrow_mut();
-        if !log.recording {
+        if !log.recording || (!log.filter.everything && !log.filter.members.contains(member_name)) {
             return;
         }
+        log.questions += 1;
         let by_package = !log.asked_by_std;
         let receivers = match log.members.get_mut(member_name) {
             Some(receivers) => receivers,
@@ -48722,9 +48833,12 @@ impl<'src> Analyzer<'src> {
     /// resolve is recording ([`ImplReachLog`]).
     fn note_trait_query(&self, subject_type: &Type, trait_id: Id) {
         let mut log = self.impl_reach.borrow_mut();
-        if !log.recording {
+        // Only a foreign TRAIT impl answers a trait question, and one of those
+        // records everything.
+        if !log.recording || !log.filter.everything {
             return;
         }
+        log.questions += 1;
         let by_package = !log.asked_by_std;
         note_receiver(
             log.traits.entry(trait_id).or_default(),
@@ -70803,6 +70917,12 @@ struct BaseCacheKey {
     /// requests are why a keystroke that adds an import misses: the prefix
     /// loaded what the hot modules asked for, so a new ask is a new prefix.
     hot: Option<(Vec<PathBuf>, Vec<(Origin, &'static str)>)>,
+    /// M121 / B553: what the stored world's resolve RECORDED of the impl
+    /// table ([`ReachFilter`]) — `None` when it recorded nothing. Which
+    /// questions are worth recording is read off the late files' syntax (the
+    /// entry's, a hot set's), so a world recorded for one set of late impls is
+    /// not offered to another.
+    reach: Option<ReachFilter>,
 }
 
 /// One retained base world and the claims that keep its borrows alive (M23).
@@ -73788,6 +73908,7 @@ fn analyze_inner<'src>(
         }),
         entry_open_module: entry_open_module.clone(),
         hot: None,
+        reach: None,
     };
     let base_cacheable = shape.cache
         && !entry_is_inside_std
@@ -73861,6 +73982,17 @@ fn analyze_inner<'src>(
     base_cache_key.hot = hot_world
         .as_ref()
         .map(|hot| (hot.paths.clone(), hot.requests.clone()));
+    // M121 / B553: what the pre-entry resolve must record, from the late files'
+    // syntax ([`ReachFilter`]): the entry, and the hot modules when this is a
+    // hot-set world. Nothing, for a check whose entry writes no foreign impl.
+    base_cache_key.reach = {
+        let hot_files: Vec<&'static crate::span::Spanned<NodeList<'static>>> = hot_world
+            .iter()
+            .flat_map(|hot| hot.paths.iter())
+            .filter_map(|path| load_package_module(path).map(|module| module.ast))
+            .collect();
+        ReachFilter::of(std::iter::once(&nodes.0).chain(hot_files.iter().map(|file| &file.0)))
+    };
     let hot_world = if hot_world.is_some() && hot_world_refused(&base_cache_key) {
         base_cache_key.hot = None;
         crate::incremental::update_census(|census| census.hot_refusal = Some("refused-before"));
@@ -76008,9 +76140,14 @@ fn analyze_inner<'src>(
         // M121 / B553: what this resolve asks of the impl table is recorded,
         // so the impls walked after it — the entry's, a hot set's — can be
         // tested against it once they have resolved (`impl_reach`).
-        analyzer.begin_impl_reach_log();
-        analyzer.resolve_world();
-        analyzer.end_impl_reach_log();
+        match &base_cache_key.reach {
+            Some(filter) => {
+                analyzer.begin_impl_reach_log(filter.clone());
+                analyzer.resolve_world();
+                analyzer.end_impl_reach_log();
+            }
+            None => analyzer.resolve_world(),
+        }
     }
     let phase_base = phase_base_start.elapsed();
     let prefix_len = sources.len();
