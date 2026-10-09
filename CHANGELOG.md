@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**E274: member completion on a generic receiver offers the methods of the impls that apply to ITS type arguments — after `store.` on a `Store<App>`, the derive's `impl Store<Address>` projections (`city`, `path`) are no longer offered beside `App`'s own, and accepting one was refused.** The member table grouped every impl by the nominal its subject names and offered them all; each member now carries its impl's subject, and a request with a typed receiver keeps the members of the impls the solver selects for it (`impl_select::applying_implementations`, scoped to the file — the selection emission dispatches through), one per name, so a name two instantiations both declare is offered once, as the receiver's. A receiver no walk could type, a `Type::` path, and a receiver whose arguments select none of the nominal's impls keep every impl's members, as before. Pins: `vilan-ide`'s `completion::tests::e274_a_store_handle_is_not_offered_another_instantiations_projections` and `e274_an_inherent_impl_at_other_arguments_is_not_offered` (an impl at `Box<i32>`, one at `Box<str>`, a generic one, and a name both declare), red with the filter planted off. Tracker E274.
+
+---
+
 <!-- family: diagnostics -->
 **B555: `import std::js::null;` is refused with the reason, at the keyword — "`null` is a keyword, so no import path can name `std::js::null` — and none needs to: that module declares only the type of the `null` value, which every file has without an import. Drop the import" — where it got the general "an `import`/`use` path is `::`-separated NAMES …" rule.** The module's name is the keyword, so the path grammar stops at it in every spelling: bare, braced (`std::js::null::{ .. }` — not the working spelling the item supposed; it stops at the same token), under `use`, and at the old `std::null` path. Nothing is lost: the module is a core module loaded in every program. **Pins:** `parsing::tests::b555_an_import_of_the_null_module_is_steered_at_the_keyword` (four spellings, anchored on `null`), `inference::modules::b555_importing_the_null_module_is_refused_once_with_the_steer`. Row 229's rule population is 62 (`RULE_STATEMENT_SITES`; the ledger prose carries the number). Tracker B555.
 
