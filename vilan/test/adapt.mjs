@@ -15,41 +15,50 @@ function __sleep(ms, signal) {
 function fold_unsigned(value, modulus) {
 	const truncated = Math.trunc(value);
 	const wrapped = truncated % modulus;
-	let $e = null;
-	if (wrapped < 0) {
-		$e = wrapped + modulus;
-	} else {
-		$e = wrapped;
-	}
-	return $e;
-}
-function fold_signed(value, modulus, half) {
-	const wrapped = fold_unsigned(value, modulus);
 	let $f = null;
-	if (wrapped >= half) {
-		$f = wrapped - modulus;
+	if (wrapped < 0) {
+		$f = wrapped + modulus;
 	} else {
 		$f = wrapped;
 	}
 	return $f;
+}
+function fold_signed(value, modulus, half) {
+	const wrapped = fold_unsigned(value, modulus);
+	let $g = null;
+	if (wrapped >= half) {
+		$g = wrapped - modulus;
+	} else {
+		$g = wrapped;
+	}
+	return $g;
 }
 function as_i32(self) {
 	const widened = Number(self);
 	return Number(fold_signed(widened, 4294967296, 2147483648));
 }
 async function sleep(ms, $a) {
-	await (__sleep(ms, ambient_signal($a)));
+	await (__sleep(clamp_delay(ms), ambient_signal($a)));
 }
-function ambient_signal($b) {
-	const $c = $b;
-	let $d = null;
-	if ($c[0] === 0) {
-		const n = $c[1];
-		$d = [ 0, n.signal_of() ];
+function clamp_delay(ms) {
+	let $b = null;
+	if (ms < 0) {
+		$b = 0;
 	} else {
-		$d = [ 1 ];
+		$b = ms;
 	}
-	return $d;
+	return $b;
+}
+function ambient_signal($c) {
+	const $d = $c;
+	let $e = null;
+	if ($d[0] === 0) {
+		const n = $d[1];
+		$e = [ 0, n.signal_of() ];
+	} else {
+		$e = [ 1 ];
+	}
+	return $e;
 }
 function run(f) {
 	return f() + 100;
@@ -96,7 +105,7 @@ async function helper(urls, f) {
 		await (sleep(1, [ 1 ]));
 		return as_i32(url.length) + 10;
 	})));
-})().catch(($g) => {
-	console.error(String($g));
+})().catch(($h) => {
+	console.error(String($h));
 	process.exit(1);
 });

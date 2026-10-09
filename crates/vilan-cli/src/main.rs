@@ -3867,10 +3867,14 @@ fn owning_package(file: &Path) -> Result<Option<(PathBuf, Manifest)>, String> {
 ///
 /// A file with no manifest above it keeps its old context exactly: its own
 /// directory as the package root, no dependencies, default options — and so does
-/// a file under a `[project]` or `[library]` root, which has no `[package]` to
-/// belong to.
+/// a file under a `[project]` root, which has no `[package]` to belong to. A file
+/// under a `[library]` root takes the library's layer root for `pkg::` (B586) and
+/// nothing else of it.
 fn file_project(entry: PathBuf) -> Result<Project, String> {
-    let bare = |entry: PathBuf| {
+    // `library_root`: for a `[library]` file, the layer root `pkg::` resolves
+    // from (B586); `None` for a file no library owns, which resolves `pkg::` from
+    // its own directory and is the program it names.
+    let bare = |entry: PathBuf, library_root: Option<PathBuf>| {
         // No project to colour it — but the file may say itself (F27 R1):
         // `[platform("browser")] mod self;`, or fences that admit one platform, is the
         // platform the editor analyzes it under, and the terminal must not
@@ -3907,16 +3911,26 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
         Project::Single {
             unit: Unit {
                 name: String::new(),
-                pkg_root: pkg_root_of(&entry),
+                pkg_root: library_root.clone().unwrap_or_else(|| pkg_root_of(&entry)),
                 entry,
                 package_dir: None,
                 split: false,
                 options: BuildOptions::default(),
                 platform_reasons,
                 // A file with no `[package]` above it IS the program it names,
-                // and there is no manifest to name any other (B250).
-                entry_mode: vilan_core::EntryMode::Declared {
-                    declared_entries: Vec::new(),
+                // and there is no manifest to name any other (B250). A file of
+                // a `[library]` is the opposite - a MODULE of it, which has no
+                // `main` and which its siblings import (B586: the same
+                // `OpenFile` the editor's analysis of it is, and a library
+                // declares no program to refuse).
+                entry_mode: if library_root.is_some() {
+                    vilan_core::EntryMode::OpenFile {
+                        declared_entries: Vec::new(),
+                    }
+                } else {
+                    vilan_core::EntryMode::Declared {
+                        declared_entries: Vec::new(),
+                    }
                 },
             },
             platform,
@@ -3925,10 +3939,30 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
         }
     };
     let Some((directory, manifest)) = owning_package(&entry)? else {
-        return Ok(bare(entry));
+        return Ok(bare(entry, None));
     };
     let Some(package) = manifest.package.as_ref() else {
-        return Ok(bare(entry));
+        // B586: a `[library]` file resolves `pkg::` from its LAYER root - the
+        // deepest of the library's layer roots containing it, else its base
+        // root - the rule the language server takes (vilan-lsp's document.rs),
+        // not from the file's own directory: `src/deep/pair.vl` importing
+        // `pkg::util::unit` found no `util` under `src/deep/`. Still no
+        // platform and no entries (a library declares neither), and no
+        // dependency workspace, as before.
+        let layer_root = manifest.library.is_some().then(|| {
+            let spec = vilan_core::manifest::resolve_library(&directory);
+            let within = |root: &Path| {
+                vilan_core::util::canonical_path_of_unwritten(&entry)
+                    .starts_with(vilan_core::util::canonical_path_of_unwritten(root))
+            };
+            spec.layers
+                .iter()
+                .filter(|layer| within(&layer.root))
+                .max_by_key(|layer| layer.root.as_os_str().len())
+                .map(|layer| layer.root.clone())
+                .unwrap_or(spec.base_root)
+        });
+        return Ok(bare(entry, layer_root));
     };
     let options = manifest
         .build_options()

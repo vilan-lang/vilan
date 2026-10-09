@@ -43,6 +43,9 @@ written down.
 <!-- family: miscompile -->
 **A tuple, a fixed array or one enum variant holding TWO values that owe a teardown is refused by name natively, where it printed the teardowns in the opposite order to JS.** vilan drops an aggregate's members in reverse (destruction.md §5); Rust drops a tuple's, an array's and a variant's in declaration order, and only a struct's fields can be declared reversed (F97), so `let pair = (Handle { .. }, Handle { .. })` closed `a` then `b` natively and `b` then `a` on JS, silently. The refusal stands where Rust's own glue would drop the aggregate WHOLE (a binding the block owes a teardown, at any depth of its type) and names the aggregate and the steer (hold them in a struct's fields); a variant CONSUMED by a by-value `match`, whose captures drop on their own (resource_take.vl's `Couple::Two`), one teardown per aggregate, and a struct holding two, build and agree as before. Pin: `native_differential::an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered` (the variant, the tuple and the array refused, a struct and a one-resource variant and tuple identical; red on 0.46.0). Found building F116.
 
+<!-- family: fix -->
+**B586: `vilan check <file>` on a nested module of a `[library]` resolves `pkg::` from the library's layer root, as the editor does.** `vilan check src/deep/pair.vl` rooted `pkg::` at `src/deep/` — the file's own directory — so `import pkg::util::unit` reported "cannot find 'util' in the imported path", and so did std's own `vilan check vilan/std/src/web/dom.vl` (`pkg::reactive`). A file under a `[library]` is now rooted at the deepest of the library's layer roots containing it, else its base root; it still gets no platform, no entries and no dependency workspace.
+
 ---
 
 <!-- family: fix -->
@@ -57,6 +60,9 @@ written down.
 
 <!-- family: feature -->
 **F118: std's tuple-family blankets build natively — tuple `==` (`compare`'s position-by-position `eq`), a tuple as a map or set key, and `(..).debug()`; each was refused at the `TupleKeys` intrinsic.** `std::tuple`'s readers are emitted against the instance's concrete tuple: `len()` is the arity, `keys()` a `TupleKey` per position, `entries()` a `(key, copy)` pair per position, and `get(key)` a copy of the element the key names, at the type the call's `U` binds (`vilan_rt::tuple_get`; a key is a value, so its position is read at run time). A `for` over a tuple is UNROLLED, one body per position with the binder at that position's own type (the body was checked once, at the element template) — the lowering F101 gave a tuple comprehension — and `jump break` / `jump continue` leave the walk and the position through labelled blocks. A comprehension over `keys()` builds too, and so does `zip_some` / `unzip` (A152), whose last wall this was. A walk nested in another's slot (a tuple of tuples) rebinds the element template rather than reading the outer slot's binding. Pins: `native_differential::f118_the_tuple_blankets_are_identical_on_both_backends` (`native/tuple_blankets.vl`), A152's pin flipped to the claim (`zip_some_and_unzip_are_identical_natively`). Tracker F118.
+
+<!-- family: fix -->
+**E286: a `pkg::` or dependency import of a module whose file declares `[platform("browser")] mod self;` is browser evidence for a file with no project to colour it, as a `std::` one is (E266).** The editor's platform inference read `std::` imports only, so a `[library]` file importing its own browser-declared module — or a dependency's — was analyzed as node ("analyzed as: node — default") and its `Region` was the process twin's, while the module itself was analyzed as browser. It now reads the entry package's root and the workspace's dependencies for the same file declaration (and a dependency's browser-only layer); a dependency's surface re-exports are not followed.
 
 ---
 
@@ -73,16 +79,41 @@ written down.
 <!-- family: fix -->
 **F121: a struct with a fixed-array field builds natively — `struct Pixel { rgba: [u8; 4] }` was refused by rustc (E0277) before the program printed anything, because the struct's emitted `Js` impl reads every field and vilan-rt had no `Js` for `[T; N]`.** It has one now, laid out as a `List` is (node prints both as arrays), so an array prints whole, in a struct, in an `Option` and through a generic as on JS. vilan-rt's other per-type traits already covered arrays (`Json`; `Clone` and `PartialEq` are Rust's). F109's own repro — a list literal under `[i32; 3]` handed to a `[i32; 3]` parameter — already ran on 0.46.0 (F100 lowered the directed literal to a Rust array); it heads this pin. Pin: `native_differential::f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends` (`native/fixed_array_values.vl`, red on 0.46.0 at the struct). Tracker F121 (papers-49's find), F109 (closed as fixed by F100).
 
+<!-- family: fix -->
+**E280: a file opened into a world another open document already holds still gets its FURTHER worlds analyzed.** Opening `shared.vl` (a module both the browser entry and the node entry reach) with `client.vl` open and settled served it from the held browser world, which analyzes nothing and used to return before the sweep that creates the node entry's world — so the module showed only the browser leg's verdict, with no node-leg diagnostics (E113) and no twin legs, until its next edit; opened the other way round the sweep ran. The served open now schedules that sweep for the further worlds nothing holds, and only those: the held world and every open document are left alone.
+
 ---
 
 <!-- family: tooling -->
 **N154: the teardown EXTENT resolution is written once — `vilan_core::teardown` — and both emitters call it.** The JS transformer's `walk_scope_body` and the native emitter's teardown plan (F97, which had copied `teardown_extent`, `widen_over_declarations`, `own_teardown_extent` and `resolve_extent` into vilan-rust) both ask `teardown::region_end` where a declaration's region closes and `teardown::statement_teardown` what a statement owes, so the two backends print their teardowns in one order because there is one answer rather than two copies that agree. A mechanical move, no behaviour change: no corpus golden moved, F97's and F116's teardown pins and resource*.vl are identical as before. The pass map is unchanged (no pass added, removed or moved: the module is emitter-side, pure over `Program`). Tracker N154.
+
+<!-- family: tooling -->
+**N160: the parser's doc comment on what `export` admits spells a derived export the way an author writes it — `[derive(Wire)] export struct S { .. }` — and says the rotated `export [derive(Wire)]` form is the parser's own, which B485 S3 refuses as source.** A comment only; no behavior moved.
 
 ---
 
 <!-- family: tooling -->
 **N158: `native_differential`'s four longest legs run their programs concurrently — the default suite, the panic-path sites, the leak census and the copy census — about 2.4x shorter in wall each (86/78/53/30 s serially against 37/34/25/18 s under a heavier load, measured alone on this machine).** Each test's loop is `legs_in_parallel`: a `std::thread::scope` of up to four workers (half the cores), each building into its OWN cargo target directory keyed by the test and the worker (cargo locks a target directory for a whole build, and a binary lands under its program's name, so two tests sharing one could run each other's binary); answers come back in the list's order and a leg's panic is resumed on the test's thread with its own message. The panic-path test gives each of its fifteen programs its own file name (it had written one name fifteen times). Every assertion is the serial loop's. Pin: `native_differential::parallel_legs_answer_in_order_and_resume_a_legs_panic`. Tracker N158.
 
+<!-- family: tooling -->
+**N139: the `Debounce` pins' timing margins are audited and written down.** Every burst in `debounce.rs` and the `Draft` debounce pins is dispatched in ONE tick and every wait is a timer that expires after the one it waits on, so a stalled host can only make them wait longer; the two pins that do hold a window against a gap (the pushed deadline's 100 ms in a 2 s window, the nursery cancel's 10 ms in 1 s) keep 20x and 100x, and the reason is now in the file. Widening the 50 ms windows would shrink the wait that proves they fired, so they stay; the stall that did split a 50 ms window (a negative remaining delay) is N155's clamp.
+
+---
+
+<!-- family: fix -->
+**N155: a delay already past reaches the host timer as 0, not as a negative number — `std::time`'s `sleep` and `Timer::after` clamp it, and the debounce's loop clamps the time it has left.** A host that stalled past a `Debounce`'s deadline between `run` and the loop's first `now()` (a loaded runner) handed `setTimeout` `-1`, and node answered on stderr with `TimeoutNegativeWarning: -1 is a negative number. Timeout duration was set to 1.` — which failed the debounce exhibit's empty-stderr check once on a slow Windows runner. A past deadline now fires on the next turn, as `0` does; the timer is never given a number node would warn about.
+
+---
+
+<!-- family: tooling -->
+**N161: `perf_gate.py ratchet --release` resets only the bumps of the classes the verdict measured, and the cut absorbs a `ci`-class bump from CI's own measurement.** The seal's verdict measures the `reference` class; the `ci` class is measured by CI's `perf` job, so the cut used to reset a `ci` bump with nothing absorbed and the release commit's own CI went red on the rows it covered (v0.46.0: math x1.019, watch x1.019, todo x1.005). Now a bump of a class nothing measured is kept and printed; `--ci-from FILE` absorbs it from a `ci` measured JSON, and `--ci-run-of SHA` (which `cut-release.sh` passes, with the repository) fetches the `perf-measured` artifact of the latest green `ci.yml` run at the commit the cut tags from with `gh` — only when a bump is waiting on it — and without `gh`, or without that artifact, the bump stays in `perf/budgets.toml` and the ratchet says why.
+
+---
+
+<!-- family: tooling -->
+**N156: the suite runs under a `ci-test` cargo profile that builds `vilan-core` at opt-level 1 — CI's test legs (`scripts/ci-local.sh test` and `doctest`), the release gate and the seal — and the default dev/test profile is unchanged.** nextest starts a process per test and every process pays a cold std world, so an analysis is the unit the suite is made of: at opt-level 0 it costs ~3.2x its opt-level-1 CPU (the `inference` binary's 41-test sample: 25.3 CPU-s against 7.9), which the suite-48 measurement puts at roughly half of its ~13,000 CPU-s. The price is the edit tax, which is why this is a separate profile: a build after an `analyzer.rs` edit is ~17 s at opt-level 0 and ~80 s at 1, so a lane's `cargo nextest run -p vilan-core ..` keeps the fast default and only the machines that run the whole suite pay for the build once. The artifacts land in `target/ci-test/`; `VILAN_TEST_PROFILE=dev scripts/ci-local.sh test` runs the old way, and a cache keyed on `target/debug` must learn the new directory. One binary stays on the default profile: `deep_nesting`'s stack-size pins are claims about unoptimized frames (three go red at opt-level 1), so `ci-local.sh test` runs it on `dev` after the suite. The whole suite under `ci-test`: 9,933 of 9,936 pass, and those three are the only reds.
+
+---
 
 ## v0.46.0 — 2026-10-09
 

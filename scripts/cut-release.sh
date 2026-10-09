@@ -412,6 +412,7 @@ say ""
 say "ci (§7.2 step 4, backlog L17) — ci.yml on origin, at the commit that becomes the tag"
 say ""
 CI_RED=0
+CI_REPO=""
 TARGET_SHORT="$(git rev-parse --short "$TARGET")"
 ci_verdict=""
 if ! command -v gh > /dev/null 2>&1; then
@@ -749,7 +750,19 @@ if [ -f "$PERF_FILE" ] && [ -f scripts/perf_gate.py ]; then
     # E121 count the seal advanced, in the release commit. Resetting the bumps
     # and leaving their ceilings (what `ratchet --release` did, and the cut
     # never even called it) turned every approved bump red at the next gate.
-    run python3 scripts/perf_gate.py ratchet --from "$PERF_FILE" --release --stamp "v$VERSION's seal"
+    #
+    # N161: the verdict measures the reference class only; a `ci`-class bump is
+    # measured by CI's own `perf` job, and resetting it with nothing absorbed
+    # turned the release commit's own CI red (v0.46.0: math, watch, todo). So
+    # the ratchet resets only the bumps of the classes it measured, and absorbs
+    # a waiting `ci` bump from the `perf-measured` artifact of the green ci.yml
+    # run at $TARGET (the commit that becomes the tag; the release commit
+    # changes versions and prose, not code) - fetched with `gh` when a bump is
+    # waiting on it. Without gh, or without that artifact, the bump STAYS in
+    # perf/budgets.toml and the ratchet says so: the commit's CI is then judged
+    # with the bump still in force, and the next release absorbs it.
+    run python3 scripts/perf_gate.py ratchet --from "$PERF_FILE" --release --stamp "v$VERSION's seal" \
+        --ci-run-of "$TARGET" ${CI_REPO:+--ci-repo "$CI_REPO"}
     say ""
 fi
 

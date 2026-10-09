@@ -537,9 +537,10 @@ const NULL_MODULE_IS_NOT_IMPORTED: &str = "`null` is a keyword, so no import pat
 /// function where every other curated rule is a constant.
 /// Whether `export` can take this statement (B321): an ITEM, an `import`/`use`,
 /// or another `export`. The attribute wrappers are transparent — they annotate
-/// the item under them and `export [derive(Wire)] struct S { .. }` is the same
-/// declaration — so they are asked about their inner node rather than admitted
-/// blindly.
+/// the item under them and `[derive(Wire)] export struct S { .. }` (the spelling
+/// an author writes; the parser holds it rotated to `export [derive(Wire)]
+/// struct S { .. }`, which B485 S3 refuses as source) is the same declaration —
+/// so they are asked about their inner node rather than admitted blindly.
 ///
 /// [`Node::Error`] is admitted: it is the nesting bound's stand-in, already
 /// refused once, and a second message about the same input is the double-report
