@@ -7110,9 +7110,13 @@ fn compile_to_js(
 
     // Analyzer and codegen diagnostics, collected as `(source, span, message)`
     // for ariadne — the source being the file the span indexes into, so each one
-    // renders in its own file (backlog E16). Note-carrying ones render
-    // separately (they still count against a clean build via `noted_errors`).
+    // renders in its own file (backlog E16). The analysis loop renders every
+    // one in place, in the list's canonical order (N147) — note-carrying ones
+    // through their own path, counted in `noted_errors` instead of kept here.
     let mut analyzer_errors: Vec<(SourceId, std::ops::Range<usize>, String)> = Vec::new();
+    // How many of `analyzer_errors` the analysis loop already rendered in
+    // place; the rest (codegen refusals) render with the parse errors at the end.
+    let mut rendered_errors = 0usize;
     let mut noted_errors = 0usize;
     // Diagnostics this round already rendered for an earlier entry (B182). They
     // are not shown again and they still count: the leg is broken, and only the
@@ -7326,9 +7330,22 @@ fn compile_to_js(
                 report_error_with_labels(name, text, error, &located);
                 noted_errors += 1;
             } else {
+                // N147: rendered HERE, in the list's canonical order (C1,
+                // `normalize_diagnostic_order`), like the note-carrying arm
+                // above. Deferred to the closing `report` it printed after
+                // EVERY noted error whatever its position — a split
+                // toolchain's refusal, anchored at the entry's offset 0 to
+                // lead, landed behind two conformance errors noted into std.
+                report_plain(
+                    &diagnostic_files,
+                    source,
+                    error.span.into_range(),
+                    &error.msg,
+                );
                 analyzer_errors.push((source, error.span.into_range(), error.msg.clone()));
             }
         }
+        rendered_errors = analyzer_errors.len();
         // Warnings are non-fatal: render them, but they do not enter `errs`,
         // so they don't block codegen. They carry their own source too — an
         // unused `[must_use]` result in a module renders in that module.
@@ -7595,7 +7612,8 @@ fn compile_to_js(
         .count();
     // The entry's parse errors belong to the entry; the analyzer's carry their
     // own source.
-    report(&diagnostic_files, analyzer_errors, parse_errors);
+    let unrendered = analyzer_errors.split_off(rendered_errors);
+    report(&diagnostic_files, unrendered, parse_errors);
     if cascade > 1 {
         eprintln!(
             "{} {cascade} macro definitions failed to compile; this compile \
@@ -8200,34 +8218,47 @@ fn report(
             )
         }));
     for (source, span, message) in diagnostics {
-        let (filename, text) = diagnostic_file(files, source);
-        let char_span = char_range(text, &span);
-        // The ledger's key, re-derived from the same three things it is made of
-        // (M35). A capturing member defers the dedup to the replay, and the
-        // replay needs to know which diagnostic this rendering IS.
-        capture_open(Some((
-            filename.to_string(),
-            span.start,
-            span.end,
-            message.clone(),
-        )));
-        Report::build(ReportKind::Error, (filename.to_string(), char_span.clone()))
-            .with_config(diagnostic_config())
-            .with_message(&message)
-            .with_label(
-                Label::new((filename.to_string(), char_span))
-                    .with_message(&message)
-                    .with_color(Color::Red),
-            )
-            .finish()
-            // stderr, like the warnings (ratified call (f)): a diagnostic must
-            // never land in `build --stdout`'s JavaScript.
-            .write(
-                sources([(filename.to_string(), snippet(text, &span).to_string())]),
-                DiagnosticStream,
-            )
-            .unwrap()
+        report_plain(files, source, span, &message);
     }
+}
+
+/// Renders ONE diagnostic that carries no secondary location — the shared
+/// ariadne path [`report`] runs per entry, and what the analysis loop calls in
+/// place, so a plain error prints at its own place in the canonical order
+/// (N147) rather than after every note-carrying one.
+fn report_plain(
+    files: &HashMap<SourceId, (String, String)>,
+    source: SourceId,
+    span: std::ops::Range<usize>,
+    message: &str,
+) {
+    let (filename, text) = diagnostic_file(files, source);
+    let char_span = char_range(text, &span);
+    // The ledger's key, re-derived from the same three things it is made of
+    // (M35). A capturing member defers the dedup to the replay, and the
+    // replay needs to know which diagnostic this rendering IS.
+    capture_open(Some((
+        filename.to_string(),
+        span.start,
+        span.end,
+        message.to_string(),
+    )));
+    Report::build(ReportKind::Error, (filename.to_string(), char_span.clone()))
+        .with_config(diagnostic_config())
+        .with_message(message)
+        .with_label(
+            Label::new((filename.to_string(), char_span))
+                .with_message(message)
+                .with_color(Color::Red),
+        )
+        .finish()
+        // stderr, like the warnings (ratified call (f)): a diagnostic must
+        // never land in `build --stdout`'s JavaScript.
+        .write(
+            sources([(filename.to_string(), snippet(text, &span).to_string())]),
+            DiagnosticStream,
+        )
+        .unwrap()
 }
 
 /// Renders one analyzer diagnostic that carries secondary locations: the

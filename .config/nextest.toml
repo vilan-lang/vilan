@@ -67,6 +67,33 @@ filter = 'binary(replay_differential)'
 priority = 100
 slow-timeout = { period = "180s", terminate-after = 5 }
 
+# N151's measurement (Order 48, a per-test CPU runner over a whole run, base
+# next @dfe0c5fc): the next tier of long tests, which ran at their default
+# priority and so started wherever the alphabet put them — the edit-replay
+# differential's seven at +1677 s of a 3712 s run (its corpus leg alone 923 CPU
+# seconds, 293 s wall: the run's single longest test), the docs gate (212 s)
+# and `check_scope_differential`'s two corpus legs (100-105 s) beside them, and
+# the native differential's two whole-suite legs and its two censuses (119-184
+# s) at +850 s. Under a loaded box the run is throughput-bound and the order
+# barely shows; on a quiet one, a test that long started past the middle IS the
+# tail. Longest first is the classic makespan rule, so they start ahead of the
+# wide middle, one tier below the stragglers above.
+#
+# The names are a schedule, not a gate: one that rots costs the run its order,
+# never a test. Durations are wall under load 33-49; re-measure before trusting
+# the ranking on a different box.
+[[profile.default.overrides]]
+filter = '''
+    binary(edit_replay_differential)
+    + (binary(docs) & test(every_doc_example_compiles))
+    + (binary(check_scope_differential) & test(/^corpus_agrees_/))
+    + (binary(examples) & test(every_example_builds))
+    + (binary(corpus) & test(every_corpus_golden_is_byte_identical))
+    + (binary(native_differential)
+        & test(/^(the_default_suite_is_byte_identical|s0_every_panic_path_reports|the_native_(leak|copy)_census)/))
+'''
+priority = 90
+
 # The marker census (B485) analyzes a few hundred probe programs on a worker
 # pool of its own — compute, like the replay differential above, so it starts
 # first rather than holding the run open at the end, and its honest cost

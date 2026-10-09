@@ -45,8 +45,38 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**The suite's longest stragglers start first and two of them stop waiting on themselves: `style_chain_order`'s two tests build their eight fixtures concurrently (152/102 s → 23/32 s wall, alone, under load) and `examples::every_example_builds` builds its examples concurrently (76 → 22 s); the edit-replay differential, the docs gate, `check_scope_differential`'s corpus legs and the native differential's four longest legs are priority-started.** N151 measured where the suite's time goes — 9,797 tests, 13,002 CPU-seconds, `inference` 36% of it at 0.91 s a test, and in a sample of those 53.5% of a test's CPU is the cold std world it loads before its own program. The item's main door, one std world per test binary, cannot reach that: nextest runs every test in its own process, so a world built in-process dies with its test, and where one process does run many analyses the base cache already shares them (the docs gate serves 166 of its 279). What does reach it — building `vilan-core` optimized in the test profile, about a third of the CPU per test for a five-times edit tax — is filed for a ruling. No test asserts anything different. Tracker N151.
+
+---
+
 <!-- family: diagnostics -->
 **B555: `import std::js::null;` is refused with the reason, at the keyword — "`null` is a keyword, so no import path can name `std::js::null` — and none needs to: that module declares only the type of the `null` value, which every file has without an import. Drop the import" — where it got the general "an `import`/`use` path is `::`-separated NAMES …" rule.** The module's name is the keyword, so the path grammar stops at it in every spelling: bare, braced (`std::js::null::{ .. }` — not the working spelling the item supposed; it stops at the same token), under `use`, and at the old `std::null` path. Nothing is lost: the module is a core module loaded in every program. **Pins:** `parsing::tests::b555_an_import_of_the_null_module_is_steered_at_the_keyword` (four spellings, anchored on `null`), `inference::modules::b555_importing_the_null_module_is_refused_once_with_the_steer`. Row 229's rule population is 62 (`RULE_STATEMENT_SITES`; the ledger prose carries the number). Tracker B555.
+
+---
+
+<!-- family: diagnostics -->
+**The terminal prints a check's errors in their one canonical order: an error carrying a note (or a requirement trace) no longer jumps ahead of every plain one — so a `std` copied away from its `macro_std` leads with the split-toolchain refusal, not with `'Instant' does not implement trait 'PartialOrd': missing 'eq'` noted into std's `compare.vl`.** The refusal was always emitted, once, at the entry's offset 0 so it sorts first, and the analysis's list had it first; the CLI rendered note-carrying errors as it met them and held the plain ones to the end, so `Instant`'s and `Duration`'s conformance errors (std's own derives produce nothing over a half toolchain) printed above it, and the same reordering put a missing trait method on line 11 above an unresolved call on line 8. Plain errors render in place now; warnings follow the errors. Tracker N147.
+
+---
+
+<!-- family: tooling -->
+**`scripts/cut-release.sh` writes the same CHANGELOG under every awk — mawk 1.3.4 20200120 (Ubuntu 22.04) doubled the `---` rule between entries — and an applying cut refuses a missing or pre-3.11 Python up front instead of skipping, or dying after, the perf report.** That mawk has no regex intervals, so the rule pattern `-{3,}` never matched a `---` line; the rule stayed in the entry above it and the rewrite printed it beside its own separator. The pattern is `---+` now, and a `release_scripts` pin refuses an interval anywhere in the script outside `grep -E`. The script's head states what it needs (any POSIX awk; Python 3.11+ for `perf_gate.py`), and the Python check runs with the other reds before anything changes: the apply step used to skip the perf report and ratchet when `python3` was absent and to fail after the version bump when it was too old. Tracker N152.
+
+---
+
+<!-- family: tooling -->
+**`perf_gate.py measure --subject` measures any subject it can build — `plain:640`, `genapp:7`, any `example:` — and refuses one it cannot parse by name, where an unknown subject was dropped silently and the run measured nothing and exited 0.** The filter kept only the subjects `perf/budgets.toml` names, so M113's 640-module row needed a hand-written driver and a typo passed. The subjects named are measured in the order given, once each; `plain:many`, `exmaple:canvas` or a missing example stop the run before anything is measured. Tracker N148.
+
+---
+
+<!-- family: tooling -->
+**`scripts/lsp-latency.py`'s `shared.vl keystroke` row runs: its completion anchor is `self.uuid.hash()` after the indent, which survives the row's own edit, and the preflight checks every hover and completion anchor against the text AFTER the scenario's edit.** N145 anchored the edit and the completion on the same `\t\tself.uuid.hash()`; the edit inserts a space inside the `\t\t`, and the keystroke-path requests are asked against the edited buffer, so every run stopped mid-scenario ("the completion anchor … is not in src/shared.vl") and the seal's verdict carried no `shared.vl` row. `anchor_problems` now applies each scenario's edit and refuses, before the server starts, an anchor the edit destroys. Tracker N150.
+
+---
+
+<!-- family: tooling -->
+**`analyzer.rs`'s comments spell a deprecated re-export and a derived export the way the parser accepts them — `[deprecated(..)] export import …`, `[derive(Wire)] export struct` — finishing N142.** Seven comments (B472's alias re-exports, B382's deprecated leaves and their check, B318 S6's transparent wrappers) still wrote the pre-B485 order the parser refuses; they are respelled from docs-47's ready patch. Comments only. Tracker N142.
 
 ---
 

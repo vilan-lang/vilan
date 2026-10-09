@@ -4988,7 +4988,7 @@ pub struct Analyzer<'src> {
     // cache, then reused.
     std_module_files: Vec<(String, PathBuf)>,
     std_export_index: Option<HashMap<String, String>>,
-    /// B472: std's DEPRECATED alias re-exports (`export [deprecated(..)] import
+    /// B472: std's DEPRECATED alias re-exports (`[deprecated(..)] export import
     /// pkg::hash_map::HashMap as Map;`), alias → (the name it stands for, that
     /// name's module). Built in the same lazy pass as the export index; an
     /// alias that is NOT deprecated joins the export index itself.
@@ -5678,7 +5678,7 @@ pub struct Analyzer<'src> {
     attributed_declarations: HashSet<Id>,
     // B318 S6: a TRANSPARENT wrapper — `[derive(..)]`, `[service(..)]`, a macro
     // attribute — mints an entity of its own and the DECLARATION under it is
-    // the entity every other reader asks about, so `export [derive(Wire)]
+    // the entity every other reader asks about, so `[derive(Wire)] export
     // struct Handle` recorded the wrapper's id in `exported_entities` and the
     // struct stayed private: the marker parsed, formatted and round-tripped
     // through `Importable.exported` (`item_visibility` walks the wrappers) and
@@ -5940,13 +5940,13 @@ pub struct Analyzer<'src> {
     // entry asks exactly what it asked before, and the one reader that needs the
     // extra bit looks it up by the leaf's own span.
     reach_marked_spans: HashSet<(SourceId, Span)>,
-    // B382: every leaf of an `export [deprecated("…")] import` —
+    // B382: every leaf of an `[deprecated("…")] export import` —
     // `check_deprecated_reexports` warns at every OTHER file's import of a
     // name such a re-export publishes.
     deprecated_import_leaves: Vec<DeprecatedImportLeaf<'src>>,
 }
 
-/// One leaf of an `export [deprecated("…")] import` (B382).
+/// One leaf of an `[deprecated("…")] export import` (B382).
 #[derive(Clone, Debug)]
 struct DeprecatedImportLeaf<'src> {
     source: SourceId,
@@ -37368,7 +37368,7 @@ impl<'src> Analyzer<'src> {
                             .to_string(),
                     });
                 }
-                // B382: `export [deprecated("…")] import …;` deprecates each
+                // B382: `[deprecated("…")] export import …;` deprecates each
                 // name the re-export publishes — the alias where it renames,
                 // the leaf where not. Recorded per leaf with the leaf's span,
                 // which is how the statement's own reach (and so the target) is
@@ -37392,7 +37392,7 @@ impl<'src> Analyzer<'src> {
                 }
                 let walked = self.walk_expr_node(inner, scope_id);
                 // A transparent wrapper's own entity is not the declaration's
-                // (`transparent_declarations`): `export [derive(Wire)] struct
+                // (`transparent_declarations`): `[derive(Wire)] export struct
                 // Handle` must mark `Handle`.
                 let declaration_id = self
                     .transparent_declarations
@@ -56344,7 +56344,7 @@ impl<'src> Analyzer<'src> {
         Some((label, (start..end).into()))
     }
 
-    /// B382: `export [deprecated("use …")] import a::X as Y;` deprecates the
+    /// B382: `[deprecated("use …")] export import a::X as Y;` deprecates the
     /// name `Y` the re-export publishes. Every OTHER file's import of it warns
     /// `` `Y` is deprecated; use … `` — the function attribute's own warning —
     /// at its leaf. (An unexported one never gets here: the parser refuses it,

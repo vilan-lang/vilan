@@ -41,8 +41,11 @@ impl Drop for Scratch {
 }
 
 /// `python3 scripts/perf_gate.py --budgets <budgets> --work <scratch> <arguments>`.
+/// Without bytecode: perf_gate.py imports its siblings, and a run would leave
+/// an untracked `scripts/__pycache__/` in the checkout.
 fn perf_gate(budgets: &Path, work: &Path, arguments: &[&str]) -> (bool, String) {
     let output = Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .arg(repository_root().join("scripts/perf_gate.py"))
         .arg("--budgets")
         .arg(budgets)
@@ -735,6 +738,135 @@ fn the_lsp_harness_refuses_a_source_its_edit_script_does_not_land_in() {
         "{text}"
     );
     assert!(text.contains("Nothing was run."), "{text}");
+}
+
+/// N150: a hover or completion anchor is resolved in the EDITED buffer —
+/// `measure_edit` asks the keystroke-path requests before the edit is undone —
+/// so the preflight checks it against the text AFTER the scenario's edit too.
+/// The committed `shared.vl keystroke` row anchored its completion on
+/// `\t\tself.uuid.hash()` while its edit inserted a space inside the `\t\t`:
+/// the preflight passed against the unedited tree and every run stopped
+/// mid-scenario with "the completion anchor … is not in src/shared.vl".
+#[cfg(target_os = "linux")]
+#[test]
+fn the_lsp_harness_checks_the_keystroke_anchors_against_the_edited_text() {
+    let scratch = Scratch::new("lsp-edited-anchors");
+    let tree = scratch.path("tree");
+    fs::create_dir_all(tree.join("src")).expect("create the tree");
+    fs::write(
+        tree.join("src/shared.vl"),
+        "impl Hashable for UserId {\n\tfun hash(self): i64 {\n\t\tself.uuid.hash()\n\t}\n}\n",
+    )
+    .expect("write shared.vl");
+    // The harness is imported, not run: its preflight and its anchor lookup are
+    // the two functions under test, and no server is needed to ask them.
+    let probe = r#"
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("latency", sys.argv[1])
+latency = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(latency)
+root = pathlib.Path(sys.argv[2])
+shared = next(s for s in latency.SCENARIOS if s["name"] == "shared.vl keystroke")
+print("committed problems:", len(latency.anchor_problems(root, [shared])))
+text = (root / shared["file"]).read_text()
+needle, delta = shared["edit"]
+at = text.find(needle) + delta
+edited = text[:at] + shared["text"] + text[at:]
+for kind in ("hover", "completion"):
+    try:
+        latency.anchor_offset(edited, shared[kind], shared, kind)
+        print(kind, "resolves after the edit")
+    except SystemExit as refusal:
+        print(kind, "REFUSED after the edit:", refusal)
+spanning = dict(shared, completion=("\t\tself.uuid.hash()", len("\t\tself.")))
+print("spanning:", "\n".join(latency.anchor_problems(root, [spanning])))
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-B", "-c"])
+        .arg(probe)
+        .arg(repository_root().join("scripts/lsp-latency.py"))
+        .arg(&tree)
+        .output()
+        .expect("run the anchor probe");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("committed problems: 0"),
+        "the committed row lands: {text}"
+    );
+    assert!(text.contains("hover resolves after the edit"), "{text}");
+    assert!(
+        text.contains("completion resolves after the edit"),
+        "the committed completion anchor survives its own edit: {text}"
+    );
+    assert!(
+        text.contains(
+            "the completion anchor '\\t\\tself.uuid.hash()' is not in src/shared.vl after the scenario's edit"
+        ),
+        "an anchor the edit destroys is refused before anything runs: {text}"
+    );
+}
+
+/// N148: `measure --subject` measures any subject `subject_dir` builds, not
+/// only the budgets' — the filter used to drop every subject no row named, so
+/// `--subject plain:640` (M113's size) or a typo measured nothing and exited
+/// 0 — and it refuses an unparseable subject by name before running anything.
+#[test]
+fn measure_takes_any_buildable_subject_and_refuses_an_unparseable_one_by_name() {
+    let scratch = Scratch::new("measure-subjects");
+    let budgets = scratch.path("budgets.toml");
+    fs::write(&budgets, HEADER).expect("write the fixture budgets");
+    let vilan = fake_vilan(&scratch);
+    let (ok, report) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &[
+            "measure",
+            "--vilan",
+            vilan.to_str().expect("utf-8"),
+            "--subject",
+            "plain:many",
+            "--subject",
+            "exmaple:canvas",
+        ],
+    );
+    assert!(
+        !ok,
+        "an unparseable subject measured nothing and passed:\n{report}"
+    );
+    assert!(
+        report.contains("--subject 'plain:many': plain's argument is a module count"),
+        "{report}"
+    );
+    assert!(
+        report.contains("--subject 'exmaple:canvas': unknown subject kind 'exmaple'"),
+        "{report}"
+    );
+    // The selection itself, asked without a counter: a size no budget row
+    // names is measured, in the order the flags gave, once.
+    let probe = r#"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("perf_gate", sys.argv[1])
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
+data = gate.load_budgets(sys.argv[2])
+print("selected:", " ".join(gate.selected_subjects(data, ["plain:640", "example:canvas", "plain:640"])))
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-B", "-c"])
+        .arg(probe)
+        .arg(repository_root().join("scripts/perf_gate.py"))
+        .arg(&budgets)
+        .output()
+        .expect("run the selection probe");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("selected: plain:640 example:canvas\n"),
+        "{text}"
+    );
 }
 
 /// M112: `calibrate --kolt-tree` compares the generated app's phase split with
