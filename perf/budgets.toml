@@ -266,3 +266,66 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 2
 blocking = true
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.012
+reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0068 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.018
+reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0124 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.017
+reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0112 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.018
+reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0127 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.013
+reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0082 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.014
+reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0092 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.015
+reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0101 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.01
+reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0045 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.01
+reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0044 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
+item = "M120"
