@@ -3769,7 +3769,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
         let saved = self.enter_substitution(entries);
         let saved_instance = self.enter_instance(id, bits.to_vec());
-        let emitted = self.function_body(&function, span, is_main, &name);
+        let emitted = self
+            .function_body(&function, span, is_main, &name)
+            .map_err(|error| self.locate_refusal(error, function.id));
         self.restore_instance(saved_instance);
         self.current_substitution = saved;
         let out = emitted?;
@@ -9543,6 +9545,81 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     // ----------------------------------------------------------- the call --
 
+    /// F108: a refusal raised inside a function's BODY carries the file its
+    /// span indexes, as the note the CLI attributes a refusal by (E190's
+    /// channel): a span into std rendered against the entry printed one bare
+    /// `Error:` line, no file and no line. Only the innermost body says so —
+    /// an error that already names its file is passed through.
+    fn locate_refusal(&self, mut error: Error, function: Id) -> Error {
+        if error.note.is_some() {
+            return error;
+        }
+        let Some(source) = self.program.note_source_of(function) else {
+            return error;
+        };
+        if source == vilan_core::analyzer::SourceId(0) {
+            return error;
+        }
+        let name = self
+            .program
+            .functions
+            .get(&function)
+            .map_or("a function", |function| function.name);
+        error.note = Some(vilan_core::error::Note {
+            span: error.span,
+            msg: format!("in `{name}`'s body"),
+            source: Some(source),
+        });
+        error
+    }
+
+    /// F108: a refusal located in a LIBRARY file (std, a dependency) that a
+    /// call in the user's own code reached, re-anchored AT that call: the
+    /// library's line is not one the reader can act on, and the call that
+    /// instantiated it is — `names.push_many([])` on a `List<str>`, whose `[]`
+    /// stays open (`List<unknown>`) and is refused as a value of an
+    /// unresolved type inside `push_many`. The sentence gains where the
+    /// construct was found (the body and its file).
+    fn anchor_refusal_at_call(&self, mut error: Error, call_expr_id: Id) -> Error {
+        let Some(note) = &error.note else {
+            return error;
+        };
+        let Some(found_in) = note.source else {
+            return error;
+        };
+        let is_library = |source: vilan_core::analyzer::SourceId| {
+            self.program
+                .source_layers
+                .get(source.0 as usize)
+                .is_some_and(|layer| layer.containing.is_some())
+        };
+        let Some(call_source) = self.program.note_source_of(call_expr_id) else {
+            return error;
+        };
+        if !is_library(found_in) || is_library(call_source) {
+            return error;
+        }
+        let file = self
+            .program
+            .source_path(found_in)
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "a library file".to_string());
+        let call_span = self.span_of(call_expr_id);
+        let found = format!("{} (`{file}`)", note.msg);
+        error.msg = format!(
+            "{} The construct is {found}, which this call instantiates.",
+            error.msg
+        );
+        error.note = Some(vilan_core::error::Note {
+            span: call_span,
+            msg: format!("{found}, reached from this call"),
+            source: Some(call_source),
+        });
+        error.span = call_span;
+        error
+    }
+
     /// One call, plus the `.await` an async callee owes (J6).
     fn call(
         &mut self,
@@ -9568,7 +9645,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         {
             return Ok(rendered);
         }
-        let rendered = self.call_expression(call_expr_id, call_id, depth, span)?;
+        let rendered = self
+            .call_expression(call_expr_id, call_id, depth, span)
+            .map_err(|error| self.anchor_refusal_at_call(error, call_expr_id))?;
         if self.call_awaits(call_expr_id, call_id) {
             let mut awaited = Self::awaited(&rendered);
             for _ in 0..self.assimilated_task_layers(call_id) {
@@ -11864,7 +11943,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let self_traits = self.self_traits_of(default_id);
         let saved_traits = std::mem::replace(&mut self.current_self_traits, self_traits);
         let saved = std::mem::replace(&mut self.current_substitution, substitution);
-        let emitted = self.function_body(&function, function.name_span, false, &name);
+        let emitted = self
+            .function_body(&function, function.name_span, false, &name)
+            .map_err(|error| self.locate_refusal(error, function.id));
         self.current_substitution = saved;
         self.current_self_traits = saved_traits;
         self.current_self_type = saved_self;

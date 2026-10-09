@@ -9023,6 +9023,67 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
     }
 }
 
+/// F108's native half: a refusal raised inside a function body in ANOTHER
+/// file named no expression — its span indexed the other file's bytes and
+/// the CLI rendered it against the entry: `names.push_many([])` (whose `[]`
+/// stays `List<unknown>`, the solver half) printed one bare `Error:` line, no
+/// file and no line, and a refusal inside a user module was drawn over the
+/// entry's `import` line. A library body's refusal is now anchored at the
+/// user's call that instantiated it, naming the body and its file; a user
+/// module's is drawn in that module.
+#[test]
+fn a_refusal_inside_another_files_body_names_where_to_look() {
+    let staged = stage();
+    let file = "native_probe_f108_push_many.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::io::print;\n\n",
+            "fun main() {\n\tmut names: List<str> = [\"a\"];\n\tnames.push_many([]);\n",
+            "\tprint(names.len());\n}\n",
+        ),
+    )
+    .expect("write the probe");
+    let output = vilan(&staged)
+        .args(["build", "--backend", "rust", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the probe is still refused (F108's solver half)"
+    );
+    assert!(
+        stderr.contains(&format!("{file}:5:2")) && stderr.contains("names.push_many([])"),
+        "the refusal is drawn at the user's call:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("The construct is in `push_many`'s body (`list.vl`)"),
+        "the refusal names the body and its file:\n{stderr}"
+    );
+    let module = staged.join("native_probe_f108_module");
+    std::fs::create_dir_all(&module).expect("make the package");
+    std::fs::write(
+        module.join("util.vl"),
+        "export fun banner(): str {\n\t\"\"\"\n\thello\n\t\"\"\"\n}\n",
+    )
+    .expect("write the module");
+    std::fs::write(
+        module.join("main.vl"),
+        "import std::io::print;\nimport pkg::util::banner;\n\nfun main() {\n\tprint(banner());\n}\n",
+    )
+    .expect("write the entry");
+    let output = vilan(&module)
+        .args(["build", "--backend", "rust", "--stdout", "main.vl"])
+        .output()
+        .expect("build the package");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("util.vl:2:2"),
+        "a user module's refusal is drawn in that module:\n{stderr}"
+    );
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,

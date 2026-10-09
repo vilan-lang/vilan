@@ -55,6 +55,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**F108 (the native half): a native refusal raised inside a function body in another file names where to look.** Its span indexed that file's bytes and the CLI drew it against the entry: `names.push_many([])` on a `List<str>` (whose `[]` stays `List<unknown>`) printed one bare `Error:` line with no file and no line, and a refusal inside a user module was drawn over the entry's `import` line with the module's offsets. A refusal from a body now carries its file (E190's note channel, as the JS emitter's body-less refusal does), and one found in a LIBRARY body is drawn at the user's call that instantiated it, its sentence naming the body and the file (`The construct is in `push_many`'s body (`list.vl`), which this call instantiates.`). The solver half — grounding the empty list from `push_many`'s bound — is not this entry's; the program stays refused natively and runs on JS. Pin: `native_differential`'s `a_refusal_inside_another_files_body_names_where_to_look` (the `push_many` call, and a refusal in a user module drawn in that module). Tracker F108.
+
+---
+
 <!-- family: fix -->
 **F92: natively, a field read off a generic call used in place builds — `b.unwrap().v`, a trait default's `Self` in `c.twice().value`, and a field under a `?.` lift (`find("hit")?.title`).** The call records its callee's declared return (`T`, `Self` as the trait), and the field read asked that record for its struct, so each was refused "a field read of an unresolved subject" where the same call bound to a `let` built; a `?.` lift's binder, an entity of its own with no `let`, had no type for the emitter at all. The field read now names its struct through the call's own substitution (or, for `Self`, the receiver's type), and a lift binder reads the payload type the analyzer gave it. Three corpus programs flip from refused to identical natively: generic-method-return.vl, lift-chain.vl, self-return.vl. Pin: `native_differential`'s `a_field_read_off_a_generic_call_is_identical_on_both_backends` (`native/generic_call_fields.vl`: a generic method, a generic free function, a nested field, a trait default returning `Self`, and lifts over a plain and a generic call, hit and miss; plus the three corpus programs). Tracker F92 (its `is` half is F106's).
 
