@@ -266,3 +266,24 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 1
 blocking = false
+
+[[bump]]
+subject = "example:math"
+class = "ci"
+ratio = 1.01
+reason = "layout-48's platform fences (std's single-platform modules declare `[platform] mod self;`; the fence walk's twin stand-in rule; the declared-module leg) cost the smallest programs +0.5-0.6%: x1.0056 at the layout-48 merge (263,195,415 -> 264,677,058) on top of the order's earlier +0.1%."
+item = "F28"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.01
+reason = "the same fence cost on the other small program: x1.0061 at the layout-48 merge (330,268,645 -> 332,275,226)."
+item = "F28"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.01
+reason = "x1.0052 at the layout-48 merge (5,485,862,397 -> 5,514,603,202): the fence rules on a program with a server leg."
+item = "F28"
