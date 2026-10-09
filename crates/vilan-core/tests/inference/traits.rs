@@ -9766,3 +9766,78 @@ fn b567_a_self_nested_in_a_bare_trait_impls_return_is_the_receiver() {
         "3\n",
     );
 }
+
+// --- B563: conformance compares a callback's `context` clause ---
+//
+// The clause is part of a closure's TYPE (B309), and unification ignores it
+// on purpose (a literal takes its position's clause) — so the member-signature
+// comparison, which unifies, accepted an impl that dropped the trait's clause
+// or added one the trait does not declare. A call through the trait then
+// threads contexts the impl's body does not receive, or the reverse.
+
+const B563_PLAIN: &str = r#"
+        import std::reactive::{ Subscription, tracking };
+
+        trait Plain {
+            fun watch(own self, observer: (|i32| void) context tracking): Subscription;
+        }
+        trait Bare {
+            fun watch(own self, observer: |i32| void): Subscription;
+        }
+        struct Bag {}
+"#;
+
+#[test]
+fn b563_an_impl_dropping_the_traits_context_clause_is_refused() {
+    assert_fails_with(
+        &format!(
+            "{B563_PLAIN}
+        impl Bag with Plain {{
+            fun watch(own self, observer: |i32| void): Subscription {{
+                Subscription::teardown(|| {{}})
+            }}
+        }}
+        fun main() {{}}
+        "
+        ),
+        "parameter 1 of `Bag`'s `watch` is `|i32| void`, but `Plain` declares \
+         `(|i32| void) context tracking`",
+    );
+}
+
+#[test]
+fn b563_an_impl_adding_a_context_clause_is_refused() {
+    assert_fails_with(
+        &format!(
+            "{B563_PLAIN}
+        impl Bag with Bare {{
+            fun watch(own self, observer: (|i32| void) context tracking): Subscription {{
+                Subscription::teardown(|| {{}})
+            }}
+        }}
+        fun main() {{}}
+        "
+        ),
+        "parameter 1 of `Bag`'s `watch` is `(|i32| void) context tracking`, but `Bare` declares \
+         `|i32| void`",
+    );
+}
+
+#[test]
+fn b563_an_impl_writing_the_traits_clause_conforms() {
+    assert_compiles(&format!(
+        "{B563_PLAIN}
+        impl Bag with Plain {{
+            fun watch(own self, observer: (|i32| void) context tracking): Subscription {{
+                Subscription::teardown(|| {{}})
+            }}
+        }}
+        impl Bag with Bare {{
+            fun watch(own self, observer: |i32| void): Subscription {{
+                Subscription::teardown(|| {{}})
+            }}
+        }}
+        fun main() {{}}
+        "
+    ));
+}

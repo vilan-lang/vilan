@@ -11501,12 +11501,19 @@ impl<'src> Analyzer<'src> {
                 self.substitute_member_type(&trait_param_type, self_trait, subject, &context)
             };
             let actual_type = impl_shape.types[position].get_type(self);
+            // B563: a closure's `context` clause is part of its TYPE (B309),
+            // and unification ignores it on purpose (a literal takes its
+            // position's clause). A SIGNATURE is no literal: the impl's
+            // parameter must declare the clause the trait's does, or a call
+            // through the trait threads contexts the impl's body does not
+            // receive (or the reverse).
             if !self.compare_type_rigid(
                 &expected_type,
                 &actual_type,
                 &HashMap::default(),
                 &impl_shape.generic_constraint_ids,
-            ) {
+            ) || !self.context_clauses_agree(&expected_type, &actual_type, 0)
+            {
                 let note = self.conformance_note(check.trait_function_id, &check.member_name);
                 let expected_label = self.pretty_print_type(&expected_type, &HashMap::default());
                 let actual_label = self.pretty_print_type(&actual_type, &HashMap::default());
@@ -11578,7 +11585,8 @@ impl<'src> Analyzer<'src> {
             &actual_return,
             &HashMap::default(),
             &impl_shape.generic_constraint_ids,
-        ) {
+        ) || !self.context_clauses_agree(&expected_return, &actual_return, 0)
+        {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             let expected_label = self.pretty_print_type(&expected_return, &HashMap::default());
             let actual_label = self.pretty_print_type(&actual_return, &HashMap::default());
@@ -11592,6 +11600,57 @@ impl<'src> Analyzer<'src> {
                     check.subject_name, check.member_name, check.trait_name
                 ),
             }, check.impl_function_id);
+        }
+    }
+
+    /// B563: whether two types that already unify carry the same closure
+    /// `context` clauses at every closure position — order-free, since a
+    /// clause names a set of bindings. An unresolved side answers yes (the
+    /// type comparison was lenient there too).
+    fn context_clauses_agree(&self, expected: &Type, actual: &Type, depth: usize) -> bool {
+        if depth > 24 {
+            return true;
+        }
+        let all = |analyzer: &Self, expected: &[TypeId], actual: &[TypeId]| {
+            expected.len() != actual.len()
+                || expected.iter().zip(actual).all(|(expected, actual)| {
+                    analyzer.context_clauses_agree(
+                        &expected.get_type(analyzer),
+                        &actual.get_type(analyzer),
+                        depth + 1,
+                    )
+                })
+        };
+        match (expected, actual) {
+            (
+                Type::Closure(expected_parameters, expected_return, expected_contexts, _),
+                Type::Closure(actual_parameters, actual_return, actual_contexts, _),
+            ) => {
+                expected_contexts.len() == actual_contexts.len()
+                    && expected_contexts
+                        .iter()
+                        .all(|context| actual_contexts.contains(context))
+                    && all(self, expected_parameters, actual_parameters)
+                    && self.context_clauses_agree(
+                        &expected_return.get_type(self),
+                        &actual_return.get_type(self),
+                        depth + 1,
+                    )
+            }
+            (Type::Struct(_, expected_arguments), Type::Struct(_, actual_arguments))
+            | (Type::Enum(_, expected_arguments), Type::Enum(_, actual_arguments))
+            | (Type::Trait(_, expected_arguments), Type::Trait(_, actual_arguments))
+            | (Type::Dyn(_, expected_arguments), Type::Dyn(_, actual_arguments))
+            | (Type::Tuple(expected_arguments), Type::Tuple(actual_arguments)) => {
+                all(self, expected_arguments, actual_arguments)
+            }
+            (Type::Array(expected_element, _), Type::Array(actual_element, _)) => self
+                .context_clauses_agree(
+                    &expected_element.get_type(self),
+                    &actual_element.get_type(self),
+                    depth + 1,
+                ),
+            _ => true,
         }
     }
 
