@@ -180,6 +180,45 @@ fn the_browser_template_builds_a_browser_bundle() {
         !javascript.contains("require(\"node:") && !javascript.contains("from \"node:"),
         "a browser bundle must not import a node host module"
     );
+    // The counter's markup reaches the bundle: its text children (K30).
+    assert!(
+        javascript.contains("hello from Vilan") && javascript.contains("click me"),
+        "the bundle should carry the counter's text children"
+    );
+}
+
+/// K30: the first UI a new user reads is written the way the book writes a
+/// fixed-shape tree — as element syntax, not a `view("..").child(..)` chain.
+/// The code lines (comments may name the chain the markup lowers to) open the
+/// element with its style link and hold the counter's text in a hole; the
+/// builds above prove they compile, and this proves what they say.
+#[test]
+fn the_ui_templates_write_their_view_in_element_syntax() {
+    for (template, file, opening) in [
+        ("browser", "counter.vl", "<section .styled(card)>"),
+        ("fullstack", "src/client.vl", "<main .styled(card)>"),
+    ] {
+        let source = std::fs::read_to_string(template_source_dir(template).join(file))
+            .unwrap_or_else(|error| panic!("read {template}/{file}: {error}"));
+        let code: Vec<&str> = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            !code.iter().any(|line| line.contains("view(\"")),
+            "{template}/{file} still builds its view as a chain:\n{source}"
+        );
+        for expected in [
+            opening,
+            "<p>{count.derive(|n| i\"clicked {n} times\")}</p>",
+            "<button on:click(|| count.set_with(|n| n + 1))>\"click me\"</button>",
+        ] {
+            assert!(
+                code.iter().any(|line| line.trim() == expected),
+                "{template}/{file} should write `{expected}`:\n{source}"
+            );
+        }
+    }
 }
 
 #[test]

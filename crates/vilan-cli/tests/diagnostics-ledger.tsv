@@ -688,3 +688,7 @@ row	flagship	key
 664	-	`dbg` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
 665	-	`dbg` takes no type arguments: it prints each argument at the type it already has
 666	-	Both are pipe stages, and two stages of different types meet only as one erased flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the function's return), with `T` the value they carry, and each erases to it
+667	-	this element's class is written twice — `{earlier}` and then `{later}` — and `{earlier}` is a binding, so the two take turns: `{later}` writes last when the element is built, `{earlier}` writes again whenever its source changes, and the element shows whichever wrote last. Compose them into one writer (two styles add: `.styled(a + b)`), or drop one
+668	-	`{field_name}` is an `[internal]` field of std's `{struct_name}`, and a struct literal outside std cannot write an internal std field: {reason}
+669	-	a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one, and `{written}` is `{type_label}`{steer}
+670	-	A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children in one element (`<div>…</div>`), or make this position a `List<View>`

@@ -7850,11 +7850,13 @@ fn b471_a_css_call_on_a_style_names_the_rename() {
     assert_fails_with(source, CSS_RENAME_NOTE);
 }
 
-// --- A155: one element's class written twice ----------------------------------
+// --- A155 / A162: one element's class written twice ---------------------------
 //
 // RULED (2026-10-03): a WARNING naming both writers when one element sets its
 // class twice where it is statically visible in one chain. Every one of std's
 // `View` class writers SETS the attribute, so the earlier write is lost.
+// A162 (RULED 2026-10-05 on class-writes.md, R-a): a REFUSAL from v0.46.0, with
+// the same sentence and steer; the writers stay last-wins.
 
 const A155_HEAD: &str = concat!(
     "import std::reactive::{ Signal, SignalCell };\n",
@@ -7871,7 +7873,7 @@ const A155_HEAD: &str = concat!(
 /// `.bind_class` across links that are not writers (`.attr("title", ..)`, a
 /// `.child`), and a hand-written `.attr("class", ..)` before a `.bind_styled`.
 #[test]
-fn a155_an_element_that_writes_its_class_twice_warns_naming_both_writers() {
+fn a162_an_element_that_writes_its_class_twice_is_refused_naming_both_writers() {
     let cases = [
         (
             "\tlet v = <div class(\"x\") .styled(card) />;\n",
@@ -7901,25 +7903,30 @@ fn a155_an_element_that_writes_its_class_twice_warns_naming_both_writers() {
     ];
     for (body, spanning, writers) in cases {
         let source = format!("{A155_HEAD}fun main() {{\n{body}\tprint(render(v));\n}}\n");
-        let warnings = warning_diagnostics(&source);
-        let matching: Vec<_> = warnings
+        let failures = failure_diagnostics(&source);
+        let matching: Vec<_> = failures
             .iter()
             .filter(|(message, _)| message.contains("this element's class is written twice"))
             .collect();
         assert_eq!(
             matching.len(),
             1,
-            "one warning per overridden write in {body:?}; got: {warnings:#?}"
+            "one refusal per overridden write in {body:?}; got: {failures:#?}"
+        );
+        assert_eq!(
+            failures.len(),
+            1,
+            "the refusal is the program's only error; got: {failures:#?}"
         );
         let (message, range) = matching[0];
         assert!(
             message.contains(writers),
-            "the warning must name both writers ({writers}); got: {message}"
+            "the refusal must name both writers ({writers}); got: {message}"
         );
         assert_eq!(
             &source[range.clone()],
             spanning,
-            "the warning stands at the writer that wins; got: {message}"
+            "the refusal stands at the writer that wins; got: {message}"
         );
     }
 }
@@ -7927,7 +7934,8 @@ fn a155_an_element_that_writes_its_class_twice_warns_naming_both_writers() {
 /// Silent where one element writes its class once: composed styles, a class
 /// and other attributes, a nested element writing its OWN class, two elements
 /// built apart, and a chain broken by a function of the program's own (not
-/// statically one element).
+/// statically one element — class-writes.md §5's remainder, last-wins and
+/// silent after A162 too). It compiles and runs, and warns about nothing.
 #[test]
 fn a155_one_class_write_per_element_is_silent() {
     let source = format!(
@@ -7956,6 +7964,170 @@ fn a155_one_class_write_per_element_is_silent() {
             .all(|(message, _)| !message.contains("written twice")),
         "no element here writes its class twice; got: {warnings:#?}"
     );
+    assert_compiles(&source);
+}
+
+// --- A159 / A160: the class writers the A155 check missed, and its sentence ---
+//
+// A159: `.bind_attr("class", ..)` and `.toggle_attr("class", ..)` write the
+// element's class too — the second REMOVES it while its flag is false — so
+// each is a writer under the same `"class"` literal test `.attr` gets.
+// A160: when the EARLIER writer is a binding, the later one does not simply
+// stay: in the browser the binding writes again on every change of its
+// source, and the element shows whichever writer fired last
+// (class-writes.md §2.1, probes a11/a13).
+
+/// The class-written-twice reports in `source`: (message, span). Refusals
+/// since A162.
+fn class_written_twice_sites(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("this element's class is written twice"))
+        .collect()
+}
+
+/// One report per case, at `spanning`, naming `writers`, reading `sentence`.
+fn assert_class_written_twice(body: &str, spanning: &str, writers: &str, sentence: &str) {
+    let source = format!("{A155_HEAD}fun main() {{\n{body}\tprint(render(v));\n}}\n");
+    let sites = class_written_twice_sites(&source);
+    assert_eq!(sites.len(), 1, "one report for {body:?}; got: {sites:#?}");
+    let (message, range) = &sites[0];
+    assert!(
+        message.contains(writers),
+        "the report must name both writers ({writers}); got: {message}"
+    );
+    assert!(
+        message.contains(sentence),
+        "the report must say {sentence:?}; got: {message}"
+    );
+    assert_eq!(
+        &source[range.clone()],
+        spanning,
+        "the report stands at the later writer; got: {message}"
+    );
+}
+
+const A160_BINDING_SENTENCE: &str = "the two take turns";
+const A155_STATIC_SENTENCE: &str = "only the last write stays";
+
+/// A159: `bind_attr` and `toggle_attr` on the literal name `"class"` are
+/// writers, in a chain and in an element head (probes a6, a12).
+#[test]
+fn a159_bind_attr_and_toggle_attr_on_class_are_class_writers() {
+    assert_class_written_twice(
+        "\tlet v = view(\"div\").styled(card).bind_attr(\"class\", Signal::new(\"on\"));\n",
+        "bind_attr(\"class\", Signal::new(\"on\"))",
+        "`.styled(card)` and then `.bind_attr(\"class\", Signal::new(\"on\"))`",
+        A155_STATIC_SENTENCE,
+    );
+    assert_class_written_twice(
+        "\tlet v = <div .styled(card) .toggle_attr(\"class\", Signal::new(true)) />;\n",
+        "toggle_attr(\"class\", Signal::new(true))",
+        "`.styled(card)` and then `.toggle_attr(\"class\", Signal::new(true))`",
+        A155_STATIC_SENTENCE,
+    );
+    assert_class_written_twice(
+        "\tlet v = view(\"div\").class(\"a\").attr(\"title\", \"t\").toggle_attr(\"class\", Signal::new(false));\n",
+        "toggle_attr(\"class\", Signal::new(false))",
+        "`.class(\"a\")` and then `.toggle_attr(\"class\", Signal::new(false))`",
+        A155_STATIC_SENTENCE,
+    );
+}
+
+/// A159's edge: another attribute's name is not a class write, and a
+/// computed name is not judged (the check reads only the literal).
+#[test]
+fn a159_bind_attr_and_toggle_attr_on_other_names_are_not_class_writers() {
+    let source = format!(
+        "{A155_HEAD}{}",
+        concat!(
+            "fun main() {\n",
+            "\tlet name = \"class\";\n",
+            "\tprint(render(view(\"div\").styled(card).bind_attr(\"title\", Signal::new(\"t\")).toggle_attr(\"hidden\", Signal::new(false))));\n",
+            "\tprint(render(<div .styled(card) .toggle_attr(\"inert\", Signal::new(true)) />));\n",
+            "\tprint(render(view(\"div\").styled(card).toggle_attr(name, Signal::new(true))));\n",
+            "\tprint(render(view(\"div\").bind_attr(\"class\", Signal::new(\"a\"))));\n",
+            "}\n",
+        )
+    );
+    let sites = class_written_twice_sites(&source);
+    assert!(
+        sites.is_empty(),
+        "no element here writes its class twice by name; got: {sites:#?}"
+    );
+    assert_compiles(&source);
+}
+
+/// A160: an EARLIER writer that is a binding — an element head's `class(..)`
+/// over a source, `.bind_styled`, `.bind_class`, `.bind_attr("class", ..)`,
+/// `.toggle_attr("class", ..)` — takes turns with the later one; the report
+/// says so instead of claiming the later write stays (probes a11, a13).
+#[test]
+fn a160_an_earlier_binding_writer_is_reported_as_taking_turns() {
+    let cases = [
+        (
+            "\tlet label: SignalCell<str> = Signal::new(\"lbl\");\n\tlet v = <div class(label) .styled(card) />;\n",
+            "styled(card)",
+            "`class(label)` and then `.styled(card)`",
+        ),
+        (
+            "\tlet look: SignalCell<Style> = Signal::new(card);\n\tlet v = <div .bind_styled(look) class(\"x\") />;\n",
+            "class(\"x\")",
+            "`.bind_styled(look)` and then `class(\"x\")`",
+        ),
+        (
+            "\tlet v = view(\"div\").bind_class(Signal::new(\"a\")).styled(card);\n",
+            "styled(card)",
+            "`.bind_class(Signal::new(\"a\"))` and then `.styled(card)`",
+        ),
+        (
+            "\tlet v = view(\"div\").bind_attr(\"class\", Signal::new(\"a\")).class(\"x\");\n",
+            "class(\"x\")",
+            "`.bind_attr(\"class\", Signal::new(\"a\"))` and then `.class(\"x\")`",
+        ),
+        (
+            "\tlet v = view(\"div\").toggle_attr(\"class\", Signal::new(true)).styled(card);\n",
+            "styled(card)",
+            "`.toggle_attr(\"class\", Signal::new(true))` and then `.styled(card)`",
+        ),
+        (
+            "\tlet v = view(\"div\").attr(\"class\", Signal::new(\"a\")).bind_class(Signal::new(\"b\"));\n",
+            "bind_class(Signal::new(\"b\"))",
+            "`.attr(\"class\", Signal::new(\"a\"))` and then `.bind_class(Signal::new(\"b\"))`",
+        ),
+    ];
+    for (body, spanning, writers) in cases {
+        assert_class_written_twice(body, spanning, writers, A160_BINDING_SENTENCE);
+        let source = format!("{A155_HEAD}fun main() {{\n{body}\tprint(render(v));\n}}\n");
+        let sites = class_written_twice_sites(&source);
+        assert!(
+            !sites[0].0.contains(A155_STATIC_SENTENCE),
+            "an earlier binding is not overridden for good; got: {}",
+            sites[0].0
+        );
+    }
+}
+
+/// A160's other half: a STATIC earlier writer keeps the last-write sentence,
+/// whether the later writer is static or a binding — and an element head's
+/// `class(..)` over a plain `str` or an `Option<str>` is static.
+#[test]
+fn a160_an_earlier_static_writer_keeps_the_last_write_sentence() {
+    let cases = [
+        (
+            "\tlet v = <div class(\"x\") .bind_styled(Signal::new(card)) />;\n",
+            "bind_styled(Signal::new(card))",
+            "`class(\"x\")` and then `.bind_styled(Signal::new(card))`",
+        ),
+        (
+            "\tlet maybe: Option<str> = Some(\"x\");\n\tlet v = <div class(maybe) .styled(card) />;\n",
+            "styled(card)",
+            "`class(maybe)` and then `.styled(card)`",
+        ),
+    ];
+    for (body, spanning, writers) in cases {
+        assert_class_written_twice(body, spanning, writers, A155_STATIC_SENTENCE);
+    }
 }
 
 // --- A157: a WRITTEN `autofocus` in an element head is steered ---------------

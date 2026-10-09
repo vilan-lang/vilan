@@ -8006,6 +8006,10 @@ impl<'src> Analyzer<'src> {
         // every file at once, after `build()`, so nothing else can say which file
         // the span indexes (B112) — and the sort below needs the file to lead.
         let mut errors: Vec<(Id, Span, String, TypeId)> = Vec::new();
+        // E271: the element holes refused below, by (call, hole span) — they
+        // carry no "the bound is declared here" note, since the bound is on a
+        // `child` the author never wrote.
+        let mut hole_refusals: HashSet<(Id, Span)> = HashSet::default();
         let recorded: Vec<(Id, SubstitutionContext)> = self
             .method_call_substitution
             .iter()
@@ -8238,6 +8242,15 @@ impl<'src> Analyzer<'src> {
                             .rpc_refused_key_types
                             .contains(&without_spaces(&type_label))
                     {
+                        continue;
+                    }
+                    // E271: an element-syntax HOLE refused at `child`'s
+                    // `Slot` bound is said about the hole, at the hole.
+                    if let Some((hole_span, msg)) =
+                        self.element_hole_refusal(call_id, &value_type, *required_trait_id)
+                    {
+                        hole_refusals.insert((call_id, hole_span));
+                        errors.push((call_id, hole_span, msg, constraint_id));
                         continue;
                     }
                     // A generic argument fails by MISSING the bound on its own
@@ -8672,6 +8685,9 @@ impl<'src> Analyzer<'src> {
         let bound_declarations: Vec<(Id, Span, String, Option<crate::error::Note>)> = errors
             .into_iter()
             .map(|(_, anchor, span, msg, constraint_id)| {
+                if hole_refusals.contains(&(anchor, span)) {
+                    return (anchor, span, msg, None);
+                }
                 let declaration = self
                     .expr_id_to_expr_map
                     .iter()
@@ -49197,6 +49213,154 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// E271: the refusal for an element-syntax HOLE whose value is not a
+    /// `Slot` — `<p>{count}</p>` over a `SignalCell<i32>`, `<p>{5}</p>`.
+    ///
+    /// `{expr}` lowers to `.child(expr)` before analysis (`elements.rs`), so
+    /// the value failed the desugared call's bound: "'SignalCell<i32>' does not
+    /// implement trait 'Slot', required by a generic bound of this call",
+    /// spanned from the element's `<` and noting std's `child` — a call the
+    /// author never wrote. This says what a hole takes, at the hole's own
+    /// expression, and for a number or a bool (anything that renders into a
+    /// string, `str` aside) writes the hole as an i-string; for a `Source` of
+    /// one, the `.derive` that makes it text. A generated `.child` link is told
+    /// from a written one by its ZERO-WIDTH member span (the desugar's
+    /// scaffolding, as A157 tells a head's `attr`): a written `.child(5)` keeps
+    /// the bound's sentence. `None` for anything else.
+    fn element_hole_refusal(
+        &mut self,
+        call_id: Id,
+        value_type: &Type,
+        trait_id: Id,
+    ) -> Option<(Span, String)> {
+        let is_std_trait = |analyzer: &Self, name: &str, id: Id| {
+            analyzer.traits.get(&id).is_some_and(|trait_| {
+                trait_.name == name
+                    && analyzer
+                        .source_of_id(trait_.id)
+                        .is_some_and(|source| analyzer.std_sources.contains(&source))
+            })
+        };
+        if !is_std_trait(self, "Slot", trait_id) {
+            return None;
+        }
+        let member_span = self.member_name_spans.get(&call_id)?;
+        if member_span.start != member_span.end {
+            return None;
+        }
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(member_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        if self.callable_name(*member_id) != Some("child") || !self.is_std_view_member(*member_id) {
+            return None;
+        }
+        let hole = *function_call.argument_ids.get(1)?;
+        let span = **self.span_map.get(&hole)?;
+        let written = self.written_text_of(hole)?;
+        let type_label = self.pretty_print_type(value_type, &HashMap::default());
+        let is_text = |analyzer: &Self, type_: &Type| {
+            analyzer.renders_into_a_string(type_) && !analyzer.is_str_type(type_)
+        };
+        let steer = if is_text(self, value_type) {
+            format!(": show it as text, `{{i\"{{{written}}}\"}}`")
+        } else if self.is_source_of_text(value_type, &is_std_trait, &is_text) {
+            // A receiver that is not already a postfix operand is wrapped, so
+            // the `.derive` reads off the whole hole.
+            let receiver = match self.expr_id_to_expr_map.get(&hole) {
+                Some(
+                    Expr::Local(_)
+                    | Expr::Call(_)
+                    | Expr::Field(..)
+                    | Expr::TupleIndex(..)
+                    | Expr::Index(..),
+                ) => written.to_string(),
+                _ => format!("({written})"),
+            };
+            format!(": show it as text, `{{{receiver}.derive(|value| i\"{{value}}\")}}`")
+        } else {
+            String::new()
+        };
+        Some((
+            span,
+            format!(
+                "a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` \
+                 of one, and `{written}` is `{type_label}`{steer}"
+            ),
+        ))
+    }
+
+    /// E271's `Source` case: whether `value_type` is one of std's flows whose
+    /// item renders into a string. The item is not read off the type's own
+    /// arguments (a stage's arguments are its whole recipe —
+    /// `Derive<SignalCell<i32>, i32, Point>` is a flow of `Point`); each text
+    /// type the value's type mentions is a CANDIDATE, and the flow bound is
+    /// asked at it.
+    fn is_source_of_text(
+        &mut self,
+        value_type: &Type,
+        is_std_trait: &dyn Fn(&Self, &str, Id) -> bool,
+        is_text: &dyn Fn(&Self, &Type) -> bool,
+    ) -> bool {
+        let Some(flow) = self
+            .traits
+            .keys()
+            .copied()
+            .find(|id| is_std_trait(self, "Flow", *id))
+        else {
+            return false;
+        };
+        let mut candidates: Vec<TypeId> = Vec::new();
+        let mut pending: Vec<TypeId> = match value_type {
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => arguments.clone(),
+            _ => return false,
+        };
+        while let Some(argument) = pending.pop() {
+            let argument_type = argument.get_type(self);
+            if is_text(self, &argument_type) {
+                candidates.push(argument);
+            } else if let Type::Struct(_, inner) | Type::Enum(_, inner) = argument_type {
+                pending.extend(inner);
+            }
+        }
+        candidates
+            .into_iter()
+            .any(|candidate| self.satisfies_trait_bound(value_type, flow, &[candidate], 0))
+    }
+
+    /// E272: a mismatch whose refused value is a FRAGMENT (`<>…</>`) in a
+    /// position that wants std's `View` gains the sentence the book promises
+    /// (Building UI, Fragments): a fragment is a `List<View>`, not one view, and
+    /// the two fixes. The desugar lowers a fragment to a list literal, so the
+    /// plain mismatch read as if the author had written a list; a fragment is
+    /// told from a written `[..]` by its markup — the literal's own span opens
+    /// with `<`, which no written list literal does. Any other message, value
+    /// or position comes back unchanged.
+    fn with_fragment_steer(&self, msg: String, value_id: Id, expected: &Type) -> String {
+        let expects_view = match expected {
+            Type::Struct(struct_id, _) => self.structs.get(struct_id).is_some_and(|struct_| {
+                struct_.name == "View"
+                    && self
+                        .source_of_id(struct_.id)
+                        .is_some_and(|source| self.std_sources.contains(&source))
+            }),
+            _ => false,
+        };
+        let is_fragment = expects_view
+            && matches!(self.expr_id_to_expr_map.get(&value_id), Some(Expr::List(_)))
+            && self
+                .written_text_of(value_id)
+                .is_some_and(|written| written.starts_with('<'));
+        match is_fragment {
+            true => format!(
+                "{msg} A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children \
+                 in one element (`<div>…</div>`), or make this position a `List<View>`"
+            ),
+            false => msg,
+        }
+    }
+
     /// B495 Q2: the refusal for a closure whose parameter's MODE differs
     /// from the mode its type position wrote — a value closure where the type
     /// takes a view, or the reverse. The two are different calling
@@ -50836,13 +51000,21 @@ impl<'src> Analyzer<'src> {
                                     &substitution_context,
                                 ) {
                                     Some(msg) => (msg, None),
-                                    None => self.argument_mismatch(
-                                        parameter_name,
-                                        *parameter_id,
-                                        &parameter_type,
-                                        &argument_type,
-                                        &substitution_context,
-                                    ),
+                                    None => {
+                                        let (msg, note) = self.argument_mismatch(
+                                            parameter_name,
+                                            *parameter_id,
+                                            &parameter_type,
+                                            &argument_type,
+                                            &substitution_context,
+                                        );
+                                        let msg = self.with_fragment_steer(
+                                            msg,
+                                            argument_id,
+                                            &parameter_type,
+                                        );
+                                        (msg, note)
+                                    }
                                 };
                                 let span = **self.span_map.get(&argument_id).unwrap();
                                 self.calls_with_refused_arguments.insert(call_id);
@@ -52782,6 +52954,7 @@ impl<'src> Analyzer<'src> {
                             &value_type,
                             &substitution_context,
                         );
+                        let msg = self.with_fragment_steer(msg, first_value_id, &variable_type);
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,
@@ -53630,7 +53803,9 @@ impl<'src> Analyzer<'src> {
                 "Expected {expected}, but got void instead: an `if` with no `else` produces void."
             )
         } else {
-            self.type_mismatch_message(target_return_type, &body_type, substitution_context)
+            let msg =
+                self.type_mismatch_message(target_return_type, &body_type, substitution_context);
+            self.with_fragment_steer(msg, body_id, target_return_type)
         };
         ReturnPositionCheck::Mismatched(msg)
     }
@@ -55412,22 +55587,33 @@ impl<'src> Analyzer<'src> {
 
     /// A155: one element whose class is written twice in one chain — an element
     /// head's `class("x")` and a `.styled(card)`, two `.styled`s, a `.class` and
-    /// a `.bind_styled` — keeps only the LAST write: every one of std's `View`
-    /// class writers SETS the attribute, on both ui twins, so the earlier write is
-    /// silently lost (`<div class("x") .styled(card) />` renders only `card`'s
-    /// classes, and the reverse order only `x`). A WARNING naming both writers,
-    /// at the one that wins.
+    /// a `.bind_styled`, a `.bind_attr("class", ..)` or a `.toggle_attr("class",
+    /// ..)` (A159) — keeps only the LAST write: every one of std's `View` class
+    /// writers SETS the attribute (or, `toggle_attr`, removes it), on both ui
+    /// twins, so the earlier write is silently lost (`<div class("x")
+    /// .styled(card) />` renders only `card`'s classes, and the reverse order
+    /// only `x`). A REFUSAL naming both writers, at the later one (A162, v0.46.0:
+    /// class-writes.md's door C — the writers stay last-wins and never append,
+    /// and the double write nobody means is an error; it was a warning in
+    /// v0.45.0).
+    ///
+    /// A160: when the EARLIER writer is a binding — a `bind_*`, a
+    /// `toggle_attr`, or an `attr("class", ..)` over a source — the later write
+    /// does not stay: the binding writes again on every change of its source,
+    /// so the two take turns and the element shows whichever fired last. The
+    /// sentence says that instead (`class_value_is_binding`).
     ///
     /// Statically visible means one receiver chain: from each writer, the walk
     /// follows the receiver while it is a dotted call of one of std's `View`
     /// methods (every one of which hands back the element it was called on), so
     /// an element head — which lowers to exactly such a chain — and a written
     /// chain over `view("..")` are both seen, and a chain broken by a function
-    /// of the program's own is not. Whether the writers should APPEND instead is
-    /// an open design question (census first); this pass does not change them.
+    /// of the program's own is not: that remainder stays last-wins and silent
+    /// (class-writes.md §5). std, dependencies and generated code are skipped.
     fn check_class_written_twice(&mut self) {
-        // Each class writer: its call, its receiver entity, its source.
-        let mut writers: HashMap<Id, (Id, SourceId)> = HashMap::default();
+        // Each class writer: its call, its receiver entity, its source, and
+        // whether it is a binding (A160).
+        let mut writers: HashMap<Id, (Id, SourceId, bool)> = HashMap::default();
         // Every dotted call of a std `View` method, by its CALL ENTITY, with its
         // receiver entity: the links the walk may cross.
         let mut links: HashMap<Id, (Id, Id)> = HashMap::default();
@@ -55457,20 +55643,28 @@ impl<'src> Analyzer<'src> {
             if let Some(&entity) = call_entities.get(call_id) {
                 links.insert(entity, (*call_id, receiver));
             }
-            let writes_class = match self.callable_name(*member_id) {
-                Some("class" | "styled" | "bind_class" | "bind_styled") => true,
-                Some("attr") => matches!(
+            // A159: the named-attribute writers count when the name is the
+            // literal `"class"` — `toggle_attr` too, which REMOVES the class
+            // while its flag is false.
+            let names_class = || {
+                matches!(
                     function_call
                         .argument_ids
                         .get(1)
                         .and_then(|name| self.expr_id_to_expr_map.get(name)),
                     Some(Expr::String("class"))
-                ),
-                _ => false,
+                )
             };
-            if !writes_class {
-                continue;
-            }
+            let is_binding = match self.callable_name(*member_id) {
+                Some("class" | "styled") => false,
+                Some("bind_class" | "bind_styled") => true,
+                Some("bind_attr" | "toggle_attr") if names_class() => true,
+                Some("attr") if names_class() => function_call
+                    .argument_ids
+                    .get(2)
+                    .is_some_and(|value| self.class_value_is_binding(*call_id, *value)),
+                _ => continue,
+            };
             let Some(source) = self.source_of_id(*call_id) else {
                 continue;
             };
@@ -55480,51 +55674,103 @@ impl<'src> Analyzer<'src> {
             {
                 continue;
             }
-            writers.insert(*call_id, (receiver, source));
+            writers.insert(*call_id, (receiver, source, is_binding));
         }
         if writers.len() < 2 {
             return;
         }
         // From each writer, the nearest writer BELOW it on its receiver chain:
         // the write it overrides. Reported once per pair, at the later writer.
-        let mut pairs: Vec<(SourceId, Id, Id)> = Vec::new();
-        for (call_id, (receiver, source)) in &writers {
+        let mut pairs: Vec<(SourceId, Id, Id, bool)> = Vec::new();
+        for (call_id, (receiver, source, _)) in &writers {
             let mut current = *receiver;
             while let Some(&(inner_call, inner_receiver)) = links.get(&current) {
-                if writers.contains_key(&inner_call) {
-                    pairs.push((*source, inner_call, *call_id));
+                if let Some(&(_, _, earlier_is_binding)) = writers.get(&inner_call) {
+                    pairs.push((*source, inner_call, *call_id, earlier_is_binding));
                     break;
                 }
                 current = inner_receiver;
             }
         }
-        let mut sites: Vec<(SourceId, Span, String, String, Span)> = pairs
+        let mut sites: Vec<(SourceId, Span, String, String, Span, bool)> = pairs
             .into_iter()
-            .filter_map(|(source, earlier, later)| {
+            .filter_map(|(source, earlier, later, earlier_is_binding)| {
                 let (earlier_text, earlier_span) = self.class_writer_text(earlier, source)?;
                 let (later_text, later_span) = self.class_writer_text(later, source)?;
-                Some((source, later_span, earlier_text, later_text, earlier_span))
+                Some((
+                    source,
+                    later_span,
+                    earlier_text,
+                    later_text,
+                    earlier_span,
+                    earlier_is_binding,
+                ))
             })
             .collect();
         sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
         sites.dedup_by_key(|(source, span, ..)| (source.0, span.start, span.end));
-        for (source, span, earlier, later, earlier_span) in sites {
-            self.warnings.push(Error {
-                trace: Vec::new(),
-                note: Some(Note::here(
-                    earlier_span,
-                    format!("`{earlier}` writes this element's class first"),
-                )),
-                span,
-                msg: format!(
-                    "this element's class is written twice — `{earlier}` and then \
-                     `{later}` — and only the last write stays: `{later}` replaces \
-                     what `{earlier}` wrote. Compose them into one writer (two styles \
-                     add: `.styled(a + b)`), or drop one"
-                ),
-            });
-            self.warning_sources.push(source);
+        for (source, span, earlier, later, earlier_span, earlier_is_binding) in sites {
+            let note = Some(Note::here(
+                earlier_span,
+                format!("`{earlier}` writes this element's class first"),
+            ));
+            let error = match earlier_is_binding {
+                // A160: the binding writes again on every change of its source,
+                // so the later write does not stay.
+                true => Error {
+                    trace: Vec::new(),
+                    note,
+                    span,
+                    msg: format!(
+                        "this element's class is written twice — `{earlier}` and then \
+                         `{later}` — and `{earlier}` is a binding, so the two take turns: \
+                         `{later}` writes last when the element is built, `{earlier}` \
+                         writes again whenever its source changes, and the element shows \
+                         whichever wrote last. Compose them into one writer (two styles \
+                         add: `.styled(a + b)`), or drop one"
+                    ),
+                },
+                false => Error {
+                    trace: Vec::new(),
+                    note,
+                    span,
+                    msg: format!(
+                        "this element's class is written twice — `{earlier}` and then \
+                         `{later}` — and only the last write stays: `{later}` replaces \
+                         what `{earlier}` wrote. Compose them into one writer (two styles \
+                         add: `.styled(a + b)`), or drop one"
+                    ),
+                },
+            };
+            self.push_in_source(error, source);
         }
+    }
+
+    /// A160: whether an `attr("class", value)` writer is a BINDING — whether its
+    /// value is a source the writer follows, rather than a `str` (or an
+    /// `Option<str>`, A115) it writes once. `AttrValue`'s arms are exactly those
+    /// two static types and the `Flow` blankets over them, so anything that is
+    /// not one of the two is followed.
+    ///
+    /// The value's type is the call's binding of `attr<V>`'s own `V` (a call
+    /// result's type lives there, not on the argument), else the argument's
+    /// own. A value whose type is not known is taken as static: the check then
+    /// says what it always said.
+    fn class_value_is_binding(&self, call_id: Id, value: Id) -> bool {
+        let value_type = match self
+            .own_generic_call_bindings
+            .get(&call_id)
+            .and_then(|bindings| bindings.first())
+        {
+            Some(bound) => bound.get_type(self),
+            None => match self.place_value_type(value) {
+                Some(value_type) => value_type,
+                None => return false,
+            },
+        };
+        let is_static = self.is_str_type(&value_type)
+            || matches!(value_type, Type::Enum(id, _) if Some(id) == self.option_enum_id);
+        !is_static
     }
 
     /// A157: a WRITTEN `autofocus` attribute in an element head —
@@ -57733,11 +57979,13 @@ impl<'src> Analyzer<'src> {
         match self.reconcile_type(&value_type, field_type, substitution_context) {
             Some((_unified, bindings)) => FieldValueVerdict::Accepted(bindings),
             None => {
+                let msg = self.type_mismatch_message(field_type, &value_type, substitution_context);
+                let msg = self.with_fragment_steer(msg, value_id, field_type);
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: value_span,
-                    msg: self.type_mismatch_message(field_type, &value_type, substitution_context),
+                    msg,
                 });
                 FieldValueVerdict::Refused
             }
@@ -57955,6 +58203,9 @@ impl<'src> Analyzer<'src> {
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();
         let struct_fields = struct_.fields.clone();
         let struct_name_span = struct_.name_span;
+        if self.refuse_internal_field_write(constraint, struct_id, &struct_fields) {
+            return Resolution::Failed;
+        }
         if constraint.fields.len() != struct_fields.len() {
             let (msg, span) = self.struct_field_count_message(
                 constraint.struct_name,
@@ -58523,6 +58774,61 @@ impl<'src> Analyzer<'src> {
                 Resolution::Failed
             }
         }
+    }
+
+    /// B568 (R-b, v0.46.0): a struct literal outside std may not write a field
+    /// std marks `[internal]` — the construction half of A149 S4's read rule,
+    /// under the same shared rule (`labels::internal_field_out_of_reach`) and
+    /// with the label's reason. A literal names every field (there are no
+    /// defaults), so such a struct has no literal outside std at all: the
+    /// refusal stands at the first internal field the literal WRITES, or at the
+    /// struct's name in the literal when it writes none (the field-count
+    /// message would otherwise list the internal fields as missing, steering
+    /// the author to write them). One refusal per literal. Answers whether it
+    /// refused.
+    ///
+    /// No pattern reaches here: a pattern names no field (vilan's patterns are
+    /// bindings, variants, tuples, arrays and literals — there is no struct
+    /// pattern), so destructuring cannot read an internal field either.
+    fn refuse_internal_field_write(
+        &mut self,
+        constraint: &StructInitializerConstraint<'src>,
+        struct_id: Id,
+        struct_fields: &[Field<'src>],
+    ) -> bool {
+        let initializer_id = constraint.initializer_id;
+        let hidden: Vec<(usize, &'src str)> = (0..struct_fields.len())
+            .filter_map(|index| {
+                self.internal_field_hidden(struct_id, index, initializer_id)
+                    .map(|reason| (index, reason))
+            })
+            .collect();
+        let Some(&(first_index, first_reason)) = hidden.first() else {
+            return false;
+        };
+        let written = constraint
+            .fields
+            .iter()
+            .find_map(|(name, _, _, name_span)| {
+                hidden
+                    .iter()
+                    .find(|(index, _)| struct_fields[*index].name == *name)
+                    .map(|(index, reason)| (*index, *reason, *name_span))
+            });
+        let (index, reason, span) =
+            written.unwrap_or((first_index, first_reason, constraint.struct_name_span));
+        let field_name = struct_fields[index].name;
+        let struct_name = constraint.struct_name;
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: format!(
+                "`{field_name}` is an `[internal]` field of std's `{struct_name}`, and a \
+                 struct literal outside std cannot write an internal std field: {reason}"
+            ),
+        });
+        true
     }
 
     /// A149 S4 (R-e): the `[internal("reason")]` label of field `index` of the

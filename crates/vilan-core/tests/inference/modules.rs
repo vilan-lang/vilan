@@ -2440,6 +2440,196 @@ fn a46_a_fragment_is_a_list_and_not_a_view() {
     );
 }
 
+// --- B555: `std::js::null` cannot be named in an import, and needs no import --
+
+#[test]
+fn b555_importing_the_null_module_is_refused_once_with_the_steer() {
+    let source = "import std::js::null;\n\nfun main() {\n\tlet _nothing = null;\n}\n";
+    assert_fails_once_with(
+        source,
+        "`null` is a keyword, so no import path can name `std::js::null`",
+    );
+    assert_fails_without(source, "`::`-separated NAMES");
+    // What the steer promises: the value and its type are there with no import.
+    assert_compiles("fun main() {\n\tlet _nothing = null;\n}\n");
+}
+
+// --- E272: a fragment where ONE view is wanted says it is a fragment --------
+//
+// The book (Building UI, Fragments) promises "a type error that says so". The
+// plain mismatch stays the sentence's head (the A46 pin above reads it); the
+// steer is added where the refused value IS a fragment — the desugar's list
+// literal, told from a written `[..]` by its markup.
+
+const E272_STEER: &str = "A fragment `<>…</>` is a `List<View>`, not one `View`";
+
+#[test]
+fn e272_a_fragment_where_a_view_is_wanted_is_named_with_the_fix() {
+    let head = "import std::io::print;\nimport std::web::ui::{ View, render, view };\n";
+    let cases = [
+        // The find's repro: a declared `View` return.
+        (
+            "fun pair(): View {\n\t<><p>\"a\"</p><p>\"b\"</p></>\n}\nfun main() {\n\tprint(render(pair()));\n}\n",
+            "<><p>\"a\"</p><p>\"b\"</p></>",
+        ),
+        // A `let` annotation.
+        (
+            "fun main() {\n\tlet v: View = <><p>\"a\"</p></>;\n\tprint(render(v));\n}\n",
+            "<><p>\"a\"</p></>",
+        ),
+        // An argument.
+        (
+            "fun main() {\n\tprint(render(<><p>\"a\"</p></>));\n}\n",
+            "<><p>\"a\"</p></>",
+        ),
+        // A struct field.
+        (
+            "struct Card {\n\tbody: View,\n}\nfun main() {\n\tlet card = Card { body = <><p>\"a\"</p></> };\n\tprint(render(card.body));\n}\n",
+            "<><p>\"a\"</p></>",
+        ),
+    ];
+    for (body, spanning) in cases {
+        let source = format!("{head}{body}");
+        let failures = failure_diagnostics(&source);
+        let steered: Vec<_> = failures
+            .iter()
+            .filter(|(message, _)| message.contains(E272_STEER))
+            .collect();
+        assert_eq!(
+            steered.len(),
+            1,
+            "one steered refusal in {body:?}; got: {failures:#?}"
+        );
+        let (message, range) = steered[0];
+        assert!(
+            message.starts_with("Expected View, but got List<View> instead."),
+            "the mismatch stays the head; got: {message}"
+        );
+        assert!(
+            message.contains("wrap its children in one element (`<div>…</div>`)")
+                && message.contains("`List<View>`"),
+            "the fix the book promises; got: {message}"
+        );
+        assert_eq!(&source[range.clone()], spanning, "spanned on the fragment");
+    }
+}
+
+#[test]
+fn e272_a_written_list_where_a_view_is_wanted_is_not_called_a_fragment() {
+    // The steer is the fragment's: a written list literal is a list the author
+    // spelled, and keeps the plain sentence.
+    let source = "import std::web::ui::{ View, view };\nfun pair(): View {\n\t[view(\"p\")]\n}\n";
+    assert_fails_with(source, "Expected View, but got List<View> instead.");
+    assert_fails_without(source, "fragment");
+}
+
+// --- E271: a hole that holds no text says what a hole takes ------------------
+//
+// `{expr}` lowers to `.child(expr)` before analysis, so a value that is not a
+// `Slot` was refused as the desugared call's bound — spanned from the
+// element's `<`, about a `child` the author never wrote. The refusal now
+// stands on the HOLE, says what a hole takes, and for a number, a bool or a
+// `Source` of one, writes the text form.
+
+const E271_HEAD: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Signal, SignalCell };\n",
+    "import std::web::ui::{ View, render, view };\n",
+    "\n",
+    "struct Point {\n\tx: i32,\n}\n",
+    "\n",
+);
+
+const E271_SENTENCE: &str =
+    "a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one";
+
+#[test]
+fn e271_a_hole_holding_no_text_is_refused_at_the_hole_with_the_text_form() {
+    let cases = [
+        // The find's two repros: a signal of a number, and a number.
+        (
+            "\tlet count = Signal::new(0);\n\tprint(render(<p>{count}</p>));\n",
+            "count",
+            "`count` is `SignalCell<i32>`",
+            Some("`{count.derive(|value| i\"{value}\")}`"),
+        ),
+        (
+            "\tprint(render(<p>{5}</p>));\n",
+            "5",
+            "`5` is `i32`",
+            Some("`{i\"{5}\"}`"),
+        ),
+        // A bool, an expression, and a call — the hole's own text in the form.
+        (
+            "\tlet on = true;\n\tprint(render(<p>\"x\"{on}</p>));\n",
+            "on",
+            "`on` is `bool`",
+            Some("`{i\"{on}\"}`"),
+        ),
+        (
+            "\tlet n = 2;\n\tprint(render(<p>{n * 3}</p>));\n",
+            "n * 3",
+            "`n * 3` is `i32`",
+            Some("`{i\"{n * 3}\"}`"),
+        ),
+        (
+            "\tlet count: SignalCell<f64> = Signal::new(1.5);\n\tprint(render(<div><p>{count.derive(|v| v * 2.0)}</p></div>));\n",
+            "count.derive(|v| v * 2.0)",
+            " is `",
+            Some("`{count.derive(|v| v * 2.0).derive(|value| i\"{value}\")}`"),
+        ),
+        // A value with no text form: what a hole takes, and no rewrite.
+        (
+            "\tlet point = Point { x = 1 };\n\tprint(render(<p>{point}</p>));\n",
+            "point",
+            "`point` is `Point`",
+            None,
+        ),
+    ];
+    for (body, spanning, typed, rewrite) in cases {
+        let source = format!("{E271_HEAD}fun main() {{\n{body}}}\n");
+        let failures = failure_diagnostics(&source);
+        let matching: Vec<_> = failures
+            .iter()
+            .filter(|(message, _)| message.contains(E271_SENTENCE))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "one refusal for {body:?}; got: {failures:#?}"
+        );
+        assert_eq!(failures.len(), 1, "and nothing else; got: {failures:#?}");
+        let (message, range) = matching[0];
+        assert_eq!(
+            &source[range.clone()],
+            spanning,
+            "spanned on the hole; got: {message}"
+        );
+        assert!(
+            message.contains(typed),
+            "names the hole's type ({typed}); got: {message}"
+        );
+        match rewrite {
+            Some(rewrite) => assert!(
+                message.contains(rewrite),
+                "writes the text form {rewrite}; got: {message}"
+            ),
+            None => assert!(
+                !message.contains("as text"),
+                "no text form for a value that has none; got: {message}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn e271_a_written_child_call_keeps_the_bound_refusal() {
+    // `.child(5)` is a call the author wrote: the bound's own sentence stays.
+    let source = format!("{E271_HEAD}fun main() {{\n\tprint(render(view(\"p\").child(5)));\n}}\n");
+    assert_fails_with(&source, "'i32' does not implement trait 'Slot'");
+    assert_fails_without(&source, "a hole in element syntax");
+}
+
 #[test]
 fn a46_a_fragment_close_must_be_the_nameless_one() {
     // `<>` opens the nameless head, so only `</>` closes it — a named close
