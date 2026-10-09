@@ -2380,6 +2380,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.rust_type(tuple, span)
             }
             Type::Tuple(elements) => {
+                self.refuse_an_unordered_teardown(&elements, "a tuple", span)?;
                 let mut parts = Vec::new();
                 for element in &elements {
                     parts.push(self.rust_type(*element, span)?);
@@ -2392,6 +2393,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 Ok(format!("({})", parts.join(", ")))
             }
             Type::Array(element, length) => {
+                if length > 1 {
+                    self.refuse_an_unordered_teardown(&[element, element], "a fixed array", span)?;
+                }
                 let element = self.rust_type(element, span)?;
                 Ok(format!("[{element}; {length}]"))
             }
@@ -3073,7 +3077,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 );
             }
         }
-        let drop_name = self.ensure_function(drop_impl.function, &substitution)?.name;
+        let drop_name = self
+            .ensure_function(drop_impl.function, &substitution)?
+            .name;
         let mut out = String::new();
         let _ = writeln!(out, "impl Drop for {type_name} {{");
         let _ = writeln!(out, "    fn drop(&mut self) {{");
@@ -3120,6 +3126,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // of them that a struct asks of its fields: is a closure reachable?
         let mut payload_types: Vec<Vec<String>> = Vec::new();
         for variant in &declaration.variants {
+            if let Err(error) = self.refuse_an_unordered_teardown(
+                &variant.data_type_ids,
+                &format!("the variant `{}::{}`", declaration.name, variant.name),
+                span,
+            ) {
+                rendered = Err(error);
+                break;
+            }
             let mut payload = Vec::new();
             for data_type_id in &variant.data_type_ids {
                 match self.rust_type(*data_type_id, span) {
@@ -4729,6 +4743,36 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
+    /// Refuses, by name, an aggregate whose members' teardown ORDER is
+    /// visible and that this backend cannot declare reversed: two or more
+    /// members that owe a teardown in a tuple, a fixed array or one enum
+    /// variant's payloads. vilan drops an aggregate's members in REVERSE
+    /// (destruction.md §5), Rust drops a tuple's, an array's and a variant's
+    /// in declaration order, and only a struct's fields can be declared the
+    /// other way round ([`Self::ensure_struct`]) — so the base printed the
+    /// teardowns in the opposite order to the JS backend, silently.
+    fn refuse_an_unordered_teardown(
+        &self,
+        members: &[TypeId],
+        what: &str,
+        span: Span,
+    ) -> Result<(), Error> {
+        let owing = members
+            .iter()
+            .filter(|member| self.owes_a_teardown(**member, &mut HashSet::new()))
+            .count();
+        if owing > 1 {
+            return Err(unsupported(
+                &format!(
+                    "{what} holding two or more values that owe a teardown (vilan drops them \
+                     in reverse, Rust in declaration order; hold them in a struct's fields)"
+                ),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
     /// F97: whether dropping a value of `type_id` runs a `Drop` body
     /// somewhere inside it — its own nominal's, a field's or a payload's, an
     /// element's. Only such fields' order is visible, so only a struct with
@@ -5097,6 +5141,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .and_then(|type_id| self.resolve(type_id))
                     .is_some_and(|resolved| matches!(resolved, Type::Array(..)));
                 if fixed {
+                    // As a tuple literal: the elements' teardown order.
+                    let members: Vec<TypeId> = elements
+                        .iter()
+                        .filter_map(|element| self.type_of(*element))
+                        .collect();
+                    self.refuse_an_unordered_teardown(&members, "a fixed array", span)?;
                     format!("[{}]", parts.join(", "))
                 } else {
                     format!("vec![{}]", parts.join(", "))
@@ -5109,6 +5159,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 {
                     return self.spread_tuple(&elements, depth, span);
                 }
+                // A tuple literal names no type a position renders (nor does
+                // the analyzer record one on it), so the teardown order is
+                // asked of its elements' own records.
+                let members: Vec<TypeId> = elements
+                    .iter()
+                    .filter_map(|element| self.type_of(*element))
+                    .collect();
+                self.refuse_an_unordered_teardown(&members, "a tuple", span)?;
                 let mut parts = Vec::new();
                 for element in &elements {
                     let expecting = self.expected_type;
@@ -5481,8 +5539,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// written `&place`, or a call to a `borrows` function. Both answer a
     /// reference natively and a value is what the position wants.
     fn reads_through_a_view(&self, id: Id) -> bool {
-        matches!(self.program.entity_map.get(&id), Some(Expr::Reference(_, _)))
-            || self.is_a_view_call(id)
+        matches!(
+            self.program.entity_map.get(&id),
+            Some(Expr::Reference(_, _))
+        ) || self.is_a_view_call(id)
     }
 
     /// Whether `id` is a call to a `borrows` function whose return is a view
@@ -11444,15 +11504,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 continue;
             }
             if takes_a_view.get(index).copied().unwrap_or(false)
-                && let Some(path) =
-                    self.cell_view_place(
-                        *argument,
-                        depth,
-                        prelude,
-                        &mut view_borrows,
-                        &mut views,
-                        false,
-                    )?
+                && let Some(path) = self.cell_view_place(
+                    *argument,
+                    depth,
+                    prelude,
+                    &mut view_borrows,
+                    &mut views,
+                    false,
+                )?
             {
                 rendered.push(format!("&{path}"));
                 continue;

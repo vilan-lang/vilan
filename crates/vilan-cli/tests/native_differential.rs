@@ -11684,3 +11684,83 @@ fn f116_a_generic_resource_and_an_enum_with_drop_tear_down_alike_on_both_backend
         );
     }
 }
+
+/// A tuple, a fixed array or one enum variant holding TWO values that owe a
+/// teardown printed the teardowns in the opposite order to the JS backend,
+/// silently: vilan drops an aggregate's members in reverse (destruction.md
+/// §5), Rust drops a tuple's, an array's and a variant's in declaration
+/// order, and only a struct's fields can be declared reversed (F97). Each
+/// is refused by name now; ONE such member, or a struct holding two, still
+/// builds and agrees.
+#[test]
+fn an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered() {
+    let staged = stage();
+    let handle = concat!(
+        "import std::drop::Drop;\n",
+        "import std::io::print;\n",
+        "\n",
+        "[resource]\n",
+        "struct Handle {\n",
+        "\tname: str,\n",
+        "}\n",
+        "\n",
+        "impl Handle with Drop {\n",
+        "\tfun drop(&mut self) {\n",
+        "\t\tprint(i\"closing {self.name}\");\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+    );
+    let cases = [
+        (
+            "native_probe_unordered_variant.vl",
+            "[resource]\nenum Slot {\n\tEmpty,\n\tHeld(Handle, Handle),\n}\n\nfun main() {\n\
+             \tlet held = Slot::Held(Handle { name = \"a\" }, Handle { name = \"b\" });\n\
+             \tprint(\"end\");\n}\n",
+            "the variant `Slot::Held` holding two or more values that owe a teardown",
+        ),
+        (
+            "native_probe_unordered_tuple.vl",
+            "fun main() {\n\tlet pair = (Handle { name = \"a\" }, Handle { name = \"b\" });\n\
+             \tprint(\"end\");\n}\n",
+            "a tuple holding two or more values that owe a teardown",
+        ),
+        (
+            "native_probe_unordered_array.vl",
+            "fun main() {\n\
+             \tlet fixed: [Handle; 2] = [Handle { name = \"a\" }, Handle { name = \"b\" }];\n\
+             \tprint(\"end\");\n}\n",
+            "a fixed array holding two or more values that owe a teardown",
+        ),
+    ];
+    for (file, main, reason) in cases {
+        std::fs::write(staged.join(file), format!("{handle}{main}"))
+            .expect("write the probe program");
+        match compare(&staged, file) {
+            Verdict::Refused(refused) => assert!(
+                refused.contains(reason),
+                "{file}: refused for another reason: {refused}"
+            ),
+            other => panic!("{file}: expected a refusal by name, got {other:?}"),
+        }
+    }
+    let ordered = "native_probe_ordered_teardowns.vl";
+    std::fs::write(
+        staged.join(ordered),
+        format!(
+            "{handle}[resource]\nstruct Both {{\n\tfirst: Handle,\n\tsecond: Handle,\n}}\n\n\
+             [resource]\nenum One {{\n\tNone,\n\tHeld(Handle, i32),\n}}\n\n\
+             fun main() {{\n\
+             \tlet both = Both {{ first = Handle {{ name = \"a\" }}, second = Handle {{ name = \"b\" }} }};\n\
+             \tlet one = One::Held(Handle {{ name = \"c\" }}, 1);\n\
+             \tlet pair = (Handle {{ name = \"d\" }}, 2);\n\
+             \tprint(\"end\");\n}}\n"
+        ),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, ordered),
+        Verdict::Identical,
+        "one teardown per aggregate, or a struct's fields, keep building and agreeing"
+    );
+}

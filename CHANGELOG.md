@@ -37,6 +37,11 @@ written down.
 <!-- family: feature -->
 **F116: F97's remainder — a GENERIC resource with a `Drop` impl (`impl Guard<type T> with Drop`) and an ENUM with one build natively and tear down as on JS; both were refused by name.** Each instantiation's Rust `Drop` impl calls the `drop` instance its own arguments bind: the impl's subject, written in the impl's binders (`Guard<T>`), is matched against the instantiation (`Guard<str>`), so two instantiations of one declaration close each with its own body and a two-parameter impl reads both. An enum's `Drop` impl runs its body before the payloads drop. Inspected through a view (`match &slot`, `&named is ..`) the enum drops at its last use like any binding; CONSUMED by a by-value `match` (destruction.md R6: the subject's teardown is suppressed and each capture owns its payload) it is held undropped (`ManuallyDrop`) and each leg reads its captures out by value, which is what Rust's E0509 had refused. A guarded leg of such a consuming `match` stays refused by name. Pins: `native_differential::f116_a_generic_resource_and_an_enum_with_drop_tear_down_alike_on_both_backends` (`native/generic_resource_teardown.vl`, `native/enum_resource_teardown.vl`), and F56's enum pin flipped from a refusal to the claim (`a_resource_enum_with_drop_and_its_struct_twin_build_natively`). Tracker F116.
 
+---
+
+<!-- family: miscompile -->
+**A tuple, a fixed array or one enum variant holding TWO values that owe a teardown is refused by name natively, where it printed the teardowns in the opposite order to JS.** vilan drops an aggregate's members in reverse (destruction.md §5); Rust drops a tuple's, an array's and a variant's in declaration order, and only a struct's fields can be declared reversed (F97), so `let pair = (Handle { .. }, Handle { .. })` closed `a` then `b` natively and `b` then `a` on JS, silently. The refusal names the aggregate and the steer (hold them in a struct's fields); one teardown per aggregate, and a struct holding two, build and agree as before. Pin: `native_differential::an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered` (the variant, the tuple and the array refused, a struct and a one-resource variant and tuple identical; red on 0.46.0). Found building F116.
+
 
 ## v0.46.0 — 2026-10-09
 
