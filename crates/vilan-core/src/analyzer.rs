@@ -21058,11 +21058,16 @@ impl<'src> Analyzer<'src> {
             rows.iter()
                 .map(|index| &self.implementations[*index])
                 .filter(|implementation| {
+                    // A122's rule — a blanket over TUPLES is no candidate for
+                    // a receiver that is no tuple (left in, `list.iter().map`
+                    // found `Tuple::map` declared and never reached
+                    // `Iterator::map`'s default) — is admission's own since
+                    // B557 (`tuple_bound_admits_shape`).
                     self.impl_subject_admits(
                         subject_type,
                         implementation.subject.borrow_type(self),
                         &HashMap::default(),
-                    ) && !self.tuple_blanket_excludes(implementation.subject, subject_type)
+                    )
                 })
                 .filter_map(|implementation| {
                     if !allow_trait_only && self.member_is_trait_only(implementation, member_name) {
@@ -21143,26 +21148,6 @@ impl<'src> Analyzer<'src> {
             )
             .collect();
         self.applicable_candidates(subject_type, candidates)
-    }
-
-    /// A122: a blanket over TUPLES (`impl type T: (2..)`) is no candidate at all
-    /// for a receiver that is not a tuple — a struct, an enum, an array, a
-    /// closure, an object. Left in the candidate set, it shadowed the tier
-    /// below it: `list.iter().map(..)` found `Tuple::map` DECLARED and never
-    /// reached `Iterator::map`'s inherited default.
-    fn tuple_blanket_excludes(&self, impl_subject: TypeId, subject_type: &Type) -> bool {
-        let Type::Generic(binder_id) = impl_subject.get_type(self) else {
-            return false;
-        };
-        self.tuple_bounds.contains_key(&binder_id)
-            && matches!(
-                subject_type,
-                Type::Struct(..)
-                    | Type::Enum(..)
-                    | Type::Array(..)
-                    | Type::Closure(..)
-                    | Type::Dyn(..)
-            )
     }
 
     /// Whether the impl with this subject DECLARES `member_id` itself, as
