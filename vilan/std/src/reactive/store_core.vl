@@ -594,6 +594,14 @@ export fun touch_spine(touches: List<(StoreFeed, StoreTouch)>, woken: &mut Store
 	}
 }
 
+/// What a write's lend leaves behind: whether it reached the place, whether the
+/// diff found a change, and what it collected (C15's option S).
+struct Lent {
+	reached: bool,
+	changed: bool,
+	woken: StoreWoken,
+}
+
 /// A write of `value` at `path`: diff the subtree there against `value` through
 /// `lend`, let the touched feeds read their part, assign it in place through
 /// `modify`, let them read it again, and wake what changed — the subtree's live
@@ -610,16 +618,23 @@ fun write_at<T: Storable>(
 	let found = spine(root, &path);
 	let need = !found.ancestors.is_empty() || !found.touches.is_empty();
 	let node = found.node;
-	mut woken = StoreWoken { slots = [], feeds = [] };
-	mut reached = false;
-	mut changed = false;
+	// ONE binding the lend's closure writes (C15's option S, `closure-captures.md`
+	// Q5): natively a captured `mut` is a box, and three of them were three
+	// allocations per write.
+	mut lent = Lent {
+		reached = false,
+		changed = false,
+		woken = StoreWoken { slots = [], feeds = [] },
+	};
 	lend(|place: &T| {
-		reached = true;
-		changed = place.store_diff(&value, node, need, &mut woken);
+		lent.reached = true;
+		lent.changed = place.store_diff(&value, node, need, &mut lent.woken);
 	});
-	if !reached {
+	if !lent.reached {
 		ret false;
 	}
+	let changed = lent.changed;
+	mut woken = lent.woken;
 	if changed {
 		touch_spine(found.touches, &mut woken);
 	}
