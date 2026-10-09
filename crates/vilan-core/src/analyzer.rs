@@ -50449,9 +50449,7 @@ impl<'src> Analyzer<'src> {
         // The `Self` reading binds each impl binder the path leaves open to
         // ITSELF (`{T: T}`), and a binder of the enclosing block is rigid in
         // the body, so the argument could not have instantiated it.
-        let Some(reading) = self.static_subject_bindings.get(&subject_id) else {
-            return None;
-        };
+        let reading = self.static_subject_bindings.get(&subject_id)?;
         let mut generics = Vec::new();
         self.collect_generics(parameter_type, 0, &mut generics);
         let read_as_self = generics.iter().any(|generic| {
