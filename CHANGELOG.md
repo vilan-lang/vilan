@@ -51,6 +51,11 @@ written down.
 ---
 
 <!-- family: tooling -->
+**`scripts/cut-release.sh` writes the same CHANGELOG under every awk — mawk 1.3.4 20200120 (Ubuntu 22.04) doubled the `---` rule between entries — and an applying cut refuses a missing or pre-3.11 Python up front instead of skipping, or dying after, the perf report.** That mawk has no regex intervals, so the rule pattern `-{3,}` never matched a `---` line; the rule stayed in the entry above it and the rewrite printed it beside its own separator. The pattern is `---+` now, and a `release_scripts` pin refuses an interval anywhere in the script outside `grep -E`. The script's head states what it needs (any POSIX awk; Python 3.11+ for `perf_gate.py`), and the Python check runs with the other reds before anything changes: the apply step used to skip the perf report and ratchet when `python3` was absent and to fail after the version bump when it was too old. Tracker N152.
+
+---
+
+<!-- family: tooling -->
 **`perf_gate.py measure --subject` measures any subject it can build — `plain:640`, `genapp:7`, any `example:` — and refuses one it cannot parse by name, where an unknown subject was dropped silently and the run measured nothing and exited 0.** The filter kept only the subjects `perf/budgets.toml` names, so M113's 640-module row needed a hand-written driver and a typo passed. The subjects named are measured in the order given, once each; `plain:many`, `exmaple:canvas` or a missing example stop the run before anything is measured. Tracker N148.
 
 ---
