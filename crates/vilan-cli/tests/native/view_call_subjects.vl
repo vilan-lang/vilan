@@ -1,0 +1,47 @@
+// F113: a pattern that DESTRUCTURES the view a `borrows` call hands back
+// bound its captures as references natively — `if cell.slot() is (let cells,
+// let weight)` made `weight` a `&mut i32`, and `cells.len().as_i32() + weight`
+// was rustc's E0277. A capture is a copy (rule 1), so the subject is the
+// pointee's copy, as a place subject's is. Every pattern position: `is`, a
+// `match`, a read view, an `Option` behind a view, a destructuring `let`.
+import std::io::print;
+
+struct Cell {
+	pair: (List<i32>, i32),
+	maybe: Option<i32>,
+}
+
+impl Cell {
+	fun slot(&mut self): &mut (List<i32>, i32) borrows self {
+		&mut self.pair
+	}
+	fun look(&self): &(List<i32>, i32) borrows self {
+		&self.pair
+	}
+	fun maybe(&mut self): &mut Option<i32> borrows self {
+		&mut self.maybe
+	}
+}
+
+fun main() {
+	mut cell = Cell { pair = ([1, 2], 3), maybe = Some(4) };
+	if cell.slot() is (let cells, let weight) {
+		print(cells.len().as_i32() + weight);
+	}
+	match cell.slot() {
+		(let cells, let weight) => print(cells.len().as_i32() * weight),
+	}
+	if cell.look() is (let cells, let weight) {
+		print(cells.len().as_i32() - weight);
+	}
+	if cell.maybe() is Some(let inner) {
+		print(inner + 1);
+	}
+	match cell.maybe() {
+		Some(let inner) => print(inner * 2),
+		None => print(0),
+	}
+	let (cells, weight) = cell.slot();
+	print(cells.len().as_i32() + weight);
+	print(cell.pair.1);
+}

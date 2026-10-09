@@ -11610,3 +11610,23 @@ fun main() {
         "a one-slot tuple leaf under a view subject must write in place on both backends"
     );
 }
+
+/// F113: a pattern over a `borrows` call's VIEW — `is`, `match`, a read
+/// view, an `Option` behind a view, a destructuring `let` — binds copies, as
+/// a pattern over a place does (rule 1). The base bound references under
+/// Rust's default binding modes and rustc refused the arithmetic (E0277).
+#[test]
+fn f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f113_view_call_subjects.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/view_call_subjects.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a destructured view from a `borrows` call must bind copies natively"
+    );
+}

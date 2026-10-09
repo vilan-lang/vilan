@@ -5159,7 +5159,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // by-value ARGUMENT takes, so there is one of it — and it knows
                 // not to copy a binding that holds a view.
                 let value = self.expression(subject, depth)?;
-                let value = self.copy_a_consumed_place_read(subject, value);
+                let value = if self.is_a_view_call(subject) {
+                    // F113: a `borrows` call's value is a reference, and the
+                    // pattern binds out of its pointee.
+                    self.copy_a_pattern_subject(subject, value)
+                } else {
+                    self.copy_a_consumed_place_read(subject, value)
+                };
                 format!("let {bound} = {value}")
             }
             // The variant's declaration itself: the constructor's rule, as
@@ -5429,18 +5435,44 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// written `&place`, or a call to a `borrows` function. Both answer a
     /// reference natively and a value is what the position wants.
     fn reads_through_a_view(&self, id: Id) -> bool {
-        match self.program.entity_map.get(&id) {
-            Some(Expr::Reference(_, _)) => true,
-            Some(&Expr::Call(call_id)) => self
-                .program
-                .function_calls
-                .get(&call_id)
-                .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
-                    Some(Expr::Local(target)) => self.program.functions.get(target),
-                    _ => None,
-                })
-                .is_some_and(|function| function.returns_view || function.returns_mut_view),
-            _ => false,
+        matches!(self.program.entity_map.get(&id), Some(Expr::Reference(_, _)))
+            || self.is_a_view_call(id)
+    }
+
+    /// Whether `id` is a call to a `borrows` function whose return is a view
+    /// at the top (`&T` / `&mut T`, not a view wrapped in a payload) — so
+    /// its Rust value is a REFERENCE to storage the callee's owner holds.
+    fn is_a_view_call(&self, id: Id) -> bool {
+        let Some(&Expr::Call(call_id)) = self.program.entity_map.get(&id) else {
+            return false;
+        };
+        self.program
+            .function_calls
+            .get(&call_id)
+            .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                Some(Expr::Local(target)) => self.program.functions.get(target),
+                _ => None,
+            })
+            .is_some_and(|function| function.returns_view || function.returns_mut_view)
+    }
+
+    /// A pattern subject as the pattern consumes it: a copy where the subject
+    /// names storage, so every capture binds a value (rule 1) rather than a
+    /// reference under Rust's default binding modes (F20).
+    ///
+    /// Two shapes name storage: a PLACE ([`Self::subject_is_a_place`]) and a
+    /// call to a `borrows` function (F113) — its value is a reference into
+    /// the owner's storage, so `if cell.slot() is (let cells, let weight)`
+    /// bound `weight: &mut i32` and `.. + weight` was rustc's E0277. The
+    /// copy is the pointee's (`(*call).clone()`, F88's rule for a block's
+    /// view), taken before the pattern reads it.
+    fn copy_a_pattern_subject(&self, subject: Id, text: String) -> String {
+        if self.subject_is_a_place(subject) {
+            format!("({text}).clone()")
+        } else if self.is_a_view_call(subject) {
+            format!("(*{text}).clone()")
+        } else {
+            text
         }
     }
 
@@ -6840,10 +6872,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // The same copy `if let` takes (F20): a pattern over a PLACE binds its
         // captures by reference under Rust's default binding modes, and a
         // capture is a copy by rule 1.
-        let mut subject_text = self.expression(subject, depth)?;
-        if self.subject_is_a_place(subject) {
-            subject_text = format!("({subject_text}).clone()");
-        }
+        let subject_text = self.expression(subject, depth)?;
+        let subject_text = self.copy_a_pattern_subject(subject, subject_text);
         let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(&pattern, subject_type, self.span_of(first))?;
         for binding in &bindings {
@@ -7325,7 +7355,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let captured = self.is_condition_captures(*condition);
                 let head = match &captured {
                     Some((subject, pattern, bindings)) => {
-                        let mut subject_text = self.expression(*subject, depth)?;
+                        let subject_text = self.expression(*subject, depth)?;
                         // The same copy a destructuring `match` takes (F20): an
                         // `if let` over a PLACE binds its captures by REFERENCE
                         // under Rust's default binding modes, so
@@ -7333,9 +7363,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         // `&Option<i32>` bound `x: &i32` and `x == y` had no
                         // `PartialEq` across the reference. A capture is a copy
                         // (rule 1), and copying the subject is how it binds one.
-                        if self.subject_is_a_place(*subject) {
-                            subject_text = format!("({subject_text}).clone()");
-                        }
+                        let subject_text = self.copy_a_pattern_subject(*subject, subject_text);
                         let subject_type = self.settled_value_type(*subject);
                         let pattern_text =
                             self.pattern(pattern, subject_type, self.span_of(*condition))?;
@@ -7395,11 +7423,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             collect_pattern_bindings(&leg.pattern, &mut bindings);
             !bindings.is_empty()
         });
-        if destructures
-            && self.subject_is_a_place(subject)
-            && !self.moves_an_owned_resource(subject)
-        {
-            subject_text = format!("({subject_text}).clone()");
+        if destructures && !self.moves_an_owned_resource(subject) {
+            subject_text = self.copy_a_pattern_subject(subject, subject_text);
         }
         // A `str` subject is matched as a `&str`, which is the only form a
         // string LITERAL pattern has natively — see [`Emitter::pattern`]. The
@@ -9381,12 +9406,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 ));
             }
         };
-        let mut subject = self.expression(step, depth)?;
+        let subject = self.expression(step, depth)?;
         // A pattern over a PLACE binds by reference under Rust's default
         // binding modes; the payload is a copy by rule 1, as an `if let`'s is.
-        if self.subject_is_a_place(step) {
-            subject = format!("({subject}).clone()");
-        }
+        let subject = self.copy_a_pattern_subject(step, subject);
         let name = self.binding_name(binder);
         Ok(if is_result {
             format!("match {subject} {{ Ok({name}) => {good}, Err(error) => Err(error) }}")
