@@ -1636,6 +1636,77 @@ fn f28_vilan_check_checks_a_declared_module_no_leg_admits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Runs `vilan` from `directory` with `NO_COLOR=1`.
+fn vilan_plain_in(directory: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(args)
+        .current_dir(directory)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run vilan")
+}
+
+#[test]
+fn b556_a_file_addressed_from_inside_its_package_finds_the_package() {
+    // B556: `cd src && vilan check main.vl` — `Path::parent` of a bare
+    // `main.vl` is `""`, and the manifest walk stopped there, so the file
+    // compiled as belonging to NO package: the package's prelude was ignored
+    // and the steer named the edit already made. The same from a directory
+    // deeper (`../main.vl`), which asked `src/` and then the working directory.
+    let dir = temp_project("b556_inside");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"browser\"\nprelude = \"std::web::prelude\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "fun main() { let v = view(\"div\"); }\n",
+    );
+    write(&dir, "src/deeper/keep.vl", "export fun keep(): i32 { 1 }\n");
+    for (working, file) in [
+        ("src", "main.vl"),
+        ("src/deeper", "../main.vl"),
+        ("src", "./main.vl"),
+    ] {
+        let output = vilan_plain_in(&dir.join(working), &["check", file]);
+        let text = combined(&output);
+        assert!(
+            output.status.success() && !text.contains("prelude of the web set"),
+            "`vilan check {file}` from `{working}` resolves under the package:\n{text}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn b556_a_file_outside_the_working_package_is_not_claimed_by_it() {
+    // The lexical walk's other face: from inside a package, `../scratch/x.vl`
+    // asked `../scratch`, then `..`, then `""` — the WORKING directory, which
+    // is not above the file at all — and compiled the scratch file under the
+    // working package's manifest (here `prelude = false`, so `print` vanished).
+    let dir = temp_project("b556_outside");
+    write(
+        &dir,
+        "app/vilan.toml",
+        "[package]\nname = \"app\"\nprelude = false\n",
+    );
+    write(&dir, "app/src/main.vl", "fun main() {}\n");
+    write(
+        &dir,
+        "scratch/x.vl",
+        "fun main() { print(\"hi\") }\nmain();\n",
+    );
+    let output = vilan_plain_in(&dir.join("app"), &["check", "../scratch/x.vl"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "a file no manifest is above keeps its manifest-less context:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_file_with_no_manifest_above_it_keeps_its_manifest_less_context() {
     // The boundary, kept: a scratch program outside any project still compiles

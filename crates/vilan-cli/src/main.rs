@@ -5903,13 +5903,50 @@ fn run_workspace(
 }
 
 /// Walks up from `start` for the nearest directory containing a `vilan.toml`.
+///
+/// B556: the walk goes up the FILESYSTEM, not up the spelling. `start` is
+/// often relative — `Path::parent` of a bare `main.vl` is `""`, of `../main.vl`
+/// is `..` — and a purely lexical walk stopped where the spelling ran out:
+/// `cd src && vilan check main.vl` asked only `src/` and compiled the file as
+/// belonging to no package, and from `src/deeper`, `../main.vl` asked `src/`
+/// and then the working directory, which is not above it at all. So where the
+/// spelling has no named directory left to drop, the walk climbs through
+/// `..`, and it ends where climbing no longer moves (the filesystem root).
+/// The answer keeps the caller's spelling (`..`, not an absolute path), so a
+/// diagnostic in the package renders against the path the user wrote.
 fn find_project_root(start: &Path) -> Option<PathBuf> {
-    let mut directory = start;
+    use std::path::Component;
+    // Where `directory` is on disk, for the walk's one stopping question; the
+    // empty spelling is the working directory.
+    fn on_disk(directory: &Path) -> Option<PathBuf> {
+        let spelled = if directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            directory
+        };
+        spelled.canonicalize().ok()
+    }
+    let mut directory = start.to_path_buf();
     loop {
         if directory.join("vilan.toml").is_file() {
-            return Some(directory.to_path_buf());
+            return Some(directory);
         }
-        directory = directory.parent()?;
+        directory = match directory.components().next_back() {
+            // A named directory: drop it, as the walk always has.
+            Some(Component::Normal(_)) => directory.parent()?.to_path_buf(),
+            // The filesystem root (or a Windows prefix): nothing above.
+            Some(Component::RootDir | Component::Prefix(_)) => return None,
+            // `""`, `.` or `..`: the spelling has nothing left to drop, so
+            // climb — until climbing stops moving.
+            Some(Component::CurDir | Component::ParentDir) | None => {
+                let up = directory.join("..");
+                let here = on_disk(&directory)?;
+                if on_disk(&up).is_none_or(|above| above == here) {
+                    return None;
+                }
+                up
+            }
+        };
     }
 }
 
