@@ -1357,13 +1357,100 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 fn vilan(staged: &Path) -> Command {
+    vilan_in(staged, &shared_target())
+}
+
+/// [`vilan`] building into `target` — a WORKER's own cargo target directory
+/// ([`worker_target`]) where legs run concurrently.
+fn vilan_in(staged: &Path, target: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
     command
         .current_dir(staged)
         .env("VILAN_STD", std_dir())
         .env("VILAN_RT", runtime_dir())
-        .env("CARGO_TARGET_DIR", shared_target());
+        .env("CARGO_TARGET_DIR", target);
     command
+}
+
+/// N158: one worker's own cargo target directory, beside [`shared_target`],
+/// keyed by the TEST (`tag`) as well as the worker. Cargo LOCKS a target
+/// directory for a whole build, so legs sharing one would build one at a
+/// time however many threads ran them — and the binary lands at
+/// `<target>/debug/<program>`, so two tests building one corpus program into
+/// one directory could run each other's binary mid-write (the reason every
+/// native test builds its own program name). `vilan-rt` is built once per
+/// directory (about 3 s cold), and the directories persist under
+/// `CARGO_TARGET_TMPDIR` like the shared one.
+fn worker_target(tag: &str, worker: usize) -> PathBuf {
+    let target =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("native-differential-{tag}-w{worker}"));
+    std::fs::create_dir_all(&target).expect("create a worker's cargo target directory");
+    target
+}
+
+/// N158: how many legs of one test run at once — four, or fewer on a
+/// smaller machine. A leg is a vilan compile, a cargo build, two runs: half
+/// the cores keeps a test from starving the suite's others.
+fn leg_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| (cores.get() / 2).clamp(1, 4))
+        .unwrap_or(1)
+}
+
+/// N158: `leg` over every item, at most [`leg_workers`] at once
+/// (`std::thread::scope`), each worker with its own cargo target directory
+/// ([`worker_target`], under the test's `tag`);
+/// the answers come back in the ITEMS' order, so a test's report reads as
+/// the serial loop's did. A leg that panics (an assertion inside it) is
+/// resumed on the test's own thread once every worker has stopped, so the
+/// test fails with the leg's own message.
+fn legs_in_parallel<T, R, F>(tag: &str, items: Vec<T>, leg: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T, &Path) -> R + Sync,
+{
+    let count = items.len();
+    let queue = std::sync::Mutex::new(items.into_iter().enumerate());
+    let answers: std::sync::Mutex<Vec<Option<R>>> =
+        std::sync::Mutex::new((0..count).map(|_| None).collect());
+    let workers = leg_workers().min(count.max(1));
+    let panics: Vec<Box<dyn std::any::Any + Send>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let (queue, answers, leg) = (&queue, &answers, &leg);
+                scope.spawn(move || {
+                    let target = worker_target(tag, worker);
+                    loop {
+                        let next = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .next();
+                        let Some((index, item)) = next else {
+                            break;
+                        };
+                        let answer = leg(item, &target);
+                        answers
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] = Some(answer);
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().err())
+            .collect()
+    });
+    if let Some(panic) = panics.into_iter().next() {
+        std::panic::resume_unwind(panic);
+    }
+    answers
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .into_iter()
+        .map(|answer| answer.expect("every leg answered"))
+        .collect()
 }
 
 /// What one program did.
@@ -1378,6 +1465,12 @@ enum Verdict {
 }
 
 fn compare(staged: &Path, program: &str) -> Verdict {
+    compare_in(staged, program, &shared_target())
+}
+
+/// [`compare`] building into `target` ([`legs_in_parallel`]).
+fn compare_in(staged: &Path, program: &str, target: &Path) -> Verdict {
+    let vilan = |staged: &Path| vilan_in(staged, target);
     let native = vilan(staged)
         .args(["run", "--backend", "rust", program])
         .output()
@@ -1444,8 +1537,11 @@ fn compare(staged: &Path, program: &str) -> Verdict {
 fn the_default_suite_is_byte_identical_on_both_backends() {
     let staged = stage();
     let mut broken = Vec::new();
-    for program in DEFAULT_SUITE {
-        match compare(&staged, program) {
+    let verdicts = legs_in_parallel("suite", DEFAULT_SUITE.to_vec(), |program, target| {
+        compare_in(&staged, program, target)
+    });
+    for (program, verdict) in DEFAULT_SUITE.iter().zip(verdicts) {
+        match verdict {
             Verdict::Identical => {}
             Verdict::Refused(reason) => broken.push(format!(
                 "{program}: the default suite must be programs the backend ACCEPTS, and this one \
@@ -6567,18 +6663,15 @@ fn the_native_leak_census_matches_its_table() {
         CAPTURED_CYCLE_PROBE,
     )
     .expect("write the captured-cycle probe");
-    let mut rows = Vec::new();
-    for program in DEFAULT_SUITE
+    let programs: Vec<&str> = DEFAULT_SUITE
         .iter()
         .copied()
         .chain(["native_probe_board.vl", "native_probe_captured_cycle.vl"])
-    {
-        let (minted, live) = leak_census_of(&staged, program);
-        rows.push(format!(
-            "{}\t{minted}\t{live}",
-            program.trim_end_matches(".vl")
-        ));
-    }
+        .collect();
+    let rows = legs_in_parallel("leaks", programs, |program, target| {
+        let (minted, live) = leak_census_of_in(&staged, program, target);
+        format!("{}\t{minted}\t{live}", program.trim_end_matches(".vl"))
+    });
     let measured = format!(
         "{}{}\n",
         concat!(
@@ -6630,7 +6723,12 @@ const CAPTURED_CYCLE_PROBE: &str = concat!(
 /// Runs `program` natively under `VILAN_NATIVE_LEAK_CENSUS=1` and answers
 /// `(minted, live)` from the line the runtime prints on stderr.
 fn leak_census_of(staged: &Path, program: &str) -> (u64, u64) {
-    let output = vilan(staged)
+    leak_census_of_in(staged, program, &shared_target())
+}
+
+/// [`leak_census_of`] building into `target` ([`legs_in_parallel`]).
+fn leak_census_of_in(staged: &Path, program: &str, target: &Path) -> (u64, u64) {
+    let output = vilan_in(staged, target)
         .env("VILAN_NATIVE_LEAK_CENSUS", "1")
         .args(["run", "--backend", "rust", program])
         .output()
@@ -7526,18 +7624,20 @@ fn the_native_copy_census_matches_its_table() {
     let staged = stage();
     std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
         .expect("write the board probe");
-    let mut rows = Vec::new();
-    for program in DEFAULT_SUITE
+    let programs: Vec<&str> = DEFAULT_SUITE
         .iter()
         .copied()
         .chain(std::iter::once("native_probe_board.vl"))
-    {
+        .collect();
+    // An emission (`build --stdout`) runs no cargo: the worker's target is
+    // never written.
+    let rows = legs_in_parallel("copies", programs, |program, _| {
         let (copied, elided, captured) = copy_census_line_of(&staged, program);
-        rows.push(format!(
+        format!(
             "{}\t{copied}\t{elided}\t{captured}",
             program.trim_end_matches(".vl")
-        ));
-    }
+        )
+    });
     let measured = format!(
         "{}{}\n",
         concat!(
@@ -8120,21 +8220,19 @@ fn a_resource_is_moved_not_copied_at_its_move_sites_natively() {
     }
 }
 
-/// F56's other half, as F97 left it: a resource ENUM with a `Drop` impl is
-/// still refused by name (its body before the variant's payloads is not
-/// emitted), and the STRUCT that was refused beside it builds and agrees.
+/// F56's other half: a resource ENUM with a `Drop` impl was refused by
+/// name until F116 (its body before the variant's payloads); it builds and
+/// agrees now, as the STRUCT refused beside it has since F97.
 #[test]
-fn a_resource_enum_with_drop_is_refused_by_name_and_its_struct_twin_builds_natively() {
+fn a_resource_enum_with_drop_and_its_struct_twin_build_natively() {
     let staged = stage();
     std::fs::write(staged.join("native_probe_drop_enum.vl"), DROP_ENUM_PROBE)
         .expect("write the probe program");
-    match compare(&staged, "native_probe_drop_enum.vl") {
-        Verdict::Refused(reason) => assert!(
-            reason.contains("the enum `Slot` with a `Drop` impl"),
-            "refused for another reason: {reason}"
-        ),
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
+    assert_eq!(
+        compare(&staged, "native_probe_drop_enum.vl"),
+        Verdict::Identical,
+        "a resource enum with a `Drop` impl builds natively (F116)"
+    );
     std::fs::write(
         staged.join("native_probe_drop_struct.vl"),
         DROP_STRUCT_PROBE,
@@ -10454,30 +10552,22 @@ fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
 
 /// A152: `zip_some`'s mapped-tuple stage (start, pull and attach over every
 /// input flow) and `unzip`'s split of a tuple-valued cell, at arity two and
-/// three. The claim is the differential's own — a refusal by name, never a
-/// different answer. F101 lowered the mapped tuple and its comprehension;
-/// `unzip`'s next wall is the walk by position (`for key in current.keys()`,
-/// a `TupleKey` per element type), refused as the `TupleKeys` intrinsic.
+/// three. F101 lowered the mapped tuple and its comprehension; F118 the walk
+/// by position (`for key in current.keys()`, a `TupleKey` per element type),
+/// the program's last wall — so the claim is the differential's own now.
 #[test]
-fn zip_some_and_unzip_are_never_a_different_answer_natively() {
+fn zip_some_and_unzip_are_identical_natively() {
     let staged = stage();
     std::fs::write(
         staged.join("native_probe_zip_some_unzip.vl"),
         include_str!("native/zip_some_unzip.vl"),
     )
     .expect("write the probe program");
-    let verdict = compare(&staged, "native_probe_zip_some_unzip.vl");
-    match &verdict {
-        Verdict::Identical => {}
-        Verdict::Refused(reason) => assert!(
-            reason.contains("the intrinsic `TupleKeys`"),
-            "refused for another reason than the walk by position: {reason}"
-        ),
-        other => panic!(
-            "the native backend must refuse this program by name or print what node prints: \
-             {other:?}"
-        ),
-    }
+    assert_eq!(
+        compare(&staged, "native_probe_zip_some_unzip.vl"),
+        Verdict::Identical,
+        "`zip_some` and `unzip` must print what node prints"
+    );
 }
 
 /// F68 + B503: `print` lays a value out by ONE rule on both backends — node's
@@ -10954,7 +11044,12 @@ struct Run {
 }
 
 fn run_on(staged: &Path, backend: Option<&str>, program: &str) -> Run {
-    let mut command = vilan(staged);
+    run_on_in(staged, backend, program, &shared_target())
+}
+
+/// [`run_on`] building into `target` ([`legs_in_parallel`]).
+fn run_on_in(staged: &Path, backend: Option<&str>, program: &str, target: &Path) -> Run {
+    let mut command = vilan_in(staged, target);
     command.arg("run");
     if let Some(backend) = backend {
         command.args(["--backend", backend]);
@@ -11064,31 +11159,36 @@ fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
             "from the closure",
         ),
     ];
-    let mut wrong = Vec::new();
-    for (path, location, message) in cases {
+    // One program per path, each under its OWN file name (N158: the legs
+    // run at once, and a native binary is named by its program), so a site
+    // names that file.
+    let legs = legs_in_parallel("panics", cases, |(path, location, message), target| {
+        let file = format!("native_probe_panic_locations_{path}.vl");
+        let location = location.replacen(PANIC_LOCATIONS_FILE, &file, 1);
         let expected = format!("panicked at {location}: {message}");
-        // One program per path, all under the same FILE name so the sites
-        // read the same; each is written over the last.
         std::fs::write(
-            staged.join(PANIC_LOCATIONS_FILE),
+            staged.join(&file),
             PANIC_LOCATIONS.replace("\"PATH\"", &format!("{path:?}")),
         )
         .expect("write the probe program");
-        let native = run_on(&staged, Some("rust"), PANIC_LOCATIONS_FILE);
+        let mut wrong = Vec::new();
+        let native = run_on_in(&staged, Some("rust"), &file, target);
         if native.code != Some(1) || native.stderr != format!("{expected}\n") {
             wrong.push(format!(
                 "{path}: native exited {:?} with stderr {:?}, expected exit 1 and {expected:?}",
                 native.code, native.stderr
             ));
         }
-        let javascript = run_on(&staged, None, PANIC_LOCATIONS_FILE);
+        let javascript = run_on_in(&staged, None, &file, target);
         if javascript.code != Some(1) || !javascript.stderr.lines().any(|line| line == expected) {
             wrong.push(format!(
                 "{path}: node exited {:?} with stderr {:?}, expected exit 1 and the line {expected:?}",
                 javascript.code, javascript.stderr
             ));
         }
-    }
+        wrong
+    });
+    let wrong: Vec<String> = legs.into_iter().flatten().collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
@@ -11098,10 +11198,10 @@ fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
 /// `error.message`, the native payload's message) — identical on both backends.
 #[test]
 fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
-    // Its OWN program name. The native binary lands at `<shared target>/debug/<name>`, and the
-    // sibling test above builds `PANIC_LOCATIONS_FILE` fifteen times with other paths; two tests
-    // building one name at once run each other's binary (the Order 47 seal: this test read the
-    // `"panic"` build's exit 1 under load).
+    // Its OWN program name. The native binary lands at `<target>/debug/<name>`, and the
+    // sibling test above built `PANIC_LOCATIONS_FILE` fifteen times with other paths until N158
+    // gave each path its own name; two tests building one name at once run each other's binary
+    // (the Order 47 seal: this test read the `"panic"` build's exit 1 under load).
     const CALLER_FILE: &str = "native_probe_panic_caller.vl";
     let staged = stage();
     std::fs::write(
@@ -11608,5 +11708,325 @@ fun main() {
         compare(&staged, "native_probe_b545.vl"),
         Verdict::Identical,
         "a one-slot tuple leaf under a view subject must write in place on both backends"
+    );
+}
+
+/// F113: a pattern over a `borrows` call's VIEW — `is`, `match`, a read
+/// view, an `Option` behind a view, a destructuring `let` — binds copies, as
+/// a pattern over a place does (rule 1). The base bound references under
+/// Rust's default binding modes and rustc refused the arithmetic (E0277).
+#[test]
+fn f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f113_view_call_subjects.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/view_call_subjects.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a destructured view from a `borrows` call must bind copies natively"
+    );
+}
+
+/// F114: a reading intrinsic over a spine of a `Shared` VIEW reads through
+/// a view of the cell, as F49's boxed binding does — `cell.read().items.len()`
+/// had copied the whole list out of the borrow to count it. The emission
+/// pin: the three copies left are the std calls (`contains`, `get`,
+/// `contains_key`), which run user `Hash`/`Eq` and are not intrinsics.
+#[test]
+fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f114_shared_view_reading_intrinsics.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_reading_intrinsics.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a reading intrinsic over a `Shared` view's field must answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("read_with(").count(),
+        3,
+        "only the three std calls copy their field out of the cell:\n{main}"
+    );
+}
+
+/// F116: F97's remainder — a GENERIC resource with a `Drop` impl calls the
+/// `drop` instance its instantiation binds (two instantiations of one
+/// declaration, a two-parameter impl, a generic resource holding two
+/// others, a move into a function and into `drop`), and an ENUM with one
+/// tears down through a Rust `Drop` impl: through a view it drops at its
+/// last use, and a by-value `match` CONSUMES it (R6: its teardown is
+/// suppressed, the captures own the payloads — rustc's E0509 before).
+#[test]
+fn f116_a_generic_resource_and_an_enum_with_drop_tear_down_alike_on_both_backends() {
+    let staged = stage();
+    for (file, source) in [
+        (
+            "native_probe_f116_generic_resource_teardown.vl",
+            include_str!("native/generic_resource_teardown.vl"),
+        ),
+        (
+            "native_probe_f116_enum_resource_teardown.vl",
+            include_str!("native/enum_resource_teardown.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, file),
+            Verdict::Identical,
+            "{file}: the teardowns must run in the same order on both backends"
+        );
+    }
+}
+
+/// A tuple, a fixed array or one enum variant holding TWO values that owe a
+/// teardown printed the teardowns in the opposite order to the JS backend,
+/// silently: vilan drops an aggregate's members in reverse (destruction.md
+/// §5), Rust drops a tuple's, an array's and a variant's in declaration
+/// order, and only a struct's fields can be declared reversed (F97). Each
+/// is refused by name now where Rust's glue would drop it WHOLE; ONE such
+/// member, a struct holding two, and a variant CONSUMED by a `match` (its
+/// captures drop on their own, resource_take.vl's `Couple::Two`) still build
+/// and agree.
+#[test]
+fn an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered() {
+    let staged = stage();
+    let handle = concat!(
+        "import std::drop::Drop;\n",
+        "import std::io::print;\n",
+        "\n",
+        "[resource]\n",
+        "struct Handle {\n",
+        "\tname: str,\n",
+        "}\n",
+        "\n",
+        "impl Handle with Drop {\n",
+        "\tfun drop(&mut self) {\n",
+        "\t\tprint(i\"closing {self.name}\");\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+    );
+    let cases = [
+        (
+            "native_probe_unordered_variant.vl",
+            "[resource]\nenum Slot {\n\tEmpty,\n\tHeld(Handle, Handle),\n}\n\nfun main() {\n\
+             \tlet held = Slot::Held(Handle { name = \"a\" }, Handle { name = \"b\" });\n\
+             \tprint(\"end\");\n}\n",
+            "the variant `Slot::Held` holding two or more values that owe a teardown",
+        ),
+        (
+            "native_probe_unordered_tuple.vl",
+            "fun main() {\n\tlet pair = (Handle { name = \"a\" }, Handle { name = \"b\" });\n\
+             \tprint(\"end\");\n}\n",
+            "a tuple holding two or more values that owe a teardown",
+        ),
+        (
+            "native_probe_unordered_array.vl",
+            "fun main() {\n\
+             \tlet fixed: [Handle; 2] = [Handle { name = \"a\" }, Handle { name = \"b\" }];\n\
+             \tprint(\"end\");\n}\n",
+            "a fixed array holding two or more values that owe a teardown",
+        ),
+    ];
+    for (file, main, reason) in cases {
+        std::fs::write(staged.join(file), format!("{handle}{main}"))
+            .expect("write the probe program");
+        match compare(&staged, file) {
+            Verdict::Refused(refused) => assert!(
+                refused.contains(reason),
+                "{file}: refused for another reason: {refused}"
+            ),
+            other => panic!("{file}: expected a refusal by name, got {other:?}"),
+        }
+    }
+    let ordered = "native_probe_ordered_teardowns.vl";
+    std::fs::write(
+        staged.join(ordered),
+        format!(
+            "{handle}[resource]\nstruct Both {{\n\tfirst: Handle,\n\tsecond: Handle,\n}}\n\n\
+             [resource]\nenum One {{\n\tNone,\n\tHeld(Handle, i32),\n}}\n\n\
+             [resource]\nenum Couple {{\n\tTwo(Handle, Handle),\n\tNeither,\n}}\n\n\
+             fun main() {{\n\
+             \tlet consumed = Couple::Two(Handle {{ name = \"e\" }}, Handle {{ name = \"f\" }});\n\
+             \tmatch consumed {{\n\
+             \t\tCouple::Two(let left, let right) => print(left.name + right.name),\n\
+             \t\tCouple::Neither => print(\"neither\"),\n\
+             \t}}\n\
+             \tlet both = Both {{ first = Handle {{ name = \"a\" }}, second = Handle {{ name = \"b\" }} }};\n\
+             \tlet one = One::Held(Handle {{ name = \"c\" }}, 1);\n\
+             \tlet pair = (Handle {{ name = \"d\" }}, 2);\n\
+             \tprint(\"end\");\n}}\n"
+        ),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, ordered),
+        Verdict::Identical,
+        "one teardown per aggregate, or a struct's fields, keep building and agreeing"
+    );
+}
+
+/// F117: a `Self` written in a member of a bare-trait impl is the receiver
+/// the instance is minted for — the analyzer types it as the trait (B567
+/// made the CALL read the receiver), and natively a trait is no value, so
+/// the member was refused as "a trait object". The rewrite is a trait
+/// default's (`current_self_type`), scoped to the impl's subject trait.
+#[test]
+fn f117_a_self_in_a_bare_trait_impl_member_is_the_receiver_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f117_bare_trait_self.vl";
+    std::fs::write(staged.join(file), include_str!("native/bare_trait_self.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a bare-trait impl member's `Self` must be its receiver natively"
+    );
+}
+
+/// A generic operator (`a != b` with `a: T`, `T: PartialEq`; `<` over
+/// `PartialOrd`; `+` over `Add`) whose concrete type has a WRITTEN impl
+/// calls that impl natively, as the JS emitter re-dispatches it. The base
+/// emitted Rust's own operator, whose `==` over an emitted struct is the
+/// derived structural one: `Loose`'s one-field `eq` answered `true` through
+/// a generic `!=`, a `List`'s `==` and an `Option`'s, where JS answered with
+/// the program's impl.
+#[test]
+fn a_generic_operator_calls_the_written_impl_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_generic_operator_impls.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_operator_impls.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a generic operator must call the concrete type's written impl natively"
+    );
+}
+
+/// F118: std's tuple-family blankets (B443: `compare`'s `eq`, `hash`'s key,
+/// `debug`'s rendering) build natively — `TupleKeys`, `TupleEntries`,
+/// `TupleLen` and `TupleGet` against the instance's tuple, and a `for` over
+/// a tuple unrolled one body per position (its jumps labelled).
+#[test]
+fn f118_the_tuple_blankets_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f118_tuple_blankets.vl";
+    std::fs::write(staged.join(file), include_str!("native/tuple_blankets.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "tuple `==`, a tuple key and a tuple's `debug` must agree natively"
+    );
+}
+
+/// F119: a blanket method on an unannotated FUNCTION ITEM (`let f =
+/// nothing; f.leaf()`, B565) mints its instance at the item's own type,
+/// which the native backend refused to render ("a value of type `a function
+/// value`"). The type is the counted closure the item's value is, keyed per
+/// item; a binding of it calls the item through its parameters' receiving
+/// forms (`b(&mut count)` was rustc's E0308).
+#[test]
+fn f119_a_blanket_method_on_a_function_item_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f119_function_item_receivers.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/function_item_receivers.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a blanket method on a function item must answer the same natively"
+    );
+}
+
+/// F120: an `async` block whose body is itself a handle (`async { async {
+/// "s" } }`, nested three deep, or a call answering a `Task`) is one
+/// `Task<payload>`, as the analyzer types it and JS's promise adoption
+/// answers: natively each layer is one more `.await` inside the block, where
+/// the base handed the inner handle back as the value and rustc refused it.
+#[test]
+fn f120_a_nested_async_block_is_assimilated_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f120_nested_async_blocks.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/nested_async_blocks.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested `async` block must answer its payload natively"
+    );
+}
+
+/// F121: a struct with a fixed-array field emits a `Js` impl that reads it,
+/// and vilan-rt had none for `[T; N]`, so the struct did not build natively
+/// whether or not it was printed (rustc E0277). The probe prints arrays
+/// whole, in a struct, in an `Option`, through a generic, by element and by
+/// loop. F109's repro is its head: a list literal under `[i32; 3]`, which
+/// F100 had already lowered to a Rust array.
+#[test]
+fn f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f121_fixed_array_values.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/fixed_array_values.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a fixed array and a struct holding one must print the same natively"
+    );
+}
+
+/// N158: the four longest legs run under [`legs_in_parallel`], whose two
+/// claims are the serial loop's: answers come back in the ITEMS' order
+/// whatever order the workers finish in, and a leg's panic fails the test
+/// with the leg's own payload once every worker has stopped.
+#[test]
+fn parallel_legs_answer_in_order_and_resume_a_legs_panic() {
+    let items: Vec<usize> = (0..23).collect();
+    let answers = legs_in_parallel("order-check", items.clone(), |item, _| {
+        // Later items finish first, so completion order is not item order.
+        std::thread::sleep(std::time::Duration::from_millis((23 - item as u64) % 5));
+        item * 10
+    });
+    assert_eq!(
+        answers,
+        items.iter().map(|item| item * 10).collect::<Vec<_>>()
+    );
+    let caught = std::panic::catch_unwind(|| {
+        legs_in_parallel("panic-check", (0..9).collect(), |item: usize, _| {
+            assert_ne!(item, 6, "leg six fails");
+            item
+        })
+    });
+    let payload = caught.expect_err("a leg's panic fails the call");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        message.contains("leg six fails"),
+        "the leg's own message: {message:?}"
     );
 }

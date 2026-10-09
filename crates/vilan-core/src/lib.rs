@@ -49,6 +49,7 @@ pub mod printer;
 pub mod span;
 pub mod stack_guard;
 pub mod target;
+pub mod teardown;
 pub mod token;
 pub mod track_caller;
 pub mod transformer;

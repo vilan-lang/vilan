@@ -1,0 +1,62 @@
+// F114: a READING intrinsic (`len`, `get`, `trim`, a subscript chain's
+// `len`) over a field of a `Shared` view read through a view of the cell,
+// as F49 reads a boxed binding's: `cell.read().items.len()` had copied the
+// whole list out of the borrow (`read_with(|view| view.items.clone())`) to
+// count it. The receiver's cell is settled before the arguments, the borrow
+// taken after them (`touch` pushes first and the read sees the push, as JS's
+// does). `HashSet::contains` and `HashMap::get` are std calls, not
+// intrinsics: they still read a copy.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::shared::Shared;
+
+struct Bag {
+	items: List<i32>,
+	names: List<str>,
+	label: str,
+	seen: HashSet<str>,
+	counts: HashMap<str, i32>,
+	inner: Inner,
+}
+
+struct Inner {
+	rows: List<List<i32>>,
+}
+
+struct Holder {
+	cell: Shared<Bag>,
+}
+
+fun touch(cell: Shared<Bag>): usize {
+	cell.write().items.push(99);
+	1
+}
+
+fun main() {
+	let cell = Shared::new(Bag {
+		items = [1, 2, 3],
+		names = ["a", "b"],
+		label = "  Bag  ",
+		seen = HashSet::new(),
+		counts = HashMap::new(),
+		inner = Inner { rows = [[1], [2, 3]] },
+	});
+	cell.write().seen.insert("x");
+	cell.write().counts.insert("k", 4);
+	print(cell.read().items.len());
+	print(cell.write().items.len());
+	print(cell.read().names.get(1));
+	print(cell.read().label.trim());
+	print(cell.read().label.len());
+	print(cell.read().seen.contains("x"));
+	print(cell.read().counts.get("k"));
+	print(cell.read().counts.contains_key("z"));
+	print(cell.read().inner.rows[1].len());
+	let index = 0;
+	print(cell.read().inner.rows[index].len());
+	let holder = Holder { cell };
+	print(holder.cell.read().items.len());
+	print(cell.read().items.get(touch(cell)));
+	print(cell.read().items.len() + cell.read().names.len());
+}

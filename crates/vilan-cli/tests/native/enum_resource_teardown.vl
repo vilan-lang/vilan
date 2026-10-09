@@ -1,0 +1,111 @@
+// F116: an ENUM with a `Drop` impl was refused by name. Its body is a Rust
+// `Drop` impl now, run before the payloads drop: inspected through a view
+// (`match &slot`, `&named is ..`) it drops at its last use; CONSUMED by a
+// by-value `match` (R6) its teardown is suppressed and each capture owns its
+// payload — which Rust refuses for a `Drop` type (E0509), so the subject is
+// held undropped and each leg reads its captures out. A generic enum's
+// `drop` is its instance's.
+import std::drop::Drop;
+import std::io::print;
+
+[resource]
+struct Handle {
+	name: str,
+}
+
+impl Handle with Drop {
+	fun drop(&mut self) {
+		print(i"closing handle {self.name}");
+	}
+}
+
+[resource]
+enum Slot {
+	Empty,
+	Named(str),
+	Held(Handle, i32),
+}
+
+impl Slot with Drop {
+	fun drop(&mut self) {
+		match &self {
+			Slot::Empty => print("closing an empty slot"),
+			Slot::Named(let name) => print(i"closing slot {*name}"),
+			Slot::Held(_, let count) => print(i"closing a held slot {*count}"),
+		}
+	}
+}
+
+fun describe(slot: &Slot): str {
+	match &slot {
+		Slot::Empty => "empty",
+		Slot::Named(let name) => *name,
+		Slot::Held(let handle, _) => handle.name,
+	}
+}
+
+[resource]
+struct Wrapper {
+	handle: Handle,
+	count: i32,
+}
+
+impl Wrapper with Drop {
+	fun drop(&mut self) {
+		print("closing a wrapper");
+	}
+}
+
+[resource]
+enum Boxed<T> {
+	Vacant,
+	Full(T),
+}
+
+impl Boxed<type T> with Drop {
+	fun drop(&mut self) {
+		print("closing a box");
+	}
+}
+
+fun take(own slot: Slot): str {
+	match slot {
+		Slot::Held(let handle, let count) => {
+			print(count);
+			handle.name
+		},
+		Slot::Named(let name) => name,
+		Slot::Empty => "empty",
+	}
+}
+
+fun main() {
+	let empty = Slot::Empty;
+	let named = Slot::Named("n");
+	let kept = Slot::Held(Handle { name = "k" }, 2);
+	print(describe(&empty));
+	print(describe(&named));
+	print(describe(&kept));
+	if &named is Slot::Named(let name) {
+		print(*name);
+	}
+	let held = Slot::Held(Handle { name = "h" }, 2);
+	match held {
+		Slot::Held(let handle, let count) => print(handle.name),
+		Slot::Named(_) => print("named"),
+		Slot::Empty => print("empty"),
+	}
+	print(take(Slot::Held(Handle { name = "i" }, 3)));
+	print(take(Slot::Named("n")));
+	print(take(Slot::Empty));
+	let wrapper = Wrapper { handle = Handle { name = "w" }, count = 1 };
+	print(wrapper.count);
+	let boxed = Boxed::Full(Handle { name = "g" });
+	let other: Boxed<i32> = Boxed::Full(5);
+	match boxed {
+		Boxed::Full(let handle) => print(handle.name),
+		Boxed::Vacant => print("vacant"),
+	}
+	print(other is Boxed::Full(_));
+	print("end");
+}

@@ -23,6 +23,67 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**F113: a pattern over the view a `borrows` call hands back binds copies natively — `if cell.slot() is (let cells, let weight)` bound `weight` as a `&mut i32`, and `cells.len().as_i32() + weight` was refused by rustc (E0277); JS printed 5.** A capture is a copy (rule 1), and a pattern over a PLACE already copies its subject first (F20); a call to a `borrows` function names storage the same way, but its native value is a reference, so Rust's default binding modes bound every capture through it. The subject is now the pointee's copy (`(*call).clone()`, F88's rule for a view) at every pattern position: an `is` test, a `match`, a read view (`&T`), an `Option` behind a view, and a destructuring `let`. A view WRAPPED in a payload (`Option<&mut T>`, the wrapped-view capture) is a value natively and is untouched. Pin: `native_differential::f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends` (`native/view_call_subjects.vl`, red on 0.46.0). capture-clones.vl's `called_component` is the corpus site; that program's first wall is still B579 (mixed integer widths). Tracker F113.
+
+---
+
+<!-- family: performance -->
+**F114: a reading intrinsic over a field of a `Shared` view reads through a view of the cell natively — `cell.read().items.len()` had copied the whole list out of the cell's borrow (`read_with(|view| view.items.clone())`) to count it.** F49 read a boxed binding's receiver this way for the reading intrinsics (`len`, `get`, `contains`, `contains_key`, the `str` readers); the same view serves a spine over a `Shared` view call, fields, tuple slots and subscripts alike. An intrinsic runs no user code, so nothing can meet the borrow (F39's alias through a parameter needs a callee). The cell's handle is settled with the subscripts, ahead of the arguments, and the borrow is taken after them, the order spec §6.9's native note states for F49. A std METHOD over such a field (`HashSet::contains`, `HashMap::get`) is a call, not an intrinsic: it runs the key's `Hash`/`Eq`, and still reads a copy. Pin: `native_differential::f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_backends` (`native/shared_view_reading_intrinsics.vl`: eleven intrinsic reads leave no copy; the three left are the std calls). Tracker F114.
+
+---
+
+<!-- family: feature -->
+**F116: F97's remainder — a GENERIC resource with a `Drop` impl (`impl Guard<type T> with Drop`) and an ENUM with one build natively and tear down as on JS; both were refused by name.** Each instantiation's Rust `Drop` impl calls the `drop` instance its own arguments bind: the impl's subject, written in the impl's binders (`Guard<T>`), is matched against the instantiation (`Guard<str>`), so two instantiations of one declaration close each with its own body and a two-parameter impl reads both. An enum's `Drop` impl runs its body before the payloads drop. Inspected through a view (`match &slot`, `&named is ..`) the enum drops at its last use like any binding; CONSUMED by a by-value `match` (destruction.md R6: the subject's teardown is suppressed and each capture owns its payload) it is held undropped (`ManuallyDrop`) and each leg reads its captures out by value, which is what Rust's E0509 had refused. A guarded leg of such a consuming `match` stays refused by name. Pins: `native_differential::f116_a_generic_resource_and_an_enum_with_drop_tear_down_alike_on_both_backends` (`native/generic_resource_teardown.vl`, `native/enum_resource_teardown.vl`), and F56's enum pin flipped from a refusal to the claim (`a_resource_enum_with_drop_and_its_struct_twin_build_natively`). Tracker F116.
+
+---
+
+<!-- family: miscompile -->
+**A tuple, a fixed array or one enum variant holding TWO values that owe a teardown is refused by name natively, where it printed the teardowns in the opposite order to JS.** vilan drops an aggregate's members in reverse (destruction.md §5); Rust drops a tuple's, an array's and a variant's in declaration order, and only a struct's fields can be declared reversed (F97), so `let pair = (Handle { .. }, Handle { .. })` closed `a` then `b` natively and `b` then `a` on JS, silently. The refusal stands where Rust's own glue would drop the aggregate WHOLE (a binding the block owes a teardown, at any depth of its type) and names the aggregate and the steer (hold them in a struct's fields); a variant CONSUMED by a by-value `match`, whose captures drop on their own (resource_take.vl's `Couple::Two`), one teardown per aggregate, and a struct holding two, build and agree as before. Pin: `native_differential::an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered` (the variant, the tuple and the array refused, a struct and a one-resource variant and tuple identical; red on 0.46.0). Found building F116.
+
+---
+
+<!-- family: fix -->
+**F117: a member of a blanket over a parameterized BARE trait (`impl Iterator<type T> with Again<T>`) that writes `Self` builds natively; it was refused as "a value of type `a trait object`".** B567 made the call read the bare-trait subject as the binder bound to the receiver, so `[5, 6].iter().map(..).again()` typed and ran on JS; the analyzer still types the member's own `Self` as the trait, in a type id of its own beside the subject's, and the native instance rendered it as one. An instance of such a member now reads a `Self` of its subject trait as the receiver the subject is bound to — the rewrite a trait default's `Self` already takes — in the signature, the body and nested positions (`Option<Self>`). Pin: `native_differential::f117_a_self_in_a_bare_trait_impl_member_is_the_receiver_on_both_backends` (`native/bare_trait_self.vl`: std's list iterator and a user one; `Self` returned, taken, annotated and nested). Tracker F117.
+
+---
+
+<!-- family: miscompile -->
+**A generic operator whose concrete type has a WRITTEN impl calls that impl natively — `a != b` with `a: T`, `T: PartialEq`, over `struct Loose` whose `eq` compares one field, answered `true` natively and `false` on JS, and so did a `List`'s `==` and an `Option`'s over it.** The analyzer records the operator's re-dispatch on the binary expression (on the constraint, or on the type a trait default is specialized for), and the JS emitter has always read it; the native emitter emitted Rust's own operator, whose `==` over an emitted struct is the derived STRUCTURAL equality. It now reads the same record, as the JS emitter's `compares_natively` does: over a scalar (the numbers, `str`, `BigInt`), `bool` or a backed enum the operator stays Rust's, and over any other type whose member is a function (a written `eq`, `partial_compare`, `add`, or the derive's) that function is called. Pin: `native_differential::a_generic_operator_calls_the_written_impl_on_both_backends` (`native/generic_operator_impls.vl`: a one-field `eq` through a generic `!=`, a `List`, an `Option`; a reversed `PartialOrd` through a generic `<`; an `Add` through a generic `+`; a derived impl and scalars; red on 0.46.0). Found building F118.
+
+---
+
+<!-- family: feature -->
+**F118: std's tuple-family blankets build natively — tuple `==` (`compare`'s position-by-position `eq`), a tuple as a map or set key, and `(..).debug()`; each was refused at the `TupleKeys` intrinsic.** `std::tuple`'s readers are emitted against the instance's concrete tuple: `len()` is the arity, `keys()` a `TupleKey` per position, `entries()` a `(key, copy)` pair per position, and `get(key)` a copy of the element the key names, at the type the call's `U` binds (`vilan_rt::tuple_get`; a key is a value, so its position is read at run time). A `for` over a tuple is UNROLLED, one body per position with the binder at that position's own type (the body was checked once, at the element template) — the lowering F101 gave a tuple comprehension — and `jump break` / `jump continue` leave the walk and the position through labelled blocks. A comprehension over `keys()` builds too, and so does `zip_some` / `unzip` (A152), whose last wall this was. A walk nested in another's slot (a tuple of tuples) rebinds the element template rather than reading the outer slot's binding. Pins: `native_differential::f118_the_tuple_blankets_are_identical_on_both_backends` (`native/tuple_blankets.vl`), A152's pin flipped to the claim (`zip_some_and_unzip_are_identical_natively`). Tracker F118.
+
+---
+
+<!-- family: fix -->
+**F119: a blanket method on an unannotated FUNCTION ITEM — `let f = nothing; f.leaf()`, which B565 made resolve — builds natively; it was refused as "a value of type `a function value`".** The blanket's `T` binds the item's own type, and the native backend now renders that type as what the item's value is: the counted closure over its signature (`Rc<dyn Fn(..) -> ..>`, each parameter in its receiving form), keyed per item so two items of different signatures are two instances. The item's value is built at that type, so an unannotated binding of it is the same closure a typed position takes, and a binding of an item that takes a view calls it with the view (`let b = bump; b(&mut count)` was rustc's E0308). The fix is the native one the item's second door named; the analyzer's recorded substitution is untouched. Pin: `native_differential::f119_a_blanket_method_on_a_function_item_is_identical_on_both_backends` (`native/function_item_receivers.vl`: a bare and a bound item, `&self` and `self` blankets, a one-parameter item, a `&mut` one, an item through a generic, a field). Tracker F119.
+
+---
+
+<!-- family: fix -->
+**F120: an `async` block whose body is itself a handle — `async { async { "s" } }`, nested deeper, or a call answering a `Task` — builds natively and answers its payload; rustc refused the emitted Rust (E0308).** The analyzer types such a block by the payload (`assimilated_task_payload`), as the JS host's promise adoption answers it; the native block handed the inner handle back as its value, one `Task` layer deeper than its type. Each layer the body's value carries is now one more `.await` inside the block, the way F107 awaits a written-async call's declared handle. Pre-existing (the plain `fun deeper(): Task<str> { async { async { "s" } } }` failed the same way), and B559's written `Task<Task<str>>` reaches it too. Pin: `native_differential::f120_a_nested_async_block_is_assimilated_on_both_backends` (`native/nested_async_blocks.vl`: two and three deep with a capture, a relayed `Task` call, a written-async `Task<Task<str>>`, a plain block). Tracker F120.
+
+---
+
+<!-- family: fix -->
+**F121: a struct with a fixed-array field builds natively — `struct Pixel { rgba: [u8; 4] }` was refused by rustc (E0277) before the program printed anything, because the struct's emitted `Js` impl reads every field and vilan-rt had no `Js` for `[T; N]`.** It has one now, laid out as a `List` is (node prints both as arrays), so an array prints whole, in a struct, in an `Option` and through a generic as on JS. vilan-rt's other per-type traits already covered arrays (`Json`; `Clone` and `PartialEq` are Rust's). F109's own repro — a list literal under `[i32; 3]` handed to a `[i32; 3]` parameter — already ran on 0.46.0 (F100 lowered the directed literal to a Rust array); it heads this pin. Pin: `native_differential::f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends` (`native/fixed_array_values.vl`, red on 0.46.0 at the struct). Tracker F121 (papers-49's find), F109 (closed as fixed by F100).
+
+---
+
+<!-- family: tooling -->
+**N154: the teardown EXTENT resolution is written once — `vilan_core::teardown` — and both emitters call it.** The JS transformer's `walk_scope_body` and the native emitter's teardown plan (F97, which had copied `teardown_extent`, `widen_over_declarations`, `own_teardown_extent` and `resolve_extent` into vilan-rust) both ask `teardown::region_end` where a declaration's region closes and `teardown::statement_teardown` what a statement owes, so the two backends print their teardowns in one order because there is one answer rather than two copies that agree. A mechanical move, no behaviour change: no corpus golden moved, F97's and F116's teardown pins and resource*.vl are identical as before. The pass map is unchanged (no pass added, removed or moved: the module is emitter-side, pure over `Program`). Tracker N154.
+
+---
+
+<!-- family: tooling -->
+**N158: `native_differential`'s four longest legs run their programs concurrently — the default suite, the panic-path sites, the leak census and the copy census — about 2.4x shorter in wall each (86/78/53/30 s serially against 37/34/25/18 s under a heavier load, measured alone on this machine).** Each test's loop is `legs_in_parallel`: a `std::thread::scope` of up to four workers (half the cores), each building into its OWN cargo target directory keyed by the test and the worker (cargo locks a target directory for a whole build, and a binary lands under its program's name, so two tests sharing one could run each other's binary); answers come back in the list's order and a leg's panic is resumed on the test's thread with its own message. The panic-path test gives each of its fifteen programs its own file name (it had written one name fifteen times). Every assertion is the serial loop's. Pin: `native_differential::parallel_legs_answer_in_order_and_resume_a_legs_panic`. Tracker N158.
+
+
 ## v0.46.0 — 2026-10-09
 
 <!-- family: breaking -->

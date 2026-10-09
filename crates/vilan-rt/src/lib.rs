@@ -202,11 +202,103 @@ js_for_tuple!(A, B, C, D);
 js_for_tuple!(A, B, C, D, E);
 js_for_tuple!(A, B, C, D, E, F);
 
+/// A position in a tuple (`std::tuple`'s `TupleKey<T, U>`, F118): the position
+/// alone. The vilan type also names the family and the element type, which
+/// are the compiler's to check; at run time a key is where it points, as the
+/// JS backend's `[at]` is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TupleKey(pub usize);
+
+impl Js for TupleKey {
+    fn js(&self) -> String {
+        vec![self.0].js()
+    }
+}
+
+impl Json for TupleKey {
+    fn json(&self) -> String {
+        vec![self.0].json()
+    }
+}
+
+/// A tuple read at a position the program holds as a VALUE (a [`TupleKey`])
+/// rather than writes as a slot: each position's element, as `Any`, so
+/// [`tuple_get`] can hand it back at the type the call site names. Written
+/// for the arities [`Js`] is.
+pub trait TupleAt {
+    /// The element at `at`, or `None` past the end.
+    fn element_at(&self, at: usize) -> Option<&dyn std::any::Any>;
+}
+
+macro_rules! tuple_at_for_tuple {
+    ($($name:ident $at:tt),+) => {
+        impl<$($name: 'static),+> TupleAt for ($($name,)+) {
+            fn element_at(&self, at: usize) -> Option<&dyn std::any::Any> {
+                match at {
+                    $($at => Some(&self.$at),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+/// A tuple a frame holds by reference (a `&self` receiver) reads as the tuple.
+impl<T: TupleAt + ?Sized> TupleAt for &T {
+    fn element_at(&self, at: usize) -> Option<&dyn std::any::Any> {
+        (**self).element_at(at)
+    }
+}
+
+tuple_at_for_tuple!(A 0);
+tuple_at_for_tuple!(A 0, B 1);
+tuple_at_for_tuple!(A 0, B 1, C 2);
+tuple_at_for_tuple!(A 0, B 1, C 2, D 3);
+tuple_at_for_tuple!(A 0, B 1, C 2, D 3, E 4);
+tuple_at_for_tuple!(A 0, B 1, C 2, D 3, E 4, F 5);
+
+/// `tuple.get(key)` (`std::tuple`, F118): a copy of the element `key` names,
+/// at the type `U` the call site reads it as. The compiler proved the key
+/// names a position of this tuple's family holding a `U`, so a miss is a
+/// backend defect and says so.
+pub fn tuple_get<U: Clone + 'static>(tuple: &impl TupleAt, key: TupleKey) -> U {
+    match tuple
+        .element_at(key.0)
+        .and_then(|element| element.downcast_ref::<U>())
+    {
+        Some(element) => element.clone(),
+        None => panic_with(&format!(
+            "a tuple key at position {} does not name an element of the type it was read as \
+             (a backend defect)",
+            key.0
+        )),
+    }
+}
+
 /// A `List` is a JS array: node's layout ([`inspect::array`]). At the top of a
 /// `print`, and inside another list, its elements are in the region the JS
 /// backend converts at the host boundary (B503), so they render HOSTED; inside
 /// any other container they render as stored.
 impl<T: Js> Js for Vec<T> {
+    fn js(&self) -> String {
+        self.js_hosted()
+    }
+    fn js_nested(&self) -> String {
+        inspect::array(self.iter().map(|item| item as &dyn Js), |item| {
+            item.js_nested()
+        })
+    }
+    fn js_hosted(&self) -> String {
+        inspect::array(self.iter().map(|item| item as &dyn Js), |item| {
+            item.js_hosted()
+        })
+    }
+}
+
+/// A fixed array (`[T; n]`) is a JS array too, laid out as a `List` is
+/// (F121: every struct holding an array field emits a `Js` impl that reads
+/// it, printed or not, so the struct did not build).
+impl<T: Js, const N: usize> Js for [T; N] {
     fn js(&self) -> String {
         self.js_hosted()
     }
