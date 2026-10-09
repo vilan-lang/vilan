@@ -60916,6 +60916,23 @@ impl<'src> Analyzer<'src> {
                         (Type::Enum(id, _), false) => {
                             Type::Enum(id, self.with_defaulted_arguments(id, argument_type_ids))
                         }
+                        // B559: a WRITTEN handle assimilates as a formed one
+                        // does (`assimilated_task_payload`): `Task<Task<str>>`
+                        // IS `Task<str>` — the host adopts a task's result —
+                        // and kept as two layers it never reconciled with the
+                        // `Task<str>` its body forms.
+                        (Type::Struct(id, _), false) if self.is_task_handle(id) => {
+                            let mut arguments =
+                                self.with_defaulted_arguments(id, argument_type_ids);
+                            if let Some(payload_id) = arguments.first_mut() {
+                                let payload = payload_id.get_type(self);
+                                let assimilated = self.assimilated_task_payload(payload.clone());
+                                if assimilated != payload {
+                                    *payload_id = assimilated.get_type_id(self);
+                                }
+                            }
+                            Type::Struct(id, arguments)
+                        }
                         (Type::Struct(id, _), false) => {
                             Type::Struct(id, self.with_defaulted_arguments(id, argument_type_ids))
                         }

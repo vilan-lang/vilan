@@ -3026,7 +3026,9 @@ fn a_chain_of_nested_tasks_collapses_to_one_layer() {
 }
 
 /// The same chain typed the old way is rejected at every depth — the pin that
-/// the collapse is total, not a single-layer trim.
+/// the collapse is total, not a single-layer trim. The WRITTEN deep type
+/// assimilates too since B559 (`Task<Task<i32>>` is `Task<i32>`), so the
+/// refusal names the one layer the awaited value is not.
 #[test]
 fn a_chain_of_nested_tasks_rejects_the_deep_type() {
     assert_fails_with(
@@ -3040,7 +3042,7 @@ fn a_chain_of_nested_tasks_rejects_the_deep_type() {
             let value: Task<Task<i32>> = await c;
         }
         "#,
-        "Expected Task<Task<i32>>, but got i32 instead.",
+        "Expected Task<i32>, but got i32 instead.",
     );
 }
 
@@ -7890,5 +7892,40 @@ fn a158_push_many_of_an_empty_run_appends_nothing() {
         main();
         "#,
         "1\n",
+    );
+}
+
+/// B559: a WRITTEN nested handle assimilates as a formed one does. A task of a
+/// task does not exist at run time (the host adopts a task's result), and
+/// `assimilated_task_payload` normalized every handle the solver FORMS; the
+/// written annotation kept its two layers, so `async fun deeper():
+/// Task<Task<str>> { async { async { "s" } } }` was refused "Expected
+/// Task<Task<str>>, but got Task<str>". Written at a return, a `let` and a
+/// parameter, each now IS `Task<..>` of the innermost payload.
+#[test]
+fn b559_a_written_nested_task_is_the_inner_task() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::task::Task;
+
+        async fun deeper(): Task<Task<str>> { async { async { "s" } } }
+        async fun take(t: Task<Task<i32>>): i32 {
+            let v: i32 = await t;
+            v + 1
+        }
+
+        async fun main() {
+            let t: Task<Task<i32>> = async { 1 };
+            let v: i32 = await t;
+            print(v);
+            print(take(async { 41 }));
+            let s: str = deeper();
+            print(s);
+        }
+
+        main();
+        "#,
+        "1\n42\ns\n",
     );
 }

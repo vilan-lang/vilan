@@ -183,7 +183,8 @@ The explicit forms:
 one: spawning a computation that produces a task yields `Task<T>`, not
 `Task<Task<T>>`, and one `await` reaches the value. This holds however the
 type arises — including a generic `T` that instantiates at a task — so
-`Task<..>` is idempotent: `Task<Task<T>>` is not a type any expression has.
+`Task<..>` is idempotent: `Task<Task<T>>` is not a type any expression has,
+and written as an annotation it means `Task<T>`.
 
 ```vilan
 import std::task::Task;
