@@ -33,6 +33,8 @@
 // observation helpers) — each a different subset; `support/mod.rs`'s precedent.
 #![allow(dead_code)]
 
+pub mod packages;
+
 use std::path::{Component, Path, PathBuf};
 
 use vilan_core::{

@@ -4725,7 +4725,7 @@ pub struct Analyzer<'src> {
     /// pass refuses it by name: `(member, implementation index, member name)`
     /// by call anchor. A declared member needs no record; the pass finds its
     /// block by its declarations.
-    declined_default_calls: HashMap<Id, (Id, usize, String)>,
+    declined_default_calls: HashMap<Id, (Id, Id, String)>,
     /// The loaded files' paths by `SourceId`, handed in by the driver before
     /// each resolve: [`Analyzer::build_lookup_admission`] reads a module's
     /// ANCESTOR files off them (`ancestor_module_sources`), as the post-build
@@ -4938,7 +4938,7 @@ pub struct Analyzer<'src> {
     for_each_next: HashMap<Id, Id>,
     // B481: a for-each loop whose `next` is an INHERITED default → the index of
     // the implementation that provides it, for the post-build admission pass.
-    for_each_next_providers: HashMap<Id, usize>,
+    for_each_next_providers: HashMap<Id, Id>,
     // For-each loops → the type the iterable INFERRED to, by loop id. The
     // transformer's native lowerings are chosen by that type, and it cannot
     // recover it on its own: an iterable written as a parameter (`self` above
@@ -22004,7 +22004,13 @@ impl<'src> Analyzer<'src> {
     /// The specificity order over two impls of ONE home (§13.4(a)): subject
     /// shape first, then the binders' bounds when the shapes are equal.
     fn impl_outranks(&self, candidate: &ImplMemberCandidate, other: &ImplMemberCandidate) -> bool {
-        let (subject, other_subject) = (candidate.impl_subject, other.impl_subject);
+        self.impl_subject_outranks(candidate.impl_subject, other.impl_subject)
+    }
+
+    /// [`Self::impl_outranks`] over the two blocks' SUBJECTS — the whole of
+    /// the specificity order, which the call-operator coercion asks without a
+    /// member candidate in hand (M128).
+    fn impl_subject_outranks(&self, subject: TypeId, other_subject: TypeId) -> bool {
         if subject == other_subject {
             return false;
         }
@@ -24528,9 +24534,10 @@ impl<'src> Analyzer<'src> {
     ) -> Vec<(Id, TypeId, Id, Vec<TypeId>)> {
         self.note_member_query(subject_type, member_name);
         let mut reached: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
-        // B401: parallel to `reached` — the providing block's index, and
-        // whether the calling file admits the member from it.
-        let mut providers: Vec<(usize, bool)> = Vec::new();
+        // B401: parallel to `reached` — the providing block (by its own id,
+        // M128: never its index), and whether the calling file admits the
+        // member from it.
+        let mut providers: Vec<(Id, bool)> = Vec::new();
         // Per trait, whether it has a method of this name — asked once per
         // trait rather than once per impl that provides it.
         // M103: the trait test before the subject comparison, for
@@ -24552,10 +24559,10 @@ impl<'src> Analyzer<'src> {
         providing_traits.sort_unstable_by_key(|trait_id| trait_id.0);
         let rows = self.trait_impl_rows(subject_type, &providing_traits);
         count_impl_rows(rows.len());
-        for (index, implementation) in rows
+        for implementation in rows
             .iter()
-            .map(|index| (*index, &self.implementations[*index]))
-            .filter(|(_, implementation)| {
+            .map(|index| &self.implementations[*index])
+            .filter(|implementation| {
                 INHERITED_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
                 self.impl_subject_admits(
                     subject_type,
@@ -24590,13 +24597,16 @@ impl<'src> Analyzer<'src> {
                     *trait_id,
                     trait_arguments,
                 ));
-                providers.push((index, self.lookup_admits(implementation, member_name)));
+                providers.push((
+                    implementation.impl_id,
+                    self.lookup_admits(implementation, member_name),
+                ));
             }
         }
         // B401: the calling file's admission narrows first, and never empties
         // (`impl_member_candidates`' rule): two defaults of one name, one of
         // them through a block the file declined, are ONE candidate.
-        let mut reached: Vec<((Id, TypeId, Id, Vec<TypeId>), (usize, bool))> =
+        let mut reached: Vec<((Id, TypeId, Id, Vec<TypeId>), (Id, bool))> =
             reached.into_iter().zip(providers).collect();
         if reached.iter().any(|(_, (_, admitted))| *admitted) {
             reached.retain(|(_, (_, admitted))| *admitted);
@@ -24607,7 +24617,7 @@ impl<'src> Analyzer<'src> {
                 applying.push(candidate.clone());
             }
         }
-        let mut candidates: Vec<((Id, TypeId, Id, Vec<TypeId>), (usize, bool))> = Vec::new();
+        let mut candidates: Vec<((Id, TypeId, Id, Vec<TypeId>), (Id, bool))> = Vec::new();
         for candidate in match applying.is_empty() {
             true => reached,
             false => applying,
@@ -24619,11 +24629,11 @@ impl<'src> Analyzer<'src> {
         // B401: one candidate, and the file declined the block it comes
         // through — the answer stands (a lookup never empties), and the
         // post-build pass refuses the call by name.
-        if let [((member_id, ..), (index, false))] = candidates.as_slice()
+        if let [((member_id, ..), (block, false))] = candidates.as_slice()
             && let Some(anchor) = self.lookup_anchor
         {
             self.declined_default_calls
-                .insert(anchor, (*member_id, *index, member_name.to_string()));
+                .insert(anchor, (*member_id, *block, member_name.to_string()));
         }
         candidates
             .into_iter()
@@ -29172,7 +29182,14 @@ impl<'src> Analyzer<'src> {
             );
             Self::record_pending_crossings(&mut pending, &view_origins, state);
         }
-        self.view_suspension_checks = pending;
+        // Extended, not assigned: a reused module's rows were replayed from
+        // its record before this window ran (B575).
+        self.view_suspension_checks
+            .crossings
+            .extend(pending.crossings);
+        self.view_suspension_checks
+            .signatures
+            .extend(pending.signatures);
         self.check_closure_view_capture_ban(&view_bindings);
         for violation in violations {
             let (anchor, msg) = match violation {
@@ -29372,7 +29389,7 @@ impl<'src> Analyzer<'src> {
                 pending.push((argument_id, reference_id, name));
             }
         }
-        self.view_suspension_checks.captures = pending;
+        self.view_suspension_checks.captures.extend(pending);
         for (reference_id, name) in errors {
             self.push_anchored(
                 Error {
@@ -31696,13 +31713,14 @@ impl<'src> Analyzer<'src> {
         let layer = self.std_layer_sources.get(&source)?;
         let span = **self.span_map.get(&definition_id)?;
         let platform = self.platform.runtime_name();
-        let head = format!(
-            "`{type_name}` here is std's {layer} twin — this file is analyzed under {platform}"
+        // B576: the platform is the stored world's own (it is in the base cache
+        // key); WHY the analysis runs under it is the serving call's
+        // (`Workspace::platform_reason`, deliberately out of the key), so the
+        // clause is rendered when the diagnostic is published, never here.
+        let mut msg = format!(
+            "`{type_name}` here is std's {layer} twin — this file is analyzed under \
+             {platform}{PLATFORM_REASON_MARK}"
         );
-        let mut msg = match &self.platform_reason {
-            Some(reason) => format!("{head}: {reason}"),
-            None => head,
-        };
         // F27 R6: the third fact. The reader now knows which twin this is and
         // why the file is under it; what they asked for is a member, and the
         // answer that settles it is that the OTHER twin has one by that name.
@@ -46535,15 +46553,55 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         self.note_member_query(subject_type, CALL_OPERATOR_MEMBER);
-        let member_id = self.implementations.iter().find_map(|implementation| {
-            let member_id = implementation.declarations.get(CALL_OPERATOR_MEMBER)?;
-            self.impl_subject_admits(
-                subject_type,
-                implementation.subject.borrow_type(self),
-                &HashMap::default(),
-            )
-            .then_some(*member_id)
-        })?;
+        // M128: RANKED, never the first block in load order. Every block that
+        // declares `call` and admits the subject is a candidate; a concrete
+        // subject outranks a blanket (B456's rule, as `rank_member_candidates`
+        // ranks an inherent member) and between blankets the most specific
+        // wins (B477); two that do not rank offer NO coercion — the ordinary
+        // method path, which ranks the same way, reports the ambiguity at the
+        // call. The answer is a function of the impl set, not of which block
+        // registered first.
+        let candidates: Vec<(Id, TypeId)> = self
+            .implementations
+            .iter()
+            .filter_map(|implementation| {
+                let member_id = implementation.declarations.get(CALL_OPERATOR_MEMBER)?;
+                self.impl_subject_admits(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+                .then_some((*member_id, implementation.subject))
+            })
+            .collect();
+        let blanket =
+            |subject: TypeId| matches!(self.borrow_type_by_type_id(subject), Type::Generic(_));
+        let concrete: Vec<&(Id, TypeId)> = candidates
+            .iter()
+            .filter(|(_, subject)| !blanket(*subject))
+            .collect();
+        let blankets: Vec<&(Id, TypeId)> = candidates
+            .iter()
+            .filter(|(_, subject)| blanket(*subject))
+            .collect();
+        let member_id = match concrete.as_slice() {
+            [(member_id, _)] => *member_id,
+            [] => {
+                let most_specific: Vec<&&(Id, TypeId)> = blankets
+                    .iter()
+                    .filter(|(_, subject)| {
+                        !blankets
+                            .iter()
+                            .any(|(_, other)| self.impl_subject_outranks(*other, *subject))
+                    })
+                    .collect();
+                match most_specific.as_slice() {
+                    [(member_id, _)] => *member_id,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
         let function_id = self.resolve_member_function_id(member_id);
         let function = self.functions.get(&function_id)?;
         let mut parameter_type_ids = Vec::with_capacity(function.parameters.len());
@@ -47928,8 +47986,26 @@ impl<'src> Analyzer<'src> {
             .filter(|id| is_marker(self, id))
             .or_else(|| {
                 // The macro NAMESPACE: same-module and prelude macros resolve
-                // here even when an item owns the plain name.
+                // here even when an item owns the plain name. M128: the SCOPE
+                // CHAIN, never the first module in load order — the
+                // referencing scope's own chain up to its module's namespace
+                // (the expansion's highest precedence, `macros::scope_for`),
+                // then std's namespaces (the expansion's prelude, always in
+                // the prefix). An unimported package module's macro is not
+                // what the expansion used, whatever position it loaded in.
+                let mut current = Some(scope_id);
+                while let Some(id) = current {
+                    let scope = self.scopes.get(&id)?;
+                    if let Some(marker) = scope.macro_name_to_id.get(name) {
+                        return Some(*marker);
+                    }
+                    current = scope.parent_id;
+                }
                 self.modules.values().find_map(|module| {
+                    let file = self.scope_file(module.body.1)?;
+                    if !self.std_sources.contains(&file) {
+                        return None;
+                    }
                     self.scopes
                         .get(&module.body.1)
                         .and_then(|scope| scope.macro_name_to_id.get(name).copied())
@@ -49599,8 +49675,43 @@ impl<'src> Analyzer<'src> {
         &mut self,
         source_count: usize,
     ) -> (HashMap<u32, ModuleDiagnostics>, HashSet<u32>) {
-        let derived = std::mem::take(&mut self.reuse_derived);
+        let mut derived = std::mem::take(&mut self.reuse_derived);
         let unrecordable = std::mem::take(&mut self.reuse_unrecordable);
+        // B575: the enrolment rows, filed under the module whose body
+        // enrolled them (the anchor, the function, the closure — each an id
+        // that module minted). Rows a replay put here are filed again under
+        // their own module, which the loop below skips as reused.
+        let file_of = |analyzer: &Self, id: Id| -> Option<u32> {
+            let source = analyzer.source_of_id(id)?;
+            (source != SourceId(0) && source != DERIVED_SOURCE).then_some(source.0)
+        };
+        for &(anchor, call, view, root) in &self.view_suspension_checks.crossings {
+            if let Some(source) = file_of(self, anchor) {
+                derived
+                    .entry(source)
+                    .or_default()
+                    .suspension_crossings
+                    .push((anchor, call, view, root));
+            }
+        }
+        for &(function_id, parameter_id, form) in &self.view_suspension_checks.signatures {
+            if let Some(source) = file_of(self, function_id) {
+                derived
+                    .entry(source)
+                    .or_default()
+                    .suspension_signatures
+                    .push((function_id, parameter_id, form));
+            }
+        }
+        for &(closure_id, reference_id, _) in &self.view_suspension_checks.captures {
+            if let Some(source) = file_of(self, closure_id) {
+                derived
+                    .entry(source)
+                    .or_default()
+                    .suspension_captures
+                    .push((closure_id, reference_id));
+            }
+        }
         let mut record = HashMap::default();
         for index in 1..source_count as u32 {
             let source = SourceId(index);
@@ -49656,6 +49767,28 @@ impl<'src> Analyzer<'src> {
             // skipped is indistinguishable, to both checks, from one that ran.
             for key in &record.container_structures {
                 self.reported_container_structures.insert(key.clone());
+            }
+            // B575: the module's pending suspension checks, enrolled again for
+            // the post pass to decide against THIS analysis's async set — the
+            // bodies they name are skipped by the Class A window below.
+            self.view_suspension_checks
+                .crossings
+                .extend(record.suspension_crossings.iter().copied());
+            self.view_suspension_checks
+                .signatures
+                .extend(record.suspension_signatures.iter().copied());
+            for &(closure_id, reference_id) in &record.suspension_captures {
+                let name = match self.expr_id_to_expr_map.get(&reference_id) {
+                    Some(Expr::Local(binding_id)) => self
+                        .variables
+                        .get(binding_id)
+                        .map(|variable| variable.name)
+                        .unwrap_or("the view"),
+                    _ => "the view",
+                };
+                self.view_suspension_checks
+                    .captures
+                    .push((closure_id, reference_id, name));
             }
         }
     }
@@ -55404,12 +55537,27 @@ impl<'src> Analyzer<'src> {
         if !self.web_prelude_index.as_ref()?.contains(name) {
             return None;
         }
+        // B576: WHETHER the steer fires is the stored world's own answer (the
+        // entry's prelude is in the base cache key); WHICH repair it names is
+        // the serving front end's (`Workspace::prelude_repair`, out of the
+        // key), so the sentence is rendered when the diagnostic is published
+        // ([`Self::web_prelude_repair`]), never into a world another call may
+        // be served.
+        Some(format!(
+            "{PUBLISH_MARK}{WEB_PRELUDE_MARK}{name}{PUBLISH_MARK}"
+        ))
+    }
+
+    /// The web-set steer's sentence for `name`, in the repair THIS call's front
+    /// end can take — the rendering [`Self::web_prelude_steer`] defers to
+    /// publish (B576).
+    fn web_prelude_repair(&mut self, name: &str) -> String {
         // Each arm spells its whole sentence, rather than sharing a factored-out
         // head: `diagnostics_ledger.rs`'s appendix gate greps the tree for the
         // text the errors appendix quotes, so a message composed from two
         // literals is a message it can no longer hold to its documentation. The
         // shared clause is nine words; the guarantee is worth them.
-        Some(match self.prelude_repair {
+        match self.prelude_repair {
             PreludeRepair::Manifest => format!(
                 "; `{name}` is in the prelude of the web set — set \
                  `prelude = \"{}\"` in vilan.toml",
@@ -55433,7 +55581,68 @@ impl<'src> Analyzer<'src> {
                      playground's prelude to the web set{import}"
                 )
             }
-        })
+        }
+    }
+
+    /// B576: renders every publish mark in the diagnostics and warnings —
+    /// the facts a stored world may not carry rendered, because they are
+    /// the SERVING call's and not the world's key's: `platform_reason`'s
+    /// clause and the web-set steer's repair. Runs once, where the lists
+    /// leave the analyzer for the `Program`, after M19's record is taken (so
+    /// a record replays the mark, and the call that replays it renders its
+    /// own facts) and after every pass that could push one.
+    fn render_publish_marks(&mut self) {
+        let has_mark = |text: &str| text.contains(PUBLISH_MARK);
+        let mut diagnostics = std::mem::take(&mut self.diagnostics);
+        let mut warnings = std::mem::take(&mut self.warnings);
+        for error in diagnostics.iter_mut().chain(warnings.iter_mut()) {
+            if has_mark(&error.msg) {
+                error.msg = self.render_marks(&error.msg);
+            }
+            if let Some(note) = &mut error.note
+                && has_mark(&note.msg)
+            {
+                note.msg = self.render_marks(&note.msg);
+            }
+            for hop in &mut error.trace {
+                if has_mark(&hop.note.msg) {
+                    hop.note.msg = self.render_marks(&hop.note.msg);
+                }
+            }
+        }
+        self.diagnostics = diagnostics;
+        self.warnings = warnings;
+    }
+
+    /// `text` with each `PUBLISH_MARK…PUBLISH_MARK` segment rendered.
+    fn render_marks(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find(PUBLISH_MARK) {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + PUBLISH_MARK.len()..];
+            let Some(close) = after.find(PUBLISH_MARK) else {
+                out.push_str(&rest[open..]);
+                return out;
+            };
+            let mark = &after[..close];
+            if mark == PLATFORM_REASON_MARK_NAME {
+                if let Some(reason) = &self.platform_reason {
+                    out.push_str(": ");
+                    out.push_str(reason);
+                }
+            } else if let Some(name) = mark.strip_prefix(WEB_PRELUDE_MARK) {
+                let repair = self.web_prelude_repair(name);
+                out.push_str(&repair);
+            } else {
+                // An unknown mark is left as written rather than dropped: a
+                // reader sees it, a silent omission nobody would.
+                out.push_str(&rest[open..open + PUBLISH_MARK.len() + close + PUBLISH_MARK.len()]);
+            }
+            rest = &after[close + PUBLISH_MARK.len()..];
+        }
+        out.push_str(rest);
+        out
     }
 
     /// Reads `std::web::prelude`'s importable names off disk, once, on the first failed
@@ -56421,6 +56630,15 @@ impl<'src> Analyzer<'src> {
     /// B561: the module's FULL path ([`Self::module_import_paths`], B560's
     /// walk) — a trait in `pkg::geo::shapes` was spelled `pkg::shapes::Area`,
     /// from the module's leaf name, an import that resolves nowhere.
+    ///
+    /// M128: a first match over `modules` in load order, and the one such
+    /// site that is NOT positional — an entity sits in exactly one module
+    /// scope's `declaration_order` (`declare_scope_item`'s callers are the
+    /// walk's item declarations and the generated-declaration hoist, each
+    /// into the declaring module's own scope; an import or a re-export binds
+    /// a name and declares nothing), so the first match is the only match
+    /// under any load order. The permutation differential's `import_path`
+    /// fixture holds it to that.
     fn import_path_of(&self, entity: Id) -> Option<String> {
         let paths = self.module_import_paths();
         self.modules.values().find_map(|module| {
@@ -60882,6 +61100,10 @@ impl<'src> Analyzer<'src> {
             self.generic_bounds.insert(binder_constraint_id, bounds);
         }
 
+        if split_on {
+            split.push(("binder-bounds", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // B222: the drain runs in two parts. A guard clause publishes its
         // condition's false-path captures into the enclosing scope only once
         // the divergence leaves have settled — `panic(…)` is an ending the walk
@@ -60908,7 +61130,7 @@ impl<'src> Analyzer<'src> {
         }
 
         if split_on {
-            split.push(("binder-bounds", split_mark.elapsed()));
+            split.push(("locals", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
         // --- Wire assignments to their variables ---
@@ -60933,7 +61155,7 @@ impl<'src> Analyzer<'src> {
         }
 
         if split_on {
-            split.push(("locals", split_mark.elapsed()));
+            split.push(("assignments", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
 
@@ -62487,6 +62709,10 @@ impl<'src> Analyzer<'src> {
         // closure type carries is part of that type for every substitution and
         // reconcile the solver performs.
         self.resolve_context_clauses();
+        if split_on {
+            split.push(("context-clauses", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Check trait conformance for `impl Subject with Trait` ---
         for check in std::mem::take(&mut self.prepped_trait_impls) {
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
@@ -63038,7 +63264,7 @@ impl<'src> Analyzer<'src> {
         self.build_lookup_admission();
 
         if split_on {
-            split.push(("contexts", split_mark.elapsed()));
+            split.push(("admission", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
         // --- Constraint solving loop ---
@@ -63266,6 +63492,17 @@ impl<'src> Analyzer<'src> {
             if self.tuple_walk_views.contains_key(&iterable_id) {
                 continue;
             }
+            // B401 / M128: the loop's `next` lookup is admitted under the
+            // LOOPING file's imports, as a call's is under its constraint's
+            // anchor (`resolve_constraints`) — this runs outside that loop,
+            // and without the importer the lookup narrowed nothing, so two
+            // blocks providing the default (one admitted, one declined) were
+            // one candidate by MEMBER, the first registered: the post-build
+            // refusal then followed the load order.
+            if self.lookup_admission.is_some() {
+                self.lookup_anchor = Some(for_each_id);
+                self.lookup_importer = self.admitting_source_of(for_each_id);
+            }
             let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::default());
             // Keep it: emission picks its native lowering by this same type, and
             // it is the only place the type is known. A `for x in <expr>` whose
@@ -63369,14 +63606,32 @@ impl<'src> Analyzer<'src> {
                         }
                         self.for_each_next.insert(for_each_id, next_id);
                         // B481: the block that provides the default, for the
-                        // admission pass — the loop's `next` is no call.
-                        if let Some(index) =
-                            self.implementations.iter().position(|implementation| {
+                        // admission pass — the loop's `next` is no call. M128:
+                        // the block's own id, never its INDEX in
+                        // `implementations` (an index into a load-ordered
+                        // table is no stored value).
+                        // The block is the one whose trait ARGUMENTS the
+                        // candidate carries: `impl Box with Counting<i32> {}`
+                        // beside `impl Box with Counting<str> {}` share the
+                        // subject and the trait, and only the arguments say
+                        // which one the lookup took.
+                        if let Some(block) = self
+                            .implementations
+                            .iter()
+                            .find(|implementation| {
                                 implementation.subject == impl_subject_id
                                     && implementation.trait_ids.contains(&trait_id)
+                                    && implementation
+                                        .trait_args
+                                        .iter()
+                                        .find(|(id, _)| *id == trait_id)
+                                        .map(|(_, arguments)| arguments.as_slice())
+                                        .unwrap_or(&[])
+                                        == trait_arguments.as_slice()
                             })
+                            .map(|implementation| implementation.impl_id)
                         {
-                            self.for_each_next_providers.insert(for_each_id, index);
+                            self.for_each_next_providers.insert(for_each_id, block);
                         }
                         let receiver_type_id = iterable_type.clone().get_type_id(self);
                         self.generic_dispatch.insert(
@@ -63530,6 +63785,10 @@ impl<'src> Analyzer<'src> {
                 _ => {}
             }
         }
+        // The admission context is a per-lookup fact (`resolve_constraints`
+        // clears it after every constraint); nothing after the loop reads it.
+        self.lookup_importer = None;
+        self.lookup_anchor = None;
 
         // --- Resolve operator overloading --- an arithmetic `a <op> b` whose
         // left operand's type implements the matching operator trait
@@ -66484,6 +66743,19 @@ pub struct SourceLayer {
 /// skip them instead of pointing into the user's text at a bogus offset.
 pub const DERIVED_SOURCE: SourceId = SourceId(u32::MAX);
 
+/// B576: the delimiter of a PUBLISH MARK — a placeholder in a diagnostic's
+/// text for a fact the serving call owns and a stored world may not render
+/// (`Workspace::platform_reason`, `Workspace::prelude_repair`, both out of
+/// the base cache key). `Analyzer::render_publish_marks` replaces every
+/// `PUBLISH_MARK<name>PUBLISH_MARK` where the lists leave the analyzer. A
+/// control character no message spells.
+const PUBLISH_MARK: &str = "\u{1}";
+const PLATFORM_REASON_MARK_NAME: &str = "platform-reason";
+/// The mark `overlaid_std_type_note` writes: `: <reason>` when the call has one.
+const PLATFORM_REASON_MARK: &str = "\u{1}platform-reason\u{1}";
+/// The web-set steer's mark, followed by the unresolved name.
+const WEB_PRELUDE_MARK: &str = "web-prelude:";
+
 /// How one `expr!` site lowers (proposal/try-and-lift.md §4): the std pair gets
 /// the inline tag-branch fast path; any other `Try` type dispatches to its
 /// impl's `verdict`/`from_bad` (the members recorded here), with the receiver's
@@ -66967,7 +67239,7 @@ pub struct Program<'src> {
     /// (into `implementations`) of the block that provides it — what the
     /// post-build admission pass checks against the loop's file, as it checks
     /// a call's.
-    pub for_each_next_providers: HashMap<Id, usize>,
+    pub for_each_next_providers: HashMap<Id, Id>,
     /// Per `for x in iterable` loop: the type the ITERABLE inferred to. The
     /// native lowerings are chosen by it (`HashSet` walks its backing map's values,
     /// everything else is a plain `for...of`), and emission cannot recover it —
@@ -67049,7 +67321,7 @@ pub struct Program<'src> {
     /// block their file did not admit (`Analyzer::declined_default_calls`),
     /// read by [`check_call_site_admission`] — a default's block is not found
     /// by its declarations.
-    pub declined_default_calls: HashMap<Id, (Id, usize, String)>,
+    pub declined_default_calls: HashMap<Id, (Id, Id, String)>,
     /// E224 (R-j): every `import`/`use` statement's span, by file. An import
     /// line names what it binds, and a name row inside one is not a USE: the
     /// labels pass warns at uses only (`labels::check`).
@@ -72245,6 +72517,19 @@ struct ModuleDiagnostics {
     /// [`Analyzer::take_reuse_record`] so a record is a function of the module
     /// and not of the walk.
     container_structures: Vec<String>,
+    /// B575: E3's PENDING suspension checks this module's bodies enrolled —
+    /// `check_invalidation`'s crossings and signatures and the capture ban's
+    /// captures ([`ViewSuspensionChecks`]) — which `check_view_suspensions`
+    /// decides once the async set is known, in a post pass that runs after
+    /// the record is taken and so is never recorded itself. A Class A check
+    /// may skip a reused body only if every table it writes for a later pass
+    /// is recorded or recomputed (pass map §5.4); this is the record. Ids the
+    /// module minted, the same §2.1 guarantee [`ModuleTables`] rests on; the
+    /// capture's view NAME is re-read from the module's own binding at replay
+    /// rather than carried.
+    suspension_crossings: Vec<(Id, Id, Id, Option<Id>)>,
+    suspension_signatures: Vec<(Id, Id, &'static str)>,
+    suspension_captures: Vec<(Id, Id)>,
 }
 
 /// One reused module's rows in the class D tables, kept in ascending id order
@@ -78731,6 +79016,9 @@ fn analyze_over_world<'src>(
     // M106: the per-declaration work, ranked — empty unless attribution is on.
     let item_costs = analyzer.ranked_item_costs();
 
+    // B576: the serving call's facts into the diagnostics, last.
+    analyzer.render_publish_marks();
+
     Ok(Some(Program {
         hidden_impls_pending,
         exported_entities,
@@ -79836,6 +80124,14 @@ pub fn check_call_site_admission(program: &mut Program) {
         }
     }
     let mut violations: Vec<(Error, SourceId)> = Vec::new();
+    // M128: a recorded provider is a block's ID (an index into the
+    // load-ordered table is no stored value); its index is this pass's own.
+    let index_of_block: HashMap<Id, usize> = program
+        .implementations
+        .iter()
+        .enumerate()
+        .map(|(index, implementation)| (implementation.impl_id, index))
+        .collect();
     // The SITES that resolved a member through an implementation: every wired
     // call, and (B481) every `for` loop over a custom iterator — whose `next`
     // is the lookup's answer exactly as a call's is, but is no call, so the
@@ -79854,7 +80150,9 @@ pub fn check_call_site_admission(program: &mut Program) {
                 *call_id,
                 *member_id,
                 function_call.argument_ids.first().copied(),
-                declined.get(call_id).cloned(),
+                declined.get(call_id).and_then(|(member, block, name)| {
+                    Some((*member, *index_of_block.get(block)?, name.clone()))
+                }),
             ))
         })
         .collect();
@@ -79862,6 +80160,7 @@ pub fn check_call_site_admission(program: &mut Program) {
         let provided = program
             .for_each_next_providers
             .get(&loop_id)
+            .and_then(|block| index_of_block.get(block))
             .map(|index| (next_id, *index, "next".to_string()));
         // Anchored at the ITERABLE — the `box` of `for item in box`, the
         // receiver the loop calls `next` on — rather than the whole loop.
