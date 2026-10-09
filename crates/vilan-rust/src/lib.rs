@@ -7701,8 +7701,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // refuse the commonest loop in the corpus.
                 _ => false,
             });
+        // F95: a `HashSet` iterates its members in INSERTION order on both
+        // backends — std stores each value beside its canonical hash in the
+        // set's `table`, and the JS backend's `__set_iter` walks that table's
+        // values. Natively the table is the runtime's insertion-ordered map,
+        // and `values()` is the walk: a copy of each member (rule 1's element
+        // copy), taken before the body runs, as JS's array iterator takes it.
+        if self.for_each_iterates_a_set(id) {
+            let set_text = self.expression(iterable_place, depth)?;
+            let binder = match item {
+                Some(item) => self.binding_name(item),
+                None => "_".to_string(),
+            };
+            let mut body = String::new();
+            self.emit_block(statements, tail, &mut body, depth + 1)?;
+            let pad = Self::indent(depth);
+            return Ok(format!(
+                "for {binder} in ({set_text}).table.values().into_iter() {{\n{body}{pad}}}"
+            ));
+        }
         if iterates_something_else {
-            return self.for_each_iterator(id, iterable_place, item, statements, tail, depth, span);
+            return self.for_each_iterator(id, iterable, item, statements, tail, depth, span);
         }
         let iterable_text = self.expression(iterable, depth)?;
         let binder = match item {
@@ -7759,6 +7778,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// An iterator whose `next` resolves to an intrinsic or to a host binding
     /// is refused by name rather than guessed at — no `Iterator` impl in std is
     /// either, and one that were would need its own arm.
+    /// F95: whether a `for` walks a `HashSet` — read off the loop's own
+    /// recorded iterable type, as the JS transformer's
+    /// `for_each_iterates_a_set` reads it.
+    fn for_each_iterates_a_set(&self, for_each_id: Id) -> bool {
+        self.program
+            .for_each_iterable_types
+            .get(&for_each_id)
+            .map(|type_id| self.concrete(*type_id))
+            .and_then(|type_id| self.resolve(type_id))
+            .is_some_and(|resolved| match resolved {
+                Type::Struct(struct_id, _) => self
+                    .program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| declaration.name == "HashSet"),
+                _ => false,
+            })
+    }
+
     fn for_each_iterator(
         &mut self,
         id: Id,
@@ -7769,7 +7807,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
-        let Some(_next_id) = self.program.for_each_next.get(&id).copied() else {
+        let Some(next_id) = self.program.for_each_next.get(&id).copied() else {
             return Err(unsupported(
                 concat!(
                     "a `for` over anything but a `List` ",
@@ -7778,24 +7816,54 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         };
-        let Some(subject) = self.type_of(iterable).map(|type_id| self.concrete(type_id)) else {
+        let iterable_place = match self.program.entity_map.get(&iterable) {
+            Some(&Expr::Reference(place, _)) => place,
+            _ => iterable,
+        };
+        let Some(subject) = self
+            .type_of(iterable_place)
+            .map(|type_id| self.concrete(type_id))
+        else {
             return Err(unsupported(
                 "a `for` over an iterator of unresolved type",
                 span,
             ));
         };
         let preferred = self.program.bound_dispatch_traits.get(&id).cloned();
+        // F95: the member the analyzer recorded — `next`, or `next_mut` for a
+        // `for e in &mut c` loop — by its own name.
+        let member = self
+            .program
+            .functions
+            .get(&next_id)
+            .map_or("next", |function| function.name);
         let Some(NativeDispatch::Call(next)) =
-            self.resolve_dispatch(subject, "next", &[], preferred, span)?
+            self.resolve_dispatch(subject, member, &[], preferred, span)?
         else {
             return Err(unsupported(
                 "a `for` over an iterator whose `next` is not an ordinary member",
                 span,
             ));
         };
+        // F95: `for e in &mut c` drives `next_mut` on the container ITSELF —
+        // each element a writable view into it — so the place is borrowed
+        // for every step rather than copied.
+        if let Some(&Expr::Reference(place, true)) = self.program.entity_map.get(&iterable) {
+            let place_text = self.mutable_place(place, depth)?;
+            let binder = match item {
+                Some(item) => self.binding_name(item),
+                None => "_".to_string(),
+            };
+            let mut body = String::new();
+            self.emit_block(statements, tail, &mut body, depth + 1)?;
+            let pad = Self::indent(depth);
+            return Ok(format!(
+                "while let Some({binder}) = {next}(&mut {place_text}) {{\n{body}{pad}}}"
+            ));
+        }
         // The iterable is CONSUMED by the loop (the iterator is advanced), so a
         // read of a place copies — rule 1's answer at a consuming position.
-        let iterable_text = self.consumed_value_of(iterable, depth)?;
+        let iterable_text = self.consumed_value_of(iterable_place, depth)?;
         let binder = match item {
             Some(item) => self.binding_name(item),
             None => "_".to_string(),

@@ -9191,6 +9191,35 @@ fn a_resource_with_a_drop_impl_tears_down_in_the_same_order_on_both_backends() {
     }
 }
 
+/// F95: a `for` over anything but a `List` was refused by name — a
+/// `HashSet` (set.vl) and a user container's `next_mut` (for-mut-container.vl),
+/// each its program's first wall. A set walks its members in insertion order,
+/// and `for e in &mut c` drives `next_mut` on the container itself. The
+/// probe: numbers and strings, a member re-inserted to the end, a set behind
+/// a `&` parameter and one a call returns, a `jump break`, a `next_mut` loop.
+#[test]
+fn a_for_over_a_set_or_a_containers_next_mut_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_set_and_container_loops.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/set_and_container_loops.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `for` over a set or a `next_mut` container must agree natively"
+    );
+    for program in ["set.vl", "for-mut-container.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F95 was its first wall"
+        );
+    }
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,

@@ -1,0 +1,71 @@
+// F95: a `for` over anything but a `List` was refused natively by name — a
+// `HashSet` (set.vl) and a user container's `next_mut` (for-mut-container.vl).
+// A set walks its members in INSERTION order (std keeps each beside its hash
+// in the set's table, which both backends walk); `for e in &mut c` drives the
+// container's `next_mut` on the container itself, each element a writable
+// view. The shapes: a set of numbers and of strings, a member removed and
+// re-inserted (to the end), a set behind a `&` parameter and one a call
+// returns, a `jump break`, and a `next_mut` loop.
+import std::hash_set::HashSet;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Counter {
+	items: List<i32>,
+	pos: usize,
+}
+
+impl Counter {
+	fun next_mut(&mut self): Option<&mut i32> {
+		if self.pos < self.items.len() {
+			let index = self.pos;
+			self.pos = self.pos + 1;
+			Some(&mut self.items[index])
+		} else {
+			None
+		}
+	}
+}
+
+fun total(set: &HashSet<i32>): i32 {
+	mut sum = 0;
+	for value in set {
+		sum = sum + value;
+	}
+	sum
+}
+
+fun letters(): HashSet<str> {
+	mut set: HashSet<str> = HashSet::new();
+	set.insert("x");
+	set.insert("y");
+	set.insert("x");
+	set
+}
+
+fun main() {
+	mut numbers: HashSet<i32> = HashSet::new();
+	numbers.insert(5);
+	numbers.insert(1);
+	numbers.insert(3);
+	numbers.remove(5);
+	numbers.insert(5);
+	for value in numbers {
+		print(value);
+	}
+	print(total(&numbers));
+	for letter in letters() {
+		print(letter);
+	}
+	for value in numbers {
+		if value == 3 {
+			jump break;
+		}
+		print(i"before three {value}");
+	}
+	mut counter = Counter { items = [1, 2, 3], pos = 0 };
+	for element in &mut counter {
+		element = *element * 10;
+	}
+	print(counter.items);
+}
