@@ -56,6 +56,11 @@ written down.
 ---
 
 <!-- family: fix -->
+**F106: natively, a generic call used directly as a pattern subject builds — `match wrap(3) { Maybe::Just(let v) => .. }`, `if wrap("deep") is Maybe::Just(let s)`.** The call records its callee's declared return (`Maybe<T>`), and the `match`, `is`, conjunction and destructuring-`let` subjects read that record raw, so a user generic enum was refused as "an unbound generic type parameter (parameter 1 of `wrap`)" where the same call bound to a `let` first, or returning std's `Option`, built. A call's value type is now its record rebuilt under the call's own substitution wherever that closes it — F36's `settled_value_type`, which answered only a bare parameter, widened to the whole type — and every pattern subject reads it. Pin: `native_differential`'s `a_generic_call_as_a_pattern_subject_is_identical_on_both_backends` (`native/generic_call_subjects.vl`: each subject form over a free call, a method, a nested call and a call inside a generic instance). Tracker F106 (and the `is` half of F92).
+
+---
+
+<!-- family: fix -->
 **F105: natively, a generic enum's variant built inside a list inside another variant builds — `let t: Tree<i32> = Tree::Node([Tree::Leaf(1), Tree::Node([Tree::Leaf(2)])]);`.** It was refused as "a generic type instantiated at `any`", annotation or not: the inner constructor's `T` is grounded only through the outer constructor's payload, and that payload's type (`List<Tree<T>>` under `Tree<i32>`) was resolved at its head alone, so the position stayed open, handed the list nothing, and each element was minted at `any`. The payload type is now resolved whole. Pin: `native_differential`'s `a_generic_variant_nested_in_a_variants_list_builds_on_both_backends` (`native/nested_generic_variants.vl`: an annotated `let`, a struct field, a call argument, three levels deep, a two-parameter enum and an `Option` around the tree, each walked). Tracker F105.
 
 ---

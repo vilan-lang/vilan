@@ -8964,6 +8964,29 @@ fn a_generic_variant_nested_in_a_variants_list_builds_on_both_backends() {
     );
 }
 
+/// F106: a `match` whose SUBJECT is a generic call returning a USER generic
+/// enum — `match wrap(3) { Maybe::Just(let v) => .. }` — was refused natively
+/// as "an unbound generic type parameter (parameter 1 of `wrap`)": the call
+/// records the callee's declared `Maybe<T>`, and the subject's type was read
+/// raw where a `let` first, or std's `Option`, built. The probe: a `match`,
+/// an `is` test, a conjunction and a destructuring `let` over a free call, a
+/// method, a nested call and a call inside a generic instance.
+#[test]
+fn a_generic_call_as_a_pattern_subject_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_generic_call_subjects.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_call_subjects.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a generic call as a pattern subject must take the call's own instance"
+    );
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,

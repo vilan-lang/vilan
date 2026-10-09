@@ -4588,7 +4588,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // Rust too. `std::http`'s response loop is the customer:
             // `for header in response.headers { let (name, value) = header; .. }`.
             Expr::Destructure(subject, pattern) => {
-                let subject_type = self.type_of(subject);
+                let subject_type = self.settled_value_type(subject);
                 let bound = self.pattern(&pattern, subject_type, span)?;
                 // A destructure CONSUMES what it binds, so a destructure of a
                 // PLACE is a copy by rule 1 and has to be written as one:
@@ -6263,7 +6263,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.subject_is_a_place(subject) {
             subject_text = format!("({subject_text}).clone()");
         }
-        let subject_type = self.type_of(subject);
+        let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(&pattern, subject_type, self.span_of(first))?;
         for binding in &bindings {
             self.is_captures.insert(*binding);
@@ -6453,14 +6453,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `cell.get()` records `SignalCell<T>::get`'s `T` — in which case it is
     /// that parameter as this call binds it, through the same substitution the
     /// call itself is emitted under ([`Self::call_substitution`]).
+    ///
+    /// F106: a record that NAMES the callee's parameter anywhere inside it —
+    /// `wrap(3)` recording `Maybe<T>` — is the whole type rebuilt under that
+    /// substitution, when that closes it: the one place a pattern subject
+    /// (`match`, `is`, a conjunction, a destructure) reads a call's type
+    /// through, so a generic call used in place is typed as it is bound to a
+    /// `let`.
     fn settled_value_type(&mut self, id: Id) -> Option<TypeId> {
         let recorded = self.type_of(id)?;
-        if !matches!(self.resolve(recorded), Some(Type::Generic(_))) {
-            return Some(recorded);
-        }
         let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id).cloned() else {
             return Some(recorded);
         };
+        if self.is_grounded(recorded) {
+            return Some(recorded);
+        }
         let Some(call) = self.program.function_calls.get(&call_id) else {
             return Some(recorded);
         };
@@ -6470,10 +6477,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Some(recorded);
         };
         let substitution = self.call_substitution(call_id, target, &generic_arguments);
+        let entries = self.resolved_entries(&substitution);
         let saved = self.enter_substitution(substitution.into_iter().collect());
-        let settled = self.concrete(recorded);
+        let head = self.concrete(recorded);
         self.current_substitution = saved;
-        Some(settled)
+        let rebuilt = self.substituted(recorded, &entries);
+        let rebuilt = self.deeply_resolved(rebuilt);
+        if self.is_grounded(rebuilt) {
+            return Some(rebuilt);
+        }
+        if matches!(self.resolve(recorded), Some(Type::Generic(_))) {
+            return Some(head);
+        }
+        Some(recorded)
     }
 
     fn if_branch(&mut self, branch: &ExprIfBranch, depth: usize) -> Result<String, Error> {
@@ -6500,7 +6516,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         if self.subject_is_a_place(*subject) {
                             subject_text = format!("({subject_text}).clone()");
                         }
-                        let subject_type = self.type_of(*subject);
+                        let subject_type = self.settled_value_type(*subject);
                         let pattern_text =
                             self.pattern(pattern, subject_type, self.span_of(*condition))?;
                         for binding in bindings {
@@ -6543,7 +6559,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let rendered_subject = self.expression(subject, depth);
         self.matching_the_subject = saved_matching;
         let mut subject_text = rendered_subject?;
-        let subject_type = self.type_of(subject);
+        let subject_type = self.settled_value_type(subject);
         // A leg that DESTRUCTURES moves the payload out of the subject, so a
         // subject that is a PLACE has to be copied first (F20). On the JS
         // backend a capture is an accessor into the value the subject names and
@@ -6844,7 +6860,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         span: Span,
     ) -> Result<String, Error> {
         let subject_text = self.expression(subject, depth)?;
-        let subject_type = self.type_of(subject);
+        let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(pattern, subject_type, span)?;
         Ok(format!("matches!({subject_text}, {pattern_text})"))
     }
