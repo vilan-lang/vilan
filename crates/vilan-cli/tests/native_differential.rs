@@ -11814,3 +11814,25 @@ fn f118_the_tuple_blankets_are_identical_on_both_backends() {
         "tuple `==`, a tuple key and a tuple's `debug` must agree natively"
     );
 }
+
+/// F119: a blanket method on an unannotated FUNCTION ITEM (`let f =
+/// nothing; f.leaf()`, B565) mints its instance at the item's own type,
+/// which the native backend refused to render ("a value of type `a function
+/// value`"). The type is the counted closure the item's value is, keyed per
+/// item; a binding of it calls the item through its parameters' receiving
+/// forms (`b(&mut count)` was rustc's E0308).
+#[test]
+fn f119_a_blanket_method_on_a_function_item_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f119_function_item_receivers.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/function_item_receivers.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a blanket method on a function item must answer the same natively"
+    );
+}

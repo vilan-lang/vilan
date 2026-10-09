@@ -1,0 +1,63 @@
+// F119: a blanket method on an unannotated FUNCTION ITEM (B565) was refused
+// natively ("a value of type `a function value`"): the instance is minted
+// at the item's own type, which renders as the counted closure the item's
+// value is. A bare item and a bound one, a one-parameter item, an item
+// taking a view, a generic passing one through, and a field.
+import std::io::print;
+
+trait Leaf {
+	fun leaf(&self): str;
+}
+
+impl type T with Leaf {
+	fun leaf(&self): str {
+		"leaf"
+	}
+}
+
+trait Twice {
+	fun twice(self): i32;
+}
+
+impl type T with Twice {
+	fun twice(self): i32 {
+		2
+	}
+}
+
+fun nothing() {}
+
+fun double(value: i32): i32 {
+	value * 2
+}
+
+fun bump(value: &mut i32) {
+	value += 1;
+}
+
+fun keep<T>(value: T): T {
+	value
+}
+
+struct Holder {
+	apply: |i32| i32,
+}
+
+fun main() {
+	let f = nothing;
+	print(f.leaf());
+	print(nothing.leaf());
+	let g = double;
+	print(g.leaf());
+	print(g(4));
+	print(double.twice());
+	let b = bump;
+	print(b.leaf());
+	mut count = 1;
+	b(&mut count);
+	print(count);
+	let kept = keep(double);
+	print(kept.leaf());
+	let holder = Holder { apply = double };
+	print((holder.apply)(5));
+}

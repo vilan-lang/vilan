@@ -1935,6 +1935,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let _ = write!(out, "G{}", constraint_id.0);
             }
             Type::Void => out.push_str("void"),
+            // F119: a function item's own type keys by the item — `describe`
+            // names every one "a function value", and two items of different
+            // signatures are two Rust closure types.
+            Type::Function(function_id) => {
+                let _ = write!(out, "Item{}", function_id.0);
+            }
             other => {
                 let _ = write!(out, "X{}", describe(other));
             }
@@ -2509,6 +2515,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Type::Struct(id, arguments) => self.nominal_struct(id, &arguments, span),
             Type::Enum(id, arguments) => self.nominal_enum(id, &arguments, span),
+            // F119: a function ITEM's own type — `let f = nothing;` binds it
+            // without an annotation, and a blanket over `T` instantiated there
+            // names it. Its value is the counted closure [`Self::function_value`]
+            // builds, so the type is that closure's.
+            Type::Function(function_id) => self.function_item_type(function_id, span),
             // F18 slice 2: `any`. It exists for `std::db`'s bind list, and
             // `vilan_rt::Any` says what its scope is — not a dynamic type
             // system, just the value type a heterogeneous list needs where the
@@ -6391,6 +6402,60 @@ impl<'a, 'src> Emitter<'a, 'src> {
         )))
     }
 
+    /// F119: the Rust type of a function item's VALUE — the counted closure
+    /// over its signature, each parameter in its receiving form, as
+    /// [`Self::function_value`] builds it. A function whose value is built
+    /// another way (generic, `async`, reshaped by a `lazy`, spread or context
+    /// parameter) is refused by name, as naming it as a value is.
+    fn function_item_type(&mut self, function_id: Id, span: Span) -> Result<String, Error> {
+        let Some(function) = self.program.functions.get(&function_id).cloned() else {
+            return Err(unsupported("an unresolved function", span));
+        };
+        let reshaped = !function.generic_parameter_constraint_ids.is_empty()
+            || function.is_async
+            || self.program.async_functions.contains(&function_id)
+            || function.parameters.iter().any(|parameter| {
+                self.program
+                    .context_hidden_parameters
+                    .contains_key(parameter)
+                    || self
+                        .program
+                        .parameters
+                        .get(parameter)
+                        .is_some_and(|declared| declared.lazy || declared.spread)
+            });
+        if reshaped {
+            return Err(unsupported(
+                &format!(
+                    "a value of the function `{}`'s own type (a generic, `async` or reshaped \
+                     signature)",
+                    function.name
+                ),
+                span,
+            ));
+        }
+        let mut parts = Vec::new();
+        for parameter_id in &function.parameters {
+            let Some(parameter) = self.program.parameters.get(parameter_id).cloned() else {
+                return Err(unsupported("an unresolved parameter", span));
+            };
+            let rendered = self.rust_type(parameter.type_id, span)?;
+            parts.push(match self.receiving_form(&parameter) {
+                Receiving::RefMut => format!("&mut {rendered}"),
+                Receiving::Ref => format!("&{rendered}"),
+                Receiving::ByValue => rendered,
+            });
+        }
+        let returned = match function.return_type_id {
+            Some(return_type) => self.rust_type(return_type, span)?,
+            None => "()".to_string(),
+        };
+        Ok(format!(
+            "std::rc::Rc<dyn Fn({}) -> {returned}>",
+            parts.join(", ")
+        ))
+    }
+
     fn function_value(&mut self, function_id: Id, span: Span) -> Result<String, Error> {
         let Some(function) = self.program.functions.get(&function_id).cloned() else {
             return Err(unsupported("an unresolved function", span));
@@ -6438,7 +6503,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(adapted) = self.context_adapted_function(function_id, &instance.name, span)? {
             return Ok(adapted);
         }
-        Ok(format!("std::rc::Rc::new({})", instance.name))
+        // F119: typed as the closure it is, so a binding without an
+        // annotation (`let f = nothing;`) holds the same `Rc<dyn Fn>` a
+        // position typed by the item's own type ([`Self::function_item_type`])
+        // takes — a `&` of it cannot coerce later.
+        let closure = self.function_item_type(function_id, span)?;
+        Ok(format!(
+            "(std::rc::Rc::new({}) as {closure})",
+            instance.name
+        ))
     }
 
     /// Emits the `thread_local!` for one module-level binding, once, and
@@ -12344,11 +12417,33 @@ impl<'a, 'src> Emitter<'a, 'src> {
         argument_ids: &[Id],
         depth: usize,
     ) -> Result<Vec<String>, Error> {
-        let views = callee_type
+        let callee = callee_type
             .map(|type_id| self.concrete(type_id))
             .and_then(|type_id| self.type_entry(&type_id))
-            .map(|type_| self.program.closure_parameter_views(type_))
-            .unwrap_or_default();
+            .cloned();
+        let views = match callee {
+            // F119: a binding of a function ITEM's own type (`let b = bump;`)
+            // calls the item's closure, whose parameters take the item's
+            // receiving forms ([`Self::function_item_type`]).
+            Some(Type::Function(function_id)) => self
+                .program
+                .functions
+                .get(&function_id)
+                .map(|function| function.parameters.clone())
+                .unwrap_or_default()
+                .iter()
+                .map(|parameter| {
+                    let parameter = self.program.parameters.get(parameter)?.clone();
+                    match self.receiving_form(&parameter) {
+                        Receiving::RefMut => Some(true),
+                        Receiving::Ref => Some(false),
+                        Receiving::ByValue => None,
+                    }
+                })
+                .collect(),
+            Some(type_) => self.program.closure_parameter_views(&type_),
+            None => Vec::new(),
+        };
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
             let already_a_reference = matches!(
