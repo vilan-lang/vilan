@@ -55,6 +55,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**F99 (its first half): natively, an `Option` whose payload is a shared view, consumed where it stands, builds — `numbers.get(a).unwrap_or(-1)` over std's `Arena`.** `Arena::get` answers `Option<&T>`, a reference natively, and anywhere but a `match` subject it was refused by name, because `unwrap_or` and every other generic over the option is monomorphised at the pointee (`Option<i32>`). A by-value or `&` argument that IS such a call now reads the payload out (`.cloned()`), which is rule 1's copy of a view read as a value, taken at the only moment the view is read. A `let` holding the option, and an `Option<&mut T>`, stay refused by name; so does F99's other half, a view binding aliasing another (transparent-references.vl). arena.vl runs natively. Pin: `native_differential`'s `an_option_of_a_shared_view_consumed_in_place_is_identical_on_both_backends` (`native/payload_view_reads.vl`: `unwrap_or`, `is_some`, `map`, a struct payload, a user function taking the option; plus arena.vl). Tracker F99.
+
+---
+
 <!-- family: diagnostics -->
 **F108 (the native half): a native refusal raised inside a function body in another file names where to look.** Its span indexed that file's bytes and the CLI drew it against the entry: `names.push_many([])` on a `List<str>` (whose `[]` stays `List<unknown>`) printed one bare `Error:` line with no file and no line, and a refusal inside a user module was drawn over the entry's `import` line with the module's offsets. A refusal from a body now carries its file (E190's note channel, as the JS emitter's body-less refusal does), and one found in a LIBRARY body is drawn at the user's call that instantiated it, its sentence naming the body and the file (`The construct is in `push_many`'s body (`list.vl`), which this call instantiates.`). The solver half — grounding the empty list from `push_many`'s bound — is not this entry's; the program stays refused natively and runs on JS. Pin: `native_differential`'s `a_refusal_inside_another_files_body_names_where_to_look` (the `push_many` call, and a refusal in a user module drawn in that module). Tracker F108.
 

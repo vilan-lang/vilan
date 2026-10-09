@@ -9084,6 +9084,34 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
     );
 }
 
+/// F99 (its first half): an `Option` whose payload is a shared VIEW —
+/// `Arena::get`'s `Option<&T>` — read anywhere but as a `match` subject was
+/// refused by name; `arena.get(a).unwrap_or(-1)` hands it to a generic
+/// monomorphised at the POINTEE. A by-value or `&` argument that consumes it
+/// where it stands reads the payload out (rule 1's copy of a view read as a
+/// value). arena.vl had this as its only wall. The probe: `unwrap_or`,
+/// `is_some`, `map`, a struct payload and a user function taking the option.
+#[test]
+fn an_option_of_a_shared_view_consumed_in_place_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_payload_view_reads.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/payload_view_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an `Option<&T>` consumed in place must read its payload out natively"
+    );
+    assert_eq!(
+        compare(&staged, "arena.vl"),
+        Verdict::Identical,
+        "arena.vl: F99 was its first wall"
+    );
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,

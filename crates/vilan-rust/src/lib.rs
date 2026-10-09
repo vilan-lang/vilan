@@ -491,6 +491,11 @@ struct Emitter<'a, 'src> {
     /// Taken by the call arm that reads it, so only the outermost call of the
     /// subject is affected.
     matching_the_subject: bool,
+    /// F99: set while a by-value or `&` argument that IS a call handing back
+    /// an `Option<&T>` is rendered — the position consumes the option at
+    /// once, so its payload is read out (a copy, rule 1's) and the option
+    /// arrives at the pointee type every generic over it is monomorphised at.
+    copying_a_payload_view: bool,
     /// F22 (async-polymorphism.md A.1): the ADAPTED INSTANCE being emitted —
     /// which of the callee's closure parameters arrive async at this instance,
     /// and the emission decisions the analyzer already made for that pairing.
@@ -664,6 +669,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             closure_captures: Vec::new(),
             expects_payload_view: None,
             matching_the_subject: false,
+            copying_a_payload_view: false,
             current_adapted_bits: Vec::new(),
             current_instance: None,
             last_uses: HashSet::new(),
@@ -10008,20 +10014,34 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &function_call.argument_ids,
         );
         // F21: an `Option` whose payload is a VIEW is a `&`/`&mut` natively,
-        // and the only position that carries it today is a `match` subject,
-        // where the leg binds the reference and reads through it. Anywhere else
-        // it meets code written against the payload's POINTEE — `arena.vl`
-        // hands one to `unwrap_or`, a generic monomorphised at `Option<i32>` —
-        // so it is named rather than emitted. The general answer is a
-        // monomorphisation keyed on viewness, which is its own slice.
+        // and a `match` subject carries it as one, the leg binding the
+        // reference and reading through it. F99: a by-value or `&` argument
+        // that consumes a SHARED one where it stands reads its payload out
+        // (`arena.get(a).unwrap_or(-1)`: `unwrap_or` is monomorphised at the
+        // pointee, `Option<i32>`), which is rule 1's copy of a view read as a
+        // value, taken at the only moment the view is read. Anywhere else —
+        // a `let` holding it, a `&mut` payload — it is named rather than
+        // emitted; the general answer is a monomorphisation keyed on
+        // viewness, which is its own slice.
         let carries_a_payload_view = self
             .program
             .functions
             .get(&target)
             .is_some_and(|function| self.payload_view_of(function).is_some());
-        if carries_a_payload_view && !std::mem::take(&mut self.matching_the_subject) {
+        let payload_view = self
+            .program
+            .functions
+            .get(&target)
+            .and_then(|function| self.payload_view_of(function));
+        let copies_the_payload =
+            payload_view == Some(false) && std::mem::take(&mut self.copying_a_payload_view);
+        if carries_a_payload_view
+            && !copies_the_payload
+            && !std::mem::take(&mut self.matching_the_subject)
+        {
             return self.host_gap(
-                "an `Option` with a VIEW payload read anywhere but as a `match` subject (the \
+                "an `Option` with a VIEW payload held anywhere but where it is read at once \
+                 (a `match` subject, or a by-value or `&` argument of a shared view: the \
                  payload is a reference natively, and a generic over it monomorphises at the \
                  pointee)"
                     .to_string(),
@@ -10047,10 +10067,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         );
         self.argument_substitution = None;
         let arguments = arguments?;
-        Ok(Self::with_argument_prelude(
-            prelude,
-            format!("{name}({})", arguments.join(", ")),
-        ))
+        let rendered =
+            Self::with_argument_prelude(prelude, format!("{name}({})", arguments.join(", ")));
+        // F99: the option is consumed where it stands, so its payload is read
+        // out now — the copy rule 1 owes a view read as a value — and the
+        // option is the pointee's (`arena.get(a).unwrap_or(-1)`).
+        if copies_the_payload {
+            return Ok(format!("({rendered}).cloned()"));
+        }
+        Ok(rendered)
     }
 
     // ------------------------------------------------- arguments by position --
@@ -10220,7 +10245,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.program.async_values.contains(&parameter.id)
                     || callee_bits.contains(&parameter.id)
             });
-            let mut text = if wants_a_place {
+            // F99: an argument that IS a call handing back an `Option<&T>`,
+            // at a position that reads it (by value, or by `&`), takes the
+            // option with its payload read out ([`Emitter::copying_a_payload_view`]).
+            let copies_a_payload =
+                !wants_a_mutable_place && self.hands_back_a_shared_payload_view(*argument);
+            let saved_copying =
+                std::mem::replace(&mut self.copying_a_payload_view, copies_a_payload);
+            let text = if wants_a_place {
                 // The declared type is threaded even for a PLACE, because a
                 // numeric LITERAL at a `&`/`&mut` position still has to be
                 // written at the width the signature names — `as_f32(self)`
@@ -10234,14 +10266,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 };
                 self.expected_type = saved;
                 self.expects_async_value = false;
-                place?
+                place
             } else {
                 // A by-value parameter CONSUMES its argument, so a plain read
                 // of a place copies — see [`Emitter::copy_a_consumed_place_read`].
                 let value = self.value_of_expecting(*argument, expecting, depth);
                 self.expects_async_value = false;
-                self.copy_a_consumed_place_read(*argument, value?)
+                value.map(|value| self.copy_a_consumed_place_read(*argument, value))
             };
+            self.copying_a_payload_view = saved_copying;
+            let mut text = text?;
             // H9: a `mut` parameter of aggregate type is copied at BODY ENTRY
             // on the JS backend (`parameter_entry_clones`), because there the
             // callee and the caller share one array and the copy has to happen
@@ -10506,6 +10540,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             _ => false,
         }
+    }
+
+    /// F99: whether `id` is a call to a function whose return carries a
+    /// SHARED view in its payload (`Option<&T>`, `Arena::get`).
+    fn hands_back_a_shared_payload_view(&self, id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id) else {
+            return false;
+        };
+        let Some(call) = self.program.function_calls.get(call_id) else {
+            return false;
+        };
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id) else {
+            return false;
+        };
+        self.program
+            .functions
+            .get(target)
+            .is_some_and(|function| self.payload_view_of(function) == Some(false))
     }
 
     /// Whether a call to `target` may take its `&` arguments over boxed
