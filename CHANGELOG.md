@@ -50,6 +50,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**The terminal prints a check's errors in their one canonical order: an error carrying a note (or a requirement trace) no longer jumps ahead of every plain one — so a `std` copied away from its `macro_std` leads with the split-toolchain refusal, not with `'Instant' does not implement trait 'PartialOrd': missing 'eq'` noted into std's `compare.vl`.** The refusal was always emitted, once, at the entry's offset 0 so it sorts first, and the analysis's list had it first; the CLI rendered note-carrying errors as it met them and held the plain ones to the end, so `Instant`'s and `Duration`'s conformance errors (std's own derives produce nothing over a half toolchain) printed above it, and the same reordering put a missing trait method on line 11 above an unresolved call on line 8. Plain errors render in place now; warnings follow the errors. Tracker N147.
+
+---
+
 <!-- family: tooling -->
 **`scripts/cut-release.sh` writes the same CHANGELOG under every awk — mawk 1.3.4 20200120 (Ubuntu 22.04) doubled the `---` rule between entries — and an applying cut refuses a missing or pre-3.11 Python up front instead of skipping, or dying after, the perf report.** That mawk has no regex intervals, so the rule pattern `-{3,}` never matched a `---` line; the rule stayed in the entry above it and the rewrite printed it beside its own separator. The pattern is `---+` now, and a `release_scripts` pin refuses an interval anywhere in the script outside `grep -E`. The script's head states what it needs (any POSIX awk; Python 3.11+ for `perf_gate.py`), and the Python check runs with the other reds before anything changes: the apply step used to skip the perf report and ratchet when `python3` was absent and to fail after the version bump when it was too old. Tracker N152.
 
