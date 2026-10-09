@@ -2309,6 +2309,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 for element in &elements {
                     parts.push(self.rust_type(*element, span)?);
                 }
+                // F94: a ONE-element tuple — the pack `count(1)` collects — is
+                // `(T,)`; `(T)` is only a parenthesised `T`.
+                if parts.len() == 1 {
+                    return Ok(format!("({},)", parts[0]));
+                }
                 Ok(format!("({})", parts.join(", ")))
             }
             Type::Array(element, length) => {
@@ -3639,6 +3644,47 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Some(path))
     }
 
+    /// F94: a tuple literal with SPREAD elements — `(..pair, 3)`, and the
+    /// pack a call collects for a spread parameter (`width(..items)`,
+    /// `need2(..pair, 7)`) — is the CONCATENATION of its parts, one level
+    /// deep (variadic-generics.md §T): each element is evaluated once, in
+    /// order, and a spread one contributes its own slots.
+    fn spread_tuple(&mut self, elements: &[Id], depth: usize, span: Span) -> Result<String, Error> {
+        let mut prelude = String::new();
+        let mut slots = Vec::new();
+        for (index, element) in elements.iter().enumerate() {
+            let value = self.consumed_value_of(*element, depth)?;
+            let name = format!("__part{index}");
+            let _ = write!(prelude, "let {name} = {value}; ");
+            if !self.program.spread_elements.contains(element) {
+                slots.push(name);
+                continue;
+            }
+            let arity = match self
+                .settled_value_type(*element)
+                .map(|type_id| self.concrete(type_id))
+                .and_then(|type_id| self.resolve(type_id))
+            {
+                Some(Type::Tuple(parts)) => parts.len(),
+                _ => {
+                    return Err(unsupported(
+                        "a spread element whose tuple type did not resolve",
+                        span,
+                    ));
+                }
+            };
+            for slot in 0..arity {
+                slots.push(format!("{name}.{slot}"));
+            }
+        }
+        let tuple = if slots.is_empty() {
+            "()".to_string()
+        } else {
+            format!("({},)", slots.join(", "))
+        };
+        Ok(format!("{{ {prelude}{tuple} }}"))
+    }
+
     /// The type an `await` produces (J6): a `Task<T>`'s payload.
     ///
     /// `(await pending).id` reads a field off the await, and the await
@@ -4194,9 +4240,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
             )
         {
             parameter.type_id = positioned;
-        }
-        if parameter.spread {
-            return Err(unsupported("a spread parameter", span));
         }
         // F20: a `lazy` parameter carries the memo cell, by value — one handle
         // per call, and a FORWARD passes the same cell on so a chain memoizes
@@ -4836,12 +4879,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
             }
             Expr::Tuple(elements) => {
+                if elements
+                    .iter()
+                    .any(|element| self.program.spread_elements.contains(element))
+                {
+                    return self.spread_tuple(&elements, depth, span);
+                }
                 let mut parts = Vec::new();
                 for element in &elements {
                     let expecting = self.expected_type;
                     parts.push(self.consumed_value_of_expecting(*element, expecting, depth)?);
                 }
-                format!("({},)", parts.join(", "))
+                // F94: the EMPTY pack — `pack()` against a spread parameter —
+                // is the unit, which `(,)` does not spell.
+                if parts.is_empty() {
+                    "()".to_string()
+                } else {
+                    format!("({},)", parts.join(", "))
+                }
             }
             Expr::TupleIndex(subject, offset, width) => {
                 let Some(path) = self.tuple_slot_path(id, offset, width) else {

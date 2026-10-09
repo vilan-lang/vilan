@@ -56,6 +56,11 @@ written down.
 ---
 
 <!-- family: feature -->
+**F94: natively, a spread parameter (`fun middle(...items: (i32, i32, i32))`) and a tuple spread (`(..pair, 3)`) build.** The spread parameter was refused by name, the first wall of spread-parameters.vl and tuple-spread.vl; it is a call convention over an ordinary tuple parameter (variadic-generics.md §S), and the analyzer already collects a call's arguments into the one tuple, so natively the parameter is that tuple. Behind it, tuple-spread.vl's own walls: a tuple literal with SPREAD elements is the concatenation of its parts, one level deep, each part evaluated once and in order (`width(..items)` forwards the pack itself rather than a one-element pack of it); the empty pack is the unit (`()`, not `(,)`); and a one-element tuple type is `(T,)`, not a parenthesised `T`. tuple-spread.vl runs natively; spread-parameters.vl's next wall is F101's mapped tuple. Pin: `native_differential`'s `a_spread_parameter_and_a_tuple_spread_are_identical_on_both_backends` (`native/spread_packs.vl`; plus tuple-spread.vl). Tracker F94.
+
+---
+
+<!-- family: feature -->
 **F93: natively, a guarded `match` leg builds — `let x if x <= 2 => ..`, `Signal::Finished if count > 0 => ..`.** It was refused by name, the first wall of match-patterns.vl and capture-clones.vl and the last of resource_take.vl. A leg's guard is Rust's guard, after the nested string literals' own: inside it a capture is read through a borrow of the subject, and the leg moves it only once the guard accepts, so a rejecting guard leaves the subject whole for the next leg — the JS backend's accessor, a resource's teardown included. A guarded wildcard or binding is no longer counted as the catch-all. Behind it, match-patterns.vl's next wall goes too: a `str`-backed variant NESTED in a payload or a tuple (`Pair::Of(Align::Start)`, `(Align::Start, true)`) is a guard over a binder, as a nested string literal already was. capture-clones.vl's next wall — `cells.len() * weight`, a `usize` times an `i32`, which the analyzer admits (filed) — was a rustc refusal and is refused by name now. match-patterns.vl and resource_take.vl run natively. Pin: `native_differential`'s `a_guarded_match_leg_is_identical_on_both_backends` (`native/guarded_legs.vl`; plus the two programs, and capture-clones.vl refused by its new name). Tracker F93.
 
 ---
