@@ -4660,8 +4660,40 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "vilan_rt::Location({})",
                 rust_literal(&self.program.site_location(anchor))
             ),
-            Expr::MultilineString(_) => {
-                return Err(unsupported("a triple-quoted string", span));
+            // F100: a triple-quoted string is RAW (no escape is interpreted)
+            // and trimmed to its content by spec §2's rule — the value the JS
+            // emitter writes, written here as a Rust literal of that value.
+            Expr::MultilineString(text) => format!(
+                "vilan_rt::str_new({})",
+                rust_literal(&vilan_core::util::trim_multiline_string(text).unwrap_or_default())
+            ),
+            // F100: `arr.len()` of a fixed array is its type's length. The
+            // JS backend folds a pure subject to the constant and reads a
+            // call's or a subscript's `.length` in place, so the subject is
+            // evaluated exactly when it is written; natively `len()` of the
+            // `[T; n]` it renders as is both, the subject read in place.
+            Expr::ArrayLen(subject, _) => {
+                let subject =
+                    self.expecting_nothing(|emitter| emitter.expression(subject, depth))?;
+                format!("({subject}).len()")
+            }
+            // F100: `[value; n]` evaluates the value ONCE and copies it into
+            // each slot — the JS backend's `__repeat`, which fills a scalar and
+            // clones an aggregate per slot.
+            Expr::Repeat(value, length) => {
+                let element = self
+                    .type_of(id)
+                    .or(self.expected_type)
+                    .and_then(|type_id| self.resolve(type_id))
+                    .and_then(|resolved| match resolved {
+                        Type::Array(element, _) => Some(*element),
+                        _ => None,
+                    });
+                let value = self.consumed_value_of_expecting(value, element, depth)?;
+                format!(
+                    "{{ let __repeated = {value}; \
+                     std::array::from_fn::<_, {length}, _>(|_| __repeated.clone()) }}"
+                )
             }
             // B462: a tuple variant standing for a closure is its
             // eta-expansion, one per instantiation (the closure type the
@@ -4790,7 +4822,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 for element in &elements {
                     parts.push(self.consumed_value_of_expecting(*element, element_type, depth)?);
                 }
-                format!("vec![{}]", parts.join(", "))
+                // A literal a fixed-array position directs (`mut buf: [i32; 3] =
+                // [1, 2, 3]`) is the `[T; n]` that position renders as.
+                let fixed = self
+                    .type_of(id)
+                    .or(self.expected_type)
+                    .and_then(|type_id| self.resolve(type_id))
+                    .is_some_and(|resolved| matches!(resolved, Type::Array(..)));
+                if fixed {
+                    format!("[{}]", parts.join(", "))
+                } else {
+                    format!("vec![{}]", parts.join(", "))
+                }
             }
             Expr::Tuple(elements) => {
                 let mut parts = Vec::new();
@@ -4910,7 +4953,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Error => return Err(unsupported("an expression that did not analyze", span)),
             other => {
                 return Err(unsupported(
-                    &format!("the expression form `{}`", form_name(&other)),
+                    &format!("the expression form {}", form_name(&other)),
                     span,
                 ));
             }
@@ -7134,7 +7177,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 Ok(format!("({},)", parts.join(", ")))
             }
-            ExprPattern::Array(_) => Err(unsupported("an array pattern", span)),
+            // F100's neighbour in fixed-arrays.vl: `let [a, b] = arr` is
+            // irrefutable (the count is the type's length), and Rust's array
+            // pattern is the same text.
+            ExprPattern::Array(elements) => {
+                let element_type = match subject_type.and_then(|type_id| self.resolve(type_id)) {
+                    Some(Type::Array(element, _)) => Some(*element),
+                    _ => None,
+                };
+                let mut parts = Vec::new();
+                for element in elements {
+                    self.pattern_nesting += 1;
+                    let part = self.pattern(element, element_type, span);
+                    self.pattern_nesting -= 1;
+                    parts.push(part?);
+                }
+                Ok(format!("[{}]", parts.join(", ")))
+            }
         }
     }
 
@@ -9601,6 +9660,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.value_argument(argument_ids, 0, depth)?
                 )
             }
+            // F100: `f64::is_finite` is `Number.isFinite(x)`, which over a
+            // number is exactly Rust's `is_finite` (neither NaN nor ±∞).
+            Some(ExternBinding::Function {
+                module: None,
+                symbol: "Number.isFinite",
+            }) if name == "is_finite" => format!(
+                "(({}) as f64).is_finite()",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
             Some(ExternBinding::Method {
                 symbol: Some("charCodeAt"),
             }) if name == "code_at" => format!(
@@ -13113,7 +13181,12 @@ fn collect_pattern_bindings(pattern: &ExprPattern, out: &mut Vec<Id>) {
                 collect_pattern_bindings(element, out);
             }
         }
-        ExprPattern::Wildcard | ExprPattern::Literal(_) | ExprPattern::Array(_) => {}
+        ExprPattern::Array(elements) => {
+            for element in elements {
+                collect_pattern_bindings(element, out);
+            }
+        }
+        ExprPattern::Wildcard | ExprPattern::Literal(_) => {}
     }
 }
 
@@ -13172,8 +13245,6 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
         Expr::Lift(_, _, _) | Expr::LiftBinder | Expr::LiftRegion(_, _) => "a `?` lift",
         Expr::Destructure(_, _) => "a destructuring binding",
         Expr::TupleComprehension(_, _) => "a tuple comprehension",
-        Expr::Repeat(_, _) => "a `[value; n]` literal",
-        Expr::ArrayLen(_, _) => "a fixed-array `len()`",
         Expr::Generic(_) => "a generic type reference",
         Expr::Macro => "a macro name",
         _ => "an unsupported form",

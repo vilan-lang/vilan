@@ -1,0 +1,50 @@
+// F100: three small lowerings were refused natively by name, each the first
+// wall of its corpus program — a triple-quoted string (multiline-string.vl),
+// the repeat literal `[value; n]` (fixed-arrays.vl, whose refusal also
+// doubled a backtick) and std's `f64::is_finite` (`Number.isFinite`,
+// math.vl). Behind the repeat stood fixed-arrays.vl's other walls: a
+// fixed array's `len()`, an array pattern, and a list literal a `[T; n]`
+// position directs. The shapes: a raw multiline string (no escape read, the
+// indentation trimmed), a scalar and an aggregate repeat (independent
+// slots), a repeat evaluated once, `len()` of a place and of a call, an
+// array destructure, and `is_finite` over a finite value, an infinity and NaN.
+import std::io::print;
+
+struct Slot {
+	n: i32,
+}
+
+mut calls = 0;
+
+fun counted(): i32 {
+	calls += 1;
+	calls
+}
+
+fun pair(): [i32; 2] {
+	[3, 4]
+}
+
+fun main() {
+	let text = """
+		raw \\n stays
+		  indented
+		""";
+	print(text);
+	let zeros = [0; 3];
+	print(zeros[2]);
+	mut slots = [Slot { n = 1 }; 2];
+	slots[0].n = 9;
+	print(i"{slots[0].n} {slots[1].n}");
+	let once = [counted(); 4];
+	print(i"{once[3]} calls={calls}");
+	print(zeros.len());
+	print(pair().len());
+	let [left, right] = pair();
+	print(left + right);
+	let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+	print(grid[1][1]);
+	print(1.5f.is_finite());
+	print((1.0f / 0.0f).is_finite());
+	print((0.0f / 0.0f).is_finite());
+}

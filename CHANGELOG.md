@@ -56,6 +56,11 @@ written down.
 ---
 
 <!-- family: feature -->
+**F100: natively, a triple-quoted string, the repeat literal `[value; n]` and `f64::is_finite` build — and so does the rest of fixed-arrays.vl.** Each was refused by name as its corpus program's first wall (the repeat's refusal also doubled a backtick: "the expression form `a `[value; n]` literal`"). A triple-quoted string is the raw, trimmed value the JS emitter writes (spec §2's rule, `trim_multiline_string`); `[value; n]` evaluates the value once and copies it into each slot, as `__repeat` does (a scalar fills, an aggregate clones); `is_finite` is Rust's own over the number. Behind the repeat, fixed-arrays.vl's other three walls go too: a fixed array's `len()` reads the `[T; n]` in place (so a call or subscript subject is evaluated where it is written), `let [a, b] = arr` is Rust's array pattern, and a list literal a `[T; n]` position directs is an array, not a `Vec`. The form-name refusal no longer doubles its backticks. multiline-string.vl, fixed-arrays.vl and math.vl run natively. Pin: `native_differential`'s `the_small_lowerings_are_identical_on_both_backends` (`native/small_lowerings.vl`; plus the three corpus programs). Tracker F100.
+
+---
+
+<!-- family: feature -->
 **F95: natively, a `for` walks a `HashSet` and drives a user container's `next_mut`.** Both were refused by name ("a `for` over anything but a `List`"; "an iterator whose `next` is not an ordinary member"). A set iterates its members in INSERTION order on both backends — std keeps each value beside its canonical hash in the set's `table`, which the JS backend's `__set_iter` walks — and natively that walk is the runtime map's own ordered `values()`, each member a copy taken before the body runs. `for e in &mut c` drives the member the analyzer recorded (`next_mut`) on the container itself rather than on a copy, so each element is a writable view and the writes land. set.vl and for-mut-container.vl run natively. Pin: `native_differential`'s `a_for_over_a_set_or_a_containers_next_mut_is_identical_on_both_backends` (`native/set_and_container_loops.vl`: numbers and strings, a member re-inserted to the end, a set behind a `&` parameter and one a call returns, a `jump break`, a `next_mut` loop; plus the two corpus programs). Tracker F95.
 
 ---

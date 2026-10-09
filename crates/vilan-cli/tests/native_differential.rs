@@ -9220,6 +9220,34 @@ fn a_for_over_a_set_or_a_containers_next_mut_is_identical_on_both_backends() {
     }
 }
 
+/// F100: three small lowerings, each its corpus program's first wall — a
+/// triple-quoted string (multiline-string.vl), the repeat literal `[value;
+/// n]` (fixed-arrays.vl) and `f64::is_finite` (math.vl) — and, behind the
+/// repeat, fixed-arrays.vl's other walls: a fixed array's `len()`, an array
+/// pattern, a list literal a `[T; n]` position directs. The probe: a raw
+/// multiline string, scalar and aggregate repeats (one evaluation, independent
+/// slots), `len()` of a place and a call, a destructure, `is_finite` over a
+/// finite value, an infinity and NaN; plus the three corpus programs.
+#[test]
+fn the_small_lowerings_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_small_lowerings.vl";
+    std::fs::write(staged.join(file), include_str!("native/small_lowerings.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "the small lowerings must agree natively"
+    );
+    for program in ["multiline-string.vl", "fixed-arrays.vl", "math.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F100 was its first wall"
+        );
+    }
+}
+
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
 /// subject of a destructuring `match`, an `is` capture, a `?` lift and a
 /// conjunction was copied for a binding and a field and MOVED for a subscript,
