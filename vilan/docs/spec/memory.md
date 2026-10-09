@@ -1061,6 +1061,28 @@ cell cannot collect a cycle through itself. The program's output is the
 same on both backends; only the memory differs. The native leak census
 pins the shape as a row that is live by design.
 
+**Native note: a view of a captured binding.** A read of a captured
+`mut` binding's field, tuple slot or element reads through the binding's
+cell in place and copies only what it reads. A `&self` call on the binding,
+or any `&` argument over it, takes a view of the cell for the length of
+the call, and the order is the source's: the call's by-value arguments are
+evaluated first, left to right, and the view is taken after them, once
+nothing but the call is left to run. So an argument that writes the
+binding (`w.measured(w.add("c"))`) is seen by the callee, exactly as it is
+on JavaScript, whose view is the binding's object itself. The view ends
+when the call returns. A call that holds a view while another of its
+arguments carries a closure that writes the same binding hands its `&`
+callee a copy taken at the call instead, the order every `&` argument over
+a captured binding had before the view. A `&mut` argument over a captured
+binding (a `&mut self` receiver among them) holds the cell for the call
+the same way, and a closure that reaches the binding during that call is
+a second path to a place under a live `&mut` view, the aliasing §6.4
+exists to refuse: the native backend refuses a call that hands such a
+closure beside the view (written in the call, bound by a `let`, or held by
+a value a `let` built), and a closure that arrives any other way stops the
+program with the runtime's reentrancy sentence when it touches the
+binding. JavaScript answers the in-progress value in both cases.
+
 ## 6.10 `lazy` — a binding initialized at first use
 
 *(Design: [`lazy`](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/lazy.md) §2.)*

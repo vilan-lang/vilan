@@ -1,0 +1,184 @@
+// F97: a `[resource]` type WITH a `Drop` impl was refused natively by name
+// ("destruction.md's teardown is a later slice"). Natively its `drop` is a
+// Rust `Drop` impl, its resource fields drop after the body in REVERSE
+// declaration order, and a binding drops after the statement holding its
+// last read (`lifetimes.md` §6) — an explicit `std::mem::drop` where that is
+// short of the scope's end, Rust's own scope-end drop where it is not. Every
+// teardown prints, so the ORDER is the claim: last use, never read, a loop's
+// iteration, an `own` parameter, the `drop` sink, an unbound temporary, an
+// overwrite, a match leg's capture, a destructure, a field write, nested
+// owners, a region widened over a name declared inside it, a last read in a
+// branch, an early `ret`, a `jump break`, and a field read off a value whose
+// type has a `Drop` impl (copied out, never moved: rustc's E0509).
+import std::drop::{ Drop, drop };
+import std::io::print;
+
+[resource]
+struct Res {
+	tag: str,
+}
+
+impl Res with Drop {
+	fun drop(&mut self) {
+		print(i"drop {self.tag}");
+	}
+}
+
+[resource]
+struct Pair {
+	left: Res,
+	right: Res,
+}
+
+impl Pair with Drop {
+	fun drop(&mut self) {
+		print("drop pair");
+	}
+}
+
+[resource]
+struct Bag {
+	first: Res,
+	second: Res,
+}
+
+fun make(tag: str): Res {
+	Res { tag }
+}
+
+fun consume(own r: Res) {
+	print(i"consume {r.tag}");
+}
+
+fun last_use() {
+	let a = make("a");
+	let b = make("b");
+	print(i"read {a.tag}");
+	print("after a");
+	print(i"read {b.tag}");
+	print("after b");
+}
+
+fun never_read() {
+	let unused = make("unused");
+	print("never-read body");
+}
+
+fun loop_iterations() {
+	mut index = 0;
+	for index < 2 {
+		let each = make(i"iteration {index}");
+		print(i"loop {each.tag}");
+		index += 1;
+	}
+	print("loop done");
+}
+
+fun widened() {
+	let outer = make("outer");
+	let label = i"label of {outer.tag}";
+	print("widened body");
+	print(label);
+}
+
+fun overwrite() {
+	mut slot = make("old");
+	print("before overwrite");
+	slot = make("new");
+	print(i"after overwrite {slot.tag}");
+}
+
+fun field_write() {
+	mut bag = Bag { first = make("first"), second = make("second") };
+	bag.first = make("replaced");
+	print(i"bag {bag.first.tag} {bag.second.tag}");
+}
+
+fun leg_capture() {
+	let held: Option<Res> = Some(make("leg"));
+	match held {
+		Some(let r) => print(i"leg {r.tag}"),
+		None => print("leg none"),
+	}
+	print("leg after");
+}
+
+fun destructure() {
+	let pair = (make("tupled"), 3);
+	let (r, n) = pair;
+	print(i"destructure {r.tag} {n}");
+	print("destructure after");
+}
+
+fun branchy(flag: bool) {
+	let r = Res { tag = "branchy" };
+	if flag {
+		print(i"in branch {r.tag}");
+	}
+	print("after if");
+}
+
+fun early(flag: bool): i32 {
+	let r = Res { tag = "early" };
+	let s = Res { tag = "second" };
+	if flag {
+		print("leaving early");
+		ret 1;
+	}
+	print(i"fell {r.tag} {s.tag}");
+	2
+}
+
+fun breaking() {
+	mut index = 0;
+	for {
+		let each = Res { tag = i"spin {index}" };
+		if index == 1 {
+			print("break");
+			jump break;
+		}
+		print(i"spin body {each.tag}");
+		index += 1;
+	}
+	print("after loop");
+}
+
+fun take_left(own pair: Pair): str {
+	pair.left.tag
+}
+
+fun main() {
+	last_use();
+	print("--");
+	never_read();
+	print("--");
+	loop_iterations();
+	print("--");
+	widened();
+	print("--");
+	overwrite();
+	print("--");
+	field_write();
+	print("--");
+	leg_capture();
+	print("--");
+	destructure();
+	print("--");
+	consume(make("owned"));
+	print("consumed");
+	let gone = make("sunk");
+	drop(gone);
+	print("sunk");
+	make("temporary");
+	print("after temporary");
+	let pair = Pair { left = make("left"), right = make("right") };
+	print(i"pair {pair.left.tag}");
+	print("--");
+	branchy(true);
+	branchy(false);
+	print(early(true));
+	print(early(false));
+	breaking();
+	print(take_left(Pair { left = make("l"), right = make("r") }));
+	print("end of main");
+}

@@ -1,0 +1,79 @@
+// F106: a `match` whose SUBJECT is a generic call returning a USER generic
+// enum — `match wrap(3) { Maybe::Just(let v) => .. }` — was refused natively
+// as "an unbound generic type parameter (parameter 1 of `wrap`)": the call
+// records the callee's declared `Maybe<T>`, and the subject's type was read
+// raw, where a `let` first (or std's `Option`) built. The subject's type is
+// the call's under its own substitution now — at a `match`, an `is` test, a
+// conjunction and a destructuring `let`, over a free call, a method, a
+// nested call and a call inside a generic instance.
+import std::display::Display;
+import std::io::print;
+
+enum Maybe<T> {
+	Just(T),
+	Nothing,
+}
+
+struct Holder<T> {
+	value: T,
+}
+
+impl Holder<type T> {
+	fun peek(self): Maybe<T> {
+		Maybe::Just(self.value)
+	}
+}
+
+fun wrap<T>(item: T): Maybe<T> {
+	Maybe::Just(item)
+}
+
+fun pair<A, B>(a: A, b: B): (A, B) {
+	(a, b)
+}
+
+fun opt<T>(item: T): Option<T> {
+	Some(item)
+}
+
+fun shown<T: Display>(item: T): str {
+	match wrap(item) {
+		Maybe::Just(let v) => i"just {v}",
+		Maybe::Nothing => "nothing",
+	}
+}
+
+fun main() {
+	match wrap(3) {
+		Maybe::Just(let v) => print(v),
+		Maybe::Nothing => print("none"),
+	}
+	let r = wrap(4);
+	match r {
+		Maybe::Just(let v) => print(v),
+		Maybe::Nothing => print("none"),
+	}
+	match opt(5) {
+		Some(let v) => print(v),
+		None => print("none"),
+	}
+	let holder = Holder { value = "held" };
+	match holder.peek() {
+		Maybe::Just(let v) => print(v),
+		Maybe::Nothing => print("none"),
+	}
+	match wrap(wrap(6)) {
+		Maybe::Just(Maybe::Just(let v)) => print(v),
+		_ => print("none"),
+	}
+	if wrap("deep") is Maybe::Just(let s) {
+		print(s);
+	}
+	if wrap(7) is Maybe::Just(let n) && n > 1 {
+		print("seven");
+	}
+	let (a, b) = pair(8, "eight");
+	print(i"{a} {b}");
+	print(shown(9));
+	print(shown("ten"));
+}

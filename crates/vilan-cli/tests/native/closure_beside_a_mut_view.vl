@@ -1,0 +1,38 @@
+// F102's control: a call that holds a `&mut` view of a captured binding's
+// cell, handed a closure that touches OTHER bindings only, builds and runs
+// the same on both backends. The refused shapes are F102's pin, beside it.
+import std::io::print;
+
+struct Counter {
+	n: i32,
+}
+
+impl Counter {
+	fun bump_then(&mut self, f: || void) {
+		self.n += 1;
+		f();
+		self.n += 1;
+	}
+}
+
+fun apply(x: &mut i32, f: || void) {
+	f();
+	x += 10;
+}
+
+fun main() {
+	mut n = 0;
+	mut other = 0;
+	let touch_n = || n += 1;
+	touch_n();
+	apply(&mut n, || {
+		other += 5;
+	});
+	print(n);
+	print(other);
+	mut c = Counter { n = 0 };
+	let peek = || print(c.n);
+	peek();
+	c.bump_then(|| print(i"tick {other}"));
+	print(c.n);
+}

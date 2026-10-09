@@ -1382,6 +1382,31 @@ fn compare(staged: &Path, program: &str) -> Verdict {
         .args(["run", "--backend", "rust", program])
         .output()
         .expect("run the native backend");
+    // A `main` that answers its EXIT CODE (`fun main(): i32`, resource_exit.vl)
+    // exits with it on both backends: a code other than 0 and 1 (node's and
+    // the runtime's failure) is the program's own, and the two legs must agree
+    // on it as they agree on stdout.
+    let chosen_code = native.status.code().filter(|code| *code != 0 && *code != 1);
+    if let Some(code) = chosen_code {
+        let javascript = vilan(staged)
+            .args(["run", program])
+            .output()
+            .expect("run the JS backend");
+        if javascript.status.code() != Some(code) {
+            return Verdict::Broken(format!(
+                "the native leg exited {code}, the JS leg {:?}",
+                javascript.status.code()
+            ));
+        }
+        if native.stdout == javascript.stdout {
+            return Verdict::Identical;
+        }
+        return Verdict::Broken(format!(
+            "stdout differs.\n  js:   {:?}\n  rust: {:?}",
+            String::from_utf8_lossy(&javascript.stdout),
+            String::from_utf8_lossy(&native.stdout),
+        ));
+    }
     if !native.status.success() {
         let message = String::from_utf8_lossy(&native.stderr).into_owned();
         if message.contains("does not emit") {
@@ -8095,32 +8120,31 @@ fn a_resource_is_moved_not_copied_at_its_move_sites_natively() {
     }
 }
 
-/// F56's other half: a resource WITH a `Drop` impl is still refused by name —
-/// its teardown is F1's later slice — as a struct and as an enum.
+/// F56's other half, as F97 left it: a resource ENUM with a `Drop` impl is
+/// still refused by name (its body before the variant's payloads is not
+/// emitted), and the STRUCT that was refused beside it builds and agrees.
 #[test]
-fn a_resource_with_drop_is_still_refused_by_name_natively() {
+fn a_resource_enum_with_drop_is_refused_by_name_and_its_struct_twin_builds_natively() {
     let staged = stage();
-    for (program, source, named) in [
-        (
-            "native_probe_drop_struct.vl",
-            DROP_STRUCT_PROBE,
-            "the `resource` type `Guard`",
+    std::fs::write(staged.join("native_probe_drop_enum.vl"), DROP_ENUM_PROBE)
+        .expect("write the probe program");
+    match compare(&staged, "native_probe_drop_enum.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("the enum `Slot` with a `Drop` impl"),
+            "refused for another reason: {reason}"
         ),
-        (
-            "native_probe_drop_enum.vl",
-            DROP_ENUM_PROBE,
-            "the `resource` enum `Slot`",
-        ),
-    ] {
-        std::fs::write(staged.join(program), source).expect("write the probe program");
-        match compare(&staged, program) {
-            Verdict::Refused(reason) => assert!(
-                reason.contains(named),
-                "{program} refused for another reason: {reason}"
-            ),
-            other => panic!("{program}: expected a refusal by name, got {other:?}"),
-        }
+        other => panic!("expected a refusal by name, got {other:?}"),
     }
+    std::fs::write(
+        staged.join("native_probe_drop_struct.vl"),
+        DROP_STRUCT_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_drop_struct.vl"),
+        Verdict::Identical,
+        "a resource struct with a `Drop` impl builds natively (F97)"
+    );
 }
 
 const PIPE_FUSED_MAIN: &str = concat!(
@@ -8689,6 +8713,702 @@ fn a_compound_write_at_a_subscript_through_a_shared_view_is_identical_on_both_ba
         Verdict::Identical,
         "a compound write at a subscript through a `Shared` view must not abort natively"
     );
+}
+
+/// The emitted Rust of `file`'s `main`, from `fn main()` on — what a pin on
+/// the native emission reads, apart from the std functions the crate carries.
+fn emitted_main(staged: &Path, file: &str) -> String {
+    let output = vilan(staged)
+        .args(["build", "--backend", "rust", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    assert!(
+        output.status.success(),
+        "{file} must build natively:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let emitted = String::from_utf8_lossy(&output.stdout).into_owned();
+    let start = emitted
+        .find("fn main()")
+        .expect("the emitted crate has a `main`");
+    emitted[start..].to_string()
+}
+
+/// F103: a FIELD read on a BOXED binding (a `mut` local a closure captures,
+/// spec §6.9) copied the WHOLE value first — `log.lines.len()` was
+/// `log.get().lines.len()`, every list in `log` cloned to read one of them,
+/// and std's `write_at` paid six whole-`StoreWoken` copies per `Store` write.
+/// A field, a nested field, a tuple slot and a subscript (its index reading
+/// the same cell) now read through the cell's scoped borrow, and so do a
+/// pattern subject, a `for` iterable and a field handed on by value; the
+/// program prints the same on both backends. The emission pin: the only
+/// whole-value copy left in `main` is the program's own `let whole = log;`.
+#[test]
+fn a_field_read_on_a_boxed_binding_copies_the_field_alone_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_boxed_field_reads.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/boxed_field_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a field read on a boxed binding must read the same on both backends"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches(".get()").count(),
+        1,
+        "only `let whole = log;` copies the whole boxed value:\n{main}"
+    );
+    assert!(
+        !main.contains(".clone()).clone()"),
+        "a read out of a cell is not copied twice:\n{main}"
+    );
+}
+
+/// F49: a `&self` METHOD CALL — any `&` argument — on a BOXED binding
+/// deep-copied the whole value first: `writer.result()` was
+/// `result(&writer.get())`, so std's JSON codec cloned its writer, buffer
+/// included, on every encoded frame. The call takes a VIEW of the cell for
+/// its own length, after its by-value arguments are evaluated — which also
+/// fixes the order: `writer.measured(writer.add("c"))` printed 5 natively and
+/// 6 on JS, because the copy was taken before the argument wrote the binding.
+/// The probe: a `&self` call, a `&` parameter, a field and a subscript handed
+/// by `&`, a reading intrinsic, an argument that writes the binding first, a
+/// closure argument reading the binding under the view, one writing a field
+/// the callee does not read (handed a copy, as before), and a `dyn` object.
+/// The emission pin: the two whole-value copies left in `main` are that
+/// writing closure's call and the object's construction.
+#[test]
+fn a_shared_loan_of_a_boxed_binding_reads_through_its_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_boxed_self_calls.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/boxed_self_calls.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `&self` call on a boxed binding must answer the same on both backends"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches(".get()").count(),
+        2,
+        "only the writing closure's call and the object copy the whole value:\n{main}"
+    );
+}
+
+/// F102 (closure-captures.md Q3, RULED: refused at compile time, as F39 was):
+/// a closure that reaches a captured binding, handed to a call that holds a
+/// `&mut` view of that binding. Natively the binding is a cell (§6.9, R3), the
+/// view borrows it for the whole call, and the closure's read or write met
+/// the borrow: `apply(&mut n, || { n += 1; })` and `c.bump_then(poke)` (with
+/// `poke` writing `c.n`) exited 1 with the runtime's reentrancy sentence
+/// where the JS backend prints 11 and 102. The shape is refused by name, the
+/// span the touch inside the closure — through a `let`-bound closure, an
+/// alias of one, a closure the literal calls by name, and a READ as well as a
+/// write. The control (`native/closure_beside_a_mut_view.vl`): closures
+/// touching other bindings beside the same views build and agree.
+#[test]
+fn a_closure_reaching_a_binding_under_its_mut_view_is_refused_by_name() {
+    let staged = stage();
+    let counter = concat!(
+        "struct Counter {\n\tn: i32,\n}\n\nimpl Counter {\n",
+        "\tfun bump_then(&mut self, f: || void) {\n\t\tself.n += 1;\n\t\tf();\n\t\tself.n += 1;\n\t}\n\n",
+        "\tfun bump_all(&mut self, hooks: &List<|| void>) {\n\t\tself.n += 1;\n\t\tfor hook in hooks {\n\t\t\thook();\n\t\t}\n\t\tself.n += 1;\n\t}\n}\n\n",
+        "fun apply(x: &mut i32, f: || void) {\n\tf();\n\tx += 10;\n}\n",
+    );
+    for (name, body) in [
+        (
+            "native_probe_f102_literal.vl",
+            "\tmut n = 0;\n\tapply(&mut n, || {\n\t\tn += 1;\n\t});\n\tprint(n);\n",
+        ),
+        (
+            "native_probe_f102_receiver.vl",
+            "\tmut c = Counter { n = 0 };\n\tlet poke = || {\n\t\tc.n += 100;\n\t};\n\tc.bump_then(poke);\n\tprint(c.n);\n",
+        ),
+        (
+            "native_probe_f102_alias.vl",
+            "\tmut c = Counter { n = 0 };\n\tlet poke = || {\n\t\tc.n += 100;\n\t};\n\tlet again = poke;\n\tc.bump_then(again);\n\tprint(c.n);\n",
+        ),
+        (
+            "native_probe_f102_called.vl",
+            "\tmut n = 0;\n\tlet inc = || {\n\t\tn += 1;\n\t};\n\tapply(&mut n, || inc());\n\tprint(n);\n",
+        ),
+        (
+            "native_probe_f102_read.vl",
+            "\tmut n = 0;\n\tlet reset = || {\n\t\tn = 0;\n\t};\n\treset();\n\tapply(&mut n, || print(n));\n\tprint(n);\n",
+        ),
+        (
+            "native_probe_f102_held.vl",
+            "\tmut c = Counter { n = 0 };\n\tlet hooks = [|| {\n\t\tc.n += 100;\n\t}];\n\tc.bump_all(&hooks);\n\tprint(c.n);\n",
+        ),
+    ] {
+        std::fs::write(
+            staged.join(name),
+            format!("import std::io::print;\n\n{counter}\nfun main() {{\n{body}}}\n"),
+        )
+        .expect("write the probe");
+        match compare(&staged, name) {
+            Verdict::Refused(reason) => assert!(
+                reason.contains("handed to a call that holds a `&mut` view"),
+                "{name}: refused, and for this reason: {reason}"
+            ),
+            other => panic!("{name}: a closure under a `&mut` view must be refused: {other:?}"),
+        }
+    }
+    let control = "native_probe_closure_beside_a_mut_view.vl";
+    std::fs::write(
+        staged.join(control),
+        include_str!("native/closure_beside_a_mut_view.vl"),
+    )
+    .expect("write the control");
+    assert_eq!(
+        compare(&staged, control),
+        Verdict::Identical,
+        "closures touching other bindings beside a `&mut` view build and agree"
+    );
+}
+
+/// F102's runtime half: a closure the static walk cannot see arrive — pushed
+/// into a list after the list was built — that writes a captured binding
+/// while a call holds a `&mut` view of it still stops natively, with the
+/// runtime's own sentence and node's exit code. Outside the differential by
+/// construction: the JS backend answers the in-progress value (102).
+#[test]
+fn a_closure_under_a_mut_view_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
+    let staged = stage();
+    let file = "native_probe_f102_runtime.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::io::print;\n\n",
+            "struct Counter {\n\tn: i32,\n}\n\nimpl Counter {\n",
+            "\tfun bump_all(&mut self, hooks: &List<|| void>) {\n\t\tself.n += 1;\n",
+            "\t\tfor hook in hooks {\n\t\t\thook();\n\t\t}\n\t\tself.n += 1;\n\t}\n}\n\n",
+            "fun main() {\n\tmut c = Counter { n = 0 };\n\tmut hooks: List<|| void> = [];\n",
+            "\thooks.push(|| {\n\t\tc.n += 100;\n\t});\n\tc.bump_all(&hooks);\n\tprint(c.n);\n}\n",
+        ),
+    )
+    .expect("write the probe");
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", file])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        native.status.code(),
+        Some(1),
+        "node's exit code for a throw"
+    );
+    let stderr = String::from_utf8_lossy(&native.stderr);
+    assert!(
+        stderr.contains("a closure touching a captured binding a call holds a view of"),
+        "the runtime names the shape:\n{stderr}"
+    );
+    let javascript = vilan(&staged)
+        .args(["run", file])
+        .output()
+        .expect("run the JS backend");
+    assert_eq!(String::from_utf8_lossy(&javascript.stdout), "102\n");
+}
+
+/// F107 (B149's native half): a call to a function WRITTEN `async` whose
+/// declared return is itself a `Task` answers the task's VALUE — the JS host
+/// assimilates the handle the body returns, and B149 types the call as the
+/// payload. Natively the call awaited its own future once and kept the inner
+/// handle: `make() + 1` was rustc's E0369 ("cannot add `i32` to `Task<i32>`")
+/// and `print(make())` was refused as a `print` of the host handle. The
+/// probe: a plain handle, a generic payload, a method, the call used in place,
+/// bound and printed, beside a plain `async fun` and an interleaving task
+/// whose prints keep their order against the extra await.
+#[test]
+fn an_async_function_returning_a_task_answers_the_value_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_async_task_returns.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/async_task_returns.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a call to an `async fun` returning a `Task` must answer its payload natively"
+    );
+}
+
+/// F104: a closure whose body only DIVERGES — `|| panic("x")`, a block
+/// ending in a `panic`, a `match` whose every leg panics — did not build
+/// natively: rustc typed the body `!` with the return left to inference, and
+/// a `!`-returning closure is no `Rc<dyn Fn() -> ()>` (E0271; five errors on
+/// 0.45.0 over this probe). The diverging closure writes its return. The
+/// probe builds and holds each shape, beside a block that `ret`s early.
+#[test]
+fn a_closure_whose_body_diverges_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_diverging_closures.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/diverging_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a closure that only panics must build natively"
+    );
+}
+
+/// F105: a generic enum's variant built inside a LIST inside another
+/// variant — `Tree::Node([Tree::Leaf(1)])` — was refused natively as "a
+/// generic type instantiated at `any`", even under an annotation: the inner
+/// constructor's `T` is grounded only through the outer one's payload, whose
+/// type was resolved at its head alone (`List<Tree<T>>`, still open). The
+/// probe: an annotated `let`, a struct field, a call argument, three levels
+/// deep, a two-parameter enum and an `Option` around the tree, each walked.
+#[test]
+fn a_generic_variant_nested_in_a_variants_list_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_nested_generic_variants.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/nested_generic_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested generic variant must build at its position's instance"
+    );
+}
+
+/// F106: a `match` whose SUBJECT is a generic call returning a USER generic
+/// enum — `match wrap(3) { Maybe::Just(let v) => .. }` — was refused natively
+/// as "an unbound generic type parameter (parameter 1 of `wrap`)": the call
+/// records the callee's declared `Maybe<T>`, and the subject's type was read
+/// raw where a `let` first, or std's `Option`, built. The probe: a `match`,
+/// an `is` test, a conjunction and a destructuring `let` over a free call, a
+/// method, a nested call and a call inside a generic instance.
+#[test]
+fn a_generic_call_as_a_pattern_subject_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_generic_call_subjects.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_call_subjects.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a generic call as a pattern subject must take the call's own instance"
+    );
+}
+
+/// F92: a GENERIC call's own type was read UNSUBSTITUTED where the call is
+/// used in place — a field read off it (`b.unwrap().v`, a trait default's
+/// `Self` in `c.twice().value`) and a field read under a `?.` lift
+/// (`find("hit")?.title`, whose binder had no type at all) were refused "a
+/// field read of an unresolved subject". Three corpus programs had this as
+/// their first wall (generic-method-return.vl, lift-chain.vl,
+/// self-return.vl). The probe: a generic method, a generic free function, a
+/// nested field, a trait default returning `Self`, and lifts over a plain
+/// and a generic call, hit and miss.
+#[test]
+fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_generic_call_fields.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_call_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a field read off a generic call must name the call's own struct"
+    );
+    for program in [
+        "generic-method-return.vl",
+        "lift-chain.vl",
+        "self-return.vl",
+    ] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F92 was its first wall"
+        );
+    }
+}
+
+/// F108's native half: a refusal raised inside a function body in ANOTHER
+/// file named no expression — its span indexed the other file's bytes and
+/// the CLI rendered it against the entry: `names.push_many([])` (whose `[]`
+/// stays `List<unknown>`, the solver half) printed one bare `Error:` line, no
+/// file and no line, and a refusal inside a user module was drawn over the
+/// entry's `import` line. A library body's refusal is now anchored at the
+/// user's call that instantiated it, naming the body and its file; a user
+/// module's is drawn in that module.
+#[test]
+fn a_refusal_inside_another_files_body_names_where_to_look() {
+    let staged = stage();
+    let file = "native_probe_f108_push_many.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::io::print;\n\n",
+            "fun main() {\n\tmut names: List<str> = [\"a\"];\n\tnames.push_many([]);\n",
+            "\tprint(names.len());\n}\n",
+        ),
+    )
+    .expect("write the probe");
+    let output = vilan(&staged)
+        .args(["build", "--backend", "rust", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the probe is still refused (F108's solver half)"
+    );
+    assert!(
+        stderr.contains(&format!("{file}:5:2")) && stderr.contains("names.push_many([])"),
+        "the refusal is drawn at the user's call:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("The construct is in `push_many`'s body (`list.vl`)"),
+        "the refusal names the body and its file:\n{stderr}"
+    );
+    let module = staged.join("native_probe_f108_module");
+    std::fs::create_dir_all(&module).expect("make the package");
+    // The module's refusal is F25's, which is by design and stays: `print`
+    // of a value holding a function.
+    std::fs::write(
+        module.join("util.vl"),
+        "import std::io::print;\n\nexport fun banner() {\n\tlet shown = || 1;\n\tprint(shown);\n}\n",
+    )
+    .expect("write the module");
+    std::fs::write(
+        module.join("main.vl"),
+        "import pkg::util::banner;\n\nfun main() {\n\tbanner();\n}\n",
+    )
+    .expect("write the entry");
+    let output = vilan(&module)
+        .args(["build", "--backend", "rust", "--stdout", "main.vl"])
+        .output()
+        .expect("build the package");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("util.vl:5:2") && stderr.contains("print(shown)"),
+        "a user module's refusal is drawn in that module:\n{stderr}"
+    );
+}
+
+/// F99 (its first half): an `Option` whose payload is a shared VIEW —
+/// `Arena::get`'s `Option<&T>` — read anywhere but as a `match` subject was
+/// refused by name; `arena.get(a).unwrap_or(-1)` hands it to a generic
+/// monomorphised at the POINTEE. A by-value or `&` argument that consumes it
+/// where it stands reads the payload out (rule 1's copy of a view read as a
+/// value). arena.vl had this as its only wall. The probe: `unwrap_or`,
+/// `is_some`, `map`, a struct payload and a user function taking the option.
+#[test]
+fn an_option_of_a_shared_view_consumed_in_place_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_payload_view_reads.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/payload_view_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an `Option<&T>` consumed in place must read its payload out natively"
+    );
+    assert_eq!(
+        compare(&staged, "arena.vl"),
+        Verdict::Identical,
+        "arena.vl: F99 was its first wall"
+    );
+}
+
+/// A `main` that answers its EXIT CODE (`fun main(): i32`, resource_exit.vl's
+/// shape) emitted its tail followed by the event loop's turn, which rustc
+/// refused ("expected `;`"). It exits with the code natively now, after its
+/// frame — and its teardowns — have ended, as `process.exit(main())` does.
+/// The differential compares a program-chosen code (one other than 0 and 1)
+/// as it compares stdout.
+#[test]
+fn a_main_answering_its_exit_code_exits_with_it_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_exit_code_main.vl";
+    std::fs::write(staged.join(file), include_str!("native/exit_code_main.vl"))
+        .expect("write the probe program");
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", file])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(native.status.code(), Some(7), "the program's own exit code");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an exit-code `main` must answer the same code and stdout on both backends"
+    );
+}
+
+/// F97: a `[resource]` type WITH a `Drop` impl was refused by name
+/// ("destruction.md's teardown is a later slice"). Its `drop` is a Rust
+/// `Drop` impl now, its resource fields drop after the body in reverse, and
+/// a binding drops after the statement holding its last read, at the extent
+/// the JS backend closes its `finally` at (regions widened and nested
+/// alike). The probe prints every teardown, so the ORDER is the claim; the
+/// corpus programs resource.vl and resource_exit.vl had it as their first
+/// wall (resource_take.vl's next is F93's guarded leg).
+#[test]
+fn a_resource_with_a_drop_impl_tears_down_in_the_same_order_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_resource_teardown.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/resource_teardown.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a resource's teardowns must run in the same order on both backends"
+    );
+    for program in ["resource.vl", "resource_exit.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F97 was its first wall"
+        );
+    }
+}
+
+/// F95: a `for` over anything but a `List` was refused by name — a
+/// `HashSet` (set.vl) and a user container's `next_mut` (for-mut-container.vl),
+/// each its program's first wall. A set walks its members in insertion order,
+/// and `for e in &mut c` drives `next_mut` on the container itself. The
+/// probe: numbers and strings, a member re-inserted to the end, a set behind
+/// a `&` parameter and one a call returns, a `jump break`, a `next_mut` loop.
+#[test]
+fn a_for_over_a_set_or_a_containers_next_mut_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_set_and_container_loops.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/set_and_container_loops.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `for` over a set or a `next_mut` container must agree natively"
+    );
+    for program in ["set.vl", "for-mut-container.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F95 was its first wall"
+        );
+    }
+}
+
+/// F100: three small lowerings, each its corpus program's first wall — a
+/// triple-quoted string (multiline-string.vl), the repeat literal `[value;
+/// n]` (fixed-arrays.vl) and `f64::is_finite` (math.vl) — and, behind the
+/// repeat, fixed-arrays.vl's other walls: a fixed array's `len()`, an array
+/// pattern, a list literal a `[T; n]` position directs. The probe: a raw
+/// multiline string, scalar and aggregate repeats (one evaluation, independent
+/// slots), `len()` of a place and a call, a destructure, `is_finite` over a
+/// finite value, an infinity and NaN; plus the three corpus programs.
+#[test]
+fn the_small_lowerings_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_small_lowerings.vl";
+    std::fs::write(staged.join(file), include_str!("native/small_lowerings.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "the small lowerings must agree natively"
+    );
+    for program in ["multiline-string.vl", "fixed-arrays.vl", "math.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F100 was its first wall"
+        );
+    }
+}
+
+/// F98: a `const` value that is not plain data was refused by name — the
+/// first wall of css-block.vl, preflight.vl, style-when.vl, style.vl and
+/// theme.vl. The value arrives in the JS layout and the declared type reads
+/// it back. The probe: a struct with a nested struct, a list, a nested tuple
+/// and two options; a list of enum values with payloads; a `HashMap` and a
+/// `HashSet`; a `Style` (whose CSS sidecar both runs write and report); and
+/// a `const` call of a `void` function. Plus the five corpus programs.
+#[test]
+fn a_const_aggregate_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_const_aggregates.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/const_aggregates.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a const aggregate must read back the same natively"
+    );
+    for program in [
+        "css-block.vl",
+        "preflight.vl",
+        "style-when.vl",
+        "style.vl",
+        "theme.vl",
+    ] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F98 was its first wall"
+        );
+    }
+}
+
+/// F93: a GUARDED `match` leg was refused by name — the first wall of
+/// match-patterns.vl and capture-clones.vl, and the last of resource_take.vl
+/// (behind F97). A leg's guard is Rust's guard, and a `str`-backed variant
+/// nested in a payload or a tuple is a guard over a binder (match-patterns'
+/// next wall). capture-clones.vl's next wall is an operator over two numeric
+/// widths the analyzer admits, now refused by name rather than by rustc. The
+/// probe: guarded bindings, variants and tuples, a guard on outer state, a
+/// guarded wildcard, a string capture compared in a guard, the nested
+/// backed variant beside a guard; plus the two programs F93 completes.
+#[test]
+fn a_guarded_match_leg_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_guarded_legs.vl";
+    std::fs::write(staged.join(file), include_str!("native/guarded_legs.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a guarded leg must choose the same leg natively"
+    );
+    for program in ["match-patterns.vl", "resource_take.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F93 was its last wall"
+        );
+    }
+    match compare(&staged, "capture-clones.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("an operator over two numeric types"),
+            "capture-clones.vl's next wall is the mixed-width operator: {reason}"
+        ),
+        other => panic!("capture-clones.vl must be refused by name: {other:?}"),
+    }
+}
+
+/// F94: a SPREAD parameter was refused by name — the first wall of
+/// spread-parameters.vl and tuple-spread.vl. It is a call convention over an
+/// ordinary tuple parameter, and behind it tuple-spread.vl's walls went too:
+/// a tuple literal with spread elements is the concatenation of its parts,
+/// the empty pack is the unit, a one-element pack's type is `(T,)`. The
+/// probe: fixed and generic packs, a leading parameter, a `mut` pack, a pack
+/// handed on, a tuple argument kept whole, the empty and one-element packs,
+/// spreads at every position, a nested operand, a forwarded pack. Plus
+/// tuple-spread.vl; spread-parameters.vl's next wall is F101's mapped tuple.
+#[test]
+fn a_spread_parameter_and_a_tuple_spread_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_spread_packs.vl";
+    std::fs::write(staged.join(file), include_str!("native/spread_packs.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a spread pack must build and agree natively"
+    );
+    assert_eq!(
+        compare(&staged, "tuple-spread.vl"),
+        Verdict::Identical,
+        "tuple-spread.vl: F94 was its first wall"
+    );
+}
+
+/// F101: a function over a MAPPED-TUPLE parameter was refused by name ("a
+/// value of type `a mapped tuple`"), and the tuple comprehension behind it
+/// too — side-effect-let.vl's first wall, and spread-parameters.vl's next
+/// after F94. A mapped tuple renders as the tuple its family expands to per
+/// instantiation, and a comprehension is unrolled, each slot's body emitted
+/// with the binder (and the binder's own generics) at that slot's type. The
+/// probe: a field read through the binder, an identity body, a template
+/// wrapping each element, per-slot side effects in order, a zipped
+/// comprehension, results read by slot; plus the two corpus programs.
+#[test]
+fn a_mapped_tuple_and_its_comprehension_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_mapped_tuples.vl";
+    std::fs::write(staged.join(file), include_str!("native/mapped_tuples.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a mapped tuple must expand per instantiation natively"
+    );
+    for program in ["side-effect-let.vl", "spread-parameters.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F101 was its wall"
+        );
+    }
+}
+
+/// F96: a `?` lift over a USER `Lift` container and a `!` through a USER
+/// `Try` impl were refused by name — the walls of expression-lift.vl and
+/// try-assert.vl. A user lift calls the container's own `map`/`and_then`
+/// with the continuation as a closure over the step's element (a region's
+/// later receivers nested inside, so they run only when the container calls
+/// on); a user `!` is `verdict(receiver)` with the bad half returned through
+/// `from_bad`. The probe: one step, a continuation reading outer state, a
+/// region of two receivers, one skipped by a container that never calls on
+/// (the fetch count says so), a flattening body, and a `Try` impl's good and
+/// bad paths; plus the two corpus programs.
+#[test]
+fn a_user_lift_container_and_a_user_try_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_user_lift_and_try.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/user_lift_and_try.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a user `Lift` and a user `Try` must agree natively"
+    );
+    for program in ["expression-lift.vl", "try-assert.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: F96 was its wall"
+        );
+    }
 }
 
 /// F89: a pattern over an INDEXED element whose payload is not `Copy`. The
@@ -9734,10 +10454,10 @@ fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
 
 /// A152: `zip_some`'s mapped-tuple stage (start, pull and attach over every
 /// input flow) and `unzip`'s split of a tuple-valued cell, at arity two and
-/// three. Both are mapped tuples, which the native backend refuses by name
-/// today (`combine`'s state, B397's pin above); the claim is the
-/// differential's own — a refusal now, never a different answer, and the same
-/// bytes once it lowers comprehensions.
+/// three. The claim is the differential's own — a refusal by name, never a
+/// different answer. F101 lowered the mapped tuple and its comprehension;
+/// `unzip`'s next wall is the walk by position (`for key in current.keys()`,
+/// a `TupleKey` per element type), refused as the `TupleKeys` intrinsic.
 #[test]
 fn zip_some_and_unzip_are_never_a_different_answer_natively() {
     let staged = stage();
@@ -9750,8 +10470,8 @@ fn zip_some_and_unzip_are_never_a_different_answer_natively() {
     match &verdict {
         Verdict::Identical => {}
         Verdict::Refused(reason) => assert!(
-            reason.contains("a mapped tuple"),
-            "refused for another reason than the mapped tuple: {reason}"
+            reason.contains("the intrinsic `TupleKeys`"),
+            "refused for another reason than the walk by position: {reason}"
         ),
         other => panic!(
             "the native backend must refuse this program by name or print what node prints: \

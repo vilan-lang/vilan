@@ -446,6 +446,18 @@ pub fn main_guard(body: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// [`main_guard`] for a `main` that answers its EXIT CODE (`fun main(): i32`):
+/// the JS backend writes `process.exit(main())`, so the code is the process's
+/// and no microtask the body left runs after it. The body's own frame — its
+/// resources' teardowns among them (destruction.md §5/§7) — has ended by the
+/// time the code is read; `std::process::exit` runs no destructor itself.
+pub fn main_guard_exiting(body: impl FnOnce() -> i32 + Send + 'static) {
+    let code = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let answered = std::sync::Arc::clone(&code);
+    main_guard(move || answered.store(body(), std::sync::atomic::Ordering::Relaxed));
+    std::process::exit(code.load(std::sync::atomic::Ordering::Relaxed));
+}
+
 /// [`main_guard`]'s body under node's failure shape; answers whether it
 /// failed.
 fn run_guarded_main(body: impl FnOnce()) -> bool {
@@ -554,9 +566,15 @@ pub struct Shared<T> {
 /// object; safe Rust has no second view of storage under mutation to answer
 /// with, so the program stops, and says why, instead of printing Rust's
 /// `already mutably borrowed`.
-pub const REENTRANT_READ: &str = "a cell was read while it is being updated: a read inside \
-    `update` reached the same cell through another handle (the JS backend answers the \
-    in-progress value; the native backend cannot)";
+///
+/// F102: the same collision through §6.9's capture cell — a call holding a
+/// view of a captured `mut` binding runs a closure that touches the binding,
+/// one the compiler could not see arrive (a closure in a list the call was
+/// handed). The sentence names both.
+pub const REENTRANT_READ: &str = "a cell was read while it is being updated: a second path \
+    reached a cell under a live view of it (a read inside `update` through another handle, or \
+    a closure touching a captured binding a call holds a view of; the JS backend answers the \
+    in-progress value, and the native backend cannot)";
 
 /// What a [`Shared`] handle points at: the value, and the identity stamp
 /// [`Shared::identity`] takes on the first ask (`0` until then).
@@ -663,6 +681,21 @@ impl<T> Shared<T> {
     pub fn read_with<R>(&self, read: impl FnOnce(&T) -> R) -> R {
         match self.inner.value.try_borrow() {
             Ok(value) => read(&value),
+            Err(_) => panic_with(REENTRANT_READ),
+        }
+    }
+
+    /// A shared VIEW of the cell for the length of one call (F49): a `&self`
+    /// call or a `&` argument over a boxed binding reads the value in place
+    /// instead of copying all of it out ([`Shared::get`]). The emitter holds
+    /// the guard in a `let` of the call's own block, taken after every
+    /// by-value argument is evaluated, so it ends when the call does. A write
+    /// of the same cell while it is live — a closure the callee runs that
+    /// writes the binding — panics here as an aliasing read does in
+    /// [`Shared::get`], with the runtime's own sentence.
+    pub fn borrow(&self) -> std::cell::Ref<'_, T> {
+        match self.inner.value.try_borrow() {
+            Ok(value) => value,
             Err(_) => panic_with(REENTRANT_READ),
         }
     }

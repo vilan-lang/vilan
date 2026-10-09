@@ -1,0 +1,97 @@
+// F49: a `&self` METHOD CALL (or any `&` argument) on a BOXED binding — a
+// `mut` local a closure captures (spec §6.9) — deep-copied the whole value
+// first: `writer.result()` emitted `result(&writer.get())`, so std's JSON
+// codec cloned its writer, buffer included, on every encoded frame. The call
+// now takes a VIEW of the cell for its own length, after its by-value
+// arguments are evaluated: a `&self` call, a `&` parameter, a generic `&T`,
+// a field and a subscript handed by `&`, an argument that writes the same
+// binding first (its write is seen, as on JS), a closure argument that reads
+// the binding while the view is live, one that writes a field the callee
+// does not read (handed a copy, as before), a reading intrinsic, and a call
+// through a `dyn` object.
+import std::display::Display;
+import std::io::print;
+
+struct Writer {
+	parts: List<str>,
+	depth: i32,
+}
+
+impl Writer {
+	fun result(&self): str {
+		mut out = "";
+		for part in self.parts {
+			out = out + part;
+		}
+		out
+	}
+
+	fun size(&self): usize {
+		self.parts.len()
+	}
+
+	fun add(&mut self, part: str): usize {
+		self.parts.push(part);
+		self.parts.len()
+	}
+
+	fun measured(&self, extra: usize): usize {
+		self.parts.len() + extra
+	}
+
+	fun each(&self, f: |str| void) {
+		for part in self.parts {
+			f(part);
+		}
+	}
+}
+
+trait Sized2 {
+	fun size2(&self): usize;
+}
+
+impl Writer with Sized2 {
+	fun size2(&self): usize {
+		self.parts.len() * 2
+	}
+}
+
+fun describe(writer: &Writer): str {
+	i"{writer.parts.len()} parts at depth {writer.depth}"
+}
+
+fun shown<T: Display>(value: &T): str {
+	i"<{value}>"
+}
+
+fun first(parts: &List<str>): str {
+	parts[0]
+}
+
+fun main() {
+	mut writer = Writer { parts = ["a"], depth = 0 };
+	let push = |part: str| {
+		writer.parts.push(part);
+	};
+	push("b");
+	print(writer.result());
+	print(writer.size());
+	print(describe(&writer));
+	print(shown(&writer.depth));
+	print(first(&writer.parts));
+	print(writer.measured(writer.add("c")));
+	writer.each(|part| print(i"{part} of {writer.parts.len()}"));
+	writer.each(|part| {
+		writer.depth += 1;
+	});
+	print(writer.depth);
+	print(writer.parts.len());
+	print(writer.parts.contains("c"));
+	let object: dyn Sized2 = writer;
+	print(object.size2());
+	mut names = ["x", "y"];
+	let more = || names.push("z");
+	more();
+	print(first(&names));
+	print(names.len());
+}

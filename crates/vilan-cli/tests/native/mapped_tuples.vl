@@ -1,0 +1,56 @@
+// F101: a function over a MAPPED-TUPLE parameter (`values: (U in T: U)`) was
+// refused natively ("a value of type `a mapped tuple`"), and behind it the
+// tuple COMPREHENSION was refused too. A mapped tuple is a tuple per
+// instantiation — `T = (i32, str)` gives `(i32, str)` — and a comprehension
+// over one is unrolled, one body per slot, each emitted with the binder at
+// that slot's own type. The shapes: a field read through the binder at each
+// type, an identity body answering each slot's own type, a template wrapping
+// each element, side effects running once per slot and in order, a zipped
+// comprehension over two mapped sources, and a mapped result read by slot
+// at the call site.
+import std::io::print;
+
+struct Labelled<V> {
+	label: str,
+	value: V,
+}
+
+mut ticks = 0;
+
+fun tick(): i32 {
+	ticks += 1;
+	ticks
+}
+
+fun labels<T: (2..)>(items: (U in T: Labelled<U>)): (U in T: str) {
+	(item in items => item.label)
+}
+
+fun echo<T: (..)>(values: (U in T: U)): (U in T: U) {
+	(value in values => value)
+}
+
+fun wrap<T: (2..)>(values: (U in T: U)): (U in T: Labelled<U>) {
+	(value in values => Labelled { label = "w", value })
+}
+
+fun counted<T: (..)>(values: (U in T: U)): i32 {
+	let _order = (value in values => tick());
+	ticks
+}
+
+fun picks<T: (2..)>(values: (U in T: U), names: (U in T: str)): (U in T: str) {
+	(value in values, name in names => name + "!")
+}
+
+fun main() {
+	let named = labels((Labelled { label = "a", value = 1 }, Labelled { label = "b", value = true }));
+	print(named.0 + named.1);
+	let back = echo((7, "seven", false));
+	print(i"{back.0} {back.1} {back.2}");
+	let wrapped = wrap((3, "three"));
+	print(i"{wrapped.0.label}{wrapped.0.value} {wrapped.1.value}");
+	print(counted((1, "x", 2.5f)));
+	let picked = picks((1, "one"), ("first", "second"));
+	print(picked.0 + picked.1);
+}
