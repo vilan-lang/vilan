@@ -45,6 +45,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**The suite's longest stragglers start first and two of them stop waiting on themselves: `style_chain_order`'s two tests build their eight fixtures concurrently (152/102 s → 23/32 s wall, alone, under load) and `examples::every_example_builds` builds its examples concurrently (76 → 22 s); the edit-replay differential, the docs gate, `check_scope_differential`'s corpus legs and the native differential's four longest legs are priority-started.** N151 measured where the suite's time goes — 9,797 tests, 13,002 CPU-seconds, `inference` 36% of it at 0.91 s a test, and in a sample of those 53.5% of a test's CPU is the cold std world it loads before its own program. The item's main door, one std world per test binary, cannot reach that: nextest runs every test in its own process, so a world built in-process dies with its test, and where one process does run many analyses the base cache already shares them (the docs gate serves 166 of its 279). What does reach it — building `vilan-core` optimized in the test profile, about a third of the CPU per test for a five-times edit tax — is filed for a ruling. No test asserts anything different. Tracker N151.
+
+---
+
 <!-- family: diagnostics -->
 **B555: `import std::js::null;` is refused with the reason, at the keyword — "`null` is a keyword, so no import path can name `std::js::null` — and none needs to: that module declares only the type of the `null` value, which every file has without an import. Drop the import" — where it got the general "an `import`/`use` path is `::`-separated NAMES …" rule.** The module's name is the keyword, so the path grammar stops at it in every spelling: bare, braced (`std::js::null::{ .. }` — not the working spelling the item supposed; it stops at the same token), under `use`, and at the old `std::null` path. Nothing is lost: the module is a core module loaded in every program. **Pins:** `parsing::tests::b555_an_import_of_the_null_module_is_steered_at_the_keyword` (four spellings, anchored on `null`), `inference::modules::b555_importing_the_null_module_is_refused_once_with_the_steer`. Row 229's rule population is 62 (`RULE_STATEMENT_SITES`; the ledger prose carries the number). Tracker B555.
 
