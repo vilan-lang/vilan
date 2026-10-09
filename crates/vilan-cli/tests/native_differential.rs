@@ -8120,21 +8120,19 @@ fn a_resource_is_moved_not_copied_at_its_move_sites_natively() {
     }
 }
 
-/// F56's other half, as F97 left it: a resource ENUM with a `Drop` impl is
-/// still refused by name (its body before the variant's payloads is not
-/// emitted), and the STRUCT that was refused beside it builds and agrees.
+/// F56's other half: a resource ENUM with a `Drop` impl was refused by
+/// name until F116 (its body before the variant's payloads); it builds and
+/// agrees now, as the STRUCT refused beside it has since F97.
 #[test]
-fn a_resource_enum_with_drop_is_refused_by_name_and_its_struct_twin_builds_natively() {
+fn a_resource_enum_with_drop_and_its_struct_twin_build_natively() {
     let staged = stage();
     std::fs::write(staged.join("native_probe_drop_enum.vl"), DROP_ENUM_PROBE)
         .expect("write the probe program");
-    match compare(&staged, "native_probe_drop_enum.vl") {
-        Verdict::Refused(reason) => assert!(
-            reason.contains("the enum `Slot` with a `Drop` impl"),
-            "refused for another reason: {reason}"
-        ),
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
+    assert_eq!(
+        compare(&staged, "native_probe_drop_enum.vl"),
+        Verdict::Identical,
+        "a resource enum with a `Drop` impl builds natively (F116)"
+    );
     std::fs::write(
         staged.join("native_probe_drop_struct.vl"),
         DROP_STRUCT_PROBE,
@@ -11656,4 +11654,33 @@ fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_bac
         3,
         "only the three std calls copy their field out of the cell:\n{main}"
     );
+}
+
+/// F116: F97's remainder — a GENERIC resource with a `Drop` impl calls the
+/// `drop` instance its instantiation binds (two instantiations of one
+/// declaration, a two-parameter impl, a generic resource holding two
+/// others, a move into a function and into `drop`), and an ENUM with one
+/// tears down through a Rust `Drop` impl: through a view it drops at its
+/// last use, and a by-value `match` CONSUMES it (R6: its teardown is
+/// suppressed, the captures own the payloads — rustc's E0509 before).
+#[test]
+fn f116_a_generic_resource_and_an_enum_with_drop_tear_down_alike_on_both_backends() {
+    let staged = stage();
+    for (file, source) in [
+        (
+            "native_probe_f116_generic_resource_teardown.vl",
+            include_str!("native/generic_resource_teardown.vl"),
+        ),
+        (
+            "native_probe_f116_enum_resource_teardown.vl",
+            include_str!("native/enum_resource_teardown.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, file),
+            Verdict::Identical,
+            "{file}: the teardowns must run in the same order on both backends"
+        );
+    }
 }

@@ -197,7 +197,7 @@ mod dbg;
 /// functions, whose subject names the declaration. A generic resource
 /// (`impl Guard<type T> with Drop`) is one declaration with one `drop`, so the
 /// answer is per declaration, not per instantiation.
-fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, Id> {
+fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, DropImpl> {
     let drop_functions: HashSet<Id> = program
         .drop_method_checks
         .iter()
@@ -220,12 +220,28 @@ fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, Id> {
         }
         match program.type_id_to_type_map.get(&implementation.subject) {
             Some(Type::Struct(id, _)) | Some(Type::Enum(id, _)) => {
-                nominals.insert(*id, function_id);
+                nominals.insert(
+                    *id,
+                    DropImpl {
+                        function: function_id,
+                        subject: implementation.subject,
+                    },
+                );
             }
             _ => {}
         }
     }
     nominals
+}
+
+/// A nominal's `Drop` impl: its `drop` function, and the impl's SUBJECT in
+/// the impl's own generic terms (`Guard<T>` for `impl Guard<type T> with
+/// Drop`), which binds the impl's binders from one instantiation's arguments
+/// (F116).
+#[derive(Clone, Copy)]
+struct DropImpl {
+    function: Id,
+    subject: TypeId,
 }
 
 fn unsupported(what: &str, span: Span) -> Error {
@@ -541,10 +557,10 @@ struct Emitter<'a, 'src> {
     /// vilan types that lower to one Rust type must share one impl.
     object_impls: HashSet<(String, String)>,
     /// F56: the nominal declarations (struct or enum) that implement std's
-    /// `Drop`, each with its `drop` function. F97: a non-generic one is
-    /// emitted with a Rust `Drop` impl calling it; a GENERIC one is still
-    /// refused by name. See [`drop_implementing_nominals`].
-    drop_nominals: HashMap<Id, Id>,
+    /// `Drop`, each with its `drop` impl. F97: one is emitted with a Rust
+    /// `Drop` impl calling it; F116: a GENERIC one calls the `drop` instance
+    /// its instantiation binds. See [`drop_implementing_nominals`].
+    drop_nominals: HashMap<Id, DropImpl>,
 }
 
 /// One object type's Rust trait: its name and its slots, each slot's
@@ -2844,21 +2860,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // F56: a Drop-less resource (A142's pipe nodes) is move-only and
         // nothing more — the analyzer's move checker enforces that on both
         // backends — so it is an ordinary struct. F97: one WITH a `Drop` impl
-        // is a Rust `Drop` impl calling it (below); a generic one is not
-        // emitted yet, because its `drop` would be one instance per
-        // instantiation, reached from the impl's own binders.
-        if self.drop_nominals.contains_key(&id)
-            && !declaration.generic_parameter_constraint_ids.is_empty()
-        {
-            return Err(unsupported(
-                &format!(
-                    "the generic type `{}` with a `Drop` impl (its teardown is one instance \
-                     per instantiation)",
-                    declaration.name
-                ),
-                span,
-            ));
-        }
+        // is a Rust `Drop` impl calling it (below); F116: a generic one calls
+        // the `drop` instance its own arguments bind.
         let entries =
             self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
         let key: Vec<String> = entries
@@ -2882,7 +2885,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             },
         );
 
-        let saved = self.enter_substitution(entries);
+        let saved = self.enter_substitution(entries.clone());
         let rendered_types: Result<Vec<String>, Error> = declaration
             .fields
             .iter()
@@ -2953,16 +2956,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let _ = writeln!(out, "}}");
         // F97: the `Drop` impl's body runs first, then the fields drop.
-        if let Some(&drop_function) = self.drop_nominals.get(&id) {
-            let drop_name = self
-                .ensure_function(drop_function, &HashMap::default())?
-                .name;
-            let _ = writeln!(out, "impl Drop for {type_name} {{");
-            let _ = writeln!(out, "    fn drop(&mut self) {{");
-            let _ = writeln!(out, "        {drop_name}(self);");
-            let _ = writeln!(out, "    }}");
-            let _ = writeln!(out, "}}");
-        }
+        out.push_str(&self.drop_impl(id, &type_name, &entries)?);
         if reaches_a_closure {
             let comparisons: Vec<String> = declaration
                 .fields
@@ -3040,23 +3034,62 @@ impl<'a, 'src> Emitter<'a, 'src> {
         })
     }
 
+    /// Whether `type_id` (resolved) is a struct or an enum with a `Drop` impl.
+    fn has_a_drop_impl(&self, type_id: Option<TypeId>) -> bool {
+        type_id
+            .and_then(|type_id| self.resolve(self.concrete(type_id)))
+            .is_some_and(|resolved| {
+                matches!(resolved, Type::Struct(id, _) | Type::Enum(id, _)
+                    if self.drop_nominals.contains_key(id))
+            })
+    }
+
+    /// F97/F116: the Rust `Drop` impl of one instantiation of a nominal with
+    /// a `Drop` impl — empty for one without. The body calls the `drop`
+    /// instance the instantiation binds: the impl's subject (`Guard<T>`, in
+    /// the impl's own binders) is matched against the declaration's
+    /// arguments (`entries`, the declaration's parameters bound for this
+    /// instance), so `impl Guard<type T> with Drop` reaches `drop` at `T =
+    /// str` for a `Guard<str>`.
+    fn drop_impl(
+        &mut self,
+        id: Id,
+        type_name: &str,
+        entries: &[(TypeId, TypeId)],
+    ) -> Result<String, Error> {
+        let Some(drop_impl) = self.drop_nominals.get(&id).copied() else {
+            return Ok(String::new());
+        };
+        let mut substitution = HashMap::default();
+        if let Some(Type::Struct(_, pattern) | Type::Enum(_, pattern)) =
+            self.program.type_id_to_type_map.get(&drop_impl.subject)
+        {
+            for (pattern_argument, (_, concrete)) in pattern.iter().zip(entries) {
+                impl_select::bind_subject(
+                    self.program,
+                    *pattern_argument,
+                    self.concrete(*concrete),
+                    &mut substitution,
+                );
+            }
+        }
+        let drop_name = self.ensure_function(drop_impl.function, &substitution)?.name;
+        let mut out = String::new();
+        let _ = writeln!(out, "impl Drop for {type_name} {{");
+        let _ = writeln!(out, "    fn drop(&mut self) {{");
+        let _ = writeln!(out, "        {drop_name}(self);");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "}}");
+        Ok(out)
+    }
+
     fn ensure_enum(&mut self, id: Id, arguments: &[TypeId], span: Span) -> Result<Reserved, Error> {
         let declaration = self.program.enums.get(&id).cloned().unwrap();
         self.refuse_an_any_argument(arguments, span)?;
-        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown. F97
-        // emitted the struct half; an enum's `Drop` (a body before a
-        // variant's payloads, which Rust drops in declaration order) is not
-        // emitted yet.
-        if self.drop_nominals.contains_key(&id) {
-            return Err(unsupported(
-                &format!(
-                    "the enum `{}` with a `Drop` impl (its body runs before the variant's \
-                     payloads, which drop in reverse)",
-                    declaration.name
-                ),
-                span,
-            ));
-        }
+        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown. F116:
+        // an enum's `Drop` impl is a Rust one calling the body, which runs
+        // before the payloads drop (the variant's ORDER is the aggregate
+        // rule's, see [`Self::refuse_an_unordered_teardown`]).
         let entries =
             self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
         let key: Vec<String> = entries
@@ -3080,7 +3113,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             },
         );
 
-        let saved = self.enter_substitution(entries);
+        let saved = self.enter_substitution(entries.clone());
         let mut rendered: Result<Vec<String>, Error> = Ok(Vec::new());
         // The payload types per variant, kept beside the rendered declaration
         // because `PartialEq`, `Js` and `Json` all have to ask the same question
@@ -3138,6 +3171,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = writeln!(out, "{variant}");
         }
         let _ = writeln!(out, "}}");
+        out.push_str(&self.drop_impl(id, &type_name, &entries)?);
         if reaches_a_closure {
             let mut legs = String::new();
             for (index, variant) in declaration.variants.iter().enumerate() {
@@ -7435,7 +7469,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             collect_pattern_bindings(&leg.pattern, &mut bindings);
             !bindings.is_empty()
         });
-        if destructures && !self.moves_an_owned_resource(subject) {
+        // F116: a match CONSUMING a value whose type has a `Drop` impl (R6:
+        // the subject's teardown is suppressed, each capture owns its
+        // payload) moves the payloads out of it — which Rust refuses for a
+        // `Drop` type (E0509). The subject is held undropped
+        // (`ManuallyDrop`), the pattern binds through a reference to it, and
+        // each leg reads its captures out by value: one owner per payload,
+        // and the value's own `drop` never runs, as on the JS backend.
+        let consumes_a_drop_value = destructures && self.has_a_drop_impl(subject_type);
+        if consumes_a_drop_value {
+            if let Some(leg) = legs.iter().find(|leg| leg.guard.is_some()) {
+                return Err(unsupported(
+                    "a guarded leg of a `match` that consumes a value with a `Drop` impl (the \
+                     guard would read its captures through the undropped value)",
+                    self.span_of(leg.body),
+                ));
+            }
+            subject_text = format!("&*std::mem::ManuallyDrop::new({subject_text})");
+        } else if destructures && !self.moves_an_owned_resource(subject) {
             subject_text = self.copy_a_pattern_subject(subject, subject_text);
         }
         // A `str` subject is matched as a `&str`, which is the only form a
@@ -7503,6 +7554,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             } else {
                 let expecting = self.expected_type;
                 self.consumed_value_of_expecting(leg.body, expecting, depth + 1)?
+            };
+            let body = if consumes_a_drop_value {
+                let mut bindings = Vec::new();
+                collect_pattern_bindings(&leg.pattern, &mut bindings);
+                let reads: String = bindings
+                    .iter()
+                    .map(|binding| {
+                        let name = self.binding_name(*binding);
+                        format!("let {name} = unsafe {{ std::ptr::read({name}) }}; ")
+                    })
+                    .collect();
+                if reads.is_empty() {
+                    body
+                } else {
+                    format!("{{ {reads}{body} }}")
+                }
+            } else {
+                body
             };
             let _ = writeln!(out, "{leg_pad}{pattern} => {body},");
         }
