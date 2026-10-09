@@ -271,7 +271,7 @@ fn replay(package: &mut Package, edit: &Edit, divergences: &mut Vec<String>) -> 
 
 // --- the §6 edit classes ------------------------------------------------------
 
-const CLASSES_MAIN: &str = "import pkg::views::render;\nimport pkg::cycle_a::ring;\nimport pkg::impls;\nimport pkg::user::use_it;\nimport pkg::side::side_value;\nimport pkg::ext;\nimport pkg::reader::shouted;\nimport pkg::runner::run_read;\nimport pkg::bag::fill;\nimport pkg::a_spoil::spoil;\nimport pkg::painter::painted;\nimport pkg::shiner::shone;\nimport pkg::bar_eq;\nimport pkg::bar_user::bars_match;\n\nfun main() {\n\tprint(render());\n\tprint(ring(1));\n\tprint(use_it());\n\tprint(side_value());\n\tprint(shouted());\n\tprint(run_read());\n\tfill();\n\tspoil();\n\tprint(painted());\n\tprint(shone());\n\tprint(bars_match());\n}\n";
+const CLASSES_MAIN: &str = "import pkg::views::render;\nimport pkg::cycle_a::ring;\nimport pkg::impls;\nimport pkg::user::use_it;\nimport pkg::side::side_value;\nimport pkg::ext;\nimport pkg::reader::shouted;\nimport pkg::runner::run_read;\nimport pkg::bag::fill;\nimport pkg::a_spoil::spoil;\nimport pkg::painter::painted;\nimport pkg::shiner::shone;\nimport pkg::bar_eq;\nimport pkg::bar_user::bars_match;\nimport pkg::data_user::{ banner, smaller };\n\nfun main() {\n\tprint(render());\n\tprint(ring(1));\n\tprint(use_it());\n\tprint(side_value());\n\tprint(shouted());\n\tprint(run_read());\n\tfill();\n\tspoil();\n\tprint(painted());\n\tprint(shone());\n\tprint(bars_match());\n\tprint(banner());\n\tprint(smaller());\n}\n";
 
 // S1's hazards, each a module the PREFIX holds and a module the hot set holds:
 // an inherent impl on a prefix type, written in a module the caller never
@@ -321,6 +321,12 @@ const CLASSES_SHINER: &str = "import pkg::shine;\nimport pkg::shapes::{ Foo, Shi
 
 const CLASSES_BAR_EQ: &str = "import std::compare::PartialEq;\nimport pkg::shapes::Bar;\n\nimpl Bar with PartialEq {\n\tfun eq(self, other: Self): bool {\n\t\tself.n == other.n\n\t}\n}\n";
 
+// M110 S4's const sites over the project and std: one reads an input file the
+// edit script moves, one calls a std function the script edits in std itself.
+const CLASSES_DATA_USER: &str = "import std::math;\nimport std::web::asset;\n\nexport fun banner(): str {\n\tconst asset::read(\"banner.txt\")\n}\n\nexport fun smaller(): i32 {\n\tconst math::minmax(2, 1).0\n}\n";
+
+const CLASSES_BANNER: &str = "hello\n";
+
 const CLASSES_BAR_USER: &str = "import pkg::shapes::Bar;\n\nexport fun bars_match(): bool {\n\tBar { n = 1 } == Bar { n = 1 }\n}\n";
 
 const CLASSES_IMPLS: &str = "import pkg::shapes::{ Foo, Greet };\n\nexport impl Foo with Greet {\n\tfun greet(self): str {\n\t\t\"hi\"\n\t}\n}\n";
@@ -355,6 +361,8 @@ fn classes_package() -> Package {
             ("shiner.vl", CLASSES_SHINER),
             ("bar_eq.vl", CLASSES_BAR_EQ),
             ("bar_user.vl", CLASSES_BAR_USER),
+            ("data_user.vl", CLASSES_DATA_USER),
+            ("banner.txt", CLASSES_BANNER),
         ],
     )
 }
@@ -449,6 +457,15 @@ const CLASS_EDITS: &[Edit] = &[
         )],
     },
     Edit {
+        label: "a const callee's value edited, the site's own text unchanged (S4)",
+        file: "model.vl",
+        seed: None,
+        replacements: &[(
+            "export fun size(): i32 {\n\t4\n}",
+            "export fun size(): i32 {\n\t5\n}",
+        )],
+    },
+    Edit {
         label: "a body edit inside an import cycle",
         file: "cycle_b.vl",
         seed: None,
@@ -491,12 +508,65 @@ const CLASS_EDITS: &[Edit] = &[
         replacements: &[("\t\tself.n == other.n", "\t\tself.n + 0 == other.n")],
     },
     Edit {
+        label: "an input file a const site reads, edited (S4)",
+        file: "banner.txt",
+        seed: Some("data_user.vl"),
+        replacements: &[("hello", "HELLO")],
+    },
+    Edit {
         label: "a module binding's push typed in the entry's hot set's neighbour",
         file: "model.vl",
         seed: None,
         replacements: &[("\titems.push(1);\n", "\titems.push(1);\n\titems.push(2);\n")],
     },
 ];
+
+/// S4's std bump: std's own `math::minmax` edited under the analysis (an
+/// edited std buffer, through the overlay every load reads), with the
+/// classes package's const site that calls it. A const result remembered from
+/// before the edit is the stale answer the const cache must not serve.
+const STD_EDIT_FILE: &str = "src/math.vl";
+const STD_EDIT_LABEL: &str = "a std function a const site calls, edited (S4's std bump)";
+const STD_EDIT: (&str, &str) = (
+    "\tif a <= b {\n\t\t(a, b)\n\t} else {\n\t\t(b, a)\n\t}",
+    "\tif a <= b {\n\t\t(b, a)\n\t} else {\n\t\t(a, b)\n\t}",
+);
+
+/// [`replay`] for [`STD_EDIT`]: std's file moves (and moves back), the seed
+/// stays on the module whose const site calls it.
+fn replay_std_edit(package: &Package, divergences: &mut Vec<String>) -> Vec<Census> {
+    let path = std::fs::canonicalize(replay_harness::std_root().join(STD_EDIT_FILE))
+        .expect("std's math module");
+    let before = std::fs::read_to_string(&path).expect("read std's math module");
+    assert!(
+        before.contains(STD_EDIT.0),
+        "{STD_EDIT_LABEL}: the edit's anchor is not in {STD_EDIT_FILE}"
+    );
+    let after = before.replacen(STD_EDIT.0, STD_EDIT.1, 1);
+    let seed = package.path("data_user.vl");
+    let mut censuses = Vec::new();
+    for (phase, text) in [("edit", Some(after)), ("undo", None)] {
+        vilan_core::analyzer::set_document_overlay(&path, text);
+        let incremental = observe(package, vec![seed.clone()], Leg::Incremental);
+        let clean = observe(package, Vec::new(), Leg::Clean);
+        let same_shape = observe(package, vec![seed.clone()], Leg::CleanSameShape);
+        if incremental.rendering != clean.rendering {
+            divergences.push(format!(
+                "{STD_EDIT_LABEL} ({phase}): the incremental analysis differs from the clean one at {}",
+                first_difference(&incremental.rendering, &clean.rendering)
+            ));
+        }
+        if incremental.javascript != same_shape.javascript
+            || incremental.javascript.is_some() != clean.javascript.is_some()
+        {
+            divergences.push(format!(
+                "{STD_EDIT_LABEL} ({phase}): the emitted JS differs from a clean analysis"
+            ));
+        }
+        censuses.push(incremental.census);
+    }
+    censuses
+}
 
 /// M121's acceptance shape, over the classes package: a keystroke in a module
 /// whose hot set writes impls on PREFIX types that nothing in the prefix asks
@@ -668,6 +738,7 @@ fn replay_the_classes() -> Replayed {
     for edit in CLASS_EDITS {
         censuses.extend(replay(&mut package, edit, &mut divergences));
     }
+    censuses.extend(replay_std_edit(&package, &mut divergences));
     let mut served = Vec::new();
     for edit in SERVED_IMPL_EDITS {
         served.extend(replay(&mut package, edit, &mut divergences));
@@ -770,6 +841,13 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
             .step_by(2)
             .all(|census| census.base_hits > 0),
         "the warm keystrokes reuse the stored prefix: {served:#?}"
+    );
+    // M110 S4: the const cache served sites — or every comparison above said
+    // nothing about it.
+    let const_hits: u64 = censuses.iter().map(|census| census.const_cache_hits).sum();
+    assert!(
+        const_hits > 0,
+        "the classes leg must serve const sites from the const cache"
     );
     // B553: the entry's impl is one a STORED module calls, so the entry's own
     // keystrokes resolve the world once, after the entry walks — and agree.
@@ -1035,6 +1113,48 @@ fn a_hot_twin_module_keeps_its_platforms_twin() {
     assert!(
         javascript.contains("browser twin") && !javascript.contains("process twin"),
         "the browser world holds the browser twin:\n{javascript}"
+    );
+}
+
+/// S4's plant: a remembered const site served without asking its project reads
+/// again. The input-file edit is then served stale.
+#[test]
+fn the_differential_sees_a_const_site_served_without_its_reads() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::const_cache::clear();
+    let divergences = replay_with_plant(Plant::ConstCacheUnvalidated);
+    vilan_core::const_cache::clear();
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("input file a const site reads")),
+        "the unvalidated-const plant must turn the input-file edit red; it found: {divergences:#?}"
+    );
+}
+
+/// S4's plant: a const site keyed without the world declarations it reaches. A
+/// callee edited — in the package, and in std — is then served stale.
+#[test]
+fn the_differential_sees_a_const_key_without_its_callees() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::const_cache::clear();
+    let divergences = replay_with_plant(Plant::ConstKeyWithoutWorld);
+    vilan_core::const_cache::clear();
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("const callee's value edited")),
+        "the callee-blind key plant must turn the const callee edit red; it found: {divergences:#?}"
+    );
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains(STD_EDIT_LABEL)),
+        "the callee-blind key plant must turn the std edit red; it found: {divergences:#?}"
     );
 }
 

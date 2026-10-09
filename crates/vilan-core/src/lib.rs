@@ -9,6 +9,7 @@ pub mod call_graph;
 pub mod cancel;
 pub mod chunks;
 pub mod closest_name;
+pub mod const_cache;
 pub mod const_eval;
 pub mod context;
 pub mod contract_hash;
@@ -1244,6 +1245,15 @@ pub fn post_analysis_passes(
     let phase_const_start = PhaseClock::now();
     let evaluated = const_eval::evaluate(program, options, &call_graph);
     let phase_const = phase_const_start.elapsed();
+    // M110 S4: what the pass served from the const cache, for the census and
+    // the counters line `incremental::report` prints below.
+    if !macros::in_macro_world() {
+        let (hits, misses) = const_cache::counts();
+        incremental::update_census(|census| {
+            census.const_cache_hits = hits;
+            census.const_cache_misses = misses;
+        });
+    }
     program.const_results = evaluated.results;
     program.const_assets = evaluated.assets;
     program.const_input_files = evaluated.input_files;

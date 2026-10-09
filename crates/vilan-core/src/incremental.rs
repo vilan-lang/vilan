@@ -186,6 +186,13 @@ pub enum Plant {
     /// S1: drop the use-inferred-binding guard — defer a hot module that
     /// imports a prefix binding whose type the first use decides.
     UseInferredGuardOff,
+    /// S4: serve a remembered const site without asking its project reads
+    /// again — an edited input file is then served stale.
+    ConstCacheUnvalidated,
+    /// S4: key a const site by its own expression and prelude only, without
+    /// the world declarations it reaches — an edited callee is then served
+    /// stale.
+    ConstKeyWithoutWorld,
 }
 
 impl Plant {
@@ -196,6 +203,8 @@ impl Plant {
             Plant::ImplGuardOff => 3,
             Plant::WholePackageHot => 5,
             Plant::UseInferredGuardOff => 6,
+            Plant::ConstCacheUnvalidated => 7,
+            Plant::ConstKeyWithoutWorld => 8,
         }
     }
 }
@@ -250,6 +259,10 @@ pub struct Census {
     /// Functions whose Class A checks this analysis ran — every function
     /// outside the frozen (std) and replayed ranges.
     pub functions_checked: usize,
+    /// M110 S4: `const` sites this analysis served from the const cache, and
+    /// the ones it evaluated (`crate::const_cache`).
+    pub const_cache_hits: u64,
+    pub const_cache_misses: u64,
 }
 
 thread_local! {
@@ -266,6 +279,8 @@ thread_local! {
             sources_walked: 0,
             records_replayed: 0,
             functions_checked: 0,
+            const_cache_hits: 0,
+            const_cache_misses: 0,
         })
     };
 }
@@ -618,7 +633,8 @@ pub fn report(program: &Program) {
     if crate::counters::counters_enabled() {
         eprintln!(
             "[vilan counters] incremental base-hits={} base-misses={} base-stores={} \
-             hot-world={} sources-walked={} records-replayed={} functions-checked={}",
+             hot-world={} sources-walked={} records-replayed={} functions-checked={} \
+             const-hits={} const-misses={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -626,6 +642,8 @@ pub fn report(program: &Program) {
             census.sources_walked,
             census.records_replayed,
             census.functions_checked,
+            census.const_cache_hits,
+            census.const_cache_misses,
         );
     }
 }
