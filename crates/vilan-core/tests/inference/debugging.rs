@@ -224,9 +224,20 @@ fn s1_dbg_of_a_generic_value_prints_each_instantiations_type() {
     );
 }
 
+/// The first 98 entries of a filled `0..` list (E277), as `dbg` lays them out
+/// two spaces deep.
+const FILLED_ZERO_TO_97: &str = concat!(
+    "  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,\n",
+    "  22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,\n",
+    "  41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59,\n",
+    "  60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,\n",
+    "  79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97,\n",
+);
+
 /// Q1's layout: one line when it fits 80 columns from where it starts, else
-/// one entry per line, two spaces deeper, each with a trailing comma; a list
-/// past 100 entries stops with `… N more`; a closure prints by its type.
+/// one entry per line, two spaces deeper, each with a trailing comma (a list
+/// of scalars filling its lines instead, E277); a list past 100 entries stops
+/// with `… N more`; a closure prints by its type.
 #[test]
 fn s1_dbg_breaks_past_80_columns_and_cuts_a_long_list() {
     assert_dbg_runs(
@@ -247,8 +258,251 @@ fn s1_dbg_breaks_past_80_columns_and_cuts_a_long_list() {
         ),
         "103\n",
         &format!(
-            "[test.vl:4:2] long = Line {{\n  from = (1, 2),\n  to = (3, 4),\n  label = \"a label long enough to break\",\n}}\n[test.vl:9:13] many = [\n{}  \u{2026} 3 more,\n]\n[test.vl:12:2] add = <closure |i32, i32| -> i32>\n",
-            (0..100).map(|n| format!("  {n},\n")).collect::<String>()
+            "[test.vl:4:2] long = Line {{\n  from = (1, 2),\n  to = (3, 4),\n  label = \"a label long enough to break\",\n}}\n[test.vl:9:13] many = [\n{}  98, 99, \u{2026} 3 more,\n]\n[test.vl:12:2] add = <closure |i32, i32| i32>\n",
+            FILLED_ZERO_TO_97
+        ),
+    );
+}
+
+/// E277: a broken list (or set) whose entries are all scalars — numbers,
+/// strings, bools, a field-less enum — fills each line up to the 80-column
+/// limit, a trailing comma after every entry, where an aggregate element
+/// (a struct, an `Option`) keeps a line of its own; nested in a broken struct
+/// the filled lines sit two spaces deeper, and a list that fits stays on one
+/// line.
+#[test]
+fn e277_a_list_of_scalars_fills_its_lines_and_aggregates_keep_one_per_line() {
+    assert_dbg_runs(
+        concat!(
+            "import std::hash_set::HashSet;\n",
+            "\n",
+            "struct Point {\n",
+            "\tx: i32,\n",
+            "\ty: i32,\n",
+            "}\n",
+            "\n",
+            "enum Color {\n",
+            "\tRed,\n",
+            "\tGreen,\n",
+            "\tBlue,\n",
+            "}\n",
+            "\n",
+            "struct Bag {\n",
+            "\tlabel: str,\n",
+            "\tvalues: List<i32>,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut numbers: List<i32> = [];\n",
+            "\tmut next = 0;\n",
+            "\tfor next < 40 {\n",
+            "\t\tnumbers.push(next);\n",
+            "\t\tnext = next + 1;\n",
+            "\t}\n",
+            "\tdbg(numbers);\n",
+            "\tlet words = [\"alpha\", \"beta\", \"gamma\", \"delta\", \"epsilon\", \"zeta\", \"eta\", \"theta\", \"iota\", \"kappa\"];\n",
+            "\tdbg(words);\n",
+            "\tlet points = [Point { x = 1, y = 2 }, Point { x = 3, y = 4 }, Point { x = 5, y = 6 }];\n",
+            "\tdbg(points);\n",
+            "\tlet colors = [Color::Red, Color::Green, Color::Blue, Color::Red, Color::Green, Color::Blue];\n",
+            "\tdbg(colors);\n",
+            "\tlet maybes = [Some(1), None, Some(3), None, Some(5), None, Some(7), None, Some(9)];\n",
+            "\tdbg(maybes);\n",
+            "\tdbg(Bag { label = \"b\", values = numbers });\n",
+            "\tmut seen: HashSet<i32> = HashSet::new();\n",
+            "\tmut item = 100;\n",
+            "\tfor item < 130 {\n",
+            "\t\tseen.insert(item);\n",
+            "\t\titem = item + 1;\n",
+            "\t}\n",
+            "\tdbg(seen);\n",
+            "\tdbg([1.5, 2.5], [true, false]);\n",
+            "}\n",
+        ),
+        "",
+        concat!(
+            "[test.vl:26:2] numbers = [\n",
+            "  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,\n",
+            "  22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,\n",
+            "]\n",
+            "[test.vl:28:2] words = [\n",
+            "  \"alpha\", \"beta\", \"gamma\", \"delta\", \"epsilon\", \"zeta\", \"eta\", \"theta\", \"iota\",\n",
+            "  \"kappa\",\n",
+            "]\n",
+            "[test.vl:30:2] points = [\n",
+            "  Point { x = 1, y = 2 },\n",
+            "  Point { x = 3, y = 4 },\n",
+            "  Point { x = 5, y = 6 },\n",
+            "]\n",
+            "[test.vl:32:2] colors = [\n",
+            "  Color::Red, Color::Green, Color::Blue, Color::Red, Color::Green, Color::Blue,\n",
+            "]\n",
+            "[test.vl:34:2] maybes = [\n",
+            "  Some(1),\n",
+            "  None,\n",
+            "  Some(3),\n",
+            "  None,\n",
+            "  Some(5),\n",
+            "  None,\n",
+            "  Some(7),\n",
+            "  None,\n",
+            "  Some(9),\n",
+            "]\n",
+            "[test.vl:35:2] Bag { label = \"b\", values = numbers } = Bag {\n",
+            "  label = \"b\",\n",
+            "  values = [\n",
+            "    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,\n",
+            "    21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,\n",
+            "  ],\n",
+            "}\n",
+            "[test.vl:42:2] seen = HashSet {\n",
+            "  100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114,\n",
+            "  115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129,\n",
+            "}\n",
+            "[test.vl:43:2] [1.5, 2.5] = [1.5, 2.5]\n",
+            "[test.vl:43:2] [true, false] = [true, false]\n",
+        ),
+    );
+}
+
+/// E275 (1): a WRITTEN `Debug` impl decides how `dbg` prints its type — at
+/// the top, as a list element, as an option's payload, as a field of a type
+/// that prints by its structure, and through a generic `T` — and a written
+/// generic impl whose bound the type misses (`Boxed<Opaque>`) does not apply,
+/// so the structure prints.
+#[test]
+fn e275_a_written_debug_impl_decides_how_dbg_prints_its_type() {
+    assert_dbg_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "struct Celsius { degrees: f64 }\n",
+            "impl Celsius with Debug {\n",
+            "\tfun debug(self): str { self.degrees.debug() + \"C\" }\n",
+            "}\n",
+            "struct Boxed<T> { inner: T }\n",
+            "impl Boxed<type T: Debug> with Debug {\n",
+            "\tfun debug(self): str { \"boxed \" + self.inner.debug() }\n",
+            "}\n",
+            "struct Opaque { tag: i32 }\n",
+            "enum Signal { Go, Stop(str) }\n",
+            "impl Signal with Debug {\n",
+            "\tfun debug(self): str {\n",
+            "\t\tmatch self {\n",
+            "\t\t\tSignal::Go => \"go!\",\n",
+            "\t\t\tSignal::Stop(let why) => \"stop: \" + why,\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "struct Reading { place: str, temperature: Celsius }\n",
+            "fun show<T>(value: T) {\n",
+            "\tdbg(value);\n",
+            "}\n",
+            "fun main() {\n",
+            "\tdbg(Celsius { degrees = 21.5 });\n",
+            "\tdbg([Celsius { degrees = 1.0 }, Celsius { degrees = 2.0 }]);\n",
+            "\tdbg(Boxed { inner = 7 }, Boxed { inner = Opaque { tag = 1 } });\n",
+            "\tdbg(Signal::Go, Some(Signal::Stop(\"red\")));\n",
+            "\tshow(Celsius { degrees = 3.0 });\n",
+            "\tdbg(Reading { place = \"here\", temperature = Celsius { degrees = 4.5 } });\n",
+            "}\n",
+        ),
+        "",
+        concat!(
+            "[test.vl:25:2] Celsius { degrees = 21.5 } = 21.5C\n",
+            "[test.vl:26:2] [Celsius { degrees = 1.0 }, Celsius { degrees = 2.0 }] = [\n",
+            "  1.0C,\n",
+            "  2.0C,\n",
+            "]\n",
+            "[test.vl:27:2] Boxed { inner = 7 } = boxed 7\n",
+            "[test.vl:27:2] Boxed { inner = Opaque { tag = 1 } } = Boxed {\n",
+            "  inner = Opaque { tag = 1 },\n",
+            "}\n",
+            "[test.vl:28:2] Signal::Go = go!\n",
+            "[test.vl:28:2] Some(Signal::Stop(\"red\")) = Some(stop: red)\n",
+            "[test.vl:22:2] value = 3.0C\n",
+            "[test.vl:30:2] Reading { place = \"here\", temperature = Celsius { degrees = 4.5 } } = Reading {\n",
+            "  place = \"here\",\n",
+            "  temperature = 4.5C,\n",
+            "}\n",
+        ),
+    );
+}
+
+/// E275 (2): `[derive(Debug)]` spells an enum variant qualified
+/// (`Shape::Rect(2, 3)`) and a string as the printer escapes it, so `.debug()`
+/// is `dbg`'s spelling on one line; a field whose type has a written impl
+/// renders through it in both; and `dbg` still lays a derived value out over
+/// lines past 80 columns, where `.debug()` stays one line.
+#[test]
+fn e275_the_derive_spells_variants_qualified_and_agrees_with_dbg() {
+    assert_dbg_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "struct Celsius { degrees: f64 }\n",
+            "impl Celsius with Debug {\n",
+            "\tfun debug(self): str { self.degrees.debug() + \"C\" }\n",
+            "}\n",
+            "[derive(Debug)]\n",
+            "enum Shape { Circle(f64), Rect(i32, i32), Empty }\n",
+            "[derive(Debug)]\n",
+            "struct Reading { place: str, temperature: Celsius, shape: Shape }\n",
+            "[derive(Debug)]\n",
+            "struct Wide { first_label: str, second_label: str, numbers: List<i32> }\n",
+            "fun main() {\n",
+            "\tlet reading = Reading { place = \"a \\\"quoted\\\"\\tplace\\0\", temperature = Celsius { degrees = 4.5 }, shape = Shape::Rect(2, 3) };\n",
+            "\tdbg(reading);\n",
+            "\tprint(reading.debug());\n",
+            "\tprint(Shape::Circle(1.5).debug());\n",
+            "\tprint(Shape::Empty.debug());\n",
+            "\tlet wide = Wide { first_label = \"the first label\", second_label = \"the second label\", numbers = [1, 2, 3] };\n",
+            "\tdbg(wide);\n",
+            "\tprint(wide.debug());\n",
+            "}\n",
+        ),
+        concat!(
+            "Reading { place = \"a \\\"quoted\\\"\\tplace\\0\", temperature = 4.5C, shape = Shape::Rect(2, 3) }\n",
+            "Shape::Circle(1.5)\n",
+            "Shape::Empty\n",
+            "Wide { first_label = \"the first label\", second_label = \"the second label\", numbers = [1, 2, 3] }\n",
+        ),
+        concat!(
+            "[test.vl:14:2] reading = Reading {\n",
+            "  place = \"a \\\"quoted\\\"\\tplace\\0\",\n",
+            "  temperature = 4.5C,\n",
+            "  shape = Shape::Rect(2, 3),\n",
+            "}\n",
+            "[test.vl:19:2] wide = Wide {\n",
+            "  first_label = \"the first label\",\n",
+            "  second_label = \"the second label\",\n",
+            "  numbers = [1, 2, 3],\n",
+            "}\n",
+        ),
+    );
+}
+
+/// E275 (3): `.debug()` stays opt-in — a type without a derived or written
+/// impl has no `debug` method (`dbg` is the path that needs none) — and a
+/// program's own enum named `Option` prints qualified, as any enum of its own
+/// does; only std's `Option` and `Result` print bare.
+#[test]
+fn e275_debug_stays_opt_in_and_only_stds_prelude_enums_print_bare() {
+    assert_fails_with(
+        "import std::debug::Debug;\nstruct Point { x: i32 }\nfun main() { print(Point { x = 1 }.debug()); }\n",
+        "Point has no method 'debug'",
+    );
+    assert_dbg_runs(
+        concat!(
+            "mod mine {\n",
+            "\texport enum Option { Some(i32), None }\n",
+            "}\n",
+            "fun main() {\n",
+            "\tdbg(mine::Option::Some(3), Some(3));\n",
+            "}\n",
+        ),
+        "",
+        concat!(
+            "[test.vl:5:2] mine::Option::Some(3) = Option::Some(3)\n",
+            "[test.vl:5:2] Some(3) = Some(3)\n",
         ),
     );
 }
@@ -260,6 +514,78 @@ fn s1_a_programs_own_dbg_shadows_the_intrinsic() {
         "fun dbg(value: i32): i32 { value * 10 }\nfun main() { print(dbg(4)); }\n",
         "40\n",
     );
+}
+
+/// E276: `dbg` shows the real value, so negative zero is `-0.0` — a literal,
+/// a computed one, an `f32`, and one inside an aggregate — while `print` keeps
+/// N136's `0`. `.debug()` agrees with `dbg` (the printer's spelling, E275).
+#[test]
+fn e276_dbg_shows_negative_zero_and_print_keeps_zero() {
+    assert_dbg_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "fun main() {\n",
+            "\tlet zero = 0.0;\n",
+            "\tdbg(-0.0, zero * -1.0, -0.0f, [0.0, -0.0], Some(-0.0));\n",
+            "\tprint(zero * -1.0);\n",
+            "\tprint((zero * -1.0).debug());\n",
+            "\tprint((-0.0f).debug());\n",
+            "\tdbg(0.0, -1.5);\n",
+            "}\n",
+        ),
+        "0\n-0.0\n-0.0\n",
+        concat!(
+            "[test.vl:4:2] -0.0 = -0.0\n",
+            "[test.vl:4:2] zero * -1.0 = -0.0\n",
+            "[test.vl:4:2] -0.0f = -0.0\n",
+            "[test.vl:4:2] [0.0, -0.0] = [0.0, -0.0]\n",
+            "[test.vl:4:2] Some(-0.0) = Some(-0.0)\n",
+            "[test.vl:8:2] 0.0 = 0.0\n",
+            "[test.vl:8:2] -1.5 = -1.5\n",
+        ),
+    );
+}
+
+/// S1b: a `dyn` value prints the value it erased — `dyn Area(Square { side
+/// = 2 })`, through the `show` slot its table carries — alone, in a list, in
+/// an option and with trait arguments; a value whose type has a written
+/// `Debug` prints through it there too. A table keeps its members' names
+/// (`show` is a member here), and a program that never calls `dbg` carries no
+/// slot at all.
+#[test]
+fn s1b_a_dyn_value_prints_what_it_holds() {
+    let source = concat!(
+        "trait Area { fun area(self): i32; }\n",
+        "trait Named { fun show(self): str; }\n",
+        "trait Label<T> { fun label(self): T; }\n",
+        "struct Square { side: i32 }\n",
+        "impl Square with Area { fun area(self): i32 { self.side * self.side } }\n",
+        "impl Square with Named { fun show(self): str { \"square\" } }\n",
+        "impl Square with Label<str> { fun label(self): str { \"sq\" } }\n",
+        "fun main() {\n",
+        "\tlet one: dyn Area = Square { side = 2 };\n",
+        "\tlet shapes: List<dyn Area> = [Square { side = 3 }];\n",
+        "\tlet named: dyn Named = Square { side = 4 };\n",
+        "\tlet labelled: dyn Label<str> = Square { side = 5 };\n",
+        "\tdbg(one, shapes, Some(one), named, labelled);\n",
+        "\tprint(named.show());\n",
+        "}\n",
+    );
+    assert_dbg_runs(
+        source,
+        "square\n",
+        concat!(
+            "[test.vl:13:2] one = dyn Area(Square { side = 2 })\n",
+            "[test.vl:13:2] shapes = [dyn Area(Square { side = 3 })]\n",
+            "[test.vl:13:2] Some(one) = Some(dyn Area(Square { side = 2 }))\n",
+            "[test.vl:13:2] named = dyn Named(Square { side = 4 })\n",
+            "[test.vl:13:2] labelled = dyn Label<str>(Square { side = 5 })\n",
+        ),
+    );
+    let without_dbg = source.replace("\tdbg(one, shapes, Some(one), named, labelled);\n", "");
+    let javascript = compile(&without_dbg).expect("a clean compile");
+    assert!(!javascript.contains("$show"), "{javascript}");
+    assert!(compile(source).expect("a clean compile").contains("$show:"));
 }
 
 // --- S4: `Debug` through the printer (E260) -----------------------------
@@ -293,7 +619,7 @@ fn s4_debug_covers_every_container_the_printer_prints() {
             "Some([Some(1)])\n",
             "Err(\"no\")\n",
             "3.0\n",
-            "0.0\n",
+            "-0.0\n",
             "1.5\n",
         ),
     );
@@ -386,4 +712,42 @@ fn n136_print_writes_negative_zero_as_zero() {
         "{javascript}"
     );
     assert_compiles_and_runs(source, "0\n0\n0\n2.5\n[ 1, 2 ]\n");
+}
+
+/// N149: N136's recording is static, so `print(value)` with `value: T` was not
+/// wrapped where `T` is a number and negative zero printed `-0` on JS (`0`
+/// natively). The type is read per instance now: the number instances share a
+/// wrapped body, the string's stays bare — and a closure parameter whose type
+/// is inferred from its use (`|n| print(n)` handed to a `List<i32>` walk) is
+/// wrapped too.
+#[test]
+fn n149_print_of_a_generic_number_is_wrapped_per_instance() {
+    let source = concat!(
+        "fun show<T>(value: T) {\n",
+        "\tprint(value);\n",
+        "}\n",
+        "struct Holder<T> { value: T }\n",
+        "fun shout<T>(holder: Holder<T>) {\n",
+        "\tprint(holder.value);\n",
+        "}\n",
+        "fun main() {\n",
+        "\tlet zero = 0.0;\n",
+        "\tshow(zero * -1.0);\n",
+        "\tshow(-0.0f);\n",
+        "\tshow(0 * -1);\n",
+        "\tshow(\"text\");\n",
+        "\tshout(Holder { value = zero * -1.0 });\n",
+        "\t[0.0 * -1.0].for_each(|n| print(n));\n",
+        "}\n",
+    );
+    let javascript = compile(source).expect("a clean compile");
+    assert!(
+        javascript.contains("function show(value) {\n\tconsole.log(String(value));"),
+        "{javascript}"
+    );
+    assert!(
+        javascript.contains("function show2(value) {\n\tconsole.log(value);"),
+        "{javascript}"
+    );
+    assert_compiles_and_runs(source, "0\n0\n0\ntext\n0\n0\n");
 }

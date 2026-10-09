@@ -17,7 +17,7 @@ use vilan_core::printer::{Shape, shape_of};
 use vilan_core::span::Span;
 use vilan_core::type_::{Type, TypeId};
 
-use crate::{Emitter, rust_literal, rust_string, sanitize, unsupported};
+use crate::{Emitter, NativeDispatch, Receiving, rust_literal, rust_string, sanitize, unsupported};
 
 impl<'a, 'src> Emitter<'a, 'src> {
     /// `dbg(a, b, ..)`: prints `[file:line:col] expr = value` per argument to
@@ -139,6 +139,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // Recorded BEFORE the body is built: a recursive type's printer calls
         // itself.
         self.printers.insert(key, name.clone());
+        if let Some(body) = self.written_debug_body(type_id, span)? {
+            self.printer_bodies.push(format!(
+                "fn {name}(value: &{rust_type}) -> vilan_rt::show::Doc {{\n    {body}\n}}\n"
+            ));
+            return Ok(name);
+        }
         let body = match shape {
             Shape::Integer | Shape::BigInt => "vilan_rt::show::integer(value)".to_string(),
             Shape::Float => "vilan_rt::show::float(*value as f64)".to_string(),
@@ -186,7 +192,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Shape::List(element) => {
                 let printer = self.native_printer_for(element, span)?;
-                format!("vilan_rt::show::list(&value[..], |item| {printer}(item))")
+                let fill = self.prints_as_a_scalar(element);
+                format!("vilan_rt::show::list(&value[..], {fill}, |item| {printer}(item))")
             }
             Shape::Shared(inner) => {
                 let printer = self.native_printer_for(inner, span)?;
@@ -214,7 +221,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let key_printer = self.native_printer_for(key, span)?;
                 let value_printer = self.native_printer_for(entry_value, span)?;
                 format!(
-                    "vilan_rt::show::members({}, &value.{}.values(), |entry| (format!(\"{{}} => \", {key_printer}(&entry.0).flat()), {value_printer}(&entry.1)))",
+                    "vilan_rt::show::members({}, &value.{}.values(), false, |entry| (format!(\"{{}} => \", {key_printer}(&entry.0).flat()), {value_printer}(&entry.1)))",
                     rust_literal(&format!("{label} {{")),
                     sanitize(&field)
                 )
@@ -225,11 +232,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 element,
             } => {
                 let printer = self.native_printer_for(element, span)?;
+                let fill = self.prints_as_a_scalar(element);
                 format!(
-                    "vilan_rt::show::members({}, &value.{}.values(), |item| (String::new(), {printer}(item)))",
+                    "vilan_rt::show::members({}, &value.{}.values(), {fill}, |item| (String::new(), {printer}(item)))",
                     rust_literal(&format!("{label} {{")),
                     sanitize(&field)
                 )
+            }
+            Shape::Object { label } => {
+                let Some(Type::Dyn(trait_id, arguments)) = self.resolve(type_id).cloned() else {
+                    return Err(unsupported("printing an object that did not resolve", span));
+                };
+                let object = self.ensure_object_trait(trait_id, &arguments, span)?;
+                match object.show {
+                    Some(show) => format!(
+                        "vilan_rt::show::Doc::group({}, \")\", false, vec![(String::new(), {}::{show}(value.object()))])",
+                        rust_literal(&format!("{label}(")),
+                        object.name
+                    ),
+                    None => format!(
+                        "vilan_rt::show::Doc::text({})",
+                        rust_literal(&format!("<{label}>"))
+                    ),
+                }
             }
             Shape::Enum { variants, bindings } => {
                 let Some(Type::Enum(enum_id, arguments)) = self.resolve(type_id).cloned() else {
@@ -284,6 +309,43 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "fn {name}(value: &{rust_type}) -> vilan_rt::show::Doc {{\n    {body}\n}}\n"
         ));
         Ok(name)
+    }
+
+    /// E275: a printer body that answers the text of the type's WRITTEN
+    /// `Debug` impl, or `None` when the structure prints
+    /// ([`vilan_core::printer::written_debug`] says which) — the twin of the
+    /// JS emitter's. The impl's `debug` takes its receiver as a loan or a
+    /// copy, by its own convention.
+    fn written_debug_body(&mut self, type_id: TypeId, span: Span) -> Result<Option<String>, Error> {
+        let Some(trait_id) = vilan_core::printer::written_debug(self.program, type_id) else {
+            return Ok(None);
+        };
+        let Some(NativeDispatch::Call(function_name)) =
+            self.resolve_dispatch(type_id, "debug", &[], Some((trait_id, Vec::new())), span)?
+        else {
+            return Ok(None);
+        };
+        let receiver = self
+            .instance_target(&function_name)
+            .and_then(|target| self.program.functions.get(&target))
+            .and_then(|function| function.parameters.first())
+            .and_then(|parameter| self.program.parameters.get(parameter))
+            .map(|parameter| self.receiving_form(parameter));
+        let argument = match receiver {
+            Some(Receiving::Ref) => "value",
+            Some(Receiving::ByValue) => "value.clone()",
+            _ => return Ok(None),
+        };
+        Ok(Some(format!(
+            "vilan_rt::show::Doc::text({function_name}({argument}).to_string())"
+        )))
+    }
+
+    /// Whether an element of `type_id` prints as one short token, so its list
+    /// or set fills its broken lines (E277) — the JS emitter asks the same.
+    fn prints_as_a_scalar(&self, type_id: TypeId) -> bool {
+        let resolve = |type_id| self.concrete(type_id);
+        shape_of(self.program, type_id, &resolve).is_scalar()
     }
 
     /// Runs `body` with a nominal declaration's generic parameters bound to

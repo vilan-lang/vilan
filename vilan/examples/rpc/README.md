@@ -12,7 +12,7 @@ vilan run vilan/examples/rpc
 ```
 ok: found ada (@ada)
 ok: no such user
-raw error: Remote("unknown method: delete_everything")
+raw error: RpcError::Remote("unknown method: delete_everything")
 --- reactive: a remote Source<i32> ---
 count = 0
 count = 1
@@ -28,10 +28,10 @@ login -> false
 status = online
 login -> true
 whoami -> ada (@ada)
-note status = Waiting
+note status = Status::Waiting
 note = hello, ada
 edit -> true
-note status = Ready
+note status = Status::Ready
 ```
 
 Everything runs in-process over a local transport — no network, no server to

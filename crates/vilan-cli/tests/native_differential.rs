@@ -1501,6 +1501,48 @@ fn negative_zero_prints_zero_on_both_backends() {
     );
 }
 
+/// N149: `print(value)` with `value: T` at a float or an integer instance
+/// prints negative zero as `0` on both backends (the JS instance is wrapped
+/// per instance), a string instance prints the string, and a struct field of
+/// a generic type and an inferred closure parameter follow the same rule.
+#[test]
+fn n149_a_generic_print_of_negative_zero_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_n149_generic_print.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "fun show<T>(value: T) {\n",
+            "\tprint(value);\n",
+            "}\n",
+            "\n",
+            "struct Holder<T> {\n",
+            "\tvalue: T,\n",
+            "}\n",
+            "\n",
+            "fun shout<T>(holder: Holder<T>) {\n",
+            "\tprint(holder.value);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet zero = 0.0;\n",
+            "\tshow(zero * -1.0);\n",
+            "\tshow(-0.0f);\n",
+            "\tshow(0 * -1);\n",
+            "\tshow(\"text\");\n",
+            "\tshout(Holder { value = zero * -1.0 });\n",
+            "\t[0.0 * -1.0].for_each(|n| print(n));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "0\n0\n0\ntext\n0\n0\n", "{backend:?}");
+    }
+}
+
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.
 ///
 /// It prints the census — refused / identical — because that census IS the
@@ -4997,7 +5039,7 @@ fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_b
         "a per-key subscription sees ITS key and no other:\n{}",
         native.1
     );
-    assert_eq!(native.2.trim(), "err:Unauthorized");
+    assert_eq!(native.2.trim(), "err:RpcError::Unauthorized");
 }
 
 /// Replaces every session token in `exchanges`' bodies — a run of exactly 64
@@ -10453,5 +10495,89 @@ fn s4_debug_over_containers_is_identical_on_both_backends() {
         compare(&staged, "native_probe_debug_containers.vl"),
         Verdict::Identical,
         "Debug over containers must render the same on both backends"
+    );
+}
+
+/// Runs `source` as `file` (its OWN program name: the shared target keys a
+/// native binary by it) on both backends and holds each leg's streams to the
+/// expected bytes — `dbg`'s lines on stderr, the program's own on stdout.
+#[track_caller]
+fn assert_dbg_lines_on_both_backends(file: &str, source: &str, stdout: &str, stderr: &str) {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stderr, stderr, "{backend:?}: the dbg lines");
+        assert_eq!(run.stdout, stdout, "{backend:?}: the program's output");
+    }
+}
+
+/// E275: a written `Debug` impl decides how `dbg` prints its type (at the top,
+/// in a list, in an option, as a field, through a generic `T`; a generic impl
+/// whose bound misses leaves the structure), the derive spells variants
+/// qualified and agrees with `dbg`, and `dbg` still lays a derived value out —
+/// the same bytes on both backends (`native/dbg_debug_impls.*`).
+#[test]
+fn e275_written_and_derived_debug_print_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_debug_impls.vl",
+        include_str!("native/dbg_debug_impls.vl"),
+        include_str!("native/dbg_debug_impls.stdout"),
+        include_str!("native/dbg_debug_impls.stderr"),
+    );
+}
+
+/// E277: a broken list or set of scalars (numbers, strings, a field-less
+/// enum) fills its lines to 80 columns, nested ones two spaces deeper, while a
+/// list of structs or options keeps one entry per line — the same bytes on
+/// both backends (`native/dbg_fill.stderr`).
+#[test]
+fn e277_scalar_lists_fill_their_lines_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_fill.vl",
+        include_str!("native/dbg_fill.vl"),
+        "",
+        include_str!("native/dbg_fill.stderr"),
+    );
+}
+
+/// S1b: a `dyn` value prints the value it erased through its table's `show`
+/// slot — alone, in a list, nested in a struct, in an option, with trait
+/// arguments, through a written `Debug` — and a trait whose members are
+/// named `show` and `dbg_show` keeps them (`native/dbg_dyn.*`).
+#[test]
+fn s1b_a_dyn_value_prints_what_it_holds_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_dyn.vl",
+        include_str!("native/dbg_dyn.vl"),
+        "4\nrect\nalso rect\n",
+        include_str!("native/dbg_dyn.stderr"),
+    );
+}
+
+/// E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an
+/// `f32`, one inside a list — and `.debug()` agrees, while `print` keeps
+/// N136's `0`; the same bytes on both backends.
+#[test]
+fn e276_dbg_shows_negative_zero_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_e276_negative_zero.vl",
+        concat!(
+            "import std::debug::Debug;\n",
+            "fun main() {\n",
+            "\tlet zero = 0.0;\n",
+            "\tdbg(-0.0, zero * -1.0, -0.0f, [0.0, -0.0]);\n",
+            "\tprint(zero * -1.0);\n",
+            "\tprint((zero * -1.0).debug());\n",
+            "}\n",
+        ),
+        "0\n-0.0\n",
+        concat!(
+            "[native_probe_e276_negative_zero.vl:4:2] -0.0 = -0.0\n",
+            "[native_probe_e276_negative_zero.vl:4:2] zero * -1.0 = -0.0\n",
+            "[native_probe_e276_negative_zero.vl:4:2] -0.0f = -0.0\n",
+            "[native_probe_e276_negative_zero.vl:4:2] [0.0, -0.0] = [0.0, -0.0]\n",
+        ),
     );
 }

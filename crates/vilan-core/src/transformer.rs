@@ -1892,11 +1892,13 @@ fn helper_source(name: &str) -> &'static str {
         // `dbg(..)`'s runtime (debugging.md S1): the layout and the scalar
         // spellings every generated `__show_*` printer builds on, written to
         // agree byte for byte with `vilan_rt::show`. A document is a string or
-        // a group `{ o, c, p, e }`: open text, close text, whether the entries
-        // are padded by a space (`Point { x = 1 }` against `[1, 2]`), and
-        // `[label, document]` entries. It lays out on one line when that fits
-        // 80 columns from where it starts, else one entry per line, two spaces
-        // deeper, each with a trailing comma (Q1). Widths count characters.
+        // a group `{ o, c, p, e, f }`: open text, close text, whether the
+        // entries are padded by a space (`Point { x = 1 }` against `[1, 2]`),
+        // `[label, document]` entries, and whether a broken group FILLS its
+        // lines (a list or set of scalars, E277). It lays out on one line when
+        // that fits 80 columns from where it starts, else one entry per line
+        // (or as many as fit, filled), two spaces deeper, each with a trailing
+        // comma (Q1). Widths count characters.
         "__dbg" => {
             "function __dbg(write, location, entries) {\n\
              \tif (entries.length === 0) {\n\
@@ -1916,15 +1918,15 @@ fn helper_source(name: &str) -> &'static str {
              \t__dbg(write, location, values.map((value, index) => [ texts[index], shows[index](value) ]));\n\
              \treturn spread ? values.flatMap((value, index) => spread[index] ? value : [ value ]) : values;\n\
              }\n\
-             function __dbg_group(open, close, padded, entries) {\n\
-             \treturn { o: open, c: close, p: padded, e: entries };\n\
+             function __dbg_group(open, close, padded, entries, fill) {\n\
+             \treturn { o: open, c: close, p: padded, e: entries, f: fill === true };\n\
              }\n\
-             function __dbg_list(items, show) {\n\
+             function __dbg_list(items, show, fill) {\n\
              \tconst entries = [];\n\
              \tconst shown = Math.min(items.length, 100);\n\
              \tfor (let index = 0; index < shown; index++) entries.push([ \"\", show(items[index]) ]);\n\
              \tif (items.length > shown) entries.push([ \"\", \"\u{2026} \" + (items.length - shown) + \" more\" ]);\n\
-             \treturn __dbg_group(\"[\", \"]\", false, entries);\n\
+             \treturn __dbg_group(\"[\", \"]\", false, entries, fill);\n\
              }\n\
              const __dbg_seen = [];\n\
              function __dbg_shared(cell, show) {\n\
@@ -1936,7 +1938,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\t__dbg_seen.pop();\n\
              \t}\n\
              }\n\
-             function __dbg_members(open, items, show) {\n\
+             function __dbg_members(open, items, show, fill) {\n\
              \tconst entries = [];\n\
              \tfor (const item of items) {\n\
              \t\tif (entries.length === 100) {\n\
@@ -1945,7 +1947,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\t}\n\
              \t\tentries.push(show(item));\n\
              \t}\n\
-             \treturn __dbg_group(open, \"}\", true, entries);\n\
+             \treturn __dbg_group(open, \"}\", true, entries, fill);\n\
              }\n\
              function __dbg_map(open, table, showKey, showValue, keyWidth, valueWidth) {\n\
              \tconst items = Array.from(table.values());\n\
@@ -1955,8 +1957,8 @@ fn helper_source(name: &str) -> &'static str {
              \t\treturn [ __dbg_flat(showKey(key)) + \" => \", showValue(value) ];\n\
              \t});\n\
              }\n\
-             function __dbg_set(open, table, show) {\n\
-             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ]);\n\
+             function __dbg_set(open, table, show, fill) {\n\
+             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ], fill);\n\
              }\n\
              function __dbg_str(text) {\n\
              \tlet out = \"\\\"\";\n\
@@ -1972,6 +1974,7 @@ fn helper_source(name: &str) -> &'static str {
              \treturn out + \"\\\"\";\n\
              }\n\
              function __dbg_float(value) {\n\
+             \tif (Object.is(value, -0)) return \"-0.0\";\n\
              \tconst text = String(value);\n\
              \treturn Number.isInteger(value) && !text.includes(\"e\") ? text + \".0\" : text;\n\
              }\n\
@@ -1991,6 +1994,18 @@ fn helper_source(name: &str) -> &'static str {
              \tif (typeof document === \"string\" || document.e.length === 0 || column + __dbg_width(flat) <= 80) return flat;\n\
              \tconst pad = \" \".repeat(indent + 2);\n\
              \tlet out = document.o + \"\\n\";\n\
+             \tif (document.f) {\n\
+             \t\tlet line = \"\";\n\
+             \t\tfor (const entry of document.e) {\n\
+             \t\t\tconst text = entry[0] + __dbg_flat(entry[1]) + \",\";\n\
+             \t\t\tif (line === \"\") line = pad + text;\n\
+             \t\t\telse if (__dbg_width(line) + 1 + __dbg_width(text) > 80) {\n\
+             \t\t\t\tout += line + \"\\n\";\n\
+             \t\t\t\tline = pad + text;\n\
+             \t\t\t} else line += \" \" + text;\n\
+             \t\t}\n\
+             \t\treturn out + line + \"\\n\" + \" \".repeat(indent) + document.c;\n\
+             \t}\n\
              \tfor (const entry of document.e) out += pad + entry[0] + __dbg_layout(entry[1], __dbg_width(pad + entry[0]), indent + 2) + \",\\n\";\n\
              \treturn out + \" \".repeat(indent) + document.c;\n\
              }"
@@ -5258,6 +5273,14 @@ impl<'src> Transformer<'src> {
     /// own conversion, `String(x)` — the one an i-string and the native
     /// backend use — so negative zero prints `0`, where `console.log`'s
     /// inspect wrote `-0`. Every other `print` is untouched.
+    ///
+    /// N149: the analyzer's recording is STATIC, so it cannot see a generic
+    /// body's `print(value)` with `value: T` at a number. The argument's
+    /// type is therefore also read under the ACTIVE substitution: the
+    /// instance where `T` is a number is wrapped and the one where it is a
+    /// string is not — two bodies, which instance emission already keeps
+    /// apart. (The recording stays: the emitter's own type table does not
+    /// cover every argument expression the analyzer typed.)
     fn number_print_arguments(
         &self,
         target_id: Id,
@@ -5265,9 +5288,10 @@ impl<'src> Transformer<'src> {
         args: Vec<js::Node<'src>>,
     ) -> Vec<js::Node<'src>> {
         if target_id != self.print_fn_id
-            || !argument_ids
-                .first()
-                .is_some_and(|argument| self.program.number_print_arguments.contains(argument))
+            || !argument_ids.first().is_some_and(|argument| {
+                self.program.number_print_arguments.contains(argument)
+                    || self.prints_a_number(*argument)
+            })
         {
             return args;
         }
@@ -11188,6 +11212,12 @@ impl<'src> Transformer<'src> {
                 }
             };
             entries.push((member_name.to_string(), slot));
+        }
+        // S1b: in a program that prints a `dbg`, the table also carries the
+        // value's printer, so a `dyn` prints what it holds. `$show` cannot
+        // collide with a member: no vilan name starts with `$`.
+        if let Some(show) = self.object_show_slot(type_id) {
+            entries.push(("$show".to_string(), show));
         }
         // M89: a table whose every slot names a function is a function of its
         // slot set, so a second pair answering every member with the same

@@ -23,6 +23,36 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: tooling -->
+**E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an `f32`, one inside a list or an option — where it printed `0.0`; `print` keeps N136's `0`.** `dbg` is the tool that shows the real value, so it no longer follows `print`'s `String(x)` rule for this one value; `.debug()` on `f32`/`f64` answers `"-0.0"` too, so a derived `Debug` and `dbg` still agree. Identical bytes on both backends (`__dbg_float`, `vilan_rt::show::float`). The committed `native/dbg_printer.stderr` moves by its one `0.0 * -1.0` line, and `s4_debug_covers_every_container_the_printer_prints`'s `(0.0 * -1.0).debug()` reads `-0.0`. Pins: `inference::debugging::e276_dbg_shows_negative_zero_and_print_keeps_zero`, `native_differential::e276_dbg_shows_negative_zero_on_both_backends`, `vilan_rt::show`'s `floats_keep_their_point_and_strings_their_quotes`. Tracker E276.
+
+---
+
+<!-- family: tooling -->
+**E277: a broken `dbg` list or set of scalars fills its lines to the 80-column limit — `[\n  0, 1, 2, …, 21,\n  22, …` — where it took a line per entry; an aggregate element (a struct, an `Option`, a tuple) keeps a line of its own, and the 100-entry cap stands.** A scalar is a number, a string, a bool, `()`, a backed enum or one whose variants carry nothing (`Color::Red`), decided from the element's printing shape (`printer::Shape::is_scalar`), so both backends decide alike; each line ends with a comma, the `… N more` marker packs like an entry, and a list nested in a broken struct fills two spaces deeper. Identical bytes on both backends (`__dbg_layout`, `vilan_rt::show::Doc::layout`, both taking a group's new `fill` flag). The committed `native/dbg_printer.stderr` moves by its 103-entry list (106 lines become 8). Pins: `inference::debugging::e277_a_list_of_scalars_fills_its_lines_and_aggregates_keep_one_per_line`, the re-read `s1_dbg_breaks_past_80_columns_and_cuts_a_long_list`, `native_differential::e277_scalar_lists_fill_their_lines_on_both_backends` (`native/dbg_fill.vl`), `vilan_rt::show`'s `a_broken_list_of_scalars_fills_each_line_to_80_columns`. Tracker E277.
+
+---
+
+<!-- family: breaking -->
+**E275: a `Debug` impl you write decides how `dbg` prints that type — at the top, as a field, a list element, an option's payload or a generic `T` — and `[derive(Debug)]` spells enum variants qualified (`Shape::Circle(1.5)`, was `Circle(1.5)`) and strings as `dbg` escapes them, so a derived `.debug()` is `dbg`'s spelling on one line.** The impl is the one impl selection picks for the concrete type, so a written generic impl whose bound the type misses (`impl Boxed<type T: Debug>` at `Boxed<Opaque>`) leaves the structure printing. std's own impls and the derive's are not "written": they spell what the printer spells, so `dbg` keeps laying those values out over lines past 80 columns (`printer::written_debug` holds the rule, both emitters ask it; the native printer calls the impl's `debug` by its receiver's convention). `.debug()` stays opt-in: no implicit `Debug` on every type. `str`'s `Debug` escapes `\\`, `"`, `\n`, `\t`, `\r` and `\0` as the printer does, where `JSON.stringify` wrote other control characters as `\u00XX`. Only std's `Option` and `Result` print bare now; a program's own enum of either name prints qualified. **Breaking for `.debug()` output:** every derived enum's text is qualified now, std's own included — `RpcError::Unauthorized`, `RpcError::Remote("..")`, `Status::Ready`, `Status::Failed(RpcError::Remote(".."))`, `ConnectionState::Connected`, `DraftState::Synced`, `WriteState::..`, `DialFailure::..` — so a program or a harness that matches those strings (a log line, `contains("state:Connected")`) reads the new spelling. **Migration:** match the qualified text, or the value itself (`status == Status::Ready`). The estate: the `rpc` example's expected output and README, and the vilan-cli harnesses that print these through `.debug()` (`examples`, `hmr_swap`, `transport_robustness`, `service_layer`, `reactive_channels`, `rpc_http`, `native_differential`'s kolt-shape server) move with it; kolt only logs them. Corpus: `derive-enum.mjs` moves with its stdout (the intended `Shape::` prefix) and `derive-debug.mjs` runtime-identically (the string impl is a function now). Pins: `inference::debugging::e275_a_written_debug_impl_decides_how_dbg_prints_its_type`, `e275_the_derive_spells_variants_qualified_and_agrees_with_dbg`, `e275_debug_stays_opt_in_and_only_stds_prelude_enums_print_bare`, `native_differential::e275_written_and_derived_debug_print_the_same_on_both_backends` (`native/dbg_debug_impls.*`). Tracker E275.
+
+---
+
+<!-- family: fix -->
+**N149: `print(value)` with `value: T` at a number instance prints negative zero as `0` on JS, as natively — it printed `-0`, because N136's wrap (`String(x)`) came from a static recording that cannot see `T`.** The JS emitter also reads the argument's type under the instance's substitution, so the number instances share a wrapped body and a string instance keeps the bare `console.log`; the same reading catches a closure parameter whose type is inferred from its use (`xs.for_each(|n| print(n))`), which the recording also missed. Corpus: `list-methods.mjs` and `reactive.mjs` move runtime-identically (three closure-parameter prints gain the wrap). Pins: `inference::debugging::n149_print_of_a_generic_number_is_wrapped_per_instance`, `native_differential::n149_a_generic_print_of_negative_zero_is_identical_on_both_backends`. Tracker N149.
+
+---
+
+<!-- family: feature -->
+**debugging.md S1b, the rest: a `dyn` value prints the value it holds — `dyn Area(Square { side = 2 })`, `dyn Label<str>(..)` — where `dbg` printed `<dyn Area>`.** In a program whose build prints a `dbg`, every trait-object table carries the erased value's printer: a `$show` entry on the JS table (no vilan name starts with `$`), a `dbg_show` method on the native object trait (named clear of the trait's own members, so a member called `show` or `dbg_show` is untouched). The `dyn`'s printer calls it, so the value prints as its own type would — a written `Debug` included. A program that never calls `dbg` (or strips it) carries no slot: no corpus golden moves. Pins: `inference::debugging::s1b_a_dyn_value_prints_what_it_holds` (alone, in a list, in an option, trait arguments; no `$show` without a `dbg`), `native_differential::s1b_a_dyn_value_prints_what_it_holds_on_both_backends` (`native/dbg_dyn.*`). Tracker E257 (S1b).
+
+---
+
+<!-- family: fix -->
+**`dbg` spells a closure's type as vilan writes it — `<closure |i32, i32| i32>` — where it wrote `<closure |i32, i32| -> i32>`, a spelling the parser refuses ("`->` is not how vilan writes a closure type").** The printer's labels are meant to be vilan's own syntax; a pipe's label (`<pipe Derive<..>>`) that names a closure type follows. The committed `native/dbg_printer.stderr` moves by its last line. Pins: the re-read `inference::debugging::s1_dbg_breaks_past_80_columns_and_cuts_a_long_list` and `native_differential::s1_dbg_writes_the_same_bytes_on_both_backends`. Found by debug-48 probing the printer.
+
 ## v0.45.0 — 2026-10-08
 
 <!-- family: breaking -->

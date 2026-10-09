@@ -23,17 +23,20 @@ generates for each type a `dbg` reaches, the same on both backends:
 | an enum variant | `Shape::Circle(1.5)`, `Shape::Empty`; `Some(5)`, `None`, `Ok(1)`, `Err("no")` |
 | a tuple, a list | `(1, "two", 3.0)`, `[1, 2, 3]` |
 | a string | `"a \"quoted\" line\n"` |
-| a float, an integer | `3.0`, `0.25`, `1e+21`; `7`, `-3` |
-| a closure | `<closure |i32, i32| -> i32>` |
+| a float, an integer | `3.0`, `0.25`, `1e+21`, `-0.0`; `7`, `-3` |
+| a closure | `<closure |i32, i32| i32>` |
 | a `HashMap`, a `HashSet` | `HashMap { "ada" => 36 }`, `HashSet { "a", "b" }`, in insertion order |
 | a `Shared`, a `SignalCell` | `Shared(Point { x = 7, y = 8 })`, `SignalCell(3)` (read without tracking) |
 | a pipe | `<pipe Derive<SignalCell<i32>, i32, i32>>`: sampling one would run it |
 | a cycle | `Shared(Link { next = Some(<cycle>) })`: a cell met again is not entered |
-| a trait object, a host handle | `<dyn Area>`, `<Task>` |
+| a trait object | `dyn Area(Square { side = 2 })`: the value it holds |
+| a host handle | `<Task>` |
 
 A value that fits in 80 columns from where it starts stays on one line;
 otherwise each entry takes a line of its own, two spaces deeper, with a
-trailing comma. A list stops after 100 entries with `… N more`.
+trailing comma. A list or a set of scalars (numbers, strings, bools, an enum
+whose variants carry nothing) fills each of those lines instead, as many
+entries as fit the 80 columns. A list stops after 100 entries with `… N more`.
 
 `[build] dbg` in `vilan.toml` decides what a call does in a build: the
 `debug` preset prints, the `release` preset refuses the build, `"strip"` makes
@@ -48,11 +51,35 @@ trait Debug {
 ```
 
 `.debug()` renders a value in the same syntax `dbg` prints, on one line. std
-implements it for `str`, `bool`, every number (a float keeps its `.0`:
-`3.0.debug()` is `"3.0"`), and for `List`, `Option` and `Result` whose
-elements are `Debug`; `[derive(Debug)]` writes it for a struct or an enum from
-its fields, so a struct holding a `List<i32>` or an `Option<f64>` derives it.
-`dbg` needs none of this: it prints every type.
+implements it for `str` (quoted and escaped as `dbg` writes it), `bool`, every
+number (a float keeps its `.0`: `3.0.debug()` is `"3.0"`, and negative zero is
+`"-0.0"`), and for `List`, `Option` and `Result` whose elements are `Debug`;
+`[derive(Debug)]` writes it for a struct or an enum from its fields
+(`Point { x = 1, y = 2 }`, `Shape::Circle(1.5)`), so a struct holding a
+`List<i32>` or an `Option<f64>` derives it. `.debug()` is opt-in: a type has
+it only through the derive or an impl of its own.
+
+`dbg` needs none of this: it prints every type. A `Debug` impl you WRITE decides
+how `dbg` prints that type, wherever the value sits (a field, a list element,
+a generic `T`), and a written generic impl applies only where its bounds hold.
+A derived impl spells what `dbg` already prints, so `dbg` keeps laying a
+derived value out over lines past 80 columns:
+
+```vilan
+import std::debug::Debug;
+
+struct Celsius { degrees: f64 }
+
+impl Celsius with Debug {
+	fun debug(self): str {
+		self.degrees.debug() + "°C"
+	}
+}
+
+fun main() {
+	dbg(Celsius { degrees = 21.5 });   // [src/main.vl:12:2] Celsius { degrees = 21.5 } = 21.5°C
+}
+```
 
 ## Locations
 
