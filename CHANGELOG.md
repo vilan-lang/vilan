@@ -23,6 +23,13 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: performance -->
+**M127 / M110 S3 (Order 50): the post passes' whole-program work cut on every analysis — kolt's cold check −5.6% instructions (13.78 → 13.00 G), the served keystroke's `contexts+graph`, `async-infer` and `infer_bumps` down together.** Measured first (`VILAN_PHASE_TIMING=passes` and CPU probes on kolt's client leg): the five effect fixpoints the pass map listed as S3's 183 ms are not iteration — the context pass's `grow`/`strict`/coverage loops are ~1.5 ms and the async base fixpoint ~5 ms; the time was in what runs around them. Three of those are gone here: `infer_bumps` was a Jacobi loop that rescanned every non-restored body per round (51–102 ms cold, 31–48 ms served) and is a worklist now — each body scanned once, the callees its scan read recorded (`BumpScan::callees`), only a moved verdict's callers rescanned; the context pass found each needy node's owner by a linear search of `graph.nodes()` (quadratic, 6 ms) and rescanned the whole entity map once per context for the value-use refusal (6 ms per context) — one node map and one scan of the function-valued entities serve both; `async_infer` paid a whole reachability walk from `main` (`reachable_bindings`, 30 ms) on every analysis to drop initializer refusals at bindings nothing reaches, and now derives the refusals first and walks only when one exists. No output moves: the four differentials, the corpus goldens and the native differential are the gate.
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->

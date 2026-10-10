@@ -325,18 +325,17 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     // binding the entry never reaches never runs, so it cannot await —
     // with no user `main` (a library, a fragment) every binding is checked,
     // since each runs in some dependent program.
-    let running_bindings = crate::platform_color::entry_function(program)
-        .map(|entry| crate::platform_color::reachable_bindings(program, graph, entry, &[]));
+    // Which module bindings RUN is a whole reachability walk from `main`
+    // (`reachable_bindings`: 30 ms of kolt's client leg, Order 50), asked only
+    // to drop refusals at bindings nothing reaches — so the refusals are
+    // derived first, per binding, and the walk is paid only when one exists.
+    // Deriving is pure (the targets are read, nothing is written), so the
+    // order of the refusals that survive is the bindings' order either way.
     let initializer_adaptive = adaptive_params_of(program);
     let module_bindings: HashSet<Id> = program.module_level_bindings().into_iter().collect();
     let mut initializer_refusals: Vec<(crate::error::Error, SourceId)> = Vec::new();
+    let mut refusal_bindings: Vec<(Id, usize)> = Vec::new();
     for binding in program.module_level_bindings() {
-        if running_bindings
-            .as_ref()
-            .is_some_and(|running| !running.contains(&binding))
-        {
-            continue;
-        }
         let refusals_before = initializer_refusals.len();
         for call in graph.initializer_calls_of(binding) {
             let async_target = match call.target {
@@ -481,6 +480,25 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
                 Some(crate::error::Note::here(span_of(program, await_id), steer)),
             ));
         }
+        if initializer_refusals.len() > refusals_before {
+            refusal_bindings.push((binding, initializer_refusals.len()));
+        }
+    }
+    if !refusal_bindings.is_empty() {
+        let running_bindings = crate::platform_color::entry_function(program)
+            .map(|entry| crate::platform_color::reachable_bindings(program, graph, entry, &[]));
+        let mut kept: Vec<(crate::error::Error, SourceId)> = Vec::new();
+        let mut from = 0;
+        for (binding, to) in refusal_bindings {
+            let runs = running_bindings
+                .as_ref()
+                .is_none_or(|running| running.contains(&binding));
+            if runs {
+                kept.extend(initializer_refusals[from..to].iter().cloned());
+            }
+            from = to;
+        }
+        initializer_refusals = kept;
     }
     for (error, source) in initializer_refusals {
         program.push_diagnostic(error, source);

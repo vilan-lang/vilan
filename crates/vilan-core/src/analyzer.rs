@@ -27297,34 +27297,72 @@ impl<'src> Analyzer<'src> {
                 function.bumps = positions;
             }
         }
-        loop {
-            let mut updates: Vec<(Id, BTreeSet<u32>)> = Vec::new();
-            for function_id in &function_ids {
-                if self.bumps_tabled.contains(function_id) || restored_ids.contains(function_id) {
+        // M127 (Order 50): the seventh worklist as a WORKLIST. Every body is
+        // scanned once; the scan also names the callees whose verdict it read
+        // (`BumpScan::callees`), and only the CALLERS of a function whose
+        // verdict then moved are rescanned. The Jacobi form rescanned every
+        // non-restored body per round (kolt's client leg: 51-102 ms cold,
+        // 31-48 ms on a served keystroke, three to four rounds); the answer is
+        // the same least fixpoint, because the verdicts only grow and a body's
+        // positions depend on nothing but its callees' verdicts.
+        let mut callers_of: HashMap<Id, Vec<Id>> = HashMap::default();
+        let mut moved: Vec<Id> = Vec::new();
+        for function_id in &function_ids {
+            if self.bumps_tabled.contains(function_id) || restored_ids.contains(function_id) {
+                continue;
+            }
+            let (has_body, current) = {
+                let Some(function) = self.functions.get(function_id) else {
                     continue;
-                }
-                let (has_body, current) = {
-                    let Some(function) = self.functions.get(function_id) else {
-                        continue;
-                    };
-                    (function.has_body, function.bumps.clone())
                 };
-                if !has_body {
-                    continue;
+                (function.has_body, function.bumps.clone())
+            };
+            if !has_body {
+                continue;
+            }
+            let mut scan = BumpScan {
+                positions: current.clone(),
+                callees: Vec::new(),
+            };
+            self.collect_bumps_positions(*function_id, &mut scan);
+            for callee in scan.callees {
+                callers_of.entry(callee).or_default().push(*function_id);
+            }
+            if scan.positions != current {
+                if let Some(function) = self.functions.get_mut(function_id) {
+                    function.bumps = scan.positions;
                 }
-                let mut positions = current.clone();
-                self.collect_bumps_positions(*function_id, &mut positions);
-                if positions != current {
-                    updates.push((*function_id, positions));
+                moved.push(*function_id);
+            }
+        }
+        let mut worklist: Vec<Id> = Vec::new();
+        let mut queued: HashSet<Id> = HashSet::default();
+        let enqueue_callers = |callee: Id, worklist: &mut Vec<Id>, queued: &mut HashSet<Id>| {
+            for caller in callers_of.get(&callee).into_iter().flatten() {
+                if queued.insert(*caller) {
+                    worklist.push(*caller);
                 }
             }
-            if updates.is_empty() {
-                break;
-            }
-            for (function_id, positions) in updates {
+        };
+        for function_id in moved {
+            enqueue_callers(function_id, &mut worklist, &mut queued);
+        }
+        while let Some(function_id) = worklist.pop() {
+            queued.remove(&function_id);
+            let current = match self.functions.get(&function_id) {
+                Some(function) => function.bumps.clone(),
+                None => continue,
+            };
+            let mut scan = BumpScan {
+                positions: current.clone(),
+                callees: Vec::new(),
+            };
+            self.collect_bumps_positions(function_id, &mut scan);
+            if scan.positions != current {
                 if let Some(function) = self.functions.get_mut(&function_id) {
-                    function.bumps = positions;
+                    function.bumps = scan.positions;
                 }
+                enqueue_callers(function_id, &mut worklist, &mut queued);
             }
         }
     }
@@ -27367,7 +27405,7 @@ impl<'src> Analyzer<'src> {
 
     /// Scan a function body for the `&mut` parameter positions its bumps, growing
     /// `positions` (the monotone step of `infer_bumps`).
-    fn collect_bumps_positions(&self, function_id: Id, positions: &mut BTreeSet<u32>) {
+    fn collect_bumps_positions(&self, function_id: Id, scan: &mut BumpScan) {
         let Some(function) = self.functions.get(&function_id) else {
             return;
         };
@@ -27375,9 +27413,9 @@ impl<'src> Analyzer<'src> {
         let tail = function.body.1;
         let mut visited = HashSet::default();
         for statement in &statements {
-            self.scan_bumps(*statement, function_id, positions, &mut visited);
+            self.scan_bumps(*statement, function_id, scan, &mut visited);
         }
-        self.scan_bumps(tail, function_id, positions, &mut visited);
+        self.scan_bumps(tail, function_id, scan, &mut visited);
     }
 
     /// Walk one expression, recording any `&mut` parameter of `function_id` that it
@@ -27390,7 +27428,7 @@ impl<'src> Analyzer<'src> {
         &self,
         expr_id: Id,
         function_id: Id,
-        positions: &mut BTreeSet<u32>,
+        scan: &mut BumpScan,
         visited: &mut HashSet<Id>,
     ) {
         if !visited.insert(expr_id) {
@@ -27401,65 +27439,65 @@ impl<'src> Analyzer<'src> {
         };
         match expr {
             Expr::Assignment(target_id, value_id) => {
-                self.scan_bumps(value_id, function_id, positions, visited);
+                self.scan_bumps(value_id, function_id, scan, visited);
                 if let Some(position) = self.assignment_bumps_position(target_id, function_id) {
-                    positions.insert(position);
+                    scan.positions.insert(position);
                 }
-                self.scan_bumps(target_id, function_id, positions, visited);
+                self.scan_bumps(target_id, function_id, scan, visited);
             }
             Expr::Call(call_id) => {
-                self.call_bumps_positions(call_id, function_id, positions);
+                self.call_bumps_positions(call_id, function_id, scan);
                 if let Some(function_call) = self.function_calls.get(&call_id) {
                     for argument in function_call.argument_ids.clone() {
-                        self.scan_bumps(argument, function_id, positions, visited);
+                        self.scan_bumps(argument, function_id, scan, visited);
                     }
                 }
             }
             Expr::Variable(variable_id) => {
                 if let Some(initial) = self.variables.get(&variable_id).and_then(|v| v.initial) {
-                    self.scan_bumps(initial, function_id, positions, visited);
+                    self.scan_bumps(initial, function_id, scan, visited);
                 }
             }
             Expr::Block((statements, tail)) => {
                 for statement in statements {
-                    self.scan_bumps(statement, function_id, positions, visited);
+                    self.scan_bumps(statement, function_id, scan, visited);
                 }
-                self.scan_bumps(tail, function_id, positions, visited);
+                self.scan_bumps(tail, function_id, scan, visited);
             }
             Expr::For(condition, (statements, tail)) => {
                 if let Some(condition) = condition {
-                    self.scan_bumps(condition, function_id, positions, visited);
+                    self.scan_bumps(condition, function_id, scan, visited);
                 }
                 for statement in statements {
-                    self.scan_bumps(statement, function_id, positions, visited);
+                    self.scan_bumps(statement, function_id, scan, visited);
                 }
-                self.scan_bumps(tail, function_id, positions, visited);
+                self.scan_bumps(tail, function_id, scan, visited);
             }
             Expr::ForEach(iterable, _, (statements, tail)) => {
-                self.scan_bumps(iterable, function_id, positions, visited);
+                self.scan_bumps(iterable, function_id, scan, visited);
                 for statement in statements {
-                    self.scan_bumps(statement, function_id, positions, visited);
+                    self.scan_bumps(statement, function_id, scan, visited);
                 }
-                self.scan_bumps(tail, function_id, positions, visited);
+                self.scan_bumps(tail, function_id, scan, visited);
             }
-            Expr::If(branch) => self.scan_bumps_if(&branch, function_id, positions, visited),
+            Expr::If(branch) => self.scan_bumps_if(&branch, function_id, scan, visited),
             Expr::Match(subject_id, legs) => {
-                self.scan_bumps(subject_id, function_id, positions, visited);
+                self.scan_bumps(subject_id, function_id, scan, visited);
                 for leg in legs {
                     if let Some(guard) = leg.guard {
-                        self.scan_bumps(guard, function_id, positions, visited);
+                        self.scan_bumps(guard, function_id, scan, visited);
                     }
-                    self.scan_bumps(leg.body, function_id, positions, visited);
+                    self.scan_bumps(leg.body, function_id, scan, visited);
                 }
             }
             Expr::Closure(inner_id) | Expr::Async(inner_id) => {
                 if let Some(inner) = self.closures.get(&inner_id) {
-                    self.scan_bumps(inner.return_, function_id, positions, visited);
+                    self.scan_bumps(inner.return_, function_id, scan, visited);
                 }
             }
             Expr::Binary(_, lhs, rhs) => {
-                self.scan_bumps(lhs, function_id, positions, visited);
-                self.scan_bumps(rhs, function_id, positions, visited);
+                self.scan_bumps(lhs, function_id, scan, visited);
+                self.scan_bumps(rhs, function_id, scan, visited);
             }
             Expr::Reference(operand, _)
             | Expr::Dereference(operand)
@@ -27471,43 +27509,43 @@ impl<'src> Analyzer<'src> {
             | Expr::TryAssert(operand)
             | Expr::Ascribe(operand)
             | Expr::ArrayLen(operand, _) => {
-                self.scan_bumps(operand, function_id, positions, visited);
+                self.scan_bumps(operand, function_id, scan, visited);
             }
             Expr::Index(subject, index) => {
-                self.scan_bumps(subject, function_id, positions, visited);
-                self.scan_bumps(index, function_id, positions, visited);
+                self.scan_bumps(subject, function_id, scan, visited);
+                self.scan_bumps(index, function_id, scan, visited);
             }
             Expr::List(ids) | Expr::Tuple(ids) => {
                 for id in ids {
-                    self.scan_bumps(id, function_id, positions, visited);
+                    self.scan_bumps(id, function_id, scan, visited);
                 }
             }
             Expr::StructInitializer(_, fields) => {
                 for value in fields.values() {
-                    self.scan_bumps(*value, function_id, positions, visited);
+                    self.scan_bumps(*value, function_id, scan, visited);
                 }
             }
             // Expression-carrying forms `scan_move` also walks — a bumping call can
             // hide inside any of these (a lift region's steps carry real calls), so
             // the coverage set mirrors the move scan's, not a shorter list.
             Expr::Destructure(value_id, _) => {
-                self.scan_bumps(value_id, function_id, positions, visited);
+                self.scan_bumps(value_id, function_id, scan, visited);
             }
             Expr::Repeat(value_id, _) => {
-                self.scan_bumps(value_id, function_id, positions, visited);
+                self.scan_bumps(value_id, function_id, scan, visited);
             }
             Expr::Is(subject, _) => {
-                self.scan_bumps(subject, function_id, positions, visited);
+                self.scan_bumps(subject, function_id, scan, visited);
             }
             Expr::Lift(subject, _, continuation) => {
-                self.scan_bumps(subject, function_id, positions, visited);
-                self.scan_bumps(continuation, function_id, positions, visited);
+                self.scan_bumps(subject, function_id, scan, visited);
+                self.scan_bumps(continuation, function_id, scan, visited);
             }
             Expr::LiftRegion(steps, body) => {
                 for (step_id, _, _) in &steps {
-                    self.scan_bumps(*step_id, function_id, positions, visited);
+                    self.scan_bumps(*step_id, function_id, scan, visited);
                 }
-                self.scan_bumps(body, function_id, positions, visited);
+                self.scan_bumps(body, function_id, scan, visited);
             }
             // A comprehension's source and body are executable — a bump inside
             // (`(s in xs => { h.inner = [0]; .. })`) counts like any other.
@@ -27516,9 +27554,9 @@ impl<'src> Analyzer<'src> {
             // list, and the omission read as content-stable, an unsafe default.)
             Expr::TupleComprehension(bindings, body) => {
                 for (_, source) in bindings {
-                    self.scan_bumps(source, function_id, positions, visited);
+                    self.scan_bumps(source, function_id, scan, visited);
                 }
-                self.scan_bumps(body, function_id, positions, visited);
+                self.scan_bumps(body, function_id, scan, visited);
             }
             _ => {}
         }
@@ -27528,25 +27566,25 @@ impl<'src> Analyzer<'src> {
         &self,
         branch: &ExprIfBranch,
         function_id: Id,
-        positions: &mut BTreeSet<u32>,
+        scan: &mut BumpScan,
         visited: &mut HashSet<Id>,
     ) {
         match branch {
             ExprIfBranch::If(condition, (statements, tail), else_branch) => {
-                self.scan_bumps(*condition, function_id, positions, visited);
+                self.scan_bumps(*condition, function_id, scan, visited);
                 for statement in statements {
-                    self.scan_bumps(*statement, function_id, positions, visited);
+                    self.scan_bumps(*statement, function_id, scan, visited);
                 }
-                self.scan_bumps(*tail, function_id, positions, visited);
+                self.scan_bumps(*tail, function_id, scan, visited);
                 if let Some(else_branch) = else_branch {
-                    self.scan_bumps_if(else_branch, function_id, positions, visited);
+                    self.scan_bumps_if(else_branch, function_id, scan, visited);
                 }
             }
             ExprIfBranch::Else((statements, tail)) => {
                 for statement in statements {
-                    self.scan_bumps(*statement, function_id, positions, visited);
+                    self.scan_bumps(*statement, function_id, scan, visited);
                 }
-                self.scan_bumps(*tail, function_id, positions, visited);
+                self.scan_bumps(*tail, function_id, scan, visited);
             }
         }
     }
@@ -27607,14 +27645,19 @@ impl<'src> Analyzer<'src> {
             })
     }
 
-    fn call_bumps_positions(&self, call_id: Id, function_id: Id, positions: &mut BTreeSet<u32>) {
+    fn call_bumps_positions(&self, call_id: Id, function_id: Id, scan: &mut BumpScan) {
         let Some(function_call) = self.function_calls.get(&call_id) else {
             return;
         };
         let argument_ids = function_call.argument_ids.clone();
         let callee_bumps: Option<BTreeSet<u32>> =
             match self.expr_id_to_expr_map.get(&function_call.subject_id) {
-                Some(Expr::Local(callee_id)) => self.callee_bumps_set(callee_id),
+                Some(Expr::Local(callee_id)) => {
+                    // The verdict this scan READ: a change to it re-scans this
+                    // body (`infer_bumps`' worklist).
+                    scan.callees.push(*callee_id);
+                    self.callee_bumps_set(callee_id)
+                }
                 _ => None,
             };
         match callee_bumps {
@@ -27624,7 +27667,7 @@ impl<'src> Analyzer<'src> {
                         && let Some(caller_position) =
                             self.argument_root_mutable_position(*argument_id, function_id)
                     {
-                        positions.insert(caller_position);
+                        scan.positions.insert(caller_position);
                     }
                 }
             }
@@ -27638,7 +27681,7 @@ impl<'src> Analyzer<'src> {
                         && let Some(caller_position) =
                             self.argument_root_mutable_position(*argument_id, function_id)
                     {
-                        positions.insert(caller_position);
+                        scan.positions.insert(caller_position);
                     }
                 }
             }
@@ -69932,6 +69975,14 @@ pub enum TryDispatch {
 /// source file. Since entity ids are minted monotonically and each file is
 /// walked by a single top-level pass, these ranges map an entity back to the
 /// file it came from (see `Program::source_of`).
+/// One body's `bumps` scan (`Analyzer::infer_bumps`): the parameter positions
+/// it bumps, and the callees whose verdict it read on the way — the
+/// dependency edges the worklist follows (M127).
+struct BumpScan {
+    positions: BTreeSet<u32>,
+    callees: Vec<Id>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceRange {
     pub start: u32,

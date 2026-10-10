@@ -987,7 +987,12 @@ fn analyze(
 
     // call id -> the function/closure it sits in.
     let mut owner_of: HashMap<Id, Node> = HashMap::default();
+    // node id -> the node (its kind): the plan below names owners by id, and
+    // a linear search of `graph.nodes()` per needy node was quadratic (6 ms of
+    // kolt's client leg; Order 50).
+    let mut node_of: HashMap<Id, Node> = HashMap::default();
     for node in graph.nodes() {
+        node_of.insert(node.id(), *node);
         for call in graph.calls_of(node.id()) {
             owner_of.insert(call.call_id, *node);
         }
@@ -1316,7 +1321,12 @@ fn analyze(
                 .map(|(_, subject_id, _)| *subject_id),
         )
         .collect();
-    let value_taken: HashSet<Id> = program
+    // Every function named as a VALUE, with the entity naming it: the
+    // dead-code exemption reads the set, and the per-context value-use
+    // refusal reads the sites — one scan of the entity map for both, where the
+    // refusal used to rescan it per context (6 ms of kolt's client leg per
+    // context; Order 50). Scan order is the map's, as the refusal's was.
+    let function_value_sites: Vec<(Id, Id)> = program
         .entity_map
         .iter()
         .filter_map(|(entity_id, expr)| match expr {
@@ -1324,10 +1334,14 @@ fn analyze(
                 if program.functions.contains_key(target)
                     && !call_subject_entities.contains(entity_id) =>
             {
-                Some(*target)
+                Some((*entity_id, *target))
             }
             _ => None,
         })
+        .collect();
+    let value_taken: HashSet<Id> = function_value_sites
+        .iter()
+        .map(|(_, target)| *target)
         .collect();
 
     // --- Coverage-only dispatch refinement (element-syntax H8 →
@@ -2121,7 +2135,7 @@ fn analyze(
             let Some(parent) = graph.closure_parent_of(*closure_id) else {
                 continue;
             };
-            let Some(&owner) = graph.nodes().iter().find(|node| node.id() == parent) else {
+            let Some(&owner) = node_of.get(&parent) else {
                 continue;
             };
             spawn_sites.push((entity_id, owner));
@@ -3019,11 +3033,8 @@ fn analyze(
             .copied()
             .filter(|&id| is_function(id))
             .collect();
-        for (&entity_id, expr) in &program.entity_map {
-            if let Expr::Local(target) = expr
-                && needs_functions.contains(target)
-                && !call_subject_entities.contains(&entity_id)
-            {
+        for &(entity_id, target) in &function_value_sites {
+            if needs_functions.contains(&target) {
                 errors.push(anchored(
                     program,
                     entity_id,
@@ -3031,7 +3042,7 @@ fn analyze(
                         "`{}` reads context `{}`, so it can't be used as a value",
                         program
                             .functions
-                            .get(target)
+                            .get(&target)
                             .map(|function| function.name)
                             .unwrap_or("function"),
                         context_name(program, context)
@@ -3165,7 +3176,7 @@ fn analyze(
         // `Some`-wraps (the covered→safe boundary). Safe→strict cannot occur
         // (strictness propagated to the caller).
         for &node_id in &needs {
-            let Some(&owner) = graph.nodes().iter().find(|node| node.id() == node_id) else {
+            let Some(&owner) = node_of.get(&node_id) else {
                 continue;
             };
             for call in graph.calls_of(node_id) {
@@ -3206,7 +3217,7 @@ fn analyze(
             if needy.is_empty() {
                 continue;
             }
-            let Some(&owner) = graph.nodes().iter().find(|node| node.id() == *caller) else {
+            let Some(&owner) = node_of.get(caller) else {
                 continue;
             };
             // Mixed flavors were promoted away: needy candidates are now all
