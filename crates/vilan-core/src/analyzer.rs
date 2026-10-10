@@ -29348,14 +29348,27 @@ impl<'src> Analyzer<'src> {
                 _ => {}
             }
         }
-        if let ExprPattern::Variant(_, _, sub_patterns) = pattern {
-            for sub_pattern in sub_patterns {
-                match sub_pattern {
-                    ExprPattern::Tuple(_) => leaves(sub_pattern, out),
-                    ExprPattern::Variant(..) => Self::collect_tuple_leaf_captures(sub_pattern, out),
-                    _ => {}
+        match pattern {
+            ExprPattern::Variant(_, _, sub_patterns) => {
+                for sub_pattern in sub_patterns {
+                    match sub_pattern {
+                        ExprPattern::Tuple(_) => leaves(sub_pattern, out),
+                        ExprPattern::Variant(..) => {
+                            Self::collect_tuple_leaf_captures(sub_pattern, out)
+                        }
+                        _ => {}
+                    }
                 }
             }
+            // B587: the same rule one level up — a TOP-LEVEL tuple pattern
+            // over a view subject (`match &mut pair { (let a, let b) => .. }`)
+            // reaches its leaves exactly as a payload's tuple pattern does, so
+            // a one-slot leaf is a view into its slot of the tuple (door A),
+            // `mut` on it is refused (Q4), and a multi-slot leaf keeps the
+            // whole-tuple steer. A copy before: `(mut a, let b) => a += 10`
+            // compiled on JS and the write never reached `pair`.
+            ExprPattern::Tuple(_) => leaves(pattern, out),
+            _ => {}
         }
     }
 

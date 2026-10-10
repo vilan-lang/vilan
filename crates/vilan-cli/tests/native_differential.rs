@@ -12386,3 +12386,57 @@ fun main() {
         "a tuple-bounded parameter dispatches its blanket's trait per instance on both backends"
     );
 }
+
+/// B587: a TOP-LEVEL tuple pattern under `match &mut <tuple place>` binds a
+/// view per one-slot leaf (payload-views.md's door A, one level up) on both
+/// backends: the writes land in the tuple, through `is` too, and a struct leaf
+/// writes its field in place. The copy it was compiled on JS without the
+/// write landing, and natively rustc refused the emitted match.
+#[test]
+fn a_top_level_tuple_pattern_under_a_view_subject_writes_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b587.vl"),
+        r#"import std::io::print;
+
+struct Point {
+    x: i32,
+}
+
+fun main() {
+    mut pair = (1, 2);
+    match &mut pair {
+        (let a, let b) => {
+            a += 10;
+            b = *b * 3;
+        },
+    }
+    print(pair.0);
+    print(pair.1);
+    mut nested = (1, Point { x = 5 }, "s");
+    match &mut nested {
+        (let n, let p, _) => {
+            n += 1;
+            p.x = 50;
+        },
+    }
+    print(nested.0);
+    print(nested.1.x);
+    let shown = (7, 8);
+    match &shown {
+        (let a, _) => print(*a),
+    }
+    if &mut pair is (let first, _) {
+        first = 100;
+    }
+    print(pair.0);
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b587.vl"),
+        Verdict::Identical,
+        "a top-level tuple leaf under a view subject is a view on both backends"
+    );
+}
