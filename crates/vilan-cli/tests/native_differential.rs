@@ -10080,6 +10080,26 @@ fn an_injected_clause_written_out_of_order_is_identical_on_both_backends() {
     );
 }
 
+/// B596: a struct literal runs its initializers in the order it WRITES them.
+/// The JS array lays the struct out in declaration order, and two plain calls
+/// written the other way round ran in layout order; a Rust struct literal runs
+/// them as written. Two fields swapped, four rotated around a literal, a `mut`
+/// read ahead of the call that writes it, and a nested generic literal.
+#[test]
+fn a_struct_literal_written_out_of_declaration_order_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_struct_literal_written_order.vl"),
+        include_str!("native/struct_literal_written_order.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_struct_literal_written_order.vl"),
+        Verdict::Identical,
+        "a struct literal must run its initializers as written on both backends"
+    );
+}
+
 /// F63: a closure's expression body is the value it hands back, a CONSUMING
 /// position like a function body's tail, so a place read there takes rule 1's
 /// copy. `id.derive(|index| cells[index])` moved a `str` out of the captured
