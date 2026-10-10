@@ -45098,8 +45098,9 @@ impl<'src> Analyzer<'src> {
                 Type::Array(element_type.get_type_id(self), length)
             }
             // `arr.len()` — the length is a compile-time constant; the result is
-            // `i32`, matching `List.len()`.
-            Expr::ArrayLen(_, _) => self.primitive_struct_type("i32"),
+            // a `usize`, as every length is (B590: fixed-arrays.md §10 typed it
+            // `i32` "matching `List.len()`", and I5 S2 moved `List.len()`).
+            Expr::ArrayLen(_, _) => self.primitive_struct_type("usize"),
             Expr::Tuple(item_ids) => {
                 // A construction that is EXACTLY one spread is the concatenation
                 // of one: its type is the operand's, unchanged. This is the only

@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: breaking -->
+**B590: `[T; n].len()` is a `usize`, as every other length has been since I5 S2 — it answered `i32`, so `let m: usize = a.len()` and `xs.len() + a.len()` were refused, and `a[a.len() - 1]` checked, ran on JS and was refused by rustc (`usize - i32`).** `len` on an array is a compiler fold (`Expr::ArrayLen`), not a std signature, so I5 S2's census never saw it; fixed-arrays.md §10 typed it `i32` "matching `List.len()`", and `List.len()` moved. The emitters were already right (natively Rust's own `usize` `len()`, on JS the literal or `.length`). Breaking in principle; the estate is 4 `.len()` calls on arrays (3 in the corpus' `fixed-arrays.vl`, 1 in the book's tour), all passed to `print` — no edit, no golden moved. Pins: `inference::tuples::fixed_array_len_folds_to_the_constant_and_types_as_usize` (was `…_as_i32`), `b590_a_fixed_arrays_length_is_a_usize`.
+
 <!-- family: fix -->
 **B581 (R-e, door (a)): the spec no longer says a spread call and its tuple call are one call.** types.md §5.9 wrote `log(1, "hi") == log((1, "hi"))`, but a spread function called by name always COLLECTS its arguments — `draw((3, 4))` against `fun draw(...at: (f64, f64))` passes a one-slot pack and is refused "Expected (f64, f64), but got ((i32, i32))" — and the ruling keeps that (a lone tuple argument that spread when its type fit would make a one-slot pack of a tuple unwritable, and the rule would depend on a type). The comment now says a direct call collects, and the paragraph after it names the spelling for a tuple already built: the tuple-value spread, `draw(..pair)`, `log(..(1, "hi"))`. No behaviour changed. Pin: `inference::tuples::b581_a_direct_spread_call_collects_and_a_built_tuple_spreads`.
 
