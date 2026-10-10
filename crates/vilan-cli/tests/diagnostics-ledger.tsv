@@ -711,3 +711,4 @@ row	flagship	key
 687	-	a spread parameter's arguments are all named or none: name every argument it collects, or drop the names and pass them by position
 NEW	-	`{name}`'s element type is decided by its uses, and uses in two files disagree: one gives it `{first}`, another `{second}`. Write the element type on the declaration (`{name}: List<…>`)
 NEW	-	'{member_name}' is ambiguous on '{type_str}': {both}{providers} provide it as their trait's default, and no call spelling names one instantiation; declare `{member_name}` on `{type_str}` itself — an inherent member beats every trait-provided one
+NEW	-	`{symbol}` computes on two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: there are no implicit conversions; suffix the literal or convert with `as_*`

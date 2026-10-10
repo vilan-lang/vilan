@@ -66578,6 +66578,57 @@ impl<'src> Analyzer<'src> {
                         );
                         continue;
                     }
+                    // B579 (R-d, v0.47.0): `-`, `*`, `/` and `%` over two
+                    // DIFFERENT integer types are refused as `+`, `<` and `==`
+                    // over the same pair already were — there are no implicit
+                    // conversions. `usize - i32` checked, ran on JS and was
+                    // refused by rustc (no Rust spelling of the pair), so
+                    // `a[a.len() - 1]` and capture-clones.vl's `total +
+                    // cells.len() * weight` compiled on the hole. A float and
+                    // an integer (`f64 * i32`) stay the carve-out above.
+                    let integer = |analyzer: &Self, operand: &Type| {
+                        matches!(
+                            analyzer.numeric_primitive_name(operand),
+                            Some(
+                                "i8" | "i16"
+                                    | "i32"
+                                    | "i53"
+                                    | "u8"
+                                    | "u16"
+                                    | "u32"
+                                    | "u53"
+                                    | "usize"
+                            )
+                        )
+                    };
+                    // Two equal operand types (the usual case) settle it with
+                    // one comparison, before either is named.
+                    if matches!(
+                        op,
+                        BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
+                    ) && lhs_type != rhs_type
+                        && integer(self, &lhs_type)
+                        && integer(self, &rhs_type)
+                        && !self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
+                    {
+                        let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{symbol}` computes on two values of the same type, but the \
+                                     operands are `{lhs_label}` and `{rhs_label}`: there are no \
+                                     implicit conversions; suffix the literal or convert with \
+                                     `as_*`"
+                                ),
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
                 }
                 // Same-type operands on the native path (`B = Self`). The
                 // non-native equality path falls through to the trait

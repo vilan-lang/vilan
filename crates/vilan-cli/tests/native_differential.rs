@@ -9581,11 +9581,12 @@ fn a_const_aggregate_is_identical_on_both_backends() {
 /// match-patterns.vl and capture-clones.vl, and the last of resource_take.vl
 /// (behind F97). A leg's guard is Rust's guard, and a `str`-backed variant
 /// nested in a payload or a tuple is a guard over a binder (match-patterns'
-/// next wall). capture-clones.vl's next wall is an operator over two numeric
-/// widths the analyzer admits, now refused by name rather than by rustc. The
+/// next wall). capture-clones.vl's next wall was an operator over two numeric
+/// widths, which the analyzer refuses since B579 (the program converts). The
 /// probe: guarded bindings, variants and tuples, a guard on outer state, a
 /// guarded wildcard, a string capture compared in a guard, the nested
-/// backed variant beside a guard; plus the two programs F93 completes.
+/// backed variant beside a guard; plus the two programs F93 completes, and
+/// capture-clones.vl, whose operator wall B579 removed.
 #[test]
 fn a_guarded_match_leg_is_identical_on_both_backends() {
     let staged = stage();
@@ -9604,13 +9605,14 @@ fn a_guarded_match_leg_is_identical_on_both_backends() {
             "{program}: F93 was its last wall"
         );
     }
-    match compare(&staged, "capture-clones.vl") {
-        Verdict::Refused(reason) => assert!(
-            reason.contains("an operator over two numeric types"),
-            "capture-clones.vl's next wall is the mixed-width operator: {reason}"
-        ),
-        other => panic!("capture-clones.vl must be refused by name: {other:?}"),
-    }
+    // B579 (v0.47.0) refuses the mixed-width operator in the analyzer, which
+    // was capture-clones.vl's last wall natively: the corpus program converts
+    // its operand now, and runs the same on both backends.
+    assert_eq!(
+        compare(&staged, "capture-clones.vl"),
+        Verdict::Identical,
+        "capture-clones.vl: B579 took its last wall"
+    );
 }
 
 /// F94: a SPREAD parameter was refused by name — the first wall of

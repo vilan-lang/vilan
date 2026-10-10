@@ -979,6 +979,7 @@ fun check<T: PartialEq>(x: T, y: T) { if x == y { … } }  // the test produces 
 "p=" + point.to_string()     // the fix the error names
 count + "n="                 // error: only a `str` LEFT operand concatenates
 1.5 + count                  // error: f64 and i32; no implicit conversions
+index - count                // error: usize and i32 — `-`, `*`, `/`, `%` as `+`
 count * true                 // error: `*` computes on two numbers, and `bool` is not one
 count * "2"                  // error: the same, for `str`
 ```
@@ -1486,7 +1487,8 @@ Normative rejection cases (each is a compile error):
   just with its neighbour. Diverging legs and arms (`ret`, `panic`,
   `jump`) are `Never` and don't participate (§5.1).
 - An `i53`/`i32` operand mix (no implicit widening; suffix the
-  literal).
+  literal) — two different integer types as the operands of `+`, `-`,
+  `*`, `/`, `%`, a comparison or `==` (B579).
 - A value written into a struct field it does not match, through either
   door: the literal `S { field = v }` and the assignment `s.field = v`
   are governed by ONE rule, and a place chain of any depth (`a.b.c = v`,
