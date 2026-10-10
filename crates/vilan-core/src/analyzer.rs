@@ -27471,6 +27471,7 @@ impl<'src> Analyzer<'src> {
             | Expr::FunctionReturn(Some(operand))
             | Expr::Await(operand)
             | Expr::TryAssert(operand)
+            | Expr::Ascribe(operand)
             | Expr::ArrayLen(operand, _) => {
                 self.scan_bumps(operand, function_id, positions, visited);
             }
@@ -28176,7 +28177,10 @@ impl<'src> Analyzer<'src> {
                     self.scan_view_param_ref(own_parameters, initial, captured, visited);
                 }
             }
-            Expr::Reference(operand, _) | Expr::Dereference(operand) | Expr::Unary(_, operand) => {
+            Expr::Reference(operand, _)
+            | Expr::Dereference(operand)
+            | Expr::Unary(_, operand)
+            | Expr::Ascribe(operand) => {
                 self.scan_view_param_ref(own_parameters, operand, captured, visited)
             }
             Expr::Binary(_, lhs, rhs) => {
@@ -30328,6 +30332,7 @@ impl<'src> Analyzer<'src> {
             Expr::Reference(operand, _)
             | Expr::Dereference(operand)
             | Expr::Unary(_, operand)
+            | Expr::Ascribe(operand)
             | Expr::Field(operand, _, _)
             | Expr::TupleIndex(operand, _, _)
             | Expr::FunctionReturn(Some(operand)) => {
@@ -30802,7 +30807,10 @@ impl<'src> Analyzer<'src> {
                 }
                 state.dbg_stack.join();
             }
-            Expr::Reference(operand, _) | Expr::Dereference(operand) | Expr::Unary(_, operand) => {
+            Expr::Reference(operand, _)
+            | Expr::Dereference(operand)
+            | Expr::Unary(_, operand)
+            | Expr::Ascribe(operand) => {
                 self.scan_invalidation(operand, scan, live, violations, state);
             }
             Expr::Binary(_, lhs, rhs) => {
@@ -44756,6 +44764,7 @@ impl<'src> Analyzer<'src> {
                     | Expr::Call(_)
                     | Expr::StructInitializer(..)
                     | Expr::Dereference(_)
+                    | Expr::Ascribe(_)
             )
         ) {
             return;
@@ -44864,6 +44873,7 @@ impl<'src> Analyzer<'src> {
                     | Expr::Call(_)
                     | Expr::StructInitializer(..)
                     | Expr::Dereference(_)
+                    | Expr::Ascribe(_)
             )
         ) {
             return;
@@ -45151,6 +45161,7 @@ impl<'src> Analyzer<'src> {
                     | Expr::Call(_)
                     | Expr::StructInitializer(..)
                     | Expr::Dereference(_)
+                    | Expr::Ascribe(_)
             )
         ) {
             return;

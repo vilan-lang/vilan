@@ -797,3 +797,61 @@ fn e284_a_spaced_generic_call_on_a_function_is_still_a_call() {
         "is read as the generic call",
     );
 }
+
+// --- The flow analyses see through an ascription -------------------------------
+
+/// An ascribed value landing in a `dyn` position is erased there (the
+/// coercion sites accept an ascription as they accept the value it holds),
+/// and a bare-trait ascription keeps the concrete type until it lands.
+#[test]
+fn b571_an_ascribed_value_erases_where_it_lands() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Shape {
+            fun area(self): i32;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape {
+            fun area(self): i32 {
+                self.side * self.side
+            }
+        }
+
+        fun show(shape: dyn Shape): i32 {
+            shape.area()
+        }
+
+        fun main() {
+            print(show(Square { side = 3 } as Square));
+            print(show(Square { side = 2 } as Shape));
+        }
+        "#,
+        "9\n4\n",
+    );
+}
+
+/// Rule 4 scans through an ascription: a push written INSIDE one, under a
+/// live view, is refused as it is without one (planted red by dropping the
+/// `Ascribe` arm from `scan_invalidation`).
+#[test]
+fn b571_an_invalidating_call_inside_an_ascription_is_still_seen() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            mut xs = [1, 2];
+            let first = &xs[0];
+            let _ = xs.push(3) as void;
+            print(*first);
+        }
+        "#,
+        "while a view into it is live",
+    );
+}

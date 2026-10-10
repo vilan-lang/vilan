@@ -2529,7 +2529,8 @@ fn b569_named_arguments_are_identical_on_both_backends() {
 /// re-typed as closures; a closure literal adopting the ascribed modes;
 /// `Never` yielding — plus the copies rule 1 owes through an ascription, the
 /// precedence rows, a chain ascribed per stage and an ascription after a
-/// block-like brace. Natively an open value (an empty list, a bare `None`) is
+/// block-like brace, and a labelled tuple (B569) matched by name, labelled
+/// in one slot, or labelled from positions. Natively an open value (an empty list, a bare `None`) is
 /// written through a typed block, and the copy and the erasure both land on
 /// the value, as at an annotated binding.
 #[test]
@@ -2597,6 +2598,10 @@ const B571_PROBE: &str = concat!(
     "\n",
     "fun echo(items: List<i32>): List<i32> {\n",
     "\titems as List<i32>\n",
+    "}\n",
+    "\n",
+    "fun show(shape: dyn Shape): i32 {\n",
+    "\tshape.area()\n",
     "}\n",
     "\n",
     "fun each(f: |&str| void) {\n",
@@ -2668,6 +2673,12 @@ const B571_PROBE: &str = concat!(
     "\t\t.len() as usize;\n",
     "\tprint(count);\n",
     "\tprint(if wide { 7 } else { 8 } as usize);\n",
+    "\tprint(show(Square { side = 5 } as Square));\n",
+    "\tprint(show(Square { side = 6 } as Shape));\n",
+    "\tlet named = (x = 1, y = 2) as (y: i32, x: i32);\n",
+    "\tprint(named.0 + named.x * 10);\n",
+    "\tlet one = (x = 5) as (x: i32);\n",
+    "\tprint((3, 4) as (w: i32, h: i32).h + one.x);\n",
     "}\n",
 );
 
