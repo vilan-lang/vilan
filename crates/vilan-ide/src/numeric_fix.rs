@@ -179,7 +179,9 @@ fn binary_operands(message: &str) -> Option<(&str, &str)> {
 fn ascribed_value(written: &str) -> Option<&str> {
     const PREFIX: &str = "fun probe() {\n\tlet value = ";
     let probe = format!("{PREFIX}{written};\n}}\n");
-    let (parsed, errors) = parsing::parse(&probe);
+    // Groups preserved, so a parenthesized value (`(a + b) as f64`) keeps
+    // its parentheses in its span.
+    let (parsed, errors) = parsing::parse_preserving_groups(&probe);
     if !errors.is_empty() {
         return None;
     }
