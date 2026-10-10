@@ -119,11 +119,53 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
         sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
             canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
                 collapse_field_shorthands(canonicalize_marker_heads(drop_redundant_view_prefixes(
-                    drop_trailing_commas(tokens),
+                    drop_ascribed_closure_parens(drop_trailing_commas(tokens)),
                 ))),
             )),
         ))),
     ))))
+}
+
+/// Drops the parentheses around a closure type right after `as` — `x as
+/// (|i32| i32)` is `x as |i32| i32` — so the safety net accepts the printer
+/// parenthesizing every ascribed closure type (B571 §10, Q9 RULED). The
+/// pair is found by depth from the `(` that follows `as` and opens with a
+/// closure type's first token (`|`, `||`, `async`, `sync`); both streams are
+/// folded alike, so a CALL of a function named `as` with a closure argument
+/// (`as(|x| x)`) folds identically on both sides and still compares.
+fn drop_ascribed_closure_parens(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut dropped: Vec<bool> = vec![false; tokens.len()];
+    for index in 0..tokens.len() {
+        let opens = tokens[index] == Token::Ident("as")
+            && tokens.get(index + 1) == Some(&Token::Ctrl('('))
+            && matches!(
+                tokens.get(index + 2),
+                Some(Token::Op("|" | "||") | Token::Async | Token::Ident("sync"))
+            );
+        if !opens {
+            continue;
+        }
+        let mut depth = 0usize;
+        for (at, token) in tokens.iter().enumerate().skip(index + 1) {
+            match token {
+                Token::Ctrl('(') => depth += 1,
+                Token::Ctrl(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        dropped[index + 1] = true;
+                        dropped[at] = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    tokens
+        .into_iter()
+        .zip(dropped)
+        .filter_map(|(token, drop)| (!drop).then_some(token))
+        .collect()
 }
 
 /// Drops a parameter's view prefix that its type already states — `&x: &i32`
@@ -6606,13 +6648,45 @@ impl<'src> Printer<'src> {
         while let Node::MemberAccessor(inner, _)
         | Node::Index(inner, _)
         | Node::TryAssert(inner)
-        | Node::Lifted(inner) = &subject.0
+        | Node::Lifted(inner)
+        | Node::Ascribe(inner, _) = &subject.0
         {
             spine.push(subject);
             subject = inner;
         }
         spine.reverse();
         (subject, spine)
+    }
+
+    /// ` as T` — an ascription's word and type (B571, type-ascription.md §10):
+    /// one space each side, the type canonical (generic lists tight), and a
+    /// closure type parenthesized, `as (|i32| i32)`, so a reader never has to
+    /// find where a greedy return type ends.
+    fn print_ascription(&mut self, type_: &Spanned<Node<'src>>) {
+        self.out.push_str(" as ");
+        let closure = match &type_.0 {
+            Node::ClosureType(..) | Node::AsyncType(_) | Node::SyncType(_) => true,
+            Node::TypeWithContexts(inner, _) => matches!(inner.0, Node::ClosureType(..)),
+            _ => false,
+        };
+        if closure {
+            self.out.push('(');
+            self.print_type(&type_.0);
+            self.out.push(')');
+        } else {
+            self.print_type(&type_.0);
+        }
+    }
+
+    /// How many ascriptions `expr`'s postfix spine carries — a chain with one
+    /// on more than one stage breaks one stage per line, each ascription at
+    /// the end of its stage's line (B571 §10).
+    fn chain_ascriptions(expr: &Spanned<Node<'src>>) -> usize {
+        let (_, spine) = Self::postfix_spine(expr);
+        spine
+            .iter()
+            .filter(|node| matches!(node.0, Node::Ascribe(..)))
+            .count()
     }
 
     /// Whether a ONE-link chain may break on width at all: its single link's
@@ -6849,6 +6923,10 @@ impl<'src> Printer<'src> {
         // a `?`/`!` subject through the plain operand rule.
         match &spine[0].0 {
             Node::MemberAccessor(_, _) | Node::Index(_, _) => self.print_postfix_subject(subject),
+            // A block-like form ascribed after its brace (B571 Q4) prints bare.
+            Node::Ascribe(..) if crate::parsing::is_block_like(&subject.0) => {
+                self.print_expr(subject);
+            }
             _ => self.print_operand(subject, 100),
         }
         for step in spine {
@@ -7778,7 +7856,8 @@ impl<'src> Printer<'src> {
             }
             Node::TryAssert(_) => self.out.push('!'),
             Node::Lifted(_) => self.out.push('?'),
-            // `postfix_spine` yields only the four forms above.
+            Node::Ascribe(_, type_) => self.print_ascription(type_),
+            // `postfix_spine` yields only the five forms above.
             _ => self.decline(Some(step.1)),
         }
     }
@@ -8145,6 +8224,12 @@ impl<'src> Printer<'src> {
             self.print_split_chain(expr);
             return;
         }
+        // A third door (B571 §10): ascriptions on more than one stage put each
+        // stage on its own line, the ascription closing it.
+        if call_links >= 1 && Self::chain_ascriptions(expr) >= 2 {
+            self.print_split_chain(expr);
+            return;
+        }
         // A `style()` builder chain that the canonical order PERMUTES cannot go
         // through the recursive `MemberAccessor` arm below, which prints the
         // spine in its written order. It gets the same inline rendering, link by
@@ -8376,8 +8461,7 @@ impl<'src> Printer<'src> {
                 } else {
                     self.print_operand(value, 100);
                 }
-                self.out.push_str(" as ");
-                self.print_type(&type_.0);
+                self.print_ascription(type_);
             }
             Node::Lift(subject, continuation) => {
                 // `a?.b.c`: the subject, `?`, then the continuation — whose
@@ -9201,6 +9285,57 @@ mod reformats {
     fn an_identity_pin_over_a_declined_source_fails() {
         let source = "fun main() {\n\tlet x = (;\n}\n";
         assert_formats(source, source);
+    }
+
+    // B571 §10: `as` with one space each side, the type canonical, a closure
+    // type parenthesized, a spaced generic list after `as` written tight, a
+    // block-like form ascribed after its brace, and a single ascription on
+    // the ordinary chain rule.
+    #[test]
+    fn b571_an_ascription_prints_canonically() {
+        assert_formats(
+            "fun main() {\n\tlet a = 5  as   f64;\n\tlet xs = [] as List <i32>;\n\tlet m = x as HashMap< str ,List <i32> >;\n}\n",
+            "fun main() {\n\tlet a = 5 as f64;\n\tlet xs = [] as List<i32>;\n\tlet m = x as HashMap<str, List<i32>>;\n}\n",
+        );
+        assert_formats(
+            "fun main() {\n\tlet f = measure as |str| i32;\n\tlet g = f as async || i32;\n}\n",
+            "fun main() {\n\tlet f = measure as (|str| i32);\n\tlet g = f as (async || i32);\n}\n",
+        );
+        let kept = concat!(
+            "fun main() {\n",
+            "\tlet f = measure as (|str| i32);\n",
+            "\tlet n = count as (usize) < limit;\n",
+            "\tlet picked = match flag {\n\t\ttrue => 1,\n\t\tfalse => 2,\n\t} as f64;\n",
+            "\tlet one = words.map(f) as List<usize>;\n",
+            "\tlet total = a + b as f64;\n",
+            "\tlet value = (await promise) as i32;\n",
+            "\tlet as = 5;\n",
+            "}\n",
+        );
+        assert_formats(kept, kept);
+    }
+
+    /// B571 §10: ascriptions on more than one stage put each stage on its own
+    /// line, the ascription closing it — the owner's layout — whatever the
+    /// width; written on one line, the chain is broken into it.
+    #[test]
+    fn b571_a_chain_ascribed_on_several_stages_breaks_one_stage_per_line() {
+        let broken = concat!(
+            "fun main() {\n",
+            "\tlet y = a() as A\n",
+            "\t\t.b() as B\n",
+            "\t\t.c() as C;\n",
+            "}\n",
+        );
+        assert_formats(broken, broken);
+        assert_formats(
+            "fun main() {\n\tlet y = a() as A.b() as B.c() as C;\n}\n",
+            broken,
+        );
+        assert_formats(
+            "fun main() {\n\tlet n = words as List<str>.len() as usize;\n}\n",
+            "fun main() {\n\tlet n = words as List<str>\n\t\t.len() as usize;\n}\n",
+        );
     }
 
     // B414: the six demoted keywords reprint as NAMES where they are names and

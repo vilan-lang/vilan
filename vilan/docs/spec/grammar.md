@@ -742,8 +742,8 @@ followed by `;`, `,`, a closer or `.` (`xs as List <i32>;`) — is refused
 with the tight spelling, read as written tight, and `vilan fmt` writes it
 so. The rule binds in ascribed types only; elsewhere a spaced generic list
 parses as before (and the formatter tightens it). A closure type after
-`as` is read greedily, as everywhere — `f as |i32| i32` — and the
-formatter parenthesizes it (§10 of the formatter rules).
+`as` is read greedily, as everywhere — `f as |i32| i32` — and `vilan fmt`
+prints it parenthesized, `f as (|i32| i32)`.
 
 A `match`, `if`, `for` or `{` form is complete at its closing brace (the
 block-like rule, §3.8), with one continuation it admits: `as`. `match k {

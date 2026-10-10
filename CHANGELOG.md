@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**B571 S3: `vilan fmt` lays ascriptions out (type-ascription.md §10).** `as` takes one space each side and its type prints canonically; a closure type after `as` is parenthesized (`f as (|i32| i32)`), so a reader never has to find where a greedy return type ends; a spaced generic list after `as` is written tight; a block-like form ascribed after its brace stays on the brace's line; and a chain with an ascription on MORE than one stage breaks one stage per line whatever its width, each `as T` closing its stage's line (`let y = a() as A` / `.b() as B` / `.c() as C;`). A single ascription follows the ordinary chain rule. The `vilan fmt` appendix says so.
+
 <!-- family: diagnostics -->
 **B571 S2: an ascription's refusals teach once — `as` names a type, it does not convert.** `n as f64` over an `i32` is refused with the conversion that exists, `` `n` is `i32`, not `f64` (ascribed here): `as` names the type a value already has, and does not convert. … convert with `.as_f64()` ``, and `vilan check --fix` (and the editor's quick fix) writes `n.as_f64()` IN PLACE of the ascription — never `(n as f64).as_f64()`. A mismatch is reported at the ascription and names the chain STAGE that disagrees (`` `.len()` returns `usize`, not `i32` ``, with the stage's link noted), or the value and both types (`` `bar` is `Bar`, not `Foo` ``). `await p as T` — which ascribes the promise, `as` binding tighter — steers to `(await p) as T` when `T` is the awaited type; `&x as &T` reads `&(x as &T)`, a view of a value, and is refused with the view taken first, `(&x) as &T`. The cannot-infer steer offers the inline spelling (`… or ascribe the call (`make(…) as …`)`), and E261's two-stage steer names `match .. { .. } as dyn Flow<T>`.
 <!-- family: performance -->

@@ -408,6 +408,14 @@ is the current directory. Formatting is conservative and a fixed point:
   lowest-precedence operator and operator-leading. The permission stops at the
   head: a loop body is a fresh statement list and a `match`'s legs earn their
   own breaks from their own lines.
+- A chain with a type ascription on MORE than one stage splits regardless
+  of width, one stage per line, each `as T` closing its stage's line:
+  `let n = words as List<str>` on the first line, then `.map(f) as
+  List<usize>` and `.len() as usize` below it. A single ascription follows
+  the ordinary chain rule. A closure type after `as` is printed
+  parenthesized — `f as (|i32| i32)` — so its greedy return type never has
+  to be found by eye, and a spaced generic list after `as` is written tight
+  (`as List<i32>`), the spelling the grammar reads as one.
 - Parenthesized groups you wrote are kept, even where the grammar
   doesn't need them: a redundant paren is usually there for clarity.
 - A call's *argument* list is never wrapped, but the split reaches the
