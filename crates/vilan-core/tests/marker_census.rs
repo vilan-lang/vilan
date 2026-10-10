@@ -184,6 +184,11 @@ const KEYWORD_CLASSES: &[(&str, Class, &str)] = &[
         "the alias on an import leaf; the type ascription (B571)",
     ),
     (
+        "auto",
+        Class::Typing,
+        "a type the toolchain writes and keeps current (B570): part of the signature",
+    ),
+    (
         "borrows",
         Class::Typing,
         "names the parameter a returned view projects: part of the signature",

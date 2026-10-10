@@ -5686,6 +5686,14 @@ impl<'src> Printer<'src> {
                 }
                 self.print_type(&inner.0);
             }
+            // `auto T` / `auto` (B570): one space after the marker.
+            Node::AutoType(written) => {
+                self.out.push_str("auto");
+                if let Some(written) = written.as_deref() {
+                    self.out.push(' ');
+                    self.print_type(&written.0);
+                }
+            }
             // `async |A| B` / `sync |A| B` — closure-type contract markers.
             Node::AsyncType(inner) => {
                 self.out.push_str("async ");
@@ -9312,6 +9320,18 @@ mod reformats {
             "\tlet as = 5;\n",
             "}\n",
         );
+        assert_formats(kept, kept);
+    }
+
+    /// B570: `auto` prints canonically — one space after the marker — and the
+    /// formatter never fills or rewrites one (that is `check --fix`'s).
+    #[test]
+    fn b570_an_auto_annotation_prints_canonically_and_is_never_filled() {
+        assert_formats(
+            "fun f():  auto   i32 {\n\t5\n}\n\nfun g(): auto {\n\t5\n}\n\nmut xs: auto  List< str > = [];\n",
+            "fun f(): auto i32 {\n\t5\n}\n\nfun g(): auto {\n\t5\n}\n\nmut xs: auto List<str> = [];\n",
+        );
+        let kept = "fun h(): auto i32 context settings {\n\t5\n}\n";
         assert_formats(kept, kept);
     }
 

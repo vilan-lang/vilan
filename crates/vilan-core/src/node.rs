@@ -712,6 +712,16 @@ pub enum Node<'src> {
     // an object changes which member runs where an inherent one outranks the
     // trait's, so the change of surface must be written, not inferred.
     DynType(Box<Spanned<Node<'src>>>),
+    // `auto T` / `auto` — a type the TOOLCHAIN writes and keeps current (B570,
+    // `proposal/auto-annotations.md`): at a return, a `let`'s annotation, or
+    // an ascription (`as auto T`). A SIGNATURE, not a constraint: the body (or
+    // initializer, or value) is inferred as if the annotation were absent,
+    // everything outside reads the written `T`, and `check` refuses a `T` the
+    // inference no longer agrees with (stale), with the rewrite as its fix.
+    // `None` is the bare `auto`, which promised nothing yet (a warning, with
+    // the fill as its fix). `auto` is contextual at a type's head, except
+    // `auto::`, a path into a module named `auto`.
+    AutoType(Option<Box<Spanned<Node<'src>>>>),
     // `(|| void) context owner_scope` / `context (a, b)` — a closure type
     // carrying a context requirement (proposal/ambient-owner.md §5): the
     // closure defers those contexts' bindings to its CALL sites instead of
@@ -1292,6 +1302,11 @@ impl<'src> Node<'src> {
             Node::AsyncType(inner) => visit(inner),
             Node::SyncType(inner) => visit(inner),
             Node::DynType(inner) => visit(inner),
+            Node::AutoType(written) => {
+                if let Some(written) = written.as_deref() {
+                    visit(written);
+                }
+            }
             Node::Const(inner) => visit(inner),
             Node::MappedType {
                 source, template, ..

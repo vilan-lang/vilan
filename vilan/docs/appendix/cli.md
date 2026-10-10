@@ -253,8 +253,7 @@ the package's own files (never to std or a dependency), analyzes again,
 and repeats until a round finds nothing more to fix; then it checks as
 usual and reports what is left. The edits are the editor's quick fixes,
 computed by the same functions, so the two never disagree. It cannot be
-combined with `--watch`. It fixes two kinds of diagnostic, each the
-migration tool for one release:
+combined with `--watch`. It fixes four kinds of diagnostic:
 
 - **A moved std path** (v0.44.0, where std's modules were grouped under
   namespaces): every `import std::dom::…` becomes `import
@@ -286,11 +285,22 @@ migration tool for one release:
   literal (**Convert with `.as_usize()`**, **Declare `at` a `usize`**).
   What it cannot decide — a `-1` "not found", a `for i >= 0` loop, signed
   arithmetic that should convert once at its end — stays a diagnostic,
-  for a person.
+  for a person. An ascription to another width (`n as f64`, which names
+  a type and never converts) is rewritten to the conversion in its place,
+  `n.as_f64()`.
+- **A stale or unfilled `auto`** ([`auto` annotations](../spec/types.md#auto-types-the-toolchain-keeps)):
+  the written type is rewritten to what the item now infers, and a bare
+  `auto` is filled, spelled the shortest way the file can name the type —
+  by name, or through a module it imports. It never adds an import: a
+  type the file cannot name is left, with the import that would let it.
+  A rewrite that changes what callers read re-checks them in the next
+  round, so a caller's own `auto`, or a conversion a caller now needs,
+  follows it.
 
 It prints what it did before the check's own report: for moved paths, a
 total and then one line per file with its count, and a line for each
-path it left; then, always, the numeric line.
+path it left; then, always, the numeric line; then, when it wrote any,
+a line counting the `auto` annotations.
 
 ```text
 fixed 4 moved std paths in 3 files

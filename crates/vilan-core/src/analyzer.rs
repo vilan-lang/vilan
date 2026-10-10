@@ -15,6 +15,7 @@ use crate::target::{Platform, PlatformPattern};
 use crate::type_::{Mode, ParameterMode, SubstitutionContext, TupleLabels, Type, TypeId};
 use crate::util::{join_with, plural};
 
+mod auto_annotations;
 mod dbg_stack;
 mod hint_labels;
 mod hover_labels;
@@ -646,6 +647,32 @@ pub const TRAIT_SCOPE_CODE: &str = "trait-scope/not-imported";
 /// The fixed head of B535's refusal after its member and trait names, which
 /// recognizes it.
 const TRAIT_SCOPE_MARK: &str = "and this file does not import `";
+
+/// B570 (`auto-annotations.md` §2): where an `auto` annotation may stand —
+/// the refusal everywhere else, a parameter, a field, a generic argument, a
+/// closure parameter, a trait declaration.
+const AUTO_WHERE_NOTHING_IS_INFERRED: &str = "`auto` writes a type the toolchain infers and \
+     keeps current, so it stands only where a type is inferred: a function's return, a `let` \
+     or `mut` binding, or an ascription (`as auto T`) — nothing is inferred here, so write \
+     the type";
+
+/// B570 §2: a trait member's or an `external`'s return is not inferred — the
+/// trait, or the host, fixes it.
+const AUTO_WHERE_THE_RETURN_IS_FIXED: &str = "`auto` writes a return the toolchain infers, \
+     and nothing is inferred here: a trait member's return is the trait's, and an `external`'s \
+     is the host's — write the type";
+
+/// B570: the edit a stale or unfilled `auto` carries, quoted at the end of its
+/// message — `vilan check --fix` and the editor read it back with
+/// [`auto_annotation_rewrite`].
+const AUTO_REWRITE_MARK: &str = " — `vilan check --fix` writes `";
+
+/// B570: the annotation an `auto` diagnostic's fix writes over its span
+/// (`auto str`), or `None` for any other message.
+pub fn auto_annotation_rewrite(message: &str) -> Option<&str> {
+    let at = message.rfind(AUTO_REWRITE_MARK)?;
+    message[at + AUTO_REWRITE_MARK.len()..].strip_suffix('`')
+}
 
 /// B535's quick-fix data: the import statement the refusal `message` names
 /// (`import std::display::Display;`), or `None` when `message` is not that
@@ -3051,6 +3078,28 @@ pub struct StageHint {
     /// trait for an abbreviated one (Q8 RULED), named as the file can write
     /// it — or why it cannot be written here.
     pub written: Result<String, String>,
+}
+
+/// What an `auto` annotation is written on (B570).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoOwner {
+    /// A function's return.
+    Return(Id),
+    /// A `let` / `mut` binding (a module's or a local).
+    Binding(Id),
+}
+
+/// One `auto` annotation as the walk met it (B570): its owner, the name it is
+/// reported under, the whole annotation's span (what `--fix` rewrites), the
+/// written type's slot when one is written (`None`: the bare `auto`), and the
+/// scope its rewrite is spelled for.
+#[derive(Debug, Clone)]
+struct AutoAnnotation<'src> {
+    owner: AutoOwner,
+    name: &'src str,
+    span: Span,
+    written: Option<TypeId>,
+    scope_id: Id,
 }
 
 /// Who a binding-style annotation belongs to (B161, B184, B461): a `let`'s
@@ -5732,6 +5781,15 @@ pub struct Analyzer<'src> {
     // finds the head its subject belongs to in one lookup (a scan of
     // `chain_stages` per call was quadratic in a program's calls).
     chain_heads: HashMap<Id, Id>,
+    // B570: every `auto` annotation, checked once the program has settled
+    // (`check_auto_annotations`); and the written `T` of each fully written one
+    // (no bare trait inside), which callers of the function and readers of the
+    // binding read while the body or initializer is inferred without it.
+    auto_annotations: Vec<AutoAnnotation<'src>>,
+    auto_written: HashMap<Id, TypeId>,
+    // B570: what an `auto`-locked binding's initializer inferred, before its
+    // readers were given the written `T`.
+    auto_inferred_bindings: HashMap<Id, TypeId>,
     // E278: the values that land in a position that already states their type
     // — an annotated `let`'s initializer — so their stage hint would only
     // repeat the annotation.
@@ -7855,6 +7913,9 @@ impl<'src> Analyzer<'src> {
             ascriptions: HashMap::default(),
             chain_stages: Vec::new(),
             chain_heads: HashMap::default(),
+            auto_annotations: Vec::new(),
+            auto_written: HashMap::default(),
+            auto_inferred_bindings: HashMap::default(),
             annotated_landings: HashSet::default(),
             hidden_generic_parameters: HashMap::default(),
             attributed_declarations: HashSet::default(),
@@ -24006,6 +24067,7 @@ impl<'src> Analyzer<'src> {
             self.generic_list_label_under(&function.generic_parameter_constraint_ids, substitution);
         let return_label = function
             .return_type_id
+            .or_else(|| self.auto_written_type_id(function.id))
             .map(|return_type_id| {
                 format!(
                     ": {}",
@@ -39430,6 +39492,15 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Binary(*op, lhs_id, rhs_id))
             }
             Node::Let(name, type_, value, mutable, lazy, labels) => {
+                // B570: `auto T` / `auto` on a binding is a SIGNATURE, not an
+                // annotation — the initializer is inferred as if none were
+                // written, and the binding's uses read `T`. Taken off here.
+                let (type_, auto_annotation) = match type_.as_deref() {
+                    Some((Node::AutoType(written), span)) => {
+                        (None, Some((*span, written.as_deref())))
+                    }
+                    other => (other, None),
+                };
                 let name_span = name.1;
                 let name = name.0;
                 // E221: a labelled binding's labels, keyed by its entity id
@@ -39462,7 +39533,7 @@ impl<'src> Analyzer<'src> {
                 });
                 // The annotation's view-ness is recorded before `walk_type_node`
                 // erases the `&`/`&mut`, for the R1 check.
-                if let Some(type_node) = type_.as_deref() {
+                if let Some(type_node) = type_ {
                     self.binding_annotation_view
                         .insert(id, matches!(&type_node.0, Node::Reference(_, _)));
                 }
@@ -39472,7 +39543,7 @@ impl<'src> Analyzer<'src> {
                 // literal defers, passing it matches same-clause parameters,
                 // and calling it is a read at the call site. Resolution is
                 // deferred past the import fixpoint, like parameters'.
-                let mut annotation: Option<&Spanned<Node>> = type_.as_deref();
+                let mut annotation: Option<&Spanned<Node>> = type_;
                 let mut clause: Option<&Vec<(&'src str, Span)>> = None;
                 if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
                     annotation.map(|node| (&node.0, node.1))
@@ -39554,6 +39625,15 @@ impl<'src> Analyzer<'src> {
                     .push(Constraint::Variable(VariableConstraint::from_walk(
                         id, type_id, value_ids,
                     )));
+                if let Some((span, written)) = auto_annotation {
+                    self.record_auto_annotation(
+                        AutoOwner::Binding(id),
+                        name,
+                        span,
+                        written,
+                        scope_id,
+                    );
+                }
                 Some(Expr::Variable(id))
             }
             Node::LetDestructure(pattern, type_, value, mutable) => {
@@ -39857,6 +39937,17 @@ impl<'src> Analyzer<'src> {
                 });
                 Some(Expr::Error)
             }
+            Node::AutoType(_) => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: node.1,
+                    msg: "`auto` marks a type annotation, not a value (expected an expression \
+                          here)"
+                        .to_string(),
+                });
+                Some(Expr::Error)
+            }
             Node::MappedType { .. } => {
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
@@ -40013,8 +40104,36 @@ impl<'src> Analyzer<'src> {
             }
             _ => {}
         }
+        // B570: `auto T` / `auto` on a return is a SIGNATURE — the body is
+        // inferred as if no return were written, callers read `T` — so it is
+        // taken off before the return type is walked.
+        let mut auto_return: Option<(Span, Option<&'src Spanned<Node<'src>>>)> = None;
+        if let Some((Node::AutoType(written), span)) =
+            return_type_node.map(|node| (&node.0, node.1))
+        {
+            auto_return = Some((span, written.as_deref()));
+            return_type_node = None;
+        }
         let return_type_id =
             return_type_node.map(|return_type| self.walk_type_node(return_type, body_scope_id));
+        if let Some((span, written)) = auto_return {
+            if function.external || self.walking_trait_body || self.walking_trait_impl_body {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: AUTO_WHERE_THE_RETURN_IS_FIXED.to_string(),
+                });
+            } else {
+                self.record_auto_annotation(
+                    AutoOwner::Return(id),
+                    name,
+                    span,
+                    written,
+                    body_scope_id,
+                );
+            }
+        }
         // B460: the drain decides whether a bare trait here is an
         // opaque return (a free fun, an inherent method) or a trait
         // method's (refused).
@@ -42317,6 +42436,18 @@ impl<'src> Analyzer<'src> {
             // `resolve_dyn_annotations` writes `Type::Dyn` once the inner has
             // landed. That is also where object safety is checked, because that
             // is the first point at which the trait's members are knowable.
+            // B570: an `auto` annotation is read at a return, a `let` and an
+            // ascription, each of which takes it off before walking its type;
+            // reaching here, it stands where nothing is inferred.
+            Node::AutoType(_) => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: node.1,
+                    msg: AUTO_WHERE_NOTHING_IS_INFERRED.to_string(),
+                });
+                Some(Type::Unknown)
+            }
             Node::DynType(inner) => {
                 let inner_type_id = self.walk_trait_position_type_node(inner, scope_id);
                 self.prepped_dyn_annotations.push(PreppedDyn {
@@ -46071,13 +46202,19 @@ impl<'src> Analyzer<'src> {
                         // resolved to the trait's BODYLESS requirement — an
                         // internal error anchored wherever the generic std
                         // function that received it lives, over a correct program.
+                        // B570 (Q2 RULED): an `auto T` return is read as its
+                        // WRITTEN `T` by every caller, stale or not — the
+                        // body's own inference is checked against it once.
                         let callee_return_type = match declared_return_type {
                             Some(declared) => declared,
-                            None => self.inferred_return_type(
-                                function_id,
-                                &substitution_context,
-                                exprs_seen,
-                            ),
+                            None => match self.auto_written_type(function_id) {
+                                Some(written) => written,
+                                None => self.inferred_return_type(
+                                    function_id,
+                                    &substitution_context,
+                                    exprs_seen,
+                                ),
+                            },
                         };
                         // B567: a member of a BARE-TRAIT IMPL (B299, `impl
                         // Iterator<type T> with Iterable<T>`) writes `Self` as
@@ -46353,6 +46490,14 @@ impl<'src> Analyzer<'src> {
                 // for, or a reader could ground on a type the binding never
                 // takes.
                 let initializer_id = variable.initial.filter(|_| !variable.annotated);
+                // B570: a binding locked by a fully written `auto T` is read
+                // as `T` before it grounds too — its readers never see the
+                // initializer's own answer (u03: a use cannot widen it).
+                if matches!(variable_type, Type::Unknown)
+                    && let Some(written) = self.auto_written_type(*variable_id)
+                {
+                    return written;
+                }
                 match (&variable_type, initializer_id) {
                     (Type::Unknown, Some(initializer_id)) => self.infer_type_inner(
                         initializer_id,
@@ -56393,6 +56538,17 @@ impl<'src> Analyzer<'src> {
             initial_type_id
         } else {
             variable_type.clone().get_type_id(self)
+        };
+        // B570: a binding locked by a fully written `auto T` is READ as `T`;
+        // what its initializer inferred is kept for the stale check.
+        let var_type_id = match self.auto_written_type(variable_id) {
+            Some(written) => {
+                self.auto_inferred_bindings
+                    .entry(variable_id)
+                    .or_insert(var_type_id);
+                written.get_type_id(self)
+            }
+            None => var_type_id,
         };
         self.variables.get_mut(&variable_id).unwrap().type_id = var_type_id;
         self.resolved_types.insert(variable_id, var_type_id);
@@ -80803,6 +80959,8 @@ fn analyze_over_world<'src>(
         analyzer.check_binding_existential_constraints();
         analyzer.check_opaque_returns();
         analyzer.check_binding_hidden_nominal_constraints();
+        // B570: every `auto` against what its owner inferred, once settled.
+        analyzer.check_auto_annotations();
         // B251's twin of the bound check above, at the third binding channel:
         // a WRITTEN type application (`let h: Held<i32, SignalCell<List<str>>>`).
         analyzer.check_written_nominal_bounds();

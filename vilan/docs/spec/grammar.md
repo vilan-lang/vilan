@@ -967,6 +967,7 @@ type = "&" [ "mut" ] type                       (* view type *)
                                                  (* impl-subject binder *)
      | [ "async" | "sync" ] closure-type [ context-clause ]
      | "dyn" type-path                           (* trait object, §5.12 *)
+     | "auto" [ type ]                           (* toolchain-kept, §5.8 *)
      | type-path                                 (* nominal *)
      | "(" IDENT "in" type ":" type ")"          (* mapped tuple, §5.9 *)
      | "(" [ tuple-slot { "," tuple-slot } [ "," ] ] ")"  (* tuple type *)
@@ -1003,6 +1004,14 @@ A tuple type's slots may carry **labels** (B569): `(x: f64, y: f64)`.
 labelled or none, each label once. A labelled one-slot type `(x: i32)` is a
 tuple, where `(T)` stays a group. Labels name positions and are no part of
 the type's identity (types §5.9).
+
+`auto` is contextual by `dyn`'s rule — the marker at a type's head,
+except `auto::`, a path into a module named `auto`. It stands at a
+function's return, a `let` or `mut` annotation and after `as`, and is
+refused everywhere else (a parameter, a field, a generic argument, a
+trait member's return); the type after it is optional, and with none the
+annotation ends at the `=`, the `{`, the `;` or a `context`/`borrows`
+clause — the bare `auto`, which `vilan check --fix` fills (§5.8).
 
 `dyn` takes a `type-path` and nothing else: the keyword erases a TRAIT's
 implementation, so a closure type, a tuple, an array or a view after it names

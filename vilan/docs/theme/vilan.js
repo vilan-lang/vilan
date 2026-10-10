@@ -130,6 +130,10 @@
 		const CONTEXTUAL_LAZY = { className: "keyword", begin: "\\blazy\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
 		const CONTEXTUAL_DYN = { className: "keyword", begin: "\\bdyn\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
 		const CONTEXTUAL_JUMP = { className: "keyword", begin: "\\bjump\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		// B570: `auto`, the toolchain-kept type, at an annotation's head —
+		// after a `:` (never `::`, so `Length::auto()` stays plain) or `as`,
+		// and never before `::`.
+		const CONTEXTUAL_AUTO = { className: "keyword", begin: "(?<=(?:[^:]:|\\b[a][s])\\s{0,8})auto\\b(?!\\s{0,8}::)" };
 		// B414 S4, the member tier: every word — a reserved one included —
 		// names a member, so `event.type`, `bag.if()` and a field `type: str`
 		// are NAMES. R-k writes a member's name against its dot, which makes
@@ -218,6 +222,7 @@
 				CONTEXTUAL_OWN,
 				CONTEXTUAL_LAZY,
 				CONTEXTUAL_DYN,
+				CONTEXTUAL_AUTO,
 				CONTEXTUAL_JUMP,
 				CONTEXTUAL_THEN,
 				ELEMENT_TAG,

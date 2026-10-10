@@ -8143,6 +8143,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_word("dyn") && !self.peek_at_is_op(1, "::") {
             return self.parse_dyn_type();
         }
+        // B570: `auto` is contextual by `dyn`'s rule — the toolchain-kept
+        // marker at a type's head, except `auto::`. A type follows, or the
+        // annotation ends there (`= .. ;`, `{`, a `context` or `borrows`
+        // clause): the bare `auto`, filled by `check --fix`. Where nothing is
+        // inferred (a parameter, a field) the analyzer refuses it by name.
+        if self.peek_is_word("auto") && !self.peek_at_is_op(1, "::") {
+            return self.parse_auto_type();
+        }
         if let Some(closure) = self.parse_closure_type() {
             return Some(closure);
         }
@@ -8159,6 +8167,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         self.note_expected("a type");
         None
+    }
+
+    /// `auto T` / `auto` (B570): the marker, then the written type when one
+    /// follows — read without its own `context` suffix, which the enclosing
+    /// [`Parser::parse_type_inner`] takes over the whole annotation, so a
+    /// return's clause still binds to the function.
+    fn parse_auto_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        if !self.eat_word("auto") {
+            return None;
+        }
+        let ends_here = !self.type_can_start_at(0)
+            || self.peek_is_word("context")
+            || self.peek_is_word("borrows");
+        let written = match ends_here {
+            true => None,
+            false => Some(Box::new(
+                self.parse_nested(Self::TYPE_NESTING_REFUSAL, Self::parse_type_atom)?,
+            )),
+        };
+        Some((Node::AutoType(written), self.span_from(start)))
     }
 
     /// `dyn Source<i32>` — a trait object type (A124 R3).
@@ -15819,5 +15848,33 @@ mod ascription_tests {
             rendered_errors("fun main() {\n\tlet x = foo()\n\tas = 5;\n}\n"),
             vec!["expected `;` to end this statement".to_string()]
         );
+    }
+
+    // --- B570: `auto` -------------------------------------------------------
+
+    fn type_shape(source: &str) -> String {
+        let (mut tokens, errors) = lexing::tokenize(source);
+        assert!(errors.is_empty());
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
+        let node = parser.parse_type().expect("a type");
+        assert_eq!(
+            parser.position, token_count,
+            "unconsumed tokens in {source:?}"
+        );
+        format!("{:?}", node.0)
+    }
+
+    #[test]
+    fn auto_is_a_marker_at_a_types_head_and_a_name_elsewhere() {
+        assert!(type_shape("auto i32").starts_with("AutoType(Some("));
+        assert!(type_shape("auto List<str>").starts_with("AutoType(Some("));
+        assert!(type_shape("auto").starts_with("AutoType(None)"));
+        assert!(type_shape("auto::Thing").starts_with("StaticAccessor"));
+        assert!(rendered_errors("fun f(): auto { 5 }").is_empty());
+        assert!(rendered_errors("fun f(): auto i32 context settings { 5 }").is_empty());
+        assert!(rendered_errors("fun main() { let x: auto = 5; let auto = 1; }").is_empty());
+        assert!(rendered_errors("fun main() { let w = Length::auto(); }").is_empty());
+        assert_eq!(expression("x as auto List<i32>"), "(as x auto List<i32>)");
     }
 }

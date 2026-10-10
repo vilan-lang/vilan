@@ -720,3 +720,8 @@ NEW	-	`as {written}` then `<`: a generic list after `as` touches its type, `{tig
 NEW	-	`{word}` here takes a view of an ascription, and an ascription is a value, never a place to view — `as` binds tighter than `{word}`{steer}
 NEW	-	{subject}, not `{expected}` (ascribed here): `as` names the type a value already has, and does not convert. {conversion}
 NEW	-	{subject}, not `{expected}`: `await p as T` ascribes the PROMISE, because `as` binds tighter than `await` — ascribe the awaited value, `(await p) as {expected}`
+NEW	-	stale `auto`: {now}, not the written `auto {written}`{readers}{fix}
+NEW	-	unfilled `auto`: {what}{fix}
+NEW	-	`auto` writes a type the toolchain infers and keeps current, so it stands only where a type is inferred: a function's return, a `let` or `mut` binding, or an ascription (`as auto T`) — nothing is inferred here, so write the type
+NEW	-	`auto` writes a return the toolchain infers, and nothing is inferred here: a trait member's return is the trait's, and an `external`'s is the host's — write the type
+NEW	-	`auto` marks a type annotation, not a value (expected an expression here)

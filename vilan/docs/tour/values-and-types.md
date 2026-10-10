@@ -59,7 +59,7 @@ A few more words mean something only in one position and are ordinary
 identifiers everywhere else: `own` (a parameter that takes ownership —
 see [the memory model](memory-model.md)), `jump` (the prefix on `break`
 and `continue`), `lazy`, `dyn`, `with`, `borrows`, `self`, `Self`, `void`,
-`context`, `sync`, `as`, and the attribute names in `[...]`. So `let own =
+`context`, `sync`, `as`, `auto`, and the attribute names in `[...]`. So `let own =
 owner();`, a field called `with` and a method called `jump` are all fine,
 beside the keyword readings in the same file. Even a reserved word names a
 MEMBER — a field `type`, a method `match`, read as `event.type` and called

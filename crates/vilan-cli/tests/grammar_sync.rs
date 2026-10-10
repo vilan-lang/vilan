@@ -627,6 +627,45 @@ fn b571_the_ascription_as_is_coloured_by_position_in_both_grammars() {
     }
 }
 
+/// B570: `auto` colours as a keyword in BOTH grammars at an annotation's
+/// head — after a `:` or `as` — and stays a name everywhere else: a path
+/// segment (`Length::auto()`), `auto::`, a binding, a field.
+#[test]
+fn b570_auto_is_coloured_at_an_annotations_head_in_both_grammars() {
+    const MARKERS: &[&str] = &[
+        "fun f(): auto i32 {",
+        "fun g(): auto {",
+        "let x: auto = 1;",
+        "mut items: auto List<str> = [];",
+        "let y = make() as auto List<str>;",
+    ];
+    const NAMES: &[&str] = &[
+        "let auto = 1;",
+        "Length::auto()",
+        "let a: auto::Thing = t;",
+        "f(auto)",
+        "auto: i32,",
+    ];
+    for (file, grammar, key) in [
+        (TEXTMATE_GRAMMAR, textmate_grammar(&[]), "keywords"),
+        (HIGHLIGHT_THEME, highlight_grammar(&[]), "keyword"),
+    ] {
+        let rule = contextual_rule(&grammar, key, "auto");
+        assert_eq!(
+            regex_matches(&rule.regex, MARKERS),
+            vec![true; MARKERS.len()],
+            "{file}: {:?} misses an `auto` annotation among {MARKERS:?}",
+            rule.regex,
+        );
+        assert_eq!(
+            regex_matches(&rule.regex, NAMES),
+            vec![false; NAMES.len()],
+            "{file}: {:?} colours `auto` where it is a name ({NAMES:?})",
+            rule.regex,
+        );
+    }
+}
+
 /// K26 — `only`, B318's trailing import modifier, colours as a keyword in
 /// BOTH grammars after a path's end and before the statement's `;`, and not
 /// where a VALUE named `only` sits before a `;` — after `ret`, `else`, `then`,

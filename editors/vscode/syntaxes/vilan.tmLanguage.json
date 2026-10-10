@@ -397,6 +397,15 @@
      }
     },
     {
+     "comment": "B570: `auto` \u2014 the toolchain-kept type at an annotation's head: after a `:` (never a `::`, so `Length::auto()` stays a name) or after `as`, and never before `::` (a path into a module named `auto`). `let auto = 1` and a field named `auto` stay plain.",
+     "match": "(?:(?<=[^:]:)|(?<=\\b[a][s]\\s))\\s*(auto)\\b(?!\\s*::)",
+     "captures": {
+      "1": {
+       "name": "keyword.other.vilan"
+      }
+     }
+    },
+    {
      "comment": "B414: `jump` \u2014 see `own` above; loop control before its target.",
      "match": "\\b(jump)\\b(?=\\s+(?!i[ns]\\b|as\\b)[A-Za-z_])",
      "captures": {

@@ -59,15 +59,17 @@ take meaning only by position, and are ordinary identifiers everywhere
 else (`vilan --print-keywords` prints both lists, each word flagged):
 
 ```text
-as        borrows   context   dyn       jump      lazy      only
-own       self      Self      sync      then      void      with
+as        auto      borrows   context   dyn       jump      lazy
+only      own       self      Self      sync      then      void
+with
 ```
 
 `with` is the trait list of an `impl` or `trait` head (§3.3); `borrows`
 the return clause after a declaration's return type (§3.3); `own` and
 `lazy` a parameter's prefix when a binder follows (§3.3), and `lazy` also
 opens a `lazy let` (§3.4); `dyn` the trait-object marker at a type's head
-(§3.9 — `dyn::` is a path instead); `jump` loop control when its target
+(§3.9 — `dyn::` is a path instead); `auto` the toolchain-kept type at an
+annotation's head (§3.9, §5.8 — `auto::` is a path instead); `jump` loop control when its target
 follows (§3.4); `context` the clause after a closure type or a return type
 (§3.9); `sync` the marker opening a closure type (§3.9); `then` the
 infix conditional after a complete operand (§3.8); `void` the unit

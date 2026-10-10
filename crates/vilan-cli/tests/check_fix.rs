@@ -130,6 +130,54 @@ fn b571_an_ascription_to_another_width_is_rewritten_to_the_conversion() {
     );
 }
 
+/// B570: a stale `auto` is rewritten and a bare one filled, in `--fix`'s
+/// rounds — and a rewrite that changes what callers read re-checks them in the
+/// next round (here a caller's numeric conversion follows the rewrite).
+#[test]
+fn b570_stale_and_unfilled_autos_are_rewritten_to_a_clean_check() {
+    let dir = temp_package(
+        "auto",
+        concat!(
+            "fun ratio(): auto f64 {\n",
+            "\t5\n",
+            "}\n",
+            "\n",
+            "fun greeting(): auto {\n",
+            "\t\"hi\"\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet half: f64 = ratio();\n",
+            "\tprint(i\"{half} {greeting()}\");\n",
+            "}\n",
+        ),
+    );
+    assert!(
+        !vilan(&dir, &["check", "."]).status.success(),
+        "the stale `auto` is refused before the fix"
+    );
+    let output = vilan(&dir, &["check", "--fix", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let text = entry(&dir);
+    let second = vilan(&dir, &["check", "--fix", "."]);
+    let after = entry(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("fixed 2 `auto` annotations in 1 file"),
+        "{stdout}"
+    );
+    assert!(text.contains("fun ratio(): auto i32 {"), "{text}");
+    assert!(text.contains("fun greeting(): auto str {"), "{text}");
+    assert!(text.contains("let half: f64 = ratio().as_f64();"), "{text}");
+    assert!(second.status.success());
+    assert_eq!(text, after, "a second run changes nothing");
+}
+
 #[test]
 fn a_literal_counter_is_declared_usize_and_its_other_uses_convert_in_later_rounds() {
     let dir = temp_package(
