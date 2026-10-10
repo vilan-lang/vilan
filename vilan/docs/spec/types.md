@@ -979,6 +979,7 @@ fun check<T: PartialEq>(x: T, y: T) { if x == y { … } }  // the test produces 
 "p=" + point.to_string()     // the fix the error names
 count + "n="                 // error: only a `str` LEFT operand concatenates
 1.5 + count                  // error: f64 and i32; no implicit conversions
+index - count                // error: usize and i32 — `-`, `*`, `/`, `%` as `+`
 count * true                 // error: `*` computes on two numbers, and `bool` is not one
 count * "2"                  // error: the same, for `str`
 ```
@@ -1249,12 +1250,23 @@ position satisfies it only through its own declared tuple bound: a
 contained arity range whose element bound names the same trait or a
 subtrait.
 
+A tuple bound also **declares** the trait of a blanket written over a
+tuple bound that contains it — by the same containment, a range inside
+the blanket's and an element bound naming its trait or a subtrait. Over
+std's `impl type T: (2..: PartialEq) with PartialEq`, a parameter `T:
+(2..: PartialEq)` is `PartialEq`: two `T`s compare with `==`, and a
+callee bounded `U: PartialEq` takes one. The containment is a proof about
+every instantiation, not an impl search, so an abstract value's declared
+bounds stay its only answer (§5.4); and the dispatch stays per instance —
+at `T = (i32, i32)` a program's own `impl (i32, i32) with PartialEq`
+outranks the blanket (B588).
+
 A **spread parameter** `...items: T` is a *call convention* over an
 ordinary tuple parameter — the call site writes the pack's elements out
 flat, and they are collected into that one tuple argument:
 
 ```vilan,fragment
-fun log<T: (..: Display)>(...items: T)      //  log(1, "hi")  ==  log((1, "hi"))
+fun log<T: (..: Display)>(...items: T)      //  log(1, "hi") collects the pack (1, "hi")
 fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): SignalCell<T>
 ```
 
@@ -1268,6 +1280,13 @@ what makes 0- and 1-arity tuple *values* reachable; tuple types already
 admit them. Since the convention lives on the declaration, a spread
 function used as a **value** has its tuple type, and is called with a
 tuple.
+
+A direct call by name always **collects**, whatever its arguments' types:
+`log((1, "hi"))` passes ONE argument, so its pack is the one-slot
+`((1, "hi"))`, and against `fun draw(...at: (f64, f64))` the call
+`draw((3, 4))` is refused. A tuple already built is passed AS the pack
+with a tuple-value spread (below): `draw(..pair)`, `log(..(1, "hi"))`
+(B581).
 
 Grammar and the positions where `...` is rejected: §3.3.
 
@@ -1475,7 +1494,13 @@ Normative rejection cases (each is a compile error):
   just with its neighbour. Diverging legs and arms (`ret`, `panic`,
   `jump`) are `Never` and don't participate (§5.1).
 - An `i53`/`i32` operand mix (no implicit widening; suffix the
-  literal).
+  literal) — two different integer types as the operands of `+`, `-`,
+  `*`, `/`, `%`, a comparison or `==` (B579).
+- A binding whose type still holds a part nothing determines once
+  inference is done — `let xs = []` read only through `len()`, `let o =
+  None` — is refused at its initializer, naming where to write the type
+  (`xs: List<…>`); a later use that states it (`xs.push(1)`) is what
+  inference reads, and only an annotation can stand in for one (B580).
 - A value written into a struct field it does not match, through either
   door: the literal `S { field = v }` and the assignment `s.field = v`
   are governed by ONE rule, and a place chain of any depth (`a.b.c = v`,

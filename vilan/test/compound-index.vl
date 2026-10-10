@@ -13,7 +13,7 @@ struct Cell {
 
 mut calls = 0;
 
-fun bump(): i32 {
+fun bump(): usize {
 	calls += 1;
 	0
 }

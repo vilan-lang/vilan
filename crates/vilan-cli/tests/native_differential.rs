@@ -6240,15 +6240,15 @@ const ORDER_PROBE: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tmut list = [0, 0, 0, 0];\n",
-    "\tlist[next()] = next() * 10;\n",
+    "\tlist[next().as_usize()] = next() * 10;\n",
     "\tprint(i\"{list[0]} {list[1]} {list[2]} {list[3]}\");\n",
     "\tmut grid = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];\n",
-    "\tgrid[next() - 3][next() - 3] = next();\n",
+    "\tgrid[(next() - 3).as_usize()][(next() - 3).as_usize()] = next();\n",
     "\tprint(i\"{grid[0][0]} {grid[0][1]} {grid[1][0]} {grid[1][2]} {grid[2][1]}\");\n",
     "\tmut points = [Point { x = 0, y = 0 }, Point { x = 0, y = 0 }];\n",
-    "\tpoints[next() - 6].x = next();\n",
+    "\tpoints[(next() - 6).as_usize()].x = next();\n",
     "\tprint(i\"{points[0].x} {points[1].x}\");\n",
-    "\tlist[next() - 8] += next();\n",
+    "\tlist[(next() - 8).as_usize()] += next();\n",
     "\tprint(i\"{list[0]} {list[1]}\");\n",
     "}\n",
 );
@@ -9340,22 +9340,23 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 
 /// F108's native half: a refusal raised inside a function body in ANOTHER
 /// file named no expression — its span indexed the other file's bytes and
-/// the CLI rendered it against the entry: `names.push_many([])` (whose `[]`
-/// stays `List<unknown>`, the solver half) printed one bare `Error:` line, no
-/// file and no line, and a refusal inside a user module was drawn over the
-/// entry's `import` line. A library body's refusal is now anchored at the
-/// user's call that instantiated it, naming the body and its file; a user
-/// module's is drawn in that module.
+/// the CLI rendered it against the entry: `names.push_many([])` printed one
+/// bare `Error:` line, no file and no line, and a refusal inside a user module
+/// was drawn over the entry's `import` line. A library body's refusal is now
+/// anchored at the user's call that instantiated it, naming the body and its
+/// file; a user module's is drawn in that module. (F108's solver half grounds
+/// `push_many([])` now, so the library-body probe is an `Option::None` whose
+/// payload nothing states, instantiating `is_some`'s body open.)
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
-    let file = "native_probe_f108_push_many.vl";
+    let file = "native_probe_f108_open_option.vl";
     std::fs::write(
         staged.join(file),
         concat!(
-            "import std::io::print;\n\n",
-            "fun main() {\n\tmut names: List<str> = [\"a\"];\n\tnames.push_many([]);\n",
-            "\tprint(names.len());\n}\n",
+            "import std::io::print;\nimport std::option::Option;\n\n",
+            "fun main() {\n\tlet present = Option::None.is_some();\n",
+            "\tprint(present);\n}\n",
         ),
     )
     .expect("write the probe");
@@ -9364,16 +9365,13 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
         .output()
         .expect("build the probe");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the probe is refused natively");
     assert!(
-        !output.status.success(),
-        "the probe is still refused (F108's solver half)"
-    );
-    assert!(
-        stderr.contains(&format!("{file}:5:2")) && stderr.contains("names.push_many([])"),
+        stderr.contains(&format!("{file}:5:16")) && stderr.contains("Option::None.is_some()"),
         "the refusal is drawn at the user's call:\n{stderr}"
     );
     assert!(
-        stderr.contains("The construct is in `push_many`'s body (`list.vl`)"),
+        stderr.contains("The construct is in `is_some`'s body (`option.vl`)"),
         "the refusal names the body and its file:\n{stderr}"
     );
     let module = staged.join("native_probe_f108_module");
@@ -9581,11 +9579,12 @@ fn a_const_aggregate_is_identical_on_both_backends() {
 /// match-patterns.vl and capture-clones.vl, and the last of resource_take.vl
 /// (behind F97). A leg's guard is Rust's guard, and a `str`-backed variant
 /// nested in a payload or a tuple is a guard over a binder (match-patterns'
-/// next wall). capture-clones.vl's next wall is an operator over two numeric
-/// widths the analyzer admits, now refused by name rather than by rustc. The
+/// next wall). capture-clones.vl's next wall was an operator over two numeric
+/// widths, which the analyzer refuses since B579 (the program converts). The
 /// probe: guarded bindings, variants and tuples, a guard on outer state, a
 /// guarded wildcard, a string capture compared in a guard, the nested
-/// backed variant beside a guard; plus the two programs F93 completes.
+/// backed variant beside a guard; plus the two programs F93 completes, and
+/// capture-clones.vl, whose operator wall B579 removed.
 #[test]
 fn a_guarded_match_leg_is_identical_on_both_backends() {
     let staged = stage();
@@ -9604,13 +9603,14 @@ fn a_guarded_match_leg_is_identical_on_both_backends() {
             "{program}: F93 was its last wall"
         );
     }
-    match compare(&staged, "capture-clones.vl") {
-        Verdict::Refused(reason) => assert!(
-            reason.contains("an operator over two numeric types"),
-            "capture-clones.vl's next wall is the mixed-width operator: {reason}"
-        ),
-        other => panic!("capture-clones.vl must be refused by name: {other:?}"),
-    }
+    // B579 (v0.47.0) refuses the mixed-width operator in the analyzer, which
+    // was capture-clones.vl's last wall natively: the corpus program converts
+    // its operand now, and runs the same on both backends.
+    assert_eq!(
+        compare(&staged, "capture-clones.vl"),
+        Verdict::Identical,
+        "capture-clones.vl: B579 took its last wall"
+    );
 }
 
 /// F94: a SPREAD parameter was refused by name — the first wall of
@@ -12330,5 +12330,139 @@ fn parallel_legs_answer_in_order_and_resume_a_legs_panic() {
     assert!(
         message.contains("leg six fails"),
         "the leg's own message: {message:?}"
+    );
+}
+
+/// B588: a parameter whose TUPLE bound sits inside a tuple blanket's subject
+/// bound (`T: (2..: PartialEq)`, std's `impl type T: (2..: PartialEq) with
+/// PartialEq`) is `PartialEq` abstractly, and each instance dispatches on its
+/// own: a user's `impl (i32, i32) with PartialEq` answers at its instance, the
+/// blanket at the others, and `(2..: Hashable)` keys a map — on both backends.
+#[test]
+fn a_tuple_bound_inside_a_tuple_blanket_dispatches_per_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b588.vl"),
+        r#"import std::io::print;
+import std::compare::PartialEq;
+import std::hash::Hashable;
+import std::hash_map::HashMap;
+import std::option::Option;
+
+impl (i32, i32) with PartialEq {
+    fun eq(self, other: (i32, i32)): bool {
+        true
+    }
+}
+
+fun same<U: PartialEq>(a: U, b: U): bool {
+    a == b
+}
+
+fun all_eq<T: (2..: PartialEq)>(values: T, other: T): bool {
+    same(values, other) && !(values != other) && values.eq(other)
+}
+
+fun count<K: (2..: Hashable)>(key: K): i32 {
+    mut counts: HashMap<K, i32> = HashMap::new();
+    counts.insert(key, 7);
+    counts.get(key).unwrap_or(0)
+}
+
+fun main() {
+    print(all_eq((1, "a"), (1, "a")));
+    print(all_eq((1, 2, 3), (1, 2, 4)));
+    print(all_eq((1, 2), (1, 3)));
+    print(count((1, "a")));
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b588.vl"),
+        Verdict::Identical,
+        "a tuple-bounded parameter dispatches its blanket's trait per instance on both backends"
+    );
+}
+
+/// B587: a TOP-LEVEL tuple pattern under `match &mut <tuple place>` binds a
+/// view per one-slot leaf (payload-views.md's door A, one level up) on both
+/// backends: the writes land in the tuple, through `is` too, and a struct leaf
+/// writes its field in place. The copy it was compiled on JS without the
+/// write landing, and natively rustc refused the emitted match.
+#[test]
+fn a_top_level_tuple_pattern_under_a_view_subject_writes_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b587.vl"),
+        r#"import std::io::print;
+
+struct Point {
+    x: i32,
+}
+
+fun main() {
+    mut pair = (1, 2);
+    match &mut pair {
+        (let a, let b) => {
+            a += 10;
+            b = *b * 3;
+        },
+    }
+    print(pair.0);
+    print(pair.1);
+    mut nested = (1, Point { x = 5 }, "s");
+    match &mut nested {
+        (let n, let p, _) => {
+            n += 1;
+            p.x = 50;
+        },
+    }
+    print(nested.0);
+    print(nested.1.x);
+    let shown = (7, 8);
+    match &shown {
+        (let a, _) => print(*a),
+    }
+    if &mut pair is (let first, _) {
+        first = 100;
+    }
+    print(pair.0);
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b587.vl"),
+        Verdict::Identical,
+        "a top-level tuple leaf under a view subject is a view on both backends"
+    );
+}
+
+/// F108's solver half: an EMPTY list literal at a parameter whose element is
+/// fixed only through its bound (`names.push_many([])`, `push_many<S:
+/// Items<T>>`) is grounded `List<str>` from the bound, so the native build has
+/// an element type to emit (it was refused "does not emit a value of type `an
+/// unresolved type`").
+#[test]
+fn an_empty_literal_at_a_bounded_generic_is_grounded_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_f108.vl"),
+        r#"import std::io::print;
+
+fun main() {
+    mut names: List<str> = ["a"];
+    names.push_many([]);
+    names.push_many(["b"]);
+    print(names.len());
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_f108.vl"),
+        Verdict::Identical,
+        "an empty literal grounded through its parameter's bound builds on both backends"
     );
 }

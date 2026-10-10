@@ -9955,3 +9955,75 @@ fn b561_a_nested_package_traits_import_is_spelled_at_its_full_path() {
         "the refusal's import compiles: {errors:#?}"
     );
 }
+
+// --- B585: `resolve_world`'s static-path refusals in a module are anchored -----
+
+/// B585: the static-member arms of `resolve_world` pushed with no attribution,
+/// so a refusal raised inside a MODULE rendered against whichever file was
+/// walked last (std's `lib.vl`, with std's comment text under the label).
+/// Each arm now anchors at its own expression; one helper, one pin per arm.
+fn b585_refusal_is_anchored_in_the_module(user: &str, message_part: &str) {
+    let entry = "import pkg::user::call;\n\nfun main() {\n\tlet _ = call(1);\n}\n";
+    let errors = analyze_package_spanned(
+        &[("main.vl", entry), ("user.vl", user)],
+        "main.vl",
+        Platform::default(),
+    );
+    let refusal = errors
+        .iter()
+        .find(|(message, ..)| message.contains(message_part))
+        .unwrap_or_else(|| panic!("no `{message_part}` refusal: {errors:#?}"));
+    assert_eq!(refusal.1, "user.vl", "{errors:#?}");
+    assert!(
+        refusal.2.end <= user.len() && !user[refusal.2.clone()].trim().is_empty(),
+        "the span indexes user.vl's own text: {errors:#?}"
+    );
+}
+
+#[test]
+fn b585_an_unconstrained_parameters_static_miss_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "export fun call<T>(value: T): i32 {\n\tlet _ = T::missing();\n\t1\n}\n",
+        "cannot access 'missing' on an unconstrained type parameter",
+    );
+}
+
+#[test]
+fn b585_a_types_static_miss_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "import std::option::Option;\n\nexport fun call(value: i32): i32 {\n\tlet _ = Option::nothing_here();\n\tvalue\n}\n",
+        "cannot find 'nothing_here' in Option",
+    );
+}
+
+#[test]
+fn b585_a_bounded_parameters_static_miss_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "import std::display::Display;\n\nexport fun call<T: Display>(value: T): i32 {\n\tlet _ = T::missing();\n\t1\n}\n",
+        "no bound of this type parameter (Display) has a member 'missing'",
+    );
+}
+
+#[test]
+fn b585_a_bodyless_associated_function_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "trait Make {\n\tfun make(): i32;\n}\n\nexport fun call(value: i32): i32 {\n\tMake::make() + value\n}\n",
+        "'Make::make' has no default body",
+    );
+}
+
+#[test]
+fn b585_an_ambiguous_static_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "trait A {\n\tfun make(): i32;\n}\n\ntrait B {\n\tfun make(): i32;\n}\n\nstruct Thing {}\n\nimpl Thing with A {\n\tfun make(): i32 {\n\t\t1\n\t}\n}\n\nimpl Thing with B {\n\tfun make(): i32 {\n\t\t2\n\t}\n}\n\nexport fun call(value: i32): i32 {\n\tThing::make() + value\n}\n",
+        "'make' is ambiguous on 'Thing'",
+    );
+}
+
+#[test]
+fn b585_a_trait_member_on_the_types_path_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "trait Greet {\n\tfun hello(self): str;\n}\n\nstruct Thing {}\n\nimpl Thing with Greet {\n\tfun hello(self): str {\n\t\t\"hi\"\n\t}\n}\n\nexport fun call(value: i32): i32 {\n\tlet _ = Thing::hello(Thing {});\n\tvalue\n}\n",
+        "'hello' is not an inherent member of 'Thing'",
+    );
+}

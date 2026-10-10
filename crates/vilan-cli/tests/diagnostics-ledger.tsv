@@ -709,3 +709,8 @@ row	flagship	key
 685	-	this pattern destructures by name, so the value must be a labelled tuple, and it is `{rendered}`
 686	-	`{label} = {value}` names an argument, and only a spread parameter takes names (`...at: ({label}: T, …)`), which this one is not: drop `{label} =` to pass it by position, or, to assign, write `{label} = {value};` before the call
 687	-	a spread parameter's arguments are all named or none: name every argument it collects, or drop the names and pass them by position
+688	-	`{name}`'s element type is decided by its uses, and uses in two files disagree: one gives it `{first}`, another `{second}`. Write the element type on the declaration (`{name}: List<…>`)
+689	-	'{member_name}' is ambiguous on '{type_str}': {both}{providers} provide it as their trait's default, and no call spelling names one instantiation; declare `{member_name}` on `{type_str}` itself — an inherent member beats every trait-provided one
+690	-	`{symbol}` computes on two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: there are no implicit conversions; suffix the literal or convert with `as_*`
+691	-	cannot infer the element type of this empty list from anything the program does with `{name}`. Write the type on the binding (`{name}: {written}`)
+692	-	cannot infer the type of `{name}`: it is `{written}`, and inference cannot settle the `…` from anything the program does with it. Write the type on the binding (`{name}: {written}`)

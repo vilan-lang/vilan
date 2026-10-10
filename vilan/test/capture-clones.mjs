@@ -22,33 +22,33 @@ function __replace(target, value) {
 function fold_unsigned(value, modulus) {
 	const truncated = Math.trunc(value);
 	const wrapped = truncated % modulus;
-	let $e = null;
-	if (wrapped < 0) {
-		$e = wrapped + modulus;
-	} else {
-		$e = wrapped;
-	}
-	return $e;
-}
-function saturate_unsigned(value) {
-	const truncated = Math.trunc(value);
-	let $q = null;
-	if (truncated > 0) {
-		$q = truncated;
-	} else {
-		$q = 0;
-	}
-	return $q;
-}
-function fold_signed(value, modulus, half) {
-	const wrapped = fold_unsigned(value, modulus);
 	let $f = null;
-	if (wrapped >= half) {
-		$f = wrapped - modulus;
+	if (wrapped < 0) {
+		$f = wrapped + modulus;
 	} else {
 		$f = wrapped;
 	}
 	return $f;
+}
+function saturate_unsigned(value) {
+	const truncated = Math.trunc(value);
+	let $e = null;
+	if (truncated > 0) {
+		$e = truncated;
+	} else {
+		$e = 0;
+	}
+	return $e;
+}
+function fold_signed(value, modulus, half) {
+	const wrapped = fold_unsigned(value, modulus);
+	let $g = null;
+	if (wrapped >= half) {
+		$g = wrapped - modulus;
+	} else {
+		$g = wrapped;
+	}
+	return $g;
 }
 function as_usize(self) {
 	const widened = Number(self);
@@ -59,10 +59,10 @@ function as_i32(self) {
 	return Number(fold_signed(widened, 4294967296, 2147483648));
 }
 function step(self) {
-	const $p = self;
-	const items = __clone($p[1]);
-	const at = $p[2];
-	if ($p[0] === 0) {
+	const $q = self;
+	const items = __clone($q[1]);
+	const at = $q[2];
+	if ($q[0] === 0) {
 		__replace(self, [ 0, __clone(items), at + 1 ]);
 		return __at(items, as_usize(at), "capture-clones.vl:75:8");
 	}
@@ -149,7 +149,7 @@ function total_width(rows2) {
 		let $d = null;
 		const cells = $c[0];
 		const weight = $c[1];
-		total = total + cells.length * weight;
+		total = total + cells.length * as_usize(weight);
 		$d = undefined;
 		$d;
 	}
@@ -158,45 +158,45 @@ function total_width(rows2) {
 function guarded_width(rows2) {
 	let total = 0;
 	for (const row of rows2) {
-		const $g = row;
-		let $h = null;
-		if ($g[1] > 1) {
-			total = total + $g[0].length;
-			$h = undefined;
+		const $h = row;
+		let $i = null;
+		if ($h[1] > 1) {
+			total = total + $h[0].length;
+			$i = undefined;
 		} else {
-			$h = undefined;
+			$i = undefined;
 		}
-		$h;
+		$i;
 	}
 	return as_i32(total);
 }
 function first_or(held2, fallback) {
-	const $i = held2;
-	let $j = null;
-	if ($i[0] === 0) {
-		const inner2 = __clone($i[1]);
-		$j = inner2;
+	const $j = held2;
+	let $k = null;
+	if ($j[0] === 0) {
+		const inner2 = __clone($j[1]);
+		$k = inner2;
 	} else {
-		$j = __clone(fallback);
+		$k = __clone(fallback);
 	}
-	return $j;
+	return $k;
 }
 function first_or_guarded(held2, limit, fallback) {
-	const $k = held2;
-	let $l = null;
-	if ($k[0] === 0 && limit > 0) {
-		const inner2 = __clone($k[1]);
-		$l = inner2;
+	const $l = held2;
+	let $m = null;
+	if ($l[0] === 0 && limit > 0) {
+		const inner2 = __clone($l[1]);
+		$m = inner2;
 	} else {
-		$l = __clone(fallback);
+		$m = __clone(fallback);
 	}
-	return $l;
+	return $m;
 }
 function grow_first(pair2) {
-	const $o = pair2;
-	let cells = __clone($o[0]);
+	const $p = pair2;
+	let cells = __clone($p[0]);
 	if (true) {
-		cells.push($o[1]);
+		cells.push($p[1]);
 		return as_i32(cells.length);
 	}
 	return 0;
@@ -255,15 +255,15 @@ console.log(String(got.length));
 let guarded = first_or_guarded(held, 1, [  ]);
 guarded.push(9);
 console.log(String(guarded.length));
-const $m = held;
-let $n = null;
-if ($m[0] === 0) {
-	const inner = $m[1];
-	$n = console.log(String(inner.length));
+const $n = held;
+let $o = null;
+if ($n[0] === 0) {
+	const inner = $n[1];
+	$o = console.log(String(inner.length));
 } else {
-	$n = console.log(String(0));
+	$o = console.log(String(0));
 }
-$n;
+$o;
 const pair = [ [ 1, 2 ], 3 ];
 console.log(String(grow_first(pair)));
 console.log(String(pair[0].length));

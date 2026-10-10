@@ -1537,20 +1537,111 @@ fn fixed_array_destructuring_rejects_a_list() {
 // --- `[T; n].len()` — the fold (fixed-arrays.md §10) -----------------------------
 
 #[test]
-fn fixed_array_len_folds_to_the_constant_and_types_as_i32() {
-    // `arr.len()` is the compile-time length, typed `i32` (like `List.len()`),
-    // so it participates in arithmetic and satisfies an `i32` annotation.
+fn fixed_array_len_folds_to_the_constant_and_types_as_usize() {
+    // `arr.len()` is the compile-time length, typed `usize` like every length
+    // (B590: it answered `i32` after I5 S2 moved `List.len()`), so it
+    // satisfies a `usize` annotation, meets a list's length, and indexes.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         fun main() {
             let a = [0; 4];
-            let n: i32 = a.len();
-            print(n);             // 4
-            print(a.len() + 1);   // 5
+            let n: usize = a.len();
+            let xs = [1, 2];
+            print(n);                  // 4
+            print(a.len() + 1);        // 5
+            print(xs.len() + a.len()); // 6
+            print(a[a.len() - 1]);     // 0
         }
         "#,
-        "4\n5\n",
+        "4\n5\n6\n0\n",
+    );
+}
+
+/// B590's other side: an `i32` annotation is refused with the index steer,
+/// as for a list's length, and inside an impl over a fixed array `self.len()`
+/// is the `usize` its signature says.
+#[test]
+fn b590_a_fixed_arrays_length_is_a_usize() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let a = [0; 4];
+            let n: i32 = a.len();
+        }
+        "#,
+        "Expected i32, but got usize (an index: a position, a length or a count)",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Size {
+            fun size(self): usize;
+        }
+        impl [i32; 3] with Size {
+            fun size(self): usize {
+                self.len()
+            }
+        }
+        fun main() {
+            let a: [i32; 3] = [1, 2, 3];
+            print(a.size());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+/// B582 (array-lengths.md §11, S0): an impl head over a fixed array binds its
+/// ELEMENT — `impl [type T; 3] with Count` was refused "cannot find type 'T'"
+/// at both `T`s while `impl [i32; 3]` compiled; selection already binds
+/// through an array's element. One literal length per impl, element-generic.
+#[test]
+fn b582_an_impl_head_over_a_fixed_array_binds_its_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        trait Count {
+            fun count(self): usize;
+            fun first_shown(self): str;
+        }
+        impl [type T: Display; 3] with Count {
+            fun count(self): usize {
+                self.len()
+            }
+            fun first_shown(self): str {
+                let first: T = self[0];
+                first.to_string()
+            }
+        }
+        fun main() {
+            let numbers: [i32; 3] = [1, 2, 3];
+            let words: [str; 3] = ["a", "b", "c"];
+            print(numbers.count());
+            print(numbers.first_shown());
+            print(words.first_shown());
+        }
+        "#,
+        "3\n1\na\n",
+    );
+    // The length is still the head's: a `[i32; 2]` is no `[T; 3]`.
+    assert_fails_with(
+        r#"
+        trait Count {
+            fun count(self): usize;
+        }
+        impl [type T; 3] with Count {
+            fun count(self): usize {
+                self.len()
+            }
+        }
+        fun main() {
+            let pair: [i32; 2] = [1, 2];
+            let _n = pair.count();
+        }
+        "#,
+        "has no method 'count'",
     );
 }
 
@@ -6368,7 +6459,7 @@ fn b220_len_stays_structural_on_an_array() {
         fun main() {
             let pair: [i32; 2] = [4, 9];
             print(pair.len());
-            print(pair.len() + pair.first());
+            print(pair.len().as_i32() + pair.first());
         }
         "#,
         "2\n6\n",
@@ -8695,5 +8786,48 @@ fn b443_a_tuple_is_a_map_key() {
         main();
         "#,
         "2\n7\n1\ntrue\n",
+    );
+}
+
+// --- B581 (R-e, door (a)): a direct spread call always collects --------------
+
+/// B581: the spec said a spread call and its tuple call are one call
+/// (`log(1, "hi") == log((1, "hi"))`); the RULING is that a direct call by
+/// name always collects — `draw((3, 4))` passes a one-slot pack and is
+/// refused — and a tuple already built is passed as the pack with a
+/// tuple-value spread, `draw(..pair)`. The spec's comment is corrected; this
+/// pins the behaviour it now describes.
+#[test]
+fn b581_a_direct_spread_call_collects_and_a_built_tuple_spreads() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::tuple::Tuple;
+        fun draw(...at: (f64, f64)): f64 {
+            at.0 + at.1
+        }
+        fun count<T: (2..)>(...items: T): usize {
+            items.len()
+        }
+        fun main() {
+            print(draw(1.0, 2.0));
+            let pair = (3.0, 4.0);
+            print(draw(..pair));
+            print(count(1, "hi"));
+            print(count(..(1, "hi")));
+        }
+        "#,
+        "3\n7\n2\n2\n",
+    );
+    assert_fails_with(
+        r#"
+        fun draw(...at: (f64, f64)): f64 {
+            at.0 + at.1
+        }
+        fun main() {
+            let _sum = draw((3.0, 4.0));
+        }
+        "#,
+        "Expected (f64, f64)",
     );
 }

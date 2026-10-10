@@ -579,13 +579,12 @@ fn the_corpus_as_modules_answers_the_same_under_every_permutation() {
     );
 }
 
-/// **B554, the known red.** Two modules push `1` and `"two"` into one module
-/// binding; the blame lands on whichever push's module loads later. The
-/// invariant (pass map §5.2): a diagnostic's location is a function of the
-/// program, not of the file names — the conflict is reported at the binding's
-/// declaration, or names every push.
+/// **B554.** Two modules push `1` and `"two"` into one module binding; the
+/// blame landed on whichever push's module loaded later. The invariant (pass
+/// map §5.2): a diagnostic's location is a function of the program, not of
+/// the file names — the conflict is reported at the binding's declaration,
+/// naming both uses, and the slot settles on `any` in every load order.
 #[test]
-#[ignore = "B554: an element-type conflict on a module binding is blamed on whichever push's module loads later in name order"]
 fn b554_an_element_conflicts_blame_is_a_fact_about_the_program() {
     let mut divergences = compare_fixture(&B554_FIXTURE, &[]);
     let (label, files) = CLASSES_FIXTURE

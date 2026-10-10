@@ -705,3 +705,111 @@ fn a158_a_list_cell_pushes_a_batch_as_one_splice() {
         "splice(2,-0,+3) \nsplice(5,-0,+2) \nsplice(7,-0,+2) \n9\n",
     );
 }
+
+// --- B580: a binding whose type keeps a hole is refused at its initializer --
+
+/// B580 (R-c, v0.47.0): `let xs = []` read only through `len()` and `let o =
+/// None` checked clean and ran on JS; natively the first was refused blaming
+/// the backend and the second emitted a `let` rustc cannot type. Nothing the
+/// program does with either states the missing part, so each is refused at
+/// its initializer, saying where to write the type.
+#[test]
+fn b580_a_binding_whose_type_keeps_a_hole_is_refused_at_its_initializer() {
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        fun main() {
+            let xs = [];
+            print(xs.len());
+        }
+        "#,
+        "[]",
+        "cannot infer the element type of this empty list from anything the program does \
+         with `xs`. Write the type on the binding (`xs: List<…>`)",
+    );
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let o = None;
+        }
+        "#,
+        "None",
+        "cannot infer the type of `o`: it is `Option<…>`, and inference cannot settle the `…` \
+         from anything the program does with it. Write the type on the binding (`o: Option<…>`)",
+    );
+}
+
+/// B580's boundary: a slot a use fills, a written type, a parameter the
+/// enclosing function declares, and a hole that is another error's cascade
+/// are not refused (the last speaks once, as itself).
+#[test]
+fn b580_a_filled_written_or_generic_binding_is_not_refused() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        fun keep<T>(value: T): T {
+            let held = value;
+            held
+        }
+        fun main() {
+            mut xs = [];
+            xs.push(1);
+            let ys: List<str> = [];
+            let o: Option<i32> = None;
+            mut found = None;
+            found = Some("x");
+            print(xs.len() + ys.len());
+            print(o.is_none());
+            print(keep(3));
+            print(found.is_some());
+        }
+        "#,
+        "1\ntrue\n3\ntrue\n",
+    );
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            let xs = [];
+            let n: str = 5;
+        }
+        "#,
+        "Expected str, but got i32 instead.",
+    );
+}
+
+// --- F108: an empty literal grounded through its parameter's bound ----------
+
+/// F108's solver half: `names.push_many([])` on a `List<str>` bound `S =
+/// List<unknown>` — the literal's element slot stayed open (JS ran it, the
+/// native build had nothing to emit). The bound `S: Items<T>` with `T = str`
+/// from the receiver, and the one `Items` impl a `List` meets, say `S =
+/// List<str>`: the slot is filled from the bound, as a `push` fills it.
+#[test]
+fn f108_an_empty_literal_at_a_bounded_generic_is_grounded_from_the_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut names: List<str> = ["a"];
+            names.push_many([]);
+            print(names.len());
+        }
+        "#,
+        "1\n",
+    );
+    // The binding the literal lands in is grounded too — B580 would refuse a
+    // `let none = []` whose element nothing states.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut names: List<str> = ["a"];
+            let none = [];
+            names.push_many(none);
+            print(names.len());
+        }
+        "#,
+        "1\n",
+    );
+}
