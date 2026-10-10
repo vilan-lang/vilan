@@ -70455,6 +70455,13 @@ pub struct Program<'src> {
     /// `trait_subject_candidates` before its receiver filter. Derived data,
     /// like the graph.
     trait_subject_memo: std::sync::Mutex<HashMap<String, Option<Vec<Id>>>>,
+    /// The members a trait-bounded dispatch of `member` can select under
+    /// `trait` — every impl's member plus the trait's default — per (trait,
+    /// member) (M132): `async_infer`'s `trait_method_candidates`, asked per
+    /// generic call site by the async fixpoint, the call graph and platform
+    /// coloring, and a scan of every impl each time. Derived data, like the
+    /// graph.
+    trait_method_memo: std::sync::Mutex<HashMap<(Id, String), std::sync::Arc<Vec<Id>>>>,
 }
 
 /// One module-level binding's HMR transfer descriptor (`hmr.md` §4).
@@ -70942,6 +70949,16 @@ impl<'src> Program<'src> {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<String, Option<Vec<Id>>>> {
         self.trait_subject_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `async_infer`'s per-(trait, member) candidate memo (M132), read
+    /// through a poisoned lock for [`Self::bound_selection_memo`]'s reason.
+    pub(crate) fn trait_method_memo(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(Id, String), std::sync::Arc<Vec<Id>>>> {
+        self.trait_method_memo
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -81739,6 +81756,7 @@ fn analyze_over_world<'src>(
         bound_selection_memo: std::sync::Mutex::default(),
         selection_memos: crate::impl_select::SelectionMemos::default(),
         trait_subject_memo: std::sync::Mutex::default(),
+        trait_method_memo: std::sync::Mutex::default(),
     }))
 }
 
