@@ -821,6 +821,11 @@ struct MirrorView {
 	subscribing: Shared<List<i32>>,
 	unsubscribing: Shared<List<i32>>,
 	pending: Shared<i32>,
+	/// Its connection dropped (A153 S4): the channel it names died with the
+	/// session, so it sends nothing more — a `Subscribe` or an `Unsubscribe` for
+	/// that id would reach the FRESH session, which may have minted it for
+	/// something else.
+	dead: Shared<bool>,
 }
 
 /// Every client's open mirror views, by channel and by the client's routes table
@@ -860,6 +865,7 @@ fun mirror_view(client: ReactiveClient, channel: i32): MirrorView {
 		subscribing = Shared::new([]),
 		unsubscribing = Shared::new([]),
 		pending = Shared::new(0 - 1),
+		dead = Shared::new(false),
 	};
 	mirror_views.write().push((owner, made));
 	turn_scope.clear(|| client.routes.write().push(MirrorRoute {
@@ -1013,6 +1019,9 @@ impl MirrorView {
 	/// held, one `Unsubscribe` for the slots that reached zero and stayed there.
 	fun flush(self) {
 		self.pending.write() = 0 - 1;
+		if self.dead.read() {
+			ret;
+		}
 		let opened = self.subscribing.read();
 		self.subscribing.write() = [];
 		let closed = self.unsubscribing.read();
@@ -1070,6 +1079,15 @@ impl MirrorView {
 		// The channel's last grant went: the server revoked the channel, and the
 		// view and its route go with it.
 		if self.slots.read().is_empty() {
+			self.close();
+		}
+	}
+
+	/// The connection dropped: the view sends nothing more, and leaves the client
+	/// with its route. Every mint bound to it rebinds on the reconnect's replay.
+	fun kill(self) {
+		if !self.dead.read() {
+			self.dead.write() = true;
 			self.close();
 		}
 	}
@@ -1264,6 +1282,8 @@ struct StoreMint<T> {
 	/// One cell per boundary a handle's `states()` follows (`follow`), set only
 	/// when its answer changes, and dropped with the boundary's last hold.
 	cells: Shared<List<(i32, SignalCell<MirrorKnown>)>>,
+	/// The key the mint's reconnect hooks are kept under on its client (A153 S4).
+	hooks: i32,
 }
 
 impl StoreMint<type T: StoreWire + Storable> {
@@ -1281,7 +1301,13 @@ impl StoreMint<type T: StoreWire + Storable> {
 				let (view, base) = binding;
 				release.write() = Some(view.hold(boundary, base));
 			},
-			None => self.ask(),
+			// While the connection is down the hold is only recorded: the
+			// reconnect's replay asks, and puts it on the fresh channel.
+			None => {
+				if self.client.connected.get() {
+					self.ask();
+				}
+			},
 		}
 		turn_scope.clear(|| || mint.release(id))
 	}
@@ -1289,11 +1315,15 @@ impl StoreMint<type T: StoreWire + Storable> {
 	fun release(self, id: i32) {
 		mut kept: List<MintHold> = [];
 		mut gone: List<i32> = [];
+		mut unbound: List<MirrorBoundary> = [];
 		for held in self.holds.read() {
 			if held.id == id {
 				match held.release.read() {
 					Some(let release) => release(),
-					None => {},
+					// Not on a channel (unbound, or its view died with a dropped
+					// connection): nothing to send, but its key still leaves the
+					// replica with its last hold, as the channel's flush does.
+					None => unbound.push(held.boundary),
 				}
 				gone.push(held.boundary.identity);
 			} else {
@@ -1301,6 +1331,11 @@ impl StoreMint<type T: StoreWire + Storable> {
 			}
 		}
 		self.holds.write() = kept;
+		for boundary in unbound {
+			if !boundary.path.is_empty() && !self.holding(boundary.identity) {
+				batch(|| (boundary.gone)());
+			}
+		}
 		// A boundary nobody holds any more is owed a fresh seed when it is held
 		// again: its slot goes with its last hold.
 		for identity in gone {
@@ -1337,18 +1372,24 @@ impl StoreMint<type T: StoreWire + Storable> {
 				self.status.set(StoreMintStatus::Waiting);
 				self.heard.write() = [];
 				self.touch();
+				self.client.unenlist_store(self.hooks);
 				for retire in self.retire.read() {
 					retire();
 				}
 				self.retire.write() = [];
 			},
-			None => {},
+			// Never bound, or its view died with a dropped connection: nothing to
+			// release, and nothing for a reconnect to replay.
+			None => self.client.unenlist_store(self.hooks),
 		}
 	}
 
 	/// What the wire has told this mirror about the boundary whose identity is
 	/// `identity` (the link's `known`).
 	fun known(self, identity: i32): MirrorKnown {
+		if !self.client.connected.get() {
+			ret MirrorKnown::Down;
+		}
 		match self.status.get() {
 			StoreMintStatus::Failed(let _failure) => MirrorKnown::Failed,
 			_ => match self.bound.read() {
@@ -1443,11 +1484,49 @@ impl StoreMint<type T: StoreWire + Storable> {
 		}
 	}
 
+	/// The connection dropped (the client's drop hook): the channel died with the
+	/// session, so its view is let go of — it sends nothing more — and every hold
+	/// waits for the replay. The replica keeps its last value; the handles read
+	/// `Refreshing` (§7).
+	fun dropped(self) {
+		match self.bound.read() {
+			Some(let binding) => {
+				let (view, _base) = binding;
+				view.kill();
+				self.bound.write() = None;
+				for held in self.holds.read() {
+					held.release.write() = None;
+				}
+			},
+			None => {},
+		}
+		self.heard.write() = [];
+		self.touch();
+	}
+
+	/// The reconnect's replay (§7): a mint still held asks its call again — ONE
+	/// call per origin — and its reply rebinds it on the fresh session's channel:
+	/// the seed lands as a comparing write over what the replica held, and every
+	/// hold goes onto the new channel in one turn, so the boundaries are
+	/// re-subscribed in ONE `Subscribe` and their re-seeds compare too. What did
+	/// not change while the socket was down wakes nothing.
+	fun replay(self) {
+		self.touch();
+		if !self.holds.read().is_empty() {
+			match self.bound.read() {
+				Some(let _binding) => {},
+				None => self.ask(),
+			}
+		}
+	}
+
 	fun ask(self) {
 		if self.asking.read() {
 			ret;
 		}
 		self.asking.write() = true;
+		let enlisted = self;
+		self.client.enlist_store(self.hooks, || enlisted.replay(), || enlisted.dropped());
 		// A failed mint asked again is on its way, not failed: its handles read
 		// `Refreshing` (or `Pending`) until the reply says.
 		match self.status.get() {
@@ -1486,8 +1565,11 @@ impl StoreMint<type T: StoreWire + Storable> {
 		let view = mirror_view(self.client, reply.channel);
 		let replica = self.replica;
 		view.adopt_base(reply.base, turn_scope.clear(|| base_boundary(replica)));
+		let enlisted = self;
+		self.client.enlist_store(self.hooks, || enlisted.replay(), || enlisted.dropped());
+		let landed = landed_over(self.replica.get(), reply.seed, self.client.codec);
 		batch(|| {
-			self.replica.set(reply.seed);
+			self.replica.set(landed);
 			self.bound.write() = Some((view, reply.base));
 			set_mint_failure(self.epoch, None);
 			self.status.set(StoreMintStatus::Bound);
@@ -1502,6 +1584,32 @@ impl StoreMint<type T: StoreWire + Storable> {
 		if self.holds.read().is_empty() {
 			self.let_go();
 		}
+	}
+}
+
+/// A reply's seed over what the replica already holds (A153 S4): a seed carries
+/// its keyed collections EMPTY — their keys are boundaries of their own — so a
+/// replica that holds keys (a rebind after a reconnect, its slots still held)
+/// takes the seed the way a `Seed` frame lands, through `store_apply_at`, which
+/// keeps them; a replica that holds nothing takes it whole. The seed was read
+/// fresh off the reply, so it is described again for the landing — once per
+/// rebind, never per frame.
+fun landed_over<T: StoreWire>(held: Option<T>, seed: Option<T>, codec: Codec): Option<T> {
+	match held {
+		None => seed,
+		Some(let current) => match seed {
+			None => None,
+			Some(let fresh) => {
+				let (record, finish) = (codec.writer)();
+				mut writer = record;
+				let here: List<StoreStep> = [];
+				let _described = fresh.store_describe_at(&here, 0, &mut writer, true);
+				mut reader = (codec.reader)(finish());
+				mut copy = current;
+				let _landed = copy.store_apply_at(&here, 0, &mut reader);
+				Some(copy)
+			},
+		},
 	}
 }
 
@@ -1560,6 +1668,7 @@ fun minted_store<T: StoreWire + Storable>(
 		heard = Shared::new([]),
 		epoch = SignalCell::new(0),
 		cells = Shared::new([]),
+		hooks = fresh_id(),
 	};
 	let link = turn_scope.clear(|| MirrorLink {
 		hold = |boundary: MirrorBoundary| mint.hold(boundary),

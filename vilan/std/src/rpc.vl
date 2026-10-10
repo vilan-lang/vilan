@@ -688,6 +688,11 @@ export struct SocketDuplex {
 	// anywhere in scope. Sync closures, run in registration order;
 	// `dispose_on_close` is the one std registers.
 	on_terminal: Shared<List<|| void>>,
+	// Run when a LIVE connection drops, before the redial — what a client that
+	// keeps its last values while it is down is told (a mirrored store's handles
+	// read `Refreshing`, A153 S4). Sync closures, in registration order;
+	// `dispose_on_close` registers the client's.
+	on_drop: Shared<List<|| void>>,
 }
 
 export impl SocketDuplex with DuplexTransport {
@@ -1117,6 +1122,9 @@ fun handle_drop(duplex: SocketDuplex) {
 	if duplex.state.get() == ConnectionState::Connected {
 		duplex.state.set(ConnectionState::Reconnecting);
 		duplex.reject_pending("connection lost");
+		for dropped in duplex.on_drop.read() {
+			dropped();
+		}
 		let pending = duplex.pending;
 		let inbound = duplex.inbound;
 		let early = duplex.early;
@@ -1208,6 +1216,7 @@ export fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, Dia
 				early_serve,
 				on_reconnect = Shared::new([]),
 				on_terminal = Shared::new([]),
+				on_drop = Shared::new([]),
 			};
 			watch_socket(duplex);
 			// HMR (`hmr.md` §3, step 2): close the live socket before the next
@@ -3696,6 +3705,13 @@ export struct ReactiveClient {
 	// Every mirror's demand, and the ONE forward per channel it adds up to on the
 	// wire (A143). Every mirror this client mints carries a copy.
 	wire: WireDemand,
+	// Whether the connection is up, as this client was last told: `false` from a
+	// drop (`connection_lost`) until the reconnect's replay (`replay_dynamic`). A
+	// mirrored store's handles read `Refreshing` while it is (A153 S4).
+	connected: SignalCell<bool>,
+	// What to tell when the connection drops, keyed like `replays`: a mirrored
+	// store's mint lets go of its dead channel's view (A153 S4).
+	drops: Shared<List<(i32, || void)>>,
 }
 
 export impl ReactiveClient {
@@ -3708,6 +3724,8 @@ export impl ReactiveClient {
 			replays = Shared::new([]),
 			tables = Shared::new([]),
 			wire = WireDemand::new(transport, codec),
+			connected = SignalCell::new(true),
+			drops = Shared::new([]),
 		};
 		(client.transport).on_frame(|frame| {
 			// every inbound frame is handled in a turn
@@ -3878,11 +3896,67 @@ export impl ReactiveClient {
 	/// reconnect half of §9.2, run by `reattach_mirrors` after the contract
 	/// re-verify and the positional `__attach` rebind, so the fresh session exists
 	/// before any of these calls reaches it.
+	///
+	/// The connection is up again when this runs (the fresh session is attached),
+	/// so it is what says so to a client a drop told otherwise.
 	fun replay_dynamic(self) {
+		if !self.connected.get() {
+			self.connected.set(true);
+		}
 		for entry in self.replays.read() {
 			let (_mirror, replay) = entry;
 			replay();
 		}
+	}
+
+	/// The connection dropped (`dispose_on_close` registers this on a socket's
+	/// drop): every handle that keeps its last value while it is down is told —
+	/// a mirrored store's mint lets go of its dead channel's view, and its handles
+	/// read `Refreshing` until the reconnect's replay re-seeds them (A153 S4).
+	/// Nothing is sent: there is no connection to send it on.
+	fun connection_lost(self) {
+		if self.connected.get() {
+			self.connected.set(false);
+			for entry in self.drops.read() {
+				let (_mirror, dropped) = entry;
+				dropped();
+			}
+		}
+	}
+
+	/// Keep `replay` and `dropped` under `key` for as long as a mirrored store's
+	/// mint holds a grant (A153 S4): a reconnect replays it, a drop tells it.
+	/// Once per key.
+	fun enlist_store(self, key: i32, replay: || void, dropped: || void) {
+		for entry in self.drops.read() {
+			let (held, _dropped) = entry;
+			if held == key {
+				ret;
+			}
+		}
+		self.replays.write().push((key, replay));
+		self.drops.write().push((key, dropped));
+	}
+
+	/// Take a mint's reconnect hooks off this client: it holds no grant now, and
+	/// its next hold asks afresh (and enlists again).
+	fun unenlist_store(self, key: i32) {
+		mut replays: List<(i32, || void)> = [];
+		for entry in self.replays.read() {
+			let (held, _replay) = entry;
+			if held != key {
+				replays.push(entry);
+			}
+		}
+		self.replays.write() = replays;
+		mut drops: List<(i32, || void)> = [];
+		for entry in self.drops.read() {
+			let (held, _dropped) = entry;
+			if held != key {
+				drops.push(entry);
+			}
+		}
+		self.drops.write() = drops;
 	}
 
 	/// A remote handle for a channel this connection's `__attach` reply named: a
@@ -4329,6 +4403,7 @@ export impl ReactiveClient with Disposable {
 		self.tables.write() = [];
 		self.routes.write() = [];
 		self.replays.write() = [];
+		self.drops.write() = [];
 		self.dynamic.write() = [];
 		self.wire.reset();
 	}
@@ -6242,8 +6317,14 @@ fun dial_for_service_with(url: str, protocols: List<str>): Result<SocketDuplex, 
 /// nothing else it must remember, and with no window in which a connection could
 /// close unbound. A `ReactiveClient` an app already disposed is unharmed: `dispose`
 /// is idempotent (it assigns empties, it does not consume).
+///
+/// It also tells the client of every DROP (`ReactiveClient::connection_lost`), so
+/// what keeps its last value while the socket redials can say it is stale — a
+/// mirrored store's handles read `Refreshing` until the reconnect's re-seed
+/// lands (A153 S4).
 fun dispose_on_close(socket: SocketDuplex, client: ReactiveClient) {
 	socket.on_terminal.write().push(|| client.dispose());
+	socket.on_drop.write().push(|| client.connection_lost());
 }
 
 /// Bind a hand-wired client's DYNAMIC mirrors to its connection's fate: when

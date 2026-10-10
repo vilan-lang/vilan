@@ -447,6 +447,11 @@ global.messages().at(7).some().content().effect(|content| print(content.unwrap_o
 
 A frame's ops land in ONE client turn, so an observer never sees half a patch.
 
+A reconnect keeps the replica. While the socket is down every handle holds its
+last value; the replay asks each held root's method again, once, re-subscribes
+every boundary still held in one `Subscribe`, and lands the re-seeds as
+comparing writes — only what changed while the connection was down wakes.
+
 A handle through a variant or a key is a transient, as a `RemoteSource` is: its
 value is `None` both before its boundary's seed lands and after the server says
 there is nothing there, and `states()` tells the two apart — `Pending`, then

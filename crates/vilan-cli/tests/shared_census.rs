@@ -158,7 +158,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "rpc.vl",
-        56,
+        58,
         "R + O + E: sessions, wiring, the mirrors' leases. FIVE fewer since \
          A112 S1: `KeyedCell`'s own log, version, base and cursors, and its \
          cursor's sequence, are `DeltaLog`'s now (see `delta.vl`). +4 at A134 \
@@ -174,11 +174,14 @@ const CENSUS: &[(&str, usize, &str)] = &[
          the client that enlisted it, run by its `rebind`). +1 at A143: a \
          client's wire demand (R: one per `ReactiveClient`, every mirror's \
          `Subscribe`/`Unsubscribe` registered in it, cleared by a reconnect \
-         and by `dispose`).",
+         and by `dispose`). +2 at A153 S4: a socket duplex's drop hooks (E: \
+         `dispose_on_close` registers the client's, `handle_drop` runs them) \
+         and a client's mirrored-store drop hooks (E: enlisted by a store \
+         mint while it holds a grant, run by `connection_lost`).",
     ),
     (
         "rpc/mirror.vl",
-        28,
+        29,
         "R + E: the open mirror channels, the client's views and the failed \
          mints' last errors (three module bindings), and the cells every copy of \
          a record reaches — on the server per channel the grants, the slots, the \
@@ -188,7 +191,8 @@ const CENSUS: &[(&str, usize, &str)] = &[
          subscribe and unsubscribe lists and its pending flush, each slot's hold \
          count, and per store mirror its binding, its call in flight, its holds, \
          each hold's release, its retire list, the boundaries it has heard and \
-         the cells its handles' `states()` follow (A153 S2)",
+         the cells its handles' `states()` follow (A153 S2), and per view whether \
+         its connection dropped (A153 S4)",
     ),
     (
         "rpc/server.vl",
@@ -319,7 +323,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 226,
+        total, 229,
         "the total number of `Shared` construction sites in std changed"
     );
 

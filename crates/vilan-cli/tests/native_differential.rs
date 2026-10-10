@@ -11420,6 +11420,23 @@ fn a153_s2_a_patch_lands_in_one_client_turn_on_both_backends() {
     );
 }
 
+/// A153 S4: a mirrored store's reconnect — one replayed call, one re-subscribe,
+/// comparing re-seeds — behaves the same on both backends.
+#[test]
+fn a153_s4_a_mirrored_store_reconnects_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_reconnect.vl"),
+        include_str!("native/store_mirror_reconnect.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_reconnect.vl"),
+        Verdict::Identical,
+        "a mirrored store must reconnect the same on both backends"
+    );
+}
+
 /// B436 + B437: a trait object prints as its value, alone, and as the pair a
 /// list holds; two applications of one trait over one type dispatch through
 /// their own tables — identical on both backends (the JS leg printed the pair
