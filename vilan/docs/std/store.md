@@ -445,6 +445,18 @@ let global: RemoteStoreSome<Global> = client.global();
 global.messages().at(7).some().content().effect(|content| print(content.unwrap_or("")));
 ```
 
+A list field crosses by its splices — a push is the one element and a count,
+never the list again — and a map's or a set's KEY SET is a boundary of its own:
+`keys()` on a remote map or set is a `RemoteStoreKeys<K>`, a `Source<List<K>>`
+told its keys when one comes or goes. `each` over it, each row on its own key,
+is the map leased as a collection:
+
+```vilan,fragment
+<ul>{each(global.channels().keys(), |id| id, |id| {
+	<li>{when_remote_live(global.channels().at(id).some(), |channel| <b>{channel.name()}</b>)}</li>
+})}</ul>
+```
+
 A frame's ops land in ONE client turn, so an observer never sees half a patch.
 
 A reconnect keeps the replica. While the socket is down every handle holds its

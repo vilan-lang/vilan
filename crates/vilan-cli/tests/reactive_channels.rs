@@ -5818,7 +5818,7 @@ fn a153_s1_a_mirrored_store_seeds_once_and_patches_at_the_writers_paths() {
             "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":0,\"name\":\"general\",\"messages\":[7]}]},{\"Seed\":[1,{\"id\":8,\"author\":\"amy\",\"content\":\"ho\"}]}]]}",
             "subscribed: slots=4 nodes=7 wire=1",
             "-- one turn, many writes",
-            "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"one turn\"]},{\"Set\":[0,[1,1],\"lounge\"]},{\"Set\":[0,[1,2],[7,9]]},{\"Set\":[1,[1,2],\"x\"]},{\"Set\":[1,[1,1],\"zed\"]}]]}",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"one turn\"]},{\"Set\":[0,[1,1],\"lounge\"]},{\"Seq\":[0,[1,2],{\"Splice\":[1,0,[9]]}]},{\"Set\":[1,[1,2],\"x\"]},{\"Set\":[1,[1,1],\"zed\"]}]]}",
             "-- a write above a boundary covers the writes inside it",
             "down {\"Patch\":[0,[{\"Seed\":[-2,{\"id\":7,\"author\":\"bob\",\"content\":\"whole\"}]}]]}",
             "-- the same value",
@@ -6877,5 +6877,195 @@ fn a168_a_set_field_crosses_the_wire_and_each_watched_member_is_a_boundary() {
             "done",
         ],
         "the mirrored set went differently:\n{stdout}"
+    );
+}
+
+// --- A153 S3: collections over the wire -----------------------------------------
+
+/// A list field crosses by SPLICES (`Seq`), a map's and a set's key sets by
+/// `Keys`.
+const MIRROR_COLLECTIONS: &str = r##"import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::batch;
+import std::reactive::delta::SequenceCell;
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Room {
+	id: u53,
+	name: str,
+	messages: List<u53>,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+	motd: str,
+	tags: HashSet<str>,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun ids(list: Option<List<u53>>): str {
+	match list {
+		Some(let held) => {
+			mut out = "[";
+			mut first = true;
+			for id in held {
+				if !first {
+					out = out + ",";
+				}
+				first = false;
+				out = out + i"{id}";
+			}
+			out + "]"
+		},
+		None => "-",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(0, Room { id = 0, name = "general", messages = [1, 2, 3] });
+	rooms.insert(5, Room { id = 5, name = "random", messages = [] });
+	mut tags: HashSet<str> = HashSet::new();
+	tags.insert("pinned");
+	let global = Store::new(Global { rooms, motd = "hi", tags });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.rooms().at(0).some().messages().effect(|list| print(i"general {ids(list)}"));
+		g.rooms().keys().effect(|keys| {
+			mut out = "";
+			for key in keys {
+				out = out + i" {key}";
+			}
+			print(i"rooms:{out}");
+		});
+		g.tags().keys().effect(|members| {
+			mut out = "";
+			for member in members {
+				out = out + i" {member}";
+			}
+			print(i"tags:{out}");
+		});
+	});
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	let general = global.rooms().at(0).some().messages();
+	print("-- a push is a splice at the end");
+	general.push(4);
+	sleep_for(Duration::millis(0));
+	print("-- one turn's splices are one");
+	batch(|| {
+		general.insert_at(0, 0);
+		general.remove_at(2);
+		general.push(9);
+	});
+	sleep_for(Duration::millis(0));
+	print("-- a whole write is the list again");
+	let _whole = general.patch([7, 8]);
+	sleep_for(Duration::millis(0));
+	print("-- a room's name is not a key change");
+	let _named = global.rooms().at(5).some().name().patch("chat");
+	sleep_for(Duration::millis(0));
+	print("-- a room created and one deleted");
+	global.rooms().at(9).set(Some(Room { id = 9, name = "new", messages = [] }));
+	global.rooms().at(5).set(None);
+	sleep_for(Duration::millis(0));
+	print("-- a set's members are its key set");
+	global.tags().insert("urgent");
+	sleep_for(Duration::millis(0));
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s3_a_list_crosses_by_splices_and_a_key_set_by_keys() {
+    // §3.2. A push into a list field inside a boundary is ONE `Seq` op — a
+    // `Splice` carrying the inserted elements and only the COUNT removed — not
+    // the list again; one turn's three splices compose into one; a whole write
+    // is the list again (`Set`). `keys()` on a remote map or set is a key-set
+    // slot: seeded with `Keys(Reset([..]))`, told again when a key comes or
+    // goes, and told nothing for a write inside a key's value (the rename).
+    let stdout = run_program("mirror_collections", MIRROR_COLLECTIONS);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "general -",
+            "rooms:",
+            "tags:",
+            "general -",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,0]],[1,-1,[0]],[2,-1,[2]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":0,\"name\":\"general\",\"messages\":[1,2,3]}]},{\"Keys\":[1,{\"Reset\":[0,5]}]},{\"Keys\":[2,{\"Reset\":[\"pinned\"]}]}]]}",
+            "general [1,2,3]",
+            "rooms: 0 5",
+            "tags: pinned",
+            "-- a push is a splice at the end",
+            "down {\"Patch\":[0,[{\"Seq\":[0,[1,2],{\"Splice\":[3,0,[4]]}]}]]}",
+            "general [1,2,3,4]",
+            "-- one turn's splices are one",
+            "down {\"Patch\":[0,[{\"Seq\":[0,[1,2],{\"Splice\":[0,4,[0,1,3,4,9]]}]}]]}",
+            "general [0,1,3,4,9]",
+            "-- a whole write is the list again",
+            "down {\"Patch\":[0,[{\"Set\":[0,[1,2],[7,8]]}]]}",
+            "general [7,8]",
+            "-- a room's name is not a key change",
+            "-- a room created and one deleted",
+            "down {\"Patch\":[0,[{\"Keys\":[1,{\"Reset\":[0,5,9]}]}]]}",
+            "down {\"Patch\":[0,[{\"Keys\":[1,{\"Reset\":[0,9]}]}]]}",
+            "rooms: 0 5 9",
+            "rooms: 0 9",
+            "-- a set's members are its key set",
+            "down {\"Patch\":[0,[{\"Keys\":[2,{\"Reset\":[\"pinned\",\"urgent\"]}]}]]}",
+            "tags: pinned urgent",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "up   {\"Unsubscribe\":[0,[1]]}",
+            "up   {\"Unsubscribe\":[0,[2]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "done",
+        ],
+        "the mirrored collections went differently:\n{stdout}"
     );
 }

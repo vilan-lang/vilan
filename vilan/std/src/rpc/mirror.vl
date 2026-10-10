@@ -65,6 +65,7 @@ import pkg::reactive::store_core::{
 	store_identity_at,
 	store_watch,
 	store_wire_attach,
+	WireWrite,
 	store_wire_detach,
 	store_wire_since,
 };
@@ -140,6 +141,9 @@ struct MirrorSlot {
 	path: List<StoreStep>,
 	watch: Subscription,
 	holds: Shared<i32>,
+	/// The boundary is a map's or a set's KEY SET (§2.2 point 3, S3): it is seeded
+	/// and told with `Keys` ops, never with the collection's values.
+	keys: bool,
 }
 
 /// What one frame's op says, planned before the frame is written.
@@ -147,6 +151,11 @@ enum MirrorOpKind {
 	Seed,
 	Set,
 	Gone,
+	/// A sequence field's change, as ONE splice in the list's positions before
+	/// the turn: `(at, removed)`, the inserted elements read at the flush (S3).
+	Seq(usize, usize),
+	/// A key-set slot's keys, whole (S3).
+	Keys,
 }
 
 /// One planned op: its kind, its slot, and — for a seed or a set — the value's
@@ -476,9 +485,13 @@ impl MirrorChannel {
 		let root = self.root;
 		let watch = turn_scope
 			.clear(|| store_watch(root, path, || mark(channel, slot, dirty, pending)));
+		let keys = match self.grant_of(base) {
+			Some(let grant) => (grant.walkers.reach)(rel) == StoreReach::Keyed,
+			None => false,
+		};
 		self.slots
 			.write()
-			.push(MirrorSlot { slot, base, rel, path, watch, holds = Shared::new(1) });
+			.push(MirrorSlot { slot, base, rel, path, watch, holds = Shared::new(1), keys });
 	}
 
 	/// One control frame, past the channel id.
@@ -696,6 +709,25 @@ impl MirrorChannel {
 						serializer.i32_value(op.slot);
 						serializer.end_variant();
 					},
+					MirrorOpKind::Seq(let at, let removed) => {
+						serializer.begin_variant("Seq", 3);
+						serializer.i32_value(op.slot);
+						describe_steps(op.rel, &mut serializer);
+						serializer.begin_variant("Splice", 3);
+						serializer.i32_value(at.as_i32());
+						serializer.i32_value(removed.as_i32());
+						let _inserted = (op.describe)(op.at, serializer);
+						serializer.end_variant();
+						serializer.end_variant();
+					},
+					MirrorOpKind::Keys => {
+						serializer.begin_variant("Keys", 2);
+						serializer.i32_value(op.slot);
+						serializer.begin_variant("Reset", 1);
+						let _keys = (op.describe)(op.at, serializer);
+						serializer.end_variant();
+						serializer.end_variant();
+					},
 				}
 			}
 			serializer.end_list();
@@ -716,34 +748,67 @@ fun describe_steps(rel: List<StoreStep>, serializer: &mut Serializer) {
 	serializer.end_list();
 }
 
-/// A slot's whole subtree, or `Gone` when its boundary is not reachable.
+/// A slot's whole subtree, or `Gone` when its boundary is not reachable; a key-set
+/// slot's keys (S3).
 fun seed_or_gone(grant: MirrorGrant, held: MirrorSlot): MirrorOp {
 	let kind = match (grant.walkers.reach)(held.rel) {
 		StoreReach::Absent => MirrorOpKind::Gone,
-		_ => MirrorOpKind::Seed,
+		_ => {
+			if held.keys {
+				ret MirrorOp {
+					kind = MirrorOpKind::Keys,
+					slot = held.slot,
+					describe = grant.walkers.describe,
+					at = joined(held.rel, [StoreStep::Field(0)]),
+					rel = [],
+				};
+			}
+			MirrorOpKind::Seed
+		},
 	};
 	MirrorOp { kind, slot = held.slot, describe = grant.walkers.describe, at = held.rel, rel = [] }
 }
 
-/// What a woken slot is owed for the turn's written `paths` (§4.1, §5): a write at
-/// or above its boundary re-seeds it; writes inside it set their own paths, cut at
-/// a key and with every path another one covers dropped; and a slot no write
-/// explains (a `notify` from below a key, a write whose own path is gone) is
-/// seeded.
-fun plan(
-	ops: &mut List<MirrorOp>,
-	grant: MirrorGrant,
-	held: MirrorSlot,
-	paths: List<List<StoreStep>>,
-) {
+/// What a woken slot is owed for the turn's `writes` (§4.1, §5): a write at or
+/// above its boundary re-seeds it; writes inside it set their own paths, cut at a
+/// key and with every path another one covers dropped — and a path written only by
+/// SPLICES (a sequence field's `push`, `splice`, …) crosses as ONE `Seq` op, the
+/// turn's splices composed (S3); and a slot no write explains (a `notify` from
+/// below a key, a write whose own path is gone) is seeded. A key-set slot is told
+/// its keys again when a key may have come or gone — a write at or above the
+/// collection, or at one of its keys — and nothing for a write inside a key's
+/// value.
+fun plan(ops: &mut List<MirrorOp>, grant: MirrorGrant, held: MirrorSlot, writes: List<WireWrite>) {
+	if held.keys {
+		for write in writes {
+			let at_or_above = starts_with(held.path, write.path);
+			let a_key = write.path.len() == held.path.len() + 1 && starts_with(write.path, held.path);
+			if at_or_above || a_key {
+				ops.push(seed_or_gone(grant, held));
+				ret;
+			}
+		}
+		ret;
+	}
 	mut rels: List<List<StoreStep>> = [];
-	for path in paths {
-		if starts_with(held.path, path) {
+	mut splices: List<Option<(usize, usize, usize)>> = [];
+	for write in writes {
+		let exact = write.path.len() == held.path.len();
+		let spliced = match write.splice {
+			Some(let _splice) => true,
+			None => false,
+		};
+		if starts_with(held.path, write.path) && !(exact && spliced) {
 			ops.push(seed_or_gone(grant, held));
 			ret;
 		}
-		if starts_with(path, held.path) {
-			rels.push(below_to_key(path, held.path.len()));
+		if starts_with(write.path, held.path) {
+			let rel = below_to_key(write.path, held.path.len());
+			// A splice cut at a key (a keyed list inside a keyed value) says nothing
+			// about the list the cut path names.
+			let whole = rel.len() == write.path.len() - held.path.len();
+			rels.push(rel);
+			splices.push(if whole { write.splice } else { None });
 		}
 	}
 	if rels.is_empty() {
@@ -766,20 +831,81 @@ fun plan(
 		}
 		if !covered {
 			let at = joined(held.rel, rel);
-			match (grant.walkers.reach)(at) {
-				StoreReach::Described => ops.push(MirrorOp {
-					kind = MirrorOpKind::Set,
-					slot = held.slot,
-					describe = grant.walkers.describe,
-					at,
-					rel,
-				}),
-				// A keyed collection crosses by its keys, and a path a later write
-				// made unreachable is covered by that write's own op.
-				_ => {},
+			match composed(rels, splices, rel) {
+				Some(let span) => {
+					let (start, removed, end) = span;
+					ops.push(MirrorOp {
+						kind = MirrorOpKind::Seq(start, removed),
+						slot = held.slot,
+						describe = grant.walkers.describe,
+						at = joined(at, [StoreStep::Field(start), StoreStep::Field(end - start)]),
+						rel,
+					});
+				},
+				None => match (grant.walkers.reach)(at) {
+					StoreReach::Described => ops.push(MirrorOp {
+						kind = MirrorOpKind::Set,
+						slot = held.slot,
+						describe = grant.walkers.describe,
+						at,
+						rel,
+					}),
+					// A keyed collection crosses by its keys, and a path a later write
+					// made unreachable is covered by that write's own op.
+					_ => {},
+				},
 			}
 		}
 		index += 1;
+	}
+}
+
+/// The turn's splices at `rel`, composed into ONE: `(start, removed, end)` — the
+/// span `[start, start + removed)` of the list as it was before the turn became
+/// `[start, end)` of the list as it is (S3). `None` when anything else wrote
+/// there, which crosses as the list whole (`Set`).
+fun composed(
+	rels: List<List<StoreStep>>,
+	splices: List<Option<(usize, usize, usize)>>,
+	rel: List<StoreStep>,
+): Option<(usize, usize, usize)> {
+	mut found = false;
+	mut start: usize = 0;
+	mut end: usize = 0;
+	mut was: usize = 0;
+	mut index: usize = 0;
+	for index < rels.len() {
+		if rels[index].len() == rel.len() && starts_with(rels[index], rel) {
+			match splices[index] {
+				None => {
+					ret None;
+				},
+				Some(let splice) => {
+					let (at, removed, inserted) = splice;
+					if !found {
+						found = true;
+						start = at;
+						end = at + inserted;
+						was = removed;
+					} else {
+						// The span in the list as it is, before this splice, and how far
+						// past it the positions moved since the turn began.
+						let through = if at + removed > end { at + removed } else { end };
+						let old_end = start + was + (through - end);
+						let first = if at < start { at } else { start };
+						was = old_end - first;
+						end = through - removed + inserted;
+						start = first;
+					}
+				},
+			}
+		}
+		index += 1;
+	}
+	if found {
+		Some((start, was, end))
+	} else {
+		None
 	}
 }
 
@@ -1231,6 +1357,50 @@ impl MirrorView {
 					match self.slot_named(slot) {
 						Some(let held) => (held.boundary.gone)(),
 						None => {},
+					}
+					reader.end_variant();
+				},
+				// A sequence field's splice (S3): it lands at the list's path with
+				// the span it replaced, `[Field(at), Field(removed)]`, the inserted
+				// elements read there.
+				"Seq" => {
+					reader.begin_variant(op, 3);
+					let slot = reader.i32_value();
+					let steps = reader.begin_list();
+					mut rel: List<StoreStep> = [];
+					mut step = 0;
+					for step < steps {
+						rel.push(StoreStep::Field(reader.i32_value().as_usize()));
+						step += 1;
+					}
+					reader.end_list();
+					let kind = reader.variant_tag();
+					if kind != "Splice" {
+						ret;
+					}
+					reader.begin_variant(kind, 3);
+					let at = reader.i32_value().as_usize();
+					let removed = reader.i32_value().as_usize();
+					rel.push(StoreStep::Field(at));
+					rel.push(StoreStep::Field(removed));
+					match self.slot_named(slot) {
+						Some(let held) => (held.boundary.apply)(rel, reader),
+						None => {
+							ret;
+						},
+					}
+					reader.end_variant();
+					reader.end_variant();
+				},
+				// A key-set slot's keys (S3): its boundary reads the key op.
+				"Keys" => {
+					reader.begin_variant(op, 2);
+					let slot = reader.i32_value();
+					match self.slot_named(slot) {
+						Some(let held) => (held.boundary.apply)([], reader),
+						None => {
+							ret;
+						},
 					}
 					reader.end_variant();
 				},

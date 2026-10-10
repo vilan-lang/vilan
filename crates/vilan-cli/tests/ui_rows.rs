@@ -3757,6 +3757,124 @@ fn a153_s2_when_remote_live_and_when_all_some_take_remote_handles() {
     );
 }
 
+/// A153 S3: a remote MAP leased as a collection — `each` over its key set, each
+/// row waiting for its own key's boundary, a list field inside a row patched by
+/// splices.
+const REMOTE_MAP_ROWS: &str = r#"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::delta::SequenceCell;
+import std::reactive::store::{ RemoteStore, RemoteStoreSome, Storable, Store };
+import std::reactive::{ Flow, Source, queue_microtask };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexEnd,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::web::remote::when_remote_live;
+import std::web::ui::{ View, each, mount_root, view };
+import std::wire::{ Deserializer, Wire };
+
+[derive(Storable, Wire)]
+struct Room {
+	id: u53,
+	name: str,
+	messages: List<u53>,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+}
+
+fun main() {
+	let codec = json_codec();
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(1, Room { id = 1, name = "general", messages = [10, 11] });
+	rooms.insert(2, Room { id = 2, name = "random", messages = [] });
+	let global = Store::new(Global { rooms });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| server_relay.send(frame));
+	server_relay.on_frame(|frame| queue_microtask(|| client_relay.send(frame)));
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let root: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	// The remote map leased as a collection: its key set drives the rows, each
+	// row waits for its own key's boundary, and a room's message list is a
+	// sequence inside it (each push one splice).
+	let app = mount_root("app", || {
+		view("div").child(when_remote_live(root, |g: RemoteStore<Global>| {
+			view("ul").child(each(g.rooms().keys(), |id| id, |id| {
+				print(i"build room {id}");
+				view("li").child(when_remote_live(g.rooms().at(id).some(), |room: RemoteStore<Room>| {
+					view("p")
+						.child(view("b").bind_text(room.name()))
+						.child(each(room.messages(), |message| message, |message| view("i").text(i"{message}")))
+				}))
+			}))
+		}))
+	});
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print(i"seeded={tree()}");
+	global.rooms().at(1).some().messages().push(12);
+	let _renamed = global.rooms().at(2).some().name().patch("chat");
+	sleep_for(Duration::millis(0));
+	print(i"patched={tree()}");
+	global.rooms().at(3).set(Some(Room { id = 3, name = "new", messages = [] }));
+	global.rooms().at(2).set(None);
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print(i"changed={tree()}");
+	app.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+#[test]
+fn a153_s3_each_over_a_remote_maps_keys_builds_one_row_per_key_and_keeps_them() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("remote_map_rows", REMOTE_MAP_ROWS, &harness);
+    // Two rows from the key set; a push into room 1's list adds ONE `<i>` (i#26)
+    // and keeps the others (i#11, i#13); a rename rewrites room 2's `<b>` in
+    // place; a created key builds one row and a deleted key removes its row —
+    // room 1's row is never rebuilt.
+    assert_eq!(
+        stdout,
+        "build room 1\n\
+         build room 2\n\
+         seeded=root#1 div#2 #text#3 ul#4 #text#5 li#6 #text#7 p#8 b#9'general' #text#10 i#11'10' #text#12 i#13'11' #text#14 #text#15 #text#16 li#17 #text#18 p#19 b#20'random' #text#21 #text#22 #text#23 #text#24\n\
+         patched=root#1 div#2 #text#3 ul#4 #text#5 li#6 #text#7 p#8 b#9'general' #text#10 i#11'10' #text#12 i#13'11' #text#25 i#26'12' #text#14 #text#15 #text#16 li#17 #text#18 p#19 b#20'chat' #text#21 #text#22 #text#23 #text#24\n\
+         build room 3\n\
+         changed=root#1 div#2 #text#3 ul#4 #text#5 li#6 #text#7 p#8 b#9'general' #text#10 i#11'10' #text#12 i#13'11' #text#25 i#26'12' #text#14 #text#15 #text#27 li#28 #text#29 p#30 b#31'new' #text#32 #text#33 #text#23 #text#24\n\
+         done\n",
+        "the remote map's rows went differently"
+    );
+}
+
 /// The server twin: the zip is read ONCE — an all-`Some` renders the body with
 /// its cells holding the current payloads, and any `None` renders nothing.
 const WHEN_ALL_SOME_SSR: &str = r#"import std::io::print;
