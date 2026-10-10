@@ -266,3 +266,24 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.012
+reason = "store-50's std::rpc growth, M120's class: A153 S3's `WireWrite` splice record and `RemoteStoreKeys`, A169's `Gone` acknowledgement and the reconnect hooks (A153 S4) live in std::rpc, which the three rpc-bearing examples load; x1.0103 callgrind on CI run 38084320109 against the v0.47.0 ceiling (the lane measured ±0.07% instructions:u on 5fe24f86's binary, which did not reproduce). The mirror module itself loads only once a service returns a Store. Re-taken at the Order 50 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.01
+reason = "store-50's std::rpc growth, M120's class: A153 S3's `WireWrite` splice record and `RemoteStoreKeys`, A169's `Gone` acknowledgement and the reconnect hooks (A153 S4) live in std::rpc, which the three rpc-bearing examples load; x1.0082 callgrind on CI run 38084320109 against the v0.47.0 ceiling (the lane measured ±0.07% instructions:u on 5fe24f86's binary, which did not reproduce). The mirror module itself loads only once a service returns a Store. Re-taken at the Order 50 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.01
+reason = "store-50's std::rpc growth, M120's class: A153 S3's `WireWrite` splice record and `RemoteStoreKeys`, A169's `Gone` acknowledgement and the reconnect hooks (A153 S4) live in std::rpc, which the three rpc-bearing examples load; x1.0078 callgrind on CI run 38084320109 against the v0.47.0 ceiling (the lane measured ±0.07% instructions:u on 5fe24f86's binary, which did not reproduce). The mirror module itself loads only once a service returns a Store. Re-taken at the Order 50 seal."
+item = "M120"
