@@ -79038,8 +79038,16 @@ fn analyze_over_world<'src>(
             }
         }
         // M110 S2b: the label rows, per module, in id order (a record is a
-        // function of the module, not of a hash map's walk).
-        let mut label_rows: Vec<(&Id, &String)> = expr_types.iter().collect();
+        // function of the module, not of a hash map's walk). Only for an
+        // analysis a front end SEEDED (the editor's keystrokes): a one-shot
+        // `vilan check` never reads a record back, and the id-sorted copy of
+        // every label was a uniform ~1% on every cold check (M129's shape).
+        let seeded = !workspace.hot_seeds.is_empty();
+        let mut label_rows: Vec<(&Id, &String)> = if seeded {
+            expr_types.iter().collect()
+        } else {
+            Vec::new()
+        };
         label_rows.sort_unstable_by_key(|(id, _)| id.0);
         for (id, label) in label_rows {
             if let Some(source) = file(*id) {
@@ -79050,7 +79058,11 @@ fn analyze_over_world<'src>(
                     .push((*id, label.clone()));
             }
         }
-        let mut label_rows: Vec<(&Id, &String)> = declaration_labels.iter().collect();
+        let mut label_rows: Vec<(&Id, &String)> = if seeded {
+            declaration_labels.iter().collect()
+        } else {
+            Vec::new()
+        };
         label_rows.sort_unstable_by_key(|(id, _)| id.0);
         for (id, label) in label_rows {
             if let Some(source) = file(*id) {
