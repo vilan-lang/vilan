@@ -93,7 +93,7 @@ fun run(finished: || void) {
 			let port = server.port();
 			print(i"[port] {port}");
 			let elapsed = drive(HttpTransport { url = i"http://localhost:{port}/rpc" }, json_codec(), http_calls);
-			let average_us = round(elapsed * 1000.0 / http_calls);
+			let average_us = round(elapsed * 1000.0 / http_calls.as_f64());
 			print(i"http json: {http_calls} calls in {round(elapsed)} ms -> {rate(http_calls, elapsed)} calls/sec ({average_us} us avg)");
 			// The binary codec end-to-end over real HTTP rides the service's
 			// byte-reading /rpc route; the next server's upgrade path then
@@ -109,7 +109,7 @@ fun run(finished: || void) {
 					let binary_port = server.port();
 					print(i"[port] {binary_port}");
 					let binary_elapsed = drive(HttpTransport { url = i"http://localhost:{binary_port}/rpc" }, binary_codec(), http_calls);
-					let binary_average_us = round(binary_elapsed * 1000.0 / http_calls);
+					let binary_average_us = round(binary_elapsed * 1000.0 / http_calls.as_f64());
 					print(i"http binary: {http_calls} calls in {round(binary_elapsed)} ms -> {rate(http_calls, binary_elapsed)} calls/sec ({binary_average_us} us avg)");
 					Server::builder()
 						.port(0)
@@ -128,7 +128,7 @@ fun run(finished: || void) {
 								Err(let reason) => panic(reason),
 							};
 							let ws_elapsed = drive(socket.transport(), json_codec(), http_calls);
-							let ws_average_us = round(ws_elapsed * 1000.0 / http_calls);
+							let ws_average_us = round(ws_elapsed * 1000.0 / http_calls.as_f64());
 							print(i"ws multiplex json: {http_calls} calls in {round(ws_elapsed)} ms -> {rate(http_calls, ws_elapsed)} calls/sec ({ws_average_us} us avg)");
 							finished();
 						})

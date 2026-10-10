@@ -57428,6 +57428,35 @@ impl<'src> Analyzer<'src> {
             .then(|| self.primitive_struct_type("f64"))
     }
 
+    /// B602 — whether an operand beside a FLOAT takes the float's type
+    /// rather than standing as an integer: an expression of unsuffixed
+    /// literals with no fraction (`1`, `-2`, `3 * 4`), or a reference to a
+    /// literal binding of one (`let one = 1`). A fractional literal never
+    /// adapts to an integer (B405), so it is not one of these.
+    fn adapts_to_a_float_peer(&self, expr_id: Id) -> bool {
+        let mut shape = LiteralShape::default();
+        if self.literal_numeric_shape(expr_id, false, &mut shape) {
+            return shape.saw_literal && !shape.fractional;
+        }
+        let Some(Expr::Local(variable_id)) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return false;
+        };
+        let Some(initial) = self
+            .variables
+            .get(variable_id)
+            .and_then(|variable| variable.initial)
+        else {
+            return false;
+        };
+        let mut shape = LiteralShape {
+            lets: vec![*variable_id],
+            ..LiteralShape::default()
+        };
+        self.is_literal_let(*variable_id)
+            && self.literal_numeric_shape(initial, true, &mut shape)
+            && !shape.fractional
+    }
+
     /// B389 — whether `variable_id` is a LITERAL binding: unannotated, not
     /// `lazy`, initialized by unsuffixed literals (through other literal
     /// bindings). See `literal_lets_wait`.
@@ -67723,10 +67752,10 @@ impl<'src> Analyzer<'src> {
                 //
                 // So the carve-out is "the left operand is a number", never
                 // "the operator is not `+`". The numeric MIXING b148's SCOPE
-                // note deferred is a different question and stays deferred:
-                // `f64 * i32` computes a correct answer of the declared type,
-                // and refusing it is a numeric-strictness change with an
-                // `as_f64()` migration, not a miscompile fix.
+                // note deferred was a different question, answered later by
+                // B579 (two integer types) and B602 (a float beside an
+                // integer or another float): there are no implicit
+                // conversions, so `f64 * i32` is refused with an `as_*` steer.
                 //
                 // `+` keeps the block below rather than joining this one,
                 // because its admitted set is not this one: `str + x`
@@ -67871,11 +67900,9 @@ impl<'src> Analyzer<'src> {
                 // and the reason is now the block ABOVE, not the one this note
                 // used to give. It read: "the other native operators emit
                 // arithmetic on numbers, where `+` emits a rendering", which
-                // was half right. It is right about a NUMERIC left operand,
-                // and `f64 * i32` is still the deliberate carve-out on that
-                // half: two grounded numbers computing a correct answer of the
-                // declared type, whose refusal is a numeric-strictness change
-                // with an `as_f64()` migration. It was wrong about `str - str`
+                // was half right. It is right about a NUMERIC left operand
+                // (whose mixed pairs B579 and B602 refuse below, with the same
+                // sentence as this block's). It was wrong about `str - str`
                 // and its siblings, which had `+`'s own bug and no numbers
                 // anywhere — B196 closed them.
                 if native_left && matches!(op, BinaryOp::Add) {
@@ -68143,9 +68170,8 @@ impl<'src> Analyzer<'src> {
                         continue;
                     }
                     // B531: and a grounded right operand that is not a NUMBER
-                    // at all. `f64 * i32` stays the carve-out the SCOPE note
-                    // above keeps (two numbers computing a correct answer of
-                    // the declared type), but `2 * true` emitted the host's
+                    // at all (two numbers of different types are B579's and
+                    // B602's, below): `2 * true` emitted the host's
                     // `2 * true` — `2`, typed `i32` — and `2 * "3"` computed
                     // `6`: a native left operand never dispatches, so nothing
                     // typed the right one unless it was a parameter.
@@ -68189,11 +68215,18 @@ impl<'src> Analyzer<'src> {
                     // DIFFERENT integer types are refused as `+`, `<` and `==`
                     // over the same pair already were — there are no implicit
                     // conversions. `usize - i32` checked, ran on JS and was
-                    // refused by rustc (no Rust spelling of the pair), so
-                    // `a[a.len() - 1]` and capture-clones.vl's `total +
-                    // cells.len() * weight` compiled on the hole. A float and
-                    // an integer (`f64 * i32`) stay the carve-out above.
-                    let integer = |analyzer: &Self, operand: &Type| {
+                    // refused by the native backend (no Rust spelling of the
+                    // pair), so `a[a.len() - 1]` and capture-clones.vl's
+                    // `total + cells.len() * weight` compiled on the hole.
+                    //
+                    // B602 (R-c, v0.48.0): and over a FLOAT and an integer
+                    // (`f64 * i32`, `usize / f64`) or two different floats
+                    // (`f64 - f32`), which B579 left as a carve-out: `+`, the
+                    // comparisons and `==` already refused the pair, JS
+                    // computed a float silently, and the native backend
+                    // refused the build. A literal is not in scope — it takes
+                    // the other operand's type (B389).
+                    let numeric = |analyzer: &Self, operand: &Type| {
                         matches!(
                             analyzer.numeric_primitive_name(operand),
                             Some(
@@ -68205,18 +68238,33 @@ impl<'src> Analyzer<'src> {
                                     | "u32"
                                     | "u53"
                                     | "usize"
+                                    | "f32"
+                                    | "f64"
                             )
                         )
                     };
+                    let float = |analyzer: &Self, operand: &Type| {
+                        matches!(
+                            analyzer.numeric_primitive_name(operand),
+                            Some("f32" | "f64")
+                        )
+                    };
                     // Two equal operand types (the usual case) settle it with
-                    // one comparison, before either is named.
+                    // one comparison, before either is named. Beside a float,
+                    // an INTEGER literal (or a binding of one) is the float's
+                    // too — `1 / 4.0` and `let one = 1; one / 4.0` divide as
+                    // floats on both backends — so only a typed integer, or a
+                    // fractional literal beside one (`2.5 * count`, which the
+                    // native build refused), meets the refusal.
                     if matches!(
                         op,
                         BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
                     ) && lhs_type != rhs_type
-                        && integer(self, &lhs_type)
-                        && integer(self, &rhs_type)
+                        && numeric(self, &lhs_type)
+                        && numeric(self, &rhs_type)
                         && !self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
+                        && !((float(self, &rhs_type) && self.adapts_to_a_float_peer(lhs_id))
+                            || (float(self, &lhs_type) && self.adapts_to_a_float_peer(rhs_id)))
                     {
                         let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
                         let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());

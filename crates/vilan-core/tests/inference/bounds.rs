@@ -13965,18 +13965,29 @@ fn b405_a_fractional_literal_right_of_an_integer_is_refused_at_every_operator() 
     }
 }
 
-/// A fractional literal on the LEFT types the expression `f64` itself — the
-/// shape `vilan/benchmarks`' report writes (`1000.0 * count / elapsed_ms`) —
-/// so it is a float product, not this refusal (the numeric mixing B148
-/// deferred stays deferred).
+/// A fractional literal on the LEFT types the expression `f64` itself, and
+/// until B602 (v0.48.0) the product with a typed integer checked clean — a
+/// float on JS (`7.5`) and a native build rustc refused (E0277). It is a float
+/// beside a typed integer, B602's refusal; the shape `vilan/benchmarks`'
+/// report wrote (`1000.0 * count / elapsed_ms`) converts the integer.
 #[test]
-fn b405_a_fractional_literal_left_of_an_integer_stays_a_float_expression() {
-    assert_compiles_and_runs(
+fn b602_a_fractional_literal_left_of_an_integer_is_refused() {
+    assert_fails_with(
         concat!(
             "import std::io::print;\n",
             "fun main() {\n",
             "\tlet count: i32 = 3;\n",
             "\tprint(2.5 * count);\n",
+            "}\n",
+        ),
+        "`*` computes on two values of the same type, but the operands are `f64` and `i32`",
+    );
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet count: i32 = 3;\n",
+            "\tprint(2.5 * count.as_f64());\n",
             "}\n",
         ),
         "7.5\n",

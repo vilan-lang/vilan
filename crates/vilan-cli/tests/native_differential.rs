@@ -10120,6 +10120,24 @@ fn a_binding_filled_from_its_use_is_identical_on_both_backends() {
     );
 }
 
+/// B602: a float beside an integer, or two float types, compute through a
+/// conversion (a literal takes the float's type) — the forms the refusal
+/// leaves, the same answer on both backends.
+#[test]
+fn a_float_beside_a_converted_integer_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_float_integer_operands.vl"),
+        include_str!("native/float_integer_operands.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_float_integer_operands.vl"),
+        Verdict::Identical,
+        "a float beside a converted integer must compute the same on both backends"
+    );
+}
+
 /// F63: a closure's expression body is the value it hands back, a CONSUMING
 /// position like a function body's tail, so a place read there takes rule 1's
 /// copy. `id.derive(|index| cells[index])` moved a `str` out of the captured

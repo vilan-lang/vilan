@@ -1018,8 +1018,8 @@ fn b579_arithmetic_over_two_integer_widths_is_refused() {
 }
 
 /// B579's boundary: one width on both sides computes, a literal takes the
-/// left operand's width, a converted operand computes, and a float with an
-/// integer stays the deliberate carve-out it was (not R-d's question).
+/// left operand's width, a converted operand computes. (A float with an
+/// integer was the carve-out here until B602 refused it, below.)
 #[test]
 fn b579_one_width_a_literal_and_a_conversion_still_compute() {
     assert_compiles_and_runs(
@@ -1033,10 +1033,84 @@ fn b579_one_width_a_literal_and_a_conversion_still_compute() {
             print(b % 3);
             print(a / 2);
             let x: f64 = 1.5;
-            print(x * b);
+            print(x * b.as_f64());
         }
         "#,
         "5\n24\n1\n3\n6\n",
+    );
+}
+
+// --- B602: `-`, `*`, `/`, `%` over a float and an integer, or two floats ----
+
+/// B602 (R-c, v0.48.0): B579's float scope. A float beside an integer — on
+/// either side — and two different float types are refused with B579's
+/// sentence, as `+`, the comparisons and `==` over the same pairs already
+/// were. `f64 * i32` checked and computed a float silently on JS, and the
+/// native backend refused the build.
+#[test]
+fn b602_arithmetic_over_a_float_and_an_integer_is_refused() {
+    for symbol in ["-", "*", "/", "%"] {
+        for (left, right) in [
+            ("f64", "i32"),
+            ("i32", "f64"),
+            ("usize", "f64"),
+            ("f64", "f32"),
+        ] {
+            let source = format!(
+                r#"
+                fun main() {{
+                    let a: {left} = 6;
+                    let b: {right} = 3;
+                    let _c = a {symbol} b;
+                }}
+                "#
+            );
+            assert_fails_once_with(
+                &source,
+                &format!(
+                    "`{symbol}` computes on two values of the same type, but the operands are \
+                     `{left}` and `{right}`: there are no implicit conversions"
+                ),
+            );
+        }
+    }
+}
+
+/// B602 through a compound assignment: `x -= n` is `x = x - n`.
+#[test]
+fn b602_a_compound_assignment_over_a_float_and_an_integer_is_refused() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut total: f64 = 1.5;
+            let count: i32 = 2;
+            total *= count;
+        }
+        "#,
+        "`*` computes on two values of the same type, but the operands are `f64` and `i32`",
+    );
+}
+
+/// B602's boundary: a LITERAL takes the float's type on either side (B389),
+/// a literal-bound `let` takes it from its use, and a converted operand
+/// computes — the answers both backends give.
+#[test]
+fn b602_a_literal_a_literal_binding_and_a_conversion_still_compute() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let x: f64 = 1.5;
+            let count: i32 = 3;
+            print(x * 2);
+            print(10 - x);
+            let n = 4;
+            print(x * n);
+            print(x * count.as_f64());
+            print(count.as_f64() / x);
+        }
+        "#,
+        "3\n8.5\n6\n4.5\n2\n",
     );
 }
 
