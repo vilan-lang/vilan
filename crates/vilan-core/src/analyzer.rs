@@ -5146,6 +5146,10 @@ pub struct Analyzer<'src> {
     // loaded file's namespace scope, and every `mod { .. }` body. `export` is
     // legal exactly in these (a block-scoped `import` is not exportable, H2).
     module_scope_ids: HashSet<Id>,
+    /// The scope the ENTRY walks in (the world's global scope), for the
+    /// trait-reach questions that are asked before the post-build passes hand
+    /// it over ([`Self::files_reached_by`], B598).
+    entry_scope_id: Option<Id>,
     prepped_locals: Vec<(Id, &'src str)>,
     // B270: a desugar's scope-independent std references — `(id, module, item)`
     // for each `Node::StdItem`. They resolve through `std`'s own namespace, not
@@ -7807,6 +7811,7 @@ impl<'src> Analyzer<'src> {
             macro_expression_expansions: HashMap::default(),
             macro_failed_sites: HashSet::default(),
             module_scope_ids: HashSet::default(),
+            entry_scope_id: None,
             prepped_locals: Vec::new(),
             prepped_std_items: Vec::new(),
             css_scope_depth: 0,
@@ -54959,6 +54964,14 @@ impl<'src> Analyzer<'src> {
                 if !object_declares_member =>
             {
                 let mut resolution = self.resolve_impl_member(&subject_type, member_name);
+                // B598: an ambiguity between traits the calling file does not
+                // all reach is decided among the ones it does.
+                if matches!(resolution, ImplMemberResolution::AmbiguousTraits(_)) {
+                    let candidates = self.method_member_candidates(&subject_type, member_name);
+                    if let Some(reached) = self.candidates_reached_at(id, candidates) {
+                        resolution = self.rank_member_candidates(reached);
+                    }
+                }
                 // R2: before reporting two argument-distinct homes, let the type
                 // the call site expects choose between them.
                 if let ImplMemberResolution::AmbiguousTraitArguments(homes) = &resolution {
@@ -59858,10 +59871,16 @@ impl<'src> Analyzer<'src> {
             .find_map(|id| self.source_of_id(id))
     }
 
-    fn check_trait_method_scope(&mut self, global_scope_id: Id) {
-        // The files a user file REACHES: its own, and the declaring file of
-        // every name its module scope binds — its imports, what the prelude
-        // seeded, its own declarations — and of every module it imports whole.
+    /// The files each user file REACHES for B515's trait-scope rule: its
+    /// own, and the declaring file of every name its module scope binds — its
+    /// imports, what the prelude seeded, its own declarations — and of every
+    /// module it imports whole. `only` restricts the walk to one file's
+    /// scopes (B598 asks for the calling file alone, mid-solve).
+    fn trait_reach_by_file(
+        &self,
+        global_scope_id: Id,
+        only: Option<SourceId>,
+    ) -> HashMap<SourceId, HashSet<SourceId>> {
         let imported_modules: HashSet<(SourceId, Id)> = self
             .import_reaches
             .iter()
@@ -59879,7 +59898,8 @@ impl<'src> Analyzer<'src> {
             let Some(source) = source else {
                 continue;
             };
-            if self.std_sources.contains(&source)
+            if only.is_some_and(|only| only != source)
+                || self.std_sources.contains(&source)
                 || self.frozen_sources.contains(&source)
                 || self.dependency_sources.contains(&source)
             {
@@ -59908,6 +59928,98 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        reached
+    }
+
+    /// For an impl block's member, the trait it is (the declaring trait of
+    /// its home's member) and the files that bring it in scope (B515): the
+    /// block's (a derived block's is its attribute's file, B354), the home
+    /// trait's, the declaring trait's. `None` for an inherent member.
+    fn impl_member_providing_files(&mut self, member_id: Id) -> Option<(Id, Vec<SourceId>)> {
+        let implementation =
+            &self.implementations[*self.implementation_by_declaration.get(&member_id)?];
+        let member_name = implementation
+            .declarations
+            .iter()
+            .find(|(_, id)| **id == member_id)
+            .map(|(name, _)| *name)?;
+        let home = self.member_home_trait(implementation, member_name)?;
+        let mut providing = vec![
+            self.derived_origin_file(implementation.impl_id)
+                .unwrap_or(implementation.source),
+        ];
+        if let Some(home_source) = self
+            .traits
+            .get(&home)
+            .and_then(|trait_| self.source_of_id(trait_.id))
+        {
+            providing.push(home_source);
+        }
+        let declaring = self
+            .method_member_in_trait_at(home, &[], member_name)
+            .map_or(home, |(_, declaring, _)| declaring);
+        if let Some(declaring_source) = self
+            .traits
+            .get(&declaring)
+            .and_then(|trait_| self.source_of_id(trait_.id))
+        {
+            providing.push(declaring_source);
+        }
+        Some((declaring, providing))
+    }
+
+    /// B598: two traits providing a method name at a USER file's call, where
+    /// the file reaches only some of them, are not an ambiguity — a trait the
+    /// file does not bring in scope is no candidate there (B515's rule, and
+    /// Rust's). The candidates whose trait the calling file reaches, with the
+    /// inherent ones; `None` when the call is not in a user file, or when the
+    /// filter would leave no trait candidate (the ambiguity then stands, and
+    /// names the traits as before).
+    fn candidates_reached_at(
+        &mut self,
+        call_id: Id,
+        candidates: Vec<ImplMemberCandidate>,
+    ) -> Option<Vec<ImplMemberCandidate>> {
+        let source = self.source_of_id(call_id)?;
+        if source == DERIVED_SOURCE
+            || self.std_sources.contains(&source)
+            || self.frozen_sources.contains(&source)
+            || self.dependency_sources.contains(&source)
+            || self.derived_origin_file(call_id).is_some()
+        {
+            return None;
+        }
+        let files = self
+            .trait_reach_by_file(self.entry_scope_id?, Some(source))
+            .remove(&source)?;
+        let mut kept: Vec<ImplMemberCandidate> = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let Some(home) = candidate.home_trait else {
+                kept.push(candidate);
+                continue;
+            };
+            let mut providing: Vec<SourceId> = self
+                .impl_member_providing_files(candidate.member_id)
+                .map(|(_, files)| files)
+                .unwrap_or_default();
+            if let Some(home_source) = self
+                .traits
+                .get(&home)
+                .and_then(|trait_| self.source_of_id(trait_.id))
+            {
+                providing.push(home_source);
+            }
+            if providing.iter().any(|file| files.contains(file)) {
+                kept.push(candidate);
+            }
+        }
+        kept.iter()
+            .any(|candidate| candidate.home_trait.is_some())
+            .then_some(kept)
+    }
+
+    fn check_trait_method_scope(&mut self, global_scope_id: Id) {
+        let reached = self.trait_reach_by_file(global_scope_id, None);
         if reached.is_empty() {
             return;
         }
@@ -59937,34 +60049,13 @@ impl<'src> Analyzer<'src> {
             // scope: the trait's own, the impl clause's trait's, the block's.
             let mut providing: Vec<SourceId> = Vec::new();
             let trait_id = match self.implementation_by_declaration.get(member_id) {
-                Some(index) => {
-                    let implementation = &self.implementations[*index];
-                    let Some(member_name) = implementation
-                        .declarations
-                        .iter()
-                        .find(|(_, id)| *id == member_id)
-                        .map(|(name, _)| *name)
+                Some(_) => {
+                    let Some((trait_id, files)) = self.impl_member_providing_files(*member_id)
                     else {
                         continue;
                     };
-                    let Some(home) = self.member_home_trait(implementation, member_name) else {
-                        continue;
-                    };
-                    // A derived block belongs to the file whose attribute
-                    // generated it (B354's rule).
-                    providing.push(
-                        self.derived_origin_file(implementation.impl_id)
-                            .unwrap_or(implementation.source),
-                    );
-                    if let Some(home_source) = self
-                        .traits
-                        .get(&home)
-                        .and_then(|trait_| self.source_of_id(trait_.id))
-                    {
-                        providing.push(home_source);
-                    }
-                    self.method_member_in_trait_at(home, &[], member_name)
-                        .map_or(home, |(_, declaring, _)| declaring)
+                    providing = files;
+                    trait_id
                 }
                 None => match self.trait_by_declaration.get(member_id) {
                     // A default reached on a concrete receiver (Gap E's
@@ -78945,6 +79036,7 @@ fn analyze_inner<'src>(
         .map(|path| path.to_string());
     let global_scope = analyzer.create_scope(None);
     let global_scope_id = analyzer.push_scope(global_scope);
+    analyzer.entry_scope_id = Some(global_scope_id);
     // Every primitive is now migrated to source and captured after its module
     // loads, reachable as the bare name (the prelude, here the global scope) and
     // — since the module scopes below are children of the global scope — as
