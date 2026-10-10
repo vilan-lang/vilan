@@ -73,14 +73,12 @@ fn high_water_under(package: &Package, mode: Mode) -> (u32, u32, u32) {
             );
             id_windows::force_mode(None);
             let program = program.expect("a program");
+            // The entity counter as the post passes left it (they mint from
+            // it too, the same way under every mode); the other two lanes
+            // only the report carries, so they are zero when it is off.
             let next = program.next_entity_id;
             match program.id_windows {
-                Some(report) => (
-                    report.entity_high_water as u32,
-                    report.type_high_water as u32,
-                    report.scope_high_water as u32,
-                ),
-                // Off: the entity counter is the only one the program carries.
+                Some(report) => (next, report.type_high_water as u32, report.scope_high_water as u32),
                 None => (next, 0, 0),
             }
         })
