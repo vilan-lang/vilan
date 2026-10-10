@@ -106,6 +106,20 @@ full type, and hover shows both: the full type in the declaration, and
 its iterator adapters (`~Iterator<T>`) carry the attribute, and a package's
 own types can too. `vilan.inlayHints.abbreviate` turns it off.
 
+A chain written **one stage per line** is hinted per stage, in the
+spelling an ascription is written in: each line that ends a stage shows
+` as List<usize>` — or ` as ~Pipe<str>` where the abbreviation applies —
+and so does the chain's head when the first link breaks onto a new line.
+A stage you have already ascribed shows nothing, and neither does the
+last stage of a chain that lands in an annotated `let`. On a hinted line
+the refactor **Ascribe this stage** writes it into the file — the full
+type, or the bare trait for an abbreviated hint (`as Pipe<str>`, which is
+checked against the trait and keeps the concrete type, so nothing after
+it changes) — and **Ascribe every stage of this chain** writes them all.
+A type is written the shortest way the file can name it, through a module
+the file imports where needed; a type the file cannot name without a new
+import offers no action, because the action never adds one.
+
 **Semantic highlighting** from the analyzer, over the TextMate grammar,
 which also highlights `vilan` fences inside Markdown.
 

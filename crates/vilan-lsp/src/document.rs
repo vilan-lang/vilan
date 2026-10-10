@@ -4806,8 +4806,79 @@ impl Document {
                     .map(|hint| format!(": {}", hint.label)),
             });
         }
+        // E278: a hint per STAGE of a chain split one stage per line, spelled
+        // the way an ascription is written — ` as T`, ` as ~Pipe<T>` — at the
+        // end of each line a stage ends.
+        for stage in &program.stage_hints {
+            if source_of.of(stage.id) != Some(self.focus) {
+                continue;
+            }
+            hints.push(LandedHint {
+                name: stage.span,
+                label: format!(" as {}", stage.full),
+                abbreviated: stage
+                    .abbreviated
+                    .as_ref()
+                    .map(|abbreviated| format!(" as {abbreviated}")),
+            });
+        }
         hints.sort_by_key(|hint| hint.name.end);
         hints
+    }
+
+    /// E278's code actions (`type-ascription.md` §11): "Ascribe this stage"
+    /// on a line a hinted stage ends, writing ` as T` after it — the full
+    /// type, or the bare trait for an abbreviated hint (Q8 RULED) — and, on a
+    /// chain with more than one hinted stage, "Ascribe every stage of this
+    /// chain". Read from the ANALYZED program, so declined while the buffer
+    /// is ahead of it; a stage whose type this file cannot name offers
+    /// nothing (the writer never adds an import).
+    pub fn stage_ascriptions(&self, range: Span) -> Vec<(String, Vec<(Span, String)>)> {
+        let Some(program) = self.program.as_ref() else {
+            return Vec::new();
+        };
+        if self.is_stale() {
+            return Vec::new();
+        }
+        let text = self.analyzed_text();
+        let source_of = program.source_lookup();
+        let ours: Vec<&vilan_core::analyzer::StageHint> = program
+            .stage_hints
+            .iter()
+            .filter(|stage| source_of.of(stage.id) == Some(self.focus))
+            .collect();
+        let line_start = |offset: usize| {
+            text[..offset.min(text.len())]
+                .rfind('\n')
+                .map_or(0, |at| at + 1)
+        };
+        let Some(at) = ours.iter().find(|stage| {
+            let start = line_start(stage.span.end);
+            range.start <= stage.span.end && range.end >= start
+        }) else {
+            return Vec::new();
+        };
+        let edit = |stage: &vilan_core::analyzer::StageHint| {
+            stage.written.as_ref().ok().map(|written| {
+                (
+                    Span::from(stage.span.end..stage.span.end),
+                    format!(" as {written}"),
+                )
+            })
+        };
+        let mut actions = Vec::new();
+        if let Some(one) = edit(at) {
+            actions.push(("Ascribe this stage".to_string(), vec![one]));
+        }
+        let chain: Vec<(Span, String)> = ours
+            .iter()
+            .filter(|stage| stage.chain == at.chain)
+            .filter_map(|stage| edit(stage))
+            .collect();
+        if chain.len() > 1 {
+            actions.push(("Ascribe every stage of this chain".to_string(), chain));
+        }
+        actions
     }
 
     /// The entry document's semantic tokens (E2), name-sized and
@@ -31789,6 +31860,236 @@ mod hint_abbreviation_tests {
             "not admitted: the full type, never a claim the value cannot keep"
         );
         assert_eq!(stranded.full, None);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E278 (`proposal/type-ascription.md` §11, RULED with B571 Q8): a hint per
+/// STAGE of a chain split one stage per line, spelled as an ascription is
+/// written — ` as T`, ` as ~Pipe<T>` — and the actions that write it.
+#[cfg(test)]
+mod stage_hint_tests {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    fn analyzed(tag: &str, text: &str) -> (PathBuf, Document) {
+        let directory =
+            std::env::temp_dir().join(format!("vilan_e278_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let entry = directory.join("main.vl");
+        let document = Document::analyze(text, &std_root(), &entry);
+        let errors: Vec<String> = document
+            .published_diagnostics()
+            .into_iter()
+            .filter(|diagnostic| !diagnostic.warning)
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(errors.is_empty(), "the fixture compiles: {errors:?}");
+        (directory, document)
+    }
+
+    /// The served stage hints, `(the text before the hint's line end, label)`.
+    fn stage_hints(document: &Document, text: &str, abbreviate: bool) -> Vec<(String, String)> {
+        document
+            .keystroke_hints_served(false, abbreviate)
+            .into_iter()
+            .filter(|hint| hint.label.starts_with(" as "))
+            .map(|hint| {
+                let line_start = text[..hint.offset].rfind('\n').map_or(0, |at| at + 1);
+                (text[line_start..hint.offset].trim().to_string(), hint.label)
+            })
+            .collect()
+    }
+
+    const CHAIN: &str = "fun main() {\n\
+         \tlet words = [\"a\", \"bb\", \"ccc\"];\n\
+         \tlet count = words\n\
+         \t\t.map(|word| word.len())\n\
+         \t\t.filter(|length| length > 1)\n\
+         \t\t.len();\n\
+         \tprint(count);\n\
+         }\n";
+
+    #[test]
+    fn a_three_stage_chain_hints_each_line() {
+        let (directory, document) = analyzed("three", CHAIN);
+        assert_eq!(
+            stage_hints(&document, CHAIN, true),
+            vec![
+                ("let count = words".to_string(), " as List<str>".to_string()),
+                (
+                    ".map(|word| word.len())".to_string(),
+                    " as List<usize>".to_string()
+                ),
+                (
+                    ".filter(|length| length > 1)".to_string(),
+                    " as List<usize>".to_string()
+                ),
+                (".len()".to_string(), " as usize".to_string()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// An ascribed stage hints nothing, as an annotated binding gets none; nor
+    /// does the last stage when the chain lands in an annotated `let`; and a
+    /// chain on one line hints no stage at all.
+    #[test]
+    fn an_ascribed_stage_and_an_annotated_landing_hint_nothing() {
+        let text = "fun main() {\n\
+             \tlet words = [\"a\", \"bb\"];\n\
+             \tlet count: usize = words\n\
+             \t\t.map(|word| word.len()) as List<usize>\n\
+             \t\t.len();\n\
+             \tlet inline = words.map(|word| word.len()).len();\n\
+             \tprint(count + inline);\n\
+             }\n";
+        let (directory, document) = analyzed("ascribed", text);
+        assert_eq!(
+            stage_hints(&document, text, true),
+            vec![(
+                "let count: usize = words".to_string(),
+                " as List<str>".to_string()
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A stage typed by a labelled tuple (B569) hints its labels, and
+    /// "Ascribe this stage" writes them.
+    #[test]
+    fn a_labelled_tuple_stage_hints_its_labels() {
+        let text = "fun main() {\n\
+             \tlet points = [(x = 1, y = 2), (x = 3, y = 4)];\n\
+             \tlet total = points\n\
+             \t\t.map(|point| (x = point.y, y = point.x))\n\
+             \t\t.len();\n\
+             \tprint(total);\n\
+             }\n";
+        let (directory, document) = analyzed("labelled", text);
+        assert_eq!(
+            stage_hints(&document, text, true),
+            vec![
+                (
+                    "let total = points".to_string(),
+                    " as List<(x: i32, y: i32)>".to_string()
+                ),
+                (
+                    ".map(|point| (x = point.y, y = point.x))".to_string(),
+                    " as List<(x: i32, y: i32)>".to_string()
+                ),
+                (".len()".to_string(), " as usize".to_string()),
+            ]
+        );
+        let line = text.find(".map(").unwrap();
+        let actions = document.stage_ascriptions(Span::from(line..line));
+        assert_eq!(actions[0].1[0].1, " as List<(x: i32, y: i32)>");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    const PIPE: &str = "import std::reactive::{ Flow, Pipe, SignalCell, Source };\n\n\
+         fun main() {\n\
+         \tlet cell = SignalCell::new(2);\n\
+         \tlet labels = cell\n\
+         \t\t.derive(|value| value * 2)\n\
+         \t\t.derive(|value| i\"{value}\");\n\
+         \tprint(labels.sample());\n\
+         }\n";
+
+    /// A hinted node abbreviates as E227 abbreviates it, with the full type in
+    /// the tooltip — and the switch off shows the full type.
+    #[test]
+    fn a_hinted_stage_abbreviates() {
+        let (directory, document) = analyzed("pipe", PIPE);
+        assert_eq!(
+            stage_hints(&document, PIPE, true),
+            vec![
+                (
+                    "let labels = cell".to_string(),
+                    " as SignalCell<i32>".to_string()
+                ),
+                (
+                    ".derive(|value| value * 2)".to_string(),
+                    " as ~Pipe<i32>".to_string()
+                ),
+                (
+                    ".derive(|value| i\"{value}\")".to_string(),
+                    " as ~Pipe<str>".to_string()
+                ),
+            ]
+        );
+        let full = stage_hints(&document, PIPE, false);
+        assert_eq!(full[1].1, " as Derive<SignalCell<i32>, i32, i32>");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// "Ascribe this stage" writes the full type; on an abbreviated hint it
+    /// writes the BARE trait (Q8), which B161 checks and keeps concrete — so
+    /// the file the action leaves checks clean, and the stage after it still
+    /// resolves its concrete members.
+    #[test]
+    fn the_actions_write_the_type_and_round_trip_through_the_checker() {
+        let (directory, document) = analyzed("act", PIPE);
+        let line = PIPE.find(".derive(|value| value * 2)").unwrap();
+        let actions = document.stage_ascriptions(Span::from(line..line));
+        assert_eq!(
+            actions
+                .iter()
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Ascribe this stage", "Ascribe every stage of this chain"]
+        );
+        let (_, one) = &actions[0];
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].1, " as Pipe<i32>");
+        let mut written = PIPE.to_string();
+        let (_, every) = &actions[1];
+        let mut edits = every.clone();
+        edits.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+        for (span, text) in edits {
+            written.insert_str(span.start, &text);
+        }
+        assert!(
+            written.contains("let labels = cell as SignalCell<i32>\n"),
+            "{written}"
+        );
+        assert!(
+            written.contains(".derive(|value| value * 2) as Pipe<i32>\n"),
+            "{written}"
+        );
+        assert!(
+            written.contains(".derive(|value| i\"{value}\") as Pipe<str>;"),
+            "{written}"
+        );
+        let (second, rewritten) = analyzed("act_written", &written);
+        assert!(
+            stage_hints(&rewritten, &written, true).is_empty(),
+            "every stage is ascribed now"
+        );
+        let _ = std::fs::remove_dir_all(&second);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A type the file cannot name — `Derive` is not imported here, and the
+    /// writer never adds an import — offers no action, and says nothing it
+    /// would have to take back.
+    #[test]
+    fn an_unnameable_stage_type_offers_no_action() {
+        let text = "import std::reactive::{ Flow, SignalCell, Source };\n\n\
+             fun main() {\n\
+             \tlet cell = SignalCell::new(2);\n\
+             \tlet doubled = cell\n\
+             \t\t.derive(|value| value * 2);\n\
+             \tprint(doubled.sample());\n\
+             }\n";
+        let (directory, document) = analyzed("unnamed", text);
+        let line = text.find(".derive").unwrap();
+        assert!(
+            document
+                .stage_ascriptions(Span::from(line..line))
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

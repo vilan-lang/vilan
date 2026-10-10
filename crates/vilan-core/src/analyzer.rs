@@ -19,6 +19,7 @@ mod dbg_stack;
 mod hint_labels;
 mod hover_labels;
 mod liveness;
+mod written_types;
 
 pub use dbg_stack::{
     DbgStackBinding, DbgStackInvalidation, DbgStackMove, DbgStackSite, DbgStackValue,
@@ -3017,6 +3018,41 @@ struct AscriptionSite<'src> {
     awaited: bool,
 }
 
+/// One `.name(..)` chain link as the walk met it (E278): the link's own id,
+/// the id of the expression it is called on, the chain's head (its innermost
+/// subject), where the subject ends and the member begins (a line break
+/// between them is a chain split one stage per line), and the link's span.
+#[derive(Debug, Clone, Copy)]
+struct ChainStage {
+    id: Id,
+    subject_id: Id,
+    head_id: Id,
+    subject_end: usize,
+    member_start: usize,
+    span: Span,
+}
+
+/// One per-stage inlay hint (E278, `type-ascription.md` §11): a stage of a
+/// chain split one stage per line, whose line it ends, with its type as the
+/// hint shows it and as the "Ascribe this stage" action writes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageHint {
+    /// The stage expression (or the chain's head): the hint sits at its end.
+    pub id: Id,
+    /// The chain the stage belongs to — its head's id — so "ascribe every
+    /// stage" can find its siblings.
+    pub chain: Id,
+    pub span: Span,
+    /// The type as hover spells it: `as {full}`.
+    pub full: String,
+    /// E227's abbreviation, `~Pipe<T>`, where a `[hint]` gives one.
+    pub abbreviated: Option<String>,
+    /// What the action writes after the stage: the type in full, or the bare
+    /// trait for an abbreviated one (Q8 RULED), named as the file can write
+    /// it — or why it cannot be written here.
+    pub written: Result<String, String>,
+}
+
 /// Who a binding-style annotation belongs to (B161, B184, B461): a `let`'s
 /// binding by name, or an ascription (B571), which has none.
 #[derive(Debug, Clone, Copy)]
@@ -5688,6 +5724,18 @@ pub struct Analyzer<'src> {
     binding_hidden_nominal_constraints: Vec<(Id, Id, Vec<TypeId>, Span)>,
     // B571: every `EXP as T` site, by the ascription's id.
     ascriptions: HashMap<Id, AscriptionSite<'src>>,
+    // E278: every `.name(..)` chain link the walk met, with its chain's head
+    // — the candidates for a per-stage inlay hint, filtered to the multi-line
+    // ones when the program is built (`stage_hints`).
+    chain_stages: Vec<ChainStage>,
+    // E278: each recorded link's chain head, by the link's id — how a link
+    // finds the head its subject belongs to in one lookup (a scan of
+    // `chain_stages` per call was quadratic in a program's calls).
+    chain_heads: HashMap<Id, Id>,
+    // E278: the values that land in a position that already states their type
+    // — an annotated `let`'s initializer — so their stage hint would only
+    // repeat the annotation.
+    annotated_landings: HashSet<Id>,
     // B251: every WRITTEN application of a struct that declared bounded
     // parameters — `(struct id, written arguments, span, source, type id,
     // generic arguments exempt)` — asked after `build()` by
@@ -7805,6 +7853,9 @@ impl<'src> Analyzer<'src> {
             impl_subject_annotation_type_ids: HashMap::default(),
             binding_hidden_nominal_constraints: Vec::new(),
             ascriptions: HashMap::default(),
+            chain_stages: Vec::new(),
+            chain_heads: HashMap::default(),
+            annotated_landings: HashSet::default(),
             hidden_generic_parameters: HashMap::default(),
             attributed_declarations: HashSet::default(),
             transparent_declarations: HashMap::default(),
@@ -38314,6 +38365,20 @@ impl<'src> Analyzer<'src> {
                     Node::Call(call_subject, call_generic_arguments, call_arguments) => {
                         match &call_subject.0 {
                             Node::Accessor(name) => {
+                                let head_id = self
+                                    .chain_heads
+                                    .get(&subject_id)
+                                    .copied()
+                                    .unwrap_or(subject_id);
+                                self.chain_heads.insert(id, head_id);
+                                self.chain_stages.push(ChainStage {
+                                    id,
+                                    subject_id,
+                                    head_id,
+                                    subject_end: subject.1.end,
+                                    member_start: member.1.start,
+                                    span: node.1,
+                                });
                                 self.member_name_spans.insert(id, call_subject.1);
                                 let argument_ids =
                                     self.walk_expr_nodes(&call_arguments.0, scope_id);
@@ -39465,6 +39530,7 @@ impl<'src> Analyzer<'src> {
                     && let Some(value_id) = initial
                 {
                     self.seed_tail_expectations(value_id, type_id);
+                    self.annotated_landings.insert(value_id);
                 }
                 self.variables.insert(
                     id,
@@ -70581,6 +70647,9 @@ pub struct Program<'src> {
     /// by the inlay hint and hover's second line only; everything else keeps
     /// the full type.
     pub hint_labels: HashMap<Id, HintLabel>,
+    /// E278: the per-stage inlay hints of every chain split one stage per
+    /// line in the package's own files (never std's).
+    pub stage_hints: Vec<StageHint>,
     /// Full declaration labels for hover (E9): function signatures,
     /// struct/enum blocks — keyed by declaration id, fenced by the LSP.
     pub declaration_labels: HashMap<Id, String>,
@@ -81297,6 +81366,7 @@ fn analyze_over_world<'src>(
     // BEFORE the label loop below, which borrows the analyzer immutably, since
     // admission is the solver's `&mut` question.
     let hint_labels = analyzer.hint_labels();
+    let stage_hints = analyzer.stage_hints();
 
     // Pre-render a type label for every typed expression (for hover). Done here
     // while the analyzer still holds the type tables; `expr_id_to_type_id_map`
@@ -82177,6 +82247,7 @@ fn analyze_over_world<'src>(
         prelude_bindings: analyzer.prelude_entry_bindings.clone(),
         expr_types,
         hint_labels,
+        stage_hints,
         declaration_labels,
         member_owners,
         member_headers,

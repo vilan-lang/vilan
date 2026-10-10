@@ -5008,7 +5008,9 @@ impl LanguageServer for Backend {
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
                         tooltip: hint.full.map(|full| {
-                            InlayHintTooltip::String(full.trim_start_matches(": ").to_string())
+                            // `: T` for a binding, ` as T` for a stage (E278).
+                            let full = full.trim_start_matches(": ").trim_start_matches(" as ");
+                            InlayHintTooltip::String(full.to_string())
                         }),
                         padding_left: Some(false),
                         padding_right: Some(false),
@@ -5767,6 +5769,31 @@ impl LanguageServer for Backend {
                     }),
                     ..Default::default()
                 }));
+            }
+            // E278: "Ascribe this stage" and "Ascribe every stage of this
+            // chain", the per-stage hints written into the file.
+            if wants_refactor {
+                for (title, edits) in document.stage_ascriptions(live_span(&document, params.range))
+                {
+                    let text_edits: Vec<TextEdit> = edits
+                        .into_iter()
+                        .map(|(span, new_text)| TextEdit {
+                            range: document.line_index.range(&span),
+                            new_text,
+                        })
+                        .collect();
+                    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                    changes.insert(uri.clone(), text_edits);
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title,
+                        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
             }
             if let Some(program) = document.program.as_ref() {
                 if wants_quickfix {

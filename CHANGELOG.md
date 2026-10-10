@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**E278: a chain written one stage per line is hinted per stage, in the ascription's spelling, and the hint can be written into the file (`type-ascription.md` §11; B571 Q8 RULED).** Each line that ends a stage shows ` as List<usize>`, or ` as ~Pipe<str>` under E227's abbreviation with the full type in the tooltip; the chain's head hints too when the first link breaks a line. An ascribed stage, and the last stage of a chain landing in an annotated `let`, hint nothing. The refactors "Ascribe this stage" and "Ascribe every stage of this chain" write ` as T` after the stage — the full type, or the BARE trait for an abbreviated hint (`as Pipe<str>`, B161's checked-and-kept reading, so the stages after it still reach the concrete members). Types are written the shortest way the file can name them — by name, or through a module it imports; never by adding an import — and a stage whose type the file cannot name offers no action. The editor appendix says so.
+
+<!-- family: tooling -->
 **B571 S3: `vilan fmt` lays ascriptions out (type-ascription.md §10).** `as` takes one space each side and its type prints canonically; a closure type after `as` is parenthesized (`f as (|i32| i32)`), so a reader never has to find where a greedy return type ends; a spaced generic list after `as` is written tight; a block-like form ascribed after its brace stays on the brace's line; and a chain with an ascription on MORE than one stage breaks one stage per line whatever its width, each `as T` closing its stage's line (`let y = a() as A` / `.b() as B` / `.c() as C;`). A single ascription follows the ordinary chain rule. The `vilan fmt` appendix says so.
 
 <!-- family: diagnostics -->
