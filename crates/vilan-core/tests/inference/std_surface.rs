@@ -6971,7 +6971,7 @@ fn a118_an_integer_range_still_answers_every_value_below_its_bound() {
                 if value < 0 || value > 2 {
                     outside += 1;
                 } else {
-                    seen[value] = true;
+                    seen[value.as_usize()] = true;
                 }
                 draws += 1;
             }

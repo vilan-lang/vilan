@@ -12729,7 +12729,7 @@ fn m90_a_read_only_let_of_a_stable_place_copies_nothing() {
                 n += 1;
             }
             let found = [config, Config { layout = Layout { table = [0] } }];
-            let order = [0, 1].sort_by(|a, b| {
+            let order = [0usize, 1usize].sort_by(|a, b| {
                 let x = found[a];
                 let y = found[b];
                 if x.layout.table[0] < y.layout.table[0] { Ordering::Less } else { Ordering::Greater }

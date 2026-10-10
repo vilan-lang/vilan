@@ -13393,7 +13393,7 @@ fn b389_controls(ty: &str) {
         ),
         (
             "downward_loop",
-            "\tlet xs: List<str> = [\"a\", \"b\"];\n\tmut i: WIDTH = xs.len().as_WIDTH();\n\tfor i > 0 {\n\t\ti -= 1;\n\t\tprint(xs[i.as_i32()]);\n\t}",
+            "\tlet xs: List<str> = [\"a\", \"b\"];\n\tmut i: WIDTH = xs.len().as_WIDTH();\n\tfor i > 0 {\n\t\ti -= 1;\n\t\tprint(xs[i.as_usize()]);\n\t}",
         ),
         (
             "underflow_runs",

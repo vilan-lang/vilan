@@ -4896,6 +4896,10 @@ pub struct Analyzer<'src> {
     /// whether the two sit in different files (where walk order is the
     /// modules' NAME order, and the blame must not follow it).
     slot_fill_sites: HashMap<TypeId, Id>,
+    /// B591: the subscript indexes the `usize` check passed while they had no
+    /// type yet, for the fixpoint's end to ask again
+    /// ([`Analyzer::recheck_lenient_subscript_indexes`]).
+    lenient_subscript_indexes: Vec<Id>,
     /// Diagnostics a constraint raised about an entity in ANOTHER file than
     /// its anchor's, by index: `resolve_constraints` attributes everything a
     /// constraint pushed to the anchor's file, then re-attributes these to
@@ -7560,6 +7564,7 @@ impl<'src> Analyzer<'src> {
             bool_enum_id: None,
             list_element_slots: HashMap::default(),
             slot_fill_sites: HashMap::default(),
+            lenient_subscript_indexes: Vec::new(),
             pinned_diagnostic_anchors: Vec::new(),
             prepped_assignments: Vec::new(),
             compound_reread_ids: HashSet::default(),
@@ -61928,34 +61933,54 @@ impl<'src> Analyzer<'src> {
     /// migration's codemod and the editor's quick fix both write
     /// `.as_usize()` at it.
     ///
-    /// Lenient about what is not yet a type: an index still `Unknown` or
-    /// `Unresolved` is reported by the fixpoint's own leftover sweep, and a
-    /// GENERIC one is left alone rather than refused here — a parameter's
-    /// bounds are the only thing that could make it an index, and the language
-    /// has no such bound to write yet.
+    /// Lenient about what is not yet a type, and a GENERIC index is left alone
+    /// rather than refused here — a parameter's bounds are the only thing that
+    /// could make it an index, and the language has no such bound to write
+    /// yet. An index still `Unknown` or `Unresolved` is RECORDED (B591): a
+    /// call's or a closure parameter's type often lands after the subscript
+    /// resolves (`xs[one()]`, `xs[n.max(0)]`, `|i| xs[i]`), and nothing asked
+    /// again once it typed the index `i32` — so a negative call index checked
+    /// clean and panicked "the index is -1" on JS and
+    /// "18446744073709551615" natively. The fixpoint's end asks each recorded
+    /// index again ([`Self::recheck_lenient_subscript_indexes`]); one nothing
+    /// ever types is the leftover sweep's.
     fn subscript_index_is_an_index(&mut self, index_id: Id) -> bool {
         let Some(index_struct_id) = self.primitive_struct_ids.get("usize").copied() else {
             return true;
         };
         let expected = Type::Struct(index_struct_id, Vec::new());
         let index_type = self.infer_type(index_id, &expected, &HashMap::default());
+        if matches!(index_type, Type::Unknown | Type::Unresolved) {
+            self.lenient_subscript_indexes.push(index_id);
+            return true;
+        }
+        match self.index_refusal(index_id, &index_type, &expected) {
+            Some(error) => {
+                self.diagnostics.push(error);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// The refusal of an index typed `index_type` — `None` when it is a
+    /// `usize`, or a type with no verdict to give (`any`, `never`, a generic).
+    fn index_refusal(&self, index_id: Id, index_type: &Type, expected: &Type) -> Option<Error> {
         if matches!(
             index_type,
             Type::Unknown | Type::Unresolved | Type::Any | Type::Never | Type::Generic(_)
-        ) {
-            return true;
+        ) || index_type == expected
+        {
+            return None;
         }
-        if index_type == expected {
-            return true;
-        }
-        let index_str = self.pretty_print_type(&index_type, &HashMap::default());
-        let conversion = match self.numeric_conversion_target(&expected, &index_type) {
+        let index_str = self.pretty_print_type(index_type, &HashMap::default());
+        let conversion = match self.numeric_conversion_target(expected, index_type) {
             Some(target) => format!(
                 ". There are no implicit numeric conversions; convert with `.as_{target}()`"
             ),
             None => String::new(),
         };
-        self.diagnostics.push(Error {
+        Some(Error {
             trace: Vec::new(),
             note: None,
             span: **self.span_map.get(&index_id).unwrap_or(&&EMPTY_SPAN),
@@ -61965,8 +61990,32 @@ impl<'src> Analyzer<'src> {
                  anything else names no element, and the emitted subscript read `undefined` \
                  back instead of failing{conversion}"
             ),
-        });
-        false
+        })
+    }
+
+    /// B591: the indexes the subscript check passed while they had no type,
+    /// asked again once the fixpoint has typed what it can — each refusal in
+    /// its index's own file. Run at every fixpoint's end (the pre-entry
+    /// world's and the build's), so a module's subscripts are answered with
+    /// the world they resolved in. No constraint waits for it: deferring the
+    /// subscript instead cost every program a round of retries.
+    fn recheck_lenient_subscript_indexes(&mut self) {
+        if self.lenient_subscript_indexes.is_empty() {
+            return;
+        }
+        let Some(index_struct_id) = self.primitive_struct_ids.get("usize").copied() else {
+            return;
+        };
+        let expected = Type::Struct(index_struct_id, Vec::new());
+        let mut indexes = std::mem::take(&mut self.lenient_subscript_indexes);
+        indexes.sort_unstable_by_key(|index_id| index_id.0);
+        indexes.dedup();
+        for index_id in indexes {
+            let index_type = self.infer_type(index_id, &expected, &HashMap::default());
+            if let Some(error) = self.index_refusal(index_id, &index_type, &expected) {
+                self.push_anchored(error, index_id);
+            }
+        }
     }
 
     /// `subject[index]`: once the subject's `List<T>` type is known, the
@@ -65104,6 +65153,7 @@ impl<'src> Analyzer<'src> {
         }
         self.fixpoint_stalled = false;
         self.literal_lets_wait = false;
+        self.recheck_lenient_subscript_indexes();
         if split_on {
             split.push(("fixpoint", split_mark.elapsed()));
             let stages: Vec<String> = split

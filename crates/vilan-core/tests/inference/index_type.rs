@@ -1039,3 +1039,48 @@ fn b579_one_width_a_literal_and_a_conversion_still_compute() {
         "5\n24\n1\n3\n6\n",
     );
 }
+
+// --- B591: a subscript's index typed after the subscript resolves -----------
+
+/// B591: the `usize` check passed an index whose type was not known when the
+/// subscript resolved — a call's (`xs[minus_one()]`, `xs[n.max(0)]`) — and
+/// nothing asked again, so an `i32` index checked clean and a negative one
+/// panicked "the index is -1" on JS and "18446744073709551615" natively. The
+/// subscript waits for its index's type, then checks it.
+#[test]
+fn b591_a_late_typed_index_is_checked() {
+    for index in ["minus_one()", "n.max(0)", "pick(1)"] {
+        let source = format!(
+            r#"
+            import std::io::print;
+            fun minus_one(): i32 {{
+                0 - 1
+            }}
+            fun pick<T>(value: T): T {{
+                value
+            }}
+            fun main() {{
+                let xs = [1, 2, 3];
+                let n: i32 = 1;
+                print(xs[{index}]);
+            }}
+            "#
+        );
+        assert_fails_once_with(&source, "an index must be a `usize`, and this one is `i32`");
+    }
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun one(): usize {
+            1
+        }
+        fun main() {
+            let xs = [1, 2, 3];
+            let n: i32 = 2;
+            print(xs[one()]);
+            print(xs[n.as_usize()]);
+        }
+        "#,
+        "2\n3\n",
+    );
+}
