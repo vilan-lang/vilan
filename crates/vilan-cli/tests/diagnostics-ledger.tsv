@@ -710,3 +710,4 @@ row	flagship	key
 686	-	`{label} = {value}` names an argument, and only a spread parameter takes names (`...at: ({label}: T, …)`), which this one is not: drop `{label} =` to pass it by position, or, to assign, write `{label} = {value};` before the call
 687	-	a spread parameter's arguments are all named or none: name every argument it collects, or drop the names and pass them by position
 NEW	-	`{name}`'s element type is decided by its uses, and uses in two files disagree: one gives it `{first}`, another `{second}`. Write the element type on the declaration (`{name}: List<…>`)
+NEW	-	'{member_name}' is ambiguous on '{type_str}': {both}{providers} provide it as their trait's default, and no call spelling names one instantiation; declare `{member_name}` on `{type_str}` itself — an inherent member beats every trait-provided one

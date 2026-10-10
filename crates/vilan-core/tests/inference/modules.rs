@@ -7697,3 +7697,77 @@ fn b554_a_same_file_element_conflict_stays_at_the_later_use() {
     assert_eq!(&bag[span.clone()], "\"two\"");
     assert_eq!(message, "Expected i32, but got str instead.");
 }
+
+// --- M130: two admitted homes of one trait default ---------------------------
+
+const M130_TRAIT: &str = "import std::option::Option::{ self, None, Some };\n\nexport trait Counting<T> {\n\tfun next(mut self): Option<T> {\n\t\tNone\n\t}\n}\n";
+const M130_BOX: &str = "export struct Box {\n\tn: i32,\n}\n";
+const M130_I32: &str =
+    "import pkg::b::Box;\nimport pkg::t::Counting;\n\nexport impl Box with Counting<i32> {}\n";
+const M130_STR: &str =
+    "import pkg::b::Box;\nimport pkg::t::Counting;\n\nexport impl Box with Counting<str> {}\n";
+
+/// M130: `impl Box with Counting<i32> {}` beside `impl Box with Counting<str>
+/// {}` were ONE candidate for the trait's default `next` — deduplicated by
+/// member — so `for item in box` typed `item` by whichever block's module
+/// loaded first (clean one way, refused the other). Two homes are two
+/// candidates, reported ambiguous at the loop and at a call, the same
+/// sentence (providers sorted) in either load order.
+#[test]
+fn m130_two_homes_of_one_default_are_ambiguous_in_every_load_order() {
+    for (first, second) in [("p1.vl", "p9.vl"), ("p9.vl", "p1.vl")] {
+        for (body, expected) in [
+            (
+                "\tmut box = Box { n = 1 };\n\tfor item in box {\n\t\tlet copy: i32 = item;\n\t}\n",
+                "`next` is ambiguous on `Box`: both 'Counting<i32>' and 'Counting<str>' provide it \
+                 as an inherited default",
+            ),
+            (
+                "\tmut box = Box { n = 1 };\n\tlet _next = box.next();\n",
+                "'next' is ambiguous on 'Box': both 'Counting<i32>' and 'Counting<str>' provide it \
+                 as their trait's default",
+            ),
+        ] {
+            let main = format!(
+                "import pkg::b::Box;\nimport pkg::t::Counting;\nimport pkg::p1;\nimport pkg::p9;\n\nfun main() {{\n{body}}}\n"
+            );
+            let outcome = analyze_package(
+                &[
+                    ("main.vl", &main),
+                    ("b.vl", M130_BOX),
+                    ("t.vl", M130_TRAIT),
+                    (first, M130_I32),
+                    (second, M130_STR),
+                ],
+                "main.vl",
+            );
+            let [(message, _, _)] = outcome.diagnostics.as_slice() else {
+                panic!("one diagnostic ({first} first): {:?}", outcome.diagnostics);
+            };
+            assert!(message.starts_with(expected), "({first} first) {message}");
+        }
+    }
+}
+
+/// M130's boundary: one home is one candidate — a blanket and a concrete block
+/// that instantiate the trait at the SAME arguments rank inside the home, the
+/// concrete one answering, whichever registered first.
+#[test]
+fn m130_one_home_stays_one_candidate() {
+    let blanket = "import pkg::t::Counting;\n\nexport impl type T with Counting<i32> {}\n";
+    let main = "import std::io::print;\nimport pkg::b::Box;\nimport pkg::t::Counting;\nimport pkg::p1;\nimport pkg::p9;\n\nfun main() {\n\tmut box = Box { n = 1 };\n\tfor item in box {\n\t\tlet copy: i32 = item;\n\t\tprint(copy);\n\t}\n\tprint(\"done\");\n}\n";
+    for (first, second) in [("p1.vl", "p9.vl"), ("p9.vl", "p1.vl")] {
+        let (_, stdout) = compile_and_run_package(
+            &[
+                ("main.vl", main),
+                ("b.vl", M130_BOX),
+                ("t.vl", M130_TRAIT),
+                (first, M130_I32),
+                (second, blanket),
+            ],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("one home ({first} first): {errors:?}"));
+        assert_eq!(stdout, "done\n");
+    }
+}

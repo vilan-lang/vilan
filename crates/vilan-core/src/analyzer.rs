@@ -25012,13 +25012,68 @@ impl<'src> Analyzer<'src> {
                 applying.push(candidate.clone());
             }
         }
+        // M130: one candidate per HOME — `(member, the arguments THIS receiver
+        // instantiates the trait at)`, `rank_member_candidates`' key (B73 R1).
+        // Keyed by the member alone, `impl Box with Counting<i32> {}` beside
+        // `impl Box with Counting<str> {}` were ONE candidate, the block
+        // registered first, so `for item in box` typed `item` by the modules'
+        // load order; two homes are two candidates, and the callers report the
+        // pair. Inside one home the more specific subject stays (R3), whichever
+        // registered first.
         let mut candidates: Vec<((Id, TypeId, Id, Vec<TypeId>), (Id, bool))> = Vec::new();
-        for candidate in match applying.is_empty() {
+        let mut homes: Vec<Vec<TypeId>> = Vec::new();
+        let field = match applying.is_empty() {
             true => reached,
             false => applying,
-        } {
-            if !candidates.iter().any(|((id, ..), _)| *id == candidate.0.0) {
+        };
+        // A home is computed only for a member two blocks offer — the one case
+        // the key can tell apart; a lone member is its own candidate (and a
+        // field of one, the usual lookup, allocates nothing for it).
+        let repeated: Vec<Id> = match field.len() {
+            0 | 1 => Vec::new(),
+            _ => field
+                .iter()
+                .enumerate()
+                .filter(|(position, ((member_id, ..), _))| {
+                    field[..*position]
+                        .iter()
+                        .any(|((earlier, ..), _)| earlier == member_id)
+                })
+                .map(|(_, ((member_id, ..), _))| *member_id)
+                .collect(),
+        };
+        for candidate in field {
+            let ((member_id, impl_subject, trait_id, written), _) = &candidate;
+            if !repeated.contains(member_id) {
                 candidates.push(candidate);
+                homes.push(Vec::new());
+                continue;
+            }
+            let home =
+                self.instantiated_home_arguments(subject_type, *trait_id, written, *impl_subject);
+            // The home is the DECLARING trait's: a default a sub-trait
+            // inherits from its supertrait (`DeltaFeed<T> with
+            // Source<List<T>>` reaching `Source`'s `effect`) is one member at
+            // one home with the supertrait's own provider, not a second home.
+            let home = self
+                .method_member_in_trait_at(*trait_id, &home, member_name)
+                .map_or(home, |(_, _, declaring_arguments)| declaring_arguments);
+            let same_home = candidates
+                .iter()
+                .zip(&homes)
+                .position(|(((id, ..), _), held)| {
+                    *id == *member_id && !self.homes_clearly_differ(held, &home)
+                });
+            match same_home {
+                Some(position) => {
+                    if self.impl_subject_outranks(*impl_subject, candidates[position].0.1) {
+                        candidates[position] = candidate;
+                    }
+                }
+                None => {
+                    candidates.push(candidate);
+                    homes.push(home);
+                }
             }
         }
         // B401: one candidate, and the file declined the block it comes
@@ -25034,6 +25089,64 @@ impl<'src> Analyzer<'src> {
             .into_iter()
             .map(|(candidate, _)| candidate)
             .collect()
+    }
+
+    /// M130: whether two homes of one default are DIFFERENT instantiations —
+    /// some position where both arguments are concrete and disagree
+    /// (`Counting<i32>` against `Counting<str>`). A position still abstract on
+    /// either side (a `Self` the supertrait chain threads as the trait, a
+    /// binder, a hole) is no evidence of a second home: the two read as one,
+    /// as they did before homes were keyed.
+    fn homes_clearly_differ(&self, held: &[TypeId], home: &[TypeId]) -> bool {
+        if held.len() != home.len() {
+            return false;
+        }
+        let concrete = |argument: TypeId| {
+            !matches!(
+                self.borrow_type_by_type_id(argument),
+                Type::Generic(_) | Type::Trait(..) | Type::Unknown | Type::Unresolved | Type::Any
+            ) && !self.type_has_hole(argument)
+        };
+        held.iter().zip(home).any(|(left, right)| {
+            concrete(*left)
+                && concrete(*right)
+                && !self.same_impl_types(&[*left], &[*right], &mut Vec::new())
+        })
+    }
+
+    /// The providers of two or more inherited-default candidates, as an
+    /// ambiguity names them: the trait alone when the candidates are of
+    /// DIFFERENT traits (`'Counting' and 'Tally'`, as before), and the trait AT
+    /// the arguments this receiver instantiates it with when they are one
+    /// trait's homes (`'Counting<i32>' and 'Counting<str>'`, M130) — the bare
+    /// name twice would say nothing.
+    fn default_provider_labels(
+        &mut self,
+        subject_type: &Type,
+        candidates: &[(Id, TypeId, Id, Vec<TypeId>)],
+    ) -> Vec<String> {
+        let one_trait = candidates
+            .iter()
+            .all(|(_, _, trait_id, _)| Some(trait_id) == candidates.first().map(|first| &first.2));
+        // Sorted: the candidates arrive in registration order, which is the
+        // modules' load order, and the message must not be (the C1 rule).
+        let mut labels: Vec<String> = candidates
+            .iter()
+            .map(|(_, impl_subject, trait_id, written)| match one_trait {
+                true => {
+                    let home = self.instantiated_home_arguments(
+                        subject_type,
+                        *trait_id,
+                        written,
+                        *impl_subject,
+                    );
+                    self.pretty_print_type(&Type::Trait(*trait_id, home), &HashMap::default())
+                }
+                false => self.trait_label_for(subject_type, *trait_id),
+            })
+            .collect();
+        labels.sort();
+        labels
     }
 
     /// Whether a trait member has a source-provided body (a default method), so
@@ -42257,13 +42370,13 @@ impl<'src> Analyzer<'src> {
         iterable_id: Id,
         iterable_type: &Type,
         next_method: &str,
-        trait_ids: &[Id],
+        providers: &[String],
         providers_tier: ForEachNextProviders,
     ) {
         let rendered = self.pretty_print_type(iterable_type, &HashMap::default());
-        let providers: Vec<String> = trait_ids
+        let providers: Vec<String> = providers
             .iter()
-            .map(|trait_id| format!("'{}'", self.trait_label_for(iterable_type, *trait_id)))
+            .map(|provider| format!("'{provider}'"))
             .collect();
         self.report_for_each_error(
             for_each_id,
@@ -53745,6 +53858,10 @@ impl<'src> Analyzer<'src> {
             // The trait is object-safe (its requirements are); this member is
             // one of the conveniences an object leaves behind.
             NotThroughObject(String),
+            // M130: ONE trait's DEFAULT reached at two or more instantiations —
+            // the providers labelled at the arguments this receiver
+            // instantiates them with. No call spelling names which.
+            AmbiguousDefaultHomes(Vec<String>),
         }
         let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         // A method on a `List::new()` whose element slot is still unknown but has a
@@ -53810,6 +53927,7 @@ impl<'src> Analyzer<'src> {
         // another verdict (the inherited-default tier, the bound list): the
         // competing traits, which override whatever the arm returns.
         let mut return_ambiguous: Option<Vec<Id>> = None;
+        let mut return_ambiguous_defaults: Option<Vec<String>> = None;
         // A124 R3, the blanket (`impl dyn Trait with Trait`): a member the
         // object's TRAIT declares is the object's own surface and takes the
         // `Type::Dyn` arm below — a slot, or a per-call refusal. Every OTHER
@@ -53997,17 +54115,24 @@ impl<'src> Analyzer<'src> {
                         // Two traits offering same-named DEFAULTS are as
                         // ambiguous as two declaring the name outright (§3):
                         // the same rule, one tier down.
-                        let inherited = match inherited.len() > 1 {
-                            true => {
-                                return_ambiguous = Some(
-                                    inherited
-                                        .iter()
-                                        .map(|(_, _, trait_id, _)| *trait_id)
-                                        .collect(),
-                                );
+                        let mut traits: Vec<Id> = Vec::new();
+                        for (_, _, trait_id, _) in &inherited {
+                            if !traits.contains(trait_id) {
+                                traits.push(*trait_id);
+                            }
+                        }
+                        let inherited = match (inherited.len() > 1, traits.len() > 1) {
+                            (true, true) => {
+                                return_ambiguous = Some(traits);
                                 None
                             }
-                            false => inherited.into_iter().next(),
+                            // M130: one trait's default at two homes.
+                            (true, false) => {
+                                return_ambiguous_defaults =
+                                    Some(self.default_provider_labels(&subject_type, &inherited));
+                                None
+                            }
+                            (false, _) => inherited.into_iter().next(),
                         };
                         match inherited {
                             Some((member_id, impl_subject_id, trait_id, trait_arguments)) => {
@@ -54444,9 +54569,10 @@ impl<'src> Analyzer<'src> {
             }
             _ => MethodLookup::NotCallable,
         };
-        let lookup = match return_ambiguous {
-            Some(trait_ids) => MethodLookup::AmbiguousTraits(trait_ids),
-            None => lookup,
+        let lookup = match (return_ambiguous, return_ambiguous_defaults) {
+            (Some(trait_ids), _) => MethodLookup::AmbiguousTraits(trait_ids),
+            (None, Some(providers)) => MethodLookup::AmbiguousDefaultHomes(providers),
+            (None, None) => lookup,
         };
         // A122: a `Tuple` member reads its receiver's LAYOUT at emission, and a
         // receiver that is itself a call records no type of its own — so the
@@ -54782,6 +54908,36 @@ impl<'src> Analyzer<'src> {
                         "'{member_name}' is ambiguous on '{type_str}': {}{} provide it, and \
                          '{trait_name}::{member_name}' names only the trait, not which of its \
                          instantiations; annotate the type this call must produce to pick one",
+                        if providers.len() == 2 { "both " } else { "" },
+                        join_with(&providers, "and"),
+                    ),
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                Resolution::Failed
+            }
+            // M130: one trait's DEFAULT at two homes. Neither `Trait::member`
+            // (it names only the trait) nor an expected type (the default's
+            // signature is one member's) picks between them; an inherent
+            // member outranks both.
+            MethodLookup::AmbiguousDefaultHomes(providers) => {
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
+                let providers: Vec<String> = providers
+                    .iter()
+                    .map(|provider| format!("'{provider}'"))
+                    .collect();
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: self
+                        .member_name_spans
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(arguments_span),
+                    msg: format!(
+                        "'{member_name}' is ambiguous on '{type_str}': {}{} provide it as their \
+                         trait's default, and no call spelling names one instantiation; declare \
+                         `{member_name}` on `{type_str}` itself — an inherent member beats every \
+                         trait-provided one",
                         if providers.len() == 2 { "both " } else { "" },
                         join_with(&providers, "and"),
                     ),
@@ -65020,13 +65176,16 @@ impl<'src> Analyzer<'src> {
                     // type that has two (B96).
                     let declared = self.resolve_impl_member(&iterable_type, next_method);
                     if let ImplMemberResolution::AmbiguousTraits(homes) = &declared {
-                        let homes = homes.clone();
+                        let providers: Vec<String> = homes
+                            .iter()
+                            .map(|trait_id| self.trait_label_for(&iterable_type, *trait_id))
+                            .collect();
                         self.report_ambiguous_for_each_next(
                             for_each_id,
                             iterable_id,
                             &iterable_type,
                             next_method,
-                            &homes,
+                            &providers,
                             ForEachNextProviders::Declared,
                         );
                         continue;
@@ -65140,18 +65299,17 @@ impl<'src> Analyzer<'src> {
                         // as two declaring the name outright (§3, one tier down),
                         // and saying "it has no `next`" of a type that has two
                         // sends the reader looking for the wrong edit.
-                        let ambiguous: Vec<Id> = self
-                            .inherited_default_candidates(&iterable_type, next_method)
-                            .iter()
-                            .map(|(_, _, trait_id, _)| *trait_id)
-                            .collect();
+                        let ambiguous =
+                            self.inherited_default_candidates(&iterable_type, next_method);
                         if ambiguous.len() > 1 {
+                            let providers =
+                                self.default_provider_labels(&iterable_type, &ambiguous);
                             self.report_ambiguous_for_each_next(
                                 for_each_id,
                                 iterable_id,
                                 &iterable_type,
                                 next_method,
-                                &ambiguous,
+                                &providers,
                                 ForEachNextProviders::InheritedDefaults,
                             );
                             continue;
