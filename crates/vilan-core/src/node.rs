@@ -1126,6 +1126,7 @@ impl<'src> Node<'src> {
                     }
                 }
                 Pattern::Literal(literal) => visit(literal),
+                Pattern::Labelled(_, inner) => visit_pattern(&inner.0, visit),
             }
         }
         fn visit_parameters<'a, 'src>(
@@ -1714,6 +1715,12 @@ pub enum Pattern<'src> {
     // A literal value pattern (`"quit"`, `42`, `true`): matches by equality,
     // binding nothing. Holds the literal as its node.
     Literal(Box<Spanned<Node<'src>>>),
+    // B569 S3: one BY-NAME element of a tuple pattern — `let (y = top, x =
+    // left) = p;`, `(x = 0, y = let v)` — the label (with its own span) and
+    // the sub-pattern its slot meets. Only ever an element of a `Tuple`, which
+    // labels every element or none; the analyzer places each at its label's
+    // slot once the matched type is known.
+    Labelled(Spanned<&'src str>, Box<Spanned<Pattern<'src>>>),
 }
 
 // One match leg: the patterns it matches (more than one is an or-pattern,

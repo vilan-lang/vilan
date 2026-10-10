@@ -11442,6 +11442,29 @@ fn s1_dbg_writes_the_same_bytes_on_both_backends() {
     assert_eq!(native.stdout, expected_stdout);
 }
 
+/// B569 S3: `dbg` prints a labelled tuple as its literal — nested, in a
+/// list, on one line or broken at 80 columns — and a tuple reached through a
+/// generic's substitution erased (label sets share one instance); by-name
+/// patterns in a `let`, a `match` and a `for` bind the same slots. The same
+/// bytes on both backends, and the committed ones (`native/dbg_labels.*`).
+#[test]
+fn b569_labels_print_and_destructure_the_same_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b569_dbg_labels.vl";
+    std::fs::write(staged.join(file), include_str!("native/dbg_labels.vl"))
+        .expect("write the probe program");
+    let expected_stderr = include_str!("native/dbg_labels.stderr");
+    let expected_stdout = include_str!("native/dbg_labels.stdout");
+    let javascript = run_on(&staged, None, file);
+    let native = run_on(&staged, Some("rust"), file);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(javascript.stderr, expected_stderr, "the JS leg's dbg lines");
+    assert_eq!(native.stderr, expected_stderr, "the native leg's dbg lines");
+    assert_eq!(javascript.stdout, expected_stdout);
+    assert_eq!(native.stdout, expected_stdout);
+}
+
 /// debugging.md S1b: std's handles print as themselves, the same bytes on
 /// both backends (`native/dbg_handles.stderr`): a `HashMap` and a `HashSet`
 /// by their members in insertion order, a `Shared` and a `SignalCell` by their

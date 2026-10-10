@@ -214,7 +214,9 @@ parameter  = [ "lazy" ] [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
 convention = "own" | "&" [ "mut" ] ;
 binder     = IDENT
            | "(" binder "," binder { "," binder } [ "," ] ")"
+           | "(" named-binder { "," named-binder } [ "," ] ")"  (* by name, B569 *)
            | "[" binder { "," binder } [ "," ] "]" ;
+named-binder = MEMBER "=" binder ;
 
 extern-attr = "[" "extern" "(" extern-args [ "," "retains" ] [ "," ] ")" "]" ;
 extern-args = STRING [ "," STRING ]              (* global, or module and symbol *)
@@ -987,11 +989,21 @@ form.
 ```text
 pattern = ("let" | "mut") binder                (* binding *)
         | "(" pattern "," pattern { "," pattern } [ "," ] ")"
+        | "(" named-pattern { "," named-pattern } [ "," ] ")"  (* by name *)
         | STRING | MULTILINE_STRING | NUMBER    (* equality literal *)
         | "_"                                   (* wildcard *)
         | NAME { "::" IDENT }
           [ "(" [ pattern { "," pattern } [ "," ] ] ")" ] ;  (* variant *)
+named-pattern = MEMBER "=" pattern ;
 ```
+
+A tuple pattern may be written **by name** (B569): `let (y = top, x =
+left) = p;`, `(x = 0, y = let v)` — the label, then what its slot meets,
+the literal's spelling. It names exactly the matched value's labels, in
+any order (the value must be a labelled tuple), and is placed slot by slot
+once the value's type is known; every element is named or none, and a
+one-element by-name pattern `(x = a)` is a tuple pattern. A positional
+pattern ignores labels.
 
 Bindings inside patterns are written explicitly (`Some(let x)`), so a
 bare name is always a **variant** reference, never a fresh binding: the

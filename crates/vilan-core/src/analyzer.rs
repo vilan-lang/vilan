@@ -2612,6 +2612,10 @@ enum WalkPattern<'src> {
         Option<Vec<WalkPattern<'src>>>,
     ),
     Tuple(Span, Vec<WalkPattern<'src>>),
+    // B569 S3: a by-name element of a tuple pattern — its label, the label's
+    // span, and the sub-pattern its slot meets. Placed at the label's slot
+    // when the `Tuple` around it resolves.
+    Labelled(&'src str, Span, Box<WalkPattern<'src>>),
     // `[a, b, c]` — a fixed-array binder (fixed-arrays.md §7): irrefutable,
     // its element count must equal the array type's length.
     Array(Span, Vec<WalkPattern<'src>>),
@@ -40375,6 +40379,7 @@ impl<'src> Analyzer<'src> {
                     self.set_pattern_bindings_mutable(sub_pattern);
                 }
             }
+            WalkPattern::Labelled(_, _, inner) => self.set_pattern_bindings_mutable(inner),
             _ => {}
         }
     }
@@ -40691,6 +40696,11 @@ impl<'src> Analyzer<'src> {
                     })
                     .collect(),
             ),
+            Pattern::Labelled((label, label_span), inner) => WalkPattern::Labelled(
+                label,
+                *label_span,
+                Box::new(self.walk_pattern(&inner.0, &inner.1, scope_id, visible_from)),
+            ),
             Pattern::Literal(literal) => {
                 WalkPattern::Literal(self.walk_expr_node(literal, scope_id))
             }
@@ -40768,6 +40778,100 @@ impl<'src> Analyzer<'src> {
                 .sum(),
             _ => 1,
         }
+    }
+
+    /// B569 S3: a tuple pattern written BY NAME — `let (y = top, x = left) =
+    /// p;` — over a labelled tuple: each element meets the slot its label
+    /// names, and the resolved pattern is the positional one in the value's
+    /// order, so everything past here (bindings, exhaustiveness, both
+    /// emitters) reads an ordinary tuple pattern. It names exactly the
+    /// value's labels, as a labelled literal does.
+    fn resolve_by_name_tuple_pattern(
+        &mut self,
+        span: Span,
+        patterns: &[WalkPattern<'src>],
+        expected_type_id: TypeId,
+        lookup_scope_id: Id,
+    ) -> Option<ExprPattern> {
+        let expected = self.expand_mapped(expected_type_id.get_type(self));
+        let rendered = self.pretty_print_type(&expected, &HashMap::default());
+        let refuse = |analyzer: &mut Self, msg: String| {
+            analyzer.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            None
+        };
+        let (slots, labels) = match expected {
+            Type::Tuple(slots, labels) if labels.is_labelled() => (slots, labels),
+            Type::Tuple(..) => {
+                return refuse(
+                    self,
+                    format!(
+                        "this pattern destructures by name, but `{rendered}` has no labels: \
+                         destructure it by position, `(a, b)`"
+                    ),
+                );
+            }
+            _ => {
+                return refuse(
+                    self,
+                    format!(
+                        "this pattern destructures by name, so the value must be a labelled \
+                         tuple, and it is `{rendered}`"
+                    ),
+                );
+            }
+        };
+        let written: Vec<(&str, Span, &WalkPattern<'src>)> = patterns
+            .iter()
+            .filter_map(|pattern| match pattern {
+                WalkPattern::Labelled(label, label_span, inner) => {
+                    Some((*label, *label_span, &**inner))
+                }
+                _ => None,
+            })
+            .collect();
+        let extra = written
+            .iter()
+            .find(|(label, _, _)| labels.position(label).is_none())
+            .map(|(label, label_span, _)| (*label, *label_span));
+        let missing: Vec<String> = labels
+            .labels()
+            .unwrap_or_default()
+            .iter()
+            .filter(|label| !written.iter().any(|(written, _, _)| *written == &***label))
+            .map(|label| format!("`{label}`"))
+            .collect();
+        if extra.is_some() || !missing.is_empty() {
+            let head = match extra {
+                Some((extra, _)) => format!("`{extra}` is not a label of `{rendered}`"),
+                None => format!("this pattern does not name every label of `{rendered}`"),
+            };
+            let tail = match missing.is_empty() {
+                true => String::new(),
+                false => format!(", and this one leaves out {}", missing.join(", ")),
+            };
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: extra.map_or(span, |(_, label_span)| label_span),
+                msg: format!("{head}: a by-name pattern names exactly its value's labels{tail}"),
+            });
+            return None;
+        }
+        let mut resolved = Vec::with_capacity(slots.len());
+        for (slot, element_type_id) in slots.iter().enumerate() {
+            let label = labels.get(slot).unwrap_or_default();
+            let (_, _, sub_pattern) = written.iter().find(|(written, _, _)| *written == label)?;
+            resolved.push((
+                self.resolve_pattern(sub_pattern, *element_type_id, lookup_scope_id)?,
+                *element_type_id,
+            ));
+        }
+        Some(ExprPattern::Tuple(resolved))
     }
 
     fn resolve_pattern(
@@ -40989,6 +41093,25 @@ impl<'src> Analyzer<'src> {
                     variant_index,
                     resolved_payload,
                 ))
+            }
+            // Reached only as an element of a positional resolve — a mixed
+            // pattern the parser already refused: the slot is the value.
+            WalkPattern::Labelled(_, _, inner) => {
+                self.resolve_pattern(inner, expected_type_id, lookup_scope_id)
+            }
+            // A MIX of named and positional elements was refused by the parser;
+            // it resolves positionally below, so nothing past it double-reports.
+            WalkPattern::Tuple(span, patterns)
+                if patterns
+                    .iter()
+                    .all(|pattern| matches!(pattern, WalkPattern::Labelled(..))) =>
+            {
+                self.resolve_by_name_tuple_pattern(
+                    *span,
+                    patterns,
+                    expected_type_id,
+                    lookup_scope_id,
+                )
             }
             WalkPattern::Tuple(span, patterns) => {
                 // Element types come from the matched tuple type when known (a

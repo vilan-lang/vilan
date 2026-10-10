@@ -1366,6 +1366,14 @@ exception below. So:
 - a **join** types a later arm against a labelled first arm, so labelled
   literal arms and list elements match it by name.
 
+A tuple PATTERN may name its elements too — `let (y = top, x = left) =
+p;`, `match q { (x = 0, y = let v) => … }` — and is placed by the labels
+of the value it matches, which it names exactly; a positional pattern
+ignores them. `dbg` prints a labelled tuple as its literal, `p = (x = 5.0,
+y = 7.0)`; a tuple a generic body prints through its parameter prints
+positionally, since labels erase at the instance (below). `Debug`'s
+`debug()` is positional.
+
 Labels flow through generics as part of the type a parameter binds
 (`id(p).x`), and a **mapped tuple** keeps its source's labels position by
 position — `combine((x = a, y = b))` derives over `(x: i32, y: i32)`. They

@@ -416,3 +416,100 @@ fn b569_an_impl_on_a_labelled_tuple_is_refused() {
         "an `impl` cannot name a labelled tuple: labels name positions and are not an identity",
     );
 }
+
+// --- S3: by name in patterns, and `dbg` -----------------------------------------
+
+/// §2: a tuple pattern written by name — label, then what its slot meets —
+/// places each element at its label's slot, in a `let`, a `match` arm, an
+/// `is`, a `for` binder and the one-slot form; positional patterns ignore
+/// labels as before.
+#[test]
+fn b569_a_pattern_destructures_by_name() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let p: (x: f64, y: f64) = (x = 5, y = 7);
+            let (y = top, x = left) = p;
+            print(i"{top} {left}");
+            let (a, b) = p;
+            print(a + b);
+            let q = (x = 0, y = 3);
+            match q {
+                (x = 0, y = let v) => print(i"on the axis at {v}"),
+                (x = let h, y = _) => print(h),
+            }
+            q is (y = 3, x = let found) then print(found);
+            for (y = second, x = first) in [(x = 1, y = 2), (x = 3, y = 4)] {
+                print(first * 10 + second);
+            }
+            let (x = only) = (x = 9);
+            print(only);
+            mut (b = ys, a = xs) = (a = 1, b = 2);
+            xs += 10;
+            print(xs + ys);
+        }
+        "#,
+        "7 5\n12\non the axis at 3\n0\n12\n34\n9\n13\n",
+    );
+}
+
+/// A by-name pattern names exactly its value's labels, over a labelled tuple.
+#[test]
+fn b569_a_by_name_pattern_is_checked_against_the_labels() {
+    let base = "fun main() {\n    let p: (x: f64, y: f64) = (x = 5, y = 7);\n";
+    assert_fails_with(
+        &format!("{base}    let (y = top, z = left) = p;\n}}\n"),
+        "`z` is not a label of `(x: f64, y: f64)`: a by-name pattern names exactly its value's labels, and this one leaves out `x`",
+    );
+    assert_fails_with(
+        &format!("{base}    let (y = only) = p;\n}}\n"),
+        "this pattern does not name every label of `(x: f64, y: f64)`",
+    );
+    assert_fails_with(
+        "fun main() {\n    let (x = a, y = b) = (1, 2);\n}\n",
+        "this pattern destructures by name, but `(i32, i32)` has no labels: destructure it by position, `(a, b)`",
+    );
+    assert_fails_once_with(
+        &format!("{base}    let (x = c, d) = p;\n}}\n"),
+        "a tuple labels every slot or none",
+    );
+}
+
+/// §5: `dbg` prints a labelled tuple as its literal, nested and in a list —
+/// and a tuple reached through a generic's substitution erased, whichever
+/// label set reached the shared instance first (§6.3).
+#[test]
+fn b569_dbg_prints_labels_where_they_are_written() {
+    let source = r#"
+        fun show<T>(value: T) {
+            dbg(value);
+        }
+
+        fun main() {
+            let p: (x: f64, y: f64) = (x = 5, y = 7);
+            let q: (f64, f64) = (1, 2);
+            dbg(p);
+            dbg(q);
+            dbg([(a = 1, b = "one")]);
+            dbg((outer = (left = 1, right = 2), tag = "t"));
+            show(p);
+            show(q);
+        }
+    "#;
+    let stderr = compile_and_run_status(source).1;
+    for line in [
+        "p = (x = 5.0, y = 7.0)",
+        "q = (1.0, 2.0)",
+        "[(a = 1, b = \"one\")]",
+        "(outer = (left = 1, right = 2), tag = \"t\")",
+        "value = (5.0, 7.0)",
+        "value = (1.0, 2.0)",
+    ] {
+        assert!(
+            stderr.contains(line),
+            "`dbg` printed {line:?}; got:\n{stderr}"
+        );
+    }
+}

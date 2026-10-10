@@ -2217,6 +2217,13 @@ fn apply_binding_mutability(pattern: Pattern<'_>, mutable: bool) -> Pattern<'_> 
                 .map(|(pattern, span)| (apply_binding_mutability(pattern, mutable), span))
                 .collect(),
         ),
+        Pattern::Labelled(label, inner) => {
+            let (inner, span) = *inner;
+            Pattern::Labelled(
+                label,
+                Box::new((apply_binding_mutability(inner, mutable), span)),
+            )
+        }
         other => other,
     }
 }
@@ -7707,18 +7714,64 @@ impl<'a, 'src> Parser<'a, 'src> {
         )
     }
 
+    /// B569 S3: `MEMBER "=" sub-pattern` — a by-name element of a tuple
+    /// pattern, the literal's spelling (label, then what its slot meets) —
+    /// when one begins here, else `otherwise`.
+    fn parse_labelled_pattern_or(
+        &mut self,
+        otherwise: fn(&mut Self) -> Option<Spanned<Pattern<'src>>>,
+    ) -> Option<Spanned<Pattern<'src>>> {
+        if !self.at_tuple_label("=") {
+            return otherwise(self);
+        }
+        let start = self.position;
+        let label_span = self.here_span();
+        let label = self.eat_member_name()?;
+        self.bump(); // `=`
+        let inner = otherwise(self)?;
+        Some((
+            Pattern::Labelled((label, label_span), Box::new(inner)),
+            self.span_from(start),
+        ))
+    }
+
+    /// A tuple pattern holds two or more elements — a single parenthesized
+    /// pattern is no grouping — save the one-slot BY-NAME pattern `(x = a)`,
+    /// which the label makes a tuple, as it makes `(x = 5)` one (B569 §7).
+    fn tuple_pattern_arity_holds(&self, patterns: &[Spanned<Pattern<'src>>]) -> bool {
+        patterns.len() >= 2 || matches!(patterns, [(Pattern::Labelled(..), _)])
+    }
+
+    /// [`Parser::check_tuple_labels`] for a tuple PATTERN: every element by
+    /// name or none, each label once.
+    fn check_pattern_labels(&mut self, patterns: &[Spanned<Pattern<'src>>]) {
+        let entries = patterns
+            .iter()
+            .map(|pattern| match &pattern.0 {
+                Pattern::Labelled((label, label_span), _) => {
+                    (Some((*label, *label_span)), pattern.1)
+                }
+                _ => (None, pattern.1),
+            })
+            .collect();
+        self.refuse_unbalanced_labels(entries);
+    }
+
     /// [`Parser::parse_binder`]'s body, past the depth bound.
     fn parse_binder_inner(&mut self) -> Option<Spanned<Pattern<'src>>> {
         let start = self.position;
         if self.peek_is_ctrl('(') {
             return self.attempt(|parser| {
                 parser.expect_ctrl('(')?;
-                let patterns =
-                    parser.comma_list(Self::parse_binder, |parser| parser.peek_is_ctrl(')'))?;
+                let patterns = parser.comma_list(
+                    |parser| parser.parse_labelled_pattern_or(Self::parse_binder),
+                    |parser| parser.peek_is_ctrl(')'),
+                )?;
                 parser.expect_ctrl(')')?;
-                if patterns.len() < 2 {
+                if !parser.tuple_pattern_arity_holds(&patterns) {
                     return None;
                 }
+                parser.check_pattern_labels(&patterns);
                 Some((Pattern::Tuple(patterns), parser.span_from(start)))
             });
         }
@@ -7821,12 +7874,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_ctrl('(') {
             return self.attempt(|parser| {
                 parser.expect_ctrl('(')?;
-                let patterns =
-                    parser.comma_list(Self::parse_pattern, |parser| parser.peek_is_ctrl(')'))?;
+                let patterns = parser.comma_list(
+                    |parser| parser.parse_labelled_pattern_or(Self::parse_pattern),
+                    |parser| parser.peek_is_ctrl(')'),
+                )?;
                 parser.expect_ctrl(')')?;
-                if patterns.len() < 2 {
+                if !parser.tuple_pattern_arity_holds(&patterns) {
                     return None;
                 }
+                parser.check_pattern_labels(&patterns);
                 Some((Pattern::Tuple(patterns), parser.span_from(start)))
             });
         }
@@ -8281,22 +8337,29 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// slot or none, and names each label once. A spread brings its operand's
     /// slots, which only the analyzer can see, so spreads are left to it.
     fn check_tuple_labels(&mut self, entries: &[Spanned<Node<'src>>]) {
-        let written: Vec<&Spanned<Node<'src>>> = entries
+        let written = entries
             .iter()
             .filter(|entry| !matches!(entry.0, Node::Spread(_)))
-            .collect();
-        let labelled = written
-            .iter()
-            .filter(|entry| matches!(entry.0, Node::Labelled(..)))
-            .count();
+            .map(|entry| match &entry.0 {
+                Node::Labelled((label, label_span), _) => (Some((*label, *label_span)), entry.1),
+                _ => (None, entry.1),
+            });
+        self.refuse_unbalanced_labels(written.collect());
+    }
+
+    /// The one rule [`Parser::check_tuple_labels`] and
+    /// [`Parser::check_pattern_labels`] state: each entry is its label (with
+    /// the label's span) or `None`, beside the entry's own span.
+    fn refuse_unbalanced_labels(&mut self, entries: Vec<(Option<(&'src str, Span)>, Span)>) {
+        let labelled = entries.iter().filter(|(label, _)| label.is_some()).count();
         if labelled == 0 {
             return;
         }
-        if labelled < written.len() {
-            let first = written
+        if labelled < entries.len() {
+            let first = entries
                 .iter()
-                .find(|entry| !matches!(entry.0, Node::Labelled(..)))
-                .map_or(Span::from(0..0), |entry| entry.1);
+                .find(|(label, _)| label.is_none())
+                .map_or(Span::from(0..0), |(_, span)| *span);
             self.errors.push(ParseError {
                 span: first,
                 reason: ParseErrorReason::Rule(A_TUPLE_LABELS_EVERY_SLOT_OR_NONE),
@@ -8306,18 +8369,16 @@ impl<'a, 'src> Parser<'a, 'src> {
             return;
         }
         let mut seen: Vec<&str> = Vec::new();
-        for entry in written {
-            if let Node::Labelled((label, label_span), _) = &entry.0 {
-                if seen.contains(label) {
-                    self.errors.push(ParseError {
-                        span: *label_span,
-                        reason: ParseErrorReason::Rule(A_TUPLE_LABEL_IS_WRITTEN_ONCE),
-                        context: Vec::new(),
-                        hint: None,
-                    });
-                }
-                seen.push(label);
+        for (label, label_span) in entries.into_iter().flat_map(|(label, _)| label) {
+            if seen.contains(&label) {
+                self.errors.push(ParseError {
+                    span: label_span,
+                    reason: ParseErrorReason::Rule(A_TUPLE_LABEL_IS_WRITTEN_ONCE),
+                    context: Vec::new(),
+                    hint: None,
+                });
             }
+            seen.push(label);
         }
     }
 
@@ -11630,6 +11691,38 @@ mod tests {
             program_errors("fun f() { print(i\"{(x = 5)}\"); }"),
             Vec::<String>::new()
         );
+    }
+
+    /// B569 S3: a tuple pattern's element may be written by name — `MEMBER
+    /// "="` then the sub-pattern — in a binder and a match pattern alike;
+    /// the one-slot by-name pattern is a tuple, every element named or none.
+    #[test]
+    fn b569_a_tuple_pattern_takes_labelled_elements() {
+        let (tree, errors) = parse("fun f() { let (y = top, x = left) = p; }");
+        assert!(errors.is_empty(), "{errors:?}");
+        let rendered = format!("{tree:?}");
+        assert!(rendered.contains("Labelled((\"y\""), "{rendered}");
+        assert_eq!(
+            program_errors(
+                "fun f() { match q { (x = 0, y = let v) => v, (x = let h, y = _) => h } }"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            program_errors("fun f() { let (x = only) = p; }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            program_errors("fun f() { for (y = b, x = a) in rows { } }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(program_errors("fun f() { let (x = a, b) = p; }").len(), 1);
+        assert_eq!(
+            program_errors("fun f() { let (x = a, x = b) = p; }").len(),
+            1
+        );
+        // A single parenthesized pattern without a label is still no tuple.
+        assert!(!program_errors("fun f() { let (a) = p; }").is_empty());
     }
 
     // --- Closures ------------------------------------------------------------

@@ -9013,6 +9013,12 @@ impl<'src> Printer<'src> {
                 }
                 self.out.push(']');
             }
+            // B569 S3: a by-name element, `y = top`.
+            Pattern::Labelled((label, _), inner) => {
+                self.out.push_str(label);
+                self.out.push_str(" = ");
+                self.print_binder(&inner.0);
+            }
             // A binder is only ever a name, a tuple, or an array of binders;
             // other pattern shapes can't reach here from the parser.
             other => self.print_pattern(other),
@@ -9094,6 +9100,12 @@ impl<'src> Printer<'src> {
                 self.out.push(']');
             }
             Pattern::Literal(literal) => self.print_expr(literal),
+            // B569 S3: a by-name element, `x = let v`.
+            Pattern::Labelled((label, _), inner) => {
+                self.out.push_str(label);
+                self.out.push_str(" = ");
+                self.print_match_pattern(inner);
+            }
         }
     }
 }

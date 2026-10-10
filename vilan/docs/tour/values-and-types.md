@@ -253,6 +253,8 @@ fun bounds(xs: List<i32>): (min: i32, max: i32) {
 fun main() {
 	let b = bounds([3, 1, 4, 1, 5]);
 	print(i"{b.min}..{b.max}");
+	let (max = top, min = bottom) = b;            // destructure by name
+	print(top - bottom);
 	let point: (x: f64, y: f64) = (y = 7, x = 5); // by name: (5, 7)
 	print(point.x);
 	print(point.0);                               // positions still work
@@ -265,7 +267,7 @@ refused is a label that would land at a *different* position —
 `(x: f64, y: f64)` into `(y: f64, x: f64)` — because nobody can tell
 whether that was a reorder or a swap; the error offers both rewrites.
 Every slot is labelled or none, and `(x = 5)` is a one-slot tuple whose
-label makes it one.
+label makes it one. `dbg` prints the labels too: `b = (min = 1, max = 5)`.
 
 Reach for a **struct** instead once the shape has an identity: it is named
 in more than one signature, it needs methods or derives, it crosses the

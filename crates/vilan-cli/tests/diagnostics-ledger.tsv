@@ -705,3 +705,6 @@ NEW	-	`{tuple_label}` has no label `{member_name}`; its labels are {labels}
 NEW	-	Expected {expected}, but got {got} instead: the label `{label}` names slot {from} of the value and slot {to} here, so the two do not convert — match by name, writing the labels out, or by position, dropping them
 NEW	-	{msg} `({label} = {value})` is a tuple with the label `{label}`; to assign, write `{label} = {value};`
 NEW	-	an `impl` cannot name a labelled tuple: labels name positions and are not an identity, so this impl would answer for every tuple of these slot types under any labels — declare a struct for a shape that has methods
+NEW	-	{head}: a by-name pattern names exactly its value's labels{tail}
+NEW	-	this pattern destructures by name, but `{rendered}` has no labels: destructure it by position, `(a, b)`
+NEW	-	this pattern destructures by name, so the value must be a labelled tuple, and it is `{rendered}`
