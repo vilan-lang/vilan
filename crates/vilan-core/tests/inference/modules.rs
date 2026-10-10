@@ -7771,3 +7771,28 @@ fn m130_one_home_stays_one_candidate() {
         assert_eq!(stdout, "done\n");
     }
 }
+
+// --- B574: a std trait whose derive macro shares its name -------------------
+
+/// B574: a miss of `Storable` got no import steer in ANY type position — a
+/// bound, an annotation — because std's import index read the derive MACRO
+/// `Storable` (`std::reactive::store`) and the TRAIT `Storable`
+/// (`store_core`) as two homes and dropped the name. A macro is its own
+/// namespace; the trait's home is the facade that re-exports it beside its
+/// derive.
+#[test]
+fn b574_a_trait_sharing_its_derives_name_gets_the_import_steer() {
+    let outcome = analyze_package(
+        &[(
+            "main.vl",
+            "fun keep<T: Storable>(value: T): T {\n\tvalue\n}\n\nfun main() {\n\tlet _kept = keep(1);\n}\n",
+        )],
+        "main.vl",
+    );
+    assert!(
+        outcome.diagnostics.iter().any(|(message, _, _)| message
+            == "cannot find type 'Storable'; import it first (`import std::reactive::store::Storable;`)"),
+        "{:?}",
+        outcome.diagnostics
+    );
+}

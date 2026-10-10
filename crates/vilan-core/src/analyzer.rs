@@ -6513,6 +6513,18 @@ fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>
     );
 }
 
+/// The MACROS among a module's declared names (B574's namespace split).
+fn collect_declared_macro_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>) {
+    let mut importables = Vec::new();
+    collect_importables(items, &mut importables);
+    out.extend(
+        importables
+            .iter()
+            .filter(|importable| importable.kind == ImportableKind::Macro)
+            .map(|importable| importable.name),
+    );
+}
+
 /// One `export import … as Alias;` a module publishes (B472).
 struct AliasReexport<'src> {
     alias: &'src str,
@@ -57626,6 +57638,8 @@ impl<'src> Analyzer<'src> {
         }
         let mut export_index: HashMap<String, String> = HashMap::default();
         let mut ambiguous_names: HashSet<String> = HashSet::default();
+        let mut macro_index: HashMap<String, String> = HashMap::default();
+        let mut ambiguous_macros: HashSet<String> = HashSet::default();
         let mut method_index: HashMap<(String, String), (String, String)> = HashMap::default();
         let mut ambiguous_methods: HashSet<(String, String)> = HashSet::default();
         let mut deprecated_aliases: HashMap<String, (String, String)> = HashMap::default();
@@ -57649,7 +57663,34 @@ impl<'src> Analyzer<'src> {
             };
             let mut names = Vec::new();
             collect_declared_names(&loaded.ast.0, &mut names);
-            for declared in &names {
+            // B574: a MACRO lives in its own namespace (macro-engine.md §4),
+            // so a derive that shares its trait's name in another module is no
+            // second home for the name: the macro `Storable` in
+            // `std::reactive::store` beside the trait `Storable` in
+            // `store_core` made the name ambiguous here, and every type-position
+            // miss of `Storable` — a bound, an annotation — went without its
+            // import steer. Items index first; a macro indexes only a name no
+            // item declares.
+            let mut macro_names = Vec::new();
+            collect_declared_macro_names(&loaded.ast.0, &mut macro_names);
+            for declared in &macro_names {
+                match macro_index.get(*declared) {
+                    Some(existing) if existing == module_name => {}
+                    Some(_) => {
+                        ambiguous_macros.insert(declared.to_string());
+                    }
+                    None => {
+                        macro_index.insert(declared.to_string(), module_name.clone());
+                    }
+                }
+            }
+            let mut item_names = names.clone();
+            for declared in &macro_names {
+                if let Some(position) = item_names.iter().position(|name| name == declared) {
+                    item_names.remove(position);
+                }
+            }
+            for declared in &item_names {
                 match export_index.get(*declared) {
                     Some(existing) if existing == module_name => {}
                     Some(_) => {
@@ -57718,8 +57759,16 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
-        for name in ambiguous_names {
-            export_index.remove(&name);
+        for name in &ambiguous_names {
+            export_index.remove(name);
+        }
+        for name in ambiguous_macros {
+            macro_index.remove(&name);
+        }
+        for (name, module) in macro_index {
+            if !ambiguous_names.contains(&name) {
+                export_index.entry(name).or_insert(module);
+            }
         }
         for key in ambiguous_methods {
             method_index.remove(&key);
