@@ -3332,6 +3332,8 @@ fn handle_spelling(returned: &Node) -> Option<&'static str> {
         ("KeyedCell", 2) => Some("KeyedCell"),
         ("HashMapEntry", 2) => Some("HashMapEntry"),
         ("MemoEntry", 2) => Some("MemoEntry"),
+        ("Store", 1) => Some("Store"),
+        ("StoreSome", 1) => Some("StoreSome"),
         _ => None,
     }
 }

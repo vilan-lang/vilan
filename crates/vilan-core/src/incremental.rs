@@ -193,6 +193,14 @@ pub enum Plant {
     /// the world declarations it reaches — an edited callee is then served
     /// stale.
     ConstKeyWithoutWorld,
+    /// S2a: the bound audit skips a reused module's sites but RECORDS nothing
+    /// for them — a prefix module's bound refusal is then dropped on the hit.
+    BoundAuditUnrecorded,
+    /// S2a: a module's recorded audit is replayed without asking whether an
+    /// impl that arrived after the stored world answers one of its questions
+    /// — an impl moved in a hot module then leaves the prefix's old verdict
+    /// in place.
+    BoundRecordUnguarded,
 }
 
 impl Plant {
@@ -205,6 +213,8 @@ impl Plant {
             Plant::UseInferredGuardOff => 6,
             Plant::ConstCacheUnvalidated => 7,
             Plant::ConstKeyWithoutWorld => 8,
+            Plant::BoundAuditUnrecorded => 9,
+            Plant::BoundRecordUnguarded => 10,
         }
     }
 }
@@ -267,6 +277,11 @@ pub struct Census {
     /// zero when no late file writes an impl on a type it does not declare
     /// (`analyzer::ReachFilter`), and on every base-cache hit.
     pub reach_questions: u64,
+    /// M110 S2a: the bound audit's call sites this analysis SERVED from a
+    /// reused module's record (skipped, their verdicts replayed) and the ones
+    /// it CHECKED.
+    pub bound_sites_served: u64,
+    pub bound_sites_checked: u64,
 }
 
 thread_local! {
@@ -286,6 +301,8 @@ thread_local! {
             const_cache_hits: 0,
             const_cache_misses: 0,
             reach_questions: 0,
+            bound_sites_served: 0,
+            bound_sites_checked: 0,
         })
     };
 }
@@ -639,7 +656,8 @@ pub fn report(program: &Program) {
         eprintln!(
             "[vilan counters] incremental base-hits={} base-misses={} base-stores={} \
              hot-world={} sources-walked={} records-replayed={} functions-checked={} \
-             const-hits={} const-misses={} reach-questions={}",
+             const-hits={} const-misses={} reach-questions={} bound-sites-served={} \
+             bound-sites-checked={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -650,6 +668,8 @@ pub fn report(program: &Program) {
             census.const_cache_hits,
             census.const_cache_misses,
             census.reach_questions,
+            census.bound_sites_served,
+            census.bound_sites_checked,
         );
     }
 }
