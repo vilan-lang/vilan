@@ -12332,3 +12332,55 @@ fn parallel_legs_answer_in_order_and_resume_a_legs_panic() {
         "the leg's own message: {message:?}"
     );
 }
+
+/// B588: a parameter whose TUPLE bound sits inside a tuple blanket's subject
+/// bound (`T: (2..: PartialEq)`, std's `impl type T: (2..: PartialEq) with
+/// PartialEq`) is `PartialEq` abstractly, and each instance dispatches on its
+/// own: a user's `impl (i32, i32) with PartialEq` answers at its instance, the
+/// blanket at the others, and `(2..: Hashable)` keys a map — on both backends.
+#[test]
+fn a_tuple_bound_inside_a_tuple_blanket_dispatches_per_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b588.vl"),
+        r#"import std::io::print;
+import std::compare::PartialEq;
+import std::hash::Hashable;
+import std::hash_map::HashMap;
+import std::option::Option;
+
+impl (i32, i32) with PartialEq {
+    fun eq(self, other: (i32, i32)): bool {
+        true
+    }
+}
+
+fun same<U: PartialEq>(a: U, b: U): bool {
+    a == b
+}
+
+fun all_eq<T: (2..: PartialEq)>(values: T, other: T): bool {
+    same(values, other) && !(values != other) && values.eq(other)
+}
+
+fun count<K: (2..: Hashable)>(key: K): i32 {
+    mut counts: HashMap<K, i32> = HashMap::new();
+    counts.insert(key, 7);
+    counts.get(key).unwrap_or(0)
+}
+
+fun main() {
+    print(all_eq((1, "a"), (1, "a")));
+    print(all_eq((1, 2, 3), (1, 2, 4)));
+    print(all_eq((1, 2), (1, 3)));
+    print(count((1, "a")));
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b588.vl"),
+        Verdict::Identical,
+        "a tuple-bounded parameter dispatches its blanket's trait per instance on both backends"
+    );
+}

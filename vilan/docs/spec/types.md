@@ -1249,6 +1249,17 @@ position satisfies it only through its own declared tuple bound: a
 contained arity range whose element bound names the same trait or a
 subtrait.
 
+A tuple bound also **declares** the trait of a blanket written over a
+tuple bound that contains it — by the same containment, a range inside
+the blanket's and an element bound naming its trait or a subtrait. Over
+std's `impl type T: (2..: PartialEq) with PartialEq`, a parameter `T:
+(2..: PartialEq)` is `PartialEq`: two `T`s compare with `==`, and a
+callee bounded `U: PartialEq` takes one. The containment is a proof about
+every instantiation, not an impl search, so an abstract value's declared
+bounds stay its only answer (§5.4); and the dispatch stays per instance —
+at `T = (i32, i32)` a program's own `impl (i32, i32) with PartialEq`
+outranks the blanket (B588).
+
 A **spread parameter** `...items: T` is a *call convention* over an
 ordinary tuple parameter — the call site writes the pack's elements out
 flat, and they are collected into that one tuple argument:

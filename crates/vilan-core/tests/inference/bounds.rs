@@ -14516,3 +14516,113 @@ fn m123_a_no_under_an_outer_cycle_is_not_remembered() {
         );
     }
 }
+
+// --- B588: a tuple bound inside a tuple blanket's subject bound is declared ---
+
+/// B588 (RULED 2026-10-09): `T: (2..: PartialEq)` sits inside std's
+/// `impl type T: (2..: PartialEq) with PartialEq`, and that containment is a
+/// proof about every instantiation — a DECLARED bound under B173. So `==`,
+/// `!=` and `.eq` on two `T`s dispatch through it, a callee asking
+/// `U: PartialEq` of a `T` is satisfied, and `T: (2..: Hashable)` keys a map.
+/// Each was refused "`T` is unbounded".
+#[test]
+fn b588_a_tuple_bound_inside_a_tuple_blanket_is_a_declared_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+        import std::hash::Hashable;
+        import std::hash_map::HashMap;
+        import std::option::Option;
+
+        fun same<U: PartialEq>(a: U, b: U): bool {
+            a == b
+        }
+
+        fun all_eq<T: (2..: PartialEq)>(values: T, other: T): bool {
+            values == other && !(values != other) && values.eq(other) && same(values, other)
+        }
+
+        fun count<K: (2..: Hashable)>(key: K): i32 {
+            mut counts: HashMap<K, i32> = HashMap::new();
+            counts.insert(key, 7);
+            counts.get(key).unwrap_or(0)
+        }
+
+        fun main() {
+            print(all_eq((1, "a"), (1, "a")));
+            print(all_eq((1, 2, 3), (1, 2, 4)));
+            print(count((1, "a")));
+        }
+        "#,
+        "true\nfalse\n7\n",
+    );
+}
+
+/// B588's other half of the ruling: the DISPATCH stays per instance. A user's
+/// `impl (i32, i32) with PartialEq` outranks the blanket at that instance, so
+/// the abstract call reaches it there and the blanket everywhere else.
+#[test]
+fn b588_the_dispatch_through_a_tuple_bound_stays_per_instance() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        impl (i32, i32) with PartialEq {
+            fun eq(self, other: (i32, i32)): bool {
+                true
+            }
+        }
+
+        fun all_eq<T: (2..: PartialEq)>(values: T, other: T): bool {
+            values == other
+        }
+
+        fun main() {
+            print(all_eq((1, 2), (1, 3)));
+            print(all_eq((1, "a"), (1, "b")));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+/// B588's boundary: only CONTAINMENT declares. An arity range the blanket's
+/// does not contain (`(1..)` against `(2..)`), a tuple bound with no element
+/// bound, and an element bound that is not the blanket's trait stay refused;
+/// so does a right operand that is not `T` (B233: `eq` takes `T`).
+#[test]
+fn b588_a_tuple_bound_the_blanket_does_not_contain_stays_refused() {
+    for (bound, operand, refusal) in [
+        (
+            "(1..: PartialEq)",
+            "other",
+            "`T`'s tuple bound sits inside no blanket over a tuple bound that provides `eq`",
+        ),
+        ("(2..)", "other", "its bounds (`Tuple`) do not declare `eq`"),
+        (
+            "(2..: Display)",
+            "other",
+            "its bounds (`Tuple`) do not declare `eq`",
+        ),
+        ("(2..: PartialEq)", "5", "but the right operand is `i32`"),
+    ] {
+        let source = format!(
+            r#"
+            import std::io::print;
+            import std::compare::PartialEq;
+            import std::display::Display;
+
+            fun all_eq<T: {bound}>(values: T, other: T): bool {{
+                values == {operand}
+            }}
+
+            fun main() {{
+                print(all_eq((1, 2), (1, 2)));
+            }}
+            "#
+        );
+        assert_fails_with(&source, refusal);
+    }
+}

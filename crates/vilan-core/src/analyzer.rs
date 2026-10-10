@@ -8028,14 +8028,10 @@ impl<'src> Analyzer<'src> {
         // where the question has a real answer, so the concrete check is the one
         // that counts and the declared bound is what an abstract call may lean
         // on. The refusal below is the promise; declaring the bound is the fix.
+        // B588: a tuple bound contained in a tuple blanket's is declared too
+        // (`generic_bound_carries_trait` reads both).
         if let Type::Generic(inner_constraint_id) = value_type {
-            return self
-                .generic_bound_trait_ids(*inner_constraint_id)
-                .iter()
-                .any(|declared| {
-                    self.trait_with_supertraits(*declared)
-                        .contains(&required_trait_id)
-                });
+            return self.generic_bound_carries_trait(*inner_constraint_id, required_trait_id);
         }
         // A124 R3: a trait OBJECT satisfies the trait it was erased to and that
         // trait's supertraits — at the arguments the object carries, threaded
@@ -24453,8 +24449,10 @@ impl<'src> Analyzer<'src> {
         if !left_rigid || !right_admissible {
             return false;
         }
-        let Some((member_id, declaring_trait_id, declaring_arguments)) = self
-            .generic_bound_traits(constraint_id)
+        let mut bound_traits = self.generic_bound_traits(constraint_id);
+        // B588: a tuple blanket's trait, at the arguments it provides at `T`.
+        bound_traits.extend(self.tuple_blanket_traits(constraint_id));
+        let Some((member_id, declaring_trait_id, declaring_arguments)) = bound_traits
             .into_iter()
             .find_map(|(trait_id, trait_arguments)| {
                 self.method_member_in_trait_at(trait_id, &trait_arguments, method_name)
@@ -36875,10 +36873,107 @@ impl<'src> Analyzer<'src> {
     fn generic_bound_carries_trait(&self, constraint_id: TypeId, required_trait_id: Id) -> bool {
         self.generic_bound_trait_ids(constraint_id)
             .iter()
+            .chain(self.tuple_blanket_trait_ids(constraint_id).iter())
             .any(|declared| {
                 self.trait_with_supertraits(*declared)
                     .contains(&required_trait_id)
             })
+    }
+
+    /// B588 (RULED 2026-10-09): the traits a parameter's TUPLE bound declares
+    /// through a blanket written over a tuple bound. `T: (2..: PartialEq)`
+    /// sits inside std's `impl type U: (2..: PartialEq) with PartialEq`, and
+    /// that containment is a proof about every instantiation of `T` — not an
+    /// impl search B173 refuses (a blanket a more specific impl could
+    /// outrank at abstract time), so it counts as a DECLARED bound: an
+    /// abstract `T` value is `PartialEq`, `values == other` dispatches through
+    /// it, and a callee asking `PartialEq` of it is satisfied. Dispatch stays
+    /// per instance — the call is recorded `OnConstraint` and re-resolved at
+    /// each monomorphization, where a user's `impl (i32, i32) with PartialEq`
+    /// still outranks the blanket.
+    ///
+    /// A blanket counts when its subject is a binder carrying a tuple bound
+    /// that `T`'s entails (`tuple_family_entails`: a contained arity range, an
+    /// element bound that is the same trait or a subtrait) and every trait
+    /// bound the binder writes beside it is one `T` declares. Empty for a
+    /// parameter with no tuple bound — every parameter but a handful.
+    fn tuple_blanket_trait_ids(&self, constraint_id: TypeId) -> Vec<Id> {
+        self.tuple_blanket_rows(constraint_id)
+            .into_iter()
+            .flat_map(|index| self.implementations[index].trait_ids.clone())
+            .collect()
+    }
+
+    /// The blankets [`Self::tuple_blanket_trait_ids`] reads, by index.
+    fn tuple_blanket_rows(&self, constraint_id: TypeId) -> Vec<usize> {
+        if !self.tuple_bounds.contains_key(&constraint_id) {
+            return Vec::new();
+        }
+        let family = Type::Generic(constraint_id);
+        self.implementations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, implementation)| {
+                let Type::Generic(binder) = self.borrow_type_by_type_id(implementation.subject)
+                else {
+                    return None;
+                };
+                let requirement = self.tuple_bounds.get(binder)?;
+                if *binder == constraint_id || !self.tuple_family_entails(&family, requirement) {
+                    return None;
+                }
+                let declared = self.generic_bound_trait_ids(constraint_id);
+                self.generic_bound_trait_ids(*binder)
+                    .iter()
+                    .all(|required| {
+                        declared.iter().any(|declared| {
+                            self.trait_with_supertraits(*declared).contains(required)
+                        })
+                    })
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    /// [`Self::tuple_blanket_trait_ids`] with each trait's arguments as the
+    /// blanket provides them AT `T` — the blanket's binder read as `T`, a
+    /// defaulted `= Self` argument as `T` itself (`PartialEq<T>`).
+    fn tuple_blanket_traits(&mut self, constraint_id: TypeId) -> Vec<(Id, Vec<TypeId>)> {
+        let mut provided = Vec::new();
+        for index in self.tuple_blanket_rows(constraint_id) {
+            let implementation = &self.implementations[index];
+            let subject = implementation.subject;
+            let clauses: Vec<(Id, Vec<TypeId>)> = implementation
+                .trait_ids
+                .iter()
+                .map(|trait_id| {
+                    let written = implementation
+                        .trait_args
+                        .iter()
+                        .find(|(id, _)| id == trait_id)
+                        .map(|(_, arguments)| arguments.clone())
+                        .unwrap_or_default();
+                    (*trait_id, written)
+                })
+                .collect();
+            let Type::Generic(binder) = subject.get_type(self) else {
+                continue;
+            };
+            let mut bindings: SubstitutionContext = HashMap::default();
+            bindings.insert(binder, Type::Generic(constraint_id).get_type_id(self));
+            for (trait_id, written) in clauses {
+                let arguments = self
+                    .effective_trait_arguments_of(trait_id, &written, subject)
+                    .into_iter()
+                    .map(|argument| {
+                        let argument = argument.get_type(self);
+                        self.substitute_type(&argument, &bindings).get_type_id(self)
+                    })
+                    .collect();
+                provided.push((trait_id, arguments));
+            }
+        }
+        provided
     }
 
     /// The bound traits of a generic parameter as `(trait id, trait arguments)` — like
@@ -66092,7 +66187,14 @@ impl<'src> Analyzer<'src> {
             // receiver, recorded in the same `generic_dispatch` channel.
             if let Type::Generic(constraint_id) = lhs_type {
                 if let Some((_, method_name)) = operator_trait_method(op) {
-                    let bound_trait_ids = self.generic_bound_trait_ids(constraint_id);
+                    let mut bound_trait_ids = self.generic_bound_trait_ids(constraint_id);
+                    // B588: and what its tuple bound declares through a tuple
+                    // blanket (`T: (2..: PartialEq)` is `PartialEq`).
+                    for trait_id in self.tuple_blanket_trait_ids(constraint_id) {
+                        if !bound_trait_ids.contains(&trait_id) {
+                            bound_trait_ids.push(trait_id);
+                        }
+                    }
                     let provides = bound_trait_ids.iter().any(|trait_id| {
                         self.method_member_in_trait(*trait_id, method_name)
                             .is_some()
@@ -66181,7 +66283,16 @@ impl<'src> Analyzer<'src> {
                         let label = self.pretty_print_type(&lhs_type, &HashMap::default());
                         let (trait_name, _) =
                             operator_trait_method(op).expect("matched just above");
-                        let promise = if bound_trait_ids.is_empty() {
+                        let promise = if bound_trait_ids.is_empty()
+                            && self.tuple_bounds.contains_key(&constraint_id)
+                        {
+                            // B588: a tuple bound is a bound, and it declares
+                            // a trait only through a tuple blanket it sits in.
+                            format!(
+                                "`{label}`'s tuple bound sits inside no blanket over a tuple \
+                                 bound that provides `{method_name}`"
+                            )
+                        } else if bound_trait_ids.is_empty() {
                             format!("`{label}` is unbounded")
                         } else {
                             let bounds = bound_trait_ids
