@@ -107,7 +107,15 @@ import pkg::reactive::store_core::{
 	touch_spine,
 	watch_at,
 };
-import pkg::reactive::{ Signal, Source, Subscriber, Subscription, also_releasing };
+import pkg::reactive::{
+	Signal,
+	SignalCell,
+	Source,
+	Subscriber,
+	Subscription,
+	also_releasing,
+	turn_scope,
+};
 import pkg::shared::{ Shared, fresh_identity };
 import pkg::wire::{ Deserialize, Deserializer, Keyed, Serialize, Serializer, Wire };
 
@@ -125,6 +133,7 @@ export import pkg::reactive::store_core::{
 	StoreStep,
 	StoreTouch,
 	StoreWoken,
+	WireWrite,
 	store_census,
 	store_feed_census,
 	store_has_me,
@@ -423,7 +432,8 @@ fun splice_at<T: Storable + StoreKey>(
 	if !reached || !changed {
 		ret;
 	}
-	store_touch(node, StoreTouch::Span(start, taking, inserted.len()), &mut woken);
+	let arriving = inserted.len();
+	store_touch(node, StoreTouch::Span(start, taking, arriving), &mut woken);
 	touch_spine(found.touches, &mut woken);
 	for feed in woken.feeds {
 		(feed.before)();
@@ -449,7 +459,7 @@ fun splice_at<T: Storable + StoreKey>(
 		woken.slots.push(slot);
 	}
 	match found.wire {
-		Some(let log) => log.record(path),
+		Some(let log) => log.record(WireWrite { path, splice = Some((start, taking, arriving)) }),
 		None => {},
 	}
 	deliver(woken.slots);
@@ -825,6 +835,17 @@ export impl Store<HashSet<type T: Hashable>> {
 }
 
 export impl StoreSome<HashSet<type T: Hashable>> {
+	/// `member` joins the set while every variant on the path is live —
+	/// `contains(member).patch(true)`: whether it landed.
+	fun insert(self, member: T): bool {
+		self.contains(member).patch(true)
+	}
+
+	/// `member` leaves the set — `contains(member).patch(false)`.
+	fun remove(self, member: T): bool {
+		self.contains(member).patch(false)
+	}
+
 	fun contains(self, member: T): StoreSome<bool> {
 		self.descend(StoreStep::Key(member.hash()), |held: &HashSet<T>, f: |&bool| void| {
 			let present = held.contains(member);
@@ -1300,7 +1321,21 @@ export impl HashMap<type K: Hashable + Wire, type V: StoreWire> with StoreWire {
 				let value = value_at(self, hash);
 				value.store_describe_at(path, from + 1, serializer, write)
 			},
-			StoreStep::Field(let _index) => StoreReach::Absent,
+			// The map's KEY SET (S3): what a key-set slot is seeded and reset with.
+			StoreStep::Field(let index) => {
+				if index != KEY_SET || from + 1 != path.len() {
+					ret StoreReach::Absent;
+				}
+				if write {
+					let keys = self.keys();
+					serializer.begin_list(keys.len().as_i32());
+					for key in keys {
+						key.describe(serializer);
+					}
+					serializer.end_list();
+				}
+				StoreReach::Described
+			},
 		}
 	}
 
@@ -1359,7 +1394,21 @@ export impl HashSet<type T: Hashable + Wire> with StoreWire {
 				let present = self.table.contains_key(hash);
 				present.store_describe_at(path, from + 1, serializer, write)
 			},
-			StoreStep::Field(let _index) => StoreReach::Absent,
+			// The set's MEMBERS as a key set (S3).
+			StoreStep::Field(let index) => {
+				if index != KEY_SET || from + 1 != path.len() {
+					ret StoreReach::Absent;
+				}
+				if write {
+					let members = self.values();
+					serializer.begin_list(members.len().as_i32());
+					for member in members {
+						member.describe(serializer);
+					}
+					serializer.end_list();
+				}
+				StoreReach::Described
+			},
 		}
 	}
 
@@ -1395,9 +1444,34 @@ export impl HashSet<type T: Hashable + Wire> with StoreWire {
 	}
 }
 
+/// The step after a map or a set that names its KEY SET in a wire walk (S3): never
+/// a subscription path's — `store_read_path` stops at the collection — only the
+/// forward's own walk to describe a key-set slot.
+let KEY_SET: usize = 0;
+
+/// The two steps after a list in a wire walk that name a SPAN of it (S3),
+/// `[Field(start), Field(count)]`: never a subscription path's (a position is not
+/// an address, Q11) — only a forward describing what a `Seq` op inserts, and a
+/// replica landing it.
+fun list_span(path: &List<StoreStep>, from: usize): Option<(usize, usize)> {
+	if from + 2 != path.len() {
+		ret None;
+	}
+	match path[from] {
+		StoreStep::Field(let start) => match path[from + 1] {
+			StoreStep::Field(let count) => Some((start, count)),
+			StoreStep::Key(let _hash) => None,
+		},
+		StoreStep::Key(let _hash) => None,
+	}
+}
+
 /// A list is a sequence INSIDE its boundary: described element by element, and no
 /// subscription stands below it (a position is not an address, Q11; a `by_key`
-/// element crosses with its list).
+/// element crosses with its list). Its change crosses as a SPLICE (`Seq`, S3): a
+/// span `[start, count]` below it is what a forward describes for the elements a
+/// splice inserted, and what a replica lands one at — `count` read as the number of
+/// elements the splice removed there, the inserted ones arriving as a list.
 export impl List<type T: StoreWire> with StoreWire {
 	fun store_describe_at(
 		&self,
@@ -1406,6 +1480,24 @@ export impl List<type T: StoreWire> with StoreWire {
 		serializer: &mut Serializer,
 		write: bool,
 	): StoreReach {
+		match list_span(path, from) {
+			Some(let span) => {
+				let (start, count) = span;
+				let first = splice_start(self.len(), start);
+				let taking = splice_count(self.len(), first, count);
+				if write {
+					serializer.begin_list(taking.as_i32());
+					mut index: usize = 0;
+					for index < taking {
+						let _described = self[first + index].store_describe_at(path, path.len(), serializer, true);
+						index += 1;
+					}
+					serializer.end_list();
+				}
+				ret StoreReach::Described;
+			},
+			None => {},
+		}
 		if from != path.len() {
 			ret StoreReach::Absent;
 		}
@@ -1425,6 +1517,17 @@ export impl List<type T: StoreWire> with StoreWire {
 		from: usize,
 		deserializer: &mut Deserializer,
 	): StoreReach {
+		match list_span(path, from) {
+			Some(let span) => {
+				let (start, removed) = span;
+				let inserted = List<T>::store_fresh(deserializer);
+				let first = splice_start(self.len(), start);
+				let taking = splice_count(self.len(), first, removed);
+				let _op = splice_in_place(&mut self, first, taking, inserted);
+				ret StoreReach::Described;
+			},
+			None => {},
+		}
 		if from != path.len() {
 			ret StoreReach::Absent;
 		}
@@ -1481,18 +1584,53 @@ export enum MirrorStep {
 /// grant's base, the identity of its place in the replica (two handles on one
 /// boundary share one slot), and how a frame for its slot lands — `apply` at a path
 /// below it, `gone` when the server says it is no longer reachable.
+///
+/// Both land in the CALLER's turn (`context turn_scope`): a closure otherwise
+/// writes in the turn it was made in, and a frame's ops — made by handles built
+/// long before the frame — must land as ONE turn, so the replica's subscribers see
+/// one consistent state (§5).
 export struct MirrorBoundary {
 	path: List<MirrorStep>,
 	identity: i32,
-	apply: |List<StoreStep>, Deserializer| void,
-	gone: || void,
+	/// Its place in the REPLICA: the boundary's value lives at this path, and a
+	/// boundary held below it keeps it there (a released key's value stays while a
+	/// member or a key inside it is still watched).
+	place: List<StoreStep>,
+	apply: (|List<StoreStep>, Deserializer| void) context turn_scope,
+	gone: (|| void) context turn_scope,
 }
 
-/// The connection a remote handle subscribes through, erased to what a handle
-/// needs from it: hold a boundary, answer the release. Made by `std::rpc::mirror`,
-/// which owns the channel, its slots and its frames.
+/// The connection a remote handle subscribes through, erased to what a handle needs
+/// from it: hold a boundary and answer the release, and say what the wire has told
+/// it about a boundary, by the boundary's identity — once (`known`), or as a cell
+/// that moves when that answer does (`follow`, what a handle's `states()` binds
+/// beside its value; kept while the boundary is held). `heard` moves whenever any
+/// answer may have. Made by `std::rpc::mirror`, which owns the channel, its slots
+/// and its frames.
 export struct MirrorLink {
 	hold: |MirrorBoundary| (|| void),
+	known: |i32| MirrorKnown,
+	follow: |i32| SignalCell<MirrorKnown>,
+	heard: SignalCell<i32>,
+}
+
+/// What the wire has told a remote handle's mint about one of its boundaries (A153
+/// S2): what `states()` reads beside the replica's value, to tell a value on its
+/// way from one that is not there.
+[derive(Debug, PartialEq)]
+export enum MirrorKnown {
+	/// Nothing yet in this binding: the minting call is out, or the boundary's
+	/// `Subscribe` is — the replica's value, if it holds one, is the last one it
+	/// was told.
+	Waiting,
+	/// The boundary has been seeded (or told it is gone): the replica's value is
+	/// the server's.
+	Heard,
+	/// The connection is down: the replica keeps its last value, and a refresh is
+	/// owed (§7).
+	Down,
+	/// The minting call failed; the next hold asks again.
+	Failed,
 }
 
 /// Where a remote handle hangs: the link, its wire path from the grant's base, and
@@ -1525,11 +1663,12 @@ impl MirrorAt {
 export fun mirror_boundary<T: StoreWire + Storable>(
 	local: Store<T>,
 	path: List<MirrorStep>,
-	gone: || void,
+	gone: (|| void) context turn_scope,
 ): MirrorBoundary {
 	MirrorBoundary {
 		path,
 		identity = store_identity_at(local.root, local.path),
+		place = local.path,
 		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 			mut reader = deserializer;
 			mut copy = local.get();
@@ -1675,22 +1814,182 @@ export impl RemoteStoreSome<HashMap<type K: Hashable + Wire, type V: StoreWire +
 			at = MirrorAt {
 				link = at.link,
 				path = at.path,
-				boundary = mirror_boundary_some(local, at.path),
+				boundary = mirror_boundary_some(local, at.path, || {
+					let _patched = local.patch(None);
+				}),
 			},
 		}
 	}
 }
 
+/// A set's member is a BOUNDARY (§2.2 point 2): `contains(member)` on a remote set
+/// is a handle whose subscription puts that member's own slot on the wire, seeded
+/// with whether the set holds it (A168).
+export impl RemoteStore<HashSet<type T: Hashable + Wire>> {
+	fun contains(self, member: T): RemoteStore<bool> {
+		let local = self.local.contains(member);
+		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| member.describe(serializer)));
+		RemoteStore {
+			local,
+			at = MirrorAt {
+				link = at.link,
+				path = at.path,
+				boundary = mirror_boundary(local, at.path, || local.set(false)),
+			},
+		}
+	}
+}
+
+export impl RemoteStoreSome<HashSet<type T: Hashable + Wire>> {
+	/// The set's members as a key set (S3).
+	fun keys(self): RemoteStoreKeys<T> {
+		remote_keys(self.local.path, self.at)
+	}
+
+	fun contains(self, member: T): RemoteStoreSome<bool> {
+		let local = self.local.contains(member);
+		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| member.describe(serializer)));
+		RemoteStoreSome {
+			local,
+			at = MirrorAt {
+				link = at.link,
+				path = at.path,
+				boundary = mirror_boundary_some(local, at.path, || {
+					let _patched = local.patch(false);
+				}),
+			},
+		}
+	}
+}
+
+/// A map's or a set's KEY SET on the wire (§2.2 point 3, S3): what `keys()` answers
+/// on a remote map — a `Source<List<K>>` fed by `Keys` ops, which `each_by` takes
+/// as it takes any list (`each_by(g.channels().keys(), |id| id, |id| ..)` is the
+/// remote map leased as a collection: its keys, then each row's `at(id)`). Empty
+/// until its slot's first `Keys` op lands. Its slot is its own: two `keys()` calls
+/// are two slots, one handle subscribed many times is one.
+[hint(Source<List<K>>)]
+export struct RemoteStoreKeys<K> {
+	[internal("the keys the wire last said")] keys: SignalCell<List<K>>,
+	[internal("where the handle hangs on the wire")] at: MirrorAt,
+}
+
+/// The key-set handle under `at`, a map's or a set's place on the wire.
+fun remote_keys<K: Hashable + Wire>(place: List<StoreStep>, at: MirrorAt): RemoteStoreKeys<K> {
+	mut keyset = place;
+	keyset.push(StoreStep::Field(KEY_SET));
+	let keys: SignalCell<List<K>> = SignalCell::new([]);
+	RemoteStoreKeys {
+		keys,
+		at = MirrorAt {
+			link = at.link,
+			path = at.path,
+			boundary = MirrorBoundary {
+				path = at.path,
+				identity = keys.identity().unwrap_or(0 - 1),
+				place = keyset,
+				apply = |_rel: List<StoreStep>, deserializer: Deserializer| {
+					mut reader = deserializer;
+					let tag = reader.variant_tag();
+					if tag != "Reset" {
+						ret;
+					}
+					reader.begin_variant(tag, 1);
+					let length = reader.begin_list();
+					mut landed: List<K> = [];
+					mut index = 0;
+					for index < length {
+						landed.push(K::rebuild(&mut reader));
+						index += 1;
+					}
+					reader.end_list();
+					reader.end_variant();
+					// A reset that names the keys already held moves nothing.
+					if !same_keys(keys.get(), landed) {
+						keys.set(landed);
+					}
+				},
+				gone = || {
+					if !keys.get().is_empty() {
+						keys.set([]);
+					}
+				},
+			},
+		},
+	}
+}
+
+fun same_keys<K: Hashable>(held: List<K>, landed: List<K>): bool {
+	if held.len() != landed.len() {
+		ret false;
+	}
+	mut index: usize = 0;
+	for index < held.len() {
+		if held[index].hash() != landed[index].hash() {
+			ret false;
+		}
+		index += 1;
+	}
+	true
+}
+
+export impl RemoteStore<HashMap<type K: Hashable + Wire, type V: StoreWire + Storable>> {
+	/// The map's key set, on its own slot (S3).
+	fun keys(self): RemoteStoreKeys<K> {
+		remote_keys(self.local.path, self.at)
+	}
+}
+
+export impl RemoteStoreSome<HashMap<type K: Hashable + Wire, type V: StoreWire + Storable>> {
+	fun keys(self): RemoteStoreKeys<K> {
+		remote_keys(self.local.path, self.at)
+	}
+}
+
+/// A set's members as a key set (S3).
+export impl RemoteStore<HashSet<type T: Hashable + Wire>> {
+	fun keys(self): RemoteStoreKeys<T> {
+		remote_keys(self.local.path, self.at)
+	}
+}
+
+export impl RemoteStoreKeys<type K> with Source<List<K>> {
+	fun get(self): List<K> {
+		self.keys.get()
+	}
+
+	fun identity(self): Option<i32> {
+		self.keys.identity()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		let handle = self.keys.on_settle(subscriber);
+		self.at.hold_for(handle);
+		handle
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |List<K>| void, immediately: bool): Subscription {
+		let handle = self.keys.attach_observer(observer, immediately);
+		self.at.hold_for(handle);
+		handle
+	}
+}
+
 /// `mirror_boundary` for a boundary reached through a variant: the frame lands
-/// through `patch`, and lands nowhere while the variant is not live.
+/// through `patch`, and lands nowhere while the variant is not live; `gone` is what
+/// the boundary reads when the server says it is not there.
 [internal("the mirrored store's client half (A153 S2)")]
 export fun mirror_boundary_some<P: StoreWire + Storable>(
-	local: StoreSome<Option<P>>,
+	local: StoreSome<P>,
 	path: List<MirrorStep>,
+	gone: (|| void) context turn_scope,
 ): MirrorBoundary {
 	MirrorBoundary {
 		path,
 		identity = store_identity_at(local.root, local.path),
+		place = local.path,
 		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 			mut reader = deserializer;
 			match local.get() {
@@ -1702,9 +2001,7 @@ export fun mirror_boundary_some<P: StoreWire + Storable>(
 				None => {},
 			}
 		},
-		gone = || {
-			let _patched = local.patch(None);
-		},
+		gone,
 	}
 }
 

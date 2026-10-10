@@ -94,17 +94,27 @@ export struct StoreWoken {
 /// the table hangs off the one node that never goes. Every other node's is `None`.
 ///
 /// And, while a WIRE forward stands on the store (A153 S1, `mirrored-store.md`
-/// §4.1), the root's `wire` log: the path of every write that changed something,
-/// which each mirrored connection reads past its own cursor when its turn settles.
-/// Made by the first forward and dropped with the last, so a store nobody mirrors
-/// records nothing.
+/// §4.1), the root's `wire` log: every write that changed something, which each
+/// mirrored connection reads past its own cursor when its turn settles. Made by
+/// the first forward and dropped with the last, so a store nobody mirrors records
+/// nothing.
 export struct StoreNode {
 	me: Option<StoreSlot>,
 	kids: List<Option<Shared<StoreNode>>>,
 	keyed: Option<Shared<NativeMap<Shared<StoreNode>>>>,
 	feeds: List<StoreFeed>,
 	ids: Option<NativeMap<i32>>,
-	wire: Option<DeltaLog<List<StoreStep>>>,
+	wire: Option<DeltaLog<WireWrite>>,
+}
+
+/// One write the wire log keeps (A153 S1, S3): the path it wrote, and — for a
+/// sequence write — the splice it made there, `(start, removed, inserted)` in the
+/// list's positions as they were when it ran, so a forward can send the list's
+/// change as a `Seq` op rather than the list again (§3.2).
+[internal("the mirrored store's write log (A153 S3)")]
+export struct WireWrite {
+	path: List<StoreStep>,
+	splice: Option<(usize, usize, usize)>,
 }
 
 fun empty_node(): Shared<StoreNode> {
@@ -362,7 +372,7 @@ export struct Spine {
 	touches: List<(StoreFeed, StoreTouch)>,
 	node: Option<Shared<StoreNode>>,
 	/// The root's wire log, while a mirror forward stands on the store.
-	wire: Option<DeltaLog<List<StoreStep>>>,
+	wire: Option<DeltaLog<WireWrite>>,
 }
 
 [internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
@@ -467,7 +477,7 @@ export fun store_watch(
 /// the cursor names the writes the forward has not read yet.
 [internal("the mirrored store's write log (A153 S1)")]
 export fun store_wire_attach(root: Shared<StoreNode>): DeltaCursor {
-	let log: DeltaLog<List<StoreStep>> = match root.read().wire {
+	let log: DeltaLog<WireWrite> = match root.read().wire {
 		Some(let held) => held,
 		None => DeltaLog::new(),
 	};
@@ -475,13 +485,10 @@ export fun store_wire_attach(root: Shared<StoreNode>): DeltaCursor {
 	log.cursor()
 }
 
-/// The paths written past `cursor`, and advance it — `None` when the log lost them
-/// (it outran its ceiling), which a forward answers by re-seeding.
+/// The writes past `cursor`, and advance it — `None` when the log lost them (it
+/// outran its ceiling), which a forward answers by re-seeding.
 [internal("the mirrored store's write log (A153 S1)")]
-export fun store_wire_since(
-	root: Shared<StoreNode>,
-	cursor: DeltaCursor,
-): Option<List<List<StoreStep>>> {
+export fun store_wire_since(root: Shared<StoreNode>, cursor: DeltaCursor): Option<List<WireWrite>> {
 	match root.read().wire {
 		Some(let log) => log.since(cursor),
 		None => None,
@@ -654,7 +661,7 @@ fun write_at<T: Storable>(
 		// Inline rather than a helper: an argument is a copy, and a store nobody
 		// mirrors must not pay one per write for a log it does not keep.
 		match found.wire {
-			Some(let log) => log.record(path),
+			Some(let log) => log.record(WireWrite { path, splice = None }),
 			None => {},
 		}
 	}
@@ -670,7 +677,7 @@ fun notify_at(root: Shared<StoreNode>, path: List<StoreStep>) {
 	mut woken = StoreWoken { slots = found.ancestors, feeds = [] };
 	store_wake_me(found.node, true, &mut woken);
 	match found.wire {
-		Some(let log) => log.record(path),
+		Some(let log) => log.record(WireWrite { path, splice = None }),
 		None => {},
 	}
 	deliver(woken.slots);

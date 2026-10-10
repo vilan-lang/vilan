@@ -11401,6 +11401,93 @@ fn a153_s2_a_store_mirror_behaves_the_same_on_both_backends() {
     );
 }
 
+/// A153 S2: a patch's ops land in ONE client turn on both backends — an observer
+/// woken by the first op reads the second op's field already landed — and a key
+/// the server does not hold is seeded `null`. (`states()` itself stays on the JS
+/// pin, `reactive_channels`: natively a generic `dyn Pipe` is not emitted yet.)
+#[test]
+fn a153_s2_a_patch_lands_in_one_client_turn_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_turn.vl"),
+        include_str!("native/store_mirror_turn.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_turn.vl"),
+        Verdict::Identical,
+        "a patch must land in one client turn on both backends"
+    );
+}
+
+/// A153 S4: a mirrored store's reconnect — one replayed call, one re-subscribe,
+/// comparing re-seeds — behaves the same on both backends.
+#[test]
+fn a153_s4_a_mirrored_store_reconnects_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_reconnect.vl"),
+        include_str!("native/store_mirror_reconnect.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_reconnect.vl"),
+        Verdict::Identical,
+        "a mirrored store must reconnect the same on both backends"
+    );
+}
+
+/// A168: a mirrored set — its `Wire`, a member's boundary, a parent released
+/// while a member inside it is watched — behaves the same on both backends.
+#[test]
+fn a168_a_mirrored_set_behaves_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_set.vl"),
+        include_str!("native/store_mirror_set.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_set.vl"),
+        Verdict::Identical,
+        "a mirrored set must behave the same on both backends"
+    );
+}
+
+/// A153 S3: a mirrored list's splices and a map's and a set's key sets cross and
+/// land the same on both backends.
+#[test]
+fn a153_s3_mirrored_collections_cross_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_collections.vl"),
+        include_str!("native/store_mirror_collections.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_collections.vl"),
+        Verdict::Identical,
+        "mirrored collections must cross the same on both backends"
+    );
+}
+
+/// A169: a released slot's `Gone` acknowledgement, and the client forgetting
+/// the reader on it, behave the same on both backends.
+#[test]
+fn a169_an_acknowledged_unsubscribe_is_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_ack.vl"),
+        include_str!("native/store_mirror_ack.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_ack.vl"),
+        Verdict::Identical,
+        "an acknowledged unsubscribe must be the same on both backends"
+    );
+}
+
 /// B436 + B437: a trait object prints as its value, alone, and as the pair a
 /// list holds; two applications of one trait over one type dispatch through
 /// their own tables — identical on both backends (the JS leg printed the pair

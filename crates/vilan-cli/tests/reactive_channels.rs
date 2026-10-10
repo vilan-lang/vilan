@@ -5818,7 +5818,7 @@ fn a153_s1_a_mirrored_store_seeds_once_and_patches_at_the_writers_paths() {
             "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":0,\"name\":\"general\",\"messages\":[7]}]},{\"Seed\":[1,{\"id\":8,\"author\":\"amy\",\"content\":\"ho\"}]}]]}",
             "subscribed: slots=4 nodes=7 wire=1",
             "-- one turn, many writes",
-            "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"one turn\"]},{\"Set\":[0,[1,1],\"lounge\"]},{\"Set\":[0,[1,2],[7,9]]},{\"Set\":[1,[1,2],\"x\"]},{\"Set\":[1,[1,1],\"zed\"]}]]}",
+            "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"one turn\"]},{\"Set\":[0,[1,1],\"lounge\"]},{\"Seq\":[0,[1,2],{\"Splice\":[1,0,[9]]}]},{\"Set\":[1,[1,2],\"x\"]},{\"Set\":[1,[1,1],\"zed\"]}]]}",
             "-- a write above a boundary covers the writes inside it",
             "down {\"Patch\":[0,[{\"Seed\":[-2,{\"id\":7,\"author\":\"bob\",\"content\":\"whole\"}]}]]}",
             "-- the same value",
@@ -5830,6 +5830,7 @@ fn a153_s1_a_mirrored_store_seeds_once_and_patches_at_the_writers_paths() {
             "-- a whole-root write",
             "down {\"Patch\":[0,[{\"Seed\":[-1,{\"rooms\":[],\"messages\":[],\"motd\":\"reset\"}]},{\"Seed\":[0,null]},{\"Seed\":[1,null]}]]}",
             "-- release the client slots, then the bases",
+            "down {\"Patch\":[0,[{\"Gone\":0},{\"Gone\":1}]]}",
             "bases only: slots=1 nodes=1 wire=1",
             "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"still the root's\"]}]]}",
             "released: slots=0 nodes=1 wire=0",
@@ -5962,6 +5963,7 @@ fn a153_s1_a_subscription_reaches_only_below_a_grant_and_a_grant_counts_its_repl
             "-- and comes back",
             "down {\"Patch\":[0,[{\"Seed\":[-2,\"phone\"]}]]}",
             "-- the deduped grant needs both releases",
+            "down {\"Patch\":[0,[{\"Gone\":7}]]}",
             "down {\"Patch\":[0,[{\"Set\":[-1,[1,1],\"once\"]}]]}",
             "one grant left: slots=1 nodes=3 wire=1",
             "-- the session ends: every mirror torn down",
@@ -6180,6 +6182,7 @@ fn a153_s2_a_store_mirror_mints_on_its_first_hold_and_patches_its_replica() {
             "seven goodbye",
             "-- the page goes: the grant is let go",
             "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
             "up   {\"Unsubscribe\":[0,[-1]]}",
             "held: bye",
             "the released key left the replica: true",
@@ -6320,5 +6323,899 @@ fn a153_s2_a_generated_store_stub_mints_on_its_first_hold_and_lets_go_with_its_l
             "done",
         ],
         "the generated store stub went differently:\n{stdout}"
+    );
+}
+
+/// A remote handle's `states()` (A150's leased pipe, `mirrored-store.md` §6.1),
+/// the minting call made to FAIL once; down frames land a microtask later, each in
+/// its own turn, as a socket's do.
+const MIRROR_STATES: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::transient::{ TransientSource, TransientState };
+import std::reactive::{ Owner, Source, batch, combine, queue_microtask, run_with_owner };
+import std::result::Result::{ self, Err };
+import std::rpc::mirror::{ StoreReply, mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcError,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	motd: str,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun shown<T>(state: TransientState<T, RpcError>, show: |T| str): str {
+	match state {
+		TransientState::Pending => "Pending",
+		TransientState::Ready(let value) => i"Ready({show(value)})",
+		TransientState::Refreshing(let value) => i"Refreshing({show(value)})",
+		TransientState::Failed(let error, let stale) => i"Failed({error.debug()}, {stale.map(show).unwrap_or("-")})",
+		TransientState::Absent => "Absent",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	let global = Store::new(Global { messages, motd = "welcome" });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	// Down frames land a microtask later, each in its own turn, as a socket's do.
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let fail_next = Shared::new(true);
+	let dispatcher = Dispatcher::new().on("global", |request: RpcRequest| {
+		print("  rpc  global");
+		reply_store(request, global)
+	});
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || {
+		if fail_next.read() {
+			fail_next.write() = false;
+			let refused: Result<StoreReply<Global>, RpcError> = Err(RpcError::Unavailable);
+			ret refused;
+		}
+		call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false))
+	});
+	print(i"passive: {shown(g.state().get(), |value: Global| value.motd)}");
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.states().effect(|state| print(i"root {shown(state, |value: Global| value.motd)}"));
+	});
+	sleep_for(Duration::millis(0));
+	print("-- the next hold asks again");
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	let again = Owner::new();
+	run_with_owner(again, || {
+		g.states().effect(|state| print(i"root {shown(state, |value: Global| value.motd)}"));
+		g
+			.messages()
+			.at(7)
+			.some()
+			.states()
+			.effect(|state| print(i"seven {shown(state, |value: Message| value.content)}"));
+		g
+			.messages()
+			.at(9)
+			.some()
+			.states()
+			.effect(|state| print(i"nine {shown(state, |value: Message| value.content)}"));
+		g.messages().at(7).some().is_pending().effect(|pending| print(i"seven pending {pending}"));
+		let content: dyn Source<Option<str>> = g.messages().at(7).some().content();
+		let id: dyn Source<Option<u53>> = g.messages().at(7).some().id();
+		combine((content, id)).effect(|both| {
+			let (text, number) = both;
+			print(i"seven's pair {number.unwrap_or(0)}:{text.unwrap_or("-")}");
+		});
+	});
+	sleep_for(Duration::millis(0));
+	print("-- two fields in one patch: one turn on the client");
+	batch(|| {
+		let _content = global.messages().at(7).some().content().patch("both");
+		let _id = global.messages().at(7).some().id().patch(70);
+	});
+	sleep_for(Duration::millis(0));
+	print("-- the key goes, then comes back");
+	global.messages().at(7).set(None);
+	sleep_for(Duration::millis(0));
+	global.messages().at(7).set(Some(Message { id = 7, content = "back" }));
+	sleep_for(Duration::millis(0));
+	again.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s2_a_remote_handle_tells_pending_ready_absent_and_failed_through_states() {
+    // §6.1. `state()` reports without holding (`passive: Pending`). The first
+    // hold's call fails: `Failed(Unavailable, -)`, no value to carry. The next
+    // hold asks again and reads `Pending` while it is out, `Ready` with the
+    // reply; a key's handle reads `Pending` until ITS seed lands — `Ready` for a
+    // key the server holds, `Absent` for one it does not (both seeded in the
+    // turn's one `Subscribe`/`Patch`) — and `is_pending` follows. Two fields
+    // written in one server turn land in ONE client turn: the pair's observer
+    // wakes once, never with the content beside the old id. A removed key reads
+    // `Absent`, and `Ready` again when it is back.
+    let stdout = run_program("mirror_states", MIRROR_STATES);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "passive: Pending",
+            "root Pending",
+            "root Failed(RpcError::Unavailable, -)",
+            "-- the next hold asks again",
+            "rpc  global",
+            "root Pending",
+            "seven Pending",
+            "nine Pending",
+            "seven pending true",
+            "seven's pair 0:-",
+            "root Ready(welcome)",
+            "seven Pending",
+            "nine Pending",
+            "seven pending true",
+            "seven's pair 0:-",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,7]],[1,-1,[0,9]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":7,\"content\":\"hello\"}]},{\"Seed\":[1,null]}]]}",
+            "root Ready(welcome)",
+            "seven Ready(hello)",
+            "nine Absent",
+            "seven pending false",
+            "seven's pair 7:hello",
+            "-- two fields in one patch: one turn on the client",
+            "down {\"Patch\":[0,[{\"Set\":[0,[1,1],\"both\"]},{\"Set\":[0,[1,0],70]}]]}",
+            "root Ready(welcome)",
+            "seven Ready(both)",
+            "seven pending false",
+            "seven's pair 70:both",
+            "-- the key goes, then comes back",
+            "down {\"Patch\":[0,[{\"Seed\":[0,null]}]]}",
+            "root Ready(welcome)",
+            "seven Absent",
+            "seven pending false",
+            "seven's pair 0:-",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":7,\"content\":\"back\"}]}]]}",
+            "root Ready(welcome)",
+            "seven Ready(back)",
+            "seven pending false",
+            "seven's pair 7:back",
+            "up   {\"Unsubscribe\":[0,[1]]}",
+            "down {\"Patch\":[0,[{\"Gone\":1}]]}",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "done",
+        ],
+        "the remote handle's states went differently:\n{stdout}"
+    );
+}
+
+// --- A153 S4: reconnect (`mirrored-store.md` §7) ------------------------------
+
+/// A mirrored store over a connection that DROPS and is re-made: the old session
+/// goes with its channels, a fresh one takes the same wire, and the client's
+/// replay (what `reattach_mirrors` runs) rebinds the mirror. Down frames land a
+/// microtask later, each in its own turn.
+const MIRROR_RECONNECT: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::transient::{ TransientSource, TransientState };
+import std::reactive::{ Owner, Source, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcError,
+	RpcRequest,
+	call_reading,
+	drop_session,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	motd: str,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun shown<T>(state: TransientState<T, RpcError>, show: |T| str): str {
+	match state {
+		TransientState::Pending => "Pending",
+		TransientState::Ready(let value) => i"Ready({show(value)})",
+		TransientState::Refreshing(let value) => i"Refreshing({show(value)})",
+		TransientState::Failed(let error, let _stale) => i"Failed({error.debug()})",
+		TransientState::Absent => "Absent",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	messages.insert(8, Message { id = 8, content = "hi" });
+	let global = Store::new(Global { messages, motd = "welcome" });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	// Down frames land a microtask later, each in its own turn, as a socket's do.
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new().on("global", |request: RpcRequest| {
+		print("  rpc  global");
+		reply_store(request, global)
+	});
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		g
+			.messages()
+			.at(7)
+			.some()
+			.content()
+			.effect(|content| print(i"seven {content.unwrap_or("-")}"));
+		g
+			.messages()
+			.at(8)
+			.some()
+			.content()
+			.effect(|content| print(i"eight {content.unwrap_or("-")}"));
+		g.states().effect(|state| print(i"root {shown(state, |value: Global| value.motd)}"));
+		g
+			.messages()
+			.at(7)
+			.some()
+			.states()
+			.effect(|state| print(i"seven's state {shown(state, |value: Message| value.content)}"));
+	});
+	sleep_for(Duration::millis(0));
+	print("-- the connection drops: the old session goes with its channels");
+	client.connection_lost();
+	drop_session(7);
+	sleep_for(Duration::millis(0));
+	print("-- written while down: the motd and seven; eight untouched");
+	global.motd().set("while down");
+	let _edited = global.messages().at(7).some().content().patch("edited");
+	print("-- a hold taken while down waits for the replay");
+	let late = Owner::new();
+	run_with_owner(late, || {
+		g.messages().at(8).some().id().effect(|id| print(i"eight's id {id.unwrap_or(0)}"));
+	});
+	sleep_for(Duration::millis(0));
+	print("-- a fresh session on the wire, and the replay");
+	register_session(7, server_end, codec);
+	client.replay_dynamic();
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print("-- the fresh channel follows");
+	global.motd().set("after");
+	sleep_for(Duration::millis(0));
+	late.dispose();
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s4_a_reconnect_replays_the_root_once_resubscribes_in_one_frame_and_reseeds_by_comparison() {
+    // §7. While down every handle keeps its last value and reads `Refreshing`
+    // (the drop is what `dispose_on_close` tells the client), and a hold taken
+    // meanwhile asks nothing. The replay re-issues the root's call ONCE; the
+    // seed lands over the replica, keeping the keys it holds (a seed carries
+    // its maps empty), so only the field written while down wakes (`motd while
+    // down`); every live boundary is re-subscribed in ONE `Subscribe` on the
+    // fresh channel, and the re-seeds compare: seven's edit wakes seven, eight
+    // — untouched — wakes nothing, nor does the hold taken while down. The
+    // fresh channel follows, and the page's release lets it go.
+    let stdout = run_program("mirror_reconnect", MIRROR_RECONNECT);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "rpc  global",
+            "motd -",
+            "seven -",
+            "eight -",
+            "root Pending",
+            "seven's state Pending",
+            "motd welcome",
+            "seven -",
+            "eight -",
+            "root Ready(welcome)",
+            "seven's state Pending",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,7]],[1,-1,[0,8]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":7,\"content\":\"hello\"}]},{\"Seed\":[1,{\"id\":8,\"content\":\"hi\"}]}]]}",
+            "seven hello",
+            "eight hi",
+            "root Ready(welcome)",
+            "seven's state Ready(hello)",
+            "-- the connection drops: the old session goes with its channels",
+            "root Refreshing(welcome)",
+            "seven's state Refreshing(hello)",
+            "-- written while down: the motd and seven; eight untouched",
+            "-- a hold taken while down waits for the replay",
+            "eight's id 8",
+            "-- a fresh session on the wire, and the replay",
+            "root Refreshing(welcome)",
+            "seven's state Refreshing(hello)",
+            "rpc  global",
+            "motd while down",
+            "root Ready(while down)",
+            "up   {\"Subscribe\":[1,[[0,-1,[0,7]],[1,-1,[0,8]]]]}",
+            "down {\"Patch\":[1,[{\"Seed\":[0,{\"id\":7,\"content\":\"edited\"}]},{\"Seed\":[1,{\"id\":8,\"content\":\"hi\"}]}]]}",
+            "seven edited",
+            "root Ready(while down)",
+            "seven's state Ready(edited)",
+            "-- the fresh channel follows",
+            "down {\"Patch\":[1,[{\"Set\":[-1,[1],\"after\"]}]]}",
+            "motd after",
+            "root Ready(after)",
+            "root Ready(after)",
+            "up   {\"Unsubscribe\":[1,[1]]}",
+            "down {\"Patch\":[1,[{\"Gone\":1}]]}",
+            "up   {\"Unsubscribe\":[1,[0]]}",
+            "down {\"Patch\":[1,[{\"Gone\":0}]]}",
+            "up   {\"Unsubscribe\":[1,[-1]]}",
+            "done",
+        ],
+        "the mirrored store's reconnect went differently:\n{stdout}"
+    );
+}
+
+// --- A168: a set crosses the wire ---------------------------------------------
+
+/// A struct with a `HashSet` field derives `Wire`, and a mirrored store carries
+/// it: each watched member is a boundary of its own.
+const MIRROR_SET: &str = r##"import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Room {
+	name: str,
+	members: HashSet<str>,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut members: HashSet<str> = HashSet::new();
+	members.insert("amy");
+	members.insert("bob");
+	let room = Room { name = "lounge", members };
+	// The set's own `Wire`: the list of its members, in insertion order.
+	let (record, finish) = (codec.writer)();
+	mut writer = record;
+	room.describe(&mut writer);
+	let frame = finish();
+	print(i"wire {text(frame)}");
+	mut reader = (codec.reader)(frame);
+	let back = Room::rebuild(&mut reader);
+	print(i"back {back.name} amy={back.members.contains("amy")} zed={back.members.contains("zed")} n={back.members.len()}");
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(1, room);
+	let global = Store::new(Global { rooms });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	let watching = Owner::new();
+	run_with_owner(page, || {
+		g.rooms().at(1).some().name().effect(|name| print(i"name {name.unwrap_or("-")}"));
+	});
+	run_with_owner(watching, || {
+		let lounge = g.rooms().at(1).some();
+		lounge.members().contains("amy").effect(|present| print(i"amy {present.unwrap_or(false)}"));
+		lounge.members().contains("zed").effect(|present| print(i"zed {present.unwrap_or(false)}"));
+	});
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print("-- zed joins, amy leaves, bob stays: only the watched members cross");
+	let _zed = global.rooms().at(1).some().members().insert("zed");
+	let _amy = global.rooms().at(1).some().members().remove("amy");
+	let _cat = global.rooms().at(1).some().members().insert("cat");
+	sleep_for(Duration::millis(0));
+	print("-- the room's own hold goes; the members watched inside it keep it");
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
+	let _back = global.rooms().at(1).some().members().insert("amy");
+	sleep_for(Duration::millis(0));
+	print("-- the last hold inside it goes: the room leaves the replica");
+	watching.dispose();
+	sleep_for(Duration::millis(0));
+	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
+	print("done");
+}
+"##;
+
+#[test]
+fn a168_a_set_field_crosses_the_wire_and_each_watched_member_is_a_boundary() {
+    // A168: the set's `Wire` is the list of its members in insertion order, and
+    // a round trip keeps them. Mirrored, the room's seed carries the set EMPTY
+    // (its members are boundaries), `contains("amy")` and `contains("zed")` are
+    // two slots seeded `true`/`false`, and of four writes only the two watched
+    // members cross. And the fix beside it: the room's own hold going does NOT
+    // take the room out of the replica while members inside it are watched (the
+    // member's next seed still lands); the last hold inside it does.
+    let stdout = run_program("mirror_set", MIRROR_SET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "wire {\"name\":\"lounge\",\"members\":[\"amy\",\"bob\"]}",
+            "back lounge amy=true zed=false n=2",
+            "name -",
+            "amy false",
+            "zed false",
+            "name -",
+            "amy false",
+            "zed false",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,1]],[1,-1,[0,1,1,1,\"amy\"]],[2,-1,[0,1,1,1,\"zed\"]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"name\":\"lounge\",\"members\":[]}]},{\"Seed\":[1,true]},{\"Seed\":[2,false]}]]}",
+            "name lounge",
+            "amy true",
+            "zed false",
+            "-- zed joins, amy leaves, bob stays: only the watched members cross",
+            "down {\"Patch\":[0,[{\"Seed\":[2,true]}]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[1,false]}]]}",
+            "zed true",
+            "amy false",
+            "-- the room's own hold goes; the members watched inside it keep it",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
+            "room held: true",
+            "down {\"Patch\":[0,[{\"Seed\":[1,true]}]]}",
+            "amy true",
+            "-- the last hold inside it goes: the room leaves the replica",
+            "up   {\"Unsubscribe\":[0,[1]]}",
+            "down {\"Patch\":[0,[{\"Gone\":1}]]}",
+            "up   {\"Unsubscribe\":[0,[2]]}",
+            "down {\"Patch\":[0,[{\"Gone\":2}]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "room held: false",
+            "done",
+        ],
+        "the mirrored set went differently:\n{stdout}"
+    );
+}
+
+// --- A153 S3: collections over the wire -----------------------------------------
+
+/// A list field crosses by SPLICES (`Seq`), a map's and a set's key sets by
+/// `Keys`.
+const MIRROR_COLLECTIONS: &str = r##"import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::batch;
+import std::reactive::delta::SequenceCell;
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Room {
+	id: u53,
+	name: str,
+	messages: List<u53>,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+	motd: str,
+	tags: HashSet<str>,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun ids(list: Option<List<u53>>): str {
+	match list {
+		Some(let held) => {
+			mut out = "[";
+			mut first = true;
+			for id in held {
+				if !first {
+					out = out + ",";
+				}
+				first = false;
+				out = out + i"{id}";
+			}
+			out + "]"
+		},
+		None => "-",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(0, Room { id = 0, name = "general", messages = [1, 2, 3] });
+	rooms.insert(5, Room { id = 5, name = "random", messages = [] });
+	mut tags: HashSet<str> = HashSet::new();
+	tags.insert("pinned");
+	let global = Store::new(Global { rooms, motd = "hi", tags });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.rooms().at(0).some().messages().effect(|list| print(i"general {ids(list)}"));
+		g.rooms().keys().effect(|keys| {
+			mut out = "";
+			for key in keys {
+				out = out + i" {key}";
+			}
+			print(i"rooms:{out}");
+		});
+		g.tags().keys().effect(|members| {
+			mut out = "";
+			for member in members {
+				out = out + i" {member}";
+			}
+			print(i"tags:{out}");
+		});
+	});
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	let general = global.rooms().at(0).some().messages();
+	print("-- a push is a splice at the end");
+	general.push(4);
+	sleep_for(Duration::millis(0));
+	print("-- one turn's splices are one");
+	batch(|| {
+		general.insert_at(0, 0);
+		general.remove_at(2);
+		general.push(9);
+	});
+	sleep_for(Duration::millis(0));
+	print("-- a whole write is the list again");
+	let _whole = general.patch([7, 8]);
+	sleep_for(Duration::millis(0));
+	print("-- a room's name is not a key change");
+	let _named = global.rooms().at(5).some().name().patch("chat");
+	sleep_for(Duration::millis(0));
+	print("-- a room created and one deleted");
+	global.rooms().at(9).set(Some(Room { id = 9, name = "new", messages = [] }));
+	global.rooms().at(5).set(None);
+	sleep_for(Duration::millis(0));
+	print("-- a set's members are its key set");
+	global.tags().insert("urgent");
+	sleep_for(Duration::millis(0));
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s3_a_list_crosses_by_splices_and_a_key_set_by_keys() {
+    // §3.2. A push into a list field inside a boundary is ONE `Seq` op — a
+    // `Splice` carrying the inserted elements and only the COUNT removed — not
+    // the list again; one turn's three splices compose into one; a whole write
+    // is the list again (`Set`). `keys()` on a remote map or set is a key-set
+    // slot: seeded with `Keys(Reset([..]))`, told again when a key comes or
+    // goes, and told nothing for a write inside a key's value (the rename).
+    let stdout = run_program("mirror_collections", MIRROR_COLLECTIONS);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "general -",
+            "rooms:",
+            "tags:",
+            "general -",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,0]],[1,-1,[0]],[2,-1,[2]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":0,\"name\":\"general\",\"messages\":[1,2,3]}]},{\"Keys\":[1,{\"Reset\":[0,5]}]},{\"Keys\":[2,{\"Reset\":[\"pinned\"]}]}]]}",
+            "general [1,2,3]",
+            "rooms: 0 5",
+            "tags: pinned",
+            "-- a push is a splice at the end",
+            "down {\"Patch\":[0,[{\"Seq\":[0,[1,2],{\"Splice\":[3,0,[4]]}]}]]}",
+            "general [1,2,3,4]",
+            "-- one turn's splices are one",
+            "down {\"Patch\":[0,[{\"Seq\":[0,[1,2],{\"Splice\":[0,4,[0,1,3,4,9]]}]}]]}",
+            "general [0,1,3,4,9]",
+            "-- a whole write is the list again",
+            "down {\"Patch\":[0,[{\"Set\":[0,[1,2],[7,8]]}]]}",
+            "general [7,8]",
+            "-- a room's name is not a key change",
+            "-- a room created and one deleted",
+            "down {\"Patch\":[0,[{\"Keys\":[1,{\"Reset\":[0,5,9]}]}]]}",
+            "down {\"Patch\":[0,[{\"Keys\":[1,{\"Reset\":[0,9]}]}]]}",
+            "rooms: 0 5 9",
+            "rooms: 0 9",
+            "-- a set's members are its key set",
+            "down {\"Patch\":[0,[{\"Keys\":[2,{\"Reset\":[\"pinned\",\"urgent\"]}]}]]}",
+            "tags: pinned urgent",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
+            "up   {\"Unsubscribe\":[0,[1]]}",
+            "down {\"Patch\":[0,[{\"Gone\":1}]]}",
+            "up   {\"Unsubscribe\":[0,[2]]}",
+            "down {\"Patch\":[0,[{\"Gone\":2}]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "done",
+        ],
+        "the mirrored collections went differently:\n{stdout}"
+    );
+}
+
+// --- A169: the server acknowledges an `Unsubscribe` -------------------------------
+
+/// A released slot's reader is kept until the server says nothing will name the
+/// slot again.
+const MIRROR_ACK: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, mirror_retired_census, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	messages.insert(8, Message { id = 8, content = "hi" });
+	let global = Store::new(Global { messages });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	let row = Owner::new();
+	run_with_owner(page, || {
+		g
+			.messages()
+			.at(7)
+			.some()
+			.content()
+			.effect(|content| print(i"seven {content.unwrap_or("-")}"));
+	});
+	run_with_owner(row, || {
+		g
+			.messages()
+			.at(8)
+			.some()
+			.content()
+			.effect(|content| print(i"eight {content.unwrap_or("-")}"));
+	});
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print("-- eight's row goes; a write to eight is already on its way");
+	let _late = global.messages().at(8).some().content().patch("late");
+	row.dispose();
+	print(i"retired readers while the acknowledgement is on its way: {mirror_retired_census()}");
+	sleep_for(Duration::millis(0));
+	print(i"after it lands: {mirror_retired_census()}");
+	print("-- eight is written again: nothing names its slot");
+	let _again = global.messages().at(8).some().content().patch("unwatched");
+	sleep_for(Duration::millis(0));
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+fn a169_the_server_acknowledges_an_unsubscribe_with_gone_and_the_client_forgets_the_reader() {
+    // Door (a): a released client slot is answered with `Gone(slot)` in the
+    // server's next patch, AFTER every op it sent for the slot — here a write
+    // already on its way when the row went, which still lands through the kept
+    // reader (into nothing) — and the client forgets the reader on it: one
+    // retired reader while the acknowledgement is in flight, none after. A later
+    // write to the key names no slot. Red before: the census stayed at 1 for the
+    // life of the channel view.
+    let stdout = run_program("mirror_ack", MIRROR_ACK);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "seven -",
+            "eight -",
+            "seven -",
+            "eight -",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,7]],[1,-1,[0,8]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":7,\"content\":\"hello\"}]},{\"Seed\":[1,{\"id\":8,\"content\":\"hi\"}]}]]}",
+            "seven hello",
+            "eight hi",
+            "-- eight's row goes; a write to eight is already on its way",
+            "down {\"Patch\":[0,[{\"Set\":[1,[1,1],\"late\"]}]]}",
+            "up   {\"Unsubscribe\":[0,[1]]}",
+            "down {\"Patch\":[0,[{\"Gone\":1}]]}",
+            "retired readers while the acknowledgement is on its way: 1",
+            "after it lands: 0",
+            "-- eight is written again: nothing names its slot",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "done",
+        ],
+        "the acknowledged unsubscribe went differently:\n{stdout}"
     );
 }
