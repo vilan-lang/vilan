@@ -3945,14 +3945,73 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `need2(..pair, 7)`) — is the CONCATENATION of its parts, one level
     /// deep (variadic-generics.md §T): each element is evaluated once, in
     /// order, and a spread one contributes its own slots.
-    fn spread_tuple(&mut self, elements: &[Id], depth: usize, span: Span) -> Result<String, Error> {
+    fn spread_tuple(
+        &mut self,
+        id: Id,
+        elements: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        // F127: the pack's own slot types, which a spread tuple LITERAL's
+        // parts take (`draw(..(3, 4))` into `(f64, f64)` writes `3f64`).
+        let slot_types: Vec<TypeId> = match self
+            .type_of(id)
+            .or(self.expected_type)
+            .map(|type_id| self.concrete(type_id))
+            .and_then(|type_id| self.resolve(type_id))
+        {
+            Some(Type::Tuple(parts, _)) => parts.clone(),
+            _ => Vec::new(),
+        };
         let mut prelude = String::new();
         let mut slots = Vec::new();
-        for (index, element) in elements.iter().enumerate() {
-            let value = self.consumed_value_of(*element, depth)?;
-            let name = format!("__part{index}");
+        let mut parts = 0;
+        self.spread_parts(
+            elements,
+            false,
+            &slot_types,
+            (&mut prelude, &mut slots, &mut parts),
+            depth,
+            span,
+        )?;
+        let tuple = if slots.is_empty() {
+            "()".to_string()
+        } else {
+            format!("({},)", slots.join(", "))
+        };
+        Ok(format!("{{ {prelude}{tuple} }}"))
+    }
+
+    /// [`Self::spread_tuple`]'s walk: each element evaluated once, in order,
+    /// into a `__part` binding, a spread one contributing its slots. A
+    /// spread of a tuple LITERAL (F127: `..(3, 4)`, labelled or holding
+    /// spreads of its own) is its parts, each written at the slot it lands
+    /// in — the literal has no settled type of its own to read an arity off.
+    fn spread_parts(
+        &mut self,
+        elements: &[Id],
+        inside_a_literal: bool,
+        slot_types: &[TypeId],
+        (prelude, slots, parts): (&mut String, &mut Vec<String>, &mut usize),
+        depth: usize,
+        span: Span,
+    ) -> Result<(), Error> {
+        for element in elements {
+            let spread = self.program.spread_elements.contains(element);
+            if spread && let Some(Expr::Tuple(inner)) = self.program.entity_map.get(element).cloned() {
+                self.spread_parts(&inner, true, slot_types, (prelude, slots, parts), depth, span)?;
+                continue;
+            }
+            let value = match slot_types.get(slots.len()) {
+                Some(expected) if inside_a_literal && !spread => {
+                    self.consumed_value_of_expecting(*element, Some(*expected), depth)?
+                }
+                _ => self.consumed_value_of(*element, depth)?,
+            };
+            let name = format!("__part{parts}");
+            *parts += 1;
             let _ = write!(prelude, "let {name} = {value}; ");
-            if !self.program.spread_elements.contains(element) {
+            if !spread {
                 slots.push(name);
                 continue;
             }
@@ -3973,12 +4032,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 slots.push(format!("{name}.{slot}"));
             }
         }
-        let tuple = if slots.is_empty() {
-            "()".to_string()
-        } else {
-            format!("({},)", slots.join(", "))
-        };
-        Ok(format!("{{ {prelude}{tuple} }}"))
+        Ok(())
     }
 
     /// The type an `await` produces (J6): a `Task<T>`'s payload.
@@ -5254,7 +5308,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .iter()
                     .any(|element| self.program.spread_elements.contains(element))
                 {
-                    return self.spread_tuple(&elements, depth, span);
+                    return self.spread_tuple(id, &elements, depth, span);
                 }
                 let mut parts = Vec::new();
                 for element in &elements {

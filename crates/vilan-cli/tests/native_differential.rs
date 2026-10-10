@@ -12667,3 +12667,25 @@ fn f128_a_dereference_of_a_value_binding_reads_the_value_on_both_backends() {
         "a `*` over a value binding must read the value natively"
     );
 }
+
+/// F127: a spread of a tuple LITERAL (`draw(..(3, 4))`, labelled or not)
+/// was refused natively "a spread element whose tuple type did not
+/// resolve": the literal has no settled type of its own to read an arity
+/// off. Its parts are now the pack's slots, each written at the slot's
+/// type and evaluated once in order — beside other arguments, nested
+/// inside another literal spread, and in a tuple literal of spreads.
+#[test]
+fn f127_a_spread_of_a_tuple_literal_is_its_parts_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f127_spread_tuple_literals.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/spread_tuple_literals.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a spread of a tuple literal must build and answer the same natively"
+    );
+}

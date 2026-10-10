@@ -60,6 +60,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**F127: a spread of a tuple LITERAL builds natively — `draw(..(3, 4))` and `draw(..(x = 3, y = 4))` into `fun draw(...at: (f64, f64))` printed `34` on JS and were refused natively "does not emit a spread element whose tuple type did not resolve", while `draw(..p)` over a binding built.** The spread lowering read the spread operand's arity off its settled type, which a literal operand does not carry. A literal operand is now its own parts, each a slot of the pack written at the slot's type (`3.0f64`) and evaluated once in source order, nested literal spreads included (`(..(1, 2), 3, ..(4, ..(5, 6)))`). Pin: `f127_a_spread_of_a_tuple_literal_is_its_parts_on_both_backends` (`native/spread_tuple_literals.vl`).
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->
