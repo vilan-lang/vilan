@@ -3043,6 +3043,9 @@ struct AscriptionSite<'src> {
     /// Whether the ascription is the operand of an `await` (`await p as T`
     /// ascribes the PROMISE, §6's wart, steered when `T` is the awaited type).
     awaited: bool,
+    /// `value as auto T` (B570 S2): the type is the toolchain's, written and
+    /// kept, and never directs the value.
+    auto: bool,
 }
 
 /// One `.name(..)` chain link as the walk met it (E278): the link's own id,
@@ -3087,6 +3090,8 @@ enum AutoOwner {
     Return(Id),
     /// A `let` / `mut` binding (a module's or a local).
     Binding(Id),
+    /// An ascription, `value as auto T` (S2).
+    Ascription(Id),
 }
 
 /// One `auto` annotation as the walk met it (B570): its owner, the name it is
@@ -5789,7 +5794,7 @@ pub struct Analyzer<'src> {
     auto_written: HashMap<Id, TypeId>,
     // B570: what an `auto`-locked binding's initializer inferred, before its
     // readers were given the written `T`.
-    auto_inferred_bindings: HashMap<Id, TypeId>,
+    auto_inferred: HashMap<Id, TypeId>,
     // E278: the values that land in a position that already states their type
     // — an annotated `let`'s initializer — so their stage hint would only
     // repeat the annotation.
@@ -7915,7 +7920,7 @@ impl<'src> Analyzer<'src> {
             chain_heads: HashMap::default(),
             auto_annotations: Vec::new(),
             auto_written: HashMap::default(),
-            auto_inferred_bindings: HashMap::default(),
+            auto_inferred: HashMap::default(),
             annotated_landings: HashSet::default(),
             hidden_generic_parameters: HashMap::default(),
             attributed_declarations: HashSet::default(),
@@ -39866,10 +39871,37 @@ impl<'src> Analyzer<'src> {
             // binds from the type before its own constraint resolves.
             Node::Ascribe(value, type_node) => {
                 let value_id = self.walk_expr_node(value, scope_id);
-                let type_id = self.walk_type_node(type_node, scope_id);
-                self.binding_annotation_type_ids.insert(type_id, id);
-                self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
-                self.seed_tail_expectations(value_id, type_id);
+                // B570 S2: `value as auto T` is an ascription the toolchain
+                // writes and keeps — output only, like every `auto` — so its
+                // type is recorded as a signature and never seeded into the
+                // value.
+                let auto = match &type_node.0 {
+                    Node::AutoType(written) => {
+                        self.record_auto_annotation(
+                            AutoOwner::Ascription(id),
+                            "",
+                            type_node.1,
+                            written.as_deref(),
+                            scope_id,
+                        );
+                        true
+                    }
+                    _ => false,
+                };
+                let type_id = match auto {
+                    true => self
+                        .auto_written
+                        .get(&id)
+                        .copied()
+                        .unwrap_or_else(|| Type::Unknown.get_type_id(self)),
+                    false => {
+                        let type_id = self.walk_type_node(type_node, scope_id);
+                        self.binding_annotation_type_ids.insert(type_id, id);
+                        self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
+                        self.seed_tail_expectations(value_id, type_id);
+                        type_id
+                    }
+                };
                 let stage = match &value.0 {
                     Node::MemberAccessor(_, member) => match &member.0 {
                         Node::Call(callee, _, _) => match &callee.0 {
@@ -39888,6 +39920,7 @@ impl<'src> Analyzer<'src> {
                         type_span: type_node.1,
                         stage,
                         awaited: false,
+                        auto,
                     },
                 );
                 self.constraints.push(Constraint::Ascription {
@@ -56149,6 +56182,9 @@ impl<'src> Analyzer<'src> {
     /// `Unknown`, it is the value's own concrete type, checked against the
     /// trait afterwards like a binding's.
     fn resolve_ascription(&mut self, id: Id, value_id: Id, type_id: TypeId) -> Resolution {
+        if self.ascriptions.get(&id).is_some_and(|site| site.auto) {
+            return self.resolve_auto_ascription(id, value_id);
+        }
         let annotation = type_id.get_type(self);
         // The annotation reaches the value through `expected_types` before the
         // readiness probe, whose undirected answer is cached (A124 R3).
@@ -56340,6 +56376,25 @@ impl<'src> Analyzer<'src> {
         };
         self.reconcile_type(&payload, ascribed, &HashMap::default())
             .is_some()
+    }
+
+    /// `value as auto T` (B570 S2): the value inferred as if nothing were
+    /// ascribed; the ascription READ as the written `T` when it is fully
+    /// written (as an `auto` return's callers read it), else as the value's
+    /// own type; what the value inferred kept for the stale check.
+    fn resolve_auto_ascription(&mut self, id: Id, value_id: Id) -> Resolution {
+        if !self.expr_id_to_expr_map.contains_key(&value_id) {
+            return Resolution::Deferred;
+        }
+        let inferred = self.infer_type(value_id, &Type::Unknown, &HashMap::default());
+        if matches!(inferred, Type::Unresolved) {
+            return Resolution::Deferred;
+        }
+        let inferred_id = inferred.get_type_id(self);
+        self.auto_inferred.insert(id, inferred_id);
+        let read = self.auto_written_type_id(id).unwrap_or(inferred_id);
+        self.resolved_types.insert(id, read);
+        Resolution::Resolved
     }
 
     /// The binding-style annotation `owner_id` keys (B161, B184, B461): a
@@ -56543,9 +56598,7 @@ impl<'src> Analyzer<'src> {
         // what its initializer inferred is kept for the stale check.
         let var_type_id = match self.auto_written_type(variable_id) {
             Some(written) => {
-                self.auto_inferred_bindings
-                    .entry(variable_id)
-                    .or_insert(var_type_id);
+                self.auto_inferred.entry(variable_id).or_insert(var_type_id);
                 written.get_type_id(self)
             }
             None => var_type_id,

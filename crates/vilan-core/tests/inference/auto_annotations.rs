@@ -386,3 +386,70 @@ fn b570_a_contradicting_tuple_label_is_stale() {
         "{diagnostics:#?}"
     );
 }
+
+// --- S2: `as auto T` ------------------------------------------------------------
+
+/// An `auto` ascription is a stage hint frozen into the file: output only,
+/// checked equal, the chain after it reading the written type.
+#[test]
+fn b570_an_auto_ascription_that_agrees_checks_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let count = ["a", "bb"] as auto List<str>
+                .map(|word| word.len()) as auto List<usize>
+                .len() as auto usize;
+            print(count);
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// Output only: `5 as auto f64` does not make `5` a float — the ascription is
+/// stale, and the stage that moved is named.
+#[test]
+fn b570_a_stale_auto_ascription_is_refused_at_its_stage() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let ratio = 5 as auto f64;
+            let _ = ratio;
+        }
+        "#,
+        "stale `auto`: the value is now `i32`, not the written `auto f64`, and the chain after \
+         it was checked against it — `vilan check --fix` writes `auto i32`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let words = ["a"];
+            let count = words.len() as auto i32;
+            let _ = count;
+        }
+        "#,
+        "stale `auto`: `.len()` now returns `usize`, not the written `auto i32`",
+    );
+}
+
+#[test]
+fn b570_a_bare_auto_ascription_warns_with_the_fill() {
+    let warnings = warnings(
+        r#"
+        fun main() {
+            let words = ["a"];
+            let count = words.len() as auto;
+            let _ = count;
+        }
+        "#,
+    );
+    assert!(
+        warnings.contains(
+            &"unfilled `auto`: `.len()` returns `usize` — `vilan check --fix` writes `auto usize`"
+                .to_string()
+        ),
+        "{warnings:#?}"
+    );
+}

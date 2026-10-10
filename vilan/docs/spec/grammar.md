@@ -745,6 +745,11 @@ parses as before (and the formatter tightens it). A closure type after
 `as` is read greedily, as everywhere — `f as |i32| i32` — and `vilan fmt`
 prints it parenthesized, `f as (|i32| i32)`.
 
+`value as auto T` (and the bare `value as auto`) is an ascription the
+toolchain writes and keeps (§5.8): it never directs the value, and `vilan
+check --fix` rewrites it when the stage's type moves — a stage hint frozen
+into the file.
+
 A `match`, `if`, `for` or `{` form is complete at its closing brace (the
 block-like rule, §3.8), with one continuation it admits: `as`. `match k {
 .. } as dyn Flow<i32>` ascribes the whole form, in a value position and

@@ -51,7 +51,7 @@ impl<'src> Analyzer<'src> {
             type_id
         });
         let owner_id = match owner {
-            AutoOwner::Return(id) | AutoOwner::Binding(id) => id,
+            AutoOwner::Return(id) | AutoOwner::Binding(id) | AutoOwner::Ascription(id) => id,
         };
         if let Some(written) = written {
             self.auto_written.insert(owner_id, written);
@@ -197,7 +197,7 @@ impl<'src> Analyzer<'src> {
                     (function_id, self.inferred_return_type_of(function_id))
                 }
                 AutoOwner::Binding(variable_id) => {
-                    let inferred = match self.auto_inferred_bindings.get(&variable_id) {
+                    let inferred = match self.auto_inferred.get(&variable_id) {
                         Some(type_id) => type_id.get_type(self),
                         None => match self.variables.get(&variable_id) {
                             Some(variable) => variable.type_id.get_type(self),
@@ -206,15 +206,31 @@ impl<'src> Analyzer<'src> {
                     };
                     (variable_id, inferred)
                 }
+                AutoOwner::Ascription(ascription_id) => {
+                    match self.auto_inferred.get(&ascription_id) {
+                        Some(type_id) => (ascription_id, type_id.get_type(self)),
+                        None => continue,
+                    }
+                }
             };
             if matches!(inferred, Type::Unknown | Type::Unresolved | Type::Any) {
                 continue;
             }
             let name = annotation.name;
             let shown = self.pretty_print_type(&inferred, &SubstitutionContext::default());
-            let what = match annotation.owner {
-                AutoOwner::Return(_) => format!("`{name}` returns `{shown}`"),
-                AutoOwner::Binding(_) => format!("`{name}` is `{shown}`"),
+            // An ascription names its stage when it is one, as B571's
+            // mismatch does (§8), else "the value".
+            let stage = match annotation.owner {
+                AutoOwner::Ascription(id) => self.ascriptions.get(&id).and_then(|site| site.stage),
+                _ => None,
+            };
+            let what = match (annotation.owner, stage) {
+                (AutoOwner::Return(_), _) => format!("`{name}` returns `{shown}`"),
+                (AutoOwner::Binding(_), _) => format!("`{name}` is `{shown}`"),
+                (AutoOwner::Ascription(_), Some((stage, _))) => {
+                    format!("`.{stage}()` returns `{shown}`")
+                }
+                (AutoOwner::Ascription(_), None) => format!("the value is `{shown}`"),
             };
             let spelled = match inferred {
                 Type::Never => Err(Unwritable(
@@ -256,10 +272,17 @@ impl<'src> Analyzer<'src> {
                         AutoOwner::Binding(_) => {
                             ", and its uses were checked against it".to_string()
                         }
+                        AutoOwner::Ascription(_) => {
+                            ", and the chain after it was checked against it".to_string()
+                        }
                     };
-                    let now = match annotation.owner {
-                        AutoOwner::Return(_) => format!("`{name}` now returns `{shown}`"),
-                        AutoOwner::Binding(_) => format!("`{name}` is now `{shown}`"),
+                    let now = match (annotation.owner, stage) {
+                        (AutoOwner::Return(_), _) => format!("`{name}` now returns `{shown}`"),
+                        (AutoOwner::Binding(_), _) => format!("`{name}` is now `{shown}`"),
+                        (AutoOwner::Ascription(_), Some((stage, _))) => {
+                            format!("`.{stage}()` now returns `{shown}`")
+                        }
+                        (AutoOwner::Ascription(_), None) => format!("the value is now `{shown}`"),
                     };
                     self.push_anchored(
                         Error {

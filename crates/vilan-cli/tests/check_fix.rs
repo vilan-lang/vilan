@@ -178,6 +178,33 @@ fn b570_stale_and_unfilled_autos_are_rewritten_to_a_clean_check() {
     assert_eq!(text, after, "a second run changes nothing");
 }
 
+/// B570 S2: a stale `as auto T` is rewritten in place, its `auto` kept.
+#[test]
+fn b570_a_stale_auto_ascription_is_rewritten() {
+    let dir = temp_package(
+        "auto_as",
+        concat!(
+            "fun main() {\n",
+            "\tlet words = [\"a\", \"bb\"];\n",
+            "\tlet count = words.len() as auto i32;\n",
+            "\tprint(count);\n",
+            "}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "--fix", "."]);
+    let text = entry(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        text.contains("let count = words.len() as auto usize;"),
+        "{text}"
+    );
+}
+
 #[test]
 fn a_literal_counter_is_declared_usize_and_its_other_uses_convert_in_later_rounds() {
     let dir = temp_package(

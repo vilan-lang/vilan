@@ -4868,7 +4868,15 @@ impl Document {
         };
         let mut actions = Vec::new();
         if let Some(one) = edit(at) {
-            actions.push(("Ascribe this stage".to_string(), vec![one]));
+            actions.push(("Ascribe this stage".to_string(), vec![one.clone()]));
+            // B570 S2: the same type as an `auto` ascription — written and
+            // kept by the toolchain, `check --fix` rewriting it when the
+            // stage's type moves.
+            let (span, text) = one;
+            actions.push((
+                "Ascribe this stage with `auto`".to_string(),
+                vec![(span, text.replacen(" as ", " as auto ", 1))],
+            ));
         }
         let chain: Vec<(Span, String)> = ours
             .iter()
@@ -32038,13 +32046,18 @@ mod stage_hint_tests {
                 .iter()
                 .map(|(title, _)| title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Ascribe this stage", "Ascribe every stage of this chain"]
+            vec![
+                "Ascribe this stage",
+                "Ascribe this stage with `auto`",
+                "Ascribe every stage of this chain"
+            ]
         );
+        assert_eq!(actions[1].1[0].1, " as auto Pipe<i32>");
         let (_, one) = &actions[0];
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].1, " as Pipe<i32>");
         let mut written = PIPE.to_string();
-        let (_, every) = &actions[1];
+        let (_, every) = &actions[2];
         let mut edits = every.clone();
         edits.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
         for (span, text) in edits {
