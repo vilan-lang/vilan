@@ -73,7 +73,23 @@ exactly as addressing the directory would — so `vilan check src/main.vl`
 answers about that file what `vilan check .` answers. What it does *not* do is
 run the package's `[build]` hooks: naming one file asks for that file, not for
 the package's build pipeline. A file with no `vilan.toml` above it compiles on
-its own, with the default prelude and no dependencies.
+its own, with the default prelude and no dependencies. A file of a `[library]`
+is a *module* of it (no `main` is asked for), rooted at the library's layer
+for `pkg::` paths, and imports the library's `[library.dependencies]` as the
+editor does.
+
+**std is not checked as an entry.** Address a file inside the toolchain's own
+`std/src/` and about one in six of them (twelve of seventy-one at v0.47.0)
+reports errors that a program importing std never sees: the files that
+declare compiler intrinsics as bodyless `external fun`s (`context.vl`,
+`process.vl`, `random.vl`, `shared.vl`, `web/dom.vl`) are refused for naming
+no `[extern(..)]` binding, the platform-layer files (`browser/web/ui.vl`,
+`process/web/ui.vl`, `web/document.vl`, `web/prelude.vl`, `web/router.vl`)
+cannot reach their base layer's modules through `pkg::`, which has one root in
+file mode, and `reactive/store.vl` and `rpc/mirror.vl` read an `[internal]`
+field that only std's own code may. None of those is a defect in std. Std is
+checked through the programs and tests that import it (`vilan check .` in any
+package, `vilan test`), never one file at a time.
 
 - `--stdout`: print the JavaScript instead of writing a file.
 - `--rerun-hooks`: run every `[[build.hook]]` even if it is fresh — the

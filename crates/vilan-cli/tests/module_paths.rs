@@ -734,6 +734,71 @@ fn b586_a_nested_library_file_resolves_pkg_from_the_library_base_root() {
 }
 
 #[test]
+fn b594_a_library_file_resolves_the_librarys_dependencies() {
+    // `vilan check lib/src/user.vl` reported "cannot find module 'dep' to import"
+    // (and "cannot find 'd' in this scope") for a module of a `[library]` that
+    // declares `dep` under `[library.dependencies]`, while `vilan check lib` and
+    // the editor resolved it: B586 rooted the file at its layer but handed it no
+    // dependency workspace. A library file takes the library's dependencies now,
+    // as the language server's `[library]` arm does.
+    let root = temp_root("b594");
+    write_library(
+        &root.join("dep"),
+        "[library]\nname = \"dep\"\n",
+        &[("src/lib.vl", "export fun d(): i32 {\n\t1\n}\n")],
+    );
+    write_library(
+        &root.join("lib"),
+        "[library]\nname = \"lib\"\n[library.dependencies]\ndep = { path = \"../dep\" }\n",
+        &[
+            ("src/lib.vl", "export fun noop() {}\n"),
+            (
+                "src/user.vl",
+                "import dep::d;\n\nexport fun use_d(): i32 {\n\td()\n}\n",
+            ),
+            // A nested module resolves it too, from the base layer's `pkg::` root.
+            (
+                "src/deep/nested.vl",
+                "import dep::d;\nimport pkg::user::use_d;\n\nexport fun both(): i32 {\n\td() + use_d()\n}\n",
+            ),
+        ],
+    );
+    let lib = root.join("lib");
+    for file in ["src/user.vl", "src/deep/nested.vl"] {
+        let output = vilan(&lib, &["check", file]);
+        assert!(
+            output.status.success(),
+            "{file} resolves the library's `dep`: {}",
+            combined(&output)
+        );
+    }
+    // The directory form and the file form agree.
+    let output = vilan(&lib, &["check", "."]);
+    assert!(output.status.success(), "{}", combined(&output));
+
+    // Control: a library that does NOT declare the dependency still refuses the
+    // import - the fix reads the manifest, it does not guess a sibling directory.
+    write_library(
+        &root.join("lonely"),
+        "[library]\nname = \"lonely\"\n",
+        &[
+            ("src/lib.vl", "export fun noop() {}\n"),
+            (
+                "src/user.vl",
+                "import dep::d;\n\nexport fun use_d(): i32 {\n\td()\n}\n",
+            ),
+        ],
+    );
+    let output = vilan(&root.join("lonely"), &["check", "src/user.vl"]);
+    assert!(
+        !output.status.success() && combined(&output).contains("cannot find module 'dep'"),
+        "an undeclared dependency is still refused: {}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn b586_a_library_file_in_a_layer_resolves_pkg_from_that_layer() {
     // The deepest layer root containing the file is its `pkg::` root; a file in
     // the base root keeps the base root. Both are what the editor does (a layer

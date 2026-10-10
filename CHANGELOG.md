@@ -23,6 +23,33 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: tooling -->
+**N164: the language server's burst pin is paced by the server's own counter, not by a sleep.** `a_burst_of_edits_performs_one_complete_analysis_plus_at_most_one_partial` typed its eight keystrokes `DEBOUNCE_MS + 20` apart and then asserted that at least two analyses had started; on a stalled hosted runner the server's debounce task woke more than its 20 ms margin late, every keystroke superseded the one before it, ONE analysis started, and the non-vacuity premise ("1 started") fired before the claim the pin exists for was read - twice in three CI runs on the Windows shard. Each keystroke now waits until the server's `started` counter has moved past where it stood when the keystroke was sent, then leaves the analysis 20 ms in flight before the next one, so a slow host stretches the burst instead of folding it, and the premise is `started >= 8` - a number the loop guarantees and the server must meet. The old form was reproduced by taking the margin to -40 ms ("1 started", the CI message); the new one is green at load 23-30 beside other lanes' builds.
+
+---
+
+<!-- family: tooling -->
+**N165: the perf harnesses refuse a copy that does not check clean, and the RSS probe ships.** `scripts/lsp-latency.py` and `scripts/perf_gate.py seal` run `vilan check .` in the copy they prepared, under the compiler they will drive (`lsp-latency.py --vilan`, default the `vilan` beside `--lsp`), before the first edit or measurement, and refuse with the compiler's errors when it exits non-zero: a server that analyzes a broken program stops early, so every row reads a fraction of its true cost - Order 49's seal read x2..x7 for want of kolt's gitignored `src/lucide` in the base's archive. A shared-source seal used to note a compiler's disagreement and measure anyway; it now refuses like the breaking-release seal does. `scripts/rss-probe.py` (peak RSS of a `vilan check .`, a fresh process per run, the median) joins the tree, and the seal's T3 kolt row reports its peak RSS the same way - the median of the runs, the per-run figures listed - where it took the max. Pins: a copy with `BROKEN`, an archive without `src/lucide`, a shared source either compiler rejects, the probe against a compiler whose first run allocates five times its others.
+
+---
+
+<!-- family: fix -->
+**B594: `vilan check <file>` on a `[library]` file resolves the library's `[library.dependencies]`.** `import dep::d;` in a module of a library that declares `dep` reported "cannot find module 'dep' to import" (and "cannot find 'd' in this scope") when the module was addressed by path, while `vilan check <library>` and the editor resolved it: B586 rooted the file at its layer but handed it no dependency workspace. File mode now gives a library file the library's own directory as its package, so its dependencies (and its prelude, as the language server's `[library]` arm reads them) apply; a library that does not declare the dependency still refuses the import. Pins: `b594_a_library_file_resolves_the_librarys_dependencies`, red against the previous `file_project`.
+
+---
+
+<!-- family: tooling -->
+**N162: std is not checked as an entry, and the CLI reference says so.** `vilan check <file>` on a file inside the toolchain's own `std/src/` reports errors on twelve of its seventy-one files (v0.47.0) that no program importing std ever sees: five declare compiler intrinsics as bodyless `external fun`s (`context.vl`, `process.vl`, `random.vl`, `shared.vl`, `web/dom.vl`), five platform-layer files import their base layer by `pkg::`, which has one root in file mode, and `reactive/store.vl` and `rpc/mirror.vl` read an `[internal]` field only std may. Measured, the three causes are the analyzer's (the intrinsic table is resolved by name against a program that imports std, and B568's internal-field rule treats the entry as outside std) and module loading's (a layer overlays its base), not file mode's, so none is the small fix the item hoped for; the appendix's `vilan check [file]` section now says std is checked through the programs and tests that import it.
+
+---
+
+<!-- family: tooling -->
+**N163: the nextest priority tiers re-measured under `ci-test`.** The tiers were ranked at opt-level 0; one full run of the suite under the `ci-test` profile (10,157 tests, 762.7 s wall at `-j 6`, load 10-25) shows what moved: the edit-replay corpus leg 293 s -> 97 s, the docs gate 212 s -> 29 s, the check-scope corpus legs 100 s -> 23 s, the native differential's legs 119-184 s -> 22-32 s, the replay differential 60-170 s -> 24 s. `.config/nextest.toml` now starts first (priority 100) the stragglers - the edit-replay differential, the permutation differential (untiered until now: three tests of 36-45 s, 297 CPU-s on its corpus leg), `dependent_edit_measurement` and the diagnostics ledger's single-thread 35 s scan - and second (90) the 15-35 s tier, which now includes the two tests that WAIT (a transport retry budget and a service socket: 25 s of wall for ~1.5 CPU-s, a slot held idle that is free to overlap only when started early); the replay differential, the marker census, `examples` and `corpus` leave tier 100/90 for what they now cost. The header of the file carries the measurements and why the order moves only the tail of a throughput-bound run.
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->
