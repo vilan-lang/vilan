@@ -829,7 +829,11 @@ fn the_lsp_harness_carries_lucide_and_an_archive_that_lacks_it_goes_red() {
     let repository = scratch.path("kolt");
     fs::create_dir_all(repository.join("src")).expect("create the repository");
     git(&repository, &["init", "--quiet", "."]);
-    fs::write(repository.join("vilan.toml"), "[package]\nname = \"kolt\"\n").expect("write");
+    fs::write(
+        repository.join("vilan.toml"),
+        "[package]\nname = \"kolt\"\n",
+    )
+    .expect("write");
     fs::write(repository.join("src/uses-lucide"), "").expect("write the marker");
     fs::write(repository.join(".gitignore"), "src/lucide/\n").expect("write");
     git(&repository, &["add", "-A"]);
@@ -1040,7 +1044,11 @@ fn the_rss_probe_reads_each_fresh_runs_own_peak_not_the_max_over_children() {
         .output()
         .expect("run scripts/rss-probe.py");
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(output.status.success(), "{text}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let runs: Vec<u64> = text
         .split("runs:")
         .nth(1)
