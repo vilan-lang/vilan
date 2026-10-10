@@ -42656,46 +42656,50 @@ impl<'src> Analyzer<'src> {
         }
         // B589: a closure argument whose parameters are ALL written needs
         // nothing from the call to type them, so in the first phase its written
-        // parameter types bind the generics they stand at — BEFORE the other
-        // arguments, so `fold(0, |acc: usize, n: usize| acc + n)` binds `B =
-        // usize` from the closure and the literal `0` then takes `usize` as its
-        // expectation, where it defaulted to `i32` first and the closure was
-        // refused against `|i32, usize| i32`. Only the PARAMETERS are read: the
-        // closure itself is typed in the second phase as before (its body and
-        // return may still lean on the call's expectation).
-        if skip_closures {
-            for (index, argument_id) in argument_ids.iter().enumerate() {
-                let Some(written) = self.closure_written_parameter_types(*argument_id) else {
-                    continue;
-                };
-                let Some(Type::Closure(positions, ..)) = parameter_ids
-                    .get(index + self_parameter_offset)
-                    .and_then(|parameter_id| self.parameters.get(parameter_id))
-                    .map(|parameter| parameter.type_id.get_type(self))
-                else {
-                    continue;
-                };
-                if positions.len() != written.len() {
-                    continue;
-                }
-                for (position, written) in positions.iter().zip(written) {
-                    let position = position.get_type(self);
-                    let written = written.get_type(self);
-                    let previously_inferable =
-                        std::mem::replace(&mut self.inferable_generics, bindable.clone());
-                    let reconciled = self.reconcile_type(&position, &written, substitution);
-                    self.inferable_generics = previously_inferable;
-                    if let Some((_, bindings)) = reconciled {
-                        for (constraint_id, type_id) in bindings {
-                            if bindable.contains(&constraint_id) {
-                                self.record_generic_binding(substitution, constraint_id, type_id);
-                            }
-                        }
-                    }
-                }
-            }
+        // parameter types bind the generics they stand at — after the typed
+        // value arguments and BEFORE an unsuffixed numeric literal, so `fold(0,
+        // |acc: usize, n: usize| acc + n)` binds `B = usize` from the closure
+        // and the literal `0` then takes `usize` as its expectation (B389),
+        // where it defaulted to `i32` first and the closure was refused against
+        // `|i32, usize| i32`. A typed value still binds first (`nested(|a:
+        // List<i32>| .., "s")` keeps blaming the closure, B306). Only the
+        // PARAMETERS are read: the closure itself is typed in the second phase
+        // as before (its body and return may still lean on the expectation).
+        let literal_last = skip_closures
+            && argument_ids
+                .iter()
+                .any(|argument_id| self.closure_written_parameter_types(*argument_id).is_some());
+        // The literals' reordering is paid only where a written closure asks
+        // for it; every other call walks its arguments in place, allocating
+        // nothing.
+        let mut order: Vec<usize> = Vec::new();
+        let mut first_literal = argument_ids.len();
+        if literal_last {
+            order.extend(0..argument_ids.len());
+            order.sort_by_key(|index| self.is_unsuffixed_numeric(argument_ids[*index]));
+            first_literal = order
+                .iter()
+                .position(|index| self.is_unsuffixed_numeric(argument_ids[*index]))
+                .unwrap_or(order.len());
         }
-        for (index, argument_id) in argument_ids.iter().enumerate() {
+        let mut closures_read = !literal_last;
+        let schedule = (0..argument_ids.len()).map(|step| match literal_last {
+            true => order[step],
+            false => step,
+        });
+        for (step, index) in schedule.enumerate() {
+            if !closures_read && step == first_literal {
+                closures_read = true;
+                self.derive_generics_from_bounds(&bindable, &bindable, substitution);
+                self.bind_from_written_closure_parameters(
+                    &parameter_ids,
+                    argument_ids,
+                    self_parameter_offset,
+                    &bindable,
+                    substitution,
+                );
+            }
+            let argument_id = &argument_ids[index];
             let is_closure = matches!(
                 self.expr_id_to_expr_map.get(argument_id),
                 Some(Expr::Closure(_))
@@ -42770,6 +42774,16 @@ impl<'src> Analyzer<'src> {
                     }
                 }
             }
+        }
+        if !closures_read {
+            self.derive_generics_from_bounds(&bindable, &bindable, substitution);
+            self.bind_from_written_closure_parameters(
+                &parameter_ids,
+                argument_ids,
+                self_parameter_offset,
+                &bindable,
+                substitution,
+            );
         }
         // A generic that appears only in another generic's parameterized bound
         // (`m<T, S: Source<T>>(source: S)`): recover `T` from the concrete `S`'s impl,
@@ -55561,6 +55575,53 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B589: bind the generics each fully annotated closure argument's WRITTEN
+    /// parameter types stand at (`|B, T| B` against `|usize, usize|` binds `B`
+    /// and `T`), reading nothing else of the closure. A generic already bound
+    /// stays bound: a contradicting closure is the later check's to report.
+    fn bind_from_written_closure_parameters(
+        &mut self,
+        parameter_ids: &[Id],
+        argument_ids: &[Id],
+        self_parameter_offset: usize,
+        bindable: &[TypeId],
+        substitution: &mut SubstitutionContext,
+    ) {
+        for (index, argument_id) in argument_ids.iter().enumerate() {
+            let Some(written) = self.closure_written_parameter_types(*argument_id) else {
+                continue;
+            };
+            let Some(Type::Closure(positions, ..)) = parameter_ids
+                .get(index + self_parameter_offset)
+                .and_then(|parameter_id| self.parameters.get(parameter_id))
+                .map(|parameter| parameter.type_id.get_type(self))
+            else {
+                continue;
+            };
+            if positions.len() != written.len() {
+                continue;
+            }
+            for (position, written) in positions.iter().zip(written) {
+                let position = position.get_type(self);
+                let written = written.get_type(self);
+                let previously_inferable =
+                    std::mem::replace(&mut self.inferable_generics, bindable.to_vec());
+                let reconciled = self.reconcile_type(&position, &written, substitution);
+                self.inferable_generics = previously_inferable;
+                let Some((_, bindings)) = reconciled else {
+                    continue;
+                };
+                for (constraint_id, type_id) in bindings {
+                    if bindable.contains(&constraint_id)
+                        && !substitution.contains_key(&constraint_id)
+                    {
+                        self.record_generic_binding(substitution, constraint_id, type_id);
+                    }
+                }
+            }
+        }
+    }
+
     /// B589: the WRITTEN parameter types of a closure literal with at least
     /// one parameter, every one of them annotated — `None` for anything else.
     fn closure_written_parameter_types(&self, expr_id: Id) -> Option<Vec<TypeId>> {
@@ -55568,7 +55629,16 @@ impl<'src> Analyzer<'src> {
             return None;
         };
         let closure = self.closures.get(closure_id)?;
-        if closure.parameters.is_empty() {
+        // WRITTEN is the walk's record (`parameter_modes`): a parameter an
+        // earlier attempt FILLED from the call (B13) has a type too, and is no
+        // annotation. Asked first, so an unannotated closure — most of them —
+        // costs no parameter lookup.
+        if closure.parameters.is_empty()
+            || closure
+                .parameter_modes
+                .iter()
+                .any(|mode| matches!(mode, ParameterMode::Open(_)))
+        {
             return None;
         }
         closure
