@@ -509,6 +509,7 @@ fn every_other_fixture_answers_the_same_under_every_permutation() {
         .iter()
         .chain(M128_FIXTURES)
         .chain(BOUND_FIXTURES)
+        .chain(EFFECT_FIXTURES)
     {
         divergences.extend(compare_fixture(fixture, &[]));
     }

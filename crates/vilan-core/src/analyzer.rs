@@ -4579,6 +4579,12 @@ pub struct Analyzer<'src> {
     /// module's bound question names (the reach filter's reading, in which
     /// case no log was kept).
     prefix_impl_count: Option<usize>,
+    /// M110 S3 (Order 50): the entity counter of the STORED world — every
+    /// entity below it was minted by the prefix (the same ids on every hit,
+    /// §2.1's guarantee), every one at or past it by this analysis (the hot
+    /// set, the entry, the resolve of their constraints, the post passes).
+    /// `None` until the world is stored or served.
+    prefix_entity_end: Option<u32>,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -7680,6 +7686,7 @@ impl<'src> Analyzer<'src> {
             bound_questions_derived: HashMap::default(),
             bound_recompute_ranges: Vec::new(),
             prefix_impl_count: None,
+            prefix_entity_end: None,
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reused_sources: Vec::new(),
@@ -27297,34 +27304,72 @@ impl<'src> Analyzer<'src> {
                 function.bumps = positions;
             }
         }
-        loop {
-            let mut updates: Vec<(Id, BTreeSet<u32>)> = Vec::new();
-            for function_id in &function_ids {
-                if self.bumps_tabled.contains(function_id) || restored_ids.contains(function_id) {
+        // M127 (Order 50): the seventh worklist as a WORKLIST. Every body is
+        // scanned once; the scan also names the callees whose verdict it read
+        // (`BumpScan::callees`), and only the CALLERS of a function whose
+        // verdict then moved are rescanned. The Jacobi form rescanned every
+        // non-restored body per round (kolt's client leg: 51-102 ms cold,
+        // 31-48 ms on a served keystroke, three to four rounds); the answer is
+        // the same least fixpoint, because the verdicts only grow and a body's
+        // positions depend on nothing but its callees' verdicts.
+        let mut callers_of: HashMap<Id, Vec<Id>> = HashMap::default();
+        let mut moved: Vec<Id> = Vec::new();
+        for function_id in &function_ids {
+            if self.bumps_tabled.contains(function_id) || restored_ids.contains(function_id) {
+                continue;
+            }
+            let (has_body, current) = {
+                let Some(function) = self.functions.get(function_id) else {
                     continue;
-                }
-                let (has_body, current) = {
-                    let Some(function) = self.functions.get(function_id) else {
-                        continue;
-                    };
-                    (function.has_body, function.bumps.clone())
                 };
-                if !has_body {
-                    continue;
+                (function.has_body, function.bumps.clone())
+            };
+            if !has_body {
+                continue;
+            }
+            let mut scan = BumpScan {
+                positions: current.clone(),
+                callees: Vec::new(),
+            };
+            self.collect_bumps_positions(*function_id, &mut scan);
+            for callee in scan.callees {
+                callers_of.entry(callee).or_default().push(*function_id);
+            }
+            if scan.positions != current {
+                if let Some(function) = self.functions.get_mut(function_id) {
+                    function.bumps = scan.positions;
                 }
-                let mut positions = current.clone();
-                self.collect_bumps_positions(*function_id, &mut positions);
-                if positions != current {
-                    updates.push((*function_id, positions));
+                moved.push(*function_id);
+            }
+        }
+        let mut worklist: Vec<Id> = Vec::new();
+        let mut queued: HashSet<Id> = HashSet::default();
+        let enqueue_callers = |callee: Id, worklist: &mut Vec<Id>, queued: &mut HashSet<Id>| {
+            for caller in callers_of.get(&callee).into_iter().flatten() {
+                if queued.insert(*caller) {
+                    worklist.push(*caller);
                 }
             }
-            if updates.is_empty() {
-                break;
-            }
-            for (function_id, positions) in updates {
+        };
+        for function_id in moved {
+            enqueue_callers(function_id, &mut worklist, &mut queued);
+        }
+        while let Some(function_id) = worklist.pop() {
+            queued.remove(&function_id);
+            let current = match self.functions.get(&function_id) {
+                Some(function) => function.bumps.clone(),
+                None => continue,
+            };
+            let mut scan = BumpScan {
+                positions: current.clone(),
+                callees: Vec::new(),
+            };
+            self.collect_bumps_positions(function_id, &mut scan);
+            if scan.positions != current {
                 if let Some(function) = self.functions.get_mut(&function_id) {
-                    function.bumps = positions;
+                    function.bumps = scan.positions;
                 }
+                enqueue_callers(function_id, &mut worklist, &mut queued);
             }
         }
     }
@@ -27367,7 +27412,7 @@ impl<'src> Analyzer<'src> {
 
     /// Scan a function body for the `&mut` parameter positions its bumps, growing
     /// `positions` (the monotone step of `infer_bumps`).
-    fn collect_bumps_positions(&self, function_id: Id, positions: &mut BTreeSet<u32>) {
+    fn collect_bumps_positions(&self, function_id: Id, scan: &mut BumpScan) {
         let Some(function) = self.functions.get(&function_id) else {
             return;
         };
@@ -27375,9 +27420,9 @@ impl<'src> Analyzer<'src> {
         let tail = function.body.1;
         let mut visited = HashSet::default();
         for statement in &statements {
-            self.scan_bumps(*statement, function_id, positions, &mut visited);
+            self.scan_bumps(*statement, function_id, scan, &mut visited);
         }
-        self.scan_bumps(tail, function_id, positions, &mut visited);
+        self.scan_bumps(tail, function_id, scan, &mut visited);
     }
 
     /// Walk one expression, recording any `&mut` parameter of `function_id` that it
@@ -27390,7 +27435,7 @@ impl<'src> Analyzer<'src> {
         &self,
         expr_id: Id,
         function_id: Id,
-        positions: &mut BTreeSet<u32>,
+        scan: &mut BumpScan,
         visited: &mut HashSet<Id>,
     ) {
         if !visited.insert(expr_id) {
@@ -27401,65 +27446,65 @@ impl<'src> Analyzer<'src> {
         };
         match expr {
             Expr::Assignment(target_id, value_id) => {
-                self.scan_bumps(value_id, function_id, positions, visited);
+                self.scan_bumps(value_id, function_id, scan, visited);
                 if let Some(position) = self.assignment_bumps_position(target_id, function_id) {
-                    positions.insert(position);
+                    scan.positions.insert(position);
                 }
-                self.scan_bumps(target_id, function_id, positions, visited);
+                self.scan_bumps(target_id, function_id, scan, visited);
             }
             Expr::Call(call_id) => {
-                self.call_bumps_positions(call_id, function_id, positions);
+                self.call_bumps_positions(call_id, function_id, scan);
                 if let Some(function_call) = self.function_calls.get(&call_id) {
                     for argument in function_call.argument_ids.clone() {
-                        self.scan_bumps(argument, function_id, positions, visited);
+                        self.scan_bumps(argument, function_id, scan, visited);
                     }
                 }
             }
             Expr::Variable(variable_id) => {
                 if let Some(initial) = self.variables.get(&variable_id).and_then(|v| v.initial) {
-                    self.scan_bumps(initial, function_id, positions, visited);
+                    self.scan_bumps(initial, function_id, scan, visited);
                 }
             }
             Expr::Block((statements, tail)) => {
                 for statement in statements {
-                    self.scan_bumps(statement, function_id, positions, visited);
+                    self.scan_bumps(statement, function_id, scan, visited);
                 }
-                self.scan_bumps(tail, function_id, positions, visited);
+                self.scan_bumps(tail, function_id, scan, visited);
             }
             Expr::For(condition, (statements, tail)) => {
                 if let Some(condition) = condition {
-                    self.scan_bumps(condition, function_id, positions, visited);
+                    self.scan_bumps(condition, function_id, scan, visited);
                 }
                 for statement in statements {
-                    self.scan_bumps(statement, function_id, positions, visited);
+                    self.scan_bumps(statement, function_id, scan, visited);
                 }
-                self.scan_bumps(tail, function_id, positions, visited);
+                self.scan_bumps(tail, function_id, scan, visited);
             }
             Expr::ForEach(iterable, _, (statements, tail)) => {
-                self.scan_bumps(iterable, function_id, positions, visited);
+                self.scan_bumps(iterable, function_id, scan, visited);
                 for statement in statements {
-                    self.scan_bumps(statement, function_id, positions, visited);
+                    self.scan_bumps(statement, function_id, scan, visited);
                 }
-                self.scan_bumps(tail, function_id, positions, visited);
+                self.scan_bumps(tail, function_id, scan, visited);
             }
-            Expr::If(branch) => self.scan_bumps_if(&branch, function_id, positions, visited),
+            Expr::If(branch) => self.scan_bumps_if(&branch, function_id, scan, visited),
             Expr::Match(subject_id, legs) => {
-                self.scan_bumps(subject_id, function_id, positions, visited);
+                self.scan_bumps(subject_id, function_id, scan, visited);
                 for leg in legs {
                     if let Some(guard) = leg.guard {
-                        self.scan_bumps(guard, function_id, positions, visited);
+                        self.scan_bumps(guard, function_id, scan, visited);
                     }
-                    self.scan_bumps(leg.body, function_id, positions, visited);
+                    self.scan_bumps(leg.body, function_id, scan, visited);
                 }
             }
             Expr::Closure(inner_id) | Expr::Async(inner_id) => {
                 if let Some(inner) = self.closures.get(&inner_id) {
-                    self.scan_bumps(inner.return_, function_id, positions, visited);
+                    self.scan_bumps(inner.return_, function_id, scan, visited);
                 }
             }
             Expr::Binary(_, lhs, rhs) => {
-                self.scan_bumps(lhs, function_id, positions, visited);
-                self.scan_bumps(rhs, function_id, positions, visited);
+                self.scan_bumps(lhs, function_id, scan, visited);
+                self.scan_bumps(rhs, function_id, scan, visited);
             }
             Expr::Reference(operand, _)
             | Expr::Dereference(operand)
@@ -27471,43 +27516,43 @@ impl<'src> Analyzer<'src> {
             | Expr::TryAssert(operand)
             | Expr::Ascribe(operand)
             | Expr::ArrayLen(operand, _) => {
-                self.scan_bumps(operand, function_id, positions, visited);
+                self.scan_bumps(operand, function_id, scan, visited);
             }
             Expr::Index(subject, index) => {
-                self.scan_bumps(subject, function_id, positions, visited);
-                self.scan_bumps(index, function_id, positions, visited);
+                self.scan_bumps(subject, function_id, scan, visited);
+                self.scan_bumps(index, function_id, scan, visited);
             }
             Expr::List(ids) | Expr::Tuple(ids) => {
                 for id in ids {
-                    self.scan_bumps(id, function_id, positions, visited);
+                    self.scan_bumps(id, function_id, scan, visited);
                 }
             }
             Expr::StructInitializer(_, fields) => {
                 for value in fields.values() {
-                    self.scan_bumps(*value, function_id, positions, visited);
+                    self.scan_bumps(*value, function_id, scan, visited);
                 }
             }
             // Expression-carrying forms `scan_move` also walks — a bumping call can
             // hide inside any of these (a lift region's steps carry real calls), so
             // the coverage set mirrors the move scan's, not a shorter list.
             Expr::Destructure(value_id, _) => {
-                self.scan_bumps(value_id, function_id, positions, visited);
+                self.scan_bumps(value_id, function_id, scan, visited);
             }
             Expr::Repeat(value_id, _) => {
-                self.scan_bumps(value_id, function_id, positions, visited);
+                self.scan_bumps(value_id, function_id, scan, visited);
             }
             Expr::Is(subject, _) => {
-                self.scan_bumps(subject, function_id, positions, visited);
+                self.scan_bumps(subject, function_id, scan, visited);
             }
             Expr::Lift(subject, _, continuation) => {
-                self.scan_bumps(subject, function_id, positions, visited);
-                self.scan_bumps(continuation, function_id, positions, visited);
+                self.scan_bumps(subject, function_id, scan, visited);
+                self.scan_bumps(continuation, function_id, scan, visited);
             }
             Expr::LiftRegion(steps, body) => {
                 for (step_id, _, _) in &steps {
-                    self.scan_bumps(*step_id, function_id, positions, visited);
+                    self.scan_bumps(*step_id, function_id, scan, visited);
                 }
-                self.scan_bumps(body, function_id, positions, visited);
+                self.scan_bumps(body, function_id, scan, visited);
             }
             // A comprehension's source and body are executable — a bump inside
             // (`(s in xs => { h.inner = [0]; .. })`) counts like any other.
@@ -27516,9 +27561,9 @@ impl<'src> Analyzer<'src> {
             // list, and the omission read as content-stable, an unsafe default.)
             Expr::TupleComprehension(bindings, body) => {
                 for (_, source) in bindings {
-                    self.scan_bumps(source, function_id, positions, visited);
+                    self.scan_bumps(source, function_id, scan, visited);
                 }
-                self.scan_bumps(body, function_id, positions, visited);
+                self.scan_bumps(body, function_id, scan, visited);
             }
             _ => {}
         }
@@ -27528,25 +27573,25 @@ impl<'src> Analyzer<'src> {
         &self,
         branch: &ExprIfBranch,
         function_id: Id,
-        positions: &mut BTreeSet<u32>,
+        scan: &mut BumpScan,
         visited: &mut HashSet<Id>,
     ) {
         match branch {
             ExprIfBranch::If(condition, (statements, tail), else_branch) => {
-                self.scan_bumps(*condition, function_id, positions, visited);
+                self.scan_bumps(*condition, function_id, scan, visited);
                 for statement in statements {
-                    self.scan_bumps(*statement, function_id, positions, visited);
+                    self.scan_bumps(*statement, function_id, scan, visited);
                 }
-                self.scan_bumps(*tail, function_id, positions, visited);
+                self.scan_bumps(*tail, function_id, scan, visited);
                 if let Some(else_branch) = else_branch {
-                    self.scan_bumps_if(else_branch, function_id, positions, visited);
+                    self.scan_bumps_if(else_branch, function_id, scan, visited);
                 }
             }
             ExprIfBranch::Else((statements, tail)) => {
                 for statement in statements {
-                    self.scan_bumps(*statement, function_id, positions, visited);
+                    self.scan_bumps(*statement, function_id, scan, visited);
                 }
-                self.scan_bumps(*tail, function_id, positions, visited);
+                self.scan_bumps(*tail, function_id, scan, visited);
             }
         }
     }
@@ -27607,14 +27652,19 @@ impl<'src> Analyzer<'src> {
             })
     }
 
-    fn call_bumps_positions(&self, call_id: Id, function_id: Id, positions: &mut BTreeSet<u32>) {
+    fn call_bumps_positions(&self, call_id: Id, function_id: Id, scan: &mut BumpScan) {
         let Some(function_call) = self.function_calls.get(&call_id) else {
             return;
         };
         let argument_ids = function_call.argument_ids.clone();
         let callee_bumps: Option<BTreeSet<u32>> =
             match self.expr_id_to_expr_map.get(&function_call.subject_id) {
-                Some(Expr::Local(callee_id)) => self.callee_bumps_set(callee_id),
+                Some(Expr::Local(callee_id)) => {
+                    // The verdict this scan READ: a change to it re-scans this
+                    // body (`infer_bumps`' worklist).
+                    scan.callees.push(*callee_id);
+                    self.callee_bumps_set(callee_id)
+                }
                 _ => None,
             };
         match callee_bumps {
@@ -27624,7 +27674,7 @@ impl<'src> Analyzer<'src> {
                         && let Some(caller_position) =
                             self.argument_root_mutable_position(*argument_id, function_id)
                     {
-                        positions.insert(caller_position);
+                        scan.positions.insert(caller_position);
                     }
                 }
             }
@@ -27638,7 +27688,7 @@ impl<'src> Analyzer<'src> {
                         && let Some(caller_position) =
                             self.argument_root_mutable_position(*argument_id, function_id)
                     {
-                        positions.insert(caller_position);
+                        scan.positions.insert(caller_position);
                     }
                 }
             }
@@ -69932,6 +69982,14 @@ pub enum TryDispatch {
 /// source file. Since entity ids are minted monotonically and each file is
 /// walked by a single top-level pass, these ranges map an entity back to the
 /// file it came from (see `Program::source_of`).
+/// One body's `bumps` scan (`Analyzer::infer_bumps`): the parameter positions
+/// it bumps, and the callees whose verdict it read on the way — the
+/// dependency edges the worklist follows (M127).
+struct BumpScan {
+    positions: BTreeSet<u32>,
+    callees: Vec<Id>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceRange {
     pub start: u32,
@@ -71064,6 +71122,12 @@ pub struct Program<'src> {
     // pass) mint fresh entities — synthetic parameters and references — from
     // here without colliding with analyzed ones.
     pub next_entity_id: u32,
+    /// M110 S3 (Order 50): the reuse seam the post passes read — which
+    /// entities the STORED world minted (cold: identical on every analysis
+    /// served from it), the world's post-pass record, and where to file one.
+    /// `None` for an analysis no world key describes (a macro world, an
+    /// entry that is itself a module, a clean analysis).
+    pub(crate) seam: Option<Box<ReuseSeam>>,
     // Functions and closures that are async (declared `async`, or inferred — its
     // body awaits, directly or by calling an async function). Filled by the
     // async inference pass; the transformer emits these as `async` and awaits
@@ -74961,6 +75025,85 @@ fn interned_display_name(name: String) -> &'static str {
     leaked
 }
 
+/// M110 S3 (Order 50): what the post passes know about the world an analysis
+/// was served from — see [`Program::seam`].
+#[derive(Debug)]
+pub(crate) struct ReuseSeam {
+    /// Entity ids below this were minted by the stored world.
+    pub boundary: u32,
+    /// The entity ranges of the prefix sources this analysis does NOT treat
+    /// as cold (the entry dirtied them, or an alias of the entry reaches
+    /// them): sorted, disjoint. Their entities are recomputed with the hot
+    /// set's.
+    pub warm_ranges: Vec<(u32, u32)>,
+    /// The cold source set, fingerprinted: a record is replayed only for the
+    /// set it was computed over.
+    pub cold_fingerprint: u64,
+    pub key: BaseCacheKey,
+    pub prefix_hashes: Vec<u64>,
+    /// The world's post-pass record for this cold set, if one is filed.
+    pub record: Option<std::sync::Arc<PostRecord>>,
+    /// Whether the record describes the cold tree in THIS analysis's rewrite
+    /// state — its context log equals this analysis's (the context pass sets
+    /// it). A cold result that depends on the rewrite (the async set: a
+    /// lowered `run` is a call of its body) is read and written only then.
+    pub record_matches: bool,
+    /// Whether a front end seeded this analysis — the record is filed only
+    /// then, as the label tables are (S2b): a cold `vilan check` never reads
+    /// one back and must not pay for writing it.
+    pub seeded: bool,
+}
+
+/// M110 S3 (Order 50): the post passes' PREFIX results, recorded with the
+/// world ([`WorldChecks::post`]) and read back by every analysis served from
+/// it over the same cold set. Everything here is keyed by ids the stored
+/// world minted (§2.1: the same on every hit) or carries none.
+#[derive(Debug)]
+pub(crate) struct PostRecord {
+    /// The cold nodes' call graph BEFORE the context rewrite: a pure function
+    /// of the cold tree. A hit clones it and adds the hot nodes over it.
+    pub graph_before: crate::call_graph::CallGraph,
+    /// The cold nodes' call graph AFTER the context rewrite — `None` when the
+    /// recording analysis rewrote nothing, or when the rewritten cold graph
+    /// names an entity the rewrite minted (minted ids are this analysis's,
+    /// not the world's). Valid only while [`Self::context_log`] matches.
+    pub graph_after: Option<crate::call_graph::CallGraph>,
+    /// The context rewrite's cold edits — the mutation LOG: the plan's rows
+    /// over cold entities, canonically ordered. A hit whose own cold rows
+    /// differ rebuilds the graph after the rewrite rather than replaying
+    /// `graph_after`.
+    pub context_log: crate::context::ContextLog,
+    /// The entity counter the recording analysis's rewrite minted from; the
+    /// ids `graph_after` names at or past it are the cold rewrite's mints,
+    /// renumbered from the replaying analysis's own counter.
+    pub rewrite_base: u32,
+    /// S3b (M127): the async fixpoint's COLD result — the least fixpoint over
+    /// the cold nodes alone, every hot callee unknown — which the next
+    /// analysis's fixpoint starts from (`async_infer::infer`). Set once, by
+    /// the first analysis that reads the record after filing it; sorted.
+    pub async_cold: std::sync::OnceLock<Vec<Id>>,
+    /// What the record retains, in bytes (M46's currency).
+    pub bytes: usize,
+}
+
+impl Program<'_> {
+    /// M110 S3: whether `id` names an entity the STORED world minted and this
+    /// analysis treats as the prefix's — identical on every analysis served
+    /// from the world, so an answer about it can be read off the record.
+    pub(crate) fn cold_entity(&self, id: Id) -> bool {
+        let Some(seam) = &self.seam else {
+            return false;
+        };
+        if id.0 >= seam.boundary {
+            return false;
+        }
+        let index = seam
+            .warm_ranges
+            .partition_point(|(start, _)| *start <= id.0);
+        !(index > 0 && id.0 < seam.warm_ranges[index - 1].1)
+    }
+}
+
 /// What a resolved pre-entry world is a function of, apart from the loaded
 /// files' CONTENT — which the per-hit re-hash validates instead of keying on
 /// (the E12 rule). Two analyses agreeing on every field here discover, load,
@@ -74971,8 +75114,8 @@ fn interned_display_name(name: String) -> &'static str {
 /// `workspace.packages.is_empty()` gate could never satisfy even though every
 /// macro world in a process shares one `macro_std` — the gate was standing in
 /// for a key that did not describe the workspace, not for a real hazard.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct BaseCacheKey {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BaseCacheKey {
     platform: Platform,
     /// B422: the std package's ROOTS, canonical — its base root, then each
     /// layer's, in the spec's order. A world's std modules are loaded FROM
@@ -75969,6 +76112,10 @@ struct WorldChecks {
     source_hashes: Vec<u64>,
     sources_fingerprint: u64,
     per_source: HashMap<u32, ModuleDiagnostics>,
+    /// M110 S3: the post passes' prefix record, with the cold-set fingerprint
+    /// it was computed over. One per world key: a session's keystrokes in one
+    /// file share a cold set, and a different set files its own.
+    post: Option<(u64, std::sync::Arc<PostRecord>)>,
     /// M46: what this record costs in BYTES — the input to the budget below,
     /// kept as a running total so enforcing it costs an addition rather than a
     /// walk. M19 T1b counted ROWS here, which priced a one-`Id` last-use row
@@ -75985,6 +76132,7 @@ impl WorldChecks {
     /// table slices.
     fn compute_bytes(&self) -> usize {
         let hashes = self.source_hashes.len() * std::mem::size_of::<u64>();
+        let post = self.post.as_ref().map_or(0, |(_, record)| record.bytes);
         let modules: usize = self
             .per_source
             .values()
@@ -75995,7 +76143,7 @@ impl WorldChecks {
                     + module.tables.as_ref().map_or(0, ModuleTables::bytes)
             })
             .sum();
-        hashes + modules
+        hashes + modules + post
     }
 }
 
@@ -76227,6 +76375,8 @@ fn checked_cache_store(
     let mut per_source = existing
         .map(|recorded| recorded.per_source.clone())
         .unwrap_or_default();
+    // M110 S3: a post record filed under the same content stays with it.
+    let post = existing.and_then(|recorded| recorded.post.clone());
     // A source this analysis found unrecordable loses whatever an EARLIER one
     // remembered about it: the merge above would otherwise keep serving a
     // record the current derivation has just declared unfit.
@@ -76243,6 +76393,7 @@ fn checked_cache_store(
         source_hashes: source_hashes.to_vec(),
         sources_fingerprint: fingerprint,
         per_source,
+        post,
         bytes: 0,
         last_used: tick,
     };
@@ -76305,6 +76456,69 @@ fn checked_cache_store_tables(
     // every one of them pays a full class D phase again; evicting means the
     // shapes a session keeps replaying survive. The record just written is
     // exempt, as M24's world is.
+    let bytes = recorded.bytes;
+    let tick = state.next_tick();
+    if let Some(recorded) = state.records.get_mut(key) {
+        recorded.last_used = tick;
+    }
+    state.bytes = state
+        .bytes
+        .saturating_sub(previous_bytes)
+        .saturating_add(bytes);
+    state.evict_to_budget(Some(key));
+}
+
+/// M110 S3: the post passes' prefix record for `key`, if one is filed for
+/// this content and this cold set.
+fn checked_cache_lookup_post(
+    key: &BaseCacheKey,
+    source_hashes: &[u64],
+    cold_fingerprint: u64,
+) -> Option<std::sync::Arc<PostRecord>> {
+    let cache = CHECKED_CACHE.get()?;
+    let state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let recorded = state.records.get(key)?;
+    if recorded.source_hashes.len() != source_hashes.len()
+        || recorded.source_hashes[1..] != source_hashes[1..]
+    {
+        return None;
+    }
+    recorded
+        .post
+        .as_ref()
+        .filter(|(fingerprint, _)| *fingerprint == cold_fingerprint)
+        .map(|(_, record)| record.clone())
+}
+
+/// M110 S3: files the post passes' prefix record beside the checks record
+/// the diagnostics store wrote for this key — never creating one (the
+/// diagnostics store is what says the content was recorded at all).
+pub(crate) fn checked_cache_store_post(
+    key: &BaseCacheKey,
+    source_hashes: &[u64],
+    cold_fingerprint: u64,
+    record: std::sync::Arc<PostRecord>,
+) {
+    let Some(cache) = CHECKED_CACHE.get() else {
+        return;
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous_bytes = state.records.get(key).map_or(0, |record| record.bytes);
+    let Some(recorded) = state.records.get_mut(key) else {
+        return;
+    };
+    if recorded.source_hashes.len() != source_hashes.len()
+        || recorded.source_hashes[1..] != source_hashes[1..]
+    {
+        return;
+    }
+    let was = recorded.post.as_ref().map_or(0, |(_, record)| record.bytes);
+    recorded.bytes = recorded.bytes.saturating_sub(was) + record.bytes;
+    recorded.post = Some((cold_fingerprint, record));
     let bytes = recorded.bytes;
     let tick = state.next_tick();
     if let Some(recorded) = state.records.get_mut(key) {
@@ -78241,6 +78455,7 @@ fn analyze_inner<'src>(
         // M19 T0/T1: from here every type-slot write is the ENTRY's, so
         // `write_type_slot` can attribute the ones that move a module's slots.
         // Set before the entry expansion, which is already entry work.
+        world.analyzer.prefix_entity_end = Some(world.analyzer.entity_id);
         world.analyzer.entry_phase = true;
         // M110 S1: the hot set, over the served prefix — exactly what the miss
         // below does after its store, so a hit and a miss build one world.
@@ -80510,6 +80725,7 @@ fn analyze_inner<'src>(
     }
     // After the store, so the world the cache holds is the pre-entry one it
     // has always been.
+    world.analyzer.prefix_entity_end = Some(world.analyzer.entity_id);
     world.analyzer.entry_phase = true;
     // M110 S1: the hot set, over the prefix just stored — what a hit on that
     // world does too, so the two build one world.
@@ -82409,6 +82625,63 @@ fn analyze_over_world<'src>(
         );
     }
 
+    // M110 S3 (Order 50): the reuse seam for the post passes. The COLD sources
+    // are the stored world's modules this analysis treats as the prefix: every
+    // source below `prefix_len` that the entry neither dirtied (its slots are
+    // the stored world's) nor reaches through an alias of itself. A post pass
+    // may read a cold entity's answer off the world's record; a module outside
+    // the set is recomputed like the hot set's. The set is fingerprinted so a
+    // record filed for one cold set is never replayed for another.
+    let reuse_seam: Option<Box<ReuseSeam>> = match (&checks_key, analyzer.prefix_entity_end) {
+        (Some(key), Some(boundary))
+            if !entry_is_module
+                && !crate::cancel::cancelled()
+                && !crate::incremental::clean_requested() =>
+        {
+            let cold_sources: Vec<SourceId> = (1..prefix_len as u32)
+                .map(SourceId)
+                .filter(|source| {
+                    !analyzer.entry_dirty_sources.contains(source)
+                        && !alias_reaching.contains(source)
+                })
+                .collect();
+            let cold_fingerprint = {
+                let mut rendered = String::new();
+                for source in &cold_sources {
+                    rendered.push_str(&source.0.to_string());
+                    rendered.push('\u{0}');
+                }
+                rendered.push_str(&prefix_len.to_string());
+                crate::content_hash(&rendered)
+            };
+            let cold: HashSet<SourceId> = cold_sources.iter().copied().collect();
+            let mut warm_ranges: Vec<(u32, u32)> = analyzer
+                .source_ranges
+                .iter()
+                .filter(|range| {
+                    range.source.0 != 0
+                        && (range.source.0 as usize) < prefix_len
+                        && !cold.contains(&range.source)
+                })
+                .map(|range| (range.start, range.end))
+                .collect();
+            warm_ranges.sort_unstable();
+            let record =
+                checked_cache_lookup_post(key, &source_hashes[..prefix_len], cold_fingerprint);
+            Some(Box::new(ReuseSeam {
+                boundary,
+                warm_ranges,
+                cold_fingerprint,
+                key: key.clone(),
+                prefix_hashes: source_hashes[..prefix_len].to_vec(),
+                record,
+                record_matches: false,
+                seeded: !workspace.hot_seeds.is_empty(),
+            }))
+        }
+        _ => None,
+    };
+
     Ok(Some(Program {
         hidden_impls_pending,
         exported_entities,
@@ -82603,6 +82876,7 @@ fn analyze_over_world<'src>(
         dyn_method_calls: std::mem::take(&mut analyzer.dyn_method_calls),
         dyn_dispatched_members: std::mem::take(&mut analyzer.dyn_dispatched_members),
         next_entity_id: analyzer.entity_id,
+        seam: reuse_seam,
         async_functions: HashSet::default(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),
         view_suspension_checks: std::mem::take(&mut analyzer.view_suspension_checks),
