@@ -713,6 +713,240 @@ fn n136_print_writes_negative_zero_as_zero() {
     assert_compiles_and_runs(source, "0\n0\n0\n2.5\n[ 1, 2 ]\n");
 }
 
+// --- S2: `dbg_stack()` ---------------------------------------------------
+
+/// `L:C` of a byte offset in `source`, 1-based, columns in characters.
+fn line_column(source: &str, offset: usize) -> String {
+    let prefix = &source[..offset];
+    let line = prefix.matches('\n').count() + 1;
+    let column = prefix[prefix.rfind('\n').map_or(0, |at| at + 1)..]
+        .chars()
+        .count()
+        + 1;
+    format!("{line}:{column}")
+}
+
+/// E281/E282: what the move and view checks recorded at each `dbg_stack()`
+/// call of `source`, as `L: name: verdict` lines — the call's line, then each
+/// recorded binding — in source order.
+#[track_caller]
+fn dbg_stack_records(source: &str) -> Vec<String> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                errors.is_empty(),
+                "expected a clean analysis, got: {:#?}",
+                errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+            );
+            let program = program.expect("a program");
+            let name = |id| {
+                program
+                    .variables
+                    .get(&id)
+                    .map(|variable| variable.name)
+                    .or_else(|| program.parameters.get(&id).map(|parameter| parameter.name))
+                    .unwrap_or("?")
+            };
+            let mut lines: Vec<(usize, u32, String)> = Vec::new();
+            for (call, moved) in &program.dbg_stack_moves {
+                let at = program.span_map[call].start;
+                let line = line_column(leaked, at);
+                let line = line.split(':').next().unwrap_or("?").to_string();
+                for (binding, state) in moved {
+                    let verdict = match state {
+                        vilan_core::analyzer::DbgStackMove::Moved(span) => {
+                            format!("moved at {}", line_column(leaked, span.start))
+                        }
+                        vilan_core::analyzer::DbgStackMove::MovedOnSomePaths(_) => {
+                            "moved on some paths".to_string()
+                        }
+                    };
+                    lines.push((
+                        at,
+                        binding.0,
+                        format!("{line}: {}: {verdict}", name(*binding)),
+                    ));
+                }
+            }
+            for (call, views) in &program.dbg_stack_invalidated {
+                let at = program.span_map[call].start;
+                let line = line_column(leaked, at);
+                let line = line.split(':').next().unwrap_or("?").to_string();
+                for entry in views {
+                    let by = match entry.callee {
+                        Some(callee) => program
+                            .functions
+                            .get(&callee)
+                            .map(|function| function.name)
+                            .or_else(|| {
+                                program
+                                    .external_functions
+                                    .get(&callee)
+                                    .map(|external| external.name)
+                            })
+                            .unwrap_or("?"),
+                        None => "assignment",
+                    };
+                    let event_at = line_column(leaked, program.span_map[&entry.event].start);
+                    lines.push((
+                        at,
+                        entry.view.0,
+                        format!(
+                            "{line}: {}: invalidated by {by} at {event_at}",
+                            name(entry.view)
+                        ),
+                    ));
+                }
+            }
+            lines.sort();
+            lines.into_iter().map(|(_, _, line)| line).collect()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// E281 + E282 on debug-48's repro (`s2_prerequisites.vl`): at a `dbg_stack()`
+/// call the resource move scan records the moved binding with its move site,
+/// and the view-invalidation scan the capture view past its last use that a
+/// push invalidated since — the two facts the expansion must have to print
+/// `<moved at 29:10>` and `<view, invalidated by push at 34:4>` without
+/// reading either.
+#[test]
+fn e281_e282_the_move_and_view_scans_record_their_state_at_a_dbg_stack_call() {
+    let source = concat!(
+        "[resource]\n",
+        "struct Guard {\n",
+        "\tid: i32,\n",
+        "}\n",
+        "\n",
+        "fun consume(own guard: Guard) {\n",
+        "\tprint(guard.id);\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tlet guard = Guard { id = 1 };\n",
+        "\tconsume(guard);\n",
+        "\tmut rows = [Some(1), Some(2)];\n",
+        "\tmatch &rows[0] {\n",
+        "\t\tSome(let first) => {\n",
+        "\t\t\tprint(*first);\n",
+        "\t\t\trows.push(None);\n",
+        "\t\t\tprint(rows.len());\n",
+        "\t\t\tdbg_stack();\n",
+        "\t\t},\n",
+        "\t\tNone => {},\n",
+        "\t}\n",
+        "}\n",
+    );
+    assert_eq!(
+        dbg_stack_records(source),
+        vec![
+            "19: guard: moved at 12:10".to_string(),
+            "19: first: invalidated by push at 17:4".to_string(),
+        ]
+    );
+}
+
+/// E281: R7's other legal state — moved on one path, payload-free on the other
+/// (B67's `is` refinement) — is recorded as moved on SOME paths.
+#[test]
+fn e281_a_binding_moved_on_some_paths_is_recorded_so() {
+    let source = concat!(
+        "[resource]\n",
+        "struct Guard { id: i32 }\n",
+        "fun consume(own held: Option<Guard>) {\n",
+        "\tif held is Some(let guard) {\n",
+        "\t\tprint(guard.id);\n",
+        "\t}\n",
+        "}\n",
+        "fun main() {\n",
+        "\tlet held: Option<Guard> = Some(Guard { id = 1 });\n",
+        "\tdbg_stack();\n",
+        "\tif held is Some(_) {\n",
+        "\t\tconsume(held);\n",
+        "\t}\n",
+        "\tdbg_stack();\n",
+        "}\n",
+    );
+    assert_eq!(
+        dbg_stack_records(source),
+        vec!["14: held: moved on some paths".to_string()]
+    );
+}
+
+/// E282 across branches and loops. An event on one path of an `if` reaches a
+/// call after it but not a call on the other path; an assignment to the root
+/// is an event too; and a capture view that is never used — retired from its
+/// arm's start — is invalidated for a call EARLIER in a loop by a push later
+/// in it, which comes first on the next iteration.
+#[test]
+fn e282_an_invalidation_follows_the_paths_and_the_loops_to_a_dbg_stack_call() {
+    let branches = concat!(
+        "fun main() {\n",
+        "\tmut rows = [Some(1), Some(2)];\n",
+        "\tmatch &rows[0] {\n",
+        "\t\tSome(let first) => {\n",
+        "\t\t\tprint(*first);\n",
+        "\t\t\tif rows.len() > 5 {\n",
+        "\t\t\t\trows.push(None);\n",
+        "\t\t\t} else {\n",
+        "\t\t\t\tdbg_stack();\n",
+        "\t\t\t}\n",
+        "\t\t\tdbg_stack();\n",
+        "\t\t},\n",
+        "\t\tNone => {},\n",
+        "\t}\n",
+        "\tmatch &rows[1] {\n",
+        "\t\tSome(let second) => {\n",
+        "\t\t\tprint(*second);\n",
+        "\t\t\trows = [None];\n",
+        "\t\t\tdbg_stack();\n",
+        "\t\t},\n",
+        "\t\tNone => {},\n",
+        "\t}\n",
+        "}\n",
+    );
+    assert_eq!(
+        dbg_stack_records(branches),
+        vec![
+            "11: first: invalidated by push at 7:5".to_string(),
+            "19: second: invalidated by assignment at 18:4".to_string(),
+        ]
+    );
+    let looped = concat!(
+        "fun main() {\n",
+        "\tmut rows = [Some(1), Some(2)];\n",
+        "\tmatch &rows[0] {\n",
+        "\t\tSome(let first) => {\n",
+        "\t\t\tmut count = 0;\n",
+        "\t\t\tfor count < 2 {\n",
+        "\t\t\t\tdbg_stack();\n",
+        "\t\t\t\trows.push(None);\n",
+        "\t\t\t\tcount = count + 1;\n",
+        "\t\t\t}\n",
+        "\t\t},\n",
+        "\t\tNone => {},\n",
+        "\t}\n",
+        "}\n",
+    );
+    assert_eq!(
+        dbg_stack_records(looped),
+        vec!["7: first: invalidated by push at 8:5".to_string()]
+    );
+}
+
 /// N149: N136's recording is static, so `print(value)` with `value: T` was not
 /// wrapped where `T` is a number and negative zero printed `-0` on JS (`0`
 /// natively). The type is read per instance now: the number instances share a

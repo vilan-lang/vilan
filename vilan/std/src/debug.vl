@@ -246,6 +246,22 @@ external fun caller(): Location;
 /// `vilan.toml` sets `[build] dbg = "strip"` or `"keep"`.
 external fun dbg(): void;
 
+// --- `dbg_stack` (debugging.md S2) ---
+
+/// `dbg_stack()` prints every binding in scope at the call to stderr
+/// (`console.log` in the browser): a `[src/main.vl:12:5] dbg_stack() in main`
+/// line, then one `name: Type = value` line per parameter and local, innermost
+/// scope first, a shadowed binding under the one that hides it. The compiler
+/// expands the call from the scope it sits in, so it prints without looking
+/// anything up at run time and the same bytes on both backends. It reads
+/// nothing it must not: a resource already moved prints `<moved at L:C>` (or
+/// `<moved on some paths>`), a view a later push invalidated prints `<view,
+/// invalidated by push at L:C>`, a pipe and a `lazy` parameter print without
+/// running, and a cell prints its current value without subscribing. Inside a
+/// closure it lists the closure's own bindings and then the ones it captures.
+/// A release build refuses it, as it refuses `dbg`.
+external fun dbg_stack(): void;
+
 // --- Json / Wire (shared JSON impls via in-world helpers) ---
 
 // --- The sized numeric family (proposal/numeric-types.md §5) ---

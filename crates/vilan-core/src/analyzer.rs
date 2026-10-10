@@ -15,10 +15,13 @@ use crate::target::{Platform, PlatformPattern};
 use crate::type_::{Mode, ParameterMode, SubstitutionContext, Type, TypeId};
 use crate::util::{join_with, plural};
 
+mod dbg_stack;
 mod hint_labels;
 mod hover_labels;
 mod liveness;
 
+pub use dbg_stack::{DbgStackInvalidation, DbgStackMove};
+use dbg_stack::{DbgStackViewSite, DbgStackViewState};
 pub use hint_labels::HintLabel;
 pub use hover_labels::{DEFINITION_MEMBER_CAP, PatternLabel, ReferenceHover, TypeDefinitions};
 pub use liveness::DropExtent;
@@ -1561,6 +1564,9 @@ struct InvalidationScanState {
     /// set when the scan passes it. A capture with a use inside a loop or a
     /// closure in its arm is not counted; it stays live for the whole arm.
     capture_uses: HashMap<Id, usize>,
+    /// E282 (debugging.md S2): what a `dbg_stack()` call must know about the
+    /// capture views it may not read — kept only in a program that has one.
+    dbg_stack: DbgStackViewState,
 }
 
 /// A call site with a view live across it, pending the suspension verdict.
@@ -1719,7 +1725,16 @@ struct MoveScan<'a> {
     /// of its fields is the ordinary use-after-move. Every other consuming
     /// field read stays R5's partial move.
     partial_move_roots: &'a HashMap<Id, Id>,
+    /// E281 (debugging.md S2): where the scan files the move state it holds at
+    /// each `dbg_stack()` call — the record the expansion reads to print a
+    /// moved binding without reading it. The concrete scan's is the record
+    /// itself; R11's per-instantiation re-scan files the generic half.
+    dbg_stack_sink: Option<&'a std::cell::RefCell<DbgStackMoveRecords>>,
 }
+
+/// E281: per `dbg_stack()` call, the resource bindings [`MoveFlow::moved`]
+/// holds there.
+type DbgStackMoveRecords = Vec<(Id, Vec<(Id, MoveState)>)>;
 
 /// One arm's outcome, for R7's cross-arm comparison and the continuation merge.
 struct ArmMoveState {
@@ -5766,6 +5781,25 @@ pub struct Analyzer<'src> {
     dbg_argument_types: HashMap<Id, TypeId>,
     // N136: the `print` arguments typed as a number.
     number_print_arguments: HashSet<Id>,
+    // `std::debug::dbg_stack` (debugging.md S2): the call the analyzer expands
+    // from the scope it sits in (`analyzer/dbg_stack.rs`).
+    dbg_stack_fn_id: Option<Id>,
+    // Every resolved `dbg_stack()` call's subject → the call, in resolution
+    // order. `callee_conventions` answers the expansion's minted arguments
+    // `Ref`: a listed binding is read in place, never moved.
+    dbg_stack_calls: IndexMap<Id, Id>,
+    // E281: the resource move scan's state at each `dbg_stack()` call — every
+    // resource binding moved on all paths or on some paths there, with its move
+    // site — so the expansion prints `<moved at L:C>` instead of reading it.
+    // R11's per-instantiation scan adds a generic body's: a `T`-typed binding
+    // moved where an instantiation makes `T` a resource is moved for every
+    // instance (a read would keep it alive past its move, so the move would
+    // have to copy a resource).
+    dbg_stack_moves: HashMap<Id, Vec<(Id, DbgStackMove)>>,
+    // E282: the capture views a `dbg_stack()` call must not read — past their
+    // last use, with a rule-4 event on their root since (the view-invalidation
+    // scan's per-site record).
+    dbg_stack_invalidated: HashMap<Id, Vec<DbgStackInvalidation>>,
     panic_fn_id: Option<Id>,
     // Every call's `(call id, subject id)` pair, banked at WALK time (B204).
     // `function_calls` holds the same pair, but only once the call's own
@@ -7585,6 +7619,10 @@ impl<'src> Analyzer<'src> {
             dbg_statement_calls: HashSet::default(),
             dbg_argument_types: HashMap::default(),
             number_print_arguments: HashSet::default(),
+            dbg_stack_fn_id: None,
+            dbg_stack_calls: IndexMap::default(),
+            dbg_stack_moves: HashMap::default(),
+            dbg_stack_invalidated: HashMap::default(),
             call_subjects: Vec::new(),
             call_subject_ids: HashSet::default(),
             divergence_leaves: DivergenceLeaves::default(),
@@ -14131,6 +14169,7 @@ impl<'src> Analyzer<'src> {
         );
         self.partial_move_roots = partial_move_roots.clone();
 
+        let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
         let scan = MoveScan {
             resource_bindings: &resource_bindings,
             resource_value_places: &resource_value_places,
@@ -14139,8 +14178,10 @@ impl<'src> Analyzer<'src> {
             is_refinements: &is_refinements,
             value_crossings: &value_crossings,
             partial_move_roots: &partial_move_roots,
+            dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
         };
         let violations = self.scan_bodies_for_moves(&scan);
+        self.record_dbg_stack_moves(dbg_stack_sink.into_inner());
         self.emit_resource_move_violations(violations);
     }
 
@@ -16512,6 +16553,18 @@ impl<'src> Analyzer<'src> {
                 ) {
                     self.scan_move(subject_id, false, false, scan, flow, loop_depth, violations);
                 }
+                // E281: what is moved where a `dbg_stack()` sits.
+                if let Some(sink) = scan.dbg_stack_sink
+                    && self.dbg_stack_calls.contains_key(&subject_id)
+                {
+                    let mut moved: Vec<(Id, MoveState)> = flow
+                        .moved
+                        .iter()
+                        .map(|(binding, state)| (*binding, *state))
+                        .collect();
+                    moved.sort_unstable_by_key(|(binding, _)| binding.0);
+                    sink.borrow_mut().push((call_id, moved));
+                }
             }
 
             // R4: a return moves its value out — terminal (a returned `if`/`match`
@@ -17013,6 +17066,15 @@ impl<'src> Analyzer<'src> {
                 Convention::Own
             };
             return Some(vec![convention; arity]);
+        }
+        // debugging.md S2: a `dbg_stack()` call's arguments are the reads its
+        // expansion minted, one per listed binding, each read in place.
+        if let Some(call_id) = self.dbg_stack_calls.get(&subject_id) {
+            let arity = self
+                .function_calls
+                .get(call_id)
+                .map_or(0, |call| call.argument_ids.len());
+            return Some(vec![Convention::Ref; arity]);
         }
         let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
             return None;
@@ -18400,6 +18462,7 @@ impl<'src> Analyzer<'src> {
                 &loaned_captures,
                 &known_instantiation,
             );
+            let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
             let violations = {
                 // A generic body's bindings are all in-body (parameters / locals);
                 // module-level resources never enter its delta set, so the loan-only
@@ -18412,9 +18475,11 @@ impl<'src> Analyzer<'src> {
                     is_refinements: &is_refinements,
                     value_crossings: &value_crossings,
                     partial_move_roots: &partial_move_roots,
+                    dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
                 };
                 self.scan_instantiated_body(instance.callee, &closures, &scan)
             };
+            self.record_dbg_stack_moves(dbg_stack_sink.into_inner());
             let body_is_move_clean = violations.is_empty();
             let reported_before = self.diagnostics.len();
             match instance.site {
@@ -29180,6 +29245,7 @@ impl<'src> Analyzer<'src> {
             .collect();
         let mut violations: Vec<InvalidationViolation<'src>> = Vec::new();
         let mut pending = ViewSuspensionChecks::default();
+        let mut dbg_stack_sites: Vec<DbgStackViewSite> = Vec::new();
         // B313's stand-down: the RECEIVERS of `[rpc]` methods the `[service]`
         // attribute has already refused for being `async` beside `&mut self`
         // (B287). Both reports are true and neither is wrong — E3 says the view
@@ -29200,6 +29266,7 @@ impl<'src> Analyzer<'src> {
         for (function_id, statements, tail) in &bodies {
             let mut live = HashSet::default();
             let mut state = InvalidationScanState::default();
+            state.dbg_stack.tracking = !self.dbg_stack_calls.is_empty();
             self.scan_invalidation_block(
                 statements,
                 *tail,
@@ -29259,11 +29326,13 @@ impl<'src> Analyzer<'src> {
                         .map(|(parameter_id, form)| (*function_id, parameter_id, form)),
                 );
             }
+            dbg_stack_sites.append(&mut state.dbg_stack.sites);
             Self::record_pending_crossings(&mut pending, &view_origins, state);
         }
         for return_id in closure_returns {
             let mut live = HashSet::default();
             let mut state = InvalidationScanState::default();
+            state.dbg_stack.tracking = !self.dbg_stack_calls.is_empty();
             self.scan_invalidation_block(
                 &[],
                 return_id,
@@ -29272,8 +29341,10 @@ impl<'src> Analyzer<'src> {
                 &mut violations,
                 &mut state,
             );
+            dbg_stack_sites.append(&mut state.dbg_stack.sites);
             Self::record_pending_crossings(&mut pending, &view_origins, state);
         }
+        self.record_dbg_stack_invalidations(dbg_stack_sites);
         // Extended, not assigned: a reused module's rows were replayed from
         // its record before this window ran (B575).
         self.view_suspension_checks
@@ -29982,6 +30053,9 @@ impl<'src> Analyzer<'src> {
             }
             Expr::Assignment(target_id, value_id) => {
                 self.scan_invalidation(value_id, scan, live, violations, state);
+                if state.dbg_stack.tracking {
+                    self.note_dbg_stack_assignment(target_id, scan, state);
+                }
                 // Reassigning a whole binding invalidates views into it (E1).
                 if let Some(Expr::Local(root_id)) = self.expr_id_to_expr_map.get(&target_id)
                     && live.iter().any(|view| {
@@ -30024,7 +30098,9 @@ impl<'src> Analyzer<'src> {
                 if let Some(condition) = condition {
                     self.scan_invalidation(condition, scan, live, violations, state);
                 }
+                state.dbg_stack.enter_loop();
                 self.scan_invalidation_block(&statements, tail, scan, live, violations, state);
+                state.dbg_stack.leave_loop();
             }
             Expr::ForEach(iterable, item, (statements, tail)) => {
                 self.scan_invalidation(iterable, scan, live, violations, state);
@@ -30032,7 +30108,9 @@ impl<'src> Analyzer<'src> {
                 // body's extent — live across every iteration.
                 let loop_view = item.filter(|item| scan.view_bindings.contains(item));
                 let newly_live = loop_view.is_some_and(|item| live.insert(item));
+                state.dbg_stack.enter_loop();
                 self.scan_invalidation_block(&statements, tail, scan, live, violations, state);
+                state.dbg_stack.leave_loop();
                 if newly_live && let Some(item) = loop_view {
                     live.remove(&item);
                 }
@@ -30040,7 +30118,9 @@ impl<'src> Analyzer<'src> {
             Expr::If(branch) => self.scan_invalidation_if(&branch, scan, live, violations, state),
             Expr::Match(subject_id, legs) => {
                 self.scan_invalidation(subject_id, scan, live, violations, state);
+                state.dbg_stack.fork();
                 for leg in legs {
+                    state.dbg_stack.enter_path();
                     if let Some(guard) = leg.guard {
                         self.scan_invalidation(guard, scan, live, violations, state);
                     }
@@ -30056,7 +30136,10 @@ impl<'src> Analyzer<'src> {
                         live.remove(&view);
                         state.capture_uses.remove(&view);
                     }
+                    state.dbg_stack.leave_scope(&leg_views);
+                    state.dbg_stack.leave_path();
                 }
+                state.dbg_stack.join();
             }
             Expr::Reference(operand, _) | Expr::Dereference(operand) | Expr::Unary(_, operand) => {
                 self.scan_invalidation(operand, scan, live, violations, state);
@@ -30101,6 +30184,10 @@ impl<'src> Analyzer<'src> {
                 let subject_id = function_call.subject_id;
                 for argument in &argument_ids {
                     self.scan_invalidation(*argument, scan, live, violations, state);
+                }
+                // E282: which capture views a `dbg_stack()` here may not read.
+                if state.dbg_stack.tracking && self.dbg_stack_calls.contains_key(&subject_id) {
+                    state.dbg_stack.note_site(call_id);
                 }
                 // E3, B119: the call is a suspension point in its own right
                 // when its CALLEE can suspend — the implicit await
@@ -30186,6 +30273,15 @@ impl<'src> Analyzer<'src> {
                     {
                         continue;
                     }
+                    if state.dbg_stack.tracking {
+                        state
+                            .dbg_stack
+                            .note_event(expr_id, Some(*callee_id), |view| {
+                                scan.view_origins
+                                    .get(view)
+                                    .is_some_and(|roots| roots.contains(&root))
+                            });
+                    }
                     if live.iter().any(|view| {
                         scan.view_origins
                             .get(view)
@@ -30217,6 +30313,7 @@ impl<'src> Analyzer<'src> {
                     if *remaining == 0 {
                         state.capture_uses.remove(&binding);
                         live.remove(&binding);
+                        state.dbg_stack.retire(binding);
                     }
                 }
             }
@@ -30237,7 +30334,12 @@ impl<'src> Analyzer<'src> {
         let mut newly_live = Vec::new();
         for view in views {
             let uses = self.binding_use_count(body, *view);
-            if uses == Some(0) || !live.insert(*view) {
+            if uses == Some(0) {
+                // Never live, so never read: past its last use from the start.
+                state.dbg_stack.retire(*view);
+                continue;
+            }
+            if !live.insert(*view) {
                 continue;
             }
             if let Some(uses) = uses {
@@ -30265,14 +30367,20 @@ impl<'src> Analyzer<'src> {
                 let mut views = Vec::new();
                 self.collect_is_capture_views(*condition, &mut views);
                 views.retain(|view| scan.view_bindings.contains(view));
+                state.dbg_stack.fork();
                 let mut newly_live = Vec::new();
-                for view in views {
+                for view in &views {
+                    let view = *view;
                     let uses = statements
                         .iter()
                         .chain(std::iter::once(tail))
                         .map(|id| self.binding_use_count(*id, view))
                         .try_fold(0usize, |total, uses| uses.map(|uses| total + uses));
-                    if uses == Some(0) || !live.insert(view) {
+                    if uses == Some(0) {
+                        state.dbg_stack.retire(view);
+                        continue;
+                    }
+                    if !live.insert(view) {
                         continue;
                     }
                     if let Some(uses) = uses {
@@ -30285,9 +30393,14 @@ impl<'src> Analyzer<'src> {
                     live.remove(&view);
                     state.capture_uses.remove(&view);
                 }
+                state.dbg_stack.leave_scope(&views);
+                state.dbg_stack.leave_path();
                 if let Some(else_branch) = else_branch {
+                    state.dbg_stack.enter_path();
                     self.scan_invalidation_if(else_branch, scan, live, violations, state);
+                    state.dbg_stack.leave_path();
                 }
+                state.dbg_stack.join();
             }
             ExprIfBranch::Else((statements, tail)) => {
                 self.scan_invalidation_block(statements, *tail, scan, live, violations, state);
@@ -51992,6 +52105,17 @@ impl<'src> Analyzer<'src> {
                         arguments_span,
                     );
                 }
+                if let Expr::ExternalFunction(function_id) = &target
+                    && Some(*function_id) == self.dbg_stack_fn_id
+                {
+                    return self.resolve_dbg_stack_call(
+                        call_id,
+                        subject_id,
+                        generic_argument_ids,
+                        argument_ids,
+                        arguments_span,
+                    );
+                }
                 let function_data = match &target {
                     Expr::Function(function_id) | Expr::ExternalFunction(function_id) => self
                         .callable_signature(*function_id)
@@ -67930,6 +68054,15 @@ pub struct Program<'src> {
     /// name the enclosing function's generics; an emitter resolves it under
     /// the instance it is emitting.
     pub dbg_argument_types: HashMap<Id, TypeId>,
+    /// `std::debug::dbg_stack` (debugging.md S2): the call both emitters lower
+    /// to the expansion in [`Program::dbg_stack_sites`].
+    pub dbg_stack_fn_id: Option<Id>,
+    /// E281: at each `dbg_stack()` call, the resource bindings the move scan
+    /// holds as moved (on every path, or on some) with the move's span.
+    pub dbg_stack_moves: HashMap<Id, Vec<(Id, DbgStackMove)>>,
+    /// E282: at each `dbg_stack()` call, the capture views past their last
+    /// use that a rule-4 event has invalidated since.
+    pub dbg_stack_invalidated: HashMap<Id, Vec<DbgStackInvalidation>>,
     /// N136: the `print` arguments the analysis typed as a number of the
     /// language's own (every integer width, `f32`, `f64`) — the JS backend
     /// prints them through `String(x)`.
@@ -77082,6 +77215,10 @@ fn analyze_inner<'src>(
             .scopes
             .get(debug_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("dbg").copied());
+        analyzer.dbg_stack_fn_id = analyzer
+            .scopes
+            .get(debug_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("dbg_stack").copied());
     }
     // Remember `std::web::asset`'s const-only compile-time channel — lines out (in
     // both spellings), the end-of-evaluation hook, text in, whole files out
@@ -78180,6 +78317,11 @@ fn analyze_over_world<'src>(
         // debugging.md S1 (Q2): which `dbg(..)` calls are statements — read by
         // the ownership checks below and by both emitters.
         analyzer.classify_dbg_calls();
+        // debugging.md S2: a module holding a `dbg_stack()` call keeps no
+        // Class A record, so the two per-site records the window's scans
+        // write for the expansion (E281, E282) are re-derived on every
+        // analysis rather than replayed without them (B575).
+        analyzer.mark_dbg_stack_modules_unrecordable();
     }
     // ------------------------------------------------------------------
     // M19 T1's Class A window (`per-module-analysis-reuse.md` §3.3).
@@ -79650,6 +79792,9 @@ fn analyze_over_world<'src>(
             .collect(),
         dbg_statement_calls: analyzer.dbg_statement_calls.clone(),
         dbg_argument_types: analyzer.dbg_argument_types.clone(),
+        dbg_stack_fn_id: analyzer.dbg_stack_fn_id,
+        dbg_stack_moves: std::mem::take(&mut analyzer.dbg_stack_moves),
+        dbg_stack_invalidated: std::mem::take(&mut analyzer.dbg_stack_invalidated),
         number_print_arguments: std::mem::take(&mut analyzer.number_print_arguments),
         track_caller_parameters: HashMap::default(),
         index_location_arguments: HashMap::default(),
@@ -81856,6 +82001,7 @@ pub fn check_unlowered_externals(program: &mut Program) {
         program.panic_fn_id,
         program.caller_fn_id,
         program.dbg_fn_id,
+        program.dbg_stack_fn_id,
         program.print_fn_id,
         program.drop_fn_id,
         program.context_new_fn_id,

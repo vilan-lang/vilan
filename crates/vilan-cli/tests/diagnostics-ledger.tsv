@@ -693,3 +693,4 @@ row	flagship	key
 669	-	a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one, and `{written}` is `{type_label}`{steer}
 670	-	A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children in one element (`<div>…</div>`), or make this position a `List<View>`
 671	-	Expected {expected}, but got {got} instead: inside the impl that declares it, a bare `{path}::{member}(..)` is `Self::{member}(..)`, whose `{expected}` is this block's own. Write `{suggested}::{member}(..)` to call it at another instantiation
+NEW	-	`dbg_stack()` takes no arguments: it prints every binding in scope at the call. To print chosen values, use `dbg(..)`
