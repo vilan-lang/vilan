@@ -5066,6 +5066,14 @@ pub struct Analyzer<'src> {
     // `push` unifies it with the pushed value's type, so a built-up list's
     // element is inferred (`List::new(); push(p: Point)` -> `List<Point>`).
     list_element_slots: HashMap<Id, TypeId>,
+    /// B599: the holes a payload-less variant of a generic enum (`None`,
+    /// `Holder::Empty`) answers with at each USE SITE, keyed by the use's id —
+    /// minted once, as an empty list's element slot is, so every inference of
+    /// the site (and of a call built from it) reads the same slots and a use
+    /// that fills one fills it for all of them ([`Self::fill_holes_from_use`]).
+    /// Minted per inference, `Cell::new(None)` answered a fresh hole each time
+    /// it was asked, and its binding's slot was not the one a later use filled.
+    variant_use_holes: HashMap<Id, Vec<TypeId>>,
     /// B554: the argument whose `push`/`run` FILLED each element slot — the
     /// first use in walk order — so a later use that contradicts it can tell
     /// whether the two sit in different files (where walk order is the
@@ -7781,6 +7789,7 @@ impl<'src> Analyzer<'src> {
             field_syntax_reads: HashSet::default(),
             bool_enum_id: None,
             list_element_slots: HashMap::default(),
+            variant_use_holes: HashMap::default(),
             slot_fill_sites: HashMap::default(),
             lenient_subscript_indexes: Vec::new(),
             pinned_diagnostic_anchors: Vec::new(),
@@ -44162,6 +44171,40 @@ impl<'src> Analyzer<'src> {
     /// by the non-empty path whose elements did not type (B305: the same
     /// erasure, manufactured for `[x]` over a closure parameter nothing had
     /// filled yet).
+    /// B599: a payload-less variant of a generic enum that answered a HOLE per
+    /// parameter (B357: nothing named its arguments) answers the SAME holes at
+    /// the same use site every time ([`Analyzer::variant_use_holes`]). `None`
+    /// when `subject` is not that answer.
+    fn stable_variant_use_holes(
+        &mut self,
+        use_id: Id,
+        subject_id: Id,
+        subject: &Type,
+    ) -> Option<Type> {
+        let Type::Enum(enum_id, arguments) = subject else {
+            return None;
+        };
+        if arguments.is_empty()
+            || !matches!(
+                self.expr_id_to_expr_map.get(&subject_id),
+                Some(Expr::EnumVariant(variant_enum_id, _)) if variant_enum_id == enum_id
+            )
+            || !arguments
+                .iter()
+                .all(|argument| matches!(argument.borrow_type(self), Type::Unknown))
+        {
+            return None;
+        }
+        if let Some(holes) = self.variant_use_holes.get(&use_id) {
+            if holes.len() == arguments.len() {
+                return Some(Type::Enum(*enum_id, holes.clone()));
+            }
+            return None;
+        }
+        self.variant_use_holes.insert(use_id, arguments.clone());
+        None
+    }
+
     fn list_literal_element_slot(&mut self, literal_id: Id) -> TypeId {
         if let Some(slot) = self.list_element_slots.get(&literal_id).copied() {
             return slot;
@@ -46100,6 +46143,9 @@ impl<'src> Analyzer<'src> {
                     && let Some(written) = self.written_payload_less_variant(expr_id, subject_id)
                 {
                     return written;
+                }
+                if let Some(stable) = self.stable_variant_use_holes(expr_id, subject_id, &subject) {
+                    return stable;
                 }
                 match subject {
                     Type::Unresolved => Type::Unresolved,
@@ -49629,6 +49675,16 @@ impl<'src> Analyzer<'src> {
                     return type_.clone();
                 };
                 let resolved = type_id.get_type(self);
+                // B599: a generic bound to a value substitution cannot change
+                // IS that value — its argument slots, not copies of them. A
+                // copy re-minted every hole the value held: `Cell::new(None)`
+                // binds `T` to the `None`'s `Option<hole>`, and the call's
+                // `Cell<T>` answered `Cell<Option<fresh hole>>` on every ask,
+                // so a use that filled the binding's hole filled a slot no
+                // other reader held (fill-from-use, [`Self::fill_holes_from_use`]).
+                if self.substitution_fixed(type_id) {
+                    return resolved;
+                }
                 self.substitute_type(&resolved, substitution_context)
             }
             // A nominal type substitutes its arguments (`Option<T>` -> `Option<i32>`
@@ -54216,6 +54272,9 @@ impl<'src> Analyzer<'src> {
                         argument_ids,
                         &substitution_context,
                     );
+                    // B599: the arguments whose types hold a hole, filled once
+                    // every argument has bound what it binds.
+                    let mut holed_arguments: Vec<(Id, Type, Type)> = Vec::new();
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
@@ -54370,6 +54429,13 @@ impl<'src> Analyzer<'src> {
                                         );
                                     }
                                 }
+                                if self.type_value_has_hole(&argument_type) {
+                                    holed_arguments.push((
+                                        argument_id,
+                                        argument_type.clone(),
+                                        parameter_type.clone(),
+                                    ));
+                                }
                             }
                             None => {
                                 let (msg, note) = match self.underdetermined_mapped_argument(
@@ -54433,6 +54499,20 @@ impl<'src> Analyzer<'src> {
                         &generic_parameter_constraint_ids,
                         &mut substitution_context,
                     );
+                    // B599: the parameter states what a hole in the argument
+                    // stands for — through the call's bindings, or, for a
+                    // bare-trait or bounded parameter nothing grounds, through
+                    // its bound.
+                    for (argument_id, argument_type, parameter_type) in holed_arguments {
+                        let declared = self.substitute_type(&parameter_type, &substitution_context);
+                        let stating = match parameter_type {
+                            Type::Generic(_) if self.type_value_has_hole(&declared) => {
+                                parameter_type
+                            }
+                            _ => declared,
+                        };
+                        self.fill_holes_from_use(&argument_type, &stating, argument_id);
+                    }
                     self.wire_call(
                         call_id,
                         subject_id,
@@ -55607,6 +55687,27 @@ impl<'src> Analyzer<'src> {
                         self.own_generic_call_bindings.insert(id, values);
                     }
                 }
+                // B599, the receiver channel: an argument that states what the
+                // receiver's hole stands for (`subject.set(Some("x"))` binds
+                // `T = Option<str>` over the receiver's `Option<unknown>`, the
+                // weaker binding) fills the receiver where it stands, through
+                // `self`'s declared type under the call's bindings.
+                // `push`/`run` on a container's open element slot are the
+                // slot's own channel (`SlotUnification`, which records the
+                // fill's site for B554's cross-file report).
+                let slot_channel = (member_name == "push" || member_name == "run")
+                    && self.list_element_slot(&subject_type).is_some();
+                if !slot_channel
+                    && self.type_value_has_hole(&subject_type)
+                    && let Some((parameter_ids, _)) = self.method_signature(member_id)
+                    && let Some(self_type) = parameter_ids
+                        .first()
+                        .and_then(|parameter_id| self.parameters.get(parameter_id))
+                        .map(|parameter| parameter.type_id.get_type(self))
+                {
+                    let stated = self.substitute_type(&self_type, &substitution);
+                    self.fill_holes_from_use(&subject_type, &stated, subject_id);
+                }
                 if !substitution.is_empty() {
                     self.method_call_substitution.insert(id, substitution);
                 }
@@ -56212,8 +56313,14 @@ impl<'src> Analyzer<'src> {
             }
             if self
                 .reconcile_type(&argument_type, &parameter_type, &HashMap::default())
-                .is_none()
+                .is_some()
             {
+                // B599: the parameter states what a hole in the argument
+                // stands for — `v` in `list.push(v)` takes the list's element
+                // (the receiver's holes are filled at the call's resolution,
+                // where its bindings are decided).
+                self.fill_holes_from_use(&argument_type, &parameter_type, argument_id);
+            } else {
                 let msg = self.type_mismatch_message(
                     &parameter_type,
                     &argument_type,
@@ -57634,6 +57741,108 @@ impl<'src> Analyzer<'src> {
             return;
         }
         self.fill_holes_admitting(binding_type_id, value, Some(value_id));
+    }
+
+    /// B599 — fill-from-use: a use that STATES the type a hole stands for
+    /// fills it where it stands. `let subject = Signal::new(None)` is
+    /// `SignalCell<Option<unknown>>` — a nullary variant names no payload — and
+    /// `take(subject)` at `subject: Signal<Option<str>>`, or `subject.set(Some(
+    /// "x"))` with `set(value: T)` under `T = Option<unknown>`, says what the
+    /// `unknown` is. The reconcile admitted the use (a hole reconciles with
+    /// anything) and bound nothing, so the binding stayed open to the end and
+    /// B580 refused it, over code that says the type.
+    ///
+    /// `held` is the side carrying the hole — an argument's type (the argument
+    /// channel) or a parameter's type through the receiver's substitution (the
+    /// receiver channel: its holes ARE the receiver's slots) — and `wanted` the
+    /// side that states it. A bare-trait or bounded-generic `wanted` states the
+    /// value's type through the ONE impl of the trait its head answers
+    /// ([`Self::type_expected_through_impl`]). Only a component with no hole
+    /// and no `any` is written — `any` is a coercion sink that tells a hole
+    /// nothing (B227) — and a generic in it only when it is a binder in scope
+    /// at `use_id` (B540's admission). Every reader of the slot sees the fill,
+    /// and a later use that disagrees is reported against it as a mismatch.
+    fn fill_holes_from_use(&mut self, held: &Type, wanted: &Type, use_id: Id) {
+        if !self.type_value_has_hole(held) {
+            return;
+        }
+        let wanted = match wanted {
+            Type::Trait(trait_id, arguments) => {
+                let (trait_id, arguments) = (*trait_id, arguments.clone());
+                match self.type_expected_through_impl(held, trait_id, &arguments) {
+                    Some(concrete) => concrete,
+                    None => return,
+                }
+            }
+            Type::Generic(constraint_id)
+                if !self.generic_is_enclosing_binder(*constraint_id, use_id) =>
+            {
+                let stated: Vec<Type> = self
+                    .generic_bound_traits(*constraint_id)
+                    .into_iter()
+                    .filter(|(_, arguments)| !arguments.is_empty())
+                    .filter_map(|(trait_id, arguments)| {
+                        self.type_expected_through_impl(held, trait_id, &arguments)
+                    })
+                    .collect();
+                match stated.as_slice() {
+                    [concrete] => concrete.clone(),
+                    _ => return,
+                }
+            }
+            other => other.clone(),
+        };
+        if self.type_value_mentions_any(&wanted) {
+            return;
+        }
+        match (held, &wanted) {
+            (Type::Struct(left, held_arguments), Type::Struct(right, wanted_arguments))
+            | (Type::Enum(left, held_arguments), Type::Enum(right, wanted_arguments))
+                if left == right && held_arguments.len() == wanted_arguments.len() =>
+            {
+                for (held_argument, wanted_argument) in held_arguments.iter().zip(wanted_arguments)
+                {
+                    let wanted_argument = wanted_argument.get_type(self);
+                    self.fill_holes_admitting(*held_argument, &wanted_argument, Some(use_id));
+                }
+            }
+            (Type::Tuple(held_elements, _), Type::Tuple(wanted_elements, _))
+                if held_elements.len() == wanted_elements.len() =>
+            {
+                for (held_element, wanted_element) in held_elements.iter().zip(wanted_elements) {
+                    let wanted_element = wanted_element.get_type(self);
+                    self.fill_holes_admitting(*held_element, &wanted_element, Some(use_id));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `any` appears anywhere in `type_` ([`Self::fill_holes_from_use`]).
+    fn type_value_mentions_any(&self, type_: &Type) -> bool {
+        let mentions = |type_id: &TypeId| self.type_value_mentions_any(type_id.borrow_type(self));
+        match type_ {
+            Type::Any => true,
+            Type::Closure(parameter_type_ids, return_type_id, _, _) => {
+                parameter_type_ids.iter().any(mentions) || mentions(return_type_id)
+            }
+            Type::Enum(_, argument_type_ids)
+            | Type::Struct(_, argument_type_ids)
+            | Type::Trait(_, argument_type_ids)
+            | Type::Dyn(_, argument_type_ids)
+            | Type::Tuple(argument_type_ids, _) => argument_type_ids.iter().any(mentions),
+            Type::Array(element_type_id, _) => mentions(element_type_id),
+            Type::Mapped(_, source_type_id, template_type_id) => {
+                mentions(source_type_id) || mentions(template_type_id)
+            }
+            Type::Generic(_)
+            | Type::Unknown
+            | Type::Unresolved
+            | Type::Never
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void => false,
+        }
     }
 
     /// Writes `wanted`'s components into the `Unknown` slots of `held`, at

@@ -1,0 +1,74 @@
+// B599: fill-from-use — a use that states a binding's hole fills it, and both
+// backends build the binding at the stated type. The argument channel (a
+// concrete parameter, a generic call's initializer, a bare-trait and a bounded
+// parameter), the receiver channel, a pushed binding, an empty list handed to
+// a parameter, and a binder of the enclosing body.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+
+struct Cell<T> {
+	value: T,
+}
+
+impl Cell<type T> {
+	fun new(value: T): Cell<T> {
+		Cell { value }
+	}
+}
+
+fun take_option(value: Option<str>): bool {
+	value.is_some()
+}
+
+fun take_cell(cell: Cell<Option<str>>): str {
+	cell.value.unwrap_or("empty")
+}
+
+fun take_signal(subject: Signal<Option<str>>): bool {
+	subject.get().is_some()
+}
+
+fun take_bounded<S: Signal<Option<i32>>>(subject: S): bool {
+	subject.get().is_some()
+}
+
+fun take_list(values: List<str>): usize {
+	values.len()
+}
+
+fun pick<T>(first: Option<T>, fallback: T): T {
+	match first {
+		Some(let value) => value,
+		None => fallback,
+	}
+}
+
+fun either<T>(value: T): T {
+	let nothing = None;
+	pick(nothing, value)
+}
+
+fun main() {
+	let value = None;
+	print(take_option(value));
+	let cell = Cell::new(None);
+	print(take_cell(cell));
+	let subject = Signal::new(None);
+	print(take_signal(subject));
+	subject.set(Some("x"));
+	print(subject.get().unwrap_or("none"));
+	let bounded = Signal::new(None);
+	print(take_bounded(bounded));
+	let counted = SignalCell::new(None);
+	counted.set(Some(3));
+	print(counted.get().unwrap_or(0));
+	mut names: List<Option<str>> = [];
+	let missing = None;
+	names.push(missing);
+	print(names.len());
+	let values = [];
+	print(take_list(values));
+	print(either(4));
+	print(either("s"));
+}

@@ -11584,15 +11584,17 @@ fn b357_a_payload_less_variant_with_no_constraint_still_lands() {
     );
 }
 
-/// B580 (R-c, v0.47.0) and B357's binding: a `let` holding such a variant is
-/// a BINDING whose type keeps a hole — its uses state the payload, but
-/// inference does not carry a use's type back into the binding — so it is
-/// refused at the initializer, once per binding (the write-the-type steer).
+/// B599 (was B580's refusal here): a `let` holding such a variant is a
+/// binding whose type keeps a hole, and its USES state the payload — an
+/// argument at `Slot<str>`, a receiver whose `unwrap_or("d")` binds `T = str`
+/// — so inference carries the use's type back into the binding (fill-from-
+/// use) and the program runs.
 #[test]
-fn b580_a_let_of_a_payload_less_variant_whose_uses_state_its_type_is_refused() {
-    let failures = failure_diagnostics(
+fn b599_a_let_of_a_payload_less_variant_whose_uses_state_its_type_takes_it() {
+    assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::option::Option::{ self, None, Some };
 
         enum Slot<T> { Filled(T), Bare }
 
@@ -11610,14 +11612,243 @@ fn b580_a_let_of_a_payload_less_variant_whose_uses_state_its_type_is_refused() {
             print(n.unwrap_or("d"));
         }
         "#,
+        "bare\nd\n",
     );
-    let messages: Vec<&str> = failures
-        .iter()
-        .map(|(message, _)| message.as_str())
-        .collect();
-    assert_eq!(messages.len(), 2, "{messages:#?}");
-    assert!(messages[0].starts_with("cannot infer the type of `s`: it is `Slot<…>`"));
-    assert!(messages[1].starts_with("cannot infer the type of `n`: it is `Option<…>`"));
+}
+
+// --- B599: fill-from-use — a use that states a hole's type fills it ---------
+//
+// The argument channel (a parameter states the argument's hole), the receiver
+// channel (a call's bindings state the receiver's hole), through a generic
+// call's initializer (`Cell::new(None)`: the call's `T` IS the `None`'s
+// `Option<hole>`, never a copy), a bare-trait or bounded parameter (through
+// the one impl its head answers), and a binder of the enclosing body. A hole
+// nothing states keeps B580's refusal (`b580_*`).
+
+#[test]
+fn b599_a_concrete_parameter_states_an_argument_bindings_hole() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun take(value: Option<str>): bool {
+            value.is_some()
+        }
+
+        fun main() {
+            let value = None;
+            print(take(value));
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn b599_a_generic_calls_initializer_takes_its_type_from_an_argument_use() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+            fun new(value: T): Cell<T> {
+                Cell { value = value }
+            }
+        }
+
+        fun take(cell: Cell<Option<str>>) {
+            print(cell.value.unwrap_or("empty"));
+        }
+
+        fun main() {
+            let cell = Cell::new(None);
+            take(cell);
+        }
+        "#,
+        "empty\n",
+    );
+}
+
+/// The item's shape (kolt's `src/sidebar.vl:65`): a BARE-TRAIT parameter
+/// states the binding's hole through `impl SignalCell<type T> with Signal<T>`.
+#[test]
+fn b599_a_bare_trait_parameter_states_the_bindings_hole_through_its_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell };
+
+        fun take(subject: Signal<Option<str>>) {
+            print(subject.get().is_some());
+        }
+
+        fun main() {
+            let subject = Signal::new(None);
+            take(subject);
+            subject.set(Some("x"));
+            print(subject.get().unwrap_or("none"));
+        }
+        "#,
+        "false\nx\n",
+    );
+}
+
+#[test]
+fn b599_a_bounded_generic_parameter_states_the_bindings_hole_through_its_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell };
+
+        fun take<S: Signal<Option<str>>>(subject: S) {
+            print(subject.get().is_some());
+        }
+
+        fun main() {
+            let subject = Signal::new(None);
+            take(subject);
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn b599_a_method_argument_states_the_receivers_hole() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let subject = SignalCell::new(None);
+            subject.set(Some(3));
+            print(subject.get().unwrap_or(0));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b599_a_receivers_element_states_a_pushed_bindings_hole() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun main() {
+            mut names: List<Option<str>> = [];
+            let missing = None;
+            names.push(missing);
+            print(names.len());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b599_an_empty_list_takes_its_element_from_an_argument_use() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun take(values: List<str>): usize {
+            values.len()
+        }
+
+        fun main() {
+            let values = [];
+            print(take(values));
+        }
+        "#,
+        "0\n",
+    );
+}
+
+/// A parameter the call binds from a LATER argument still states the hole:
+/// the fill waits for every argument, and the enclosing body's `T` is a type
+/// there (B540's admission).
+#[test]
+fn b599_a_hole_stated_through_a_binding_a_later_argument_makes_takes_the_enclosing_binder() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun pick<T>(first: Option<T>, fallback: T): T {
+            match first {
+                Some(let value) => value,
+                None => fallback,
+            }
+        }
+
+        fun either<T>(value: T): T {
+            let nothing = None;
+            pick(nothing, value)
+        }
+
+        fun main() {
+            print(either(4));
+            print(either("s"));
+        }
+        "#,
+        "4\ns\n",
+    );
+}
+
+/// The first use states the type; a later use that disagrees is refused at
+/// itself, as a mismatch against what the first stated.
+#[test]
+fn b599_a_second_use_that_disagrees_is_refused_at_it() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun take(value: Option<str>) {
+            print(value.is_some());
+        }
+
+        fun count(value: Option<i32>) {
+            print(value.is_some());
+        }
+
+        fun main() {
+            let value = None;
+            take(value);
+            count(value);
+        }
+        "#,
+        "Expected Option<i32>, but got Option<str> instead.",
+    );
+}
+
+/// `any` tells a hole nothing (B227): a binding whose only use is an `any`
+/// parameter keeps B580's refusal.
+#[test]
+fn b599_an_any_parameter_states_nothing() {
+    assert_fails_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+
+        fun sink(values: List<any>) {}
+
+        fun main() {
+            let values = [];
+            sink(values);
+        }
+        "#,
+        "cannot infer the element type of this empty list",
+    );
 }
 
 // --- B370: an arithmetic expression's EMISSION VERDICT is a property of the

@@ -10100,6 +10100,26 @@ fn a_struct_literal_written_out_of_declaration_order_is_identical_on_both_backen
     );
 }
 
+/// B599: fill-from-use — a binding whose hole a later use states (an
+/// argument at a concrete, bare-trait or bounded parameter, a receiver's
+/// call, a push, a binder of the enclosing body) takes the stated type, and
+/// both backends build it there: before, `vilan check` refused every one of
+/// these (B580), and on JS alone the binding kept the hole.
+#[test]
+fn a_binding_filled_from_its_use_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_fill_from_use.vl"),
+        include_str!("native/fill_from_use.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_fill_from_use.vl"),
+        Verdict::Identical,
+        "a binding filled from its use must build and print the same on both backends"
+    );
+}
+
 /// F63: a closure's expression body is the value it hands back, a CONSUMING
 /// position like a function body's tail, so a place read there takes rule 1's
 /// copy. `id.derive(|index| cells[index])` moved a `str` out of the captured
