@@ -7797,6 +7797,30 @@ fn b574_a_trait_sharing_its_derives_name_gets_the_import_steer() {
     );
 }
 
+// --- E285: a fragment straight inside a fragment ------------------------------
+
+/// E285: `<><i>"a"</i><><b>"b"</b></></>` reached the list literal's own
+/// element check, whose sentence said nothing of fragments — E272's marker
+/// (a list literal written as markup) now carries its steer there, and a
+/// written list keeps the plain sentence.
+#[test]
+fn e285_a_fragment_inside_a_fragment_is_named_with_the_fix() {
+    let source = "import std::web::ui::{ View, render, view };\n\nfun main() {\n\tlet _group: List<View> = <><i>\"a\"</i><><b>\"b\"</b></></>;\n}\n";
+    assert_fails_spanning(
+        source,
+        "<><b>\"b\"</b></>",
+        "Expected View (this literal's element type), but got List<View> instead. A fragment \
+         does not flatten into a fragment: put the inner one in a child position \
+         (`<span>…</span>`), or write its children into the outer one",
+    );
+    let written = "import std::web::ui::{ View, view };\n\nfun main() {\n\tlet _group: List<View> = [view(\"i\"), [view(\"b\")]];\n}\n";
+    assert_fails_with(
+        written,
+        "Expected View (this literal's element type), but got List<View> instead.",
+    );
+    assert_fails_without(written, "fragment");
+}
+
 // --- A164 (R-g): `null`'s type stays unwritable ------------------------------
 
 /// A164 (RULED: unwritable): a mismatch names the `null` VALUE, never a type

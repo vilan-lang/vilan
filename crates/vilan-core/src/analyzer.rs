@@ -45087,7 +45087,20 @@ impl<'src> Analyzer<'src> {
                                 // the object.
                                 let steer = self
                                     .bare_trait_element_steer(expr_id, expected_element.as_ref())
-                                    .unwrap_or_default();
+                                    .unwrap_or_else(|| {
+                                        // E285: a fragment written straight
+                                        // inside a fragment (`<><i>…</i><>…</></>`)
+                                        // — E272's marker at the literal's
+                                        // own element check.
+                                        match self.is_fragment_at_a_view(*item_id, &element_type) {
+                                            true => " A fragment does not flatten into a \
+                                                     fragment: put the inner one in a child \
+                                                     position (`<span>…</span>`), or write its \
+                                                     children into the outer one"
+                                                .to_string(),
+                                            false => String::new(),
+                                        }
+                                    });
                                 self.diagnostics.push(Error { trace: Vec::new(), note: None,
                                     span: **self.span_map.get(item_id).unwrap_or(&&EMPTY_SPAN),
                                     msg: format!(
@@ -51620,21 +51633,7 @@ impl<'src> Analyzer<'src> {
     /// with `<`, which no written list literal does. Any other message, value
     /// or position comes back unchanged.
     fn with_fragment_steer(&self, msg: String, value_id: Id, expected: &Type) -> String {
-        let expects_view = match expected {
-            Type::Struct(struct_id, _) => self.structs.get(struct_id).is_some_and(|struct_| {
-                struct_.name == "View"
-                    && self
-                        .source_of_id(struct_.id)
-                        .is_some_and(|source| self.std_sources.contains(&source))
-            }),
-            _ => false,
-        };
-        let is_fragment = expects_view
-            && matches!(self.expr_id_to_expr_map.get(&value_id), Some(Expr::List(_)))
-            && self
-                .written_text_of(value_id)
-                .is_some_and(|written| written.starts_with('<'));
-        if is_fragment {
+        if self.is_fragment_at_a_view(value_id, expected) {
             return format!(
                 "{msg} A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children \
                  in one element (`<div>…</div>`), or make this position a `List<View>`"
@@ -51730,6 +51729,25 @@ impl<'src> Analyzer<'src> {
             by_name.join(", "),
             by_position.join(", ")
         )
+    }
+
+    /// E272's marker: `value_id` is a FRAGMENT — a list literal whose written
+    /// text opens with `<` — landing where std's `View` is `expected`.
+    fn is_fragment_at_a_view(&self, value_id: Id, expected: &Type) -> bool {
+        let expects_view = match expected {
+            Type::Struct(struct_id, _) => self.structs.get(struct_id).is_some_and(|struct_| {
+                struct_.name == "View"
+                    && self
+                        .source_of_id(struct_.id)
+                        .is_some_and(|source| self.std_sources.contains(&source))
+            }),
+            _ => false,
+        };
+        expects_view
+            && matches!(self.expr_id_to_expr_map.get(&value_id), Some(Expr::List(_)))
+            && self
+                .written_text_of(value_id)
+                .is_some_and(|written| written.starts_with('<'))
     }
 
     /// B495 Q2: the refusal for a closure whose parameter's MODE differs

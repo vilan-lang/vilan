@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**E285: a fragment written straight inside a fragment says it is one — `<><i>"a"</i><><b>"b"</b></></>` was refused "Expected View (this literal's element type), but got List<View> instead." with no word about fragments.** The list literal's own element check is a fifth site for E272's marker (a list literal whose written text opens with `<`), and now appends "A fragment does not flatten into a fragment: put the inner one in a child position (`<span>…</span>`), or write its children into the outer one"; a written `[..]` keeps the plain sentence. E272's detection is shared (`is_fragment_at_a_view`). Pin: `inference::modules::e285_a_fragment_inside_a_fragment_is_named_with_the_fix`.
+
+<!-- family: diagnostics -->
 **A164 (R-g): a mismatch names the `null` VALUE — "Expected i32, but got the `null` value instead." — where it named a type the author cannot write ("Expected i32, but got null instead", while `let x: null = null` is refused "found 'null' expected a type in type annotation").** The ruling keeps `null`'s type unwritable: `null` is a value, `void` is the unit type, and `std::js::null`'s declaration stays internal. Pin: `inference::modules::a164_a_mismatch_names_the_null_value`.
 
 <!-- family: diagnostics -->
