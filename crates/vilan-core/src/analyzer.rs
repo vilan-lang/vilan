@@ -82779,7 +82779,10 @@ fn analyze_over_world<'src>(
                 .iter()
                 .map(|(expression, type_id)| (*expression, *type_id)),
         );
-        if !crate::macros::in_macro_world() {
+        // Printed only where the counters line is (`VILAN_COUNTERS`): a
+        // compiled program's stderr is asserted on by the native
+        // differential, and an instrument must not be in it.
+        if !crate::macros::in_macro_world() && crate::counters::counters_enabled() {
             eprintln!("{}", report.line());
             report.dump();
         }
