@@ -5810,6 +5810,9 @@ pub struct Analyzer<'src> {
     // `auto` — the name the editor's "Add `auto` type" is offered on, and the
     // offset `: auto T` is inserted at.
     auto_fill_points: HashMap<Id, (Span, usize)>,
+    // E284: each call whose generic list was written spaced from its callee
+    // — the callee's, the list's and the arguments' spans.
+    spaced_generic_calls: HashMap<Id, (Span, Span, Span)>,
     // E278: the values that land in a position that already states their type
     // — an annotated `let`'s initializer — so their stage hint would only
     // repeat the annotation.
@@ -7937,6 +7940,7 @@ impl<'src> Analyzer<'src> {
             auto_written: HashMap::default(),
             auto_inferred: HashMap::default(),
             auto_fill_points: HashMap::default(),
+            spaced_generic_calls: HashMap::default(),
             annotated_landings: HashSet::default(),
             hidden_generic_parameters: HashMap::default(),
             attributed_declarations: HashSet::default(),
@@ -39227,6 +39231,16 @@ impl<'src> Analyzer<'src> {
             }
             Node::Func(..) => self.walk_func_entity(node, scope_id, id),
             Node::Call(subject, generic_arguments, arguments) => {
+                // E284: a generic list written SPACED after the callee (`a < b
+                // > (c)`) may be two comparisons the parser read as a generic
+                // call; remembered so a callee that turns out not callable
+                // names both readings.
+                if let Some(generics) = generic_arguments
+                    && generics.1.start > subject.1.end
+                {
+                    self.spaced_generic_calls
+                        .insert(id, (subject.1, generics.1, arguments.1));
+                }
                 let subject_id = self.walk_expr_node(subject, scope_id);
                 // B204: bank the call's subject as the WALK saw it. The pair
                 // is what `DivergenceLeaves` reads to find the `panic(…)`
@@ -53063,6 +53077,42 @@ impl<'src> Analyzer<'src> {
         )
     }
 
+    /// E284: a callee that is not callable, under a generic list written
+    /// SPACED from it (`a < b > (c)`), may be the two comparisons the author
+    /// meant: the message names the reading the parser took, the comparison
+    /// reading, and its parenthesized spelling — and that a comparison chain
+    /// needs `&&`, since `bool` has no order.
+    fn with_spaced_generic_reading(&self, call_id: Id, message: String) -> String {
+        let Some(&(callee, generics, arguments)) = self.spaced_generic_calls.get(&call_id) else {
+            return message;
+        };
+        let Some(text) = self
+            .source_of_id(call_id)
+            .and_then(|source| self.source_text(source))
+        else {
+            return message;
+        };
+        let (Some(callee), Some(generics), Some(arguments)) = (
+            text.get(callee.start..callee.end),
+            text.get(generics.start..generics.end),
+            text.get(arguments.start..arguments.end),
+        ) else {
+            return message;
+        };
+        let inner = generics
+            .strip_prefix('<')
+            .and_then(|rest| rest.strip_suffix('>'))
+            .unwrap_or(generics)
+            .trim();
+        format!(
+            "{message} — `{callee} < {inner} > {arguments}` is read as the generic call \
+             `{callee}<{inner}>{arguments}`; if you meant two comparisons, parenthesize: \
+             `({callee} < {inner}) > {arguments}` (a comparison answers `bool`, which has no \
+             order — a chain of comparisons is joined with `&&`: `{callee} < {inner} && {inner} > \
+             {arguments}`)"
+        )
+    }
+
     /// The "not callable" message for a call subject that isn't one.
     ///
     /// When the subject IS a function, the bare form ("it is `fn id<T>(T): T`")
@@ -54314,7 +54364,8 @@ impl<'src> Analyzer<'src> {
                     let non_function_message = {
                         let subject_type =
                             self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
-                        self.not_callable_message(&subject_type)
+                        let message = self.not_callable_message(&subject_type);
+                        self.with_spaced_generic_reading(call_id, message)
                     };
                     self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         // The SUBJECT is what isn't callable (A1).
@@ -54346,6 +54397,7 @@ impl<'src> Analyzer<'src> {
             _ => {
                 let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
                 let msg = self.not_callable_message(&subject_type);
+                let msg = self.with_spaced_generic_reading(call_id, msg);
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,

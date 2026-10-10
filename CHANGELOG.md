@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**E284: `a < b > (c)`, spaced, names both readings.** Expression position still reads it as the generic call `a<b>(c)` (B571 Q3 keeps the whitespace rule to ascribed types for now), and when `a` turns out not to be callable the refusal no longer stops at "cannot call this as a function: it is i32": it says the call was read as `a<b>(c)`, gives the parenthesized comparison `(a < b) > (c)`, and notes that a comparison chain is joined with `&&`, since `bool` has no order.
+
 <!-- family: tooling -->
 **B570 S4: `[check] auto` — a package asks for its inferred types to be kept written as `auto`.** `auto = "exported"` warns on each return and module binding reachable from outside its module (`export`-marked, an `export *;` file, an inherent method of an exported type) whose type is inferred, carrying the `: auto T` that `vilan check --fix` and the editor's on-save action write; `"all"` covers every return and module binding; `"off"` is the default. Void returns and locals are never asked for. The section is in the editor's manifest schema and completion. std's opt-in was measured first: under `"exported"` it would write ONE annotation (`std::base64`'s `alphabet: auto str`) — std already writes every return that is not void — so it is not taken (the opt-in reads the entry package's manifest, and std is never the entry).
 

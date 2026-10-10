@@ -744,3 +744,56 @@ fn b571_tuple_labels_through_an_ascription_read_as_at_a_binding() {
          `(p.0, p.1)`",
     );
 }
+
+// --- E284: a spaced `a < b > (c)` names both readings -------------------------
+
+/// The parser reads `a < b > (c)` as the generic call `a<b>(c)` (expression
+/// position keeps that reading, Q3 RULED); when `a` is no function the refusal
+/// says so and gives the comparison spelling.
+#[test]
+fn e284_a_spaced_generic_call_on_a_value_names_both_readings() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let a = 1;
+            let b = 2;
+            let c = 3;
+            let chained = a < b > (c);
+            let _ = chained;
+        }
+        "#,
+        "cannot call this as a function: it is i32 — `a < b > (c)` is read as the generic call \
+         `a<b>(c)`; if you meant two comparisons, parenthesize: `(a < b) > (c)`",
+    );
+}
+
+/// A spaced generic call on a real generic function stays a generic call
+/// (the paper's a14), and a tight one says nothing new.
+#[test]
+fn e284_a_spaced_generic_call_on_a_function_is_still_a_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun pick<T>(first: T, second: T): T {
+            first
+        }
+
+        fun main() {
+            print(pick <f64>(1, 2));
+            print(pick<f64>(3, 4));
+        }
+        "#,
+        "1\n3\n",
+    );
+    assert_fails_without(
+        r#"
+        fun main() {
+            let a = 1;
+            let b = a<i32>(2);
+            let _ = b;
+        }
+        "#,
+        "is read as the generic call",
+    );
+}
