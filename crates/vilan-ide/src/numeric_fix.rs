@@ -78,9 +78,13 @@ pub fn numeric_fixes(source: &str, span: Span, message: &str) -> Vec<NumericFix>
                 index,
             });
         }
+        // B571 Q7 (RULED): an ascription that asked a value to BE a width it
+        // is not (`n as f64`) is rewritten to the conversion, in its place —
+        // `n.as_f64()`, never `(n as f64).as_f64()`.
+        let value = ascribed_value(written).unwrap_or(written);
         fixes.push(NumericFix {
             span,
-            replacement: converted(written, method),
+            replacement: converted(value, method),
             edit: NumericEdit::Convert(method.to_string()),
             index,
         });
@@ -168,6 +172,32 @@ fn binary_operands(message: &str) -> Option<(&str, &str)> {
     let (left, rest) = rest.split_once("` and `")?;
     let (right, _) = rest.split_once('`')?;
     Some((left, right))
+}
+
+/// The value text of `written` when the whole of it is one ascription,
+/// `value as T` (B571) — the value's own text, as written.
+fn ascribed_value(written: &str) -> Option<&str> {
+    const PREFIX: &str = "fun probe() {\n\tlet value = ";
+    let probe = format!("{PREFIX}{written};\n}}\n");
+    let (parsed, errors) = parsing::parse(&probe);
+    if !errors.is_empty() {
+        return None;
+    }
+    let (items, _) = parsed?;
+    let Node::Func(function) = &items.first()?.0 else {
+        return None;
+    };
+    let ((statements, _), _) = function.body.as_ref()?;
+    let Node::Let(_, _, Some(value), ..) = &statements.first()?.0 else {
+        return None;
+    };
+    let Node::Ascribe(inner, _) = &value.0 else {
+        return None;
+    };
+    if value.1.start != PREFIX.len() || value.1.end != PREFIX.len() + written.len() {
+        return None;
+    }
+    written.get(inner.1.start - PREFIX.len()..inner.1.end - PREFIX.len())
 }
 
 /// `written` with the conversion after it, parenthesized unless it already
@@ -348,6 +378,29 @@ mod tests {
         assert_eq!(fixes[0].replacement, "(xs.len() + 1).as_u53()");
         assert_eq!(fixes[0].edit, NumericEdit::Convert("as_u53".to_string()));
         assert!(fixes[0].index, "the message names `usize`");
+    }
+
+    /// B571 Q7: `n as f64` asked `n` to BE an `f64`; the fix writes the
+    /// conversion in the ascription's place, never after it.
+    #[test]
+    fn an_ascription_to_another_width_is_rewritten_to_the_conversion() {
+        let source = "fun main() {\n\tlet n: i32 = 3;\n\tlet x = n as f64;\n\tlet y = xs.len() as i32 + 1;\n}\n";
+        let message = "`n` is `i32`, not `f64` (ascribed here): `as` names the type a value \
+                       already has, and does not convert. There are no implicit numeric \
+                       conversions; convert with `.as_f64()`";
+        let fixes = numeric_fixes(source, span_of(source, "n as f64"), message);
+        assert_eq!(fixes.len(), 1, "{fixes:?}");
+        assert_eq!(fixes[0].replacement, "n.as_f64()");
+        let stage = "`.len()` returns `usize`, not `i32` (ascribed here): `as` names the type a \
+                     value already has, and does not convert. There are no implicit numeric \
+                     conversions; convert with `.as_i32()`";
+        let fixes = numeric_fixes(source, span_of(source, "xs.len() as i32"), stage);
+        assert_eq!(
+            fixes.last().map(|fix| fix.replacement.as_str()),
+            Some("xs.len().as_i32()")
+        );
+        assert_eq!(ascribed_value("(a + b) as f64"), Some("(a + b)"));
+        assert_eq!(ascribed_value("a + b as f64"), None, "not ONE ascription");
     }
 
     #[test]

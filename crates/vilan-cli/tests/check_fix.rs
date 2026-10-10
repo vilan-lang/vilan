@@ -92,6 +92,44 @@ fn every_steered_mismatch_is_converted_and_the_check_then_passes() {
     assert!(text.contains("{width.as_usize() < at}"), "{text}");
 }
 
+/// B571 Q7 (RULED): `as` names a type and never converts, so `n as f64` over
+/// an `i32` is refused with the conversion — and `check --fix` writes the
+/// conversion IN PLACE of the ascription (`n.as_f64()`), a stage's too
+/// (`xs.len().as_i32()`), never `(n as f64).as_f64()`.
+#[test]
+fn b571_an_ascription_to_another_width_is_rewritten_to_the_conversion() {
+    let dir = temp_package(
+        "ascribe",
+        concat!(
+            "fun main() {\n",
+            "\tlet n: i32 = 3;\n",
+            "\tlet ratio = n as f64 / 2.0;\n",
+            "\tlet xs = [\"a\", \"b\"];\n",
+            "\tlet count = xs.len() as i32 + 1;\n",
+            "\tprint(i\"{ratio} {count}\");\n",
+            "}\n",
+        ),
+    );
+    assert!(
+        !vilan(&dir, &["check", "."]).status.success(),
+        "the program is refused before the fix, so the pin is not vacuous"
+    );
+    let output = vilan(&dir, &["check", "--fix", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let text = entry(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("let ratio = n.as_f64() / 2.0;"), "{text}");
+    assert!(
+        text.contains("let count = xs.len().as_i32() + 1;"),
+        "{text}"
+    );
+}
+
 #[test]
 fn a_literal_counter_is_declared_usize_and_its_other_uses_convert_in_later_rounds() {
     let dir = temp_package(

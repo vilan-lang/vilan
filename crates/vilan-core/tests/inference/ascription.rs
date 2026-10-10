@@ -260,7 +260,7 @@ fn b571_a_mismatch_is_refused_as_an_annotated_binding_refuses_it() {
             let _ = words;
         }
         "#,
-        "Expected List<i32>, but got List<str> instead",
+        "`[\"a\"]` is `List<str>`, not `List<i32>`",
     );
 }
 
@@ -358,7 +358,7 @@ fn b571_a_writable_view_of_an_ascription_is_refused() {
             let _ = view;
         }
         "#,
-        "an ascription is a value, not a place",
+        "an ascription is a value, never a place to view",
     );
 }
 
@@ -508,5 +508,239 @@ fn b571_as_is_still_a_name_where_a_name_can_stand() {
         }
         "#,
         "1\n5\n5\n",
+    );
+}
+
+// --- S2: the refusals teach once (§7, §8) -------------------------------------
+
+/// Q7 (RULED): `as` names a type, it does not convert — the numeric refusal
+/// carries the conversion that exists, which `check --fix` writes.
+#[test]
+fn b571_an_ascription_to_another_width_is_refused_with_the_conversion() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let n: i32 = 3;
+            let x = n as f64;
+            let _ = x;
+        }
+        "#,
+        "n as f64",
+        "`n` is `i32`, not `f64` (ascribed here): `as` names the type a value already has, and \
+         does not convert. There are no implicit numeric conversions; convert with `.as_f64()`",
+    );
+}
+
+/// §8: a stage that disagrees is named, at the ascription, with the stage's
+/// own link noted.
+#[test]
+fn b571_a_mismatched_stage_names_the_stage() {
+    assert_fails_noting(
+        r#"
+        fun main() {
+            let words = ["a", "bb"];
+            let count = words.len() as i32;
+            let _ = count;
+        }
+        "#,
+        "`.len()` returns `usize`, not `i32` (ascribed here): `as` names the type a value \
+         already has, and does not convert",
+        "len()",
+        "this stage returns `usize`",
+    );
+}
+
+#[test]
+fn b571_a_plain_mismatch_names_the_value_and_both_types() {
+    assert_fails_with(
+        r#"
+        struct Foo {
+            n: i32,
+        }
+
+        struct Bar {
+            n: i32,
+        }
+
+        fun main() {
+            let bar = Bar { n = 1 };
+            let foo = bar as Foo;
+            let text = "12";
+            let number = text as i32;
+            let _ = (foo, number);
+        }
+        "#,
+        "`bar` is `Bar`, not `Foo`",
+    );
+}
+
+#[test]
+fn b571_a_string_is_not_converted_either() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let text = "12";
+            let number = text as i32;
+            let _ = number;
+        }
+        "#,
+        "`text` is `str`, not `i32`",
+    );
+}
+
+/// §7: nothing narrows an object.
+#[test]
+fn b571_a_trait_object_is_not_downcast() {
+    assert_fails_with(
+        r#"
+        trait Shape {
+            fun area(self): i32;
+        }
+
+        struct Square {
+            side: i32,
+        }
+
+        impl Square with Shape {
+            fun area(self): i32 {
+                self.side
+            }
+        }
+
+        fun main() {
+            let shape: dyn Shape = Square { side = 2 };
+            let square = shape as Square;
+            let _ = square;
+        }
+        "#,
+        "Expected Square, but got dyn Shape instead: an object does not narrow back to the type it \
+         erased",
+    );
+}
+
+/// §6's wart: `await p as T` ascribes the promise; when `T` is the awaited
+/// type the refusal says so.
+#[test]
+fn b571_an_awaited_ascription_steers_to_the_awaited_value() {
+    assert_fails_with(
+        r#"
+        async fun main() {
+            let promise = async { 4 };
+            let value = await promise as i32;
+            let _ = value;
+        }
+        "#,
+        "`await p as T` ascribes the PROMISE, because `as` binds tighter than `await` — ascribe \
+         the awaited value, `(await p) as i32`",
+    );
+}
+
+#[test]
+fn b571_an_ascribed_awaited_value_checks() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        async fun fetch(): i32 {
+            4
+        }
+
+        async fun main() {
+            let value = (await fetch()) as i32;
+            print(value);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+/// §6: `&x as &T` reads `&(x as &T)`, a view of a value — refused with the
+/// view taken first.
+#[test]
+fn b571_a_view_of_an_ascription_is_refused_with_the_view_first() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let n = 3;
+            let view = &n as &i32;
+            let _ = view;
+        }
+        "#,
+        "`&` here takes a view of an ascription, and an ascription is a value, never a place to \
+         view — `as` binds tighter than `&`: take the view first and ascribe it, `(&n) as &i32`",
+    );
+}
+
+/// §8: the cannot-infer steer offers the inline spelling.
+#[test]
+fn b571_cannot_infer_offers_the_ascription() {
+    assert_fails_with(
+        r#"
+        fun make<T>(): List<T> {
+            []
+        }
+
+        fun main() {
+            let made = make();
+            let _ = made;
+        }
+        "#,
+        "as the call's type argument (`make<…>(…)`), or ascribe the call (`make(…) as …`)",
+    );
+}
+
+/// §2.3: E261's steer names the inline form.
+#[test]
+fn b571_the_e261_steer_names_the_ascription() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{Source, SignalCell, Flow};
+
+        fun main() {
+            let cell = SignalCell::new(2);
+            let pick = true;
+            let state = match pick {
+                true => Source::constant(1),
+                false => cell.derive(|v| v * 10),
+            };
+            let _ = state;
+        }
+        "#,
+        "or ascribe the form, `match .. { .. } as dyn Flow<T>`",
+    );
+}
+
+/// B569: a labelled tuple literal is matched to an ascribed labelled type by
+/// NAME, as at an annotated binding — and a place whose labels contradict the
+/// ascription's is refused with the label that moved and both rewrites.
+#[test]
+fn b571_tuple_labels_through_an_ascription_read_as_at_a_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let by_name = (x = 1, y = 2) as (y: i32, x: i32);
+            let bound: (y: i32, x: i32) = (x = 1, y = 2);
+            print(by_name.0 == bound.0);
+            print(by_name.y);
+            let labelled = (3, 4) as (w: i32, h: i32);
+            print(labelled.h);
+        }
+        "#,
+        "true\n2\n4\n",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let p = (x = 1, y = 2);
+            let q = p as (y: i32, x: i32);
+            let _ = q;
+        }
+        "#,
+        "`p` is `(x: i32, y: i32)`, not `(y: i32, x: i32)`: the label `x` names slot 0 of the \
+         value and slot 1 here, so the two do not convert — match by name, writing the labels \
+         out, or by position, dropping them: by name, `(y = p.y, x = p.x)`; by position, \
+         `(p.0, p.1)`",
     );
 }

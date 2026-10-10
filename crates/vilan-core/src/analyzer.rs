@@ -3004,10 +3004,17 @@ struct SupertraitSelf {
 /// type's span — read by `Constraint::Ascription` and by the binding-style
 /// annotation checks ([`Analyzer::annotated_value`]).
 #[derive(Debug, Clone, Copy)]
-struct AscriptionSite {
+struct AscriptionSite<'src> {
     value_id: Id,
     type_id: TypeId,
     type_span: Span,
+    /// The chain STAGE the value is, when it is one — `.name(..)` as the last
+    /// link: the member's name and the link's span (§8: a mismatch names the
+    /// stage that disagrees).
+    stage: Option<(&'src str, Span)>,
+    /// Whether the ascription is the operand of an `await` (`await p as T`
+    /// ascribes the PROMISE, §6's wart, steered when `T` is the awaited type).
+    awaited: bool,
 }
 
 /// Who a binding-style annotation belongs to (B161, B184, B461): a `let`'s
@@ -5680,7 +5687,7 @@ pub struct Analyzer<'src> {
     // binding is forced to.
     binding_hidden_nominal_constraints: Vec<(Id, Id, Vec<TypeId>, Span)>,
     // B571: every `EXP as T` site, by the ascription's id.
-    ascriptions: HashMap<Id, AscriptionSite>,
+    ascriptions: HashMap<Id, AscriptionSite<'src>>,
     // B251: every WRITTEN application of a struct that declared bounded
     // parameters — `(struct id, written arguments, span, source, type id,
     // generic arguments exempt)` — asked after `build()` by
@@ -9175,8 +9182,9 @@ impl<'src> Analyzer<'src> {
                     **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
                     format!(
                         "cannot infer '{generic_label}' for this call: {why}. Write the type — on \
-                         the binding the result lands in (`let value: … = …`), or as the call's \
-                         type argument (`{member}<…>(…)`)"
+                         the binding the result lands in (`let value: … = …`), as the call's \
+                         type argument (`{member}<…>(…)`), or ascribe the call \
+                         (`{member}(…) as …`)"
                     ),
                     constraint_id,
                 ));
@@ -30961,7 +30969,16 @@ impl<'src> Analyzer<'src> {
                 .iter()
                 .filter(|(id, _)| !self.reusable_entity(**id))
                 .filter_map(|(_, expr)| match expr {
-                    Expr::Reference(operand, true) => Some(*operand),
+                    // A view of an ascription ITSELF was refused where the `&`
+                    // is written (`refuse_view_of_ascription`).
+                    Expr::Reference(operand, true)
+                        if !matches!(
+                            self.expr_id_to_expr_map.get(operand),
+                            Some(Expr::Ascribe(_))
+                        ) =>
+                    {
+                        Some(*operand)
+                    }
                     _ => None,
                 }),
         );
@@ -36086,7 +36103,8 @@ impl<'src> Analyzer<'src> {
         }
         " Both are pipe stages, and two stages of different types meet only as one erased \
          flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the \
-         function's return), with `T` the value they carry, and each erases to it"
+         function's return), or ascribe the form, `match .. { .. } as dyn Flow<T>`, with `T` \
+         the value they carry, and each erases to it"
             .to_string()
     }
 
@@ -38870,6 +38888,9 @@ impl<'src> Analyzer<'src> {
             // value's own reference, so it types and lowers as the operand;
             // mutability tracking and primitive-local boxing come later.
             Node::Reference(mutable, operand) => {
+                if let Node::Ascribe(value, type_node) = &operand.0 {
+                    self.refuse_view_of_ascription(*mutable, value, type_node, operand.1);
+                }
                 let operand_id = self.walk_expr_node(operand, scope_id);
                 Some(Expr::Reference(operand_id, *mutable))
             }
@@ -39685,6 +39706,9 @@ impl<'src> Analyzer<'src> {
             // `await <inner>` — its type (the unwrapped `T`) is inferred lazily.
             Node::Await(inner) => {
                 let inner_id = self.walk_expr_node(inner, scope_id);
+                if let Some(site) = self.ascriptions.get_mut(&inner_id) {
+                    site.awaited = true;
+                }
                 Some(Expr::Await(inner_id))
             }
             // `value as T` (B571): the annotated-binding path with no binding.
@@ -39700,12 +39724,24 @@ impl<'src> Analyzer<'src> {
                 self.binding_annotation_type_ids.insert(type_id, id);
                 self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
                 self.seed_tail_expectations(value_id, type_id);
+                let stage = match &value.0 {
+                    Node::MemberAccessor(_, member) => match &member.0 {
+                        Node::Call(callee, _, _) => match &callee.0 {
+                            Node::Accessor(name) => Some((*name, member.1)),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 self.ascriptions.insert(
                     id,
                     AscriptionSite {
                         value_id,
                         type_id,
                         type_span: type_node.1,
+                        stage,
+                        awaited: false,
                     },
                 );
                 self.constraints.push(Constraint::Ascription {
@@ -55938,7 +55974,8 @@ impl<'src> Analyzer<'src> {
                     ascribed = unified;
                 }
             }
-            None => self.report_initializer_mismatch(
+            None => self.report_ascription_mismatch(
+                id,
                 value_id,
                 &ascribed,
                 &value_type,
@@ -55954,6 +55991,144 @@ impl<'src> Analyzer<'src> {
         };
         self.resolved_types.insert(id, ascribed_id);
         Resolution::Resolved
+    }
+
+    /// B571 §6: `&x as &T` reads `&(x as &T)` — a view of an ascription, and
+    /// an ascription is a value, never a place to view. Refused where the `&`
+    /// is written, with the view taken first, which is what the author meant.
+    fn refuse_view_of_ascription(
+        &mut self,
+        mutable: bool,
+        value: &Spanned<Node<'src>>,
+        type_node: &Spanned<Node<'src>>,
+        span: Span,
+    ) {
+        let (marker, word) = if mutable {
+            ("&mut ", "&mut")
+        } else {
+            ("&", "&")
+        };
+        let steer = self.source_text(self.current_source_id).and_then(|text| {
+            let value = text.get(value.1.start..value.1.end)?;
+            let written = text.get(type_node.1.start..type_node.1.end)?;
+            let pointee = written
+                .strip_prefix("&mut ")
+                .or_else(|| written.strip_prefix('&'))
+                .unwrap_or(written)
+                .trim_start();
+            Some(format!(
+                ": take the view first and ascribe it, `({marker}{value}) as {marker}{pointee}`"
+            ))
+        });
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: format!(
+                "`{word}` here takes a view of an ascription, and an ascription is a value, \
+                 never a place to view — `as` binds tighter than `{word}`{}",
+                steer.unwrap_or_default()
+            ),
+        });
+    }
+
+    /// An ascription's value that does not fit the ascribed type (B571 §7,
+    /// §8), reported at the ascription: the stage that disagrees named when
+    /// the value is one, the numeric conversion that exists when it is a
+    /// width, and the awaited spelling when `await p as T` ascribed the
+    /// promise. (A downcast of an object is refused by the inference itself,
+    /// with the narrowing message an annotated binding gets.)
+    fn report_ascription_mismatch(
+        &mut self,
+        id: Id,
+        value_id: Id,
+        ascribed: &Type,
+        value_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        if let Some((span, msg)) =
+            self.void_closure_steer(value_id, ascribed, value_type, substitution_context)
+        {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            return;
+        }
+        let Some(site) = self.ascriptions.get(&id).copied() else {
+            return;
+        };
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        let expected = self.pretty_print_type(ascribed, substitution_context);
+        let got = self.pretty_print_type(value_type, substitution_context);
+        let subject = match site.stage {
+            Some((name, _)) => format!("`.{name}()` returns `{got}`"),
+            None => match self
+                .written_text_of(value_id)
+                .filter(|text| text.len() <= 40 && !text.contains('\n'))
+            {
+                Some(text) => format!("`{text}` is `{got}`"),
+                None => format!("the value is `{got}`"),
+            },
+        };
+        let note = site.stage.map(|(_, stage_span)| {
+            crate::error::Note::here(stage_span, format!("this stage returns `{got}`"))
+        });
+        let msg = if site.awaited && self.awaited_payload_fits(value_type, ascribed) {
+            format!(
+                "{subject}, not `{expected}`: `await p as T` ascribes the PROMISE, because `as` \
+                 binds tighter than `await` — ascribe the awaited value, `(await p) as \
+                 {expected}`"
+            )
+        } else {
+            let mismatch = self.type_mismatch_message(ascribed, value_type, substitution_context);
+            // B569 §4.3: a label at two different slots names the label that
+            // moved; `with_fragment_steer` appends the two spellings.
+            if mismatch.contains(LABEL_CONTRADICTION_STEER)
+                && let Some(at) = mismatch.find(": the label ")
+            {
+                format!("{subject}, not `{expected}`{}", &mismatch[at..])
+            } else {
+                match mismatch.find(NUMERIC_CONVERSION_STEER) {
+                    // §7, Q7 RULED: the conversion that exists, which `check
+                    // --fix` writes in the ascription's place.
+                    Some(at) => format!(
+                        "{subject}, not `{expected}` (ascribed here): `as` names the type a value \
+                     already has, and does not convert. {}",
+                        &mismatch[at..]
+                    ),
+                    None if site.stage.is_some() => {
+                        format!("{subject}, not `{expected}` (ascribed here)")
+                    }
+                    None => format!("{subject}, not `{expected}`"),
+                }
+            }
+        };
+        let msg = self.with_fragment_steer(msg, value_id, ascribed);
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note,
+            span,
+            msg,
+        });
+    }
+
+    /// Whether `value_type` is a task or promise whose payload fits `ascribed`
+    /// — the `await p as T` that meant `(await p) as T`.
+    fn awaited_payload_fits(&mut self, value_type: &Type, ascribed: &Type) -> bool {
+        let Type::Struct(id, arguments) = value_type else {
+            return false;
+        };
+        if !self.is_task_handle(*id) {
+            return false;
+        }
+        let Some(payload) = arguments.first().map(|argument| argument.get_type(self)) else {
+            return false;
+        };
+        self.reconcile_type(&payload, ascribed, &HashMap::default())
+            .is_some()
     }
 
     /// The binding-style annotation `owner_id` keys (B161, B184, B461): a

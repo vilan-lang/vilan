@@ -602,7 +602,7 @@ row	flagship	key
 578	-	a `{got}` does not become a `{expected}` as a whole: an object is built where ONE value lands, and each `{concrete}` inside this one was built already; {steer}
 579	-	`-` on an unsigned value: `{name}` has no negative values, so its negation is out of range on every backend. Convert it to a signed type first (`.as_i53()`) and negate that
 580	-	`{name}` is unsigned ({range}), and this constant folds to `{value}`: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
-581	-	cannot infer '{generic_label}' for this call: {why}. Write the type — on the binding the result lands in (`let value: … = …`), or as the call's type argument (`{member}<…>(…)`)
+581	-	cannot infer '{generic_label}' for this call: {why}. Write the type — on the binding the result lands in (`let value: … = …`), as the call's type argument (`{member}<…>(…)`), or ascribe the call (`{member}(…) as …`)
 582	-	a function cannot be named `Self`: `Self` names the type an `impl` or `trait` is about, so `value.Self()` reads as that type and never reaches this member. Give it another name
 583	-	`map` over a tuple takes one closure LITERAL with one parameter: its body is checked once per position, at that position's element, and a closure value has one type. Write `t.map(|x| f(x))`
 584	-	'{value_label}' is a mapped tuple whose family is not bound to guarantee '{bound_label}', which this argument's parameter requires
@@ -687,7 +687,7 @@ row	flagship	key
 663	-	`{name}` is `[track_caller]`: it takes its caller's location as a hidden argument, and a call through a value cannot pass one
 664	-	`dbg` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
 665	-	`dbg` takes no type arguments: it prints each argument at the type it already has
-666	-	Both are pipe stages, and two stages of different types meet only as one erased flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the function's return), with `T` the value they carry, and each erases to it
+666	-	Both are pipe stages, and two stages of different types meet only as one erased flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the function's return), or ascribe the form, `match .. { .. } as dyn Flow<T>`, with `T` the value they carry, and each erases to it
 667	-	this element's class is written twice — `{earlier}` and then `{later}` — and `{earlier}` is a binding, so the two take turns: `{later}` writes last when the element is built, `{earlier}` writes again whenever its source changes, and the element shows whichever wrote last. Compose them into one writer (two styles add: `.styled(a + b)`), or drop one
 668	-	`{field_name}` is an `[internal]` field of std's `{struct_name}`, and a struct literal outside std cannot write an internal std field: {reason}
 669	-	a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one, and `{written}` is `{type_label}`{steer}
@@ -717,3 +717,6 @@ row	flagship	key
 NEW	-	an ascription is a value, not a place — `as` names the type a value has, and there is nothing to write through{steer}
 NEW	-	'{type_label}' does not implement trait '{trait_label}', required by the ascription: a trait named by `as` is a CONSTRAINT on the value's own type, which stays '{type_label}'
 NEW	-	`as {written}` then `<`: a generic list after `as` touches its type, `{tight}` — spaced, the `<` after an ascribed type is a comparison
+NEW	-	`{word}` here takes a view of an ascription, and an ascription is a value, never a place to view — `as` binds tighter than `{word}`{steer}
+NEW	-	{subject}, not `{expected}` (ascribed here): `as` names the type a value already has, and does not convert. {conversion}
+NEW	-	{subject}, not `{expected}`: `await p as T` ascribes the PROMISE, because `as` binds tighter than `await` — ascribe the awaited value, `(await p) as {expected}`
