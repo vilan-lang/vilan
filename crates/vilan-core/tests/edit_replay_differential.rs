@@ -198,7 +198,7 @@ fn replay_the_classes() -> Replayed {
     // M110 S2a: the bound audit's verdicts at PREFIX sites are recorded and
     // replayed; the plants that serve a stale record (the audit skipped
     // without recording, the impl guard off) must turn this package red.
-    for fixture in BOUND_FIXTURES {
+    for fixture in BOUND_FIXTURES.iter().chain(WINDOW_FIXTURES) {
         let mut package = fixture.write();
         for edit in fixture.edits {
             censuses.extend(replay(&mut package, edit, &mut divergences));
@@ -357,6 +357,37 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
         "the classes leg must replay the call graphs and seed the async fixpoint from the \
          world's record (graphs {graphs_replayed}, after the rewrite {logs_replayed}, seeded \
          {seeded})"
+    );
+    // M110 S6's standing counter pins, over every incremental analysis of the
+    // leg: no relocated mint left its anchor's window, and the served
+    // keystrokes inherited the stored world's windows. A constraint's write
+    // into ANOTHER item's window is reported here and pinned at zero on the
+    // leaf package (`a_keystroke_rewalks_its_hot_set_and_nothing_else`): the
+    // classes package pushes into another module's use-inferred binding on
+    // purpose (`bag`/`a_spoil`, S1's third hazard), and that push IS a
+    // constraint of one item writing a slot minted for another — the
+    // cross-item edge a per-item record (S7) carries, not an invariant.
+    let writes_other: u64 = censuses
+        .iter()
+        .map(|census| census.window_writes_other)
+        .sum();
+    let outside_anchor: u64 = censuses
+        .iter()
+        .map(|census| census.window_outside_anchor)
+        .sum();
+    let laid_out: u64 = censuses.iter().map(|census| census.windows_laid_out).sum();
+    let inherited: u64 = censuses.iter().map(|census| census.windows_inherited).sum();
+    eprintln!(
+        "S6: {laid_out} windows laid out, {inherited} inherited; writes into another item's \
+         window {writes_other}; mints outside their anchor {outside_anchor}"
+    );
+    assert_eq!(
+        outside_anchor, 0,
+        "a relocated mint left its anchor's window"
+    );
+    assert!(
+        inherited > 0,
+        "the served keystrokes inherit the stored world's windows"
     );
     // The stand-down edit (the browser effect package's last edit, replayed
     // last: edit then undo) applies no rewrite, so the recorded post-rewrite
@@ -969,6 +1000,39 @@ fn a_keystroke_rewalks_its_hot_set_and_nothing_else() {
         (2, 2),
         "a keystroke in a leaf importer re-walks the leaf and the entry: {leaf:?}"
     );
+    // M110 S6: and lays out ONE module's windows beside the entry's — one
+    // window per top-level item of the two re-walked files — inheriting the
+    // stored world's for every other item.
+    let items = |text: &str| -> u64 {
+        let (tree, errors) = vilan_core::parsing::parse(text);
+        assert!(errors.is_empty(), "the fixture parses");
+        tree.map_or(0, |tree| tree.0.len() as u64)
+    };
+    assert_eq!(
+        leaf.windows_laid_out,
+        items(PINS_VIEWS) + items(PINS_MAIN),
+        "a body edit lays out the leaf's and the entry's windows and no other: {leaf:?}"
+    );
+    assert!(
+        leaf.windows_inherited > leaf.windows_laid_out,
+        "the prefix's windows are the stored world's: {leaf:?}"
+    );
+    // The standing counter pins on a package with no cross-module binding
+    // write: no constraint of one item rewrote a slot minted for another,
+    // and no relocated mint left its anchor's window — on every keystroke.
+    for (name, census) in [
+        ("leaf", &leaf),
+        ("cycle", &cycle),
+        ("entry", &entry),
+        ("hub", &hub),
+    ] {
+        assert_eq!(
+            (census.window_writes_other, census.window_outside_anchor),
+            (0, 0),
+            "the {name} keystroke: a constraint rewrote a slot minted for another item, or a \
+             mint left its anchor's window: {census:?}"
+        );
+    }
     assert!(
         cycle.hot_world && cycle.base_hits == 1,
         "a cycle keystroke is a hot-set hit: {cycle:?}"

@@ -308,6 +308,18 @@ pub struct Census {
     pub seeded_passes: u64,
     /// Post-pass records this analysis filed.
     pub post_records_filed: u64,
+    /// M110 S6 (Order 50): the id windows this analysis laid out (the hot
+    /// set's and the entry's items on a served keystroke; every item on a
+    /// cold analysis) and the ones it took from the stored world.
+    pub windows_laid_out: u64,
+    pub windows_inherited: u64,
+    /// Windows a relocated mint found no room in (the item's demand grew).
+    pub windows_overflowed: u64,
+    /// The standing pins' counters: world-changing slot writes into another
+    /// item's window (the shared-slot hazard, B77/B95), and mints relocated
+    /// outside their anchor's window — both 0 by construction, both pinned.
+    pub window_writes_other: u64,
+    pub window_outside_anchor: u64,
 }
 
 thread_local! {
@@ -333,6 +345,11 @@ thread_local! {
             context_log_replayed: 0,
             seeded_passes: 0,
             post_records_filed: 0,
+            windows_laid_out: 0,
+            windows_inherited: 0,
+            windows_overflowed: 0,
+            window_writes_other: 0,
+            window_outside_anchor: 0,
         })
     };
 }
@@ -688,7 +705,8 @@ pub fn report(program: &Program) {
              hot-world={} sources-walked={} records-replayed={} functions-checked={} \
              const-hits={} const-misses={} reach-questions={} bound-sites-served={} \
              bound-sites-checked={} graphs-replayed={} context-log-replayed={} \
-             seeded-passes={} post-records-filed={}",
+             seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
+             windows-overflowed={} window-writes-other={} window-outside-anchor={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -705,6 +723,11 @@ pub fn report(program: &Program) {
             census.context_log_replayed,
             census.seeded_passes,
             census.post_records_filed,
+            census.windows_laid_out,
+            census.windows_inherited,
+            census.windows_overflowed,
+            census.window_writes_other,
+            census.window_outside_anchor,
         );
     }
 }

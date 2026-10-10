@@ -1156,6 +1156,56 @@ pub const EFFECT_FIXTURES: &[Fixture] = &[
     },
 ];
 
+// --- M110 S6: the id-window classes (incr-50, Order 50; spike-49's two predicted reds) ---
+//
+// Two shapes the spike named as classes to ADD. (1) A std item's resolve
+// mints entities (the desugars: `for .. in`, an interpolation) that the
+// windows relocate into the std item's window, where `frozen_entity` reads
+// them as std's — a definition-site check must not skip a verdict about the
+// USER's code because of it. (2) A generated expansion (`[derive]`) gets a
+// window of its own; a fixpoint type id relocated into a USER item's window
+// beside it must not land in the expansion's `derived_type_origins` range,
+// where B217 would re-anchor a diagnostic to the derive attribute. The prefix
+// module carries both a derived struct and a bound refusal that names it; the
+// leaf and the entry are typed into around them, and the derive is flipped.
+
+pub const WINDOW_MAIN: &str = "import pkg::shapes::{ Pair, refused, same, total };\nimport pkg::views::render;\n\nfun main() {\n\tprint(total([1, 2, 3]));\n\tprint(same(Pair { a = 1, b = 2 }));\n\tprint(refused());\n\tprint(render());\n}\n";
+
+pub const WINDOW_SHAPES: &str = "import std::compare::PartialEq;\n\n[derive(PartialEq)]\nexport struct Pair {\n\ta: i32,\n\tb: i32,\n}\n\nexport fun total(items: List<i32>): i32 {\n\tmut sum = 0;\n\tfor item in items {\n\t\tsum = sum + item;\n\t}\n\tsum\n}\n\nexport fun same(pair: Pair): bool {\n\tpair == Pair { a = pair.b, b = pair.a }\n}\n\nexport fun label(pair: Pair): str {\n\ti\"{pair.a}/{pair.b}\"\n}\n\nfun wants_eq<T: PartialEq>(value: T): bool {\n\tvalue == value\n}\n\nexport fun refused(): bool {\n\twants_eq(total)\n}\n";
+
+pub const WINDOW_FIXTURES: &[Fixture] = &[Fixture {
+    name: "id_windows",
+    platform: NODE,
+    files: &[
+        ("main.vl", WINDOW_MAIN),
+        ("shapes.vl", WINDOW_SHAPES),
+        ("views.vl", POST_PASS_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a statement typed into the leaf beside the derived prefix module (S6)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
+        },
+        Edit {
+            label: "a statement typed into the entry beside the derived prefix module (S6)",
+            file: "main.vl",
+            seed: None,
+            replacements: &[(
+                "\tprint(render());\n",
+                "\tprint(render());\n\tlet extra = 1;\n",
+            )],
+        },
+        Edit {
+            label: "the prefix module's derive flipped off while the seed stays on the leaf (S6)",
+            file: "shapes.vl",
+            seed: Some("views.vl"),
+            replacements: &[("[derive(PartialEq)]\n", "")],
+        },
+    ],
+}];
+
 // --- B569: a labelled tuple in a reused module (lang-a-49, Order 49) -------------
 //
 // A PREFIX module whose declarations print labels — a labelled return, a

@@ -4650,7 +4650,7 @@ pub struct Analyzer<'src> {
     // through `source_ranges`; `TypeId`s are a separate counter and had
     // nothing, which is what made "did the entry move THIS module's slots?"
     // unanswerable.
-    type_id_sources: Vec<SourceId>,
+    type_id_sources: id_windows::TypeSourceRuns,
     // M19 T1: the sources whose record this analysis must NOT write, because
     // something it derived for them reaches OUTSIDE the world — a note or a
     // trace hop pointing into the entry. Such a diagnostic is about a module
@@ -7703,7 +7703,7 @@ impl<'src> Analyzer<'src> {
             source_range_index: std::cell::RefCell::new(RangeIndex::default()),
             tuple_member_index: std::cell::RefCell::new(None),
             derived_origin_index: std::cell::RefCell::new(RangeIndex::default()),
-            type_id_sources: Vec::new(),
+            type_id_sources: id_windows::TypeSourceRuns::default(),
             reuse_derived: HashMap::default(),
             reuse_unrecordable: HashSet::default(),
             entry_dirty_sources: HashSet::default(),
@@ -8062,9 +8062,8 @@ impl<'src> Analyzer<'src> {
                     // room is padded with the window's source, which is what
                     // a mint relocated into it later would have recorded.
                     let (from, to) = padded[1];
-                    debug_assert_eq!(self.type_id_sources.len(), from as usize);
                     self.type_id_sources
-                        .resize(to as usize, self.current_source_id);
+                        .note_range(from, to, self.current_source_id);
                 }
                 id
             })
@@ -25796,8 +25795,7 @@ impl<'src> Analyzer<'src> {
                 .id_windows
                 .mint(id_windows::Lane::Type, &mut self.type_id);
             if from_counter {
-                debug_assert_eq!(self.type_id_sources.len(), id as usize);
-                self.type_id_sources.push(self.current_source_id);
+                self.type_id_sources.note(id, self.current_source_id);
             }
             // A mint relocated into a window has its row already: the
             // window's room was padded with its source at close.
@@ -25810,8 +25808,7 @@ impl<'src> Analyzer<'src> {
         // so the push keeps `type_id_sources` indexed by the id itself — one
         // `u32` per slot, and the only thing that makes `write_type_slot`'s
         // dirty bit attributable to a MODULE rather than to the program.
-        debug_assert_eq!(self.type_id_sources.len(), id as usize);
-        self.type_id_sources.push(self.current_source_id);
+        self.type_id_sources.note(id, self.current_source_id);
         crate::counters::count_type_slot();
         TypeId(id)
     }
@@ -25921,7 +25918,7 @@ impl<'src> Analyzer<'src> {
             // everything past it is the entry's doing. Over-dirtying costs
             // reuse; under-dirtying costs soundness.
             if self.entry_phase
-                && let Some(source) = self.type_id_sources.get(type_id.0 as usize).copied()
+                && let Some(source) = self.type_id_sources.get(type_id.0)
             {
                 self.entry_dirty_sources.insert(source);
             }
@@ -64130,6 +64127,8 @@ impl<'src> Analyzer<'src> {
         // resolving it before the locals means an `Expr::Local` is already in
         // place when the ordinary pass walks the same chain.
         for (id, module, item) in std::mem::take(&mut self.prepped_std_items) {
+            // M110 S6: what the drain mints for a row belongs to the row's item.
+            self.id_windows.set_drain_anchor(id);
             self.resolve_prepped_std_item(id, module, item);
         }
         let mut guarded_locals = Vec::new();
@@ -64138,6 +64137,7 @@ impl<'src> Analyzer<'src> {
                 guarded_locals.push((id, name));
                 continue;
             }
+            self.id_windows.set_drain_anchor(id);
             self.resolve_prepped_local(id, name);
         }
 
@@ -64159,6 +64159,7 @@ impl<'src> Analyzer<'src> {
         // Those go into the second part, at the seam the guard pass uses.
         let mut guarded_assignments = Vec::new();
         for (target_id, value_id) in std::mem::take(&mut self.prepped_assignments) {
+            self.id_windows.set_drain_anchor(target_id);
             if guarded_locals.iter().any(|(id, _)| *id == target_id) {
                 guarded_assignments.push((target_id, value_id));
                 continue;
@@ -64174,6 +64175,9 @@ impl<'src> Analyzer<'src> {
         for (type_id, name, scope_id, span, argument_type_ids, source_id) in
             std::mem::take(&mut self.prepped_type_locals)
         {
+            // M110 S6: an annotation's drain mints for the item whose slot it
+            // fills.
+            self.id_windows.set_anchor_type(type_id);
             // The written spelling outlives the queue: conformance checking
             // reads it after build (the `= Self` disambiguation), so the
             // drain retains the projection it needs.
@@ -64952,6 +64956,7 @@ impl<'src> Analyzer<'src> {
         }
 
         for path in std::mem::take(&mut self.prepped_type_static_accessors) {
+            self.id_windows.set_anchor_type(path.type_id);
             let PreppedTypePath {
                 type_id,
                 subject_type_id,
@@ -65744,6 +65749,9 @@ impl<'src> Analyzer<'src> {
         }
         // --- Check trait conformance for `impl Subject with Trait` ---
         for check in std::mem::take(&mut self.prepped_trait_impls) {
+            // M110 S6: the conformance check mints for the impl block's item
+            // (its scope is the block's).
+            self.id_windows.set_anchor_scope(check.scope_id);
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
                 Some(trait_id) => trait_id,
                 None => {
@@ -66449,6 +66457,9 @@ impl<'src> Analyzer<'src> {
     /// a pre-entry world would freeze std constraints the entry still binds
     /// (the chained-`map` failure that pinned this split).
     fn finalize_build(&mut self) {
+        // M110 S6: the drains' anchors end here; what `build()` mints past
+        // this point is counted unanchored (M134's territory).
+        self.id_windows.clear_anchor();
         // A67: the module-tree ambiguity. Here rather than in `resolve_world`
         // because that runs TWICE under the S3 two-phase shape — once over the
         // pre-entry world and once for the build — and a fact about the tree
@@ -75809,7 +75820,7 @@ fn base_cache_world_bytes(world: &World<'_>) -> usize {
 /// The M41 half of [`base_cache_world_bytes`], alone: T0's dirty-bit census
 /// (`type_id_sources`), one [`SourceId`] per `TypeId` the world minted.
 fn base_cache_world_type_census_bytes(world: &World<'_>) -> usize {
-    world.analyzer.type_id_sources.len() * std::mem::size_of::<SourceId>()
+    world.analyzer.type_id_sources.bytes()
 }
 
 #[doc(hidden)]
@@ -77290,6 +77301,10 @@ fn load_hot_modules<'src>(
             &module,
             source_id,
         );
+        analyzer
+            .id_windows
+            .source_keys
+            .push(crate::content_hash(&module_path.to_string_lossy()));
         world.sources.push(module_path);
         world.source_hashes.push(crate::content_hash(module.text));
         analyzer.source_texts.push((source_id, module.text));
@@ -78541,6 +78556,12 @@ fn analyze_inner<'src>(
         // `write_type_slot` can attribute the ones that move a module's slots.
         // Set before the entry expansion, which is already entry work.
         world.analyzer.prefix_entity_end = Some(world.analyzer.entity_id);
+        // M110 S6: the stored world's windows are its own; this analysis
+        // lays out the hot set's and the entry's after them.
+        world
+            .analyzer
+            .id_windows
+            .inherit(crate::content_hash(&entry_path.to_string_lossy()));
         world.analyzer.entry_phase = true;
         // M110 S1: the hot set, over the served prefix — exactly what the miss
         // below does after its store, so a hit and a miss build one world.
@@ -78608,6 +78629,10 @@ fn analyze_inner<'src>(
     let mut sources: Vec<PathBuf> = vec![entry_path.to_path_buf()];
     let mut source_hashes: Vec<u64> = vec![crate::content_hash(entry_source)];
     let mut analyzer = Analyzer::new();
+    // M110 S6: the id windows are the editor's (a seeded analysis, or one
+    // asked for reading aids); a cold check runs without them.
+    analyzer.id_windows.mode =
+        id_windows::mode_for(workspace.reading_aids || !workspace.hot_seeds.is_empty());
     // B573: the platform BEFORE anything walks. The load drain below walks every
     // module and selects its `[platform(..)]` twins (`select_platform_twins`
     // reads `self.platform`), and so does a hot set's walk over the stored
@@ -78621,6 +78646,10 @@ fn analyze_inner<'src>(
     // The entry file's text, registered first so SourceId(0) always resolves
     // (element-syntax S4 — the source-inspecting diagnostics read it).
     analyzer.source_texts.push((SourceId(0), entry_source));
+    analyzer
+        .id_windows
+        .source_keys
+        .push(crate::content_hash(&entry_path.to_string_lossy()));
     // The std module inventory for the B4 import steer (module name, path) —
     // every layer's modules except the package surface itself, which is
     // integrated into the package name and is not a module a user imports
@@ -79587,6 +79616,11 @@ fn analyze_inner<'src>(
                     )
                 };
             analyzer.source_texts.push((module_source_id, module_text));
+            analyzer.id_windows.source_keys.push(
+                sources
+                    .last()
+                    .map_or(0, |path| crate::content_hash(&path.to_string_lossy())),
+            );
             let module_scope = analyzer.create_scope(Some(global_scope_id));
             let module_scope_id = analyzer.push_scope(module_scope);
             // A65: a module already has an entity when a CHILD of it loaded
@@ -80811,6 +80845,8 @@ fn analyze_inner<'src>(
     // After the store, so the world the cache holds is the pre-entry one it
     // has always been.
     world.analyzer.prefix_entity_end = Some(world.analyzer.entity_id);
+    // (S6: no `inherit` here — this analysis laid the prefix's windows out
+    // itself and records their demand; a HIT inherits them.)
     world.analyzer.entry_phase = true;
     // M110 S1: the hot set, over the prefix just stored — what a hit on that
     // world does too, so the two build one world.
@@ -82768,6 +82804,9 @@ fn analyze_over_world<'src>(
         _ => None,
     };
 
+    // M110 S6: what every window this analysis laid out demanded, for the
+    // next analysis of the same items to size by.
+    analyzer.id_windows.record_demand();
     // M110 S5: the spike's census over the final tables, printed per analysis.
     let id_windows_report = analyzer.id_windows.on().then(|| {
         let report = analyzer.id_windows.report(
@@ -82788,6 +82827,22 @@ fn analyze_over_world<'src>(
         }
         report
     });
+    // M110 S6: the windows' counters, on the census the pins read.
+    if let Some(report) = &id_windows_report
+        && !crate::macros::in_macro_world()
+    {
+        let census = &report.census;
+        let outside = census.entities.relocated_outside_anchor
+            + census.types.relocated_outside_anchor
+            + census.scopes.relocated_outside_anchor;
+        crate::incremental::update_census(|incremental| {
+            incremental.windows_laid_out = report.laid_out;
+            incremental.windows_inherited = report.inherited;
+            incremental.windows_overflowed = census.overflowed;
+            incremental.window_writes_other = census.writes_other;
+            incremental.window_outside_anchor = outside;
+        });
+    }
     Ok(Some(Program {
         hidden_impls_pending,
         exported_entities,

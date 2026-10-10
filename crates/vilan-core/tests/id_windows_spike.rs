@@ -41,7 +41,10 @@ fn report_under(package: &Package, mode: Mode, plant: Option<Plant>) -> IdWindow
             );
             id_windows::force_mode(None);
             id_windows::force_plant(None);
-            assert!(errors.is_empty(), "the classes package is clean: {errors:?}");
+            assert!(
+                errors.is_empty(),
+                "the classes package is clean: {errors:?}"
+            );
             program
                 .expect("a program")
                 .id_windows
@@ -78,7 +81,11 @@ fn high_water_under(package: &Package, mode: Mode) -> (u32, u32, u32) {
             // only the report carries, so they are zero when it is off.
             let next = program.next_entity_id;
             match program.id_windows {
-                Some(report) => (next, report.type_high_water as u32, report.scope_high_water as u32),
+                Some(report) => (
+                    next,
+                    report.type_high_water as u32,
+                    report.scope_high_water as u32,
+                ),
                 None => (next, 0, 0),
             }
         })
@@ -167,7 +174,12 @@ fn the_fixpoints_mints_are_anchored() {
     // Non-vacuity: with the anchor never set, every fixpoint mint is
     // unanchored.
     let planted = report_under(&package, Mode::Census, Some(Plant::AnchorOff));
-    assert_eq!(planted.census.types.anchored(), 0, "{:?}", planted.census.types);
+    assert_eq!(
+        planted.census.types.anchored(),
+        0,
+        "{:?}",
+        planted.census.types
+    );
     assert!(planted.census.types.unanchored_total() > types.unanchored_total());
 }
 
@@ -187,13 +199,112 @@ fn the_census_mode_mints_todays_ids() {
     );
 }
 
+/// S6's standing pins, on the DEFAULT (every lane relocated): no constraint
+/// rewrites a slot minted for another item, no relocated mint leaves its
+/// anchor's window, every lane relocates something, and the three lanes
+/// stay disjoint and in load order.
+#[test]
+fn the_default_relocates_every_lane_inside_its_anchor() {
+    let package = classes_package();
+    let report = report_under(&package, Mode::All, None);
+    assert_eq!(report.mode, Mode::All);
+    // The classes package pushes into another module's use-inferred binding
+    // on purpose (`bag`/`a_spoil`): a constraint of one item writing a slot
+    // minted for another, counted, not an invariant. The leaf package has no
+    // such write, and there the count is pinned at zero.
+    eprintln!(
+        "classes: writes own {} other {} drain-other {} tail {}",
+        report.census.writes_own,
+        report.census.writes_other,
+        report.census.writes_drain_other,
+        report.census.writes_tail
+    );
+    let leaf = leaf_package();
+    let leaf_report = report_under(&leaf, Mode::All, None);
+    assert_eq!(
+        leaf_report.census.writes_other, 0,
+        "{:?}",
+        leaf_report.census
+    );
+    assert_eq!(
+        leaf_report.census.writes_drain_other, 0,
+        "{:?}",
+        leaf_report.census
+    );
+    leaf.remove();
+    for (lane, census) in [
+        (Lane::Entity, &report.census.entities),
+        (Lane::Type, &report.census.types),
+        (Lane::Scope, &report.census.scopes),
+    ] {
+        assert_eq!(census.relocated_outside_anchor, 0, "{lane:?}: {census:?}");
+        lanes_disjoint_and_ordered(&report, lane);
+    }
+    assert!(
+        report.census.types.anchored_in_window > 0,
+        "{:?}",
+        report.census.types
+    );
+    assert!(
+        report.census.entities.anchored_in_window > 0,
+        "{:?}",
+        report.census.entities
+    );
+    assert_eq!(
+        report.laid_out, report.windows,
+        "a cold analysis lays out every window"
+    );
+    package.remove();
+}
+
+/// S6: a type window is sized from the item's previous demand. The first
+/// analysis of a package sizes every type lane at ×8 of its walk; the second
+/// sizes it at ×1.5 of what the first actually used, so the id space the
+/// windows span shrinks and nothing newly overflows.
+#[test]
+fn a_second_analysis_sizes_the_type_windows_from_the_demand() {
+    let package = classes_package();
+    let first = report_under(&package, Mode::All, None);
+    let second = report_under(&package, Mode::All, None);
+    assert_eq!(first.windows, second.windows);
+    eprintln!(
+        "first: span {} high {} overflowed {}; second: span {} high {} overflowed {}",
+        first.type_span,
+        first.type_high_water,
+        first.census.overflowed,
+        second.type_span,
+        second.type_high_water,
+        second.census.overflowed
+    );
+    assert!(
+        second.type_span < first.type_span,
+        "the demand-sized layout is tighter: first {} slots, second {}",
+        first.type_span,
+        second.type_span
+    );
+    assert!(
+        second.census.overflowed <= first.census.overflowed + 1,
+        "a demand-sized window holds what the item minted last time: first {} overflowed, second {}",
+        first.census.overflowed,
+        second.census.overflowed
+    );
+    assert_eq!(second.census.types.relocated_outside_anchor, 0);
+    package.remove();
+}
+
 #[test]
 fn the_report_line_names_the_mode() {
     let package = classes_package();
     let report = report_under(&package, Mode::All, None);
-    assert!(report.line().starts_with("[vilan windows] mode=all windows="));
+    assert!(
+        report
+            .line()
+            .starts_with("[vilan windows] mode=all windows=")
+    );
     assert_eq!(report.mode, Mode::All);
     // `all` relocates every lane: scopes and entities too.
-    assert!(report.census.entities.anchored_in_window + report.census.entities.anchored_spilled > 0
-        || report.census.entities.anchored() == 0);
+    assert!(
+        report.census.entities.anchored_in_window + report.census.entities.anchored_spilled > 0
+            || report.census.entities.anchored() == 0
+    );
 }

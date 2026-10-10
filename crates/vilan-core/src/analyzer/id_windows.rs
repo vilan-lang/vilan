@@ -98,20 +98,112 @@ pub fn force_plant(plant: Option<Plant>) {
     FORCED_PLANT.with(|forced| forced.set(plant));
 }
 
-fn env_mode() -> Mode {
-    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+/// The mode `VILAN_ID_WINDOWS` names, if it is set at all.
+fn env_mode() -> Option<Mode> {
+    static MODE: std::sync::OnceLock<Option<Mode>> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VILAN_ID_WINDOWS").as_deref() {
-        Ok("census") => Mode::Census,
-        Ok("walk") => Mode::Walk,
-        Ok("types") => Mode::Types,
-        Ok("all") | Ok("1") => Mode::All,
-        _ => Mode::Off,
+        Ok("off") | Ok("0") => Some(Mode::Off),
+        Ok("census") => Some(Mode::Census),
+        Ok("walk") => Some(Mode::Walk),
+        Ok("types") => Some(Mode::Types),
+        Ok("all") | Ok("1") => Some(Mode::All),
+        _ => None,
     })
+}
+
+/// The mode an analysis runs in (M110 S6, Order 50). A test's forced mode
+/// first, then the environment's, else: ON — every lane relocated, the
+/// spike's `all` — for an EDITOR analysis (one a front end seeded or asked
+/// reading aids of), OFF for a cold `vilan check`. The windows exist for the
+/// editor's per-item records (S7); a cold check pays nothing for them — the
+/// Mechanics' rule for every editor-only table — and the corpus and native
+/// legs force `all` through the environment to prove the output identical.
+pub fn mode_for(editor: bool) -> Mode {
+    FORCED
+        .with(|forced| forced.get())
+        .or_else(env_mode)
+        .unwrap_or(if editor { Mode::All } else { Mode::Off })
+}
+
+/// M110 S6: the TYPE window an item is given is sized from the item's
+/// PREVIOUS analysis's demand — what its fixpoint minted last time, ×1.5 —
+/// and from its walk's mints ×8 the first time (the spike measured the
+/// fixpoint minting 2.9× the walk at p50 and 54× at p99, so a walk ratio
+/// cannot size it: 1,213 of kolt's 4,602 client windows overflowed at ×16).
+/// Keyed by the source's PATH and the item's ordinal in it, so the demand
+/// survives the keystrokes that re-walk a hot module and the sessions that
+/// rebuild a world. Process-wide; an overflowing item records the demand it
+/// actually had, spill included, and is sized by it next time.
+static WINDOW_DEMAND: std::sync::OnceLock<std::sync::Mutex<crate::fx::FxHashMap<(u64, u32), u32>>> =
+    std::sync::OnceLock::new();
+
+fn demand_table() -> &'static std::sync::Mutex<crate::fx::FxHashMap<(u64, u32), u32>> {
+    WINDOW_DEMAND.get_or_init(|| std::sync::Mutex::new(crate::fx::FxHashMap::default()))
+}
+
+/// The first analysis's type-window ratio over the walk's mints. The spike
+/// measured the ratio's overflow on kolt's client leg — ×4: 2,110 of 4,602
+/// windows, ×8: 1,860, ×16: 1,213 — and every slack slot of the type lane
+/// is a hole in the type table (`Vec<Option<Type>>`): at ×8 a stored world
+/// paid for the padding in a session's heap (the LSP's retention pin), at
+/// ×4 for half of it with the same items overflowing. The demand table sizes
+/// them right from the second analysis on.
+pub const FIRST_TYPE_RATIO: u32 = 4;
+
+/// The run-length form of the per-type-slot source stamp (M19 T0's
+/// `type_id_sources`): one row per run of slots stamped with one source,
+/// looked up by the slot's id. A window's room is one run (its item's
+/// source), so the padding costs no row per slack slot.
+#[derive(Clone, Debug, Default)]
+pub struct TypeSourceRuns {
+    runs: Vec<(u32, SourceId)>,
+    high: u32,
+}
+
+impl TypeSourceRuns {
+    /// Stamps the slot `id` — which must be the next unstamped one.
+    pub fn note(&mut self, id: u32, source: SourceId) {
+        debug_assert_eq!(self.high, id);
+        self.note_range(id, id + 1, source);
+    }
+
+    /// Stamps the slots `from..to`, which must start at the next unstamped one.
+    pub fn note_range(&mut self, from: u32, to: u32, source: SourceId) {
+        debug_assert_eq!(self.high, from);
+        if to <= from {
+            return;
+        }
+        match self.runs.last() {
+            Some((_, last)) if *last == source => {}
+            _ => self.runs.push((from, source)),
+        }
+        self.high = to;
+    }
+
+    pub fn get(&self, id: u32) -> Option<SourceId> {
+        if id >= self.high {
+            return None;
+        }
+        let index = self.runs.partition_point(|(start, _)| *start <= id);
+        index.checked_sub(1).map(|index| self.runs[index].1)
+    }
+
+    pub fn high(&self) -> u32 {
+        self.high
+    }
+
+    /// What the stamp is WORTH in the world tally's currency (M11/M41: one
+    /// `SourceId` per slot the world minted, a figure proportional to the
+    /// world's types) — not what the run-length form happens to allocate,
+    /// which a window's padding would otherwise make a few dozen bytes.
+    pub fn bytes(&self) -> usize {
+        self.high as usize * std::mem::size_of::<SourceId>()
+    }
 }
 
 /// The mode this analysis runs under.
 pub fn mode() -> Mode {
-    FORCED.with(|forced| forced.get()).unwrap_or_else(env_mode)
+    mode_for(false)
 }
 
 /// `VILAN_ID_WINDOW_SLACK`: the room after an item's walk, as a percent of
@@ -138,11 +230,13 @@ pub enum Plant {
 
 fn env_plant() -> Option<Plant> {
     static PLANT: std::sync::OnceLock<Option<Plant>> = std::sync::OnceLock::new();
-    *PLANT.get_or_init(|| match std::env::var("VILAN_ID_WINDOWS_PLANT").as_deref() {
-        Ok("anchor-off") => Some(Plant::AnchorOff),
-        Ok("cross") => Some(Plant::Cross),
-        _ => None,
-    })
+    *PLANT.get_or_init(
+        || match std::env::var("VILAN_ID_WINDOWS_PLANT").as_deref() {
+            Ok("anchor-off") => Some(Plant::AnchorOff),
+            Ok("cross") => Some(Plant::Cross),
+            _ => None,
+        },
+    )
 }
 
 pub fn plant() -> Option<Plant> {
@@ -209,6 +303,9 @@ pub struct ItemWindow {
     /// The top-level node's id (the item), known once its walk returns.
     pub item: Option<Id>,
     pub source: SourceId,
+    /// The demand table's key: the source's path key and the item's ordinal
+    /// among the source's windows.
+    pub key: (u64, u32),
     pub entities: Range,
     pub types: Range,
     pub scopes: Range,
@@ -282,7 +379,14 @@ pub struct Census {
     /// anchor: into the anchor's own window, into ANOTHER item's window, into
     /// the tail (a slot no window owns), and writes made with no anchor.
     pub writes_own: u64,
+    /// Into another item's window by a CONSTRAINT of the fixpoint — the
+    /// spike's datum (0 on kolt), the standing pin.
     pub writes_other: u64,
+    /// Into another item's window by a prepped DRAIN's row (S6 anchors the
+    /// drains): a name resolved in item A that grounds a use-inferred binding
+    /// minted for item B — the cross-item dependency M19 tracks as a dirty
+    /// source and a per-item record (S7) must carry. Counted, not pinned.
+    pub writes_drain_other: u64,
     pub writes_tail: u64,
     pub writes_unanchored: u64,
     /// Windows whose relocated mints spilled.
@@ -318,6 +422,10 @@ pub struct Containment {
 pub struct IdWindowsReport {
     pub mode: Mode,
     pub windows: u64,
+    /// The windows this analysis laid out, and the ones it inherited from
+    /// the stored world (S6).
+    pub laid_out: u64,
+    pub inherited: u64,
     pub census: Census,
     pub containment: Containment,
     /// Per lane: ids the windows span (room included) and ids the counter
@@ -342,7 +450,10 @@ impl IdWindowsReport {
             return;
         };
         use std::io::Write;
-        let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(path)
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
         else {
             return;
         };
@@ -389,7 +500,7 @@ impl IdWindowsReport {
         };
         format!(
             "[vilan windows] mode={} windows={} overflowed={} | {} | {} | {} | writes own={} \
-             other={} tail={} unanchored={} | expr-types own={} foreign={} tail={} \
+             other={} drain-other={} tail={} unanchored={} | expr-types own={} foreign={} tail={} \
              unwindowed-expr={} | span entity={}/{} type={}/{} scope={}/{}",
             self.mode.name(),
             self.windows,
@@ -399,6 +510,7 @@ impl IdWindowsReport {
             lane("scopes", &self.census.scopes),
             self.census.writes_own,
             self.census.writes_other,
+            self.census.writes_drain_other,
             self.census.writes_tail,
             self.census.writes_unanchored,
             self.containment.own,
@@ -426,8 +538,20 @@ pub struct IdWindows {
     /// The entity the anchor was last resolved from, to skip the search when
     /// consecutive constraints share it.
     anchor_entity: Option<Id>,
+    /// Whether the anchor was set by a prepped drain's row rather than a
+    /// constraint of the fixpoint (the write census keeps the two apart).
+    anchor_is_drain: bool,
     pub phase: Phase,
     pub census: Census,
+    /// Per source (by its id), a key of its PATH — the demand table's key.
+    /// Pushed as the sources are registered; a stored world carries its
+    /// prefix's, the hot set's and the entry's follow.
+    pub source_keys: Vec<u64>,
+    /// The next ordinal per source, for the windows laid out so far.
+    ordinals: crate::fx::FxHashMap<SourceId, u32>,
+    /// How many windows the stored world carried when this analysis took it
+    /// — the ones below were not laid out by this analysis.
+    pub inherited: usize,
 }
 
 impl IdWindows {
@@ -444,6 +568,21 @@ impl IdWindows {
 
     /// Opens a window at the counters' current values. The caller walks the
     /// item, then [`Self::close`]s it.
+    /// Marks every window laid out so far as the stored world's (taken by
+    /// this analysis, not laid out by it).
+    pub fn inherit(&mut self, entry_key: u64) {
+        self.inherited = self.windows.len();
+        // The entry is THIS analysis's file, not the storing one's: its key
+        // and its ordinals start over, so the demand table keys its windows
+        // by its own path.
+        if self.source_keys.is_empty() {
+            self.source_keys.push(entry_key);
+        } else {
+            self.source_keys[0] = entry_key;
+        }
+        self.ordinals.insert(SourceId(0), 0);
+    }
+
     pub fn open(&mut self, source: SourceId, entity: u32, type_: u32, scope: u32) -> Option<usize> {
         if !self.on() {
             return None;
@@ -453,9 +592,19 @@ impl IdWindows {
             end: start,
             cursor: start,
         };
+        let ordinal = self.ordinals.entry(source).or_insert(0);
+        let key = (
+            self.source_keys
+                .get(source.0 as usize)
+                .copied()
+                .unwrap_or(0),
+            *ordinal,
+        );
+        *ordinal += 1;
         self.windows.push(ItemWindow {
             item: None,
             source,
+            key,
             entities: range(entity),
             types: range(type_),
             scopes: range(scope),
@@ -487,6 +636,17 @@ impl IdWindows {
         let mut padded = [(0, 0); 3];
         let window = &mut self.windows[index];
         window.item = Some(item);
+        // S6: the type lane is sized from the item's recorded demand when
+        // there is one, else from its walk ×FIRST_TYPE_RATIO.
+        let demanded: Option<u32> = if lays_out {
+            demand_table()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&window.key)
+                .copied()
+        } else {
+            None
+        };
         for (slot, (lane, counter)) in [
             (Lane::Entity, entity),
             (Lane::Type, type_),
@@ -499,7 +659,16 @@ impl IdWindows {
             range.cursor = *counter;
             let minted = *counter - range.start;
             range.end = if lays_out {
-                let room = ((minted as u64) * (slack as u64) / 100).max(MIN_SLACK as u64) as u32;
+                let room = match (lane, demanded) {
+                    (Lane::Type, Some(demand)) => {
+                        // ×1.5 of what the item minted last time (walk and
+                        // fixpoint together), less the walk's own share.
+                        (u64::from(demand) * 3 / 2).saturating_sub(u64::from(minted))
+                    }
+                    (Lane::Type, None) => u64::from(minted) * u64::from(FIRST_TYPE_RATIO),
+                    _ => (u64::from(minted) * u64::from(slack)) / 100,
+                }
+                .max(u64::from(MIN_SLACK)) as u32;
                 *counter + room
             } else {
                 *counter
@@ -608,6 +777,7 @@ impl IdWindows {
         if !self.on() || plant() == Some(Plant::AnchorOff) {
             return;
         }
+        self.anchor_is_drain = false;
         if self.anchor_entity == Some(anchor) {
             return;
         }
@@ -615,14 +785,62 @@ impl IdWindows {
         self.anchor = self.window_of_entity(anchor);
     }
 
+    /// A prepped drain's row anchor (S6): the row's item, by its entity.
+    pub fn set_drain_anchor(&mut self, anchor: Id) {
+        self.set_anchor(anchor);
+        self.anchor_is_drain = true;
+    }
+
     pub fn clear_anchor(&mut self) {
         self.anchor = None;
         self.anchor_entity = None;
+        self.anchor_is_drain = false;
     }
 
     /// A pre-settle world-changing write to `slot`, classified by the anchor.
+    /// S6: records every window this analysis laid out into the demand
+    /// table — what its type lane used, spill included — for the next
+    /// analysis of the same item to size by.
+    pub fn record_demand(&self) {
+        if !self.mode.lays_out() {
+            return;
+        }
+        let mut table = demand_table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for window in &self.windows[self.inherited..] {
+            let demand = window.types.used() + window.spilled[1];
+            table.insert(window.key, demand);
+        }
+    }
+
+    /// The anchor set from a TYPE slot's window (the resolve's annotation
+    /// drains carry a type id, not an entity).
+    pub fn set_anchor_type(&mut self, slot: TypeId) {
+        if !self.on() || plant() == Some(Plant::AnchorOff) {
+            return;
+        }
+        self.anchor_entity = None;
+        self.anchor_is_drain = true;
+        self.anchor = self.window_of_type(slot);
+    }
+
+    /// The anchor set from a SCOPE's window (an impl block's conformance
+    /// check carries its scope).
+    pub fn set_anchor_scope(&mut self, scope: Id) {
+        if !self.on() || plant() == Some(Plant::AnchorOff) {
+            return;
+        }
+        self.anchor_entity = None;
+        self.anchor_is_drain = true;
+        self.anchor = self.window_of(Lane::Scope, scope.0);
+    }
+
+    /// The census of world-changing slot writes by window — a binary search
+    /// per write, so it is kept only where the counters read it (a debug
+    /// build, or `VILAN_COUNTERS`); the standing pins run on debug builds.
     pub fn note_slot_write(&mut self, slot: TypeId) {
-        if !self.on() {
+        if !self.on() || !(cfg!(debug_assertions) || crate::counters::counters_enabled()) {
             return;
         }
         let Some(anchor) = self.anchor else {
@@ -631,6 +849,7 @@ impl IdWindows {
         };
         match self.window_of_type(slot) {
             Some(window) if window == anchor => self.census.writes_own += 1,
+            Some(_) if self.anchor_is_drain => self.census.writes_drain_other += 1,
             Some(_) => self.census.writes_other += 1,
             None => self.census.writes_tail += 1,
         }
@@ -638,10 +857,11 @@ impl IdWindows {
 
     /// The source a type id belongs to by its window, when one holds it.
     pub fn source_of_type(&self, id: TypeId) -> Option<SourceId> {
-        self.window_of_type(id).map(|index| self.windows[index].source)
+        self.window_of_type(id)
+            .map(|index| self.windows[index].source)
     }
 
-    pub fn report<'a>(
+    pub fn report(
         &self,
         entity_high_water: u32,
         type_high_water: u32,
@@ -649,12 +869,18 @@ impl IdWindows {
         expr_types: impl Iterator<Item = (Id, TypeId)>,
     ) -> IdWindowsReport {
         let mut containment = Containment::default();
-        for (expr, type_id) in expr_types {
-            match (self.window_of_entity(expr), self.window_of_type(type_id)) {
-                (None, _) => containment.unwindowed_expr += 1,
-                (Some(_), None) => containment.tail += 1,
-                (Some(own), Some(other)) if own == other => containment.own += 1,
-                (Some(_), Some(_)) => containment.foreign += 1,
+        // The containment census (two binary searches per typed expression)
+        // and the layout copy are the counters' and the dump's; a release
+        // analysis reports the cheap counters alone.
+        let census_requested = crate::counters::counters_enabled() || cfg!(debug_assertions);
+        if census_requested {
+            for (expr, type_id) in expr_types {
+                match (self.window_of_entity(expr), self.window_of_type(type_id)) {
+                    (None, _) => containment.unwindowed_expr += 1,
+                    (Some(_), None) => containment.tail += 1,
+                    (Some(own), Some(other)) if own == other => containment.own += 1,
+                    (Some(_), Some(_)) => containment.foreign += 1,
+                }
             }
         }
         let span = |lane: Lane| -> u64 {
@@ -666,6 +892,8 @@ impl IdWindows {
         IdWindowsReport {
             mode: self.mode,
             windows: self.windows.len() as u64,
+            laid_out: (self.windows.len() - self.inherited) as u64,
+            inherited: self.inherited as u64,
             census: self.census.clone(),
             containment,
             entity_span: span(Lane::Entity),
@@ -674,7 +902,11 @@ impl IdWindows {
             type_high_water: u64::from(type_high_water),
             scope_span: span(Lane::Scope),
             scope_high_water: u64::from(scope_high_water),
-            layout: self.windows.clone(),
+            layout: if census_requested || std::env::var_os("VILAN_ID_WINDOWS_DUMP").is_some() {
+                self.windows.clone()
+            } else {
+                Vec::new()
+            },
         }
     }
 }
