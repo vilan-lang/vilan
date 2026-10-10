@@ -157,6 +157,11 @@
           "type": "boolean",
           "default": false,
           "description": "Run Organize Imports (sort and prune unused) on save. Registers the `source.organizeImports` code action in `editor.codeActionsOnSave`; your own `editor.codeActionsOnSave` settings are respected and take precedence."
+        },
+        "vilan.autoTypes.onSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep `auto` types current on save (B570): rewrite a stale `auto T` to the type its item now infers, and fill a bare `auto`, through the server's `source.fixAll.vilan.auto` action — the edits `vilan check --fix` makes. Nothing is written while the file has any other error, since a type filled from a broken program is noise."
         }
       }
     },

@@ -315,3 +315,62 @@ impl<'src> Analyzer<'src> {
             .count()
     }
 }
+
+impl<'src> Analyzer<'src> {
+    /// B570 S3: the `: auto T` each unannotated return and `let` binding of
+    /// the package's own files would take — what the editor's "Add `auto`
+    /// type" writes — built on every analysis for every id (no per-module
+    /// record takes part). A void return, a type still a hole and a type the
+    /// file cannot name offer nothing.
+    pub(super) fn auto_fills(&mut self) -> Vec<AutoFill> {
+        let mut points: Vec<(Id, (Span, usize))> = self
+            .auto_fill_points
+            .iter()
+            .map(|(id, point)| (*id, *point))
+            .collect();
+        points.sort_by_key(|(id, _)| id.0);
+        let mut admitted: HashMap<TypeId, bool> = HashMap::default();
+        let mut fills = Vec::new();
+        for (id, (name, at)) in points {
+            if self
+                .source_of_id(id)
+                .is_none_or(|source| self.std_sources.contains(&source))
+            {
+                continue;
+            }
+            let Some(scope_id) = self.expr_id_to_scope_id_map.get(&id).copied() else {
+                continue;
+            };
+            let inferred = if self.functions.contains_key(&id) {
+                // A reading aid asks; it never reports (`stage_hints`' rule).
+                let (diagnostics, marks) =
+                    (self.diagnostics.len(), self.diagnostic_source_marks.len());
+                let inferred = self.inferred_return_type_of(id);
+                self.diagnostics.truncate(diagnostics);
+                self.diagnostic_source_marks.truncate(marks);
+                inferred
+            } else if let Some(variable) = self.variables.get(&id) {
+                variable.type_id.get_type(self)
+            } else {
+                continue;
+            };
+            if matches!(
+                inferred,
+                Type::Unknown | Type::Unresolved | Type::Void | Type::Never | Type::Any
+            ) {
+                continue;
+            }
+            let Ok(spelling) = self.written_spelling(&inferred, scope_id, true, &mut admitted)
+            else {
+                continue;
+            };
+            fills.push(AutoFill {
+                id,
+                name,
+                at,
+                text: format!(": auto {spelling}"),
+            });
+        }
+        fills
+    }
+}

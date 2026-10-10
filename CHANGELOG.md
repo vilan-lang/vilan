@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**B570 S3: the editor keeps `auto` types current.** `vilan.autoTypes.onSave` (its own setting, off by default, and a menu toggle) runs the server's new `source.fixAll.vilan.auto` action on save: every stale `auto` rewritten and every bare one filled — `vilan check --fix`'s edits from the analysis the editor holds — and nothing while the file has any other error. A stale `auto` shows the type it would become as an inlay hint (`: auto i32` ⟶ `str`) and carries its rewrite as a quick fix, and **Add `auto` type** is offered on any unannotated return or `let` binding (never a void return, never a type the file cannot name without an import). Locals take `auto` like module bindings. The editor appendix says so.
+
 <!-- family: feature -->
 **B570 S2: `value as auto T` — an ascription the toolchain writes and keeps.** Output only, like every `auto`: the value is inferred as if nothing were ascribed, the chain after it reads the written `T`, and a stale one is refused naming the stage that moved (`` stale `auto`: `.len()` now returns `usize`, not the written `auto i32` … `vilan check --fix` writes `auto usize` ``); a bare `as auto` warns with the fill. `a() as auto A .b() as auto B` is E278's per-stage hints frozen into the file, and E278 offers "Ascribe this stage with `auto`" beside the plain action.
 

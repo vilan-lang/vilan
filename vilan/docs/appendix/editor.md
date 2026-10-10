@@ -385,6 +385,19 @@ save. It is the extension's own hook rather than a line in your
 `editor.codeActionsOnSave`, and organizing is a fixed point, so turning
 both on is harmless.
 
+**`auto` types** ([`auto` annotations](../spec/types.md#auto-types-the-toolchain-keeps)).
+`vilan.autoTypes.onSave` (off by default) runs the server's **Keep `auto`
+types current** source action (`source.fixAll.vilan.auto`) on save: every
+stale `auto T` in the file is rewritten to what its item now infers and
+every bare `auto` is filled — the edits `vilan check --fix` makes, from the
+analysis the editor already holds. It writes nothing while the file has
+any other error, since a type filled from a broken program is noise. While
+you type, a stale `auto` shows the type it would become after it
+(`: auto i32` ⟶ `str`), and its diagnostic carries the rewrite as a quick
+fix. On any unannotated return or `let` binding, **Add `auto` type** writes
+`: auto T` after its parameter list or its name — never on a void return,
+and never for a type the file cannot name without a new import.
+
 ## Refactors
 
 A refactor is offered on the construct your cursor is in, rather than on a
@@ -464,6 +477,7 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 | `vilan.completion.functionCall` | `full` | `parensOnly`, or `none` |
 | `vilan.autoClosing.generics` | `true` | pair a generic `<` and type over its `>`; off for Vim emulation |
 | `vilan.organizeImports.onSave` | `false` | |
+| `vilan.autoTypes.onSave` | `false` | rewrite stale and fill bare `auto` types on save |
 
 Everything but the two paths applies live. **Vilan: Restart Language
 Server** is in the command palette when you want the blunt instrument, and

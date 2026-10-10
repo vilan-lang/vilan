@@ -3107,6 +3107,17 @@ struct AutoAnnotation<'src> {
     scope_id: Id,
 }
 
+/// One "Add `auto` type" the editor can offer (B570 S3): the item, the name
+/// the action is offered on, the offset the annotation is inserted at, and
+/// the text (`: auto List<str>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoFill {
+    pub id: Id,
+    pub name: Span,
+    pub at: usize,
+    pub text: String,
+}
+
 /// Who a binding-style annotation belongs to (B161, B184, B461): a `let`'s
 /// binding by name, or an ascription (B571), which has none.
 #[derive(Debug, Clone, Copy)]
@@ -5795,6 +5806,10 @@ pub struct Analyzer<'src> {
     // B570: what an `auto`-locked binding's initializer inferred, before its
     // readers were given the written `T`.
     auto_inferred: HashMap<Id, TypeId>,
+    // B570 S3: every unannotated return and `let` binding that could take an
+    // `auto` — the name the editor's "Add `auto` type" is offered on, and the
+    // offset `: auto T` is inserted at.
+    auto_fill_points: HashMap<Id, (Span, usize)>,
     // E278: the values that land in a position that already states their type
     // — an annotated `let`'s initializer — so their stage hint would only
     // repeat the annotation.
@@ -7921,6 +7936,7 @@ impl<'src> Analyzer<'src> {
             auto_annotations: Vec::new(),
             auto_written: HashMap::default(),
             auto_inferred: HashMap::default(),
+            auto_fill_points: HashMap::default(),
             annotated_landings: HashSet::default(),
             hidden_generic_parameters: HashMap::default(),
             attributed_declarations: HashSet::default(),
@@ -39638,6 +39654,8 @@ impl<'src> Analyzer<'src> {
                         written,
                         scope_id,
                     );
+                } else if type_.is_none() && name != "_" && !name_span.into_range().is_empty() {
+                    self.auto_fill_points.insert(id, (name_span, name_span.end));
                 }
                 Some(Expr::Variable(id))
             }
@@ -40149,6 +40167,16 @@ impl<'src> Analyzer<'src> {
         }
         let return_type_id =
             return_type_node.map(|return_type| self.walk_type_node(return_type, body_scope_id));
+        if auto_return.is_none()
+            && return_type_node.is_none()
+            && function.body.is_some()
+            && !function.external
+            && !self.walking_trait_body
+            && !self.walking_trait_impl_body
+        {
+            self.auto_fill_points
+                .insert(id, (function.name.1, function.parameters.1.end));
+        }
         if let Some((span, written)) = auto_return {
             if function.external || self.walking_trait_body || self.walking_trait_impl_body {
                 self.diagnostics.push(Error {
@@ -70859,6 +70887,9 @@ pub struct Program<'src> {
     /// E278: the per-stage inlay hints of every chain split one stage per
     /// line in the package's own files (never std's).
     pub stage_hints: Vec<StageHint>,
+    /// B570 S3: what "Add `auto` type" writes on every unannotated return
+    /// and `let` binding of the package's own files.
+    pub auto_fills: Vec<AutoFill>,
     /// Full declaration labels for hover (E9): function signatures,
     /// struct/enum blocks — keyed by declaration id, fenced by the LSP.
     pub declaration_labels: HashMap<Id, String>,
@@ -81578,6 +81609,7 @@ fn analyze_over_world<'src>(
     // admission is the solver's `&mut` question.
     let hint_labels = analyzer.hint_labels();
     let stage_hints = analyzer.stage_hints();
+    let auto_fills = analyzer.auto_fills();
 
     // Pre-render a type label for every typed expression (for hover). Done here
     // while the analyzer still holds the type tables; `expr_id_to_type_id_map`
@@ -82459,6 +82491,7 @@ fn analyze_over_world<'src>(
         expr_types,
         hint_labels,
         stage_hints,
+        auto_fills,
         declaration_labels,
         member_owners,
         member_headers,

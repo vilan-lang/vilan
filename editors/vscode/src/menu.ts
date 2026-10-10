@@ -45,6 +45,7 @@ export const TOGGLES: ReadonlyArray<{ key: string; label: string }> = [
     { key: 'semanticTokens.enabled', label: 'Semantic highlighting' },
     { key: 'autoClosing.generics', label: 'Pair a generic < with its >' },
     { key: 'organizeImports.onSave', label: 'Organize Imports on save' },
+    { key: 'autoTypes.onSave', label: 'Keep `auto` types current on save' },
 ];
 
 /// The commands an action row runs — each declared in `package.json`.

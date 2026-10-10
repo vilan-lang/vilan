@@ -4806,6 +4806,27 @@ impl Document {
                     .map(|hint| format!(": {}", hint.label)),
             });
         }
+        // B570 S3 (§4.3): after a STALE `auto`, the type it would become —
+        // `: auto i32` ⟶ `str` — so the file shows the type between saves.
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != self.focus
+            {
+                continue;
+            }
+            if let Some(rewrite) = vilan_core::analyzer::auto_annotation_rewrite(&diagnostic.msg) {
+                let becomes = rewrite.strip_prefix("auto ").unwrap_or(rewrite);
+                hints.push(LandedHint {
+                    name: diagnostic.span,
+                    label: format!(" ⟶ {becomes}"),
+                    abbreviated: None,
+                });
+            }
+        }
         // E278: a hint per STAGE of a chain split one stage per line, spelled
         // the way an ascription is written — ` as T`, ` as ~Pipe<T>` — at the
         // end of each line a stage ends.
@@ -4824,6 +4845,96 @@ impl Document {
         }
         hints.sort_by_key(|hint| hint.name.end);
         hints
+    }
+
+    /// B570 S3: the focus file's `auto` diagnostics with their rewrites —
+    /// the stale ERRORS and the unfilled WARNINGS — in analyzed coordinates,
+    /// and whether the file carries any OTHER error.
+    fn auto_rewrites(&self) -> (Vec<(Span, String, bool)>, bool) {
+        let mut rewrites = Vec::new();
+        let mut other_errors = false;
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != self.focus
+            {
+                continue;
+            }
+            match vilan_core::analyzer::auto_annotation_rewrite(&diagnostic.msg) {
+                Some(rewrite) => rewrites.push((diagnostic.span, rewrite.to_string(), true)),
+                None => other_errors = true,
+            }
+        }
+        for (index, warning) in self.warnings.iter().enumerate() {
+            if self
+                .warning_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != self.focus
+            {
+                continue;
+            }
+            if let Some(rewrite) = vilan_core::analyzer::auto_annotation_rewrite(&warning.msg) {
+                rewrites.push((warning.span, rewrite.to_string(), false));
+            }
+        }
+        (rewrites, other_errors)
+    }
+
+    /// B570 S3 (§4.3): the on-save action's edits — every stale or unfilled
+    /// `auto` in the file rewritten, from the analysis the editor already
+    /// holds. None while the file has any other error (a type filled from a
+    /// broken program is noise), and none while the buffer is ahead of it.
+    pub fn auto_fix_all(&self) -> Vec<(Span, String)> {
+        if self.is_stale() {
+            return Vec::new();
+        }
+        let (rewrites, other_errors) = self.auto_rewrites();
+        if other_errors {
+            return Vec::new();
+        }
+        let mut edits: Vec<(Span, String)> = rewrites
+            .into_iter()
+            .map(|(span, rewrite, _)| (span, rewrite))
+            .collect();
+        edits.sort_by_key(|(span, _)| (span.start, span.end));
+        edits.dedup_by_key(|(span, _)| (span.start, span.end));
+        edits
+    }
+
+    /// B570 S3: the quick fixes `auto` adds at `range` — the rewrite a stale
+    /// or unfilled one carries, and "Add `auto` type" on an unannotated
+    /// return or binding (its name).
+    fn auto_quickfixes(&self, program: &Program, range: Span) -> Vec<QuickFix> {
+        let mut fixes = Vec::new();
+        let (rewrites, _) = self.auto_rewrites();
+        for (span, rewrite, _) in rewrites {
+            if spans_overlap(span, range) {
+                fixes.push(QuickFix {
+                    title: format!("Write `{rewrite}`"),
+                    span,
+                    replacement: rewrite,
+                    target: None,
+                });
+            }
+        }
+        let source_of = program.source_lookup();
+        for fill in &program.auto_fills {
+            if source_of.of(fill.id) != Some(self.focus) || !spans_overlap(fill.name, range) {
+                continue;
+            }
+            fixes.push(QuickFix {
+                title: format!("Add `auto` type (`{}`)", fill.text.trim_start_matches(": ")),
+                span: Span::from(fill.at..fill.at),
+                replacement: fill.text.clone(),
+                target: None,
+            });
+        }
+        fixes
     }
 
     /// E278's code actions (`type-ascription.md` §11): "Ascribe this stage"
@@ -7754,7 +7865,7 @@ impl Document {
     /// rather than the client-echoed `context.diagnostics` — only ours
     /// carries the span and note data a fix needs.
     pub fn quickfixes(&self, program: &Program, range: Span) -> Vec<QuickFix> {
-        let mut fixes = Vec::new();
+        let mut fixes = self.auto_quickfixes(program, range);
         // E255: a duplicate import's fix is Organize Imports' own edit for the
         // run it is in — E251's merge, which removes exactly the repeat (and
         // tidies the run the way the organize action always does).
@@ -32103,6 +32214,136 @@ mod stage_hint_tests {
                 .stage_ascriptions(Span::from(line..line))
                 .is_empty()
         );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// B570 S3 (`proposal/auto-annotations.md` §4.3): the editor's half of
+/// `auto` — the on-save rewrite, the stale inlay, the quick fixes.
+#[cfg(test)]
+mod auto_editor_tests {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    fn analyzed(tag: &str, text: &str) -> (PathBuf, Document) {
+        let directory =
+            std::env::temp_dir().join(format!("vilan_b570_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let entry = directory.join("main.vl");
+        let document = Document::analyze(text, &std_root(), &entry);
+        (directory, document)
+    }
+
+    fn apply(text: &str, mut edits: Vec<(Span, String)>) -> String {
+        edits.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+        let mut written = text.to_string();
+        for (span, replacement) in edits {
+            written.replace_range(span.start..span.end, &replacement);
+        }
+        written
+    }
+
+    const STALE: &str = "fun ratio(): auto f64 {\n\t5\n}\n\n\
+         fun greeting(): auto {\n\t\"hi\"\n}\n\n\
+         fun main() {\n\tlet half: f64 = ratio();\n\tprint(i\"{half} {greeting()}\");\n}\n";
+
+    /// The on-save action rewrites every stale `auto` and fills every bare
+    /// one, and the file it leaves analyzes clean of them.
+    #[test]
+    fn the_on_save_action_rewrites_stale_and_unfilled_autos() {
+        let (directory, document) = analyzed("save", STALE);
+        let edits = document.auto_fix_all();
+        assert_eq!(
+            edits
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["auto i32", "auto str"]
+        );
+        let written = apply(STALE, edits);
+        assert!(written.contains("fun ratio(): auto i32 {"), "{written}");
+        assert!(written.contains("fun greeting(): auto str {"), "{written}");
+        let (second, rewritten) = analyzed("save_after", &written);
+        assert!(
+            rewritten.auto_fix_all().is_empty(),
+            "nothing left for the action to write"
+        );
+        let _ = std::fs::remove_dir_all(&second);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Q5 (RULED): it never runs on a file with any other error.
+    #[test]
+    fn the_on_save_action_writes_nothing_beside_another_error() {
+        let text = "fun ratio(): auto f64 {\n\t5\n}\n\nfun main() {\n\tlet x: str = 1;\n\tlet _ = (x, ratio());\n}\n";
+        let (directory, document) = analyzed("broken", text);
+        assert!(document.auto_fix_all().is_empty());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// While typing, a stale `auto` shows the type it would become.
+    #[test]
+    fn a_stale_auto_hints_the_type_it_would_become() {
+        let (directory, document) = analyzed("hint", STALE);
+        let after = STALE.find("auto f64").unwrap() + "auto f64".len();
+        let hints = document.keystroke_hints_served(false, true);
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.offset == after && hint.label == " ⟶ i32"),
+            "{:?}",
+            hints
+                .iter()
+                .map(|hint| (hint.offset, hint.label.clone()))
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The quick fixes: the rewrite a stale `auto` carries, and "Add `auto`
+    /// type" on an unannotated return and binding — never on a void return.
+    #[test]
+    fn the_quick_fixes_write_the_rewrite_and_add_an_auto() {
+        let text = "fun five() {\n\t5\n}\n\nfun shout() {\n\tprint(\"!\");\n}\n\n\
+             fun ratio(): auto f64 {\n\t5\n}\n\n\
+             fun main() {\n\tlet words = [\"a\"];\n\tshout();\n\tlet _ = (five(), words, ratio());\n}\n";
+        let (directory, document) = analyzed("fixes", text);
+        let program = document.program.as_ref().expect("analyzed");
+        let titles = |at: usize| -> Vec<String> {
+            document
+                .quickfixes(program, Span::from(at..at))
+                .into_iter()
+                .map(|fix| fix.title)
+                .collect()
+        };
+        assert!(
+            titles(text.find("five").unwrap() + 1)
+                .contains(&"Add `auto` type (`auto i32`)".to_string())
+        );
+        assert!(
+            titles(text.find("words").unwrap() + 1)
+                .contains(&"Add `auto` type (`auto List<str>`)".to_string())
+        );
+        assert!(
+            !titles(text.find("shout").unwrap() + 1)
+                .iter()
+                .any(|title| title.starts_with("Add `auto` type")),
+            "a void return takes no `auto`"
+        );
+        assert!(
+            titles(text.find("auto f64").unwrap() + 1).contains(&"Write `auto i32`".to_string())
+        );
+        let fill = document
+            .quickfixes(
+                program,
+                Span::from(text.find("five").unwrap()..text.find("five").unwrap()),
+            )
+            .into_iter()
+            .find(|fix| fix.title.starts_with("Add `auto` type"))
+            .expect("the fill");
+        let written = apply(text, vec![(fill.span, fill.replacement)]);
+        assert!(written.starts_with("fun five(): auto i32 {"), "{written}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 }
