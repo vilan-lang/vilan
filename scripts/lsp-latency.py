@@ -927,10 +927,14 @@ def prepare_source(source, scratch):
 
 
 def copy_untracked_inputs(kolt, target):
-    """The gitignored inputs the const pass reads — kolt's generated
-    `src/search-dict/` — copied beside the archive when the checkout has them;
-    without them the copy reports const-eval errors the owner's tree does not."""
-    for relative in ("search-dict", "src/search-dict"):
+    """The gitignored GENERATED inputs — kolt's `src/search-dict/` (the const pass
+    reads it) and `src/lucide/` (the icon module every view imports) — copied beside
+    the archive when the checkout has them; without them the copy reports errors the
+    owner's tree does not (56 `cannot find 'lucide'` at v0.46.0), and a server that
+    analyzes a BROKEN program stops early, so every base row reads half its true cost
+    and the seal's ratios inflate (Order 49's seal 1). `perf_gate.py prepare_kolt`
+    carries the same two."""
+    for relative in ("search-dict", "src/search-dict", "lucide", "src/lucide"):
         source = kolt / relative
         if source.is_dir() and not (target / relative).exists():
             shutil.copytree(source, target / relative)
