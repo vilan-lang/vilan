@@ -148,6 +148,21 @@ def measure(argv, cwd=None, env=None, counter="auto", log=None):
     }
 
 
+def peak_rss(argv, cwd=None, env=None):
+    """Run `argv` once, as a FRESH process, and return {peak_rss_kb, cpu_s, exit} - no counter, so it works where
+    `perf_event_open` is refused. `wait4`'s rusage is that child's alone: `RUSAGE_CHILDREN` is the max over EVERY
+    child the caller ever reaped, which is how scripts/rss-probe.py's first form read the MAX of its runs as each
+    run's figure (Order 49). `ru_maxrss` also folds in the forking process's resident set (~10 MB for Python), a
+    floor that is invisible next to any compiler run but is the reading for a command that allocates nothing."""
+    env = dict(os.environ if env is None else env)
+    argv = [os.path.abspath(argv[0]) if os.sep in argv[0] else argv[0], *argv[1:]]
+    process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _, status, usage = os.wait4(process.pid, 0)
+    process.returncode = os.waitstatus_to_exitcode(status)  # reaped here; keep Popen from waiting again
+    return {"peak_rss_kb": usage.ru_maxrss, "cpu_s": round(usage.ru_utime + usage.ru_stime, 3),
+            "exit": process.returncode}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--json", action="store_true")

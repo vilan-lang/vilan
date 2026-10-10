@@ -30,6 +30,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**N165: the perf harnesses refuse a copy that does not check clean, and the RSS probe ships.** `scripts/lsp-latency.py` and `scripts/perf_gate.py seal` run `vilan check .` in the copy they prepared, under the compiler they will drive (`lsp-latency.py --vilan`, default the `vilan` beside `--lsp`), before the first edit or measurement, and refuse with the compiler's errors when it exits non-zero: a server that analyzes a broken program stops early, so every row reads a fraction of its true cost - Order 49's seal read x2..x7 for want of kolt's gitignored `src/lucide` in the base's archive. A shared-source seal used to note a compiler's disagreement and measure anyway; it now refuses like the breaking-release seal does. `scripts/rss-probe.py` (peak RSS of a `vilan check .`, a fresh process per run, the median) joins the tree, and the seal's T3 kolt row reports its peak RSS the same way - the median of the runs, the per-run figures listed - where it took the max. Pins: a copy with `BROKEN`, an archive without `src/lucide`, a shared source either compiler rejects, the probe against a compiler whose first run allocates five times its others.
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->
