@@ -49271,11 +49271,22 @@ impl<'src> Analyzer<'src> {
         if with_tables.is_empty() {
             return;
         }
+        let mut label_sources: HashSet<SourceId> = HashSet::default();
         for source in &with_tables {
             if let Some(tables) = records.get(&source.0).and_then(|r| r.tables.as_ref()) {
                 self.restored_tables.absorb(tables);
+                if tables.labels_recorded {
+                    label_sources.insert(*source);
+                }
             }
         }
+        self.restored_tables.label_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| label_sources.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.restored_tables.label_ranges.sort_unstable();
         self.world_table_ranges = self
             .source_ranges
             .iter()
@@ -49296,9 +49307,11 @@ impl<'src> Analyzer<'src> {
         if stale_table_planted() {
             let nominals = self.restored_tables.drop_nominals_world;
             let agree = self.restored_tables.drop_nominals_agree;
+            let label_ranges = std::mem::take(&mut self.restored_tables.label_ranges);
             self.restored_tables = RestoredTables {
                 drop_nominals_world: nominals,
                 drop_nominals_agree: agree,
+                label_ranges,
                 ..RestoredTables::default()
             };
         }
@@ -49314,6 +49327,16 @@ impl<'src> Analyzer<'src> {
     /// at all about a `LastUse` row or a clone decision the emitter reads. And
     /// a module whose diagnostics replay may still have no tables recorded, in
     /// which case it recomputes them.
+    /// M110 S2b: whether `id`'s module restored its LABEL rows — the only
+    /// case the tail may skip rendering it ([`RestoredTables::label_ranges`]).
+    /// A reused module whose record was filed by an unseeded analysis carries
+    /// no rows and is rendered like a hot one.
+    fn label_row_restored(&self, id: Id) -> bool {
+        let ranges = &self.restored_tables.label_ranges;
+        let index = ranges.partition_point(|(start, _)| *start <= id.0);
+        index > 0 && id.0 < ranges[index - 1].1
+    }
+
     fn table_entity(&self, id: Id) -> bool {
         let index = self
             .world_table_ranges
@@ -70863,14 +70886,36 @@ fn service_seeds(nodes: &NodeList) -> &'static [&'static str] {
     if !contains_service(nodes) {
         return &[];
     }
-    let reaches_store = collect_module_paths(nodes, "std")
-        .iter()
-        .any(|(module, _)| *module == "reactive::store" || module.starts_with("reactive::store::"));
-    if reaches_store {
+    // C3b (incr-49): keyed on the service's SURFACE — a function in the file
+    // whose written return is a store handle — not on the file importing
+    // `std::reactive::store`: kolt's service file imports the store for a
+    // field and returns no handle, and the import rule loaded `rpc::mirror`
+    // (1,409 lines) for it on every keystroke, +5% of each.
+    if service_surface_returns_store(nodes) {
         &["rpc", "rpc::mirror"]
     } else {
         &["rpc"]
     }
+}
+
+/// Whether a function in `nodes` — at any depth: the service's `[rpc]`
+/// members sit in its impl block — writes a `Store<T>` / `StoreSome<P>`
+/// return, which is what the `[service]` expansion names `std::rpc::mirror`
+/// for (A153).
+fn service_surface_returns_store(nodes: &NodeList) -> bool {
+    fn walk(node: &Spanned<Node>) -> bool {
+        if let Node::Func(function) = &node.0
+            && let Some(return_type) = function.return_type.as_deref()
+            && is_store_handle_spelling(&return_type.0)
+        {
+            return true;
+        }
+        let mut found = false;
+        node.0
+            .for_each_child(&mut |child| found = found || walk(child));
+        found
+    }
+    nodes.iter().any(walk)
 }
 
 /// Whether an AST carries a `[service(..)]` item at any depth — the trigger
@@ -72878,6 +72923,21 @@ struct ModuleTables {
     /// not in the condition; see
     /// [`Analyzer::drop_nominals_fingerprints`] for the whole argument.
     drop_nominals_world: u64,
+    /// M110 S2b: the editor's rendered labels for this module's entities —
+    /// the hover type label per typed expression, binding, declaration and
+    /// nominal (`Program::expr_types`) and the declaration label per function,
+    /// external, struct and enum (`Program::declaration_labels`). Strings keyed
+    /// by ids the module minted: a pure function of the settled types, so a
+    /// reused module's rows are restored and never rendered again. Measured
+    /// on kolt at ~0.5 MB of strings per stored world.
+    expr_types: Vec<(Id, String)>,
+    declaration_labels: Vec<(Id, String)>,
+    /// Whether the two label rows above were FILED for this module — only an
+    /// analysis a front end seeded files them (a cold `vilan check` never
+    /// reads a record back), so a record written by any other analysis
+    /// carries none, and the tail must render that module's labels rather
+    /// than skip them.
+    labels_recorded: bool,
 }
 
 impl ModuleTables {
@@ -72896,6 +72956,12 @@ impl ModuleTables {
     /// and the budget is set knowing it.
     fn bytes(&self) -> usize {
         let id = std::mem::size_of::<Id>();
+        let labels: usize = self
+            .expr_types
+            .iter()
+            .chain(&self.declaration_labels)
+            .map(|(_, label)| id + std::mem::size_of::<String>() + label.len())
+            .sum();
         let flat = self.last_uses.len()
             + self.last_use_opaque.len()
             + self.last_use_unreached.len()
@@ -72918,7 +72984,7 @@ impl ModuleTables {
             .sum();
         let decisions = (self.clone_sites.len() + self.return_clone_sites.len())
             * std::mem::size_of::<(Id, CopyDecision)>();
-        flat * id + chains + bumps + decisions
+        flat * id + chains + bumps + decisions + labels
     }
 }
 
@@ -72952,6 +73018,14 @@ struct RestoredTables {
     drop_nominals_world: Option<u64>,
     /// Whether the records seen so far agreed on that fingerprint.
     drop_nominals_agree: bool,
+    /// M110 S2b: the restored label rows (`ModuleTables::expr_types`,
+    /// `declaration_labels`), merged into the tail's tables in place of the
+    /// rendering the reused ranges skip.
+    expr_types: HashMap<Id, String>,
+    declaration_labels: HashMap<Id, String>,
+    /// The id ranges of the modules whose record CARRIED label rows — the
+    /// only ids the tail's builders may skip rendering for. Sorted, disjoint.
+    label_ranges: Vec<(u32, u32)>,
 }
 
 impl Default for RestoredTables {
@@ -72973,6 +73047,9 @@ impl Default for RestoredTables {
             drop_roots: HashSet::default(),
             drop_nominals_world: None,
             drop_nominals_agree: true,
+            expr_types: HashMap::default(),
+            declaration_labels: HashMap::default(),
+            label_ranges: Vec::new(),
         }
     }
 }
@@ -72999,6 +73076,9 @@ impl RestoredTables {
         self.scalar_view_refs
             .extend(tables.scalar_view_refs.iter().copied());
         self.drop_roots.extend(tables.drop_roots.iter().copied());
+        self.expr_types.extend(tables.expr_types.iter().cloned());
+        self.declaration_labels
+            .extend(tables.declaration_labels.iter().cloned());
         // Two records under one world key disagreeing about the world's own
         // nominal set is not a shape this can reach; if it ever does, the whole
         // enrolment restore stands down rather than serving half an answer.
@@ -78711,6 +78791,267 @@ fn analyze_over_world<'src>(
     // RESTORED was not re-derived, and a module the entry DIRTIED was derived
     // against a slot the buffer moved. A cancelled analysis never reaches this
     // line at all — the tail above returns `None` first.
+    // The HMR transfer classification (`hmr.md` §4), computed while the analyzer
+    // still holds the type tables and the resource classifier. Always computed (a
+    // cheap type-level pass over the entry's module-level bindings); the transformer
+    // consults it only under `BuildOptions.hmr`, so non-HMR output is unaffected.
+    let hmr_bindings = analyzer.compute_hmr_bindings(global_scope_id);
+
+    // E227: the abbreviated inlay-hint labels, where they differ — asked
+    // BEFORE the label loop below, which borrows the analyzer immutably, since
+    // admission is the solver's `&mut` question.
+    let hint_labels = analyzer.hint_labels();
+
+    // Pre-render a type label for every typed expression (for hover). Done here
+    // while the analyzer still holds the type tables; `expr_id_to_type_id_map`
+    // is applied last so it wins over `resolved_types`, matching `type_of_expr`.
+    let empty_substitution = SubstitutionContext::default();
+    let mut expr_types: HashMap<Id, String> = HashMap::default();
+    // The same merge, kept as raw type ids for the transformer (tuple layout).
+    let mut expr_type_ids: HashMap<Id, TypeId> = HashMap::default();
+    for (expr_id, type_id) in analyzer
+        .resolved_types
+        .iter()
+        .chain(analyzer.expr_id_to_type_id_map.iter())
+    {
+        // M110 S2b: a reused module's label is restored from its record
+        // below; its type id is still this analysis's to carry.
+        if analyzer.label_row_restored(*expr_id) {
+            expr_type_ids.insert(*expr_id, *type_id);
+            continue;
+        }
+        // BORROWED, not cloned (M32): `pretty_print_type` reads the type and
+        // the analyzer is immutable for the whole loop, so the owning read here
+        // was a deep clone of a `Vec<TypeId>` per typed expression, dropped one
+        // line later. This loop and the two below it run once per expression,
+        // variable and parameter in the program.
+        let type_ = type_id.borrow_type(&analyzer);
+        expr_types.insert(
+            *expr_id,
+            analyzer.pretty_print_type(type_, &empty_substitution),
+        );
+        expr_type_ids.insert(*expr_id, *type_id);
+    }
+    // B389: a literal's settled width, where nothing above typed it.
+    for (literal_id, type_id) in &analyzer.literal_types {
+        expr_type_ids.entry(*literal_id).or_insert(*type_id);
+    }
+    // Also label variable and parameter bindings by their own id: a *use* of one
+    // (an `Expr::Local`/`Expr::Parameter`) carries no type on its own expr id, so
+    // hover resolves through the binding.
+    for (binding_id, variable) in &analyzer.variables {
+        if analyzer.label_row_restored(*binding_id) {
+            continue;
+        }
+        let type_ = variable.type_id.borrow_type(&analyzer);
+        expr_types.insert(
+            *binding_id,
+            analyzer.pretty_print_type(type_, &empty_substitution),
+        );
+    }
+    for (binding_id, parameter) in &analyzer.parameters {
+        if analyzer.label_row_restored(*binding_id) {
+            continue;
+        }
+        let type_ = parameter.type_id.borrow_type(&analyzer);
+        expr_types.insert(
+            *binding_id,
+            analyzer.pretty_print_type(type_, &empty_substitution),
+        );
+    }
+    // Label declarations themselves, so hover works on a function/type at its
+    // definition (and on a bare reference to one).
+    for function_id in analyzer
+        .functions
+        .keys()
+        .chain(analyzer.external_functions.keys())
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        if analyzer.label_row_restored(function_id) {
+            continue;
+        }
+        let label = analyzer.pretty_print_type(&Type::Function(function_id), &empty_substitution);
+        expr_types.insert(function_id, label);
+    }
+    for struct_id in analyzer.structs.keys().copied().collect::<Vec<_>>() {
+        if analyzer.label_row_restored(struct_id) {
+            continue;
+        }
+        let label =
+            analyzer.pretty_print_type(&Type::Struct(struct_id, Vec::new()), &empty_substitution);
+        expr_types.insert(struct_id, label);
+    }
+    for enum_id in analyzer.enums.keys().copied().collect::<Vec<_>>() {
+        if analyzer.label_row_restored(enum_id) {
+            continue;
+        }
+        let label =
+            analyzer.pretty_print_type(&Type::Enum(enum_id, Vec::new()), &empty_substitution);
+        expr_types.insert(enum_id, label);
+    }
+    // Full declaration labels for hover (E9): a function's complete
+    // signature, a struct/enum's fields and variants — the language server
+    // fences these as code and appends docs and platform lines.
+    let mut declaration_labels: HashMap<Id, String> = HashMap::default();
+    // E128: a TRAIT member's signature renders for the trait's own declaration,
+    // so a `Self` position — and a `= Self`-defaulted parameter, which resolves
+    // to the very same type — renders as the literal `Self` rather than as the
+    // trait's name. `fun add(self, b: Add): Add` was not a signature anyone
+    // could write; `fun add(self, b: Self): Self` is what the author wrote.
+    let declaring_trait_of_member: HashMap<Id, Id> = analyzer
+        .traits
+        .iter()
+        .flat_map(|(trait_id, trait_)| {
+            trait_
+                .declarations
+                .values()
+                .map(move |member_id| (*member_id, *trait_id))
+        })
+        .map(|(member_id, trait_id)| (analyzer.resolve_member_function_id(member_id), trait_id))
+        .collect();
+    for (function_id, function) in &analyzer.functions {
+        if analyzer.label_row_restored(*function_id) {
+            continue;
+        }
+        let label = match declaring_trait_of_member.get(function_id) {
+            Some(declaring_trait_id) => analyzer.function_signature_label_for(
+                function,
+                Some(&SignatureSubject {
+                    declaring_trait_id: *declaring_trait_id,
+                    rendered_for: SignatureSide::Declaration,
+                }),
+            ),
+            None => analyzer.function_signature_label(function),
+        };
+        declaration_labels.insert(*function_id, label);
+    }
+    // E206: the signature each generic call SITE reached, rendered under the
+    // bindings the solver chose there. Keyed by every entity id a cursor can
+    // land on for that site — the call's own id and its source subject (a
+    // method call's wired subject is the resolved member, and which of the two
+    // `entity_at` answers depends on where in the expression the caret sits) —
+    // so a consumer looks the hovered id up directly and needs no reverse
+    // index. An entry exists ONLY where the substitution changed the rendering:
+    // a non-generic callee, and a generic one whose parameters are all still
+    // open (a call inside another generic body), write nothing, which is what
+    // keeps "show one line when nothing is substituted" a property of the map
+    // rather than a rule its readers each have to remember.
+    //
+    // ENTRY-FILE sites only, which is not a shortcut but the reach of the one
+    // question this answers: a hover resolves through `entity_at`, whose table
+    // is the entry's id range and nothing else (M27), so a label for a call
+    // inside std could never be looked up — and std is where the generic call
+    // sites are. This is the compiler's largest per-process retention's
+    // neighbourhood (M11), and a String per generic call in the whole world is
+    // what the unfiltered loop would have kept.
+    // M110 S2b: the reused modules' declaration labels, restored before the
+    // call-signature pass below compares against them. The plant keeps the
+    // skip and drops the rows.
+    let label_rows_planted =
+        crate::incremental::planted(crate::incremental::Plant::LabelTablesUnrecorded);
+    if !label_rows_planted {
+        declaration_labels.extend(
+            analyzer
+                .restored_tables
+                .declaration_labels
+                .iter()
+                .map(|(id, label)| (*id, label.clone())),
+        );
+    }
+    let mut call_signature_labels: HashMap<Id, String> = HashMap::default();
+    for (call_id, substitution) in &analyzer.method_call_substitution {
+        if substitution.is_empty() {
+            continue;
+        }
+        if analyzer.source_of_id(*call_id) != Some(SourceId(0)) {
+            continue;
+        }
+        let Some(call) = analyzer.function_calls.get(call_id) else {
+            continue;
+        };
+        // The call's written subject. The context pass's `context_erased_subjects`
+        // is deliberately not consulted: that pass runs AFTER this label build,
+        // so what is recorded here is the source subject already.
+        let subject_id = call.subject_id;
+        let Some(function_id) = analyzer.signature_site_callee(subject_id) else {
+            continue;
+        };
+        let Some(function) = analyzer.functions.get(&function_id) else {
+            continue;
+        };
+        let computed = analyzer.function_signature_label_under(function, substitution);
+        if declaration_labels.get(&function_id) == Some(&computed) {
+            continue;
+        }
+        call_signature_labels.insert(*call_id, computed.clone());
+        call_signature_labels.insert(subject_id, computed);
+    }
+    for (function_id, external) in &analyzer.external_functions {
+        if analyzer.label_row_restored(*function_id) {
+            continue;
+        }
+        let mut parameters: Vec<String> = Vec::new();
+        for parameter_id in &external.parameters {
+            if let Some(parameter) = analyzer.parameters.get(parameter_id) {
+                // E235: an external's receiver and parameters carry their
+                // conventions too (`List::push` is `&mut self, own item`).
+                let type_label = if parameter.name == "self" {
+                    String::new()
+                } else {
+                    analyzer.declaration_type_label(parameter.type_id)
+                };
+                parameters.push(parameter.signature_label(&type_label));
+            }
+        }
+        let return_label = format!(
+            ": {}",
+            analyzer.declaration_type_label(external.return_type_id)
+        );
+        let borrows_label = analyzer.borrows_clause_label(&external.borrows, &external.parameters);
+        let bumps_label = analyzer.bumps_clause_label(&external.bumps, &external.parameters);
+        declaration_labels.insert(
+            *function_id,
+            format!(
+                "external fun {}({}){return_label}{borrows_label}{bumps_label}",
+                external.name,
+                parameters.join(", ")
+            ),
+        );
+    }
+    for (struct_id, struct_) in &analyzer.structs {
+        if analyzer.label_row_restored(*struct_id) {
+            continue;
+        }
+        declaration_labels.insert(*struct_id, analyzer.struct_declaration_label(struct_));
+    }
+    for (enum_id, enum_) in &analyzer.enums {
+        if analyzer.label_row_restored(*enum_id) {
+            continue;
+        }
+        declaration_labels.insert(*enum_id, analyzer.enum_declaration_label(enum_));
+    }
+    for trait_id in analyzer.traits.keys().copied().collect::<Vec<_>>() {
+        if analyzer.label_row_restored(trait_id) {
+            continue;
+        }
+        let label =
+            analyzer.pretty_print_type(&Type::Trait(trait_id, Vec::new()), &empty_substitution);
+        expr_types.insert(trait_id, label);
+    }
+    // M110 S2b: the reused modules' type labels, restored.
+    if !label_rows_planted {
+        expr_types.extend(
+            analyzer
+                .restored_tables
+                .expr_types
+                .iter()
+                .map(|(id, label)| (*id, label.clone())),
+        );
+    }
+    // E238: the block each member is declared in, and each block's header.
+    let (member_owners, member_headers) = analyzer.member_headers();
+
     if let Some(key) = &checks_key
         && !entry_is_module
         && world_table_reuse_enabled()
@@ -78749,6 +79090,42 @@ fn analyze_over_world<'src>(
                     .or_default()
                     .clone_sites
                     .push((*site_id, decision.clone()));
+            }
+        }
+        // M110 S2b: the label rows, per module, in id order (a record is a
+        // function of the module, not of a hash map's walk). Only for an
+        // analysis a front end SEEDED (the editor's keystrokes): a one-shot
+        // `vilan check` never reads a record back, and the id-sorted copy of
+        // every label was a uniform ~1% on every cold check (M129's shape).
+        let seeded = !workspace.hot_seeds.is_empty();
+        let mut label_rows: Vec<(&Id, &String)> = if seeded {
+            expr_types.iter().collect()
+        } else {
+            Vec::new()
+        };
+        label_rows.sort_unstable_by_key(|(id, _)| id.0);
+        for (id, label) in label_rows {
+            if let Some(source) = file(*id) {
+                tables
+                    .entry(source)
+                    .or_default()
+                    .expr_types
+                    .push((*id, label.clone()));
+            }
+        }
+        let mut label_rows: Vec<(&Id, &String)> = if seeded {
+            declaration_labels.iter().collect()
+        } else {
+            Vec::new()
+        };
+        label_rows.sort_unstable_by_key(|(id, _)| id.0);
+        for (id, label) in label_rows {
+            if let Some(source) = file(*id) {
+                tables
+                    .entry(source)
+                    .or_default()
+                    .declaration_labels
+                    .push((*id, label.clone()));
             }
         }
         for (site_id, decision) in &return_clone_sites {
@@ -78811,210 +79188,12 @@ fn analyze_over_world<'src>(
         // exactly the module whose gate cost the most to answer.
         for slice in tables.values_mut() {
             slice.drop_nominals_world = analyzer.drop_nominals_world_digest;
+            // M110 S2b: the label rows ride only a seeded analysis's record.
+            slice.labels_recorded = seeded;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
     }
 
-    // The HMR transfer classification (`hmr.md` §4), computed while the analyzer
-    // still holds the type tables and the resource classifier. Always computed (a
-    // cheap type-level pass over the entry's module-level bindings); the transformer
-    // consults it only under `BuildOptions.hmr`, so non-HMR output is unaffected.
-    let hmr_bindings = analyzer.compute_hmr_bindings(global_scope_id);
-
-    // E227: the abbreviated inlay-hint labels, where they differ — asked
-    // BEFORE the label loop below, which borrows the analyzer immutably, since
-    // admission is the solver's `&mut` question.
-    let hint_labels = analyzer.hint_labels();
-
-    // Pre-render a type label for every typed expression (for hover). Done here
-    // while the analyzer still holds the type tables; `expr_id_to_type_id_map`
-    // is applied last so it wins over `resolved_types`, matching `type_of_expr`.
-    let empty_substitution = SubstitutionContext::default();
-    let mut expr_types: HashMap<Id, String> = HashMap::default();
-    // The same merge, kept as raw type ids for the transformer (tuple layout).
-    let mut expr_type_ids: HashMap<Id, TypeId> = HashMap::default();
-    for (expr_id, type_id) in analyzer
-        .resolved_types
-        .iter()
-        .chain(analyzer.expr_id_to_type_id_map.iter())
-    {
-        // BORROWED, not cloned (M32): `pretty_print_type` reads the type and
-        // the analyzer is immutable for the whole loop, so the owning read here
-        // was a deep clone of a `Vec<TypeId>` per typed expression, dropped one
-        // line later. This loop and the two below it run once per expression,
-        // variable and parameter in the program.
-        let type_ = type_id.borrow_type(&analyzer);
-        expr_types.insert(
-            *expr_id,
-            analyzer.pretty_print_type(type_, &empty_substitution),
-        );
-        expr_type_ids.insert(*expr_id, *type_id);
-    }
-    // B389: a literal's settled width, where nothing above typed it.
-    for (literal_id, type_id) in &analyzer.literal_types {
-        expr_type_ids.entry(*literal_id).or_insert(*type_id);
-    }
-    // Also label variable and parameter bindings by their own id: a *use* of one
-    // (an `Expr::Local`/`Expr::Parameter`) carries no type on its own expr id, so
-    // hover resolves through the binding.
-    for (binding_id, variable) in &analyzer.variables {
-        let type_ = variable.type_id.borrow_type(&analyzer);
-        expr_types.insert(
-            *binding_id,
-            analyzer.pretty_print_type(type_, &empty_substitution),
-        );
-    }
-    for (binding_id, parameter) in &analyzer.parameters {
-        let type_ = parameter.type_id.borrow_type(&analyzer);
-        expr_types.insert(
-            *binding_id,
-            analyzer.pretty_print_type(type_, &empty_substitution),
-        );
-    }
-    // Label declarations themselves, so hover works on a function/type at its
-    // definition (and on a bare reference to one).
-    for function_id in analyzer
-        .functions
-        .keys()
-        .chain(analyzer.external_functions.keys())
-        .copied()
-        .collect::<Vec<_>>()
-    {
-        let label = analyzer.pretty_print_type(&Type::Function(function_id), &empty_substitution);
-        expr_types.insert(function_id, label);
-    }
-    for struct_id in analyzer.structs.keys().copied().collect::<Vec<_>>() {
-        let label =
-            analyzer.pretty_print_type(&Type::Struct(struct_id, Vec::new()), &empty_substitution);
-        expr_types.insert(struct_id, label);
-    }
-    for enum_id in analyzer.enums.keys().copied().collect::<Vec<_>>() {
-        let label =
-            analyzer.pretty_print_type(&Type::Enum(enum_id, Vec::new()), &empty_substitution);
-        expr_types.insert(enum_id, label);
-    }
-    // Full declaration labels for hover (E9): a function's complete
-    // signature, a struct/enum's fields and variants — the language server
-    // fences these as code and appends docs and platform lines.
-    let mut declaration_labels: HashMap<Id, String> = HashMap::default();
-    // E128: a TRAIT member's signature renders for the trait's own declaration,
-    // so a `Self` position — and a `= Self`-defaulted parameter, which resolves
-    // to the very same type — renders as the literal `Self` rather than as the
-    // trait's name. `fun add(self, b: Add): Add` was not a signature anyone
-    // could write; `fun add(self, b: Self): Self` is what the author wrote.
-    let declaring_trait_of_member: HashMap<Id, Id> = analyzer
-        .traits
-        .iter()
-        .flat_map(|(trait_id, trait_)| {
-            trait_
-                .declarations
-                .values()
-                .map(move |member_id| (*member_id, *trait_id))
-        })
-        .map(|(member_id, trait_id)| (analyzer.resolve_member_function_id(member_id), trait_id))
-        .collect();
-    for (function_id, function) in &analyzer.functions {
-        let label = match declaring_trait_of_member.get(function_id) {
-            Some(declaring_trait_id) => analyzer.function_signature_label_for(
-                function,
-                Some(&SignatureSubject {
-                    declaring_trait_id: *declaring_trait_id,
-                    rendered_for: SignatureSide::Declaration,
-                }),
-            ),
-            None => analyzer.function_signature_label(function),
-        };
-        declaration_labels.insert(*function_id, label);
-    }
-    // E206: the signature each generic call SITE reached, rendered under the
-    // bindings the solver chose there. Keyed by every entity id a cursor can
-    // land on for that site — the call's own id and its source subject (a
-    // method call's wired subject is the resolved member, and which of the two
-    // `entity_at` answers depends on where in the expression the caret sits) —
-    // so a consumer looks the hovered id up directly and needs no reverse
-    // index. An entry exists ONLY where the substitution changed the rendering:
-    // a non-generic callee, and a generic one whose parameters are all still
-    // open (a call inside another generic body), write nothing, which is what
-    // keeps "show one line when nothing is substituted" a property of the map
-    // rather than a rule its readers each have to remember.
-    //
-    // ENTRY-FILE sites only, which is not a shortcut but the reach of the one
-    // question this answers: a hover resolves through `entity_at`, whose table
-    // is the entry's id range and nothing else (M27), so a label for a call
-    // inside std could never be looked up — and std is where the generic call
-    // sites are. This is the compiler's largest per-process retention's
-    // neighbourhood (M11), and a String per generic call in the whole world is
-    // what the unfiltered loop would have kept.
-    let mut call_signature_labels: HashMap<Id, String> = HashMap::default();
-    for (call_id, substitution) in &analyzer.method_call_substitution {
-        if substitution.is_empty() {
-            continue;
-        }
-        if analyzer.source_of_id(*call_id) != Some(SourceId(0)) {
-            continue;
-        }
-        let Some(call) = analyzer.function_calls.get(call_id) else {
-            continue;
-        };
-        // The call's written subject. The context pass's `context_erased_subjects`
-        // is deliberately not consulted: that pass runs AFTER this label build,
-        // so what is recorded here is the source subject already.
-        let subject_id = call.subject_id;
-        let Some(function_id) = analyzer.signature_site_callee(subject_id) else {
-            continue;
-        };
-        let Some(function) = analyzer.functions.get(&function_id) else {
-            continue;
-        };
-        let computed = analyzer.function_signature_label_under(function, substitution);
-        if declaration_labels.get(&function_id) == Some(&computed) {
-            continue;
-        }
-        call_signature_labels.insert(*call_id, computed.clone());
-        call_signature_labels.insert(subject_id, computed);
-    }
-    for (function_id, external) in &analyzer.external_functions {
-        let mut parameters: Vec<String> = Vec::new();
-        for parameter_id in &external.parameters {
-            if let Some(parameter) = analyzer.parameters.get(parameter_id) {
-                // E235: an external's receiver and parameters carry their
-                // conventions too (`List::push` is `&mut self, own item`).
-                let type_label = if parameter.name == "self" {
-                    String::new()
-                } else {
-                    analyzer.declaration_type_label(parameter.type_id)
-                };
-                parameters.push(parameter.signature_label(&type_label));
-            }
-        }
-        let return_label = format!(
-            ": {}",
-            analyzer.declaration_type_label(external.return_type_id)
-        );
-        let borrows_label = analyzer.borrows_clause_label(&external.borrows, &external.parameters);
-        let bumps_label = analyzer.bumps_clause_label(&external.bumps, &external.parameters);
-        declaration_labels.insert(
-            *function_id,
-            format!(
-                "external fun {}({}){return_label}{borrows_label}{bumps_label}",
-                external.name,
-                parameters.join(", ")
-            ),
-        );
-    }
-    for (struct_id, struct_) in &analyzer.structs {
-        declaration_labels.insert(*struct_id, analyzer.struct_declaration_label(struct_));
-    }
-    for (enum_id, enum_) in &analyzer.enums {
-        declaration_labels.insert(*enum_id, analyzer.enum_declaration_label(enum_));
-    }
-    for trait_id in analyzer.traits.keys().copied().collect::<Vec<_>>() {
-        let label =
-            analyzer.pretty_print_type(&Type::Trait(trait_id, Vec::new()), &empty_substitution);
-        expr_types.insert(trait_id, label);
-    }
-    // E238: the block each member is declared in, and each block's header.
-    let (member_owners, member_headers) = analyzer.member_headers();
     // E237: the definition under an entry binding's, member's or field's type.
     let type_definitions = analyzer.type_definitions(&expr_type_ids);
     // E241: a variant pattern's label, rendered once its types have settled.

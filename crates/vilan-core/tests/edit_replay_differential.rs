@@ -663,6 +663,61 @@ fn the_differential_sees_a_bound_record_kept_over_a_moved_impl() {
     );
 }
 
+/// S2b's plant: the tail skips a reused module's label rendering and drops
+/// the restored rows — the prefix's hover types and declaration labels are
+/// then missing on the hit; the gate must see it.
+#[test]
+fn the_differential_sees_label_tables_served_without_their_rows() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::LabelTablesUnrecorded);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("type ") || divergence.contains("declaration ")),
+        "the unrecorded-labels plant must turn a hover label red; it found: {divergences:#?}"
+    );
+}
+
+/// S2b's other seam: an analysis NO front end seeded (a plain base-cache hit
+/// — the CLI's watch, an editor leg served without a seed) reuses modules
+/// whose record was filed by an unseeded analysis and so carries no label
+/// rows; the tail must render their labels, not skip them. The hit's
+/// rendering is compared with the clean one in full (the hover types and
+/// declaration labels included), where the fixup that filed rows only for a
+/// seeded analysis left four of vilan-lsp's hovers empty.
+#[test]
+fn a_reused_module_keeps_its_labels_without_a_seed() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let package = leaf_package();
+    let cold = observe(&package, Vec::new(), Leg::Incremental);
+    let warm = observe(&package, Vec::new(), Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        cold.census.base_misses == 1 && warm.census.base_hits == 1,
+        "the second unseeded analysis is served the stored world: {:?} / {:?}",
+        cold.census,
+        warm.census
+    );
+    assert!(
+        warm.census.records_replayed > 0,
+        "the hit replays module records: {:?}",
+        warm.census
+    );
+    assert!(
+        warm.rendering == clean.rendering,
+        "an unseeded hit renders every label a clean analysis renders: {}",
+        first_difference(&warm.rendering, &clean.rendering)
+    );
+}
+
 /// M121 / B553's cost: a check whose late files write no impl on a type they
 /// do not declare RECORDS NOTHING — the pre-entry resolve asks the impl table
 /// thousands of questions and none of them is kept (`reach_questions` 0), which
