@@ -12689,3 +12689,22 @@ fn f127_a_spread_of_a_tuple_literal_is_its_parts_on_both_backends() {
         "a spread of a tuple literal must build and answer the same natively"
     );
 }
+
+/// F125: a `BigInt` as TEXT — `i"{big}"`, `"" + big`, `big.to_string()`
+/// (std's `Display` impl is that interpolation), a generic `T: Display`, a
+/// `join` — was refused natively "does not emit an interpolation of a value
+/// with its own `render`", while JS wrote `12` (`String(12n)`, no `n`).
+/// The concatenation now renders a `BigInt` operand as its digits; `print`
+/// of the value itself keeps node's `12n`.
+#[test]
+fn f125_a_bigint_as_text_writes_its_digits_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f125_bigint_text.vl";
+    std::fs::write(staged.join(file), include_str!("native/bigint_text.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `BigInt` as text must write the same digits natively"
+    );
+}

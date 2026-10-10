@@ -1678,6 +1678,13 @@ impl BigInt {
     }
 }
 
+/// F125: a `BigInt` as TEXT — an i-string hole, `"" + big`, and so std's
+/// `Display` impl — is `String(big)` on the JS backend: the digits, without
+/// the `n` node's `console.log` puts back (which [`Js`] writes).
+pub fn bigint_text(value: &BigInt) -> Str {
+    Rc::from(value.0.to_string().as_str())
+}
+
 impl Js for BigInt {
     /// node prints a `BigInt` with its suffix, at the top level and nested:
     /// `console.log(1n)` is `1n` and `console.log([1n])` is `[ 1n ]`.

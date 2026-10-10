@@ -7446,6 +7446,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.is_str_expr(id) || settled.is_some_and(|type_id| self.is_str_type(type_id)) {
             return Ok(text);
         }
+        // F125: a `BigInt` renders as `String(big)` — its digits, where its
+        // `console.log` form (`js_of`) carries node's `n`. An operator's
+        // result (`i"{big * big}"`) took the scalar arm below and printed
+        // `144n` against JS's `144`, silently.
+        if self.holds_a_bigint(id, settled) {
+            return Ok(format!("vilan_rt::bigint_text(&({text}))"));
+        }
         // A scalar renders as its `console.log` form, which is the same string
         // on both backends. So does an operand whose type this emitter cannot
         // see at all — which happens for exactly one shape, a call inside a
@@ -7747,6 +7754,57 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(Type::Enum(enum_id, _)) => self.program.bool_enum_id == Some(*enum_id),
             _ => false,
         }
+    }
+
+    /// F125: whether `id`'s value is a `BigInt` — by its settled or recorded
+    /// type, or, for an operator's result (which records no type of its
+    /// own), by its operand: `big * big`, `-big`, `big << 2` are `BigInt`s.
+    fn holds_a_bigint(&mut self, id: Id, settled: Option<TypeId>) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return false;
+        };
+        if settled
+            .into_iter()
+            .chain(self.type_of(id))
+            .any(|type_id| self.is_bigint_type(type_id))
+        {
+            return true;
+        }
+        match self.program.entity_map.get(&id) {
+            Some(&Expr::Binary(
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Rem
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::BitAnd
+                | BinaryOp::BitXor
+                | BinaryOp::BitOr,
+                left,
+                _,
+            )) if self.type_of(id).is_none() => {
+                let settled = self.settled_value_type(left);
+                self.holds_a_bigint(left, settled)
+            }
+            Some(&Expr::Unary('-', operand)) if self.type_of(id).is_none() => {
+                let settled = self.settled_value_type(operand);
+                self.holds_a_bigint(operand, settled)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `type_id` is std's `BigInt` (`vilan_rt::BigInt`, an `i128`).
+    fn is_bigint_type(&self, type_id: TypeId) -> bool {
+        matches!(
+            self.resolve(type_id),
+            Some(Type::Struct(struct_id, _))
+                if self.program.structs.get(struct_id).is_some_and(|declaration| {
+                    declaration.external && declaration.name == "BigInt"
+                })
+        )
     }
 
     fn is_str(&self, id: Id) -> bool {

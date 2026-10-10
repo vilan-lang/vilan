@@ -65,6 +65,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**F125: a `BigInt` as TEXT writes its digits natively — `i"{big}"`, `"" + big` and `big.to_string()` were refused "does not emit an interpolation of a value with its own `render`" (so std's `Display for BigInt` and E283's `Debug` were JS-only natively), and an operator's result in the same position printed node's `console.log` form silently: `i"{big * big}"` wrote `144n` natively against JS's `144`, `"x" + (big + 1n)` wrote `x13n`.** On JS a `BigInt` concatenated is `String(big)`, its digits without the `n`; natively the concatenation operand now renders through the new `vilan_rt::bigint_text` whenever its value is a `BigInt` — by its settled or recorded type, or, for an operator's result (which records no type of its own and had taken the scalar `js_of` arm), by its operand. `print(big)` itself keeps node's `12n`. Pin: `f125_a_bigint_as_text_writes_its_digits_on_both_backends` (`native/bigint_text.vl`: the three spellings, a negative value past `i64`, a generic `T: Display`, `format`, `join`, and the two operator results).
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->
