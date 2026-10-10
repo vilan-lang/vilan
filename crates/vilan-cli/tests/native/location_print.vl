@@ -1,0 +1,19 @@
+// F126: `print` of a `std::debug::Location` writes its text at the top level
+// (`console.log` of the JS string) and the printer's `<Location>` inside an
+// aggregate, on both backends.
+import std::debug::caller;
+import std::debug::Location;
+import std::io::print;
+
+[track_caller]
+fun here(): Location {
+	caller()
+}
+
+fun main() {
+	print(caller());
+	let site = here();
+	print(site);
+	print([here(), here()]);
+	print(Some(here()));
+}
