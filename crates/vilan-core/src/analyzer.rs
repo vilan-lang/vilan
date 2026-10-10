@@ -36924,6 +36924,14 @@ impl<'src> Analyzer<'src> {
                     self.register_subject_binders(return_type, scope_id);
                 }
             }
+            // B582 (array-lengths.md §11, S0): a fixed array's ELEMENT binds
+            // like a tuple's — `impl [type T; 3] with Count` declares `T`, and
+            // selection already binds through an array's element
+            // (`impl_select::bind_subject`'s `Type::Array` arm). The length is a
+            // literal; a length binder is the paper's S2.
+            Node::ArrayType(element, _) => {
+                self.register_subject_binders(element, scope_id);
+            }
             _ => {}
         }
     }

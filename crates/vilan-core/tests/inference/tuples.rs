@@ -1592,6 +1592,59 @@ fn b590_a_fixed_arrays_length_is_a_usize() {
     );
 }
 
+/// B582 (array-lengths.md §11, S0): an impl head over a fixed array binds its
+/// ELEMENT — `impl [type T; 3] with Count` was refused "cannot find type 'T'"
+/// at both `T`s while `impl [i32; 3]` compiled; selection already binds
+/// through an array's element. One literal length per impl, element-generic.
+#[test]
+fn b582_an_impl_head_over_a_fixed_array_binds_its_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        trait Count {
+            fun count(self): usize;
+            fun first_shown(self): str;
+        }
+        impl [type T: Display; 3] with Count {
+            fun count(self): usize {
+                self.len()
+            }
+            fun first_shown(self): str {
+                let first: T = self[0];
+                first.to_string()
+            }
+        }
+        fun main() {
+            let numbers: [i32; 3] = [1, 2, 3];
+            let words: [str; 3] = ["a", "b", "c"];
+            print(numbers.count());
+            print(numbers.first_shown());
+            print(words.first_shown());
+        }
+        "#,
+        "3\n1\na\n",
+    );
+    // The length is still the head's: a `[i32; 2]` is no `[T; 3]`.
+    assert_fails_with(
+        r#"
+        trait Count {
+            fun count(self): usize;
+        }
+        impl [type T; 3] with Count {
+            fun count(self): usize {
+                self.len()
+            }
+        }
+        fun main() {
+            let pair: [i32; 2] = [1, 2];
+            let _n = pair.count();
+        }
+        "#,
+        "has no method 'count'",
+    );
+}
+
 #[test]
 fn fixed_array_len_on_nested_arrays_and_through_a_view() {
     // The outer length, the inner length through a subscript (which keeps its

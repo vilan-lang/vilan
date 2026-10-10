@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**B582: an impl head over a fixed array binds its element — `impl [type T; 3] with Count { .. }` was refused "cannot find type 'T'" at both `T`s, while `impl [i32; 3] with Count` compiled (B177) and impl selection already bound through an array's element.** The subject-binder registration walk (`register_subject_binders`) did not descend into `Node::ArrayType`; it now registers the element's binders as it does a tuple's (array-lengths.md §11, slice S0). An impl is element-generic at one literal length — `impl [type T: PartialEq; 2] with PartialEq`, `impl Option<[type T; 2]>` — and a `[i32; 2]` is still no `[T; 3]`; a length binder is the paper's S2. Pin: `inference::tuples::b582_an_impl_head_over_a_fixed_array_binds_its_element`.
+
 <!-- family: breaking -->
 **B590: `[T; n].len()` is a `usize`, as every other length has been since I5 S2 — it answered `i32`, so `let m: usize = a.len()` and `xs.len() + a.len()` were refused, and `a[a.len() - 1]` checked, ran on JS and was refused by rustc (`usize - i32`).** `len` on an array is a compiler fold (`Expr::ArrayLen`), not a std signature, so I5 S2's census never saw it; fixed-arrays.md §10 typed it `i32` "matching `List.len()`", and `List.len()` moved. The emitters were already right (natively Rust's own `usize` `len()`, on JS the literal or `.length`). Breaking in principle; the estate is 4 `.len()` calls on arrays (3 in the corpus' `fixed-arrays.vl`, 1 in the book's tour), all passed to `print` — no edit, no golden moved. Pins: `inference::tuples::fixed_array_len_folds_to_the_constant_and_types_as_usize` (was `…_as_i32`), `b590_a_fixed_arrays_length_is_a_usize`.
 
