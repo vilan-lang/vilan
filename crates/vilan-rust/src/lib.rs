@@ -2284,7 +2284,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     if arguments.is_empty()
                         && self.program.structs.get(struct_id).is_some_and(|declaration| declaration.name == "str"))
             })
-            .map(|(type_id, _)| *type_id)
+            .map(|(type_id, _)| type_id)
             .min_by_key(|type_id| type_id.0)
     }
 

@@ -26,10 +26,10 @@
 //! `List`, `Option`, `Result` and `Shared` are `external` declarations, which
 //! is the other way a declaration can reach the tables.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use vilan_core::type_::{Type, TypeId};
+use vilan_core::type_::{Type, TypeId, TypeTable};
 use vilan_core::{PackageSpec, Platform, Workspace, analyze_source};
 
 fn std_spec() -> PackageSpec {
@@ -94,8 +94,8 @@ struct Census {
 /// before any gate sees it (`borrow_type_by_type_id`'s unwrap). That is a
 /// stronger statement of the invariant than this gate makes, and a worse
 /// failure to read, which is why the gate stays.
-fn walk<S: std::hash::BuildHasher>(
-    types: &HashMap<TypeId, Type, S>,
+fn walk(
+    types: &TypeTable,
     parameters: &HashSet<TypeId>,
     mut pending: Vec<(String, TypeId)>,
 ) -> Census {
@@ -258,7 +258,7 @@ fn the_spelling_walk_finds_a_bare_constraint_id_and_passes_a_wrapped_one() {
     let element = TypeId(5);
     let array = TypeId(6);
 
-    let mut types: HashMap<TypeId, Type> = HashMap::new();
+    let mut types = TypeTable::default();
     types.insert(constraint, Type::Any);
     types.insert(wrapped, Type::Generic(constraint));
     types.insert(nominal, Type::Struct(vilan_core::id::Id(7), vec![wrapped]));
