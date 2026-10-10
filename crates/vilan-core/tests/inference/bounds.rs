@@ -4297,10 +4297,11 @@ fn a_never_grounded_list_new_subscript_errors() {
 }
 
 #[test]
-fn a_never_pushed_lists_len_stays_legal() {
-    // The tolerance that must survive: methods that don't touch the element
-    // type work on a never-grounded list.
-    assert_compiles_and_runs(
+fn a_never_pushed_lists_len_is_refused_at_the_literal() {
+    // The tolerance that survived until B580 (R-c, v0.47.0): a list whose
+    // element nothing states ran on JS and could not build natively. It is
+    // refused once, at the literal, naming the annotation.
+    assert_fails_once_with(
         r#"
         import std::io::print;
         fun main() {
@@ -4309,7 +4310,7 @@ fn a_never_pushed_lists_len_stays_legal() {
         }
         main();
         "#,
-        "0\n",
+        "cannot infer the element type of this empty list from anything the program does with `a`",
     );
 }
 
@@ -11555,8 +11556,9 @@ fn b357_a_payload_less_variant_takes_its_arguments_from_the_landing_constraint()
 }
 
 /// And the hole where nothing lands: a payload-less variant with no constraint
-/// to take arguments from still flows into a slot that fixes them, which is the
-/// half that must not become a refusal.
+/// to take arguments from still flows into a slot that fixes them — as an
+/// ARGUMENT and as a RECEIVER — which is the half that must not become a
+/// refusal at the call.
 #[test]
 fn b357_a_payload_less_variant_with_no_constraint_still_lands() {
     assert_compiles_and_runs(
@@ -11573,15 +11575,49 @@ fn b357_a_payload_less_variant_with_no_constraint_still_lands() {
         }
 
         fun main() {
-            let s = Slot::Bare;
-            print(want(s));
+            print(want(Slot::Bare));
             print(want(Slot::Filled("f")));
-            let n = None;
-            print(n.unwrap_or("d"));
+            print(None.unwrap_or("d"));
         }
         "#,
         "bare\nf\nd\n",
     );
+}
+
+/// B580 (R-c, v0.47.0) and B357's binding: a `let` holding such a variant is
+/// a BINDING whose type keeps a hole — its uses state the payload, but
+/// inference does not carry a use's type back into the binding — so it is
+/// refused at the initializer, once per binding (the write-the-type steer).
+#[test]
+fn b580_a_let_of_a_payload_less_variant_whose_uses_state_its_type_is_refused() {
+    let failures = failure_diagnostics(
+        r#"
+        import std::io::print;
+
+        enum Slot<T> { Filled(T), Bare }
+
+        fun want(x: Slot<str>): str {
+            match x {
+                Slot::Filled(let v) => v,
+                Slot::Bare => "bare",
+            }
+        }
+
+        fun main() {
+            let s = Slot::Bare;
+            print(want(s));
+            let n = None;
+            print(n.unwrap_or("d"));
+        }
+        "#,
+    );
+    let messages: Vec<&str> = failures
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .collect();
+    assert_eq!(messages.len(), 2, "{messages:#?}");
+    assert!(messages[0].starts_with("cannot infer the type of `s`: it is `Slot<…>`"));
+    assert!(messages[1].starts_with("cannot infer the type of `n`: it is `Option<…>`"));
 }
 
 // --- B370: an arithmetic expression's EMISSION VERDICT is a property of the

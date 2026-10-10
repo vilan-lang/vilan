@@ -1489,6 +1489,11 @@ Normative rejection cases (each is a compile error):
 - An `i53`/`i32` operand mix (no implicit widening; suffix the
   literal) — two different integer types as the operands of `+`, `-`,
   `*`, `/`, `%`, a comparison or `==` (B579).
+- A binding whose type still holds a part nothing determines once
+  inference is done — `let xs = []` read only through `len()`, `let o =
+  None` — is refused at its initializer, naming where to write the type
+  (`xs: List<…>`); a later use that states it (`xs.push(1)`) is what
+  inference reads, and only an annotation can stand in for one (B580).
 - A value written into a struct field it does not match, through either
   door: the literal `S { field = v }` and the assignment `s.field = v`
   are governed by ONE rule, and a place chain of any depth (`a.b.c = v`,

@@ -24710,6 +24710,38 @@ impl<'src> Analyzer<'src> {
             .collect()
     }
 
+    /// The type of `access_id` — a path naming a PAYLOAD-LESS variant of a
+    /// generic enum at written arguments (`Holder<str>::Empty`) — read off the
+    /// arguments the path banked; `None` for any other reference.
+    fn written_payload_less_variant(&self, access_id: Id, target_id: Id) -> Option<Type> {
+        // The path's banked arguments first: a handful of paths have any, and
+        // this is asked of every reference.
+        if self.static_subject_bindings.is_empty() {
+            return None;
+        }
+        let bindings = self.static_subject_bindings.get(&access_id)?;
+        let Some(Expr::EnumVariant(enum_id, variant_index)) =
+            self.expr_id_to_expr_map.get(&target_id)
+        else {
+            return None;
+        };
+        let enum_ = self.enums.get(enum_id)?;
+        if !enum_
+            .variants
+            .get(*variant_index)
+            .is_some_and(|variant| variant.data_type_ids.is_empty())
+        {
+            return None;
+        }
+        let arguments: Option<Vec<TypeId>> = enum_
+            .generic_parameter_constraint_ids
+            .iter()
+            .map(|parameter| bindings.get(parameter).copied())
+            .collect();
+        let arguments = arguments.filter(|arguments| !arguments.is_empty())?;
+        Some(Type::Enum(*enum_id, arguments))
+    }
+
     fn seed_variant_subject_bindings(&mut self, id: Id, subject_type: &Type) {
         let Type::Enum(enum_id, arguments) = subject_type else {
             return;
@@ -43293,20 +43325,15 @@ impl<'src> Analyzer<'src> {
     /// structure — a still-open slot, as opposed to an abstract but fixed
     /// generic (`type_is_ground` refuses those too; `type_is_fully_determined`
     /// refuses `Mapped` as well). A binding with a hole is not evidence.
-    fn type_has_hole(&self, type_id: TypeId) -> bool {
-        match type_id.get_type(self) {
+    /// [`Self::type_has_hole`] for a type in hand rather than a slot.
+    fn type_value_has_hole(&self, type_: &Type) -> bool {
+        match type_ {
             Type::Unknown | Type::Unresolved => true,
-            Type::Generic(_)
-            | Type::Any
-            | Type::Never
-            | Type::Function(_)
-            | Type::Module(_)
-            | Type::Void => false,
             Type::Closure(parameter_type_ids, return_type_id, _, _) => {
                 parameter_type_ids
                     .iter()
                     .any(|parameter_type_id| self.type_has_hole(*parameter_type_id))
-                    || self.type_has_hole(return_type_id)
+                    || self.type_has_hole(*return_type_id)
             }
             Type::Enum(_, argument_type_ids)
             | Type::Struct(_, argument_type_ids)
@@ -43315,11 +43342,19 @@ impl<'src> Analyzer<'src> {
             | Type::Tuple(argument_type_ids, _) => argument_type_ids
                 .iter()
                 .any(|argument_type_id| self.type_has_hole(*argument_type_id)),
-            Type::Array(element_type_id, _) => self.type_has_hole(element_type_id),
+            Type::Array(element_type_id, _) => self.type_has_hole(*element_type_id),
             Type::Mapped(_, source_type_id, template_type_id) => {
-                self.type_has_hole(source_type_id) || self.type_has_hole(template_type_id)
+                self.type_has_hole(*source_type_id) || self.type_has_hole(*template_type_id)
             }
+            _ => false,
         }
+    }
+
+    fn type_has_hole(&self, type_id: TypeId) -> bool {
+        // Borrowed, not cloned: asked per call of every generic callee (F108's
+        // grounding, B580's sweep), and a clone of a nominal's argument list
+        // is an allocation per ask.
+        self.type_value_has_hole(self.borrow_type_by_type_id(type_id))
     }
 
     /// Whether some NON-closure argument's type has not landed on this attempt,
@@ -45295,12 +45330,27 @@ impl<'src> Analyzer<'src> {
                 Type::Tuple(items, labels)
             }
             Expr::Local(subject_id) => {
+                let subject_id = *subject_id;
+                // A payload-less variant at a WRITTEN instantiation —
+                // `Holder<str>::Empty` — is that instantiation: the path banked
+                // its arguments (`seed_variant_subject_bindings`, B356), and the
+                // variant's own typing below sees only the expectation, so
+                // without this the binding it lands in held a hole per
+                // parameter (B580 refused `let e = Holder<str>::Empty`).
                 let subject = self.infer_type_inner(
-                    *subject_id,
+                    subject_id,
                     &constraint,
                     substitution_context,
                     exprs_seen,
                 );
+                // Asked only of an enum answer with arguments — the
+                // payload-less variant's shape — so a reference costs nothing
+                // more.
+                if matches!(&subject, Type::Enum(_, arguments) if !arguments.is_empty())
+                    && let Some(written) = self.written_payload_less_variant(expr_id, subject_id)
+                {
+                    return written;
+                }
                 match subject {
                     Type::Unresolved => Type::Unresolved,
                     _ => subject,
@@ -67711,6 +67761,98 @@ impl<'src> Analyzer<'src> {
                              its callee's type parameters, so uses of it cannot be checked; \
                              annotate the binding (e.g. `: HashMap<str, i32>`)"
                         ),
+                    },
+                    variable_id,
+                );
+            }
+        }
+
+        // B580 (R-c, v0.47.0): a `let` whose type still holds a HOLE once
+        // inference is done — `let xs = []` read only through `len()`, `let o =
+        // None` — checked clean and ran on JS, while natively the first was
+        // refused at emission blaming the backend ("does not emit a value of
+        // type `an unresolved type`") and the second emitted a `let` rustc
+        // cannot type. Nothing the program does with the binding states the
+        // missing part, so it is refused at the initializer, with the
+        // generic-call refusal's shape: what cannot be inferred, and where to
+        // write it. As the residual sweep above, it speaks only as the lone
+        // signal — a hole is as often the cascade of another error as it is
+        // its own — and only over user files' `let`s (a pattern capture has
+        // no initializer to blame, and a closure's unannotated parameter is
+        // B131's starved-parameter refusal).
+        if !residuals_are_cascade {
+            // A binding whose slot already holds a hole-free type is settled;
+            // only a slot still open (or holding a hole) is asked again, so a
+            // plain package's thousands of `let`s cost a slot read each.
+            let mut holes: Vec<(Id, Id)> = self
+                .variables
+                .iter()
+                .filter_map(|(variable_id, variable)| {
+                    variable
+                        .initial
+                        .map(|initial| (*variable_id, initial, variable.type_id))
+                })
+                .filter(|(_, _, type_id)| self.type_has_hole(*type_id))
+                .map(|(variable_id, initial, _)| (variable_id, initial))
+                .collect();
+            holes.sort_unstable_by_key(|(variable_id, _)| variable_id.0);
+            for (variable_id, initial) in holes {
+                let Some(source) = self.source_of_id(variable_id) else {
+                    continue;
+                };
+                if source == DERIVED_SOURCE
+                    || self.std_sources.contains(&source)
+                    || self.frozen_sources.contains(&source)
+                    || self.dependency_sources.contains(&source)
+                {
+                    continue;
+                }
+                let variable_type =
+                    self.infer_type(variable_id, &Type::Unknown, &HashMap::default());
+                // Asked of the type's own arguments, so no slot is minted per
+                // binding to ask it (a plain package mints one per `let`).
+                if matches!(
+                    variable_type,
+                    Type::Closure(..) | Type::Unknown | Type::Unresolved | Type::Any
+                ) || !self.type_value_has_hole(&variable_type)
+                {
+                    continue;
+                }
+                let name = self
+                    .variables
+                    .get(&variable_id)
+                    .map(|variable| variable.name)
+                    .unwrap_or("this binding");
+                let written = self
+                    .pretty_print_type(&variable_type, &HashMap::default())
+                    .replace("unknown", "…");
+                let empty_list = matches!(
+                    self.expr_id_to_expr_map.get(&initial),
+                    Some(Expr::List(elements)) if elements.is_empty()
+                );
+                let msg = match empty_list {
+                    true => format!(
+                        "cannot infer the element type of this empty list from anything the \
+                         program does with `{name}`. Write the type on the binding \
+                         (`{name}: {written}`)"
+                    ),
+                    false => format!(
+                        "cannot infer the type of `{name}`: it is `{written}`, and inference \
+                         cannot settle the `…` from anything the program does with it. Write the \
+                         type on the binding (`{name}: {written}`)"
+                    ),
+                };
+                let span = **self
+                    .span_map
+                    .get(&initial)
+                    .or_else(|| self.span_map.get(&variable_id))
+                    .unwrap_or(&&EMPTY_SPAN);
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg,
                     },
                     variable_id,
                 );

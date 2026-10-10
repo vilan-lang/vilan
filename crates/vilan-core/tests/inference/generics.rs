@@ -1070,9 +1070,11 @@ fn inferred_list_closure_param_field_access() {
 #[test]
 fn inferred_list_never_pushed_still_resolves() {
     // The deferral must not strand a `List::new()` that is *never* pushed: with no
-    // pending `SlotUnification`, its methods resolve immediately (element stays
-    // `Unknown`/`any`) rather than deferring forever.
-    assert_compiles_and_runs(
+    // pending `SlotUnification`, its methods resolve immediately rather than
+    // deferring forever — so the program says ONE thing, B580's refusal of the
+    // binding whose element nothing states (v0.47.0; it ran with the element
+    // `any` before), and no stalled-constraint residual beside it.
+    assert_fails_once_with(
         r#"
         import std::io::print;
         fun main() {
@@ -1082,7 +1084,7 @@ fn inferred_list_never_pushed_still_resolves() {
             print(ys.len());
         }
         "#,
-        "0\n0\n",
+        "cannot infer the type of `xs`: it is `List<…>`",
     );
 }
 
