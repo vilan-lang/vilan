@@ -547,7 +547,7 @@ fn i9_hash_map_and_hash_set_iterate_in_insertion_order() {
             print(s.values());
         }
         "#,
-        "[ 'a', 'c', 'b', 'd' ]\n[ 10, 3, 20, 4 ]\n[ 3, 2, 1 ]\n",
+        "[\"a\", \"c\", \"b\", \"d\"]\n[10, 3, 20, 4]\n[3, 2, 1]\n",
     );
 }
 

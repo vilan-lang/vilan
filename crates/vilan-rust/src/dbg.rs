@@ -9,7 +9,7 @@
 
 use std::fmt::Write as _;
 
-use vilan_core::analyzer::BackingValue;
+use vilan_core::analyzer::{BackingValue, DbgStackValue};
 use vilan_core::error::Error;
 use vilan_core::id::Id;
 use vilan_core::options::DbgPolicy;
@@ -92,6 +92,104 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let _ = write!(out, "({}) }}", names.join(", "));
         }
         Ok(out)
+    }
+
+    /// `dbg_stack()` (debugging.md §4): the header line and one line per
+    /// binding the analyzer listed, to stderr. A binding it may read prints
+    /// through its type's printer from the read the expansion minted (an
+    /// argument of the call, borrowed in place); the rest print their fixed
+    /// text. Under `[build] dbg = "strip"` the call is nothing.
+    pub(crate) fn dbg_stack_call(
+        &mut self,
+        call_id: Id,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let program = self.program;
+        let Some(site) = program.dbg_stack_sites.get(&call_id) else {
+            return Ok("()".to_string());
+        };
+        if self.dbg_policy == DbgPolicy::Strip {
+            return Ok("()".to_string());
+        }
+        let mut entries = Vec::with_capacity(site.bindings.len());
+        for binding in &site.bindings {
+            let (head, unread, note) = {
+                let resolve = |type_id| self.concrete(type_id);
+                (
+                    vilan_core::printer::dbg_stack_head(program, binding, &resolve),
+                    vilan_core::printer::dbg_stack_unread_value(program, binding, &resolve),
+                    vilan_core::printer::dbg_stack_note(program, binding, &resolve),
+                )
+            };
+            let document = match (&binding.value, unread) {
+                (_, Some(fixed)) => format!("vilan_rt::show::Doc::text({})", rust_literal(&fixed)),
+                (DbgStackValue::Read(read), None) => {
+                    match argument_ids.iter().position(|argument| argument == read) {
+                        Some(index) => {
+                            let printer = self.native_printer_for(binding.type_id, span)?;
+                            let place = self.place_argument(argument_ids, index, depth)?;
+                            format!("{printer}(&({place}))")
+                        }
+                        None => "vilan_rt::show::Doc::text(\"<?>\")".to_string(),
+                    }
+                }
+                (_, None) => "vilan_rt::show::Doc::text(\"<?>\")".to_string(),
+            };
+            entries.push(format!(
+                "({}, {document}, {})",
+                rust_literal(&head),
+                rust_literal(&note)
+            ));
+        }
+        Ok(format!(
+            "vilan_rt::show::dbg_stack(vilan_rt::Location({}), {}, vec![{}])",
+            rust_literal(&program.site_location(call_id)),
+            rust_literal(&vilan_core::printer::dbg_stack_title(site)),
+            entries.join(", ")
+        ))
+    }
+
+    /// debugging.md S3: `print` of an aggregate writes the printer's document
+    /// on one line — the JS backend's `__dbg_flat` — so a struct prints
+    /// `Point { x = 1, y = 2 }`. `None` for a value `print` keeps rendering as
+    /// it always has (a number, a string, a host handle).
+    pub(crate) fn printed_aggregate(
+        &mut self,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<Option<String>, Error> {
+        let Some(&argument) = argument_ids.first() else {
+            return Ok(None);
+        };
+        if self.program.number_print_arguments.contains(&argument) {
+            return Ok(None);
+        }
+        let Some(type_id) = self
+            .program
+            .print_argument_types
+            .get(&argument)
+            .copied()
+            .or_else(|| self.type_of(argument))
+        else {
+            return Ok(None);
+        };
+        let program = self.program;
+        let shape = {
+            let concrete = self.concrete(type_id);
+            let resolve = |type_id| self.concrete(type_id);
+            shape_of(program, concrete, &resolve)
+        };
+        if !vilan_core::printer::print_uses_the_printer(&shape) {
+            return Ok(None);
+        }
+        let printer = self.native_printer_for(type_id, span)?;
+        let place = self.place_argument(argument_ids, 0, depth)?;
+        Ok(Some(format!(
+            "vilan_rt::show::print({printer}(&({place})))"
+        )))
     }
 
     fn dbg_argument_type(&self, argument: Id) -> Option<TypeId> {

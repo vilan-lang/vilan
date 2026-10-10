@@ -3526,13 +3526,15 @@ fn b79_std_ordering_still_lowers_to_its_bare_discriminant() {
         import std::io::print;
         import std::compare::Ordering;
         fun main() {
-            print(Ordering::Greater);
+            print(Ordering::Greater.value());
         }
         "#,
     )
     .expect("a clean compile");
+    // `.value()` folds to its receiver: the value IS `1` (a bare
+    // `print(Ordering::Greater)` prints the name since debugging.md S3).
     assert!(
-        javascript.contains("console.log(1)"),
+        javascript.contains("console.log(String(1))"),
         "Ordering::Greater should lower to the bare `1`, got:\n{javascript}"
     );
 }

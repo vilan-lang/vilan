@@ -1,0 +1,111 @@
+// debugging.md S2: `dbg_stack()` prints every binding in scope at the call —
+// innermost scope first, a shadowed binding under the one hiding it, a
+// closure's captures marked, a moved resource and an invalidated view without
+// reading them, a cell without subscribing, a pipe and a `lazy` parameter
+// without running them — the same bytes on both backends.
+import std::drop::Drop;
+import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+
+[resource]
+struct Guard {
+	id: i32,
+}
+
+impl Guard with Drop {
+	fun drop(&mut self) {
+		print(i"drop {self.id}");
+	}
+}
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+impl Point {
+	fun shifted(self, by: i32): Point {
+		dbg_stack();
+		Point { x = self.x + by, y = self.y }
+	}
+}
+
+trait Area {
+	fun area(self): i32;
+}
+
+impl Point with Area {
+	fun area(self): i32 {
+		self.x * self.y
+	}
+}
+
+fun consume(own guard: Guard) {
+	print(i"consume {guard.id}");
+}
+
+fun pass<T>(own value: T): T {
+	let kept = value;
+	dbg_stack();
+	kept
+}
+
+fun forces(lazy message: str, read: bool): str {
+	dbg_stack();
+	if read {
+		message
+	} else {
+		"unread"
+	}
+}
+
+fun bump(list: &mut List<i32>) {
+	list.push(9);
+	dbg_stack()
+}
+
+fun main() {
+	let x = 1;
+	let point = Point { x = 1, y = 2 };
+	let moved = Guard { id = 1 };
+	let kept = Guard { id = 2 };
+	consume(moved);
+	{
+		let x = "shadow";
+		let wide = [point, point, point, point, point];
+		dbg_stack();
+	}
+	let shifted = point.shifted(3);
+	let shape: dyn Area = shifted;
+	print(pass(5));
+	let held = pass(Guard { id = 3 });
+	print(forces("never", false));
+	mut numbers = [1];
+	bump(&mut numbers);
+	mut rows = [Some(1), Some(2)];
+	match &rows[0] {
+		Some(let first) => {
+			dbg(first);
+			print(*first);
+			rows.push(None);
+			dbg_stack();
+		},
+		None => {},
+	}
+	let count: SignalCell<i32> = Signal::new(3);
+	let other: SignalCell<i32> = Signal::new(5);
+	let doubled = count.derive(|value| value * 2);
+	let owner = Owner::new();
+	owner_scope.run(owner, || {
+		count.effect(|value| {
+			if value > 100 {
+				other.set(0);
+			}
+			dbg_stack();
+		});
+	});
+	other.set(6);
+	count.set(4);
+	let copied = numbers;
+	dbg_stack();
+	print(i"{kept.id} {held.id} {shape.area()} {copied.len()}");
+}

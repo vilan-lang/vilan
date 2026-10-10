@@ -4312,7 +4312,7 @@ fn an_async_closure_adapts_map_and_runs_sequentially() {
             print(ids);
         }
         "#,
-        "2\n4\n[ 2, 4 ]\n",
+        "2\n4\n[2, 4]\n",
     );
 }
 
@@ -4355,7 +4355,7 @@ fn adaptation_rides_through_a_forwarding_helper() {
             }));
         }
         "#,
-        "[ 12, 14 ]\n",
+        "[12, 14]\n",
     );
 }
 
@@ -5039,7 +5039,7 @@ fn spawn_then_settle_composes_with_a_nursery() {
             print(results);
         }
         "#,
-        "[ 10, 20, 30 ]\n",
+        "[10, 20, 30]\n",
     );
 }
 

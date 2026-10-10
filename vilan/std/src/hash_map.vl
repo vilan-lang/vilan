@@ -11,6 +11,7 @@
 // returns real `K`s, and mutating the original afterward can't desync the map
 // (value semantics snapshot it on insert).
 import pkg::compare::PartialEq;
+import pkg::debug::Debug;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
 import pkg::js::native_map::NativeMap;
@@ -176,5 +177,26 @@ impl List<(type K: Hashable, type V)> {
 impl HashMap<type K: Hashable, type V> with Default {
 	fun default(): HashMap<K, V> {
 		HashMap::new()
+	}
+}
+
+/// `HashMap { "ada" => 36, "alan" => 41 }` in insertion order, `HashMap {}`
+/// empty: what `dbg` prints, on one line, so a struct holding a map derives
+/// `Debug` (E283).
+impl HashMap<type K: Hashable + Debug, type V: Debug> with Debug {
+	fun debug(self): str {
+		if self.is_empty() {
+			ret "HashMap {}";
+		}
+		mut out = "HashMap { ";
+		mut first = true;
+		for entry in self.entries() {
+			if !first {
+				out = out + ", ";
+			}
+			first = false;
+			out = out + entry.0.debug() + " => " + entry.1.debug();
+		}
+		out + " }"
 	}
 }

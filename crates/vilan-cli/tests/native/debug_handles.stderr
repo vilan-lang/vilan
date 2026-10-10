@@ -1,0 +1,9 @@
+[native_probe_debug_handles.vl:54:2] registry = Registry {
+  names = HashMap { "ada" => 36, "alan" => 41 },
+  tags = HashSet { "x" },
+  cell = Shared(7),
+  count = SignalCell(3),
+}
+[native_probe_debug_handles.vl:69:2] head = Shared(
+  Link { label = "head", next = Some(<cycle>) },
+)

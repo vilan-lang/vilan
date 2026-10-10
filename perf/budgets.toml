@@ -329,3 +329,87 @@ class = "ci"
 ratio = 1.01
 reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0044 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
 item = "M120"
+
+[[bump]]
+subject = "example:math"
+class = "ci"
+ratio = 1.009
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0066 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.013
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0100 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.006
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0036 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.006
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0036 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.006
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0035 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.005
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0023 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.004
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0017 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.007
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0045 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.006
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0038 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.005
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0026 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.006
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0031 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"
+
+[[bump]]
+subject = "genapp:46"
+class = "ci"
+ratio = 1.006
+reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0033 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
+item = "M120"

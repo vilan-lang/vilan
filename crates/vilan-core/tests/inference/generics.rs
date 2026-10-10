@@ -6513,7 +6513,7 @@ fn b225_a_methods_own_generic_still_binds_the_literals_parameter() {
             print(b);
         }
         "#,
-        "[ 's' ]\n[ 't' ]\n",
+        "Boxy { value = \"s\" }\nBoxy { value = \"t\" }\n",
     );
 }
 
@@ -6532,7 +6532,7 @@ fn b225_the_impls_own_parameter_still_fills_its_own_structs_literal() {
         }
         fun main() { print(Pair::of(1, 2).swap()); }
         "#,
-        "[ 2, 1 ]\n",
+        "Pair { a = 2, b = 1 }\n",
     );
 }
 
@@ -6874,7 +6874,7 @@ fn b230_bang_under_a_short_circuit_keeps_its_operand_ungated() {
             print(check(true));
         }
         "#,
-        "[ 0, false ]\nprobe ran\n[ 0, true ]\n",
+        "Ok(false)\nprobe ran\nOk(true)\n",
     );
 }
 
@@ -6899,7 +6899,7 @@ fn b230_the_expected_type_still_seeds_a_payload_it_agrees_with() {
             print(pass("hi"));
         }
         "#,
-        "[ 0, [ 0, 7 ] ]\n[ 0, 1 ]\n[ 1 ]\n[ 0, 'hi' ]\n",
+        "Ok(Some(7))\nOk(1)\nNone\nOk(\"hi\")\n",
     );
 }
 

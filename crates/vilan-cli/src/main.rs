@@ -7254,6 +7254,7 @@ fn compile_to_js(
         // not told to keep or strip. It reads the BUILD's options, which the
         // shared passes above deliberately do not.
         vilan_core::track_caller::refuse_release_dbg(&mut program, options);
+        vilan_core::analyzer::refuse_release_dbg_stack(&mut program, options);
 
         // Every file `const asset::read` touched is a build input: hand the
         // set to the watcher so a change to one — or the appearance of one

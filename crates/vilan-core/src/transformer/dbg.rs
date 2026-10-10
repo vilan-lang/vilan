@@ -17,6 +17,7 @@
 use std::borrow::Cow;
 
 use super::{Transformer, js};
+use crate::analyzer::DbgStackValue;
 use crate::id::Id;
 use crate::node::BinaryOp;
 use crate::options::DbgPolicy;
@@ -124,6 +125,13 @@ impl<'src> Transformer<'src> {
             })
             .collect();
         if statement || arguments.is_empty() {
+            let arguments: Vec<js::Node<'src>> = argument_ids
+                .iter()
+                .zip(arguments)
+                .map(|(argument_id, argument)| {
+                    self.read_through_scalar_view(*argument_id, argument)
+                })
+                .collect();
             let entries = texts
                 .into_iter()
                 .zip(printers)
@@ -162,6 +170,140 @@ impl<'src> Transformer<'src> {
             ));
         }
         call("__dbg_values", parameters)
+    }
+
+    /// `dbg_stack()` (debugging.md §4): the header line and one line per
+    /// binding the analyzer listed, to the stream `dbg` writes to. A binding
+    /// it may read prints through its type's printer from the read the
+    /// expansion minted (an argument of the call); the rest print their fixed
+    /// text. Under `[build] dbg = "strip"` the call is nothing.
+    pub(super) fn dbg_stack_call(
+        &mut self,
+        call_id: Id,
+        argument_ids: &[Id],
+        arguments: Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let program = self.program;
+        let Some(site) = program.dbg_stack_sites.get(&call_id) else {
+            return js::Node::Void;
+        };
+        if self.dbg_policy == DbgPolicy::Strip {
+            return js::Node::Void;
+        }
+        self.used_helpers.insert("__dbg_stack");
+        let write = js::Node::Property(
+            Box::new(js::Node::Local("console".to_string())),
+            if program.platform.has_process_exit() {
+                "error".to_string()
+            } else {
+                "log".to_string()
+            },
+        );
+        let mut arguments: Vec<Option<js::Node<'src>>> = arguments.into_iter().map(Some).collect();
+        let mut entries = Vec::with_capacity(site.bindings.len());
+        for binding in &site.bindings {
+            let (head, unread, note) = {
+                let resolve = |type_id| self.ground_printer_type(type_id);
+                (
+                    crate::printer::dbg_stack_head(program, binding, &resolve),
+                    crate::printer::dbg_stack_unread_value(program, binding, &resolve),
+                    crate::printer::dbg_stack_note(program, binding, &resolve),
+                )
+            };
+            let document = match (&binding.value, unread) {
+                (_, Some(fixed)) => text(fixed),
+                (DbgStackValue::Read(read), None) => {
+                    let value = argument_ids
+                        .iter()
+                        .position(|argument| argument == read)
+                        .and_then(|index| arguments.get_mut(index))
+                        .and_then(Option::take);
+                    match value {
+                        Some(value) => {
+                            let value = self.read_through_scalar_view(*read, value);
+                            let printer = self.printer_for(binding.type_id);
+                            call(&printer, vec![value])
+                        }
+                        None => text("<?>"),
+                    }
+                }
+                (_, None) => text("<?>"),
+            };
+            entries.push(js::Node::Array(vec![text(head), document, text(note)]));
+        }
+        call(
+            "__dbg_stack",
+            vec![
+                write,
+                text(program.site_location(call_id)),
+                text(crate::printer::dbg_stack_title(site)),
+                js::Node::Array(entries),
+            ],
+        )
+    }
+
+    /// debugging.md S3: a `print` of an aggregate writes the printer's document
+    /// on one line (`__dbg_flat`), so a struct prints `Point { x = 1, y = 2 }`
+    /// rather than its field array; every other argument is left as it is.
+    pub(super) fn printed_aggregates(
+        &mut self,
+        target_id: Id,
+        argument_ids: &[Id],
+        args: Vec<js::Node<'src>>,
+    ) -> (Vec<js::Node<'src>>, bool) {
+        if target_id != self.print_fn_id {
+            return (args, false);
+        }
+        let mut printed = false;
+        let args = argument_ids
+            .iter()
+            .zip(args)
+            .map(|(argument, value)| {
+                let Some(type_id) = self.printed_type(*argument) else {
+                    return value;
+                };
+                printed = true;
+                self.used_helpers.insert("__dbg");
+                let value = self.read_through_scalar_view(*argument, value);
+                let printer = self.printer_for(type_id);
+                call("__dbg_flat", vec![call(&printer, vec![value])])
+            })
+            .collect();
+        (args, printed)
+    }
+
+    /// S3: the type a `print` argument prints through the printer at, under
+    /// the active substitution — `None` for a value `print` keeps rendering as
+    /// it always has (a number, a string, a host handle).
+    fn printed_type(&self, argument: Id) -> Option<TypeId> {
+        if self.program.number_print_arguments.contains(&argument) {
+            return None;
+        }
+        let type_id = self
+            .program
+            .print_argument_types
+            .get(&argument)
+            .copied()
+            .or_else(|| self.expr_type_id(argument))?;
+        let resolve = |type_id| self.ground_printer_type(type_id);
+        let shape = shape_of(self.program, resolve(type_id), &resolve);
+        crate::printer::print_uses_the_printer(&shape).then_some(type_id)
+    }
+
+    /// A value read in place for printing: a binding that holds a scalar view
+    /// emits its `(base, key)` pair, so the printer is handed `base[key]` —
+    /// the value, as the native backend's borrow reads it (a view of an
+    /// aggregate is the aggregate's own reference and reads as itself).
+    fn read_through_scalar_view(&mut self, argument: Id, value: js::Node<'src>) -> js::Node<'src> {
+        match self.program.entity_map.get(&argument) {
+            Some(crate::analyzer::Expr::Local(binding))
+                if self.binding_holds_a_scalar_view_pair(*binding) =>
+            {
+                // A binding's pair is read twice by name, so nothing is hoisted.
+                self.emit_scalar_view_read(argument, value, &mut Vec::new())
+            }
+            _ => value,
+        }
     }
 
     /// A `dbg` argument's type as the analyzer settled it, which may name the

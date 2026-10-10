@@ -1,0 +1,70 @@
+// E283: `[derive(Debug)]` and `T: Debug` take every type `dbg` prints — std's
+// handles through impls beside each type, a closure field by its written type,
+// a fixed array of a literal length element by element — and `.debug()`
+// spells what `dbg` prints, on one line, the same on both backends. (`BigInt`'s
+// impl is JS-only for now: the native backend renders no `BigInt` as text.)
+import std::debug::Debug;
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::reactive::{ Signal, SignalCell };
+import std::shared::Shared;
+
+[derive(Debug)]
+struct Registry {
+	names: HashMap<str, i32>,
+	tags: HashSet<str>,
+	cell: Shared<i32>,
+	count: SignalCell<i32>,
+}
+
+[derive(Debug)]
+struct Fixed {
+	cells: [i32; 2],
+	grid: [[u8; 2]; 2],
+	none: [str; 0],
+	run: |i32| i32,
+}
+
+[derive(Debug)]
+enum Event {
+	Moved([f64; 2]),
+	Handler(|str| void),
+	Empty,
+}
+
+[derive(Debug)]
+struct Link {
+	label: str,
+	next: Option<Shared<Link>>,
+}
+
+fun show<T: Debug>(value: T) {
+	print(value.debug());
+}
+
+fun main() {
+	mut names: HashMap<str, i32> = HashMap::new();
+	names.insert("ada", 36);
+	names.insert("alan", 41);
+	mut tags: HashSet<str> = HashSet::new();
+	tags.insert("x");
+	let count: SignalCell<i32> = Signal::new(3);
+	let registry = Registry { names, tags, cell = Shared::new(7), count };
+	print(registry.debug());
+	dbg(registry);
+	let fixed = Fixed { cells = [1, 2], grid = [[1, 2], [3, 4]], none = [], run = |x| x };
+	print(fixed.debug());
+	print(Event::Moved([1.0, 2.5]).debug());
+	print(Event::Handler(|text| print(text)).debug());
+	print(Event::Empty.debug());
+	let empty: HashMap<str, i32> = HashMap::new();
+	show(empty);
+	let none: HashSet<i32> = HashSet::new();
+	show(none);
+	show(Shared::new([1, 2]));
+	show(count);
+	let head = Shared::new(Link { label = "head", next = None });
+	head.write().next = Some(head.clone());
+	print(head.debug());
+	dbg(head);
+}

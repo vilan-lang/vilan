@@ -687,8 +687,8 @@ fn e259_a_generic_instance_is_named_after_its_function() {
 
 /// N136 (R-g door (a)): a number prints by the language's own conversion —
 /// negative zero is `0`, a float and an integer alike, as on the native
-/// backend — and only numbers are wrapped: a list still prints by node's
-/// layout.
+/// backend — and only numbers are wrapped: a list prints through the
+/// printer (debugging.md S3).
 #[test]
 fn n136_print_writes_negative_zero_as_zero() {
     let source = concat!(
@@ -706,11 +706,751 @@ fn n136_print_writes_negative_zero_as_zero() {
         javascript.contains("console.log(String(0.0 * -(1.0)));"),
         "{javascript}"
     );
+    // A list prints through the printer (debugging.md S3), unwrapped.
     assert!(
-        javascript.contains("console.log([ 1, 2 ]);"),
+        javascript.contains("console.log(__dbg_flat(__show_List_i32([ 1, 2 ])));"),
         "{javascript}"
     );
-    assert_compiles_and_runs(source, "0\n0\n0\n2.5\n[ 1, 2 ]\n");
+    assert_compiles_and_runs(source, "0\n0\n0\n2.5\n[1, 2]\n");
+}
+
+// --- S2: `dbg_stack()` ---------------------------------------------------
+
+/// `L:C` of a byte offset in `source`, 1-based, columns in characters.
+fn line_column(source: &str, offset: usize) -> String {
+    let prefix = &source[..offset];
+    let line = prefix.matches('\n').count() + 1;
+    let column = prefix[prefix.rfind('\n').map_or(0, |at| at + 1)..]
+        .chars()
+        .count()
+        + 1;
+    format!("{line}:{column}")
+}
+
+/// E281/E282: what the move and view checks recorded at each `dbg_stack()`
+/// call of `source`, as `L: name: verdict` lines — the call's line, then each
+/// recorded binding — in source order.
+#[track_caller]
+fn dbg_stack_records(source: &str) -> Vec<String> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                errors.is_empty(),
+                "expected a clean analysis, got: {:#?}",
+                errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+            );
+            let program = program.expect("a program");
+            let name = |id| {
+                program
+                    .variables
+                    .get(&id)
+                    .map(|variable| variable.name)
+                    .or_else(|| program.parameters.get(&id).map(|parameter| parameter.name))
+                    .unwrap_or("?")
+            };
+            let mut lines: Vec<(usize, u32, String)> = Vec::new();
+            for (call, moved) in &program.dbg_stack_moves {
+                let at = program.span_map[call].start;
+                let line = line_column(leaked, at);
+                let line = line.split(':').next().unwrap_or("?").to_string();
+                for (binding, state) in moved {
+                    let verdict = match state {
+                        vilan_core::analyzer::DbgStackMove::Moved(span) => {
+                            format!("moved at {}", line_column(leaked, span.start))
+                        }
+                        vilan_core::analyzer::DbgStackMove::MovedOnSomePaths(_) => {
+                            "moved on some paths".to_string()
+                        }
+                    };
+                    lines.push((
+                        at,
+                        binding.0,
+                        format!("{line}: {}: {verdict}", name(*binding)),
+                    ));
+                }
+            }
+            for (call, views) in &program.dbg_stack_invalidated {
+                let at = program.span_map[call].start;
+                let line = line_column(leaked, at);
+                let line = line.split(':').next().unwrap_or("?").to_string();
+                for entry in views {
+                    let by = match entry.callee {
+                        Some(callee) => program
+                            .functions
+                            .get(&callee)
+                            .map(|function| function.name)
+                            .or_else(|| {
+                                program
+                                    .external_functions
+                                    .get(&callee)
+                                    .map(|external| external.name)
+                            })
+                            .unwrap_or("?"),
+                        None => "assignment",
+                    };
+                    let event_at = line_column(leaked, program.span_map[&entry.event].start);
+                    lines.push((
+                        at,
+                        entry.view.0,
+                        format!(
+                            "{line}: {}: invalidated by {by} at {event_at}",
+                            name(entry.view)
+                        ),
+                    ));
+                }
+            }
+            lines.sort();
+            lines.into_iter().map(|(_, _, line)| line).collect()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// E281 + E282 on debug-48's repro (`s2_prerequisites.vl`): at a `dbg_stack()`
+/// call the resource move scan records the moved binding with its move site,
+/// and the view-invalidation scan the capture view past its last use that a
+/// push invalidated since — the two facts the expansion must have to print
+/// `<moved at 29:10>` and `<view, invalidated by push at 34:4>` without
+/// reading either.
+#[test]
+fn e281_e282_the_move_and_view_scans_record_their_state_at_a_dbg_stack_call() {
+    let source = concat!(
+        "[resource]\n",
+        "struct Guard {\n",
+        "\tid: i32,\n",
+        "}\n",
+        "\n",
+        "fun consume(own guard: Guard) {\n",
+        "\tprint(guard.id);\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tlet guard = Guard { id = 1 };\n",
+        "\tconsume(guard);\n",
+        "\tmut rows = [Some(1), Some(2)];\n",
+        "\tmatch &rows[0] {\n",
+        "\t\tSome(let first) => {\n",
+        "\t\t\tprint(*first);\n",
+        "\t\t\trows.push(None);\n",
+        "\t\t\tprint(rows.len());\n",
+        "\t\t\tdbg_stack();\n",
+        "\t\t},\n",
+        "\t\tNone => {},\n",
+        "\t}\n",
+        "}\n",
+    );
+    assert_eq!(
+        dbg_stack_records(source),
+        vec![
+            "19: guard: moved at 12:10".to_string(),
+            "19: first: invalidated by push at 17:4".to_string(),
+        ]
+    );
+}
+
+/// E281: R7's other legal state — moved on one path, payload-free on the other
+/// (B67's `is` refinement) — is recorded as moved on SOME paths.
+#[test]
+fn e281_a_binding_moved_on_some_paths_is_recorded_so() {
+    let source = concat!(
+        "[resource]\n",
+        "struct Guard { id: i32 }\n",
+        "fun consume(own held: Option<Guard>) {\n",
+        "\tif held is Some(let guard) {\n",
+        "\t\tprint(guard.id);\n",
+        "\t}\n",
+        "}\n",
+        "fun main() {\n",
+        "\tlet held: Option<Guard> = Some(Guard { id = 1 });\n",
+        "\tdbg_stack();\n",
+        "\tif held is Some(_) {\n",
+        "\t\tconsume(held);\n",
+        "\t}\n",
+        "\tdbg_stack();\n",
+        "}\n",
+    );
+    assert_eq!(
+        dbg_stack_records(source),
+        vec!["14: held: moved on some paths".to_string()]
+    );
+}
+
+/// E282 across branches and loops. An event on one path of an `if` reaches a
+/// call after it but not a call on the other path; an assignment to the root
+/// is an event too; and a capture view that is never used — retired from its
+/// arm's start — is invalidated for a call EARLIER in a loop by a push later
+/// in it, which comes first on the next iteration.
+#[test]
+fn e282_an_invalidation_follows_the_paths_and_the_loops_to_a_dbg_stack_call() {
+    let branches = concat!(
+        "fun main() {\n",
+        "\tmut rows = [Some(1), Some(2)];\n",
+        "\tmatch &rows[0] {\n",
+        "\t\tSome(let first) => {\n",
+        "\t\t\tprint(*first);\n",
+        "\t\t\tif rows.len() > 5 {\n",
+        "\t\t\t\trows.push(None);\n",
+        "\t\t\t} else {\n",
+        "\t\t\t\tdbg_stack();\n",
+        "\t\t\t}\n",
+        "\t\t\tdbg_stack();\n",
+        "\t\t},\n",
+        "\t\tNone => {},\n",
+        "\t}\n",
+        "\tmatch &rows[1] {\n",
+        "\t\tSome(let second) => {\n",
+        "\t\t\tprint(*second);\n",
+        "\t\t\trows = [None];\n",
+        "\t\t\tdbg_stack();\n",
+        "\t\t},\n",
+        "\t\tNone => {},\n",
+        "\t}\n",
+        "}\n",
+    );
+    assert_eq!(
+        dbg_stack_records(branches),
+        vec![
+            "11: first: invalidated by push at 7:5".to_string(),
+            "19: second: invalidated by assignment at 18:4".to_string(),
+        ]
+    );
+    let looped = concat!(
+        "fun main() {\n",
+        "\tmut rows = [Some(1), Some(2)];\n",
+        "\tmatch &rows[0] {\n",
+        "\t\tSome(let first) => {\n",
+        "\t\t\tmut count = 0;\n",
+        "\t\t\tfor count < 2 {\n",
+        "\t\t\t\tdbg_stack();\n",
+        "\t\t\t\trows.push(None);\n",
+        "\t\t\t\tcount = count + 1;\n",
+        "\t\t\t}\n",
+        "\t\t},\n",
+        "\t\tNone => {},\n",
+        "\t}\n",
+        "}\n",
+    );
+    assert_eq!(
+        dbg_stack_records(looped),
+        vec!["7: first: invalidated by push at 8:5".to_string()]
+    );
+}
+
+/// S2 (debugging.md §4.1): the parameters and locals in scope at the call,
+/// innermost scope first and in declaration order within a scope, each
+/// shadowed binding directly under the one hiding it with where it was hidden;
+/// a binding declared after the call, and a module-level one, are not listed;
+/// a value lays out from where it starts, broken entries two spaces under the
+/// binding; the header names the function.
+#[test]
+fn s2_dbg_stack_lists_the_scope_innermost_first_with_shadowed_bindings_under_their_shadows() {
+    assert_dbg_runs(
+        concat!(
+            "struct Point { x: i32, y: i32 }\n",
+            "let global = 7;\n",
+            "fun area(point: Point, scale: i32): i32 {\n",
+            "\tlet x = point.x * scale;\n",
+            "\t{\n",
+            "\t\tlet x = \"inner\";\n",
+            "\t\tlet points = [point, point, point, point, point];\n",
+            "\t\tdbg_stack();\n",
+            "\t}\n",
+            "\tlet later = 1;\n",
+            "\tx * point.y + later\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(area(Point { x = 1, y = 2 }, 3) + global);\n",
+            "}\n",
+        ),
+        "14\n",
+        concat!(
+            "[test.vl:8:3] dbg_stack() in area\n",
+            "  x: str = \"inner\"\n",
+            "  x (shadowed at 6:7): i32 = 3\n",
+            "  points: List<Point> = [\n",
+            "    Point { x = 1, y = 2 },\n",
+            "    Point { x = 1, y = 2 },\n",
+            "    Point { x = 1, y = 2 },\n",
+            "    Point { x = 1, y = 2 },\n",
+            "    Point { x = 1, y = 2 },\n",
+            "  ]\n",
+            "  point: Point = Point { x = 1, y = 2 }\n",
+            "  scale: i32 = 3\n",
+        ),
+    );
+}
+
+/// S2 on debug-48's repro: E281's and E282's records decide that `guard` (moved)
+/// and `first` (a capture view a push invalidated since its last use) print
+/// their state and are NOT read — a read of either would be refused — while a
+/// view still valid at the call prints through, marked as one.
+#[test]
+fn s2_dbg_stack_prints_a_moved_resource_and_an_invalidated_view_without_reading_them() {
+    assert_dbg_runs(
+        concat!(
+            "[resource]\n",
+            "struct Guard { id: i32 }\n",
+            "fun consume(own guard: Guard) {\n",
+            "\tprint(guard.id);\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet guard = Guard { id = 1 };\n",
+            "\tconsume(guard);\n",
+            "\tmut rows = [Some(1), Some(2)];\n",
+            "\tmatch &rows[1] {\n",
+            "\t\tSome(let second) => {\n",
+            "\t\t\tdbg_stack();\n",
+            "\t\t\tprint(*second);\n",
+            "\t\t},\n",
+            "\t\tNone => {},\n",
+            "\t}\n",
+            "\tmatch &rows[0] {\n",
+            "\t\tSome(let first) => {\n",
+            "\t\t\tprint(*first);\n",
+            "\t\t\trows.push(None);\n",
+            "\t\t\tdbg_stack();\n",
+            "\t\t},\n",
+            "\t\tNone => {},\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "1\n2\n1\n",
+        concat!(
+            "[test.vl:12:4] dbg_stack() in main\n",
+            "  second: view i32 = 2  (a view into rows)\n",
+            "  guard: Guard = <moved at 8:10>\n",
+            "  rows: List<Option<i32>> = [Some(1), Some(2)]\n",
+            "[test.vl:21:4] dbg_stack() in main\n",
+            "  first: view i32 = <view, invalidated by push at 20:4>  (a view into rows)\n",
+            "  guard: Guard = <moved at 8:10>\n",
+            "  rows: List<Option<i32>> = [Some(1), Some(2), None]\n",
+        ),
+    );
+}
+
+/// S2 inside a closure: its own parameters and locals, then the enclosing
+/// bindings it CAPTURES, marked — and not one it does not (listing it would
+/// capture it); the header names the function the closure is written in.
+#[test]
+fn s2_dbg_stack_in_a_closure_lists_its_own_bindings_then_its_captures() {
+    assert_dbg_runs(
+        concat!(
+            "fun main() {\n",
+            "\tlet base = 10;\n",
+            "\tlet unused = \"not captured\";\n",
+            "\tlet add = |n: i32| {\n",
+            "\t\tlet sum = n + base;\n",
+            "\t\tdbg_stack();\n",
+            "\t\tsum\n",
+            "\t};\n",
+            "\tprint(add(1));\n",
+            "}\n",
+        ),
+        "11\n",
+        concat!(
+            "[test.vl:6:3] dbg_stack() in a closure in main\n",
+            "  sum: i32 = 11\n",
+            "  n: i32 = 1\n",
+            "  base: i32 = 10  (captured)\n",
+        ),
+    );
+}
+
+/// S2 (§4.2): a cell prints its current value WITHOUT subscribing. Inside an
+/// effect, a `dbg_stack()` reading a captured cell leaves the effect
+/// subscribed to what it was — a `set` of that cell does not re-run it.
+#[test]
+fn s2_dbg_stack_reads_a_cell_without_subscribing() {
+    assert_dbg_runs(
+        concat!(
+            "import std::reactive::{ Owner, Signal, SignalCell, owner_scope };\n",
+            "fun main() {\n",
+            "\tlet count: SignalCell<i32> = Signal::new(3);\n",
+            "\tlet other: SignalCell<i32> = Signal::new(5);\n",
+            "\tlet owner = Owner::new();\n",
+            "\towner_scope.run(owner, || {\n",
+            "\t\tcount.effect(|value| {\n",
+            "\t\t\tif value > 100 {\n",
+            "\t\t\t\tother.set(0);\n",
+            "\t\t\t}\n",
+            "\t\t\tdbg_stack();\n",
+            "\t\t});\n",
+            "\t});\n",
+            "\tother.set(6);\n",
+            "\tcount.set(4);\n",
+            "}\n",
+        ),
+        "",
+        concat!(
+            "[test.vl:11:4] dbg_stack() in a closure in main\n",
+            "  value: i32 = 3\n",
+            "  other: SignalCell<i32> = SignalCell(5)  (captured, read without tracking)\n",
+            "[test.vl:11:4] dbg_stack() in a closure in main\n",
+            "  value: i32 = 4\n",
+            "  other: SignalCell<i32> = SignalCell(6)  (captured, read without tracking)\n",
+        ),
+    );
+}
+
+/// S2 (§4.2): looking must not change the program. A pipe prints by its type
+/// alone (sampling it would run its bodies) and a `lazy` parameter is not
+/// forced — the argument's side effect never happens.
+#[test]
+fn s2_dbg_stack_prints_a_pipe_and_a_lazy_parameter_without_running_them() {
+    assert_dbg_runs(
+        concat!(
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "fun noisy(): str {\n",
+            "\tprint(\"forced\");\n",
+            "\t\"noisy\"\n",
+            "}\n",
+            "fun forces(lazy message: str, read: bool): str {\n",
+            "\tdbg_stack();\n",
+            "\tif read { message } else { \"unread\" }\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet count: SignalCell<i32> = Signal::new(3);\n",
+            "\tlet doubled = count.derive(|value| {\n",
+            "\t\tprint(\"sampled\");\n",
+            "\t\tvalue * 2\n",
+            "\t});\n",
+            "\tprint(forces(noisy(), false));\n",
+            "\tdbg_stack();\n",
+            "}\n",
+        ),
+        "unread\n",
+        concat!(
+            "[test.vl:7:2] dbg_stack() in forces\n",
+            "  message: str = <lazy, not forced>\n",
+            "  read: bool = false\n",
+            "[test.vl:17:2] dbg_stack() in main\n",
+            "  count: SignalCell<i32> = SignalCell(3)  (read without tracking)\n",
+            "  doubled: Derive<SignalCell<i32>, i32, i32> = <pipe, not sampled>\n",
+        ),
+    );
+}
+
+/// S2 in a generic body: each instance prints its own types, and a `T`-typed
+/// binding moved where an instantiation makes `T` a resource (R11's scan, the
+/// generic half of E281's record) prints as moved in every instance — a read
+/// would keep it alive past the move, which would then have to copy a
+/// resource.
+#[test]
+fn s2_dbg_stack_in_a_generic_body_prints_each_instance() {
+    assert_dbg_runs(
+        concat!(
+            "[resource]\n",
+            "struct Guard { id: i32 }\n",
+            "fun pass<T>(own value: T, label: str): T {\n",
+            "\tlet kept = value;\n",
+            "\tdbg_stack();\n",
+            "\tkept\n",
+            "}\n",
+            "fun show<T>(value: T) {\n",
+            "\tdbg_stack();\n",
+            "}\n",
+            "fun main() {\n",
+            "\tshow(2.5);\n",
+            "\tshow([\"a\"]);\n",
+            "\tprint(pass(5, \"number\"));\n",
+            "\tlet guard = pass(Guard { id = 3 }, \"guard\");\n",
+            "\tprint(guard.id);\n",
+            "}\n",
+        ),
+        "5\n3\n",
+        concat!(
+            "[test.vl:9:2] dbg_stack() in show\n",
+            "  value: f64 = 2.5\n",
+            "[test.vl:9:2] dbg_stack() in show\n",
+            "  value: List<str> = [\"a\"]\n",
+            "[test.vl:5:2] dbg_stack() in pass\n",
+            "  value: i32 = <moved at 4:13>\n",
+            "  label: str = \"number\"\n",
+            "  kept: i32 = 5\n",
+            "[test.vl:5:2] dbg_stack() in pass\n",
+            "  value: Guard = <moved at 4:13>\n",
+            "  label: str = \"guard\"\n",
+            "  kept: Guard = Guard { id = 3 }\n",
+        ),
+    );
+}
+
+/// S2 (§4.2, "each listed binding counts as a use"): the read at the call keeps
+/// a resource owned to the `dbg_stack()` line, so its drop runs after the
+/// listing rather than right after its last use above it.
+#[test]
+fn s2_a_listed_binding_is_a_use_at_the_call() {
+    assert_dbg_runs(
+        concat!(
+            "import std::drop::Drop;\n",
+            "[resource]\n",
+            "struct Guard { id: i32 }\n",
+            "impl Guard with Drop {\n",
+            "\tfun drop(&mut self) {\n",
+            "\t\tdbg(self.id);\n",
+            "\t}\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet guard = Guard { id = 1 };\n",
+            "\tprint(guard.id);\n",
+            "\tdbg_stack();\n",
+            "\tdbg();\n",
+            "}\n",
+        ),
+        "1\n",
+        concat!(
+            "[test.vl:12:2] dbg_stack() in main\n",
+            "  guard: Guard = Guard { id = 1 }\n",
+            "[test.vl:6:3] self.id = 1\n",
+            "[test.vl:13:2]\n",
+        ),
+    );
+}
+
+/// S2: `dbg_stack()` takes no arguments — the expansion supplies them.
+#[test]
+fn s2_dbg_stack_takes_no_arguments() {
+    assert_fails_with(
+        "fun main() {\n\tlet x = 1;\n\tdbg_stack(x);\n}\n",
+        "`dbg_stack()` takes no arguments: it prints every binding in scope at the call",
+    );
+}
+
+/// S2 writes where `dbg` writes: stderr on node, `console.log` in the browser.
+#[test]
+fn s2_dbg_stack_writes_to_the_console_log_in_the_browser() {
+    let javascript = compile_on(
+        "fun main() {\n\tlet x = 1;\n\tdbg_stack();\n}\n",
+        Platform::Browser,
+    )
+    .expect("a clean browser compile");
+    assert!(
+        javascript.contains("__dbg_stack(console.log, \"test.vl:3:2\", \"dbg_stack() in main\""),
+        "{javascript}"
+    );
+    let node = compile("fun main() {\n\tlet x = 1;\n\tdbg_stack();\n}\n").expect("a clean compile");
+    assert!(
+        node.contains("__dbg_stack(console.error, \"test.vl:3:2\""),
+        "{node}"
+    );
+}
+
+/// `dbg(view)` of a scalar view prints the VALUE on JS, as the native backend's
+/// borrow does — not the `(base, key)` pair a scalar view is represented by
+/// (found building S2, which reads views the same way).
+#[test]
+fn s2_dbg_of_a_scalar_view_prints_its_value() {
+    assert_dbg_runs(
+        concat!(
+            "fun main() {\n",
+            "\tmut rows = [Some(1), Some(2)];\n",
+            "\tmatch &rows[0] {\n",
+            "\t\tSome(let first) => {\n",
+            "\t\t\tdbg(first);\n",
+            "\t\t\tprint(*first);\n",
+            "\t\t},\n",
+            "\t\tNone => {},\n",
+            "\t}\n",
+            "\tmut points = [(1, 2)];\n",
+            "\tfor pair in &mut points {\n",
+            "\t\tdbg(pair);\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "1\n",
+        concat!(
+            "[test.vl:5:4] first = 1\n",
+            "[test.vl:12:3] pair = (1, 2)\n",
+        ),
+    );
+}
+
+/// E283 on debug-48's repro: a derive over a `HashMap`, a `Shared` and a
+/// `BigInt` field compiles (it failed inside the generated code: "HashMap<str,
+/// i32> has no method 'debug'") and spells what `dbg` prints, on one line.
+#[test]
+fn e283_the_derive_takes_stds_handles() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "import std::hash_map::HashMap;\n",
+            "import std::hash_set::HashSet;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "import std::shared::Shared;\n",
+            "[derive(Debug)]\n",
+            "struct Registry {\n",
+            "\tnames: HashMap<str, i32>,\n",
+            "\ttags: HashSet<i32>,\n",
+            "\tcell: Shared<i32>,\n",
+            "\tcount: SignalCell<i32>,\n",
+            "\tbig: BigInt,\n",
+            "}\n",
+            "fun main() {\n",
+            "\tmut names: HashMap<str, i32> = HashMap::new();\n",
+            "\tnames.insert(\"a\", 1);\n",
+            "\tlet tags: HashSet<i32> = HashSet::new();\n",
+            "\tlet count: SignalCell<i32> = Signal::new(2);\n",
+            "\tlet registry = Registry { names = names, tags = tags, cell = Shared::new(1), count = count, big = 10n };\n",
+            "\tprint(registry.debug());\n",
+            "}\n",
+        ),
+        "Registry { names = HashMap { \"a\" => 1 }, tags = HashSet {}, cell = Shared(1), count = SignalCell(2), big = 10 }\n",
+    );
+}
+
+/// E283's other half: a closure field prints its written type and a fixed
+/// array of a LITERAL length prints element by element — nested, empty, and in
+/// an enum variant's payload — as `dbg` prints them.
+#[test]
+fn e283_the_derive_prints_a_closure_and_a_literal_length_array_field() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "[derive(Debug)]\n",
+            "struct Fixed {\n",
+            "\tcells: [i32; 2],\n",
+            "\tgrid: [[u8; 2]; 2],\n",
+            "\tnone: [str; 0],\n",
+            "\trun: |i32| i32,\n",
+            "}\n",
+            "[derive(Debug)]\n",
+            "enum Event {\n",
+            "\tMoved([f64; 2]),\n",
+            "\tHandler(|str| void),\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(Fixed { cells = [1, 2], grid = [[1, 2], [3, 4]], none = [], run = |x| x }.debug());\n",
+            "\tprint(Event::Moved([1.0, 2.5]).debug());\n",
+            "\tprint(Event::Handler(|text| print(text)).debug());\n",
+            "}\n",
+        ),
+        concat!(
+            "Fixed { cells = [1, 2], grid = [[1, 2], [3, 4]], none = [], run = <closure |i32| i32> }\n",
+            "Event::Moved([1.0, 2.5])\n",
+            "Event::Handler(<closure |str| void>)\n",
+        ),
+    );
+}
+
+/// E283: `T: Debug` takes each handle, and a `Shared` cycle prints `<cycle>`
+/// rather than recursing forever, as `dbg` cuts it.
+#[test]
+fn e283_t_debug_takes_stds_handles_and_cuts_a_cycle() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "import std::hash_map::HashMap;\n",
+            "import std::shared::Shared;\n",
+            "[derive(Debug)]\n",
+            "struct Link {\n",
+            "\tlabel: str,\n",
+            "\tnext: Option<Shared<Link>>,\n",
+            "}\n",
+            "fun show<T: Debug>(value: T) {\n",
+            "\tprint(value.debug());\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet empty: HashMap<str, i32> = HashMap::new();\n",
+            "\tshow(empty);\n",
+            "\tshow(Shared::new([1, 2]));\n",
+            "\tshow(123456789012345678901234567890n);\n",
+            "\tlet head = Shared::new(Link { label = \"head\", next = None });\n",
+            "\thead.write().next = Some(head.clone());\n",
+            "\tshow(head);\n",
+            "}\n",
+        ),
+        concat!(
+            "HashMap {}\n",
+            "Shared([1, 2])\n",
+            "123456789012345678901234567890\n",
+            "Shared(Link { label = \"head\", next = Some(<cycle>) })\n",
+        ),
+    );
+}
+
+// --- S3: `print` of non-scalars ------------------------------------------
+
+/// S3 (the ruling's five points): an aggregate prints in vilan's literal
+/// syntax on ONE line, a float inside it keeping its `.0`; a backed enum by its
+/// name; a top-level number, string and bool as `print` always printed them
+/// (`3.0` is `3`, a string bare).
+#[test]
+fn s3_print_writes_an_aggregate_through_the_printer_on_one_line() {
+    assert_compiles_and_runs(
+        concat!(
+            "struct Point { x: i32, y: f64 }\n",
+            "enum Color { Red = \"red\", Green = \"green\" }\n",
+            "fun main() {\n",
+            "\tprint(3.0);\n",
+            "\tprint(\"raw\");\n",
+            "\tprint(true);\n",
+            "\tprint(Point { x = 1, y = 3.0 });\n",
+            "\tprint(Color::Green);\n",
+            "\tprint([Some(\"a\"), None]);\n",
+            "\tprint((1, [2.5, 3.0]));\n",
+            "\tprint([Point { x = 1, y = 1.0 }, Point { x = 2, y = 2.0 }, Point { x = 3, y = 3.0 }, Point { x = 4, y = 4.0 }]);\n",
+            "}\n",
+        ),
+        concat!(
+            "3\n",
+            "raw\n",
+            "true\n",
+            "Point { x = 1, y = 3.0 }\n",
+            "Color::Green\n",
+            "[Some(\"a\"), None]\n",
+            "(1, [2.5, 3.0])\n",
+            "[Point { x = 1, y = 1.0 }, Point { x = 2, y = 2.0 }, Point { x = 3, y = 3.0 }, Point { x = 4, y = 4.0 }]\n",
+        ),
+    );
+}
+
+/// S3: a generic `print(value)` prints each instance's type through the
+/// printer — a struct as a struct, a number as a number — and a `dyn` value
+/// prints what it holds (its table carries the `show` slot with no `dbg` in
+/// the program).
+#[test]
+fn s3_print_of_a_generic_value_and_a_dyn_prints_per_instance() {
+    assert_compiles_and_runs(
+        concat!(
+            "trait Area {\n",
+            "\tfun area(self): i32;\n",
+            "}\n",
+            "struct Square { side: i32 }\n",
+            "impl Square with Area {\n",
+            "\tfun area(self): i32 { self.side * self.side }\n",
+            "}\n",
+            "fun show<T>(value: T) {\n",
+            "\tprint(value);\n",
+            "}\n",
+            "fun main() {\n",
+            "\tshow(Square { side = 2 });\n",
+            "\tshow(2.5);\n",
+            "\tshow(\"text\");\n",
+            "\tlet shape: dyn Area = Square { side = 3 };\n",
+            "\tprint(shape);\n",
+            "\tprint([shape]);\n",
+            "}\n",
+        ),
+        concat!(
+            "Square { side = 2 }\n",
+            "2.5\n",
+            "text\n",
+            "dyn Area(Square { side = 3 })\n",
+            "[dyn Area(Square { side = 3 })]\n",
+        ),
+    );
 }
 
 /// N149: N136's recording is static, so `print(value)` with `value: T` was not

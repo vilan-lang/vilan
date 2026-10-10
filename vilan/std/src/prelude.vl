@@ -24,7 +24,7 @@
 //
 // Selected as `prelude = "std::prelude"`, which is also what omitting the key
 // means. The web set is next door in `web.vl`.
-export import pkg::debug::dbg;
+export import pkg::debug::{ dbg, dbg_stack };
 export import pkg::io::print;
 export import pkg::iterator::Iterator;
 export import pkg::option::Option::{ self, None, Some };

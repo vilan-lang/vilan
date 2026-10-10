@@ -11261,7 +11261,7 @@ fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
         (line, column)
     };
     let expected = format!(
-        "{}\n{CALLER_FILE}\n{line}\n{column}\n{own}\n[ 0, 'expected Some but got None' ]\n",
+        "{}\n{CALLER_FILE}\n{line}\n{column}\n{own}\nSome(\"expected Some but got None\")\n",
         site("print(here())", "here"),
     );
     assert_eq!(native.stdout, expected);
@@ -11408,6 +11408,57 @@ fn s1b_a_dyn_value_prints_what_it_holds_on_both_backends() {
         include_str!("native/dbg_dyn.vl"),
         "4\nrect\nalso rect\n",
         include_str!("native/dbg_dyn.stderr"),
+    );
+}
+
+/// debugging.md S2: `dbg_stack()` prints every binding in scope — innermost
+/// scope first, a shadowed one under the binding hiding it, a closure's
+/// captures marked, a moved resource (at a concrete site and in a generic
+/// body's resource instance) and an invalidated view without reading them, a
+/// cell without subscribing (the effect does not re-run on the captured cell's
+/// `set`), a pipe and a `lazy` parameter without running them — the same bytes
+/// on both backends (`native/dbg_stack.*`). Each listed binding is a use at
+/// the call, so `let copied = numbers` copies where it used to move, and
+/// `dbg(first)` of a scalar view prints the value (not the JS pair).
+#[test]
+fn s2_dbg_stack_prints_the_scope_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_stack.vl",
+        include_str!("native/dbg_stack.vl"),
+        include_str!("native/dbg_stack.stdout"),
+        include_str!("native/dbg_stack.stderr"),
+    );
+}
+
+/// E283: `[derive(Debug)]` and `T: Debug` take std's handles (`HashMap`,
+/// `HashSet`, `Shared` with its cycle cut, `SignalCell` read untracked), a
+/// closure field by its type and a literal-length array field (nested, empty,
+/// in a variant) element by element, and `.debug()` spells what `dbg` prints —
+/// the same bytes on both backends (`native/debug_handles.*`).
+#[test]
+fn e283_debug_takes_every_type_dbg_prints_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_debug_handles.vl",
+        include_str!("native/debug_handles.vl"),
+        include_str!("native/debug_handles.stdout"),
+        include_str!("native/debug_handles.stderr"),
+    );
+}
+
+/// debugging.md S3 (P2 and the 2026-10-09 ruling's five points): `print`
+/// writes an aggregate through the `dbg` printer on ONE line — a struct, an
+/// enum, a tuple, a list (nested, empty), an option, a map, a `dyn`, a long
+/// list that `dbg` would break — a float inside it keeping its `.0`, a backed
+/// enum by its name, a generic `T` per instance; a top-level number, string
+/// and bool print as before (`3.0` prints `3`). The same stdout on both
+/// backends (`native/print_aggregates.*`).
+#[test]
+fn s3_print_writes_aggregates_through_the_printer_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_print_aggregates.vl",
+        include_str!("native/print_aggregates.vl"),
+        include_str!("native/print_aggregates.stdout"),
+        "",
     );
 }
 
