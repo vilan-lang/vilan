@@ -780,6 +780,7 @@ impl<'a, 'src> Collector<'a, 'src> {
             Expr::Closure(closure_id) | Expr::Async(closure_id) => {
                 self.nested_closures.push(*closure_id)
             }
+            Expr::Ascribe(inner) => self.walk(*inner),
             // An `await` makes this node async; its operand may hold more calls.
             Expr::Await(inner) => {
                 self.await_sites.push(id);

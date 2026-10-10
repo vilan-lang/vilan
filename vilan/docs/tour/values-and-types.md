@@ -17,6 +17,26 @@ fun main() {
 }
 ```
 
+Where there is no `let` to annotate, `as` names a type in place. It
+directs inference exactly as an annotation would, and it never converts
+anything:
+
+```vilan
+import std::reactive::SignalCell;
+
+fun main() {
+	let ratio = 7 as f64 / 2.0;
+	let sizes = SignalCell::new([] as List<usize>);
+	print(i"{ratio} {sizes.get().len()}");
+}
+```
+
+`7 as f64` makes the literal an `f64` the way `let seven: f64 = 7` would,
+and the empty list is a `List<usize>` because the ascription says so. A
+value that already has another type is refused rather than converted:
+with `n: i32`, `n as f64` is an error that points you at `n.as_f64()`.
+The method converts; the keyword constrains.
+
 One thing to know up front: everything in Vilan is a **value**. Assigning
 a value to a new binding gives you a copy, not a second name for the same
 thing. If that sounds strange coming from JavaScript, start with

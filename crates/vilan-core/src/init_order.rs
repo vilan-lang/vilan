@@ -1033,9 +1033,11 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
             // `expr?` yields the receiver's unwrapped payload.
             Expr::TryAssert(receiver) => self.value_bodies(*receiver, bodies, seen),
             // A view of a value, and an awaited promise of one, are that value.
-            Expr::Reference(inner, _) | Expr::Dereference(inner) | Expr::Await(inner) => {
-                self.value_bodies(*inner, bodies, seen)
-            }
+            // An ascription is its value (B571).
+            Expr::Reference(inner, _)
+            | Expr::Dereference(inner)
+            | Expr::Await(inner)
+            | Expr::Ascribe(inner) => self.value_bodies(*inner, bodies, seen),
             // `return e` in expression position diverges, but its operand is
             // still a value that flows outward.
             Expr::FunctionReturn(Some(value)) => self.value_bodies(*value, bodies, seen),

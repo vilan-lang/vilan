@@ -3419,6 +3419,9 @@ fn parse(source: &str) -> Option<NodeList<'_>> {
                 error.reason,
                 crate::parsing::ParseErrorReason::MarkerOrder { .. }
                     | crate::parsing::ParseErrorReason::AttributeOrder { .. }
+                    // B571 §5.1: a spaced generic list after `as` is read as
+                    // the tight one, and the reprint is the fix.
+                    | crate::parsing::ParseErrorReason::SpacedAscribedGenerics { .. }
             )
         })
     })
@@ -8363,6 +8366,18 @@ impl<'src> Printer<'src> {
             Node::TryAssert(subject) => {
                 self.print_operand(subject, 100);
                 self.out.push('!');
+            }
+            // `value as T` (B571): a chain-tier postfix. A block-like value
+            // (`match .. { .. } as T`, Q4) prints bare — the ascription after
+            // its brace is the form's own continuation, on the brace's line.
+            Node::Ascribe(value, type_) => {
+                if crate::parsing::is_block_like(&value.0) {
+                    self.print_expr(value);
+                } else {
+                    self.print_operand(value, 100);
+                }
+                self.out.push_str(" as ");
+                self.print_type(&type_.0);
             }
             Node::Lift(subject, continuation) => {
                 // `a?.b.c`: the subject, `?`, then the continuation — whose

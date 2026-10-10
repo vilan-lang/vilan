@@ -421,7 +421,7 @@ row	flagship	key
 389	-	this {construct} is `{label}`, and a condition must be `bool`: `bool`'s set is `bool` itself and no trait names it, so no bound on `{label}` can prove membership
 390	-	a name after `::` on the same line: a `::` path does not cross a line break, because `a::` at the end of a line joins whatever the next line starts with — join the line, or import the path under a shorter name (`import a::b::c as d;`) and write `d`
 391	-	`{name}` {reason}carries a hidden type parameter — and nothing here can supply one
-392	-	Expected {struct}, but got {rendered} instead. '{struct}' has a trait-typed field, so the annotation on
+392	-	Expected {struct}, but got {rendered} instead. '{struct}' has a trait-typed field, so {subject}
 393	-	this call could not be resolved: the type of {operand} is never determined
 394	-	a `context` clause on a trait or `impl` method is not supported yet: a dispatched call selects its callee at the call site, so the requirement cannot be checked against one declaration. Declare it on a free `fun` and call that from the method
 395	-	this `context` clause names a value that is not a context
@@ -615,7 +615,7 @@ row	flagship	key
 591	-	the trait default `{name}` is not move-clean when a resource inherits it: {summary}, and a trait default cannot destroy a resource `Self` (its teardown is planned once, before any implementing type is known); move it out on every path, or declare `{name}` in this impl
 592	-	`{rendered}` is a resource, so it can become a `{object_label}` only when `{trait_name}` is declared `[resource]`: mark the trait `[resource]` — its trait objects may hold a resource, and are moved, never copied
 593	-	`clear` must be called on a named context with a closure literal body
-594	-	'{type_label}' does not match the annotation on '{name}', '{annotation_label}': each trait written inside the annotation must be met by ONE type that implements it (values of different types need a trait object there, `dyn …`)
+594	-	'{type_label}' does not match {subject}, '{annotation_label}': each trait written inside the annotation must be met by ONE type that implements it (values of different types need a trait object there, `dyn …`)
 595	-	`{name}` carries a payload, so it is not a value on its own: call it (`{name}({list})`), or pass it where a closure is expected, where it stands for `|{list}| {name}({list})`
 596	-	'{trait_name}' is a trait, not a type: a TRAIT method cannot return a bare trait yet — each impl would pick its own type, an associated type vilan does not have. Return `dyn {application}` from `{member}` (the object), or a concrete type; a free `fun` or an inherent method may return `{application}` itself
 597	-	'{produced_label}' does not implement trait '{trait_label}', which `{name}` returns: a trait written as a return type is the ONE type the body produces, and it must implement the trait (callers see that type — the return is not hidden)
@@ -714,3 +714,6 @@ row	flagship	key
 690	-	`{symbol}` computes on two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: there are no implicit conversions; suffix the literal or convert with `as_*`
 691	-	cannot infer the element type of this empty list from anything the program does with `{name}`. Write the type on the binding (`{name}: {written}`)
 692	-	cannot infer the type of `{name}`: it is `{written}`, and inference cannot settle the `…` from anything the program does with it. Write the type on the binding (`{name}: {written}`)
+NEW	-	an ascription is a value, not a place — `as` names the type a value has, and there is nothing to write through{steer}
+NEW	-	'{type_label}' does not implement trait '{trait_label}', required by the ascription: a trait named by `as` is a CONSTRAINT on the value's own type, which stays '{type_label}'
+NEW	-	`as {written}` then `<`: a generic list after `as` touches its type, `{tight}` — spaced, the `<` after an ascribed type is a comparison

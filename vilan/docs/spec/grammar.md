@@ -646,7 +646,9 @@ postfix = "." member                     (* span-adjacent: `.` then the member *
         | "(" [ entry { "," entry } [ "," ] ] ")"
                                           (* direct call on the chain result *)
         | "?." member                    (* lift link, §5.10 *)
-        | "?" ;                           (* expression lift, §5.10 *)
+        | "?"                            (* expression lift, §5.10 *)
+        | "as" ascribed-type ;           (* ascription, §5.8 *)
+ascribed-type = type ;   (* every generic list in it span-adjacent, below *)
 
 atom    = literal | IDENT | IDENT generic-args | struct-init
         | "(" expression ")" | tuple | list
@@ -716,6 +718,40 @@ result (§5.10). A bare `?` — a `?` with no `.` after it — is the
 SLOT rather than a continuation, so the slot receives the container
 (§5.10). It has been in the language since 2026-07-16 and had no
 production here until now.
+
+`EXP as T` is a **type ascription** (§5.8): a postfix of this tier, so
+`a + b as f64` is `a + (b as f64)`, `-x as T` is `-(x as T)`, `await p
+as T` ascribes the promise, and the chain goes on after the type —
+`a() as A .b() as B` is `((a() as A).b()) as B`. A type never holds a
+`.`, so a `.` after it is the next link; a `[` is an index, a `(` a direct
+call, and `?`/`!` the lift and the try-assert of the ascribed value. An
+ascription is not absorbed into a `?.` link's continuation: what stands
+left of `as` is the whole chain so far. `as` is a contextual word (§2.2):
+it is read here only after a complete operand and only when a type can
+begin after it, so `let as = 5;`, `as(2)` and `import a::{b as c}` keep
+their meanings.
+
+The type after `as` ends where the type grammar (§3.9) ends it, with ONE
+rule of its own, the **whitespace rule**: inside an ascribed type a `<`
+opens a generic list only when it is span-adjacent to the name before it.
+So `n as usize < limit` is a comparison, `xs as List<usize>` an ascription
+to a generic type, and `x as List<i32> > y` a comparison after a complete
+list; `as (T)` is the escape, `n as (usize) < limit`. A spaced list no
+comparison could be — inside another generic list, or one whose `>` is
+followed by `;`, `,`, a closer or `.` (`xs as List <i32>;`) — is refused
+with the tight spelling, read as written tight, and `vilan fmt` writes it
+so. The rule binds in ascribed types only; elsewhere a spaced generic list
+parses as before (and the formatter tightens it). A closure type after
+`as` is read greedily, as everywhere — `f as |i32| i32` — and the
+formatter parenthesizes it (§10 of the formatter rules).
+
+A `match`, `if`, `for` or `{` form is complete at its closing brace (the
+block-like rule, §3.8), with one continuation it admits: `as`. `match k {
+.. } as dyn Flow<i32>` ascribes the whole form, in a value position and
+at a statement's head alike — where the `as` must stand on the brace's
+own line, because on a later line it is a name beginning the next
+statement. After the type the form is an ordinary operand: the chain and
+the operators go on.
 
 A leading `..` marks a **tuple-value spread** (§5.9). It is recognized
 only where an *entry* begins — a tuple construction's entry, or a call
@@ -821,7 +857,7 @@ From tightest to loosest; every binary level is left-associative:
 
 | Level | Operators | Notes |
 |---|---|---|
-| 1 | `::` paths, calls, `.` `[]` `!` `?.` `?` | §3.6 |
+| 1 | `::` paths, calls, `.` `[]` `!` `?.` `?`, `as T` | §3.6; `as` ascribes (§5.8) |
 | 2 | prefix `!` `-` `await` `async` `&` `&mut` `*` | unary; `async` also takes a block |
 | 3 | `*` `/` `%` | |
 | 4 | `+` `-` | |

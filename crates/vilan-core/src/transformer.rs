@@ -4086,6 +4086,12 @@ impl<'src> Transformer<'src> {
     /// that would otherwise alias its source. `__clone` (not `structuredClone`)
     /// so a value holding closures can be copied.
     fn maybe_clone(&mut self, value_id: Id, node: js::Node<'src>) -> js::Node<'src> {
+        // B571: an ascription's copy is decided at its VALUE (the analyzer's
+        // `peel_ascriptions`), where its coercion is keyed too.
+        let mut value_id = value_id;
+        while let Some(Expr::Ascribe(inner)) = self.program.entity_map.get(&value_id) {
+            value_id = *inner;
+        }
         // M90: a read-only `let` of a stable place shares it — nothing can
         // write either side while the binding lives, and it never leaves the
         // frame (`Analyzer::compute_shared_place_lets`).
@@ -4396,6 +4402,7 @@ impl<'src> Transformer<'src> {
             Expr::Unary(_, operand)
             | Expr::Reference(operand, _)
             | Expr::Dereference(operand)
+            | Expr::Ascribe(operand)
             | Expr::Is(operand, _)
             | Expr::Destructure(operand, _) => self.expr_has_side_effects(*operand),
             Expr::Field(subject, _, _)
@@ -5554,6 +5561,10 @@ impl<'src> Transformer<'src> {
             // A macro-name marker: never a value (the analyzer rejects value
             // uses); reached only as an inert statement — emit nothing.
             Expr::Macro => js::Node::Void,
+            // An ascription (B571) evaluates exactly its value: the type it
+            // names was checked, and any coercion it asked for is recorded at
+            // the value's own id, which `walk_entity` applies.
+            Expr::Ascribe(inner) => return self.walk_entity(*inner, block),
             Expr::TupleComprehension(bindings, body_id) => {
                 // A flat tuple is a JS array, so the comprehension lowers to a
                 // runtime `source.map((x) => body)` — arity-independent, no

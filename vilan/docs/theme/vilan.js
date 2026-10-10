@@ -94,12 +94,13 @@
 			begin: "(?<=\\()sync\\b",
 		};
 		// `as` is CONTEXTUAL the same way (E142/E145): it names an import
-		// alias — `import a::b as c;` — and a value may still be NAMED `as`.
-		// Guarded on BOTH sides, since between two identifiers is the only
-		// place the alias sits.
+		// alias — `import a::b as c;` — and the type ascription after a
+		// complete operand (`[] as List<str>`, `f() as A`, B571), and a value
+		// may still be NAMED `as`. Guarded on BOTH sides: something an operand
+		// ends with before it, something a type begins with after it.
 		const IMPORT_ALIAS = {
 			className: "keyword",
-			begin: "(?<=[A-Za-z0-9_]\\s{1,8})as\\b(?=\\s{1,8}[A-Za-z_])",
+			begin: "(?<=[A-Za-z0-9_\\)\\]\\}\"']\\s{1,8})as\\b(?=\\s{1,8}[A-Za-z_(&|])",
 		};
 		// `only` is CONTEXTUAL too (B318's trailing import modifier, K26):
 		// `import a::{ b } only;`. It sits between a path's end — a name or a

@@ -836,7 +836,7 @@ impl Liveness<'_, '_> {
             }
 
             // --- pass-through ---
-            Expr::Await(inner_id) | Expr::TryAssert(inner_id) => {
+            Expr::Await(inner_id) | Expr::TryAssert(inner_id) | Expr::Ascribe(inner_id) => {
                 self.walk(inner_id);
             }
             Expr::Unary(_, operand_id) => {

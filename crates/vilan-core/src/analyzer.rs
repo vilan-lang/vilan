@@ -712,6 +712,15 @@ pub enum Expr<'src> {
     // `await <inner>` — resolve the inner promise; forces the enclosing function
     // async at code generation.
     Await(Id),
+    /// `inner as T` — a type ascription (B571, `proposal/type-ascription.md`):
+    /// the value, typed as an annotated `let`'s initializer is, with no binding
+    /// made. Its own entry in `resolved_types` holds the ascribed type (the
+    /// annotation, or the value's concrete type under a bare trait, B161), set
+    /// by `Constraint::Ascription`. Transparent to every emitter and every
+    /// flow analysis: it evaluates exactly its inner expression, whose
+    /// coercion (an erasure, a closure re-typing) is recorded at the inner's
+    /// id as at a binding's initializer. A value, never a place.
+    Ascribe(Id),
     Binary(BinaryOp, Id, Id),
     Block((Vec<Id>, Id)),
     Bool(bool),
@@ -2991,6 +3000,44 @@ struct SupertraitSelf {
 /// concrete types fail at the unification, with the ordinary mismatch, even
 /// when both implement the trait — there is no widening here for them to meet
 /// in.
+/// One `EXP as T` site (B571): the value, the written type's slot, and the
+/// type's span — read by `Constraint::Ascription` and by the binding-style
+/// annotation checks ([`Analyzer::annotated_value`]).
+#[derive(Debug, Clone, Copy)]
+struct AscriptionSite {
+    value_id: Id,
+    type_id: TypeId,
+    type_span: Span,
+}
+
+/// Who a binding-style annotation belongs to (B161, B184, B461): a `let`'s
+/// binding by name, or an ascription (B571), which has none.
+#[derive(Debug, Clone, Copy)]
+enum AnnotationOwner<'src> {
+    Binding(&'src str),
+    Ascription,
+}
+
+impl AnnotationOwner<'_> {
+    /// How a refusal names the annotation: "the annotation on 'x'", "the
+    /// ascription".
+    fn phrase(self) -> String {
+        match self {
+            AnnotationOwner::Binding(name) => format!("the annotation on '{name}'"),
+            AnnotationOwner::Ascription => "the ascription".to_string(),
+        }
+    }
+}
+
+/// What [`Analyzer::annotated_value`] answers: the annotation's owner, the
+/// type it grounded to, and its initializer.
+struct AnnotatedValue<'src> {
+    owner: AnnotationOwner<'src>,
+    type_id: TypeId,
+    initial: Option<Id>,
+    span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct BindingTraitConstraint {
     /// The annotated binding.
@@ -3433,6 +3480,14 @@ enum Constraint<'src> {
     /// An unannotated function's return positions — its reachable tail and
     /// every `ret` — must agree (proposal/ret-checking.md rule 3).
     FunctionReturns { function_id: Id },
+    /// `value as T` (B571): types the value as an annotated `let`'s
+    /// initializer is typed against its annotation, and lands the ascribed
+    /// type in `resolved_types` under the ascription's own id.
+    Ascription {
+        id: Id,
+        value_id: Id,
+        type_id: TypeId,
+    },
 }
 
 impl Constraint<'_> {
@@ -3471,6 +3526,7 @@ impl Constraint<'_> {
             Constraint::LiftRegion { id, .. } => *id,
             Constraint::ClosureReturns { closure_id } => *closure_id,
             Constraint::FunctionReturns { function_id } => *function_id,
+            Constraint::Ascription { id, .. } => *id,
         }
     }
 
@@ -3502,6 +3558,8 @@ impl Constraint<'_> {
             Constraint::LiftRegion { .. } => 10,
             Constraint::ClosureReturns { .. } => 10,
             Constraint::FunctionReturns { .. } => 10,
+            // With `Variable` (10): it IS an annotated binding's typing.
+            Constraint::Ascription { .. } => 10,
             Constraint::CallSubject(_) => 11,
             // Last. Unlike `Match` — which must run early because it TYPES the
             // match every dependent then reads — the arm check produces
@@ -5621,6 +5679,8 @@ pub struct Analyzer<'src> {
     // grounds, checked once that type has settled — rather than as a type the
     // binding is forced to.
     binding_hidden_nominal_constraints: Vec<(Id, Id, Vec<TypeId>, Span)>,
+    // B571: every `EXP as T` site, by the ascription's id.
+    ascriptions: HashMap<Id, AscriptionSite>,
     // B251: every WRITTEN application of a struct that declared bounded
     // parameters — `(struct id, written arguments, span, source, type id,
     // generic arguments exempt)` — asked after `build()` by
@@ -7737,6 +7797,7 @@ impl<'src> Analyzer<'src> {
             field_annotation_type_ids: HashMap::default(),
             impl_subject_annotation_type_ids: HashMap::default(),
             binding_hidden_nominal_constraints: Vec::new(),
+            ascriptions: HashMap::default(),
             hidden_generic_parameters: HashMap::default(),
             attributed_declarations: HashSet::default(),
             transparent_declarations: HashMap::default(),
@@ -9480,11 +9541,11 @@ impl<'src> Analyzer<'src> {
         for (variable_id, annotation, span) in
             std::mem::take(&mut self.binding_existential_constraints)
         {
-            let Some(variable) = self.variables.get(&variable_id) else {
+            let Some(annotated) = self.annotated_value(variable_id) else {
                 continue;
             };
-            let name = variable.name;
-            let value_type = variable.type_id.get_type(self);
+            let subject = annotated.owner.phrase();
+            let value_type = annotated.type_id.get_type(self);
             if matches!(
                 value_type,
                 Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
@@ -9503,7 +9564,7 @@ impl<'src> Analyzer<'src> {
                     note: None,
                     span,
                     msg: format!(
-                        "'{type_label}' does not match the annotation on '{name}', \
+                        "'{type_label}' does not match {subject}, \
                          '{annotation_label}': each trait written inside the annotation must be \
                          met by ONE type that implements it (values of different types need a \
                          trait object there, `dyn …`)"
@@ -9516,11 +9577,11 @@ impl<'src> Analyzer<'src> {
 
     fn check_binding_trait_constraints(&mut self) {
         for constraint in std::mem::take(&mut self.binding_trait_constraints) {
-            let Some(variable) = self.variables.get(&constraint.variable_id) else {
+            let Some(annotated) = self.annotated_value(constraint.variable_id) else {
                 continue;
             };
-            let name = variable.name;
-            let value_type = variable.type_id.get_type(self);
+            let owner = annotated.owner;
+            let value_type = annotated.type_id.get_type(self);
             // Indeterminate values are other diagnostics' business: a binding
             // that never grounded already failed elsewhere.
             if matches!(
@@ -9569,11 +9630,18 @@ impl<'src> Analyzer<'src> {
                     trace: Vec::new(),
                     note,
                     span: constraint.span,
-                    msg: format!(
-                        "'{type_label}' does not implement trait '{trait_label}', required by \
-                         the annotation on '{name}': a trait annotation on a binding is a \
-                         CONSTRAINT on the value's own type, which stays '{type_label}'"
-                    ),
+                    msg: match owner {
+                        AnnotationOwner::Binding(name) => format!(
+                            "'{type_label}' does not implement trait '{trait_label}', required by \
+                             the annotation on '{name}': a trait annotation on a binding is a \
+                             CONSTRAINT on the value's own type, which stays '{type_label}'"
+                        ),
+                        AnnotationOwner::Ascription => format!(
+                            "'{type_label}' does not implement trait '{trait_label}', required by \
+                             the ascription: a trait named by `as` is a CONSTRAINT on the value's \
+                             own type, which stays '{type_label}'"
+                        ),
+                    },
                 },
                 constraint.variable_id,
             );
@@ -9593,11 +9661,11 @@ impl<'src> Analyzer<'src> {
         for (variable_id, struct_id, written_arguments, span) in
             std::mem::take(&mut self.binding_hidden_nominal_constraints)
         {
-            let Some(variable) = self.variables.get(&variable_id) else {
+            let Some(annotated) = self.annotated_value(variable_id) else {
                 continue;
             };
-            let name = variable.name;
-            let value_type = variable.type_id.get_type(self);
+            let subject = annotated.owner.phrase();
+            let value_type = annotated.type_id.get_type(self);
             // Indeterminate values are other diagnostics' business: a binding
             // that never grounded already failed elsewhere.
             if matches!(
@@ -9652,8 +9720,8 @@ impl<'src> Analyzer<'src> {
                     span,
                     msg: format!(
                         "Expected {expected}, but got {type_label} instead. \
-                         '{struct_name}' has a trait-typed field, so the annotation on \
-                         '{name}' is a CONSTRAINT on the initializer's own type — it names \
+                         '{struct_name}' has a trait-typed field, so {subject} \
+                         is a CONSTRAINT on the initializer's own type — it names \
                          the struct and every argument the author may write, and the hidden \
                          argument comes from the value"
                     ),
@@ -14982,6 +15050,7 @@ impl<'src> Analyzer<'src> {
             Expr::Assignment(target_id, value_id) => out.extend([*target_id, *value_id]),
             Expr::Await(inner)
             | Expr::TryAssert(inner)
+            | Expr::Ascribe(inner)
             | Expr::Unary(_, inner)
             | Expr::Reference(inner, _)
             | Expr::Dereference(inner)
@@ -15816,6 +15885,9 @@ impl<'src> Analyzer<'src> {
                 self.plan_expr(iterable, false, resources, owned, plan);
                 self.plan_loop(None, &statements, tail, resources, owned, plan);
             }
+            // An ascription is its value (B571): the role flows to it, and so
+            // does any temporary it constructs.
+            Expr::Ascribe(inner) => self.plan_expr(inner, consuming, resources, owned, plan),
             // Pass-through: the value's role flows to the inner expression.
             Expr::Await(inner) | Expr::TryAssert(inner) => {
                 self.plan_expr(inner, consuming, resources, owned, plan);
@@ -16890,7 +16962,7 @@ impl<'src> Analyzer<'src> {
             }
 
             // --- transparent / pass-through ---
-            Expr::Await(inner) | Expr::TryAssert(inner) => {
+            Expr::Await(inner) | Expr::TryAssert(inner) | Expr::Ascribe(inner) => {
                 self.scan_move(
                     inner, consuming, terminal, scan, flow, loop_depth, violations,
                 );
@@ -18101,7 +18173,8 @@ impl<'src> Analyzer<'src> {
             Expr::Reference(operand, _)
             | Expr::Dereference(operand)
             | Expr::Unary(_, operand)
-            | Expr::TryAssert(operand) => recurse!(operand),
+            | Expr::TryAssert(operand)
+            | Expr::Ascribe(operand) => recurse!(operand),
             // The one arm that is here for the EFFECTS sink rather than for a
             // capture: lazy.md §1's sync-only restriction needs the `await` a
             // thunked argument writes, and this walk already reaches every one.
@@ -20155,7 +20228,8 @@ impl<'src> Analyzer<'src> {
             | Expr::Dereference(operand)
             | Expr::Unary(_, operand)
             | Expr::Await(operand)
-            | Expr::TryAssert(operand) => recurse!(operand),
+            | Expr::TryAssert(operand)
+            | Expr::Ascribe(operand) => recurse!(operand),
             Expr::Binary(_, lhs, rhs) => {
                 recurse!(lhs);
                 recurse!(rhs);
@@ -25977,14 +26051,19 @@ impl<'src> Analyzer<'src> {
     /// Whether an expression reads existing aggregate storage (a binding or a
     /// field) rather than producing a fresh value (a literal, constructor, or
     /// call). Only a place can alias, so only a place needs a copy.
+    ///
+    /// An ascription reads its value transparently (B571 §2.2): `xs as
+    /// List<i32>` names `xs`'s storage exactly as `xs` does, so it is a place
+    /// for every copy and move question here — `let ys = xs as List<i32>`
+    /// copies as `let ys = xs` does. (Writing through one is refused at the
+    /// walk, §7.1.)
     fn is_place_expr(&self, expr_id: Id) -> bool {
-        matches!(
-            self.expr_id_to_expr_map.get(&expr_id),
-            Some(Expr::Local(_))
-                | Some(Expr::Field(_, _, _))
-                | Some(Expr::TupleIndex(_, _, _))
-                | Some(Expr::Index(_, _))
-        )
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Local(_) | Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _))
+            | Some(Expr::Index(_, _)) => true,
+            Some(Expr::Ascribe(inner)) => self.is_place_expr(*inner),
+            _ => false,
+        }
     }
 
     /// B256: whether `expr_id` is a `Shared.read()` — a call that hands back the
@@ -28063,7 +28142,9 @@ impl<'src> Analyzer<'src> {
                 self.place_root(*subject_id)
             }
             Expr::Index(subject_id, _) => self.place_root(*subject_id),
-            Expr::Dereference(operand_id) => self.place_root(*operand_id),
+            Expr::Dereference(operand_id) | Expr::Ascribe(operand_id) => {
+                self.place_root(*operand_id)
+            }
             _ => None,
         }
     }
@@ -28297,7 +28378,9 @@ impl<'src> Analyzer<'src> {
                 path.push(PlaceStep::Element);
                 Some((root, path))
             }
-            Expr::Dereference(operand_id) => self.place_path(*operand_id),
+            Expr::Dereference(operand_id) | Expr::Ascribe(operand_id) => {
+                self.place_path(*operand_id)
+            }
             _ => None,
         }
     }
@@ -28791,8 +28874,22 @@ impl<'src> Analyzer<'src> {
                 }
             }
             Some(Expr::Block((_, tail))) => self.collect_tail_leaves(*tail, leaves),
+            // An ascription hands back its value (B571).
+            Some(Expr::Ascribe(inner)) => self.collect_tail_leaves(*inner, leaves),
             _ => leaves.push(expr_id),
         }
+    }
+
+    /// The value under any ascriptions (B571): `xs as List<i32>` is `xs` for
+    /// every question about what storage a position receives. Rule 1's copy
+    /// is decided — and keyed — at the value, which is where an ascription's
+    /// coercion lands too, so both emitters copy first and erase after, as
+    /// at an annotated binding.
+    fn peel_ascriptions(&self, mut expr_id: Id) -> Id {
+        while let Some(Expr::Ascribe(inner)) = self.expr_id_to_expr_map.get(&expr_id) {
+            expr_id = *inner;
+        }
+        expr_id
     }
 
     fn collect_tail_leaves_if(&self, branch: &ExprIfBranch, leaves: &mut Vec<Id>) {
@@ -30855,7 +30952,30 @@ impl<'src> Analyzer<'src> {
             // was pinned clean; the skip keys on the assignment itself.
             .filter(|target_id| !self.reusable_entity(*target_id))
             .collect();
+        // B571 §7.1: a write THROUGH an ascription — an assignment whose place
+        // stands on one, or a `&mut` view of one — is refused before the
+        // mutability rules ask about its root.
+        let mut written_places = assignment_targets.clone();
+        written_places.extend(
+            self.expr_id_to_expr_map
+                .iter()
+                .filter(|(id, _)| !self.reusable_entity(**id))
+                .filter_map(|(_, expr)| match expr {
+                    Expr::Reference(operand, true) => Some(*operand),
+                    _ => None,
+                }),
+        );
+        written_places.sort_by_key(|id| id.0);
+        let mut refused_writes = HashSet::default();
+        for place_id in written_places {
+            if self.refuse_write_through_ascription(place_id) {
+                refused_writes.insert(place_id);
+            }
+        }
         for target_id in assignment_targets {
+            if refused_writes.contains(&target_id) {
+                continue;
+            }
             if let Some((name, fix)) = self.readonly_root(target_id) {
                 // B528/B509: a write through a match capture says what the
                 // capture IS — a copy, or a readonly view — and how to write
@@ -30974,6 +31094,10 @@ impl<'src> Analyzer<'src> {
             Expr::Unary(..) => "an operator expression",
             Expr::Binary(..) => "an arithmetic expression",
             Expr::Await(_) => "an `await`",
+            Expr::Ascribe(_) => {
+                "an ascription, which is a value and never a place (write the place itself: \
+                 `p.x = 1`, not `(p as Point).x = 1`)"
+            }
             Expr::Async(_) => "an `async` block",
             Expr::Bool(_)
             | Expr::Number(..)
@@ -31512,6 +31636,68 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The ascription a place stands on (B571 §7.1): the place itself, or the
+    /// subject a field, slot or element read is taken from, recursively.
+    fn ascription_on_place_spine(&self, place_id: Id) -> Option<Id> {
+        match self.expr_id_to_expr_map.get(&place_id)? {
+            Expr::Ascribe(_) => Some(place_id),
+            Expr::Field(subject, _, _)
+            | Expr::TupleIndex(subject, _, _)
+            | Expr::Index(subject, _) => self.ascription_on_place_spine(*subject),
+            _ => None,
+        }
+    }
+
+    /// The source text of `place_id` with the ascription it stands on replaced
+    /// by the ascription's value — and the parentheses that only held the
+    /// ascription dropped: `(p as Point).x` is `p.x`.
+    fn place_without_ascription(&self, place_id: Id, ascription_id: Id) -> Option<String> {
+        let text = self.source_text(self.source_of_id(place_id)?)?;
+        let place = **self.span_map.get(&place_id)?;
+        let mut ascription = **self.span_map.get(&ascription_id)?;
+        let value = self.written_text_of(self.ascriptions.get(&ascription_id)?.value_id)?;
+        if text[..ascription.start].ends_with('(') && text[ascription.end..].starts_with(')') {
+            ascription = Span {
+                start: ascription.start - 1,
+                end: ascription.end + 1,
+            };
+        }
+        let start = place.start.min(ascription.start);
+        let end = place.end.max(ascription.end);
+        Some(format!(
+            "{}{value}{}",
+            text.get(start..ascription.start)?,
+            text.get(ascription.end..end)?
+        ))
+    }
+
+    /// B571 §7.1 (RULED: a value, never a place): a write whose place stands
+    /// on an ascription is refused, with the place spelled without it. Answers
+    /// whether it refused.
+    fn refuse_write_through_ascription(&mut self, place_id: Id) -> bool {
+        let Some(ascription_id) = self.ascription_on_place_spine(place_id) else {
+            return false;
+        };
+        let steer = self
+            .place_without_ascription(place_id, ascription_id)
+            .map(|place| format!(": write the place itself, `{place}`"))
+            .unwrap_or_default();
+        let span = **self.span_map.get(&ascription_id).unwrap_or(&&EMPTY_SPAN);
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "an ascription is a value, not a place — `as` names the type a value \
+                     has, and there is nothing to write through{steer}"
+                ),
+            },
+            place_id,
+        );
+        true
+    }
+
     /// Rule 3: an argument passed to a `&mut` parameter must be a mutable place.
     /// In particular the receiver of a `&mut self` method (argument 0) cannot be
     /// rooted in a readonly parameter — `self.cars.push(..)` inside a bare-`self`
@@ -31557,6 +31743,9 @@ impl<'src> Analyzer<'src> {
                     .parameters
                     .get(parameter_id)
                     .is_some_and(|parameter| parameter.convention == Convention::RefMut);
+                if writable && self.refuse_write_through_ascription(*argument_id) {
+                    continue;
+                }
                 if writable && let Some((name, fix)) = self.readonly_root(*argument_id) {
                     let advice = Self::immutability_advice(name, fix);
                     self.push_anchored(
@@ -32768,6 +32957,7 @@ impl<'src> Analyzer<'src> {
         // aliased its source, while `b = a[0]` (an `Index`, which does intern)
         // copied one line away.
         let mut consider = |analyzer: &Self, value_id: Id, declared_type: Option<TypeId>| {
+            let value_id = analyzer.peel_ascriptions(value_id);
             if let Some(type_id) =
                 analyzer.copy_candidate_type(value_id, declared_type, shared_captures)
             {
@@ -33107,6 +33297,7 @@ impl<'src> Analyzer<'src> {
         }
         match self.expr_id_to_expr_map.get(&value_id) {
             Some(Expr::Block((_, tail))) => self.value_tails(*tail, tails),
+            Some(Expr::Ascribe(inner)) => self.value_tails(*inner, tails),
             Some(Expr::If(branch)) => branch_tails(self, branch, tails),
             Some(Expr::Match(_, legs)) => {
                 for leg in legs {
@@ -33937,6 +34128,9 @@ impl<'src> Analyzer<'src> {
             let Some(value_id) = variable.initial else {
                 continue;
             };
+            // B571: the initializer's VALUE, under any ascription — the id
+            // rule 1's copy is keyed at.
+            let value_id = self.peel_ascriptions(value_id);
             if variable.mutable || self.view_binding_mutability(*variable_id).is_some() {
                 continue;
             }
@@ -35972,18 +36166,14 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             let annotation = annotation_type.clone().get_type_id(self);
-            let span = self
-                .variables
-                .get(&variable_id)
-                .map(|variable| variable.name_span)
+            let annotated = self.annotated_value(variable_id);
+            let span = annotated
+                .as_ref()
+                .map(|annotated| annotated.span)
                 .unwrap_or(EMPTY_SPAN);
             self.binding_existential_constraints
                 .push((variable_id, annotation, span));
-            if let Some(initial) = self
-                .variables
-                .get(&variable_id)
-                .and_then(|variable| variable.initial)
-            {
+            if let Some(initial) = annotated.and_then(|annotated| annotated.initial) {
                 self.existential_initializers.insert(initial, annotation);
             }
             self.write_type_slot(type_id, Type::Unknown);
@@ -39496,6 +39686,34 @@ impl<'src> Analyzer<'src> {
             Node::Await(inner) => {
                 let inner_id = self.walk_expr_node(inner, scope_id);
                 Some(Expr::Await(inner_id))
+            }
+            // `value as T` (B571): the annotated-binding path with no binding.
+            // The annotation is registered exactly as a `let`'s is — keyed by
+            // this site where a `let` keys its variable — so a bare trait
+            // (B161), a hidden-parameter struct (B184) and a nested trait
+            // (B461) read here as they read there, and the value's
+            // expectation is seeded at the walk (B125) so a generic call in it
+            // binds from the type before its own constraint resolves.
+            Node::Ascribe(value, type_node) => {
+                let value_id = self.walk_expr_node(value, scope_id);
+                let type_id = self.walk_type_node(type_node, scope_id);
+                self.binding_annotation_type_ids.insert(type_id, id);
+                self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
+                self.seed_tail_expectations(value_id, type_id);
+                self.ascriptions.insert(
+                    id,
+                    AscriptionSite {
+                        value_id,
+                        type_id,
+                        type_span: type_node.1,
+                    },
+                );
+                self.constraints.push(Constraint::Ascription {
+                    id,
+                    value_id,
+                    type_id,
+                });
+                Some(Expr::Ascribe(value_id))
             }
             Node::ClosureType(_, _) => {
                 self.diagnostics.push(Error {
@@ -44780,6 +44998,14 @@ impl<'src> Analyzer<'src> {
             // so dependents (a `let` grounding on it) defer and wake instead of
             // committing to a bogus type.
             Expr::TryAssert(_) => {
+                if let Some(waiting) = self.current_waiting_on.as_mut() {
+                    waiting.push(expr_id);
+                }
+                Type::Unresolved
+            }
+            // `value as T` — typed by `Constraint::Ascription` (landing in
+            // `resolved_types`, consulted above); unresolved until then.
+            Expr::Ascribe(_) => {
                 if let Some(waiting) = self.current_waiting_on.as_mut() {
                     waiting.push(expr_id);
                 }
@@ -51365,6 +51591,11 @@ impl<'src> Analyzer<'src> {
                 self.resolve_lift_region(*id, &steps.clone(), *body_id)
             }
             Constraint::ClosureReturns { closure_id } => self.resolve_closure_returns(*closure_id),
+            Constraint::Ascription {
+                id,
+                value_id,
+                type_id,
+            } => self.resolve_ascription(*id, *value_id, *type_id),
             Constraint::FunctionReturns { function_id } => {
                 self.resolve_function_returns(*function_id)
             }
@@ -55629,6 +55860,127 @@ impl<'src> Analyzer<'src> {
     /// first value (which must be ready), then reconcile the reassignments. A
     /// reassignment that isn't ready re-queues a fresh `Variable` task carrying
     /// the grounded type and just the still-pending values.
+    /// An initializer that does not fit its annotation — an annotated `let`'s,
+    /// or an ascription's (B571) — reported at the value.
+    fn report_initializer_mismatch(
+        &mut self,
+        value_id: Id,
+        annotation: &Type,
+        value_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        // E226: a `void` the annotation did not want, reaching the binding
+        // through a method chain (`count.map(|n| { n * 2; }).cell()`), is the
+        // regime-3 `;` in a closure the chain was handed — the expectation
+        // stops at the receiver, so the closure's own check never saw a
+        // target. Said at the closure's brace, as the direct binding says it.
+        if let Some((span, msg)) =
+            self.void_closure_steer(value_id, annotation, value_type, substitution_context)
+        {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            return;
+        }
+        let msg = self.type_mismatch_message(annotation, value_type, substitution_context);
+        let msg = self.with_fragment_steer(msg, value_id, annotation);
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: **self.span_map.get(&value_id).unwrap(),
+            msg,
+        });
+    }
+
+    /// `value as T` (B571, type-ascription.md §2): the value typed exactly as
+    /// an annotated `let`'s initializer is — [`Self::resolve_variable`]'s
+    /// first value, step for step — with no binding to ground. The ascribed
+    /// type is the annotation; under a bare trait (B161), whose slot reads
+    /// `Unknown`, it is the value's own concrete type, checked against the
+    /// trait afterwards like a binding's.
+    fn resolve_ascription(&mut self, id: Id, value_id: Id, type_id: TypeId) -> Resolution {
+        let annotation = type_id.get_type(self);
+        // The annotation reaches the value through `expected_types` before the
+        // readiness probe, whose undirected answer is cached (A124 R3).
+        self.seed_expectation(value_id, &annotation);
+        // B516: a closure type directs the probe, so a closure literal whose
+        // parameters only the annotation types can be ready at all.
+        let probe_direction = match &annotation {
+            closure @ Type::Closure(..) => closure.clone(),
+            _ => Type::Unknown,
+        };
+        if !self.expr_id_to_expr_map.contains_key(&value_id)
+            || matches!(
+                self.infer_type(value_id, &probe_direction, &HashMap::default()),
+                Type::Unresolved
+            )
+        {
+            return Resolution::Deferred;
+        }
+        let substitution_context = HashMap::default();
+        let bare = matches!(annotation, Type::Unknown);
+        let mut ascribed = annotation.clone();
+        // B539: a trait annotation's arguments name the value's concrete type
+        // when the value left a hole.
+        if bare && let Some(through_trait) = self.direction_through_trait_annotation(id, value_id) {
+            ascribed = through_trait;
+        }
+        let value_type = self.infer_type(value_id, &ascribed, &substitution_context);
+        if matches!(value_type, Type::Unresolved) {
+            return Resolution::Deferred;
+        }
+        match self.reconcile_type(&value_type, &ascribed, &substitution_context) {
+            Some((unified, _)) => {
+                if matches!(ascribed, Type::Unknown) {
+                    ascribed = unified;
+                }
+            }
+            None => self.report_initializer_mismatch(
+                value_id,
+                &ascribed,
+                &value_type,
+                &substitution_context,
+            ),
+        }
+        // A written type keeps its own slot, as an annotated binding's does
+        // (B516): tables keyed by the written type read the site through it.
+        let ascribed_id = if !bare && ascribed == annotation {
+            type_id
+        } else {
+            ascribed.get_type_id(self)
+        };
+        self.resolved_types.insert(id, ascribed_id);
+        Resolution::Resolved
+    }
+
+    /// The binding-style annotation `owner_id` keys (B161, B184, B461): a
+    /// `let`'s variable, or an ascription site (B571), with the type it
+    /// grounded to and its initializer.
+    fn annotated_value(&self, owner_id: Id) -> Option<AnnotatedValue<'src>> {
+        if let Some(variable) = self.variables.get(&owner_id) {
+            return Some(AnnotatedValue {
+                owner: AnnotationOwner::Binding(variable.name),
+                type_id: variable.type_id,
+                initial: variable.initial,
+                span: variable.name_span,
+            });
+        }
+        let site = self.ascriptions.get(&owner_id)?;
+        Some(AnnotatedValue {
+            owner: AnnotationOwner::Ascription,
+            type_id: self
+                .resolved_types
+                .get(&owner_id)
+                .copied()
+                .unwrap_or(site.type_id),
+            initial: Some(site.value_id),
+            span: site.type_span,
+        })
+    }
+
     fn resolve_variable(&mut self, constraint: &VariableConstraint) -> Resolution {
         let variable_id = constraint.variable_id;
         let initial_type_id = constraint.initial_type_id;
@@ -55781,40 +56133,12 @@ impl<'src> Analyzer<'src> {
                         }
                     }
                 }
-                None => {
-                    // E226: a `void` the annotation did not want, reaching the
-                    // binding through a method chain (`count.map(|n| { n * 2;
-                    // }).cell()`), is the regime-3 `;` in a closure the chain
-                    // was handed — the expectation stops at the receiver, so
-                    // the closure's own check never saw a target. Said at the
-                    // closure's brace, as the direct binding says it.
-                    if let Some((span, msg)) = self.void_closure_steer(
-                        first_value_id,
-                        &variable_type,
-                        &value_type,
-                        &substitution_context,
-                    ) {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span,
-                            msg,
-                        });
-                    } else {
-                        let msg = self.type_mismatch_message(
-                            &variable_type,
-                            &value_type,
-                            &substitution_context,
-                        );
-                        let msg = self.with_fragment_steer(msg, first_value_id, &variable_type);
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: **self.span_map.get(&first_value_id).unwrap(),
-                            msg,
-                        });
-                    }
-                }
+                None => self.report_initializer_mismatch(
+                    first_value_id,
+                    &variable_type,
+                    &value_type,
+                    &substitution_context,
+                ),
             }
         }
 
@@ -63844,9 +64168,8 @@ impl<'src> Analyzer<'src> {
                                     span,
                                 ));
                                 if let Some(initial) = self
-                                    .variables
-                                    .get(variable_id)
-                                    .and_then(|variable| variable.initial)
+                                    .annotated_value(*variable_id)
+                                    .and_then(|annotated| annotated.initial)
                                 {
                                     self.existential_initializers.insert(initial, annotation);
                                 }

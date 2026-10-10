@@ -1557,6 +1557,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Expr::Async(a)
             | Expr::Await(a)
+            | Expr::Ascribe(a)
             | Expr::Unary(_, a)
             | Expr::Reference(a, _)
             | Expr::Dereference(a)
@@ -5347,6 +5348,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Call(call_id) => self.call(id, call_id, depth, span)?,
             Expr::Async(spawned) => self.async_spawn(id, spawned, depth, span)?,
             Expr::Await(awaited) => self.await_of(awaited, depth)?,
+            // An ascription (B571) is its value: the type was checked, and a
+            // coercion it asked for is recorded at the value's own id.
+            Expr::Ascribe(inner) => {
+                let value = self.expression(inner, depth)?;
+                self.ascription(id, inner, value, span)?
+            }
             Expr::Closure(closure_id) => self.closure(closure_id, depth, span)?,
             Expr::Is(subject, pattern) => self.is_test(subject, &pattern, depth, span)?,
             // A destructuring `let` — `let (name, value) = pair;`. The pattern
@@ -5512,6 +5519,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn value_of_unerased(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        // B571: an ascription in a value position hands its VALUE there — the
+        // copy rule 1 owes and the erasure it asked for both belong to the
+        // value (the analyzer keys them there), and the ascription's own
+        // position erases after, in `value_of`.
+        if let Some(&Expr::Ascribe(inner)) = self.program.entity_map.get(&id) {
+            let value = self.value_of(inner, depth)?;
+            return self.ascription(id, inner, value, self.span_of(id));
+        }
         // B109: a `&place` and a `borrows` CALL are leaves that name storage
         // without being places, and in a VALUE position both are read THROUGH —
         // which is rule 1's copy. `element-clones.vl` states the claim in its
@@ -6702,6 +6717,39 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             _ => false,
         }
+    }
+
+    /// `value as T` (B571): the value itself. The ascribed type was checked
+    /// by the analyzer and any coercion is recorded at the value's own id, so
+    /// the one thing left to say natively is the type of a value that cannot
+    /// type itself — an empty list, a bare `None`, a cell around one, whose
+    /// type Rust would otherwise take from a reader that may not exist
+    /// (E0282). Those are written through a typed block; it binds a fresh
+    /// VALUE (never a place, so nothing is moved that the source did not
+    /// move).
+    fn ascription(
+        &mut self,
+        id: Id,
+        inner: Id,
+        value: String,
+        span: Span,
+    ) -> Result<String, Error> {
+        if !(self.cannot_type_itself(inner) || self.builds_a_host_variant(inner)) {
+            return Ok(value);
+        }
+        let Some(type_id) = self
+            .type_of(id)
+            .filter(|type_id| self.is_grounded(*type_id))
+        else {
+            return Ok(value);
+        };
+        let rendered = self.rust_type(type_id, span)?;
+        if mentions_a_closure(&rendered) {
+            return Ok(value);
+        }
+        Ok(format!(
+            "{{ let ascribed: {rendered} = {value}; ascribed }}"
+        ))
     }
 
     /// Whether `id` builds an `Option` or a `Result` variant directly — `None`,

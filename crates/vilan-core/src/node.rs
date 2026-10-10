@@ -646,6 +646,14 @@ pub enum Node<'src> {
     // `await <expr>` — suspends until the promise resolves, yielding `T`. Forces
     // its enclosing function to be async.
     Await(Box<Spanned<Self>>),
+    // `EXP as T` — a type ASCRIPTION (B571, `proposal/type-ascription.md`):
+    // the value and the written type. A constraint, never a cast: `EXP` is
+    // typed exactly as `let tmp: T = EXP`'s initializer is (the expected type
+    // flows in, every coercion an annotated binding performs is performed, a
+    // mismatch is refused), but no binding is made — no copy, no drop point,
+    // no name — and the result is a value, never a place. A postfix of the
+    // chain tier, so `a() as A .b()` continues after the type.
+    Ascribe(Box<Spanned<Self>>, Box<Spanned<Self>>),
     // A `type X` generic binder appearing inside a type — the impl subject
     // pattern (`impl Option<(type T, type U)>`), including a bare blanket
     // (`impl type T`). The optional bounds are `T: A + B`. The ANONYMOUS
@@ -1208,6 +1216,10 @@ impl<'src> Node<'src> {
                 }
             }
             Node::Export(_, inner, _) => visit(inner),
+            Node::Ascribe(value, type_) => {
+                visit(value);
+                visit(type_);
+            }
             Node::Async(inner)
             | Node::Await(inner)
             | Node::Dereference(inner)

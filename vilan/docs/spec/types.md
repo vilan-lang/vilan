@@ -1198,6 +1198,38 @@ already a value and never coerces.
 `any` unifies with every type in both directions (it is produced by
 `panic` and host boundaries; it absorbs rather than converts).
 
+### Ascription: `EXP as T`
+
+`EXP as T` names the type a value has, in place, where no `let` is at
+hand. It is typed exactly as the initializer of `let tmp: T = EXP` is:
+the type flows into `EXP` (an unsuffixed literal, an empty list, a bare
+`None` and a generic call's result take it), every coercion an annotated
+binding performs is performed (a value erased to `dyn T`, §5.12; a named
+function or a tuple variant re-typed as a closure, above; a closure
+literal's parameters adopting the type's modes; `Never` yielding), a bare
+trait is checked and the value keeps its concrete type (§5.5, as at a
+binding), and a mismatch is refused. The result has type `T` — or the
+concrete type, under a bare trait.
+
+```vilan,fragment
+SignalCell::new([1, 2, 3] as List<usize>)
+make() as List<str>
+match pick { true => Source::constant(1), false => cell.derive(f) } as dyn Flow<i32>
+```
+
+It is **not a binding**: nothing is copied that the unascribed value
+would not copy (`f(xs as List<i32>)` passes `xs` exactly as `f(xs)`
+does, and `let ys = xs as List<i32>` copies as `let ys = xs` does), it
+has no drop point and no name, and a resource moves exactly when the
+unascribed expression would. It is a **value, never a place**: an
+assignment through one, a `&mut` view of one and a mutating method called
+on one are refused (`(p as Point).x = 1` — write `p.x = 1`).
+
+**The method converts, the keyword constrains.** `n.as_f64()` makes an
+`f64`; `n as f64` says `n` already is one, and with `n: i32` it is
+refused with the conversion that exists. vilan has no cast: a `dyn`
+value never narrows back (§5.12), so `as` cannot downcast either.
+
 ## 5.9 Variadic tuples
 
 A generic parameter with a **tuple bound** ranges over tuples:

@@ -73,7 +73,8 @@ follows (§3.4); `context` the clause after a closure type or a return type
 infix conditional after a complete operand (§3.8); `void` the unit
 value and type; `self` and `Self` the receiver and its type (`self` is
 also the file's own module in `mod self;`, §3.1); `as` the alias on an
-import path leaf and `only` the trailing modifier on an import (§3.2).
+import path leaf (§3.2) and the type ascription after a complete operand
+(§3.6, §5.8), and `only` the trailing modifier on an import (§3.2).
 Beside them, two families of words are matched by text in one position
 and are ordinary identifiers everywhere else: the ATTRIBUTE names in
 `[...]` position (`derive`, `service`, `client_service`, `extern`,

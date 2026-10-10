@@ -17,6 +17,7 @@
 
 mod support;
 
+mod ascription;
 mod backed_enums;
 mod borrows;
 mod bounds;

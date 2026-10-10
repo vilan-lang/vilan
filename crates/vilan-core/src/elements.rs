@@ -319,6 +319,7 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Spread(inner) => Node::Spread(desugar_boxed(inner, source)),
         Node::TryAssert(inner) => Node::TryAssert(desugar_boxed(inner, source)),
         Node::Await(inner) => Node::Await(desugar_boxed(inner, source)),
+        Node::Ascribe(value, type_) => Node::Ascribe(desugar_boxed(value, source), type_),
         Node::Async(inner) => Node::Async(desugar_boxed(inner, source)),
         Node::FuncReturn(value) => Node::FuncReturn(desugar_opt(value, source)),
         Node::Export(scope, inner, labels) => {
