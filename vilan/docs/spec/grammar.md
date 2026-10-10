@@ -569,6 +569,16 @@ there, so a left side that denotes no location — `-x`, `!b`, `(x + 1)`,
 refused by the checker, once per assignment. `jump break` / `jump continue` control the
 innermost enclosing loop.
 
+An assignment is a statement: its value is `void`, and it stands only where
+a value is **discarded** — an expression statement (`x = 5;`), a block's
+trailing expression (`{ x = 5 }`), a `match` arm's body (`A => x = 5,`), a
+closure's expression body (`|v| total += v`), and a `then`/`else` branch of a
+conditional that itself stands in one of these (`c then x = 5;`). Anywhere
+its value would be USED — inside parentheses, as an argument, a tuple or list
+entry, a `let` initializer, the right of another `=`, an operand — it is
+refused, naming the statement to write before it (B569,
+`named-tuple-fields.md` §3.2).
+
 ## 3.5 Blocks and control expressions
 
 ```text

@@ -2329,6 +2329,51 @@ const DESTRUCTURE_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B569 S1: assignment keeps every position whose value is discarded — a
+/// statement, a block's tail, a `match` arm, a closure's expression body and
+/// a `then`/`else` branch of a statement — and those positions mean the same
+/// thing on both backends.
+#[test]
+fn b569_assignment_in_a_discarded_position_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b569_discarded_assignment.vl"),
+        B569_DISCARDED_ASSIGNMENT_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b569_discarded_assignment.vl"),
+        Verdict::Identical,
+        "an assignment where its value is discarded must run the same on both backends"
+    );
+}
+
+const B569_DISCARDED_ASSIGNMENT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut x = 0;\n",
+    "\tx = 1;\n",
+    "\tx += 1;\n",
+    "\tlet unit = { x = x * 10 };\n",
+    "\tprint(x);\n",
+    "\tmatch x {\n",
+    "\t\t20 => x = 3,\n",
+    "\t\t_ => x = 4,\n",
+    "\t}\n",
+    "\tprint(x);\n",
+    "\tmut total = 0;\n",
+    "\tfor v in [5, 6] {\n",
+    "\t\t[v].for_each(|w| total += w);\n",
+    "\t}\n",
+    "\tprint(total);\n",
+    "\tx > 2 then x = 7 else x = 8;\n",
+    "\tprint(x);\n",
+    "\tx == 0 else x = 9;\n",
+    "\tprint(x);\n",
+    "}\n",
+);
+
 /// F41: a field named `self`, `super` or `crate` builds natively.
 ///
 /// Vilan's `self` and `super` are contextual, so they are legal field names

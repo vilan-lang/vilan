@@ -188,6 +188,15 @@ pub enum ParseErrorReason {
     /// are written out of [`attribute_rank`]'s order, and nothing else out of
     /// order. `canonical` is the head respelled in it; the parse read it so.
     AttributeOrder { canonical: String },
+    /// An assignment where its value is used (B569 S1): `written` is the
+    /// assignment's own text when it fits on one line, `place` its target,
+    /// `labelled` whether it is an entry of a parenthesized list with a bare
+    /// name for a place — the spelling of a tuple's label.
+    ValuedAssignment {
+        written: Option<String>,
+        place: String,
+        labelled: bool,
+    },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -1750,6 +1759,11 @@ pub fn render(error: &ParseError) -> String {
         ParseErrorReason::ForeignSpelling(spelling) => spelling.message().to_string(),
         ParseErrorReason::MarkerOrder { canonical } => marker_order_rule(canonical),
         ParseErrorReason::AttributeOrder { canonical } => attribute_order_rule(canonical),
+        ParseErrorReason::ValuedAssignment {
+            written,
+            place,
+            labelled,
+        } => valued_assignment_rule(written.as_deref(), place, *labelled),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -2086,6 +2100,23 @@ struct Parser<'a, 'src> {
     /// restored around each statement's expression, so a statement nested in
     /// a block inside it has its own.
     statement_head: Option<usize>,
+    /// The token index at which an expression whose value is DISCARDED
+    /// begins (B569 S1, `named-tuple-fields.md` §3.2): a statement's, a
+    /// block's tail, a `match` arm's body, a closure's expression body, and a
+    /// `then`/`else` branch of a conditional that itself stands at one. An
+    /// assignment is legal only there — its value is `void`, so it is a
+    /// statement — and [`Parser::parse_assignment`] refuses one that begins
+    /// anywhere else, where its value would be used. A position, not a flag:
+    /// the only expression that can begin at the recorded token is the one
+    /// the discarding production asked for, so every nested operand reads
+    /// false without being told. Set and restored by
+    /// [`Parser::parse_discarded`].
+    assignment_head: Option<usize>,
+    /// The token index at which an entry of a parenthesized list begins —
+    /// a group's, a tuple's, an argument list's — where `name = value` is the
+    /// spelling of a tuple's LABEL (B569). Read only to word the refusal of an
+    /// assignment there ([`Parser::refuse_valued_assignment`]).
+    entry_head: Option<usize>,
     /// The diagnostics of the parser's in-place TOKEN REWRITES (B520's
     /// foreign spellings), held aside from `errors` for `nesting_refusal`'s
     /// reason: [`Parser::attempt`] truncates `errors` when a branch declines,
@@ -2416,6 +2447,27 @@ fn marker_keywords_are_legal(keywords: &[MarkerKeyword], word: &str) -> bool {
 /// attributes first, then the keywords in one order, then the declaration
 /// word. `canonical` is the head respelled in that order, attributes
 /// abbreviated. An ERROR ([`MarkerOrderDiagnostic::Keywords`]).
+/// [`ParseErrorReason::ValuedAssignment`]'s message: the rule, and the
+/// statement to write in its place. As a parenthesized entry the steer says
+/// what `name = value` reads as there instead.
+fn valued_assignment_rule(written: Option<&str>, place: &str, labelled: bool) -> String {
+    let statement = written.map_or_else(
+        || "the assignment as a statement".to_string(),
+        |written| format!("`{written};`"),
+    );
+    if labelled {
+        format!(
+            "inside parentheses `{place} = …` is a tuple's label, not an assignment: to \
+             assign, write {statement} before this, and use `{place}`"
+        )
+    } else {
+        format!(
+            "an assignment is a statement and has no value: write {statement} before \
+             this, and use `{place}`"
+        )
+    }
+}
+
 fn marker_order_rule(canonical: &str) -> String {
     format!(
         "a declaration's markers are written in one order — its attributes, then the keywords \
@@ -2782,6 +2834,8 @@ impl<'a, 'src> Parser<'a, 'src> {
             contextual_readings: Vec::new(),
             member_readings: Vec::new(),
             statement_head: None,
+            assignment_head: None,
+            entry_head: None,
             rewrite_refusals: Vec::new(),
             written_starts: Vec::new(),
             warnings: Vec::new(),
@@ -3532,6 +3586,15 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
         }
         None
+    }
+
+    /// Whether the `(` at `position` is an i-string interpolation hole's —
+    /// the lexer's desugaring gives a hole's parens the `{…}` span
+    /// ([`Parser::istring_brace_hint`] reads the same mark).
+    fn opener_is_interpolation_hole(&self, position: usize) -> bool {
+        self.tokens
+            .get(position)
+            .is_some_and(|(_, span)| self.source[span.start..].starts_with('{'))
     }
 
     /// The anchor for a missing statement terminator: the LAST CHARACTER of the
@@ -4813,8 +4876,23 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// may be the statement reading and the guard may stand (B459).
     fn parse_statement_expression(&mut self) -> Option<Spanned<Node<'src>>> {
         let outer = self.statement_head.replace(self.position);
-        let expression = self.parse_expression();
+        let expression = self.parse_discarded(Self::parse_expression);
         self.statement_head = outer;
+        expression
+    }
+
+    /// `parse` at a position whose value is DISCARDED, where an assignment
+    /// may stand ([`Parser::assignment_head`]). Restores the enclosing one,
+    /// so a discarding production nested inside (a block in an operand, a
+    /// closure in an argument) has its own and the operand around it has
+    /// none.
+    fn parse_discarded(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Option<Spanned<Node<'src>>>,
+    ) -> Option<Spanned<Node<'src>>> {
+        let outer = self.assignment_head.replace(self.position);
+        let expression = parse(self);
+        self.assignment_head = outer;
         expression
     }
 
@@ -4936,6 +5014,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_conditional(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let at_statement_head = self.statement_head == Some(start);
+        // A branch's value is discarded exactly when the form's is: `c then
+        // x = 5;` assigns, `let v = c then x = 5 else 0;` is refused.
+        let discarded = self.assignment_head == Some(start);
         let condition = self.parse_logical_or(no_struct)?;
         let guard = at_statement_head && self.peek_is(&Token::Else);
         if !self.peek_is_word("then") && !guard {
@@ -4947,14 +5028,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                 let word = parser.here_span();
                 parser.contextual_readings.push(parser.position);
                 parser.bump();
-                Some((word, parser.parse_then_branch(no_struct)?))
+                Some((word, parser.parse_then_branch(no_struct, discarded)?))
             } else {
                 None
             };
             let otherwise = if parser.peek_is(&Token::Else) {
                 let word = parser.here_span();
                 parser.bump();
-                Some((word, parser.parse_then_branch(no_struct)?))
+                Some((word, parser.parse_then_branch(no_struct, discarded)?))
             } else {
                 None
             };
@@ -5005,11 +5086,22 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// statement position — every statement vilan has is an expression
     /// production), in the enclosing condition mode. A `let` parses and is
     /// refused (Q8, [`A_BRANCH_BINDS_NOTHING`]).
-    fn parse_then_branch(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
-        let branch = if no_struct {
-            self.parse_secondary(true)?
+    fn parse_then_branch(
+        &mut self,
+        no_struct: bool,
+        discarded: bool,
+    ) -> Option<Spanned<Node<'src>>> {
+        let parse = |parser: &mut Self| {
+            if no_struct {
+                parser.parse_secondary(true)
+            } else {
+                parser.parse_expression()
+            }
+        };
+        let branch = if discarded {
+            self.parse_discarded(parse)?
         } else {
-            self.parse_expression()?
+            parse(self)?
         };
         if matches!(branch.0, Node::Let(..)) {
             self.errors.push(ParseError {
@@ -5968,7 +6060,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                 parser.expect_ctrl(')')?;
                 return Some((Node::Tuple(items), parser.span_from(start)));
             }
-            let first = parser.parse_expression()?;
+            // An i-string's interpolation hole is lexed as a group whose `(`
+            // carries the `{…}` span: its expression is a VALUE, never an
+            // entry that could carry a label.
+            let first = if parser.opener_is_interpolation_hole(start) {
+                parser.parse_expression()?
+            } else {
+                parser.parse_entry_expression()?
+            };
             if parser.peek_is_ctrl(',') {
                 // A tuple is `expr (',' expr)*` (≥2 elements) with NO trailing comma
                 // — unlike a list literal, the chumsky `tuple` atom has no
@@ -5998,8 +6097,17 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_element_or_spread(&mut self) -> Option<Spanned<Node<'src>>> {
         match self.parse_spread_element() {
             Some(spread) => Some(spread),
-            None => self.parse_expression(),
+            None => self.parse_entry_expression(),
         }
+    }
+
+    /// An entry of a parenthesized list, recorded as one
+    /// ([`Parser::entry_head`]).
+    fn parse_entry_expression(&mut self) -> Option<Spanned<Node<'src>>> {
+        let outer = self.entry_head.replace(self.position);
+        let expression = self.parse_expression();
+        self.entry_head = outer;
+        expression
     }
 
     /// `..e` — a tuple-value spread, recognized ONLY where an element begins
@@ -6868,7 +6976,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // other legitimate reading (it is the one thing in a block that needs
             // no `;`), and it must close the block to be one.
             if let Some(expression) = self.attempt(|parser| {
-                let expression = parser.parse_expression()?;
+                let expression = parser.parse_discarded(Self::parse_expression)?;
                 parser.peek_is_ctrl('}').then_some(expression)
             }) {
                 tail = Some(expression);
@@ -7100,7 +7208,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             None
         };
         self.expect_op("=>")?;
-        let body = self.parse_expression()?;
+        let body = self.parse_discarded(Self::parse_expression)?;
         Some((patterns, guard, body))
     }
 
@@ -7396,11 +7504,44 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return None;
             };
             let value = parser.parse_expression()?;
-            Some((
-                Node::Assign(Box::new(target), op, Box::new(value)),
-                parser.span_from(start),
-            ))
+            let span = parser.span_from(start);
+            if parser.assignment_head != Some(start) {
+                parser.refuse_valued_assignment(start, &target, op.is_none(), span);
+            }
+            Some((Node::Assign(Box::new(target), op, Box::new(value)), span))
         })
+    }
+
+    /// B569 S1 (`named-tuple-fields.md` §3.2): an assignment whose value would
+    /// be USED — an operand, an argument, a tuple or list entry, a `let`
+    /// initializer, the right of another `=`. Its value is `void`, so the
+    /// author meant the statement; and inside parentheses `name = value` is a
+    /// tuple's label, which is why the place left. The tree keeps the
+    /// assignment, so everything after it still analyzes.
+    fn refuse_valued_assignment(
+        &mut self,
+        start: usize,
+        target: &Spanned<Node<'src>>,
+        plain: bool,
+        span: Span,
+    ) {
+        let written = &self.source[span.start..span.end];
+        let place = &self.source[target.1.start..target.1.end];
+        let labelled =
+            plain && self.entry_head == Some(start) && matches!(target.0, Node::Accessor(_));
+        // One line of source quotes; a statement spread over lines quotes
+        // only its place.
+        let written = (!written.contains('\n')).then(|| written.to_string());
+        self.errors.push(ParseError {
+            span,
+            reason: ParseErrorReason::ValuedAssignment {
+                written,
+                place: place.to_string(),
+                labelled,
+            },
+            context: Vec::new(),
+            hint: None,
+        });
     }
 
     /// A closure literal: `|param, …| : return_type? body` or `|| : return_type?
@@ -7448,7 +7589,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 } else {
                     None
                 };
-            let return_value = parser.parse_expression()?;
+            let return_value = parser.parse_discarded(Self::parse_expression)?;
             Some((
                 Node::Closure(Closure {
                     parameters,
@@ -11133,6 +11274,126 @@ mod tests {
             Node::Assign(target, None, _) => assert!(matches!(target.0, Node::Dereference(_))),
             other => panic!("expected Assign over a Dereference target, got {other:?}"),
         }
+    }
+
+    /// The rendered diagnostics of `source` parsed as a whole program.
+    fn program_errors(source: &str) -> Vec<String> {
+        let (tree, errors) = parse(source);
+        assert!(tree.is_some(), "no tree came back for {source:?}");
+        errors.iter().map(render).collect()
+    }
+
+    /// B569 S1 (`named-tuple-fields.md` §3.2): every position whose value is
+    /// DISCARDED keeps assignment — a statement, a block's tail, a `match`
+    /// arm, a closure's expression body, the branches of a `then`/`else` form
+    /// standing at one, nested — and parses clean.
+    #[test]
+    fn b569_an_assignment_stands_where_its_value_is_discarded() {
+        for body in [
+            "x = 5;",
+            "x += 1;",
+            "*view = 5;",
+            "point.x = 5;",
+            "rows[0] = 5;",
+            "{ x = 5 }",
+            "let unit = { x = 5 };",
+            "match x { 0 => x = 1, _ => x = 2 }",
+            "let pick = match x { 0 => x = 1, _ => x = 2 };",
+            "let set = |v: i32| x = v;",
+            "list.each(|v| total += v);",
+            "c then x = 5;",
+            "c else x = 5;",
+            "c then x = 5 else x = 6;",
+            "c then x = 5 else d then x = 6 else x = 7;",
+            "if c { x = 5 } else { x = 6 }",
+            "for v in vs { total += v }",
+            "let nested = || { x = 5; |v: i32| x = v };",
+            "match x { 0 => c then x = 1 else x = 2, _ => {} }",
+        ] {
+            let source = format!("fun f() {{ {body} }}");
+            assert_eq!(
+                program_errors(&source),
+                Vec::<String>::new(),
+                "`{body}` discards the assignment's value"
+            );
+        }
+    }
+
+    /// B569 S1: every position whose value is USED refuses an assignment,
+    /// naming the statement to write instead; a parenthesized entry with a
+    /// bare name for a place says it is a label's spelling there.
+    #[test]
+    fn b569_an_assignment_is_refused_where_its_value_is_used() {
+        let general = "an assignment is a statement and has no value: write ";
+        let label = "inside parentheses `x = …` is a tuple's label, not an assignment: to assign, write `x = 5;` before this, and use `x`";
+        for (body, expected) in [
+            ("let y = (x = 5);", label.to_string()),
+            ("takes(x = 5);", label.to_string()),
+            ("let pair = (x = 5, 1);", label.to_string()),
+            ("let pair = (1, x = 5);", label.to_string()),
+            ("takes(1, x = 5);", label.to_string()),
+            (
+                "let y = (x += 5);",
+                format!("{general}`x += 5;` before this, and use `x`"),
+            ),
+            (
+                "let y = (p.x = 5);",
+                format!("{general}`p.x = 5;` before this, and use `p.x`"),
+            ),
+            (
+                "let y = x = 5;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "w = x = 5;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "let list = [x = 5];",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "ret x = 5;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "let v = c then x = 5 else 0;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "takes(c then x = 5 else 0);",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "let s = Point { x = y = 5 };",
+                format!("{general}`y = 5;` before this, and use `y`"),
+            ),
+            (
+                "let s = i\"{x = 5}\";",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+        ] {
+            let source = format!("fun f() {{ {body} }}");
+            assert_eq!(
+                program_errors(&source),
+                vec![expected],
+                "`{body}` uses the assignment's value"
+            );
+        }
+    }
+
+    /// B569 S1: an assignment that spans lines is not quoted whole — the
+    /// steer names its place.
+    #[test]
+    fn b569_a_multi_line_assignment_is_steered_by_its_place() {
+        assert_eq!(
+            program_errors("fun f() { let y = (x =\n 5 + 1); }"),
+            vec![
+                "inside parentheses `x = …` is a tuple's label, not an assignment: to assign, \
+                 write the assignment as a statement before this, and use `x`"
+                    .to_string()
+            ]
+        );
     }
 
     // --- Closures ------------------------------------------------------------

@@ -695,3 +695,5 @@ row	flagship	key
 671	-	Expected {expected}, but got {got} instead: inside the impl that declares it, a bare `{path}::{member}(..)` is `Self::{member}(..)`, whose `{expected}` is this block's own. Write `{suggested}::{member}(..)` to call it at another instantiation
 672	-	`dbg_stack()` takes no arguments: it prints every binding in scope at the call. To print chosen values, use `dbg(..)`
 673	-	`dbg_stack()` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
+NEW	-	an assignment is a statement and has no value: write {statement} before this, and use `{place}`
+NEW	-	inside parentheses `{place} = …` is a tuple's label, not an assignment: to assign, write {statement} before this, and use `{place}`
