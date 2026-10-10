@@ -77,7 +77,7 @@ use vilan_core::node::{BinaryOp, Convention, ExternBinding};
 use vilan_core::options::BuildOptions;
 use vilan_core::span::Span;
 use vilan_core::teardown;
-use vilan_core::type_::{Type, TypeId};
+use vilan_core::type_::{TupleLabels, Type, TypeId};
 
 /// What one emit produced: the Rust source, and the measurement R3 asked for.
 pub struct Emitted {
@@ -1681,7 +1681,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 Type::Trait(id, self.substituted_all(&arguments, entries))
             }
             Type::Dyn(id, arguments) => Type::Dyn(id, self.substituted_all(&arguments, entries)),
-            Type::Tuple(elements) => Type::Tuple(self.substituted_all(&elements, entries)),
+            Type::Tuple(elements, _) => {
+                Type::Tuple(self.substituted_all(&elements, entries), TupleLabels::NONE)
+            }
             Type::Array(element, length) => Type::Array(self.substituted(element, entries), length),
             Type::Closure(parameters, returns, contexts, modes) => Type::Closure(
                 self.substituted_all(&parameters, entries),
@@ -1719,7 +1721,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let _guard = vilan_core::util::RecursionGuard::enter()?;
         let concrete = self.concrete(type_id);
         match self.type_entry(&concrete).cloned()? {
-            Type::Tuple(elements) => Some(
+            Type::Tuple(elements, _) => Some(
                 elements
                     .into_iter()
                     .map(|element| (element, Vec::new()))
@@ -1901,7 +1903,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let _ = write!(out, "D{}", id.0);
                 self.write_key_arguments(arguments, out);
             }
-            Type::Tuple(elements) => {
+            Type::Tuple(elements, _) => {
                 out.push_str("Tup");
                 self.write_key_arguments(elements, out);
             }
@@ -2429,10 +2431,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         span,
                     ));
                 };
-                let tuple = self.mint(Type::Tuple(elements));
+                let tuple = self.mint(Type::Tuple(elements, TupleLabels::NONE));
                 self.rust_type(tuple, span)
             }
-            Type::Tuple(elements) => {
+            Type::Tuple(elements, _) => {
                 let mut parts = Vec::new();
                 for element in &elements {
                     parts.push(self.rust_type(*element, span)?);
@@ -2601,7 +2603,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         match self.resolve(type_id) {
             Some(Type::Any) => true,
             Some(
-                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
+                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments, _),
             ) => arguments
                 .clone()
                 .iter()
@@ -2876,7 +2878,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Type::Enum(id, ref arguments) => Type::Enum(id, self.deeply_resolved_all(arguments)),
             Type::Trait(id, ref arguments) => Type::Trait(id, self.deeply_resolved_all(arguments)),
             Type::Dyn(id, ref arguments) => Type::Dyn(id, self.deeply_resolved_all(arguments)),
-            Type::Tuple(ref elements) => Type::Tuple(self.deeply_resolved_all(elements)),
+            Type::Tuple(ref elements, _) => {
+                Type::Tuple(self.deeply_resolved_all(elements), TupleLabels::NONE)
+            }
             Type::Array(element, length) => Type::Array(self.deeply_resolved(element), length),
             Type::Closure(ref parameters, returns, ref contexts, ref modes) => Type::Closure(
                 self.deeply_resolved_all(parameters),
@@ -3541,7 +3545,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut remaining = offset;
         let mut path = String::new();
         loop {
-            let Some(Type::Tuple(elements)) = self.resolve(type_id) else {
+            let Some(Type::Tuple(elements, _)) = self.resolve(type_id) else {
                 return None;
             };
             let elements = elements.clone();
@@ -3571,7 +3575,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return 1;
         };
         match self.resolve(type_id) {
-            Some(Type::Tuple(elements)) => elements
+            Some(Type::Tuple(elements, _)) => elements
                 .clone()
                 .iter()
                 .map(|element| self.flat_width(*element))
@@ -3924,7 +3928,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.bind_generics_against(declared, concrete, entries);
                 }
             }
-            (Some(Type::Tuple(left)), Some(Type::Tuple(right))) if left.len() == right.len() => {
+            (Some(Type::Tuple(left, _)), Some(Type::Tuple(right, _)))
+                if left.len() == right.len() =>
+            {
                 for (declared, concrete) in left.clone().into_iter().zip(right.clone()) {
                     self.bind_generics_against(declared, concrete, entries);
                 }
@@ -3954,7 +3960,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .map(|type_id| self.concrete(type_id))
                 .and_then(|type_id| self.resolve(type_id))
             {
-                Some(Type::Tuple(parts)) => parts.len(),
+                Some(Type::Tuple(parts, _)) => parts.len(),
                 _ => {
                     return Err(unsupported(
                         "a spread element whose tuple type did not resolve",
@@ -4829,7 +4835,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         let concrete = self.concrete(type_id);
         match self.resolve(concrete).cloned() {
-            Some(Type::Tuple(elements)) => {
+            Some(Type::Tuple(elements, _)) => {
                 self.refuse_an_unordered_teardown(&elements, "a tuple", span)?;
                 for element in elements {
                     self.refuse_an_unordered_drop(element, span, visiting)?;
@@ -4964,7 +4970,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     })
                 })
             }
-            Some(Type::Tuple(elements)) => elements
+            Some(Type::Tuple(elements, _)) => elements
                 .iter()
                 .any(|element| self.owes_a_teardown(*element, visiting)),
             Some(Type::Array(element, _)) => self.owes_a_teardown(element, visiting),
@@ -5253,6 +5259,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 for element in &elements {
                     let expecting = self.expected_type;
                     parts.push(self.consumed_value_of_expecting(*element, expecting, depth)?);
+                }
+                // B569 §4.1: a literal matched by name stores its entries in
+                // its type's order and evaluates them as WRITTEN — each bound
+                // in written order, the tuple built from the bindings.
+                if let Some(layout) = self.program.tuple_literal_layouts.get(&id)
+                    && layout.len() == parts.len()
+                {
+                    let mut block = String::from("{ ");
+                    for (index, part) in parts.iter().enumerate() {
+                        let _ = write!(block, "let __entry{index} = {part}; ");
+                    }
+                    let stored: Vec<String> = layout
+                        .iter()
+                        .map(|index| format!("__entry{index}"))
+                        .collect();
+                    let _ = write!(block, "({},) }}", stored.join(", "));
+                    return Ok(block);
                 }
                 // F94: the EMPTY pack — `pack()` against a spread parameter —
                 // is the unit, which `(,)` does not spell.
@@ -7313,7 +7336,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 Ok(format!("(({number:?}f64) as {rendered})"))
             }
-            (ConstValue::Array(items), Some(Type::Tuple(elements))) => {
+            (ConstValue::Array(items), Some(Type::Tuple(elements, _))) => {
                 let mut cursor = 0;
                 let rendered = self.const_tuple(items, &mut cursor, &elements, span)?;
                 Ok(rendered)
@@ -7452,7 +7475,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut parts = Vec::new();
         for element in elements {
             let element = self.deeply_resolved(*element);
-            if let Some(Type::Tuple(inner)) = self.resolve(element).cloned() {
+            if let Some(Type::Tuple(inner, _)) = self.resolve(element).cloned() {
                 parts.push(self.const_tuple(items, cursor, &inner, span)?);
                 continue;
             }
@@ -7491,7 +7514,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut cursor = 1;
         let mut parts = Vec::new();
         for payload in payload_types {
-            if let Some(Type::Tuple(inner)) = self.resolve(payload).cloned() {
+            if let Some(Type::Tuple(inner, _)) = self.resolve(payload).cloned() {
                 parts.push(self.const_tuple(items, &mut cursor, &inner, span)?);
                 continue;
             }
@@ -7983,7 +8006,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             ExprPattern::Tuple(elements) => {
                 let element_types = match subject_type.and_then(|type_id| self.resolve(type_id)) {
-                    Some(Type::Tuple(types)) => types.clone(),
+                    Some(Type::Tuple(types, _)) => types.clone(),
                     _ => Vec::new(),
                 };
                 let mut parts = Vec::new();
@@ -8302,14 +8325,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(
                 Type::Struct(_, pattern_arguments)
                 | Type::Enum(_, pattern_arguments)
-                | Type::Tuple(pattern_arguments),
+                | Type::Tuple(pattern_arguments, _),
             ) => {
                 let pattern_arguments = pattern_arguments.clone();
                 let concrete_arguments = match self.type_entry(&concrete) {
                     Some(
                         Type::Struct(_, arguments)
                         | Type::Enum(_, arguments)
-                        | Type::Tuple(arguments),
+                        | Type::Tuple(arguments, _),
                     ) => arguments.clone(),
                     _ => return,
                 };
@@ -8356,7 +8379,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(
                 Type::Struct(_, arguments)
                 | Type::Enum(_, arguments)
-                | Type::Tuple(arguments)
+                | Type::Tuple(arguments, _)
                 | Type::Dyn(_, arguments),
             ) => arguments
                 .iter()
@@ -8391,7 +8414,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             )
             | None => false,
             Some(
-                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
+                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments, _),
             ) => arguments
                 .clone()
                 .iter()
@@ -13753,7 +13776,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .map(|(element, bindings)| {
                     let key = self.mint(Type::Struct(key_struct, vec![receiver_type, element]));
                     let slot = if entries {
-                        self.mint(Type::Tuple(vec![key, element]))
+                        self.mint(Type::Tuple(vec![key, element], TupleLabels::NONE))
                     } else {
                         key
                     };

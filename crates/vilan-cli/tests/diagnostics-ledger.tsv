@@ -697,3 +697,11 @@ row	flagship	key
 673	-	`dbg_stack()` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
 NEW	-	an assignment is a statement and has no value: write {statement} before this, and use `{place}`
 NEW	-	inside parentheses `{place} = …` is a tuple's label, not an assignment: to assign, write {statement} before this, and use `{place}`
+NEW	-	`({label} = {value})` is a tuple with the label `{label}`, and a statement discards it: to assign, write `{label} = {value};`
+NEW	-	`{extra}` is not a label of `{landing}`: a labelled tuple names exactly its type's labels, and this one leaves out {missing}
+NEW	-	a tuple's labels name its slots, so each is written once: `{duplicate}` labels two of these
+NEW	-	a tuple labels every slot or none, and a spread brings its operand's slots with their labels: label every entry and spread a labelled tuple, or drop the labels
+NEW	-	`{tuple_label}` has no label `{member_name}`; its labels are {labels}
+NEW	-	Expected {expected}, but got {got} instead: the label `{label}` names slot {from} of the value and slot {to} here, so the two do not convert — match by name, writing the labels out, or by position, dropping them
+NEW	-	{msg} `({label} = {value})` is a tuple with the label `{label}`; to assign, write `{label} = {value};`
+NEW	-	an `impl` cannot name a labelled tuple: labels name positions and are not an identity, so this impl would answer for every tuple of these slot types under any labels — declare a struct for a shape that has methods

@@ -33,6 +33,8 @@ mod member_admission_tests;
 #[cfg(test)]
 mod moved_std_path_tests;
 #[cfg(test)]
+mod named_tuple_tests;
+#[cfg(test)]
 mod organize_duplicate_tests;
 #[cfg(test)]
 mod sticky_span_tests;

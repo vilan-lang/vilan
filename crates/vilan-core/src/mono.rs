@@ -79,7 +79,7 @@ pub fn collect_type_generics(
                 out.push(*constraint_id);
             }
         }
-        Some(Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments)) => {
+        Some(Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments, _)) => {
             for argument in arguments.clone() {
                 collect_type_generics(program, argument, depth + 1, out);
             }

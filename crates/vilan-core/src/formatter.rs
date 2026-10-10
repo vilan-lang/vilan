@@ -5699,6 +5699,13 @@ impl<'src> Printer<'src> {
                     self.print_tuple_bound(tuple_bound);
                 }
             }
+            // B569: `x: f64` — a labelled slot of a tuple type, one space after
+            // the `:` as a field's.
+            Node::Labelled((label, _), inner) => {
+                self.out.push_str(label);
+                self.out.push_str(": ");
+                self.print_type(&inner.0);
+            }
             // `(A, B)` — a tuple type.
             Node::Tuple(elements) => {
                 self.out.push('(');
@@ -8672,6 +8679,13 @@ impl<'src> Printer<'src> {
                 self.out.push('(');
                 self.print_expression_list(elements);
                 self.out.push(')');
+            }
+            // B569: `x = 5` — a labelled tuple entry, spaced as a struct
+            // literal's field.
+            Node::Labelled((label, _), value) => {
+                self.out.push_str(label);
+                self.out.push_str(" = ");
+                self.print_expr(value);
             }
             Node::Closure(closure) => {
                 self.print_closure_parameters(&closure.parameters.0);

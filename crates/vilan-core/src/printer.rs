@@ -148,7 +148,7 @@ fn may_hold_an_object(program: &Program, type_id: TypeId, seen: &mut Vec<TypeId>
     seen.push(type_id);
     match program.type_id_to_type_map.get(&type_id) {
         Some(Type::Dyn(..) | Type::Generic(_)) => true,
-        Some(Type::Tuple(elements)) => elements
+        Some(Type::Tuple(elements, _)) => elements
             .iter()
             .any(|element| may_hold_an_object(program, *element, seen)),
         Some(Type::Array(element, _)) => may_hold_an_object(program, *element, seen),
@@ -382,8 +382,8 @@ pub fn shape_of(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> 
     };
     match resolved {
         Type::Void => Shape::Void,
-        Type::Tuple(elements) if elements.is_empty() => Shape::Void,
-        Type::Tuple(elements) => Shape::Tuple(elements.clone()),
+        Type::Tuple(elements, _) if elements.is_empty() => Shape::Void,
+        Type::Tuple(elements, _) => Shape::Tuple(elements.clone()),
         Type::Array(element, _) => Shape::List(*element),
         Type::Closure(..) | Type::Function(_) => Shape::Text(format!(
             "<closure {}>",
@@ -618,7 +618,7 @@ pub fn type_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) ->
                 .unwrap_or("?"),
             arguments_text(arguments)
         ),
-        Some(Type::Tuple(elements)) => {
+        Some(Type::Tuple(elements, _)) => {
             let parts: Vec<String> = elements
                 .iter()
                 .map(|element| type_text(program, *element, resolve))

@@ -204,7 +204,7 @@ impl<'program, 'src> Renderer<'program, 'src> {
                     substitution,
                 )
             ),
-            Type::Tuple(elements) => format!("({})", self.list(elements, substitution)),
+            Type::Tuple(elements, _) => format!("({})", self.list(elements, substitution)),
             Type::Array(element, length) => {
                 format!("[{}; {length}]", self.render(*element, substitution))
             }

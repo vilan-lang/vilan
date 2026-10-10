@@ -2374,6 +2374,106 @@ const B569_DISCARDED_ASSIGNMENT_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B569 S2: labelled tuples mean the same on both backends — a literal
+/// matched BY NAME stores in its type's order and evaluates as written (the
+/// two calls print in written order), a label reads and writes its slot, the
+/// one-slot tuple, a spread that concatenates labels, a join matched by name,
+/// a mapped tuple's labels and a reconcile that drops them.
+#[test]
+fn b569_labelled_tuples_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b569_labels.vl"),
+        B569_LABELS_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b569_labels.vl"),
+        Verdict::Identical,
+        "a labelled tuple must mean the same thing on both backends"
+    );
+}
+
+const B569_LABELS_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun say(label: str, value: f64): f64 {\n",
+    "\tprint(label);\n",
+    "\tvalue\n",
+    "}\n",
+    "\n",
+    "fun pick(first: bool): (x: i32, y: i32) {\n",
+    "\tfirst then (x = 1, y = 2) else (y = 3, x = 4)\n",
+    "}\n",
+    "\n",
+    "fun plain(pair: (f64, f64)): f64 {\n",
+    "\tpair.0 - pair.1\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet point: (x: f64, y: f64) = (y = say(\"y\", 7), x = say(\"x\", 5));\n",
+    "\tprint(i\"{point.x} {point.y} {point.0}\");\n",
+    "\tmut m: (a: i32, b: i32) = (1, 2);\n",
+    "\tm.b = 10;\n",
+    "\tm.a += 1;\n",
+    "\tprint(m.a + m.b);\n",
+    "\tlet one = (x = 5);\n",
+    "\tprint(one.x);\n",
+    "\tlet s = (..m, c = 3);\n",
+    "\tprint(s.c + s.b);\n",
+    "\tprint(pick(false).x);\n",
+    "\tprint(plain(point));\n",
+    "\tlet rows = [(x = 1, y = 2), (y = 3, x = 4)];\n",
+    "\tprint(rows[1].x);\n",
+    "\tlet nested: (outer: (left: i32, right: i32), tag: str) = (tag = \"t\", outer = (right = 4, left = 3));\n",
+    "\tprint(i\"{nested.outer.left} {nested.outer.right} {nested.tag}\");\n",
+    "}\n",
+);
+
+/// B569 §6.3: labels are erased at monomorphization — one generic function
+/// called with a labelled and an unlabelled tuple of the same slot types is
+/// ONE native instance.
+#[test]
+fn b569_labels_never_split_a_native_instance() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b569_mono.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun first<T, U>(pair: (T, U)): T {\n",
+            "\tpair.0\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet labelled: (x: i32, y: i32) = (x = 1, y = 2);\n",
+            "\tlet plain: (i32, i32) = (3, 4);\n",
+            "\tprint(first(labelled));\n",
+            "\tprint(first(plain));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    let built = vilan(&staged)
+        .args(["build", "--backend", "rust", "native_probe_b569_mono.vl"])
+        .output()
+        .expect("build natively");
+    assert!(
+        built.status.success(),
+        "the native leg did not build:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let emitted =
+        std::fs::read_to_string(staged.join("dist/native/native_probe_b569_mono/src/main.rs"))
+            .expect("the emitted crate's main.rs");
+    let instances = emitted.matches("fn first_").count();
+    assert_eq!(
+        instances, 1,
+        "a labelled and an unlabelled `(i32, i32)` are one instance of `first`:\n{emitted}"
+    );
+}
+
 /// F41: a field named `self`, `super` or `crate` builds natively.
 ///
 /// Vilan's `self` and `super` are contextual, so they are legal field names

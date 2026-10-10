@@ -233,6 +233,44 @@ elements, so an element that is itself a tuple stays one. And `..` only
 means this at the start of an entry — `a..b` after an expression is not
 a spread, and vilan has no range operator for it to be confused with.
 
+### Naming the positions
+
+A tuple's positions can carry **labels**, so a reader does not have to
+remember which slot is which. Write them in the type with `:` and in the
+value with `=`, the way a struct literal names its fields:
+
+```vilan
+fun bounds(xs: List<i32>): (min: i32, max: i32) {
+	mut low = xs[0];
+	mut high = xs[0];
+	for x in xs {
+		x < low then low = x;
+		x > high then high = x;
+	}
+	(min = low, max = high)
+}
+
+fun main() {
+	let b = bounds([3, 1, 4, 1, 5]);
+	print(i"{b.min}..{b.max}");
+	let point: (x: f64, y: f64) = (y = 7, x = 5); // by name: (5, 7)
+	print(point.x);
+	print(point.0);                               // positions still work
+}
+```
+
+A labelled value goes anywhere its unlabelled shape goes, and back:
+labels are names for positions, not part of the type. The one thing
+refused is a label that would land at a *different* position —
+`(x: f64, y: f64)` into `(y: f64, x: f64)` — because nobody can tell
+whether that was a reorder or a swap; the error offers both rewrites.
+Every slot is labelled or none, and `(x = 5)` is a one-slot tuple whose
+label makes it one.
+
+Reach for a **struct** instead once the shape has an identity: it is named
+in more than one signature, it needs methods or derives, it crosses the
+wire, or it has more than three fields.
+
 ## Collections
 
 `List<T>` is built in and has literal syntax. `HashMap<K, V>` and `HashSet<T>`

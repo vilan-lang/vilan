@@ -1030,6 +1030,12 @@ pub enum Node<'src> {
         ItemLabels<'src>,
     ),
     Tuple(NodeList<'src>),
+    // B569 (`named-tuple-fields.md` §2): one LABELLED slot of a tuple — a
+    // tuple type's `x: f64`, a tuple literal's `x = 5`. The label is a MEMBER
+    // (any word, B414 S4) with its own span; the inner node is the slot's
+    // type or value. Only ever an entry of a `Tuple`, and a tuple labels every
+    // slot or none — the parser refuses a mix.
+    Labelled(Spanned<&'src str>, Box<Spanned<Self>>),
     // `..e` — a tuple-value SPREAD element (proposal/variadic-generics.md §T):
     // inside a tuple construction it contributes the ELEMENTS of `e`'s tuple
     // type rather than `e` itself, so the construction's type is the
@@ -1361,6 +1367,7 @@ impl<'src> Node<'src> {
                     visit(item);
                 }
             }
+            Node::Labelled(_, inner) => visit(inner),
             Node::Repeat(value, length) | Node::ArrayType(value, length) => {
                 visit(value);
                 visit(length);

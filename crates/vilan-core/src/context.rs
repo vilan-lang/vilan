@@ -793,7 +793,7 @@ fn unfollowable_clause(
             .iter()
             .map(|&argument| (argument, false))
             .collect(),
-        Type::Tuple(elements) => elements.iter().map(|&element| (element, false)).collect(),
+        Type::Tuple(elements, _) => elements.iter().map(|&element| (element, false)).collect(),
         Type::Array(element, _) => vec![(*element, false)],
         Type::Mapped(binder, source, template) => {
             vec![(*binder, false), (*source, false), (*template, false)]
