@@ -111,7 +111,12 @@ pub enum Type {
     // §0 of trait-objects.md says the one representation was missing. Every
     // reader that asks "is this a value" answers yes here and no there.
     Dyn(Id, Vec<TypeId>),
-    Tuple(Vec<TypeId>),
+    // A tuple: its element types, and the LABELS its positions carry (B569,
+    // `named-tuple-fields.md`) — `(x: f64, y: f64)`. The labels are names for
+    // positions, never part of the type's identity: equality and hashing
+    // ignore them ([`TupleLabels`]), unification carries them, mono and the
+    // emitters erase them.
+    Tuple(Vec<TypeId>, TupleLabels),
     // A fixed-length array `[T; n]` — the element type and a compile-time-known
     // length (`[i32; 4]` -> `Array(i32, 4)`). Unlike `List<T>` (a growable
     // `Struct(list_id, [T])`), the length is part of the type, so `[i32; 3]` and
@@ -182,6 +187,103 @@ pub enum ParameterMode {
     Written(Mode),
     /// A closure literal's bare parameter, by the parameter's id.
     Open(Id),
+}
+
+/// The labels of a tuple type's positions (B569, `named-tuple-fields.md`
+/// §10): `None` for an unlabelled tuple, one label per slot otherwise — a
+/// tuple labels every slot or none.
+///
+/// **Carried, never compared.** `PartialEq` holds for any two values and
+/// `Hash` writes nothing, so `(x: f64, y: f64)` and `(f64, f64)` are one
+/// [`Type`] to every map, memo and comparison that keys on it — the
+/// instantiation keys mono builds, the selection memos, the conformance
+/// tables. That is what erases labels at monomorphization: two label sets
+/// can never split an instance. Code that must SEE the labels — the
+/// printer, member access, the literal's by-name match, the contradiction
+/// refusal — reads them through the accessors here; [`TupleLabels::spelled_alike`]
+/// is the comparison that does look, for the one place that interns a type
+/// by its printed form.
+#[derive(Clone, Debug, Default)]
+pub struct TupleLabels(Option<std::sync::Arc<[Box<str>]>>);
+
+impl TupleLabels {
+    /// An unlabelled tuple's labels.
+    pub const NONE: TupleLabels = TupleLabels(None);
+
+    /// One label per slot, in slot order.
+    pub fn new<S: Into<Box<str>>>(labels: impl IntoIterator<Item = S>) -> TupleLabels {
+        TupleLabels(Some(labels.into_iter().map(Into::into).collect()))
+    }
+
+    /// The labels, when the tuple has them.
+    pub fn labels(&self) -> Option<&[Box<str>]> {
+        self.0.as_deref()
+    }
+
+    pub fn is_labelled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The label of slot `index`.
+    pub fn get(&self, index: usize) -> Option<&str> {
+        self.0.as_deref()?.get(index).map(|label| &**label)
+    }
+
+    /// The slot `label` names.
+    pub fn position(&self, label: &str) -> Option<usize> {
+        self.0.as_deref()?.iter().position(|each| &**each == label)
+    }
+
+    /// These labels for a tuple of `arity` slots: kept when they label
+    /// exactly that many, dropped otherwise (a label set describes ONE
+    /// arity, and a slot list rebuilt at another has nothing to name).
+    pub fn for_arity(&self, arity: usize) -> TupleLabels {
+        match self.labels() {
+            Some(labels) if labels.len() == arity => self.clone(),
+            _ => TupleLabels::NONE,
+        }
+    }
+
+    /// The first label both carry at DIFFERENT positions (B569 §4.3): the
+    /// one pair of label sets that does not reconcile. The same set
+    /// reordered is the common case (`(x, y)` into `(y, x)`), and one
+    /// renamed slot is the same mistake (`(x, y)` into `(y, z)` moves `y`).
+    /// Disjoint sets reconcile by position, and shared labels at the same
+    /// positions agree.
+    pub fn contradiction<'a>(&'a self, other: &TupleLabels) -> Option<&'a str> {
+        let (mine, theirs) = (self.labels()?, other.labels()?);
+        mine.iter().enumerate().find_map(|(index, label)| {
+            let position = theirs.iter().position(|each| each == label)?;
+            (position != index).then_some(&**label)
+        })
+    }
+
+    /// The labels a reconcile keeps: `self`'s when it has them, else
+    /// `other`'s.
+    pub fn or(&self, other: &TupleLabels) -> TupleLabels {
+        if self.is_labelled() {
+            self.clone()
+        } else {
+            other.clone()
+        }
+    }
+
+    /// Whether the two print alike — the comparison [`PartialEq`] declines.
+    pub fn spelled_alike(&self, other: &TupleLabels) -> bool {
+        self.labels() == other.labels()
+    }
+}
+
+impl PartialEq for TupleLabels {
+    fn eq(&self, _: &TupleLabels) -> bool {
+        true
+    }
+}
+
+impl Eq for TupleLabels {}
+
+impl std::hash::Hash for TupleLabels {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

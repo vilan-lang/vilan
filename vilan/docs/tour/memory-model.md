@@ -43,6 +43,10 @@ nothing it does leaks back to you. If you've ever defensively
 `structuredClone`d an object before handing it out, this is that,
 everywhere, for free.
 
+An assignment is a statement, not a value: `let y = (x = 5);` and
+`f(x = 5)` are refused, because nothing could use the `void` they would
+produce. Assign first, then use the binding.
+
 > **Going deeper.** "Copy" describes the *semantics*, not necessarily
 > the machine code. The compiler skips copies whenever no program could
 > tell the difference (for example, when the source is never used

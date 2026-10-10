@@ -188,6 +188,21 @@ pub enum ParseErrorReason {
     /// are written out of [`attribute_rank`]'s order, and nothing else out of
     /// order. `canonical` is the head respelled in it; the parse read it so.
     AttributeOrder { canonical: String },
+    /// An assignment where its value is used (B569 S1): `written` is the
+    /// assignment's own text when it fits on one line, `place` its target.
+    /// (`name = value` as an entry of parentheses never reaches here: it is
+    /// a tuple's label, or a call's named argument.)
+    ValuedAssignment {
+        written: Option<String>,
+        place: String,
+    },
+    /// `(x = 5);` — a one-slot labelled tuple standing as a statement (B569
+    /// §3.2), which an author writes meaning the assignment. `value` is the
+    /// entry's text when it fits on one line.
+    DiscardedLabelledTuple {
+        label: String,
+        value: Option<String>,
+    },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -450,6 +465,14 @@ const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibil
 /// R1's `[platform(..)]` today), so it leads the file — the one place a reader
 /// looks for what the whole file is. Curated: the rule states itself and names
 /// the move that satisfies it.
+/// B569 §2: a tuple's written slots are all labelled or none are.
+pub const A_TUPLE_LABELS_EVERY_SLOT_OR_NONE: &str = "a tuple labels every slot or none: \
+     label this one too, or drop the labels and use positions (`.0`, `.1`, …)";
+
+/// B569 §2: each label names one slot.
+pub const A_TUPLE_LABEL_IS_WRITTEN_ONCE: &str = "a tuple's labels name its slots, so each is \
+     written once: this label is already on another slot";
+
 pub const MODULE_SELF_LEADS_THE_FILE: &str = "`mod self;` carries the attributes of the whole file, so it is the file's first statement: \
      move it above the first import. To fence one function instead, write `[platform(..)]` on \
      the function";
@@ -1750,6 +1773,16 @@ pub fn render(error: &ParseError) -> String {
         ParseErrorReason::ForeignSpelling(spelling) => spelling.message().to_string(),
         ParseErrorReason::MarkerOrder { canonical } => marker_order_rule(canonical),
         ParseErrorReason::AttributeOrder { canonical } => attribute_order_rule(canonical),
+        ParseErrorReason::ValuedAssignment { written, place } => {
+            valued_assignment_rule(written.as_deref(), place)
+        }
+        ParseErrorReason::DiscardedLabelledTuple { label, value } => {
+            let value = value.as_deref().unwrap_or("…");
+            format!(
+                "`({label} = {value})` is a tuple with the label `{label}`, and a statement \
+                 discards it: to assign, write `{label} = {value};`"
+            )
+        }
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -2086,6 +2119,18 @@ struct Parser<'a, 'src> {
     /// restored around each statement's expression, so a statement nested in
     /// a block inside it has its own.
     statement_head: Option<usize>,
+    /// The token index at which an expression whose value is DISCARDED
+    /// begins (B569 S1, `named-tuple-fields.md` §3.2): a statement's, a
+    /// block's tail, a `match` arm's body, a closure's expression body, and a
+    /// `then`/`else` branch of a conditional that itself stands at one. An
+    /// assignment is legal only there — its value is `void`, so it is a
+    /// statement — and [`Parser::parse_assignment`] refuses one that begins
+    /// anywhere else, where its value would be used. A position, not a flag:
+    /// the only expression that can begin at the recorded token is the one
+    /// the discarding production asked for, so every nested operand reads
+    /// false without being told. Set and restored by
+    /// [`Parser::parse_discarded`].
+    assignment_head: Option<usize>,
     /// The diagnostics of the parser's in-place TOKEN REWRITES (B520's
     /// foreign spellings), held aside from `errors` for `nesting_refusal`'s
     /// reason: [`Parser::attempt`] truncates `errors` when a branch declines,
@@ -2164,6 +2209,13 @@ fn apply_binding_mutability(pattern: Pattern<'_>, mutable: bool) -> Pattern<'_> 
                 .map(|(pattern, span)| (apply_binding_mutability(pattern, mutable), span))
                 .collect(),
         ),
+        Pattern::Labelled(label, inner) => {
+            let (inner, span) = *inner;
+            Pattern::Labelled(
+                label,
+                Box::new((apply_binding_mutability(inner, mutable), span)),
+            )
+        }
         other => other,
     }
 }
@@ -2416,6 +2468,19 @@ fn marker_keywords_are_legal(keywords: &[MarkerKeyword], word: &str) -> bool {
 /// attributes first, then the keywords in one order, then the declaration
 /// word. `canonical` is the head respelled in that order, attributes
 /// abbreviated. An ERROR ([`MarkerOrderDiagnostic::Keywords`]).
+/// [`ParseErrorReason::ValuedAssignment`]'s message: the rule, and the
+/// statement to write in its place.
+fn valued_assignment_rule(written: Option<&str>, place: &str) -> String {
+    let statement = written.map_or_else(
+        || "the assignment as a statement".to_string(),
+        |written| format!("`{written};`"),
+    );
+    format!(
+        "an assignment is a statement and has no value: write {statement} before this, and \
+         use `{place}`"
+    )
+}
+
 fn marker_order_rule(canonical: &str) -> String {
     format!(
         "a declaration's markers are written in one order — its attributes, then the keywords \
@@ -2782,6 +2847,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             contextual_readings: Vec::new(),
             member_readings: Vec::new(),
             statement_head: None,
+            assignment_head: None,
             rewrite_refusals: Vec::new(),
             written_starts: Vec::new(),
             warnings: Vec::new(),
@@ -3534,6 +3600,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         None
     }
 
+    /// Whether the `(` at `position` is an i-string interpolation hole's —
+    /// the lexer's desugaring gives a hole's parens the `{…}` span
+    /// ([`Parser::istring_brace_hint`] reads the same mark).
+    fn opener_is_interpolation_hole(&self, position: usize) -> bool {
+        self.tokens
+            .get(position)
+            .is_some_and(|(_, span)| self.source[span.start..].starts_with('{'))
+    }
+
     /// The anchor for a missing statement terminator: the LAST CHARACTER of the
     /// token before `position` — the gap where the `;` belongs (`editing-dx.md`
     /// §4.4, drawn under the `}` of `… y = 4 }`). One character rather than the
@@ -4189,6 +4264,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             let head = parser.position;
             let expression = parser.parse_statement_expression()?;
             if parser.eat_ctrl(';') {
+                parser.refuse_a_discarded_one_slot_tuple(&expression);
                 return Some(parser.read_at_statement_position(expression, head));
             }
             // A block-bearing form needs no `;` (chumsky's `not_block_end`). Its
@@ -4800,6 +4876,13 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is(&Token::Const) {
             let start = self.position;
             self.bump();
+            // `const x = 3;` at a statement is the JS declaration habit, which
+            // the analyzer steers to `const let` by name: the assignment under
+            // the prefix stands where the prefix does, so S1's refusal leaves
+            // it to that steer.
+            if self.assignment_head == Some(start) {
+                self.assignment_head = Some(self.position);
+            }
             // `const const .. 1` recurses HERE, not through `parse_secondary`,
             // so it carries its own nesting level (B142).
             let inner = self.parse_nested(Self::NESTING_REFUSAL, Self::parse_expression)?;
@@ -4813,8 +4896,23 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// may be the statement reading and the guard may stand (B459).
     fn parse_statement_expression(&mut self) -> Option<Spanned<Node<'src>>> {
         let outer = self.statement_head.replace(self.position);
-        let expression = self.parse_expression();
+        let expression = self.parse_discarded(Self::parse_expression);
         self.statement_head = outer;
+        expression
+    }
+
+    /// `parse` at a position whose value is DISCARDED, where an assignment
+    /// may stand ([`Parser::assignment_head`]). Restores the enclosing one,
+    /// so a discarding production nested inside (a block in an operand, a
+    /// closure in an argument) has its own and the operand around it has
+    /// none.
+    fn parse_discarded(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Option<Spanned<Node<'src>>>,
+    ) -> Option<Spanned<Node<'src>>> {
+        let outer = self.assignment_head.replace(self.position);
+        let expression = parse(self);
+        self.assignment_head = outer;
         expression
     }
 
@@ -4936,6 +5034,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_conditional(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let at_statement_head = self.statement_head == Some(start);
+        // A branch's value is discarded exactly when the form's is: `c then
+        // x = 5;` assigns, `let v = c then x = 5 else 0;` is refused.
+        let discarded = self.assignment_head == Some(start);
         let condition = self.parse_logical_or(no_struct)?;
         let guard = at_statement_head && self.peek_is(&Token::Else);
         if !self.peek_is_word("then") && !guard {
@@ -4947,14 +5048,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                 let word = parser.here_span();
                 parser.contextual_readings.push(parser.position);
                 parser.bump();
-                Some((word, parser.parse_then_branch(no_struct)?))
+                Some((word, parser.parse_then_branch(no_struct, discarded)?))
             } else {
                 None
             };
             let otherwise = if parser.peek_is(&Token::Else) {
                 let word = parser.here_span();
                 parser.bump();
-                Some((word, parser.parse_then_branch(no_struct)?))
+                Some((word, parser.parse_then_branch(no_struct, discarded)?))
             } else {
                 None
             };
@@ -5005,11 +5106,22 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// statement position — every statement vilan has is an expression
     /// production), in the enclosing condition mode. A `let` parses and is
     /// refused (Q8, [`A_BRANCH_BINDS_NOTHING`]).
-    fn parse_then_branch(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
-        let branch = if no_struct {
-            self.parse_secondary(true)?
+    fn parse_then_branch(
+        &mut self,
+        no_struct: bool,
+        discarded: bool,
+    ) -> Option<Spanned<Node<'src>>> {
+        let parse = |parser: &mut Self| {
+            if no_struct {
+                parser.parse_secondary(true)
+            } else {
+                parser.parse_expression()
+            }
+        };
+        let branch = if discarded {
+            self.parse_discarded(parse)?
         } else {
-            self.parse_expression()?
+            parse(self)?
         };
         if matches!(branch.0, Node::Let(..)) {
             self.errors.push(ParseError {
@@ -5468,9 +5580,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_argument_list(&mut self) -> Option<Spanned<NodeList<'src>>> {
         let start = self.position;
         self.expect_ctrl('(')?;
-        let arguments = self.comma_list(Self::parse_element_or_spread, |parser| {
-            parser.peek_is_ctrl(')')
-        })?;
+        let arguments =
+            self.comma_list(Self::parse_tuple_entry, |parser| parser.peek_is_ctrl(')'))?;
         self.expect_ctrl(')')?;
         Some((arguments, self.span_from(start)))
     }
@@ -5963,12 +6074,26 @@ impl<'a, 'src> Parser<'a, 'src> {
             if let Some(spread) = parser.parse_spread_element() {
                 let mut items = vec![spread];
                 while parser.eat_ctrl(',') {
-                    items.push(parser.parse_element_or_spread()?);
+                    items.push(parser.parse_tuple_entry()?);
                 }
                 parser.expect_ctrl(')')?;
+                parser.check_tuple_labels(&items);
                 return Some((Node::Tuple(items), parser.span_from(start)));
             }
-            let first = parser.parse_expression()?;
+            // An i-string's interpolation hole is lexed as a group whose `(`
+            // carries the `{…}` span: its expression is a VALUE, never an
+            // entry that could carry a label.
+            let first = if parser.opener_is_interpolation_hole(start) {
+                parser.parse_expression()?
+            } else {
+                parser.parse_labelled_entry_or(Self::parse_expression)?
+            };
+            // B569 §7: `(x = 5)` is the one-slot labelled tuple — the label is
+            // what makes it a tuple, where `(5)` stays a group.
+            if matches!(first.0, Node::Labelled(..)) && parser.peek_is_ctrl(')') {
+                parser.bump();
+                return Some((Node::Tuple(vec![first]), parser.span_from(start)));
+            }
             if parser.peek_is_ctrl(',') {
                 // A tuple is `expr (',' expr)*` (≥2 elements) with NO trailing comma
                 // — unlike a list literal, the chumsky `tuple` atom has no
@@ -5976,9 +6101,10 @@ impl<'a, 'src> Parser<'a, 'src> {
                 // either). Every `,` here must be followed by an expression.
                 let mut items = vec![first];
                 while parser.eat_ctrl(',') {
-                    items.push(parser.parse_element_or_spread()?);
+                    items.push(parser.parse_tuple_entry()?);
                 }
                 parser.expect_ctrl(')')?;
+                parser.check_tuple_labels(&items);
                 Some((Node::Tuple(items), parser.span_from(start)))
             } else {
                 parser.expect_ctrl(')')?;
@@ -5993,13 +6119,34 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
-    /// One entry of a tuple construction or an argument list: a spread (`..e`) or
-    /// an ordinary expression.
-    fn parse_element_or_spread(&mut self) -> Option<Spanned<Node<'src>>> {
+    /// One entry of a tuple literal or an argument list: a spread, a labelled
+    /// entry `MEMBER "=" expression` (B569 §2 — in an argument list, a NAMED
+    /// argument, §8), or an expression.
+    fn parse_tuple_entry(&mut self) -> Option<Spanned<Node<'src>>> {
         match self.parse_spread_element() {
             Some(spread) => Some(spread),
-            None => self.parse_expression(),
+            None => self.parse_labelled_entry_or(Self::parse_expression),
         }
+    }
+
+    /// `MEMBER "=" expression` — a labelled tuple entry, the struct literal's
+    /// `name = value` spelling — when one begins here, else `otherwise`.
+    fn parse_labelled_entry_or(
+        &mut self,
+        otherwise: fn(&mut Self) -> Option<Spanned<Node<'src>>>,
+    ) -> Option<Spanned<Node<'src>>> {
+        if !self.at_tuple_label("=") {
+            return otherwise(self);
+        }
+        let start = self.position;
+        let label_span = self.here_span();
+        let label = self.eat_member_name()?;
+        self.bump(); // `=`
+        let value = self.parse_expression()?;
+        Some((
+            Node::Labelled((label, label_span), Box::new(value)),
+            self.span_from(start),
+        ))
     }
 
     /// `..e` — a tuple-value spread, recognized ONLY where an element begins
@@ -6868,7 +7015,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // other legitimate reading (it is the one thing in a block that needs
             // no `;`), and it must close the block to be one.
             if let Some(expression) = self.attempt(|parser| {
-                let expression = parser.parse_expression()?;
+                let expression = parser.parse_discarded(Self::parse_expression)?;
                 parser.peek_is_ctrl('}').then_some(expression)
             }) {
                 tail = Some(expression);
@@ -7100,7 +7247,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             None
         };
         self.expect_op("=>")?;
-        let body = self.parse_expression()?;
+        let body = self.parse_discarded(Self::parse_expression)?;
         Some((patterns, guard, body))
     }
 
@@ -7396,11 +7543,57 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return None;
             };
             let value = parser.parse_expression()?;
-            Some((
-                Node::Assign(Box::new(target), op, Box::new(value)),
-                parser.span_from(start),
-            ))
+            let span = parser.span_from(start);
+            if parser.assignment_head != Some(start) {
+                parser.refuse_valued_assignment(&target, span);
+            }
+            Some((Node::Assign(Box::new(target), op, Box::new(value)), span))
         })
+    }
+
+    /// B569 §3.2's second steer: `(x = 5);` as a statement builds a one-slot
+    /// labelled tuple and throws it away — the parentheses an assignment
+    /// never needed, written out of habit.
+    fn refuse_a_discarded_one_slot_tuple(&mut self, expression: &Spanned<Node<'src>>) {
+        let Node::Tuple(entries) = &expression.0 else {
+            return;
+        };
+        let [(Node::Labelled((label, _), value), _)] = &entries[..] else {
+            return;
+        };
+        let written = &self.source[value.1.start..value.1.end];
+        self.errors.push(ParseError {
+            span: expression.1,
+            reason: ParseErrorReason::DiscardedLabelledTuple {
+                label: label.to_string(),
+                value: (!written.contains('\n')).then(|| written.to_string()),
+            },
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// B569 S1 (`named-tuple-fields.md` §3.2): an assignment whose value would
+    /// be USED — an operand, an argument, a tuple or list entry, a `let`
+    /// initializer, the right of another `=`. Its value is `void`, so the
+    /// author meant the statement; and inside parentheses `name = value` is a
+    /// tuple's label, which is why the place left. The tree keeps the
+    /// assignment, so everything after it still analyzes.
+    fn refuse_valued_assignment(&mut self, target: &Spanned<Node<'src>>, span: Span) {
+        let written = &self.source[span.start..span.end];
+        let place = &self.source[target.1.start..target.1.end];
+        // One line of source quotes; a statement spread over lines quotes
+        // only its place.
+        let written = (!written.contains('\n')).then(|| written.to_string());
+        self.errors.push(ParseError {
+            span,
+            reason: ParseErrorReason::ValuedAssignment {
+                written,
+                place: place.to_string(),
+            },
+            context: Vec::new(),
+            hint: None,
+        });
     }
 
     /// A closure literal: `|param, …| : return_type? body` or `|| : return_type?
@@ -7448,7 +7641,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 } else {
                     None
                 };
-            let return_value = parser.parse_expression()?;
+            let return_value = parser.parse_discarded(Self::parse_expression)?;
             Some((
                 Node::Closure(Closure {
                     parameters,
@@ -7477,18 +7670,64 @@ impl<'a, 'src> Parser<'a, 'src> {
         )
     }
 
+    /// B569 S3: `MEMBER "=" sub-pattern` — a by-name element of a tuple
+    /// pattern, the literal's spelling (label, then what its slot meets) —
+    /// when one begins here, else `otherwise`.
+    fn parse_labelled_pattern_or(
+        &mut self,
+        otherwise: fn(&mut Self) -> Option<Spanned<Pattern<'src>>>,
+    ) -> Option<Spanned<Pattern<'src>>> {
+        if !self.at_tuple_label("=") {
+            return otherwise(self);
+        }
+        let start = self.position;
+        let label_span = self.here_span();
+        let label = self.eat_member_name()?;
+        self.bump(); // `=`
+        let inner = otherwise(self)?;
+        Some((
+            Pattern::Labelled((label, label_span), Box::new(inner)),
+            self.span_from(start),
+        ))
+    }
+
+    /// A tuple pattern holds two or more elements — a single parenthesized
+    /// pattern is no grouping — save the one-slot BY-NAME pattern `(x = a)`,
+    /// which the label makes a tuple, as it makes `(x = 5)` one (B569 §7).
+    fn tuple_pattern_arity_holds(&self, patterns: &[Spanned<Pattern<'src>>]) -> bool {
+        patterns.len() >= 2 || matches!(patterns, [(Pattern::Labelled(..), _)])
+    }
+
+    /// [`Parser::check_tuple_labels`] for a tuple PATTERN: every element by
+    /// name or none, each label once.
+    fn check_pattern_labels(&mut self, patterns: &[Spanned<Pattern<'src>>]) {
+        let entries = patterns
+            .iter()
+            .map(|pattern| match &pattern.0 {
+                Pattern::Labelled((label, label_span), _) => {
+                    (Some((*label, *label_span)), pattern.1)
+                }
+                _ => (None, pattern.1),
+            })
+            .collect();
+        self.refuse_unbalanced_labels(entries);
+    }
+
     /// [`Parser::parse_binder`]'s body, past the depth bound.
     fn parse_binder_inner(&mut self) -> Option<Spanned<Pattern<'src>>> {
         let start = self.position;
         if self.peek_is_ctrl('(') {
             return self.attempt(|parser| {
                 parser.expect_ctrl('(')?;
-                let patterns =
-                    parser.comma_list(Self::parse_binder, |parser| parser.peek_is_ctrl(')'))?;
+                let patterns = parser.comma_list(
+                    |parser| parser.parse_labelled_pattern_or(Self::parse_binder),
+                    |parser| parser.peek_is_ctrl(')'),
+                )?;
                 parser.expect_ctrl(')')?;
-                if patterns.len() < 2 {
+                if !parser.tuple_pattern_arity_holds(&patterns) {
                     return None;
                 }
+                parser.check_pattern_labels(&patterns);
                 Some((Pattern::Tuple(patterns), parser.span_from(start)))
             });
         }
@@ -7591,12 +7830,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_ctrl('(') {
             return self.attempt(|parser| {
                 parser.expect_ctrl('(')?;
-                let patterns =
-                    parser.comma_list(Self::parse_pattern, |parser| parser.peek_is_ctrl(')'))?;
+                let patterns = parser.comma_list(
+                    |parser| parser.parse_labelled_pattern_or(Self::parse_pattern),
+                    |parser| parser.peek_is_ctrl(')'),
+                )?;
                 parser.expect_ctrl(')')?;
-                if patterns.len() < 2 {
+                if !parser.tuple_pattern_arity_holds(&patterns) {
                     return None;
                 }
+                parser.check_pattern_labels(&patterns);
                 Some((Pattern::Tuple(patterns), parser.span_from(start)))
             });
         }
@@ -7992,9 +8234,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.attempt(|parser| {
             let start = parser.position;
             parser.expect_ctrl('(')?;
-            let elements =
-                parser.comma_list(Self::parse_type, |parser| parser.peek_is_ctrl(')'))?;
+            let elements = parser.comma_list(Self::parse_tuple_type_slot, |parser| {
+                parser.peek_is_ctrl(')')
+            })?;
             parser.expect_ctrl(')')?;
+            parser.check_tuple_labels(&elements);
             // N113: `()` reads as the EMPTY tuple, and nothing can produce one
             // — a field, parameter or return written at it is uninhabited, so
             // every program that touched it was refused somewhere else, with a
@@ -8015,6 +8259,83 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             Some((Node::Tuple(elements), parser.span_from(start)))
         })
+    }
+
+    /// One slot of a tuple type: `MEMBER ":" type` (a labelled slot, B569
+    /// §2) or a type. Decided at the second token — `name :` and not `name
+    /// ::`, which is a path.
+    fn parse_tuple_type_slot(&mut self) -> Option<Spanned<Node<'src>>> {
+        if self.at_tuple_label(":") {
+            let start = self.position;
+            let label_span = self.here_span();
+            let label = self.eat_member_name()?;
+            self.bump(); // `:`
+            let slot = self.parse_type()?;
+            return Some((
+                Node::Labelled((label, label_span), Box::new(slot)),
+                self.span_from(start),
+            ));
+        }
+        self.parse_type()
+    }
+
+    /// Whether a tuple label begins at the cursor: a member name (any word,
+    /// B414 S4 — never a position number) followed by `separator` (`:` in a
+    /// type, `=` in a literal). `::`, `==` and `=>` are tokens of their own,
+    /// so none of them reads as one.
+    fn at_tuple_label(&self, separator: &str) -> bool {
+        !matches!(self.peek(), Some(Token::Number(..)))
+            && self.peek_is_member_name()
+            && matches!(self.peek_at(1), Some(Token::Op(op)) if *op == separator)
+    }
+
+    /// B569 §2: a tuple — its type or its literal — labels every written
+    /// slot or none, and names each label once. A spread brings its operand's
+    /// slots, which only the analyzer can see, so spreads are left to it.
+    fn check_tuple_labels(&mut self, entries: &[Spanned<Node<'src>>]) {
+        let written = entries
+            .iter()
+            .filter(|entry| !matches!(entry.0, Node::Spread(_)))
+            .map(|entry| match &entry.0 {
+                Node::Labelled((label, label_span), _) => (Some((*label, *label_span)), entry.1),
+                _ => (None, entry.1),
+            });
+        self.refuse_unbalanced_labels(written.collect());
+    }
+
+    /// The one rule [`Parser::check_tuple_labels`] and
+    /// [`Parser::check_pattern_labels`] state: each entry is its label (with
+    /// the label's span) or `None`, beside the entry's own span.
+    fn refuse_unbalanced_labels(&mut self, entries: Vec<(Option<(&'src str, Span)>, Span)>) {
+        let labelled = entries.iter().filter(|(label, _)| label.is_some()).count();
+        if labelled == 0 {
+            return;
+        }
+        if labelled < entries.len() {
+            let first = entries
+                .iter()
+                .find(|(label, _)| label.is_none())
+                .map_or(Span::from(0..0), |(_, span)| *span);
+            self.errors.push(ParseError {
+                span: first,
+                reason: ParseErrorReason::Rule(A_TUPLE_LABELS_EVERY_SLOT_OR_NONE),
+                context: Vec::new(),
+                hint: None,
+            });
+            return;
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for (label, label_span) in entries.into_iter().flat_map(|(label, _)| label) {
+            if seen.contains(&label) {
+                self.errors.push(ParseError {
+                    span: label_span,
+                    reason: ParseErrorReason::Rule(A_TUPLE_LABEL_IS_WRITTEN_ONCE),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            seen.push(label);
+        }
     }
 
     /// `context name` / `context (a, b)` — the optional context clause on a type
@@ -11133,6 +11454,252 @@ mod tests {
             Node::Assign(target, None, _) => assert!(matches!(target.0, Node::Dereference(_))),
             other => panic!("expected Assign over a Dereference target, got {other:?}"),
         }
+    }
+
+    /// The rendered diagnostics of `source` parsed as a whole program.
+    fn program_errors(source: &str) -> Vec<String> {
+        let (tree, errors) = parse(source);
+        assert!(tree.is_some(), "no tree came back for {source:?}");
+        errors.iter().map(render).collect()
+    }
+
+    /// B569 S1 (`named-tuple-fields.md` §3.2): every position whose value is
+    /// DISCARDED keeps assignment — a statement, a block's tail, a `match`
+    /// arm, a closure's expression body, the branches of a `then`/`else` form
+    /// standing at one, nested — and parses clean.
+    #[test]
+    fn b569_an_assignment_stands_where_its_value_is_discarded() {
+        for body in [
+            "x = 5;",
+            "x += 1;",
+            "*view = 5;",
+            "point.x = 5;",
+            "rows[0] = 5;",
+            "{ x = 5 }",
+            "let unit = { x = 5 };",
+            "match x { 0 => x = 1, _ => x = 2 }",
+            "let pick = match x { 0 => x = 1, _ => x = 2 };",
+            "let set = |v: i32| x = v;",
+            "list.each(|v| total += v);",
+            "c then x = 5;",
+            "c else x = 5;",
+            "c then x = 5 else x = 6;",
+            "c then x = 5 else d then x = 6 else x = 7;",
+            "if c { x = 5 } else { x = 6 }",
+            "for v in vs { total += v }",
+            "let nested = || { x = 5; |v: i32| x = v };",
+            "match x { 0 => c then x = 1 else x = 2, _ => {} }",
+        ] {
+            let source = format!("fun f() {{ {body} }}");
+            assert_eq!(
+                program_errors(&source),
+                Vec::<String>::new(),
+                "`{body}` discards the assignment's value"
+            );
+        }
+    }
+
+    /// B569 S1: every position whose value is USED refuses an assignment,
+    /// naming the statement to write instead. (`name = value` as an entry of
+    /// parentheses is no assignment at all since S2/S4: a tuple's label, or a
+    /// call's named argument.)
+    #[test]
+    fn b569_an_assignment_is_refused_where_its_value_is_used() {
+        let general = "an assignment is a statement and has no value: write ";
+        for (body, expected) in [
+            (
+                "let y = (x += 5);",
+                format!("{general}`x += 5;` before this, and use `x`"),
+            ),
+            (
+                "let y = (p.x = 5);",
+                format!("{general}`p.x = 5;` before this, and use `p.x`"),
+            ),
+            (
+                "let y = x = 5;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "w = x = 5;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "let list = [x = 5];",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "ret x = 5;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "let v = c then x = 5 else 0;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "takes(p.x = 5);",
+                format!("{general}`p.x = 5;` before this, and use `p.x`"),
+            ),
+            (
+                "takes(c then x = 5 else 0);",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "let s = Point { x = y = 5 };",
+                format!("{general}`y = 5;` before this, and use `y`"),
+            ),
+            (
+                "let s = i\"{x = 5}\";",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+        ] {
+            let source = format!("fun f() {{ {body} }}");
+            assert_eq!(
+                program_errors(&source),
+                vec![expected],
+                "`{body}` uses the assignment's value"
+            );
+        }
+    }
+
+    /// B569 S1: an assignment that spans lines is not quoted whole — the
+    /// steer names its place.
+    #[test]
+    fn b569_a_multi_line_assignment_is_steered_by_its_place() {
+        assert_eq!(
+            program_errors("fun f() { let y = [x =\n 5 + 1]; }"),
+            vec![
+                "an assignment is a statement and has no value: write the assignment as a \
+                 statement before this, and use `x`"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// B569 §2: a tuple type's slot is `MEMBER ":" type` or a type, every
+    /// slot labelled or none; a one-slot labelled type is a tuple, `(T)` a
+    /// group; `name ::` stays a path.
+    #[test]
+    fn b569_a_tuple_type_takes_labelled_slots() {
+        match &type_("(x: f64, y: f64)").0 {
+            Node::Tuple(slots) => {
+                assert!(
+                    matches!(&slots[0].0, Node::Labelled(("x", _), inner) if matches!(inner.0, Node::Accessor("f64")))
+                );
+                assert!(matches!(&slots[1].0, Node::Labelled(("y", _), _)));
+            }
+            other => panic!("expected a labelled tuple type, got {other:?}"),
+        }
+        assert!(
+            matches!(&type_("(x: i32)").0, Node::Tuple(slots) if matches!(slots[..], [(Node::Labelled(..), _)]))
+        );
+        assert!(
+            matches!(&type_("(type: str, if: bool)").0, Node::Tuple(slots) if matches!(&slots[1].0, Node::Labelled(("if", _), _)))
+        );
+        assert!(
+            matches!(&type_("(a::B, C)").0, Node::Tuple(slots) if matches!(slots[0].0, Node::StaticAccessor(..)))
+        );
+        assert!(matches!(
+            &type_("(U in T: List<U>)").0,
+            Node::MappedType { .. }
+        ));
+        for refused in [
+            "fun f(p: (x: f64, f64)) {}",
+            "fun f(p: (x: f64, x: f64)) {}",
+        ] {
+            assert_eq!(program_errors(refused).len(), 1, "{refused}");
+        }
+    }
+
+    /// B569 §2/§7: a literal's entry is `MEMBER "=" expression` once
+    /// assignment has left value position; `(x = 5)` is the one-slot tuple,
+    /// `(5)` a group, `==`/`=>` never a label, and an i-string hole a value.
+    #[test]
+    fn b569_a_tuple_literal_takes_labelled_entries() {
+        match &expr("(x = 5, y = 7)").0 {
+            Node::Tuple(entries) => {
+                assert!(
+                    matches!(&entries[0].0, Node::Labelled(("x", _), value) if matches!(value.0, Node::Number(..)))
+                );
+                assert!(matches!(&entries[1].0, Node::Labelled(("y", _), _)));
+            }
+            other => panic!("expected a labelled tuple, got {other:?}"),
+        }
+        assert!(
+            matches!(&expr("(x = 5)").0, Node::Tuple(entries) if matches!(entries[..], [(Node::Labelled(..), _)]))
+        );
+        assert!(matches!(expr("(5)").0, Node::Number(..)));
+        assert!(matches!(expr("(x == 5)").0, Node::Binary(..)));
+        assert!(
+            matches!(&expr("(..p, z = 3)").0, Node::Tuple(entries) if matches!(entries[1].0, Node::Labelled(("z", _), _)))
+        );
+        assert!(
+            matches!(&expr("(type = 1, match = 2)").0, Node::Tuple(entries) if matches!(entries[1].0, Node::Labelled(("match", _), _)))
+        );
+        assert_eq!(program_errors("fun f() { let a = (x = 1, 2); }").len(), 1);
+        assert_eq!(
+            program_errors("fun f() { let a = (x = 1, x = 2); }").len(),
+            1
+        );
+        assert_eq!(
+            program_errors("fun f() { let a = (..p, x = 1); }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            program_errors("fun f() { print(i\"{(x = 5)}\"); }"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// B569 S3: a tuple pattern's element may be written by name — `MEMBER
+    /// "="` then the sub-pattern — in a binder and a match pattern alike;
+    /// the one-slot by-name pattern is a tuple, every element named or none.
+    #[test]
+    fn b569_a_tuple_pattern_takes_labelled_elements() {
+        let (tree, errors) = parse("fun f() { let (y = top, x = left) = p; }");
+        assert!(errors.is_empty(), "{errors:?}");
+        let rendered = format!("{tree:?}");
+        assert!(rendered.contains("Labelled((\"y\""), "{rendered}");
+        assert_eq!(
+            program_errors(
+                "fun f() { match q { (x = 0, y = let v) => v, (x = let h, y = _) => h } }"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            program_errors("fun f() { let (x = only) = p; }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            program_errors("fun f() { for (y = b, x = a) in rows { } }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(program_errors("fun f() { let (x = a, b) = p; }").len(), 1);
+        assert_eq!(
+            program_errors("fun f() { let (x = a, x = b) = p; }").len(),
+            1
+        );
+        // A single parenthesized pattern without a label is still no tuple.
+        assert!(!program_errors("fun f() { let (a) = p; }").is_empty());
+    }
+
+    /// B569 S4: a call's argument may be NAMED — `MEMBER "=" expression`, a
+    /// labelled entry of the literal a spread parameter collects; a place
+    /// that is not a bare name is still an assignment, and refused.
+    #[test]
+    fn b569_an_argument_may_be_named() {
+        match &expr("draw(x = 1, y = 2)").0 {
+            Node::Call(_, _, arguments) => {
+                assert!(matches!(&arguments.0[0].0, Node::Labelled(("x", _), _)));
+                assert!(matches!(&arguments.0[1].0, Node::Labelled(("y", _), _)));
+            }
+            other => panic!("expected a call, got {other:?}"),
+        }
+        assert!(matches!(&expr("p.draw(x = 1)").0, Node::MemberAccessor(..)));
+        assert_eq!(
+            program_errors("fun f() { draw(x = 1, y = 2); }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(program_errors("fun f() { takes(p.x = 1); }").len(), 1);
     }
 
     // --- Closures ------------------------------------------------------------

@@ -332,14 +332,24 @@ impl<'src> Transformer<'src> {
     /// The name of the printer for `type_id` under the active substitution,
     /// generating it (and every printer it calls) on first ask.
     fn printer_for(&mut self, type_id: TypeId) -> String {
+        // B569 S3: the printer reads the WRITTEN id, so labels a generic's
+        // substitution brings stay erased (`printer::shape_of`); and a label
+        // is no part of a type's identity, so the key carries the labels the
+        // printer writes beside it.
+        let written = type_id;
         let type_id = self.ground_printer_type(type_id);
-        let key = self.type_key(type_id);
+        let program = self.program;
+        let key = format!(
+            "{}{}",
+            self.type_key(type_id),
+            crate::printer::label_key(program, written, &|type_id| self
+                .ground_printer_type(type_id))
+        );
         if let Some(name) = self.printers.get(&key) {
             return name.clone();
         }
-        let program = self.program;
         let resolve = |type_id| self.ground_printer_type(type_id);
-        let shape = shape_of(program, type_id, &resolve);
+        let shape = shape_of(program, written, &resolve);
         let label = crate::printer::type_text(program, type_id, &resolve);
         let name = self.printer_name(&label);
         // Recorded BEFORE the body is built: a recursive type's printer
@@ -384,7 +394,7 @@ impl<'src> Transformer<'src> {
             Shape::Tuple(elements) => {
                 let mut offset = 0;
                 let mut entries = Vec::with_capacity(elements.len());
-                for element in elements {
+                for (opens, element) in elements {
                     let width = self.flat_width(element);
                     let printer = self.printer_for(element);
                     let read = if width == 1 {
@@ -401,7 +411,7 @@ impl<'src> Transformer<'src> {
                             ],
                         )
                     };
-                    entries.push((String::new(), call(&printer, vec![read])));
+                    entries.push((opens, call(&printer, vec![read])));
                     offset += width;
                 }
                 group("(", ")", false, entries)

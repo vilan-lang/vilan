@@ -57,8 +57,10 @@ pub enum Shape {
     Backed {
         variants: Vec<(String, BackingValue)>,
     },
-    /// A tuple: its element types, in order.
-    Tuple(Vec<TypeId>),
+    /// A tuple: its element types, in order, each with the text its entry
+    /// opens with — `x = ` for a labelled slot (B569 S3: `dbg` prints the
+    /// literal, `(x = 5.0, y = 7.0)`), empty for a positional one.
+    Tuple(Vec<(String, TypeId)>),
     /// `List<T>` and `[T; n]`.
     List(TypeId),
     /// A value that prints as fixed text: a closure by its type, a pipe by
@@ -148,7 +150,7 @@ fn may_hold_an_object(program: &Program, type_id: TypeId, seen: &mut Vec<TypeId>
     seen.push(type_id);
     match program.type_id_to_type_map.get(&type_id) {
         Some(Type::Dyn(..) | Type::Generic(_)) => true,
-        Some(Type::Tuple(elements)) => elements
+        Some(Type::Tuple(elements, _)) => elements
             .iter()
             .any(|element| may_hold_an_object(program, *element, seen)),
         Some(Type::Array(element, _)) => may_hold_an_object(program, *element, seen),
@@ -371,19 +373,86 @@ fn is_std(program: &Program, id: Id) -> bool {
         .is_some_and(|source| program.std_sources.contains(&source))
 }
 
+/// The LABELS a printer for `type_id` writes (B569 S3), spelled for a
+/// printer cache's key: every tuple label the type reaches, in walk order,
+/// and the empty string for a type that reaches none. The emitters key their
+/// printers by the type's identity, which a label is no part of (labels
+/// erase at mono), so a key that is only the identity would hand
+/// `(x: i32, y: i32)` the printer `(i32, i32)` built first, or the reverse.
+pub fn label_key(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> String {
+    fn walk(
+        program: &Program,
+        type_id: TypeId,
+        resolve: &dyn Fn(TypeId) -> TypeId,
+        out: &mut String,
+    ) {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return;
+        };
+        let written = type_id;
+        let type_id = resolve(type_id);
+        let Some(resolved) = program.type_id_to_type_map.get(&type_id) else {
+            return;
+        };
+        match resolved {
+            Type::Tuple(elements, labels) => {
+                // Erased through a substitution, as `shape_of` reads it.
+                if written == type_id
+                    && let Some(labels) = labels.labels()
+                {
+                    out.push('(');
+                    out.push_str(&labels.join(","));
+                    out.push(')');
+                }
+                for element in elements {
+                    walk(program, *element, resolve, out);
+                }
+            }
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => {
+                for argument in arguments {
+                    walk(program, *argument, resolve, out);
+                }
+            }
+            Type::Array(element, _) => walk(program, *element, resolve, out),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    walk(program, type_id, resolve, &mut out);
+    out
+}
+
 /// The printing shape of `type_id`. `resolve` grounds a generic under the
 /// asking emitter's active substitution (and returns any other id as is);
 /// the shape's own type ids are NOT resolved — an emitter recursing into a
 /// field resolves it under the shape's `bindings`.
 pub fn shape_of(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> Shape {
+    let written = type_id;
     let type_id = resolve(type_id);
+    // B569 §5: labels print where the type was WRITTEN with them. A type that
+    // reaches the printer through a generic's substitution reaches it erased:
+    // label sets share one instance (§6.3), so the labels there are whichever
+    // instantiation was emitted first, and printing them would be a guess.
+    let erased = written != type_id;
     let Some(resolved) = program.type_id_to_type_map.get(&type_id) else {
         return Shape::Text("<unknown>".to_string());
     };
     match resolved {
         Type::Void => Shape::Void,
-        Type::Tuple(elements) if elements.is_empty() => Shape::Void,
-        Type::Tuple(elements) => Shape::Tuple(elements.clone()),
+        Type::Tuple(elements, _) if elements.is_empty() => Shape::Void,
+        Type::Tuple(elements, labels) => Shape::Tuple(
+            elements
+                .iter()
+                .enumerate()
+                .map(|(slot, element)| {
+                    let opens = labels
+                        .get(slot)
+                        .filter(|_| !erased)
+                        .map_or_else(String::new, |label| format!("{label} = "));
+                    (opens, *element)
+                })
+                .collect(),
+        ),
         Type::Array(element, _) => Shape::List(*element),
         Type::Closure(..) | Type::Function(_) => Shape::Text(format!(
             "<closure {}>",
@@ -618,7 +687,7 @@ pub fn type_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) ->
                 .unwrap_or("?"),
             arguments_text(arguments)
         ),
-        Some(Type::Tuple(elements)) => {
+        Some(Type::Tuple(elements, _)) => {
             let parts: Vec<String> = elements
                 .iter()
                 .map(|element| type_text(program, *element, resolve))

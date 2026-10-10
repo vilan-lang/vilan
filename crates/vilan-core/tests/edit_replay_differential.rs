@@ -718,6 +718,59 @@ fn a_reused_module_keeps_its_labels_without_a_seed() {
     );
 }
 
+/// B569 (lang-a-49, at C3's request): a reused PREFIX module's labelled
+/// tuples — the labels its hover rows and declaration labels print, which S2b
+/// records per module and restores on reuse, and the label refusal the tuple
+/// rule records during inference — render on every keystroke elsewhere, and
+/// on an unseeded hit, exactly as a clean analysis renders them.
+#[test]
+fn b569_a_reused_modules_tuple_labels_render_as_a_clean_analysis_renders() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let mut divergences = Vec::new();
+    let mut censuses = Vec::new();
+    let mut package = LABELS_FIXTURE.write();
+    for edit in LABELS_FIXTURE.edits {
+        censuses.extend(replay(&mut package, edit, &mut divergences));
+    }
+    vilan_core::analyzer::base_cache_clear();
+    let cold = observe(&package, Vec::new(), Leg::Incremental);
+    let warm = observe(&package, Vec::new(), Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(divergences.is_empty(), "{divergences:#?}");
+    assert!(
+        censuses.iter().any(|census| census.records_replayed > 0),
+        "the keystrokes reuse the prefix module's records: {censuses:#?}"
+    );
+    assert!(
+        cold.census.base_misses == 1 && warm.census.base_hits == 1,
+        "the second unseeded analysis is served the stored world: {:?} / {:?}",
+        cold.census,
+        warm.census
+    );
+    assert!(
+        warm.rendering == clean.rendering,
+        "an unseeded hit renders every label a clean analysis renders: {}",
+        first_difference(&warm.rendering, &clean.rendering)
+    );
+    for printed in [
+        "(min: i32, max: i32)",
+        "(x: f64, y: f64)",
+        "`z` is not a label of `(x: i32, y: i32)`",
+    ] {
+        assert!(
+            clean.rendering.contains(printed),
+            "the fixture renders {printed:?} (or it says nothing about labels):\n{}",
+            clean.rendering
+        );
+    }
+}
+
 /// M121 / B553's cost: a check whose late files write no impl on a type they
 /// do not declare RECORDS NOTHING — the pre-entry resolve asks the impl table
 /// thousands of questions and none of them is kept (`reach_questions` 0), which

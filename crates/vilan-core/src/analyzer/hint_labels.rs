@@ -392,7 +392,7 @@ impl<'src> Analyzer<'src> {
                         self.mentions_a_hinted_type(argument.borrow_type(self), depth + 1)
                     })
             }
-            Type::Tuple(items) => items
+            Type::Tuple(items, _) => items
                 .iter()
                 .any(|item| self.mentions_a_hinted_type(item.borrow_type(self), depth + 1)),
             Type::Array(element, _) => {
@@ -440,13 +440,20 @@ impl<'src> Analyzer<'src> {
                 self.push_rendered_arguments(&mut rendered, &arguments, admitted, hosts, depth);
                 rendered
             }
-            Type::Tuple(items) => {
-                let items = items.clone();
+            // B569 §12: a labelled tuple abbreviates in place, labels kept —
+            // `(x: ~Pipe<i32>, y: i32)`.
+            Type::Tuple(items, labels) => {
+                let (items, labels) = (items.clone(), labels.clone());
                 let parts: Vec<String> = items
                     .iter()
-                    .map(|item| {
+                    .enumerate()
+                    .map(|(index, item)| {
                         let item = item.get_type(self);
-                        self.render_hint_label(&item, admitted, hosts, depth + 1)
+                        let rendered = self.render_hint_label(&item, admitted, hosts, depth + 1);
+                        match labels.get(index) {
+                            Some(label) => format!("{label}: {rendered}"),
+                            None => rendered,
+                        }
                     })
                     .collect();
                 format!("({})", parts.join(", "))

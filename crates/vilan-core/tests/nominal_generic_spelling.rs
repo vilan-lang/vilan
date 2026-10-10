@@ -118,7 +118,7 @@ fn walk<S: std::hash::BuildHasher>(
         match types.get(&type_id) {
             Some(Type::Generic(_)) => generic_nodes += 1,
             Some(
-                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
+                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments, _),
             ) => {
                 for argument in arguments.clone() {
                     pending.push((where_.clone(), argument));
@@ -262,7 +262,10 @@ fn the_spelling_walk_finds_a_bare_constraint_id_and_passes_a_wrapped_one() {
     types.insert(constraint, Type::Any);
     types.insert(wrapped, Type::Generic(constraint));
     types.insert(nominal, Type::Struct(vilan_core::id::Id(7), vec![wrapped]));
-    types.insert(tuple, Type::Tuple(vec![wrapped, nominal]));
+    types.insert(
+        tuple,
+        Type::Tuple(vec![wrapped, nominal], vilan_core::type_::TupleLabels::NONE),
+    );
     types.insert(element, Type::Generic(constraint));
     types.insert(array, Type::Array(element, 3));
     let parameters: HashSet<TypeId> = HashSet::from([constraint]);

@@ -146,6 +146,28 @@ The bound is checked on what the spread actually contributes, so a
 at a call to a function *without* a spread parameter builds no tuple and
 is an error — write the tuple yourself (`takes_a_tuple((..pair))`).
 
+### Named arguments
+
+Give the pack's tuple **labels** and the call site can name its arguments.
+The collected tuple is a labelled literal, so the names match by name, in
+any order, and positional calls keep working:
+
+```vilan
+fun draw(...at: (x: f64, y: f64)): f64 {
+	at.x * 10 + at.y
+}
+
+fun main() {
+	print(draw(1, 2));
+	print(draw(x = 1, y = 2));
+	print(draw(y = 2, x = 1));   // the same call
+}
+```
+
+Name every argument the pack collects, or none. A name only means
+something to a spread parameter — anywhere else it is refused — and there
+are no defaults: every slot is written.
+
 ## Lazy parameters
 
 Prefix a parameter with `lazy` and the call site stops evaluating its

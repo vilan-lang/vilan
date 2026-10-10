@@ -214,7 +214,9 @@ parameter  = [ "lazy" ] [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
 convention = "own" | "&" [ "mut" ] ;
 binder     = IDENT
            | "(" binder "," binder { "," binder } [ "," ] ")"
+           | "(" named-binder { "," named-binder } [ "," ] ")"  (* by name, B569 *)
            | "[" binder { "," binder } [ "," ] "]" ;
+named-binder = MEMBER "=" binder ;
 
 extern-attr = "[" "extern" "(" extern-args [ "," "retains" ] [ "," ] ")" "]" ;
 extern-args = STRING [ "," STRING ]              (* global, or module and symbol *)
@@ -569,6 +571,17 @@ there, so a left side that denotes no location — `-x`, `!b`, `(x + 1)`,
 refused by the checker, once per assignment. `jump break` / `jump continue` control the
 innermost enclosing loop.
 
+An assignment is a statement: its value is `void`, and it stands only where
+a value is **discarded** — an expression statement (`x = 5;`), a block's
+trailing expression (`{ x = 5 }`), a `match` arm's body (`A => x = 5,`), a
+closure's expression body (`|v| total += v`), and a `then`/`else` branch of a
+conditional that itself stands in one of these (`c then x = 5;`). Anywhere
+its value would be USED — inside parentheses, as an argument, a tuple or list
+entry, a `let` initializer, the right of another `=`, an operand — it is
+refused, naming the statement to write before it (B569,
+`named-tuple-fields.md` §3.2). Inside parentheses `name = value` is a
+tuple's label (§3.6), never an assignment.
+
 ## 3.5 Blocks and control expressions
 
 ```text
@@ -623,6 +636,7 @@ path    = ( IDENT generic-args ␣"::"  (* generic static head *)
           | atom )
           { "::" MEMBER } ;
 call-suffix = [ generic-args ] "(" [ entry { "," entry } [ "," ] ] ")" ;
+                                          (* an argument: its `entry` may be NAMED *)
 member  = NUMBER                          (* tuple index: .0 *)
         | MEMBER [ call-suffix ] ;        (* field / ONE fused method call *)
 MEMBER  = IDENT | RESERVED ;              (* any word, B414 S4 (§2.2) *)
@@ -639,8 +653,10 @@ atom    = literal | IDENT | IDENT generic-args | struct-init
         | tuple-comprehension | macro-invocation | macro-block
         | element | css-block ;
 literal = NUMBER | STRING | "true" | "false" | "null" | "void" ;
-tuple   = "(" ( spread | expression "," entry { "," entry } [ "," ] ) ")" ;
-entry   = spread | expression ;
+tuple   = "(" ( spread | entry "," entry { "," entry } [ "," ] ) ")"
+        | "(" labelled-entry ")" ;        (* the one-slot labelled tuple, B569 *)
+entry   = spread | labelled-entry | expression ;
+labelled-entry = MEMBER "=" expression ;  (* a label / a named argument, B569 *)
 spread  = ".." expression ;
 list    = "[" [ expression { "," expression } [ "," ] ] "]" ;
 tuple-comprehension = "(" comprehension-binding { "," comprehension-binding }
@@ -709,6 +725,30 @@ tuple construction whose only entry is a spread is still a tuple, not a
 parenthesized group: `(..a)` is the concatenation of one, and `(e)` is a
 group as before. There is no type-level spread; `(..T, U)` does not
 parse.
+
+A tuple entry may carry a **label** (B569, `named-tuple-fields.md` §2):
+`(x = 5, y = 7)`, the struct literal's `name = value` spelling, which
+inside parentheses is free because an assignment has left value position
+(§3.4). The label is a MEMBER, so `(type = "a", if = true)` is legal. A
+tuple labels every written entry or none, and names each label once; a
+spread brings its operand's slots with their labels, so `(..p, z = 3)`
+over a labelled `p` is labelled and over an unlabelled one is refused.
+`MEMBER "="` decides it at the second token — `==` and `=>` are tokens of
+their own — and an i-string's interpolation hole holds an expression,
+never an entry. `(x = 5)` is the **one-slot labelled tuple** `(x: i32)`:
+the label is what makes it a tuple, where `(5)` stays a group. There is
+no shorthand: `(x, y)` is positional and never means `(x = x, y = y)`.
+`(x = 5);` as a statement builds a tuple and discards it, and is refused
+with the assignment it was meant to be.
+
+The same entry in an argument list is a **named argument** (B569 S4,
+`named-tuple-fields.md` §8): a spread parameter collects its arguments
+into one tuple literal, so `draw(x = 1, y = 2)` against `fun draw(...at:
+(x: f64, y: f64))` collects `(x = 1, y = 2)` and matches it by name (types
+§5.9). The collected arguments are named or none; a name no spread
+parameter collects — a callee without one, a fixed parameter before it — is
+refused, naming the assignment the author may have meant. There are no
+default arguments.
 
 An **element** appears only in atom position, where `<` begins no other
 expression; after an operand, `<` remains a comparison (`x < <div/>` is
@@ -893,8 +933,9 @@ type = "&" [ "mut" ] type                       (* view type *)
      | "dyn" type-path                           (* trait object, §5.12 *)
      | type-path                                 (* nominal *)
      | "(" IDENT "in" type ":" type ")"          (* mapped tuple, §5.9 *)
-     | "(" [ type { "," type } [ "," ] ] ")"     (* tuple type *)
+     | "(" [ tuple-slot { "," tuple-slot } [ "," ] ] ")"  (* tuple type *)
      ;
+tuple-slot     = [ MEMBER ":" ] type ;     (* labelled: every slot, or none (B569) *)
 type-path      = IDENT { "::" IDENT } [ generic-args ] ;
 closure-type   = ( "||" | "|" [ [IDENT ":"] type { "," [IDENT ":"] type } "|" )
                  [ type ] ;
@@ -919,6 +960,13 @@ With no return type at all the clause is read by the function
 production above instead. Written after the return type it precedes a
 `borrows` clause, and written without one it follows it; the formatter
 prints it where it was written.
+
+A tuple type's slots may carry **labels** (B569): `(x: f64, y: f64)`.
+`MEMBER ":"` at a slot's head is a label (decided at the second token, so
+`a::B` stays a path and `(U in T: …)` a mapped tuple); every slot is
+labelled or none, each label once. A labelled one-slot type `(x: i32)` is a
+tuple, where `(T)` stays a group. Labels name positions and are no part of
+the type's identity (types §5.9).
 
 `dyn` takes a `type-path` and nothing else: the keyword erases a TRAIT's
 implementation, so a closure type, a tuple, an array or a view after it names
@@ -950,11 +998,21 @@ form.
 ```text
 pattern = ("let" | "mut") binder                (* binding *)
         | "(" pattern "," pattern { "," pattern } [ "," ] ")"
+        | "(" named-pattern { "," named-pattern } [ "," ] ")"  (* by name *)
         | STRING | MULTILINE_STRING | NUMBER    (* equality literal *)
         | "_"                                   (* wildcard *)
         | NAME { "::" IDENT }
           [ "(" [ pattern { "," pattern } [ "," ] ] ")" ] ;  (* variant *)
+named-pattern = MEMBER "=" pattern ;
 ```
+
+A tuple pattern may be written **by name** (B569): `let (y = top, x =
+left) = p;`, `(x = 0, y = let v)` — the label, then what its slot meets,
+the literal's spelling. It names exactly the matched value's labels, in
+any order (the value must be a labelled tuple), and is placed slot by slot
+once the value's type is known; every element is named or none, and a
+one-element by-name pattern `(x = a)` is a tuple pattern. A positional
+pattern ignores labels.
 
 Bindings inside patterns are written explicitly (`Some(let x)`), so a
 bare name is always a **variant** reference, never a fresh binding: the

@@ -5699,6 +5699,13 @@ impl<'src> Printer<'src> {
                     self.print_tuple_bound(tuple_bound);
                 }
             }
+            // B569: `x: f64` — a labelled slot of a tuple type, one space after
+            // the `:` as a field's.
+            Node::Labelled((label, _), inner) => {
+                self.out.push_str(label);
+                self.out.push_str(": ");
+                self.print_type(&inner.0);
+            }
             // `(A, B)` — a tuple type.
             Node::Tuple(elements) => {
                 self.out.push('(');
@@ -8673,6 +8680,13 @@ impl<'src> Printer<'src> {
                 self.print_expression_list(elements);
                 self.out.push(')');
             }
+            // B569: `x = 5` — a labelled tuple entry, spaced as a struct
+            // literal's field.
+            Node::Labelled((label, _), value) => {
+                self.out.push_str(label);
+                self.out.push_str(" = ");
+                self.print_expr(value);
+            }
             Node::Closure(closure) => {
                 self.print_closure_parameters(&closure.parameters.0);
                 if let Some(return_type) = &closure.return_type {
@@ -8999,6 +9013,12 @@ impl<'src> Printer<'src> {
                 }
                 self.out.push(']');
             }
+            // B569 S3: a by-name element, `y = top`.
+            Pattern::Labelled((label, _), inner) => {
+                self.out.push_str(label);
+                self.out.push_str(" = ");
+                self.print_binder(&inner.0);
+            }
             // A binder is only ever a name, a tuple, or an array of binders;
             // other pattern shapes can't reach here from the parser.
             other => self.print_pattern(other),
@@ -9080,6 +9100,12 @@ impl<'src> Printer<'src> {
                 self.out.push(']');
             }
             Pattern::Literal(literal) => self.print_expr(literal),
+            // B569 S3: a by-name element, `x = let v`.
+            Pattern::Labelled((label, _), inner) => {
+                self.out.push_str(label);
+                self.out.push_str(" = ");
+                self.print_match_pattern(inner);
+            }
         }
     }
 }

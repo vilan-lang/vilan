@@ -222,8 +222,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         type_id: TypeId,
         span: Span,
     ) -> Result<String, Error> {
+        // B569 S3: the printer reads the WRITTEN id, so labels a generic's
+        // substitution brings stay erased (`printer::shape_of`); and a label
+        // is no part of a type's identity, so the key carries the labels the
+        // printer writes beside it.
+        let written = type_id;
         let type_id = self.concrete(type_id);
-        let key = self.type_key(type_id);
+        let key = format!(
+            "{}{}",
+            self.type_key(type_id),
+            vilan_core::printer::label_key(self.program, written, &|type_id| self
+                .concrete(type_id))
+        );
         if let Some(name) = self.printers.get(&key) {
             return Ok(name.clone());
         }
@@ -231,7 +241,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let program = self.program;
         let shape = {
             let resolve = |type_id| self.concrete(type_id);
-            shape_of(program, type_id, &resolve)
+            shape_of(program, written, &resolve)
         };
         let name = format!("show_{}", self.printers.len());
         // Recorded BEFORE the body is built: a recursive type's printer calls
@@ -279,9 +289,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Shape::Tuple(elements) => {
                 let mut entries = Vec::with_capacity(elements.len());
-                for (index, element) in elements.iter().enumerate() {
+                for (index, (opens, element)) in elements.iter().enumerate() {
                     let printer = self.native_printer_for(*element, span)?;
-                    entries.push(format!("(String::new(), {printer}(&value.{index}))"));
+                    entries.push(format!(
+                        "({}.to_string(), {printer}(&value.{index}))",
+                        rust_literal(opens)
+                    ));
                 }
                 format!(
                     "vilan_rt::show::Doc::group(\"(\", \")\", false, vec![{}])",

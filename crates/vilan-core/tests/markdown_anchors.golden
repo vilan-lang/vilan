@@ -330,6 +330,7 @@ spec/types.md h2 56-generic-binding-and-inference
 spec/types.md h2 57-operator-and-method-dispatch
 spec/types.md h2 58-conversions-and-coercions
 spec/types.md h2 59-variadic-tuples
+spec/types.md h3 labelled-tuples
 spec/types.md h2 510---and-
 spec/types.md h2 511-type-errors-of-note
 spec/types.md h2 512-trait-objects-dyn-trait
@@ -566,6 +567,7 @@ tour/functions-and-closures.md h1 functions--closures
 tour/functions-and-closures.md h2 functions
 tour/functions-and-closures.md h2 taking-any-number-of-arguments
 tour/functions-and-closures.md h3 passing-a-pack-on
+tour/functions-and-closures.md h3 named-arguments
 tour/functions-and-closures.md h2 lazy-parameters
 tour/functions-and-closures.md h2 closures
 tour/functions-and-closures.md h2 named-functions-as-closures
@@ -623,5 +625,6 @@ tour/values-and-types.md h2 primitives
 tour/values-and-types.md h2 strings-and-interpolation
 tour/values-and-types.md h2 tuples
 tour/values-and-types.md h3 building-one-out-of-another
+tour/values-and-types.md h3 naming-the-positions
 tour/values-and-types.md h2 collections
 tour/values-and-types.md h2 wheres-null

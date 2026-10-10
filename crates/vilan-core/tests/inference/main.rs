@@ -37,6 +37,7 @@ mod macros;
 mod maps;
 mod markdown;
 mod modules;
+mod named_tuples;
 mod platform;
 mod resources;
 mod returns;

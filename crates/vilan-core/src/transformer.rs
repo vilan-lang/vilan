@@ -7965,11 +7965,37 @@ impl<'src> Transformer<'src> {
                 // expression caches no type of its own (a call, an `if`).
                 // The splice is applied AFTER the ordered walk, so a spilled
                 // element is the value and never the `...` around it (B452).
-                let items = self
-                    .walk_siblings_in_order(ids, block, |this, id, block| {
-                        let walked = this.walk_entity(id, block)?;
-                        Some(this.maybe_clone(id, walked))
-                    })
+                let mut walked = self.walk_siblings_in_order(ids, block, |this, id, block| {
+                    let walked = this.walk_entity(id, block)?;
+                    Some(this.maybe_clone(id, walked))
+                });
+                // B569 §4.1: a literal matched by name stores its entries in
+                // its type's order, and still evaluates them as WRITTEN — so
+                // every entry whose value a later one could change is bound
+                // to a `const` first, in written order, and the array reads
+                // the bindings in storage order.
+                if let Some(layout) = self.program.tuple_literal_layouts.get(&id).cloned()
+                    && layout.len() == walked.len()
+                {
+                    for (entry_id, value) in walked.iter_mut() {
+                        if self.sibling_value_is_settled(*entry_id, value) {
+                            continue;
+                        }
+                        let temp = self.ng.next_name();
+                        let evaluated = std::mem::replace(value, js::Node::Local(temp.clone()));
+                        block.push(js::Node::ConstVariable(js::Variable {
+                            name: temp,
+                            value: Box::new(evaluated),
+                        }));
+                    }
+                    let mut written: Vec<Option<(Id, js::Node<'src>)>> =
+                        walked.into_iter().map(Some).collect();
+                    walked = layout
+                        .iter()
+                        .filter_map(|written_index| written[*written_index].take())
+                        .collect();
+                }
+                let items = walked
                     .into_iter()
                     .map(|(id, value)| {
                         let splices =
@@ -8824,7 +8850,7 @@ impl<'src> Transformer<'src> {
         else {
             return None;
         };
-        let Some(Type::Tuple(elements)) = self
+        let Some(Type::Tuple(elements, _)) = self
             .program
             .type_id_to_type_map
             .get(&self.resolve_type_id(source_tuple))
@@ -8842,13 +8868,13 @@ impl<'src> Transformer<'src> {
                 self.program
                     .type_id_to_type_map
                     .get(&self.resolve_type_id(template)),
-                Some(Type::Tuple(_))
+                Some(Type::Tuple(_, _))
             );
             let result_is_tuple = matches!(
                 self.program
                     .type_id_to_type_map
                     .get(&self.resolve_type_id(body_template)),
-                Some(Type::Tuple(_))
+                Some(Type::Tuple(_, _))
             );
             self.current_substitution = outer;
             if source_is_tuple && source_width == 1 {
@@ -9174,7 +9200,7 @@ impl<'src> Transformer<'src> {
                     self.program
                         .type_id_to_type_map
                         .get(&self.resolve_type_id(template)),
-                    Some(Type::Tuple(_))
+                    Some(Type::Tuple(_, _))
                 )
             });
             let mut body = Vec::new();
@@ -9333,7 +9359,7 @@ impl<'src> Transformer<'src> {
             .type_id_to_type_map
             .get(&self.resolve_type_id(type_id))
         {
-            Some(Type::Tuple(elements)) => {
+            Some(Type::Tuple(elements, _)) => {
                 elements.clone().iter().map(|id| self.flat_width(*id)).sum()
             }
             _ => 1,
@@ -9357,7 +9383,8 @@ impl<'src> Transformer<'src> {
         let mut type_id = self.resolve_type_id(*root_type_id);
         let mut offset = 0;
         for index in path {
-            let Some(Type::Tuple(elements)) = self.program.type_id_to_type_map.get(&type_id) else {
+            let Some(Type::Tuple(elements, _)) = self.program.type_id_to_type_map.get(&type_id)
+            else {
                 return baked;
             };
             let elements = elements.clone();
@@ -10166,7 +10193,7 @@ impl<'src> Transformer<'src> {
                     self.program
                         .type_id_to_type_map
                         .get(&self.resolve_type_id(result_template)),
-                    Some(Type::Tuple(_))
+                    Some(Type::Tuple(_, _))
                 );
                 self.current_substitution = outer;
                 is_tuple
@@ -10264,7 +10291,7 @@ impl<'src> Transformer<'src> {
                 self.program
                     .type_id_to_type_map
                     .get(&self.resolve_type_id(element)),
-                Some(Type::Tuple(_))
+                Some(Type::Tuple(_, _))
             );
             self.current_substitution = outer;
             positions.push((offset, width, is_tuple));
@@ -10287,7 +10314,7 @@ impl<'src> Transformer<'src> {
             .type_id_to_type_map
             .get(&self.resolve_type_id(type_id))?
         {
-            Type::Tuple(elements) => Some(
+            Type::Tuple(elements, _) => Some(
                 elements
                     .iter()
                     .map(|element| (*element, Vec::new()))
@@ -12517,7 +12544,7 @@ impl<'src> Transformer<'src> {
                 .program
                 .type_id_to_type_map
                 .get(&self.resolve_type_id(type_id))
-                .is_some_and(|type_| matches!(type_, Type::Tuple(_)));
+                .is_some_and(|type_| matches!(type_, Type::Tuple(_, _)));
         }
         self.program
             .tuple_element_types
@@ -12527,7 +12554,7 @@ impl<'src> Transformer<'src> {
                     .type_id_to_type_map
                     .get(&self.resolve_type_id(*type_id))
             })
-            .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
+            .is_some_and(|type_| matches!(type_, Type::Tuple(_, _)))
     }
 
     /// Whether a `for x in ...` loop's iterable is the built-in `HashSet` — a vilan
@@ -12787,7 +12814,7 @@ impl<'src> Transformer<'src> {
                 let _ = write!(out, "D{}", id.0);
                 self.write_type_key_arguments(arguments, out);
             }
-            Type::Tuple(elements) => {
+            Type::Tuple(elements, _) => {
                 out.push_str("Tup");
                 self.write_type_key_arguments(elements, out);
             }

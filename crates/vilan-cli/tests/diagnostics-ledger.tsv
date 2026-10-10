@@ -695,3 +695,17 @@ row	flagship	key
 671	-	Expected {expected}, but got {got} instead: inside the impl that declares it, a bare `{path}::{member}(..)` is `Self::{member}(..)`, whose `{expected}` is this block's own. Write `{suggested}::{member}(..)` to call it at another instantiation
 672	-	`dbg_stack()` takes no arguments: it prints every binding in scope at the call. To print chosen values, use `dbg(..)`
 673	-	`dbg_stack()` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
+674	-	an assignment is a statement and has no value: write {statement} before this, and use `{place}`
+675	-	`({label} = {value})` is a tuple with the label `{label}`, and a statement discards it: to assign, write `{label} = {value};`
+676	-	`{extra}` is not a label of `{landing}`: a labelled tuple names exactly its type's labels, and this one leaves out {missing}
+677	-	a tuple's labels name its slots, so each is written once: `{duplicate}` labels two of these
+678	-	a tuple labels every slot or none, and a spread brings its operand's slots with their labels: label every entry and spread a labelled tuple, or drop the labels
+679	-	`{tuple_label}` has no label `{member_name}`; its labels are {labels}
+680	-	Expected {expected}, but got {got} instead: the label `{label}` names slot {from} of the value and slot {to} here, so the two do not convert — match by name, writing the labels out, or by position, dropping them
+681	-	{msg} `({label} = {value})` is a tuple with the label `{label}`; to assign, write `{label} = {value};`
+682	-	an `impl` cannot name a labelled tuple: labels name positions and are not an identity, so this impl would answer for every tuple of these slot types under any labels — declare a struct for a shape that has methods
+683	-	{head}: a by-name pattern names exactly its value's labels{tail}
+684	-	this pattern destructures by name, but `{rendered}` has no labels: destructure it by position, `(a, b)`
+685	-	this pattern destructures by name, so the value must be a labelled tuple, and it is `{rendered}`
+686	-	`{label} = {value}` names an argument, and only a spread parameter takes names (`...at: ({label}: T, …)`), which this one is not: drop `{label} =` to pass it by position, or, to assign, write `{label} = {value};` before the call
+687	-	a spread parameter's arguments are all named or none: name every argument it collects, or drop the names and pass them by position

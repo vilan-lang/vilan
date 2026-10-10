@@ -12,7 +12,7 @@ use crate::node::{
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
-use crate::type_::{Mode, ParameterMode, SubstitutionContext, Type, TypeId};
+use crate::type_::{Mode, ParameterMode, SubstitutionContext, TupleLabels, Type, TypeId};
 use crate::util::{join_with, plural};
 
 mod dbg_stack;
@@ -2612,6 +2612,10 @@ enum WalkPattern<'src> {
         Option<Vec<WalkPattern<'src>>>,
     ),
     Tuple(Span, Vec<WalkPattern<'src>>),
+    // B569 S3: a by-name element of a tuple pattern — its label, the label's
+    // span, and the sub-pattern its slot meets. Placed at the label's slot
+    // when the `Tuple` around it resolves.
+    Labelled(&'src str, Span, Box<WalkPattern<'src>>),
     // `[a, b, c]` — a fixed-array binder (fixed-arrays.md §7): irrefutable,
     // its element count must equal the array type's length.
     Array(Span, Vec<WalkPattern<'src>>),
@@ -5488,6 +5492,30 @@ pub struct Analyzer<'src> {
     // element whatever it is written as. A `..e` element has no entry and needs
     // none — its splice is mark-driven (§T.5).
     tuple_element_types: HashMap<Id, TypeId>,
+    // B569: the LABEL each labelled entry of a tuple literal was written with
+    // (`(x = 5, y = 7)`), keyed by the entry's own expression. `Labelled`
+    // forwards to its value the way `..e` does, so the label is a mark on the
+    // entry and the literal's labels are its entries' — all of them, or none
+    // (the parser refuses a written mix).
+    entry_labels: HashMap<Id, &'src str>,
+    // B569 §4.1: a labelled literal matched BY NAME against a labelled type
+    // whose order differs — `let p: (x: f64, y: f64) = (y = 7, x = 5);` —
+    // keyed by the literal: the written entry each storage slot takes, and
+    // the labels in storage order. The literal's type is in storage order;
+    // its entries are evaluated as written, then laid out by this
+    // (`Program::tuple_literal_layouts`). A literal whose written order IS
+    // the storage order has no entry.
+    tuple_literal_layouts: HashMap<Id, (Vec<usize>, TupleLabels)>,
+    // B569: a labelled literal's label refusals, keyed by the literal and
+    // reported once by `check_tuple_literal_labels` — recorded by the tuple
+    // rule (the only place the landing type is known), and withdrawn when a
+    // later inference of the same literal matches.
+    tuple_literal_label_problems: HashMap<Id, String>,
+    // B569 S4: every NAMED call argument (`draw(x = 1, y = 2)`) — the
+    // argument's value id and the `name = value` span. Only a spread
+    // parameter's pack takes names (§8); `check_named_arguments` refuses any
+    // that no pack collected.
+    named_arguments: Vec<(Id, Span)>,
     // B310: for every `Expr::TupleIndex` the field-accessor rule mints, the
     // tuple type of the ROOT subject the access reads and the chain of element
     // indices from it (`deep.0.1` folds to the root plus `[0, 1]`). The offset
@@ -6687,23 +6715,69 @@ fn is_overloadable_operator(op: BinaryOp) -> bool {
     operator_trait_method(op).is_some()
 }
 
+/// The fixed middle of B569 §4.3's contradiction refusal, which
+/// [`Analyzer::with_label_contradiction_fixes`] recognizes it by (and the
+/// editor's fix reads after).
+pub const LABEL_CONTRADICTION_STEER: &str = "so the two do not convert — match by name, \
+     writing the labels out, or by position, dropping them";
+
+/// A by-name layout (storage slot → written entry) turned round: the
+/// storage slot each written entry takes.
+fn invert_layout(layout: &[usize]) -> Vec<usize> {
+    let mut slots = vec![0; layout.len()];
+    for (slot, written_index) in layout.iter().enumerate() {
+        slots[*written_index] = slot;
+    }
+    slots
+}
+
+/// Whether two equal types print the same labels at their head — the one
+/// part of a `Type` its equality does not see (B569). Elements are slot ids,
+/// so a nested tuple's labels live in its own slot and need no walk here.
+fn tuple_labels_spelled_alike(left: &Type, right: &Type) -> bool {
+    match (left, right) {
+        (Type::Tuple(_, left), Type::Tuple(_, right)) => left.spelled_alike(right),
+        _ => true,
+    }
+}
+
+/// The first label a tuple's label list carries twice.
+fn duplicate_label(labels: &[Box<str>]) -> Option<&str> {
+    labels
+        .iter()
+        .enumerate()
+        .find(|(index, label)| labels[..*index].contains(label))
+        .map(|(_, label)| &**label)
+}
+
 /// What went wrong resolving a tuple member.
 enum TupleAccessProblem {
     /// The member isn't a position at all (`pair.first`).
     NotAPosition,
+    /// The member is neither a position nor one of the tuple's labels
+    /// (B569), which are carried here.
+    NotALabel(Vec<Box<str>>),
     /// The position is past the tuple's arity, which is carried here.
     OutOfRange(usize),
 }
 
 /// Resolves `member_name` against a tuple's elements: `.0`, `.1`, … index by
-/// position (spec §5.9).
+/// position (spec §5.9), and a labelled tuple's label names its slot (B569,
+/// `named-tuple-fields.md` §5).
 fn tuple_element(
     element_type_ids: &[TypeId],
+    labels: &TupleLabels,
     member_name: &str,
 ) -> Result<usize, TupleAccessProblem> {
+    if let Some(index) = labels.position(member_name) {
+        return Ok(index);
+    }
     let index = member_name
         .parse::<usize>()
-        .map_err(|_| TupleAccessProblem::NotAPosition)?;
+        .map_err(|_| match labels.labels() {
+            Some(labels) => TupleAccessProblem::NotALabel(labels.to_vec()),
+            None => TupleAccessProblem::NotAPosition,
+        })?;
     if index < element_type_ids.len() {
         Ok(index)
     } else {
@@ -6717,6 +6791,14 @@ fn tuple_access_error(tuple_label: &str, member_name: &str, problem: TupleAccess
         TupleAccessProblem::NotAPosition => format!(
             "a tuple's members are its positions: `{tuple_label}` has no member \
              '{member_name}'; use `.0`, `.1`, … (or destructure with `let (a, b) = …`)"
+        ),
+        TupleAccessProblem::NotALabel(labels) => format!(
+            "`{tuple_label}` has no label `{member_name}`; its labels are {}",
+            labels
+                .iter()
+                .map(|label| format!("`{label}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         TupleAccessProblem::OutOfRange(arity) => {
             format!("`{tuple_label}` has no element {member_name}: its arity is {arity}")
@@ -7579,6 +7661,10 @@ impl<'src> Analyzer<'src> {
             shared_place_inits: HashSet::default(),
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
+            entry_labels: HashMap::default(),
+            tuple_literal_layouts: HashMap::default(),
+            tuple_literal_label_problems: HashMap::default(),
+            named_arguments: Vec::new(),
             tuple_index_paths: HashMap::default(),
             scope_id: 0,
             scopes: IndexMap::default(),
@@ -7825,7 +7911,9 @@ impl<'src> Analyzer<'src> {
         match type_ {
             Type::Struct(id, arguments) => Type::Struct(*id, rewrite(self, &arguments.clone())),
             Type::Enum(id, arguments) => Type::Enum(*id, rewrite(self, &arguments.clone())),
-            Type::Tuple(elements) => Type::Tuple(rewrite(self, &elements.clone())),
+            Type::Tuple(elements, labels) => {
+                Type::Tuple(rewrite(self, &elements.clone()), labels.clone())
+            }
             Type::Array(element, length) => {
                 let length = *length;
                 Type::Array(rewrite(self, &[*element])[0], length)
@@ -8077,7 +8165,7 @@ impl<'src> Analyzer<'src> {
             | (Type::Dyn(left_id, lefts), Type::Dyn(right_id, rights)) => {
                 left_id == right_id && all(&lefts, &rights)
             }
-            (Type::Tuple(lefts), Type::Tuple(rights)) => all(&lefts, &rights),
+            (Type::Tuple(lefts, _), Type::Tuple(rights, _)) => all(&lefts, &rights),
             (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {
                 left_length == right_length
                     && self.same_type_structure(left_element, right_element, depth + 1)
@@ -8296,6 +8384,121 @@ impl<'src> Analyzer<'src> {
         false
     }
 
+    /// B569: the label refusals the tuple rule recorded for its literals
+    /// (`tuple_literal_label_problems`) — a label set that is not its landing
+    /// type's, a label written twice, a labelled spread beside unlabelled
+    /// slots — reported once each, at the literal, in source order.
+    fn check_tuple_literal_labels(&mut self) {
+        if self.tuple_literal_label_problems.is_empty() {
+            return;
+        }
+        // Read, not taken: the table rides a stored world into the next
+        // analysis, whose reused modules re-run no inference to refill it.
+        let mut problems: Vec<(Id, String)> = self
+            .tuple_literal_label_problems
+            .iter()
+            .map(|(literal, message)| (*literal, message.clone()))
+            .collect();
+        problems.sort_by_key(|(literal, _)| {
+            self.span_map
+                .get(literal)
+                .map(|span| (span.start, span.end))
+                .unwrap_or_default()
+        });
+        for (literal, message) in problems {
+            let span = **self.span_map.get(&literal).unwrap_or(&&EMPTY_SPAN);
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: message,
+            });
+        }
+    }
+
+    /// B569 S4: records a call's NAMED arguments — a `Labelled` entry of the
+    /// written argument list — by the id its value walked to.
+    fn note_named_arguments(&mut self, arguments: &[Spanned<Node<'src>>], argument_ids: &[Id]) {
+        for (argument, argument_id) in arguments.iter().zip(argument_ids) {
+            if matches!(argument.0, Node::Labelled(..)) {
+                self.named_arguments.push((*argument_id, argument.1));
+            }
+        }
+    }
+
+    /// B569 S4 (`named-tuple-fields.md` §8): a named argument is an entry of
+    /// the labelled literal a spread parameter collects, so it stands only
+    /// where a pack collected it. Anywhere else — a callee without a spread
+    /// parameter, a fixed parameter before the pack — the name would be
+    /// silently dropped, so it is refused, with the assignment the author may
+    /// have meant named beside it (B569 S1).
+    fn check_named_arguments(&mut self) {
+        if self.named_arguments.is_empty() {
+            return;
+        }
+        let collected: HashSet<Id> = self
+            .spread_packs
+            .values()
+            .filter_map(|arguments| arguments.last())
+            .filter_map(|pack| match self.expr_id_to_expr_map.get(pack) {
+                Some(Expr::Tuple(elements)) => Some(elements.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for (argument_id, span) in self.named_arguments.clone() {
+            if collected.contains(&argument_id) {
+                continue;
+            }
+            let label = self
+                .entry_labels
+                .get(&argument_id)
+                .copied()
+                .unwrap_or_default();
+            let value = self.written_text_of(argument_id).unwrap_or("…");
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "`{label} = {value}` names an argument, and only a spread parameter takes \
+                     names (`...at: ({label}: T, …)`), which this one is not: drop `{label} =` \
+                     to pass it by position, or, to assign, write `{label} = {value};` before \
+                     the call"
+                ),
+            });
+        }
+    }
+
+    /// B569 §4.1: why a labelled literal's labels do not name its landing
+    /// type's. The arity is equal (a different arity is the ordinary
+    /// mismatch), so a label the type lacks always means one it needs.
+    fn literal_label_problem(
+        &self,
+        written: &[&str],
+        wanted: &TupleLabels,
+        landing: &Type,
+    ) -> String {
+        let landing = self.pretty_print_type(landing, &HashMap::default());
+        let extra = written
+            .iter()
+            .find(|label| wanted.position(label).is_none())
+            .copied()
+            .unwrap_or_default();
+        let missing: Vec<String> = wanted
+            .labels()
+            .unwrap_or_default()
+            .iter()
+            .filter(|label| !written.contains(&&***label))
+            .map(|label| format!("`{label}`"))
+            .collect();
+        format!(
+            "`{extra}` is not a label of `{landing}`: a labelled tuple names exactly its \
+             type's labels, and this one leaves out {}",
+            missing.join(", ")
+        )
+    }
+
     /// Every tuple-value spread `..e` must be (a) an element of a tuple
     /// construction and (b) a spread of a tuple — and an ABSTRACT pack may only
     /// be the construction's lone part (variadic-generics.md §T.2/§T.4).
@@ -8393,7 +8596,7 @@ impl<'src> Analyzer<'src> {
                 }
                 continue;
             }
-            if !matches!(operand_type, Type::Tuple(_)) {
+            if !matches!(operand_type, Type::Tuple(_, _)) {
                 let label = self.pretty_print_type(&operand_type, &HashMap::default());
                 errors.push((id, span, Self::not_a_tuple_message(&label)));
             }
@@ -9682,7 +9885,7 @@ impl<'src> Analyzer<'src> {
                  '{bound_label}', which this argument's parameter requires"
             )];
         }
-        let Type::Tuple(elements) = value_type else {
+        let Type::Tuple(elements, _) = value_type else {
             return vec![format!(
                 "'{value_label}' is not a tuple: this argument's parameter is bound \
                  '{bound_label}'"
@@ -10912,7 +11115,7 @@ impl<'src> Analyzer<'src> {
             Type::Enum(id, _) => ImplSubjectBucket::Enum(*id),
             Type::Trait(id, _) => ImplSubjectBucket::Trait(*id),
             Type::Generic(_) => ImplSubjectBucket::Generic,
-            Type::Tuple(items) => ImplSubjectBucket::Tuple(items.len()),
+            Type::Tuple(items, _) => ImplSubjectBucket::Tuple(items.len()),
             Type::Array(..) => ImplSubjectBucket::Array,
             Type::Closure(parameters, ..) => ImplSubjectBucket::Closure(parameters.len()),
             Type::Mapped(..) => ImplSubjectBucket::Mapped,
@@ -11249,7 +11452,7 @@ impl<'src> Analyzer<'src> {
                 left_id == right_id
                     && self.same_impl_types(left_arguments, right_arguments, comparing)
             }
-            (Type::Tuple(left_items), Type::Tuple(right_items)) => {
+            (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
                 self.same_impl_types(left_items, right_items, comparing)
             }
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
@@ -11877,7 +12080,7 @@ impl<'src> Analyzer<'src> {
             | (Type::Enum(_, expected_arguments), Type::Enum(_, actual_arguments))
             | (Type::Trait(_, expected_arguments), Type::Trait(_, actual_arguments))
             | (Type::Dyn(_, expected_arguments), Type::Dyn(_, actual_arguments))
-            | (Type::Tuple(expected_arguments), Type::Tuple(actual_arguments)) => {
+            | (Type::Tuple(expected_arguments, _), Type::Tuple(actual_arguments, _)) => {
                 all(self, expected_arguments, actual_arguments)
             }
             (Type::Array(expected_element, _), Type::Array(actual_element, _)) => self
@@ -11928,7 +12131,7 @@ impl<'src> Analyzer<'src> {
             Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
                 mentions(self, arguments)
             }
-            Type::Tuple(elements) => mentions(self, elements),
+            Type::Tuple(elements, _) => mentions(self, elements),
             Type::Array(element, _) => {
                 self.mentions_self_trait(&element.get_type(self), self_trait, depth + 1)
             }
@@ -12072,14 +12275,17 @@ impl<'src> Analyzer<'src> {
                     self.substitute_member_argument_types(&arguments, self_trait, subject, context),
                 )
             }
-            Type::Tuple(element_ids) => {
-                let element_ids = element_ids.clone();
-                Type::Tuple(self.substitute_member_argument_types(
-                    &element_ids,
-                    self_trait,
-                    subject,
-                    context,
-                ))
+            Type::Tuple(element_ids, labels) => {
+                let (element_ids, labels) = (element_ids.clone(), labels.clone());
+                Type::Tuple(
+                    self.substitute_member_argument_types(
+                        &element_ids,
+                        self_trait,
+                        subject,
+                        context,
+                    ),
+                    labels,
+                )
             }
             Type::Array(element_id, length) => {
                 let element = element_id.get_type(self);
@@ -12271,7 +12477,7 @@ impl<'src> Analyzer<'src> {
                 }
                 // A tuple / fixed-array is a value aggregate: any resource element
                 // marks the whole (destruction.md §3, "element type").
-                Type::Tuple(elements) => {
+                Type::Tuple(elements, _) => {
                     Members::Walk(elements.clone(), SubstitutionContext::default())
                 }
                 Type::Array(element, _length) => {
@@ -12439,7 +12645,7 @@ impl<'src> Analyzer<'src> {
             | Type::Enum(_, arguments)
             | Type::Trait(_, arguments)
             | Type::Dyn(_, arguments)
-            | Type::Tuple(arguments) => arguments
+            | Type::Tuple(arguments, _) => arguments
                 .iter()
                 .all(|argument| self.substitution_fixed(*argument)),
             Type::Closure(parameters, return_type, _, _) => {
@@ -12728,7 +12934,7 @@ impl<'src> Analyzer<'src> {
                 let context = Self::instantiation_context(&parameters, &arguments);
                 self.all_members_transferable(&members, &context, memo, visiting)
             }
-            Type::Tuple(elements) => self.all_members_transferable(
+            Type::Tuple(elements, _) => self.all_members_transferable(
                 &elements,
                 &SubstitutionContext::default(),
                 memo,
@@ -12863,7 +13069,7 @@ impl<'src> Analyzer<'src> {
                 buf.push_str(self.traits.get(&id).map(|t| t.name).unwrap_or("?"));
                 self.render_type_arguments_canonical(&arguments, depth, visiting, buf);
             }
-            Type::Tuple(elements) => {
+            Type::Tuple(elements, _) => {
                 buf.push('(');
                 for (index, element) in elements.iter().enumerate() {
                     if index > 0 {
@@ -13394,7 +13600,7 @@ impl<'src> Analyzer<'src> {
         let (head_id, arguments) = match type_id.get_type(self) {
             Type::Struct(id, arguments) | Type::Enum(id, arguments) => (id, arguments),
             // Value aggregates: no head, no members to name, just elements.
-            Type::Tuple(elements) => {
+            Type::Tuple(elements, _) => {
                 return self.container_resource_in_anonymous(
                     &elements,
                     type_id,
@@ -14335,7 +14541,7 @@ impl<'src> Analyzer<'src> {
                 nominals.contains(&id) || any(self, &arguments, visited)
             }
             Type::Trait(_, arguments) | Type::Dyn(_, arguments) => any(self, &arguments, visited),
-            Type::Tuple(members) => any(self, &members, visited),
+            Type::Tuple(members, _) => any(self, &members, visited),
             Type::Array(element, _length) => any(self, &[element], visited),
             Type::Closure(parameters, return_, _, _) => {
                 any(self, &parameters, visited) || any(self, &[return_], visited)
@@ -16192,7 +16398,7 @@ impl<'src> Analyzer<'src> {
                 }
                 DropMembers::Fields(fields)
             }
-            Type::Tuple(elements) => {
+            Type::Tuple(elements, _) => {
                 let mut fields = Vec::new();
                 for (index, element) in elements.into_iter().enumerate() {
                     if self.type_is_resource(element) {
@@ -16984,6 +17190,7 @@ impl<'src> Analyzer<'src> {
                     .into_iter()
                     .map(|argument_type| argument_type.get_type_id(self))
                     .collect(),
+                TupleLabels::NONE,
             ),
         }
     }
@@ -19613,7 +19820,7 @@ impl<'src> Analyzer<'src> {
                     Self::instantiation_context(&enum_.generic_parameter_constraint_ids, arguments),
                 )
             }
-            Type::Tuple(elements) => (elements.clone(), SubstitutionContext::default()),
+            Type::Tuple(elements, _) => (elements.clone(), SubstitutionContext::default()),
             Type::Array(element, _) => (vec![*element], SubstitutionContext::default()),
             Type::Generic(constraint) => {
                 let constraint = *constraint;
@@ -21591,7 +21798,7 @@ impl<'src> Analyzer<'src> {
             // `SignalCell::get` ambiguous with `Tuple::get`.
             if let Some(requirement) = self.tuple_bounds.get(&constraint_id).cloned() {
                 let holds = match &bound {
-                    Type::Tuple(elements) => {
+                    Type::Tuple(elements, _) => {
                         requirement
                             .lo
                             .is_none_or(|lo| elements.len() >= lo as usize)
@@ -22013,7 +22220,7 @@ impl<'src> Analyzer<'src> {
                 left_id == right_id
                     && self.impl_subject_arguments_match(&left_arguments, &right_arguments)
             }
-            (Type::Tuple(left_items), Type::Tuple(right_items)) => {
+            (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
                 self.impl_subject_arguments_match(&left_items, &right_items)
             }
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
@@ -22050,7 +22257,7 @@ impl<'src> Analyzer<'src> {
                     self.collect_subject_binders(argument, binders);
                 }
             }
-            Type::Tuple(items) => {
+            Type::Tuple(items, _) => {
                 for item in items {
                     self.collect_subject_binders(item, binders);
                 }
@@ -22775,7 +22982,7 @@ impl<'src> Analyzer<'src> {
                                     self.bound_argument_agrees(*left, *right, depth + 1)
                                 })))
             }
-            (Type::Tuple(left), Type::Tuple(right)) => {
+            (Type::Tuple(left, _), Type::Tuple(right, _)) => {
                 left.len() == right.len()
                     && left
                         .iter()
@@ -25158,8 +25365,13 @@ impl<'src> Analyzer<'src> {
                 type_.hash(&mut hasher);
                 hasher.finish()
             };
+            // `==` on `Type` ignores a tuple's labels (B569), and a shared
+            // slot is READ for its labels — hover, diagnostics, `p.x` — so
+            // the share also asks that the two spell them alike.
             if let Some(existing) = self.settled_type_index.get(&hash).copied()
-                && self.type_id_to_type_map.get(&existing) == Some(&type_)
+                && let Some(held) = self.type_id_to_type_map.get(&existing)
+                && *held == type_
+                && tuple_labels_spelled_alike(held, &type_)
             {
                 return existing;
             }
@@ -25328,7 +25540,7 @@ impl<'src> Analyzer<'src> {
             // pure cost, and a lie about the semantics.
             Type::Struct(id, _) if self.is_shared_cell(*id) => false,
             Type::Struct(id, _) => !self.is_scalar_primitive(*id),
-            Type::Tuple(_) => true,
+            Type::Tuple(_, _) => true,
             // A fixed-length array is a value like a `List`/tuple — copied, so
             // `mut b = a` deep-clones it (`__clone` recurses the JS array).
             Type::Array(_, _) => true,
@@ -28933,7 +29145,7 @@ impl<'src> Analyzer<'src> {
         self.variables.get(&capture_id).is_some_and(|variable| {
             !matches!(
                 variable.type_id.get_type(self),
-                Type::Tuple(_)
+                Type::Tuple(_, _)
                     | Type::Mapped(..)
                     | Type::Generic(_)
                     | Type::Unknown
@@ -33646,7 +33858,7 @@ impl<'src> Analyzer<'src> {
                 visiting.pop();
                 plain
             }
-            Type::Tuple(items) => items
+            Type::Tuple(items, _) => items
                 .iter()
                 .all(|item| self.type_is_plain_value(*item, visiting)),
             Type::Array(item, _) => self.type_is_plain_value(*item, visiting),
@@ -35501,7 +35713,7 @@ impl<'src> Analyzer<'src> {
             .filter(|(type_id, _)| {
                 matches!(
                     self.type_id_to_type_map.get(type_id),
-                    Some(Type::Tuple(_) | Type::Array(..))
+                    Some(Type::Tuple(_, _) | Type::Array(..))
                 )
             })
             .collect();
@@ -35572,7 +35784,7 @@ impl<'src> Analyzer<'src> {
             return arguments.clone();
         }
         match self.type_id_to_type_map.get(&type_id) {
-            Some(Type::Tuple(elements)) => elements.clone(),
+            Some(Type::Tuple(elements, _)) => elements.clone(),
             Some(Type::Array(element, _)) => vec![*element],
             _ => Vec::new(),
         }
@@ -35587,7 +35799,7 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .any(|argument| self.type_id_holds_existential(*argument))
             }
-            Type::Tuple(elements) => elements
+            Type::Tuple(elements, _) => elements
                 .iter()
                 .any(|element| self.type_id_holds_existential(*element)),
             Type::Array(element, _) => self.type_id_holds_existential(*element),
@@ -35634,7 +35846,7 @@ impl<'src> Analyzer<'src> {
                     self.annotation_admits(wanted, &got, depth + 1)
                 })
             }
-            (Type::Tuple(wanted), Type::Tuple(got)) if wanted.len() == got.len() => {
+            (Type::Tuple(wanted, _), Type::Tuple(got, _)) if wanted.len() == got.len() => {
                 let pairs: Vec<(TypeId, TypeId)> =
                     wanted.iter().copied().zip(got.iter().copied()).collect();
                 pairs.into_iter().all(|(wanted, got)| {
@@ -36129,7 +36341,7 @@ impl<'src> Analyzer<'src> {
             Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Dyn(_, arguments) => {
                 any(self, &arguments, visited)
             }
-            Type::Tuple(members) => any(self, &members, visited),
+            Type::Tuple(members, _) => any(self, &members, visited),
             Type::Array(element, _) => any(self, &[element], visited),
             Type::Closure(parameters, return_type_id, _, _) => {
                 any(self, &parameters, visited) || any(self, &[return_type_id], visited)
@@ -37389,6 +37601,13 @@ impl<'src> Analyzer<'src> {
             self.spread_spans.insert(operand_id, node.1);
             return operand_id;
         }
+        // B569: a labelled tuple entry `x = 5` forwards to its value the same
+        // way, and the label is the mark — the tuple rule reads it.
+        if let Node::Labelled((label, _), value) = &node.0 {
+            let value_id = self.walk_expr_node(value, scope_id);
+            self.entry_labels.insert(value_id, label);
+            return value_id;
+        }
         let id = self.new_entity_id();
 
         let entity = match &node.0 {
@@ -37402,6 +37621,7 @@ impl<'src> Analyzer<'src> {
             // Likewise: `..e` forwards to its operand and marks it, so a
             // `Spread` node never reaches the entity match.
             Node::Spread(..) => unreachable!("`..` forwards to its operand expression"),
+            Node::Labelled(..) => unreachable!("a labelled entry forwards to its value"),
             // Elements desugar to their view chains before analysis
             // (elements::rewrite_items, at every lift site); one reaching the
             // entity match is a pass bug, degraded like a parse error rather
@@ -37536,6 +37756,7 @@ impl<'src> Analyzer<'src> {
                                 self.member_name_spans.insert(id, call_subject.1);
                                 let argument_ids =
                                     self.walk_expr_nodes(&call_arguments.0, scope_id);
+                                self.note_named_arguments(&call_arguments.0, &argument_ids);
                                 let generic_argument_ids = call_generic_arguments
                                     .as_ref()
                                     .map(|x| {
@@ -38304,6 +38525,7 @@ impl<'src> Analyzer<'src> {
                 self.call_subjects.push((id, subject_id));
                 self.call_subject_ids.insert(subject_id);
                 let argument_ids = self.walk_expr_nodes(&arguments.0, scope_id);
+                self.note_named_arguments(&arguments.0, &argument_ids);
                 let generic_argument_ids = generic_arguments
                     .as_ref()
                     .map(|x| {
@@ -39640,6 +39862,25 @@ impl<'src> Analyzer<'src> {
         if let Some(labels) = labels {
             self.item_labels.insert(id, (**labels).clone());
         }
+        // B569 Q9: labels are names for positions, not an identity — a
+        // labelled tuple subject would answer for every tuple of its slot
+        // types, whatever their labels. The impl is walked as written (the
+        // labels erase), so its body still analyzes.
+        if let Node::Tuple(slots) = &subject.0
+            && slots
+                .iter()
+                .any(|slot| matches!(slot.0, Node::Labelled(..)))
+        {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: subject.1,
+                msg: "an `impl` cannot name a labelled tuple: labels name positions and are not \
+                      an identity, so this impl would answer for every tuple of these slot types \
+                      under any labels — declare a struct for a shape that has methods"
+                    .to_string(),
+            });
+        }
         let body_scope = self.create_scope(Some(scope_id));
         let body_scope_id = self.push_scope(body_scope);
         // The impl's generic parameters are the `type X` binders in the
@@ -40203,6 +40444,7 @@ impl<'src> Analyzer<'src> {
                     self.set_pattern_bindings_mutable(sub_pattern);
                 }
             }
+            WalkPattern::Labelled(_, _, inner) => self.set_pattern_bindings_mutable(inner),
             _ => {}
         }
     }
@@ -40519,6 +40761,11 @@ impl<'src> Analyzer<'src> {
                     })
                     .collect(),
             ),
+            Pattern::Labelled((label, label_span), inner) => WalkPattern::Labelled(
+                label,
+                *label_span,
+                Box::new(self.walk_pattern(&inner.0, &inner.1, scope_id, visible_from)),
+            ),
             Pattern::Literal(literal) => {
                 WalkPattern::Literal(self.walk_expr_node(literal, scope_id))
             }
@@ -40590,12 +40837,106 @@ impl<'src> Analyzer<'src> {
     /// tuple bound makes its arity known).
     fn tuple_flat_width(&self, type_id: TypeId) -> usize {
         match type_id.get_type(self) {
-            Type::Tuple(element_ids) => element_ids
+            Type::Tuple(element_ids, _) => element_ids
                 .iter()
                 .map(|id| self.tuple_flat_width(*id))
                 .sum(),
             _ => 1,
         }
+    }
+
+    /// B569 S3: a tuple pattern written BY NAME — `let (y = top, x = left) =
+    /// p;` — over a labelled tuple: each element meets the slot its label
+    /// names, and the resolved pattern is the positional one in the value's
+    /// order, so everything past here (bindings, exhaustiveness, both
+    /// emitters) reads an ordinary tuple pattern. It names exactly the
+    /// value's labels, as a labelled literal does.
+    fn resolve_by_name_tuple_pattern(
+        &mut self,
+        span: Span,
+        patterns: &[WalkPattern<'src>],
+        expected_type_id: TypeId,
+        lookup_scope_id: Id,
+    ) -> Option<ExprPattern> {
+        let expected = self.expand_mapped(expected_type_id.get_type(self));
+        let rendered = self.pretty_print_type(&expected, &HashMap::default());
+        let refuse = |analyzer: &mut Self, msg: String| {
+            analyzer.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            None
+        };
+        let (slots, labels) = match expected {
+            Type::Tuple(slots, labels) if labels.is_labelled() => (slots, labels),
+            Type::Tuple(..) => {
+                return refuse(
+                    self,
+                    format!(
+                        "this pattern destructures by name, but `{rendered}` has no labels: \
+                         destructure it by position, `(a, b)`"
+                    ),
+                );
+            }
+            _ => {
+                return refuse(
+                    self,
+                    format!(
+                        "this pattern destructures by name, so the value must be a labelled \
+                         tuple, and it is `{rendered}`"
+                    ),
+                );
+            }
+        };
+        let written: Vec<(&str, Span, &WalkPattern<'src>)> = patterns
+            .iter()
+            .filter_map(|pattern| match pattern {
+                WalkPattern::Labelled(label, label_span, inner) => {
+                    Some((*label, *label_span, &**inner))
+                }
+                _ => None,
+            })
+            .collect();
+        let extra = written
+            .iter()
+            .find(|(label, _, _)| labels.position(label).is_none())
+            .map(|(label, label_span, _)| (*label, *label_span));
+        let missing: Vec<String> = labels
+            .labels()
+            .unwrap_or_default()
+            .iter()
+            .filter(|label| !written.iter().any(|(written, _, _)| *written == &***label))
+            .map(|label| format!("`{label}`"))
+            .collect();
+        if extra.is_some() || !missing.is_empty() {
+            let head = match extra {
+                Some((extra, _)) => format!("`{extra}` is not a label of `{rendered}`"),
+                None => format!("this pattern does not name every label of `{rendered}`"),
+            };
+            let tail = match missing.is_empty() {
+                true => String::new(),
+                false => format!(", and this one leaves out {}", missing.join(", ")),
+            };
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: extra.map_or(span, |(_, label_span)| label_span),
+                msg: format!("{head}: a by-name pattern names exactly its value's labels{tail}"),
+            });
+            return None;
+        }
+        let mut resolved = Vec::with_capacity(slots.len());
+        for (slot, element_type_id) in slots.iter().enumerate() {
+            let label = labels.get(slot).unwrap_or_default();
+            let (_, _, sub_pattern) = written.iter().find(|(written, _, _)| *written == label)?;
+            resolved.push((
+                self.resolve_pattern(sub_pattern, *element_type_id, lookup_scope_id)?,
+                *element_type_id,
+            ));
+        }
+        Some(ExprPattern::Tuple(resolved))
     }
 
     fn resolve_pattern(
@@ -40818,6 +41159,25 @@ impl<'src> Analyzer<'src> {
                     resolved_payload,
                 ))
             }
+            // Reached only as an element of a positional resolve — a mixed
+            // pattern the parser already refused: the slot is the value.
+            WalkPattern::Labelled(_, _, inner) => {
+                self.resolve_pattern(inner, expected_type_id, lookup_scope_id)
+            }
+            // A MIX of named and positional elements was refused by the parser;
+            // it resolves positionally below, so nothing past it double-reports.
+            WalkPattern::Tuple(span, patterns)
+                if patterns
+                    .iter()
+                    .all(|pattern| matches!(pattern, WalkPattern::Labelled(..))) =>
+            {
+                self.resolve_by_name_tuple_pattern(
+                    *span,
+                    patterns,
+                    expected_type_id,
+                    lookup_scope_id,
+                )
+            }
             WalkPattern::Tuple(span, patterns) => {
                 // Element types come from the matched tuple type when known (a
                 // concrete-source mapped type expands to one); otherwise each
@@ -40833,7 +41193,7 @@ impl<'src> Analyzer<'src> {
                 // open (a parameter, a hole) keeps the `Unknown` elements.
                 let expected = expected_type_id.get_type(self);
                 let element_type_ids = match self.expand_mapped(expected) {
-                    Type::Tuple(ids) if ids.len() == patterns.len() => ids,
+                    Type::Tuple(ids, _) if ids.len() == patterns.len() => ids,
                     Type::Generic(_)
                     | Type::Mapped(..)
                     | Type::Unknown
@@ -40851,7 +41211,7 @@ impl<'src> Analyzer<'src> {
                             plural(patterns.len(), "element", "elements")
                         );
                         let msg = match &other {
-                            Type::Tuple(ids) => format!(
+                            Type::Tuple(ids, _) => format!(
                                 "{binds}, but the value is a {}-tuple `{rendered}`: a tuple \
                                  pattern takes one sub-pattern per element, and a nested \
                                  pattern reaches inside one (`((a, b), c)`)",
@@ -41152,15 +41512,31 @@ impl<'src> Analyzer<'src> {
             }
             // `(T)` is grouping, not a one-tuple — it types as the inner `T`
             // (needed to write a closure-typed closure parameter: `|(|| void)| void`).
-            Node::Tuple(types) if types.len() == 1 => {
+            // A LABELLED one-slot tuple `(x: i32)` is a tuple (B569 §7): the
+            // label is what makes it one.
+            Node::Tuple(types) if types.len() == 1 && !matches!(types[0].0, Node::Labelled(..)) => {
                 return self.walk_type_node(&types[0], scope_id);
             }
-            Node::Tuple(types) => Some(Type::Tuple(
-                types
+            // B569: `(x: f64, y: f64)` — a slot's label rides in the type;
+            // the parser admits every slot labelled or none.
+            Node::Tuple(types) => {
+                let labels = types
                     .iter()
-                    .map(|type_| self.walk_type_node(type_, scope_id))
-                    .collect(),
-            )),
+                    .map(|type_| match &type_.0 {
+                        Node::Labelled((label, _), _) => Some(*label),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<&str>>>()
+                    .map_or(TupleLabels::NONE, TupleLabels::new);
+                let elements = types
+                    .iter()
+                    .map(|type_| match &type_.0 {
+                        Node::Labelled(_, inner) => self.walk_type_node(inner, scope_id),
+                        _ => self.walk_type_node(type_, scope_id),
+                    })
+                    .collect();
+                Some(Type::Tuple(elements, labels))
+            }
             Node::ClosureType(parameters, return_type) => {
                 // B495: the `&`/`&mut` the parameter walk below erases is the
                 // parameter's MODE, and it stays in the type — every copy,
@@ -41371,7 +41747,7 @@ impl<'src> Analyzer<'src> {
     /// sees.
     fn for_each_give_up_type(iterable_type: &Type) -> Type {
         match iterable_type {
-            Type::Tuple(_) | Type::Mapped(_, _, _) => Type::Unresolved,
+            Type::Tuple(_, _) | Type::Mapped(_, _, _) => Type::Unresolved,
             _ => Type::Any,
         }
     }
@@ -41478,7 +41854,7 @@ impl<'src> Analyzer<'src> {
             // here, and `finalize_build` refuses the loop rather than letting
             // the default stand. A `Mapped` is the same tuple still written
             // symbolically, so it answers the same way.
-            Type::Tuple(_) | Type::Mapped(_, _, _) => None,
+            Type::Tuple(_, _) | Type::Mapped(_, _, _) => None,
             _ => None,
         }
     }
@@ -41843,7 +42219,7 @@ impl<'src> Analyzer<'src> {
                     self.collect_residual_generics(&argument.get_type(self), out);
                 }
             }
-            Type::Tuple(items) => {
+            Type::Tuple(items, _) => {
                 for item in items {
                     self.collect_residual_generics(&item.get_type(self), out);
                 }
@@ -41873,7 +42249,7 @@ impl<'src> Analyzer<'src> {
             | Type::Dyn(_, arguments) => arguments
                 .iter()
                 .all(|argument| self.type_is_fully_determined(&argument.get_type(self))),
-            Type::Tuple(items) => items
+            Type::Tuple(items, _) => items
                 .iter()
                 .all(|item| self.type_is_fully_determined(&item.get_type(self))),
             Type::Array(element_id, _) => self.type_is_fully_determined(&element_id.get_type(self)),
@@ -42376,7 +42752,7 @@ impl<'src> Analyzer<'src> {
             | Type::Dyn(_, arguments) => arguments
                 .iter()
                 .any(|argument| self.type_has_an_unknown_hole(&argument.get_type(self))),
-            Type::Tuple(items) => items
+            Type::Tuple(items, _) => items
                 .iter()
                 .any(|item| self.type_has_an_unknown_hole(&item.get_type(self))),
             Type::Array(element_id, _) => self.type_has_an_unknown_hole(&element_id.get_type(self)),
@@ -42598,7 +42974,7 @@ impl<'src> Analyzer<'src> {
             | Type::Struct(_, argument_type_ids)
             | Type::Trait(_, argument_type_ids)
             | Type::Dyn(_, argument_type_ids)
-            | Type::Tuple(argument_type_ids) => argument_type_ids
+            | Type::Tuple(argument_type_ids, _) => argument_type_ids
                 .iter()
                 .any(|argument_type_id| self.type_has_hole(*argument_type_id)),
             Type::Array(element_type_id, _) => self.type_has_hole(element_type_id),
@@ -43492,7 +43868,7 @@ impl<'src> Analyzer<'src> {
         let expanded;
         let constraint = match constraint {
             Type::Mapped(..) => match self.substitute_type(constraint, substitution_context) {
-                tuple @ Type::Tuple(_) => {
+                tuple @ Type::Tuple(_, _) => {
                     expanded = tuple;
                     &expanded
                 }
@@ -43610,7 +43986,7 @@ impl<'src> Analyzer<'src> {
         inferred: &Type,
         substitution_context: &SubstitutionContext,
     ) -> bool {
-        let (Type::Tuple(positions), Type::Tuple(values)) = (constraint, inferred) else {
+        let (Type::Tuple(positions, _), Type::Tuple(values, _)) = (constraint, inferred) else {
             return false;
         };
         if positions.len() != values.len() {
@@ -43744,7 +44120,7 @@ impl<'src> Analyzer<'src> {
             {
                 lefts.iter().copied().zip(rights.iter().copied()).collect()
             }
-            (Type::Tuple(lefts), Type::Tuple(rights)) if lefts.len() == rights.len() => {
+            (Type::Tuple(lefts, _), Type::Tuple(rights, _)) if lefts.len() == rights.len() => {
                 lefts.iter().copied().zip(rights.iter().copied()).collect()
             }
             (Type::Array(left, _), Type::Array(right, _)) => vec![(*left, *right)],
@@ -44232,7 +44608,7 @@ impl<'src> Analyzer<'src> {
                 let tuple_literal_element = seeded_element
                     .as_ref()
                     .filter(|expected| {
-                        matches!(expected, Type::Tuple(_))
+                        matches!(expected, Type::Tuple(_, _))
                             && self.type_is_fully_determined(expected)
                     })
                     .cloned();
@@ -44379,19 +44755,76 @@ impl<'src> Analyzer<'src> {
                 // typed with no expectation at all, so nothing recorded the
                 // coercion and the raw values reached a comprehension that
                 // reads each as a `(value, table)` pair.
-                let constraint_items = match constraint.as_ref() {
-                    Type::Tuple(items) => items.clone(),
+                let (constraint_items, constraint_labels) = match constraint.as_ref() {
+                    Type::Tuple(items, labels) => (items.clone(), labels.clone()),
                     Type::Mapped(..) => {
                         let mapped = constraint.as_ref().clone();
                         match self.substitute_type(&mapped, substitution_context) {
-                            Type::Tuple(items) if items.len() == arity => items,
-                            _ => Vec::new(),
+                            Type::Tuple(items, labels) if items.len() == arity => (items, labels),
+                            _ => (Vec::new(), TupleLabels::NONE),
                         }
                     }
-                    _ => Vec::new(),
+                    _ => (Vec::new(), TupleLabels::NONE),
+                };
+                let record = substitution_context.is_empty();
+                let has_spread = item_ids.iter().any(|id| self.spread_elements.contains(id));
+                // B569 §4.1: the WRITTEN labels — every entry's, or none.
+                let written: Option<Vec<&'src str>> = (!has_spread)
+                    .then(|| {
+                        item_ids
+                            .iter()
+                            .map(|id| self.entry_labels.get(id).copied())
+                            .collect()
+                    })
+                    .flatten();
+                // A labelled literal against a labelled type of its arity
+                // matches BY NAME: the storage slot each written entry takes.
+                // With no expectation that says otherwise, a match already
+                // made stands — the literal's type does not depend on which
+                // inference asked last.
+                let by_name: Option<Vec<usize>> = match (&written, constraint_labels.labels()) {
+                    (Some(written), Some(wanted)) if written.len() == wanted.len() => {
+                        let slots: Option<Vec<usize>> = written
+                            .iter()
+                            .map(|label| constraint_labels.position(label))
+                            .collect();
+                        if record {
+                            match &slots {
+                                Some(_) => {
+                                    self.tuple_literal_label_problems.remove(&expr_id);
+                                }
+                                None => {
+                                    let problem = self.literal_label_problem(
+                                        written,
+                                        &constraint_labels,
+                                        constraint.as_ref(),
+                                    );
+                                    self.tuple_literal_label_problems.insert(expr_id, problem);
+                                }
+                            }
+                        }
+                        slots
+                    }
+                    (Some(_), _) if !constraint_labels.is_labelled() => self
+                        .tuple_literal_layouts
+                        .get(&expr_id)
+                        .map(|(layout, _)| invert_layout(layout)),
+                    _ => None,
+                };
+                let target_labels = match (&by_name, constraint_labels.is_labelled()) {
+                    (Some(_), true) => constraint_labels.clone(),
+                    (Some(_), false) => self
+                        .tuple_literal_layouts
+                        .get(&expr_id)
+                        .map(|(_, labels)| labels.clone())
+                        .unwrap_or_default(),
+                    (None, _) => TupleLabels::NONE,
                 };
                 let mut items: Vec<TypeId> = Vec::with_capacity(item_ids.len());
-                for id in item_ids.clone().iter() {
+                // Each slot's label as the entries produce them — a spread
+                // brings its operand's — for the concatenation rule.
+                let mut produced_labels: Vec<Option<Box<str>>> = Vec::with_capacity(arity);
+                for (index, id) in item_ids.clone().iter().enumerate() {
                     // A spread contributes the ELEMENTS of its operand's tuple
                     // type, so the constraint cursor is the count of slots
                     // produced so far, not the element's index. Its operand takes
@@ -44411,13 +44844,20 @@ impl<'src> Analyzer<'src> {
                         // A non-tuple operand — and an ABSTRACT pack, which is a
                         // tuple whose elements are not yet a sequence — contributes
                         // nothing here; `check_tuple_spreads` reports which it was.
-                        if let Type::Tuple(elements) = self.expand_mapped(inferred) {
+                        if let Type::Tuple(elements, labels) = self.expand_mapped(inferred) {
+                            for slot in 0..elements.len() {
+                                produced_labels.push(labels.get(slot).map(Box::from));
+                            }
                             items.extend(elements);
                         }
                         continue;
                     }
+                    let slot = match &by_name {
+                        Some(slots) => slots[index],
+                        None => items.len(),
+                    };
                     let constraint_item = constraint_items
-                        .get(items.len())
+                        .get(slot)
                         .map(|x| x.get_type(self))
                         .unwrap_or(Type::Unknown);
                     let inferred = self.infer_type_inner(
@@ -44451,12 +44891,70 @@ impl<'src> Analyzer<'src> {
                     // same walk the `.n` offsets were baked from. A construction
                     // only ever typed under a substitution records nothing and
                     // keeps the old nesting, which is consistent either way.
-                    if substitution_context.is_empty() {
+                    if record {
                         self.tuple_element_types.insert(*id, item_type_id);
                     }
+                    produced_labels.push(self.entry_labels.get(id).map(|label| Box::from(*label)));
                     items.push(item_type_id);
                 }
-                Type::Tuple(items)
+                if let Some(slots) = by_name {
+                    // Storage order: the written entry at `slots[i]`'s slot.
+                    let mut layout = vec![0; slots.len()];
+                    for (written_index, slot) in slots.iter().enumerate() {
+                        layout[*slot] = written_index;
+                    }
+                    let stored: Vec<TypeId> = layout.iter().map(|index| items[*index]).collect();
+                    if record
+                        && layout
+                            .iter()
+                            .enumerate()
+                            .any(|(slot, index)| slot != *index)
+                    {
+                        self.tuple_literal_layouts
+                            .insert(expr_id, (layout, target_labels.clone()));
+                    }
+                    return Type::Tuple(stored, target_labels);
+                }
+                // Positional: the labels the entries produced when every slot
+                // has one; an unlabelled literal takes its expected type's.
+                let labelled = produced_labels
+                    .iter()
+                    .filter(|label| label.is_some())
+                    .count();
+                let labels = if labelled == 0 {
+                    constraint_labels.for_arity(items.len())
+                } else if labelled == produced_labels.len() {
+                    let labels: Vec<Box<str>> = produced_labels.into_iter().flatten().collect();
+                    match duplicate_label(&labels) {
+                        Some(duplicate) => {
+                            // Written labels the parser already refused; a
+                            // spread's are only seen here.
+                            if record && has_spread {
+                                self.tuple_literal_label_problems.insert(
+                                    expr_id,
+                                    format!(
+                                        "a tuple's labels name its slots, so each is written \
+                                         once: `{duplicate}` labels two of these"
+                                    ),
+                                );
+                            }
+                            TupleLabels::NONE
+                        }
+                        None => TupleLabels::new(labels),
+                    }
+                } else {
+                    if record && has_spread {
+                        self.tuple_literal_label_problems.insert(
+                            expr_id,
+                            "a tuple labels every slot or none, and a spread brings its \
+                             operand's slots with their labels: label every entry and spread \
+                             a labelled tuple, or drop the labels"
+                                .to_string(),
+                        );
+                    }
+                    TupleLabels::NONE
+                };
+                Type::Tuple(items, labels)
             }
             Expr::Local(subject_id) => {
                 let subject = self.infer_type_inner(
@@ -45662,6 +46160,7 @@ impl<'src> Analyzer<'src> {
         source_id: TypeId,
         template_id: TypeId,
         argument_element_ids: &[TypeId],
+        argument_labels: &TupleLabels,
         substitution_context: &SubstitutionContext,
     ) -> Option<(Type, Vec<(TypeId, TypeId)>)> {
         // The source must be an unbound generic `T`; a concrete source would have
@@ -45676,7 +46175,7 @@ impl<'src> Analyzer<'src> {
         // nothing is left to infer, and the argument checks against the
         // template expanded over that binding, element by element.
         if let Some(bound) = substitution_context.get(&source_constraint).copied()
-            && let Type::Tuple(source_elements) = self.expand_mapped(bound.get_type(self))
+            && let Type::Tuple(source_elements, _) = self.expand_mapped(bound.get_type(self))
         {
             if source_elements.len() != argument_element_ids.len() {
                 return None;
@@ -45695,7 +46194,10 @@ impl<'src> Analyzer<'src> {
                     self.reconcile_type(&argument, &expected, substitution_context)?;
                 bindings.extend(element_bindings);
             }
-            return Some((Type::Tuple(argument_element_ids.to_vec()), bindings));
+            return Some((
+                Type::Tuple(argument_element_ids.to_vec(), argument_labels.clone()),
+                bindings,
+            ));
         }
         let mut inner_ids = Vec::with_capacity(argument_element_ids.len());
         // B440: a CONSTANT template (`(U in T: str)`) binds no `U` at any
@@ -45729,14 +46231,16 @@ impl<'src> Analyzer<'src> {
             };
             return constant.then(|| {
                 (
-                    Type::Tuple(argument_element_ids.to_vec()),
+                    Type::Tuple(argument_element_ids.to_vec(), argument_labels.clone()),
                     constant_bindings,
                 )
             });
         }
-        let tuple_type_id = Type::Tuple(inner_ids).get_type_id(self);
+        // B569: the source binds at the argument's labels — a mapping keeps
+        // positions, so `combine((x = a, y = b))` binds `T = (x: A, y: B)`.
+        let tuple_type_id = Type::Tuple(inner_ids, argument_labels.clone()).get_type_id(self);
         Some((
-            Type::Tuple(argument_element_ids.to_vec()),
+            Type::Tuple(argument_element_ids.to_vec(), argument_labels.clone()),
             vec![(source_constraint, tuple_type_id)],
         ))
     }
@@ -47180,22 +47684,17 @@ impl<'src> Analyzer<'src> {
             // A mapped tuple parameter `(U in T: F<U>)` reconciled against a
             // concrete argument tuple: invert the template per element to infer the
             // source tuple `T` (`combine((Source<A>, Source<B>))` binds `T = (A, B)`).
-            (Type::Mapped(binder_id, source_id, template_id), Type::Tuple(elements)) => self
-                .invert_mapped(
+            (Type::Mapped(binder_id, source_id, template_id), Type::Tuple(elements, labels))
+            | (Type::Tuple(elements, labels), Type::Mapped(binder_id, source_id, template_id)) => {
+                self.invert_mapped(
                     *binder_id,
                     *source_id,
                     *template_id,
                     elements,
+                    labels,
                     substitution_context,
-                )?,
-            (Type::Tuple(elements), Type::Mapped(binder_id, source_id, template_id)) => self
-                .invert_mapped(
-                    *binder_id,
-                    *source_id,
-                    *template_id,
-                    elements,
-                    substitution_context,
-                )?,
+                )?
+            }
             // A concrete value satisfies a trait-typed parameter when it
             // implements that trait — e.g. a `Counter` (which `impl`s `Combine`)
             // passed where a `Combine` is expected, including a `Self`-defaulted
@@ -47308,7 +47807,18 @@ impl<'src> Analyzer<'src> {
             // distinct. It used to zip, which silently truncated to the shorter
             // side and yielded a 2-tuple for that pair — an arity the write
             // never named (B70 tail, variadic-generics.md §T.8).
-            (Type::Tuple(l_items), Type::Tuple(r_items)) if l_items.len() == r_items.len() => {
+            //
+            // B569: labels are carried, not compared — the result keeps the
+            // side that has them — save the one pair that CONTRADICTS (a label
+            // both carry at different positions, `named-tuple-fields.md`
+            // §4.3), which does not reconcile at all.
+            (Type::Tuple(l_items, l_labels), Type::Tuple(r_items, r_labels))
+                if l_items.len() == r_items.len() =>
+            {
+                if l_labels.contradiction(r_labels).is_some() {
+                    return None;
+                }
+                let labels = l_labels.or(r_labels);
                 let mut result_items = Vec::with_capacity(l_items.len());
                 let mut all_bindings = Vec::new();
                 for (l_item_id, r_item_id) in l_items.iter().zip(r_items.iter()) {
@@ -47318,7 +47828,7 @@ impl<'src> Analyzer<'src> {
                     all_bindings.extend(bindings);
                     result_items.push(item.get_type_id(self));
                 }
-                (Type::Tuple(result_items), all_bindings)
+                (Type::Tuple(result_items, labels), all_bindings)
             }
             // Two arrays unify only at the SAME length (the length is part of the
             // type) — a mismatch falls through to the no-reconcile path, so
@@ -47713,8 +48223,9 @@ impl<'src> Analyzer<'src> {
             // Arity first, like the closure arm below and like `reconcile_type`'s
             // tuple arm: a bare `zip` compares the common prefix and calls
             // `(i32, str)` compatible with `(i32, str, bool)`.
-            (Type::Tuple(l_items), Type::Tuple(r_items)) => {
+            (Type::Tuple(l_items, l_labels), Type::Tuple(r_items, r_labels)) => {
                 l_items.len() == r_items.len()
+                    && l_labels.contradiction(r_labels).is_none()
                     && l_items
                         .iter()
                         .zip(r_items.iter())
@@ -48029,9 +48540,12 @@ impl<'src> Analyzer<'src> {
                 // was bound to.
                 Type::Closure(parameters, return_type, contexts, modes)
             }
-            Type::Tuple(element_ids) => {
-                let element_ids = element_ids.clone();
-                Type::Tuple(self.substitute_argument_types(&element_ids, substitution_context))
+            Type::Tuple(element_ids, labels) => {
+                let (element_ids, labels) = (element_ids.clone(), labels.clone());
+                Type::Tuple(
+                    self.substitute_argument_types(&element_ids, substitution_context),
+                    labels,
+                )
             }
             // `[T; n]` substitutes its element (the length is a constant, carried
             // through), so a generic `[T; 4]` monomorphizes to `[i32; 4]`.
@@ -48049,7 +48563,10 @@ impl<'src> Analyzer<'src> {
                 let (binder_id, source_id, template_id) = (*binder_id, *source_id, *template_id);
                 let source = source_id.get_type(self);
                 match self.substitute_type(&source, substitution_context) {
-                    Type::Tuple(element_ids) => {
+                    // B569: a mapping keeps positions, so it keeps the
+                    // source's labels — `(U in T: F<U>)` over `(x: A, y: B)` is
+                    // `(x: F<A>, y: F<B>)`.
+                    Type::Tuple(element_ids, labels) => {
                         let template = template_id.get_type(self);
                         let slots = element_ids
                             .iter()
@@ -48059,7 +48576,7 @@ impl<'src> Analyzer<'src> {
                                 self.substitute_type(&template, &context).get_type_id(self)
                             })
                             .collect();
-                        Type::Tuple(slots)
+                        Type::Tuple(slots, labels)
                     }
                     // B543: a source that is ITSELF mapped composes —
                     // `(U in (V in S: F<V>): G<U>)` walks `S`, and its element
@@ -49730,7 +50247,7 @@ impl<'src> Analyzer<'src> {
             | Type::Struct(_, arguments)
             | Type::Trait(_, arguments)
             | Type::Dyn(_, arguments)
-            | Type::Tuple(arguments) => arguments.into_iter().any(next),
+            | Type::Tuple(arguments, _) => arguments.into_iter().any(next),
             Type::Array(element, _) => next(element),
             Type::Mapped(_, source, template) => next(source) || next(template),
             _ => false,
@@ -50426,6 +50943,22 @@ impl<'src> Analyzer<'src> {
             return Err(());
         }
         let pack_element_ids = argument_ids[fixed..].to_vec();
+        // B569 S4: the collected arguments are the pack's literal, so they are
+        // all named or none, as its entries are.
+        let named = pack_element_ids
+            .iter()
+            .filter(|element| self.entry_labels.contains_key(element))
+            .count();
+        if named > 0 && named < pack_element_ids.len() {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: arguments_span,
+                msg: "a spread parameter's arguments are all named or none: name every \
+                      argument it collects, or drop the names and pass them by position"
+                    .to_string(),
+            });
+        }
         let pack_id = self.new_entity_id();
         // The pack's diagnostic span is the first collected argument's, so a
         // pack that fails its bound points at what was written; an EMPTY pack
@@ -50477,6 +51010,24 @@ impl<'src> Analyzer<'src> {
         }
         let expected = self.pretty_print_type(expected_type, substitution_context);
         let got = self.pretty_print_type(got_type, substitution_context);
+        // B569 §4.3: two tuples whose labels CONTRADICT — a label both carry
+        // at different positions — do not convert, and the sentence says
+        // which label moved. `with_fragment_steer` appends the two spellings
+        // when the value is a place.
+        if let (Type::Tuple(slots, wanted), Type::Tuple(values, carried)) =
+            (expected_type, got_type)
+            && slots.len() == values.len()
+            && let Some(label) = carried.contradiction(wanted)
+        {
+            let (from, to) = (
+                carried.position(label).unwrap_or_default(),
+                wanted.position(label).unwrap_or_default(),
+            );
+            return format!(
+                "Expected {expected}, but got {got} instead: the label `{label}` names slot \
+                 {from} of the value and slot {to} here, {LABEL_CONTRADICTION_STEER}"
+            );
+        }
         match self.numeric_conversion_target(expected_type, got_type) {
             Some("usize") => format!(
                 "Expected usize (an index: a position, a length or a count), but got {got} \
@@ -50633,13 +51184,102 @@ impl<'src> Analyzer<'src> {
             && self
                 .written_text_of(value_id)
                 .is_some_and(|written| written.starts_with('<'));
-        match is_fragment {
-            true => format!(
+        if is_fragment {
+            return format!(
                 "{msg} A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children \
                  in one element (`<div>…</div>`), or make this position a `List<View>`"
-            ),
-            false => msg,
+            );
         }
+        // B569 §3.2: a one-slot labelled literal where no tuple is wanted is
+        // most likely an assignment written in parentheses.
+        if !matches!(expected, Type::Tuple(..) | Type::Unknown | Type::Any)
+            && let Some(Expr::Tuple(entries)) = self.expr_id_to_expr_map.get(&value_id)
+            && let [entry] = entries[..]
+            && let Some(label) = self.entry_labels.get(&entry)
+            && let Some(value) = self.written_text_of(entry)
+        {
+            return format!(
+                "{msg} `({label} = {value})` is a tuple with the label `{label}`; to assign, \
+                 write `{label} = {value};`"
+            );
+        }
+        self.with_label_contradiction_fixes(msg, value_id, expected)
+    }
+
+    /// The settled type of a place expression: a name reads its binding's,
+    /// anything else its own recorded type.
+    fn place_type_id(&self, id: Id) -> Option<TypeId> {
+        if let Some(type_id) = self
+            .expr_id_to_type_id_map
+            .get(&id)
+            .or_else(|| self.resolved_types.get(&id))
+        {
+            return Some(*type_id);
+        }
+        match self.expr_id_to_expr_map.get(&id)? {
+            Expr::Local(target) => self.place_type_id(*target),
+            Expr::Variable(variable_id) => Some(self.variables.get(variable_id)?.type_id),
+            Expr::Parameter(parameter_id) => Some(self.parameters.get(parameter_id)?.type_id),
+            _ => None,
+        }
+    }
+
+    /// B569 §4.3's two quick fixes, spelled into the contradiction's message
+    /// when the value is a PLACE (a name, a field or a position chain), which
+    /// reads the same twice: by name `(y = p.y, x = p.x)`, by position
+    /// `(p.0, p.1)`. Any other value would be evaluated once per slot, so it
+    /// keeps the sentence alone. The editor's quick fixes and `check --fix`
+    /// read the two spellings off the message.
+    fn with_label_contradiction_fixes(&self, msg: String, value_id: Id, expected: &Type) -> String {
+        if !msg.contains(LABEL_CONTRADICTION_STEER) {
+            return msg;
+        }
+        let Type::Tuple(slots, labels) = expected else {
+            return msg;
+        };
+        let Some(labels) = labels.labels() else {
+            return msg;
+        };
+        let is_place = |analyzer: &Self, id: Id| {
+            let mut id = id;
+            loop {
+                match analyzer.expr_id_to_expr_map.get(&id) {
+                    Some(Expr::Local(_) | Expr::Variable(_) | Expr::Parameter(_)) => return true,
+                    Some(Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _)) => {
+                        id = *subject
+                    }
+                    _ => return false,
+                }
+            }
+        };
+        let Some(written) = self.written_text_of(value_id) else {
+            return msg;
+        };
+        if !is_place(self, value_id) || written.contains('\n') {
+            return msg;
+        }
+        let by_position: Vec<String> = (0..slots.len())
+            .map(|slot| format!("{written}.{slot}"))
+            .collect();
+        // By name only where the value carries every label this position
+        // names — `(x, y)` into `(y, z)` has no `z` to read.
+        let carried = self
+            .place_type_id(value_id)
+            .map(|type_id| type_id.borrow_type(self));
+        let carries_all = matches!(carried, Some(Type::Tuple(_, carried))
+            if labels.iter().all(|label| carried.position(label).is_some()));
+        if !carries_all {
+            return format!("{msg}: by position, `({})`", by_position.join(", "));
+        }
+        let by_name: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label} = {written}.{label}"))
+            .collect();
+        format!(
+            "{msg}: by name, `({})`; by position, `({})`",
+            by_name.join(", "),
+            by_position.join(", ")
+        )
     }
 
     /// B495 Q2: the refusal for a closure whose parameter's MODE differs
@@ -51068,7 +51708,7 @@ impl<'src> Analyzer<'src> {
         if substitution_context.contains_key(&family) {
             return None;
         }
-        let Type::Tuple(elements) = argument_type else {
+        let Type::Tuple(elements, _) = argument_type else {
             return None;
         };
         let position = elements
@@ -51964,11 +52604,12 @@ impl<'src> Analyzer<'src> {
                     // conversion is the fix. An inferred one keeps the
                     // annotate-it steer, which is the more useful sentence.
                     let msg = if origin.is_empty() {
-                        self.type_mismatch_message(
+                        let msg = self.type_mismatch_message(
                             &parameter_type,
                             &argument_type,
                             &substitution_context,
-                        )
+                        );
+                        self.with_fragment_steer(msg, argument_id, &parameter_type)
                     } else {
                         format!("Expected {expected}, but got {got} instead.{origin}")
                     };
@@ -52997,7 +53638,7 @@ impl<'src> Analyzer<'src> {
             // void`) turned into the closure type B508 reached.
             Type::Struct(_, _)
             | Type::Enum(_, _)
-            | Type::Tuple(_)
+            | Type::Tuple(_, _)
             | Type::Array(_, _)
             | Type::Closure(..)
             | Type::Function(_)
@@ -54188,6 +54829,7 @@ impl<'src> Analyzer<'src> {
                     &argument_type,
                     &HashMap::default(),
                 );
+                let msg = self.with_fragment_steer(msg, argument_id, &parameter_type);
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
@@ -54560,6 +55202,7 @@ impl<'src> Analyzer<'src> {
                         &value_type,
                         &substitution_context,
                     );
+                    let msg = self.with_fragment_steer(msg, value_id, &variable_type);
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note,
@@ -55165,7 +55808,7 @@ impl<'src> Analyzer<'src> {
                     self.fill_holes_admitting(*held_argument, &wanted_argument, rigid_at);
                 }
             }
-            (Type::Tuple(held_elements), Type::Tuple(wanted_elements))
+            (Type::Tuple(held_elements, _), Type::Tuple(wanted_elements, _))
                 if held_elements.len() == wanted_elements.len() =>
             {
                 for (held_element, wanted_element) in held_elements.iter().zip(wanted_elements) {
@@ -55234,7 +55877,7 @@ impl<'src> Analyzer<'src> {
             | Type::Struct(_, argument_type_ids)
             | Type::Trait(_, argument_type_ids)
             | Type::Dyn(_, argument_type_ids)
-            | Type::Tuple(argument_type_ids) => argument_type_ids
+            | Type::Tuple(argument_type_ids, _) => argument_type_ids
                 .iter()
                 .all(|argument_type_id| self.type_is_ground(*argument_type_id)),
             Type::Array(element_type_id, _) => self.type_is_ground(element_type_id),
@@ -56554,7 +57197,7 @@ impl<'src> Analyzer<'src> {
             Type::Struct(id, arguments)
             | Type::Enum(id, arguments)
             | Type::Trait(id, arguments) => (Some(id), arguments),
-            Type::Tuple(elements) => (None, elements),
+            Type::Tuple(elements, _) => (None, elements),
             Type::Array(element, _) => (None, vec![element]),
             Type::Generic(inner) => (None, vec![inner]),
             Type::Closure(parameters, return_type, _, _) => {
@@ -58279,7 +58922,7 @@ impl<'src> Analyzer<'src> {
                 Some(declaration) => ValueSpace::Enum(enum_id, declaration.variants.len()),
                 None => ValueSpace::Open,
             },
-            Type::Tuple(element_type_ids) => ValueSpace::Tuple(element_type_ids),
+            Type::Tuple(element_type_ids, _) => ValueSpace::Tuple(element_type_ids),
             _ => ValueSpace::Open,
         }
     }
@@ -58551,9 +59194,17 @@ impl<'src> Analyzer<'src> {
         };
         let mut unified: Option<Type> = None;
         for (statements, body_id) in bodies {
+            // B569 §4.2: after a LABELLED tuple arm, a later arm is typed
+            // against it, so a labelled literal arm matches it by name
+            // (`c then (x = 1, y = 2) else (y = 3, x = 4)`).
+            let labelled_sibling = unified
+                .as_ref()
+                .filter(|current| matches!(current, Type::Tuple(_, labels) if labels.is_labelled()))
+                .cloned();
             let arm_constraint = expected
                 .map(|type_id| type_id.get_type(self))
                 .or_else(|| peer.clone())
+                .or(labelled_sibling)
                 .unwrap_or(Type::Unknown);
             let body_type = if self.block_diverges(statements, *body_id) {
                 Type::Never
@@ -60206,9 +60857,10 @@ impl<'src> Analyzer<'src> {
         let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         match subject_type {
             Type::Unresolved => Resolution::Deferred,
-            // `pair.0`: a tuple's members are its positions (spec §5.9).
-            Type::Tuple(element_type_ids) => {
-                match tuple_element(&element_type_ids, member_name) {
+            // `pair.0`: a tuple's members are its positions (spec §5.9), and
+            // a labelled tuple's are its labels too (B569: `p.x` is `p.0`).
+            Type::Tuple(element_type_ids, labels) => {
+                match tuple_element(&element_type_ids, &labels, member_name) {
                     Ok(index) => {
                         // Flat storage: the element lives at the sum of the
                         // widths before it (its own width decides read shape).
@@ -60245,7 +60897,8 @@ impl<'src> Analyzer<'src> {
                             // root and its own tuple type is the path's base.
                             (None, true) => {
                                 let subject_type_id =
-                                    Type::Tuple(element_type_ids.clone()).get_type_id(self);
+                                    Type::Tuple(element_type_ids.clone(), labels.clone())
+                                        .get_type_id(self);
                                 Some((subject_type_id, Vec::new()))
                             }
                             // An access the one minting site above did not
@@ -60268,7 +60921,7 @@ impl<'src> Analyzer<'src> {
                     }
                     Err(problem) => {
                         let label = self.pretty_print_type(
-                            &Type::Tuple(element_type_ids.clone()),
+                            &Type::Tuple(element_type_ids.clone(), labels.clone()),
                             &HashMap::default(),
                         );
                         self.diagnostics.push(Error {
@@ -64181,7 +64834,7 @@ impl<'src> Analyzer<'src> {
                 // a pack of `Option`s). Refusing the concrete spelling and not
                 // the abstract one would be a special case, and the abstract
                 // one is the half a LIBRARY writes.
-                Type::Tuple(_) | Type::Mapped(_, _, _) => {
+                Type::Tuple(_, _) | Type::Mapped(_, _, _) => {
                     self.report_tuple_for_each(for_each_id, iterable_id, &iterable_type)
                 }
                 _ => {}
@@ -65733,7 +66386,7 @@ impl<'src> Analyzer<'src> {
                         (
                             Type::Closure(..)
                             | Type::Function(_)
-                            | Type::Tuple(_)
+                            | Type::Tuple(_, _)
                             | Type::Array(_, _),
                             BinaryOp::Add,
                         ) => {
@@ -66516,7 +67169,7 @@ impl<'src> Analyzer<'src> {
                 }
                 self.collect_generics(&return_id.get_type(self), depth + 1, out);
             }
-            Type::Tuple(items) => {
+            Type::Tuple(items, _) => {
                 for item in items {
                     self.collect_generics(&item.get_type(self), depth + 1, out);
                 }
@@ -66799,11 +67452,17 @@ impl<'src> Analyzer<'src> {
                 }
             }
 
-            Type::Tuple(items) => {
+            // B569: a labelled tuple prints its labels, `(x: f64, y: f64)` —
+            // hover, inlay hints and every diagnostic read them here.
+            Type::Tuple(items, labels) => {
                 buf.push('(');
                 for (i, item_id) in items.iter().enumerate() {
                     if i > 0 {
                         buf.push_str(", ");
+                    }
+                    if let Some(label) = labels.get(i) {
+                        buf.push_str(label);
+                        buf.push_str(": ");
                     }
                     let item_type = item_id.get_type(self);
                     let item_str =
@@ -68343,6 +69002,12 @@ pub struct Program<'src> {
     /// consults it to decide the flat-storage splice; silence there nested the
     /// element and made every read past it `undefined`.
     pub tuple_element_types: HashMap<Id, TypeId>,
+    /// B569 §4.1: a tuple literal matched by name in an order other than its
+    /// written one — for each storage slot, the WRITTEN entry it takes. The
+    /// emitters evaluate the entries as written and lay them out by this, so
+    /// `(y = f(), x = g())` at `(x: T, y: T)` runs `f` before `g` and stores
+    /// `(g(), f())`. Labels themselves never reach emission.
+    pub tuple_literal_layouts: HashMap<Id, Vec<usize>>,
     /// B310: the layout coordinates of every positional tuple access
     /// (`Expr::TupleIndex`), keyed by the ACCESS's own id — the tuple type of
     /// the root subject it folded onto, and the chain of element indices from
@@ -78415,6 +79080,8 @@ fn analyze_over_world<'src>(
         // a WRITTEN type application (`let h: Held<i32, SignalCell<List<str>>>`).
         analyzer.check_written_nominal_bounds();
         analyzer.check_tuple_spreads();
+        analyzer.check_tuple_literal_labels();
+        analyzer.check_named_arguments();
     }
     unless_cancelled! {
         // The HMR transfer bound at `dev::stash`/`dev::take` call sites (`hmr.md` §4);
@@ -79862,6 +80529,10 @@ fn analyze_over_world<'src>(
         expr_type_ids,
         inferred_return_types: std::mem::take(&mut analyzer.inferred_return_types),
         tuple_element_types: std::mem::take(&mut analyzer.tuple_element_types),
+        tuple_literal_layouts: std::mem::take(&mut analyzer.tuple_literal_layouts)
+            .into_iter()
+            .map(|(literal, (layout, _))| (literal, layout))
+            .collect(),
         tuple_index_paths: std::mem::take(&mut analyzer.tuple_index_paths),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         callable_coercions: std::mem::take(&mut analyzer.callable_coercions),
@@ -81696,7 +82367,10 @@ mod walk_type_node_fence_tests {
         let unresolved = analyzer.walk_type_node(&(Node::Error, (0..0).into()), scope_id);
         let void = analyzer.type_id_for_type(Type::Void);
         let generic = analyzer.type_id_for_type(Type::Generic(unresolved));
-        let tuple = analyzer.type_id_for_type(Type::Tuple(vec![void, unresolved, generic]));
+        let tuple = analyzer.type_id_for_type(Type::Tuple(
+            vec![void, unresolved, generic],
+            crate::type_::TupleLabels::NONE,
+        ));
         let closure = analyzer.type_id_for_type(Type::Closure(
             vec![tuple, void],
             generic,

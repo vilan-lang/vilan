@@ -104,7 +104,7 @@ pub fn subject_shape_matches(program: &Program, subject: TypeId, target: TypeId)
             left_id == right_id
                 && subject_argument_shapes_match(program, left_arguments, right_arguments)
         }
-        (Type::Tuple(left_items), Type::Tuple(right_items)) => {
+        (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
             subject_argument_shapes_match(program, left_items, right_items)
         }
         (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
@@ -343,7 +343,7 @@ fn tuple_bound_holds(program: &Program, constraint_id: TypeId, bound_type: TypeI
         return true;
     };
     match program.type_id_to_type_map.get(&bound_type) {
-        Some(Type::Tuple(elements)) => {
+        Some(Type::Tuple(elements, _)) => {
             lo.is_none_or(|lo| elements.len() >= lo as usize)
                 && hi.is_none_or(|hi| elements.len() <= hi as usize)
         }
@@ -449,7 +449,7 @@ fn collect_subject_binders(program: &Program, subject: TypeId, binders: &mut Vec
                 collect_subject_binders(program, argument, binders);
             }
         }
-        Some(Type::Tuple(items)) => {
+        Some(Type::Tuple(items, _)) => {
             for item in items.clone() {
                 collect_subject_binders(program, item, binders);
             }
@@ -645,7 +645,7 @@ pub fn bind_subject(
         {
             zip_arguments(out, &pattern_arguments, &concrete_arguments);
         }
-        (Type::Tuple(pattern_arguments), Type::Tuple(concrete_arguments)) => {
+        (Type::Tuple(pattern_arguments, _), Type::Tuple(concrete_arguments, _)) => {
             zip_arguments(out, &pattern_arguments, &concrete_arguments);
         }
         // `[T; n]` against `[i32; n]` binds `T = i32` through the element.
@@ -724,7 +724,7 @@ fn instantiation_agrees(program: &Program, wanted: &Type, provided: &Type) -> bo
             }
             elements_agree(left_arguments, right_arguments)
         }
-        (Type::Tuple(left_elements), Type::Tuple(right_elements)) => {
+        (Type::Tuple(left_elements, _), Type::Tuple(right_elements, _)) => {
             elements_agree(left_elements, right_elements)
         }
         (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {

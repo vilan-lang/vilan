@@ -13,7 +13,10 @@ The type forms (grammar §3.9) denote:
   distinct (no implicit numeric conversions, §5.8).
 - **Tuples**: `(T, U, …)`; structural: equal iff element-wise equal.
   `()` and one-element tuples do not exist as distinct types (`(T)` is
-  `T`; the unit is `void`).
+  `T`; the unit is `void`) — save the one-slot LABELLED tuple `(x: T)`,
+  whose label makes it one. A tuple's slots may carry labels, `(x: f64, y:
+  f64)`; labels name positions and are never part of the type's identity
+  (§5.9, labelled tuples).
 - **Closure types**: `|T, U| R`, `|| R`, `|| void`; structural in their
   parameter and return types. An `async` closure type (§7.4) is distinct
   from its plain counterpart. A `context` clause (§8.5) is carried by the
@@ -1331,6 +1334,67 @@ yields its region as a value (destructuring reads the same layout).
 Positional access and destructuring are the element-wise spellings a
 tuple has: a tuple is **not iterable**, and `for x in t` is refused
 because the binder would have no single type to take (§3.5).
+
+
+### Labelled tuples
+
+A tuple's positions may carry **labels** (B569, `named-tuple-fields.md`):
+`let p: (x: f64, y: f64) = (x = 5, y = 7);` — every slot labelled, or
+none. A label is a name for a POSITION, read as `p.x` (the slot `p.0` is,
+and `p.0` keeps working) and written through a `mut` binding as `p.x = 3;`.
+Labels are carried by the type and never compared: two tuple types are
+compatible when their elements are, whatever their labels, with ONE
+exception below. So:
+
+- a **labelled literal** against a labelled type of its arity matches BY
+  NAME — `let q: (x: f64, y: f64) = (y = 7, x = 5);` is `(5, 7)` — and must
+  name exactly that type's labels; its entries are evaluated as WRITTEN,
+  then stored in the type's order. Against an unlabelled type, or with no
+  expected type, it is positional (`(y = 7, x = 5)` alone is `(y: i32, x:
+  i32)`).
+- an **unlabelled** value into a labelled position takes the position's
+  labels; a labelled one into an unlabelled position drops them; two
+  DIFFERENTLY named label sets reconcile by position — `(w: f64, h: f64)`
+  into `(x: f64, y: f64)` — and a binding, parameter, field or return takes
+  the labels of its declared type.
+- **The contradiction is refused**: two tuple types where some label sits at
+  DIFFERENT positions — `(x: f64, y: f64)` into `(y: f64, x: f64)`, and the
+  one-rename twin `(x: f64, y: f64)` into `(y: f64, z: f64)`. The two
+  readings (by name, by position) give different values, so neither is
+  picked; the refusal spells both rewrites for a value that is a place:
+  `(y = p.y, x = p.x)` by name, `(p.0, p.1)` by position.
+- a **join** types a later arm against a labelled first arm, so labelled
+  literal arms and list elements match it by name.
+
+A tuple PATTERN may name its elements too — `let (y = top, x = left) =
+p;`, `match q { (x = 0, y = let v) => … }` — and is placed by the labels
+of the value it matches, which it names exactly; a positional pattern
+ignores them. `dbg` prints a labelled tuple as its literal, `p = (x = 5.0,
+y = 7.0)`; a tuple a generic body prints through its parameter prints
+positionally, since labels erase at the instance (below). `Debug`'s
+`debug()` is positional.
+
+A **spread parameter over a labelled tuple** takes NAMED arguments: the
+call collects its arguments into one tuple literal (§5.9's desugar), so
+`draw(x = 1, y = 2)` and `draw(y = 2, x = 1)` against `fun draw(...at: (x:
+f64, y: f64))` both collect a literal that matches the pack by name, and
+`draw(1, 2)` still collects one positionally. A fixed parameter before the
+pack is passed by position; the collected arguments are all named or none;
+a name nothing collects is refused; and a slot cannot be left out — there
+are no defaults (a struct with field defaults is the shape for those).
+
+Labels flow through generics as part of the type a parameter binds
+(`id(p).x`), and a **mapped tuple** keeps its source's labels position by
+position — `combine((x = a, y = b))` derives over `(x: i32, y: i32)`. They
+are **erased** at monomorphization (`f<(x: i32, y: i32)>` and `f<(i32,
+i32)>` are one instance), in both emitters (a label is the slot offset), and
+in a service's contract hash. A tuple's future `Wire` or `Json` encoding is
+positional. `keys()` is unchanged: a key is a position. An `impl` cannot
+name a labelled tuple — labels are not an identity, so it would answer for
+every tuple of its slot types — and a shape with methods, derives, an
+identity across signatures or a wire format is a struct. `(x = 5)` is a
+one-slot labelled tuple (`(x: i32)`, arity 1, so it does not meet `T:
+(2..)`); `(5)` stays a group.
 
 ## 5.10 `!`, `?.` and `?`
 

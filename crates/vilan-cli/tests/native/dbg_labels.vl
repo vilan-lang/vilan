@@ -1,0 +1,25 @@
+import std::io::print;
+
+fun show<T>(value: T) {
+	dbg(value);
+}
+
+fun main() {
+	let p: (x: f64, y: f64) = (x = 5, y = 7);
+	let q: (f64, f64) = (1, 2);
+	dbg(p);
+	dbg(q);
+	dbg([(a = 1, b = "one")]);
+	dbg((outer = (left = 1, right = 2), tag = "t"));
+	show(p);
+	show(q);
+	let (y = top, x = left) = p;
+	print(i"{top} {left}");
+	match (x = 0, y = 3) {
+		(x = 0, y = let v) => print(v),
+		(x = let h, y = _) => print(h),
+	}
+	for (y = second, x = first) in [(x = 1, y = 2), (x = 3, y = 4)] {
+		print(first * 10 + second);
+	}
+}

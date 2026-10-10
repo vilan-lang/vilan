@@ -7887,6 +7887,25 @@ impl Document {
                         target: None,
                     },
                 });
+            } else if let fixes_by_label @ [_, ..] =
+                &vilan_ide::tuple_label_fix::tuple_label_fixes(diagnostic.span, &diagnostic.msg)[..]
+            {
+                // B569 §4.3: a contradicting label set, rewritten by name or by
+                // position — the refusal spells both for a place.
+                use vilan_ide::tuple_label_fix::LabelReading;
+                for fix in fixes_by_label {
+                    fixes.push(QuickFix {
+                        title: match fix.reading {
+                            LabelReading::ByName => format!("Match by name: `{}`", fix.replacement),
+                            LabelReading::ByPosition => {
+                                format!("Match by position: `{}`", fix.replacement)
+                            }
+                        },
+                        span: fix.span,
+                        replacement: fix.replacement.clone(),
+                        target: None,
+                    });
+                }
             } else if let Some(conversions) =
                 numeric_conversion_fixes(self.analyzed_text(), diagnostic)
             {
