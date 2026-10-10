@@ -4755,6 +4755,12 @@ pub struct Analyzer<'src> {
     /// filters nothing (today's reading).
     lookup_importer: Option<SourceId>,
     lookup_anchor: Option<Id>,
+    /// B583: the anchor of the constraint (or the `for` loop) whose method
+    /// lookups are running — set whether or not any file restricts admission,
+    /// because std's own lookups narrow by WHO asks
+    /// ([`Self::retain_std_reach`]). `None` outside them, where a lookup
+    /// narrows nothing.
+    lookup_asker: Option<Id>,
     /// B401: the calls that resolved to an inherited trait DEFAULT through a
     /// block the calling file did not admit — no admitted block offered the
     /// name, so the lookup kept today's answer and the post-build admission
@@ -7514,6 +7520,7 @@ impl<'src> Analyzer<'src> {
             lookup_admission: None,
             lookup_importer: None,
             lookup_anchor: None,
+            lookup_asker: None,
             declined_default_calls: HashMap::default(),
             source_paths: Vec::new(),
             import_statement_spans: Vec::new(),
@@ -21608,6 +21615,7 @@ impl<'src> Analyzer<'src> {
         if found.iter().any(|(_, admitted)| *admitted) {
             found.retain(|(_, admitted)| *admitted);
         }
+        self.retain_std_reach(&mut found, |((_, _, home_trait, _), _)| *home_trait);
         let mut found: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> =
             found.into_iter().map(|(candidate, _)| candidate).collect();
         found.sort_by_key(|(member_id, ..)| self.declaration_order(*member_id));
@@ -24986,6 +24994,7 @@ impl<'src> Analyzer<'src> {
         if reached.iter().any(|(_, (_, admitted))| *admitted) {
             reached.retain(|(_, (_, admitted))| *admitted);
         }
+        self.retain_std_reach(&mut reached, |((_, _, home_trait, _), _)| Some(*home_trait));
         let mut applying = Vec::with_capacity(reached.len());
         for candidate in &reached {
             if self.impl_bounds_hold(candidate.0.1, subject_type) {
@@ -35327,6 +35336,59 @@ impl<'src> Analyzer<'src> {
             }
             _ => true,
         }
+    }
+
+    /// B583 — what a package's traits provide at std's OWN call sites:
+    /// nothing through a method name. std is exempt from importing what it
+    /// calls (B515 skips its files), so a std file reaches every trait std
+    /// declares and no package's; a lookup std asks keeps the candidates whose
+    /// home trait std declares — an inherent member, and a package's impl OF a
+    /// std trait (`impl Point with Display`), stay candidates — and drops a
+    /// package trait's, blanket or not. Without it a module's
+    /// `export impl type T with Describe { fun describe(self): str }` made
+    /// std's own `items.describe(serializer)` (`wire.vl`) ambiguous between
+    /// `Wire` and `Describe`, while the same blanket written in the ENTRY —
+    /// walked after std resolved — was invisible to std: the answer depended
+    /// on which file declared the blanket. B401's shape: it narrows the field
+    /// and never empties it, and it asks the asker's file only when two
+    /// candidates disagree about whose trait they are.
+    fn retain_std_reach<Candidate>(
+        &self,
+        candidates: &mut Vec<Candidate>,
+        home_trait: impl Fn(&Candidate) -> Option<Id>,
+    ) {
+        // Cheapest first: a field of one home trait narrows to all or none,
+        // and only a lookup std asks narrows at all.
+        let Some(first) = candidates.first().map(&home_trait) else {
+            return;
+        };
+        if candidates
+            .iter()
+            .all(|candidate| home_trait(candidate) == first)
+        {
+            return;
+        }
+        let asked_by_std = self
+            .lookup_asker
+            .and_then(|asker| self.source_of_id(asker))
+            .is_some_and(|source| self.std_sources.contains(&source));
+        if !asked_by_std {
+            return;
+        }
+        let reached_by_std = |candidate: &Candidate| {
+            home_trait(candidate).is_none_or(|trait_id| self.trait_declared_in_std(trait_id))
+        };
+        if candidates.iter().any(reached_by_std) {
+            candidates.retain(reached_by_std);
+        }
+    }
+
+    /// Whether std declares the trait `trait_id` (B583's reach).
+    fn trait_declared_in_std(&self, trait_id: Id) -> bool {
+        self.traits
+            .get(&trait_id)
+            .and_then(|trait_| self.source_of_id(trait_.id))
+            .is_some_and(|source| self.std_sources.contains(&source))
     }
 
     /// The file a constraint's lookups are admitted under: the anchor's own,
@@ -50725,6 +50787,9 @@ impl<'src> Analyzer<'src> {
                     .is_some_and(|source| self.std_sources.contains(&source));
                 self.impl_reach.get_mut().asked_by_std = by_std;
             }
+            // B583: who asks, for std's own reach (a field write; the source
+            // is looked up only where two candidates disagree on it).
+            self.lookup_asker = Some(constraint.anchor());
             // B401: the file whose admission this constraint's method lookups
             // read — asked only when some file restricts anything.
             if self.lookup_admission.is_some() {
@@ -50747,6 +50812,7 @@ impl<'src> Analyzer<'src> {
             self.rigid_binder_scope = None;
             self.lookup_importer = None;
             self.lookup_anchor = None;
+            self.lookup_asker = None;
             self.impl_reach.get_mut().asked_by_std = false;
             // Attribute anything this constraint reported to its anchor's file
             // (a type error inside an imported module must publish there, E1).
@@ -64554,6 +64620,7 @@ impl<'src> Analyzer<'src> {
             // blocks providing the default (one admitted, one declined) were
             // one candidate by MEMBER, the first registered: the post-build
             // refusal then followed the load order.
+            self.lookup_asker = Some(for_each_id);
             if self.lookup_admission.is_some() {
                 self.lookup_anchor = Some(for_each_id);
                 self.lookup_importer = self.admitting_source_of(for_each_id);
@@ -64844,6 +64911,7 @@ impl<'src> Analyzer<'src> {
         // clears it after every constraint); nothing after the loop reads it.
         self.lookup_importer = None;
         self.lookup_anchor = None;
+        self.lookup_asker = None;
 
         // --- Resolve operator overloading --- an arithmetic `a <op> b` whose
         // left operand's type implements the matching operator trait

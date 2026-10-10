@@ -7607,3 +7607,42 @@ fn b573_a_modules_platform_twins_are_chosen_for_the_builds_platform() {
         );
     }
 }
+
+// --- B583: a module's traits never compete at std's own call sites ----------
+
+const B583_MAIN: &str = "import std::io::print;\nimport pkg::describe::Describe;\n\nfun main() {\n\tprint(Describe::describe(4));\n}\n";
+
+/// B583: a MODULE's exported blanket over every type declaring `describe`
+/// made std's own `items.describe(serializer)` and `index.describe(..)`
+/// (`wire.vl`) ambiguous between `Wire` and the package's `Describe` — two
+/// errors inside std for a program that never touched `Wire` — while the same
+/// blanket in the ENTRY compiled (std resolves before the entry walks). The
+/// rule: std's files reach std's traits and no package's, so a package trait
+/// is no candidate at a std call; the program runs either way round.
+#[test]
+fn b583_a_modules_blanket_does_not_make_stds_own_calls_ambiguous() {
+    let describe = "export trait Describe {\n\tfun describe(self): str;\n}\n\nexport impl type T with Describe {\n\tfun describe(self): str {\n\t\t\"mine\"\n\t}\n}\n";
+    let (_, stdout) = compile_and_run_package(
+        &[("describe.vl", describe), ("main.vl", B583_MAIN)],
+        "main.vl",
+    )
+    .expect("a module's blanket leaves std's own calls alone");
+    assert_eq!(stdout, "mine\n");
+}
+
+/// B583's other heads: an impl headed by std's own `List` (it competes at
+/// `items.describe(..)` exactly), and a blanket that provides the name as its
+/// trait's DEFAULT (the inherited-default lookup narrows by the same rule).
+#[test]
+fn b583_a_modules_list_headed_impl_and_default_leave_stds_calls_alone() {
+    let list_headed = "export trait Describe {\n\tfun describe(self): str;\n}\n\nexport impl List<type T> with Describe {\n\tfun describe(self): str {\n\t\t\"mine\"\n\t}\n}\n\nexport impl usize with Describe {\n\tfun describe(self): str {\n\t\t\"index\"\n\t}\n}\n\nexport impl i32 with Describe {\n\tfun describe(self): str {\n\t\t\"mine\"\n\t}\n}\n";
+    let by_default = "export trait Describe {\n\tfun describe(self): str {\n\t\t\"mine\"\n\t}\n}\n\nexport impl type T with Describe {}\n";
+    for describe in [list_headed, by_default] {
+        let (_, stdout) = compile_and_run_package(
+            &[("describe.vl", describe), ("main.vl", B583_MAIN)],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("std's calls stay std's: {errors:?}\n{describe}"));
+        assert_eq!(stdout, "mine\n");
+    }
+}

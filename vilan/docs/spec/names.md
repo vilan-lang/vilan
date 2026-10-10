@@ -362,6 +362,15 @@ Such a call is refused at the member's name, naming the import that brings
 the trait (`` Import it (`import std::display::Display;`) ``) — a warning in
 v0.44.0, an error from v0.45.0 (B515, B535).
 
+std's own files import nothing they call, so they reach every trait std
+declares and **no package's**: a package's trait — a blanket over every
+type included — is never a candidate at a call inside std. A module's
+`impl type T with Describe { fun describe(self): str { … } }` leaves std's
+own `describe` calls to std's `Wire`, as the same blanket written in the
+entry always did. A package's impl *of a std trait* (`impl Point with
+Display`) is an impl of a trait std names, and serves std like any other
+(B583).
+
 `Trait::member(receiver, args…)` is the disambiguator: it names which
 provider to use, and works on a concrete receiver or a trait-bounded
 generic one. `Type::member(receiver, args…)` means the type's own member
