@@ -136,29 +136,52 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
 fn drop_ascribed_closure_parens(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     let mut dropped: Vec<bool> = vec![false; tokens.len()];
     for index in 0..tokens.len() {
-        let opens = tokens[index] == Token::Ident("as")
-            && tokens.get(index + 1) == Some(&Token::Ctrl('('))
-            && matches!(
-                tokens.get(index + 2),
-                Some(Token::Op("|" | "||") | Token::Async | Token::Ident("sync"))
-            );
-        if !opens {
+        if tokens[index] != Token::Ident("as") || tokens.get(index + 1) != Some(&Token::Ctrl('(')) {
             continue;
         }
+        let closure = matches!(
+            tokens.get(index + 2),
+            Some(Token::Op("|" | "||") | Token::Async | Token::Ident("sync"))
+        );
+        // `as (x: T)` is a one-slot LABELLED tuple (B569), no group: its
+        // parentheses are its syntax, as a tuple's comma is.
+        if matches!(tokens.get(index + 2), Some(Token::Ident(_)))
+            && tokens.get(index + 3) == Some(&Token::Op(":"))
+        {
+            continue;
+        }
+        // The matching `)`, and whether the group holds a comma of its own
+        // (a tuple type, `as (A, B)`, whose parentheses are its syntax) —
+        // commas inside a nested group or a generic list are the inner
+        // type's.
         let mut depth = 0usize;
+        let mut angles = 0usize;
+        let mut comma = false;
+        let mut close = None;
         for (at, token) in tokens.iter().enumerate().skip(index + 1) {
             match token {
                 Token::Ctrl('(') => depth += 1,
+                Token::Ctrl('<') => angles += 1,
+                Token::Ctrl('>') => angles = angles.saturating_sub(1),
+                Token::Ctrl(',') if depth == 1 && angles == 0 => comma = true,
                 Token::Ctrl(')') => {
                     depth -= 1;
                     if depth == 0 {
-                        dropped[index + 1] = true;
-                        dropped[at] = true;
+                        close = Some(at);
                         break;
                     }
                 }
                 _ => {}
             }
+        }
+        // A closure type's parentheses (§10's printing), or a ONE-type group
+        // `as (T)` (§10: printed `as T` unless it is the `<` escape) — both
+        // streams fold alike, so either spelling compares to the other.
+        if let Some(close) = close
+            && (closure || !comma)
+        {
+            dropped[index + 1] = true;
+            dropped[close] = true;
         }
     }
     tokens
@@ -6672,6 +6695,23 @@ impl<'src> Printer<'src> {
     /// find where a greedy return type ends.
     fn print_ascription(&mut self, type_: &Spanned<Node<'src>>) {
         self.out.push_str(" as ");
+        // `as (T)` is the ESCAPE where a `<` follows (`n as (usize) < limit`,
+        // §5.1) and kept there; with nothing after it the parentheses are
+        // redundant and the canonical form is `as T` (§10). A labelled slot,
+        // `as (x: T)`, is a one-slot tuple (B569) and keeps them.
+        if let Node::Tuple(elements) = &type_.0
+            && let [only] = elements.as_slice()
+            && !matches!(only.0, Node::Labelled(..))
+            && !self.source[type_.1.end..].trim_start().starts_with('<')
+        {
+            self.print_ascribed_type(only);
+            return;
+        }
+        self.print_ascribed_type(type_);
+    }
+
+    /// [`Self::print_ascription`]'s type, a closure type parenthesized.
+    fn print_ascribed_type(&mut self, type_: &Spanned<Node<'src>>) {
         let closure = match &type_.0 {
             Node::ClosureType(..) | Node::AsyncType(_) | Node::SyncType(_) => true,
             Node::TypeWithContexts(inner, _) => matches!(inner.0, Node::ClosureType(..)),
@@ -9332,6 +9372,19 @@ mod reformats {
             "fun f(): auto i32 {\n\t5\n}\n\nfun g(): auto {\n\t5\n}\n\nmut xs: auto List<str> = [];\n",
         );
         let kept = "fun h(): auto i32 context settings {\n\t5\n}\n";
+        assert_formats(kept, kept);
+    }
+
+    /// B571 §10: a redundant `as (T)` prints as `as T`; the escape before a
+    /// `<` keeps its parentheses, and so does a tuple type — a one-slot
+    /// labelled one included (B569).
+    #[test]
+    fn b571_a_redundant_parenthesized_ascription_prints_bare() {
+        assert_formats(
+            "fun main() {\n\tlet n = count as (usize);\n\tlet m = count as ( List<i32> ).len();\n}\n",
+            "fun main() {\n\tlet n = count as usize;\n\tlet m = count as List<i32>.len();\n}\n",
+        );
+        let kept = "fun main() {\n\tlet a = n as (usize) < limit;\n\tlet b = pair as (i32, str);\n\tlet d = f as (|i32| i32);\n\tlet e = point as (x: i32);\n}\n";
         assert_formats(kept, kept);
     }
 
