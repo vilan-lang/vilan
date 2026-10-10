@@ -4891,6 +4891,17 @@ pub struct Analyzer<'src> {
     // `push` unifies it with the pushed value's type, so a built-up list's
     // element is inferred (`List::new(); push(p: Point)` -> `List<Point>`).
     list_element_slots: HashMap<Id, TypeId>,
+    /// B554: the argument whose `push`/`run` FILLED each element slot — the
+    /// first use in walk order — so a later use that contradicts it can tell
+    /// whether the two sit in different files (where walk order is the
+    /// modules' NAME order, and the blame must not follow it).
+    slot_fill_sites: HashMap<TypeId, Id>,
+    /// Diagnostics a constraint raised about an entity in ANOTHER file than
+    /// its anchor's, by index: `resolve_constraints` attributes everything a
+    /// constraint pushed to the anchor's file, then re-attributes these to
+    /// their own entity's (B554's declaration blame). Each is the LAST
+    /// diagnostic its constraint pushed.
+    pinned_diagnostic_anchors: Vec<(usize, Id)>,
     // Pending element-slot unifications from `push` calls: (element slot, the
     // pushed argument's expression id). Resolved in the constraint loop.
     // Assignments awaiting local resolution: (target accessor id, value id).
@@ -7548,6 +7559,8 @@ impl<'src> Analyzer<'src> {
             field_syntax_reads: HashSet::default(),
             bool_enum_id: None,
             list_element_slots: HashMap::default(),
+            slot_fill_sites: HashMap::default(),
+            pinned_diagnostic_anchors: Vec::new(),
             prepped_assignments: Vec::new(),
             compound_reread_ids: HashSet::default(),
             reported_literal_errors: HashSet::default(),
@@ -50967,6 +50980,11 @@ impl<'src> Analyzer<'src> {
             // Attribute anything this constraint reported to its anchor's file
             // (a type error inside an imported module must publish there, E1).
             self.attribute_diagnostics_to_anchor(diagnostics_before, constraint.anchor());
+            if !self.pinned_diagnostic_anchors.is_empty() {
+                for (index, anchor) in std::mem::take(&mut self.pinned_diagnostic_anchors) {
+                    self.attribute_diagnostics_to_anchor(index, anchor);
+                }
+            }
             let waiting_on = self.current_waiting_on.take().unwrap_or_default();
             match resolution {
                 Resolution::Resolved | Resolution::Failed => progress = true,
@@ -54899,6 +54917,14 @@ impl<'src> Analyzer<'src> {
                 .reconcile_type(&argument_type, &slot_type, &HashMap::default())
                 .is_none()
             {
+                if self.report_cross_file_slot_conflict(
+                    slot,
+                    &slot_type,
+                    argument_id,
+                    &argument_type,
+                ) {
+                    return Resolution::Resolved;
+                }
                 let msg =
                     self.type_mismatch_message(&slot_type, &argument_type, &HashMap::default());
                 self.diagnostics.push(Error {
@@ -54913,8 +54939,118 @@ impl<'src> Analyzer<'src> {
         }
         if !matches!(argument_type, Type::Unknown) {
             self.write_type_slot(slot, argument_type);
+            self.slot_fill_sites.insert(slot, argument_id);
         }
         Resolution::Resolved
+    }
+
+    /// B554 — two uses in DIFFERENT files that disagree about a MODULE
+    /// binding's element slot (`export mut bag = []`, `bag.push(1)` in
+    /// `bag.vl`, `bag.push("two")` in `spoil.vl`). The slot takes the first use
+    /// in walk order, and across files walk order is the modules' NAME order,
+    /// so "Expected i32, but got str" at the second push landed in whichever
+    /// file loaded later — rename a module and the error moved to the other
+    /// file, with the other sentence. The binding is what has no single type,
+    /// so the conflict is reported at its DECLARATION, in that file, naming
+    /// both types (sorted) with a trace hop at each use (sorted by the
+    /// observer, as every trace is), and the slot settles on `any` so neither
+    /// use is refused a second time: every load order gives the same
+    /// diagnostic, the same hovers, the same program.
+    ///
+    /// Two uses in ONE file keep the ordinary mismatch at the later one —
+    /// within a file the walk follows the text, which is a fact about the
+    /// program. `false` when this is not the cross-file shape.
+    fn report_cross_file_slot_conflict(
+        &mut self,
+        slot: TypeId,
+        slot_type: &Type,
+        argument_id: Id,
+        argument_type: &Type,
+    ) -> bool {
+        let Some(filler_id) = self.slot_fill_sites.get(&slot).copied() else {
+            return false;
+        };
+        let (Some(filler_source), Some(argument_source)) =
+            (self.source_of_id(filler_id), self.source_of_id(argument_id))
+        else {
+            return false;
+        };
+        if filler_source == argument_source {
+            return false;
+        }
+        let Some((variable_id, name, name_span)) = self.module_binding_of_slot(slot) else {
+            return false;
+        };
+        let mut uses = [
+            (
+                self.pretty_print_type(slot_type, &HashMap::default()),
+                filler_id,
+            ),
+            (
+                self.pretty_print_type(argument_type, &HashMap::default()),
+                argument_id,
+            ),
+        ];
+        uses.sort_by(|left, right| left.0.cmp(&right.0));
+        let trace = uses
+            .iter()
+            .map(|(label, use_id)| crate::error::TraceHop {
+                note: Note {
+                    span: **self.span_map.get(use_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!("this use gives `{name}` elements of type `{label}`"),
+                    source: self.source_of_id(*use_id),
+                },
+                call: false,
+            })
+            .collect();
+        let index = self.diagnostics.len();
+        self.diagnostics.push(Error {
+            trace,
+            note: None,
+            span: name_span,
+            msg: format!(
+                "`{name}`'s element type is decided by its uses, and uses in two files disagree: \
+                 one gives it `{}`, another `{}`. Write the element type on the declaration \
+                 (`{name}: List<…>`)",
+                uses[0].0, uses[1].0
+            ),
+        });
+        self.pinned_diagnostic_anchors.push((index, variable_id));
+        self.write_type_slot(slot, Type::Any);
+        true
+    }
+
+    /// The module-level binding whose initializer minted `slot` — `(id, name,
+    /// the name's span)` — or `None` for a slot no module binding owns (a
+    /// local's, a nested literal's). Asked only on a conflict.
+    fn module_binding_of_slot(&self, slot: TypeId) -> Option<(Id, &'src str, Span)> {
+        let mut literals: Vec<Id> = self
+            .list_element_slots
+            .iter()
+            .filter(|(_, minted)| **minted == slot)
+            .map(|(literal, _)| *literal)
+            .collect();
+        literals.sort_unstable_by_key(|literal| literal.0);
+        let mut owners: Vec<(Id, &'src str, Span)> = self
+            .variables
+            .iter()
+            .filter(|(_, variable)| {
+                variable
+                    .initial
+                    .is_some_and(|initial| literals.contains(&initial))
+            })
+            .filter(|(variable_id, _)| {
+                self.expr_id_to_scope_id_map
+                    .get(variable_id)
+                    .map(|scope_id| {
+                        expansion_home_scope(&self.generated_expansion_scopes, *scope_id)
+                    })
+                    .is_some_and(|scope_id| self.module_scope_ids.contains(&scope_id))
+            })
+            .map(|(variable_id, variable)| (*variable_id, variable.name, variable.name_span))
+            .collect();
+        owners.sort_unstable_by_key(|(variable_id, ..)| variable_id.0);
+        owners.into_iter().next()
     }
 
     /// Type-check a wired method call's arguments against the method's parameters

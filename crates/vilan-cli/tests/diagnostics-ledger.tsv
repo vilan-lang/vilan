@@ -709,3 +709,4 @@ row	flagship	key
 685	-	this pattern destructures by name, so the value must be a labelled tuple, and it is `{rendered}`
 686	-	`{label} = {value}` names an argument, and only a spread parameter takes names (`...at: ({label}: T, …)`), which this one is not: drop `{label} =` to pass it by position, or, to assign, write `{label} = {value};` before the call
 687	-	a spread parameter's arguments are all named or none: name every argument it collects, or drop the names and pass them by position
+NEW	-	`{name}`'s element type is decided by its uses, and uses in two files disagree: one gives it `{first}`, another `{second}`. Write the element type on the declaration (`{name}: List<…>`)

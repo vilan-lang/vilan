@@ -7646,3 +7646,54 @@ fn b583_a_modules_list_headed_impl_and_default_leave_stds_calls_alone() {
         assert_eq!(stdout, "mine\n");
     }
 }
+
+// --- B554: a module binding's cross-file element conflict blames the declaration
+
+/// B554: two modules push `1` and `"two"` into one `export mut bag = []`, and
+/// the slot took the FIRST push in walk order — the modules' name order — so
+/// "Expected str, but got i32" landed in `bag.vl` or "Expected i32, but got
+/// str" in `spoil.vl` by what the files were called. The binding is what has
+/// no single type: the conflict is reported at its declaration, in its file,
+/// naming both types sorted, whichever module loads first.
+#[test]
+fn b554_a_cross_file_element_conflict_blames_the_declaration_in_every_load_order() {
+    let bag = "export mut bag = [];\n\nexport fun fill() {\n\tbag.push(1);\n}\n";
+    for spoil in ["a_spoil", "z_spoil"] {
+        let spoiler = "import pkg::bag::bag;\n\nexport fun spoil() {\n\tbag.push(\"two\");\n}\n";
+        let main = format!(
+            "import pkg::bag::fill;\nimport pkg::{spoil}::spoil;\n\nfun main() {{\n\tfill();\n\tspoil();\n}}\n"
+        );
+        let spoil_file = format!("{spoil}.vl");
+        let outcome = analyze_package(
+            &[("main.vl", &main), ("bag.vl", bag), (&spoil_file, spoiler)],
+            "main.vl",
+        );
+        let [(message, span, file)] = outcome.diagnostics.as_slice() else {
+            panic!("one diagnostic under {spoil}: {:?}", outcome.diagnostics);
+        };
+        assert_eq!(file.as_deref(), Some("bag.vl"), "{spoil}: {message}");
+        assert_eq!(&bag[span.clone()], "bag", "{spoil}: the binding's name");
+        assert!(
+            message.starts_with(
+                "`bag`'s element type is decided by its uses, and uses in two files disagree: \
+                 one gives it `i32`, another `str`."
+            ),
+            "{spoil}: {message}"
+        );
+    }
+}
+
+/// B554's boundary: two disagreeing uses in ONE file keep the ordinary
+/// mismatch at the later use — within a file the walk follows the text.
+#[test]
+fn b554_a_same_file_element_conflict_stays_at_the_later_use() {
+    let bag = "export mut bag = [];\n\nexport fun fill() {\n\tbag.push(1);\n}\n\nexport fun spoil() {\n\tbag.push(\"two\");\n}\n";
+    let main = "import pkg::bag::{ fill, spoil };\n\nfun main() {\n\tfill();\n\tspoil();\n}\n";
+    let outcome = analyze_package(&[("main.vl", main), ("bag.vl", bag)], "main.vl");
+    let [(message, span, file)] = outcome.diagnostics.as_slice() else {
+        panic!("one diagnostic: {:?}", outcome.diagnostics);
+    };
+    assert_eq!(file.as_deref(), Some("bag.vl"));
+    assert_eq!(&bag[span.clone()], "\"two\"");
+    assert_eq!(message, "Expected i32, but got str instead.");
+}
