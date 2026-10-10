@@ -5511,6 +5511,11 @@ pub struct Analyzer<'src> {
     // rule (the only place the landing type is known), and withdrawn when a
     // later inference of the same literal matches.
     tuple_literal_label_problems: HashMap<Id, String>,
+    // B569 S4: every NAMED call argument (`draw(x = 1, y = 2)`) — the
+    // argument's value id and the `name = value` span. Only a spread
+    // parameter's pack takes names (§8); `check_named_arguments` refuses any
+    // that no pack collected.
+    named_arguments: Vec<(Id, Span)>,
     // B310: for every `Expr::TupleIndex` the field-accessor rule mints, the
     // tuple type of the ROOT subject the access reads and the chain of element
     // indices from it (`deep.0.1` folds to the root plus `[0, 1]`). The offset
@@ -7659,6 +7664,7 @@ impl<'src> Analyzer<'src> {
             entry_labels: HashMap::default(),
             tuple_literal_layouts: HashMap::default(),
             tuple_literal_label_problems: HashMap::default(),
+            named_arguments: Vec::new(),
             tuple_index_paths: HashMap::default(),
             scope_id: 0,
             scopes: IndexMap::default(),
@@ -8386,10 +8392,13 @@ impl<'src> Analyzer<'src> {
         if self.tuple_literal_label_problems.is_empty() {
             return;
         }
-        let mut problems: Vec<(Id, String)> =
-            std::mem::take(&mut self.tuple_literal_label_problems)
-                .into_iter()
-                .collect();
+        // Read, not taken: the table rides a stored world into the next
+        // analysis, whose reused modules re-run no inference to refill it.
+        let mut problems: Vec<(Id, String)> = self
+            .tuple_literal_label_problems
+            .iter()
+            .map(|(literal, message)| (*literal, message.clone()))
+            .collect();
         problems.sort_by_key(|(literal, _)| {
             self.span_map
                 .get(literal)
@@ -8403,6 +8412,60 @@ impl<'src> Analyzer<'src> {
                 note: None,
                 span,
                 msg: message,
+            });
+        }
+    }
+
+    /// B569 S4: records a call's NAMED arguments — a `Labelled` entry of the
+    /// written argument list — by the id its value walked to.
+    fn note_named_arguments(&mut self, arguments: &[Spanned<Node<'src>>], argument_ids: &[Id]) {
+        for (argument, argument_id) in arguments.iter().zip(argument_ids) {
+            if matches!(argument.0, Node::Labelled(..)) {
+                self.named_arguments.push((*argument_id, argument.1));
+            }
+        }
+    }
+
+    /// B569 S4 (`named-tuple-fields.md` §8): a named argument is an entry of
+    /// the labelled literal a spread parameter collects, so it stands only
+    /// where a pack collected it. Anywhere else — a callee without a spread
+    /// parameter, a fixed parameter before the pack — the name would be
+    /// silently dropped, so it is refused, with the assignment the author may
+    /// have meant named beside it (B569 S1).
+    fn check_named_arguments(&mut self) {
+        if self.named_arguments.is_empty() {
+            return;
+        }
+        let collected: HashSet<Id> = self
+            .spread_packs
+            .values()
+            .filter_map(|arguments| arguments.last())
+            .filter_map(|pack| match self.expr_id_to_expr_map.get(pack) {
+                Some(Expr::Tuple(elements)) => Some(elements.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for (argument_id, span) in self.named_arguments.clone() {
+            if collected.contains(&argument_id) {
+                continue;
+            }
+            let label = self
+                .entry_labels
+                .get(&argument_id)
+                .copied()
+                .unwrap_or_default();
+            let value = self.written_text_of(argument_id).unwrap_or("…");
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "`{label} = {value}` names an argument, and only a spread parameter takes \
+                     names (`...at: ({label}: T, …)`), which this one is not: drop `{label} =` \
+                     to pass it by position, or, to assign, write `{label} = {value};` before \
+                     the call"
+                ),
             });
         }
     }
@@ -37693,6 +37756,7 @@ impl<'src> Analyzer<'src> {
                                 self.member_name_spans.insert(id, call_subject.1);
                                 let argument_ids =
                                     self.walk_expr_nodes(&call_arguments.0, scope_id);
+                                self.note_named_arguments(&call_arguments.0, &argument_ids);
                                 let generic_argument_ids = call_generic_arguments
                                     .as_ref()
                                     .map(|x| {
@@ -38461,6 +38525,7 @@ impl<'src> Analyzer<'src> {
                 self.call_subjects.push((id, subject_id));
                 self.call_subject_ids.insert(subject_id);
                 let argument_ids = self.walk_expr_nodes(&arguments.0, scope_id);
+                self.note_named_arguments(&arguments.0, &argument_ids);
                 let generic_argument_ids = generic_arguments
                     .as_ref()
                     .map(|x| {
@@ -50878,6 +50943,22 @@ impl<'src> Analyzer<'src> {
             return Err(());
         }
         let pack_element_ids = argument_ids[fixed..].to_vec();
+        // B569 S4: the collected arguments are the pack's literal, so they are
+        // all named or none, as its entries are.
+        let named = pack_element_ids
+            .iter()
+            .filter(|element| self.entry_labels.contains_key(element))
+            .count();
+        if named > 0 && named < pack_element_ids.len() {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: arguments_span,
+                msg: "a spread parameter's arguments are all named or none: name every \
+                      argument it collects, or drop the names and pass them by position"
+                    .to_string(),
+            });
+        }
         let pack_id = self.new_entity_id();
         // The pack's diagnostic span is the first collected argument's, so a
         // pack that fails its bound points at what was written; an EMPTY pack
@@ -50933,7 +51014,9 @@ impl<'src> Analyzer<'src> {
         // at different positions — do not convert, and the sentence says
         // which label moved. `with_fragment_steer` appends the two spellings
         // when the value is a place.
-        if let (Type::Tuple(_, wanted), Type::Tuple(_, carried)) = (expected_type, got_type)
+        if let (Type::Tuple(slots, wanted), Type::Tuple(values, carried)) =
+            (expected_type, got_type)
+            && slots.len() == values.len()
             && let Some(label) = carried.contradiction(wanted)
         {
             let (from, to) = (
@@ -78998,6 +79081,7 @@ fn analyze_over_world<'src>(
         analyzer.check_written_nominal_bounds();
         analyzer.check_tuple_spreads();
         analyzer.check_tuple_literal_labels();
+        analyzer.check_named_arguments();
     }
     unless_cancelled! {
         // The HMR transfer bound at `dev::stash`/`dev::take` call sites (`hmr.md` §4);

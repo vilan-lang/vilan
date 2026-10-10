@@ -1057,3 +1057,44 @@ pub const BOUND_FIXTURES: &[Fixture] = &[Fixture {
         },
     ],
 }];
+
+// --- B569: a labelled tuple in a reused module (lang-a-49, Order 49) -------------
+//
+// A PREFIX module whose declarations print labels — a labelled return, a
+// labelled module binding built by name — and whose bodies carry a by-name
+// pattern, a named-argument call, and one label refusal the tuple rule records
+// in inference (`tuple_literal_label_problems`), with a hot leaf beside it the
+// script types into. Its hover rows and declaration labels are recorded per
+// module and restored on reuse (S2b); they must render the labels a clean
+// analysis renders, and the refusal must survive every keystroke elsewhere.
+
+pub const LABELS_MAIN: &str = "import pkg::shapes::{ bounds, origin, spread };\nimport pkg::views::render;\n\nfun main() {\n\tlet b = bounds();\n\tprint(b.max - b.min);\n\tprint(origin.x);\n\tprint(spread());\n\tprint(render());\n}\n";
+
+pub const LABELS_SHAPES: &str = "export fun bounds(): (min: i32, max: i32) {\n\t(max = 9, min = 1)\n}\n\nexport let origin: (x: f64, y: f64) = (y = 2, x = 1);\n\nfun draw(...at: (x: i32, y: i32)): i32 {\n\tlet (y = down, x = across) = at;\n\tacross * 10 + down\n}\n\nexport fun spread(): i32 {\n\tdraw(y = 4, x = 3)\n}\n\nexport fun refused(): (x: i32, y: i32) {\n\t(x = 1, z = 2)\n}\n";
+
+pub const LABELS_FIXTURE: Fixture = Fixture {
+    name: "labelled_tuples",
+    platform: NODE,
+    files: &[
+        ("main.vl", LABELS_MAIN),
+        ("shapes.vl", LABELS_SHAPES),
+        ("views.vl", POST_PASS_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a statement typed into the leaf beside the prefix module's labelled tuples",
+            file: "views.vl",
+            seed: None,
+            replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
+        },
+        Edit {
+            label: "a statement typed into the entry beside the prefix module's labelled tuples",
+            file: "main.vl",
+            seed: None,
+            replacements: &[(
+                "\tprint(render());\n",
+                "\tprint(render());\n\tlet extra = 1;\n",
+            )],
+        },
+    ],
+};

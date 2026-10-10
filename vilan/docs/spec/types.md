@@ -1374,6 +1374,15 @@ y = 7.0)`; a tuple a generic body prints through its parameter prints
 positionally, since labels erase at the instance (below). `Debug`'s
 `debug()` is positional.
 
+A **spread parameter over a labelled tuple** takes NAMED arguments: the
+call collects its arguments into one tuple literal (§5.9's desugar), so
+`draw(x = 1, y = 2)` and `draw(y = 2, x = 1)` against `fun draw(...at: (x:
+f64, y: f64))` both collect a literal that matches the pack by name, and
+`draw(1, 2)` still collects one positionally. A fixed parameter before the
+pack is passed by position; the collected arguments are all named or none;
+a name nothing collects is refused; and a slot cannot be left out — there
+are no defaults (a struct with field defaults is the shape for those).
+
 Labels flow through generics as part of the type a parameter binds
 (`id(p).x`), and a **mapped tuple** keeps its source's labels position by
 position — `combine((x = a, y = b))` derives over `(x: i32, y: i32)`. They

@@ -636,6 +636,7 @@ path    = ( IDENT generic-args ␣"::"  (* generic static head *)
           | atom )
           { "::" MEMBER } ;
 call-suffix = [ generic-args ] "(" [ entry { "," entry } [ "," ] ] ")" ;
+                                          (* an argument: its `entry` may be NAMED *)
 member  = NUMBER                          (* tuple index: .0 *)
         | MEMBER [ call-suffix ] ;        (* field / ONE fused method call *)
 MEMBER  = IDENT | RESERVED ;              (* any word, B414 S4 (§2.2) *)
@@ -652,11 +653,10 @@ atom    = literal | IDENT | IDENT generic-args | struct-init
         | tuple-comprehension | macro-invocation | macro-block
         | element | css-block ;
 literal = NUMBER | STRING | "true" | "false" | "null" | "void" ;
-tuple   = "(" ( spread | tuple-entry "," tuple-entry { "," tuple-entry } [ "," ] ) ")"
+tuple   = "(" ( spread | entry "," entry { "," entry } [ "," ] ) ")"
         | "(" labelled-entry ")" ;        (* the one-slot labelled tuple, B569 *)
-tuple-entry = spread | labelled-entry | expression ;
-labelled-entry = MEMBER "=" expression ;  (* a tuple's label: every entry, or none *)
-entry   = spread | expression ;
+entry   = spread | labelled-entry | expression ;
+labelled-entry = MEMBER "=" expression ;  (* a label / a named argument, B569 *)
 spread  = ".." expression ;
 list    = "[" [ expression { "," expression } [ "," ] ] "]" ;
 tuple-comprehension = "(" comprehension-binding { "," comprehension-binding }
@@ -740,6 +740,15 @@ the label is what makes it a tuple, where `(5)` stays a group. There is
 no shorthand: `(x, y)` is positional and never means `(x = x, y = y)`.
 `(x = 5);` as a statement builds a tuple and discards it, and is refused
 with the assignment it was meant to be.
+
+The same entry in an argument list is a **named argument** (B569 S4,
+`named-tuple-fields.md` §8): a spread parameter collects its arguments
+into one tuple literal, so `draw(x = 1, y = 2)` against `fun draw(...at:
+(x: f64, y: f64))` collects `(x = 1, y = 2)` and matches it by name (types
+§5.9). The collected arguments are named or none; a name no spread
+parameter collects — a callee without one, a fixed parameter before it — is
+refused, naming the assignment the author may have meant. There are no
+default arguments.
 
 An **element** appears only in atom position, where `<` begins no other
 expression; after an operand, `<` remains a comparison (`x < <div/>` is

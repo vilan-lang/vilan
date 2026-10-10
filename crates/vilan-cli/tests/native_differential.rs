@@ -2474,6 +2474,54 @@ fn b569_labels_never_split_a_native_instance() {
     );
 }
 
+/// B569 S4: named arguments through a spread parameter — collected into the
+/// labelled literal and matched by name, evaluated as written — mean the
+/// same on both backends, beside a fixed parameter, a one-slot pack, a
+/// positional call and a spread of a labelled binding.
+#[test]
+fn b569_named_arguments_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b569_named_arguments.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun say(label: str, value: f64): f64 {\n",
+            "\tprint(label);\n",
+            "\tvalue\n",
+            "}\n",
+            "\n",
+            "fun draw(...at: (x: f64, y: f64)): f64 {\n",
+            "\tat.x * 10 + at.y\n",
+            "}\n",
+            "\n",
+            "fun tagged(tag: str, ...at: (x: i32, y: i32)): str {\n",
+            "\ti\"{tag}: {at.x},{at.y}\"\n",
+            "}\n",
+            "\n",
+            "fun one(...only: (x: i32)): i32 {\n",
+            "\tonly.x\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(draw(1, 2));\n",
+            "\tprint(draw(x = 1, y = 2));\n",
+            "\tprint(draw(y = say(\"y\", 2), x = say(\"x\", 1)));\n",
+            "\tlet q: (x: f64, y: f64) = (x = 3, y = 4);\n",
+            "\tprint(draw(..q));\n",
+            "\tprint(tagged(\"p\", y = 6, x = 5));\n",
+            "\tprint(one(x = 7));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b569_named_arguments.vl"),
+        Verdict::Identical,
+        "named arguments must mean the same thing on both backends"
+    );
+}
+
 /// F41: a field named `self`, `super` or `crate` builds natively.
 ///
 /// Vilan's `self` and `super` are contextual, so they are legal field names

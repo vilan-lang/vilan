@@ -63,7 +63,7 @@ fn b569_an_assignment_used_as_a_value_is_refused() {
         ),
         (
             "takes(x = 5);",
-            "inside parentheses `x = …` is a tuple's label, not an assignment: to assign, write `x = 5;` before this, and use `x`",
+            "`x = 5` names an argument, and only a spread parameter takes names (`...at: (x: T, …)`), which this one is not: drop `x =` to pass it by position, or, to assign, write `x = 5;` before the call",
         ),
         (
             "let y = true then x = 5 else 0;",
@@ -512,4 +512,85 @@ fn b569_dbg_prints_labels_where_they_are_written() {
             "`dbg` printed {line:?}; got:\n{stderr}"
         );
     }
+}
+
+// --- S4: named arguments through a spread parameter ----------------------------
+//
+// §8, Q7: `f(a, b)` collects into `f((a, b))`, so `draw(x = 1, y = 2)` collects
+// into the labelled literal `(x = 1, y = 2)` against the pack type, and §4.1
+// matches it by name. No defaults (Q7); B581's door (a): a direct call always
+// collects.
+
+/// Named arguments match the pack by name, in any order, evaluated as
+/// written; positional calls, a spread of a labelled value, fixed parameters
+/// before the pack and the one-slot pack work beside them.
+#[test]
+fn b569_a_spread_parameter_takes_named_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun say(label: str, value: f64): f64 {
+            print(label);
+            value
+        }
+
+        fun draw(...at: (x: f64, y: f64)): f64 {
+            at.x * 10 + at.y
+        }
+
+        fun tagged(tag: str, ...at: (x: i32, y: i32)): str {
+            i"{tag}: {at.x},{at.y}"
+        }
+
+        fun one(...only: (x: i32)): i32 {
+            only.x
+        }
+
+        fun main() {
+            print(draw(1, 2));
+            print(draw(x = 1, y = 2));
+            print(draw(y = say("y", 2), x = say("x", 1)));
+            let q: (x: f64, y: f64) = (x = 3, y = 4);
+            print(draw(..q));
+            print(tagged("p", y = 6, x = 5));
+            print(one(x = 7));
+            print(one(8));
+        }
+        "#,
+        "12\n12\ny\nx\n12\n34\np: 5,6\n7\n8\n",
+    );
+}
+
+/// A name no pack collects is refused, with the assignment it may have been;
+/// a pack's arguments are all named or none; a name the pack lacks is the
+/// literal's refusal; and there are no defaults.
+#[test]
+fn b569_named_arguments_are_checked() {
+    let header = "fun takes(v: i32) {}\nfun draw(...at: (x: f64, y: f64)): f64 { at.x }\nfun tagged(tag: str, ...at: (x: i32, y: i32)) {}\n";
+    let case = |body: &str| format!("{header}fun main() {{\n    {body}\n}}\n");
+    assert_fails_with(
+        &case("takes(v = 5);"),
+        "`v = 5` names an argument, and only a spread parameter takes names",
+    );
+    assert_fails_with(
+        &case("tagged(tag = \"a\", x = 1, y = 2);"),
+        "`tag = \"a\"` names an argument, and only a spread parameter takes names",
+    );
+    assert_fails_with(
+        &case("draw(1, y = 2);"),
+        "a spread parameter's arguments are all named or none",
+    );
+    assert_fails_with(
+        &case("draw(x = 1, z = 2);"),
+        "`z` is not a label of `(x: f64, y: f64)`",
+    );
+    assert_fails_with(
+        &case("draw(x = 1);"),
+        "Expected (x: f64, y: f64), but got (x: f64) instead.",
+    );
+    assert_fails_without(
+        &case("draw(y = 1, x = 2, w = 3);"),
+        "the label `y` names slot",
+    );
 }

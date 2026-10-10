@@ -189,13 +189,12 @@ pub enum ParseErrorReason {
     /// order. `canonical` is the head respelled in it; the parse read it so.
     AttributeOrder { canonical: String },
     /// An assignment where its value is used (B569 S1): `written` is the
-    /// assignment's own text when it fits on one line, `place` its target,
-    /// `labelled` whether it is an entry of a parenthesized list with a bare
-    /// name for a place — the spelling of a tuple's label.
+    /// assignment's own text when it fits on one line, `place` its target.
+    /// (`name = value` as an entry of parentheses never reaches here: it is
+    /// a tuple's label, or a call's named argument.)
     ValuedAssignment {
         written: Option<String>,
         place: String,
-        labelled: bool,
     },
     /// `(x = 5);` — a one-slot labelled tuple standing as a statement (B569
     /// §3.2), which an author writes meaning the assignment. `value` is the
@@ -1774,11 +1773,9 @@ pub fn render(error: &ParseError) -> String {
         ParseErrorReason::ForeignSpelling(spelling) => spelling.message().to_string(),
         ParseErrorReason::MarkerOrder { canonical } => marker_order_rule(canonical),
         ParseErrorReason::AttributeOrder { canonical } => attribute_order_rule(canonical),
-        ParseErrorReason::ValuedAssignment {
-            written,
-            place,
-            labelled,
-        } => valued_assignment_rule(written.as_deref(), place, *labelled),
+        ParseErrorReason::ValuedAssignment { written, place } => {
+            valued_assignment_rule(written.as_deref(), place)
+        }
         ParseErrorReason::DiscardedLabelledTuple { label, value } => {
             let value = value.as_deref().unwrap_or("…");
             format!(
@@ -2134,11 +2131,6 @@ struct Parser<'a, 'src> {
     /// false without being told. Set and restored by
     /// [`Parser::parse_discarded`].
     assignment_head: Option<usize>,
-    /// The token index at which an entry of a parenthesized list begins —
-    /// a group's, a tuple's, an argument list's — where `name = value` is the
-    /// spelling of a tuple's LABEL (B569). Read only to word the refusal of an
-    /// assignment there ([`Parser::refuse_valued_assignment`]).
-    entry_head: Option<usize>,
     /// The diagnostics of the parser's in-place TOKEN REWRITES (B520's
     /// foreign spellings), held aside from `errors` for `nesting_refusal`'s
     /// reason: [`Parser::attempt`] truncates `errors` when a branch declines,
@@ -2477,24 +2469,16 @@ fn marker_keywords_are_legal(keywords: &[MarkerKeyword], word: &str) -> bool {
 /// word. `canonical` is the head respelled in that order, attributes
 /// abbreviated. An ERROR ([`MarkerOrderDiagnostic::Keywords`]).
 /// [`ParseErrorReason::ValuedAssignment`]'s message: the rule, and the
-/// statement to write in its place. As a parenthesized entry the steer says
-/// what `name = value` reads as there instead.
-fn valued_assignment_rule(written: Option<&str>, place: &str, labelled: bool) -> String {
+/// statement to write in its place.
+fn valued_assignment_rule(written: Option<&str>, place: &str) -> String {
     let statement = written.map_or_else(
         || "the assignment as a statement".to_string(),
         |written| format!("`{written};`"),
     );
-    if labelled {
-        format!(
-            "inside parentheses `{place} = …` is a tuple's label, not an assignment: to \
-             assign, write {statement} before this, and use `{place}`"
-        )
-    } else {
-        format!(
-            "an assignment is a statement and has no value: write {statement} before \
-             this, and use `{place}`"
-        )
-    }
+    format!(
+        "an assignment is a statement and has no value: write {statement} before this, and \
+         use `{place}`"
+    )
 }
 
 fn marker_order_rule(canonical: &str) -> String {
@@ -2864,7 +2848,6 @@ impl<'a, 'src> Parser<'a, 'src> {
             member_readings: Vec::new(),
             statement_head: None,
             assignment_head: None,
-            entry_head: None,
             rewrite_refusals: Vec::new(),
             written_starts: Vec::new(),
             warnings: Vec::new(),
@@ -5597,9 +5580,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_argument_list(&mut self) -> Option<Spanned<NodeList<'src>>> {
         let start = self.position;
         self.expect_ctrl('(')?;
-        let arguments = self.comma_list(Self::parse_element_or_spread, |parser| {
-            parser.peek_is_ctrl(')')
-        })?;
+        let arguments =
+            self.comma_list(Self::parse_tuple_entry, |parser| parser.peek_is_ctrl(')'))?;
         self.expect_ctrl(')')?;
         Some((arguments, self.span_from(start)))
     }
@@ -6104,7 +6086,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             let first = if parser.opener_is_interpolation_hole(start) {
                 parser.parse_expression()?
             } else {
-                parser.parse_labelled_entry_or(Self::parse_entry_expression)?
+                parser.parse_labelled_entry_or(Self::parse_expression)?
             };
             // B569 §7: `(x = 5)` is the one-slot labelled tuple — the label is
             // what makes it a tuple, where `(5)` stays a group.
@@ -6137,21 +6119,13 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
-    /// One entry of a tuple construction or an argument list: a spread (`..e`) or
-    /// an ordinary expression.
-    fn parse_element_or_spread(&mut self) -> Option<Spanned<Node<'src>>> {
-        match self.parse_spread_element() {
-            Some(spread) => Some(spread),
-            None => self.parse_entry_expression(),
-        }
-    }
-
-    /// One entry of a tuple literal: a spread, a labelled entry `MEMBER "="
-    /// expression` (B569 §2), or an expression.
+    /// One entry of a tuple literal or an argument list: a spread, a labelled
+    /// entry `MEMBER "=" expression` (B569 §2 — in an argument list, a NAMED
+    /// argument, §8), or an expression.
     fn parse_tuple_entry(&mut self) -> Option<Spanned<Node<'src>>> {
         match self.parse_spread_element() {
             Some(spread) => Some(spread),
-            None => self.parse_labelled_entry_or(Self::parse_entry_expression),
+            None => self.parse_labelled_entry_or(Self::parse_expression),
         }
     }
 
@@ -6173,15 +6147,6 @@ impl<'a, 'src> Parser<'a, 'src> {
             Node::Labelled((label, label_span), Box::new(value)),
             self.span_from(start),
         ))
-    }
-
-    /// An entry of a parenthesized list, recorded as one
-    /// ([`Parser::entry_head`]).
-    fn parse_entry_expression(&mut self) -> Option<Spanned<Node<'src>>> {
-        let outer = self.entry_head.replace(self.position);
-        let expression = self.parse_expression();
-        self.entry_head = outer;
-        expression
     }
 
     /// `..e` — a tuple-value spread, recognized ONLY where an element begins
@@ -7580,7 +7545,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             let value = parser.parse_expression()?;
             let span = parser.span_from(start);
             if parser.assignment_head != Some(start) {
-                parser.refuse_valued_assignment(start, &target, op.is_none(), span);
+                parser.refuse_valued_assignment(&target, span);
             }
             Some((Node::Assign(Box::new(target), op, Box::new(value)), span))
         })
@@ -7614,17 +7579,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// author meant the statement; and inside parentheses `name = value` is a
     /// tuple's label, which is why the place left. The tree keeps the
     /// assignment, so everything after it still analyzes.
-    fn refuse_valued_assignment(
-        &mut self,
-        start: usize,
-        target: &Spanned<Node<'src>>,
-        plain: bool,
-        span: Span,
-    ) {
+    fn refuse_valued_assignment(&mut self, target: &Spanned<Node<'src>>, span: Span) {
         let written = &self.source[span.start..span.end];
         let place = &self.source[target.1.start..target.1.end];
-        let labelled =
-            plain && self.entry_head == Some(start) && matches!(target.0, Node::Accessor(_));
         // One line of source quotes; a statement spread over lines quotes
         // only its place.
         let written = (!written.contains('\n')).then(|| written.to_string());
@@ -7633,7 +7590,6 @@ impl<'a, 'src> Parser<'a, 'src> {
             reason: ParseErrorReason::ValuedAssignment {
                 written,
                 place: place.to_string(),
-                labelled,
             },
             context: Vec::new(),
             hint: None,
@@ -11544,16 +11500,13 @@ mod tests {
     }
 
     /// B569 S1: every position whose value is USED refuses an assignment,
-    /// naming the statement to write instead; an argument with a bare name
-    /// for a place says it is a label's spelling there (inside a tuple's
-    /// parentheses S2 reads it as one).
+    /// naming the statement to write instead. (`name = value` as an entry of
+    /// parentheses is no assignment at all since S2/S4: a tuple's label, or a
+    /// call's named argument.)
     #[test]
     fn b569_an_assignment_is_refused_where_its_value_is_used() {
         let general = "an assignment is a statement and has no value: write ";
-        let label = "inside parentheses `x = …` is a tuple's label, not an assignment: to assign, write `x = 5;` before this, and use `x`";
         for (body, expected) in [
-            ("takes(x = 5);", label.to_string()),
-            ("takes(1, x = 5);", label.to_string()),
             (
                 "let y = (x += 5);",
                 format!("{general}`x += 5;` before this, and use `x`"),
@@ -11583,6 +11536,10 @@ mod tests {
                 format!("{general}`x = 5;` before this, and use `x`"),
             ),
             (
+                "takes(p.x = 5);",
+                format!("{general}`p.x = 5;` before this, and use `p.x`"),
+            ),
+            (
                 "takes(c then x = 5 else 0);",
                 format!("{general}`x = 5;` before this, and use `x`"),
             ),
@@ -11609,10 +11566,10 @@ mod tests {
     #[test]
     fn b569_a_multi_line_assignment_is_steered_by_its_place() {
         assert_eq!(
-            program_errors("fun f() { takes(x =\n 5 + 1); }"),
+            program_errors("fun f() { let y = [x =\n 5 + 1]; }"),
             vec![
-                "inside parentheses `x = …` is a tuple's label, not an assignment: to assign, \
-                 write the assignment as a statement before this, and use `x`"
+                "an assignment is a statement and has no value: write the assignment as a \
+                 statement before this, and use `x`"
                     .to_string()
             ]
         );
@@ -11723,6 +11680,26 @@ mod tests {
         );
         // A single parenthesized pattern without a label is still no tuple.
         assert!(!program_errors("fun f() { let (a) = p; }").is_empty());
+    }
+
+    /// B569 S4: a call's argument may be NAMED — `MEMBER "=" expression`, a
+    /// labelled entry of the literal a spread parameter collects; a place
+    /// that is not a bare name is still an assignment, and refused.
+    #[test]
+    fn b569_an_argument_may_be_named() {
+        match &expr("draw(x = 1, y = 2)").0 {
+            Node::Call(_, _, arguments) => {
+                assert!(matches!(&arguments.0[0].0, Node::Labelled(("x", _), _)));
+                assert!(matches!(&arguments.0[1].0, Node::Labelled(("y", _), _)));
+            }
+            other => panic!("expected a call, got {other:?}"),
+        }
+        assert!(matches!(&expr("p.draw(x = 1)").0, Node::MemberAccessor(..)));
+        assert_eq!(
+            program_errors("fun f() { draw(x = 1, y = 2); }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(program_errors("fun f() { takes(p.x = 1); }").len(), 1);
     }
 
     // --- Closures ------------------------------------------------------------

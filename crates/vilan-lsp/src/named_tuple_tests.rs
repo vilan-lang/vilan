@@ -104,3 +104,26 @@ fn b569_hover_on_a_function_prints_its_labelled_return() {
     let hover = analyzed(source).hover(offset).expect("a hover");
     assert!(hover.contains("(min: i32, max: i32)"), "{hover}");
 }
+
+/// B569 S4: there is no signature-help popup (book_sync's capability list),
+/// so the call-shaped completion is where a signature's names reach the
+/// call site: a spread parameter over a labelled tuple offers one tab stop
+/// per label, after any fixed parameter — a positional call over the pack
+/// is legal, and the names are what the author reads.
+#[test]
+fn b569_a_labelled_spread_parameters_tab_stops_are_its_labels() {
+    let source =
+        "fun draw(tag: str, ...at: (x: f64, y: f64)): f64 { at.x }\nfun main() {\n\tdra\n}\n";
+    let offset = source.find("dra\n").expect("the cursor") + "dra".len();
+    let completion = analyzed(source)
+        .completion(offset)
+        .into_iter()
+        .find(|completion| completion.label == "draw")
+        .expect("a `draw` completion");
+    assert_eq!(
+        completion.call_parameters,
+        Some(vec!["tag".to_string(), "x".to_string(), "y".to_string()])
+    );
+    let detail = completion.detail.expect("a signature");
+    assert!(detail.contains("...at: (x: f64, y: f64)"), "{detail}");
+}
