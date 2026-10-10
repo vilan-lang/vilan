@@ -311,9 +311,21 @@ impl<'src> Analyzer<'src> {
             .values()
             .map(|site| site.value_id)
             .collect();
+        // Each link's chain head, in one pass in walk order: a link's subject
+        // was recorded before it, so a subject that is itself a link already
+        // has its head, and any other subject IS the head.
+        let mut heads: HashMap<Id, Id> = HashMap::default();
+        for stage in &stages {
+            let head = heads
+                .get(&stage.subject_id)
+                .copied()
+                .unwrap_or(stage.subject_id);
+            heads.insert(stage.id, head);
+        }
         let mut hinted: Vec<(Id, Id, Span)> = Vec::new();
         let mut seen: HashSet<Id> = HashSet::default();
         for stage in &stages {
+            let head_id = heads[&stage.id];
             let Some(source) = self.source_of_id(stage.id) else {
                 continue;
             };
@@ -331,15 +343,15 @@ impl<'src> Analyzer<'src> {
             }
             // The head, when the first link of the chain breaks onto a new
             // line after it.
-            if stage.subject_id == stage.head_id
-                && let Some(head_span) = self.span_map.get(&stage.head_id).map(|span| **span)
+            if stage.subject_id == head_id
+                && let Some(head_span) = self.span_map.get(&head_id).map(|span| **span)
                 && ends_its_line(text, head_span.end)
-                && seen.insert(stage.head_id)
+                && seen.insert(head_id)
             {
-                hinted.push((stage.head_id, stage.head_id, head_span));
+                hinted.push((head_id, head_id, head_span));
             }
             if ends_its_line(text, stage.span.end) && seen.insert(stage.id) {
-                hinted.push((stage.id, stage.head_id, stage.span));
+                hinted.push((stage.id, head_id, stage.span));
             }
         }
         self.chain_stages = stages;
@@ -352,6 +364,7 @@ impl<'src> Analyzer<'src> {
             if matches!(self.expr_id_to_expr_map.get(&id), Some(Expr::Ascribe(_))) {
                 continue;
             }
+            crate::counters::count_reading_aid();
             // A call's type is not tabled (only its callee's return is), so a
             // stage is asked of the settled solver; a binding read answers
             // through its declaration.

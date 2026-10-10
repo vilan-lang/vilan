@@ -8099,8 +8099,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_type(&mut self) -> Option<Spanned<Node<'src>>> {
         // The type grammar is a closed cycle that reaches no expression rule at
         // all (B142) — `& & & ..`, `[[..; 1]; 1]`, `L<L<..>>`, `((..))`, closure
-        // types and bounds all come back through here, and `parse_type_atom` has
-        // this as its only caller, so this is the type grammar's single door. It
+        // types and bounds all come back through here, and `parse_type_atom` is
+        // reached only through a depth-bounded door (this one, and `auto`'s
+        // written type, B570), so this is the type grammar's bound. It
         // is reachable from a bounded expression too, through a call's generic
         // arguments, which is why one level of expression nesting cannot stand in
         // for it.

@@ -4089,7 +4089,9 @@ impl<'src> Transformer<'src> {
         // B571: an ascription's copy is decided at its VALUE (the analyzer's
         // `peel_ascriptions`), where its coercion is keyed too.
         let mut value_id = value_id;
-        while let Some(Expr::Ascribe(inner)) = self.program.entity_map.get(&value_id) {
+        while self.program.has_ascriptions
+            && let Some(Expr::Ascribe(inner)) = self.program.entity_map.get(&value_id)
+        {
             value_id = *inner;
         }
         // M90: a read-only `let` of a stable place shares it — nothing can

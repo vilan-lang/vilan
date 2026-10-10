@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**E278 / B570: a cold `vilan check` builds no editor reading aid.** The per-stage hints and the `auto` fills are typed and spelled only for an analysis the language server runs (`Workspace::reading_aids`); a check, a build, the playground and the tests skip both tables, which cost a cold check of the genapp perf row 1.5%. The `auto` refusals and the `[check] auto` warnings are CLI surface and still run, the opt-in rendering only the items it covers. A thread counter (`counters::reading_aids_rendered`) holds a cold check at zero. And a program with no ascription no longer pays for them: the write-through refusal's pass over every expression, the copy rule's look through an ascription and the `auto` lookups each answer from an empty table first, and the walk records a chain link without working out its head.
+
 <!-- family: diagnostics -->
 **E284: `a < b > (c)`, spaced, names both readings.** Expression position still reads it as the generic call `a<b>(c)` (B571 Q3 keeps the whitespace rule to ascribed types for now), and when `a` turns out not to be callable the refusal no longer stops at "cannot call this as a function: it is i32": it says the call was read as `a<b>(c)`, gives the parenthesized comparison `(a < b) > (c)`, and notes that a comparison chain is joined with `&&`, since `bool` has no order.
 

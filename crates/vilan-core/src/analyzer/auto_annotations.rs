@@ -90,6 +90,9 @@ impl<'src> Analyzer<'src> {
 
     /// [`Self::auto_written_type`]'s slot.
     pub(super) fn auto_written_type_id(&self, owner: Id) -> Option<TypeId> {
+        if self.auto_written.is_empty() {
+            return None;
+        }
         let written = *self.auto_written.get(&owner)?;
         self.fully_written(&written.get_type(self), 0)
             .then_some(written)
@@ -328,7 +331,19 @@ impl<'src> Analyzer<'src> {
     /// check --fix` and the on-save action write them (§8): `"exported"` —
     /// a return or module binding reachable from outside its module (Q6
     /// RULED); `"all"` — every return and module binding. A local never.
-    pub(super) fn auto_fills(&mut self, opt_in: crate::manifest::AutoOptIn) -> Vec<AutoFill> {
+    ///
+    /// `table` is whether a front end reads the fills
+    /// (`Workspace::reading_aids`): without it only the opt-in's warnings are
+    /// written — nothing at all when the package has not opted in — and no
+    /// point the opt-in does not cover is inferred or spelled.
+    pub(super) fn auto_fills(
+        &mut self,
+        opt_in: crate::manifest::AutoOptIn,
+        table: bool,
+    ) -> Vec<AutoFill> {
+        if !table && opt_in == crate::manifest::AutoOptIn::Off {
+            return Vec::new();
+        }
         // The inherent methods of each declared type, for Q6's third clause.
         let mut inherent_owner: HashMap<Id, TypeId> = HashMap::default();
         if opt_in != crate::manifest::AutoOptIn::Off {
@@ -344,12 +359,10 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
-        let mut points: Vec<(Id, (Span, usize))> = self
-            .auto_fill_points
-            .iter()
-            .map(|(id, point)| (*id, *point))
-            .collect();
+        let mut points: Vec<(Id, (Span, usize))> = self.auto_fill_points.clone();
+        // A point a re-walk met twice is one point.
         points.sort_by_key(|(id, _)| id.0);
+        points.dedup_by_key(|(id, _)| *id);
         let mut admitted: HashMap<TypeId, bool> = HashMap::default();
         let mut fills = Vec::new();
         for (id, (name, at)) in points {
@@ -362,6 +375,11 @@ impl<'src> Analyzer<'src> {
             let Some(scope_id) = self.expr_id_to_scope_id_map.get(&id).copied() else {
                 continue;
             };
+            let covered = self.auto_opt_in_covers(id, scope_id, opt_in, &inherent_owner);
+            if !table && covered.is_none() {
+                continue;
+            }
+            crate::counters::count_reading_aid();
             let inferred = if self.functions.contains_key(&id) {
                 // A reading aid asks; it never reports (`stage_hints`' rule).
                 let (diagnostics, marks) =
@@ -386,7 +404,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             let text = format!(": auto {spelling}");
-            if let Some(covered) = self.auto_opt_in_covers(id, scope_id, opt_in, &inherent_owner) {
+            if let Some(covered) = covered {
                 self.warnings.push(Error {
                     trace: Vec::new(),
                     note: None,
@@ -403,7 +421,9 @@ impl<'src> Analyzer<'src> {
                 self.warning_sources
                     .push(self.source_of_id(id).unwrap_or(SourceId(0)));
             }
-            fills.push(AutoFill { id, name, at, text });
+            if table {
+                fills.push(AutoFill { id, name, at, text });
+            }
         }
         fills
     }

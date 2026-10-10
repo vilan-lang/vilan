@@ -1997,6 +1997,9 @@ impl Document {
         mut context: ProjectContext,
         phase_context: Option<vilan_core::PhaseSpan>,
     ) -> Self {
+        // The editor reads the reading aids (E278's stage hints, B570's
+        // `auto` fills) — every analysis of a document, a twin leg's too.
+        context.workspace.reading_aids = true;
         let primary = phase_context.is_some();
         // A fresh analysis has one snapshot: its text IS both the live and the
         // analyzed one, so both indices share a single `Arc`. They part company

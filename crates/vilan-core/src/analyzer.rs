@@ -3049,14 +3049,14 @@ struct AscriptionSite<'src> {
 }
 
 /// One `.name(..)` chain link as the walk met it (E278): the link's own id,
-/// the id of the expression it is called on, the chain's head (its innermost
-/// subject), where the subject ends and the member begins (a line break
-/// between them is a chain split one stage per line), and the link's span.
+/// the id of the expression it is called on, where the subject ends and the
+/// member begins (a line break between them is a chain split one stage per
+/// line), and the link's span. The chain's head is worked out when the hints
+/// are built (`stage_hints`), never on the walk every analysis pays for.
 #[derive(Debug, Clone, Copy)]
 struct ChainStage {
     id: Id,
     subject_id: Id,
-    head_id: Id,
     subject_end: usize,
     member_start: usize,
     span: Span,
@@ -5789,14 +5789,11 @@ pub struct Analyzer<'src> {
     binding_hidden_nominal_constraints: Vec<(Id, Id, Vec<TypeId>, Span)>,
     // B571: every `EXP as T` site, by the ascription's id.
     ascriptions: HashMap<Id, AscriptionSite<'src>>,
-    // E278: every `.name(..)` chain link the walk met, with its chain's head
-    // — the candidates for a per-stage inlay hint, filtered to the multi-line
-    // ones when the program is built (`stage_hints`).
+    // E278: every `.name(..)` chain link the walk met, in walk order (a
+    // link's subject is walked, and recorded, before the link) — the
+    // candidates for a per-stage inlay hint, filtered to the multi-line ones
+    // when the program is built (`stage_hints`).
     chain_stages: Vec<ChainStage>,
-    // E278: each recorded link's chain head, by the link's id — how a link
-    // finds the head its subject belongs to in one lookup (a scan of
-    // `chain_stages` per call was quadratic in a program's calls).
-    chain_heads: HashMap<Id, Id>,
     // B570: every `auto` annotation, checked once the program has settled
     // (`check_auto_annotations`); and the written `T` of each fully written one
     // (no bare trait inside), which callers of the function and readers of the
@@ -5809,7 +5806,7 @@ pub struct Analyzer<'src> {
     // B570 S3: every unannotated return and `let` binding that could take an
     // `auto` — the name the editor's "Add `auto` type" is offered on, and the
     // offset `: auto T` is inserted at.
-    auto_fill_points: HashMap<Id, (Span, usize)>,
+    auto_fill_points: Vec<(Id, (Span, usize))>,
     // E284: each call whose generic list was written spaced from its callee
     // — the callee's, the list's and the arguments' spans.
     spaced_generic_calls: HashMap<Id, (Span, Span, Span)>,
@@ -7935,11 +7932,10 @@ impl<'src> Analyzer<'src> {
             binding_hidden_nominal_constraints: Vec::new(),
             ascriptions: HashMap::default(),
             chain_stages: Vec::new(),
-            chain_heads: HashMap::default(),
             auto_annotations: Vec::new(),
             auto_written: HashMap::default(),
             auto_inferred: HashMap::default(),
-            auto_fill_points: HashMap::default(),
+            auto_fill_points: Vec::new(),
             spaced_generic_calls: HashMap::default(),
             annotated_landings: HashSet::default(),
             hidden_generic_parameters: HashMap::default(),
@@ -29036,6 +29032,9 @@ impl<'src> Analyzer<'src> {
     /// coercion lands too, so both emitters copy first and erase after, as
     /// at an annotated binding.
     fn peel_ascriptions(&self, mut expr_id: Id) -> Id {
+        if self.ascriptions.is_empty() {
+            return expr_id;
+        }
         while let Some(Expr::Ascribe(inner)) = self.expr_id_to_expr_map.get(&expr_id) {
             expr_id = *inner;
         }
@@ -31108,31 +31107,35 @@ impl<'src> Analyzer<'src> {
             .collect();
         // B571 §7.1: a write THROUGH an ascription — an assignment whose place
         // stands on one, or a `&mut` view of one — is refused before the
-        // mutability rules ask about its root.
-        let mut written_places = assignment_targets.clone();
-        written_places.extend(
-            self.expr_id_to_expr_map
-                .iter()
-                .filter(|(id, _)| !self.reusable_entity(**id))
-                .filter_map(|(_, expr)| match expr {
-                    // A view of an ascription ITSELF was refused where the `&`
-                    // is written (`refuse_view_of_ascription`).
-                    Expr::Reference(operand, true)
-                        if !matches!(
-                            self.expr_id_to_expr_map.get(operand),
-                            Some(Expr::Ascribe(_))
-                        ) =>
-                    {
-                        Some(*operand)
-                    }
-                    _ => None,
-                }),
-        );
-        written_places.sort_by_key(|id| id.0);
+        // mutability rules ask about its root. A program with no ascription
+        // has none to write through, and skips the pass over every expression.
         let mut refused_writes = HashSet::default();
-        for place_id in written_places {
-            if self.refuse_write_through_ascription(place_id) {
-                refused_writes.insert(place_id);
+        if !self.ascriptions.is_empty() {
+            let mut written_places = assignment_targets.clone();
+            written_places.extend(
+                self.expr_id_to_expr_map
+                    .iter()
+                    .filter_map(|(id, expr)| match expr {
+                        // A view of an ascription ITSELF was refused where the
+                        // `&` is written (`refuse_view_of_ascription`).
+                        Expr::Reference(operand, true)
+                            if !matches!(
+                                self.expr_id_to_expr_map.get(operand),
+                                Some(Expr::Ascribe(_))
+                            ) =>
+                        {
+                            Some((*id, *operand))
+                        }
+                        _ => None,
+                    })
+                    .filter(|(id, _)| !self.reusable_entity(*id))
+                    .map(|(_, operand)| operand),
+            );
+            written_places.sort_by_key(|id| id.0);
+            for place_id in written_places {
+                if self.refuse_write_through_ascription(place_id) {
+                    refused_writes.insert(place_id);
+                }
             }
         }
         for target_id in assignment_targets {
@@ -38460,16 +38463,9 @@ impl<'src> Analyzer<'src> {
                     Node::Call(call_subject, call_generic_arguments, call_arguments) => {
                         match &call_subject.0 {
                             Node::Accessor(name) => {
-                                let head_id = self
-                                    .chain_heads
-                                    .get(&subject_id)
-                                    .copied()
-                                    .unwrap_or(subject_id);
-                                self.chain_heads.insert(id, head_id);
                                 self.chain_stages.push(ChainStage {
                                     id,
                                     subject_id,
-                                    head_id,
                                     subject_end: subject.1.end,
                                     member_start: member.1.start,
                                     span: node.1,
@@ -39677,7 +39673,7 @@ impl<'src> Analyzer<'src> {
                         scope_id,
                     );
                 } else if type_.is_none() && name != "_" && !name_span.into_range().is_empty() {
-                    self.auto_fill_points.insert(id, (name_span, name_span.end));
+                    self.auto_fill_points.push((id, (name_span, name_span.end)));
                 }
                 Some(Expr::Variable(id))
             }
@@ -40197,7 +40193,7 @@ impl<'src> Analyzer<'src> {
             && !self.walking_trait_impl_body
         {
             self.auto_fill_points
-                .insert(id, (function.name.1, function.parameters.1.end));
+                .push((id, (function.name.1, function.parameters.1.end)));
         }
         if let Some((span, written)) = auto_return {
             if function.external || self.walking_trait_body || self.walking_trait_impl_body {
@@ -70953,6 +70949,9 @@ pub struct Program<'src> {
     /// B570 S3: what "Add `auto` type" writes on every unannotated return
     /// and `let` binding of the package's own files.
     pub auto_fills: Vec<AutoFill>,
+    /// B571: whether the program holds any `EXP as T` — when it holds none,
+    /// the emitter has no ascription to look through for a copy's value.
+    pub has_ascriptions: bool,
     /// Full declaration labels for hover (E9): function signatures,
     /// struct/enum blocks — keyed by declaration id, fenced by the LSP.
     pub declaration_labels: HashMap<Id, String>,
@@ -74808,6 +74807,17 @@ pub struct Workspace {
     /// [`crate::incremental`]; the seed itself is not a key — the CLOSURE it
     /// computes is, because two seeds with one closure build one world.
     pub hot_seeds: Vec<PathBuf>,
+    /// Whether a front end READS this analysis's reading aids — E278's stage
+    /// hints and B570's `auto` fills, the two editor tables whose types are
+    /// asked of the settled solver and spelled for the file. Only the language
+    /// server sets it; a one-shot `vilan check`, a build, the playground and
+    /// the tests never read either table, so they skip building them (the
+    /// `auto` refusals and the `[check] auto` warnings are CLI surface and run
+    /// either way). A front-end fact like `hot_seeds`, and out of the base
+    /// cache key for the same reason: the walk's raw records (the chain links,
+    /// the fill points) are kept on every analysis, so a stored world serves
+    /// both kinds of caller and only the per-analysis tables are skipped.
+    pub reading_aids: bool,
 }
 
 /// Whether the analysis is looking at a program its package declares, or at a
@@ -81675,8 +81685,16 @@ fn analyze_over_world<'src>(
     // BEFORE the label loop below, which borrows the analyzer immutably, since
     // admission is the solver's `&mut` question.
     let hint_labels = analyzer.hint_labels();
-    let stage_hints = analyzer.stage_hints();
-    let auto_fills = analyzer.auto_fills(workspace.check.auto);
+    // E278 / B570: the editor's reading aids, only for a front end that reads
+    // them (`Workspace::reading_aids`); `auto_fills` still writes the `[check]
+    // auto` warnings on the CLI, without the table.
+    let stage_hints = if workspace.reading_aids {
+        analyzer.stage_hints()
+    } else {
+        Vec::new()
+    };
+    let auto_fills = analyzer.auto_fills(workspace.check.auto, workspace.reading_aids);
+    let has_ascriptions = !analyzer.ascriptions.is_empty();
 
     // Pre-render a type label for every typed expression (for hover). Done here
     // while the analyzer still holds the type tables; `expr_id_to_type_id_map`
@@ -82559,6 +82577,7 @@ fn analyze_over_world<'src>(
         hint_labels,
         stage_hints,
         auto_fills,
+        has_ascriptions,
         declaration_labels,
         member_owners,
         member_headers,

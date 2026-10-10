@@ -855,3 +855,85 @@ fn b571_an_invalidating_call_inside_an_ascription_is_still_seen() {
         "while a view into it is live",
     );
 }
+
+// --- E278 / B570: the reading aids, only for a front end that reads them ------
+
+/// Analyzes `source` under `workspace`, answering `(stage hints, auto fills,
+/// reading aids rendered)` — the last read off the thread's counter around the
+/// analysis.
+fn reading_aids_of(source: &'static str, workspace: Workspace) -> (usize, usize, u64) {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let before = vilan_core::counters::reading_aids_rendered();
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                std::path::Path::new("."),
+                std::path::Path::new("test.vl"),
+                Some(Platform::default()),
+                &workspace,
+            );
+            assert!(errors.is_empty(), "the fixture compiles: {errors:?}");
+            let program = program.expect("a program");
+            (
+                program.stage_hints.len(),
+                program.auto_fills.len(),
+                vilan_core::counters::reading_aids_rendered() - before,
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("analysis thread")
+}
+
+const READING_AIDS_FIXTURE: &str = r#"
+import std::io::print;
+
+fun lengths(words: List<str>) {
+    words
+        .map(|word| word.len())
+        .filter(|length| length > 1)
+}
+
+fun main() {
+    let count = lengths(["a", "bb", "ccc"])
+        .len();
+    print(count);
+}
+"#;
+
+/// A cold `vilan check` — no front end reading the tables — types and spells
+/// no stage hint and no `auto` fill: the counter stays at zero and both tables
+/// are empty. The editor's analysis (`reading_aids`) builds both.
+#[test]
+fn e278_a_cold_check_renders_no_reading_aid() {
+    assert_eq!(
+        reading_aids_of(READING_AIDS_FIXTURE, Workspace::default()),
+        (0, 0, 0)
+    );
+    let (stage_hints, auto_fills, rendered) = reading_aids_of(
+        READING_AIDS_FIXTURE,
+        Workspace {
+            reading_aids: true,
+            ..Workspace::default()
+        },
+    );
+    assert!(stage_hints >= 3, "{stage_hints} stage hints");
+    assert!(auto_fills >= 2, "{auto_fills} auto fills");
+    assert!(rendered >= (stage_hints + auto_fills) as u64);
+}
+
+/// The `[check] auto` opt-in still warns on a cold check — CLI surface, the
+/// `check --fix` input — rendering only the items it covers, and still filling
+/// no table.
+#[test]
+fn b570_a_cold_check_under_the_opt_in_renders_only_what_it_covers() {
+    let mut workspace = Workspace::default();
+    workspace.check.auto = vilan_core::manifest::AutoOptIn::All;
+    let (stage_hints, auto_fills, rendered) = reading_aids_of(READING_AIDS_FIXTURE, workspace);
+    assert_eq!((stage_hints, auto_fills), (0, 0));
+    // The two returns are covered (`main`'s is void and fills nothing); the
+    // local `count` never is, so it is not even typed.
+    assert_eq!(rendered, 2, "only the two returns are considered");
+}
