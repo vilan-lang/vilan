@@ -284,6 +284,19 @@
         }
       }
     },
+    "check": {
+      "type": "object",
+      "description": "What `vilan check` asks of the package beyond correctness.",
+      "additionalProperties": false,
+      "properties": {
+        "auto": {
+          "type": "string",
+          "enum": ["off", "exported", "all"],
+          "description": "Which inferred types to keep written as `auto` annotations (a warning each, the annotation its fix, which `vilan check --fix` writes): `exported` — the returns and module bindings reachable from outside their module; `all` — every return and module binding. Default `off`.",
+          "default": "off"
+        }
+      }
+    },
     "macro": {
       "type": "object",
       "description": "The compile-time interpreter's budget.",

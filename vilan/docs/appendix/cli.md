@@ -342,6 +342,23 @@ level the section does not have is a manifest error rather than a silent
 no-op. The section is read from the entry package's manifest; std's own uses,
 and a dependency's, are their authors' and never warn.
 
+**Keeping `auto` types: `[check] auto`.** A package can ask `vilan check` to
+keep its inferred types written as [`auto` annotations](../spec/types.md#auto-types-the-toolchain-keeps):
+
+```toml
+[check]
+auto = "exported"
+```
+
+Under `"exported"` each return and module binding reachable from outside
+its module — `export`-marked, in an `export *;` file, or an inherent method
+of an exported type — whose type is inferred gets a warning carrying its
+`: auto T`, which `vilan check --fix` (and the editor's on-save action)
+writes; `"all"` covers every return and module binding; `"off"` is the
+default. A void return and a local binding are never asked for, and a type
+the file cannot name without a new import is left for a person. Like
+`[lints]`, the section is read from the entry package's manifest.
+
 ## `vilan run [file] [args…]`
 
 Builds and runs. Anything after the file is forwarded to the program.

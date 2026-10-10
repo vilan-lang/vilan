@@ -205,6 +205,74 @@ fn b570_a_stale_auto_ascription_is_rewritten() {
     );
 }
 
+/// B570 S4 (§8, Q6 RULED): under `[check] auto = "exported"`, each exported
+/// return and module binding whose type is inferred is warned about and
+/// written by `--fix` — an exported free function, an inherent method of an
+/// exported type, an exported module binding — and a private one, a void
+/// return and a local are left alone.
+#[test]
+fn b570_the_exported_opt_in_writes_auto_on_exported_items_only() {
+    let dir = temp_tree(
+        "auto_opt_in",
+        &[
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\n\n[check]\nauto = \"exported\"\n",
+            ),
+            (
+                "src/main.vl",
+                "import pkg::model::{ total, Counter, names, #(impl Counter) };\n\nfun main() {\n\tlet c = Counter { n = 2 };\n\tprint(i\"{total(3)} {c.double()} {names.len()}\");\n}\n",
+            ),
+            (
+                "src/model.vl",
+                "export struct Counter {\n\tn: i32,\n}\n\nimpl Counter {\n\tfun double(self) {\n\t\tself.n * 2\n\t}\n}\n\nexport fun total(x: i32) {\n\tlet local = helper(x);\n\tlocal + 1\n}\n\nfun helper(x: i32) {\n\tx\n}\n\nexport fun shout() {\n\tprint(\"!\");\n}\n\nexport let names = [\"a\"];\nlet hidden = 3;\n",
+            ),
+        ],
+    );
+    let (warned, warn_stdout, warn_stderr) = run(&dir, &["check", "."]);
+    let (ok, stdout, stderr) = run(&dir, &["check", "--fix", "."]);
+    let model = read(&dir, "src/model.vl");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        warned,
+        "the opt-in warns, it does not refuse: {warn_stdout}{warn_stderr}"
+    );
+    assert!(
+        format!("{warn_stdout}{warn_stderr}").contains(
+            "`total`'s return is inferred, and this package asks for its `auto` \
+             (`[check] auto = \"exported\"`)"
+        ),
+        "{warn_stdout}{warn_stderr}"
+    );
+    assert!(ok, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("fixed 3 `auto` annotations in 1 file"),
+        "{stdout}"
+    );
+    assert!(model.contains("fun double(self): auto i32 {"), "{model}");
+    assert!(
+        model.contains("export fun total(x: i32): auto i32 {"),
+        "{model}"
+    );
+    assert!(
+        model.contains("export let names: auto List<str> = [\"a\"];"),
+        "{model}"
+    );
+    assert!(
+        model.contains("fun helper(x: i32) {"),
+        "the private function is left: {model}"
+    );
+    assert!(
+        model.contains("export fun shout() {"),
+        "a void return is never written: {model}"
+    );
+    assert!(
+        model.contains("let local = helper(x);"),
+        "a local is never written: {model}"
+    );
+    assert!(model.contains("let hidden = 3;"), "{model}");
+}
+
 #[test]
 fn a_literal_counter_is_declared_usize_and_its_other_uses_convert_in_later_rounds() {
     let dir = temp_package(

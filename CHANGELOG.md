@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**B570 S4: `[check] auto` — a package asks for its inferred types to be kept written as `auto`.** `auto = "exported"` warns on each return and module binding reachable from outside its module (`export`-marked, an `export *;` file, an inherent method of an exported type) whose type is inferred, carrying the `: auto T` that `vilan check --fix` and the editor's on-save action write; `"all"` covers every return and module binding; `"off"` is the default. Void returns and locals are never asked for. The section is in the editor's manifest schema and completion. std's opt-in was measured first: under `"exported"` it would write ONE annotation (`std::base64`'s `alphabet: auto str`) — std already writes every return that is not void — so it is not taken (the opt-in reads the entry package's manifest, and std is never the entry).
+
+<!-- family: tooling -->
 **B570 S3: the editor keeps `auto` types current.** `vilan.autoTypes.onSave` (its own setting, off by default, and a menu toggle) runs the server's new `source.fixAll.vilan.auto` action on save: every stale `auto` rewritten and every bare one filled — `vilan check --fix`'s edits from the analysis the editor holds — and nothing while the file has any other error. A stale `auto` shows the type it would become as an inlay hint (`: auto i32` ⟶ `str`) and carries its rewrite as a quick fix, and **Add `auto` type** is offered on any unannotated return or `let` binding (never a void return, never a type the file cannot name without an import). Locals take `auto` like module bindings. The editor appendix says so.
 
 <!-- family: feature -->

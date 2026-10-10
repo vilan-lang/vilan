@@ -322,7 +322,28 @@ impl<'src> Analyzer<'src> {
     /// type" writes — built on every analysis for every id (no per-module
     /// record takes part). A void return, a type still a hole and a type the
     /// file cannot name offer nothing.
-    pub(super) fn auto_fills(&mut self) -> Vec<AutoFill> {
+    ///
+    /// B570 S4: under the entry package's `[check] auto` opt-in, each fill an
+    /// item the setting covers takes is also a WARNING carrying it, so `vilan
+    /// check --fix` and the on-save action write them (§8): `"exported"` —
+    /// a return or module binding reachable from outside its module (Q6
+    /// RULED); `"all"` — every return and module binding. A local never.
+    pub(super) fn auto_fills(&mut self, opt_in: crate::manifest::AutoOptIn) -> Vec<AutoFill> {
+        // The inherent methods of each declared type, for Q6's third clause.
+        let mut inherent_owner: HashMap<Id, TypeId> = HashMap::default();
+        if opt_in != crate::manifest::AutoOptIn::Off {
+            for implementation in &self.implementations {
+                if !implementation.trait_ids.is_empty() {
+                    continue;
+                }
+                for (_, member_id) in &implementation.declared_members {
+                    inherent_owner.insert(
+                        self.resolve_member_function_id(*member_id),
+                        implementation.subject,
+                    );
+                }
+            }
+        }
         let mut points: Vec<(Id, (Span, usize))> = self
             .auto_fill_points
             .iter()
@@ -364,13 +385,70 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            fills.push(AutoFill {
-                id,
-                name,
-                at,
-                text: format!(": auto {spelling}"),
-            });
+            let text = format!(": auto {spelling}");
+            if let Some(covered) = self.auto_opt_in_covers(id, scope_id, opt_in, &inherent_owner) {
+                self.warnings.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: Span::from(at..at),
+                    msg: format!(
+                        "{covered} is inferred, and this package asks for its `auto` \
+                         (`[check] auto = \"{}\"`){AUTO_REWRITE_MARK}{text}`",
+                        match opt_in {
+                            crate::manifest::AutoOptIn::All => "all",
+                            _ => "exported",
+                        }
+                    ),
+                });
+                self.warning_sources
+                    .push(self.source_of_id(id).unwrap_or(SourceId(0)));
+            }
+            fills.push(AutoFill { id, name, at, text });
         }
         fills
+    }
+
+    /// What the opt-in names an item as when it covers it — "`load`'s
+    /// return", "`names`'s type" — or `None` (B570 S4, §8, Q6 RULED).
+    fn auto_opt_in_covers(
+        &self,
+        id: Id,
+        scope_id: Id,
+        opt_in: crate::manifest::AutoOptIn,
+        inherent_owner: &HashMap<Id, TypeId>,
+    ) -> Option<String> {
+        use crate::manifest::AutoOptIn;
+        if opt_in == AutoOptIn::Off {
+            return None;
+        }
+        let module_level = |scope: Id| {
+            self.module_scope_ids.contains(&scope)
+                || self
+                    .scopes
+                    .get(&scope)
+                    .is_some_and(|scope| scope.parent_id.is_none())
+        };
+        if let Some(function) = self.functions.get(&id) {
+            let name = function.name;
+            let exported = match inherent_owner.get(&id) {
+                // An inherent method is reached through its type.
+                Some(subject) => match subject.get_type(self) {
+                    Type::Struct(declaration, _) | Type::Enum(declaration, _) => self
+                        .expr_id_to_scope_id_map
+                        .get(&declaration)
+                        .is_some_and(|scope| self.is_exported_in(declaration, *scope)),
+                    _ => false,
+                },
+                None if module_level(scope_id) => self.is_exported_in(id, scope_id),
+                None => return None,
+            };
+            return (opt_in == AutoOptIn::All || exported).then(|| format!("`{name}`'s return"));
+        }
+        let variable = self.variables.get(&id)?;
+        if !module_level(scope_id) {
+            return None;
+        }
+        (opt_in == AutoOptIn::All || self.is_exported_in(id, scope_id))
+            .then(|| format!("`{}`'s type", variable.name))
     }
 }

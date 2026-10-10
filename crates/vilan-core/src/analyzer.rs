@@ -74683,6 +74683,10 @@ pub struct Workspace {
     /// base cache key for `platform_reason`'s reason: it changes which
     /// warnings one post-pass writes, never what loads or resolves.
     pub lints: crate::manifest::Lints,
+    /// The ENTRY package's `[check]` (B570 S4), every key defaulted — out of
+    /// the base cache key for `lints`' reason: it changes which warnings one
+    /// post-pass writes, never what loads or resolves.
+    pub check: crate::manifest::CheckOptions,
     /// WHY this analysis runs under the platform it does (E119), already
     /// rendered by [`crate::platform_color::PlatformReason::clause`] — "no entry
     /// reaches it (default-entry is `server`)". Where the front end has no
@@ -81609,7 +81613,7 @@ fn analyze_over_world<'src>(
     // admission is the solver's `&mut` question.
     let hint_labels = analyzer.hint_labels();
     let stage_hints = analyzer.stage_hints();
-    let auto_fills = analyzer.auto_fills();
+    let auto_fills = analyzer.auto_fills(workspace.check.auto);
 
     // Pre-render a type label for every typed expression (for hover). Done here
     // while the analyzer still holds the type tables; `expr_id_to_type_id_map`

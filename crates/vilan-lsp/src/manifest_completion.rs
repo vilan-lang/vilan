@@ -57,6 +57,8 @@ pub enum ValueSet {
     OnlyTrue,
     /// A `[lints]` level (E221): `allow` or `warn`.
     LintLevel,
+    /// A `[check] auto` opt-in (B570 S4): `off`, `exported` or `all`.
+    AutoOptIn,
 }
 
 impl ValueSet {
@@ -68,6 +70,9 @@ impl ValueSet {
             ValueSet::Boolean => vec!["true".to_string(), "false".to_string()],
             ValueSet::OnlyTrue => vec!["true".to_string()],
             ValueSet::LintLevel => vec!["allow".to_string(), "warn".to_string()],
+            ValueSet::AutoOptIn => {
+                vec!["off".to_string(), "exported".to_string(), "all".to_string()]
+            }
             ValueSet::Preset => Preset::all()
                 .iter()
                 .map(|preset| preset.name().to_string())
@@ -496,6 +501,19 @@ pub const TABLES: &[Table] = &[
         }],
     },
     Table {
+        path: "check",
+        documentation: "What `vilan check` asks of the package beyond correctness.",
+        keys: &[Key {
+            name: "auto",
+            documentation: "Which inferred types to keep written as `auto` annotations (a \
+                            warning each, the annotation its fix, which `vilan check --fix` \
+                            writes): `exported` — the returns and module bindings reachable \
+                            from outside their module; `all` — every return and module \
+                            binding. Default `off`.",
+            values: ValueSet::AutoOptIn,
+        }],
+    },
+    Table {
         path: "macro",
         documentation: "The compile-time interpreter's budget.",
         keys: &[
@@ -527,6 +545,7 @@ pub const HEADERS: &[&str] = &[
     "build",
     "fmt",
     "lints",
+    "check",
     "macro",
 ];
 
@@ -1197,7 +1216,7 @@ mod tests {
         let schema = schema();
         let root = &schema["properties"];
         for table in [
-            "package", "library", "project", "build", "fmt", "lints", "macro",
+            "package", "library", "project", "build", "fmt", "lints", "check", "macro",
         ] {
             assert_eq!(
                 properties(&root[table]),
@@ -1274,6 +1293,11 @@ mod tests {
             enumerated(&root["lints"]["properties"]["internal_use"]),
             sorted(ValueSet::LintLevel.values()),
             "`[lints] internal_use`"
+        );
+        assert_eq!(
+            enumerated(&root["check"]["properties"]["auto"]),
+            sorted(ValueSet::AutoOptIn.values()),
+            "`[check] auto`"
         );
         assert_eq!(
             enumerated(
